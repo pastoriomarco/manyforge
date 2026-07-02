@@ -157,6 +157,51 @@ def _configure_ros_grippers(
     for gripper_id, gripper in deployment.grippers.items():
         if gripper.command_mode != "ros_gripper_command":
             continue
+        transport = dict(getattr(gripper, "transport", {}) or {})
+        transport_kind = str(transport.get("kind") or "ros_gripper_command")
+        _seed_ros_gripper_scene_position(native_bundle, runtime_model, gripper)
+        if transport_kind == "isaac_joint_state_effort":
+            open_state_ref = str(getattr(gripper, "open_state_ref", "open") or "open")
+            closed_state_ref = str(
+                getattr(gripper, "closed_state_ref", "closed") or "closed"
+            )
+            presets = dict(getattr(gripper, "srdf_presets", {}) or {})
+            try:
+                open_position = float(presets[open_state_ref])
+                closed_position = float(presets[closed_state_ref])
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"gripper {gripper_id!r} transport.kind=isaac_joint_state_effort "
+                    f"references missing SRDF state {exc.args[0]!r}"
+                ) from exc
+            native_bundle.configure_ros_gripper_action(
+                gripper_id,
+                {
+                    "transport_kind": "isaac_joint_state_effort",
+                    "command_topic": str(transport.get("command_topic") or ""),
+                    "state_topic": str(transport.get("state_topic") or ""),
+                    "command_joint_names": list(
+                        transport.get("joint_names") or [str(gripper.joint_name)]
+                    ),
+                    "group_id": str(gripper.group_id),
+                    "joint_name": str(gripper.joint_name),
+                    "completion_policy": str(
+                        getattr(gripper, "completion_policy", "dwell_elapsed")
+                    ),
+                    "open_position": open_position,
+                    "closed_position": closed_position,
+                    "open_effort": float(transport.get("open_effort", 0.0)),
+                    "close_effort": float(transport.get("close_effort", 0.0)),
+                    "publish_nominal_position": bool(
+                        transport.get("publish_nominal_position", False)
+                    ),
+                    "state_freshness_timeout_s": float(
+                        transport.get("state_freshness_timeout_s", 1.0)
+                    ),
+                    "result_timeout_s": float(transport.get("dwell_s", 0.0)),
+                },
+            )
+            continue
         action_name = str(
             gripper_config.get("action_name")
             or gripper_config.get(f"{gripper_id}_action_name")
@@ -167,13 +212,16 @@ def _configure_ros_grippers(
                 "execution.config.gripper.action_name is required for "
                 f"gripper {gripper_id!r} command_mode=ros_gripper_command"
             )
-        _seed_ros_gripper_scene_position(native_bundle, runtime_model, gripper)
         native_bundle.configure_ros_gripper_action(
             gripper_id,
             {
+                "transport_kind": "ros_gripper_command",
                 "action_name": action_name,
                 "group_id": str(gripper.group_id),
                 "joint_name": str(gripper.joint_name),
+                "completion_policy": str(
+                    getattr(gripper, "completion_policy", "position_reached")
+                ),
                 "wait_for_action_server_timeout_s": float(
                     gripper_config.get("wait_for_action_server_timeout_s", 2.0)
                 ),

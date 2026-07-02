@@ -9,6 +9,7 @@ from manyforge_behavior.kernel_client import (
     ExecuteRequest,
     ExecutionState,
     GripperCommandRequest,
+    GripperCommandState,
     JointDynamicsLimit,
     MockKernelClient,
     ObjectState,
@@ -585,3 +586,61 @@ class TestMockKernelGripperConcurrency:
                 assert kernel.gripper_command_count == thread_count
         finally:
             sys.setswitchinterval(switch_interval)
+
+
+class TestMockKernelGripperSemantics:
+    def test_pneumatic_command_resolves_target_from_srdf_state_ref(self):
+        kernel = MockKernelClient()
+        result = kernel.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="lite_gripper",
+                joint_name="right_finger_joint",
+                target_position=0.0081000001,
+                duration_s=0.0,
+                actuation_kind="pneumatic",
+                state_authority="native_backend",
+                completion_policy="dwell_elapsed",
+                grasp_confirmation_policy="none_open_loop",
+                transport_kind="native_kinematic",
+                open_state_ref="open",
+                closed_state_ref="closed",
+                srdf_presets={"open": 0.0081, "closed": 0.0},
+            )
+        )
+
+        assert result.accepted is True
+        status = kernel.get_gripper_status("primary")
+        assert status.state == GripperCommandState.COMPLETED
+        assert status.commanded_state == "open"
+        assert status.current_position == pytest.approx(0.0081)
+        assert status.target_position == pytest.approx(0.0081)
+        assert status.observed_position == pytest.approx(0.0081)
+        assert kernel.last_gripper_command_request is not None
+        assert kernel.last_gripper_command_request.target_position == pytest.approx(
+            0.0081
+        )
+
+    def test_pneumatic_numeric_target_rejected_when_it_matches_no_state_ref(self):
+        kernel = MockKernelClient()
+        result = kernel.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="lite_gripper",
+                joint_name="right_finger_joint",
+                target_position=0.004,
+                duration_s=0.0,
+                actuation_kind="pneumatic",
+                state_authority="native_backend",
+                completion_policy="dwell_elapsed",
+                grasp_confirmation_policy="none_open_loop",
+                transport_kind="native_kinematic",
+                open_state_ref="open",
+                closed_state_ref="closed",
+                srdf_presets={"open": 0.0081, "closed": 0.0},
+            )
+        )
+
+        assert result.accepted is False
+        assert result.reason_code == "invalid_gripper_semantics"
+        assert "open_state_ref" in (result.error or "")

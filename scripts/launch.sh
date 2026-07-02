@@ -462,8 +462,8 @@ step_choose_scenario() {
     case "${SCENARIO}" in
         isaac-lite6-pick-place|isaac-lite6-trocar-foundationpose)
             export ISAAC_TOPIC_CONTROL_PROFILE="${ISAAC_TOPIC_CONTROL_PROFILE:-lite6}"
-            GRIPPER_ACTION="/lite_gripper_controller/gripper_cmd"
-            export GRIPPER_ACTION
+            export GRIPPER_TRANSPORT_KIND="${GRIPPER_TRANSPORT_KIND:-isaac_joint_state_effort}"
+            export REQUIRE_GRIPPER_ACTION="${REQUIRE_GRIPPER_ACTION:-false}"
             ;;
     esac
     pass "Scenario: ${SCENARIO}"
@@ -741,7 +741,9 @@ verb_smoke() {
         isaac-sim)
             wait_for_isaac_joint_states
             wait_for_arm_action
-            wait_for_gripper_action
+            if [[ "${REQUIRE_GRIPPER_ACTION:-true}" == "true" ]]; then
+                wait_for_gripper_action
+            fi
             wait_for_arm_controller_state
             if [[ "${ASSISTANT}" == "on" ]]; then
                 wait_for_vllm_model
@@ -751,7 +753,7 @@ verb_smoke() {
             if [[ "${SCENARIO}" == "isaac-lite6-pick-place" || "${SCENARIO}" == "isaac-lite6-trocar-foundationpose" ]]; then
                 mkdir -p "${LOG_DIR}"
                 local lite6_live_probe_artifact="${LOG_DIR}/${SCENARIO}-lite6-live-smoke.json"
-                ros_shell "source /opt/ros/jazzy/setup.bash; python3 /workspace/scripts/ros/validate-isaac-lite6-smoke.py --arm-action-name ${ARM_ACTION} --gripper-action-name ${GRIPPER_ACTION} --arm-joint-state-topic ${ARM_JOINT_STATE_TOPIC} --isaac-joint-state-topic ${ISAAC_JOINT_STATE_TOPIC} --json" \
+                ros_shell "source /opt/ros/jazzy/setup.bash; python3 /workspace/scripts/ros/validate-isaac-lite6-smoke.py --arm-action-name ${ARM_ACTION} --gripper-action-name ${GRIPPER_ACTION} --gripper-transport-kind ${GRIPPER_TRANSPORT_KIND:-ros_gripper_command} --arm-joint-state-topic ${ARM_JOINT_STATE_TOPIC} --isaac-joint-state-topic ${ISAAC_JOINT_STATE_TOPIC} --json" \
                     | tee "${lite6_live_probe_artifact}"
                 python3 "${MANYFORGE_ROOT}/scripts/ros/validate-isaac-lite6-smoke-artifact.py" \
                     "${lite6_live_probe_artifact}"

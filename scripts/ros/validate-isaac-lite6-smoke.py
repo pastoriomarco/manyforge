@@ -8,8 +8,11 @@ the complete command surface:
 * stock JTC FollowJointTrajectory action for joint1..joint6;
 * aggregated controller joint state for the arm;
 * Isaac raw joint state for the lite gripper;
-* standard GripperCommand action exposed by the ManyForge bridge;
-* raw /isaac_joint_commands_gripper messages emitted by that bridge.
+* either the legacy standard GripperCommand action exposed by the compatibility
+  bridge, or direct Isaac JointState effort commands for Lite6 pneumatic
+  profiles;
+* raw /isaac_joint_commands_gripper messages emitted by the selected gripper
+  command path.
 
 The motion is intentionally small and reversible.
 """
@@ -29,6 +32,7 @@ import rclpy
 from control_msgs.action import FollowJointTrajectory, GripperCommand
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.publisher import Publisher
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectoryPoint
 
@@ -53,12 +57,20 @@ class Lite6SmokeProbe(Node):
         self.latest_arm_state: dict[str, float] = {}
         self.latest_isaac_state: dict[str, float] = {}
         self.latest_gripper_command: dict[str, float] = {}
+        self.latest_gripper_effort: dict[str, float] = {}
 
         self.arm_client = ActionClient(
             self, FollowJointTrajectory, args.arm_action_name
         )
-        self.gripper_client = ActionClient(
-            self, GripperCommand, args.gripper_action_name
+        self.gripper_client = (
+            ActionClient(self, GripperCommand, args.gripper_action_name)
+            if args.gripper_transport_kind == "ros_gripper_command"
+            else None
+        )
+        self.direct_gripper_pub: Publisher | None = (
+            self.create_publisher(JointState, args.gripper_command_topic, 10)
+            if args.gripper_transport_kind == "isaac_joint_state_effort"
+            else None
         )
         self.create_subscription(
             JointState, args.arm_joint_state_topic, self._on_arm_joint_state, 10
@@ -99,6 +111,15 @@ class Lite6SmokeProbe(Node):
         positions = self._positions_for(msg, [self.gripper_joint])
         if positions:
             self.latest_gripper_command = positions
+        efforts = {
+            name: float(msg.effort[index])
+            for index, name in enumerate(msg.name)
+            if index < len(msg.effort)
+        }
+        if self.gripper_joint in efforts:
+            self.latest_gripper_effort = {
+                self.gripper_joint: efforts[self.gripper_joint]
+            }
 
     def spin_until(self, predicate, timeout_s: float) -> bool:
         deadline = time.monotonic() + timeout_s
@@ -107,6 +128,13 @@ class Lite6SmokeProbe(Node):
             if predicate():
                 return True
         return predicate()
+
+    def spin_for(self, duration_s: float) -> None:
+        deadline = time.monotonic() + max(0.0, float(duration_s))
+        while time.monotonic() < deadline:
+            rclpy.spin_once(
+                self, timeout_sec=min(0.05, max(0.0, deadline - time.monotonic()))
+            )
 
     def require_ready(self) -> None:
         deadline = time.monotonic() + self.args.ready_timeout_s
@@ -125,7 +153,11 @@ class Lite6SmokeProbe(Node):
                 )
             if not self.arm_client.wait_for_server(timeout_sec=0.0):
                 missing.append(self.args.arm_action_name)
-            if not self.gripper_client.wait_for_server(timeout_sec=0.0):
+            if (
+                self.args.gripper_transport_kind == "ros_gripper_command"
+                and self.gripper_client is not None
+                and not self.gripper_client.wait_for_server(timeout_sec=0.0)
+            ):
                 missing.append(self.args.gripper_action_name)
             if not missing:
                 return
@@ -196,6 +228,11 @@ class Lite6SmokeProbe(Node):
 
     def send_gripper_goal(self, position: float) -> dict[str, object]:
         self.latest_gripper_command = {}
+        self.latest_gripper_effort = {}
+        if self.args.gripper_transport_kind == "isaac_joint_state_effort":
+            return self.send_direct_gripper_command(position)
+        if self.gripper_client is None:
+            raise RuntimeError("GripperCommand action client is not configured")
         goal = GripperCommand.Goal()
         goal.command.position = float(position)
         goal.command.max_effort = float(self.args.gripper_max_effort)
@@ -234,6 +271,7 @@ class Lite6SmokeProbe(Node):
             )
         rclpy.spin_once(self, timeout_sec=0.05)
         return {
+            "transport_kind": "ros_gripper_command",
             "target_position": float(position),
             "raw_command_position": self.latest_gripper_command.get(
                 self.gripper_joint
@@ -241,6 +279,66 @@ class Lite6SmokeProbe(Node):
             "result_position": float(result.result.position),
             "reached_goal": bool(result.result.reached_goal),
             "stalled": bool(result.result.stalled),
+            "isaac_state_position": self.latest_isaac_state.get(self.gripper_joint),
+        }
+
+    def send_direct_gripper_command(self, position: float) -> dict[str, object]:
+        if self.direct_gripper_pub is None:
+            raise RuntimeError("direct gripper publisher is not configured")
+        closing = abs(position - self.args.gripper_close_position) <= abs(
+            position - self.args.gripper_open_position
+        )
+        effort = (
+            float(self.args.gripper_close_effort)
+            if closing
+            else float(self.args.gripper_open_effort)
+        )
+        command = JointState()
+        command.header.stamp = self.get_clock().now().to_msg()
+        command.name = [self.gripper_joint]
+        if self.args.gripper_publish_nominal_position:
+            command.position = [float(position)]
+        command.effort = [effort]
+        self.direct_gripper_pub.publish(command)
+
+        saw_raw_command = self.spin_until(
+            lambda: (
+                self.latest_gripper_command.get(self.gripper_joint) is not None
+                or self.latest_gripper_effort.get(self.gripper_joint) is not None
+            ),
+            min(1.0, self.args.command_timeout_s),
+        )
+        if not saw_raw_command:
+            raise RuntimeError(
+                f"direct gripper command was not observed on "
+                f"{self.args.gripper_command_topic}"
+            )
+        saw_isaac_state = self.spin_until(
+            lambda: self.latest_isaac_state.get(self.gripper_joint) is not None,
+            min(float(self.args.gripper_dwell_s), self.args.command_timeout_s),
+        )
+        if not saw_isaac_state:
+            raise RuntimeError(
+                f"simulator gripper state for {self.gripper_joint} was not observed "
+                f"on {self.args.isaac_joint_state_topic}"
+            )
+        dwell_start = time.monotonic()
+        self.spin_for(float(self.args.gripper_dwell_s))
+        dwell_elapsed_s = time.monotonic() - dwell_start
+        return {
+            "transport_kind": "isaac_joint_state_effort",
+            "actuation_kind": "pneumatic",
+            "state_authority": "sim_observed",
+            "completion_policy": "dwell_elapsed",
+            "target_position": float(position),
+            "raw_command_position": self.latest_gripper_command.get(
+                self.gripper_joint
+            ),
+            "raw_command_effort": self.latest_gripper_effort.get(
+                self.gripper_joint
+            ),
+            "dwell_s": float(self.args.gripper_dwell_s),
+            "dwell_elapsed_s": dwell_elapsed_s,
             "isaac_state_position": self.latest_isaac_state.get(self.gripper_joint),
         }
 
@@ -260,7 +358,12 @@ class Lite6SmokeProbe(Node):
             details={
                 "schema": RESULT_SCHEMA,
                 "arm_action": self.args.arm_action_name,
-                "gripper_action": self.args.gripper_action_name,
+                "gripper_action": (
+                    self.args.gripper_action_name
+                    if self.args.gripper_transport_kind == "ros_gripper_command"
+                    else "not_required"
+                ),
+                "gripper_transport_kind": self.args.gripper_transport_kind,
                 "arm_joint_state_topic": self.args.arm_joint_state_topic,
                 "isaac_joint_state_topic": self.args.isaac_joint_state_topic,
                 "arm_joints": list(self.arm_joints),
@@ -277,6 +380,9 @@ class Lite6SmokeProbe(Node):
                 "arm_motion_duration_s": float(self.args.arm_motion_duration_s),
                 "gripper_open_position": self.args.gripper_open_position,
                 "gripper_close_position": self.args.gripper_close_position,
+                "gripper_open_effort": self.args.gripper_open_effort,
+                "gripper_close_effort": self.args.gripper_close_effort,
+                "gripper_dwell_s": self.args.gripper_dwell_s,
                 "gripper_command_topic": self.args.gripper_command_topic,
                 "arm_probe_result": probe_result,
                 "gripper_close_result": close_result,
@@ -296,6 +402,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--gripper-action-name",
         default="/lite_gripper_controller/gripper_cmd",
     )
+    parser.add_argument(
+        "--gripper-transport-kind",
+        choices=("ros_gripper_command", "isaac_joint_state_effort"),
+        default="ros_gripper_command",
+    )
     parser.add_argument("--arm-joint-state-topic", default="/joint_states")
     parser.add_argument("--isaac-joint-state-topic", default="/isaac_joint_states")
     parser.add_argument(
@@ -308,6 +419,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gripper-open-position", type=float, default=0.0081)
     parser.add_argument("--gripper-close-position", type=float, default=0.0)
     parser.add_argument("--gripper-max-effort", type=float, default=10.0)
+    parser.add_argument("--gripper-open-effort", type=float, default=5.0)
+    parser.add_argument("--gripper-close-effort", type=float, default=-5.0)
+    parser.add_argument("--gripper-dwell-s", type=float, default=0.8)
+    parser.add_argument(
+        "--gripper-publish-nominal-position",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--ready-timeout-s", type=float, default=15.0)
     parser.add_argument("--command-timeout-s", type=float, default=10.0)
     parser.add_argument(
@@ -350,7 +469,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.json:
             print(
                 "Isaac Lite6 smoke passed: small arm move restored, "
-                "gripper close/open completed, raw bridge command observed."
+                "gripper close/open completed, raw gripper command observed."
             )
         return 0
     except Exception as exc:  # noqa: BLE001 - operator-facing smoke failure

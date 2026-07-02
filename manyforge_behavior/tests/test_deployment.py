@@ -219,6 +219,7 @@ def _lite6_live_smoke_artifact_payload() -> dict:
             "arm_joint_state_topic": "/joint_states",
             "isaac_joint_state_topic": "/isaac_joint_states",
             "gripper_command_topic": "/isaac_joint_commands_gripper",
+            "gripper_transport_kind": "isaac_joint_state_effort",
             "arm_joints": joints,
             "gripper_joint": "right_finger_joint",
             "start_positions_rad": start,
@@ -227,22 +228,33 @@ def _lite6_live_smoke_artifact_payload() -> dict:
             "arm_motion_duration_s": 0.8,
             "gripper_open_position": 0.0081,
             "gripper_close_position": 0.0,
+            "gripper_open_effort": 5.0,
+            "gripper_close_effort": -5.0,
+            "gripper_dwell_s": 0.8,
             "arm_probe_result": arm_result(probe),
             "arm_restore_result": arm_result(start),
             "gripper_close_result": {
+                "transport_kind": "isaac_joint_state_effort",
+                "actuation_kind": "pneumatic",
+                "state_authority": "sim_observed",
+                "completion_policy": "dwell_elapsed",
                 "target_position": 0.0,
                 "raw_command_position": 0.0,
-                "result_position": 0.0,
-                "reached_goal": True,
-                "stalled": False,
+                "raw_command_effort": -5.0,
+                "dwell_s": 0.8,
+                "dwell_elapsed_s": 0.8,
                 "isaac_state_position": 0.0,
             },
             "gripper_open_result": {
+                "transport_kind": "isaac_joint_state_effort",
+                "actuation_kind": "pneumatic",
+                "state_authority": "sim_observed",
+                "completion_policy": "dwell_elapsed",
                 "target_position": 0.0081,
                 "raw_command_position": 0.0081,
-                "result_position": 0.0081,
-                "reached_goal": True,
-                "stalled": False,
+                "raw_command_effort": 5.0,
+                "dwell_s": 0.8,
+                "dwell_elapsed_s": 0.8,
                 "isaac_state_position": 0.0081,
             },
         },
@@ -254,6 +266,56 @@ def _write_deployment(data: dict) -> str:
     yaml.dump(data, f)
     f.close()
     return f.name
+
+
+def _write_gripper_srdf(
+    tmp_path: Path,
+    *,
+    group: str = "gripper",
+    joint: str = "finger_joint",
+    states: dict[str, float] | None = None,
+) -> Path:
+    states = states or {"open": 0.0, "closed": 0.42}
+    state_xml = "\n".join(
+        f'  <group_state name="{name}" group="{group}">\n'
+        f'    <joint name="{joint}" value="{value}"/>\n'
+        "  </group_state>"
+        for name, value in states.items()
+    )
+    srdf_path = tmp_path / "robot.srdf"
+    srdf_path.write_text(
+        '<?xml version="1.0"?>\n'
+        '<robot name="fixture">\n'
+        f"{state_xml}\n"
+        "</robot>\n"
+    )
+    return srdf_path
+
+
+def _minimal_deployment_with_gripper_srdf(
+    tmp_path: Path,
+    *,
+    grippers: dict,
+    group: str = "gripper",
+    joint: str = "finger_joint",
+    states: dict[str, float] | None = None,
+) -> dict:
+    srdf_path = _write_gripper_srdf(
+        tmp_path,
+        group=group,
+        joint=joint,
+        states=states,
+    )
+    return _minimal_deployment(
+        robot_config={
+            "robot_id": "ur5",
+            "group_id": "arm",
+            "urdf_path": "package://test.urdf",
+            "srdf_path": str(srdf_path),
+            "global_max_tcp_linear_speed_mps": 0.5,
+        },
+        grippers=grippers,
+    )
 
 
 def _program_with_move_tcp(tcp_value=None, *, parameters=None) -> dict:
@@ -323,6 +385,13 @@ def _minimal_deployment(**overrides) -> dict:
         "schema_version": "0.1.0",
         "name": "test_deployment",
         "program_profile": "v0.0",
+        "grasp_risk_policy": {
+            "open_loop_grasp": {
+                "allowed": True,
+                "scope": "simulation",
+                "rationale": "Test deployments use open-loop attach assumptions.",
+            }
+        },
         "robot_config": {
             "robot_id": "ur5",
             "group_id": "arm",
@@ -754,6 +823,13 @@ class TestDeploymentLoading:
                 "gripper_frame",
                 "insertion_frame",
             ]
+            assert deploy.grippers["primary"].semantic_configured is False
+            assert deploy.grippers["primary"].actuation_kind == "position_commanded"
+            assert deploy.grippers["primary"].state_authority == "native_backend"
+            assert deploy.grippers["primary"].completion_policy == "position_reached"
+            assert deploy.grippers["primary"].grasp_confirmation_policy == "none_open_loop"
+            assert deploy.grippers["primary"].transport == {"kind": "native_kinematic"}
+            assert deploy.grippers["primary"].migration_notes
         finally:
             os.unlink(path)
 
@@ -816,6 +892,488 @@ class TestDeploymentLoading:
                 match="closed_position is no longer supported",
             ):
                 Deployment(path)
+        finally:
+            os.unlink(path)
+
+    def test_semantic_native_gripper_roundtrips_and_overlay_preserves_fields(
+        self,
+        tmp_path,
+    ):
+        data = _minimal_deployment_with_gripper_srdf(
+            tmp_path,
+            grippers={
+                "primary": {
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "actuation_kind": "pneumatic",
+                    "state_authority": "native_backend",
+                    "completion_policy": "dwell_elapsed",
+                    "grasp_confirmation_policy": "none_open_loop",
+                    "open_state_ref": "open",
+                    "closed_state_ref": "closed",
+                    "motion_time_s": 0.8,
+                    "transport": {"kind": "native_kinematic"},
+                }
+            },
+        )
+        path = _write_deployment(data)
+        try:
+            deploy = Deployment(path)
+            gripper = deploy.grippers["primary"]
+            assert gripper.command_mode == "simulated_joint"
+            assert gripper.semantic_configured is True
+            assert gripper.actuation_kind == "pneumatic"
+            assert gripper.state_authority == "native_backend"
+            assert gripper.completion_policy == "dwell_elapsed"
+            assert gripper.grasp_confirmation_policy == "none_open_loop"
+            assert gripper.open_state_ref == "open"
+            assert gripper.closed_state_ref == "closed"
+            assert gripper.transport == {"kind": "native_kinematic"}
+
+            roundtripped = Deployment.from_dict(deploy.to_dict())
+            assert roundtripped.grippers["primary"].transport == {
+                "kind": "native_kinematic"
+            }
+            assert roundtripped.grippers["primary"].semantic_configured is True
+
+            deploy.update_from_dict({"grippers": {"primary": {"motion_time_s": 1.2}}})
+            updated = deploy.grippers["primary"]
+            assert updated.motion_time_s == 1.2
+            assert updated.transport == {"kind": "native_kinematic"}
+            assert updated.actuation_kind == "pneumatic"
+            assert updated.open_state_ref == "open"
+            assert updated.closed_state_ref == "closed"
+        finally:
+            os.unlink(path)
+
+    def test_semantic_ros_gripper_command_parsed(self, tmp_path):
+        data = _minimal_deployment_with_gripper_srdf(
+            tmp_path,
+            grippers={
+                "primary": {
+                    "command_mode": "ros_gripper_command",
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "actuation_kind": "position_commanded",
+                    "state_authority": "sim_observed",
+                    "completion_policy": "position_reached",
+                    "grasp_confirmation_policy": "none_open_loop",
+                    "open_state_ref": "open",
+                    "closed_state_ref": "closed",
+                    "motion_time_s": 0.8,
+                    "transport": {
+                        "kind": "ros_gripper_command",
+                        "action_name": "/gripper/gripper_cmd",
+                        "result_timeout_s": 5.0,
+                        "position_tolerance": 0.004,
+                    },
+                }
+            },
+        )
+        path = _write_deployment(data)
+        try:
+            deploy = Deployment(path)
+            gripper = deploy.grippers["primary"]
+            assert gripper.command_mode == "ros_gripper_command"
+            assert gripper.transport["kind"] == "ros_gripper_command"
+            assert gripper.transport["action_name"] == "/gripper/gripper_cmd"
+            assert gripper.transport["result_timeout_s"] == 5.0
+        finally:
+            os.unlink(path)
+
+    def test_semantic_isaac_joint_state_effort_gripper_parsed(self, tmp_path):
+        data = _minimal_deployment_with_gripper_srdf(
+            tmp_path,
+            group="lite_gripper",
+            joint="right_finger_joint",
+            states={"open": 0.0081, "closed": 0.0},
+            grippers={
+                "primary": {
+                    "command_mode": "ros_gripper_command",
+                    "group_id": "lite_gripper",
+                    "joint_name": "right_finger_joint",
+                    "actuation_kind": "pneumatic",
+                    "state_authority": "sim_observed",
+                    "completion_policy": "dwell_elapsed",
+                    "grasp_confirmation_policy": "none_open_loop",
+                    "open_state_ref": "open",
+                    "closed_state_ref": "closed",
+                    "motion_time_s": 0.8,
+                    "transport": {
+                        "kind": "isaac_joint_state_effort",
+                        "command_topic": "/isaac_joint_commands_gripper",
+                        "state_topic": "/isaac_joint_states",
+                        "joint_names": ["right_finger_joint"],
+                        "close_effort": -5.0,
+                        "open_effort": 5.0,
+                        "publish_nominal_position": True,
+                        "dwell_s": 0.8,
+                    },
+                }
+            },
+        )
+        path = _write_deployment(data)
+        try:
+            deploy = Deployment(path)
+            gripper = deploy.grippers["primary"]
+            assert gripper.command_mode == "ros_gripper_command"
+            assert gripper.actuation_kind == "pneumatic"
+            assert gripper.completion_policy == "dwell_elapsed"
+            assert gripper.transport["kind"] == "isaac_joint_state_effort"
+            assert gripper.transport["close_effort"] == -5.0
+            assert gripper.transport["open_effort"] == 5.0
+        finally:
+            os.unlink(path)
+
+    def test_semantic_plc_gripper_request_schema_parsed_for_deferred_real_lane(
+        self,
+        tmp_path,
+    ):
+        data = _minimal_deployment_with_gripper_srdf(
+            tmp_path,
+            grippers={
+                "primary": {
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "actuation_kind": "pneumatic",
+                    "state_authority": "commanded_estimate",
+                    "completion_policy": "request_ack_then_dwell",
+                    "grasp_confirmation_policy": "none_open_loop",
+                    "open_state_ref": "open",
+                    "closed_state_ref": "closed",
+                    "motion_time_s": 0.8,
+                    "transport": {
+                        "kind": "plc_gripper_request",
+                        "command_endpoint": "lite_gripper/request",
+                        "ready_signal": "lite_gripper/ready",
+                        "fault_signal": "lite_gripper/fault",
+                        "request_timeout_s": 0.25,
+                        "dwell_s": 0.8,
+                    },
+                }
+            },
+        )
+        path = _write_deployment(data)
+        try:
+            deploy = Deployment(path)
+            gripper = deploy.grippers["primary"]
+            assert gripper.command_mode == "plc_gripper_request"
+            assert gripper.state_authority == "commanded_estimate"
+            assert gripper.transport["kind"] == "plc_gripper_request"
+            assert deploy.grasp_risk_policy.open_loop_grasp.allowed is True
+            Deployment.from_dict(deploy.to_dict())
+        finally:
+            os.unlink(path)
+
+    def test_none_open_loop_grasp_requires_deployment_risk_gate(self, tmp_path):
+        data = _minimal_deployment_with_gripper_srdf(
+            tmp_path,
+            grippers={
+                "primary": {
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "actuation_kind": "pneumatic",
+                    "state_authority": "native_backend",
+                    "completion_policy": "dwell_elapsed",
+                    "grasp_confirmation_policy": "none_open_loop",
+                    "open_state_ref": "open",
+                    "closed_state_ref": "closed",
+                    "motion_time_s": 0.8,
+                    "transport": {"kind": "native_kinematic"},
+                }
+            },
+        )
+        data.pop("grasp_risk_policy")
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(DeploymentValidationError) as exc:
+                Deployment(path)
+            assert "grasp_confirmation_policy=none_open_loop requires" in str(
+                exc.value
+            )
+            assert "primary" in str(exc.value)
+        finally:
+            os.unlink(path)
+
+    def test_legacy_none_open_loop_migration_requires_deployment_risk_gate(self):
+        data = _minimal_deployment(
+            grippers={
+                "primary": {
+                    "command_mode": "simulated_joint",
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "motion_time_s": 0.8,
+                }
+            },
+        )
+        data.pop("grasp_risk_policy")
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(DeploymentValidationError) as exc:
+                Deployment(path)
+            assert "grasp_confirmation_policy=none_open_loop requires" in str(
+                exc.value
+            )
+        finally:
+            os.unlink(path)
+
+    def test_open_loop_grasp_gate_requires_scope_and_rationale(self, tmp_path):
+        data = _minimal_deployment_with_gripper_srdf(
+            tmp_path,
+            grippers={
+                "primary": {
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "actuation_kind": "pneumatic",
+                    "state_authority": "native_backend",
+                    "completion_policy": "dwell_elapsed",
+                    "grasp_confirmation_policy": "none_open_loop",
+                    "open_state_ref": "open",
+                    "closed_state_ref": "closed",
+                    "motion_time_s": 0.8,
+                    "transport": {"kind": "native_kinematic"},
+                }
+            },
+        )
+        data["grasp_risk_policy"] = {
+            "open_loop_grasp": {
+                "allowed": True,
+                "scope": "debug",
+                "rationale": "invalid scope",
+            }
+        }
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(DeploymentValidationError) as exc:
+                Deployment(path)
+            assert "grasp_risk_policy.open_loop_grasp.scope must be one of" in str(
+                exc.value
+            )
+        finally:
+            os.unlink(path)
+
+    def test_open_loop_grasp_gate_rejects_conflicting_aliases(self, tmp_path):
+        data = _minimal_deployment_with_gripper_srdf(
+            tmp_path,
+            grippers={
+                "primary": {
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "actuation_kind": "pneumatic",
+                    "state_authority": "native_backend",
+                    "completion_policy": "dwell_elapsed",
+                    "grasp_confirmation_policy": "none_open_loop",
+                    "open_state_ref": "open",
+                    "closed_state_ref": "closed",
+                    "motion_time_s": 0.8,
+                    "transport": {"kind": "native_kinematic"},
+                }
+            },
+        )
+        data["grasp_risk_policy"]["openLoopGrasp"] = {
+            "allowed": False,
+        }
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(DeploymentValidationError) as exc:
+                Deployment(path)
+            assert "open_loop_grasp and openLoopGrasp with different values" in str(
+                exc.value
+            )
+        finally:
+            os.unlink(path)
+
+    def test_gripper_unknown_fields_are_rejected(self):
+        data = _minimal_deployment(
+            grippers={
+                "primary": {
+                    "command_mode": "simulated_joint",
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "motion_time_s": 0.8,
+                    "close_position_hint": 0.0,
+                }
+            },
+        )
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(DeploymentValidationError) as exc:
+                Deployment(path)
+            assert "grippers.primary contains unknown fields" in str(exc.value)
+            assert "close_position_hint" in str(exc.value)
+        finally:
+            os.unlink(path)
+
+    def test_legacy_ros_gripper_command_requires_explicit_semantics(self):
+        data = _minimal_deployment(
+            grippers={
+                "primary": {
+                    "command_mode": "ros_gripper_command",
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "motion_time_s": 0.8,
+                }
+            },
+        )
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(DeploymentValidationError) as exc:
+                Deployment(path)
+            assert "command_mode=ros_gripper_command is ambiguous" in str(exc.value)
+        finally:
+            os.unlink(path)
+
+    def test_legacy_plc_gripper_request_requires_explicit_semantics(self):
+        data = _minimal_deployment(
+            grippers={
+                "primary": {
+                    "command_mode": "plc_gripper_request",
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "motion_time_s": 0.8,
+                }
+            },
+        )
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(DeploymentValidationError) as exc:
+                Deployment(path)
+            assert "command_mode=plc_gripper_request requires explicit semantic" in str(
+                exc.value
+            )
+        finally:
+            os.unlink(path)
+
+    def test_semantic_gripper_missing_srdf_state_ref_rejected(self, tmp_path):
+        data = _minimal_deployment_with_gripper_srdf(
+            tmp_path,
+            states={"open": 0.0},
+            grippers={
+                "primary": {
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "actuation_kind": "pneumatic",
+                    "state_authority": "native_backend",
+                    "completion_policy": "dwell_elapsed",
+                    "grasp_confirmation_policy": "none_open_loop",
+                    "open_state_ref": "open",
+                    "closed_state_ref": "closed",
+                    "motion_time_s": 0.8,
+                    "transport": {"kind": "native_kinematic"},
+                }
+            },
+        )
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(DeploymentValidationError) as exc:
+                Deployment(path)
+            assert "grippers.primary.closed_state_ref references SRDF group_state" in str(
+                exc.value
+            )
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        ("gripper_patch", "expected"),
+        [
+            (
+                {"state_authority": "sim_observed"},
+                "transport.kind=native_kinematic requires state_authority=native_backend",
+            ),
+            (
+                {
+                    "transport": {
+                        "kind": "isaac_joint_state_effort",
+                        "command_topic": "/cmd",
+                        "close_effort": -5.0,
+                        "open_effort": 5.0,
+                        "dwell_s": 0.8,
+                    },
+                    "state_authority": "real_observed",
+                },
+                "transport.kind=isaac_joint_state_effort requires state_authority=sim_observed or commanded_estimate",
+            ),
+            (
+                {
+                    "transport": {
+                        "kind": "ros_gripper_command",
+                        "action_name": "/gripper/gripper_cmd",
+                        "result_timeout_s": 5.0,
+                    },
+                    "actuation_kind": "pneumatic",
+                    "state_authority": "sim_observed",
+                    "completion_policy": "position_reached",
+                },
+                "transport.kind=ros_gripper_command requires actuation_kind=position_commanded",
+            ),
+            (
+                {
+                    "transport": {
+                        "kind": "ros_gripper_command",
+                        "action_name": "/gripper/gripper_cmd",
+                        "result_timeout_s": 5.0,
+                    },
+                    "actuation_kind": "position_commanded",
+                    "state_authority": "sim_observed",
+                    "completion_policy": "driver_result",
+                },
+                "completion_policy=driver_result requires transport.driver_result_contract",
+            ),
+            (
+                {
+                    "transport": {
+                        "kind": "ros_gripper_command",
+                        "action_name": "/gripper/gripper_cmd",
+                        "result_timeout_s": 5.0,
+                    },
+                    "actuation_kind": "position_commanded",
+                    "state_authority": "sim_observed",
+                    "completion_policy": "dwell_elapsed",
+                },
+                "completion_policy=dwell_elapsed is valid only for pneumatic native_kinematic or isaac_joint_state_effort",
+            ),
+            (
+                {
+                    "completion_policy": "request_ack_then_dwell",
+                },
+                "completion_policy=request_ack_then_dwell requires transport.kind=plc_gripper_request",
+            ),
+            (
+                {
+                    "completion_policy": "open_loop_immediate",
+                },
+                "completion_policy=open_loop_immediate is not allowed without an explicit commissioning profile gate",
+            ),
+        ],
+    )
+    def test_semantic_gripper_invalid_cross_products_fail_closed(
+        self,
+        tmp_path,
+        gripper_patch,
+        expected,
+    ):
+        gripper = {
+            "group_id": "gripper",
+            "joint_name": "finger_joint",
+            "actuation_kind": "pneumatic",
+            "state_authority": "native_backend",
+            "completion_policy": "dwell_elapsed",
+            "grasp_confirmation_policy": "none_open_loop",
+            "open_state_ref": "open",
+            "closed_state_ref": "closed",
+            "motion_time_s": 0.8,
+            "transport": {"kind": "native_kinematic"},
+        }
+        gripper.update(gripper_patch)
+        data = _minimal_deployment_with_gripper_srdf(
+            tmp_path,
+            grippers={"primary": gripper},
+        )
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(DeploymentValidationError) as exc:
+                Deployment(path)
+            assert expected in str(exc.value)
         finally:
             os.unlink(path)
 
@@ -885,6 +1443,9 @@ class TestDeploymentLoading:
                                 "stale_behavior": "fault",
                                 "action": "interrupt",
                                 "signal_id": "attached_object_drift/isaac_cheese_box",
+                                "confirmation_signal_id": (
+                                    "attached_object_grasp_confirmed/isaac_cheese_box"
+                                ),
                                 "sample_time_tolerance_s": 0.05,
                             },
                             "metadata": {"source": "fixture"},
@@ -927,6 +1488,12 @@ class TestDeploymentLoading:
             source.objects["isaac_cheese_box"].attached_drift_monitor.translation_threshold_m
             == 0.02
         )
+        assert (
+            source.objects[
+                "isaac_cheese_box"
+            ].attached_drift_monitor.confirmation_signal_id
+            == "attached_object_grasp_confirmed/isaac_cheese_box"
+        )
         assert source.objects["isaac_cheese_box"].metadata == {"source": "fixture"}
 
         serialized = deploy.to_dict()
@@ -940,6 +1507,13 @@ class TestDeploymentLoading:
             .attached_drift_monitor
             .signal_id
             == "attached_object_drift/isaac_cheese_box"
+        )
+        assert (
+            reloaded.pose_sources["isaac_scene_objects"]
+            .objects["isaac_cheese_box"]
+            .attached_drift_monitor
+            .confirmation_signal_id
+            == "attached_object_grasp_confirmed/isaac_cheese_box"
         )
         assert (
             reloaded.pose_sources["isaac_scene_objects"].measured_tcp.entity
@@ -2691,6 +3265,10 @@ class TestCrossArtifactValidation:
             "/isaac_arm_controller/follow_joint_trajectory"
         )
         assert deploy.grippers["primary"].command_mode == "ros_gripper_command"
+        assert deploy.grippers["primary"].actuation_kind == "position_commanded"
+        assert deploy.grippers["primary"].state_authority == "sim_observed"
+        assert deploy.grippers["primary"].completion_policy == "position_reached"
+        assert deploy.grippers["primary"].transport["kind"] == "ros_gripper_command"
         assert deploy.adapters["execution"].config["gripper"]["action_name"] == (
             "/robotiq_gripper_controller/gripper_cmd"
         )
@@ -2722,12 +3300,23 @@ class TestCrossArtifactValidation:
             "/isaac_arm_controller/follow_joint_trajectory"
         )
         assert execution_config["decelerate_on_cancel"] is True
-        assert execution_config["gripper"]["action_name"] == (
-            "/lite_gripper_controller/gripper_cmd"
-        )
+        assert "gripper" not in execution_config
         assert deploy.grippers["primary"].command_mode == "ros_gripper_command"
         assert deploy.grippers["primary"].group_id == "lite_gripper"
         assert deploy.grippers["primary"].joint_name == "right_finger_joint"
+        assert deploy.grippers["primary"].actuation_kind == "pneumatic"
+        assert deploy.grippers["primary"].state_authority == "sim_observed"
+        assert deploy.grippers["primary"].completion_policy == "dwell_elapsed"
+        assert deploy.grippers["primary"].transport == {
+            "kind": "isaac_joint_state_effort",
+            "command_topic": "/isaac_joint_commands_gripper",
+            "state_topic": "/isaac_joint_states",
+            "joint_names": ["right_finger_joint"],
+            "close_effort": -5.0,
+            "open_effort": 5.0,
+            "publish_nominal_position": True,
+            "dwell_s": 0.8,
+        }
         assert deploy.grippers["primary"].srdf_presets == {
             "open": 0.0081,
             "close": 0.0,
@@ -2746,6 +3335,9 @@ class TestCrossArtifactValidation:
         prog = Program(TROCAR_LITE6_FOUNDATIONPOSE_PROGRAM_PATH, catalog)
 
         source = deploy.pose_sources["foundationpose_trocar"]
+        assert deploy.grippers["primary"].actuation_kind == "pneumatic"
+        assert deploy.grippers["primary"].completion_policy == "dwell_elapsed"
+        assert deploy.grippers["primary"].transport["kind"] == "isaac_joint_state_effort"
         assert source.kind == "detection3d_array_topic"
         assert source.topic == "/output"
         assert source.frame_id == "link_base"
@@ -2798,8 +3390,8 @@ class TestCrossArtifactValidation:
         deploy.validate_against_program(prog)
         deploy.validate_capabilities()
 
-    def test_lite6_isaac_ros2_control_scaffold_matches_bridge_contract(self):
-        """The Lite6 Isaac bridge exposes the same joints as the deployment."""
+    def test_lite6_isaac_ros2_control_scaffold_matches_direct_transport_contract(self):
+        """The Lite6 Isaac scaffold pins direct effort plus bridge compatibility."""
         urdf_text = LITE6_ISAAC_ROS2_CONTROL_URDF_PATH.read_text(encoding="utf-8")
         urdf = ET.fromstring(urdf_text.format(
             joint_commands_topic="/isaac_joint_commands",
@@ -2893,6 +3485,8 @@ class TestCrossArtifactValidation:
         assert report["gripper_group"] == "lite_gripper"
         assert report["gripper_command_joint"] == "right_finger_joint"
         assert report["gripper_derived_joints"] == ["left_finger_joint"]
+        assert report["gripper_transport_kind"] == "isaac_joint_state_effort"
+        assert report["gripper_bridge_config"] is None
         assert len(report["canonical_fingerprint"]) == 64
 
     def test_lite6_isaac_live_smoke_gate_is_profile_aware(self):
@@ -2910,6 +3504,8 @@ class TestCrossArtifactValidation:
 
         assert 'SCENARIO}" == "isaac-lite6-pick-place"' in launch_text
         assert "validate-isaac-lite6-smoke.py" in launch_text
+        assert "--gripper-transport-kind" in launch_text
+        assert "isaac_joint_state_effort" in launch_text
         assert "validate-isaac-lite6-smoke-artifact.py" in launch_text
         assert '${SCENARIO}-lite6-live-smoke.json' in launch_text
         assert '${SCENARIO}-foundationpose-detection3d.json' in launch_text
@@ -2919,6 +3515,7 @@ class TestCrossArtifactValidation:
         assert "manyforge.isaac_lite6_live_smoke.v1" in validator_text
         assert "arm_restore_result" in validator_text
         assert "raw_command_position" in validator_text
+        assert "raw_command_effort" in validator_text
 
     def test_lite6_rma0_active_artifacts_do_not_use_rejected_surfaces(self):
         """RMA-0 keeps Lite6 active artifacts on canonical model semantics."""
@@ -2953,6 +3550,11 @@ class TestCrossArtifactValidation:
         )
         assert "test_native_e2e.py -k \"lite6\"" not in qualifier
         assert "validate_lite6_authority_runtime_contract.py" in qualifier
+        assert "MANYFORGE_ROBOPLAN_PY_DIR" in qualifier
+        assert "lite6_canonical_gripper_command" in qualifier
+        assert "lite6_arm_pick_validation" in qualifier
+        assert "lite6_manyforge_collision" in qualifier
+        assert "pytest evidence summary did not match" in qualifier
         assert "Lite6 non-live model-authority qualification passed" in qualifier
 
     def test_lite6_live_smoke_artifact_validator_accepts_complete_evidence(
@@ -2997,6 +3599,15 @@ class TestCrossArtifactValidation:
             "missing_raw_gripper_command": lambda payload: payload["details"][
                 "gripper_open_result"
             ].pop("raw_command_position"),
+            "missing_direct_observed_state": lambda payload: payload["details"][
+                "gripper_open_result"
+            ].pop("isaac_state_position"),
+            "wrong_direct_completion_policy": lambda payload: payload["details"][
+                "gripper_close_result"
+            ].update({"completion_policy": "position_reached"}),
+            "short_direct_dwell": lambda payload: payload["details"][
+                "gripper_close_result"
+            ].update({"dwell_elapsed_s": 0.1}),
             "excessive_arm_target_error": lambda payload: payload["details"][
                 "arm_restore_result"
             ].update(

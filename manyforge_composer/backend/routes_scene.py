@@ -1137,6 +1137,20 @@ def _collect_gripper_states(
                 state=str(getattr(status.state, "value", status.state)),
                 current_position=status.current_position,
                 target_position=status.target_position,
+                commanded_position=getattr(status, "commanded_position", None),
+                observed_position=getattr(status, "observed_position", None),
+                commanded_state=str(getattr(status, "commanded_state", "") or ""),
+                actuation_kind=str(getattr(status, "actuation_kind", "") or ""),
+                state_authority=str(getattr(status, "state_authority", "") or ""),
+                completion_policy=str(
+                    getattr(status, "completion_policy", "") or ""
+                ),
+                grasp_confirmation_policy=str(
+                    getattr(status, "grasp_confirmation_policy", "") or ""
+                ),
+                transport_kind=str(getattr(status, "transport_kind", "") or ""),
+                evidence=list(getattr(status, "evidence", []) or []),
+                evidence_state=str(getattr(status, "evidence_state", "") or ""),
                 limit_lower=limit_lower,
                 limit_upper=limit_upper,
                 motion_time_s=config.motion_time_s,

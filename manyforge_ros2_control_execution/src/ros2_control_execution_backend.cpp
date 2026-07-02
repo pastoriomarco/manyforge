@@ -84,6 +84,16 @@ bool wait_for_fjt_action_server(
   return client->wait_for_action_server(std::chrono::milliseconds(0));
 }
 
+void add_unique_evidence(std::vector<std::string>& evidence,
+                         const std::string& label) {
+  if (label.empty()) {
+    return;
+  }
+  if (std::find(evidence.begin(), evidence.end(), label) == evidence.end()) {
+    evidence.push_back(label);
+  }
+}
+
 void disable_fjt_controller_tolerances(
     control_msgs::action::FollowJointTrajectory::Goal& goal,
     const std::vector<std::string>& joint_names) {
@@ -3925,18 +3935,60 @@ core::ExecutionSnapshot Ros2ControlExecutionBackend::get_execution_snapshot() co
   return snapshot_;
 }
 
+std::optional<double> position_for_joint(
+    const sensor_msgs::msg::JointState& msg,
+    const std::string& joint_name);
+
 void Ros2ControlExecutionBackend::configure_gripper_action(
     std::string gripper_id,
     Ros2GripperActionConfig config) {
   if (gripper_id.empty()) {
     throw std::invalid_argument("gripper_id must not be empty");
   }
-  if (config.action_name.empty()) {
-    throw std::invalid_argument("gripper action_name must not be empty");
+  if (config.transport_kind.empty()) {
+    config.transport_kind = "ros_gripper_command";
   }
-  if (config.wait_for_action_server_timeout_s < 0.0 ||
+  if (config.transport_kind != "ros_gripper_command" &&
+      config.transport_kind != "isaac_joint_state_effort") {
+    throw std::invalid_argument(
+        "gripper transport_kind must be ros_gripper_command or "
+        "isaac_joint_state_effort");
+  }
+  if (config.transport_kind == "ros_gripper_command" &&
+      config.action_name.empty()) {
+    throw std::invalid_argument(
+        "gripper action_name must not be empty for ros_gripper_command");
+  }
+  if (config.transport_kind == "isaac_joint_state_effort") {
+    if (config.command_topic.empty()) {
+      throw std::invalid_argument(
+          "gripper command_topic must not be empty for isaac_joint_state_effort");
+    }
+    if (config.command_joint_names.empty() && config.joint_name.empty()) {
+      throw std::invalid_argument(
+          "gripper joint_name or command_joint_names is required for "
+          "isaac_joint_state_effort");
+    }
+    if (!std::isfinite(config.open_position) ||
+        !std::isfinite(config.closed_position) ||
+        config.open_position == config.closed_position ||
+        !std::isfinite(config.open_effort) ||
+        !std::isfinite(config.close_effort)) {
+      throw std::invalid_argument(
+          "isaac_joint_state_effort gripper positions and efforts are invalid");
+    }
+  }
+  if (config.state_freshness_timeout_s < 0.0 ||
+      config.wait_for_action_server_timeout_s < 0.0 ||
       config.result_timeout_s < 0.0) {
     throw std::invalid_argument("gripper action timing config is invalid");
+  }
+  if (config.completion_policy != "position_reached" &&
+      config.completion_policy != "driver_result" &&
+      config.completion_policy != "dwell_elapsed") {
+    throw std::invalid_argument(
+        "gripper completion_policy must be position_reached, driver_result, "
+        "or dwell_elapsed");
   }
   if (config.group_id.empty() != config.joint_name.empty()) {
     throw std::invalid_argument(
@@ -3944,10 +3996,82 @@ void Ros2ControlExecutionBackend::configure_gripper_action(
   }
   auto runtime = std::make_shared<GripperRuntime>();
   runtime->config = std::move(config);
-  runtime->action_client =
-      rclcpp_action::create_client<GripperCommand>(node_, runtime->config.action_name);
+  if (runtime->config.transport_kind == "ros_gripper_command") {
+    runtime->action_client =
+        rclcpp_action::create_client<GripperCommand>(
+            node_, runtime->config.action_name);
+  } else {
+    runtime->joint_state_pub =
+        node_->create_publisher<sensor_msgs::msg::JointState>(
+            runtime->config.command_topic, rclcpp::SystemDefaultsQoS());
+    if (!runtime->config.state_topic.empty()) {
+      const std::weak_ptr<GripperRuntime> weak_runtime = runtime;
+      runtime->joint_state_sub =
+          node_->create_subscription<sensor_msgs::msg::JointState>(
+              runtime->config.state_topic, rclcpp::SystemDefaultsQoS(),
+              [weak_runtime](const sensor_msgs::msg::JointState::SharedPtr msg) {
+                const auto runtime = weak_runtime.lock();
+                if (!runtime || !msg) {
+                  return;
+                }
+                std::string observed_joint = runtime->config.joint_name;
+                if (observed_joint.empty() &&
+                    !runtime->config.command_joint_names.empty()) {
+                  observed_joint = runtime->config.command_joint_names.front();
+                }
+                if (observed_joint.empty()) {
+                  return;
+                }
+                const auto position = position_for_joint(*msg, observed_joint);
+                if (!position.has_value()) {
+                  return;
+                }
+                std::lock_guard<std::mutex> lock(runtime->mutex);
+                runtime->observed_position = *position;
+                runtime->observed_at = std::chrono::steady_clock::now();
+              });
+    }
+  }
   std::lock_guard<std::mutex> lock(gripper_map_mutex_);
   grippers_[std::move(gripper_id)] = std::move(runtime);
+}
+
+void publish_isaac_joint_state_gripper_command(
+    const rclcpp::Node::SharedPtr& node,
+    const Ros2GripperActionConfig& config,
+    const rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr& publisher,
+    double target_position) {
+  if (!publisher) {
+    throw std::runtime_error("Isaac gripper command publisher is not configured");
+  }
+  std::vector<std::string> joint_names = config.command_joint_names;
+  if (joint_names.empty()) {
+    joint_names.push_back(config.joint_name);
+  }
+  const bool closing =
+      std::abs(target_position - config.closed_position) <=
+      std::abs(target_position - config.open_position);
+  const double effort = closing ? config.close_effort : config.open_effort;
+
+  sensor_msgs::msg::JointState msg;
+  msg.header.stamp = node->now();
+  msg.name = joint_names;
+  if (config.publish_nominal_position) {
+    msg.position.assign(joint_names.size(), target_position);
+  }
+  msg.effort.assign(joint_names.size(), effort);
+  publisher->publish(msg);
+}
+
+std::optional<double> position_for_joint(
+    const sensor_msgs::msg::JointState& msg,
+    const std::string& joint_name) {
+  for (std::size_t i = 0; i < msg.name.size(); ++i) {
+    if (msg.name[i] == joint_name && i < msg.position.size()) {
+      return msg.position[i];
+    }
+  }
+  return std::nullopt;
 }
 
 void Ros2ControlExecutionBackend::on_gripper_feedback(
@@ -3962,6 +4086,9 @@ void Ros2ControlExecutionBackend::on_gripper_feedback(
   bool reached_goal = false;
   {
     std::lock_guard<std::mutex> lock(runtime->mutex);
+    if (runtime->externally_failed) {
+      return;
+    }
     if (!runtime->executing) {
       return;
     }
@@ -3995,6 +4122,12 @@ void Ros2ControlExecutionBackend::on_gripper_result(
   std::optional<double> result_position;
   {
     std::lock_guard<std::mutex> lock(runtime->mutex);
+    if (runtime->externally_failed) {
+      runtime->active_goal_handle.reset();
+      runtime->goal_accepted = false;
+      runtime->executing = false;
+      return;
+    }
     runtime_config = runtime->config;
     runtime->active_goal_handle.reset();
     runtime->goal_accepted = false;
@@ -4006,7 +4139,9 @@ void Ros2ControlExecutionBackend::on_gripper_result(
     }
     switch (result.code) {
       case rclcpp_action::ResultCode::SUCCEEDED:
-        if (result.result && result.result->reached_goal) {
+        if (runtime_config.completion_policy == "driver_result" ||
+            runtime_config.completion_policy == "dwell_elapsed" ||
+            (result.result && result.result->reached_goal)) {
           runtime->state = "completed";
           runtime->error.clear();
           runtime->reason_code.clear();
@@ -4067,6 +4202,9 @@ void Ros2ControlExecutionBackend::cancel_all_gripper_commands() {
       runtime->cancel_pending = true;
       runtime->active_goal_handle.reset();
       runtime->state = "idle";
+      runtime->evidence.clear();
+      runtime->evidence_state.clear();
+      runtime->externally_failed = false;
       runtime->error.clear();
     }
     if (action_client && goal_handle) {
@@ -4095,7 +4233,7 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
     std::lock_guard<std::mutex> lock(gripper_map_mutex_);
     const auto it = grippers_.find(gripper_id);
     if (it == grippers_.end()) {
-      return {false, "No ROS GripperCommand action configured for " + gripper_id,
+      return {false, "No gripper transport configured for " + gripper_id,
               ros2_control_fault_reason::kGripperNotConfigured};
     }
     runtime = it->second;
@@ -4114,13 +4252,22 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
     }
   }
 
-  const auto wait_timeout = std::chrono::duration<double>(
-      runtime->config.wait_for_action_server_timeout_s);
-  if (!runtime->action_client->wait_for_action_server(wait_timeout)) {
+  if (runtime_config.transport_kind == "ros_gripper_command") {
+    const auto wait_timeout = std::chrono::duration<double>(
+        runtime->config.wait_for_action_server_timeout_s);
+    if (!runtime->action_client ||
+        !runtime->action_client->wait_for_action_server(wait_timeout)) {
+      return {false,
+              "Timed out waiting for gripper action server " +
+                  runtime->config.action_name,
+              ros2_control_fault_reason::kGripperActionServerUnavailable};
+    }
+  } else if (!config_.command_gate_topic.empty() &&
+             !command_gate_enabled_.load(std::memory_order_acquire)) {
     return {false,
-            "Timed out waiting for gripper action server " +
-                runtime->config.action_name,
-            ros2_control_fault_reason::kGripperActionServerUnavailable};
+            "Gripper command rejected (command gate closed: simulator reset "
+            "incomplete or failed)",
+            ros2_control_fault_reason::kGripperGoalRejected};
   }
 
   {
@@ -4140,7 +4287,8 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
     runtime->max_effort = max_effort;
     runtime->started_at = std::chrono::steady_clock::now();
     runtime->deadline_at.reset();
-    if (runtime->config.result_timeout_s > 0.0) {
+    if (runtime_config.transport_kind == "ros_gripper_command" &&
+        runtime->config.result_timeout_s > 0.0) {
       runtime->deadline_at =
           runtime->started_at +
           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -4148,8 +4296,31 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
                   duration_s + runtime->config.result_timeout_s));
     }
     runtime->active_goal_handle.reset();
+    runtime->evidence.clear();
+    runtime->evidence_state.clear();
+    runtime->externally_failed = false;
     runtime->error.clear();
     runtime->reason_code.clear();
+  }
+
+  if (runtime_config.transport_kind == "isaac_joint_state_effort") {
+    try {
+      publish_isaac_joint_state_gripper_command(
+          node_, runtime_config, runtime->joint_state_pub, target_position);
+    } catch (const std::exception& exc) {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      runtime->state = "failed";
+      runtime->executing = false;
+      runtime->goal_accepted = false;
+      runtime->cancel_pending = false;
+      runtime->error =
+          std::string("Failed to publish Isaac gripper command: ") + exc.what();
+      runtime->reason_code =
+          ros2_control_fault_reason::kGripperGoalDispatchFailed;
+      return {false, runtime->error,
+              ros2_control_fault_reason::kGripperGoalDispatchFailed};
+    }
+    return {true, "", ""};
   }
 
   GripperCommand::Goal goal;
@@ -4248,6 +4419,67 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
   return {true, "", ""};
 }
 
+Ros2GripperCommandResult Ros2ControlExecutionBackend::mark_gripper_grasp_lost(
+    const std::string& gripper_id,
+    const std::string& evidence_label,
+    const std::string& message,
+    const std::string& reason_code) {
+  if (gripper_id.empty() || evidence_label.empty()) {
+    return {false, "gripper_id and evidence_label are required",
+            ros2_control_fault_reason::kGripperInvalidCommand};
+  }
+  std::shared_ptr<GripperRuntime> runtime;
+  {
+    std::lock_guard<std::mutex> lock(gripper_map_mutex_);
+    const auto it = grippers_.find(gripper_id);
+    if (it == grippers_.end()) {
+      return {false, "No gripper transport configured for " + gripper_id,
+              ros2_control_fault_reason::kGripperNotConfigured};
+    }
+    runtime = it->second;
+  }
+
+  GoalHandleGripper::SharedPtr goal_handle;
+  rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+  {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    const bool has_command_or_status =
+        runtime->state != "idle" || runtime->current_position.has_value() ||
+        runtime->observed_position.has_value() || !runtime->evidence.empty() ||
+        !runtime->error.empty() || !runtime->reason_code.empty();
+    if (!has_command_or_status) {
+      return {false,
+              "Gripper '" + gripper_id + "' has no command status to invalidate",
+              "stale_gripper_state"};
+    }
+    goal_handle = runtime->active_goal_handle;
+    action_client = runtime->action_client;
+    runtime->active_goal_handle.reset();
+    runtime->state = "failed";
+    runtime->executing = false;
+    runtime->goal_accepted = false;
+    runtime->cancel_pending = false;
+    runtime->externally_failed = true;
+    add_unique_evidence(runtime->evidence, evidence_label);
+    runtime->evidence_state = "pressure_or_part_lost";
+    runtime->error =
+        message.empty() ? "gripper grasp confirmation was lost" : message;
+    runtime->reason_code =
+        reason_code.empty() ? "grasp_confirmation_lost" : reason_code;
+  }
+
+  if (action_client && goal_handle) {
+    try {
+      (void)action_client->async_cancel_goal(goal_handle);
+    } catch (const std::exception& exc) {
+      RCLCPP_WARN(node_->get_logger(),
+                  "Failed to cancel lost-grasp gripper action goal: %s",
+                  exc.what());
+    }
+  }
+  return {true, "", ""};
+}
+
 void Ros2ControlExecutionBackend::update_gripper_commands() {
   std::vector<std::shared_ptr<GripperRuntime>> runtimes;
   {
@@ -4279,6 +4511,17 @@ void Ros2ControlExecutionBackend::update_gripper_commands() {
         runtime->error = "Timed out waiting for gripper action result";
         runtime->reason_code =
             ros2_control_fault_reason::kGripperResultTimeout;
+      } else if (runtime_config.transport_kind == "isaac_joint_state_effort" &&
+                 seconds_since(runtime->started_at, now) >=
+                     runtime->duration_s) {
+        runtime->state = "completed";
+        runtime->executing = false;
+        runtime->goal_accepted = false;
+        runtime->cancel_pending = false;
+        runtime->error.clear();
+        runtime->reason_code.clear();
+        runtime->current_position = runtime->target_position;
+        scene_position = runtime->target_position;
       } else if (!runtime_config.group_id.empty() &&
                  !runtime_config.joint_name.empty()) {
         if (is_commanded_sim_mode() && runtime->start_position.has_value()) {
@@ -4327,7 +4570,19 @@ Ros2GripperStatus Ros2ControlExecutionBackend::get_gripper_status(
   Ros2GripperStatus status;
   status.state = runtime->state;
   status.current_position = runtime->current_position;
+  if (runtime->observed_position.has_value()) {
+    const bool fresh =
+        !runtime->observed_at.has_value() ||
+        runtime->config.state_freshness_timeout_s <= 0.0 ||
+        seconds_since(*runtime->observed_at, std::chrono::steady_clock::now()) <=
+            runtime->config.state_freshness_timeout_s;
+    if (fresh) {
+      status.observed_position = runtime->observed_position;
+    }
+  }
   status.target_position = runtime->target_position;
+  status.evidence = runtime->evidence;
+  status.evidence_state = runtime->evidence_state;
   if (runtime->executing) {
     const double duration = std::max(1e-9, runtime->duration_s);
     status.progress =

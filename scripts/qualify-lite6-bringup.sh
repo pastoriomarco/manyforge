@@ -27,6 +27,26 @@ run_step() {
   "$@"
 }
 
+run_pytest_summary_requires() {
+  local expected_summary="$1"
+  shift
+  local output
+  echo
+  echo "==> $*"
+  set +e
+  output="$("$@" 2>&1)"
+  local status=$?
+  set -e
+  printf '%s\n' "${output}"
+  if [[ ${status} -ne 0 ]]; then
+    return "${status}"
+  fi
+  if ! grep -Eq "${expected_summary}" <<<"${output}"; then
+    echo "pytest evidence summary did not match ${expected_summary}" >&2
+    return 1
+  fi
+}
+
 run_in_container() {
   local workspace="${WORKSPACE:-/workspace}"
   cd "${workspace}"
@@ -54,11 +74,18 @@ run_in_container() {
   run_step ./scripts/models/validate_lite6_static_manifest.py
   run_step ./scripts/models/validate_lite6_authority_runtime_contract.py --json
 
-  local build_dir="${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}"
-  export PYTHONPATH="${build_dir}/roboplan:${workspace}:${workspace}/manyforge_behavior:${workspace}/manyforge_roboplan/python:${PYTHONPATH:-}"
+  local build_dir="${MANYFORGE_BUILD_DIR:-${workspace}/build}"
+  local roboplan_py="${MANYFORGE_ROBOPLAN_PY_DIR:-${build_dir}/manyforge_roboplan}"
+  if [[ ! -f "${roboplan_py}"/manyforge_roboplan_py*.so ]]; then
+    roboplan_py="/tmp/manyforge-build/roboplan"
+  fi
+  export PYTHONPATH="${roboplan_py}:${workspace}:${workspace}/manyforge_behavior:${workspace}/manyforge_roboplan/python:${PYTHONPATH:-}"
   run_step pytest -q \
     manyforge_behavior/tests/test_robot_model_authority.py \
     manyforge_behavior/tests/test_model_paths.py
+  run_pytest_summary_requires "3 passed" pytest -q -rs \
+    manyforge_behavior/tests/test_robot_model_authority.py \
+    -k "lite6_canonical_gripper_command or lite6_arm_pick_validation or lite6_manyforge_collision"
   run_step pytest -q manyforge_behavior/tests/test_deployment.py -k "lite6"
 
   echo

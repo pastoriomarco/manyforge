@@ -45,6 +45,9 @@ _EXAMPLE_PROGRAM_PATH = str(_REPO_ROOT / "examples" / "pick_and_place.program.ya
 _EXAMPLE_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "pick_and_place.deployment.yaml")
 _UR10E_ROBOTIQ_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "pick_and_place_ur10e_robotiq.deployment.yaml")
 _SEMANTIC_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "semantic_shape_pick.deployment.yaml")
+_ISAAC_LITE6_DEPLOYMENT_PATH = str(
+    _REPO_ROOT / "examples" / "isaac_lite6_lite_gripper_pick_and_place.deployment.yaml"
+)
 
 # Test security config: no auth, permissive filesystem roots for tmp_path access
 _TEST_SECURITY = SecurityConfig(
@@ -1531,6 +1534,20 @@ def test_gripper_command_accepts_bounded_idle_target(client, state):
     assert state.kernel.gripper_command_count == 1
     assert state.kernel.last_gripper_command_request is not None
     assert state.kernel.last_gripper_command_request.target_position == pytest.approx(0.1)
+
+
+def test_gripper_command_rejects_pneumatic_numeric_target(client, state):
+    state.deployment = Deployment(_ISAAC_LITE6_DEPLOYMENT_PATH)
+    state.deployment_source_path = _ISAAC_LITE6_DEPLOYMENT_PATH
+
+    response = client.post(
+        "/api/scene/gripper/command",
+        json={"gripperId": "primary", "targetPosition": 0.004},
+    )
+
+    assert response.status_code == 400
+    assert "open_state_ref" in response.json()["detail"]
+    assert state.kernel.gripper_command_count == 0
 
 
 def test_runtime_override_apply_updates_effective_tree_but_not_saved_artifact(client, tmp_path):
@@ -3110,6 +3127,98 @@ def test_save_deployment_payload_does_not_apply_runtime_state(client):
       suffixed_path = f"{tmp_path}.deployment.yaml"
       if os.path.exists(suffixed_path):
           os.unlink(suffixed_path)
+
+
+def test_save_full_deployment_strips_readonly_gripper_response_fields(client):
+    """Full UI payloads carry read-only gripper metadata; saved YAML must not."""
+    import os
+    import tempfile
+    import yaml
+
+    load = client.post(
+        "/api/deployment/load",
+        json={"path": _ISAAC_LITE6_DEPLOYMENT_PATH},
+    )
+    assert load.status_code == 200
+    full = client.get("/api/deployment/full").json()
+    gripper = full["grippers"]["primary"]
+    assert gripper["srdfPresets"]
+    assert "semanticConfigured" in gripper
+    assert "migrationNotes" in gripper
+
+    tmp_path = tempfile.mktemp(
+        dir=str(_REPO_ROOT / "examples"),
+        suffix=".yaml",
+    )
+    try:
+        response = client.post(
+            "/api/deployment/save",
+            json={"path": tmp_path, "deployment": full},
+        )
+        assert response.status_code == 200
+        saved_path = response.json()["path"]
+        with open(saved_path) as f:
+            saved_data = yaml.safe_load(f)
+
+        saved_gripper = saved_data["grippers"]["primary"]
+        assert saved_gripper["actuation_kind"] == "pneumatic"
+        assert saved_gripper["transport"]["kind"] == "isaac_joint_state_effort"
+        assert "srdf_presets" not in saved_gripper
+        assert "semantic_configured" not in saved_gripper
+        assert "migration_notes" not in saved_gripper
+        assert "visualization" not in saved_gripper
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        suffixed_path = f"{tmp_path}.deployment.yaml"
+        if os.path.exists(suffixed_path):
+            os.unlink(suffixed_path)
+
+
+def test_save_full_legacy_gripper_does_not_materialize_display_semantics(client):
+    """Compatibility semantics shown by the API must not silently rewrite YAML."""
+    import os
+    import tempfile
+    import yaml
+
+    load = client.post(
+        "/api/deployment/load",
+        json={"path": _UR10E_ROBOTIQ_DEPLOYMENT_PATH},
+    )
+    assert load.status_code == 200
+    full = client.get("/api/deployment/full").json()
+    gripper = full["grippers"]["primary"]
+    assert gripper["commandMode"] == "simulated_joint"
+    assert gripper["semanticConfigured"] is False
+    assert gripper["actuationKind"] == "position_commanded"
+
+    tmp_path = tempfile.mktemp(
+        dir=str(_REPO_ROOT / "examples"),
+        suffix=".yaml",
+    )
+    try:
+        response = client.post(
+            "/api/deployment/save",
+            json={"path": tmp_path, "deployment": full},
+        )
+        assert response.status_code == 200
+        saved_path = response.json()["path"]
+        with open(saved_path) as f:
+            saved_data = yaml.safe_load(f)
+
+        saved_gripper = saved_data["grippers"]["primary"]
+        assert saved_gripper["command_mode"] == "simulated_joint"
+        assert "actuation_kind" not in saved_gripper
+        assert "state_authority" not in saved_gripper
+        assert "completion_policy" not in saved_gripper
+        assert "transport" not in saved_gripper
+        assert "semantic_configured" not in saved_gripper
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        suffixed_path = f"{tmp_path}.deployment.yaml"
+        if os.path.exists(suffixed_path):
+            os.unlink(suffixed_path)
 
 
 # =============================================================================

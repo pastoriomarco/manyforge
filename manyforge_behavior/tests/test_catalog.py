@@ -131,7 +131,8 @@ class TestCatalogLoading:
         # v0.2 entries: motion-scoped trip nodes
         assert "move_until_signal" not in v0_ids
         assert "probe_search_move" not in v0_ids
-        assert len(v0_entries) == len(catalog.entries) - 10
+        assert "confirm_gripper_grasp" not in v0_ids
+        assert len(v0_entries) == len(catalog.entries) - 11
 
     def test_command_gripper_is_marked_experimental(self):
         catalog = NodeCatalog(CATALOG_PATH)

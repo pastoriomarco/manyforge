@@ -51,6 +51,34 @@ logger = logging.getLogger(__name__)
 
 _PROGRAM_SUFFIXES = (".program.yaml", ".program.yml")
 _DEPLOYMENT_SUFFIXES = (".deployment.yaml", ".deployment.yml")
+_READONLY_GRIPPER_RESPONSE_FIELDS = frozenset(
+    {
+        "migration_notes",
+        "migrationNotes",
+        "semantic_configured",
+        "semanticConfigured",
+        "srdf_presets",
+        "srdfPresets",
+        "visualization",
+    }
+)
+_SEMANTIC_GRIPPER_ARTIFACT_FIELDS = frozenset(
+    {
+        "actuation_kind",
+        "actuationKind",
+        "state_authority",
+        "stateAuthority",
+        "completion_policy",
+        "completionPolicy",
+        "grasp_confirmation_policy",
+        "graspConfirmationPolicy",
+        "transport",
+        "open_state_ref",
+        "openStateRef",
+        "closed_state_ref",
+        "closedStateRef",
+    }
+)
 
 
 def _deployment_capability_keys(state: ComposerState) -> set[str] | None:
@@ -197,6 +225,44 @@ def _validate_deployment_against_catalogs(
     deployment.validate_assistant_modes(state.catalog, state.skill_catalog)
 
 
+def _strip_readonly_deployment_response_fields(data: dict) -> dict:
+    """Drop API-only response metadata before deployment schema validation.
+
+    The deployment parser is intentionally strict: unknown gripper keys in YAML
+    must fail closed. Composer responses also carry read-only fields needed by
+    the UI, such as SRDF presets and visualization metadata. Those fields are
+    stripped at the API boundary so strict artifact validation remains intact.
+    """
+
+    cleaned = dict(data)
+    cleaned.pop("source_path", None)
+    cleaned.pop("sourcePath", None)
+    grippers = cleaned.get("grippers")
+    if isinstance(grippers, dict):
+        cleaned_grippers: dict[str, dict] = {}
+        for gripper_id, gripper_data in grippers.items():
+            if isinstance(gripper_data, dict):
+                semantic_configured = bool(
+                    gripper_data.get(
+                        "semantic_configured",
+                        gripper_data.get("semanticConfigured", False),
+                    )
+                )
+                cleaned_grippers[gripper_id] = {
+                    key: value
+                    for key, value in gripper_data.items()
+                    if key not in _READONLY_GRIPPER_RESPONSE_FIELDS
+                    and (
+                        semantic_configured
+                        or key not in _SEMANTIC_GRIPPER_ARTIFACT_FIELDS
+                    )
+                }
+            else:
+                cleaned_grippers[gripper_id] = gripper_data
+        cleaned["grippers"] = cleaned_grippers
+    return cleaned
+
+
 def _gripper_to_serialized_dict(
     state: ComposerState | None,
     gripper_id: str,
@@ -217,6 +283,15 @@ def _gripper_to_serialized_dict(
         "jointName": gripper.joint_name,
         "motionTimeS": gripper.motion_time_s,
         "srdfPresets": dict(gripper.srdf_presets),
+        "actuationKind": gripper.actuation_kind,
+        "stateAuthority": gripper.state_authority,
+        "completionPolicy": gripper.completion_policy,
+        "graspConfirmationPolicy": gripper.grasp_confirmation_policy,
+        "transport": dict(gripper.transport),
+        "openStateRef": gripper.open_state_ref,
+        "closedStateRef": gripper.closed_state_ref,
+        "semanticConfigured": gripper.semantic_configured,
+        "migrationNotes": list(gripper.migration_notes),
         "description": gripper.description,
         "touchLinks": list(gripper.touch_links),
         "mountFrame": gripper.mount_frame,
@@ -276,6 +351,17 @@ def _gripper_to_serialized_dict(
     return payload
 
 
+def _grasp_risk_policy_to_serialized_dict(deployment: Deployment) -> dict:
+    open_loop = deployment.grasp_risk_policy.open_loop_grasp
+    return {
+        "openLoopGrasp": {
+            "allowed": bool(open_loop.allowed),
+            "scope": str(open_loop.scope),
+            "rationale": str(open_loop.rationale),
+        }
+    }
+
+
 def _deployment_to_full_response(
     deployment: Deployment,
     source_path: str,
@@ -307,6 +393,7 @@ def _deployment_to_full_response(
             gripper_id: _gripper_to_serialized_dict(state, gripper_id, gripper)
             for gripper_id, gripper in deployment.grippers.items()
         },
+        graspRiskPolicy=_grasp_risk_policy_to_serialized_dict(deployment),
         adapters={
             slot: {
                 "adapterId": adapter.adapter_id,
@@ -451,6 +538,9 @@ def _deployment_to_full_response(
                                 ),
                                 "action": binding.attached_drift_monitor.action,
                                 "signalId": binding.attached_drift_monitor.signal_id,
+                                "confirmationSignalId": (
+                                    binding.attached_drift_monitor.confirmation_signal_id
+                                ),
                                 "sampleTimeToleranceS": (
                                     binding.attached_drift_monitor.sample_time_tolerance_s
                                 ),
@@ -1045,6 +1135,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 gripper_id: _gripper_to_serialized_dict(state, gripper_id, gripper)
                 for gripper_id, gripper in deployment.grippers.items()
             },
+            graspRiskPolicy=_grasp_risk_policy_to_serialized_dict(deployment),
         ).model_dump(by_alias=True)
 
     @router.get("/deployment", response_model=DeploymentResponse, response_model_by_alias=True)
@@ -1079,6 +1170,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 gripper_id: _gripper_to_serialized_dict(state, gripper_id, gripper)
                 for gripper_id, gripper in deployment.grippers.items()
             },
+            graspRiskPolicy=_grasp_risk_policy_to_serialized_dict(deployment),
         ).model_dump(by_alias=True)
 
     @router.get("/deployment/full", response_model=FullDeploymentResponse, response_model_by_alias=True)
@@ -1212,6 +1304,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
         try:
             deployment_dict = state.deployment.to_dict()
             patch_dict = request.model_dump(exclude_unset=True)
+            patch_dict = _strip_readonly_deployment_response_fields(patch_dict)
             for key, value in patch_dict.items():
                 deployment_dict[key] = value
             updated_deployment = Deployment.from_dict(
@@ -1251,7 +1344,9 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 _validate_deployment_against_catalogs(state, state.deployment)
                 state.deployment.save(target_path)
             else:
-                deployment_data = request.deployment.model_dump()
+                deployment_data = _strip_readonly_deployment_response_fields(
+                    request.deployment.model_dump()
+                )
                 candidate = Deployment.from_dict(deployment_data, path=target_path)
                 _validate_deployment_against_catalogs(state, candidate)
                 if state.program is not None:
@@ -1279,8 +1374,11 @@ def create_program_router(state: ComposerState) -> APIRouter:
             deployment = state.deployment
             deployment_capability_keys = _deployment_capability_keys(state)
             if request.deployment is not None:
+                deployment_data = _strip_readonly_deployment_response_fields(
+                    request.deployment.model_dump()
+                )
                 deployment = Deployment.from_dict(
-                    request.deployment.model_dump(),
+                    deployment_data,
                     path=state.deployment_source_path or "<memory>",
                 )
                 _validate_deployment_against_catalogs(state, deployment)

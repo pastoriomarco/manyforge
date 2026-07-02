@@ -824,6 +824,15 @@ class CycleManager:
                     "joint_name": config.joint_name,
                     "motion_time_s": config.motion_time_s,
                     "srdf_presets": dict(config.srdf_presets),
+                    "actuation_kind": config.actuation_kind,
+                    "state_authority": config.state_authority,
+                    "completion_policy": config.completion_policy,
+                    "grasp_confirmation_policy": config.grasp_confirmation_policy,
+                    "transport": dict(config.transport),
+                    "open_state_ref": config.open_state_ref,
+                    "closed_state_ref": config.closed_state_ref,
+                    "semantic_configured": config.semantic_configured,
+                    "migration_notes": list(config.migration_notes),
                     "description": config.description,
                     "touch_links": list(config.touch_links),
                     "mount_frame": config.mount_frame,
@@ -982,6 +991,102 @@ class CycleManager:
             )
         )
         self._sync_signal_blackboard(time.monotonic_ns())
+
+    def publish_force_current_evidence(
+        self,
+        *,
+        gripper_id: str,
+        value: float,
+        min_value: float | None = None,
+        max_value: float | None = None,
+        units: str = "",
+        adapter: str = "gripper_evidence",
+        signal: str | None = None,
+        mirror_key: str | None = None,
+        stale_after_ms: int = 250,
+        source: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Publish bounded force/current grasp evidence as a boolean signal.
+
+        Adapters own the sensor-specific sampling and unit conversion. This
+        producer is the runtime contract boundary: it converts one finite,
+        already-normalized force/current sample into the boolean source consumed
+        by ConfirmGripperGrasp while preserving the raw evidence in metadata.
+        """
+
+        gripper = str(gripper_id or "").strip()
+        if not gripper:
+            raise ValueError("gripper_id must be non-empty")
+        try:
+            sample = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("force/current evidence value must be numeric") from exc
+        if not math.isfinite(sample):
+            raise ValueError("force/current evidence value must be finite")
+        if min_value is None and max_value is None:
+            raise ValueError(
+                "force/current evidence requires min_value or max_value"
+            )
+
+        min_bound: float | None = None
+        max_bound: float | None = None
+        if min_value is not None:
+            min_bound = float(min_value)
+            if not math.isfinite(min_bound):
+                raise ValueError("force/current evidence min_value must be finite")
+        if max_value is not None:
+            max_bound = float(max_value)
+            if not math.isfinite(max_bound):
+                raise ValueError("force/current evidence max_value must be finite")
+        if min_bound is not None and max_bound is not None and min_bound > max_bound:
+            raise ValueError(
+                "force/current evidence min_value must be <= max_value"
+            )
+
+        confirmed = (
+            (min_bound is None or sample >= min_bound)
+            and (max_bound is None or sample <= max_bound)
+        )
+        signal_id = str(signal or f"gripper.force_current.{gripper}").strip()
+        mirror = str(
+            mirror_key or f"gripper/{gripper}/force_current_confirmed"
+        ).strip()
+        if not signal_id:
+            raise ValueError("force/current evidence signal must be non-empty")
+        if not mirror:
+            raise ValueError("force/current evidence mirror_key must be non-empty")
+
+        evidence_metadata = {
+            "evidence_kind": "force_or_current",
+            "gripper_id": gripper,
+            "value": sample,
+            "units": str(units or ""),
+            "min_value": min_bound,
+            "max_value": max_bound,
+            "confirmed": confirmed,
+        }
+        if source:
+            evidence_metadata["source"] = str(source)
+        evidence_metadata.update(metadata or {})
+
+        self.publish_signal(
+            adapter=str(adapter or "gripper_evidence"),
+            signal=signal_id,
+            value=confirmed,
+            stale_after_ms=max(1, int(stale_after_ms)),
+            mirror_key=mirror,
+            clear_on_stale=True,
+            metadata=evidence_metadata,
+        )
+        return {
+            "accepted": True,
+            "confirmed": confirmed,
+            "adapter": str(adapter or "gripper_evidence"),
+            "signal": signal_id,
+            "mirror_key": mirror,
+            "metadata": evidence_metadata,
+        }
 
     def get_signal_snapshot(self) -> dict[str, Any]:
         """Return the current runtime signal/provider snapshot."""

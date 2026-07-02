@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 from manyforge_behavior.cycle_manager import CycleState
-from manyforge_behavior.kernel_client import GripperCommandRequest, GripperCommandState
+from manyforge_behavior.kernel_client import (
+    GripperCommandRequest,
+    GripperCommandState,
+    gripper_effective_command_request,
+)
 
 from .state import ComposerState
 
@@ -26,6 +30,7 @@ GRIPPER_REASON_BACKEND_UNAVAILABLE = "backend_unavailable"
 GRIPPER_REASON_MALFORMED = "malformed_target"
 GRIPPER_REASON_LIMIT = "gripper_limit_violation"
 GRIPPER_REASON_BUSY = "gripper_busy"
+GRIPPER_REASON_INVALID_SEMANTICS = "invalid_gripper_semantics"
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,30 @@ def validate_gripper_command(
             reason_code=GRIPPER_REASON_MALFORMED,
             detail="durationS must be finite and >= 0",
         )
+    request = GripperCommandRequest(
+        gripper_id=gripper_id,
+        group_id=str(config.group_id),
+        joint_name=str(config.joint_name),
+        target_position=tp,
+        duration_s=ds,
+        max_effort=me,
+        actuation_kind=str(config.actuation_kind or ""),
+        state_authority=str(config.state_authority or ""),
+        completion_policy=str(config.completion_policy or ""),
+        grasp_confirmation_policy=str(config.grasp_confirmation_policy or ""),
+        transport_kind=str((config.transport or {}).get("kind", "")),
+        open_state_ref=str(config.open_state_ref or ""),
+        closed_state_ref=str(config.closed_state_ref or ""),
+        srdf_presets=dict(config.srdf_presets or {}),
+    )
+    request, semantic_error = gripper_effective_command_request(request)
+    if request is None:
+        return GripperValidation(
+            False,
+            reason_code=GRIPPER_REASON_INVALID_SEMANTICS,
+            detail=semantic_error or "Invalid gripper command semantics",
+        )
+
     limit_lower, limit_upper = gripper_joint_limits(state, config.joint_name)
     if limit_lower is None or limit_upper is None:
         return GripperValidation(
@@ -121,26 +150,21 @@ def validate_gripper_command(
                 f"'{config.joint_name}' has no finite URDF limits"
             ),
         )
-    if tp < float(limit_lower) or tp > float(limit_upper):
+    if (
+        request.target_position < float(limit_lower)
+        or request.target_position > float(limit_upper)
+    ):
         return GripperValidation(
             False,
             reason_code=GRIPPER_REASON_LIMIT,
             detail=(
-                f"targetPosition {tp} is outside limits "
+                f"targetPosition {request.target_position} is outside limits "
                 f"[{float(limit_lower)}, {float(limit_upper)}] for gripper joint "
                 f"'{config.joint_name}'"
             ),
             limit_lower=float(limit_lower),
             limit_upper=float(limit_upper),
         )
-    request = GripperCommandRequest(
-        gripper_id=gripper_id,
-        group_id=str(config.group_id),
-        joint_name=str(config.joint_name),
-        target_position=tp,
-        duration_s=ds,
-        max_effort=me,
-    )
     return GripperValidation(
         True,
         request=request,

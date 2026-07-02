@@ -1935,6 +1935,20 @@ def _refresh_gripper_candidate_execution_from_runtime(
             "progress": float(getattr(gripper_status, "progress", 0.0) or 0.0),
             "currentPosition": getattr(gripper_status, "current_position", None),
             "targetPosition": getattr(gripper_status, "target_position", None),
+            "commandedPosition": getattr(
+                gripper_status, "commanded_position", None
+            ),
+            "observedPosition": getattr(gripper_status, "observed_position", None),
+            "commandedState": getattr(gripper_status, "commanded_state", ""),
+            "actuationKind": getattr(gripper_status, "actuation_kind", ""),
+            "stateAuthority": getattr(gripper_status, "state_authority", ""),
+            "completionPolicy": getattr(gripper_status, "completion_policy", ""),
+            "graspConfirmationPolicy": getattr(
+                gripper_status, "grasp_confirmation_policy", ""
+            ),
+            "transportKind": getattr(gripper_status, "transport_kind", ""),
+            "evidence": list(getattr(gripper_status, "evidence", []) or []),
+            "evidenceState": getattr(gripper_status, "evidence_state", ""),
             "error": detail_error,
         },
     )

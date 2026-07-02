@@ -629,6 +629,17 @@ class GripperConfigResponse(BaseModel):
     joint_name: str = Field(alias="jointName")
     motion_time_s: float = Field(alias="motionTimeS")
     srdf_presets: Dict[str, float] = Field(default_factory=dict, alias="srdfPresets")
+    actuation_kind: str = Field(default="", alias="actuationKind")
+    state_authority: str = Field(default="", alias="stateAuthority")
+    completion_policy: str = Field(default="", alias="completionPolicy")
+    grasp_confirmation_policy: str = Field(
+        default="", alias="graspConfirmationPolicy"
+    )
+    transport: Dict[str, Any] = Field(default_factory=dict)
+    open_state_ref: str = Field(default="", alias="openStateRef")
+    closed_state_ref: str = Field(default="", alias="closedStateRef")
+    semantic_configured: bool = Field(default=False, alias="semanticConfigured")
+    migration_notes: List[str] = Field(default_factory=list, alias="migrationNotes")
     description: str = ""
     touch_links: List[str] = Field(default_factory=list, alias="touchLinks")
     mount_frame: str = Field(default="", alias="mountFrame")
@@ -640,6 +651,21 @@ class GripperConfigResponse(BaseModel):
     )
 
 
+class OpenLoopGraspRiskAcceptanceResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    allowed: bool = False
+    scope: str = ""
+    rationale: str = ""
+
+
+class GraspRiskPolicyResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    open_loop_grasp: OpenLoopGraspRiskAcceptanceResponse = Field(
+        default_factory=OpenLoopGraspRiskAcceptanceResponse,
+        alias="openLoopGrasp",
+    )
+
+
 class DeploymentResponse(BaseModel):
     model_config = _ALIAS_CFG
     name: str
@@ -647,6 +673,10 @@ class DeploymentResponse(BaseModel):
     program_profile: str = Field(alias="programProfile")
     robot_config: RobotConfigResponse = Field(alias="robotConfig")
     grippers: Dict[str, GripperConfigResponse] = Field(default_factory=dict)
+    grasp_risk_policy: GraspRiskPolicyResponse = Field(
+        default_factory=GraspRiskPolicyResponse,
+        alias="graspRiskPolicy",
+    )
 
 
 class AdapterConfigResponse(BaseModel):
@@ -866,6 +896,10 @@ class FullDeploymentResponse(BaseModel):
     program_profile: str = Field(alias="programProfile")
     robot_config: RobotConfigResponse = Field(alias="robotConfig")
     grippers: Dict[str, GripperConfigResponse] = Field(default_factory=dict)
+    grasp_risk_policy: GraspRiskPolicyResponse = Field(
+        default_factory=GraspRiskPolicyResponse,
+        alias="graspRiskPolicy",
+    )
     adapters: Dict[str, AdapterConfigResponse]
     orchestrator: OrchestratorConfigResponse
     launch: LaunchConfigResponse
@@ -936,6 +970,10 @@ class UpdateDeploymentRequest(BaseModel):
     program_profile: Optional[str] = Field(None, alias="programProfile")
     robot_config: Optional[Dict[str, Any]] = Field(None, alias="robotConfig")
     grippers: Optional[Dict[str, Dict[str, Any]]] = None
+    grasp_risk_policy: Optional[Dict[str, Any]] = Field(
+        None,
+        alias="graspRiskPolicy",
+    )
     adapters: Optional[Dict[str, Dict[str, Any]]] = None
     orchestrator: Optional[Dict[str, Any]] = None
     launch: Optional[Dict[str, Any]] = None
@@ -1079,6 +1117,16 @@ class SceneGripperStateResponse(BaseModel):
     state: str
     current_position: Optional[float] = None
     target_position: Optional[float] = None
+    commanded_position: Optional[float] = None
+    observed_position: Optional[float] = None
+    commanded_state: str = ""
+    actuation_kind: str = ""
+    state_authority: str = ""
+    completion_policy: str = ""
+    grasp_confirmation_policy: str = ""
+    transport_kind: str = ""
+    evidence: List[str] = Field(default_factory=list)
+    evidence_state: str = ""
     limit_lower: Optional[float] = None
     limit_upper: Optional[float] = None
     motion_time_s: float = 0.0

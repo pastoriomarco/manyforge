@@ -35,12 +35,23 @@ namespace manyforge::ros2_control_execution {
 
 struct Ros2GripperActionConfig {
   std::string action_name = "/robotiq_gripper_controller/gripper_cmd";
+  std::string transport_kind = "ros_gripper_command";
+  std::string command_topic;
+  std::string state_topic;
+  std::vector<std::string> command_joint_names;
   // Optional execution-state sink projection metadata. When set, the ROS
   // gripper command/status path also updates the declared gripper group so
   // Composer's FK/link-pose scene state renders the gripper through the same
   // robot-state path as the arm.
   std::string group_id;
   std::string joint_name;
+  std::string completion_policy = "position_reached";
+  double open_position = 0.0;
+  double closed_position = 0.0;
+  double open_effort = 0.0;
+  double close_effort = 0.0;
+  bool publish_nominal_position = false;
+  double state_freshness_timeout_s = 1.0;
   double wait_for_action_server_timeout_s = 2.0;
   double result_timeout_s = 5.0;
 };
@@ -56,7 +67,10 @@ struct Ros2GripperStatus {
   std::string state = "idle";
   double progress = 0.0;
   std::optional<double> current_position;
+  std::optional<double> observed_position;
   std::optional<double> target_position;
+  std::vector<std::string> evidence;
+  std::string evidence_state;
   std::string error;
   // Stable fault token from ros2_control_fault_reason; empty unless
   // state == "failed".
@@ -138,6 +152,11 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
                                            double target_position,
                                            double duration_s,
                                            double max_effort);
+  Ros2GripperCommandResult mark_gripper_grasp_lost(
+      const std::string& gripper_id,
+      const std::string& evidence_label,
+      const std::string& message,
+      const std::string& reason_code = "grasp_confirmation_lost");
   Ros2GripperStatus get_gripper_status(const std::string& gripper_id) const;
   void update_gripper_commands();
 
@@ -209,6 +228,8 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   struct GripperRuntime {
     Ros2GripperActionConfig config;
     rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub;
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub;
     mutable std::mutex mutex;
     GoalHandleGripper::SharedPtr active_goal_handle;
     std::string state = "idle";
@@ -217,11 +238,16 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
     bool cancel_pending = false;
     std::optional<double> start_position;
     std::optional<double> current_position;
+    std::optional<double> observed_position;
+    std::optional<std::chrono::steady_clock::time_point> observed_at;
     std::optional<double> max_effort;
     double target_position = 0.0;
     double duration_s = 0.0;
     std::chrono::steady_clock::time_point started_at;
     std::optional<std::chrono::steady_clock::time_point> deadline_at;
+    std::vector<std::string> evidence;
+    std::string evidence_state;
+    bool externally_failed = false;
     std::string error;
     std::string reason_code;
   };

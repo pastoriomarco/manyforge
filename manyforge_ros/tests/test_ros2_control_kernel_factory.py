@@ -198,6 +198,7 @@ def test_ros2_control_factory_keeps_ros_gripper_config_canonical_and_seeds_scene
         joint_name="right_finger_joint",
         motion_time_s=0.8,
         srdf_presets={"open": 0.0081, "close": 0.0},
+        completion_policy="driver_result",
         touch_links=[],
         mount_frame="",
         attach_frame="",
@@ -288,7 +289,121 @@ def test_ros2_control_factory_keeps_ros_gripper_config_canonical_and_seeds_scene
         fake_native_bundle.gripper_actions["primary"]
     )
     assert fake_native_bundle.gripper_actions["primary"]["group_id"] == "gripper"
+    assert fake_native_bundle.gripper_actions["primary"]["completion_policy"] == (
+        "driver_result"
+    )
     assert fake_native_bundle.seeded_positions == [("gripper", [0.0081])]
     assert fake_native_bundle.robot_model_authority_metadata[
         "canonical_to_view_joint_names"
     ]["right_finger_joint"] == view_joint
+
+
+def test_ros2_control_factory_configures_isaac_effort_gripper_transport(
+    monkeypatch, tmp_path
+):
+    urdf, srdf = _write_mimic_gripper_model(tmp_path)
+    gripper = SimpleNamespace(
+        command_mode="ros_gripper_command",
+        group_id="gripper",
+        joint_name="right_finger_joint",
+        motion_time_s=0.8,
+        srdf_presets={"open": 0.0081, "closed": 0.0},
+        actuation_kind="pneumatic",
+        state_authority="sim_observed",
+        completion_policy="dwell_elapsed",
+        grasp_confirmation_policy="none_open_loop",
+        transport={
+            "kind": "isaac_joint_state_effort",
+            "command_topic": "/isaac_joint_commands_gripper",
+            "state_topic": "/isaac_joint_states",
+            "joint_names": ["right_finger_joint"],
+            "open_effort": 5.0,
+            "close_effort": -5.0,
+            "publish_nominal_position": True,
+            "state_freshness_timeout_s": 1.5,
+            "dwell_s": 0.8,
+        },
+        open_state_ref="open",
+        closed_state_ref="closed",
+        touch_links=[],
+        mount_frame="",
+        attach_frame="",
+        tcp_frame="",
+        auxiliary_frames=[],
+    )
+    deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(
+            group_id="arm",
+            urdf_path=str(urdf),
+            srdf_path=str(srdf),
+            package_paths=[str(tmp_path)],
+        ),
+        adapters={
+            "execution": SimpleNamespace(
+                adapter_id="execution.ros2_control_follow_joint_trajectory",
+                config={
+                    "required_joints": ["joint1"],
+                    "arm_action": "/arm_controller/follow_joint_trajectory",
+                },
+            ),
+            "planning": SimpleNamespace(
+                adapter_id="planning.roboplan",
+                config={},
+            ),
+        },
+        grippers={"primary": gripper},
+        source_path=str(tmp_path / "deployment.yaml"),
+        baseline_collision_policy_snapshot=lambda: None,
+    )
+
+    class FakeNativeBundle:
+        def __init__(self):
+            self.gripper_actions: dict[str, dict[str, object]] = {}
+            self.seeded_positions: list[tuple[str, list[float]]] = []
+            self.robot_model_authority_metadata: dict[str, object] = {}
+
+        def get_group_commandable_joint_positions(self, group_id):
+            assert group_id == "gripper"
+            return [0.0]
+
+        def set_group_joint_positions(self, group_id, positions):
+            self.seeded_positions.append((group_id, list(positions)))
+
+        def configure_ros_gripper_action(self, gripper_id, config):
+            self.gripper_actions[gripper_id] = dict(config)
+
+        def set_robot_model_authority_metadata(self, metadata):
+            self.robot_model_authority_metadata = dict(metadata)
+
+    fake_native_bundle = FakeNativeBundle()
+    fake_roboplan = ModuleType("manyforge_roboplan_py")
+    fake_roboplan.create_ros2_control_kernel_from_paths = (
+        lambda *args: fake_native_bundle
+    )
+    monkeypatch.setitem(sys.modules, "manyforge_roboplan_py", fake_roboplan)
+
+    fake_client_module = ModuleType("native_kernel_client")
+
+    class FakeNativeKernelClient:
+        def __init__(self, bundle, **kwargs):
+            self.bundle = bundle
+            self.robot_model_authority_metadata = dict(
+                kwargs["robot_model_authority_metadata"]
+            )
+
+    fake_client_module.NativeKernelClient = FakeNativeKernelClient
+    monkeypatch.setitem(sys.modules, "native_kernel_client", fake_client_module)
+
+    create_ros2_control_kernel(deployment=deployment)
+
+    config = fake_native_bundle.gripper_actions["primary"]
+    assert config["transport_kind"] == "isaac_joint_state_effort"
+    assert config["command_topic"] == "/isaac_joint_commands_gripper"
+    assert config["state_topic"] == "/isaac_joint_states"
+    assert config["command_joint_names"] == ["right_finger_joint"]
+    assert config["open_position"] == 0.0081
+    assert config["closed_position"] == 0.0
+    assert config["open_effort"] == 5.0
+    assert config["close_effort"] == -5.0
+    assert config["publish_nominal_position"] is True
+    assert config["state_freshness_timeout_s"] == 1.5

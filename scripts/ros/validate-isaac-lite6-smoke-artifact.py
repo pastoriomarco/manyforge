@@ -118,26 +118,87 @@ def require_arm_result(
 
 
 def require_gripper_result(
-    value: Any, path: str, expected_target: float, command_tolerance: float
+    value: Any,
+    path: str,
+    *,
+    transport_kind: str,
+    expected_target: float,
+    command_tolerance: float,
+    expected_effort: float | None = None,
+    expected_dwell_s: float | None = None,
 ) -> None:
     result = require_dict(value, path)
+    result_transport_kind = result.get("transport_kind", transport_kind)
+    if result_transport_kind != transport_kind:
+        fail(
+            f"{path}.transport_kind={result_transport_kind!r} does not match "
+            f"details.gripper_transport_kind={transport_kind!r}"
+        )
     target = require_number(result.get("target_position"), f"{path}.target_position")
     if abs(target - expected_target) > command_tolerance:
         fail(f"{path}.target_position={target:.6g} does not match expected target")
-    raw_command = require_number(
-        result.get("raw_command_position"), f"{path}.raw_command_position"
-    )
-    if abs(raw_command - expected_target) > command_tolerance:
-        fail(
-            f"{path}.raw_command_position={raw_command:.6g} does not match "
-            f"expected target {expected_target:.6g}"
+    if transport_kind == "ros_gripper_command":
+        raw_command = require_number(
+            result.get("raw_command_position"), f"{path}.raw_command_position"
         )
-    require_number(result.get("result_position"), f"{path}.result_position")
-    if not require_bool(result.get("reached_goal"), f"{path}.reached_goal"):
-        fail(f"{path}.reached_goal must be true")
-    if require_bool(result.get("stalled"), f"{path}.stalled"):
-        fail(f"{path}.stalled must be false")
-    if result.get("isaac_state_position") is not None:
+        if abs(raw_command - expected_target) > command_tolerance:
+            fail(
+                f"{path}.raw_command_position={raw_command:.6g} does not match "
+                f"expected target {expected_target:.6g}"
+            )
+        require_number(result.get("result_position"), f"{path}.result_position")
+        if not require_bool(result.get("reached_goal"), f"{path}.reached_goal"):
+            fail(f"{path}.reached_goal must be true")
+        if require_bool(result.get("stalled"), f"{path}.stalled"):
+            fail(f"{path}.stalled must be false")
+    elif transport_kind == "isaac_joint_state_effort":
+        if result.get("actuation_kind") != "pneumatic":
+            fail(f"{path}.actuation_kind must be pneumatic for direct effort")
+        if result.get("state_authority") != "sim_observed":
+            fail(f"{path}.state_authority must be sim_observed for direct effort")
+        if result.get("completion_policy") != "dwell_elapsed":
+            fail(f"{path}.completion_policy must be dwell_elapsed for direct effort")
+        raw_command = require_number(
+            result.get("raw_command_position"), f"{path}.raw_command_position"
+        )
+        if abs(raw_command - expected_target) > command_tolerance:
+            fail(
+                f"{path}.raw_command_position={raw_command:.6g} does not "
+                f"match expected target {expected_target:.6g}"
+            )
+        raw_effort = require_number(
+            result.get("raw_command_effort"), f"{path}.raw_command_effort"
+        )
+        if (
+            expected_effort is not None
+            and abs(raw_effort - expected_effort) > command_tolerance
+        ):
+            fail(
+                f"{path}.raw_command_effort={raw_effort:.6g} does not match "
+                f"expected effort {expected_effort:.6g}"
+            )
+        dwell_s = require_number(result.get("dwell_s"), f"{path}.dwell_s")
+        dwell_elapsed_s = require_number(
+            result.get("dwell_elapsed_s"), f"{path}.dwell_elapsed_s"
+        )
+        if expected_dwell_s is not None and abs(dwell_s - expected_dwell_s) > 1e-6:
+            fail(
+                f"{path}.dwell_s={dwell_s:.6g} does not match configured dwell "
+                f"{expected_dwell_s:.6g}"
+            )
+        if dwell_elapsed_s + 1e-3 < dwell_s:
+            fail(
+                f"{path}.dwell_elapsed_s={dwell_elapsed_s:.6g} is shorter than "
+                f"dwell_s={dwell_s:.6g}"
+            )
+        require_number(
+            result.get("isaac_state_position"), f"{path}.isaac_state_position"
+        )
+    else:
+        fail(f"unsupported gripper transport kind: {transport_kind}")
+    if transport_kind != "isaac_joint_state_effort" and result.get(
+        "isaac_state_position"
+    ) is not None:
         require_number(
             result.get("isaac_state_position"), f"{path}.isaac_state_position"
         )
@@ -162,7 +223,14 @@ def validate_artifact(payload: dict[str, Any], args: argparse.Namespace) -> None
     if details.get("gripper_joint") != EXPECTED_GRIPPER_JOINT:
         fail(f"details.gripper_joint must be {EXPECTED_GRIPPER_JOINT}")
     require_string(details.get("arm_action"), "details.arm_action")
-    require_string(details.get("gripper_action"), "details.gripper_action")
+    transport_kind = str(details.get("gripper_transport_kind") or "ros_gripper_command")
+    if transport_kind not in {"ros_gripper_command", "isaac_joint_state_effort"}:
+        fail(
+            "details.gripper_transport_kind must be ros_gripper_command "
+            "or isaac_joint_state_effort"
+        )
+    if transport_kind == "ros_gripper_command":
+        require_string(details.get("gripper_action"), "details.gripper_action")
     require_string(details.get("arm_joint_state_topic"), "details.arm_joint_state_topic")
     require_string(
         details.get("isaac_joint_state_topic"), "details.isaac_joint_state_topic"
@@ -216,17 +284,42 @@ def validate_artifact(payload: dict[str, Any], args: argparse.Namespace) -> None
     open_target = require_number(
         details.get("gripper_open_position"), "details.gripper_open_position"
     )
+    close_effort = (
+        require_number(
+            details.get("gripper_close_effort"), "details.gripper_close_effort"
+        )
+        if transport_kind == "isaac_joint_state_effort"
+        else None
+    )
+    open_effort = (
+        require_number(
+            details.get("gripper_open_effort"), "details.gripper_open_effort"
+        )
+        if transport_kind == "isaac_joint_state_effort"
+        else None
+    )
+    dwell_s = (
+        require_number(details.get("gripper_dwell_s"), "details.gripper_dwell_s")
+        if transport_kind == "isaac_joint_state_effort"
+        else None
+    )
     require_gripper_result(
         details.get("gripper_close_result"),
         "details.gripper_close_result",
-        close_target,
-        args.gripper_command_tolerance,
+        transport_kind=transport_kind,
+        expected_target=close_target,
+        command_tolerance=args.gripper_command_tolerance,
+        expected_effort=close_effort,
+        expected_dwell_s=dwell_s,
     )
     require_gripper_result(
         details.get("gripper_open_result"),
         "details.gripper_open_result",
-        open_target,
-        args.gripper_command_tolerance,
+        transport_kind=transport_kind,
+        expected_target=open_target,
+        command_tolerance=args.gripper_command_tolerance,
+        expected_effort=open_effort,
+        expected_dwell_s=dwell_s,
     )
 
 

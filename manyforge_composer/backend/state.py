@@ -3081,6 +3081,42 @@ class ComposerState:
         except Exception:
             logger.debug("pose-source drift signal publish failed", exc_info=True)
 
+    def _publish_pose_source_grasp_confirmation(
+        self,
+        *,
+        source_id: str,
+        object_id: str,
+        confirmation_signal_id: str,
+        value: bool,
+        stale_after_s: float,
+        metadata: dict[str, Any],
+    ) -> None:
+        manager = self.cycle_manager
+        if manager is None:
+            return
+        signal_id = str(confirmation_signal_id or "").strip()
+        if not signal_id:
+            return
+        try:
+            manager.publish_signal(
+                adapter=f"pose_source:{source_id}",
+                signal=signal_id,
+                value=bool(value),
+                stale_after_ms=max(1, int(float(stale_after_s) * 1000.0)),
+                mirror_key=signal_id,
+                clear_on_stale=True,
+                metadata={
+                    "source_id": source_id,
+                    "object_id": object_id,
+                    **copy.deepcopy(metadata),
+                },
+            )
+        except Exception:
+            logger.debug(
+                "pose-source grasp confirmation signal publish failed",
+                exc_info=True,
+            )
+
     def _record_pose_source_drift_event(
         self,
         action: str,
@@ -3094,6 +3130,103 @@ class ComposerState:
             )
         except Exception:
             logger.debug("pose-source drift event recording failed", exc_info=True)
+
+    def _gripper_ids_for_attached_frame(self, attached_frame_id: str) -> list[str]:
+        deployment = self.deployment
+        if deployment is None:
+            return []
+        frame_id = str(attached_frame_id or "").strip()
+        if not frame_id:
+            return []
+
+        matches: list[str] = []
+        for gripper_id, gripper in sorted(deployment.grippers.items()):
+            candidate_frames = {
+                str(getattr(gripper, "attach_frame", "") or "").strip(),
+                str(getattr(gripper, "tcp_frame", "") or "").strip(),
+                str(getattr(gripper, "mount_frame", "") or "").strip(),
+            }
+            candidate_frames.update(
+                str(frame or "").strip()
+                for frame in getattr(gripper, "auxiliary_frames", [])
+            )
+            candidate_frames.discard("")
+            if frame_id in candidate_frames:
+                matches.append(str(gripper_id))
+        return matches
+
+    def _mark_attached_object_grasp_lost(
+        self,
+        *,
+        object_id: str,
+        attached_frame_id: str,
+        evidence_label: str,
+        message: str,
+    ) -> dict[str, Any]:
+        """Propagate measured attached-object loss into gripper status.
+
+        The measured-drift monitor is the primary fault source. This helper only
+        updates gripper evidence when the attached frame maps to exactly one
+        deployment gripper; ambiguous matches are surfaced in diagnostics rather
+        than guessed.
+        """
+
+        frame_id = str(attached_frame_id or "").strip()
+        if not frame_id:
+            return {
+                "gripper_grasp_loss": {
+                    "status": "not_recorded",
+                    "reason": "attached_frame_missing",
+                }
+            }
+
+        matches = self._gripper_ids_for_attached_frame(frame_id)
+        if not matches:
+            return {
+                "gripper_grasp_loss": {
+                    "status": "not_recorded",
+                    "reason": "no_matching_gripper",
+                    "attached_frame_id": frame_id,
+                }
+            }
+        if len(matches) > 1:
+            return {
+                "gripper_grasp_loss": {
+                    "status": "not_recorded",
+                    "reason": "ambiguous_gripper_frame_match",
+                    "attached_frame_id": frame_id,
+                    "gripper_ids": matches,
+                }
+            }
+
+        gripper_id = matches[0]
+        try:
+            result = self.kernel.mark_gripper_grasp_lost(
+                gripper_id=gripper_id,
+                evidence_label=evidence_label,
+                message=message,
+                reason_code="grasp_confirmation_lost",
+            )
+        except Exception as exc:
+            logger.debug("gripper grasp-loss status update failed", exc_info=True)
+            return {
+                "gripper_grasp_loss": {
+                    "status": "not_recorded",
+                    "reason": type(exc).__name__,
+                    "attached_frame_id": frame_id,
+                    "gripper_id": gripper_id,
+                }
+            }
+        return {
+            "gripper_grasp_loss": {
+                "status": "recorded" if result.accepted else "rejected",
+                "reason": result.reason_code,
+                "error": result.error,
+                "attached_frame_id": frame_id,
+                "gripper_id": gripper_id,
+                "object_id": object_id,
+            }
+        }
 
     def pose_source_drift_states(self) -> dict[tuple[str, str], dict[str, Any]]:
         with self._pose_source_drift_lock:
@@ -3113,6 +3246,7 @@ class ComposerState:
         monitor: Any,
         reason: str,
         baseline_captured: bool,
+        attached_frame_id: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> None:
         signal_id = getattr(monitor, "signal_id", f"attached_object_drift/{object_id}")
@@ -3128,6 +3262,8 @@ class ComposerState:
             "baseline_captured": baseline_captured,
             **copy.deepcopy(metadata or {}),
         }
+        if attached_frame_id:
+            details["attached_frame_id"] = attached_frame_id
         with self._pose_source_drift_lock:
             previous_state = copy.deepcopy(self._pose_source_drift_states.get(key))
         state_changed = (
@@ -3152,6 +3288,18 @@ class ComposerState:
 
         if monitor is None or not getattr(monitor, "enabled", False):
             return
+        self._publish_pose_source_grasp_confirmation(
+            source_id=source_id,
+            object_id=object_id,
+            confirmation_signal_id=getattr(
+                monitor,
+                "confirmation_signal_id",
+                "",
+            ),
+            value=False,
+            stale_after_s=getattr(source, "stale_after_s", 1.0),
+            metadata=details,
+        )
         should_fault = stale_behavior == "fault"
         self._publish_pose_source_drift_condition(
             source_id=source_id,
@@ -3170,6 +3318,18 @@ class ComposerState:
                 self._pose_source_drift_raised.add(key)
         if already_raised:
             return
+        if attached_frame_id:
+            details.update(
+                self._mark_attached_object_grasp_lost(
+                    object_id=object_id,
+                    attached_frame_id=attached_frame_id,
+                    evidence_label="attached_drift_monitor",
+                    message=(
+                        f"Attached object '{object_id}' measured grasp became "
+                        f"unverifiable: {reason}"
+                    ),
+                )
+            )
         try:
             self.cycle_manager.raise_runtime_condition_fault(
                 condition_id=signal_id,
@@ -3272,6 +3432,7 @@ class ComposerState:
                 )
                 continue
             if not getattr(object_state, "attached", False):
+                attached_frame_id = str(getattr(object_state, "frame_id", "") or "")
                 with self._pose_source_drift_lock:
                     self._pose_source_drift_baselines.pop(key, None)
                     self._pose_source_drift_exceeded_since_ns.pop(key, None)
@@ -3290,6 +3451,22 @@ class ComposerState:
                         "unverifiable_reason": "object_not_attached",
                     },
                 )
+                if monitor is not None and monitor.enabled:
+                    self._publish_pose_source_grasp_confirmation(
+                        source_id=source_id,
+                        object_id=object_id,
+                        confirmation_signal_id=monitor.confirmation_signal_id,
+                        value=False,
+                        stale_after_s=source.stale_after_s,
+                        metadata={
+                            "source_id": source_id,
+                            "object_id": object_id,
+                            "attached_frame_id": attached_frame_id,
+                            "reason": "object_not_attached",
+                            "status": "disarmed",
+                            "baseline_captured": False,
+                        },
+                    )
                 continue
 
             observed = snapshot_objects.get(object_id)
@@ -3309,6 +3486,7 @@ class ComposerState:
                     monitor=monitor,
                     reason="object_sample_not_fresh",
                     baseline_captured=self._pose_source_baseline_captured(key),
+                    attached_frame_id=str(getattr(object_state, "frame_id", "") or ""),
                 )
                 continue
             if object_pose is None:
@@ -3320,6 +3498,7 @@ class ComposerState:
                     monitor=monitor,
                     reason="object_pose_malformed",
                     baseline_captured=self._pose_source_baseline_captured(key),
+                    attached_frame_id=str(getattr(object_state, "frame_id", "") or ""),
                 )
                 continue
             if measured_tcp_pose is None or measured_tcp_monotonic_s is None:
@@ -3331,6 +3510,7 @@ class ComposerState:
                     monitor=monitor,
                     reason="measured_tcp_missing",
                     baseline_captured=self._pose_source_baseline_captured(key),
+                    attached_frame_id=str(getattr(object_state, "frame_id", "") or ""),
                 )
                 continue
             if isinstance(pose_payload, dict):
@@ -3352,6 +3532,7 @@ class ComposerState:
                     monitor=monitor,
                     reason="frame_mismatch",
                     baseline_captured=self._pose_source_baseline_captured(key),
+                    attached_frame_id=str(getattr(object_state, "frame_id", "") or ""),
                     metadata={
                         "tcp_frame_id": measured_tcp_frame,
                         "object_frame_id": object_frame,
@@ -3383,6 +3564,7 @@ class ComposerState:
                     monitor=monitor,
                     reason="sample_time_mismatch",
                     baseline_captured=self._pose_source_baseline_captured(key),
+                    attached_frame_id=str(getattr(object_state, "frame_id", "") or ""),
                     metadata={"sample_time_delta_s": sample_time_delta_s},
                 )
                 continue
@@ -3484,6 +3666,20 @@ class ComposerState:
                 "baseline": copy.deepcopy(baseline),
                 "current_measured_offset": copy.deepcopy(current_relative),
             }
+            if debounced and not already_raised and monitor.action == "interrupt":
+                condition_payload.update(
+                    self._mark_attached_object_grasp_lost(
+                        object_id=object_id,
+                        attached_frame_id=str(
+                            getattr(object_state, "frame_id", "") or ""
+                        ),
+                        evidence_label="attached_drift_monitor",
+                        message=(
+                            f"Attached object '{object_id}' drift exceeded "
+                            "measured TCP/object threshold"
+                        ),
+                    )
+                )
             drift_state = {
                 "status": status,
                 "action": monitor.action,
@@ -3500,6 +3696,18 @@ class ComposerState:
                 "metadata": condition_payload,
             }
             self._set_pose_source_drift_state(key, drift_state)
+            self._publish_pose_source_grasp_confirmation(
+                source_id=source_id,
+                object_id=object_id,
+                confirmation_signal_id=monitor.confirmation_signal_id,
+                value=status == "ok",
+                stale_after_s=source.stale_after_s,
+                metadata={
+                    **condition_payload,
+                    "status": status,
+                    "confirmation_policy": "attached_drift_monitor",
+                },
+            )
             self._publish_pose_source_drift_condition(
                 source_id=source_id,
                 object_id=object_id,

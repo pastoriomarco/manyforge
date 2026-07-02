@@ -31,6 +31,11 @@ import type {
 } from '../types/api';
 import { computeMoveToTarget } from '../utils/moveTo';
 import type { MoveToTarget, StoredPoseTarget } from '../utils/moveTo';
+import {
+  formatGripperSemanticToken,
+  gripperCompletionNotice,
+  gripperPositionSourceLabel,
+} from '../utils/gripperSemantics';
 
 // UI settle thresholds — when to clear the operator's authored value
 // from the displayed input (CartesianAxisInput draft + CartesianModeBody
@@ -1609,6 +1614,11 @@ function GripperRow({
   const upper = gripper.limit_upper ?? 1;
   const current = gripper.current_position ?? lower;
   const liveTarget = gripper.target_position ?? current;
+  const positionSourceLabel = gripperPositionSourceLabel({
+    stateAuthority: gripper.state_authority,
+    observedPosition: gripper.observed_position,
+    commandedPosition: gripper.commanded_position,
+  });
   // The staged candidate target for THIS gripper, when it is the active draft.
   // A slider/preset edit authors a gripper candidate; the robot moves only via
   // the shared Approve action, so the widget shows the staged (not-yet-executed)
@@ -1634,6 +1644,12 @@ function GripperRow({
     [gripper.srdf_presets],
   );
   const derivedJoints = gripper.derived_joints ?? [];
+  const evidence = gripper.evidence ?? [];
+  const completionNotice = gripperCompletionNotice({
+    actuationKind: gripper.actuation_kind,
+    completionPolicy: gripper.completion_policy,
+    graspConfirmationPolicy: gripper.grasp_confirmation_policy,
+  });
 
   // Author (NOT dispatch) a staged gripper candidate. Slider release and preset
   // clicks no longer call /api/scene/gripper/command directly; the robot moves
@@ -1671,6 +1687,20 @@ function GripperRow({
         </span>
         <span className="text-[10px] text-gray-500">{gripper.joint_name}</span>
       </div>
+      <div className="grid grid-cols-2 gap-1 text-[10px] text-gray-400">
+        <span title={gripper.actuation_kind ?? ''}>
+          {formatGripperSemanticToken(gripper.actuation_kind)}
+        </span>
+        <span title={gripper.transport_kind ?? ''}>
+          {formatGripperSemanticToken(gripper.transport_kind)}
+        </span>
+        <span title={gripper.state_authority ?? ''}>
+          {formatGripperSemanticToken(gripper.state_authority)}
+        </span>
+        <span title={gripper.completion_policy ?? ''}>
+          {formatGripperSemanticToken(gripper.completion_policy)}
+        </span>
+      </div>
       {derivedJoints.length > 0 && (
         <div
           className="truncate text-[10px] text-gray-500"
@@ -1681,7 +1711,7 @@ function GripperRow({
       )}
       <div className="flex items-baseline justify-between gap-2 text-[10px] text-gray-400">
         <span>
-          live:{' '}
+          {positionSourceLabel}:{' '}
           <span className="font-mono text-gray-300">{current.toFixed(3)}</span>
         </span>
         <span>
@@ -1697,6 +1727,22 @@ function GripperRow({
           {stateLabel}
         </span>
       </div>
+      {(gripper.commanded_state || evidence.length > 0 || gripper.evidence_state) && (
+        <div className="truncate text-[10px] text-gray-500" title={[
+          gripper.commanded_state ? `commanded=${gripper.commanded_state}` : '',
+          evidence.length > 0 ? `evidence=${evidence.join(',')}` : '',
+          gripper.evidence_state ? `state=${gripper.evidence_state}` : '',
+        ].filter(Boolean).join(' · ')}>
+          {gripper.commanded_state ? `cmd state: ${gripper.commanded_state}` : 'cmd state: n/a'}
+          {evidence.length > 0 ? ` · ${evidence.join(', ')}` : ''}
+          {gripper.evidence_state ? ` · ${formatGripperSemanticToken(gripper.evidence_state)}` : ''}
+        </div>
+      )}
+      {completionNotice !== null && (
+        <div className="rounded border border-amber-700/40 bg-amber-950/20 px-1.5 py-1 text-[10px] text-amber-200">
+          {completionNotice}
+        </div>
+      )}
       <input
         type="range"
         min={lower}

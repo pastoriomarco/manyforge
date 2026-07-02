@@ -547,6 +547,13 @@ class TestRunnerDeployment:
                         "srdf_path": "package://roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf",
                         "global_max_tcp_linear_speed_mps": 0.25,
                     },
+                    "grasp_risk_policy": {
+                        "open_loop_grasp": {
+                            "allowed": True,
+                            "scope": "simulation",
+                            "rationale": "runner fixture uses legacy simulated gripper semantics",
+                        }
+                    },
                     "grippers": {
                         "primary": {
                             "command_mode": "simulated_joint",

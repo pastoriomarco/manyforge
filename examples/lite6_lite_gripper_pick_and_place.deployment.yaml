@@ -6,6 +6,13 @@ description: >-
   pneumatic gripper. The model bundle is self-contained; xarm_ros2 is a
   generation-time / real-robot runtime dependency only.
 program_profile: v0.1
+grasp_risk_policy:
+  open_loop_grasp:
+    allowed: true
+    scope: simulation
+    rationale: >-
+      Native Lite6 preview uses backend-authored gripper state and simulated
+      attach actions without an independent grasp confirmation source.
 robot_config:
   robot_id: lite6
   group_id: lite6

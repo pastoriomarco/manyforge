@@ -7,6 +7,13 @@ description: >-
   model; execution is delegated to a stock ros2_control JointTrajectoryController
   exposed through Isaac's topic_based_ros2_control bridge.
 program_profile: v0.1
+grasp_risk_policy:
+  open_loop_grasp:
+    allowed: true
+    scope: simulation
+    rationale: >-
+      Isaac Lite6 simulation attaches objects after pneumatic gripper dwell
+      without an independent grasp confirmation source.
 robot_config:
   robot_id: lite6
   group_id: lite6
@@ -20,8 +27,24 @@ grippers:
     command_mode: ros_gripper_command
     group_id: lite_gripper
     joint_name: right_finger_joint
+    actuation_kind: pneumatic
+    state_authority: sim_observed
+    completion_policy: dwell_elapsed
+    grasp_confirmation_policy: none_open_loop
+    open_state_ref: open
+    closed_state_ref: closed
     motion_time_s: 0.8
-    description: UFACTORY lite pneumatic gripper through a standard ROS GripperCommand action.
+    description: UFACTORY lite pneumatic gripper through Isaac JointState effort commands.
+    transport:
+      kind: isaac_joint_state_effort
+      command_topic: /isaac_joint_commands_gripper
+      state_topic: /isaac_joint_states
+      joint_names:
+      - right_finger_joint
+      close_effort: -5.0
+      open_effort: 5.0
+      publish_nominal_position: true
+      dwell_s: 0.8
     touch_links:
     - lite_gripper_base_link
     - lite_gripper_left_finger
@@ -176,10 +199,6 @@ adapters:
       tracking_error_timeout_s: 0
       disable_controller_path_tolerances: true
       controller_result_timeout_s: 30
-      gripper:
-        action_name: /lite_gripper_controller/gripper_cmd
-        wait_for_action_server_timeout_s: 2
-        result_timeout_s: 5
 orchestrator:
   engine: py_trees
   config:

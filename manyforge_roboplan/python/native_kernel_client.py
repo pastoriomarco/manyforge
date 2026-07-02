@@ -14,6 +14,10 @@ from manyforge_behavior.kernel_client import (
     GripperCommandRequest,
     GripperCommandState,
     GripperCommandStatus,
+    gripper_effective_command_request,
+    gripper_observed_position,
+    gripper_request_status_metadata,
+    normalize_gripper_evidence,
     ExecutionState,
     ExecuteRequest,
     ExecuteResult,
@@ -315,6 +319,7 @@ class NativeKernelClient(KernelClient):
             attach_metadata(self.robot_model_authority_metadata)
         self._active_gripper_commands: Dict[str, Dict[str, Any]] = {}
         self._gripper_status_cache: Dict[str, GripperCommandStatus] = {}
+        self._gripper_semantic_metadata: Dict[str, Dict[str, Any]] = {}
 
     def _view_joint_name(self, canonical_joint_name: str) -> str:
         return self._canonical_to_view_joint_names.get(
@@ -387,6 +392,21 @@ class NativeKernelClient(KernelClient):
             progress=progress,
             current_position=current_position,
             target_position=float(command["target_position"]),
+            commanded_position=command.get("commanded_position"),
+            observed_position=gripper_observed_position(
+                str(command.get("state_authority", "")),
+                current_position,
+            ),
+            commanded_state=str(command.get("commanded_state", "")),
+            actuation_kind=str(command.get("actuation_kind", "")),
+            state_authority=str(command.get("state_authority", "")),
+            completion_policy=str(command.get("completion_policy", "")),
+            grasp_confirmation_policy=str(
+                command.get("grasp_confirmation_policy", "")
+            ),
+            transport_kind=str(command.get("transport_kind", "")),
+            evidence=normalize_gripper_evidence(command.get("evidence")),
+            evidence_state=str(command.get("evidence_state", "")),
         )
         self._gripper_status_cache[gripper_id] = status
         if status.state == GripperCommandState.COMPLETED:
@@ -879,7 +899,23 @@ class NativeKernelClient(KernelClient):
         return dict(self._bundle.get_metrics())
 
     def command_gripper(self, request: GripperCommandRequest) -> CommandResult:
-        if hasattr(self._bundle, "command_ros_gripper"):
+        effective_request, semantic_error = gripper_effective_command_request(
+            request
+        )
+        if effective_request is None:
+            return CommandResult(
+                accepted=False,
+                error=semantic_error or "Invalid gripper command semantics",
+                reason_code="invalid_gripper_semantics",
+            )
+        request = effective_request
+        self._gripper_semantic_metadata[request.gripper_id] = (
+            gripper_request_status_metadata(request)
+        )
+        if (
+            request.transport_kind != "native_kinematic"
+            and hasattr(self._bundle, "command_ros_gripper")
+        ):
             try:
                 result = self._bundle.command_ros_gripper(
                     request.gripper_id,
@@ -918,16 +954,27 @@ class NativeKernelClient(KernelClient):
         if request.duration_s <= 0.0:
             group_positions[joint_index] = float(request.target_position)
             self._bundle.set_group_joint_positions(request.group_id, group_positions)
+            metadata = gripper_request_status_metadata(
+                request,
+                current_position=float(request.target_position),
+            )
+            self._gripper_semantic_metadata[request.gripper_id] = metadata
             self._gripper_status_cache[request.gripper_id] = GripperCommandStatus(
                 state=GripperCommandState.COMPLETED,
                 gripper_id=request.gripper_id,
                 progress=1.0,
                 current_position=float(request.target_position),
                 target_position=float(request.target_position),
+                **metadata,
             )
             self._active_gripper_commands.pop(request.gripper_id, None)
             return CommandResult(accepted=True)
 
+        metadata = gripper_request_status_metadata(
+            request,
+            current_position=start_position,
+        )
+        self._gripper_semantic_metadata[request.gripper_id] = metadata
         self._active_gripper_commands[request.gripper_id] = {
             "group_id": request.group_id,
             "joint_name": request.joint_name,
@@ -936,6 +983,7 @@ class NativeKernelClient(KernelClient):
             "target_position": float(request.target_position),
             "duration_s": float(request.duration_s),
             "start_time": time.monotonic(),
+            **metadata,
         }
         self._gripper_status_cache[request.gripper_id] = GripperCommandStatus(
             state=GripperCommandState.EXECUTING,
@@ -943,22 +991,91 @@ class NativeKernelClient(KernelClient):
             progress=0.0,
             current_position=start_position,
             target_position=float(request.target_position),
+            **metadata,
         )
         return CommandResult(accepted=True)
 
     def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
+        cached = self._gripper_status_cache.get(gripper_id)
+        if (
+            cached is not None
+            and cached.evidence_state == "pressure_or_part_lost"
+            and cached.reason_code == "grasp_confirmation_lost"
+        ):
+            return cached
         if hasattr(self._bundle, "get_ros_gripper_status"):
             try:
                 status = self._bundle.get_ros_gripper_status(gripper_id)
             except RuntimeError:
                 status = None
             if status is not None:
+                metadata = self._gripper_semantic_metadata.get(gripper_id, {})
+                current_position = status.get("current_position")
+                observed_position = status.get(
+                    "observed_position",
+                    metadata.get("observed_position"),
+                )
+                if observed_position is None:
+                    observed_position = gripper_observed_position(
+                        str(metadata.get("state_authority", "")),
+                        current_position,
+                    )
                 return GripperCommandStatus(
                     state=_gripper_state_from_native(status),
                     gripper_id=gripper_id,
                     progress=float(status.get("progress", 0.0)),
-                    current_position=status.get("current_position"),
+                    current_position=current_position,
                     target_position=status.get("target_position"),
+                    commanded_position=status.get(
+                        "commanded_position",
+                        metadata.get("commanded_position"),
+                    ),
+                    observed_position=observed_position,
+                    commanded_state=str(
+                        status.get(
+                            "commanded_state",
+                            metadata.get("commanded_state", ""),
+                        )
+                    ),
+                    actuation_kind=str(
+                        status.get(
+                            "actuation_kind",
+                            metadata.get("actuation_kind", ""),
+                        )
+                    ),
+                    state_authority=str(
+                        status.get(
+                            "state_authority",
+                            metadata.get("state_authority", ""),
+                        )
+                    ),
+                    completion_policy=str(
+                        status.get(
+                            "completion_policy",
+                            metadata.get("completion_policy", ""),
+                        )
+                    ),
+                    grasp_confirmation_policy=str(
+                        status.get(
+                            "grasp_confirmation_policy",
+                            metadata.get("grasp_confirmation_policy", ""),
+                        )
+                    ),
+                    transport_kind=str(
+                        status.get(
+                            "transport_kind",
+                            metadata.get("transport_kind", ""),
+                        )
+                    ),
+                    evidence=normalize_gripper_evidence(
+                        status.get("evidence", metadata.get("evidence", []))
+                    ),
+                    evidence_state=str(
+                        status.get(
+                            "evidence_state",
+                            metadata.get("evidence_state", ""),
+                        )
+                    ),
                     error=status.get("error"),
                     reason_code=status.get("reason_code"),
                 )
@@ -969,6 +1086,82 @@ class NativeKernelClient(KernelClient):
                 gripper_id=gripper_id,
             ),
         )
+
+    def mark_gripper_grasp_lost(
+        self,
+        *,
+        gripper_id: str,
+        evidence_label: str,
+        message: str,
+        reason_code: str = "grasp_confirmation_lost",
+    ) -> CommandResult:
+        label = str(evidence_label or "").strip()
+        if not label:
+            return CommandResult(
+                accepted=False,
+                error="grasp loss evidence_label is required",
+                reason_code="invalid_gripper_semantics",
+            )
+        mark_ros = getattr(self._bundle, "mark_ros_gripper_grasp_lost", None)
+        if callable(mark_ros):
+            try:
+                result = mark_ros(
+                    gripper_id,
+                    label,
+                    str(message or "gripper grasp confirmation was lost"),
+                    str(reason_code or "grasp_confirmation_lost"),
+                )
+            except RuntimeError:
+                result = None
+            if isinstance(result, dict) and bool(result.get("accepted")):
+                self._gripper_status_cache.pop(gripper_id, None)
+                return CommandResult(accepted=True)
+            if isinstance(result, dict) and result.get("reason_code") != (
+                "gripper_not_configured"
+            ):
+                return CommandResult(
+                    accepted=False,
+                    error=str(result.get("error") or "gripper grasp-loss mark failed"),
+                    reason_code=str(
+                        result.get("reason_code") or "invalid_gripper_semantics"
+                    ),
+                )
+        current = self.get_gripper_status(gripper_id)
+        if current.state == GripperCommandState.IDLE and not (
+            current.evidence
+            or current.commanded_state
+            or current.target_position is not None
+        ):
+            return CommandResult(
+                accepted=False,
+                error=f"Gripper '{gripper_id}' has no command status to invalidate",
+                reason_code="stale_gripper_state",
+            )
+        evidence = normalize_gripper_evidence(current.evidence)
+        if label not in evidence:
+            evidence.append(label)
+        failed = GripperCommandStatus(
+            state=GripperCommandState.FAILED,
+            gripper_id=gripper_id,
+            progress=current.progress,
+            current_position=current.current_position,
+            target_position=current.target_position,
+            commanded_position=current.commanded_position,
+            observed_position=current.observed_position,
+            commanded_state=current.commanded_state,
+            actuation_kind=current.actuation_kind,
+            state_authority=current.state_authority,
+            completion_policy=current.completion_policy,
+            grasp_confirmation_policy=current.grasp_confirmation_policy,
+            transport_kind=current.transport_kind,
+            evidence=evidence,
+            evidence_state="pressure_or_part_lost",
+            error=str(message or "gripper grasp confirmation was lost"),
+            reason_code=str(reason_code or "grasp_confirmation_lost"),
+        )
+        self._active_gripper_commands.pop(gripper_id, None)
+        self._gripper_status_cache[gripper_id] = failed
+        return CommandResult(accepted=True)
 
     def drain_kernel_events(self) -> list[dict]:
         return list(self._bundle.drain_kernel_events())

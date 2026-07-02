@@ -33,6 +33,11 @@ import {
   stopModeLabel,
 } from '../store/stopProfile';
 import { DraftTextarea, DraftTextInput } from './common/DraftInputs';
+import {
+  formatGripperSemanticToken,
+  gripperCompletionNotice,
+  gripperTransportKind,
+} from '../utils/gripperSemantics';
 
 function signature(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -108,6 +113,23 @@ function Section({ title, children }: { title: string; children: React.ReactNode
         {title}
       </h3>
       <div className="space-y-1">{children}</div>
+    </div>
+  );
+}
+
+function SemanticPill({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="rounded border border-gray-700 bg-gray-900/50 px-2 py-1">
+      <div className="text-[10px] uppercase tracking-wide text-gray-500">{label}</div>
+      <div className="truncate text-xs text-gray-200" title={value}>
+        {formatGripperSemanticToken(value)}
+      </div>
     </div>
   );
 }
@@ -2311,6 +2333,54 @@ export function DeploymentPanel() {
 
       {Object.entries(deployment.grippers ?? {}).map(([gripperId, gripper]) => (
         <Section key={gripperId} title={`Gripper: ${gripperId}`}>
+          <div className="mb-2 rounded border border-gray-700 bg-gray-900/40 p-2">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-gray-400">
+                Semantic Contract
+              </span>
+              <span
+                className={`rounded px-1.5 py-0.5 text-[10px] ${
+                  gripper.semanticConfigured
+                    ? 'bg-emerald-950/50 text-emerald-300'
+                    : 'bg-amber-950/50 text-amber-300'
+                }`}
+              >
+                {gripper.semanticConfigured ? 'configured' : 'legacy migrated'}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-1">
+              <SemanticPill label="Actuation" value={gripper.actuationKind} />
+              <SemanticPill
+                label="Transport"
+                value={gripperTransportKind(gripper.transport, gripper.commandMode)}
+              />
+              <SemanticPill label="State" value={gripper.stateAuthority} />
+              <SemanticPill label="Completion" value={gripper.completionPolicy} />
+              <SemanticPill label="Grasp proof" value={gripper.graspConfirmationPolicy} />
+            </div>
+            {gripperCompletionNotice({
+              actuationKind: gripper.actuationKind,
+              completionPolicy: gripper.completionPolicy,
+              graspConfirmationPolicy: gripper.graspConfirmationPolicy,
+            }) !== null && (
+              <div className="mt-2 rounded border border-amber-700/50 bg-amber-950/25 px-2 py-1 text-[10px] text-amber-200">
+                {gripperCompletionNotice({
+                  actuationKind: gripper.actuationKind,
+                  completionPolicy: gripper.completionPolicy,
+                  graspConfirmationPolicy: gripper.graspConfirmationPolicy,
+                })}
+              </div>
+            )}
+            {gripper.migrationNotes.length > 0 && (
+              <div className="mt-2 space-y-1 text-[10px] text-amber-200">
+                {gripper.migrationNotes.map((note) => (
+                  <div key={note} className="rounded bg-amber-950/25 px-2 py-1">
+                    {note}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
           <FieldInput
             label="Description"
             value={gripper.description}
@@ -2322,6 +2392,55 @@ export function DeploymentPanel() {
             value={gripper.commandMode}
             onChange={(value) => setNestedField(`grippers.${gripperId}.commandMode`, value)}
             disabled={editLocked}
+          />
+          <FieldInput
+            label="Actuation Kind"
+            value={gripper.actuationKind}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.actuationKind`, value)}
+            disabled={editLocked}
+            help="Semantic device kind, such as position_commanded or pneumatic."
+          />
+          <FieldInput
+            label="Transport Kind"
+            value={gripperTransportKind(gripper.transport, gripper.commandMode)}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.transport.kind`, value)}
+            disabled={editLocked}
+            help="Adapter transport behind command_gripper. Behavior nodes do not use raw transport details."
+          />
+          <FieldInput
+            label="State Authority"
+            value={gripper.stateAuthority}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.stateAuthority`, value)}
+            disabled={editLocked}
+            help="Where the displayed gripper state comes from: backend, simulator, real feedback, or commanded estimate."
+          />
+          <FieldInput
+            label="Completion Policy"
+            value={gripper.completionPolicy}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.completionPolicy`, value)}
+            disabled={editLocked}
+            help="Evidence required for command_gripper to complete."
+          />
+          <FieldInput
+            label="Grasp Confirmation Policy"
+            value={gripper.graspConfirmationPolicy}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.graspConfirmationPolicy`, value)}
+            disabled={editLocked}
+            help="Evidence required before an attach can be trusted as a grasp proof."
+          />
+          <FieldInput
+            label="Open State Ref"
+            value={gripper.openStateRef}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.openStateRef`, value)}
+            disabled={editLocked}
+            help="RMA/SRDF state reference used for semantic open commands."
+          />
+          <FieldInput
+            label="Closed State Ref"
+            value={gripper.closedStateRef}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.closedStateRef`, value)}
+            disabled={editLocked}
+            help="RMA/SRDF state reference used for semantic closed commands."
           />
           <FieldInput
             label="Group ID"

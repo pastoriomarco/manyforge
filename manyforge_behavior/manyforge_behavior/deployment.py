@@ -78,12 +78,39 @@ class GripperConfig:
     joint_name: str
     motion_time_s: float
     srdf_presets: dict[str, float] = field(default_factory=dict)
+    actuation_kind: str = ""
+    state_authority: str = ""
+    completion_policy: str = ""
+    grasp_confirmation_policy: str = ""
+    transport: dict[str, Any] = field(default_factory=dict)
+    open_state_ref: str = ""
+    closed_state_ref: str = ""
+    semantic_configured: bool = False
+    migration_notes: list[str] = field(default_factory=list)
     description: str = ""
     touch_links: list[str] = field(default_factory=list)
     mount_frame: str = ""
     attach_frame: str = ""
     tcp_frame: str = ""
     auxiliary_frames: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class OpenLoopGraspRiskAcceptance:
+    """Deployment-level acknowledgement for open-loop attach assumptions."""
+
+    allowed: bool = False
+    scope: str = ""
+    rationale: str = ""
+
+
+@dataclass(frozen=True)
+class GraspRiskPolicy:
+    """Operational risk policy for grasp assumptions."""
+
+    open_loop_grasp: OpenLoopGraspRiskAcceptance = field(
+        default_factory=OpenLoopGraspRiskAcceptance
+    )
 
 
 @dataclass
@@ -149,6 +176,7 @@ class PoseSourceAttachedDriftMonitorConfig:
     stale_behavior: str = "fault"
     action: str = "interrupt"
     signal_id: str = ""
+    confirmation_signal_id: str = ""
     sample_time_tolerance_s: float = 0.05
 
 
@@ -304,8 +332,156 @@ _SIMULATION_CONTROL_CAPABILITY_FLAGS = {
     "set_entity_state",
 }
 _ALLOWED_GRIPPER_COMMAND_MODES = {
+    # command_mode is the legacy runtime dispatch field. New deployments should
+    # use transport.kind for semantics; this allowlist still includes the
+    # deferred PLC token so semantic schemas can round-trip before the runtime
+    # adapter exists.
+    "plc_gripper_request",
     "simulated_joint",
     "ros_gripper_command",
+}
+_ALLOWED_GRIPPER_ACTUATION_KINDS = {
+    "position_commanded",
+    "pneumatic",
+}
+_ALLOWED_GRIPPER_TRANSPORT_KINDS = {
+    "native_kinematic",
+    "ros_gripper_command",
+    "isaac_joint_state_effort",
+    "plc_gripper_request",
+}
+_ALLOWED_GRIPPER_STATE_AUTHORITIES = {
+    "native_backend",
+    "sim_observed",
+    "real_observed",
+    "commanded_estimate",
+}
+_ALLOWED_GRIPPER_COMPLETION_POLICIES = {
+    "position_reached",
+    "driver_result",
+    "dwell_elapsed",
+    "request_ack_then_dwell",
+    "open_loop_immediate",
+}
+_ALLOWED_GRIPPER_GRASP_CONFIRMATION_POLICIES = {
+    "none_open_loop",
+    "operator_confirm",
+    "discrete_signal",
+    "perception",
+    "force_or_current",
+}
+_ALLOWED_OPEN_LOOP_GRASP_SCOPES = {
+    "simulation",
+    "commissioning",
+    "production",
+}
+_ALLOWED_GRASP_RISK_POLICY_FIELDS = frozenset(
+    {
+        "open_loop_grasp",
+        "openLoopGrasp",
+    }
+)
+_ALLOWED_OPEN_LOOP_GRASP_FIELDS = frozenset(
+    {
+        "allowed",
+        "scope",
+        "rationale",
+    }
+)
+_GRIPPER_SEMANTIC_FIELDS = frozenset(
+    {
+        "actuation_kind",
+        "actuationKind",
+        "state_authority",
+        "stateAuthority",
+        "completion_policy",
+        "completionPolicy",
+        "grasp_confirmation_policy",
+        "graspConfirmationPolicy",
+        "transport",
+        "open_state_ref",
+        "openStateRef",
+        "closed_state_ref",
+        "closedStateRef",
+    }
+)
+_ALLOWED_GRIPPER_FIELDS = frozenset(
+    {
+        "command_mode",
+        "commandMode",
+        "group_id",
+        "groupId",
+        "joint_name",
+        "jointName",
+        "motion_time_s",
+        "motionTimeS",
+        "description",
+        "touch_links",
+        "touchLinks",
+        "mount_frame",
+        "mountFrame",
+        "attach_frame",
+        "attachFrame",
+        "tcp_frame",
+        "tcpFrame",
+        "auxiliary_frames",
+        "auxiliaryFrames",
+        "open_position",
+        "openPosition",
+        "closed_position",
+        "closedPosition",
+        *_GRIPPER_SEMANTIC_FIELDS,
+    }
+)
+_ALLOWED_GRIPPER_TRANSPORT_FIELDS = {
+    "native_kinematic": frozenset({"kind"}),
+    "ros_gripper_command": frozenset(
+        {
+            "kind",
+            "action_name",
+            "actionName",
+            "result_timeout_s",
+            "resultTimeoutS",
+            "position_tolerance",
+            "positionTolerance",
+            "driver_result_contract",
+            "driverResultContract",
+        }
+    ),
+    "isaac_joint_state_effort": frozenset(
+        {
+            "kind",
+            "command_topic",
+            "commandTopic",
+            "state_topic",
+            "stateTopic",
+            "joint_names",
+            "jointNames",
+            "close_effort",
+            "closeEffort",
+            "open_effort",
+            "openEffort",
+            "publish_nominal_position",
+            "publishNominalPosition",
+            "dwell_s",
+            "dwellS",
+        }
+    ),
+    "plc_gripper_request": frozenset(
+        {
+            "kind",
+            "command_endpoint",
+            "commandEndpoint",
+            "ready_signal",
+            "readySignal",
+            "fault_signal",
+            "faultSignal",
+            "request_timeout_s",
+            "requestTimeoutS",
+            "dwell_s",
+            "dwellS",
+        }
+    ),
 }
 _ALLOWED_AUTHORITY_DOMAINS = {
     "motion",
@@ -496,6 +672,7 @@ class Deployment:
         self.pose_sources: dict[str, PoseSourceConfig] = {}
         self.simulation_control: Optional[SimulationControlConfig] = None
         self.contact_policies: list[ContactPolicyConfig] = []
+        self.grasp_risk_policy: GraspRiskPolicy = GraspRiskPolicy()
         self.authority_matrix: dict[str, AuthorityDomain] = {}
         self.model_audit_policy: Optional[ModelAuditPolicy] = None
         self.model_endpoint_profile_registry: Optional[str] = None
@@ -532,6 +709,7 @@ class Deployment:
         self.pose_sources = {}
         self.simulation_control = None
         self.contact_policies = []
+        self.grasp_risk_policy = GraspRiskPolicy()
         self.authority_matrix = {}
         self.model_audit_policy = None
         self.model_endpoint_profile_registry = None
@@ -924,6 +1102,19 @@ class Deployment:
             )
             if not signal_id:
                 raise DeploymentValidationError(f"{field_path}.signal_id must be non-empty")
+            confirmation_signal_id = self._parse_optional_text(
+                get_alias(
+                    raw,
+                    "confirmation_signal_id",
+                    "confirmationSignalId",
+                    f"attached_object_grasp_confirmed/{object_id}",
+                ),
+                f"{field_path}.confirmation_signal_id",
+            )
+            if not confirmation_signal_id:
+                raise DeploymentValidationError(
+                    f"{field_path}.confirmation_signal_id must be non-empty"
+                )
             sample_time_tolerance_s = self._parse_positive_float(
                 get_alias(
                     raw,
@@ -941,6 +1132,7 @@ class Deployment:
                 stale_behavior=stale_behavior,
                 action=action,
                 signal_id=signal_id,
+                confirmation_signal_id=confirmation_signal_id,
                 sample_time_tolerance_s=sample_time_tolerance_s,
             )
 
@@ -1467,6 +1659,119 @@ class Deployment:
             parsed.append(ContactPolicyConfig(policy_id=policy_id, raw=dict(raw_policy)))
         return parsed
 
+    def _parse_grasp_risk_policy(self, raw_policy: Any) -> GraspRiskPolicy:
+        """Parse deployment-level gates for explicit grasp assumptions."""
+
+        if raw_policy is None:
+            return GraspRiskPolicy()
+        if not isinstance(raw_policy, dict):
+            raise DeploymentValidationError("grasp_risk_policy must be a mapping")
+        unknown_fields = sorted(
+            field
+            for field in raw_policy
+            if field not in _ALLOWED_GRASP_RISK_POLICY_FIELDS
+        )
+        if unknown_fields:
+            raise DeploymentValidationError(
+                f"grasp_risk_policy contains unknown fields: {unknown_fields}"
+            )
+
+        snake_present = "open_loop_grasp" in raw_policy
+        camel_present = "openLoopGrasp" in raw_policy
+        if (
+            snake_present
+            and camel_present
+            and raw_policy["open_loop_grasp"] != raw_policy["openLoopGrasp"]
+        ):
+            raise DeploymentValidationError(
+                "grasp_risk_policy declares both open_loop_grasp and "
+                "openLoopGrasp with different values"
+            )
+        raw_open_loop = raw_policy.get(
+            "open_loop_grasp",
+            raw_policy.get("openLoopGrasp"),
+        )
+        if raw_open_loop is None:
+            return GraspRiskPolicy()
+        if not isinstance(raw_open_loop, dict):
+            raise DeploymentValidationError(
+                "grasp_risk_policy.open_loop_grasp must be a mapping"
+            )
+        unknown_open_loop_fields = sorted(
+            field
+            for field in raw_open_loop
+            if field not in _ALLOWED_OPEN_LOOP_GRASP_FIELDS
+        )
+        if unknown_open_loop_fields:
+            raise DeploymentValidationError(
+                "grasp_risk_policy.open_loop_grasp contains unknown fields: "
+                f"{unknown_open_loop_fields}"
+            )
+
+        allowed = raw_open_loop.get("allowed", False)
+        if not isinstance(allowed, bool):
+            raise DeploymentValidationError(
+                "grasp_risk_policy.open_loop_grasp.allowed must be a boolean"
+            )
+        scope = raw_open_loop.get("scope", "")
+        if scope is None:
+            scope = ""
+        if not isinstance(scope, str):
+            raise DeploymentValidationError(
+                "grasp_risk_policy.open_loop_grasp.scope must be a string"
+            )
+        scope = scope.strip()
+        rationale = raw_open_loop.get("rationale", "")
+        if rationale is None:
+            rationale = ""
+        if not isinstance(rationale, str):
+            raise DeploymentValidationError(
+                "grasp_risk_policy.open_loop_grasp.rationale must be a string"
+            )
+        rationale = rationale.strip()
+
+        if allowed:
+            if scope not in _ALLOWED_OPEN_LOOP_GRASP_SCOPES:
+                allowed_scopes = ", ".join(sorted(_ALLOWED_OPEN_LOOP_GRASP_SCOPES))
+                raise DeploymentValidationError(
+                    "grasp_risk_policy.open_loop_grasp.scope must be one of: "
+                    f"{allowed_scopes}"
+                )
+            if not rationale:
+                raise DeploymentValidationError(
+                    "grasp_risk_policy.open_loop_grasp.rationale is required "
+                    "when open-loop grasp is allowed"
+                )
+        elif scope or rationale:
+            raise DeploymentValidationError(
+                "grasp_risk_policy.open_loop_grasp scope/rationale require "
+                "allowed=true"
+            )
+
+        return GraspRiskPolicy(
+            open_loop_grasp=OpenLoopGraspRiskAcceptance(
+                allowed=allowed,
+                scope=scope,
+                rationale=rationale,
+            )
+        )
+
+    def _validate_gripper_grasp_risk_policy(self) -> None:
+        none_open_loop_grippers = sorted(
+            gripper_id
+            for gripper_id, gripper in self.grippers.items()
+            if gripper.grasp_confirmation_policy == "none_open_loop"
+        )
+        if not none_open_loop_grippers:
+            return
+        if self.grasp_risk_policy.open_loop_grasp.allowed:
+            return
+        raise DeploymentValidationError(
+            "grasp_confirmation_policy=none_open_loop requires "
+            "grasp_risk_policy.open_loop_grasp.allowed=true with scope and "
+            f"rationale; affected grippers: {none_open_loop_grippers}"
+        )
+
     def _parse_grippers(
         self,
         grippers_data: dict[str, Any] | None,
@@ -1475,36 +1780,472 @@ class Deployment:
             raise DeploymentValidationError("grippers must be a mapping")
         parsed: dict[str, GripperConfig] = {}
         srdf_group_states = self._load_srdf_group_state_positions()
+
+        def get_alias(
+            data: dict[str, Any],
+            snake: str,
+            camel: str,
+            default: Any = None,
+            *,
+            field_path: str,
+        ) -> Any:
+            snake_present = snake in data
+            camel_present = camel in data
+            if snake_present and camel_present and data[snake] != data[camel]:
+                raise DeploymentValidationError(
+                    f"{field_path} declares both {snake} and {camel} with different values"
+                )
+            if snake_present:
+                return data[snake]
+            if camel_present:
+                return data[camel]
+            return default
+
+        def parse_text(
+            data: dict[str, Any],
+            snake: str,
+            camel: str,
+            *,
+            field_path: str,
+            required: bool = True,
+            default: str = "",
+        ) -> str:
+            value = get_alias(data, snake, camel, default, field_path=field_path)
+            if value is None:
+                value = ""
+            if not isinstance(value, str):
+                raise DeploymentValidationError(f"{field_path} must be a string")
+            value = value.strip()
+            if required and not value:
+                raise DeploymentValidationError(f"{field_path} is required")
+            return value
+
+        def parse_bool(
+            data: dict[str, Any],
+            snake: str,
+            camel: str,
+            *,
+            field_path: str,
+            default: bool = False,
+        ) -> bool:
+            value = get_alias(data, snake, camel, default, field_path=field_path)
+            if not isinstance(value, bool):
+                raise DeploymentValidationError(f"{field_path} must be a boolean")
+            return value
+
+        def parse_float(
+            data: dict[str, Any],
+            snake: str,
+            camel: str,
+            *,
+            field_path: str,
+            required: bool = False,
+        ) -> Optional[float]:
+            value = get_alias(data, snake, camel, None, field_path=field_path)
+            if value is None:
+                if required:
+                    raise DeploymentValidationError(f"{field_path} is required")
+                return None
+            try:
+                parsed_value = float(value)
+            except (TypeError, ValueError) as exc:
+                raise DeploymentValidationError(
+                    f"{field_path} must be a number"
+                ) from exc
+            if not math.isfinite(parsed_value):
+                raise DeploymentValidationError(f"{field_path} must be finite")
+            return parsed_value
+
+        def parse_positive_float(
+            data: dict[str, Any],
+            snake: str,
+            camel: str,
+            *,
+            field_path: str,
+            required: bool = False,
+        ) -> Optional[float]:
+            value = parse_float(
+                data,
+                snake,
+                camel,
+                field_path=field_path,
+                required=required,
+            )
+            if value is None:
+                return None
+            if value <= 0.0:
+                raise DeploymentValidationError(f"{field_path} must be > 0")
+            return value
+
+        def parse_string_list_alias(
+            data: dict[str, Any],
+            snake: str,
+            camel: str,
+            *,
+            field_path: str,
+            required: bool = False,
+        ) -> list[str]:
+            value = get_alias(data, snake, camel, None, field_path=field_path)
+            if value is None:
+                if required:
+                    raise DeploymentValidationError(f"{field_path} is required")
+                return []
+            return self._parse_string_list(value, field_path)
+
+        def parse_transport(raw: Any, field_path: str) -> dict[str, Any]:
+            if not isinstance(raw, dict):
+                raise DeploymentValidationError(f"{field_path} must be a mapping")
+            if any(not isinstance(key, str) or not key.strip() for key in raw):
+                raise DeploymentValidationError(
+                    f"{field_path} keys must be non-empty strings"
+                )
+            kind = parse_text(
+                raw,
+                "kind",
+                "kind",
+                field_path=f"{field_path}.kind",
+            )
+            if kind not in _ALLOWED_GRIPPER_TRANSPORT_KINDS:
+                allowed = ", ".join(sorted(_ALLOWED_GRIPPER_TRANSPORT_KINDS))
+                raise DeploymentValidationError(
+                    f"{field_path}.kind must be one of: {allowed}"
+                )
+            unknown_fields = sorted(
+                key for key in raw if key not in _ALLOWED_GRIPPER_TRANSPORT_FIELDS[kind]
+            )
+            if unknown_fields:
+                raise DeploymentValidationError(
+                    f"{field_path} contains unknown fields: {unknown_fields}"
+                )
+
+            parsed_transport: dict[str, Any] = {"kind": kind}
+            if kind == "ros_gripper_command":
+                parsed_transport["action_name"] = parse_text(
+                    raw,
+                    "action_name",
+                    "actionName",
+                    field_path=f"{field_path}.action_name",
+                )
+                result_timeout_s = parse_positive_float(
+                    raw,
+                    "result_timeout_s",
+                    "resultTimeoutS",
+                    field_path=f"{field_path}.result_timeout_s",
+                    required=True,
+                )
+                parsed_transport["result_timeout_s"] = result_timeout_s
+                position_tolerance = parse_positive_float(
+                    raw,
+                    "position_tolerance",
+                    "positionTolerance",
+                    field_path=f"{field_path}.position_tolerance",
+                )
+                if position_tolerance is not None:
+                    parsed_transport["position_tolerance"] = position_tolerance
+                driver_contract = parse_text(
+                    raw,
+                    "driver_result_contract",
+                    "driverResultContract",
+                    field_path=f"{field_path}.driver_result_contract",
+                    required=False,
+                )
+                if driver_contract:
+                    parsed_transport["driver_result_contract"] = driver_contract
+            elif kind == "isaac_joint_state_effort":
+                parsed_transport["command_topic"] = parse_text(
+                    raw,
+                    "command_topic",
+                    "commandTopic",
+                    field_path=f"{field_path}.command_topic",
+                )
+                state_topic = parse_text(
+                    raw,
+                    "state_topic",
+                    "stateTopic",
+                    field_path=f"{field_path}.state_topic",
+                    required=False,
+                )
+                if state_topic:
+                    parsed_transport["state_topic"] = state_topic
+                joint_names = parse_string_list_alias(
+                    raw,
+                    "joint_names",
+                    "jointNames",
+                    field_path=f"{field_path}.joint_names",
+                )
+                if joint_names:
+                    parsed_transport["joint_names"] = joint_names
+                close_effort = parse_float(
+                    raw,
+                    "close_effort",
+                    "closeEffort",
+                    field_path=f"{field_path}.close_effort",
+                    required=True,
+                )
+                open_effort = parse_float(
+                    raw,
+                    "open_effort",
+                    "openEffort",
+                    field_path=f"{field_path}.open_effort",
+                    required=True,
+                )
+                parsed_transport["close_effort"] = close_effort
+                parsed_transport["open_effort"] = open_effort
+                parsed_transport["publish_nominal_position"] = parse_bool(
+                    raw,
+                    "publish_nominal_position",
+                    "publishNominalPosition",
+                    field_path=f"{field_path}.publish_nominal_position",
+                    default=False,
+                )
+                parsed_transport["dwell_s"] = parse_positive_float(
+                    raw,
+                    "dwell_s",
+                    "dwellS",
+                    field_path=f"{field_path}.dwell_s",
+                    required=True,
+                )
+            elif kind == "plc_gripper_request":
+                parsed_transport["command_endpoint"] = parse_text(
+                    raw,
+                    "command_endpoint",
+                    "commandEndpoint",
+                    field_path=f"{field_path}.command_endpoint",
+                )
+                ready_signal = parse_text(
+                    raw,
+                    "ready_signal",
+                    "readySignal",
+                    field_path=f"{field_path}.ready_signal",
+                    required=False,
+                )
+                if ready_signal:
+                    parsed_transport["ready_signal"] = ready_signal
+                fault_signal = parse_text(
+                    raw,
+                    "fault_signal",
+                    "faultSignal",
+                    field_path=f"{field_path}.fault_signal",
+                    required=False,
+                )
+                if fault_signal:
+                    parsed_transport["fault_signal"] = fault_signal
+                parsed_transport["request_timeout_s"] = parse_positive_float(
+                    raw,
+                    "request_timeout_s",
+                    "requestTimeoutS",
+                    field_path=f"{field_path}.request_timeout_s",
+                    required=True,
+                )
+                parsed_transport["dwell_s"] = parse_positive_float(
+                    raw,
+                    "dwell_s",
+                    "dwellS",
+                    field_path=f"{field_path}.dwell_s",
+                    required=True,
+                )
+            return parsed_transport
+
+        def derived_command_mode(transport_kind: str) -> str:
+            if transport_kind == "native_kinematic":
+                return "simulated_joint"
+            if transport_kind in {"ros_gripper_command", "isaac_joint_state_effort"}:
+                # Current Phase-0 runtime compatibility: the behavior node still
+                # dispatches gripper commands through the legacy ROS action
+                # channel until the later transport adapter phases land.
+                return "ros_gripper_command"
+            return transport_kind
+
+        def validate_state_ref(
+            ref_name: str,
+            *,
+            srdf_presets: dict[str, float],
+            field_path: str,
+        ) -> None:
+            if ref_name not in srdf_presets:
+                available = ", ".join(sorted(srdf_presets)) or "<none>"
+                raise DeploymentValidationError(
+                    f"{field_path} references SRDF group_state '{ref_name}', "
+                    f"but available presets are: {available}"
+                )
+
+        def validate_semantics(
+            *,
+            gripper_id: str,
+            actuation_kind: str,
+            state_authority: str,
+            completion_policy: str,
+            grasp_confirmation_policy: str,
+            transport: dict[str, Any],
+            transport_kind: str,
+        ) -> None:
+            base = f"grippers.{gripper_id}"
+            if actuation_kind not in _ALLOWED_GRIPPER_ACTUATION_KINDS:
+                allowed = ", ".join(sorted(_ALLOWED_GRIPPER_ACTUATION_KINDS))
+                raise DeploymentValidationError(
+                    f"{base}.actuation_kind must be one of: {allowed}"
+                )
+            if state_authority not in _ALLOWED_GRIPPER_STATE_AUTHORITIES:
+                allowed = ", ".join(sorted(_ALLOWED_GRIPPER_STATE_AUTHORITIES))
+                raise DeploymentValidationError(
+                    f"{base}.state_authority must be one of: {allowed}"
+                )
+            if completion_policy not in _ALLOWED_GRIPPER_COMPLETION_POLICIES:
+                allowed = ", ".join(sorted(_ALLOWED_GRIPPER_COMPLETION_POLICIES))
+                raise DeploymentValidationError(
+                    f"{base}.completion_policy must be one of: {allowed}"
+                )
+            if (
+                grasp_confirmation_policy
+                not in _ALLOWED_GRIPPER_GRASP_CONFIRMATION_POLICIES
+            ):
+                allowed = ", ".join(
+                    sorted(_ALLOWED_GRIPPER_GRASP_CONFIRMATION_POLICIES)
+                )
+                raise DeploymentValidationError(
+                    f"{base}.grasp_confirmation_policy must be one of: {allowed}"
+                )
+
+            if transport_kind == "native_kinematic":
+                if state_authority != "native_backend":
+                    raise DeploymentValidationError(
+                        f"{base}.transport.kind=native_kinematic requires "
+                        "state_authority=native_backend"
+                    )
+            elif transport_kind == "isaac_joint_state_effort":
+                if state_authority not in {"sim_observed", "commanded_estimate"}:
+                    raise DeploymentValidationError(
+                        f"{base}.transport.kind=isaac_joint_state_effort requires "
+                        "state_authority=sim_observed or commanded_estimate"
+                    )
+            elif transport_kind == "plc_gripper_request":
+                if state_authority != "commanded_estimate":
+                    raise DeploymentValidationError(
+                        f"{base}.transport.kind=plc_gripper_request requires "
+                        "state_authority=commanded_estimate until a PLC/real "
+                        "feedback source is declared"
+                    )
+            elif transport_kind == "ros_gripper_command":
+                if actuation_kind != "position_commanded":
+                    raise DeploymentValidationError(
+                        f"{base}.transport.kind=ros_gripper_command requires "
+                        "actuation_kind=position_commanded"
+                    )
+                if state_authority not in {"real_observed", "sim_observed"}:
+                    raise DeploymentValidationError(
+                        f"{base}.transport.kind=ros_gripper_command requires "
+                        "state_authority=real_observed or sim_observed"
+                    )
+
+            if (
+                completion_policy == "position_reached"
+                and state_authority == "commanded_estimate"
+            ):
+                raise DeploymentValidationError(
+                    f"{base}.completion_policy=position_reached is forbidden with "
+                    "state_authority=commanded_estimate"
+                )
+            if (
+                completion_policy == "driver_result"
+                and transport_kind != "ros_gripper_command"
+            ):
+                raise DeploymentValidationError(
+                    f"{base}.completion_policy=driver_result requires "
+                    "transport.kind=ros_gripper_command"
+                )
+            if (
+                completion_policy == "driver_result"
+                and transport_kind == "ros_gripper_command"
+            ):
+                driver_contract = str(transport.get("driver_result_contract", "")).strip()
+                if not driver_contract:
+                    raise DeploymentValidationError(
+                        f"{base}.completion_policy=driver_result requires "
+                        "transport.driver_result_contract"
+                    )
+            if completion_policy == "dwell_elapsed":
+                if actuation_kind != "pneumatic" or transport_kind not in {
+                    "native_kinematic",
+                    "isaac_joint_state_effort",
+                }:
+                    raise DeploymentValidationError(
+                        f"{base}.completion_policy=dwell_elapsed is valid only "
+                        "for pneumatic native_kinematic or isaac_joint_state_effort"
+                    )
+            if completion_policy == "request_ack_then_dwell":
+                if transport_kind != "plc_gripper_request":
+                    raise DeploymentValidationError(
+                        f"{base}.completion_policy=request_ack_then_dwell requires "
+                        "transport.kind=plc_gripper_request"
+                    )
+            if completion_policy == "open_loop_immediate":
+                raise DeploymentValidationError(
+                    f"{base}.completion_policy=open_loop_immediate is not allowed "
+                    "without an explicit commissioning profile gate"
+                )
+
         for gripper_id, gripper_data in (grippers_data or {}).items():
             if not isinstance(gripper_data, dict):
                 raise DeploymentValidationError(f"grippers.{gripper_id} must be a mapping")
 
-            command_mode = str(gripper_data.get("command_mode", "")).strip()
-            group_id = str(gripper_data.get("group_id", "")).strip()
-            joint_name = str(gripper_data.get("joint_name", "")).strip()
+            if any(not isinstance(field, str) or not field.strip() for field in gripper_data):
+                raise DeploymentValidationError(
+                    f"grippers.{gripper_id} keys must be non-empty strings"
+                )
+            unknown_fields = sorted(
+                field for field in gripper_data if field not in _ALLOWED_GRIPPER_FIELDS
+            )
+            if unknown_fields:
+                raise DeploymentValidationError(
+                    f"grippers.{gripper_id} contains unknown fields: {unknown_fields}"
+                )
 
-            if command_mode not in _ALLOWED_GRIPPER_COMMAND_MODES:
+            command_mode = parse_text(
+                gripper_data,
+                "command_mode",
+                "commandMode",
+                field_path=f"grippers.{gripper_id}.command_mode",
+                required=False,
+            )
+            group_id = parse_text(
+                gripper_data,
+                "group_id",
+                "groupId",
+                field_path=f"grippers.{gripper_id}.group_id",
+            )
+            joint_name = parse_text(
+                gripper_data,
+                "joint_name",
+                "jointName",
+                field_path=f"grippers.{gripper_id}.joint_name",
+            )
+
+            if command_mode and command_mode not in _ALLOWED_GRIPPER_COMMAND_MODES:
                 allowed = ", ".join(sorted(_ALLOWED_GRIPPER_COMMAND_MODES))
                 raise DeploymentValidationError(
                     f"grippers.{gripper_id}.command_mode must be one of: {allowed}"
                 )
-            if not group_id:
-                raise DeploymentValidationError(f"grippers.{gripper_id}.group_id is required")
-            if not joint_name:
-                raise DeploymentValidationError(f"grippers.{gripper_id}.joint_name is required")
 
-            if "open_position" in gripper_data:
+            if "open_position" in gripper_data or "openPosition" in gripper_data:
                 raise DeploymentValidationError(
                     f"grippers.{gripper_id}.open_position is no longer supported; "
                     "define an SRDF group_state preset instead"
                 )
-            if "closed_position" in gripper_data:
+            if "closed_position" in gripper_data or "closedPosition" in gripper_data:
                 raise DeploymentValidationError(
                     f"grippers.{gripper_id}.closed_position is no longer supported; "
                     "define an SRDF group_state preset instead"
                 )
             try:
-                motion_time_s = float(gripper_data.get("motion_time_s", 0.0))
+                motion_time_s = float(
+                    get_alias(
+                        gripper_data,
+                        "motion_time_s",
+                        "motionTimeS",
+                        0.0,
+                        field_path=f"grippers.{gripper_id}.motion_time_s",
+                    )
+                )
             except (TypeError, ValueError) as exc:
                 raise DeploymentValidationError(
                     f"grippers.{gripper_id}.motion_time_s must be a number"
@@ -1514,7 +2255,137 @@ class Deployment:
                     f"grippers.{gripper_id}.motion_time_s must be > 0"
                 )
             srdf_presets = dict(srdf_group_states.get((group_id, joint_name), {}))
-            touch_links_data = gripper_data.get("touch_links", [])
+            semantic_configured = any(
+                field in gripper_data for field in _GRIPPER_SEMANTIC_FIELDS
+            )
+            migration_notes: list[str] = []
+            actuation_kind = ""
+            state_authority = ""
+            completion_policy = ""
+            grasp_confirmation_policy = ""
+            transport: dict[str, Any] = {}
+            open_state_ref = ""
+            closed_state_ref = ""
+
+            if semantic_configured:
+                actuation_kind = parse_text(
+                    gripper_data,
+                    "actuation_kind",
+                    "actuationKind",
+                    field_path=f"grippers.{gripper_id}.actuation_kind",
+                )
+                state_authority = parse_text(
+                    gripper_data,
+                    "state_authority",
+                    "stateAuthority",
+                    field_path=f"grippers.{gripper_id}.state_authority",
+                )
+                completion_policy = parse_text(
+                    gripper_data,
+                    "completion_policy",
+                    "completionPolicy",
+                    field_path=f"grippers.{gripper_id}.completion_policy",
+                )
+                grasp_confirmation_policy = parse_text(
+                    gripper_data,
+                    "grasp_confirmation_policy",
+                    "graspConfirmationPolicy",
+                    field_path=f"grippers.{gripper_id}.grasp_confirmation_policy",
+                )
+                open_state_ref = parse_text(
+                    gripper_data,
+                    "open_state_ref",
+                    "openStateRef",
+                    field_path=f"grippers.{gripper_id}.open_state_ref",
+                )
+                closed_state_ref = parse_text(
+                    gripper_data,
+                    "closed_state_ref",
+                    "closedStateRef",
+                    field_path=f"grippers.{gripper_id}.closed_state_ref",
+                )
+                validate_state_ref(
+                    open_state_ref,
+                    srdf_presets=srdf_presets,
+                    field_path=f"grippers.{gripper_id}.open_state_ref",
+                )
+                validate_state_ref(
+                    closed_state_ref,
+                    srdf_presets=srdf_presets,
+                    field_path=f"grippers.{gripper_id}.closed_state_ref",
+                )
+                transport = parse_transport(
+                    get_alias(
+                        gripper_data,
+                        "transport",
+                        "transport",
+                        None,
+                        field_path=f"grippers.{gripper_id}.transport",
+                    ),
+                    f"grippers.{gripper_id}.transport",
+                )
+                transport_kind = str(transport["kind"])
+                validate_semantics(
+                    gripper_id=gripper_id,
+                    actuation_kind=actuation_kind,
+                    state_authority=state_authority,
+                    completion_policy=completion_policy,
+                    grasp_confirmation_policy=grasp_confirmation_policy,
+                    transport=transport,
+                    transport_kind=transport_kind,
+                )
+                expected_command_mode = derived_command_mode(transport_kind)
+                if command_mode and command_mode != expected_command_mode:
+                    raise DeploymentValidationError(
+                        f"grippers.{gripper_id}.command_mode={command_mode!r} "
+                        f"does not match transport.kind={transport_kind!r}; "
+                        f"expected legacy command_mode {expected_command_mode!r}"
+                    )
+                command_mode = command_mode or expected_command_mode
+            else:
+                if not command_mode:
+                    raise DeploymentValidationError(
+                        f"grippers.{gripper_id}.command_mode is required for legacy "
+                        "gripper configs; new configs must declare actuation_kind, "
+                        "state_authority, completion_policy, "
+                        "grasp_confirmation_policy, transport, open_state_ref, "
+                        "and closed_state_ref"
+                    )
+                if command_mode == "ros_gripper_command":
+                    raise DeploymentValidationError(
+                        f"grippers.{gripper_id}.command_mode=ros_gripper_command is "
+                        "ambiguous without semantic gripper fields; declare "
+                        "actuation_kind, state_authority, completion_policy, "
+                        "grasp_confirmation_policy, transport.kind, "
+                        "open_state_ref, and closed_state_ref"
+                    )
+                if command_mode != "simulated_joint":
+                    raise DeploymentValidationError(
+                        f"grippers.{gripper_id}.command_mode={command_mode} "
+                        "requires explicit semantic gripper fields"
+                    )
+                actuation_kind = "position_commanded"
+                state_authority = "native_backend"
+                completion_policy = "position_reached"
+                grasp_confirmation_policy = "none_open_loop"
+                transport = {"kind": "native_kinematic"}
+                if "open" in srdf_presets:
+                    open_state_ref = "open"
+                if "closed" in srdf_presets:
+                    closed_state_ref = "closed"
+                migration_notes.append(
+                    "legacy command_mode=simulated_joint migrated to "
+                    "native_kinematic/native_backend compatibility semantics; "
+                    "declare explicit gripper semantic fields before relying on "
+                    "gripper evidence or production attach policy"
+                )
+            touch_links_data = get_alias(
+                gripper_data,
+                "touch_links",
+                "touchLinks",
+                [],
+                field_path=f"grippers.{gripper_id}.touch_links",
+            )
             if not isinstance(touch_links_data, list):
                 raise DeploymentValidationError(
                     f"grippers.{gripper_id}.touch_links must be a list of strings"
@@ -1529,19 +2400,43 @@ class Deployment:
                 touch_links.append(link_name_str)
 
             mount_frame = self._parse_optional_frame_name(
-                gripper_data.get("mount_frame"),
+                get_alias(
+                    gripper_data,
+                    "mount_frame",
+                    "mountFrame",
+                    None,
+                    field_path=f"grippers.{gripper_id}.mount_frame",
+                ),
                 f"grippers.{gripper_id}.mount_frame",
             )
             attach_frame = self._parse_optional_frame_name(
-                gripper_data.get("attach_frame"),
+                get_alias(
+                    gripper_data,
+                    "attach_frame",
+                    "attachFrame",
+                    None,
+                    field_path=f"grippers.{gripper_id}.attach_frame",
+                ),
                 f"grippers.{gripper_id}.attach_frame",
             )
             tcp_frame = self._parse_optional_frame_name(
-                gripper_data.get("tcp_frame"),
+                get_alias(
+                    gripper_data,
+                    "tcp_frame",
+                    "tcpFrame",
+                    None,
+                    field_path=f"grippers.{gripper_id}.tcp_frame",
+                ),
                 f"grippers.{gripper_id}.tcp_frame",
             )
             auxiliary_frames = self._parse_frame_name_list(
-                gripper_data.get("auxiliary_frames", []),
+                get_alias(
+                    gripper_data,
+                    "auxiliary_frames",
+                    "auxiliaryFrames",
+                    [],
+                    field_path=f"grippers.{gripper_id}.auxiliary_frames",
+                ),
                 f"grippers.{gripper_id}.auxiliary_frames",
             )
             parsed[gripper_id] = GripperConfig(
@@ -1550,7 +2445,24 @@ class Deployment:
                 joint_name=joint_name,
                 motion_time_s=motion_time_s,
                 srdf_presets=srdf_presets,
-                description=str(gripper_data.get("description", "")),
+                actuation_kind=actuation_kind,
+                state_authority=state_authority,
+                completion_policy=completion_policy,
+                grasp_confirmation_policy=grasp_confirmation_policy,
+                transport=transport,
+                open_state_ref=open_state_ref,
+                closed_state_ref=closed_state_ref,
+                semantic_configured=semantic_configured,
+                migration_notes=migration_notes,
+                description=str(
+                    get_alias(
+                        gripper_data,
+                        "description",
+                        "description",
+                        "",
+                        field_path=f"grippers.{gripper_id}.description",
+                    )
+                ),
                 touch_links=touch_links,
                 mount_frame=mount_frame,
                 attach_frame=attach_frame,
@@ -1558,6 +2470,34 @@ class Deployment:
                 auxiliary_frames=auxiliary_frames,
             )
         return parsed
+
+    @staticmethod
+    def _gripper_to_raw_dict(gripper: GripperConfig) -> dict[str, Any]:
+        raw = {
+            "command_mode": gripper.command_mode,
+            "group_id": gripper.group_id,
+            "joint_name": gripper.joint_name,
+            "motion_time_s": gripper.motion_time_s,
+            "description": gripper.description,
+            "touch_links": list(gripper.touch_links),
+            "mount_frame": gripper.mount_frame,
+            "attach_frame": gripper.attach_frame,
+            "tcp_frame": gripper.tcp_frame,
+            "auxiliary_frames": list(gripper.auxiliary_frames),
+        }
+        if gripper.semantic_configured:
+            raw.update(
+                {
+                    "actuation_kind": gripper.actuation_kind,
+                    "state_authority": gripper.state_authority,
+                    "completion_policy": gripper.completion_policy,
+                    "grasp_confirmation_policy": gripper.grasp_confirmation_policy,
+                    "open_state_ref": gripper.open_state_ref,
+                    "closed_state_ref": gripper.closed_state_ref,
+                    "transport": copy.deepcopy(gripper.transport),
+                }
+            )
+        return raw
 
     def _load_srdf_group_state_positions(
         self,
@@ -2319,6 +3259,7 @@ class Deployment:
         self.pose_sources = {}
         self.simulation_control = None
         self.contact_policies = []
+        self.grasp_risk_policy = GraspRiskPolicy()
         self.authority_matrix = {}
         self.model_audit_policy = None
         self.model_endpoint_profile_registry = None
@@ -2367,6 +3308,9 @@ class Deployment:
         if not isinstance(self.name, str) or not self.name.strip():
             raise DeploymentValidationError("name is required")
         self.description = data.get("description", "")
+        self.grasp_risk_policy = self._parse_grasp_risk_policy(
+            data.get("grasp_risk_policy", data.get("graspRiskPolicy"))
+        )
 
         # Robot config
         robot_data = data.get("robot_config")
@@ -2377,6 +3321,7 @@ class Deployment:
         # Grippers (optional)
         grippers_data = data.get("grippers", {})
         self.grippers = self._parse_grippers(grippers_data)
+        self._validate_gripper_grasp_risk_policy()
 
         # Adapters
         adapters_data = data.get("adapters", {})
@@ -2832,20 +3777,17 @@ class Deployment:
                     limits_out[joint_name] = entry
             if limits_out:
                 d["robot_config"]["robot_control_joint_limits"] = limits_out
+        if self.grasp_risk_policy.open_loop_grasp.allowed:
+            d["grasp_risk_policy"] = {
+                "open_loop_grasp": {
+                    "allowed": self.grasp_risk_policy.open_loop_grasp.allowed,
+                    "scope": self.grasp_risk_policy.open_loop_grasp.scope,
+                    "rationale": self.grasp_risk_policy.open_loop_grasp.rationale,
+                }
+            }
         if self.grippers:
             d["grippers"] = {
-                gripper_id: {
-                    "command_mode": gripper.command_mode,
-                    "group_id": gripper.group_id,
-                    "joint_name": gripper.joint_name,
-                    "motion_time_s": gripper.motion_time_s,
-                    "description": gripper.description,
-                    "touch_links": list(gripper.touch_links),
-                    "mount_frame": gripper.mount_frame,
-                    "attach_frame": gripper.attach_frame,
-                    "tcp_frame": gripper.tcp_frame,
-                    "auxiliary_frames": list(gripper.auxiliary_frames),
-                }
+                gripper_id: self._gripper_to_raw_dict(gripper)
                 for gripper_id, gripper in self.grippers.items()
             }
         # adapters dict with slots: planning, context, execution
@@ -3033,6 +3975,7 @@ class Deployment:
                             "stale_behavior": drift.stale_behavior,
                             "action": drift.action,
                             "signal_id": drift.signal_id,
+                            "confirmation_signal_id": drift.confirmation_signal_id,
                             "sample_time_tolerance_s": drift.sample_time_tolerance_s,
                         }
                         if drift.translation_threshold_m is not None:
@@ -3112,20 +4055,13 @@ class Deployment:
                 data["robot_config"],
                 current=self.robot_config,
             )
+        if "grasp_risk_policy" in data or "graspRiskPolicy" in data:
+            self.grasp_risk_policy = self._parse_grasp_risk_policy(
+                data.get("grasp_risk_policy", data.get("graspRiskPolicy"))
+            )
         if "grippers" in data:
             merged_grippers = {
-                gripper_id: {
-                    "command_mode": config.command_mode,
-                    "group_id": config.group_id,
-                    "joint_name": config.joint_name,
-                    "motion_time_s": config.motion_time_s,
-                    "description": config.description,
-                    "touch_links": list(config.touch_links),
-                    "mount_frame": config.mount_frame,
-                    "attach_frame": config.attach_frame,
-                    "tcp_frame": config.tcp_frame,
-                    "auxiliary_frames": list(config.auxiliary_frames),
-                }
+                gripper_id: self._gripper_to_raw_dict(config)
                 for gripper_id, config in self.grippers.items()
             }
             for gripper_id, gripper_data in data["grippers"].items():
@@ -3133,38 +4069,11 @@ class Deployment:
                     raise DeploymentValidationError(
                         f"grippers.{gripper_id} must be a mapping"
                     )
-                current = merged_grippers.get(gripper_id, {})
-                merged_grippers[gripper_id] = {
-                    "command_mode": gripper_data.get(
-                        "command_mode", current.get("command_mode", "")
-                    ),
-                    "group_id": gripper_data.get("group_id", current.get("group_id", "")),
-                    "joint_name": gripper_data.get(
-                        "joint_name", current.get("joint_name", "")
-                    ),
-                    "motion_time_s": gripper_data.get(
-                        "motion_time_s", current.get("motion_time_s", 0.0)
-                    ),
-                    "description": gripper_data.get(
-                        "description", current.get("description", "")
-                    ),
-                    "touch_links": gripper_data.get(
-                        "touch_links", current.get("touch_links", [])
-                    ),
-                    "mount_frame": gripper_data.get(
-                        "mount_frame", current.get("mount_frame", "")
-                    ),
-                    "attach_frame": gripper_data.get(
-                        "attach_frame", current.get("attach_frame", "")
-                    ),
-                    "tcp_frame": gripper_data.get(
-                        "tcp_frame", current.get("tcp_frame", "")
-                    ),
-                    "auxiliary_frames": gripper_data.get(
-                        "auxiliary_frames", current.get("auxiliary_frames", [])
-                    ),
-                }
+                current = dict(merged_grippers.get(gripper_id, {}))
+                current.update(copy.deepcopy(gripper_data))
+                merged_grippers[gripper_id] = current
             self.grippers = self._parse_grippers(merged_grippers)
+            self._validate_gripper_grasp_risk_policy()
         if "adapters" in data:
             adapters_data = data["adapters"]
             for slot, adapter_data in adapters_data.items():
@@ -3287,3 +4196,4 @@ class Deployment:
                 }
             self.authority_matrix = self._parse_authority_matrix(merged_matrix)
         self._validate_adapter_capability_manifests()
+        self._validate_gripper_grasp_risk_policy()

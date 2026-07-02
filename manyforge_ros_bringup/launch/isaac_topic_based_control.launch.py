@@ -5,9 +5,10 @@ This is the standard ManyForge Isaac execution path:
 ManyForge -> FollowJointTrajectory -> joint_trajectory_controller ->
 topic_based_ros2_control -> /isaac_joint_commands and /isaac_joint_states.
 
-The launch deliberately exposes the UR arm through JTC and the Robotiq gripper
-through a separate standard GripperCommand action. The Isaac-specific bridge is
-the only node that publishes the scene's raw /isaac_gripper_state command topic.
+The launch deliberately exposes the arm through JTC. Position-commanded
+GripperCommand profiles may start the Isaac action bridge; Lite6 pneumatic
+profiles should use ManyForge's C++ isaac_joint_state_effort transport and do
+not require a gripper action server.
 """
 
 from __future__ import annotations
@@ -170,6 +171,15 @@ def generate_launch_description() -> LaunchDescription:
                 description="Isaac Sim JointState feedback topic used by the gripper bridge.",
             ),
             DeclareLaunchArgument(
+                "start_gripper_action_bridge",
+                default_value="auto",
+                description=(
+                    "Start the Python Isaac GripperCommand bridge. Values: "
+                    "auto, true, false. auto starts it for action-based UR/Robotiq "
+                    "profiles and skips it for Lite6 direct-effort profiles."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "base_parent_frame",
                 default_value="universe",
                 description="Parent frame for the robot root static transform.",
@@ -304,6 +314,10 @@ def _launch_setup(context, *_, **__) -> list[object]:
     gripper_command_topic = LaunchConfiguration("gripper_command_topic").perform(context)
     if gripper_command_topic == "/isaac_gripper_state":
         gripper_command_topic = profile_default_gripper_command_topic
+    start_bridge = _resolve_start_gripper_action_bridge(
+        LaunchConfiguration("start_gripper_action_bridge").perform(context),
+        isaac_profile=isaac_profile,
+    )
 
     ros2_control_node = Node(
         package="controller_manager",
@@ -431,6 +445,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 "controller_state_topic": f"/{arm_controller_name}/controller_state",
                 "arm_action_name": f"/{arm_controller_name}/follow_joint_trajectory",
                 "gripper_action_name": gripper_action_name,
+                "require_gripper_action": start_bridge,
                 "supervisor_enable_topic": LaunchConfiguration(
                     "supervisor_command_gate_enable_topic"
                 ).perform(context),
@@ -475,13 +490,28 @@ def _launch_setup(context, *_, **__) -> list[object]:
         robot_state_publisher,
         static_base_tf,
         ros2_control_node,
-        gripper_action_bridge,
         TimerAction(period=2.0, actions=[joint_state_broadcaster]),
         TimerAction(period=3.0, actions=[arm_controller]),
     ]
+    if start_bridge:
+        actions.insert(5, gripper_action_bridge)
     if (
         LaunchConfiguration("pose_source_sidecar").perform(context).strip().lower()
         == "true"
     ):
         actions.insert(2, pose_source_snapshot_publisher)
     return actions
+
+
+def _resolve_start_gripper_action_bridge(value: str, *, isaac_profile: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized == "auto":
+        return isaac_profile != "lite6"
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "start_gripper_action_bridge must be auto, true, or false; "
+        f"got {value!r}"
+    )

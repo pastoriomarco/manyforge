@@ -2347,6 +2347,22 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               config.action_name =
                   config_dict["action_name"].cast<std::string>();
             }
+            if (config_dict.contains("transport_kind")) {
+              config.transport_kind =
+                  config_dict["transport_kind"].cast<std::string>();
+            }
+            if (config_dict.contains("command_topic")) {
+              config.command_topic =
+                  config_dict["command_topic"].cast<std::string>();
+            }
+            if (config_dict.contains("state_topic")) {
+              config.state_topic =
+                  config_dict["state_topic"].cast<std::string>();
+            }
+            if (config_dict.contains("command_joint_names")) {
+              config.command_joint_names =
+                  config_dict["command_joint_names"].cast<std::vector<std::string>>();
+            }
             if (config_dict.contains("group_id")) {
               config.group_id = config_dict["group_id"].cast<std::string>();
             }
@@ -2354,6 +2370,40 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               config.joint_name =
                   canonical_joint_name(
                       self, config_dict["joint_name"].cast<std::string>());
+            }
+            if (config_dict.contains("completion_policy")) {
+              config.completion_policy =
+                  config_dict["completion_policy"].cast<std::string>();
+            }
+            if (config_dict.contains("open_position")) {
+              config.open_position =
+                  finite_scale_from_python(config_dict["open_position"],
+                                           "open_position");
+            }
+            if (config_dict.contains("closed_position")) {
+              config.closed_position =
+                  finite_scale_from_python(config_dict["closed_position"],
+                                           "closed_position");
+            }
+            if (config_dict.contains("open_effort")) {
+              config.open_effort =
+                  finite_scale_from_python(config_dict["open_effort"],
+                                           "open_effort");
+            }
+            if (config_dict.contains("close_effort")) {
+              config.close_effort =
+                  finite_scale_from_python(config_dict["close_effort"],
+                                           "close_effort");
+            }
+            if (config_dict.contains("publish_nominal_position")) {
+              config.publish_nominal_position =
+                  config_dict["publish_nominal_position"].cast<bool>();
+            }
+            if (config_dict.contains("state_freshness_timeout_s")) {
+              config.state_freshness_timeout_s =
+                  finite_scale_from_python(
+                      config_dict["state_freshness_timeout_s"],
+                      "state_freshness_timeout_s");
             }
             if (config_dict.contains("wait_for_action_server_timeout_s")) {
               config.wait_for_action_server_timeout_s =
@@ -2397,6 +2447,30 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         py::gil_scoped_release release;
         backend.update_gripper_commands();
       })
+      .def("mark_ros_gripper_grasp_lost",
+          [](NativeKernelBundle& self, const std::string& gripper_id,
+             const std::string& evidence_label, const std::string& message,
+             const std::string& reason_code) -> py::dict {
+            auto& backend = require_ros2_control_execution(self);
+            const auto result = [&]() {
+              py::gil_scoped_release release;
+              return backend.mark_gripper_grasp_lost(
+                  gripper_id, evidence_label, message, reason_code);
+            }();
+            py::dict d;
+            d["accepted"] = result.accepted;
+            if (!result.error.empty()) {
+              d["error"] = result.error;
+            }
+            if (!result.reason_code.empty()) {
+              d["reason_code"] = result.reason_code;
+            }
+            return d;
+          },
+          py::arg("gripper_id"),
+          py::arg("evidence_label"),
+          py::arg("message"),
+          py::arg("reason_code") = "grasp_confirmation_lost")
       // Command-enable gate: the ros2_control backend is the single
       // publishing authority (reliable + transient_local). Returns false
       // when the deployment configures no gate topic.
@@ -2430,10 +2504,19 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
             } else {
               d["current_position"] = py::none();
             }
+            if (status.observed_position.has_value()) {
+              d["observed_position"] = *status.observed_position;
+            } else {
+              d["observed_position"] = py::none();
+            }
             if (status.target_position.has_value()) {
               d["target_position"] = *status.target_position;
             } else {
               d["target_position"] = py::none();
+            }
+            d["evidence"] = status.evidence;
+            if (!status.evidence_state.empty()) {
+              d["evidence_state"] = status.evidence_state;
             }
             if (!status.error.empty()) {
               d["error"] = status.error;

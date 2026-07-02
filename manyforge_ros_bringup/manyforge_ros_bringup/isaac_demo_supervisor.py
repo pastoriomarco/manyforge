@@ -4,10 +4,12 @@ This node deliberately lives in ``manyforge_ros_bringup`` because it is demo
 orchestration, not ManyForge core behavior.  It asks Composer to load the
 Isaac light-scene program/deployment as soon as Composer is reachable so the
 backend-authored scene and native viewer are available even before Isaac starts.
-It keeps the arm command gate closed until Isaac Sim, the
-topic_based_ros2_control arm controller, and the gripper action bridge are all
-reachable; once they are ready it requests a Composer reset so Isaac receives
-the configured home command through the normal execution backend path.
+It keeps the arm command gate closed until Isaac Sim and the
+topic_based_ros2_control arm controller are reachable. Action-based gripper
+profiles may also require the gripper action bridge; direct-effort Lite6
+profiles deliberately do not. Once required dependencies are ready it requests
+a Composer reset so Isaac receives the configured home command through the
+normal execution backend path.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ class IsaacDemoSupervisor(Node):
         self.declare_parameter(
             "gripper_action_name", "/robotiq_gripper_controller/gripper_cmd"
         )
+        self.declare_parameter("require_gripper_action", True)
         self.declare_parameter(
             # Supervisor-owned veto topic. Deliberately distinct from the
             # backend's enable topic: each gate authority is the SINGLE
@@ -110,6 +113,9 @@ class IsaacDemoSupervisor(Node):
         )
         arm_action_name = str(self.get_parameter("arm_action_name").value)
         gripper_action_name = str(self.get_parameter("gripper_action_name").value)
+        self._require_gripper_action = bool(
+            self.get_parameter("require_gripper_action").value
+        )
         supervisor_enable_topic = str(
             self.get_parameter("supervisor_enable_topic").value
         )
@@ -137,7 +143,11 @@ class IsaacDemoSupervisor(Node):
             10,
         )
         self._arm_client = ActionClient(self, FollowJointTrajectory, arm_action_name)
-        self._gripper_client = ActionClient(self, GripperCommand, gripper_action_name)
+        self._gripper_client = (
+            ActionClient(self, GripperCommand, gripper_action_name)
+            if self._require_gripper_action
+            else None
+        )
 
         self._last_isaac_joint_state_s: float | None = None
         self._last_controller_state_s: float | None = None
@@ -227,7 +237,11 @@ class IsaacDemoSupervisor(Node):
             missing.append("controller_state")
         if not self._arm_client.wait_for_server(timeout_sec=0.0):
             missing.append("arm_action")
-        if not self._gripper_client.wait_for_server(timeout_sec=0.0):
+        if (
+            self._require_gripper_action
+            and self._gripper_client is not None
+            and not self._gripper_client.wait_for_server(timeout_sec=0.0)
+        ):
             missing.append("gripper_action")
         return _Readiness(ready=not missing, missing=missing)
 
@@ -395,14 +409,24 @@ class IsaacDemoSupervisor(Node):
                     if "arm_action" not in missing
                     else "Waiting for arm FollowJointTrajectory action",
                 ),
-                component(
-                    "gripper_action",
-                    "Gripper action",
-                    "gripper",
-                    "gripper_action" not in missing,
-                    "GripperCommand action available"
-                    if "gripper_action" not in missing
-                    else "Waiting for GripperCommand action",
+                (
+                    component(
+                        "gripper_action",
+                        "Gripper action",
+                        "gripper",
+                        "gripper_action" not in missing,
+                        "GripperCommand action available"
+                        if "gripper_action" not in missing
+                        else "Waiting for GripperCommand action",
+                    )
+                    if self._require_gripper_action
+                    else component(
+                        "gripper_transport",
+                        "Gripper transport",
+                        "gripper",
+                        True,
+                        "Direct Isaac JointState effort transport is configured in the ManyForge execution backend",
+                    )
                 ),
                 {
                     "id": "command_gate",

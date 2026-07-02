@@ -8,6 +8,14 @@ manyforge_isaac_gripper_action_bridge:
       - right_finger_joint
     multipliers: [1.0]
     offsets: [0.0]
+    actuation_kind: pneumatic
+    completion_policy: dwell_elapsed
+    open_position: 0.0081
+    closed_position: 0.0
+    open_effort: 5.0
+    close_effort: -5.0
+    dwell_s: 0.8
+    publish_nominal_position: true
     completion_tolerance_rad: 0.004
     state_freshness_timeout_s: 1.0
     goal_timeout_s: 5.0

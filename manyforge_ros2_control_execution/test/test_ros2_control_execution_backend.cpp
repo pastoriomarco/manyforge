@@ -217,6 +217,54 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     GripperGraspLossInvalidatesBackendOwnedStatus) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  Ros2ControlExecutionBackend backend(sink, "arm", clock, base_config());
+
+  Ros2GripperActionConfig gripper;
+  gripper.transport_kind = "isaac_joint_state_effort";
+  gripper.command_topic = "/manyforge_lost_grasp_gripper_" + unique_suffix();
+  gripper.command_joint_names = {"finger_joint"};
+  gripper.group_id = "gripper";
+  gripper.joint_name = "finger_joint";
+  gripper.completion_policy = "dwell_elapsed";
+  gripper.open_position = 0.7;
+  gripper.closed_position = 0.0;
+  gripper.open_effort = 5.0;
+  gripper.close_effort = -5.0;
+  gripper.publish_nominal_position = true;
+  backend.configure_gripper_action("tool", gripper);
+
+  const auto command = backend.command_gripper("tool", 0.0, 0.2, 0.0);
+  ASSERT_TRUE(command.accepted) << command.error;
+
+  const auto lost = backend.mark_gripper_grasp_lost(
+      "tool", "attached_drift_monitor",
+      "Attached object drift exceeded measured TCP/object threshold",
+      "grasp_confirmation_lost");
+  ASSERT_TRUE(lost.accepted) << lost.error;
+
+  const auto failed = backend.get_gripper_status("tool");
+  EXPECT_EQ(failed.state, "failed");
+  EXPECT_EQ(failed.reason_code, "grasp_confirmation_lost");
+  EXPECT_EQ(failed.evidence_state, "pressure_or_part_lost");
+  ASSERT_EQ(failed.evidence.size(), 1u);
+  EXPECT_EQ(failed.evidence.front(), "attached_drift_monitor");
+  EXPECT_NE(failed.error.find("Attached object drift exceeded"),
+            std::string::npos);
+
+  const auto next = backend.command_gripper("tool", 0.7, 0.0, 0.0);
+  ASSERT_TRUE(next.accepted) << next.error;
+  const auto reset = backend.get_gripper_status("tool");
+  EXPECT_EQ(reset.state, "executing");
+  EXPECT_TRUE(reset.evidence.empty());
+  EXPECT_TRUE(reset.evidence_state.empty());
+  EXPECT_TRUE(reset.reason_code.empty());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      ObservedStateSyncAppliesGroupPositionsThroughExecutionStateSink) {
   const std::string topic = "/manyforge_joint_state_projection_" + unique_suffix();
 

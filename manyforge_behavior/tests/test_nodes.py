@@ -39,6 +39,7 @@ from manyforge_behavior.nodes.logic import (
     CheckKeyBoolValue,
     CheckSignalBool,
     CommandGripper,
+    ConfirmGripperGrasp,
     CheckGripperState,
     SetKeyBoolValue,
     SetSignalBool,
@@ -919,6 +920,7 @@ class TestAttachDetachObjectNodes:
         bb_with_kernel.gripper_configs = {
             "primary": {
                 "touch_links": ["left_inner_finger_pad", "right_inner_finger_pad"],
+                "grasp_confirmation_policy": "none_open_loop",
             }
         }
         kernel.scene_edit(
@@ -950,6 +952,7 @@ class TestAttachDetachObjectNodes:
             "left_inner_finger_pad",
             "right_inner_finger_pad",
         ]
+        assert "none_open_loop" in node.feedback_message
         state = kernel.get_object_state("box1")
         assert state.exists is True
         assert state.attached is True
@@ -991,6 +994,195 @@ class TestAttachDetachObjectNodes:
         assert status == py_trees.common.Status.SUCCESS
         assert callbacks == [("attach", kernel.scene_edits[-1])]
         assert callbacks[0][1].operation == "attach"
+
+    def test_attach_reports_grasp_policy_with_explicit_touch_links(
+        self, kernel, bb_with_kernel
+    ):
+        bb_with_kernel.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.scene_objects = {}
+        bb_with_kernel.gripper_configs = {
+            "primary": {
+                "touch_links": ["configured_pad"],
+                "grasp_confirmation_policy": "none_open_loop",
+            }
+        }
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.6, 0.0, 0.6],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+        node = AttachObjectToLink(
+            name="attach_box",
+            object_id="box1",
+            link_frame="tool0",
+            gripper_id="primary",
+            touch_links=["explicit_pad"],
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        assert kernel.scene_edits[-1].touch_links == ["explicit_pad"]
+        assert "none_open_loop" in node.feedback_message
+
+    def test_attach_rejects_evidence_backed_policy_without_confirmation(
+        self, kernel, bb_with_kernel
+    ):
+        bb_with_kernel.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.scene_objects = {}
+        bb_with_kernel.gripper_configs = {
+            "primary": {
+                "touch_links": ["configured_pad"],
+                "grasp_confirmation_policy": "operator_confirm",
+            }
+        }
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.6, 0.0, 0.6],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+        node = AttachObjectToLink(
+            name="attach_box",
+            object_id="box1",
+            link_frame="tool0",
+            gripper_id="primary",
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        assert "lacks verified grasp evidence" in node.feedback_message
+        assert kernel.get_object_state("box1").attached is False
+
+        reader = py_trees.blackboard.Client(name="attach_fault_reader")
+        reader.register_key(
+            key="gripper_fault_details", access=py_trees.common.Access.READ
+        )
+        details = reader.get("gripper_fault_details")
+        assert details["reason_code"] == "command_estimate_attach_rejected"
+        assert details["surface"] == "attach_object_to_link"
+        assert details["grasp_confirmation_policy"] == "operator_confirm"
+
+    def test_attach_accepts_verified_grasp_confirmation_status(
+        self, kernel, bb_with_kernel
+    ):
+        bb_with_kernel.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.scene_objects = {}
+        bb_with_kernel.gripper_configs = {
+            "primary": {
+                "touch_links": ["configured_pad"],
+                "grasp_confirmation_policy": "operator_confirm",
+            }
+        }
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.6, 0.0, 0.6],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+        result = kernel.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="gripper",
+                joint_name="finger_joint",
+                target_position=0.0,
+                duration_s=0.0,
+                actuation_kind="position_commanded",
+                state_authority="real_observed",
+                completion_policy="driver_result",
+                grasp_confirmation_policy="operator_confirm",
+                transport_kind="ros_gripper_command",
+            )
+        )
+        assert result.accepted is True
+        kernel._gripper_commands["primary"]["evidence_state"] = "confirmed"
+
+        node = AttachObjectToLink(
+            name="attach_box",
+            object_id="box1",
+            link_frame="tool0",
+            gripper_id="primary",
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        assert kernel.get_object_state("box1").attached is True
+
+    def test_attach_rejects_lost_grasp_confirmation_status(
+        self, kernel, bb_with_kernel
+    ):
+        bb_with_kernel.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.scene_objects = {}
+        bb_with_kernel.gripper_configs = {
+            "primary": {
+                "touch_links": ["configured_pad"],
+                "grasp_confirmation_policy": "force_or_current",
+            }
+        }
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.6, 0.0, 0.6],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+        result = kernel.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="gripper",
+                joint_name="finger_joint",
+                target_position=0.0,
+                duration_s=0.0,
+                actuation_kind="position_commanded",
+                state_authority="real_observed",
+                completion_policy="driver_result",
+                grasp_confirmation_policy="force_or_current",
+                transport_kind="ros_gripper_command",
+            )
+        )
+        assert result.accepted is True
+        kernel._gripper_commands["primary"]["evidence_state"] = (
+            "pressure_or_part_lost"
+        )
+
+        node = AttachObjectToLink(
+            name="attach_box",
+            object_id="box1",
+            link_frame="tool0",
+            gripper_id="primary",
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        assert "pressure_or_part_lost" in node.feedback_message
+        assert kernel.get_object_state("box1").attached is False
+
+        reader = py_trees.blackboard.Client(name="attach_lost_fault_reader")
+        reader.register_key(
+            key="gripper_fault_details", access=py_trees.common.Access.READ
+        )
+        details = reader.get("gripper_fault_details")
+        assert details["reason_code"] == "grasp_confirmation_lost"
+        assert details["evidence_state"] == "pressure_or_part_lost"
 
     def test_detach_delegates_to_backend_and_preserves_current_pose(
         self, kernel, bb_with_kernel
@@ -1325,7 +1517,7 @@ class TestCommandGripper:
         )
         details = reader.get("gripper_fault_details")
         assert isinstance(details, dict)
-        assert details["reason_code"] == "gripper_goal_rejected"
+        assert details["reason_code"] == "gripper_request_failed"
         assert details["gripper_id"] == "primary"
         assert details["surface"] == "command_gripper"
         assert "injected" in details["message"]
@@ -1333,6 +1525,183 @@ class TestCommandGripper:
         # A fresh command must clear the stale fault record.
         node.initialise()
         assert reader.get("gripper_fault_details") is None
+
+    def test_command_gripper_records_invalid_semantic_transport_fault(
+        self, kernel, bb_with_kernel
+    ):
+        writer = py_trees.blackboard.Client(name="gripper_setup")
+        writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        writer.gripper_configs = {
+            "primary": {
+                "command_mode": "plc_gripper_request",
+                "group_id": "gripper",
+                "joint_name": "finger_joint",
+                "motion_time_s": 0.02,
+                "actuation_kind": "pneumatic",
+                "state_authority": "commanded_estimate",
+                "completion_policy": "request_ack_then_dwell",
+                "grasp_confirmation_policy": "none_open_loop",
+                "transport": {"kind": "plc_gripper_request"},
+            }
+        }
+
+        node = CommandGripper(
+            name="close_gripper",
+            gripper_id="primary",
+            position=0.0,
+        )
+        node.setup()
+        node.initialise()
+
+        assert node.update() == py_trees.common.Status.FAILURE
+
+        reader = py_trees.blackboard.Client(name="gripper_fault_reader_plc")
+        reader.register_key(
+            key="gripper_fault_details", access=py_trees.common.Access.READ
+        )
+        details = reader.get("gripper_fault_details")
+        assert details["reason_code"] == "invalid_gripper_semantics"
+        assert details["actuation_kind"] == "pneumatic"
+        assert details["state_authority"] == "commanded_estimate"
+        assert details["transport_kind"] == "plc_gripper_request"
+
+    def test_pneumatic_command_reports_dwell_evidence_not_grasp_proof(
+        self, kernel, bb_with_kernel
+    ):
+        writer = py_trees.blackboard.Client(name="gripper_setup")
+        writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        writer.gripper_configs = {
+            "primary": {
+                "command_mode": "simulated_joint",
+                "group_id": "gripper",
+                "joint_name": "finger_joint",
+                "motion_time_s": 0.01,
+                "srdf_presets": {"open": 0.0081, "closed": 0.0},
+                "actuation_kind": "pneumatic",
+                "state_authority": "commanded_estimate",
+                "completion_policy": "dwell_elapsed",
+                "grasp_confirmation_policy": "none_open_loop",
+                "transport": {"kind": "native_kinematic"},
+                "open_state_ref": "open",
+                "closed_state_ref": "closed",
+            }
+        }
+
+        node = CommandGripper(
+            name="close_gripper",
+            gripper_id="primary",
+            position=0.0,
+            timeout_s=1.0,
+        )
+        node.setup()
+        node.initialise()
+
+        status = node.update()
+        assert status == py_trees.common.Status.RUNNING
+        assert "authority=commanded_estimate" in node.feedback_message
+        assert "evidence=dwell_elapsed" in node.feedback_message
+        assert "evidence_state=unverified" in node.feedback_message
+
+        deadline = time.monotonic() + 1.0
+        while status == py_trees.common.Status.RUNNING and time.monotonic() < deadline:
+            time.sleep(0.01)
+            status = node.update()
+
+        assert status == py_trees.common.Status.SUCCESS
+        runtime_status = kernel.get_gripper_status("primary")
+        assert runtime_status.commanded_state == "closed"
+        assert runtime_status.commanded_position == pytest.approx(0.0)
+        assert runtime_status.observed_position is None
+        assert runtime_status.evidence == ["dwell_elapsed"]
+        assert runtime_status.evidence_state == "unverified"
+
+    def test_pneumatic_dwell_timeout_uses_stable_fault_token(
+        self, kernel, bb_with_kernel
+    ):
+        writer = py_trees.blackboard.Client(name="gripper_setup")
+        writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        writer.gripper_configs = {
+            "primary": {
+                "command_mode": "simulated_joint",
+                "group_id": "gripper",
+                "joint_name": "finger_joint",
+                "motion_time_s": 10.0,
+                "srdf_presets": {"open": 0.0081, "closed": 0.0},
+                "actuation_kind": "pneumatic",
+                "state_authority": "commanded_estimate",
+                "completion_policy": "dwell_elapsed",
+                "grasp_confirmation_policy": "none_open_loop",
+                "transport": {"kind": "native_kinematic"},
+                "open_state_ref": "open",
+                "closed_state_ref": "closed",
+            }
+        }
+
+        node = CommandGripper(
+            name="close_gripper",
+            gripper_id="primary",
+            position=0.0,
+            timeout_s=0.001,
+        )
+        node.setup()
+        node.initialise()
+
+        assert node.update() == py_trees.common.Status.RUNNING
+        time.sleep(0.01)
+        assert node.update() == py_trees.common.Status.FAILURE
+
+        reader = py_trees.blackboard.Client(name="gripper_fault_reader_timeout")
+        reader.register_key(
+            key="gripper_fault_details", access=py_trees.common.Access.READ
+        )
+        details = reader.get("gripper_fault_details")
+        assert details["reason_code"] == "gripper_dwell_timeout"
+        assert details["evidence"] == ["dwell_elapsed"]
+        assert details["evidence_state"] == "unverified"
+
+    def test_pneumatic_numeric_target_rejection_surfaces_semantic_fault(
+        self, kernel, bb_with_kernel
+    ):
+        writer = py_trees.blackboard.Client(name="gripper_setup")
+        writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        writer.gripper_configs = {
+            "primary": {
+                "command_mode": "simulated_joint",
+                "group_id": "gripper",
+                "joint_name": "finger_joint",
+                "motion_time_s": 0.01,
+                "srdf_presets": {"open": 0.0081, "closed": 0.0},
+                "actuation_kind": "pneumatic",
+                "state_authority": "native_backend",
+                "completion_policy": "dwell_elapsed",
+                "grasp_confirmation_policy": "none_open_loop",
+                "transport": {"kind": "native_kinematic"},
+                "open_state_ref": "open",
+                "closed_state_ref": "closed",
+            }
+        }
+
+        node = CommandGripper(
+            name="bad_close_gripper",
+            gripper_id="primary",
+            position=0.004,
+            timeout_s=1.0,
+        )
+        node.setup()
+        node.initialise()
+
+        assert node.update() == py_trees.common.Status.FAILURE
+
+        reader = py_trees.blackboard.Client(
+            name="gripper_fault_reader_semantic_reject"
+        )
+        reader.register_key(
+            key="gripper_fault_details", access=py_trees.common.Access.READ
+        )
+        details = reader.get("gripper_fault_details")
+        assert details["reason_code"] == "invalid_gripper_semantics"
+        assert details["actuation_kind"] == "pneumatic"
+        assert details["commanded_state"] == "numeric"
 
     def test_command_gripper_unclassified_failure_records_nothing(self, kernel, bb_with_kernel):
         writer = py_trees.blackboard.Client(name="gripper_setup")
@@ -1488,6 +1857,178 @@ class TestCommandGripper:
 
         assert second.accepted is True
         assert kernel.get_gripper_status("primary").target_position == pytest.approx(0.0)
+
+
+class TestConfirmGripperGrasp:
+    def _configure_gripper(
+        self,
+        kernel,
+        *,
+        policy: str = "discrete_signal",
+    ) -> None:
+        writer = py_trees.blackboard.Client(name="grasp_confirmation_setup")
+        writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        writer.gripper_configs = {
+            "primary": {
+                "command_mode": "simulated_joint",
+                "group_id": "gripper",
+                "joint_name": "finger_joint",
+                "motion_time_s": 0.01,
+                "actuation_kind": "position_commanded",
+                "state_authority": "native_backend",
+                "completion_policy": "position_reached",
+                "grasp_confirmation_policy": policy,
+                "transport": {"kind": "native_kinematic"},
+                "open_state_ref": "open",
+                "closed_state_ref": "closed",
+                "srdf_presets": {"open": 0.008, "closed": 0.0},
+            }
+        }
+        result = kernel.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="gripper",
+                joint_name="finger_joint",
+                target_position=0.0,
+                duration_s=0.0,
+                actuation_kind="position_commanded",
+                state_authority="native_backend",
+                completion_policy="position_reached",
+                grasp_confirmation_policy=policy,
+                transport_kind="native_kinematic",
+                open_state_ref="open",
+                closed_state_ref="closed",
+                srdf_presets={"open": 0.008, "closed": 0.0},
+            )
+        )
+        assert result.accepted is True
+
+    def test_signal_confirmation_records_verified_evidence(
+        self, kernel, bb_with_kernel
+    ):
+        self._configure_gripper(kernel, policy="discrete_signal")
+        writer = py_trees.blackboard.Client(name="signal_writer")
+        writer.register_key(
+            key="cell/part_present", access=py_trees.common.Access.WRITE
+        )
+        writer.set("cell/part_present", True)
+
+        node = ConfirmGripperGrasp(
+            name="confirm_part_present",
+            gripper_id="primary",
+            source_key="cell/part_present",
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        status = kernel.get_gripper_status("primary")
+        assert status.evidence_state == "confirmed"
+        assert "discrete_signal" in status.evidence
+        assert "policy=discrete_signal" in node.feedback_message
+
+    def test_force_current_confirmation_records_default_evidence_label(
+        self,
+        kernel,
+        bb_with_kernel,
+    ):
+        self._configure_gripper(kernel, policy="force_or_current")
+        writer = py_trees.blackboard.Client(name="force_current_writer")
+        writer.register_key(
+            key="gripper/primary/force_current_confirmed",
+            access=py_trees.common.Access.WRITE,
+        )
+        writer.set("gripper/primary/force_current_confirmed", True)
+
+        node = ConfirmGripperGrasp(
+            name="confirm_force_current",
+            gripper_id="primary",
+            source_key="gripper/primary/force_current_confirmed",
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        status = kernel.get_gripper_status("primary")
+        assert status.evidence_state == "confirmed"
+        assert "force_or_current" in status.evidence
+        assert "policy=force_or_current" in node.feedback_message
+
+    def test_signal_confirmation_allows_evidence_backed_attach(
+        self, kernel, bb_with_kernel
+    ):
+        self._configure_gripper(kernel, policy="discrete_signal")
+        signal_writer = py_trees.blackboard.Client(name="signal_writer_attach")
+        signal_writer.register_key(
+            key="cell/part_present", access=py_trees.common.Access.WRITE
+        )
+        signal_writer.set("cell/part_present", True)
+        assert _tick_node(
+            ConfirmGripperGrasp(
+                name="confirm_part_present",
+                gripper_id="primary",
+                source_key="cell/part_present",
+            )
+        ) == py_trees.common.Status.SUCCESS
+
+        bb_with_kernel.register_key(
+            key="scene_objects", access=py_trees.common.Access.WRITE
+        )
+        bb_with_kernel.scene_objects = {}
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.6, 0.0, 0.6],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+
+        node = AttachObjectToLink(
+            name="attach_box",
+            object_id="box1",
+            link_frame="tool0",
+            gripper_id="primary",
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        assert kernel.get_object_state("box1").attached is True
+
+    def test_confirmation_rejects_false_source_signal(
+        self, kernel, bb_with_kernel
+    ):
+        self._configure_gripper(kernel, policy="discrete_signal")
+        writer = py_trees.blackboard.Client(name="signal_writer_false")
+        writer.register_key(
+            key="cell/part_present", access=py_trees.common.Access.WRITE
+        )
+        writer.set("cell/part_present", False)
+
+        node = ConfirmGripperGrasp(
+            name="confirm_part_present",
+            gripper_id="primary",
+            source_key="cell/part_present",
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        reader = py_trees.blackboard.Client(name="confirm_fault_reader")
+        reader.register_key(
+            key="gripper_fault_details", access=py_trees.common.Access.READ
+        )
+        details = reader.get("gripper_fault_details")
+        assert details["reason_code"] == "grasp_confirmation_lost"
+        assert details["surface"] == "confirm_gripper_grasp"
+        assert details["grasp_confirmation_policy"] == "discrete_signal"
+
+    def test_confirmation_rejects_none_open_loop_policy(self, kernel, bb_with_kernel):
+        self._configure_gripper(kernel, policy="none_open_loop")
+
+        node = ConfirmGripperGrasp(
+            name="confirm_open_loop",
+            gripper_id="primary",
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        assert "cannot be converted" in node.feedback_message
 
 
 class TestGetLinkPose:

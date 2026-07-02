@@ -9,6 +9,14 @@ description: >-
 
 program_profile: v0.1
 
+grasp_risk_policy:
+  open_loop_grasp:
+    allowed: true
+    scope: simulation
+    rationale: >-
+      Local scene-authoring fixture uses simulated attach actions without an
+      independent grasp confirmation source.
+
 robot_config:
   robot_id: ur10e
   group_id: arm

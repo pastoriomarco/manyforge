@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import math
 import threading
@@ -367,6 +367,15 @@ class GripperCommandRequest:
     target_position: float
     duration_s: float
     max_effort: Optional[float] = None
+    actuation_kind: str = ""
+    state_authority: str = ""
+    completion_policy: str = ""
+    grasp_confirmation_policy: str = ""
+    transport_kind: str = ""
+    open_state_ref: str = ""
+    closed_state_ref: str = ""
+    srdf_presets: Dict[str, float] = field(default_factory=dict)
+    commanded_state: str = ""
 
 
 @dataclass
@@ -376,9 +385,225 @@ class GripperCommandStatus:
     progress: float = 0.0
     current_position: Optional[float] = None
     target_position: Optional[float] = None
+    commanded_position: Optional[float] = None
+    observed_position: Optional[float] = None
+    commanded_state: str = ""
+    actuation_kind: str = ""
+    state_authority: str = ""
+    completion_policy: str = ""
+    grasp_confirmation_policy: str = ""
+    transport_kind: str = ""
+    evidence: List[str] = field(default_factory=list)
+    evidence_state: str = ""
     error: Optional[str] = None
     # Stable fault token from the backend fault taxonomy; None unless FAILED.
     reason_code: Optional[str] = None
+
+
+def resolve_gripper_commanded_state(
+    *,
+    target_position: float,
+    srdf_presets: Optional[Dict[str, float]] = None,
+    open_state_ref: str = "",
+    closed_state_ref: str = "",
+    tolerance: float = 1e-6,
+) -> str:
+    """Resolve an internal gripper target label from RMA/SRDF presets.
+
+    Deployment YAML owns the symbolic open/closed references. Runtime requests
+    still carry the numeric target for compatibility, but status should report
+    when that numeric target corresponds to the configured semantic open/close
+    state instead of treating every gripper as position-commanded.
+    """
+
+    presets = srdf_presets or {}
+    target = float(target_position)
+    for state_name, ref in (("open", open_state_ref), ("closed", closed_state_ref)):
+        if not ref:
+            continue
+        raw_position = presets.get(str(ref))
+        if raw_position is None:
+            continue
+        try:
+            preset_position = float(raw_position)
+        except (TypeError, ValueError):
+            continue
+        if abs(target - preset_position) <= tolerance:
+            return state_name
+    return "numeric"
+
+
+def gripper_completion_evidence(
+    completion_policy: str,
+    state_authority: str,
+) -> List[str]:
+    """Map semantic gripper policy to compact diagnostic evidence labels."""
+
+    policy = str(completion_policy or "").strip()
+    authority = str(state_authority or "").strip()
+    if policy == "dwell_elapsed":
+        return ["dwell_elapsed"]
+    if policy == "request_ack_then_dwell":
+        return ["request_ack", "dwell_elapsed"]
+    if policy == "driver_result":
+        return ["driver_result"]
+    if policy == "position_reached":
+        if authority == "sim_observed":
+            return ["sim_observed_joint_state"]
+        if authority == "real_observed":
+            return ["real_observed_joint_state"]
+        if authority == "native_backend":
+            return ["native_backend_state"]
+        return ["position_reached"]
+    if policy == "open_loop_immediate":
+        return ["open_loop_immediate"]
+    return []
+
+
+def normalize_gripper_evidence(raw_evidence: Any) -> List[str]:
+    """Return evidence as a list of non-empty string labels."""
+
+    if raw_evidence is None:
+        return []
+    if isinstance(raw_evidence, str):
+        evidence = [raw_evidence]
+    elif isinstance(raw_evidence, (list, tuple, set)):
+        evidence = list(raw_evidence)
+    else:
+        evidence = [raw_evidence]
+    return [str(item) for item in evidence if str(item)]
+
+
+def gripper_observed_position(
+    state_authority: str,
+    current_position: Optional[float],
+) -> Optional[float]:
+    """Expose a position as observed only for explicit state authorities."""
+
+    if state_authority not in {
+        "native_backend",
+        "sim_observed",
+        "real_observed",
+    }:
+        return None
+    return None if current_position is None else float(current_position)
+
+
+def gripper_evidence_state(
+    *,
+    state_authority: str,
+    grasp_confirmation_policy: str,
+    failed: bool = False,
+) -> str:
+    """Return the grasp-evidence qualifier carried beside command status."""
+
+    if failed:
+        return "faulted_unverified"
+    if (
+        str(state_authority or "").strip() == "commanded_estimate"
+        or str(grasp_confirmation_policy or "").strip() == "none_open_loop"
+    ):
+        return "unverified"
+    return ""
+
+
+def gripper_request_status_metadata(
+    request: GripperCommandRequest,
+    *,
+    current_position: Optional[float] = None,
+    failed: bool = False,
+) -> Dict[str, Any]:
+    """Normalize request semantic fields into status/cache metadata."""
+
+    commanded_state = request.commanded_state or resolve_gripper_commanded_state(
+        target_position=request.target_position,
+        srdf_presets=request.srdf_presets,
+        open_state_ref=request.open_state_ref,
+        closed_state_ref=request.closed_state_ref,
+    )
+    return {
+        "actuation_kind": request.actuation_kind,
+        "state_authority": request.state_authority,
+        "completion_policy": request.completion_policy,
+        "grasp_confirmation_policy": request.grasp_confirmation_policy,
+        "transport_kind": request.transport_kind,
+        "commanded_position": float(request.target_position),
+        "observed_position": gripper_observed_position(
+            request.state_authority,
+            current_position,
+        ),
+        "commanded_state": commanded_state,
+        "evidence": gripper_completion_evidence(
+            request.completion_policy,
+            request.state_authority,
+        ),
+        "evidence_state": gripper_evidence_state(
+            state_authority=request.state_authority,
+            grasp_confirmation_policy=request.grasp_confirmation_policy,
+            failed=failed,
+        ),
+    }
+
+
+def gripper_effective_command_request(
+    request: GripperCommandRequest,
+) -> tuple[Optional[GripperCommandRequest], Optional[str]]:
+    """Resolve semantic pneumatic targets to RMA/SRDF-owned positions."""
+
+    actuation_kind = str(request.actuation_kind or "").strip()
+    if actuation_kind in {"", "position_commanded"}:
+        return request, None
+    if actuation_kind != "pneumatic":
+        return (
+            None,
+            f"Unsupported gripper actuation_kind '{request.actuation_kind}'",
+        )
+
+    commanded_state = request.commanded_state or resolve_gripper_commanded_state(
+        target_position=request.target_position,
+        srdf_presets=request.srdf_presets,
+        open_state_ref=request.open_state_ref,
+        closed_state_ref=request.closed_state_ref,
+    )
+    if commanded_state not in {"open", "closed"}:
+        return (
+            None,
+            "pneumatic gripper target must match open_state_ref or "
+            "closed_state_ref",
+        )
+    ref_name = (
+        request.open_state_ref
+        if commanded_state == "open"
+        else request.closed_state_ref
+    )
+    if not ref_name:
+        return (
+            None,
+            f"pneumatic gripper {commanded_state} command requires "
+            f"{commanded_state}_state_ref",
+        )
+    if ref_name not in request.srdf_presets:
+        return (
+            None,
+            f"pneumatic gripper state ref '{ref_name}' is missing from "
+            "srdf_presets",
+        )
+    try:
+        target_position = float(request.srdf_presets[ref_name])
+    except (TypeError, ValueError):
+        return (
+            None,
+            f"pneumatic gripper state ref '{ref_name}' has a non-numeric "
+            "srdf preset",
+        )
+    return (
+        replace(
+            request,
+            target_position=target_position,
+            commanded_state=commanded_state,
+        ),
+        None,
+    )
 
 
 def _pose_to_matrix(pos: List[float], orient_xyzw: List[float]) -> List[List[float]]:
@@ -785,6 +1010,47 @@ class KernelClient(ABC):
 
     @abstractmethod
     def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus: ...
+
+    def confirm_gripper_grasp(
+        self,
+        *,
+        gripper_id: str,
+        grasp_confirmation_policy: str,
+        evidence_label: str,
+        evidence_state: str = "confirmed",
+    ) -> CommandResult:
+        """Record positive grasp evidence for an existing gripper command.
+
+        Backends that do not implement this fail closed; behavior nodes using
+        evidence-backed attach policies must not silently degrade to open-loop.
+        """
+
+        return CommandResult(
+            accepted=False,
+            error="Gripper grasp confirmation is not supported by this backend",
+            reason_code="invalid_gripper_semantics",
+        )
+
+    def mark_gripper_grasp_lost(
+        self,
+        *,
+        gripper_id: str,
+        evidence_label: str,
+        message: str,
+        reason_code: str = "grasp_confirmation_lost",
+    ) -> CommandResult:
+        """Invalidate grasp evidence for an existing gripper command.
+
+        This is the negative counterpart to confirm_gripper_grasp(). Backends
+        that cannot persist gripper evidence fail closed; the caller should
+        still raise its primary runtime fault rather than relying on this sink.
+        """
+
+        return CommandResult(
+            accepted=False,
+            error="Gripper grasp-loss evidence is not supported by this backend",
+            reason_code="invalid_gripper_semantics",
+        )
 
 
 class MockKernelClient(KernelClient):
@@ -1721,20 +1987,47 @@ class MockKernelClient(KernelClient):
             target_position=(
                 None if target_position is None else float(target_position)
             ),
+            commanded_position=command.get("commanded_position"),
+            observed_position=gripper_observed_position(
+                str(command.get("state_authority", "")),
+                None if current_position is None else float(current_position),
+            ),
+            commanded_state=str(command.get("commanded_state", "")),
+            actuation_kind=str(command.get("actuation_kind", "")),
+            state_authority=str(command.get("state_authority", "")),
+            completion_policy=str(command.get("completion_policy", "")),
+            grasp_confirmation_policy=str(
+                command.get("grasp_confirmation_policy", "")
+            ),
+            transport_kind=str(command.get("transport_kind", "")),
+            evidence=normalize_gripper_evidence(command.get("evidence")),
+            evidence_state=str(command.get("evidence_state", "")),
             error=command.get("error"),
+            reason_code=command.get("reason_code"),
         )
 
     def command_gripper(self, request: GripperCommandRequest) -> CommandResult:
         with self._gripper_lock:
             self.gripper_command_count += 1
+            effective_request, semantic_error = gripper_effective_command_request(
+                request
+            )
+            if effective_request is None:
+                self.last_gripper_command_request = request
+                return CommandResult(
+                    accepted=False,
+                    error=semantic_error or "Invalid gripper command semantics",
+                    reason_code="invalid_gripper_semantics",
+                )
+            request = effective_request
             self.last_gripper_command_request = request
             if self.fail_next_gripper_command:
                 self.fail_next_gripper_command = False
                 return CommandResult(
-                accepted=False,
-                error="Gripper command failed (injected)",
-                reason_code="gripper_goal_rejected",
-            )
+                    accepted=False,
+                    error="Gripper command failed (injected)",
+                    reason_code="gripper_request_failed",
+                )
 
             self.update_gripper_commands()
             current_status = self.get_gripper_status(request.gripper_id)
@@ -1750,15 +2043,25 @@ class MockKernelClient(KernelClient):
                 current_position = self._gripper_positions.get(request.gripper_id, 0.0)
             if request.duration_s <= 0.0:
                 self._gripper_positions[request.gripper_id] = request.target_position
+                metadata = gripper_request_status_metadata(
+                    request,
+                    current_position=float(request.target_position),
+                )
                 self._gripper_commands[request.gripper_id] = {
                     "state": GripperCommandState.COMPLETED,
                     "current_position": request.target_position,
                     "target_position": request.target_position,
                     "progress": 1.0,
                     "error": None,
+                    "reason_code": None,
+                    **metadata,
                 }
                 return CommandResult(accepted=True)
 
+            metadata = gripper_request_status_metadata(
+                request,
+                current_position=float(current_position),
+            )
             self._gripper_commands[request.gripper_id] = {
                 "state": GripperCommandState.EXECUTING,
                 "group_id": request.group_id,
@@ -1770,6 +2073,8 @@ class MockKernelClient(KernelClient):
                 "start_time": time.monotonic(),
                 "progress": 0.0,
                 "error": None,
+                "reason_code": None,
+                **metadata,
             }
             return CommandResult(accepted=True)
 
@@ -1783,6 +2088,10 @@ class MockKernelClient(KernelClient):
                 command["state"] = status.state
                 command["current_position"] = status.current_position
                 command["progress"] = status.progress
+                command["observed_position"] = gripper_observed_position(
+                    str(command.get("state_authority", "")),
+                    status.current_position,
+                )
                 if status.state == GripperCommandState.COMPLETED:
                     self._gripper_positions[gripper_id] = (
                         float(status.current_position)
@@ -1806,5 +2115,113 @@ class MockKernelClient(KernelClient):
                 progress=float(command.get("progress", 0.0)),
                 current_position=command.get("current_position"),
                 target_position=command.get("target_position"),
+                commanded_position=command.get("commanded_position"),
+                observed_position=command.get("observed_position"),
+                commanded_state=str(command.get("commanded_state", "")),
+                actuation_kind=str(command.get("actuation_kind", "")),
+                state_authority=str(command.get("state_authority", "")),
+                completion_policy=str(command.get("completion_policy", "")),
+                grasp_confirmation_policy=str(
+                    command.get("grasp_confirmation_policy", "")
+                ),
+                transport_kind=str(command.get("transport_kind", "")),
+                evidence=normalize_gripper_evidence(command.get("evidence")),
+                evidence_state=str(command.get("evidence_state", "")),
                 error=command.get("error"),
+                reason_code=command.get("reason_code"),
             )
+
+    def confirm_gripper_grasp(
+        self,
+        *,
+        gripper_id: str,
+        grasp_confirmation_policy: str,
+        evidence_label: str,
+        evidence_state: str = "confirmed",
+    ) -> CommandResult:
+        policy = str(grasp_confirmation_policy or "").strip()
+        label = str(evidence_label or "").strip()
+        state = str(evidence_state or "").strip()
+        if not policy:
+            return CommandResult(
+                accepted=False,
+                error="grasp_confirmation_policy is required",
+                reason_code="invalid_gripper_semantics",
+            )
+        if policy == "none_open_loop":
+            return CommandResult(
+                accepted=False,
+                error="none_open_loop does not accept verified grasp evidence",
+                reason_code="invalid_gripper_semantics",
+            )
+        if not label:
+            return CommandResult(
+                accepted=False,
+                error="grasp confirmation evidence_label is required",
+                reason_code="invalid_gripper_semantics",
+            )
+        if state not in {"confirmed", "verified", "grasp_confirmed"}:
+            return CommandResult(
+                accepted=False,
+                error="grasp confirmation evidence_state must be confirmed or verified",
+                reason_code="invalid_gripper_semantics",
+            )
+        with self._gripper_lock:
+            command = self._gripper_commands.get(gripper_id)
+            if command is None:
+                return CommandResult(
+                    accepted=False,
+                    error=f"Gripper '{gripper_id}' has no command status to confirm",
+                    reason_code="stale_gripper_state",
+                )
+            status_policy = str(command.get("grasp_confirmation_policy", "") or "")
+            if status_policy and status_policy != policy:
+                return CommandResult(
+                    accepted=False,
+                    error=(
+                        f"Gripper '{gripper_id}' status policy '{status_policy}' "
+                        f"does not match confirmation policy '{policy}'"
+                    ),
+                    reason_code="invalid_gripper_semantics",
+                )
+            evidence = normalize_gripper_evidence(command.get("evidence"))
+            if label not in evidence:
+                evidence.append(label)
+            command["evidence"] = evidence
+            command["evidence_state"] = state
+            command["grasp_confirmation_policy"] = policy
+            return CommandResult(accepted=True)
+
+    def mark_gripper_grasp_lost(
+        self,
+        *,
+        gripper_id: str,
+        evidence_label: str,
+        message: str,
+        reason_code: str = "grasp_confirmation_lost",
+    ) -> CommandResult:
+        label = str(evidence_label or "").strip()
+        if not label:
+            return CommandResult(
+                accepted=False,
+                error="grasp loss evidence_label is required",
+                reason_code="invalid_gripper_semantics",
+            )
+        with self._gripper_lock:
+            command = self._gripper_commands.get(gripper_id)
+            if command is None:
+                return CommandResult(
+                    accepted=False,
+                    error=f"Gripper '{gripper_id}' has no command status to invalidate",
+                    reason_code="stale_gripper_state",
+                )
+            evidence = normalize_gripper_evidence(command.get("evidence"))
+            if label not in evidence:
+                evidence.append(label)
+            command["evidence"] = evidence
+            command["evidence_state"] = "pressure_or_part_lost"
+            command["state"] = GripperCommandState.FAILED
+            command["progress"] = float(command.get("progress", 1.0))
+            command["error"] = str(message or "gripper grasp confirmation was lost")
+            command["reason_code"] = str(reason_code or "grasp_confirmation_lost")
+            return CommandResult(accepted=True)

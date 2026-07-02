@@ -9,8 +9,13 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from manyforge_behavior.cycle_manager import CycleState
-from manyforge_behavior.deployment import Deployment
-from manyforge_behavior.kernel_client import MockKernelClient, SceneEditRequest
+from manyforge_behavior.deployment import Deployment, GripperConfig
+from manyforge_behavior.kernel_client import (
+    GripperCommandRequest,
+    GripperCommandState,
+    MockKernelClient,
+    SceneEditRequest,
+)
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
@@ -115,6 +120,9 @@ def _pose_sources(
                     "stale_behavior": "fault",
                     "action": drift_action,
                     "signal_id": "attached_object_drift/box",
+                    "confirmation_signal_id": (
+                        "attached_object_grasp_confirmed/box"
+                    ),
                     "sample_time_tolerance_s": 0.05,
                 },
             }
@@ -843,6 +851,54 @@ def test_measured_grasp_drift_baseline_and_scene_state_status(tmp_path: Path) ->
     assert drift["sample_time_delta_s"] == 0.0
 
 
+def test_measured_grasp_publishes_confirmation_signal(tmp_path: Path) -> None:
+    client, state = _client(tmp_path)
+    recorder = _ConditionFaultRecorder()
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(
+            box_policy="continuous_unattached",
+            measured_grasp=True,
+            drift_action="diagnostic_only",
+            debounce_s=1.0,
+        )
+    )
+    _add_box(client)
+    attach = state.kernel.scene_edit(
+        SceneEditRequest(operation="attach", object_id="box", frame_id="tool0")
+    )
+    assert attach.success is True
+    state.cycle_manager = recorder
+
+    _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[0.10, 0.0, 0.0])],
+        measured_tcp=_measured_tcp_sample(),
+    )
+    confirmation_events = [
+        item
+        for item in recorder.published
+        if item["signal"] == "attached_object_grasp_confirmed/box"
+    ]
+    assert confirmation_events[-1]["value"] is True
+    assert confirmation_events[-1]["mirror_key"] == (
+        "attached_object_grasp_confirmed/box"
+    )
+    assert confirmation_events[-1]["metadata"]["status"] == "ok"
+
+    _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[0.15, 0.0, 0.0])],
+        measured_tcp=_measured_tcp_sample(),
+    )
+    confirmation_events = [
+        item
+        for item in recorder.published
+        if item["signal"] == "attached_object_grasp_confirmed/box"
+    ]
+    assert confirmation_events[-1]["value"] is False
+    assert confirmation_events[-1]["metadata"]["status"] == "near_limit"
+
+
 def test_measured_grasp_drift_interrupts_after_debounce(tmp_path: Path) -> None:
     client, state = _client(tmp_path)
     recorder = _ConditionFaultRecorder()
@@ -886,6 +942,93 @@ def test_measured_grasp_drift_interrupts_after_debounce(tmp_path: Path) -> None:
     assert fault["condition_id"] == "attached_object_drift/box"
     assert fault["details"]["reason_code"] == "attached_object_drift"
     assert fault["details"]["translation_m"] > 0.02
+
+
+def test_measured_grasp_drift_marks_confirmed_gripper_lost(tmp_path: Path) -> None:
+    client, state = _client(tmp_path)
+    recorder = _ConditionFaultRecorder()
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(
+            box_policy="continuous_unattached",
+            measured_grasp=True,
+            drift_action="interrupt",
+            debounce_s=0.001,
+        )
+    )
+    state.deployment.grippers["primary"] = GripperConfig(
+        command_mode="ros_gripper_command",
+        group_id="lite_gripper",
+        joint_name="right_finger_joint",
+        motion_time_s=0.1,
+        srdf_presets={"open": 0.04, "closed": 0.0},
+        actuation_kind="pneumatic",
+        state_authority="sim_observed",
+        completion_policy="dwell_elapsed",
+        grasp_confirmation_policy="perception",
+        transport={"kind": "isaac_joint_state_effort"},
+        open_state_ref="open",
+        closed_state_ref="closed",
+        semantic_configured=True,
+        attach_frame="tool0",
+        tcp_frame="tool0",
+    )
+    _add_box(client)
+    command = state.kernel.command_gripper(
+        GripperCommandRequest(
+            gripper_id="primary",
+            group_id="lite_gripper",
+            joint_name="right_finger_joint",
+            target_position=0.0,
+            duration_s=0.0,
+            actuation_kind="pneumatic",
+            state_authority="sim_observed",
+            completion_policy="dwell_elapsed",
+            grasp_confirmation_policy="perception",
+            transport_kind="isaac_joint_state_effort",
+            open_state_ref="open",
+            closed_state_ref="closed",
+            srdf_presets={"open": 0.04, "closed": 0.0},
+        )
+    )
+    assert command.accepted is True
+    confirmed = state.kernel.confirm_gripper_grasp(
+        gripper_id="primary",
+        grasp_confirmation_policy="perception",
+        evidence_label="perception_grasp_confirmed",
+    )
+    assert confirmed.accepted is True
+    attach = state.kernel.scene_edit(
+        SceneEditRequest(operation="attach", object_id="box", frame_id="tool0")
+    )
+    assert attach.success is True
+    state.cycle_manager = recorder
+
+    _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[0.10, 0.0, 0.0])],
+        measured_tcp=_measured_tcp_sample(),
+    )
+    _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[0.15, 0.0, 0.0])],
+        measured_tcp=_measured_tcp_sample(),
+    )
+    time.sleep(0.005)
+    _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[0.15, 0.0, 0.0])],
+        measured_tcp=_measured_tcp_sample(),
+    )
+
+    status = state.kernel.get_gripper_status("primary")
+    assert status.state == GripperCommandState.FAILED
+    assert status.evidence_state == "pressure_or_part_lost"
+    assert status.reason_code == "grasp_confirmation_lost"
+    assert "attached_drift_monitor" in status.evidence
+    fault = recorder.faults[-1]
+    assert fault["details"]["reason_code"] == "attached_object_drift"
+    assert fault["details"]["gripper_grasp_loss"]["status"] == "recorded"
+    assert fault["details"]["gripper_grasp_loss"]["gripper_id"] == "primary"
 
 
 def test_measured_grasp_drift_unverifiable_on_mixed_time_samples(tmp_path: Path) -> None:

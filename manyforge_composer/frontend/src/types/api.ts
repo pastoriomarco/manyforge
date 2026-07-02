@@ -622,6 +622,15 @@ export interface GripperConfig {
   jointName: string;
   motionTimeS: number;
   srdfPresets: Record<string, number>;
+  actuationKind: string;
+  stateAuthority: string;
+  completionPolicy: string;
+  graspConfirmationPolicy: string;
+  transport: Record<string, unknown>;
+  openStateRef: string;
+  closedStateRef: string;
+  semanticConfigured: boolean;
+  migrationNotes: string[];
   description: string;
   touchLinks: string[];
   mountFrame: string;
@@ -631,12 +640,23 @@ export interface GripperConfig {
   visualization?: GripperVisualization | null;
 }
 
+export interface OpenLoopGraspRiskAcceptance {
+  allowed: boolean;
+  scope: string;
+  rationale: string;
+}
+
+export interface GraspRiskPolicy {
+  openLoopGrasp: OpenLoopGraspRiskAcceptance;
+}
+
 export interface DeploymentInfo {
   name: string;
   description: string;
   programProfile: string;
   robotConfig: RobotConfig;
   grippers: Record<string, GripperConfig>;
+  graspRiskPolicy: GraspRiskPolicy;
 }
 
 export interface FullDeployment {
@@ -647,6 +667,7 @@ export interface FullDeployment {
   programProfile: string;
   robotConfig: RobotConfig;
   grippers: Record<string, GripperConfig>;
+  graspRiskPolicy: GraspRiskPolicy;
   adapters: Record<string, AdapterConfig>;
   orchestrator: OrchestratorConfig;
   launch: LaunchConfig;
@@ -808,6 +829,16 @@ export interface SceneGripperState {
   state: string;
   current_position: number | null;
   target_position: number | null;
+  commanded_position?: number | null;
+  observed_position?: number | null;
+  commanded_state?: string;
+  actuation_kind?: string;
+  state_authority?: string;
+  completion_policy?: string;
+  grasp_confirmation_policy?: string;
+  transport_kind?: string;
+  evidence?: string[];
+  evidence_state?: string;
   limit_lower: number | null;
   limit_upper: number | null;
   motion_time_s: number;

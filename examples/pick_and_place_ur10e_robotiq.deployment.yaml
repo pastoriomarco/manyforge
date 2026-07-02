@@ -4,6 +4,13 @@ name: ur10e_robotiq_pick_place_preview
 description: Preview deployment for UR10e + Robotiq 2F-140 native RoboPlan pick-and-place
   demo.
 program_profile: v0.1
+grasp_risk_policy:
+  open_loop_grasp:
+    allowed: true
+    scope: simulation
+    rationale: >-
+      Native Robotiq preview uses simulated gripper state and attach actions
+      without an independent grasp confirmation source.
 robot_config:
   robot_id: ur10e
   group_id: arm

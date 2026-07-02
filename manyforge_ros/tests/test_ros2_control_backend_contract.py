@@ -785,6 +785,215 @@ def test_ros2_control_gripper_updates_roboplan_scene_group_state():
         rclpy.shutdown()
 
 
+def test_ros2_control_gripper_driver_result_accepts_success_without_reached_goal():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("control_msgs")
+
+    from control_msgs.action import GripperCommand
+    from rclpy.action import ActionServer
+    from rclpy.executors import MultiThreadedExecutor
+
+    suffix = uuid.uuid4().hex
+    gripper_action = f"/manyforge_contract_gripper_driver_{suffix}/gripper_cmd"
+    rclpy.init(args=None)
+    executor = MultiThreadedExecutor(num_threads=2)
+    node = rclpy.create_node(f"manyforge_contract_gripper_driver_{suffix}")
+
+    def execute_gripper_goal(goal_handle):
+        target = float(goal_handle.request.command.position)
+        goal_handle.succeed()
+        result = GripperCommand.Result()
+        result.position = target * 0.5
+        result.effort = 1.0
+        result.stalled = True
+        result.reached_goal = False
+        return result
+
+    action_server = ActionServer(
+        node,
+        GripperCommand,
+        gripper_action,
+        execute_callback=execute_gripper_goal,
+    )
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+    bundle = _create_bundle(
+        action_name=f"/manyforge_contract_gripper_driver_{suffix}/follow_joint_trajectory",
+        joint_state_topic=f"/manyforge_contract_gripper_driver_{suffix}/joint_states",
+        controller_state_topic=f"/manyforge_contract_gripper_driver_{suffix}/controller_state",
+        wait_s=0.05,
+    )
+    try:
+        if not hasattr(bundle, "configure_ros_gripper_action"):
+            pytest.skip("manyforge_roboplan_py was built without ROS gripper support")
+
+        bundle.configure_ros_gripper_action(
+            "primary",
+            {
+                "action_name": gripper_action,
+                "completion_policy": "driver_result",
+                "wait_for_action_server_timeout_s": 2.0,
+                "result_timeout_s": 2.0,
+            },
+        )
+        time.sleep(0.2)
+
+        result = bundle.command_ros_gripper("primary", 0.7, 0.2, 5.0)
+        assert result["accepted"] is True, result
+
+        deadline = time.monotonic() + 1.0
+        status = bundle.get_ros_gripper_status("primary")
+        while time.monotonic() < deadline:
+            bundle.update_ros_grippers()
+            status = bundle.get_ros_gripper_status("primary")
+            if status["state"] != "executing":
+                break
+            time.sleep(0.02)
+
+        assert status["state"] == "completed"
+        assert status.get("error") in (None, "")
+    finally:
+        try:
+            bundle.reset()
+        except RuntimeError:
+            pass
+        action_server.destroy()
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_ros2_control_isaac_effort_gripper_publishes_joint_state_and_dwell_completes():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("sensor_msgs")
+
+    from rclpy.executors import MultiThreadedExecutor
+    from sensor_msgs.msg import JointState
+
+    suffix = uuid.uuid4().hex
+    command_topic = f"/manyforge_contract_isaac_gripper_{suffix}/command"
+    state_topic = f"/manyforge_contract_isaac_gripper_{suffix}/state"
+    rclpy.init(args=None)
+    executor = MultiThreadedExecutor(num_threads=2)
+    node = rclpy.create_node(f"manyforge_contract_isaac_gripper_{suffix}")
+    received: list[JointState] = []
+    node.create_subscription(
+        JointState,
+        command_topic,
+        lambda msg: received.append(msg),
+        10,
+    )
+    state_pub = node.create_publisher(JointState, state_topic, 10)
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+    bundle = _create_bundle(
+        action_name=f"/manyforge_contract_isaac_gripper_{suffix}/follow_joint_trajectory",
+        joint_state_topic=f"/manyforge_contract_isaac_gripper_{suffix}/joint_states",
+        controller_state_topic=f"/manyforge_contract_isaac_gripper_{suffix}/controller_state",
+        wait_s=0.05,
+        model_name="ur10e_robotiq_isaac_contract",
+        urdf_path=UR10E_ROBOTIQ_URDF_PATH,
+        srdf_path=UR10E_ROBOTIQ_SRDF_PATH,
+        package_paths=["/workspace"],
+        config_overrides={
+            "execution_state_source_mode": "commanded_sim",
+            "require_fresh_state_before_planning": False,
+            "initial_joint_positions_rad": START_POSITIONS,
+            "disable_controller_path_tolerances": True,
+        },
+    )
+    try:
+        if not hasattr(bundle, "configure_ros_gripper_action"):
+            pytest.skip("manyforge_roboplan_py was built without ROS gripper support")
+
+        bundle.configure_ros_gripper_action(
+            "primary",
+            {
+                "transport_kind": "isaac_joint_state_effort",
+                "command_topic": command_topic,
+                "state_topic": state_topic,
+                "command_joint_names": ["finger_joint"],
+                "group_id": "gripper",
+                "joint_name": "finger_joint",
+                "completion_policy": "dwell_elapsed",
+                "open_position": 0.7,
+                "closed_position": 0.0,
+                "open_effort": 5.0,
+                "close_effort": -5.0,
+                "publish_nominal_position": True,
+                "state_freshness_timeout_s": 2.0,
+            },
+        )
+        observed = JointState()
+        observed.name = ["finger_joint"]
+        observed.position = [0.004]
+        for _ in range(3):
+            observed.header.stamp = node.get_clock().now().to_msg()
+            state_pub.publish(observed)
+            time.sleep(0.02)
+
+        result = bundle.command_ros_gripper("primary", 0.0, 0.05, 0.0)
+        assert result["accepted"] is True, result
+
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and not received:
+            time.sleep(0.02)
+
+        assert received
+        assert received[-1].name == ["finger_joint"]
+        assert list(received[-1].position) == pytest.approx([0.0])
+        assert list(received[-1].effort) == pytest.approx([-5.0])
+
+        deadline = time.monotonic() + 1.0
+        status = bundle.get_ros_gripper_status("primary")
+        while time.monotonic() < deadline:
+            status = bundle.get_ros_gripper_status("primary")
+            if status.get("observed_position") is not None:
+                break
+            observed.header.stamp = node.get_clock().now().to_msg()
+            state_pub.publish(observed)
+            time.sleep(0.02)
+        assert status["observed_position"] == pytest.approx(0.004)
+
+        status = bundle.get_ros_gripper_status("primary")
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            bundle.update_ros_grippers()
+            status = bundle.get_ros_gripper_status("primary")
+            if status["state"] != "executing":
+                break
+            time.sleep(0.02)
+
+        assert status["state"] == "completed"
+        assert bundle.get_group_joint_positions("gripper")[0] == pytest.approx(
+            0.0,
+            abs=1e-6,
+        )
+
+        lost = bundle.mark_ros_gripper_grasp_lost(
+            "primary",
+            "attached_drift_monitor",
+            "measured object drift exceeded threshold",
+            "grasp_confirmation_lost",
+        )
+        assert lost["accepted"] is True, lost
+        status = bundle.get_ros_gripper_status("primary")
+        assert status["state"] == "failed"
+        assert status["reason_code"] == "grasp_confirmation_lost"
+        assert status["evidence_state"] == "pressure_or_part_lost"
+        assert "attached_drift_monitor" in status["evidence"]
+    finally:
+        try:
+            bundle.reset()
+        except RuntimeError:
+            pass
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
 def test_ros2_control_backend_documents_lock_order_contract():
     repo_root = Path(__file__).resolve().parents[2]
     header = (

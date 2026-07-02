@@ -22,6 +22,14 @@ description: >
 
 program_profile: v0.1
 
+grasp_risk_policy:
+  open_loop_grasp:
+    allowed: true
+    scope: simulation
+    rationale: >-
+      Isaac assistant preview attaches objects after gripper command completion
+      without an independent grasp confirmation source.
+
 robot_config:
   robot_id: ur10e
   group_id: arm
@@ -36,7 +44,18 @@ grippers:
     command_mode: ros_gripper_command
     group_id: gripper
     joint_name: finger_joint
+    actuation_kind: position_commanded
+    state_authority: sim_observed
+    completion_policy: position_reached
+    grasp_confirmation_policy: none_open_loop
+    open_state_ref: open
+    closed_state_ref: closed
     motion_time_s: 0.8
+    transport:
+      kind: ros_gripper_command
+      action_name: /robotiq_gripper_controller/gripper_cmd
+      result_timeout_s: 5.0
+      position_tolerance: 0.004
     touch_links:
       - robotiq_base_link
       - left_outer_knuckle

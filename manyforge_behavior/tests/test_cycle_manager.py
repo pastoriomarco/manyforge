@@ -1091,6 +1091,102 @@ class TestCycleManagerSignalRegistry:
         snapshot = manager.get_signal_snapshot()
         assert snapshot["signals"]["plc:cell.ready"]["freshness"] == "stale"
 
+    def test_force_current_evidence_publishes_bounded_boolean_signal(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        result = manager.publish_force_current_evidence(
+            gripper_id="primary",
+            value=0.42,
+            min_value=0.3,
+            units="A",
+            source="motor_current",
+            stale_after_ms=1000,
+        )
+
+        assert result["accepted"] is True
+        assert result["confirmed"] is True
+        assert result["mirror_key"] == "gripper/primary/force_current_confirmed"
+        assert (
+            py_trees.blackboard.Blackboard.get(
+                "gripper/primary/force_current_confirmed"
+            )
+            is True
+        )
+        snapshot = manager.get_signal_snapshot()
+        signal = snapshot["signals"]["gripper_evidence:gripper.force_current.primary"]
+        assert signal["value"] is True
+        assert signal["metadata"]["evidence_kind"] == "force_or_current"
+        assert signal["metadata"]["value"] == 0.42
+        assert signal["metadata"]["min_value"] == 0.3
+        assert signal["metadata"]["units"] == "A"
+
+        below = manager.publish_force_current_evidence(
+            gripper_id="primary",
+            value=0.12,
+            min_value=0.3,
+            stale_after_ms=1000,
+        )
+
+        assert below["confirmed"] is False
+        assert (
+            py_trees.blackboard.Blackboard.get(
+                "gripper/primary/force_current_confirmed"
+            )
+            is False
+        )
+
+    def test_force_current_evidence_clears_when_stale(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        manager.publish_force_current_evidence(
+            gripper_id="primary",
+            value=12.0,
+            min_value=10.0,
+            mirror_key="gripper/primary/grasp_force_ok",
+            stale_after_ms=1,
+        )
+        assert py_trees.blackboard.Blackboard.get(
+            "gripper/primary/grasp_force_ok"
+        ) is True
+
+        time.sleep(0.01)
+        manager._refresh_signal_registry()
+
+        with pytest.raises(KeyError):
+            py_trees.blackboard.Blackboard.get(
+                "gripper/primary/grasp_force_ok"
+            )
+
+    def test_force_current_evidence_rejects_unbounded_or_invalid_samples(
+        self,
+        kernel,
+    ):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        with pytest.raises(ValueError, match="requires min_value or max_value"):
+            manager.publish_force_current_evidence(
+                gripper_id="primary",
+                value=0.42,
+            )
+
+        with pytest.raises(ValueError, match="must be finite"):
+            manager.publish_force_current_evidence(
+                gripper_id="primary",
+                value=float("nan"),
+                min_value=0.1,
+            )
+
+        with pytest.raises(ValueError, match="min_value must be <= max_value"):
+            manager.publish_force_current_evidence(
+                gripper_id="primary",
+                value=0.42,
+                min_value=1.0,
+                max_value=0.5,
+            )
+
 
 
 class TestCycleManagerVelocityScale:
@@ -2308,15 +2404,15 @@ class TestGripperFaultDiagnostics:
         manager = CycleManager(runner, kernel)
         self._write_fault(
             {
-                "reason_code": "gripper_goal_rejected",
+                "reason_code": "gripper_request_failed",
                 "gripper_id": "primary",
                 "surface": "command_gripper",
-                "message": "Gripper action goal was rejected",
+                "message": "Gripper request failed",
             }
         )
 
         code, details = manager._capture_kernel_error_diagnostics()
-        assert code == "gripper_goal_rejected"
+        assert code == "gripper_request_failed"
         assert details["gripper_id"] == "primary"
         assert details["surface"] == "command_gripper"
 

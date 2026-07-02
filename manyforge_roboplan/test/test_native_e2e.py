@@ -137,6 +137,182 @@ def test_motion_interrupt_scope_serializes_settle_velocity_threshold():
     assert serialized["stop_profile"]["settle_velocity_threshold_rad_s"] == 0.02
 
 
+def test_native_gripper_grasp_loss_marks_cached_status_without_extension():
+    if not HAS_NATIVE_CLIENT:
+        pytest.skip("native_kernel_client not available")
+
+    class FakeBundle:
+        def __init__(self):
+            self.positions = [0.0081]
+
+        def get_group_joint_names(self, group_id):
+            assert group_id == "lite_gripper"
+            return ["right_finger_joint"]
+
+        def get_group_joint_positions(self, group_id):
+            assert group_id == "lite_gripper"
+            return list(self.positions)
+
+        def set_group_joint_positions(self, group_id, positions):
+            assert group_id == "lite_gripper"
+            self.positions = list(positions)
+
+    kernel = NativeKernelClient(FakeBundle())
+    close = kernel.command_gripper(
+        GripperCommandRequest(
+            gripper_id="primary",
+            group_id="lite_gripper",
+            joint_name="right_finger_joint",
+            target_position=0.0,
+            duration_s=0.0,
+            actuation_kind="pneumatic",
+            state_authority="native_backend",
+            completion_policy="dwell_elapsed",
+            grasp_confirmation_policy="perception",
+            transport_kind="native_kinematic",
+            open_state_ref="open",
+            closed_state_ref="closed",
+            srdf_presets={"open": 0.0081, "closed": 0.0},
+        )
+    )
+    assert close.accepted is True, close.error
+
+    lost = kernel.mark_gripper_grasp_lost(
+        gripper_id="primary",
+        evidence_label="attached_drift_monitor",
+        message="measured object drift exceeded threshold",
+    )
+    assert lost.accepted is True, lost.error
+    status = kernel.get_gripper_status("primary")
+    assert status.state == GripperCommandState.FAILED
+    assert status.evidence_state == "pressure_or_part_lost"
+    assert status.reason_code == "grasp_confirmation_lost"
+    assert "attached_drift_monitor" in status.evidence
+
+    reopen = kernel.command_gripper(
+        GripperCommandRequest(
+            gripper_id="primary",
+            group_id="lite_gripper",
+            joint_name="right_finger_joint",
+            target_position=0.0081,
+            duration_s=0.0,
+            actuation_kind="pneumatic",
+            state_authority="native_backend",
+            completion_policy="dwell_elapsed",
+            grasp_confirmation_policy="perception",
+            transport_kind="native_kinematic",
+            open_state_ref="open",
+            closed_state_ref="closed",
+            srdf_presets={"open": 0.0081, "closed": 0.0},
+        )
+    )
+    assert reopen.accepted is True, reopen.error
+    reopened = kernel.get_gripper_status("primary")
+    assert reopened.state == GripperCommandState.COMPLETED
+    assert reopened.commanded_state == "open"
+    assert reopened.reason_code is None
+
+
+def test_ros_gripper_grasp_loss_delegates_to_backend_status_sink():
+    if not HAS_NATIVE_CLIENT:
+        pytest.skip("native_kernel_client not available")
+
+    class FakeRosBundle:
+        def __init__(self):
+            self.mark_calls = []
+            self.status = {
+                "state": "completed",
+                "progress": 1.0,
+                "current_position": 0.0,
+                "target_position": 0.0,
+                "evidence": ["driver_result"],
+                "evidence_state": "confirmed",
+            }
+
+        def command_ros_gripper(
+            self,
+            gripper_id,
+            target_position,
+            duration_s,
+            max_effort,
+        ):
+            assert gripper_id == "primary"
+            self.status = {
+                "state": "completed",
+                "progress": 1.0,
+                "current_position": target_position,
+                "target_position": target_position,
+                "evidence": ["driver_result"],
+                "evidence_state": "confirmed",
+            }
+            return {"accepted": True}
+
+        def get_ros_gripper_status(self, gripper_id):
+            assert gripper_id == "primary"
+            return dict(self.status)
+
+        def mark_ros_gripper_grasp_lost(
+            self,
+            gripper_id,
+            evidence_label,
+            message,
+            reason_code,
+        ):
+            self.mark_calls.append(
+                (gripper_id, evidence_label, message, reason_code)
+            )
+            self.status = {
+                **self.status,
+                "state": "failed",
+                "evidence": ["driver_result", evidence_label],
+                "evidence_state": "pressure_or_part_lost",
+                "error": message,
+                "reason_code": reason_code,
+            }
+            return {"accepted": True}
+
+    bundle = FakeRosBundle()
+    kernel = NativeKernelClient(bundle)
+    close = kernel.command_gripper(
+        GripperCommandRequest(
+            gripper_id="primary",
+            group_id="lite_gripper",
+            joint_name="right_finger_joint",
+            target_position=0.0,
+            duration_s=0.0,
+            actuation_kind="pneumatic",
+            state_authority="sim_observed",
+            completion_policy="dwell_elapsed",
+            grasp_confirmation_policy="perception",
+            transport_kind="isaac_joint_state_effort",
+            open_state_ref="open",
+            closed_state_ref="closed",
+            srdf_presets={"open": 0.0081, "closed": 0.0},
+        )
+    )
+    assert close.accepted is True, close.error
+
+    lost = kernel.mark_gripper_grasp_lost(
+        gripper_id="primary",
+        evidence_label="attached_drift_monitor",
+        message="measured object drift exceeded threshold",
+    )
+    assert lost.accepted is True, lost.error
+    assert bundle.mark_calls == [
+        (
+            "primary",
+            "attached_drift_monitor",
+            "measured object drift exceeded threshold",
+            "grasp_confirmation_lost",
+        )
+    ]
+    status = kernel.get_gripper_status("primary")
+    assert status.state == GripperCommandState.FAILED
+    assert status.evidence_state == "pressure_or_part_lost"
+    assert status.reason_code == "grasp_confirmation_lost"
+    assert "attached_drift_monitor" in status.evidence
+
+
 def test_create_native_kernel_rejects_stop_profile_deceleration_time_over_cap():
     if not HAS_NATIVE:
         pytest.skip("manyforge_roboplan_py not available")

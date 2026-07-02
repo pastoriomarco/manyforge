@@ -1679,7 +1679,11 @@ entries:
       collision-aware planning). Authored by inserting it as a node in
       the behavior tree via `tree_draft_insert_node`. There is no
       design-time `scene_draft_*` equivalent — attachment is intrinsically
-      a runtime operation tied to a moment in the cycle.
+      a runtime operation tied to a moment in the cycle. When `gripper_id`
+      is provided, the runtime enforces that gripper's grasp-confirmation
+      policy. `none_open_loop` attaches with a visible open-loop assumption;
+      evidence-backed policies fail closed unless the latest gripper status
+      carries verified grasp evidence.
     tags: [scene, collision, attach]
     profiles:
       min_profile: v0.1
@@ -1707,7 +1711,7 @@ entries:
         schema:
           type: string
         required: false
-        description: Optional gripper identifier. When provided, attach uses the gripper's deployment-defined touch_links for allowable grasp contact.
+        description: Optional gripper identifier. When provided, attach uses the gripper's deployment-defined touch_links for allowable grasp contact and enforces the gripper grasp-confirmation policy.
       - name: touch_links
         schema:
           type: array
@@ -2088,7 +2092,10 @@ entries:
     description: >-
       Command an actuated gripper to a numeric command-space position and block
       until the motion completes. This is the transport-aware actuated sibling
-      of the logical set/check/wait gripper-state nodes.
+      of the logical set/check/wait gripper-state nodes. Completion means the
+      deployment's gripper completion_policy was satisfied; for pneumatic
+      dwell policies this is command/dwell completion, not proof that an
+      object was grasped.
     stability: experimental
     tags: [end_effector, gripper, actuation]
     profiles:
@@ -2146,6 +2153,76 @@ entries:
       py_trees:
         implementation_kind: plugin
         class: manyforge_behavior.nodes.CommandGripper
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: confirm_gripper_grasp
+    name: ConfirmGripperGrasp
+    category: end_effector
+    description: >-
+      Record verified grasp evidence for the latest gripper command before an
+      attach operation. This node bridges an operator confirmation, declared
+      boolean signal, perception result, or force/current result into the
+      gripper status contract consumed by AttachObjectToLink. It does not
+      command hardware and it cannot convert `none_open_loop` into proof.
+    tags: [end_effector, gripper, grasp, confirmation]
+    profiles:
+      min_profile: v0.1
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: gripper_id
+        schema:
+          type: string
+        required: true
+        description: Deployment gripper identifier whose latest command status receives the confirmation evidence.
+      - name: grasp_confirmation_policy
+        schema:
+          type: enum
+          values: [operator_confirm, discrete_signal, perception, force_or_current]
+        required: false
+        description: Optional policy override. If omitted, the deployment gripper config supplies the policy.
+      - name: source_key
+        schema:
+          type: string
+        required: false
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_reader
+        blackboard_value_type: bool
+        description: Optional declared boolean signal/key that must match expected_value before evidence is recorded. For force_or_current, this is the bounded producer's boolean confirmation signal, not the raw numeric force/current sample.
+      - name: expected_value
+        schema:
+          type: bool
+        required: false
+        default: true
+        description: Expected value for source_key when a source key is provided.
+      - name: evidence_label
+        schema:
+          type: string
+        required: false
+        description: Optional evidence label. If omitted, a policy-specific default label is used.
+      - name: evidence_state
+        schema:
+          type: enum
+          values: [confirmed, verified, grasp_confirmed]
+        required: false
+        default: confirmed
+        description: Positive evidence state written to the gripper status.
+    bb_reader_params: [source_key]
+    required_capabilities:
+      - tool.gripper.feedback
+    execution:
+      blocking: false
+      cancellable: false
+    interruptible: true
+    default_interrupt_scope: active_node
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.ConfirmGripperGrasp
     observability:
       emits_events: []
       consumes_events: []

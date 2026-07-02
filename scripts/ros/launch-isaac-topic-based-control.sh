@@ -76,15 +76,14 @@ if ! ros2 pkg prefix manyforge_ros_bringup >/dev/null 2>&1; then
 fi
 
 bringup_executables="$(ros2 pkg executables manyforge_ros_bringup 2>/dev/null || true)"
-if ! grep -q "isaac_gripper_action_bridge" <<<"${bringup_executables}" || \
-   ! grep -q "isaac_topic_command_gate" <<<"${bringup_executables}" || \
+if ! grep -q "isaac_topic_command_gate" <<<"${bringup_executables}" || \
    ! grep -q "isaac_demo_supervisor" <<<"${bringup_executables}" || \
    ! grep -q "pose_source_snapshot_publisher" <<<"${bringup_executables}"; then
     if [ "${BUILD_IF_MISSING}" != "1" ]; then
         cat >&2 <<EOF
 manyforge_ros_bringup is built, but it is stale: the
-isaac_gripper_action_bridge, isaac_topic_command_gate, or
-isaac_demo_supervisor, or pose_source_snapshot_publisher executable is missing.
+isaac_topic_command_gate, isaac_demo_supervisor, or
+pose_source_snapshot_publisher executable is missing.
 
 Rebuild with:
   colcon build --packages-select manyforge_ros_bringup

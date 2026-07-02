@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -58,6 +59,16 @@ def _assert_equal(actual: Any, expected: Any, label: str) -> None:
 def _assert_true(value: Any, label: str) -> None:
     if not value:
         raise ContractFailure(label)
+
+
+def _assert_finite_number(value: Any, label: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ContractFailure(f"{label}: expected finite number, got {value!r}") from exc
+    if not math.isfinite(result):
+        raise ContractFailure(f"{label}: expected finite number, got {value!r}")
+    return result
 
 
 def _canonical_path_from_package_uri(uri: str) -> Path:
@@ -147,6 +158,81 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         GRIPPER_COMMAND_JOINT,
         "deployment gripper command joint",
     )
+    _assert_equal(
+        gripper_config.get("actuation_kind"),
+        "pneumatic",
+        "deployment gripper actuation_kind",
+    )
+    _assert_equal(
+        gripper_config.get("state_authority"),
+        "sim_observed",
+        "deployment gripper state_authority",
+    )
+    _assert_equal(
+        gripper_config.get("completion_policy"),
+        "dwell_elapsed",
+        "deployment gripper completion_policy",
+    )
+    _assert_equal(
+        gripper_config.get("open_state_ref"),
+        "open",
+        "deployment gripper open_state_ref",
+    )
+    _assert_equal(
+        gripper_config.get("closed_state_ref"),
+        "closed",
+        "deployment gripper closed_state_ref",
+    )
+    transport = gripper_config.get("transport")
+    if not isinstance(transport, dict):
+        raise ContractFailure("deployment gripper transport must be a mapping")
+    gripper_transport_kind = str(transport.get("kind") or "")
+    if gripper_transport_kind == "isaac_joint_state_effort":
+        _assert_equal(
+            transport.get("command_topic"),
+            "/isaac_joint_commands_gripper",
+            "Lite6 direct gripper command_topic",
+        )
+        _assert_equal(
+            transport.get("state_topic"),
+            "/isaac_joint_states",
+            "Lite6 direct gripper state_topic",
+        )
+        _assert_equal(
+            transport.get("joint_names"),
+            [GRIPPER_COMMAND_JOINT],
+            "Lite6 direct gripper joint_names",
+        )
+        close_effort = _assert_finite_number(
+            transport.get("close_effort"), "Lite6 direct close_effort"
+        )
+        open_effort = _assert_finite_number(
+            transport.get("open_effort"), "Lite6 direct open_effort"
+        )
+        dwell_s = _assert_finite_number(
+            transport.get("dwell_s"), "Lite6 direct dwell_s"
+        )
+        _assert_true(
+            close_effort < 0.0,
+            "Lite6 direct close_effort must close with negative effort",
+        )
+        _assert_true(
+            open_effort > 0.0,
+            "Lite6 direct open_effort must open with positive effort",
+        )
+        _assert_true(
+            dwell_s > 0.0,
+            "Lite6 direct dwell_s must be positive",
+        )
+        _assert_true(
+            transport.get("publish_nominal_position") is True,
+            "Lite6 direct transport must publish nominal position for Isaac",
+        )
+    elif gripper_transport_kind != "ros_gripper_command":
+        raise ContractFailure(
+            "deployment gripper transport.kind must be isaac_joint_state_effort "
+            f"or ros_gripper_command, got {gripper_transport_kind!r}"
+        )
 
     ros2_joints = _ros2_control_joint_contract(args.ros2_control_urdf)
     _assert_equal(tuple(ros2_joints), ARM_JOINTS, "ros2_control URDF joint list")
@@ -200,28 +286,6 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
             f"{joint_name} max_deceleration_on_cancel must be positive",
         )
 
-    bridge = _load_yaml(args.gripper_bridge)
-    bridge_node = bridge.get("manyforge_isaac_gripper_action_bridge")
-    if not isinstance(bridge_node, dict):
-        raise ContractFailure("manyforge_isaac_gripper_action_bridge is required")
-    bridge_params = bridge_node.get("ros__parameters")
-    if not isinstance(bridge_params, dict):
-        raise ContractFailure("gripper bridge ros__parameters are required")
-    _assert_equal(
-        bridge_params.get("commanded_joint"),
-        GRIPPER_COMMAND_JOINT,
-        "gripper bridge commanded_joint",
-    )
-    _assert_equal(
-        bridge_params.get("joint_names"),
-        [GRIPPER_COMMAND_JOINT],
-        "gripper bridge joint_names",
-    )
-    _assert_true(
-        bridge_params.get("require_all_state_joints") is True,
-        "gripper bridge must require all state joints",
-    )
-
     execution = (
         deployment.get("adapters", {})
         .get("execution", {})
@@ -251,14 +315,36 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         execution.get("decelerate_on_cancel") is True,
         "deployment decelerate_on_cancel must be true",
     )
-    exec_gripper = execution.get("gripper")
-    if not isinstance(exec_gripper, dict):
-        raise ContractFailure("deployment execution gripper config required")
-    _assert_equal(
-        exec_gripper.get("action_name"),
-        bridge_params.get("action_name"),
-        "deployment gripper action must match bridge action",
-    )
+    if gripper_transport_kind == "ros_gripper_command":
+        exec_gripper = execution.get("gripper")
+        if not isinstance(exec_gripper, dict):
+            raise ContractFailure("deployment execution gripper config required")
+        bridge = _load_yaml(args.gripper_bridge)
+        bridge_node = bridge.get("manyforge_isaac_gripper_action_bridge")
+        if not isinstance(bridge_node, dict):
+            raise ContractFailure("manyforge_isaac_gripper_action_bridge is required")
+        bridge_params = bridge_node.get("ros__parameters")
+        if not isinstance(bridge_params, dict):
+            raise ContractFailure("gripper bridge ros__parameters are required")
+        _assert_equal(
+            bridge_params.get("commanded_joint"),
+            GRIPPER_COMMAND_JOINT,
+            "gripper bridge commanded_joint",
+        )
+        _assert_equal(
+            bridge_params.get("joint_names"),
+            [GRIPPER_COMMAND_JOINT],
+            "gripper bridge joint_names",
+        )
+        _assert_true(
+            bridge_params.get("require_all_state_joints") is True,
+            "gripper bridge must require all state joints",
+        )
+        _assert_equal(
+            exec_gripper.get("action_name"),
+            bridge_params.get("action_name"),
+            "deployment gripper action must match bridge action",
+        )
 
     return {
         "schema": "manyforge.lite6_authority_runtime_contract.v1",
@@ -271,7 +357,12 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         "gripper_derived_joints": [GRIPPER_DERIVED_JOINT],
         "ros2_control_urdf": str(args.ros2_control_urdf),
         "controller_config": str(args.controllers),
-        "gripper_bridge_config": str(args.gripper_bridge),
+        "gripper_transport_kind": gripper_transport_kind,
+        "gripper_bridge_config": (
+            str(args.gripper_bridge)
+            if gripper_transport_kind == "ros_gripper_command"
+            else None
+        ),
         "deployment": str(args.deployment),
     }
 
