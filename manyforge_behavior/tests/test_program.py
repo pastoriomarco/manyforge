@@ -686,6 +686,55 @@ class TestProgramValidation:
             "support_object_id"
         ] == "table"
 
+    def test_allows_scene_resource_support_contact_without_start_penetration_limit(
+        self, catalog
+    ):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "box1",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, 0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                    "metadata": {
+                        "support_contacts": [
+                            {
+                                "support_object_id": "table",
+                                "enforce_max_start_penetration": False,
+                                "require_separation_by_end": True,
+                            }
+                        ]
+                    },
+                },
+                {
+                    "object_id": "table",
+                    "shape": {"type": "box", "box_dimensions_m": [1.0, 1.0, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, -0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+            ],
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {
+                        "id": "reset_trajectories",
+                        "name": "reset",
+                    }
+                ],
+            },
+        )
+        program = Program.from_dict(data, catalog)
+        contact = program.scene[0].metadata["support_contacts"][0]
+        assert contact["enforce_max_start_penetration"] is False
+        assert "max_start_penetration_m" not in contact
+
     def test_v1_catalog_schema_accepts_pose_shape_node_params(self):
         catalog = _load_minimal_v1_catalog()
         data = _minimal_program(

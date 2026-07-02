@@ -398,6 +398,12 @@ simulator is commanded.
 
 ### Isaac / ROS 2 controller execution
 
+For the multi-machine Lite6 trocar workflow that adds Isaac ROS
+YOLOv8/FoundationPose perception, use
+[`ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md`](ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md).
+That workflow keeps Isaac ROS perception, Isaac Sim, and ManyForge in separate
+process/container contexts and adds DDS/QoS requirements for raw camera streams.
+
 1. Start the ros2_control bridge and ROS-capable Composer:
 
    ```bash

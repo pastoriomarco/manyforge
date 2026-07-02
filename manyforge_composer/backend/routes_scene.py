@@ -523,6 +523,11 @@ def _scene_object_responses(
                 source=source,
                 persistable=source == "authored",
                 viewer_frame_visible=viewer_frame_visible,
+                support_contacts=[
+                    dict(item)
+                    for item in getattr(scene_object, "support_contacts", [])
+                    if isinstance(item, dict)
+                ],
             )
         )
     return sorted(objects, key=lambda obj: obj.object_id)

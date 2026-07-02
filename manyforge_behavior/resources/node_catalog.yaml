@@ -569,6 +569,22 @@ entries:
           which the xyz/rpy offset is expressed; if omitted, it defaults to target_reference.
           Use `robot_link` for current TCP/link-relative moves, `frame` for arbitrary scene
           frames, and `pose` for either an inline reference pose or a declared pose field_ref.
+      - name: base_frame
+        schema:
+          type: string
+        required: false
+        description: >-
+          Optional planning base frame override for generated/manual interventions.
+          Authored program nodes normally inherit the deployment robot base frame.
+          When set, pose_goal.frame_id must use the same resolved frame unless
+          an upstream transform explicitly produced a different stamped pose.
+      - name: tcp_frame
+        schema:
+          type: string
+        required: false
+        description: >-
+          Optional TCP frame override for generated/manual interventions. Authored
+          program nodes normally inherit the deployment robot TCP frame.
       - name: velocity_scale
         schema:
           type: float
@@ -2840,7 +2856,8 @@ entries:
       selected object using backend-authoritative scene data and bounded
       approach envelopes. The validated sequence is current pose -> approach
       pose -> pick pose -> approach pose. Does not execute motion; writes a
-      validated pick plan to the blackboard.
+      generated pick-plan candidate to the blackboard before previewing it and
+      preserves the generated poses when feasibility fails.
     tags: [planning, pick, deterministic, blackboard]
     profiles:
       min_profile: v0.0
@@ -2868,8 +2885,8 @@ entries:
         blackboard_contract: pick_plan_v1
         description: >-
           Blackboard namespace prefix for the generated plan bundle. The node
-          publishes the validated plan at {prefix}.value with status/meta data
-          under {prefix}.meta.
+          publishes generated candidate, planned, or failed plan data at
+          {prefix}.value with status/meta data under {prefix}.meta.
       - name: object_source
         schema:
           type: enum
@@ -2931,7 +2948,21 @@ entries:
           orientation_rpy_max_deg: [0.0, 0.0, 0.0]
         description: >-
           Min/max XYZ and RPY offsets applied to the nominal grasp pose at the
-          object top surface.
+          object top surface. XYZ offsets are expressed in pick_offset_reference;
+          RPY offsets remain planner-base RPY offsets and are ignored when
+          force_vertical_pick is true.
+      - name: pick_offset_reference
+        schema_ref: "#/schema_types/relative_move_reference"
+        required: false
+        ui_editor: relative_move_reference
+        default:
+          type: frame
+          id: ""
+        description: >-
+          Reference basis for pick_offset_envelope XYZ values. Empty frame id
+          means the planning base frame. Use object to express offsets in the
+          selected object's axes, robot_link for a live link basis, or pose for
+          an inline/reference pose orientation.
       - name: approach_offset_envelope
         schema_ref: "#/schema_types/pose_offset_envelope"
         required: false
@@ -2943,7 +2974,49 @@ entries:
           orientation_rpy_max_deg: [0.0, 0.0, 0.0]
         description: >-
           Min/max XYZ and RPY offsets applied to the nominal approach pose
-          relative to the candidate pick pose.
+          relative to the candidate pick pose. XYZ offsets are expressed in
+          approach_offset_reference; RPY offsets remain planner-base RPY offsets
+          and are ignored when force_vertical_pick is true.
+      - name: approach_offset_reference
+        schema_ref: "#/schema_types/relative_move_reference"
+        required: false
+        ui_editor: relative_move_reference
+        default:
+          type: frame
+          id: ""
+        description: >-
+          Reference basis for approach_offset_envelope XYZ values. Empty frame
+          id means the planning base frame. The rotated approach vector is added
+          to the candidate pick pose.
+      - name: force_vertical_pick
+        schema:
+          type: bool
+        required: false
+        default: false
+        description: >-
+          When true, ignore pick/approach RPY offset envelopes and force the
+          planned TCP orientation to a vertical-down Z axis while preserving the
+          selected object's horizontal X-axis heading.
+      - name: enable_min_tcp_z
+        schema:
+          type: bool
+        required: false
+        default: false
+        description: >-
+          When true, enforce min_tcp_z_m as a lower bound for generated pick and
+          approach TCP Z. When false, the configured min_tcp_z_m value is kept
+          for editing but ignored by planning.
+      - name: min_tcp_z_m
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
+        required: false
+        parameterizable: true
+        description: >-
+          Optional lower bound for generated pick and approach TCP Z in the
+          planning base frame. Values below the bound are clamped before motion
+          preview.
       - name: search_strategy
         schema:
           type: enum
@@ -3006,6 +3079,33 @@ entries:
         required: false
         parameterizable: true
         description: Optional TCP speed cap enforced during preview validation.
+      - name: approach_move_node_name
+        schema:
+          type: string
+        required: false
+        default: ""
+        description: >-
+          Optional move_manipulator_action instance name to receive the generated
+          approach pose_goal for operator inspection. Best effort; the linked
+          node should be authored with motion_type=pose_goal.
+      - name: pick_move_node_name
+        schema:
+          type: string
+        required: false
+        default: ""
+        description: >-
+          Optional move_manipulator_action instance name to receive the generated
+          pick pose_goal for operator inspection. Best effort; the linked node
+          should be authored with motion_type=pose_goal.
+      - name: retreat_move_node_name
+        schema:
+          type: string
+        required: false
+        default: ""
+        description: >-
+          Optional move_manipulator_action instance name to receive the generated
+          retreat pose_goal for operator inspection. Best effort; the linked
+          node should be authored with motion_type=pose_goal.
     required_capabilities:
       - planning.motion.pose_goal
       - planning.trajectory.time_parameterized
@@ -3031,7 +3131,7 @@ entries:
         - planning_failed
         - collision_detected
       verification_evidence:
-        - pick plan response under output_key_prefix
+        - generated pick-plan candidate or planned response under output_key_prefix
     observability:
       emits_events: []
       consumes_events: []

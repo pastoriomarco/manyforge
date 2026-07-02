@@ -972,6 +972,7 @@ class _Detection3DObjectBinding:
     binding: PoseSourceBinding
     detection_id: str = ""
     class_id: str = ""
+    selection: str = ""
     max_position_variance_m2: float | None = None
 
 
@@ -988,8 +989,8 @@ class Detection3DArrayTopicPoseSource:
     """Latest-wins source backed by ``vision_msgs/Detection3DArray``.
 
     Object association is deployment-owned.  Each object binding must name
-    exactly one detection id or class id.  Confidence gates use
-    ``ObjectHypothesis.score``; covariance gates use the selected
+    exactly one detection id, class id, or selection policy.  Confidence gates
+    use ``ObjectHypothesis.score``; covariance gates use the selected
     ``PoseWithCovariance`` position diagonal.
     """
 
@@ -1003,6 +1004,8 @@ class Detection3DArrayTopicPoseSource:
         frame_id: str = "",
         max_update_hz: float = 30.0,
         stale_after_s: float = 1.0,
+        buffer: Any | None = None,
+        listener: Any | None = None,
         now_fn: Callable[[], float] | None = None,
     ) -> None:
         if not pose_source_id:
@@ -1018,6 +1021,8 @@ class Detection3DArrayTopicPoseSource:
         self.frame_id = frame_id
         self.max_update_hz = float(max_update_hz)
         self.stale_after_s = float(stale_after_s)
+        self.buffer = buffer
+        self.listener = listener
         self.now_fn = now_fn or time.monotonic
         self._last_emit_monotonic_s: float | None = None
         if not self.bindings:
@@ -1025,10 +1030,16 @@ class Detection3DArrayTopicPoseSource:
         for entry in self.bindings:
             if not entry.binding.object_id:
                 raise ValueError("binding.object_id must be non-empty")
-            if bool(entry.detection_id) == bool(entry.class_id):
+            association_count = sum(
+                bool(value)
+                for value in (entry.detection_id, entry.class_id, entry.selection)
+            )
+            if association_count != 1:
                 raise ValueError(
-                    "detection bindings require exactly one detection_id or class_id"
+                    "detection bindings require exactly one detection_id, class_id, or selection"
                 )
+            if entry.selection and entry.selection not in ("first", "best_score"):
+                raise ValueError("detection selection must be 'first' or 'best_score'")
         self.state = PoseSourceLatestState(
             pose_source_id=pose_source_id,
             object_ids=[entry.binding.object_id for entry in self.bindings],
@@ -1055,6 +1066,8 @@ class Detection3DArrayTopicPoseSource:
         *,
         node: Any,
         source_config: object,
+        buffer: Any | None = None,
+        listener: Any | None = None,
         now_fn: Callable[[], float] | None = None,
     ) -> "Detection3DArrayTopicPoseSource":
         """Build from a deployment ``PoseSourceConfig``-like object."""
@@ -1068,6 +1081,7 @@ class Detection3DArrayTopicPoseSource:
             metadata = getattr(binding_raw, "metadata", {}) or {}
             detection_id = str(metadata.get("detection_id") or "").strip()
             class_id = str(metadata.get("class_id") or "").strip()
+            selection = str(metadata.get("selection") or "").strip()
             max_position_variance_raw = metadata.get("max_position_variance_m2")
             max_position_variance_m2 = (
                 float(max_position_variance_raw)
@@ -1079,7 +1093,7 @@ class Detection3DArrayTopicPoseSource:
                 _Detection3DObjectBinding(
                     binding=PoseSourceBinding(
                         object_id=getattr(binding_raw, "object_id", object_id),
-                        entity=detection_id or class_id,
+                        entity=detection_id or class_id or selection,
                         apply_policy=getattr(
                             binding_raw,
                             "apply_policy",
@@ -1090,6 +1104,7 @@ class Detection3DArrayTopicPoseSource:
                     ),
                     detection_id=detection_id,
                     class_id=class_id,
+                    selection=selection,
                     max_position_variance_m2=max_position_variance_m2,
                 )
             )
@@ -1101,6 +1116,8 @@ class Detection3DArrayTopicPoseSource:
             frame_id=source_frame_id,
             max_update_hz=getattr(source_config, "max_update_hz", 30.0),
             stale_after_s=getattr(source_config, "stale_after_s", 1.0),
+            buffer=buffer,
+            listener=listener,
             now_fn=now_fn,
         )
 
@@ -1200,6 +1217,24 @@ class Detection3DArrayTopicPoseSource:
                         object_id=binding.object_id,
                         entity=binding.entity,
                         reason="invalid_pose",
+                        detail=str(exc),
+                        monotonic_s=now,
+                    )
+                )
+                continue
+            try:
+                pose = _transform_pose_snapshot(
+                    pose,
+                    target_frame_id=binding.frame_id or self.frame_id,
+                    buffer=self.buffer,
+                )
+            except ValueError as exc:
+                rejections.append(
+                    PoseSourceRejection(
+                        pose_source_id=self.pose_source_id,
+                        object_id=binding.object_id,
+                        entity=binding.entity,
+                        reason="tf_lookup_failed",
                         detail=str(exc),
                         monotonic_s=now,
                     )
@@ -1451,6 +1486,115 @@ def _pose_with_frame(pose: PoseSnapshot, frame_id: str) -> PoseSnapshot:
     )
 
 
+def _transform_pose_snapshot(
+    pose: PoseSnapshot,
+    *,
+    target_frame_id: str,
+    buffer: Any | None,
+) -> PoseSnapshot:
+    target_frame = str(target_frame_id or "").strip()
+    if not target_frame or pose.frame_id == target_frame:
+        return pose
+    if buffer is None:
+        raise ValueError(
+            f"no TF buffer available to transform pose from '{pose.frame_id}' "
+            f"to '{target_frame}'"
+        )
+    try:
+        transform = buffer.lookup_transform(target_frame, pose.frame_id, _tf_lookup_time())
+    except Exception as exc:
+        raise ValueError(
+            f"TF lookup failed for {target_frame} <- {pose.frame_id}: {exc}"
+        ) from exc
+
+    tf = getattr(transform, "transform", None)
+    translation = getattr(tf, "translation", None)
+    rotation = getattr(tf, "rotation", None)
+    if translation is None or rotation is None:
+        raise ValueError("TransformStamped transform is incomplete")
+    transform_translation = (
+        float(getattr(translation, "x", float("nan"))),
+        float(getattr(translation, "y", float("nan"))),
+        float(getattr(translation, "z", float("nan"))),
+    )
+    transform_orientation = _normalize_quaternion(
+        (
+            float(getattr(rotation, "x", float("nan"))),
+            float(getattr(rotation, "y", float("nan"))),
+            float(getattr(rotation, "z", float("nan"))),
+            float(getattr(rotation, "w", float("nan"))),
+        ),
+        label="TransformStamped orientation quaternion",
+    )
+    transformed_position = _vector_add(
+        transform_translation,
+        _rotate_vector(transform_orientation, pose.position_xyz),
+    )
+    transformed_orientation = _normalize_quaternion(
+        _quaternion_multiply(transform_orientation, pose.orientation_xyzw),
+        label="transformed pose orientation quaternion",
+    )
+    return PoseSnapshot(
+        frame_id=target_frame,
+        stamp_sec=pose.stamp_sec,
+        position_xyz=transformed_position,
+        orientation_xyzw=transformed_orientation,
+    )
+
+
+def _normalize_quaternion(
+    quaternion: tuple[float, float, float, float],
+    *,
+    label: str,
+) -> tuple[float, float, float, float]:
+    if not all(isfinite(value) for value in quaternion):
+        raise ValueError(f"{label} contains non-finite values")
+    norm = sqrt(sum(value * value for value in quaternion))
+    if norm <= 1e-9:
+        raise ValueError(f"{label} has zero norm")
+    return tuple(value / norm for value in quaternion)  # type: ignore[return-value]
+
+
+def _quaternion_multiply(
+    lhs: tuple[float, float, float, float],
+    rhs: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    lx, ly, lz, lw = lhs
+    rx, ry, rz, rw = rhs
+    return (
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    )
+
+
+def _quaternion_conjugate(
+    quaternion: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    x, y, z, w = quaternion
+    return (-x, -y, -z, w)
+
+
+def _rotate_vector(
+    quaternion: tuple[float, float, float, float],
+    vector: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    vx, vy, vz = vector
+    rotated = _quaternion_multiply(
+        _quaternion_multiply(quaternion, (vx, vy, vz, 0.0)),
+        _quaternion_conjugate(quaternion),
+    )
+    return (rotated[0], rotated[1], rotated[2])
+
+
+def _vector_add(
+    lhs: tuple[float, float, float],
+    rhs: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return (lhs[0] + rhs[0], lhs[1] + rhs[1], lhs[2] + rhs[2])
+
+
 def _rejection_to_dict(
     rejection: PoseSourceRejection | None,
 ) -> dict[str, Any] | None:
@@ -1534,12 +1678,12 @@ def _select_detection3d_match(
     best: _Detection3DMatch | None = None
     for detection in detections:
         detection_id = str(getattr(detection, "id", "") or "")
-        if entry.detection_id and detection_id != entry.detection_id:
+        if not entry.selection and entry.detection_id and detection_id != entry.detection_id:
             continue
         for result in getattr(detection, "results", []) or []:
             hypothesis = getattr(result, "hypothesis", None)
             class_id = str(getattr(hypothesis, "class_id", "") or "")
-            if entry.class_id and class_id != entry.class_id:
+            if not entry.selection and entry.class_id and class_id != entry.class_id:
                 continue
             try:
                 score = float(getattr(hypothesis, "score"))
@@ -1554,6 +1698,8 @@ def _select_detection3d_match(
                 pose_with_covariance=getattr(result, "pose", None),
                 header=getattr(detection, "header", None),
             )
+            if entry.selection == "first":
+                return candidate
             if best is None or candidate.score > best.score:
                 best = candidate
     return best

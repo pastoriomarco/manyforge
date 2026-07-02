@@ -155,10 +155,21 @@ class PoseSourceSnapshotPublisher(Node):
                         source_config=source,
                     )
                 elif source.kind == "detection3d_array_topic":
+                    needs_tf = bool(getattr(source, "frame_id", "")) or any(
+                        bool(getattr(binding, "frame_id", ""))
+                        for binding in getattr(source, "objects", {}).values()
+                    )
+                    if tf_buffer is None and needs_tf:
+                        from tf2_ros import Buffer, TransformListener
+
+                        tf_buffer = Buffer()
+                        tf_listener = TransformListener(tf_buffer, self)
                     runtime_source = (
                         Detection3DArrayTopicPoseSource.from_deployment_config(
                             node=self,
                             source_config=source,
+                            buffer=tf_buffer,
+                            listener=tf_listener,
                         )
                     )
                 elif source.kind == "tf":

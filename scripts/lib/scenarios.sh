@@ -25,6 +25,7 @@ _SCENARIO_TABLE=(
     "isaac-ur10e-light-scene-collision|isaac-sim|off|/workspace/examples/isaac_manipulator_scene_light_collision.program.yaml|/workspace/examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml|Isaac commanded sim with UR10e light scene + popup collision object for runtime-fault testing"
     "isaac-ur10e-light-scene-assistant|isaac-sim|on|/workspace/examples/isaac_manipulator_scene_light.program.yaml|/workspace/examples/isaac_manipulator_scene_light_assistant.deployment.yaml|Isaac commanded sim with UR10e light manipulator scene + full Cosmos assistant overlay"
     "isaac-lite6-pick-place|isaac-sim|off|/workspace/examples/isaac_lite6_lite_gripper_pick_and_place.program.yaml|/workspace/examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml|Isaac commanded sim with UFACTORY Lite6 + lite gripper pick-and-place"
+    "isaac-lite6-trocar-foundationpose|isaac-sim|off|/workspace/examples/trocar_lite6_foundationpose_pick.program.yaml|/workspace/examples/trocar_lite6_foundationpose_pick.deployment.yaml|Isaac commanded sim with Lite6 trocar pick using FoundationPose Detection3DArray"
 )
 
 # _SCENARIO_ALIASES — backward-compat for the old short names that the

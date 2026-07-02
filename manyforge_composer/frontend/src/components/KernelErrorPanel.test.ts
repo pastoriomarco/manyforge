@@ -11,6 +11,12 @@ describe('KernelErrorPanel mapping', () => {
       ).toBe('wall ↔ left_outer_finger');
     });
 
+    it('keeps attached object names instead of showing the shape index', () => {
+      expect(
+        prettyPair('object/ground/shape/0 <-> robot/robot0/attached/graspable/shape/0'),
+      ).toBe('ground ↔ attached graspable');
+    });
+
     it('keeps unfamiliar tokens intact rather than truncating data', () => {
       // No <-> separator — should round-trip the input untouched.
       expect(prettyPair('object/wall/shape/0')).toBe('object/wall/shape/0');
@@ -43,6 +49,30 @@ describe('KernelErrorPanel mapping', () => {
       expect(headline).toBe(
         'Trajectory rejected: wall ↔ left_outer_finger at waypoint 12',
       );
+    });
+
+    it('renders support-contact policy numbers for validation_collision', () => {
+      const headline = headlineForError(
+        'validation_collision',
+        {
+          collision_result_first_failure_pair:
+            'object/ground/shape/0 <-> robot/robot0/attached/graspable/shape/0',
+          collision_result_first_failure_classification: 'support_contact_start',
+          collision_result_waypoint_index: '0',
+          collision_result_raw_contact_release_current_penetration_m: '0.021667',
+          collision_result_raw_contact_release_max_start_penetration_m: '0.020000',
+        },
+        'Collision validation rejected trajectory',
+      );
+      expect(headline).toBe(
+        'Trajectory rejected: support contact ground ↔ attached graspable at waypoint 0 (current 0.022 m, max 0.020 m)',
+      );
+      expect(
+        hintForError('validation_collision', {
+          collision_result_raw_contact_release_current_penetration_m: '0.021667',
+          collision_result_raw_contact_release_max_start_penetration_m: '0.020000',
+        }),
+      ).toContain('0.022 m, max 0.020 m');
     });
 
     it('renders runtime_collision distinct from validation_collision', () => {

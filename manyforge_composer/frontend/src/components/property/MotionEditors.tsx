@@ -166,6 +166,7 @@ function validateRelativeMoveReference(
   value: RelativeMoveReferenceValue,
   label: string,
   inventory: RelativeMoveReferenceInventory,
+  options?: { allowEmptyFrameId?: boolean },
 ): string | null {
   if (!RELATIVE_MOVE_REFERENCE_TYPES.includes(value.type)) {
     return `${label} type is invalid`;
@@ -199,6 +200,9 @@ function validateRelativeMoveReference(
     return null;
   }
   if (!(value.id ?? '').trim()) {
+    if (value.type === 'frame' && options?.allowEmptyFrameId) {
+      return null;
+    }
     return `${label} id is required when type=${value.type}`;
   }
   const validIds = referenceOptionsForType(value.type, inventory);
@@ -575,6 +579,8 @@ function RelativeMoveReferenceEditor({
   onChange,
   fieldOptions,
   inventory,
+  allowEmptyFrameId = false,
+  emptyFrameLabel = 'Planning base frame',
 }: {
   label: string;
   value: RelativeMoveReferenceValue;
@@ -582,6 +588,8 @@ function RelativeMoveReferenceEditor({
   onChange: (value: RelativeMoveReferenceValue) => void;
   fieldOptions: BlackboardFieldOption[];
   inventory: RelativeMoveReferenceInventory;
+  allowEmptyFrameId?: boolean;
+  emptyFrameLabel?: string;
 }) {
   const disabledClasses = isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : '';
   const idLabel = value.type === 'robot_link'
@@ -600,6 +608,7 @@ function RelativeMoveReferenceEditor({
     : value.type === 'frame'
       ? 'Select a frame'
       : 'Select an object';
+  const hasEmptyFrameOption = value.type === 'frame' && allowEmptyFrameId;
 
   return (
     <div className="space-y-2 rounded border border-gray-700 p-2">
@@ -660,10 +669,10 @@ function RelativeMoveReferenceEditor({
           <select
             value={currentId}
             onChange={(event) => onChange({ type: value.type, id: event.target.value })}
-            disabled={isRunMode || selectOptions.length === 0}
+            disabled={isRunMode || (!hasEmptyFrameOption && selectOptions.length === 0)}
             className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${disabledClasses}`}
           >
-            <option value="">{placeholder}</option>
+            <option value="">{hasEmptyFrameOption ? emptyFrameLabel : placeholder}</option>
             {selectOptions.map((option) => (
               <option key={option} value={option}>
                 {option === currentId && !currentIdIsKnown ? `${option} (invalid)` : option}
@@ -675,13 +684,96 @@ function RelativeMoveReferenceEditor({
               Current value is not part of the known {value.type === 'object' ? 'object' : value.type === 'robot_link' ? 'robot link' : 'frame'} inventory.
             </div>
           )}
-          {selectOptions.length === 0 && (
+          {selectOptions.length === 0 && !hasEmptyFrameOption && (
             <div className="mt-1 text-[11px] text-gray-500">
               No known {value.type === 'object' ? 'objects' : value.type === 'robot_link' ? 'robot links' : 'frames'} are available.
             </div>
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+export function RelativeMoveReferenceParamEditor({
+  currentValue,
+  isRunMode,
+  onCommit,
+  fieldOptions,
+  frameOptions,
+  objectOptions,
+  robotLinkOptions,
+  allowEmptyFrameId = false,
+  emptyFrameLabel = 'Planning base frame',
+}: {
+  currentValue: unknown;
+  isRunMode: boolean;
+  onCommit: (value: unknown) => void;
+  fieldOptions: BlackboardFieldOption[];
+  frameOptions: string[];
+  objectOptions: string[];
+  robotLinkOptions: string[];
+  allowEmptyFrameId?: boolean;
+  emptyFrameLabel?: string;
+}) {
+  const inventory = useMemo<RelativeMoveReferenceInventory>(
+    () => ({
+      frameOptions: normalizeReferenceOptions(frameOptions),
+      objectOptions: normalizeReferenceOptions(objectOptions),
+      robotLinkOptions: normalizeReferenceOptions(robotLinkOptions),
+    }),
+    [frameOptions, objectOptions, robotLinkOptions],
+  );
+  const [draft, setDraft] = useState<RelativeMoveReferenceValue>(() => (
+    normalizeRelativeMoveReference(currentValue, 'frame')
+  ));
+  const [error, setError] = useState<string | null>(() => (
+    validateRelativeMoveReference(
+      normalizeRelativeMoveReference(currentValue, 'frame'),
+      'Reference',
+      inventory,
+      { allowEmptyFrameId },
+    )
+  ));
+
+  useEffect(() => {
+    const normalized = normalizeRelativeMoveReference(currentValue, 'frame');
+    setDraft(normalized);
+    setError(validateRelativeMoveReference(
+      normalized,
+      'Reference',
+      inventory,
+      { allowEmptyFrameId },
+    ));
+  }, [currentValue, inventory.frameOptions, inventory.objectOptions, inventory.robotLinkOptions, allowEmptyFrameId]);
+
+  const commit = (nextDraft: RelativeMoveReferenceValue) => {
+    setDraft(nextDraft);
+    const validationError = validateRelativeMoveReference(
+      nextDraft,
+      'Reference',
+      inventory,
+      { allowEmptyFrameId },
+    );
+    setError(validationError);
+    if (!validationError) {
+      onCommit(sanitizeRelativeMoveReference(nextDraft));
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      <RelativeMoveReferenceEditor
+        label="Reference"
+        value={draft}
+        isRunMode={isRunMode}
+        onChange={commit}
+        fieldOptions={fieldOptions}
+        inventory={inventory}
+        allowEmptyFrameId={allowEmptyFrameId}
+        emptyFrameLabel={emptyFrameLabel}
+      />
+      {error && <div className="text-[11px] text-red-400">{error}</div>}
     </div>
   );
 }

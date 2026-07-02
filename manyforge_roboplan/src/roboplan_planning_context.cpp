@@ -30,6 +30,7 @@
 #include <roboplan/core/scene_utils.hpp>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <variant>
 
 // ----------------------------------------------------------------------------
@@ -76,6 +77,32 @@ std::vector<std::filesystem::path> split_env_paths(const char* value) {
     }
   }
   return paths;
+}
+
+std::optional<std::string> object_id_from_normalized_body_id(
+    const std::string& body_id) {
+  constexpr std::string_view detached_prefix{"object/"};
+  constexpr std::string_view attached_marker{"/attached/"};
+  constexpr std::string_view shape_marker{"/shape/"};
+
+  if (body_id.rfind(detached_prefix, 0) == 0) {
+    const auto start = detached_prefix.size();
+    const auto shape = body_id.find(shape_marker, start);
+    if (shape != std::string::npos && shape > start) {
+      return body_id.substr(start, shape - start);
+    }
+  }
+
+  const auto attached = body_id.find(attached_marker);
+  if (attached != std::string::npos) {
+    const auto start = attached + attached_marker.size();
+    const auto shape = body_id.find(shape_marker, start);
+    if (shape != std::string::npos && shape > start) {
+      return body_id.substr(start, shape - start);
+    }
+  }
+
+  return std::nullopt;
 }
 
 std::optional<std::filesystem::path> first_existing_path(
@@ -1233,9 +1260,11 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
         if (waypoint_in_collision) {
           diagnostics = collect_collision_diagnostics_locked(q);
           for (const auto& pair : diagnostics.pairs) {
+            const auto support_pair =
+                pair.canonical_object_pair.value_or(pair.canonical_pair);
             if (has_support_contact_pairs &&
-                is_active_support_contact_pair_locked(pair.canonical_pair)) {
-              colliding_support_pairs.insert(pair.canonical_pair);
+                is_active_support_contact_pair_locked(support_pair)) {
+              colliding_support_pairs.insert(support_pair);
             } else {
               blocking_pairs.push_back(pair);
             }
@@ -1355,6 +1384,8 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
         details["collision_validation_duration_ns"] =
             std::to_string(collision_validation_duration_ns);
         if (policy.has_value()) {
+          details["enforce_max_start_penetration"] =
+              policy->enforce_max_start_penetration ? "true" : "false";
           details["max_start_penetration_m"] =
               std::to_string(policy->max_start_penetration_m);
           details["support_contact_depth_enforced"] = "false";
@@ -1766,6 +1797,7 @@ RoboPlanPlanningContext::scene_objects_locked() {
         pose_in_base_from_tracked_locked(tracked, "universe"),
         tracked.frame_id,
         tracked.attached,
+        tracked.support_contacts,
     });
   }
   return objects;
@@ -2213,6 +2245,8 @@ RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
         }
         if (configured) {
           entry.mode = configured->mode;
+          entry.enforce_max_start_penetration =
+              configured->enforce_max_start_penetration;
           entry.max_start_penetration_m =
               configured->max_start_penetration_m;
           entry.release_tolerance_m = configured->release_tolerance_m;
@@ -2247,6 +2281,11 @@ RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
               }
               if (lhs.mode != rhs.mode) {
                 return static_cast<int>(lhs.mode) < static_cast<int>(rhs.mode);
+              }
+              if (lhs.enforce_max_start_penetration !=
+                  rhs.enforce_max_start_penetration) {
+                return lhs.enforce_max_start_penetration <
+                       rhs.enforce_max_start_penetration;
               }
               if (lhs.max_start_penetration_m !=
                   rhs.max_start_penetration_m) {
@@ -2284,6 +2323,8 @@ RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
                   [](const auto& lhs, const auto& rhs) {
                     return lhs.pair == rhs.pair &&
                            lhs.mode == rhs.mode &&
+                           lhs.enforce_max_start_penetration ==
+                               rhs.enforce_max_start_penetration &&
                            lhs.max_start_penetration_m ==
                                rhs.max_start_penetration_m &&
                            lhs.release_tolerance_m ==
@@ -2319,6 +2360,8 @@ RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
         .mix(entry.pair.body_a)
         .mix(entry.pair.body_b)
         .mix(static_cast<std::int64_t>(entry.mode))
+        .mix(static_cast<std::int64_t>(
+            entry.enforce_max_start_penetration ? 1 : 0))
         .mix(entry.max_start_penetration_m)
         .mix(entry.release_tolerance_m)
         .mix(entry.min_release_progress_m)
@@ -2366,6 +2409,7 @@ std::string RoboPlanPlanningContext::compute_collision_world_content_hash_locked
       support_contacts.push_back(
           contact.support_object_id + ":" +
           std::to_string(static_cast<int>(contact.mode)) + ":" +
+          (contact.enforce_max_start_penetration ? "1" : "0") + ":" +
           stable_double(contact.max_start_penetration_m) + ":" +
           stable_double(contact.release_tolerance_m) + ":" +
           stable_double(contact.min_release_progress_m) + ":" +
@@ -2627,6 +2671,41 @@ std::string RoboPlanPlanningContext::collision_pair_text(
   return pair.first + " <-> " + pair.second;
 }
 
+std::optional<std::pair<std::string, std::string>>
+RoboPlanPlanningContext::canonical_object_collision_pair_locked(
+    const std::string& body1,
+    const std::string& body2,
+    const RoboPlanCollisionBodyIdMapper& diagnostic_mapper) const {
+  const auto object_id_for_body =
+      [&](const std::string& raw_body) -> std::optional<std::string> {
+    if (object_states_.find(raw_body) != object_states_.end()) {
+      return raw_body;
+    }
+    if (auto normalized = object_id_from_normalized_body_id(raw_body)) {
+      if (object_states_.find(*normalized) != object_states_.end()) {
+        return normalized;
+      }
+    }
+    auto mapped = diagnostic_mapper.lookup(raw_body);
+    if (!mapped.has_value()) {
+      return std::nullopt;
+    }
+    auto object_id = object_id_from_normalized_body_id(*mapped);
+    if (object_id.has_value() &&
+        object_states_.find(*object_id) != object_states_.end()) {
+      return object_id;
+    }
+    return std::nullopt;
+  };
+
+  auto object_a = object_id_for_body(body1);
+  auto object_b = object_id_for_body(body2);
+  if (!object_a.has_value() || !object_b.has_value()) {
+    return std::nullopt;
+  }
+  return canonical_collision_pair(*object_a, *object_b);
+}
+
 RoboPlanPlanningContext::CollisionDiagnostics
 RoboPlanPlanningContext::collect_collision_diagnostics_locked(
     const Eigen::VectorXd& q) {
@@ -2635,6 +2714,17 @@ RoboPlanPlanningContext::collect_collision_diagnostics_locked(
   diagnostics.raw_output = capture_collision_diagnostics_stdout([&]() {
     scene_->hasCollisions(q, true);
   });
+
+  std::string robot_id;
+  {
+    std::scoped_lock map_lock(mapper_mutex_);
+    robot_id = mapper_robot_id_;
+  }
+  RoboPlanCollisionBodyIdMapper diagnostic_mapper;
+  diagnostic_mapper.rebuild(
+      robot_id,
+      scene_objects_locked(),
+      robot_body_mappings_locked(robot_id));
 
   std::istringstream lines(diagnostics.raw_output);
   std::string line;
@@ -2653,6 +2743,9 @@ RoboPlanPlanningContext::collect_collision_diagnostics_locked(
     pair.body_a = pair_text.substr(0, split);
     pair.body_b = pair_text.substr(split + needle.size());
     pair.canonical_pair = canonical_collision_pair(pair.body_a, pair.body_b);
+    pair.canonical_object_pair =
+        canonical_object_collision_pair_locked(
+            pair.body_a, pair.body_b, diagnostic_mapper);
     pair.text = collision_pair_text(pair.canonical_pair);
     diagnostics.pairs.push_back(std::move(pair));
   }
@@ -2672,6 +2765,10 @@ void RoboPlanPlanningContext::add_collision_details(
     joined += diagnostics.pairs[i].text;
     details["collision_pair_" + std::to_string(i + 1)] =
         diagnostics.pairs[i].text;
+    if (diagnostics.pairs[i].canonical_object_pair.has_value()) {
+      details["collision_object_pair_" + std::to_string(i + 1)] =
+          collision_pair_text(*diagnostics.pairs[i].canonical_object_pair);
+    }
   }
   if (!joined.empty()) {
     details["collision_pairs"] = joined;
@@ -2800,8 +2897,10 @@ RoboPlanPlanningContext::recompute_support_contact_policy_locked() {
     const auto q = scene_->getCurrentJointPositions();
     const auto diagnostics = collect_collision_diagnostics_locked(q);
     for (const auto& diagnostic : diagnostics.pairs) {
-      if (candidate_pairs.find(diagnostic.canonical_pair) != candidate_pairs.end()) {
-        desired_pairs.insert(diagnostic.canonical_pair);
+      const auto support_pair =
+          diagnostic.canonical_object_pair.value_or(diagnostic.canonical_pair);
+      if (candidate_pairs.find(support_pair) != candidate_pairs.end()) {
+        desired_pairs.insert(support_pair);
       }
     }
   }

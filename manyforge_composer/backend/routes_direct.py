@@ -463,6 +463,11 @@ def create_direct_router(state: ComposerState) -> APIRouter:
         effective_principal = auth_principal or request.principal_id
 
         instance_name = f"cartesian_jog_{time.monotonic_ns()}"
+        robot = state.program.robot
+        requested_frame_id = (request.frame_id or "").strip()
+        requested_tcp_frame = (request.tcp_frame or "").strip()
+        base_frame = requested_frame_id or robot.base_frame
+        tcp_frame = requested_tcp_frame or robot.tcp_frame
         tree_dict = {
             "id": "move_manipulator_action",
             "name": instance_name,
@@ -470,9 +475,12 @@ def create_direct_router(state: ComposerState) -> APIRouter:
                 "move_id": instance_name,
                 "motion_type": "pose_goal",
                 "pose_goal": {
+                    "frame_id": base_frame,
                     "position_m": [float(v) for v in request.position_m],
                     "orientation_xyzw": [float(v) for v in request.orientation_xyzw],
                 },
+                "base_frame": base_frame,
+                "tcp_frame": tcp_frame,
             },
             "children": [],
         }

@@ -1188,12 +1188,6 @@ class _CandidatePlanner:
 
     def _plan_cartesian(self, req, start, start_state_model, snapshot, _make):
         assert req.cartesian_target is not None
-        pose_goal = {
-            "position_m": [float(v) for v in req.cartesian_target.position_m],
-            "orientation_xyzw": [
-                float(v) for v in req.cartesian_target.orientation_xyzw
-            ],
-        }
         # Honor the candidate's frameId / tcpFrame. `frame_id`
         # defaults to the sentinel "base" at the model layer and `tcp_frame` is
         # optional; both sentinels mean "use the program robot's frame". A
@@ -1210,6 +1204,13 @@ class _CandidatePlanner:
             else requested_frame_id
         )
         candidate_tcp_frame = req.cartesian_target.tcp_frame or robot.tcp_frame
+        pose_goal = {
+            "frame_id": candidate_base_frame,
+            "position_m": [float(v) for v in req.cartesian_target.position_m],
+            "orientation_xyzw": [
+                float(v) for v in req.cartesian_target.orientation_xyzw
+            ],
+        }
         move_id = f"rc_candidate_pose_{uuid.uuid4().hex}"
         exec_request = self._build_execute_request(
             move_id=move_id,

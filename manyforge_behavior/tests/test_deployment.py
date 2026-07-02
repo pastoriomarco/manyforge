@@ -68,6 +68,16 @@ ISAAC_LITE6_PICK_PLACE_PROGRAM_PATH = (
     / "examples"
     / "isaac_lite6_lite_gripper_pick_and_place.program.yaml"
 )
+TROCAR_LITE6_FOUNDATIONPOSE_DEPLOYMENT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "trocar_lite6_foundationpose_pick.deployment.yaml"
+)
+TROCAR_LITE6_FOUNDATIONPOSE_PROGRAM_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "trocar_lite6_foundationpose_pick.program.yaml"
+)
 LITE6_PICK_PLACE_DEPLOYMENT_PATH = (
     Path(__file__).resolve().parents[2]
     / "examples"
@@ -1404,6 +1414,40 @@ class TestDeploymentLoading:
             "max_position_variance_m2"
         ] == 0.0025
 
+    def test_detection3d_array_topic_source_accepts_selection_association(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "foundationpose",
+                    "kind": "detection3d_array_topic",
+                    "topic": "/output",
+                    "frame_id": "link_base",
+                    "objects": {
+                        "graspable": {
+                            "apply_policy": "before_planning",
+                            "confidence_min": 0.0,
+                            "metadata": {
+                                "selection": "first",
+                                "max_position_variance_m2": 0.0025,
+                            },
+                        },
+                    },
+                }
+            ],
+        )
+        deploy = Deployment.from_dict(data)
+        source = deploy.pose_sources["foundationpose"]
+        assert source.frame_id == "link_base"
+        assert source.objects["graspable"].metadata["selection"] == "first"
+
+        reloaded = Deployment.from_dict(deploy.to_dict())
+        assert (
+            reloaded.pose_sources["foundationpose"]
+            .objects["graspable"]
+            .metadata["selection"]
+            == "first"
+        )
+
     def test_detection3d_array_topic_source_rejects_missing_association(self):
         data = _minimal_deployment(
             pose_sources=[
@@ -1419,7 +1463,7 @@ class TestDeploymentLoading:
         )
         with pytest.raises(
             DeploymentValidationError,
-            match="exactly one of detection_id or class_id",
+            match="exactly one of detection_id, class_id, or selection",
         ):
             Deployment.from_dict(data)
 
@@ -1444,7 +1488,29 @@ class TestDeploymentLoading:
         )
         with pytest.raises(
             DeploymentValidationError,
-            match="exactly one of detection_id or class_id",
+            match="exactly one of detection_id, class_id, or selection",
+        ):
+            Deployment.from_dict(data)
+
+    def test_detection3d_array_topic_source_rejects_invalid_selection(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "detections",
+                    "kind": "detection3d_array_topic",
+                    "topic": "/detections",
+                    "objects": {
+                        "box": {
+                            "apply_policy": "observe_only",
+                            "metadata": {"selection": "closest"},
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="metadata.selection must be 'first' or 'best_score'",
         ):
             Deployment.from_dict(data)
 
@@ -2671,6 +2737,67 @@ class TestCrossArtifactValidation:
         deploy.validate_against_program(prog)
         deploy.validate_capabilities()
 
+    def test_validate_against_trocar_lite6_foundationpose_program_success(
+        self,
+        catalog,
+    ):
+        """The Lite6 trocar FoundationPose scenario pins the live pose-source gates."""
+        deploy = Deployment(TROCAR_LITE6_FOUNDATIONPOSE_DEPLOYMENT_PATH)
+        prog = Program(TROCAR_LITE6_FOUNDATIONPOSE_PROGRAM_PATH, catalog)
+
+        source = deploy.pose_sources["foundationpose_trocar"]
+        assert source.kind == "detection3d_array_topic"
+        assert source.topic == "/output"
+        assert source.frame_id == "link_base"
+        assert source.stale_after_s == 5.0
+        graspable = source.objects["graspable"]
+        assert graspable.apply_policy == "before_planning"
+        assert graspable.confidence_min == 0.0
+        assert graspable.metadata["selection"] == "first"
+        assert graspable.metadata["max_position_variance_m2"] == 0.0025
+        plan_node = next(
+            child
+            for child in prog.tree.children
+            if child.id == "plan_pick_sequence"
+        )
+        assert plan_node.params["force_vertical_pick"] is True
+        assert plan_node.params["enable_min_tcp_z"] is True
+        assert plan_node.params["min_tcp_z_m"] == 0.016
+        assert plan_node.params["pick_offset_reference"] == {
+            "type": "robot_link",
+            "id": "link_tcp",
+        }
+        assert plan_node.params["approach_offset_reference"] == {
+            "type": "robot_link",
+            "id": "link_tcp",
+        }
+        assert plan_node.params["approach_move_node_name"] == (
+            "move_to_planned_pick_approach"
+        )
+        assert plan_node.params["pick_move_node_name"] == "move_to_planned_pick"
+        assert plan_node.params["retreat_move_node_name"] == "retreat_after_pick"
+        pick_plan_namespace = prog.blackboard_namespaces["pick_plan"]
+        assert any(field.name == "retreat_pose" for field in pick_plan_namespace.fields)
+        graspable_resource = next(
+            resource for resource in prog.scene if resource.object_id == "graspable"
+        )
+        assert graspable_resource.metadata["support_contacts"] == [
+            {
+                "support_object_id": "ground",
+                "enforce_max_start_penetration": True,
+                "max_start_penetration_m": 0.03,
+                "release_tolerance_m": 0.001,
+                "min_release_progress_m": 0.0,
+                "min_separation_clearance_m": 0.0,
+                "require_separation_by_end": True,
+                "require_strictly_decreasing_penetration": True,
+                "allow_recontact": False,
+            }
+        ]
+
+        deploy.validate_against_program(prog)
+        deploy.validate_capabilities()
+
     def test_lite6_isaac_ros2_control_scaffold_matches_bridge_contract(self):
         """The Lite6 Isaac bridge exposes the same joints as the deployment."""
         urdf_text = LITE6_ISAAC_ROS2_CONTROL_URDF_PATH.read_text(encoding="utf-8")
@@ -2784,7 +2911,8 @@ class TestCrossArtifactValidation:
         assert 'SCENARIO}" == "isaac-lite6-pick-place"' in launch_text
         assert "validate-isaac-lite6-smoke.py" in launch_text
         assert "validate-isaac-lite6-smoke-artifact.py" in launch_text
-        assert "isaac-lite6-pick-place-live-smoke.json" in launch_text
+        assert '${SCENARIO}-lite6-live-smoke.json' in launch_text
+        assert '${SCENARIO}-foundationpose-detection3d.json' in launch_text
         assert "| tee" in launch_text
         assert "smoke_isaac_arm_action.py" in launch_text
         assert "--output" in validator_text

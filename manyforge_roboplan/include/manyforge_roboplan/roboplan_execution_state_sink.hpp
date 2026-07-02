@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -24,6 +25,12 @@ class RoboPlanExecutionStateSink final : public core::IExecutionStateSink {
   RoboPlanExecutionStateSink(std::shared_ptr<roboplan::Scene> scene,
                              std::shared_ptr<std::mutex> scene_mutex = nullptr);
 
+  void set_robot_model_authority_metadata(
+      std::map<std::string, std::string> canonical_to_view_joint_names,
+      std::map<std::string, std::string> view_to_canonical_joint_names,
+      std::map<std::string, std::vector<std::string>>
+          group_commandable_joint_names);
+
   core::ExecutionStateSinkResult apply_group_joint_positions(
       const std::string& group_id,
       const std::vector<double>& positions_rad,
@@ -40,8 +47,17 @@ class RoboPlanExecutionStateSink final : public core::IExecutionStateSink {
       core::ExecutionStateUpdateMode mode) override;
 
  private:
+  std::string view_joint_name_locked(const std::string& joint_name) const;
+  std::vector<std::string> commandable_view_joint_names_locked(
+      const std::string& group_id,
+      const std::vector<std::string>& group_joint_names) const;
+
   std::shared_ptr<roboplan::Scene> scene_;
   std::shared_ptr<std::mutex> scene_mutex_;
+  std::map<std::string, std::string> canonical_to_view_joint_names_;
+  std::map<std::string, std::string> view_to_canonical_joint_names_;
+  std::map<std::string, std::vector<std::string>>
+      group_commandable_joint_names_;
 };
 
 }  // namespace manyforge::roboplan_backend

@@ -101,9 +101,20 @@ The ManyForge semantic rule is:
 - the support pair may remain in contact only until it first separates;
 - after separation, re-contact fails validation;
 - the support pair must be separated by the final validation waypoint;
-- `max_start_penetration_m` is recorded for policy intent and diagnostics, but
-  the RoboPlan adapter cannot enforce contact depth until RoboPlan exposes
-  structured contact distances/depths.
+- when `enforce_max_start_penetration=true`, `max_start_penetration_m` bounds
+  first-waypoint penetration depth if structured signed-distance diagnostics are
+  available;
+- setting `enforce_max_start_penetration=false` disables only that initial-depth
+  envelope, not release, separation, or re-contact validation.
+
+RoboPlan diagnostic output may report raw geometry names instead of ManyForge
+scene-object IDs. During support-contact discovery and trajectory validation,
+ManyForge resolves each raw pair through the active collision-body mapper and
+uses the object-normalized pair only when both bodies are known scene objects.
+This allows raw names such as an attached object's internal shape index to match
+`graspable <-> ground`, while a robot-link collision such as `ground <-> 0`
+remains blocking if `0` normalizes to a robot body or cannot be resolved to the
+configured supported object.
 
 This mirrors the shape of MoveIt-style planning-scene usage: the semantic scene
 is unchanged, while validation applies a request-scoped collision policy. MoveIt
@@ -117,8 +128,8 @@ maps. RoboPlan currently exposes collision pair enablement through scene-level
    planner start-state and RRT validity checks can begin from the supported
    state.
 2. Optional `metadata.support_contacts` entries remain as explicit policy
-   hints/overrides while RoboPlan lacks structured contact-depth APIs, but
-   ordinary pick/release behavior should not require hard-coded program pairs.
+   hints/overrides for known support objects, but ordinary pick/release
+   behavior should not require hard-coded program pairs.
 3. Trajectory validation temporarily re-enables the discovered support pairs,
    checks the generated path, and restores the planner projection after the
    validation scope.
@@ -238,8 +249,9 @@ Remove this adapter workaround when all of the following are true:
   Allowed Collision Matrix query surface, or a richer API that lets ManyForge
   allow support pairs only for the start/release phase of one motion.
 - RoboPlan exposes structured contact diagnostics, including at least body
-  pairs and preferably contact distance/depth, so `max_start_penetration_m` can
-  be enforced rather than recorded.
+  pairs and preferably contact distance/depth, so support-contact depth
+  enforcement does not depend on the external ManyForge collision-validation
+  path.
 - Regression coverage proves that overlapping detached scene objects do not
   block robot start-state validation, while attached-object and robot-link
   collisions still block planning.

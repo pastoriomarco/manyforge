@@ -50,15 +50,27 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
       // start state.
       const pair = stringField(d, 'collision_result_first_failure_pair');
       const wp = stringField(d, 'collision_result_waypoint_index');
+      const classification = stringField(d, 'collision_result_first_failure_classification');
+      const contactPolicy = supportContactPolicyText(d);
+      const suffix = contactPolicy ? ` (${contactPolicy})` : '';
+      if (classification === 'support_contact_start' && pair && wp) {
+        return `Trajectory rejected: support contact ${prettyPair(pair)} at waypoint ${wp}${suffix}`;
+      }
       if (pair && wp) {
-        return `Trajectory rejected: ${prettyPair(pair)} at waypoint ${wp}`;
+        return `Trajectory rejected: ${prettyPair(pair)} at waypoint ${wp}${suffix}`;
       }
       if (pair) {
-        return `Trajectory rejected: ${prettyPair(pair)}`;
+        return `Trajectory rejected: ${prettyPair(pair)}${suffix}`;
       }
       return 'Trajectory rejected: pre-dispatch collision validation failed';
     },
-    hint: 'The trajectory failed pre-dispatch validation. Inspect the colliding pair below, adjust the scene or re-plan, then retry.',
+    hint: (d) => {
+      const policy = supportContactPolicyText(d);
+      if (policy) {
+        return `The trajectory failed support-contact validation with ${policy}. Verify the active Support contacts row in Scene, adjust the contact policy or re-plan from a less penetrating pose, then retry.`;
+      }
+      return 'The trajectory failed pre-dispatch validation. Inspect the colliding pair below, adjust the scene or re-plan, then retry.';
+    },
     severity: 'fault',
   },
   runtime_collision: {
@@ -350,6 +362,9 @@ export function prettyPair(pair: string): string {
     if (segments[0] === 'robot' && segments.length >= 4 && segments[2] === 'link') {
       return segments[3];
     }
+    if (segments[0] === 'robot' && segments.length >= 4 && segments[2] === 'attached') {
+      return `attached ${segments[3]}`;
+    }
     return segments[segments.length - 1];
   };
   return `${short(parts[0])} ↔ ${short(parts[1])}`;
@@ -367,6 +382,38 @@ export function prettyBodyId(bodyId: string): string {
     return segments[3];
   }
   return segments[segments.length - 1] || bodyId;
+}
+
+function numberField(
+  details: Record<string, unknown> | null | undefined,
+  key: string,
+): number | null {
+  if (!details) {
+    return null;
+  }
+  const value = details[key];
+  const raw = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  return Number.isFinite(raw) ? raw : null;
+}
+
+function supportContactPolicyText(details: Record<string, unknown> | null | undefined): string {
+  const current = numberField(details, 'collision_result_raw_contact_release_current_penetration_m');
+  const initial = numberField(details, 'collision_result_raw_contact_release_initial_penetration_m');
+  const maxStart = numberField(details, 'collision_result_raw_contact_release_max_start_penetration_m');
+  const enforce = stringField(details, 'collision_result_raw_contact_release_enforce_max_start_penetration');
+  const values: string[] = [];
+  if (current !== null) {
+    values.push(`current ${current.toFixed(3)} m`);
+  } else if (initial !== null) {
+    values.push(`initial ${initial.toFixed(3)} m`);
+  }
+  if (maxStart !== null) {
+    values.push(`max ${maxStart.toFixed(3)} m`);
+  }
+  if (enforce === 'false') {
+    values.push('start cap disabled');
+  }
+  return values.join(', ');
 }
 
 function mappingForError(

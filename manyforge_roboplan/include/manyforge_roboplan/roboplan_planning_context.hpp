@@ -36,6 +36,7 @@ class RoboPlanPlanningContext final
     core::Pose3DTO pose_in_universe;
     std::string frame_id;
     bool attached = false;
+    std::vector<core::SupportContactDTO> support_contacts;
   };
 
   struct SceneTraceEvent {
@@ -203,6 +204,7 @@ class RoboPlanPlanningContext final
     std::string body_b;
     std::string text;
     std::pair<std::string, std::string> canonical_pair;
+    std::optional<std::pair<std::string, std::string>> canonical_object_pair;
   };
 
   struct CollisionDiagnostics {
@@ -235,6 +237,11 @@ class RoboPlanPlanningContext final
       const std::string& body2) const;
   std::string collision_pair_text(
       const std::pair<std::string, std::string>& pair) const;
+  std::optional<std::pair<std::string, std::string>>
+  canonical_object_collision_pair_locked(
+      const std::string& body1,
+      const std::string& body2,
+      const RoboPlanCollisionBodyIdMapper& diagnostic_mapper) const;
   CollisionDiagnostics collect_collision_diagnostics_locked(
       const Eigen::VectorXd& q);
   void add_collision_details(

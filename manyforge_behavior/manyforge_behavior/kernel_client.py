@@ -338,6 +338,7 @@ class SceneObjectSnapshot:
     pose_in_universe: Optional[Dict[str, Any]] = None
     attached: bool = False
     frame_id: Optional[str] = None
+    support_contacts: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -522,6 +523,7 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
                     if not isinstance(value, (int, float)) or value < 0.0:
                         return f"support_contacts[{index}].{field_name} must be >= 0"
                 for field_name in (
+                    "enforce_max_start_penetration",
                     "require_separation_by_end",
                     "require_strictly_decreasing_penetration",
                     "allow_recontact",
@@ -1354,6 +1356,7 @@ class MockKernelClient(KernelClient):
                 "position_m": list(request.pose_position_m),
                 "orientation_xyzw": list(request.pose_orientation_xyzw),
                 "frame_id": request.frame_id or "universe",
+                "support_contacts": list(request.support_contacts or []),
             }
         elif request.operation == "upsert":
             if state_before.exists and state_before.attached:
@@ -1382,6 +1385,7 @@ class MockKernelClient(KernelClient):
                 "position_m": list(request.pose_position_m),
                 "orientation_xyzw": list(request.pose_orientation_xyzw),
                 "frame_id": request.frame_id or "universe",
+                "support_contacts": list(request.support_contacts or []),
             }
         elif request.operation == "update_pose":
             tracked = self._objects.get(request.object_id)
@@ -1664,6 +1668,7 @@ class MockKernelClient(KernelClient):
                     pose_in_universe=self.get_object_pose(object_id, "universe"),
                     attached=tracked.get("frame_id") not in {None, "universe", "base_link"},
                     frame_id=tracked.get("frame_id"),
+                    support_contacts=list(tracked.get("support_contacts") or []),
                 )
             )
         return objects

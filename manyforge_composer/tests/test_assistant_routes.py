@@ -2289,6 +2289,7 @@ def test_assistant_chat_golden_program_build_matches_expected_draft(
                 "position_m": [0.45, -0.1, 0.015],
                 "orientation_rpy_deg": [0.0, 0.0, 0.0],
             },
+            "metadata": {},
         },
         {
             "objectId": "golden_sphere_marker",
@@ -2298,6 +2299,7 @@ def test_assistant_chat_golden_program_build_matches_expected_draft(
                 "position_m": [0.55, 0.12, 0.025],
                 "orientation_rpy_deg": [0.0, 0.0, 0.0],
             },
+            "metadata": {},
         },
     ]
     expected_node = {

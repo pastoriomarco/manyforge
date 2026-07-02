@@ -9,6 +9,14 @@ from typing import Any, Callable, Optional
 
 import py_trees
 
+from manyforge_behavior.geometry import (
+    normalize_quat as _normalize_quat,
+    quat_mul as _quat_mul,
+    quat_rotate_vector as _quat_rotate_vector,
+    quats_close as _quats_close,
+    rpy_deg_to_xyzw as _rpy_deg_to_xyzw,
+    xyzw_to_rpy_deg as _xyzw_to_rpy_deg,
+)
 from manyforge_behavior.kernel_client import (
     ExecuteRequest,
     KernelClient,
@@ -19,10 +27,7 @@ from manyforge_behavior.parameters import resolve_blackboard_value
 
 
 _SCENE_SNAPSHOT_WAIT_TIMEOUT_S = 2.0
-
-
-# Canonical conversion is defined once in manyforge_behavior.geometry.
-from manyforge_behavior.geometry import rpy_deg_to_xyzw as _rpy_deg_to_xyzw
+_VECTOR_EPSILON = 1e-9
 
 
 def _default_pick_offset_envelope() -> dict[str, Any]:
@@ -41,6 +46,10 @@ def _default_approach_offset_envelope() -> dict[str, Any]:
         "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
         "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
     }
+
+
+def _default_offset_reference(base_frame: str) -> dict[str, str]:
+    return {"type": "frame", "id": base_frame}
 
 
 def _axis_values(min_value: float, max_value: float, step: float) -> list[float]:
@@ -67,17 +76,23 @@ def _iter_offset_vectors(
     *,
     translation_step_m: float,
     rotation_step_deg: float,
+    include_rotation: bool = True,
 ) -> list[tuple[list[float], list[float]]]:
     pos_min = list(envelope.get("position_min_m", [0.0, 0.0, 0.0]))
     pos_max = list(envelope.get("position_max_m", [0.0, 0.0, 0.0]))
-    rot_min = list(envelope.get("orientation_rpy_min_deg", [0.0, 0.0, 0.0]))
-    rot_max = list(envelope.get("orientation_rpy_max_deg", [0.0, 0.0, 0.0]))
     x_values = _axis_values(pos_min[0], pos_max[0], translation_step_m)
     y_values = _axis_values(pos_min[1], pos_max[1], translation_step_m)
     z_values = _axis_values(pos_min[2], pos_max[2], translation_step_m)
-    r_values = _axis_values(rot_min[0], rot_max[0], rotation_step_deg)
-    p_values = _axis_values(rot_min[1], rot_max[1], rotation_step_deg)
-    yv_values = _axis_values(rot_min[2], rot_max[2], rotation_step_deg)
+    if include_rotation:
+        rot_min = list(envelope.get("orientation_rpy_min_deg", [0.0, 0.0, 0.0]))
+        rot_max = list(envelope.get("orientation_rpy_max_deg", [0.0, 0.0, 0.0]))
+        r_values = _axis_values(rot_min[0], rot_max[0], rotation_step_deg)
+        p_values = _axis_values(rot_min[1], rot_max[1], rotation_step_deg)
+        yv_values = _axis_values(rot_min[2], rot_max[2], rotation_step_deg)
+    else:
+        r_values = [0.0]
+        p_values = [0.0]
+        yv_values = [0.0]
     return [
         ([x, y, z], [r, p, yaw])
         for x, y, z, r, p, yaw in itertools.product(
@@ -98,28 +113,239 @@ def _shape_top_height(snapshot: SceneObjectSnapshot, object_pose: dict[str, Any]
     return base_z
 
 
+def _dot(a: list[float], b: list[float]) -> float:
+    return (a[0] * b[0]) + (a[1] * b[1]) + (a[2] * b[2])
+
+
+def _cross(a: list[float], b: list[float]) -> list[float]:
+    return [
+        (a[1] * b[2]) - (a[2] * b[1]),
+        (a[2] * b[0]) - (a[0] * b[2]),
+        (a[0] * b[1]) - (a[1] * b[0]),
+    ]
+
+
+def _norm(v: list[float]) -> float:
+    return math.sqrt(_dot(v, v))
+
+
+def _normalize_vector(v: list[float]) -> list[float]:
+    length = _norm(v)
+    if length < _VECTOR_EPSILON:
+        raise ValueError("cannot normalize near-zero vector")
+    return [value / length for value in v]
+
+
+def _project_onto_plane(v: list[float], normal: list[float]) -> list[float]:
+    scale = _dot(v, normal)
+    return [
+        v[0] - scale * normal[0],
+        v[1] - scale * normal[1],
+        v[2] - scale * normal[2],
+    ]
+
+
+def _quat_from_rotation_columns(
+    x_axis: list[float],
+    y_axis: list[float],
+    z_axis: list[float],
+) -> list[float]:
+    m00, m01, m02 = x_axis[0], y_axis[0], z_axis[0]
+    m10, m11, m12 = x_axis[1], y_axis[1], z_axis[1]
+    m20, m21, m22 = x_axis[2], y_axis[2], z_axis[2]
+    trace = m00 + m11 + m22
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m21 - m12) / s
+        y = (m02 - m20) / s
+        z = (m10 - m01) / s
+    elif m00 > m11 and m00 > m22:
+        s = math.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        w = (m21 - m12) / s
+        x = 0.25 * s
+        y = (m01 + m10) / s
+        z = (m02 + m20) / s
+    elif m11 > m22:
+        s = math.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        w = (m02 - m20) / s
+        x = (m01 + m10) / s
+        y = 0.25 * s
+        z = (m12 + m21) / s
+    else:
+        s = math.sqrt(1.0 + m22 - m00 - m11) * 2.0
+        w = (m10 - m01) / s
+        x = (m02 + m20) / s
+        y = (m12 + m21) / s
+        z = 0.25 * s
+    return _normalize_quat([x, y, z, w])
+
+
+def _vertical_down_orientation_from_object(object_pose: dict[str, Any]) -> list[float]:
+    object_orientation = object_pose.get("orientation_xyzw")
+    if object_orientation is None:
+        raise ValueError("object pose has no orientation_xyzw")
+    object_q = _normalize_quat(object_orientation)
+    world_down = [0.0, 0.0, -1.0]
+    object_x = _quat_rotate_vector(object_q, [1.0, 0.0, 0.0])
+    new_x = _project_onto_plane(object_x, world_down)
+    if _norm(new_x) < _VECTOR_EPSILON:
+        object_y = _quat_rotate_vector(object_q, [0.0, 1.0, 0.0])
+        new_x = _project_onto_plane(object_y, world_down)
+    if _norm(new_x) < _VECTOR_EPSILON:
+        new_x = [1.0, 0.0, 0.0]
+    else:
+        new_x = _normalize_vector(new_x)
+
+    new_y = _cross(world_down, new_x)
+    if _norm(new_y) < _VECTOR_EPSILON:
+        new_y = [0.0, -1.0, 0.0]
+    else:
+        new_y = _normalize_vector(new_y)
+
+    return _quat_from_rotation_columns(new_x, new_y, world_down)
+
+
+def _apply_min_tcp_z(position_m: list[float], min_tcp_z_m: float | None) -> bool:
+    if min_tcp_z_m is None:
+        return False
+    if position_m[2] >= min_tcp_z_m:
+        return False
+    position_m[2] = float(min_tcp_z_m)
+    return True
+
+
+def _pose_reference_orientation_xyzw(pose: dict[str, Any]) -> list[float]:
+    has_quat = pose.get("orientation_xyzw") is not None
+    has_rpy = pose.get("orientation_rpy_deg") is not None
+    if has_quat and has_rpy:
+        quat = _normalize_quat(pose["orientation_xyzw"])
+        rpy_quat = _rpy_deg_to_xyzw(pose["orientation_rpy_deg"])
+        if not _quats_close(quat, rpy_quat):
+            raise ValueError("pose orientation_xyzw and orientation_rpy_deg disagree")
+        return quat
+    if has_quat:
+        return _normalize_quat(pose["orientation_xyzw"])
+    if has_rpy:
+        return _rpy_deg_to_xyzw(pose["orientation_rpy_deg"])
+    raise ValueError("pose reference requires orientation_xyzw or orientation_rpy_deg")
+
+
+def _normalize_offset_reference(
+    value: Any,
+    *,
+    base_frame: str,
+) -> dict[str, Any]:
+    if value is None:
+        return _default_offset_reference(base_frame)
+    if not isinstance(value, dict):
+        raise ValueError("must be a mapping")
+    reference_type = value.get("type")
+    if reference_type not in {"frame", "object", "robot_link", "pose"}:
+        raise ValueError(
+            "type must be one of ['frame', 'object', 'pose', 'robot_link']"
+        )
+    if reference_type == "pose":
+        pose = value.get("pose")
+        if not isinstance(pose, dict):
+            raise ValueError("pose is required when type='pose'")
+        _pose_reference_orientation_xyzw(pose)
+        return {"type": "pose", "pose": dict(pose)}
+    reference_id = value.get("id")
+    if isinstance(reference_id, str) and reference_id.strip():
+        return {"type": reference_type, "id": reference_id.strip()}
+    if reference_type == "frame":
+        return _default_offset_reference(base_frame)
+    raise ValueError(f"id is required when type='{reference_type}'")
+
+
+def _reference_trace_value(reference: dict[str, Any]) -> dict[str, Any]:
+    if reference.get("type") == "pose":
+        return {
+            "type": "pose",
+            "pose": dict(reference.get("pose") or {}),
+        }
+    return {
+        "type": str(reference.get("type")),
+        "id": str(reference.get("id") or ""),
+    }
+
+
+def _reference_orientation_in_base(
+    kernel: KernelClient,
+    reference: dict[str, Any],
+    *,
+    base_frame: str,
+) -> list[float]:
+    reference_type = reference.get("type")
+    if reference_type == "frame":
+        frame_id = str(reference.get("id") or base_frame)
+        if frame_id in ("", base_frame):
+            return [0.0, 0.0, 0.0, 1.0]
+        frame_pose = kernel.get_link_pose(frame_id, base_frame)
+        if frame_pose is None:
+            raise ValueError(f"frame '{frame_id}' is unavailable")
+        return _normalize_quat(frame_pose["orientation_xyzw"])
+    if reference_type == "robot_link":
+        link_id = str(reference.get("id") or "")
+        link_pose = kernel.get_link_pose(link_id, base_frame)
+        if link_pose is None:
+            raise ValueError(f"robot link '{link_id}' is unavailable")
+        return _normalize_quat(link_pose["orientation_xyzw"])
+    if reference_type == "object":
+        object_id = str(reference.get("id") or "")
+        object_pose = kernel.get_object_pose(object_id, base_frame)
+        if object_pose is None:
+            raise ValueError(f"object '{object_id}' is unavailable")
+        return _normalize_quat(object_pose["orientation_xyzw"])
+    if reference_type == "pose":
+        pose = reference.get("pose")
+        if not isinstance(pose, dict):
+            raise ValueError("pose reference must contain a pose mapping")
+        pose_orientation = _pose_reference_orientation_xyzw(pose)
+        frame_id = str(pose.get("frame_id") or pose.get("frameId") or base_frame)
+        if frame_id in ("", base_frame):
+            return pose_orientation
+        frame_pose = kernel.get_link_pose(frame_id, base_frame)
+        if frame_pose is None:
+            raise ValueError(f"pose reference frame '{frame_id}' is unavailable")
+        return _quat_mul(frame_pose["orientation_xyzw"], pose_orientation)
+    raise ValueError(f"unsupported reference type: {reference_type!r}")
+
+
 def _compose_pose(
     *,
     object_pose: dict[str, Any],
     object_top_z: float,
-    base_orientation_rpy_deg: list[float],
     position_offset_m: list[float],
     orientation_offset_rpy_deg: list[float],
+    base_orientation_rpy_deg: list[float] | None = None,
+    base_orientation_xyzw: list[float] | None = None,
+    min_tcp_z_m: float | None = None,
 ) -> dict[str, Any]:
     position = [
         float(object_pose["position_m"][0]) + float(position_offset_m[0]),
         float(object_pose["position_m"][1]) + float(position_offset_m[1]),
         float(object_top_z) + float(position_offset_m[2]),
     ]
-    orientation_rpy_deg = [
-        float(base_orientation_rpy_deg[0]) + float(orientation_offset_rpy_deg[0]),
-        float(base_orientation_rpy_deg[1]) + float(orientation_offset_rpy_deg[1]),
-        float(base_orientation_rpy_deg[2]) + float(orientation_offset_rpy_deg[2]),
-    ]
+    min_tcp_z_applied = _apply_min_tcp_z(position, min_tcp_z_m)
+    if base_orientation_xyzw is not None:
+        orientation_xyzw = _normalize_quat(base_orientation_xyzw)
+        orientation_rpy_deg = _xyzw_to_rpy_deg(orientation_xyzw)
+    elif base_orientation_rpy_deg is not None:
+        orientation_rpy_deg = [
+            float(base_orientation_rpy_deg[0]) + float(orientation_offset_rpy_deg[0]),
+            float(base_orientation_rpy_deg[1]) + float(orientation_offset_rpy_deg[1]),
+            float(base_orientation_rpy_deg[2]) + float(orientation_offset_rpy_deg[2]),
+        ]
+        orientation_xyzw = _rpy_deg_to_xyzw(orientation_rpy_deg)
+    else:
+        raise ValueError("base orientation is required")
     return {
         "position_m": position,
-        "orientation_xyzw": _rpy_deg_to_xyzw(orientation_rpy_deg),
+        "orientation_xyzw": orientation_xyzw,
         "orientation_rpy_deg": orientation_rpy_deg,
+        "min_tcp_z_applied": min_tcp_z_applied,
     }
 
 
@@ -132,6 +358,27 @@ def _detail_flag(error_details: Optional[dict[str, Any]], key: str) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes"}
     return False
+
+
+def _detail_string(error_details: dict[str, Any], key: str) -> Optional[str]:
+    value = error_details.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _detail_float(error_details: dict[str, Any], key: str) -> Optional[float]:
+    value = error_details.get(key)
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
 
 
 def _preview_failure_message(
@@ -148,10 +395,53 @@ def _preview_failure_message(
         failure_stage = error_details.get("failure_stage")
         if failure_stage:
             parts.append(f"native_stage={failure_stage}")
+        reason = _detail_string(error_details, "reason") or _detail_string(
+            error_details, "reason_code"
+        )
+        if reason:
+            parts.append(f"reason={reason}")
         if _detail_flag(error_details, "start_in_collision"):
             parts.append("start_state_in_collision=true")
         if _detail_flag(error_details, "goal_in_collision"):
             parts.append("goal_in_collision=true")
+        pair = _detail_string(
+            error_details, "collision_result_first_failure_pair"
+        )
+        if pair:
+            parts.append(f"collision_pair={pair}")
+        classification = _detail_string(
+            error_details, "collision_result_first_failure_classification"
+        )
+        if classification:
+            parts.append(f"classification={classification}")
+        waypoint_index = _detail_string(error_details, "collision_result_waypoint_index")
+        if waypoint_index:
+            parts.append(f"waypoint={waypoint_index}")
+        current_penetration = _detail_float(
+            error_details,
+            "collision_result_raw_contact_release_current_penetration_m",
+        )
+        max_start_penetration = _detail_float(
+            error_details,
+            "collision_result_raw_contact_release_max_start_penetration_m",
+        )
+        if current_penetration is not None or max_start_penetration is not None:
+            support_parts: list[str] = []
+            if current_penetration is not None:
+                support_parts.append(
+                    f"current_penetration_m={current_penetration:.6f}"
+                )
+            if max_start_penetration is not None:
+                support_parts.append(
+                    f"max_start_penetration_m={max_start_penetration:.6f}"
+                )
+            enforce = _detail_string(
+                error_details,
+                "collision_result_raw_contact_release_enforce_max_start_penetration",
+            )
+            if enforce:
+                support_parts.append(f"enforce_max_start_penetration={enforce}")
+            parts.append(f"support_contact_policy=({', '.join(support_parts)})")
         contact_a = error_details.get("contact_body_a")
         contact_b = error_details.get("contact_body_b")
         if contact_a or contact_b:
@@ -177,14 +467,22 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
         image_snapshot_format: str = "jpeg",
         tcp_frame: str = "tool0",
         pick_offset_envelope: Optional[dict[str, Any]] = None,
+        pick_offset_reference: Optional[dict[str, Any]] = None,
         approach_offset_envelope: Optional[dict[str, Any]] = None,
+        approach_offset_reference: Optional[dict[str, Any]] = None,
         search_strategy: str = "first_feasible_grid",
         translation_step_m: float = 0.01,
         rotation_step_deg: float = 15.0,
+        force_vertical_pick: bool = False,
+        enable_min_tcp_z: Optional[bool] = None,
+        min_tcp_z_m: Optional[float] = None,
         planning_timeout_s: float = 2.0,
         velocity_scale: float = 0.35,
         acceleration_scale: float = 1.0,
         max_tcp_linear_speed_mps: Optional[float] = None,
+        approach_move_node_name: str = "",
+        pick_move_node_name: str = "",
+        retreat_move_node_name: str = "",
         robot_id: str = "",
         group_id: str = "",
         base_frame: str = "",
@@ -204,16 +502,24 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
         self._pick_offset_envelope = dict(
             pick_offset_envelope or _default_pick_offset_envelope()
         )
+        self._pick_offset_reference = pick_offset_reference
         self._approach_offset_envelope = dict(
             approach_offset_envelope or _default_approach_offset_envelope()
         )
+        self._approach_offset_reference = approach_offset_reference
         self._search_strategy = search_strategy
         self._translation_step_m = translation_step_m
         self._rotation_step_deg = rotation_step_deg
+        self._force_vertical_pick = bool(force_vertical_pick)
+        self._enable_min_tcp_z = enable_min_tcp_z
+        self._min_tcp_z_m = min_tcp_z_m
         self._planning_timeout_s = planning_timeout_s
         self._velocity_scale = velocity_scale
         self._acceleration_scale = acceleration_scale
         self._max_tcp_linear_speed_mps = max_tcp_linear_speed_mps
+        self._approach_move_node_name = approach_move_node_name
+        self._pick_move_node_name = pick_move_node_name
+        self._retreat_move_node_name = retreat_move_node_name
         self._robot_id = robot_id
         self._group_id = group_id
         self._base_frame = base_frame
@@ -332,6 +638,45 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
             )
             return py_trees.common.Status.FAILURE
 
+        min_tcp_z_enabled = (
+            self._min_tcp_z_m is not None
+            if self._enable_min_tcp_z is None
+            else bool(self._enable_min_tcp_z)
+        )
+        min_tcp_z_m: float | None = None
+        if min_tcp_z_enabled:
+            if self._min_tcp_z_m is None:
+                self.feedback_message = (
+                    "min_tcp_z_m is required when enable_min_tcp_z is true"
+                )
+                self._write_failure_response(
+                    selected_object_id=selected_object_id,
+                    attempted_candidates=0,
+                    outcome="invalid_min_tcp_z",
+                    failure_detail=self.feedback_message,
+                )
+                return py_trees.common.Status.FAILURE
+            try:
+                min_tcp_z_m = float(self._min_tcp_z_m)
+            except (TypeError, ValueError):
+                self.feedback_message = "min_tcp_z_m must be a finite non-negative number"
+                self._write_failure_response(
+                    selected_object_id=selected_object_id,
+                    attempted_candidates=0,
+                    outcome="invalid_min_tcp_z",
+                    failure_detail=self.feedback_message,
+                )
+                return py_trees.common.Status.FAILURE
+            if not math.isfinite(min_tcp_z_m) or min_tcp_z_m < 0.0:
+                self.feedback_message = "min_tcp_z_m must be a finite non-negative number"
+                self._write_failure_response(
+                    selected_object_id=selected_object_id,
+                    attempted_candidates=0,
+                    outcome="invalid_min_tcp_z",
+                    failure_detail=self.feedback_message,
+                )
+                return py_trees.common.Status.FAILURE
+
         pose_source_status = self._apply_pose_source_latches(
             selected_object_id=selected_object_id
         )
@@ -416,11 +761,25 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
 
         object_top_z = _shape_top_height(scene_snapshot, object_pose)
         base_orientation = [180.0, 0.0, 0.0]
+        base_orientation_xyzw: list[float] | None = None
+        if self._force_vertical_pick:
+            try:
+                base_orientation_xyzw = _vertical_down_orientation_from_object(object_pose)
+            except ValueError as exc:
+                self.feedback_message = f"Invalid object orientation for vertical pick: {exc}"
+                self._write_failure_response(
+                    selected_object_id=selected_object_id,
+                    attempted_candidates=0,
+                    outcome="invalid_object_orientation",
+                    failure_detail=str(exc),
+                )
+                return py_trees.common.Status.FAILURE
         try:
             pick_offsets = _iter_offset_vectors(
                 self._pick_offset_envelope,
                 translation_step_m=self._translation_step_m,
                 rotation_step_deg=self._rotation_step_deg,
+                include_rotation=not self._force_vertical_pick,
             )
         except ValueError as exc:
             self.feedback_message = f"Invalid pick_offset_envelope: {exc}"
@@ -432,10 +791,31 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
             return py_trees.common.Status.FAILURE
 
         try:
+            pick_offset_reference = _normalize_offset_reference(
+                self._pick_offset_reference,
+                base_frame=self._base_frame,
+            )
+            pick_offset_orientation = _reference_orientation_in_base(
+                kernel,
+                pick_offset_reference,
+                base_frame=self._base_frame,
+            )
+        except ValueError as exc:
+            self.feedback_message = f"Invalid pick_offset_reference: {exc}"
+            self._write_failure_response(
+                selected_object_id=selected_object_id,
+                attempted_candidates=0,
+                outcome="invalid_pick_offset_reference",
+                failure_detail=str(exc),
+            )
+            return py_trees.common.Status.FAILURE
+
+        try:
             approach_offsets = _iter_offset_vectors(
                 self._approach_offset_envelope,
                 translation_step_m=self._translation_step_m,
                 rotation_step_deg=self._rotation_step_deg,
+                include_rotation=not self._force_vertical_pick,
             )
         except ValueError as exc:
             self.feedback_message = f"Invalid approach_offset_envelope: {exc}"
@@ -446,35 +826,100 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
             )
             return py_trees.common.Status.FAILURE
 
+        try:
+            approach_offset_reference = _normalize_offset_reference(
+                self._approach_offset_reference,
+                base_frame=self._base_frame,
+            )
+            approach_offset_orientation = _reference_orientation_in_base(
+                kernel,
+                approach_offset_reference,
+                base_frame=self._base_frame,
+            )
+        except ValueError as exc:
+            self.feedback_message = f"Invalid approach_offset_reference: {exc}"
+            self._write_failure_response(
+                selected_object_id=selected_object_id,
+                attempted_candidates=0,
+                outcome="invalid_approach_offset_reference",
+                failure_detail=str(exc),
+            )
+            return py_trees.common.Status.FAILURE
+
         attempted_candidates = 0
         best_candidate: Optional[dict[str, Any]] = None
+        last_candidate_response: Optional[dict[str, Any]] = None
         last_failure_detail: Optional[str] = None
 
         for (pick_pos_offset, pick_rot_offset) in pick_offsets:
+            pick_pos_offset_base = _quat_rotate_vector(
+                pick_offset_orientation,
+                pick_pos_offset,
+            )
             pick_pose = _compose_pose(
                 object_pose=object_pose,
                 object_top_z=object_top_z,
-                base_orientation_rpy_deg=base_orientation,
-                position_offset_m=pick_pos_offset,
+                position_offset_m=pick_pos_offset_base,
                 orientation_offset_rpy_deg=pick_rot_offset,
+                base_orientation_rpy_deg=(
+                    None if self._force_vertical_pick else base_orientation
+                ),
+                base_orientation_xyzw=base_orientation_xyzw,
+                min_tcp_z_m=min_tcp_z_m,
             )
             for (approach_pos_offset, approach_rot_offset) in approach_offsets:
                 attempted_candidates += 1
+                approach_pos_offset_base = _quat_rotate_vector(
+                    approach_offset_orientation,
+                    approach_pos_offset,
+                )
                 approach_pose = {
                     "position_m": [
-                        pick_pose["position_m"][0] + float(approach_pos_offset[0]),
-                        pick_pose["position_m"][1] + float(approach_pos_offset[1]),
-                        pick_pose["position_m"][2] + float(approach_pos_offset[2]),
+                        pick_pose["position_m"][0] + float(approach_pos_offset_base[0]),
+                        pick_pose["position_m"][1] + float(approach_pos_offset_base[1]),
+                        pick_pose["position_m"][2] + float(approach_pos_offset_base[2]),
                     ],
-                    "orientation_rpy_deg": [
+                }
+                approach_min_z_applied = _apply_min_tcp_z(
+                    approach_pose["position_m"],
+                    min_tcp_z_m,
+                )
+                if self._force_vertical_pick:
+                    approach_pose["orientation_xyzw"] = list(pick_pose["orientation_xyzw"])
+                    approach_pose["orientation_rpy_deg"] = list(pick_pose["orientation_rpy_deg"])
+                else:
+                    approach_pose["orientation_rpy_deg"] = [
                         pick_pose["orientation_rpy_deg"][0] + float(approach_rot_offset[0]),
                         pick_pose["orientation_rpy_deg"][1] + float(approach_rot_offset[1]),
                         pick_pose["orientation_rpy_deg"][2] + float(approach_rot_offset[2]),
-                    ],
+                    ]
+                    approach_pose["orientation_xyzw"] = _rpy_deg_to_xyzw(
+                        approach_pose["orientation_rpy_deg"]
+                    )
+
+                retreat_pose = {
+                    "position_m": list(approach_pose["position_m"]),
+                    "orientation_xyzw": list(approach_pose["orientation_xyzw"]),
+                    "orientation_rpy_deg": list(approach_pose["orientation_rpy_deg"]),
                 }
-                approach_pose["orientation_xyzw"] = _rpy_deg_to_xyzw(
-                    approach_pose["orientation_rpy_deg"]
+                candidate_response = self._make_candidate_response(
+                    selected_object_id=selected_object_id,
+                    approach_pose=approach_pose,
+                    pick_pose=pick_pose,
+                    retreat_pose=retreat_pose,
+                    attempted_candidates=attempted_candidates,
+                    planning_score=None,
+                    outcome="candidate_generated",
+                    min_tcp_z_enabled=min_tcp_z_enabled,
+                    min_tcp_z_m=min_tcp_z_m,
+                    min_tcp_z_applied=bool(
+                        pick_pose.get("min_tcp_z_applied") or approach_min_z_applied
+                    ),
+                    pick_offset_reference=pick_offset_reference,
+                    approach_offset_reference=approach_offset_reference,
                 )
+                last_candidate_response = candidate_response
+                self._write_candidate_response(candidate_response)
 
                 approach_preview = kernel.preview_motion(
                     self._make_pose_goal_request("pick_approach_preview", approach_pose)
@@ -495,6 +940,7 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                             attempted_candidates=attempted_candidates,
                             outcome="start_state_in_collision",
                             failure_detail=last_failure_detail,
+                            candidate_response=last_candidate_response,
                         )
                         return py_trees.common.Status.FAILURE
                     continue
@@ -536,20 +982,9 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                     + int(exit_preview.trajectory_waypoint_count or 0)
                 )
                 planning_score = duration_s + (0.01 * waypoint_count)
-                candidate = {
-                    "selected_object_id": selected_object_id,
-                    "approach_pose": {
-                        "position_m": list(approach_pose["position_m"]),
-                        "orientation_xyzw": list(approach_pose["orientation_xyzw"]),
-                    },
-                    "pick_pose": {
-                        "position_m": list(pick_pose["position_m"]),
-                        "orientation_xyzw": list(pick_pose["orientation_xyzw"]),
-                    },
-                    "attempted_candidates": attempted_candidates,
-                    "planning_score": planning_score,
-                    "outcome": "planned",
-                }
+                candidate = dict(candidate_response)
+                candidate["planning_score"] = planning_score
+                candidate["outcome"] = "planned"
                 if self._search_strategy == "first_feasible_grid":
                     self._write_response(candidate)
                     return py_trees.common.Status.SUCCESS
@@ -575,8 +1010,50 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
             attempted_candidates=attempted_candidates,
             outcome="no_feasible_plan",
             failure_detail=last_failure_detail,
+            candidate_response=last_candidate_response,
         )
         return py_trees.common.Status.FAILURE
+
+    def _pose_output(self, pose: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "frame_id": self._base_frame,
+            "position_m": list(pose["position_m"]),
+            "orientation_xyzw": list(pose["orientation_xyzw"]),
+        }
+
+    def _make_candidate_response(
+        self,
+        *,
+        selected_object_id: str,
+        approach_pose: dict[str, Any],
+        pick_pose: dict[str, Any],
+        retreat_pose: dict[str, Any],
+        attempted_candidates: int,
+        planning_score: Optional[float],
+        outcome: str,
+        min_tcp_z_enabled: bool,
+        min_tcp_z_m: Optional[float],
+        min_tcp_z_applied: bool,
+        pick_offset_reference: dict[str, Any],
+        approach_offset_reference: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "selected_object_id": selected_object_id,
+            "approach_pose": self._pose_output(approach_pose),
+            "pick_pose": self._pose_output(pick_pose),
+            "retreat_pose": self._pose_output(retreat_pose),
+            "attempted_candidates": attempted_candidates,
+            "planning_score": planning_score,
+            "outcome": outcome,
+            "force_vertical_pick": self._force_vertical_pick,
+            "enable_min_tcp_z": min_tcp_z_enabled,
+            "min_tcp_z_m": min_tcp_z_m,
+            "min_tcp_z_applied": min_tcp_z_applied,
+            "pick_offset_reference": _reference_trace_value(pick_offset_reference),
+            "approach_offset_reference": _reference_trace_value(
+                approach_offset_reference
+            ),
+        }
 
     def _make_pose_goal_request(self, move_id: str, pose: dict[str, Any]) -> ExecuteRequest:
         return ExecuteRequest(
@@ -587,6 +1064,7 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
             tcp_frame=self._tcp_frame,
             motion_type="pose_goal",
             pose_goal={
+                "frame_id": self._base_frame,
                 "position_m": list(pose["position_m"]),
                 "orientation_xyzw": list(pose["orientation_xyzw"]),
             },
@@ -598,7 +1076,12 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
             cache_mode="disable",
         )
 
+    def _write_candidate_response(self, response: dict[str, Any]) -> None:
+        self._populate_linked_move_nodes(response)
+        self._write_namespace_output(response, status="candidate")
+
     def _write_response(self, response: dict[str, Any]) -> None:
+        self._populate_linked_move_nodes(response)
         self._write_namespace_output(response, status="planned")
 
     def _write_failure_response(
@@ -608,14 +1091,69 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
         attempted_candidates: int,
         outcome: str,
         failure_detail: Optional[str] = None,
+        candidate_response: Optional[dict[str, Any]] = None,
     ) -> None:
-        response = {
-            "selected_object_id": selected_object_id,
-            "approach_pose": None,
-            "pick_pose": None,
-            "attempted_candidates": attempted_candidates,
-            "planning_score": None,
-            "outcome": outcome,
-            "failure_detail": failure_detail,
-        }
+        response = dict(candidate_response or {})
+        response.setdefault("selected_object_id", selected_object_id)
+        response.setdefault("approach_pose", None)
+        response.setdefault("pick_pose", None)
+        response.setdefault("retreat_pose", None)
+        response["attempted_candidates"] = attempted_candidates
+        response["planning_score"] = None
+        response["outcome"] = outcome
+        response["failure_detail"] = failure_detail
+        if candidate_response is not None:
+            self._populate_linked_move_nodes(response)
         self._write_namespace_output(response, status="failed")
+
+    def _populate_linked_move_nodes(self, response: dict[str, Any]) -> None:
+        name_to_pose = {
+            str(self._approach_move_node_name or ""): response.get("approach_pose"),
+            str(self._pick_move_node_name or ""): response.get("pick_pose"),
+            str(self._retreat_move_node_name or ""): response.get("retreat_pose"),
+        }
+        name_to_pose = {
+            name: pose
+            for name, pose in name_to_pose.items()
+            if name and isinstance(pose, dict)
+        }
+        if not name_to_pose:
+            return
+        for behaviour in self._iter_tree_behaviours():
+            pose = name_to_pose.get(getattr(behaviour, "name", ""))
+            if pose is None:
+                continue
+            params = getattr(behaviour, "_params", None)
+            if not isinstance(params, dict):
+                continue
+            if params.get("motion_type") != "pose_goal":
+                continue
+            params["pose_goal"] = {
+                "frame_id": pose["frame_id"],
+                "position_m": list(pose["position_m"]),
+                "orientation_xyzw": list(pose["orientation_xyzw"]),
+            }
+
+    def _iter_tree_behaviours(self):
+        root: Any = self
+        seen: set[int] = set()
+        while getattr(root, "parent", None) is not None:
+            if id(root) in seen:
+                break
+            seen.add(id(root))
+            root = root.parent
+
+        stack = [root]
+        seen.clear()
+        while stack:
+            behaviour = stack.pop()
+            if id(behaviour) in seen:
+                continue
+            seen.add(id(behaviour))
+            yield behaviour
+            for child in reversed(list(getattr(behaviour, "children", []) or [])):
+                stack.append(child)
+            for attr in ("decorated", "child"):
+                child = getattr(behaviour, attr, None)
+                if child is not None:
+                    stack.append(child)

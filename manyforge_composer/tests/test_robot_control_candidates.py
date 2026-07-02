@@ -288,6 +288,8 @@ def test_cartesian_candidate_honors_frame_id_and_tcp_frame(tmp_path: Path) -> No
     assert kernel.last_preview_request is not None
     assert kernel.last_preview_request.base_frame == "custom_world"
     assert kernel.last_preview_request.tcp_frame == "gripper_tip"
+    assert kernel.last_preview_request.pose_goal is not None
+    assert kernel.last_preview_request.pose_goal["frame_id"] == "custom_world"
     # The dispatch params (used at approve) carry the same frames so execute
     # validates and moves against exactly the planned frames.
     assert body["cartesianTarget"]["frameId"] == "custom_world"
@@ -314,6 +316,8 @@ def test_cartesian_candidate_defaults_use_program_frames(tmp_path: Path) -> None
     # The fixture program robot uses base_frame=base_link, tcp_frame=tool0.
     assert kernel.last_preview_request.base_frame == "base_link"
     assert kernel.last_preview_request.tcp_frame == "tool0"
+    assert kernel.last_preview_request.pose_goal is not None
+    assert kernel.last_preview_request.pose_goal["frame_id"] == "base_link"
 
 
 def test_candidate_forwards_per_joint_dynamics_limits_to_execute_request(
@@ -784,6 +788,45 @@ def test_execute_fresh_ready_candidate_dispatches(tmp_path: Path) -> None:
     while kernel.execute_count == 0 and time.time() < deadline:
         time.sleep(0.02)
     assert kernel.execute_count >= 1
+
+
+def test_execute_fresh_cartesian_candidate_dispatches_with_pose_frame(
+    tmp_path: Path,
+) -> None:
+    client, _state, kernel = _loaded_client(tmp_path)
+    cid = client.post(_BASE, json=_cartesian_body()).json()["candidateId"]
+    resp = client.post(f"{_BASE}/{cid}/execute")
+    assert resp.status_code == 200, resp.text
+    deadline = time.time() + 5.0
+    while kernel.execute_count == 0 and time.time() < deadline:
+        time.sleep(0.02)
+    assert kernel.execute_count >= 1
+    assert kernel.last_execute_request is not None
+    assert kernel.last_execute_request.pose_goal is not None
+    assert kernel.last_execute_request.pose_goal["frame_id"] == "base_link"
+    assert kernel.last_execute_request.base_frame == "base_link"
+    assert kernel.last_execute_request.tcp_frame == "tool0"
+
+
+def test_execute_fresh_cartesian_candidate_preserves_custom_frames(
+    tmp_path: Path,
+) -> None:
+    client, _state, kernel = _loaded_client(tmp_path)
+    body = _cartesian_body()
+    body["cartesianTarget"]["frameId"] = "custom_world"
+    body["cartesianTarget"]["tcpFrame"] = "gripper_tip"
+    cid = client.post(_BASE, json=body).json()["candidateId"]
+    resp = client.post(f"{_BASE}/{cid}/execute")
+    assert resp.status_code == 200, resp.text
+    deadline = time.time() + 5.0
+    while kernel.execute_count == 0 and time.time() < deadline:
+        time.sleep(0.02)
+    assert kernel.execute_count >= 1
+    assert kernel.last_execute_request is not None
+    assert kernel.last_execute_request.pose_goal is not None
+    assert kernel.last_execute_request.pose_goal["frame_id"] == "custom_world"
+    assert kernel.last_execute_request.base_frame == "custom_world"
+    assert kernel.last_execute_request.tcp_frame == "gripper_tip"
 
 
 def test_execute_candidate_blocks_unsupported_configured_stop_profile(

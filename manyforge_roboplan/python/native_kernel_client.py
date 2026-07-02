@@ -866,6 +866,11 @@ class NativeKernelClient(KernelClient):
                     pose_in_universe=pose_in_universe,
                     attached=bool(object_data.get("attached", False)),
                     frame_id=object_data.get("frame_id"),
+                    support_contacts=[
+                        dict(item)
+                        for item in object_data.get("support_contacts", [])
+                        if isinstance(item, dict)
+                    ],
                 )
             )
         return objects

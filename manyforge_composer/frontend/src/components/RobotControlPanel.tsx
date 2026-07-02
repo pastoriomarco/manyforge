@@ -37,6 +37,8 @@ import type { MoveToTarget, StoredPoseTarget } from '../utils/moveTo';
 // commandedRefs) once the live pose catches up.
 const CARTESIAN_POSITION_ARRIVAL_TOLERANCE_M = 1e-4;
 const CARTESIAN_ORIENTATION_ARRIVAL_TOLERANCE_RAD = 2e-3;
+const RAD_TO_DEG = 180 / Math.PI;
+const DEG_TO_RAD = Math.PI / 180;
 // Joint-arrival tolerance for clearing a stale draft once the live joint
 // state catches up. Keep at or below the fine jog step so a spinner click
 // does not clear early at a visibly different value.
@@ -171,8 +173,11 @@ interface RobotControlPanelProps {
   onClose: () => void;
 }
 
-const REVOLUTE_STEPS: readonly number[] = [0.001, 0.01, 0.1, 0.5];
+const ANGULAR_STEP_DEG_OPTIONS: readonly number[] = [0.1, 0.5, 1, 5, 10, 30];
+const ANGULAR_STEP_RAD_OPTIONS: readonly number[] =
+  ANGULAR_STEP_DEG_OPTIONS.map((deg) => deg * DEG_TO_RAD);
 const PRISMATIC_STEPS: readonly number[] = [0.001, 0.01, 0.1];
+const DEFAULT_ANGULAR_STEP_RAD = 5 * DEG_TO_RAD;
 
 export function RobotControlPanel({ onClose }: RobotControlPanelProps) {
   const [manifest, setManifest] = useState<SceneUrdfManifest | null>(null);
@@ -182,9 +187,10 @@ export function RobotControlPanel({ onClose }: RobotControlPanelProps) {
   // a clamp — sliders move freely limit-to-limit and commits send
   // the requested value verbatim. The dropdown picks coarse vs fine
   // arrow stepping per axis kind.
-  const [jointRadStep, setJointRadStep] = useState<number>(0.1);
+  const [jointRadStep, setJointRadStep] = useState<number>(DEFAULT_ANGULAR_STEP_RAD);
+  const [jointMStep, setJointMStep] = useState<number>(0.01);
   const [cartesianMStep, setCartesianMStep] = useState<number>(0.01);
-  const [cartesianRadStep, setCartesianRadStep] = useState<number>(0.1);
+  const [cartesianRadStep, setCartesianRadStep] = useState<number>(DEFAULT_ANGULAR_STEP_RAD);
   const robot = useSceneStateStore((s) => s.scene?.robot ?? null);
   const robotModelKey = robot?.urdf_model_key ?? robot?.robot_id ?? null;
   const robotMode = useViewerSelectionStore((s) => s.robotMode);
@@ -281,6 +287,8 @@ export function RobotControlPanel({ onClose }: RobotControlPanelProps) {
           robot={robot}
           jointRadStep={jointRadStep}
           onJointRadStepChange={setJointRadStep}
+          jointMStep={jointMStep}
+          onJointMStepChange={setJointMStep}
           commandGate={commandGate}
         />
       )}
@@ -439,6 +447,8 @@ function JointModeBody({
   robot,
   jointRadStep,
   onJointRadStepChange,
+  jointMStep,
+  onJointMStepChange,
   commandGate,
 }: {
   manifest: SceneUrdfManifest | null;
@@ -447,8 +457,14 @@ function JointModeBody({
   robot: SceneRobotState | null;
   jointRadStep: number;
   onJointRadStepChange: (next: number) => void;
+  jointMStep: number;
+  onJointMStepChange: (next: number) => void;
   commandGate: RobotCommandGate;
 }) {
+  const hasPrismaticJoints = useMemo(
+    () => drivableJoints.some((joint) => joint.type === 'prismatic'),
+    [drivableJoints],
+  );
   // Joint-name list for authored joint targets. RMA-5 makes this the active
   // arm group's commandable joints from canonical Robot Model Authority
   // metadata, so gripper mimic chains never leak into arm jogging.
@@ -479,12 +495,22 @@ function JointModeBody({
     <>
       <div className="flex items-center gap-2 border-b border-gray-800 bg-gray-900/50 px-2 py-1.5">
         <StepCapSelect
-          label="step (rad)"
-          options={REVOLUTE_STEPS}
+          label="step (deg)"
+          options={ANGULAR_STEP_RAD_OPTIONS}
           value={jointRadStep}
           onChange={onJointRadStepChange}
+          formatOption={formatRadStepAsDeg}
           disabled={!commandGate.canCommand}
         />
+        {hasPrismaticJoints && (
+          <StepCapSelect
+            label="step (m)"
+            options={PRISMATIC_STEPS}
+            value={jointMStep}
+            onChange={onJointMStepChange}
+            disabled={!commandGate.canCommand}
+          />
+        )}
       </div>
       <div className="flex-1 overflow-y-auto p-2">
         {!commandGate.canCommand && (
@@ -510,7 +536,7 @@ function JointModeBody({
             key={joint.name}
             joint={joint}
             currentValue={robot?.joint_positions[joint.name] ?? null}
-            step={jointRadStep}
+            step={joint.type === 'prismatic' ? jointMStep : jointRadStep}
             onDraftPush={jointDraftPush}
             onDraftPushFinal={jointDraftPushFinal}
             disabled={!commandGate.canCommand}
@@ -1147,10 +1173,11 @@ function CartesianModeBody({
           disabled={!commandGate.canCommand}
         />
         <StepCapSelect
-          label="step (rad)"
-          options={REVOLUTE_STEPS}
+          label="step (deg)"
+          options={ANGULAR_STEP_RAD_OPTIONS}
           value={cartesianRadStep}
           onChange={onRadStepChange}
+          formatOption={formatRadStepAsDeg}
           disabled={!commandGate.canCommand}
         />
       </div>
@@ -1177,13 +1204,13 @@ function CartesianModeBody({
               disabled={!commandGate.canCommand}
             />
             <CartesianAxisFields
-              label="orientation (rpy, rad)"
+              label="orientation (rpy, deg)"
               labels={['r', 'p', 'y']}
-              values={displayedRpy}
-              liveValues={rpyRad}
-              step={cartesianRadStep}
-              settleTolerance={CARTESIAN_ORIENTATION_ARRIVAL_TOLERANCE_RAD}
-              onCommit={commitRpy}
+              values={rpyRadToDeg(displayedRpy)}
+              liveValues={rpyRadToDeg(rpyRad)}
+              step={cartesianRadStep * RAD_TO_DEG}
+              settleTolerance={CARTESIAN_ORIENTATION_ARRIVAL_TOLERANCE_RAD * RAD_TO_DEG}
+              onCommit={(nextRpyDeg) => commitRpy(rpyDegToRad(nextRpyDeg))}
               wrap
               disabled={!commandGate.canCommand}
             />
@@ -1773,8 +1800,10 @@ function PoseEditSnapshotSection({
     }
     const tcp = robot?.tcp_pose_in_base;
     if (!tcp) return null;
+    const baseFrame = robot?.base_frame ?? 'base';
     return {
       pose_goal: {
+        frame_id: baseFrame,
         position_m: readPosition(tcp),
         orientation_xyzw: readQuat(tcp),
       },
@@ -1956,17 +1985,48 @@ function readQuat(pose: Record<string, unknown>): number[] {
   return [0, 0, 0, 1];
 }
 
+function compactNumber(value: number): string {
+  if (!Number.isFinite(value)) return '0';
+  return String(Number(value.toFixed(6)));
+}
+
+function formatRadStepAsDeg(valueRad: number): string {
+  return compactNumber(valueRad * RAD_TO_DEG);
+}
+
+function rpyRadToDeg(rpy: [number, number, number]): [number, number, number] {
+  return [rpy[0] * RAD_TO_DEG, rpy[1] * RAD_TO_DEG, rpy[2] * RAD_TO_DEG];
+}
+
+function rpyDegToRad(rpy: [number, number, number]): [number, number, number] {
+  return [rpy[0] * DEG_TO_RAD, rpy[1] * DEG_TO_RAD, rpy[2] * DEG_TO_RAD];
+}
+
+function jointValueToDisplay(joint: SceneUrdfJoint, value: number): number {
+  return joint.type === 'prismatic' ? value : value * RAD_TO_DEG;
+}
+
+function jointDisplayToValue(joint: SceneUrdfJoint, value: number): number {
+  return joint.type === 'prismatic' ? value : value * DEG_TO_RAD;
+}
+
+function jointDeltaToDisplay(joint: SceneUrdfJoint, value: number): number {
+  return joint.type === 'prismatic' ? value : value * RAD_TO_DEG;
+}
+
 function StepCapSelect({
   label,
   options,
   value,
   onChange,
+  formatOption = (option: number): string => String(option),
   disabled = false,
 }: {
   label: string;
   options: readonly number[];
   value: number;
   onChange: (next: number) => void;
+  formatOption?: (option: number) => string;
   disabled?: boolean;
 }) {
   return (
@@ -1984,7 +2044,7 @@ function StepCapSelect({
       >
         {options.map((opt) => (
           <option key={opt} value={opt}>
-            {opt}
+            {formatOption(opt)}
           </option>
         ))}
       </select>
@@ -2009,7 +2069,10 @@ function JointRow({
   disabled?: boolean;
   disabledReason?: string | null;
 }) {
-  const displayValue = currentValue ?? 0;
+  const displayValue = jointValueToDisplay(joint, currentValue ?? 0);
+  const displayStep = jointDeltaToDisplay(joint, step);
+  const displayTolerance = jointDeltaToDisplay(joint, jointArrivalTolerance(joint));
+  const displayUnit = joint.type === 'prismatic' ? 'm' : 'deg';
   const hasAuthoritativeRange =
     (joint.limit_lower !== null && joint.limit_upper !== null)
     || joint.type === 'continuous';
@@ -2021,9 +2084,16 @@ function JointRow({
     () => (
       hasAuthoritativeRange
         ? sliderRange(joint, currentValue)
-        : { min: displayValue, max: displayValue }
+        : { min: currentValue ?? 0, max: currentValue ?? 0 }
     ),
-    [displayValue, hasAuthoritativeRange, joint, currentValue],
+    [hasAuthoritativeRange, joint, currentValue],
+  );
+  const displayJointRange = useMemo(
+    () => ({
+      min: jointValueToDisplay(joint, jointRange.min),
+      max: jointValueToDisplay(joint, jointRange.max),
+    }),
+    [joint, jointRange.max, jointRange.min],
   );
   // Persistent authored-target draft. A commit (slider release, spinner click,
   // Enter, blur) KEEPS the authored value visible — the control does not snap
@@ -2034,14 +2104,14 @@ function JointRow({
   // signal: a draft within tolerance of live auto-clears, so a held draft means
   // the authored target diverges from the live joint position.
   const { draft, isDraft, setDraft, clearDraft } = usePersistentDraft(
-    currentValue === null ? Number.NaN : currentValue,
-    jointArrivalTolerance(joint),
+    currentValue === null ? Number.NaN : displayValue,
+    displayTolerance,
     'joint',
   );
   const divergesFromLive = isDraft;
   const draftNumeric = draft === null ? displayValue : Number(draft);
   const sliderValue = Number.isFinite(draftNumeric)
-    ? Math.min(jointRange.max, Math.max(jointRange.min, draftNumeric))
+    ? Math.min(displayJointRange.max, Math.max(displayJointRange.min, draftNumeric))
     : displayValue;
 
   // Clear on any cycle transition that hands the joint over to an authoritative
@@ -2060,11 +2130,16 @@ function JointRow({
   }, [cycleState, clearDraft]);
 
   const clamp = useCallback((value: number): number => {
-    return Math.min(jointRange.max, Math.max(jointRange.min, value));
-  }, [jointRange.max, jointRange.min]);
+    return Math.min(displayJointRange.max, Math.max(displayJointRange.min, value));
+  }, [displayJointRange.max, displayJointRange.min]);
+
+  const displayToInternal = useCallback(
+    (value: number): number => jointDisplayToValue(joint, value),
+    [joint],
+  );
 
   function formattedLiveValue(): string {
-    return formatJointValue(displayValue, step);
+    return formatJointValue(displayValue, displayStep);
   }
 
   // Number-input event wiring. We bind 'input' and 'change' directly
@@ -2085,14 +2160,16 @@ function JointRow({
   const jointNameRef = useRef(joint.name);
   const hasAuthoritativeRangeRef = useRef(hasAuthoritativeRange);
   const disabledRef = useRef(disabled);
+  const displayToInternalRef = useRef(displayToInternal);
   const onDraftPushFinalRef = useRef(onDraftPushFinal);
   useEffect(() => {
     clampRef.current = clamp;
     jointNameRef.current = joint.name;
     hasAuthoritativeRangeRef.current = hasAuthoritativeRange;
     disabledRef.current = disabled;
+    displayToInternalRef.current = displayToInternal;
     onDraftPushFinalRef.current = onDraftPushFinal;
-  }, [clamp, disabled, hasAuthoritativeRange, joint.name, onDraftPushFinal]);
+  }, [clamp, disabled, displayToInternal, hasAuthoritativeRange, joint.name, onDraftPushFinal]);
   useEffect(() => {
     const el = numberInputRef.current;
     if (el === null) return;
@@ -2112,7 +2189,7 @@ function JointRow({
         // Keep the authored target visible (no snap-back); it clears only on
         // Revert / mode switch / live catch-up (see usePersistentDraft).
         setDraft(String(Number(clamped.toFixed(6))));
-        onDraftPushFinalRef.current(jointNameRef.current, clamped);
+        onDraftPushFinalRef.current(jointNameRef.current, displayToInternalRef.current(clamped));
         return;
       }
       setDraft(el.value);
@@ -2125,7 +2202,7 @@ function JointRow({
       if (!Number.isFinite(v)) return;
       const clamped = clampRef.current(v);
       setDraft(String(Number(clamped.toFixed(6))));
-      onDraftPushFinalRef.current(jointNameRef.current, clamped);
+      onDraftPushFinalRef.current(jointNameRef.current, displayToInternalRef.current(clamped));
     };
     el.addEventListener('input', onNativeInput);
     el.addEventListener('change', onNativeChange);
@@ -2142,7 +2219,7 @@ function JointRow({
     if (!Number.isFinite(v)) return;
     // Author-only: records the in-progress authored value. No motion;
     // Approve is the only motion path.
-    onDraftPush(joint.name, clamp(v));
+    onDraftPush(joint.name, displayToInternal(clamp(v)));
   }
 
   function draftFinal(raw: string): void {
@@ -2150,7 +2227,7 @@ function JointRow({
     if (!hasAuthoritativeRange) return;
     const v = Number(raw);
     if (!Number.isFinite(v)) return;
-    onDraftPushFinal(joint.name, clamp(v));
+    onDraftPushFinal(joint.name, displayToInternal(clamp(v)));
   }
 
   function commitValue(raw: string): void {
@@ -2164,7 +2241,7 @@ function JointRow({
     const clamped = clamp(requested);
     // Keep the authored target visible after release/Enter (no snap-back).
     setDraft(String(Number(clamped.toFixed(6))));
-    onDraftPushFinal(joint.name, clamped);
+    onDraftPushFinal(joint.name, displayToInternal(clamped));
   }
 
   function commitTyped(): void {
@@ -2188,26 +2265,26 @@ function JointRow({
             className="font-mono text-[10px] text-gray-400"
             title="live joint position (not the authored target)"
           >
-            live {formatJointValue(currentValue, step)}
+            live {formatJointValue(jointValueToDisplay(joint, currentValue), displayStep)} {displayUnit}
           </span>
         ) : (
-          <span className="text-[10px] text-gray-500">{joint.type}</span>
+          <span className="text-[10px] text-gray-500">{joint.type} · {displayUnit}</span>
         )}
       </div>
       <div className="mt-0.5 flex items-center gap-2">
         <input
           type="range"
-          min={jointRange.min}
-          max={jointRange.max}
+          min={displayJointRange.min}
+          max={displayJointRange.max}
           // `step="any"` makes the slider accept any value the operator
           // drags to AND keeps it `:valid` when the live joint state
-          // (e.g. -0.722563 rad) is pushed in from outside. Without it,
+          // is pushed in from outside. Without it,
           // Firefox marks the slider invalid and shows the native
           // "Please select a valid value. The two nearest valid values
           // are…" tooltip — operator UX-breaking even though the value
           // is correct. Keyboard arrows fall back to (max-min)/100
-          // which is still useful for jog precision (~0.06 rad on a
-          // ±π joint). clamp() bounds the authored draft to the joint
+          // which is still useful for jog precision. clamp() bounds the
+          // authored draft to the joint
           // range; validated planning is the authoritative validator.
           step="any"
           value={sliderValue}
@@ -2238,10 +2315,10 @@ function JointRow({
           // (the slider does, for the Firefox :valid hover tooltip
           // bug — see slider above); for a number input,
           // controlled-value props are accepted verbatim regardless
-          // of step, and `step={step}` is what makes the visible
+          // of step, and `step={displayStep}` is what makes the visible
           // spinner buttons honour the operator's selected step
           // instead of the browser default of 1.
-          step={step}
+          step={displayStep}
           value={draft ?? formattedLiveValue()}
           disabled={disabled || !hasAuthoritativeRange}
           title={disabled ? disabledReason ?? undefined : undefined}
@@ -2269,7 +2346,7 @@ function JointRow({
               e.preventDefault();
               const direction = e.key === 'ArrowUp' ? 1 : -1;
               const base = Number(draft ?? displayValue);
-              const delta = (Number.isFinite(step) && step > 0 ? step : 0.01)
+              const delta = (Number.isFinite(displayStep) && displayStep > 0 ? displayStep : 0.01)
                 * (e.shiftKey ? 10 : 1)
                 * direction;
               const next = clamp((Number.isFinite(base) ? base : displayValue) + delta);
@@ -2287,8 +2364,16 @@ function JointRow({
       </div>
       {(joint.limit_lower !== null || joint.limit_upper !== null) && (
         <div className="mt-0.5 flex justify-between font-mono text-[9px] text-gray-600">
-          <span>{joint.limit_lower !== null ? joint.limit_lower.toFixed(2) : '-∞'}</span>
-          <span>{joint.limit_upper !== null ? joint.limit_upper.toFixed(2) : '+∞'}</span>
+          <span>
+            {joint.limit_lower !== null
+              ? formatJointValue(jointValueToDisplay(joint, joint.limit_lower), displayStep)
+              : '-∞'}
+          </span>
+          <span>
+            {joint.limit_upper !== null
+              ? formatJointValue(jointValueToDisplay(joint, joint.limit_upper), displayStep)
+              : '+∞'}
+          </span>
         </div>
       )}
       {!hasAuthoritativeRange && (

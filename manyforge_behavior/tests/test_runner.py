@@ -10,7 +10,7 @@ import yaml
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.kernel_client import ExecutionState, MockKernelClient
-from manyforge_behavior.program import Program, ProgramValidationError
+from manyforge_behavior.program import Program, ProgramValidationError, SceneResource
 from manyforge_behavior.runner import OrchestratorRunner
 
 CATALOG_PATH = str(Path(__file__).parent.parent / "resources" / "node_catalog.yaml")
@@ -141,6 +141,38 @@ class TestRunnerSceneApplication:
         runner.apply_scene()
         assert kernel.robot_base_pose == program.robot.base_pose
         assert kernel.scene_edits[0].object_id == "table"
+
+    def test_apply_scene_forwards_cylinder_shape_dimensions(self, kernel):
+        catalog = NodeCatalog(CATALOG_PATH)
+        program = Program(FIXTURE_PATH, catalog)
+        program.scene = [
+            SceneResource(
+                object_id="graspable",
+                shape={
+                    "type": "cylinder",
+                    "cylinder_radius_m": 0.014,
+                    "cylinder_height_m": 0.089,
+                },
+                pose={
+                    "frame_id": "link_base",
+                    "position_m": [0.18, -0.2, 0.08],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+            )
+        ]
+        runner = OrchestratorRunner(
+            CATALOG_PATH, FIXTURE_PATH, kernel, program=program
+        )
+        runner.load()
+        runner.apply_scene()
+
+        assert len(kernel.scene_edits) == 1
+        request = kernel.scene_edits[0]
+        assert request.operation == "add"
+        assert request.object_id == "graspable"
+        assert request.shape_type == "cylinder"
+        assert request.cylinder_radius_m == pytest.approx(0.014)
+        assert request.cylinder_height_m == pytest.approx(0.089)
 
     def test_apply_scene_failure(self, kernel):
         kernel.fail_next_scene_edit = True

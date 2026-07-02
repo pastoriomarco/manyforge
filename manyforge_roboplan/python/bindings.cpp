@@ -11,6 +11,7 @@
 #include <Eigen/Dense>
 
 #include <manyforge_roboplan/native_kernel_factory.hpp>
+#include <manyforge_roboplan/roboplan_execution_state_sink.hpp>
 #ifdef MANYFORGE_ROS2_CONTROL_ENABLED
 #include <manyforge_roboplan/ros2_control_kernel_factory.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
@@ -509,6 +510,10 @@ std::vector<SupportContactDTO> support_contacts_from_python(const py::dict& requ
             "support_contacts mode must be contact_release or contact_process");
       }
     }
+    if (contact_dict.contains("enforce_max_start_penetration")) {
+      contact.enforce_max_start_penetration =
+          contact_dict["enforce_max_start_penetration"].cast<bool>();
+    }
     if (contact_dict.contains("max_start_penetration_m")) {
       contact.max_start_penetration_m =
           contact_dict["max_start_penetration_m"].cast<double>();
@@ -547,6 +552,33 @@ std::vector<SupportContactDTO> support_contacts_from_python(const py::dict& requ
     contacts.push_back(std::move(contact));
   }
   return contacts;
+}
+
+py::dict support_contact_to_python(const SupportContactDTO& contact) {
+  py::dict d;
+  d["support_object_id"] = contact.support_object_id;
+  d["mode"] = contact.mode == CollisionContactPolicyMode::kContactProcess
+                  ? "contact_process"
+                  : "contact_release";
+  d["enforce_max_start_penetration"] = contact.enforce_max_start_penetration;
+  d["max_start_penetration_m"] = contact.max_start_penetration_m;
+  d["release_tolerance_m"] = contact.release_tolerance_m;
+  d["min_release_progress_m"] = contact.min_release_progress_m;
+  d["min_separation_clearance_m"] = contact.min_separation_clearance_m;
+  d["require_separation_by_end"] = contact.require_separation_by_end;
+  d["require_strictly_decreasing_penetration"] =
+      contact.require_strictly_decreasing_penetration;
+  d["allow_recontact"] = contact.allow_recontact;
+  return d;
+}
+
+py::list support_contacts_to_python(
+    const std::vector<SupportContactDTO>& contacts) {
+  py::list out;
+  for (const auto& contact : contacts) {
+    out.append(support_contact_to_python(contact));
+  }
+  return out;
 }
 
 // Helper: convert RobotStateDTO to Python dict
@@ -795,6 +827,7 @@ py::dict scene_object_snapshot_to_python(
   d["pose_in_universe"] = pose_to_python(object.pose_in_universe);
   d["frame_id"] = object.frame_id;
   d["attached"] = object.attached;
+  d["support_contacts"] = support_contacts_to_python(object.support_contacts);
   return d;
 }
 
@@ -1306,6 +1339,17 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                  metadata
                      .attr("get")("group_commandable_joint_names", py::dict())
                      .cast<std::map<std::string, std::vector<std::string>>>();
+             if (self.execution_state_sink) {
+               auto roboplan_sink =
+                   std::dynamic_pointer_cast<RoboPlanExecutionStateSink>(
+                       self.execution_state_sink);
+               if (roboplan_sink) {
+                 roboplan_sink->set_robot_model_authority_metadata(
+                     self.canonical_to_view_joint_names,
+                     self.view_to_canonical_joint_names,
+                     self.group_commandable_joint_names);
+               }
+             }
            },
            py::arg("metadata"),
            "Attach Robot Model Authority metadata for canonical public readout.")
@@ -2307,7 +2351,9 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               config.group_id = config_dict["group_id"].cast<std::string>();
             }
             if (config_dict.contains("joint_name")) {
-              config.joint_name = config_dict["joint_name"].cast<std::string>();
+              config.joint_name =
+                  canonical_joint_name(
+                      self, config_dict["joint_name"].cast<std::string>());
             }
             if (config_dict.contains("wait_for_action_server_timeout_s")) {
               config.wait_for_action_server_timeout_s =

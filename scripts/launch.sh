@@ -460,7 +460,7 @@ step_choose_scenario() {
         warn "  YAML to expose the overlay."
     fi
     case "${SCENARIO}" in
-        isaac-lite6-pick-place)
+        isaac-lite6-pick-place|isaac-lite6-trocar-foundationpose)
             export ISAAC_TOPIC_CONTROL_PROFILE="${ISAAC_TOPIC_CONTROL_PROFILE:-lite6}"
             GRIPPER_ACTION="/lite_gripper_controller/gripper_cmd"
             export GRIPPER_ACTION
@@ -748,14 +748,20 @@ verb_smoke() {
                 wait_for_vllm_proxy
                 wait_for_bridge
             fi
-            if [[ "${SCENARIO}" == "isaac-lite6-pick-place" ]]; then
+            if [[ "${SCENARIO}" == "isaac-lite6-pick-place" || "${SCENARIO}" == "isaac-lite6-trocar-foundationpose" ]]; then
                 mkdir -p "${LOG_DIR}"
-                local lite6_live_probe_artifact="${LOG_DIR}/isaac-lite6-pick-place-live-smoke.json"
+                local lite6_live_probe_artifact="${LOG_DIR}/${SCENARIO}-lite6-live-smoke.json"
                 ros_shell "source /opt/ros/jazzy/setup.bash; python3 /workspace/scripts/ros/validate-isaac-lite6-smoke.py --arm-action-name ${ARM_ACTION} --gripper-action-name ${GRIPPER_ACTION} --arm-joint-state-topic ${ARM_JOINT_STATE_TOPIC} --isaac-joint-state-topic ${ISAAC_JOINT_STATE_TOPIC} --json" \
                     | tee "${lite6_live_probe_artifact}"
                 python3 "${MANYFORGE_ROOT}/scripts/ros/validate-isaac-lite6-smoke-artifact.py" \
                     "${lite6_live_probe_artifact}"
                 pass "Lite6 live smoke artifact: ${lite6_live_probe_artifact}"
+                if [[ "${SCENARIO}" == "isaac-lite6-trocar-foundationpose" ]]; then
+                    local foundationpose_artifact="${LOG_DIR}/${SCENARIO}-foundationpose-detection3d.json"
+                    ros_shell "source /opt/ros/jazzy/setup.bash; source /workspace/install/setup.bash 2>/dev/null || true; python3 /workspace/scripts/ros/validate-foundationpose-detection3d-source.py --topic ${FOUNDATIONPOSE_DETECTION3D_TOPIC:-/output} --object-id graspable --selection ${FOUNDATIONPOSE_DETECTION3D_SELECTION:-first} --confidence-min ${FOUNDATIONPOSE_CONFIDENCE_MIN:-0.0} --allow-zero-confidence --max-position-variance-m2 ${FOUNDATIONPOSE_MAX_POSITION_VARIANCE_M2:-0.0025} --allow-zero-covariance --expected-frame-id ${FOUNDATIONPOSE_EXPECTED_FRAME_ID:-link_base} --expected-raw-frame-id ${FOUNDATIONPOSE_EXPECTED_RAW_FRAME_ID:-camera_color_optical_frame} --min-accepted-samples ${FOUNDATIONPOSE_MIN_ACCEPTED_SAMPLES:-1} --timeout-s ${FOUNDATIONPOSE_VALIDATION_TIMEOUT_S:-30}" \
+                        | tee "${foundationpose_artifact}"
+                    pass "FoundationPose Detection3D artifact: ${foundationpose_artifact}"
+                fi
             else
                 ros_shell "source /opt/ros/jazzy/setup.bash; python3 /workspace/scripts/ros/smoke_isaac_arm_action.py --action-name ${ARM_ACTION} --joint-state-topic ${ARM_JOINT_STATE_TOPIC}"
             fi

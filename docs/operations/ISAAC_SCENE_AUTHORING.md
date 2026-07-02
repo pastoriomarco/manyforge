@@ -188,6 +188,19 @@ binding, and apply policy. The Isaac demo source uses
 `kind: simulation_interfaces`, `service_prefix: auto`, `frame_id:
 universe`, and a bounded `max_update_hz` such as `4.0`.
 
+For camera/perception scenes such as the Lite6 trocar FoundationPose workflow,
+also configure each Isaac Sim `ROS2CameraHelper` publisher with bounded
+sensor-data QoS before playback:
+
+```json
+{"history":"keepLast","depth":1,"reliability":"bestEffort","durability":"volatile","deadline":0.0,"lifespan":0.0,"liveliness":"systemDefault","leaseDuration":0.0}
+```
+
+Set `queueSize` to `1` on the RGB image, depth image, and camera info helpers.
+Use a conservative `frameSkipCount` while commissioning over a shared LAN. See
+[`ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md`](ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md)
+for the full multi-machine DDS/QoS/perception runbook.
+
 Pick the apply policy per object:
 
 - `observe_only` shows freshness and observed pose without changing

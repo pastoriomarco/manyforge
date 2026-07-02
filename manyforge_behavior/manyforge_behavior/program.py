@@ -601,6 +601,7 @@ def _validate_scene_resource_value(value: Any) -> str | None:
                         f"{field_name} must be >= 0"
                     )
             for field_name in (
+                "enforce_max_start_penetration",
                 "require_separation_by_end",
                 "require_strictly_decreasing_penetration",
                 "allow_recontact",

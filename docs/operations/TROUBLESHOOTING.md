@@ -208,6 +208,48 @@ controller-state tolerance abort appears on Isaac, that's a deployment
 misconfig, not a controller bug. See [`STACK_SETUP.md`](STACK_SETUP.md)
 §"Real ROS 2 controller / robot execution".
 
+### Lite6 trocar FoundationPose stream is unstable or missing
+
+Use [`ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md`](ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md)
+as the primary runbook. The short diagnostic order is:
+
+1. Confirm the DDS environment is set in all three contexts: Isaac Sim laptop,
+   Isaac ROS container, and the ManyForge launcher shell.
+
+   ```bash
+   echo "$ROS_DOMAIN_ID"
+   echo "$RMW_IMPLEMENTATION"
+   echo "$ROS_AUTOMATIC_DISCOVERY_RANGE"
+   echo "$ROS_STATIC_PEERS"
+   ```
+
+2. Check low-payload graph info before subscribing to raw image topics:
+
+   ```bash
+   ros2 topic list --no-daemon --spin-time 20 -t | \
+     grep -E 'image_rect|depth|camera_info|detections_output|/output'
+   ros2 topic info --no-daemon --spin-time 20 -v /output
+   ```
+
+3. Echo `/output` with explicit type and QoS:
+
+   ```bash
+   ros2 topic echo /output vision_msgs/msg/Detection3DArray --once --timeout 120 \
+     --qos-reliability reliable --qos-durability volatile
+   ```
+
+4. If ManyForge reports `tf_lookup_failed`, verify:
+
+   ```bash
+   ros2 run tf2_ros tf2_echo link_base camera_color_optical_frame
+   ```
+
+Known commissioning limitation: the current Isaac ROS FoundationPose `/output`
+may publish empty detection id/class, score `0.0`, and zero covariance. The
+trocar deployment and smoke validator explicitly allow that only for the
+controlled single-trocar bootstrap scene. Treat a production cell with those
+quality fields still empty as unqualified.
+
 ## Where else troubleshooting lives
 
 Per-workflow troubleshooting blocks already exist in the operations

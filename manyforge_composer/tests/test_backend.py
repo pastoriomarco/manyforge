@@ -1228,7 +1228,12 @@ def test_catalog_entry_includes_ui_editor_hints(client):
     data = response.json()
     params = {param["name"]: param for param in data["parameters"]}
     assert params["pick_offset_envelope"]["uiEditor"] == "pose_envelope"
+    assert params["pick_offset_reference"]["uiEditor"] == "relative_move_reference"
     assert params["approach_offset_envelope"]["uiEditor"] == "pose_envelope"
+    assert params["approach_offset_reference"]["uiEditor"] == "relative_move_reference"
+    assert params["approach_move_node_name"]["schema"]["type"] == "string"
+    assert params["pick_move_node_name"]["schema"]["type"] == "string"
+    assert params["retreat_move_node_name"]["schema"]["type"] == "string"
     assert "place_pose_map" not in params
 
 
@@ -1347,6 +1352,7 @@ def test_load_program(client, state):
                 "position_m": [0.5, 0.0, 0.4],
                 "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
             },
+            "metadata": {},
         }
     ]
     assert "parameterCount" in data
@@ -1385,6 +1391,53 @@ def test_get_program(client, state):
     assert "robot" in data
     assert data["sceneResources"][0]["objectId"] == "table"
     assert data["parameters"][0]["name"] == "pick_velocity_scale"
+
+
+def test_program_scene_resource_metadata_round_trips_through_apply(client, state, tmp_path):
+    data = yaml.safe_load(Path(_PROGRAM_PATH).read_text(encoding="utf-8"))
+    data["scene"].append(
+        {
+            "object_id": "supported_box",
+            "shape": {"type": "box", "box_dimensions_m": [0.05, 0.05, 0.05]},
+            "pose": {
+                "frame_id": "base_link",
+                "position_m": [0.45, 0.0, 0.455],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+            "metadata": {
+                "support_contacts": [
+                    {
+                        "support_object_id": "table",
+                        "max_start_penetration_m": 0.01,
+                        "release_tolerance_m": 0.001,
+                        "require_separation_by_end": True,
+                    }
+                ]
+            },
+        }
+    )
+    program_path = tmp_path / "support_contact_scene.program.yaml"
+    program_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    load_response = client.post("/api/program/load", json={"path": str(program_path)})
+    assert load_response.status_code == 200
+    resources = load_response.json()["sceneResources"]
+    supported = next(item for item in resources if item["objectId"] == "supported_box")
+    assert supported["metadata"]["support_contacts"][0]["support_object_id"] == "table"
+
+    apply_response = client.post("/api/session/apply", json={"scene": resources})
+    assert apply_response.status_code == 200
+
+    current_resources = client.get("/api/program").json()["sceneResources"]
+    current_supported = next(
+        item for item in current_resources if item["objectId"] == "supported_box"
+    )
+    assert current_supported["metadata"] == supported["metadata"]
+    active_supported = next(
+        item for item in state.kernel.get_scene_objects()
+        if item.object_id == "supported_box"
+    )
+    assert active_supported.support_contacts == supported["metadata"]["support_contacts"]
 
 
 def test_get_saved_program_returns_saved_parameters(client):
@@ -4030,6 +4083,39 @@ def test_direct_execute_and_status():
         status_data = status_resp.json()
         assert status_data["sessionId"] == data["sessionId"]
         assert status_data["status"] in ("completed", "failed")
+
+
+def test_direct_cartesian_jog_preserves_requested_frames():
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        load = client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        assert load.status_code == 200, load.text
+        assert state.cycle_manager is not None
+        state.cycle_manager.reset()
+
+        response = client.post(
+            "/api/direct/cartesian-jog",
+            json={
+                "positionM": [0.4, 0.1, 0.5],
+                "orientationXyzw": [0.0, 0.0, 0.0, 1.0],
+                "frameId": "custom_world",
+                "tcpFrame": "gripper_tip",
+                "principalId": "human:test-operator",
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        deadline = time.time() + 5.0
+        while kernel.execute_count == 0 and time.time() < deadline:
+            time.sleep(0.02)
+        assert kernel.execute_count >= 1
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.base_frame == "custom_world"
+        assert kernel.last_execute_request.tcp_frame == "gripper_tip"
+        assert kernel.last_execute_request.pose_goal is not None
+        assert kernel.last_execute_request.pose_goal["frame_id"] == "custom_world"
 
 
 def test_direct_promote_blackboard_value_after_intervention():

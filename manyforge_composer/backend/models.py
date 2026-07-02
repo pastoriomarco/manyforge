@@ -247,6 +247,7 @@ class ProgramSceneResourceResponse(BaseModel):
     object_id: str = Field(alias="objectId")
     shape: Dict[str, Any] = Field(default_factory=dict)
     pose: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class BlackboardNamespaceResponse(BaseModel):
@@ -488,11 +489,9 @@ class CartesianJogRequest(BaseModel):
     """Operator-driven Cartesian end-effector jog from the robot-control
     overlay's Cartesian tab (Day 5c.2).
 
-    The viewer side sends a target TCP pose expressed in the robot's
-    base frame (the same frame the catalog's `pose_goal` parameter
-    speaks). For now, the frontend converts world-frame gizmo poses
-    to base frame using the kernel's known base pose before POSTing
-    — keeps the backend small. The backend builds a one-leaf
+    The viewer side sends a target TCP pose expressed in `frameId`
+    (default: the program robot base frame) for `tcpFrame` (default:
+    the program robot TCP frame). The backend builds a one-leaf
     intervention tree with `move_manipulator_action(motion_type=
     pose_goal, pose_goal=<pose>)` and submits via the existing
     cycle_manager.execute_intervention machinery.
@@ -503,6 +502,8 @@ class CartesianJogRequest(BaseModel):
     orientation_xyzw: List[float] = Field(
         alias="orientationXyzw", min_length=4, max_length=4
     )
+    frame_id: Optional[str] = Field(default=None, alias="frameId")
+    tcp_frame: Optional[str] = Field(default=None, alias="tcpFrame")
     lease_timeout_ms: int = Field(default=10_000, alias="leaseTimeoutMs", gt=0)
     principal_id: str = Field(default="composer-viewer", alias="principalId", min_length=1)
 
@@ -1030,6 +1031,7 @@ class SceneObjectResponse(BaseModel):
     source: str = "runtime"
     persistable: bool = False
     viewer_frame_visible: bool = False
+    support_contacts: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class SceneRobotResponse(BaseModel):

@@ -170,6 +170,30 @@ def generate_launch_description() -> LaunchDescription:
                 description="Isaac Sim JointState feedback topic used by the gripper bridge.",
             ),
             DeclareLaunchArgument(
+                "base_parent_frame",
+                default_value="universe",
+                description="Parent frame for the robot root static transform.",
+            ),
+            DeclareLaunchArgument(
+                "base_child_frame",
+                default_value="world",
+                description=(
+                    "Child frame for the static transform. The Lite6 URDF already "
+                    "publishes world -> link_base, so the default bridges "
+                    "ManyForge's universe frame to the URDF world link."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "base_xyz",
+                default_value="0 0 0",
+                description="Static base transform translation: 'x y z' in meters.",
+            ),
+            DeclareLaunchArgument(
+                "base_rpy",
+                default_value="0 0 0",
+                description="Static base transform rotation: 'roll pitch yaw' in radians.",
+            ),
+            DeclareLaunchArgument(
                 "supervisor_auto_load",
                 default_value="true",
                 description=(
@@ -297,6 +321,36 @@ def _launch_setup(context, *_, **__) -> list[object]:
         output="screen",
         parameters=[{"robot_description": robot_description}],
     )
+    base_xyz = LaunchConfiguration("base_xyz").perform(context).split()
+    base_rpy = LaunchConfiguration("base_rpy").perform(context).split()
+    if len(base_xyz) != 3:
+        raise ValueError("base_xyz must contain exactly three numbers: 'x y z'")
+    if len(base_rpy) != 3:
+        raise ValueError("base_rpy must contain exactly three numbers: 'roll pitch yaw'")
+    static_base_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="manyforge_static_base_tf",
+        output="screen",
+        arguments=[
+            "--x",
+            base_xyz[0],
+            "--y",
+            base_xyz[1],
+            "--z",
+            base_xyz[2],
+            "--roll",
+            base_rpy[0],
+            "--pitch",
+            base_rpy[1],
+            "--yaw",
+            base_rpy[2],
+            "--frame-id",
+            LaunchConfiguration("base_parent_frame"),
+            "--child-frame-id",
+            LaunchConfiguration("base_child_frame"),
+        ],
+    )
 
     joint_state_broadcaster = Node(
         package="controller_manager",
@@ -419,6 +473,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
         topic_command_gate,
         demo_supervisor,
         robot_state_publisher,
+        static_base_tf,
         ros2_control_node,
         gripper_action_bridge,
         TimerAction(period=2.0, actions=[joint_state_broadcaster]),

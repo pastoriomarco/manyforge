@@ -516,6 +516,7 @@ def _program_scene_to_response(program: Program) -> list[dict]:
             "objectId": resource.object_id,
             "shape": resource.shape,
             "pose": resource.pose,
+            "metadata": dict(resource.metadata),
         }
         for resource in program.scene
     ]

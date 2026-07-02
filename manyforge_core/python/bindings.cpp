@@ -832,6 +832,10 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("mode",
                        &manyforge::core::SupportContactPolicyEntry::mode)
         .def_readwrite(
+            "enforce_max_start_penetration",
+            &manyforge::core::SupportContactPolicyEntry::
+                enforce_max_start_penetration)
+        .def_readwrite(
             "max_start_penetration_m",
             &manyforge::core::SupportContactPolicyEntry::max_start_penetration_m)
         .def_readwrite(

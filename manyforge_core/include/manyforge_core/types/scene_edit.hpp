@@ -47,6 +47,7 @@ struct SupportContactDTO {
   std::string support_object_id;
   CollisionContactPolicyMode mode =
       CollisionContactPolicyMode::kContactRelease;
+  bool enforce_max_start_penetration = true;
   double max_start_penetration_m = 0.0;
   double release_tolerance_m = 1e-5;
   double min_release_progress_m = 0.0;

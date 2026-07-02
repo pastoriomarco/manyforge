@@ -10,6 +10,14 @@ import type {
 } from '../types/api';
 
 type SceneShapeType = 'box' | 'sphere' | 'cylinder' | 'mesh';
+type SupportContactMode = 'contact_release' | 'contact_process';
+
+interface SupportContactRow {
+  rowKey: string;
+  supportedObjectId: string;
+  supportObjectId: string;
+  contact: Record<string, unknown>;
+}
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -267,6 +275,7 @@ function buildSceneResource(
   frameId: string,
   position: number[],
   rpyDegrees: number[],
+  metadata?: Record<string, unknown>,
 ): ProgramSceneResource {
   return {
     objectId,
@@ -276,6 +285,177 @@ function buildSceneResource(
       position_m: [...position],
       orientation_xyzw: rpyDegreesToQuaternion(rpyDegrees),
     },
+    ...(metadata ? { metadata } : {}),
+  };
+}
+
+function cloneMetadata(metadata: Record<string, unknown> | null | undefined): Record<string, unknown> {
+  return structuredClone(metadata ?? {});
+}
+
+function supportContactRowsFromResources(resources: ProgramSceneResource[]): SupportContactRow[] {
+  return resources.flatMap((resource) => {
+    const contacts = resource.metadata?.support_contacts;
+    if (!Array.isArray(contacts)) {
+      return [];
+    }
+    return contacts.flatMap((entry, index) => {
+      if (entry == null || typeof entry !== 'object' || Array.isArray(entry)) {
+        return [];
+      }
+      const contact = entry as Record<string, unknown>;
+      const supportObjectId = typeof contact.support_object_id === 'string'
+        ? contact.support_object_id
+        : '';
+      return [{
+        rowKey: `${resource.objectId}:${index}`,
+        supportedObjectId: resource.objectId,
+        supportObjectId,
+        contact: structuredClone(contact),
+      }];
+    });
+  });
+}
+
+function sanitizedSupportContact(
+  supportObjectId: string,
+  contact: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = structuredClone(contact);
+  next.support_object_id = supportObjectId;
+  if (next.enforce_max_start_penetration === false) {
+    delete next.max_start_penetration_m;
+  }
+  return next;
+}
+
+function applySupportContactRows(
+  resources: ProgramSceneResource[],
+  rows: SupportContactRow[],
+): ProgramSceneResource[] {
+  const grouped = new Map<string, Record<string, unknown>[]>();
+  for (const row of rows) {
+    const contacts = grouped.get(row.supportedObjectId) ?? [];
+    contacts.push(sanitizedSupportContact(row.supportObjectId, row.contact));
+    grouped.set(row.supportedObjectId, contacts);
+  }
+  return resources.map((resource) => {
+    const metadata = cloneMetadata(resource.metadata);
+    const contacts = grouped.get(resource.objectId) ?? [];
+    if (contacts.length > 0) {
+      metadata.support_contacts = contacts;
+    } else {
+      delete metadata.support_contacts;
+    }
+    return { ...resource, metadata };
+  });
+}
+
+function duplicateSupportContact(rows: SupportContactRow[]): string | null {
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const key = `${row.supportedObjectId}\u0000${row.supportObjectId}`;
+    if (seen.has(key)) {
+      return `${row.supportedObjectId} -> ${row.supportObjectId}`;
+    }
+    seen.add(key);
+  }
+  return null;
+}
+
+function contactMode(contact: Record<string, unknown>): SupportContactMode {
+  return contact.mode === 'contact_process' ? 'contact_process' : 'contact_release';
+}
+
+function contactNumber(
+  contact: Record<string, unknown>,
+  field: string,
+  fallback: number,
+): number {
+  const value = Number(contact[field]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function contactBoolean(
+  contact: Record<string, unknown>,
+  field: string,
+  fallback: boolean,
+): boolean {
+  return typeof contact[field] === 'boolean' ? contact[field] : fallback;
+}
+
+function replaceContactField(
+  contact: Record<string, unknown>,
+  field: string,
+  value: unknown,
+): Record<string, unknown> {
+  const next = { ...contact };
+  next[field] = value;
+  return next;
+}
+
+function renameSupportContactReference(
+  resource: ProgramSceneResource,
+  previousObjectId: string,
+  nextObjectId: string,
+): ProgramSceneResource {
+  const contacts = resource.metadata?.support_contacts;
+  if (!Array.isArray(contacts)) {
+    return resource;
+  }
+  const metadata = cloneMetadata(resource.metadata);
+  metadata.support_contacts = contacts.map((entry) => {
+    if (entry == null || typeof entry !== 'object' || Array.isArray(entry)) {
+      return entry;
+    }
+    const contact = { ...(entry as Record<string, unknown>) };
+    if (contact.support_object_id === previousObjectId) {
+      contact.support_object_id = nextObjectId;
+    }
+    return contact;
+  });
+  return { ...resource, metadata };
+}
+
+function removeSupportContactsInvolving(
+  resources: ProgramSceneResource[],
+  objectId: string,
+): ProgramSceneResource[] {
+  const rows = supportContactRowsFromResources(resources).filter(
+    (row) => row.supportedObjectId !== objectId && row.supportObjectId !== objectId,
+  );
+  return applySupportContactRows(resources, rows);
+}
+
+function supportContactSummary(row: SupportContactRow): string {
+  return `${row.supportedObjectId} supported by ${row.supportObjectId}`;
+}
+
+function liveSupportContactSummary(contact: Record<string, unknown>): string {
+  const supportObjectId = typeof contact.support_object_id === 'string'
+    ? contact.support_object_id
+    : 'unknown';
+  const mode = contact.mode === 'contact_process' ? 'process' : 'release';
+  const enforceMax = contact.enforce_max_start_penetration !== false;
+  const maxStart = Number(contact.max_start_penetration_m);
+  const maxText = enforceMax && Number.isFinite(maxStart)
+    ? `max ${maxStart.toFixed(3)} m`
+    : 'start cap off';
+  return `${supportObjectId} (${mode}, ${maxText})`;
+}
+
+function defaultSupportContact(supportObjectId: string): Record<string, unknown> {
+  return {
+    support_object_id: supportObjectId,
+    mode: 'contact_release',
+    enforce_max_start_penetration: true,
+    max_start_penetration_m: 0.0,
+    release_tolerance_m: 0.001,
+    min_release_progress_m: 0.0,
+    min_separation_clearance_m: 0.0,
+    require_separation_by_end: true,
+    require_strictly_decreasing_penetration: true,
+    allow_recontact: false,
   };
 }
 
@@ -417,8 +597,18 @@ function AuthoredSceneCard({
               mesh_resource_uri: meshResourceUri.trim(),
               mesh_scale: meshScale.map((value) => Number(value)),
             };
-    onUpdate(resource.objectId, buildSceneResource(objectId.trim(), shape, frameId, position, rpyDegrees));
-  }, [boxDimensions, cylinderHeight, cylinderRadius, frameId, meshResourceUri, meshScale, objectId, onUpdate, position, resource.objectId, rpyDegrees, shapeType, sphereRadius]);
+    onUpdate(
+      resource.objectId,
+      buildSceneResource(
+        objectId.trim(),
+        shape,
+        frameId,
+        position,
+        rpyDegrees,
+        resource.metadata,
+      ),
+    );
+  }, [boxDimensions, cylinderHeight, cylinderRadius, frameId, meshResourceUri, meshScale, objectId, onUpdate, position, resource.objectId, resource.metadata, rpyDegrees, shapeType, sphereRadius]);
 
   return (
     <div className="rounded border border-gray-700 bg-gray-900/40 p-3">
@@ -598,6 +788,351 @@ function AuthoredSceneCard({
   );
 }
 
+function SupportContactEditor({
+  sceneResources,
+  disabled,
+  onChange,
+  onError,
+}: {
+  sceneResources: ProgramSceneResource[];
+  disabled: boolean;
+  onChange: (resources: ProgramSceneResource[]) => void;
+  onError: (message: string | null) => void;
+}) {
+  const objectIds = useMemo(
+    () => sceneResources.map((resource) => resource.objectId).filter(Boolean),
+    [sceneResources],
+  );
+  const rows = useMemo(
+    () => supportContactRowsFromResources(sceneResources),
+    [sceneResources],
+  );
+  const [newSupportedObjectId, setNewSupportedObjectId] = useState('');
+  const [newSupportObjectId, setNewSupportObjectId] = useState('');
+
+  useEffect(() => {
+    if (objectIds.length < 2) {
+      setNewSupportedObjectId('');
+      setNewSupportObjectId('');
+      return;
+    }
+    const supported = objectIds.includes(newSupportedObjectId)
+      ? newSupportedObjectId
+      : objectIds[0];
+    const support = objectIds.includes(newSupportObjectId) && newSupportObjectId !== supported
+      ? newSupportObjectId
+      : objectIds.find((objectId) => objectId !== supported) ?? '';
+    if (supported !== newSupportedObjectId) {
+      setNewSupportedObjectId(supported);
+    }
+    if (support !== newSupportObjectId) {
+      setNewSupportObjectId(support);
+    }
+  }, [newSupportObjectId, newSupportedObjectId, objectIds]);
+
+  const commitRows = useCallback(
+    (nextRows: SupportContactRow[]) => {
+      const duplicate = duplicateSupportContact(nextRows);
+      if (duplicate != null) {
+        onError(`Duplicate support contact policy: ${duplicate}`);
+        return;
+      }
+      onChange(applySupportContactRows(sceneResources, nextRows));
+      onError(null);
+    },
+    [onChange, onError, sceneResources],
+  );
+
+  const updateRow = useCallback(
+    (rowKey: string, patch: Partial<SupportContactRow>) => {
+      const nextRows = rows.map((row) => {
+        if (row.rowKey !== rowKey) {
+          return row;
+        }
+        const nextSupported = patch.supportedObjectId ?? row.supportedObjectId;
+        const nextSupport = patch.supportObjectId ?? row.supportObjectId;
+        if (nextSupported === nextSupport) {
+          onError('A support contact cannot reference the same object on both sides.');
+          return row;
+        }
+        return {
+          ...row,
+          ...patch,
+          contact: patch.contact ?? row.contact,
+        };
+      });
+      commitRows(nextRows);
+    },
+    [commitRows, onError, rows],
+  );
+
+  const updateContact = useCallback(
+    (rowKey: string, field: string, value: unknown) => {
+      const row = rows.find((candidate) => candidate.rowKey === rowKey);
+      if (row == null) {
+        return;
+      }
+      updateRow(rowKey, {
+        contact: replaceContactField(row.contact, field, value),
+      });
+    },
+    [rows, updateRow],
+  );
+
+  const removeRow = useCallback(
+    (rowKey: string) => {
+      commitRows(rows.filter((row) => row.rowKey !== rowKey));
+    },
+    [commitRows, rows],
+  );
+
+  const addRow = useCallback(() => {
+    if (!newSupportedObjectId || !newSupportObjectId) {
+      onError('Choose an existing supported object and support object.');
+      return;
+    }
+    if (newSupportedObjectId === newSupportObjectId) {
+      onError('A support contact cannot reference the same object on both sides.');
+      return;
+    }
+    commitRows([
+      ...rows,
+      {
+        rowKey: '__new__',
+        supportedObjectId: newSupportedObjectId,
+        supportObjectId: newSupportObjectId,
+        contact: defaultSupportContact(newSupportObjectId),
+      },
+    ]);
+  }, [commitRows, newSupportObjectId, newSupportedObjectId, onError, rows]);
+
+  if (objectIds.length < 2) {
+    return (
+      <div className="rounded border border-gray-700 bg-gray-900/40 p-3 text-xs text-gray-500">
+        Add at least two authored scene objects to define support contacts.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {rows.length === 0 && (
+        <div className="rounded border border-gray-700 bg-gray-900/40 p-3 text-xs text-gray-500">
+          No support contact policies in the current program draft.
+        </div>
+      )}
+      {rows.map((row) => {
+        const enforceMax = contactBoolean(row.contact, 'enforce_max_start_penetration', true);
+        return (
+          <div key={row.rowKey} className="rounded border border-gray-700 bg-gray-900/40 p-3">
+            <div className="mb-2 flex items-start justify-between gap-2">
+              <div>
+                <div className="text-sm font-medium text-gray-100">
+                  {supportContactSummary(row)}
+                </div>
+                <div className="text-[11px] text-gray-500">
+                  Contact-release policy for attached-object extraction.
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => removeRow(row.rowKey)}
+                disabled={disabled}
+                className="rounded border border-red-700 px-2 py-1 text-xs text-red-200 hover:bg-red-900/40 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Remove
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <label className="block">
+                <span className="text-[11px] text-gray-400">Supported object</span>
+                <select
+                  value={row.supportedObjectId}
+                  onChange={(event) => {
+                    const supportedObjectId = event.target.value;
+                    const supportObjectId = row.supportObjectId === supportedObjectId
+                      ? objectIds.find((objectId) => objectId !== supportedObjectId) ?? ''
+                      : row.supportObjectId;
+                    updateRow(row.rowKey, { supportedObjectId, supportObjectId });
+                  }}
+                  disabled={disabled}
+                  className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {objectIds
+                    .filter((objectId) => objectId !== row.supportObjectId)
+                    .map((objectId) => (
+                      <option key={objectId} value={objectId}>
+                        {objectId}
+                      </option>
+                    ))}
+                </select>
+              </label>
+              <label className="block">
+                <span className="text-[11px] text-gray-400">Support object</span>
+                <select
+                  value={row.supportObjectId}
+                  onChange={(event) => updateRow(row.rowKey, { supportObjectId: event.target.value })}
+                  disabled={disabled}
+                  className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {objectIds
+                    .filter((objectId) => objectId !== row.supportedObjectId)
+                    .map((objectId) => (
+                      <option key={objectId} value={objectId}>
+                        {objectId}
+                      </option>
+                    ))}
+                </select>
+              </label>
+            </div>
+
+            <label className="mt-2 block">
+              <span className="text-[11px] text-gray-400">Mode</span>
+              <select
+                value={contactMode(row.contact)}
+                onChange={(event) => updateContact(row.rowKey, 'mode', event.target.value as SupportContactMode)}
+                disabled={disabled}
+                className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="contact_release">contact release</option>
+                <option value="contact_process">contact process</option>
+              </select>
+            </label>
+
+            <label className="mt-3 flex items-start gap-2 text-xs text-gray-300">
+              <input
+                type="checkbox"
+                checked={enforceMax}
+                onChange={(event) => {
+                  const nextContact = { ...row.contact };
+                  nextContact.enforce_max_start_penetration = event.target.checked;
+                  if (event.target.checked) {
+                    nextContact.max_start_penetration_m = contactNumber(row.contact, 'max_start_penetration_m', 0.0);
+                  } else {
+                    delete nextContact.max_start_penetration_m;
+                  }
+                  updateRow(row.rowKey, { contact: nextContact });
+                }}
+                disabled={disabled}
+                className="mt-0.5 h-3 w-3"
+              />
+              <span>Limit start penetration</span>
+            </label>
+
+            {enforceMax && (
+              <div className="mt-2">
+                <NumericInput
+                  label="Max start penetration (m)"
+                  value={contactNumber(row.contact, 'max_start_penetration_m', 0.0)}
+                  onChange={(next) => updateContact(row.rowKey, 'max_start_penetration_m', next)}
+                  disabled={disabled}
+                />
+              </div>
+            )}
+
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <NumericInput
+                label="Release tolerance (m)"
+                value={contactNumber(row.contact, 'release_tolerance_m', 0.001)}
+                onChange={(next) => updateContact(row.rowKey, 'release_tolerance_m', next)}
+                disabled={disabled}
+              />
+              <NumericInput
+                label="Min release progress (m)"
+                value={contactNumber(row.contact, 'min_release_progress_m', 0.0)}
+                onChange={(next) => updateContact(row.rowKey, 'min_release_progress_m', next)}
+                disabled={disabled}
+              />
+            </div>
+            <div className="mt-2">
+              <NumericInput
+                label="Min separation clearance (m)"
+                value={contactNumber(row.contact, 'min_separation_clearance_m', 0.0)}
+                onChange={(next) => updateContact(row.rowKey, 'min_separation_clearance_m', next)}
+                disabled={disabled}
+              />
+            </div>
+
+            <div className="mt-3 space-y-2">
+              {[
+                ['require_separation_by_end', 'Require separation by end', true],
+                ['require_strictly_decreasing_penetration', 'Require decreasing penetration', true],
+                ['allow_recontact', 'Allow re-contact', false],
+              ].map(([field, label, fallback]) => (
+                <label key={field as string} className="flex items-start gap-2 text-xs text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={contactBoolean(row.contact, field as string, fallback as boolean)}
+                    onChange={(event) => updateContact(row.rowKey, field as string, event.target.checked)}
+                    disabled={disabled}
+                    className="mt-0.5 h-3 w-3"
+                  />
+                  <span>{label as string}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+
+      <div className="rounded border border-gray-700 bg-gray-900/40 p-3">
+        <div className="mb-2 text-sm font-medium text-gray-100">Add Support Contact</div>
+        <div className="grid grid-cols-2 gap-2">
+          <label className="block">
+            <span className="text-[11px] text-gray-400">Supported object</span>
+            <select
+              value={newSupportedObjectId}
+              onChange={(event) => {
+                const supportedObjectId = event.target.value;
+                setNewSupportedObjectId(supportedObjectId);
+                if (newSupportObjectId === supportedObjectId) {
+                  setNewSupportObjectId(objectIds.find((objectId) => objectId !== supportedObjectId) ?? '');
+                }
+              }}
+              disabled={disabled}
+              className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {objectIds
+                .filter((objectId) => objectId !== newSupportObjectId)
+                .map((objectId) => (
+                  <option key={objectId} value={objectId}>
+                    {objectId}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <label className="block">
+            <span className="text-[11px] text-gray-400">Support object</span>
+            <select
+              value={newSupportObjectId}
+              onChange={(event) => setNewSupportObjectId(event.target.value)}
+              disabled={disabled}
+              className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {objectIds
+                .filter((objectId) => objectId !== newSupportedObjectId)
+                .map((objectId) => (
+                  <option key={objectId} value={objectId}>
+                    {objectId}
+                  </option>
+                ))}
+            </select>
+          </label>
+        </div>
+        <button
+          type="button"
+          onClick={addRow}
+          disabled={disabled || !newSupportedObjectId || !newSupportObjectId}
+          className="mt-2 w-full rounded border border-gray-600 px-3 py-2 text-sm text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Add Contact Policy
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function LiveSceneObjectCard({
   objectState,
   viewerAvailable,
@@ -613,6 +1148,9 @@ function LiveSceneObjectCard({
     readPoseVector(pose, 'orientation_xyzw', 4) ?? [0, 0, 0, 1],
   );
   const badge = sourceBadge(objectState.source);
+  const supportContacts = Array.isArray(objectState.support_contacts)
+    ? objectState.support_contacts
+    : [];
 
   return (
     <div className="rounded border border-gray-700 bg-gray-900/40 p-3">
@@ -651,6 +1189,11 @@ function LiveSceneObjectCard({
         <div>
           RPY°: [{rpyDegrees.map((value) => value.toFixed(1)).join(', ')}]
         </div>
+        {supportContacts.length > 0 && (
+          <div>
+            Support contacts: {supportContacts.map(liveSupportContactSummary).join('; ')}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -714,10 +1257,13 @@ export function ScenePanel() {
 
   const replaceSceneResource = useCallback(
     (previousObjectId: string, updated: ProgramSceneResource) => {
+      const updatedObjectId = updated.objectId.trim();
       const nextScene = sceneResources.filter(
-        (resource) => resource.objectId !== previousObjectId && resource.objectId !== updated.objectId,
+        (resource) => resource.objectId !== previousObjectId && resource.objectId !== updatedObjectId,
+      ).map(
+        (resource) => renameSupportContactReference(resource, previousObjectId, updatedObjectId),
       );
-      nextScene.push(updated);
+      nextScene.push({ ...updated, objectId: updatedObjectId });
       setSceneResources(nextScene);
       setError(null);
     },
@@ -726,7 +1272,23 @@ export function ScenePanel() {
 
   const removeSceneResource = useCallback(
     (objectId: string) => {
-      setSceneResources(sceneResources.filter((resource) => resource.objectId !== objectId));
+      const relatedContacts = supportContactRowsFromResources(sceneResources).filter(
+        (row) => row.supportedObjectId === objectId || row.supportObjectId === objectId,
+      );
+      if (relatedContacts.length > 0) {
+        const contactList = relatedContacts.map((row) => `- ${supportContactSummary(row)}`).join('\n');
+        const confirmed = window.confirm(
+          `Object "${objectId}" participates in support contact policies.\n\n`
+          + `Removing it will also remove these policies:\n${contactList}\n\n`
+          + 'Continue?',
+        );
+        if (!confirmed) {
+          return;
+        }
+      }
+      const prunedScene = removeSupportContactsInvolving(sceneResources, objectId)
+        .filter((resource) => resource.objectId !== objectId);
+      setSceneResources(prunedScene);
       setError(null);
     },
     [sceneResources, setSceneResources],
@@ -1067,6 +1629,15 @@ export function ScenePanel() {
             </div>
           </div>
         )}
+      </Section>
+
+      <Section title="Support Contacts">
+        <SupportContactEditor
+          sceneResources={sceneResources}
+          disabled={editLocked}
+          onChange={setSceneResources}
+          onError={setError}
+        />
       </Section>
 
       <Section title="Program Scene Objects">

@@ -828,6 +828,90 @@ def test_detection3d_array_topic_source_updates_associated_objects():
         rclpy.shutdown()
 
 
+def test_detection3d_array_topic_source_selection_transforms_foundationpose_frame():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("vision_msgs")
+
+    from rclpy.executors import SingleThreadedExecutor
+    from vision_msgs.msg import Detection3DArray
+
+    from manyforge_ros.pose_source_sidecar import (
+        Detection3DArrayTopicPoseSource,
+        POSE_SOURCE_STATUS_FRESH,
+        PoseSourceBinding,
+        _Detection3DObjectBinding,
+    )
+
+    rclpy.init(args=None)
+    node = rclpy.create_node("manyforge_detection3d_selection_tf_test")
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    publisher = node.create_publisher(Detection3DArray, "/foundationpose_output", 1)
+    buffer = _FakeTfBuffer(
+        {
+            ("link_base", "camera_color_optical_frame"): _transform(
+                "link_base",
+                "camera_color_optical_frame",
+                10.0,
+                0.0,
+                0.0,
+            )
+        }
+    )
+    source = Detection3DArrayTopicPoseSource(
+        node=node,
+        pose_source_id="foundationpose",
+        bindings=[
+            _Detection3DObjectBinding(
+                binding=PoseSourceBinding(
+                    object_id="graspable",
+                    entity="first",
+                    frame_id="link_base",
+                    apply_policy="before_planning",
+                    confidence_min=0.0,
+                ),
+                selection="first",
+                max_position_variance_m2=0.0025,
+            )
+        ],
+        topic="/foundationpose_output",
+        frame_id="link_base",
+        buffer=buffer,
+        now_fn=lambda: 100.0,
+    )
+
+    try:
+        msg = Detection3DArray()
+        msg.header.frame_id = "camera_color_optical_frame"
+        detection = _detection3d("", "", 0.0, 1.0, 2.0, 3.0, covariance=0.0)
+        detection.header.frame_id = "camera_color_optical_frame"
+        msg.detections.append(detection)
+        _publish_until(
+            executor,
+            publisher,
+            msg,
+            lambda: source.snapshot(monotonic_s=100.0).objects[0].update is not None,
+        )
+
+        live = source.snapshot(monotonic_s=100.0)
+        assert live.status == POSE_SOURCE_STATUS_FRESH
+        update = live.objects[0].update
+        assert update is not None
+        assert update.pose.frame_id == "link_base"
+        assert update.pose.position_xyz == pytest.approx((11.0, 2.0, 3.0))
+        assert update.metadata["detectionId"] == ""
+        assert update.metadata["classId"] == ""
+        assert update.metadata["confidence"] == pytest.approx(0.0)
+        assert update.metadata["maxPositionVarianceM2"] == pytest.approx(0.0)
+        assert buffer.lookups == [("link_base", "camera_color_optical_frame")]
+    finally:
+        source.close()
+        node.destroy_publisher(publisher)
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
 def test_detection3d_array_topic_source_rejects_quality_failures_and_clears_update():
     rclpy = pytest.importorskip("rclpy")
     pytest.importorskip("vision_msgs")

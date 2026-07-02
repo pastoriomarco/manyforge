@@ -257,6 +257,7 @@ def test_support_contact_policy_entry_round_trip():
         body_b="fixture/table/shape/0",
     )
     e.mode = manyforge_core_py.CollisionContactPolicyMode.kContactRelease
+    e.enforce_max_start_penetration = False
     e.max_start_penetration_m = 0.001
     e.release_tolerance_m = 0.00001
     e.min_release_progress_m = 0.0005
@@ -267,6 +268,7 @@ def test_support_contact_policy_entry_round_trip():
 
     assert e.pair.body_b == "fixture/table/shape/0"
     assert e.mode == manyforge_core_py.CollisionContactPolicyMode.kContactRelease
+    assert e.enforce_max_start_penetration is False
     assert e.max_start_penetration_m == 0.001
     assert e.release_tolerance_m == 0.00001
     assert e.min_release_progress_m == 0.0005

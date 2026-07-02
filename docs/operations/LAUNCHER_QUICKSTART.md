@@ -61,7 +61,7 @@ Two orthogonal selectors:
     deployment declares `assistant.enabled: true`.
 
 Plus a named **scenario** selecting the program + deployment YAML
-pair. Nine scenarios today (including a 3-step `ur5-simple-pick-place`
+pair. Twelve scenarios today (including a 3-step `ur5-simple-pick-place`
 test fixture, the new `--simple` replacement); four of them cover the
 lane × assistant matrix.
 
@@ -206,7 +206,7 @@ matching flag.
 |---|---|
 | `--lane manyforge-only` / `--lane isaac-sim` | `[1/7]` |
 | `--assistant on` / `--assistant off` | `[2/7]` |
-| `--scenario NAME` | `[3/7]` (use `--list-scenarios` to see all nine; deprecated aliases — `pick-place`, `ur10e`, `shape-pick`, `vision-pose`, `assistant-authoring`, `isaac-light`, `isaac-assistant` — also resolve with a one-time deprecation warning per launch. Includes `isaac-ur10e-light-scene-collision` for testing runtime collision-fault detection with a popup object.) |
+| `--scenario NAME` | `[3/7]` (use `--list-scenarios` to see all twelve; deprecated aliases — `pick-place`, `ur10e`, `shape-pick`, `vision-pose`, `assistant-authoring`, `isaac-light`, `isaac-assistant` — also resolve with a one-time deprecation warning per launch. Includes `isaac-ur10e-light-scene-collision` for testing runtime collision-fault detection with a popup object and `isaac-lite6-trocar-foundationpose` for the Lite6/FoundationPose trocar workflow.) |
 | `--program PATH --deployment PATH` | Free-form alternative to `--scenario` |
 | `--non-interactive` (env: `MANYFORGE_NON_INTERACTIVE=1`) | Skip all prompts; any unset selection takes its default value |
 | `--yes` / `-y` (env: `MANYFORGE_ASSUME_YES=1`) | Skip the review gate confirmation |
@@ -301,6 +301,12 @@ first so port conflicts don't cause confusing errors:
 ./scripts/launch.sh --lane isaac-sim --assistant off \
     --scenario isaac-ur10e-light-scene --yes start
 # popup: core 5 + isaac_demo_supervisor rows. AI button HIDDEN.
+./scripts/launch.sh --yes stop
+
+# isaac-sim + Lite6 + FoundationPose perception
+./scripts/launch.sh --lane isaac-sim --assistant off \
+    --scenario isaac-lite6-trocar-foundationpose --yes start
+# Full workflow: docs/operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md.
 ./scripts/launch.sh --yes stop
 
 # isaac-sim + AI on

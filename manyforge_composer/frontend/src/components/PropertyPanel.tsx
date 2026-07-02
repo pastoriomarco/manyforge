@@ -19,6 +19,7 @@ import {
   collectDeclaredBlackboardOutputOptions,
   getFieldRefTarget,
   getKeyRefId,
+  getNamespaceRefId,
   LiteralOrFieldReferenceEditor,
   NamespaceBindingEditor,
   BlackboardKeySelectorEditor,
@@ -29,6 +30,7 @@ import {
   PoseEnvelopeEditor,
   PoseMapEditor,
   RelativeMoveEditor,
+  RelativeMoveReferenceParamEditor,
 } from './property/MotionEditors';
 import {
   FixedFloatListEditor,
@@ -59,6 +61,7 @@ const KIND_COLORS: Record<string, string> = {
 
 const SCENE_NODE_IDS_REQUIRING_SCENE_CONTEXT = new Set([
   'move_manipulator_action',
+  'plan_pick_sequence',
   'add_collision_object',
   'upsert_collision_object',
   'update_collision_object_pose',
@@ -627,11 +630,15 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     const frameNames = Array.from(
       new Set(
         (sceneFrames?.frames ?? [])
-          .filter((frame) => frame.poseAvailable)
           .map((frame) => frame.name),
       ),
     ).sort((left, right) => left.localeCompare(right));
-    const robotLinkNames = frameNames.filter((name) => name !== 'universe');
+    const worldFrameNames = new Set(
+      (sceneFrames?.frames ?? [])
+        .filter((frame) => frame.roles.includes('world'))
+        .map((frame) => frame.name),
+    );
+    const robotLinkNames = frameNames.filter((name) => !worldFrameNames.has(name));
     const objectIds = Array.from(
       new Set([
         ...sceneResources.map((resource) => resource.objectId).filter((value) => value.trim().length > 0),
@@ -933,6 +940,21 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
   const blackboardOutputOptions = collectDeclaredBlackboardOutputOptions(blackboardNamespaces);
   const blackboardKeyOptions = collectBlackboardKeyOptions(blackboardKeys);
   const blackboardFieldOptions = collectBlackboardFieldOptions(blackboardNamespaces);
+  const currentOutputNamespaceIds = useMemo(() => {
+    const ids = new Set<string>();
+    const outputNamespaceId = getNamespaceRefId(nodeParams.output_key_prefix);
+    if (outputNamespaceId) {
+      ids.add(outputNamespaceId);
+    }
+    return ids;
+  }, [nodeParams.output_key_prefix]);
+  const poseReferenceFieldOptions = useMemo(
+    () => blackboardFieldOptions.filter(
+      (option) => option.fieldType === 'pose'
+        && !currentOutputNamespaceIds.has(option.namespaceId),
+    ),
+    [blackboardFieldOptions, currentOutputNamespaceIds],
+  );
   const renderConstrainedSelect = (
     value: unknown,
     options: string[],
@@ -1522,10 +1544,26 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
           currentValue={currentValue}
           isRunMode={isRunMode}
           onCommit={(value) => handleParamChange(param.name, value)}
-          fieldOptions={blackboardFieldOptions.filter((option) => option.fieldType === 'pose')}
+          fieldOptions={poseReferenceFieldOptions}
           frameOptions={sceneReferenceOptions.frameOptions}
           robotLinkOptions={sceneReferenceOptions.robotLinkOptions}
           objectOptions={sceneReferenceOptions.objectOptions}
+        />
+      );
+    }
+
+    if (param.uiEditor === 'relative_move_reference') {
+      return (
+        <RelativeMoveReferenceParamEditor
+          currentValue={currentValue}
+          isRunMode={isRunMode}
+          onCommit={(value) => handleParamChange(param.name, value)}
+          fieldOptions={poseReferenceFieldOptions}
+          frameOptions={sceneReferenceOptions.frameOptions}
+          robotLinkOptions={sceneReferenceOptions.robotLinkOptions}
+          objectOptions={sceneReferenceOptions.objectOptions}
+          allowEmptyFrameId={selectedCatalogId === 'plan_pick_sequence'}
+          emptyFrameLabel="Planning base frame"
         />
       );
     }

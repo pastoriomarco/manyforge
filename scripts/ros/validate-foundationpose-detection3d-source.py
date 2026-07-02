@@ -33,6 +33,7 @@ class RawDetectionEvidence:
     last_frame_id: str = ""
     last_detection_id: str = ""
     last_class_id: str = ""
+    last_selection: str = ""
     last_score: float | None = None
     last_position_variance_m2: float | None = None
     last_stamp_sec: int = 0
@@ -45,6 +46,7 @@ class RawDetectionEvidence:
             "last_frame_id": self.last_frame_id,
             "last_detection_id": self.last_detection_id,
             "last_class_id": self.last_class_id,
+            "last_selection": self.last_selection,
             "last_score": self.last_score,
             "last_position_variance_m2": self.last_position_variance_m2,
             "last_stamp_sec": self.last_stamp_sec,
@@ -86,9 +88,11 @@ class RawDetectionAuditor:
         *,
         detection_id: str,
         class_id: str,
+        selection: str,
     ) -> None:
         self.detection_id = detection_id
         self.class_id = class_id
+        self.selection = selection
         self.evidence = RawDetectionEvidence()
 
     def observe(self, msg: Any) -> None:
@@ -97,22 +101,33 @@ class RawDetectionAuditor:
         best: tuple[float, Any, Any] | None = None
         for detection in list(getattr(msg, "detections", []) or []):
             detection_identifier = str(getattr(detection, "id", "") or "")
+            if not self.selection and self.detection_id:
+                if detection_identifier != self.detection_id:
+                    continue
             for result in list(getattr(detection, "results", []) or []):
                 hypothesis = getattr(result, "hypothesis", None)
                 result_class_id = str(getattr(hypothesis, "class_id", "") or "")
-                score = float(getattr(hypothesis, "score", 0.0) or 0.0)
-                if self.detection_id:
-                    matched = detection_identifier == self.detection_id
-                else:
-                    matched = result_class_id == self.class_id
-                if matched and (best is None or score > best[0]):
+                if not self.selection and self.class_id and result_class_id != self.class_id:
+                    continue
+                try:
+                    score = float(getattr(hypothesis, "score", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(score):
+                    continue
+                if self.selection == "first":
                     best = (score, detection, result)
+                    break
+                if best is None or score > best[0]:
+                    best = (score, detection, result)
+            if best is not None and self.selection == "first":
+                break
         if best is None:
             return
         score, detection, result = best
         self.evidence.matched_messages += 1
         detection_header = getattr(detection, "header", None)
-        selected_header = detection_header or header
+        selected_header = _preferred_raw_header(detection_header, header)
         self.evidence.last_frame_id = str(getattr(selected_header, "frame_id", "") or "")
         stamp = getattr(selected_header, "stamp", None)
         self.evidence.last_stamp_sec = int(getattr(stamp, "sec", 0) or 0)
@@ -120,6 +135,7 @@ class RawDetectionAuditor:
         self.evidence.last_detection_id = str(getattr(detection, "id", "") or "")
         hypothesis = getattr(result, "hypothesis", None)
         self.evidence.last_class_id = str(getattr(hypothesis, "class_id", "") or "")
+        self.evidence.last_selection = self.selection
         self.evidence.last_score = score
         pose_with_covariance = getattr(result, "pose", None)
         self.evidence.last_position_variance_m2 = _position_covariance_max(
@@ -140,16 +156,26 @@ def _position_covariance_max(covariance: Any) -> float | None:
     return max(diagonal)
 
 
+def _preferred_raw_header(primary: Any, fallback: Any) -> Any:
+    stamp = getattr(primary, "stamp", None)
+    has_stamp = bool(getattr(stamp, "sec", 0) or getattr(stamp, "nanosec", 0))
+    if str(getattr(primary, "frame_id", "") or "") or has_stamp:
+        return primary
+    return fallback
+
+
 def _source_config(args: argparse.Namespace) -> SimpleNamespace:
     metadata: dict[str, Any] = {}
     if args.detection_id:
         metadata["detection_id"] = args.detection_id
     if args.class_id:
         metadata["class_id"] = args.class_id
+    if args.selection:
+        metadata["selection"] = args.selection
     metadata["max_position_variance_m2"] = args.max_position_variance_m2
     binding = SimpleNamespace(
         object_id=args.object_id,
-        entity=args.detection_id or args.class_id,
+        entity=args.detection_id or args.class_id or args.selection,
         apply_policy=args.apply_policy,
         frame_id=args.expected_frame_id or args.frame_id,
         confidence_min=args.confidence_min,
@@ -167,12 +193,16 @@ def _source_config(args: argparse.Namespace) -> SimpleNamespace:
 
 
 def _qualify(args: argparse.Namespace) -> QualificationResult:
-    if bool(args.detection_id) == bool(args.class_id):
-        raise ValueError("provide exactly one of --detection-id or --class-id")
+    association_count = sum(
+        bool(value)
+        for value in (args.detection_id, args.class_id, args.selection)
+    )
+    if association_count != 1:
+        raise ValueError("provide exactly one of --detection-id, --class-id, or --selection")
     if args.min_accepted_samples <= 0:
         raise ValueError("--min-accepted-samples must be > 0")
-    if args.confidence_min <= 0.0 or not math.isfinite(args.confidence_min):
-        raise ValueError("--confidence-min must be positive and finite")
+    if args.confidence_min < 0.0 or not math.isfinite(args.confidence_min):
+        raise ValueError("--confidence-min must be finite and >= 0")
     if (
         args.max_position_variance_m2 <= 0.0
         or not math.isfinite(args.max_position_variance_m2)
@@ -190,9 +220,18 @@ def _qualify(args: argparse.Namespace) -> QualificationResult:
     node = rclpy.create_node("manyforge_foundationpose_detection3d_qualifier")
     executor = SingleThreadedExecutor()
     executor.add_node(node)
+    tf_buffer = None
+    tf_listener = None
+    target_frame = args.expected_frame_id or args.frame_id
+    if target_frame:
+        import tf2_ros
+
+        tf_buffer = tf2_ros.Buffer()
+        tf_listener = tf2_ros.TransformListener(tf_buffer, node)
     auditor = RawDetectionAuditor(
         detection_id=args.detection_id,
         class_id=args.class_id,
+        selection=args.selection,
     )
     raw_subscription = node.create_subscription(
         Detection3DArray,
@@ -203,6 +242,8 @@ def _qualify(args: argparse.Namespace) -> QualificationResult:
     source = Detection3DArrayTopicPoseSource.from_deployment_config(
         node=node,
         source_config=_source_config(args),
+        buffer=tf_buffer,
+        listener=tf_listener,
     )
 
     accepted_samples = 0
@@ -210,6 +251,7 @@ def _qualify(args: argparse.Namespace) -> QualificationResult:
     last_pose_frame_id = ""
     last_confidence: float | None = None
     last_position_variance_m2: float | None = None
+    last_rejection_detail = ""
     failure_reasons: list[str] = []
     deadline_s = time.monotonic() + args.timeout_s
 
@@ -220,6 +262,10 @@ def _qualify(args: argparse.Namespace) -> QualificationResult:
             if not snapshot.objects:
                 continue
             state = snapshot.objects[0]
+            if state.rejection is not None:
+                last_rejection_detail = (
+                    f"{state.rejection.reason}: {state.rejection.detail}"
+                )
             if state.update is None:
                 continue
             if state.update.monotonic_s in accepted_update_times:
@@ -242,6 +288,13 @@ def _qualify(args: argparse.Namespace) -> QualificationResult:
             failure_reasons.append(
                 f"accepted {accepted_samples} samples; need {args.min_accepted_samples}"
             )
+        if last_rejection_detail:
+            failure_reasons.append(f"latest sidecar rejection: {last_rejection_detail}")
+        if args.expected_raw_frame_id and raw.last_frame_id != args.expected_raw_frame_id:
+            failure_reasons.append(
+                f"raw detection frame '{raw.last_frame_id}' != expected raw "
+                f"'{args.expected_raw_frame_id}'"
+            )
         if args.expected_frame_id and last_pose_frame_id != args.expected_frame_id:
             failure_reasons.append(
                 f"pose frame '{last_pose_frame_id}' != expected '{args.expected_frame_id}'"
@@ -254,6 +307,16 @@ def _qualify(args: argparse.Namespace) -> QualificationResult:
             or last_confidence < args.confidence_min
         ):
             failure_reasons.append("accepted pose confidence did not satisfy threshold")
+        if (
+            not args.allow_zero_confidence
+            and last_confidence is not None
+            and math.isfinite(last_confidence)
+            and last_confidence <= 0.0
+        ):
+            failure_reasons.append(
+                "accepted pose confidence is zero; pass --allow-zero-confidence only "
+                "for bootstrap streams whose producer is known to publish zero scores"
+            )
         if (
             last_position_variance_m2 is None
             or not math.isfinite(last_position_variance_m2)
@@ -283,6 +346,7 @@ def _qualify(args: argparse.Namespace) -> QualificationResult:
             association={
                 "detection_id": args.detection_id,
                 "class_id": args.class_id,
+                "selection": args.selection,
             },
             accepted_samples=accepted_samples,
             last_pose_frame_id=last_pose_frame_id,
@@ -307,8 +371,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     association = parser.add_mutually_exclusive_group(required=True)
     association.add_argument("--detection-id", default="")
     association.add_argument("--class-id", default="")
+    association.add_argument("--selection", choices=("first", "best_score"), default="")
     parser.add_argument("--frame-id", default="")
     parser.add_argument("--expected-frame-id", default="")
+    parser.add_argument("--expected-raw-frame-id", default="")
     parser.add_argument("--apply-policy", default="observe_only")
     parser.add_argument("--confidence-min", type=float, required=True)
     parser.add_argument("--max-position-variance-m2", type=float, required=True)
@@ -323,6 +389,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=(
             "Allow zero position covariance. Use only after confirming the "
             "producer intentionally publishes zero covariance."
+        ),
+    )
+    parser.add_argument(
+        "--allow-zero-confidence",
+        action="store_true",
+        help=(
+            "Allow accepted detections with confidence 0.0. Use only for "
+            "commissioning streams that are known to publish zero scores."
         ),
     )
     parser.add_argument(

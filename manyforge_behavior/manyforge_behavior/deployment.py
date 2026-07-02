@@ -1161,22 +1161,27 @@ class Deployment:
                 for object_id, binding in objects.items():
                     detection_id = binding.metadata.get("detection_id")
                     class_id = binding.metadata.get("class_id")
+                    selection = binding.metadata.get("selection")
                     has_detection_id = (
                         isinstance(detection_id, str) and bool(detection_id.strip())
                     )
                     has_class_id = isinstance(class_id, str) and bool(class_id.strip())
-                    if has_detection_id == has_class_id:
+                    has_selection = isinstance(selection, str) and bool(selection.strip())
+                    if sum((has_detection_id, has_class_id, has_selection)) != 1:
                         raise DeploymentValidationError(
-                            f"{field_path}.objects.{object_id}.metadata must define exactly one of detection_id or class_id for detection3d_array_topic"
+                            f"{field_path}.objects.{object_id}.metadata must define exactly one of detection_id, class_id, or selection for detection3d_array_topic"
                         )
-                    association = (
-                        "detection_id",
-                        detection_id.strip()
-                        if isinstance(detection_id, str)
-                        else class_id.strip(),
-                    )
-                    if has_class_id:
+                    if has_detection_id:
+                        association = ("detection_id", detection_id.strip())
+                    elif has_class_id:
                         association = ("class_id", class_id.strip())
+                    else:
+                        selection_value = selection.strip()
+                        if selection_value not in ("first", "best_score"):
+                            raise DeploymentValidationError(
+                                f"{field_path}.objects.{object_id}.metadata.selection must be 'first' or 'best_score'"
+                            )
+                        association = ("selection", selection_value)
                     previous = seen_detection_associations.get(association)
                     if previous is not None:
                         association_key, association_value = association

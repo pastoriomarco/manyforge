@@ -164,6 +164,42 @@ class TestMockKernelSceneEdit:
                 "require_separation_by_end": True,
             }
         ]
+        snapshot = kernel.get_scene_objects()[0]
+        assert snapshot.support_contacts == [
+            {
+                "support_object_id": "table",
+                "max_start_penetration_m": 0.005,
+                "require_separation_by_end": True,
+            }
+        ]
+
+    def test_scene_edit_records_support_contact_without_start_penetration_limit(
+        self, kernel
+    ):
+        req = SceneEditRequest(
+            operation="add",
+            object_id="box1",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
+            support_contacts=[
+                {
+                    "support_object_id": "table",
+                    "enforce_max_start_penetration": False,
+                    "require_separation_by_end": True,
+                }
+            ],
+            pose_position_m=[0.0, 0.0, 0.0],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+        )
+        result = kernel.scene_edit(req)
+        assert result.success
+        assert kernel.scene_edits[0].support_contacts == [
+            {
+                "support_object_id": "table",
+                "enforce_max_start_penetration": False,
+                "require_separation_by_end": True,
+            }
+        ]
 
     def test_scene_edit_rejects_invalid_support_contact_policy_field(self, kernel):
         result = kernel.scene_edit(

@@ -19,6 +19,7 @@
   <exec_depend>ros2_control</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>simulation_interfaces</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
   <exec_depend>topic_based_ros2_control</exec_depend>
 
   <export>

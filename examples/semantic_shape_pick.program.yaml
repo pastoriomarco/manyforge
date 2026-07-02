@@ -98,6 +98,8 @@ blackboard:
           type: pose
         - name: pick_pose
           type: pose
+        - name: retreat_pose
+          type: pose
   keys:
     - id: gripper_closed
       type: bool
@@ -181,6 +183,9 @@ tree:
         rotation_step_deg: 15.0
         planning_timeout_s: 5.0
         velocity_scale: 0.30
+        approach_move_node_name: move_to_planned_approach_pose
+        pick_move_node_name: move_to_planned_pick_pose
+        retreat_move_node_name: retreat_after_pick
 
     - id: move_manipulator_action
       name: move_to_planned_approach_pose
@@ -231,7 +236,7 @@ tree:
         pose_goal:
           field_ref:
             namespace: pick_plan
-            field: approach_pose
+            field: retreat_pose
         velocity_scale: 0.30
 
     - id: move_manipulator_action

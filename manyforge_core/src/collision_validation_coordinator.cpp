@@ -133,6 +133,8 @@ void set_contact_release_diagnostic(CollisionValidationWaypointRecord& record,
           : "contact_release";
   record.result.raw_diagnostics["contact_release_tolerance_m"] =
       std::to_string(entry.release_tolerance_m);
+  record.result.raw_diagnostics["contact_release_enforce_max_start_penetration"] =
+      entry.enforce_max_start_penetration ? "true" : "false";
   record.result.raw_diagnostics["contact_release_max_start_penetration_m"] =
       std::to_string(entry.max_start_penetration_m);
   record.result.raw_diagnostics["contact_release_min_progress_m"] =
@@ -309,7 +311,8 @@ void CollisionValidationCoordinator::apply_contact_release_constraints(
         initial_depth = depth;
         previous_depth = depth;
         best_depth = depth;
-        if (depth > max_start + tolerance) {
+        if (support_entry.enforce_max_start_penetration &&
+            depth > max_start + tolerance) {
           record_violation(record,
                            support_entry,
                            CollisionDecisionResult::kFail,
@@ -345,7 +348,8 @@ void CollisionValidationCoordinator::apply_contact_release_constraints(
                              depth);
             break;
           }
-          if (depth > max_start + tolerance) {
+          if (support_entry.enforce_max_start_penetration &&
+              depth > max_start + tolerance) {
             record_violation(record,
                              support_entry,
                              CollisionDecisionResult::kFail,

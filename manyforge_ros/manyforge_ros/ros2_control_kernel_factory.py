@@ -128,7 +128,8 @@ def create_ros2_control_kernel(
         kernel_config_arg,
     )
 
-    _configure_ros_grippers(native_bundle, deployment, config)
+    attach_robot_model_metadata(native_bundle, runtime_model)
+    _configure_ros_grippers(native_bundle, deployment, config, runtime_model)
 
     bundle = Ros2ControlRuntimeBundle(
         native_bundle=native_bundle,
@@ -144,7 +145,12 @@ def create_ros2_control_kernel(
     return kernel, bundle
 
 
-def _configure_ros_grippers(native_bundle: Any, deployment: Deployment, config: dict) -> None:
+def _configure_ros_grippers(
+    native_bundle: Any,
+    deployment: Deployment,
+    config: dict,
+    runtime_model: Any,
+) -> None:
     if not hasattr(native_bundle, "configure_ros_gripper_action"):
         return
     gripper_config = dict(config.get("gripper") or {})
@@ -161,6 +167,7 @@ def _configure_ros_grippers(native_bundle: Any, deployment: Deployment, config: 
                 "execution.config.gripper.action_name is required for "
                 f"gripper {gripper_id!r} command_mode=ros_gripper_command"
             )
+        _seed_ros_gripper_scene_position(native_bundle, runtime_model, gripper)
         native_bundle.configure_ros_gripper_action(
             gripper_id,
             {
@@ -175,3 +182,49 @@ def _configure_ros_grippers(native_bundle: Any, deployment: Deployment, config: 
                 ),
             },
         )
+
+
+def _seed_ros_gripper_scene_position(
+    native_bundle: Any,
+    runtime_model: Any,
+    gripper: Any,
+) -> None:
+    """Seed a ROS gripper command joint in the authority-defined compact view."""
+
+    presets = getattr(gripper, "srdf_presets", {}) or {}
+    if "open" not in presets:
+        return
+    get_positions = getattr(
+        native_bundle,
+        "get_group_commandable_joint_positions",
+        None,
+    )
+    set_positions = getattr(native_bundle, "set_group_joint_positions", None)
+    if not callable(get_positions) or not callable(set_positions):
+        return
+
+    group_id = str(gripper.group_id)
+    joint_name = str(gripper.joint_name)
+    commandable_by_group = (
+        runtime_model.metadata.get("group_commandable_joint_names", {}) or {}
+    )
+    commandable_joints = [
+        str(joint) for joint in commandable_by_group.get(group_id, [])
+    ]
+    if not commandable_joints:
+        commandable_joints = [joint_name]
+    try:
+        joint_index = commandable_joints.index(joint_name)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"gripper joint {joint_name!r} is not commandable in group {group_id!r}"
+        ) from exc
+
+    positions = list(get_positions(group_id))
+    if len(positions) < len(commandable_joints):
+        raise RuntimeError(
+            f"gripper group {group_id!r} reported {len(positions)} commandable "
+            f"positions for {len(commandable_joints)} commandable joints"
+        )
+    positions[joint_index] = float(presets["open"])
+    set_positions(group_id, positions)

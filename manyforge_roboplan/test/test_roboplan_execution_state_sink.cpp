@@ -5,11 +5,16 @@
 
 #include <Eigen/Dense>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -33,6 +38,74 @@ std::shared_ptr<NativeKernelBundle> create_ur10e_robotiq_bundle() {
       "ur10e_robotiq_2f_140", "arm",
       (model_dir / "ur10e_robotiq_2f_140.urdf").string(),
       (model_dir / "ur10e_robotiq_2f_140.srdf").string(), {root.string()});
+}
+
+std::filesystem::path write_private_mimic_model() {
+  const auto suffix = std::to_string(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto dir =
+      std::filesystem::temp_directory_path() /
+      ("manyforge_rma_mimic_sink_" + suffix);
+  std::filesystem::create_directories(dir);
+
+  {
+    std::ofstream urdf(dir / "rma_mimic_sink.urdf");
+    urdf << R"xml(
+<robot name="rma_mimic_sink">
+  <link name="base"/>
+  <link name="gripper_base"/>
+  <joint name="gripper_mount" type="fixed">
+    <parent link="base"/>
+    <child link="gripper_base"/>
+  </joint>
+  <link name="right_finger"/>
+  <joint name="__rma_mimic_0000_right_finger_joint" type="prismatic">
+    <parent link="gripper_base"/>
+    <child link="right_finger"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="0" upper="0.01" effort="10" velocity="1"/>
+  </joint>
+  <link name="left_finger"/>
+  <joint name="__rma_mimic_0001_left_finger_joint" type="prismatic">
+    <parent link="gripper_base"/>
+    <child link="left_finger"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.01" effort="10" velocity="1"/>
+    <mimic joint="__rma_mimic_0000_right_finger_joint" multiplier="1" offset="0"/>
+  </joint>
+</robot>
+)xml";
+  }
+  {
+    std::ofstream srdf(dir / "rma_mimic_sink.srdf");
+    srdf << R"xml(
+<robot name="rma_mimic_sink">
+  <group name="gripper">
+    <joint name="__rma_mimic_0001_left_finger_joint"/>
+    <joint name="__rma_mimic_0000_right_finger_joint"/>
+  </group>
+  <group_state name="open" group="gripper">
+    <joint name="__rma_mimic_0001_left_finger_joint" value="0.0081"/>
+    <joint name="__rma_mimic_0000_right_finger_joint" value="0.0081"/>
+  </group_state>
+</robot>
+)xml";
+  }
+  return dir;
+}
+
+double mimic_expanded_position(const roboplan::Scene& scene,
+                               const std::string& joint_name) {
+  const auto q_with_mimics = scene.getCurrentJointPositionsWithMimics();
+  const auto joint_names = scene.getJointNamesWithMimics();
+  const auto joint_it =
+      std::find(joint_names.begin(), joint_names.end(), joint_name);
+  if (joint_it == joint_names.end()) {
+    throw std::runtime_error("joint missing from mimic-expanded readout");
+  }
+  const auto index =
+      static_cast<Eigen::Index>(std::distance(joint_names.begin(), joint_it));
+  return q_with_mimics[index];
 }
 
 class RoboPlanExecutionStateSinkTest : public ::testing::Test {
@@ -196,6 +269,64 @@ TEST_F(RoboPlanExecutionStateSinkTest, SingleJointReadAndWriteUsesGroupProjectio
   const auto projected = sink_->group_joint_position("gripper", joint_name);
   ASSERT_TRUE(projected.has_value());
   EXPECT_NEAR(*projected, 0.42, 1e-12);
+}
+
+TEST(RoboPlanExecutionStateSink,
+     RmaMimicGroupUsesCanonicalCommandableCompactSlot) {
+  const auto model_dir = write_private_mimic_model();
+  auto scene = std::make_shared<roboplan::Scene>(
+      "rma_mimic_sink", model_dir / "rma_mimic_sink.urdf",
+      model_dir / "rma_mimic_sink.srdf",
+      std::vector<std::filesystem::path>{model_dir});
+  auto scene_mutex = std::make_shared<std::mutex>();
+  RoboPlanExecutionStateSink sink(scene, scene_mutex);
+  sink.set_robot_model_authority_metadata(
+      {
+          {"right_finger_joint", "__rma_mimic_0000_right_finger_joint"},
+          {"left_finger_joint", "__rma_mimic_0001_left_finger_joint"},
+      },
+      {
+          {"__rma_mimic_0000_right_finger_joint", "right_finger_joint"},
+          {"__rma_mimic_0001_left_finger_joint", "left_finger_joint"},
+      },
+      {{"gripper", {"right_finger_joint"}}});
+
+  const auto maybe_group_info = scene->getJointGroupInfo("gripper");
+  ASSERT_TRUE(maybe_group_info);
+  EXPECT_EQ(maybe_group_info->joint_names.size(), 2u);
+  EXPECT_EQ(static_cast<size_t>(maybe_group_info->q_indices.size()), 1u);
+
+  const auto open_result = sink.apply_group_joint_position(
+      "gripper", "right_finger_joint", 0.0081,
+      ExecutionStateUpdateMode::kBlocking);
+
+  ASSERT_EQ(open_result.status, ExecutionStateSinkStatus::kApplied);
+  const auto command_position =
+      sink.group_joint_position("gripper", "right_finger_joint");
+  ASSERT_TRUE(command_position.has_value());
+  EXPECT_NEAR(*command_position, 0.0081, 1e-12);
+  EXPECT_FALSE(sink.group_joint_position("gripper", "left_finger_joint"));
+  EXPECT_NEAR(
+      mimic_expanded_position(*scene, "__rma_mimic_0000_right_finger_joint"),
+      0.0081, 1e-12);
+  EXPECT_NEAR(
+      mimic_expanded_position(*scene, "__rma_mimic_0001_left_finger_joint"),
+      0.0081, 1e-12);
+
+  const auto compact_result = sink.apply_group_joint_positions(
+      "gripper", {0.004}, ExecutionStateUpdateMode::kBlocking);
+  ASSERT_EQ(compact_result.status, ExecutionStateSinkStatus::kApplied);
+  EXPECT_NEAR(*sink.group_joint_position("gripper", "right_finger_joint"),
+              0.004, 1e-12);
+
+  const auto expanded_result = sink.apply_group_joint_positions(
+      "gripper", {0.001, 0.006}, ExecutionStateUpdateMode::kBlocking);
+  ASSERT_EQ(expanded_result.status, ExecutionStateSinkStatus::kApplied);
+  EXPECT_NEAR(*sink.group_joint_position("gripper", "right_finger_joint"),
+              0.006, 1e-12);
+  EXPECT_NEAR(
+      mimic_expanded_position(*scene, "__rma_mimic_0001_left_finger_joint"),
+      0.006, 1e-12);
 }
 
 TEST_F(RoboPlanExecutionStateSinkTest, RejectsInvalidSingleJointInputs) {

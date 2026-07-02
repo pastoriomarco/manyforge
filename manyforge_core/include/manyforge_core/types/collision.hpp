@@ -353,6 +353,7 @@ struct SupportContactPolicyEntry {
   /// Initial penetration envelope. Enforced only by evaluators/coordinators
   /// that receive penetration-depth diagnostics; otherwise full-diagnostic
   /// policies must fail closed.
+  bool enforce_max_start_penetration = true;
   double max_start_penetration_m = 0.0;
   /// Numeric tolerance for monotonic release checks. A later sample may be
   /// deeper than the previous accepted sample by at most this amount.

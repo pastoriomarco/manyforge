@@ -309,10 +309,17 @@ export const api = {
     // Day 5c.2: Cartesian end-effector jog via the panel's
     // Cartesian tab + 3D gizmo. positionM and orientationXyzw
     // express the target TCP pose in the robot's base frame.
-    cartesianJog: (positionM: number[], orientationXyzw: number[]) =>
+    cartesianJog: (
+      positionM: number[],
+      orientationXyzw: number[],
+      frameId?: string,
+      tcpFrame?: string,
+    ) =>
       request<unknown>('POST', '/api/direct/cartesian-jog', {
         positionM,
         orientationXyzw,
+        ...(frameId ? { frameId } : {}),
+        ...(tcpFrame ? { tcpFrame } : {}),
       }),
   },
   // Phase 4-P5 validated Robot Control: author a server-owned candidate

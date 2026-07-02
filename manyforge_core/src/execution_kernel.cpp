@@ -3650,6 +3650,8 @@ ExecutionKernel::update_runtime_contact_release_state(
     details["contact_b"] = entry.pair.body_b;
     details["contact_release_tolerance_m"] =
         std::to_string(entry.release_tolerance_m);
+    details["contact_release_enforce_max_start_penetration"] =
+        entry.enforce_max_start_penetration ? "true" : "false";
     details["contact_release_max_start_penetration_m"] =
         std::to_string(entry.max_start_penetration_m);
     details["contact_release_min_separation_clearance_m"] =
@@ -3677,7 +3679,8 @@ ExecutionKernel::update_runtime_contact_release_state(
     const auto key = collision_pair_key(entry.pair);
     auto it = runtime_contact_release_state_.find(key);
     if (it == runtime_contact_release_state_.end()) {
-      if (depth > std::max(0.0, entry.max_start_penetration_m) + tolerance) {
+      if (entry.enforce_max_start_penetration &&
+          depth > std::max(0.0, entry.max_start_penetration_m) + tolerance) {
         details["reason"] = "runtime_contact_release_initial_penetration_exceeds_policy";
         return details;
       }

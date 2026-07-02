@@ -11,9 +11,15 @@ from manyforge_behavior.blackboard_namespace import (
     read_namespace_value,
     write_namespace_bundle,
 )
+from manyforge_behavior.geometry import (
+    quat_rotate_vector,
+    quats_close,
+    rpy_deg_to_xyzw,
+)
 from manyforge_behavior.kernel_client import (
     MockKernelClient,
     MotionPreviewResult,
+    RobotStateSnapshot,
     SceneEditRequest,
 )
 from manyforge_behavior.nodes.pick_planning import PlanPickSequenceNode
@@ -83,6 +89,12 @@ def _seed_scene(kernel: MockKernelClient) -> None:
         assert result.success is True
 
 
+def _normalized_xy(vector: list[float]) -> list[float]:
+    length = (vector[0] ** 2 + vector[1] ** 2) ** 0.5
+    assert length > 1e-9
+    return [vector[0] / length, vector[1] / length, 0.0]
+
+
 class TestPlanPickSequenceNode:
     def test_plans_pick_from_backend_scene(self, kernel, bb_with_kernel):
         _seed_scene(kernel)
@@ -138,7 +150,12 @@ class TestPlanPickSequenceNode:
         assert plan_value["selected_object_id"] == "sphere_part"
         approach_pose = plan_value["approach_pose"]
         pick_pose = plan_value["pick_pose"]
+        retreat_pose = plan_value["retreat_pose"]
+        assert approach_pose["frame_id"] == "base_link"
+        assert pick_pose["frame_id"] == "base_link"
+        assert retreat_pose["frame_id"] == "base_link"
         assert approach_pose["position_m"][2] > pick_pose["position_m"][2]
+        assert retreat_pose == approach_pose
         assert pick_pose["position_m"] == pytest.approx([0.40, -0.14, 0.059], abs=1e-6)
         assert pick_pose["orientation_xyzw"] == pytest.approx([1.0, 0.0, 0.0, 0.0], abs=1e-6)
         assert plan_value["planning_score"] == pytest.approx(3.06)
@@ -146,6 +163,327 @@ class TestPlanPickSequenceNode:
         metrics = kernel.get_metrics()
         assert metrics["plans_succeeded"] == 3
         assert metrics["validations_passed"] == 3
+
+    def test_force_vertical_pick_preserves_object_heading_and_ignores_rpy_offsets(
+        self,
+        kernel,
+        bb_with_kernel,
+    ):
+        object_orientation = rpy_deg_to_xyzw([20.0, 35.0, 45.0])
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="tilted_part",
+                shape_type="box",
+                box_dimensions_m=[0.10, 0.02, 0.02],
+                pose_position_m=[0.35, -0.12, 0.04],
+                pose_orientation_xyzw=object_orientation,
+                frame_id="base_link",
+            )
+        )
+        assert result.success is True
+
+        node = PlanPickSequenceNode(
+            name="plan_pick_vertical",
+            selected_object_id="tilted_part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            pick_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.02],
+                "position_max_m": [0.0, 0.0, 0.02],
+                # These inverted RPY bounds prove force_vertical_pick disables
+                # rotational envelope sampling instead of using stale tilt.
+                "orientation_rpy_min_deg": [45.0, 15.0, 30.0],
+                "orientation_rpy_max_deg": [-45.0, -15.0, -30.0],
+            },
+            approach_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.05],
+                "position_max_m": [0.0, 0.0, 0.05],
+                "orientation_rpy_min_deg": [90.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [-90.0, 0.0, 0.0],
+            },
+            force_vertical_pick=True,
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        pick_orientation = plan_value["pick_pose"]["orientation_xyzw"]
+        approach_orientation = plan_value["approach_pose"]["orientation_xyzw"]
+        assert quats_close(pick_orientation, approach_orientation)
+        assert quat_rotate_vector(pick_orientation, [0.0, 0.0, 1.0]) == pytest.approx(
+            [0.0, 0.0, -1.0],
+            abs=1e-6,
+        )
+
+        expected_x = _normalized_xy(
+            quat_rotate_vector(object_orientation, [1.0, 0.0, 0.0])
+        )
+        actual_x = quat_rotate_vector(pick_orientation, [1.0, 0.0, 0.0])
+        assert actual_x == pytest.approx(expected_x, abs=1e-6)
+        assert plan_value["attempted_candidates"] == 1
+        assert plan_value["force_vertical_pick"] is True
+
+    def test_pick_offset_reference_object_rotates_translation_into_base(
+        self,
+        kernel,
+        bb_with_kernel,
+    ):
+        object_orientation = rpy_deg_to_xyzw([0.0, 0.0, 90.0])
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="yawed_part",
+                shape_type="box",
+                box_dimensions_m=[0.10, 0.02, 0.02],
+                pose_position_m=[0.35, -0.12, 0.04],
+                pose_orientation_xyzw=object_orientation,
+                frame_id="base_link",
+            )
+        )
+        assert result.success is True
+
+        node = PlanPickSequenceNode(
+            name="plan_pick_object_ref",
+            selected_object_id="yawed_part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            pick_offset_envelope={
+                "position_min_m": [0.02, 0.0, 0.0],
+                "position_max_m": [0.02, 0.0, 0.0],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            pick_offset_reference={"type": "object", "id": "yawed_part"},
+            approach_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.05],
+                "position_max_m": [0.0, 0.0, 0.05],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            approach_offset_reference={"type": "frame", "id": "base_link"},
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        assert plan_value["pick_pose"]["position_m"] == pytest.approx(
+            [0.35, -0.10, 0.05],
+            abs=1e-6,
+        )
+        assert plan_value["approach_pose"]["position_m"] == pytest.approx(
+            [0.35, -0.10, 0.10],
+            abs=1e-6,
+        )
+        assert plan_value["pick_offset_reference"] == {
+            "type": "object",
+            "id": "yawed_part",
+        }
+        assert plan_value["approach_offset_reference"] == {
+            "type": "frame",
+            "id": "base_link",
+        }
+
+    def test_approach_offset_reference_object_rotates_translation_into_base(
+        self,
+        kernel,
+        bb_with_kernel,
+    ):
+        object_orientation = rpy_deg_to_xyzw([0.0, 0.0, 90.0])
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="yawed_part",
+                shape_type="box",
+                box_dimensions_m=[0.10, 0.02, 0.02],
+                pose_position_m=[0.35, -0.12, 0.04],
+                pose_orientation_xyzw=object_orientation,
+                frame_id="base_link",
+            )
+        )
+        assert result.success is True
+
+        node = PlanPickSequenceNode(
+            name="plan_pick_approach_object_ref",
+            selected_object_id="yawed_part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            pick_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.0],
+                "position_max_m": [0.0, 0.0, 0.0],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            approach_offset_envelope={
+                "position_min_m": [0.05, 0.0, 0.0],
+                "position_max_m": [0.05, 0.0, 0.0],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            approach_offset_reference={"type": "object", "id": "yawed_part"},
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        assert plan_value["pick_pose"]["position_m"] == pytest.approx(
+            [0.35, -0.12, 0.05],
+            abs=1e-6,
+        )
+        assert plan_value["approach_pose"]["position_m"] == pytest.approx(
+            [0.35, -0.07, 0.05],
+            abs=1e-6,
+        )
+
+    def test_min_tcp_z_clamps_generated_pick_and_reports_trace(
+        self,
+        kernel,
+        bb_with_kernel,
+    ):
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="low_part",
+                shape_type="sphere",
+                sphere_radius_m=0.01,
+                pose_position_m=[0.30, 0.12, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+        assert result.success is True
+        node = PlanPickSequenceNode(
+            name="plan_pick_min_z",
+            selected_object_id="low_part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            pick_offset_envelope={
+                "position_min_m": [0.0, 0.0, -0.05],
+                "position_max_m": [0.0, 0.0, -0.05],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            approach_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.02],
+                "position_max_m": [0.0, 0.0, 0.02],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            min_tcp_z_m=0.03,
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        assert plan_value["pick_pose"]["position_m"][2] == pytest.approx(0.03)
+        assert plan_value["approach_pose"]["position_m"][2] == pytest.approx(0.05)
+        assert plan_value["enable_min_tcp_z"] is True
+        assert plan_value["min_tcp_z_m"] == pytest.approx(0.03)
+        assert plan_value["min_tcp_z_applied"] is True
+
+    def test_min_tcp_z_disabled_keeps_threshold_but_does_not_clamp(
+        self,
+        kernel,
+        bb_with_kernel,
+    ):
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="low_part",
+                shape_type="sphere",
+                sphere_radius_m=0.01,
+                pose_position_m=[0.30, 0.12, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+        assert result.success is True
+        node = PlanPickSequenceNode(
+            name="plan_pick_min_z_disabled",
+            selected_object_id="low_part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            pick_offset_envelope={
+                "position_min_m": [0.0, 0.0, -0.05],
+                "position_max_m": [0.0, 0.0, -0.05],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            approach_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.02],
+                "position_max_m": [0.0, 0.0, 0.02],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            enable_min_tcp_z=False,
+            min_tcp_z_m=0.03,
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        assert plan_value["pick_pose"]["position_m"][2] == pytest.approx(-0.04)
+        assert plan_value["approach_pose"]["position_m"][2] == pytest.approx(-0.02)
+        assert plan_value["enable_min_tcp_z"] is False
+        assert plan_value["min_tcp_z_m"] is None
+        assert plan_value["min_tcp_z_applied"] is False
+
+    def test_invalid_min_tcp_z_fails_closed(self, kernel, bb_with_kernel):
+        _seed_scene(kernel)
+        node = PlanPickSequenceNode(
+            name="plan_pick_bad_min_z",
+            selected_object_id="sphere_part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            min_tcp_z_m=-0.01,
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.FAILURE
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        assert plan_value["outcome"] == "invalid_min_tcp_z"
 
     def test_missing_viewer_snapshot_provider_fails_closed(self, kernel, bb_with_kernel):
         _seed_scene(kernel)
@@ -248,6 +586,30 @@ class TestPlanPickSequenceNode:
         assert plan_bundle["value"]["outcome"] == "invalid_pick_offset_envelope"
         assert plan_bundle["meta"]["status"] == "failed"
 
+    def test_invalid_pick_offset_reference_fails_closed(self, kernel, bb_with_kernel):
+        _seed_scene(kernel)
+        node = PlanPickSequenceNode(
+            name="plan_pick_bad_reference",
+            selected_object_id="sphere_part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            pick_offset_reference={"type": "object", "id": "missing_part"},
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.FAILURE
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_bundle = read_namespace_bundle(reader, "planning/pick_plan")
+        assert plan_bundle["value"]["outcome"] == "invalid_pick_offset_reference"
+        assert "missing_part" in plan_bundle["value"]["failure_detail"]
+        assert plan_bundle["meta"]["status"] == "failed"
+
     def test_start_state_collision_surfaces_detailed_failure(self, kernel, bb_with_kernel):
         class StartCollisionKernel(MockKernelClient):
             def preview_motion(self, request, start_state=None):
@@ -281,4 +643,117 @@ class TestPlanPickSequenceNode:
         reader = py_trees.blackboard.Client(name="reader")
         plan_value = read_namespace_value(reader, "planning/pick_plan")
         assert plan_value["outcome"] == "start_state_in_collision"
+        assert plan_value["approach_pose"] is not None
+        assert plan_value["pick_pose"] is not None
+        assert plan_value["retreat_pose"] == plan_value["approach_pose"]
         assert "start_state_in_collision=true" in plan_value["failure_detail"]
+
+    def test_support_contact_preview_failure_surfaces_policy_numbers(
+        self, kernel, bb_with_kernel
+    ):
+        class SupportContactKernel(MockKernelClient):
+            def preview_motion(self, request, start_state=None):
+                if request.move_id == "pick_approach_preview":
+                    return MotionPreviewResult(ok=True, final_state=RobotStateSnapshot())
+                return MotionPreviewResult(
+                    ok=False,
+                    error="Collision validation rejected trajectory",
+                    error_details={
+                        "collision_result_first_failure_pair": (
+                            "object/ground/shape/0 <-> "
+                            "robot/robot0/attached/graspable/shape/0"
+                        ),
+                        "collision_result_first_failure_classification": (
+                            "support_contact_start"
+                        ),
+                        "collision_result_waypoint_index": "0",
+                        "collision_result_raw_contact_release_current_penetration_m": (
+                            "0.021667"
+                        ),
+                        "collision_result_raw_contact_release_max_start_penetration_m": (
+                            "0.020000"
+                        ),
+                        "collision_result_raw_contact_release_enforce_max_start_penetration": (
+                            "true"
+                        ),
+                    },
+                )
+
+        collision_kernel = SupportContactKernel()
+        bb_with_kernel.kernel = collision_kernel
+        _seed_scene(collision_kernel)
+        node = PlanPickSequenceNode(
+            name="plan_pick",
+            selected_object_id="sphere_part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.FAILURE
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        assert plan_value["approach_pose"] is not None
+        assert plan_value["pick_pose"] is not None
+        assert plan_value["retreat_pose"] == plan_value["approach_pose"]
+        detail = plan_value["failure_detail"]
+        assert "classification=support_contact_start" in detail
+        assert "waypoint=0" in detail
+        assert "current_penetration_m=0.021667" in detail
+        assert "max_start_penetration_m=0.020000" in detail
+
+    def test_failure_populates_linked_move_pose_goals(self, kernel, bb_with_kernel):
+        class PickFailureKernel(MockKernelClient):
+            def preview_motion(self, request, start_state=None):
+                if request.move_id == "pick_approach_preview":
+                    return MotionPreviewResult(ok=True, final_state=RobotStateSnapshot())
+                return MotionPreviewResult(ok=False, error="IK failed")
+
+        class MoveStub(py_trees.behaviour.Behaviour):
+            def __init__(self, name: str):
+                super().__init__(name=name)
+                self._params = {"motion_type": "pose_goal", "pose_goal": None}
+
+            def update(self):
+                return py_trees.common.Status.SUCCESS
+
+        failure_kernel = PickFailureKernel()
+        bb_with_kernel.kernel = failure_kernel
+        _seed_scene(failure_kernel)
+        planner = PlanPickSequenceNode(
+            name="plan_pick",
+            selected_object_id="sphere_part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            approach_move_node_name="move_to_approach",
+            pick_move_node_name="move_to_pick",
+            retreat_move_node_name="move_to_retreat",
+        )
+        approach_move = MoveStub("move_to_approach")
+        pick_move = MoveStub("move_to_pick")
+        retreat_move = MoveStub("move_to_retreat")
+        root = py_trees.composites.Sequence(name="root", memory=True)
+        root.add_children([planner, approach_move, pick_move, retreat_move])
+
+        status = _tick_tree_until_done(root)
+
+        assert status == py_trees.common.Status.FAILURE
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_bundle = read_namespace_bundle(reader, "planning/pick_plan")
+        plan_value = plan_bundle["value"]
+        assert plan_bundle["meta"]["status"] == "failed"
+        assert plan_value["outcome"] == "no_feasible_plan"
+        assert approach_move._params["pose_goal"] == plan_value["approach_pose"]
+        assert pick_move._params["pose_goal"] == plan_value["pick_pose"]
+        assert retreat_move._params["pose_goal"] == plan_value["retreat_pose"]

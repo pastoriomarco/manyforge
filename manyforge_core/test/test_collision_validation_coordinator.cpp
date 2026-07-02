@@ -360,6 +360,30 @@ TEST(CollisionValidationCoordinatorTest,
 }
 
 TEST(CollisionValidationCoordinatorTest,
+     ContactReleaseInitialPenetrationEnvelopeCanBeDisabled) {
+  CollisionPairId pair{"robot/grasp", "object/box"};
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[0] = make_pass_result_with_clearance(pair, -0.020);
+  engine.result_by_waypoint[1] = make_pass_result_with_clearance(pair, -0.010);
+  engine.result_by_waypoint[2] = make_pass_result_with_clearance(pair, 0.001);
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_contact_release_snapshot(
+      pair, /*max_start=*/0.005,
+      /*require_separation_by_end=*/true,
+      /*require_strictly_decreasing_penetration=*/true);
+  cfg.policy_snapshot.support_contacts.front()
+      .enforce_max_start_penetration = false;
+  CollisionValidationCoordinator coord(cfg);
+
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(3), cancel);
+
+  EXPECT_TRUE(bundle.decision.accepted);
+}
+
+TEST(CollisionValidationCoordinatorTest,
      ContactReleasePenetrationIncreaseFailsAtFirstViolation) {
   // Penetration monotonicity: a later waypoint deeper than previous beyond
   // tolerance must fail with reason "penetration_increased" at the first

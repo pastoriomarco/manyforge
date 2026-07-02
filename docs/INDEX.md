@@ -52,6 +52,11 @@ branch/commit workflow).
   - Operator runbook for exporting Isaac Sim scene meshes and loading
     them through Composer.
 
+- [`operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md`](operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md)
+  - Multi-machine Lite6 trocar workflow with Isaac Sim, Isaac ROS 4.4
+    YOLOv8/FoundationPose perception, ManyForge ROS control, DDS/QoS
+    isolation, TF checks, and smoke qualification.
+
 - [`operations/ADDING_A_ROBOT.md`](operations/ADDING_A_ROBOT.md)
   - Operator runbook for adding a new robot deployment: URDF/SRDF
     requirements, deployment-YAML schema (arm + gripper), capability

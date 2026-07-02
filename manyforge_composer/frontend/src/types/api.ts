@@ -143,6 +143,7 @@ export interface ProgramSceneResource {
   objectId: string;
   shape: Record<string, unknown>;
   pose: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
 }
 
 export interface ProgramParameter {
@@ -781,6 +782,7 @@ export interface SceneObjectState {
   source: 'authored' | 'runtime' | 'attached' | 'sensed';
   persistable: boolean;
   viewer_frame_visible: boolean;
+  support_contacts?: Record<string, unknown>[];
 }
 
 export interface SceneGripperSubtreeLink {
