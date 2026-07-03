@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 import queue
 import shutil
 from pathlib import Path
@@ -39,11 +40,13 @@ _ALLOWED_EVENT_TYPES = {
     "validation_started",
 }
 _ALLOWED_EVENT_PREFIXES = (
+    "cycle_reset_",
     "intervention_",
     "model_call_",
     "pose_source_",
     "runtime_override_",
     "simulation_control_",
+    "tool_dispatch_",
 )
 _SEVERITY_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
 _FAILURE_ARCHIVE_EVENT_TYPES = {
@@ -151,6 +154,8 @@ def _severity_for_event(event_type: str, details: Optional[dict[str, Any]]) -> s
 def _component_for_event(event_type: str) -> str:
     if event_type.startswith("model_call_"):
         return "manyforge.model"
+    if event_type.startswith("tool_dispatch_"):
+        return "manyforge.tool_dispatch"
     if event_type.startswith("pose_source_"):
         return "manyforge.scene"
     if event_type.startswith("simulation_control_"):
@@ -245,6 +250,7 @@ def _event_channel(event_type: str, details: Optional[dict[str, Any]]) -> str:
         or event_type.startswith("simulation_control_")
         or event_type.startswith("intervention_")
         or event_type == "delegated_recovery_requested"
+        or event_type.startswith("cycle_reset_")
     ):
         return "command_runtime"
     return "execution_lifecycle"
@@ -391,7 +397,7 @@ class EventRecorder:
         # asynchronous. Bounded queue: on overflow the event is dropped from
         # the FILE sink only (the in-memory deque and failure archive still
         # see it) and the drop is counted, never blocking the hot path.
-        self._jsonl_queue: queue.Queue[tuple[Path, str] | None] | None = None
+        self._jsonl_queue: queue.Queue[tuple[Path, str, bool] | None] | None = None
         self._jsonl_worker: threading.Thread | None = None
         self._jsonl_dropped = 0
         self._last_jsonl_error: Optional[str] = None
@@ -495,7 +501,11 @@ class EventRecorder:
 
         cycle_state = cycle_manager.state.value if cycle_manager is not None else None
         if cycle_state != self._last_cycle_state:
-            self._handle_cycle_state_transition(self._last_cycle_state, cycle_state)
+            self._handle_cycle_state_transition(
+                self._last_cycle_state,
+                cycle_state,
+                runner_run_id=getattr(cycle_manager, "program_run_id", None),
+            )
             self._last_cycle_state = cycle_state
 
         status = None
@@ -680,6 +690,11 @@ class EventRecorder:
             if error_message:
                 details["error"] = error_message
 
+            native_run_id = native_event.get("program_run_id")
+            if not native_run_id and isinstance(
+                native_event.get("details"), dict
+            ):
+                native_run_id = native_event["details"].get("program_run_id")
             self._record_event(
                 event_type=(
                     "controlled_stop_completed"
@@ -688,6 +703,9 @@ class EventRecorder:
                 ),
                 execution_id=int(native_event.get("execution_id") or 0),
                 details=details or None,
+                # Kernel-stamped correlation id wins: the event belongs to
+                # the run that dispatched it, even when drained late.
+                run_id=str(native_run_id) if native_run_id else None,
                 execution_mode=None,
                 timestamp_ns=int(native_event.get("timestamp_ns") or time.monotonic_ns()),
             )
@@ -1040,6 +1058,21 @@ class EventRecorder:
             execution_mode=execution_mode,
         )
 
+    def record_cycle_reset_phase(self, phase_event: dict[str, Any]) -> None:
+        """Record one bounded phase in the operator Reset workflow."""
+        phase = str(phase_event.get("phase") or "unknown")
+        status = str(phase_event.get("status") or "unknown")
+        details = dict(phase_event)
+        run_id = details.pop("program_run_id", None)
+        details["phase"] = phase
+        details["status"] = status
+        self._record_event(
+            event_type=f"cycle_reset_phase_{status}",
+            details=details,
+            run_id=run_id if isinstance(run_id, str) and run_id else None,
+            execution_mode="program",
+        )
+
     def record_delegated_recovery_requested(self, request) -> None:
         """Record a delegated-recovery request emitted by the running program."""
         self._record_event(
@@ -1062,6 +1095,53 @@ class EventRecorder:
                 "persistent_edit_policy": request.persistent_edit_policy,
                 "requested_from_state": request.requested_from_state,
             },
+        )
+
+    def record_tool_dispatch(
+        self,
+        *,
+        tool_id: str,
+        lane: str,
+        principal_id: Optional[str] = None,
+        arguments: Optional[dict[str, Any]] = None,
+        success: bool = True,
+        error: Optional[str] = None,
+        duration_ms: Optional[float] = None,
+        effect: Optional[str] = None,
+        session_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> None:
+        """Durable per-tool-dispatch audit record (all assistant/MCP lanes).
+
+        The live UX feed keeps human-readable summaries; this record keeps
+        the durable who/what/when/outcome that survives a restart. Argument
+        VALUES are hashed, never stored raw — same default redaction as the
+        model-call audit — while argument keys stay readable so an operator
+        can see the call shape.
+        """
+        details: dict[str, Any] = {"tool_id": tool_id, "lane": lane}
+        if effect:
+            details["effect"] = effect
+        if duration_ms is not None:
+            details["duration_ms"] = round(float(duration_ms), 1)
+        if arguments:
+            details["argument_keys"] = sorted(arguments.keys())
+            details["argument_value_hashes"] = {
+                key: hashlib.sha256(
+                    json.dumps(value, sort_keys=True, default=str).encode()
+                ).hexdigest()
+                for key, value in arguments.items()
+            }
+        if error:
+            details["error"] = str(error)[:500]
+        self._record_event(
+            event_type=(
+                "tool_dispatch_completed" if success else "tool_dispatch_failed"
+            ),
+            details=details,
+            principal_id=principal_id or None,
+            session_id=session_id,
+            run_id=run_id,
         )
 
     def record_model_event(
@@ -1239,9 +1319,10 @@ class EventRecorder:
         self,
         previous_state: Optional[str],
         current_state: Optional[str],
+        runner_run_id: Optional[str] = None,
     ) -> None:
         if current_state == "running" and previous_state in {None, "idle"}:
-            self._start_run()
+            self._start_run(runner_run_id)
 
         self._record_event(
             event_type="cycle_state_changed",
@@ -1644,7 +1725,12 @@ class EventRecorder:
                 self._incident_snapshots.append(
                     self._build_incident_snapshot_locked(event)
                 )
-            self._enqueue_jsonl_locked(run_id=run_id, json_text=json_text)
+            self._enqueue_jsonl_locked(
+                run_id=run_id,
+                json_text=json_text,
+                durable=_SEVERITY_ORDER.get(str(severity).upper(), 0)
+                >= _SEVERITY_ORDER["WARN"],
+            )
             self._maybe_write_failure_archive_locked(event)
 
     def _intervention_run_id(self, session) -> str:
@@ -1697,11 +1783,18 @@ class EventRecorder:
                 )
             self._last_intervention_event_index = max_event_index
 
-    def _start_run(self) -> None:
+    def _start_run(self, runner_run_id: Optional[str] = None) -> None:
         now_ns = time.monotonic_ns()
         self._run_counter += 1
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        run_id = f"run-{stamp}-{self._run_counter:03d}"
+        if runner_run_id:
+            # spec/500 §2.2: the orchestrator runner is the authoritative
+            # minter. Adopting its id keeps ONE id space across durable
+            # history, kernel-stamped events, and runner-side records —
+            # otherwise programRunId filters silently miss kernel events.
+            run_id = runner_run_id
+        else:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            run_id = f"run-{stamp}-{self._run_counter:03d}"
         file_path = self._path_for_run(run_id)
         self._current_run = _RunInfo(run_id=run_id, started_at_ns=now_ns, file_path=file_path)
         self._last_run = self._current_run
@@ -1754,12 +1847,20 @@ class EventRecorder:
             },
         }
 
-    def _enqueue_jsonl_locked(self, *, run_id: Optional[str], json_text: str) -> None:
+    def _enqueue_jsonl_locked(
+        self,
+        *,
+        run_id: Optional[str],
+        json_text: str,
+        durable: bool = False,
+    ) -> None:
         """Hand the serialized event to the JSONL writer thread (audit 6B).
 
         Path resolution and FIFO ordering are fixed here, under `_lock`;
         only the disk append runs on the writer thread, so a slow disk can
-        never stall observers contending on the recorder lock.
+        never stall observers contending on the recorder lock. `durable`
+        events (WARN and above — faults, safety stops) are fsync'd so the
+        incident that precedes a power loss still has its record on disk.
         """
         queue_ = self._jsonl_queue
         if queue_ is None:
@@ -1768,7 +1869,7 @@ class EventRecorder:
         if file_path is None:
             return
         try:
-            queue_.put_nowait((file_path, json_text))
+            queue_.put_nowait((file_path, json_text, durable))
         except queue.Full:
             self._jsonl_dropped += 1
             self._last_jsonl_error = "jsonl writer queue full"
@@ -1782,9 +1883,9 @@ class EventRecorder:
             try:
                 if job is None:
                     return
-                file_path, json_text = job
+                file_path, json_text, durable = job
                 try:
-                    self._write_jsonl_line(file_path, json_text)
+                    self._write_jsonl_line(file_path, json_text, durable=durable)
                 except Exception as exc:  # pragma: no cover - disk failure surface
                     with self._lock:
                         self._last_jsonl_error = str(exc)
@@ -1792,10 +1893,17 @@ class EventRecorder:
                 queue_.task_done()
 
     @staticmethod
-    def _write_jsonl_line(file_path: Path, json_text: str) -> None:
+    def _write_jsonl_line(
+        file_path: Path, json_text: str, *, durable: bool = False
+    ) -> None:
         with file_path.open("a", encoding="utf-8") as handle:
             handle.write(json_text)
             handle.write("\n")
+            if durable:
+                # Fault-grade events must survive an immediate power loss —
+                # steady-state events may stay in the page cache.
+                handle.flush()
+                os.fsync(handle.fileno())
 
     def wait_for_jsonl_idle(self, timeout_s: float = 5.0) -> bool:
         """Wait until queued JSONL appends have hit disk.

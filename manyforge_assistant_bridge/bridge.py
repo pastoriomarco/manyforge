@@ -83,9 +83,19 @@ BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8100"))
 AUDIT_LOG_PATH = Path(
     os.environ.get(
         "BRIDGE_AUDIT_LOG",
-        str(Path(__file__).resolve().parent / "audit.log"),
+        # State dir, not the package source tree: an append-only log inside
+        # the repo checkout pollutes the worktree and dies with a reinstall.
+        str(
+            Path(
+                os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
+            )
+            / "manyforge"
+            / "assistant-bridge-audit.log"
+        ),
     )
-)
+).expanduser()
+AUDIT_LOG_MAX_BYTES = int(os.environ.get("BRIDGE_AUDIT_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+AUDIT_LOG_KEEP = max(1, int(os.environ.get("BRIDGE_AUDIT_LOG_KEEP", "3")))
 REQUEST_TIMEOUT_S = float(os.environ.get("BRIDGE_REQUEST_TIMEOUT_S", "60"))
 CALLBACK_TIMEOUT_S = float(os.environ.get("BRIDGE_CALLBACK_TIMEOUT_S", "10"))
 MAX_TURNS = max(1, int(os.environ.get("BRIDGE_MAX_TURNS", "16")))
@@ -329,9 +339,30 @@ def _parse_semver(value: str) -> tuple[int, int, int]:
 
 
 
+def _rotate_audit_log_if_needed() -> None:
+    """Size-based rollover: audit.log -> audit.log.1 -> ... -> .KEEP."""
+    try:
+        if (
+            not AUDIT_LOG_PATH.exists()
+            or AUDIT_LOG_PATH.stat().st_size < AUDIT_LOG_MAX_BYTES
+        ):
+            return
+        for index in range(AUDIT_LOG_KEEP - 1, 0, -1):
+            older = AUDIT_LOG_PATH.with_name(f"{AUDIT_LOG_PATH.name}.{index}")
+            newer = AUDIT_LOG_PATH.with_name(f"{AUDIT_LOG_PATH.name}.{index + 1}")
+            if older.exists():
+                older.replace(newer)
+        AUDIT_LOG_PATH.replace(
+            AUDIT_LOG_PATH.with_name(f"{AUDIT_LOG_PATH.name}.1")
+        )
+    except OSError:  # noqa: PERF203 — rotation is best-effort, audit append must proceed
+        logger.exception("bridge audit log rotation failed")
+
+
 def _audit_record(record: dict[str, Any]) -> None:
-    """Append-only JSONL audit log."""
+    """Append-only JSONL audit log with size-based rotation."""
     AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_audit_log_if_needed()
     with AUDIT_LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, separators=(",", ":")) + "\n")
 

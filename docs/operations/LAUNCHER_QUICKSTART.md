@@ -71,7 +71,7 @@ lane × assistant matrix.
 
 `./scripts/launch.sh start` blocks on the services it manages:
 
-- Composer API health (`/api/health`)
+- Composer API readiness (`/api/infra/heartbeat` — computes real kernel state; `/api/health` is liveness-only)
 - Runtime-status endpoint (`/api/runtime/status`)
 - Program/deployment load (manyforge-only) or supervisor handoff (isaac-sim)
 - Supervisor processes — `assistant_supervisor`, `isaac_demo_supervisor`

@@ -2773,6 +2773,7 @@ def test_propose_scene_objects_returns_scene_resource_drafts(
             "position_m": [0.085469, -0.004781, 0.060786],
             "orientation_rpy_deg": [0.0, 0.0, 0.0],
         },
+        "metadata": {},
     }
     proposal = data["proposals"][0]
     assert proposal["type"] == "scene_resource_add"
@@ -3047,6 +3048,7 @@ def test_assistant_scene_authoring_smoke_fixture_path() -> None:
                 "position_m": [0.085469, -0.004781, 0.060786],
                 "orientation_rpy_deg": [0.0, 0.0, 0.0],
             },
+            "metadata": {},
         }
     ]
 
@@ -3123,6 +3125,7 @@ def _scene_resource_proposal() -> dict:
             "position_m": [0.1, -0.2, 0.05],
             "orientation_rpy_deg": [0.0, 0.0, 0.0],
         },
+        "metadata": {},
     }
     return {
         "id": "proposal-scene-object-sim_soup_can",
@@ -3698,3 +3701,42 @@ def test_update_node_params_unresolvable_reference_structured_error(
         message_contains="could not be resolved",
     )
     assert data["draftMutated"] is False
+
+
+def test_assistant_bridge_tool_call_records_durable_dispatch(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    """H6: the bridge lane's live feed is in-memory only — every bridge
+    tool call must also land in durable history with lane, effect,
+    principal, hashed args, and outcome."""
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "query")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/program_read",
+        json={
+            "requestId": "req-audit",
+            "conversationId": "conv-audit",
+            "assistantMode": "query",
+            "catalogHash": catalog_hash,
+            "principal": "assistant:query",
+            "arguments": {},
+        },
+    )
+    assert response.status_code == 200
+
+    events = state.event_recorder.history(
+        event_types=["tool_dispatch_completed"]
+    )["events"]
+    bridge_events = [
+        e
+        for e in events
+        if e["details"].get("lane") == "assistant_bridge"
+        and e["details"].get("tool_id") == "program_read"
+    ]
+    assert bridge_events, "bridge tool call left no durable dispatch record"
+    event = bridge_events[-1]
+    assert event["principal_id"] == "assistant:query"
+    assert event["details"]["effect"] == "read_only"
+    assert "duration_ms" in event["details"]

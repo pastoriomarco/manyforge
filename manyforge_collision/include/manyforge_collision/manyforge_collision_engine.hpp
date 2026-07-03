@@ -75,9 +75,18 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
   std::optional<core::CollisionWorldRevision> synced_snapshot_revision_;
   std::vector<std::string> synced_scene_geometry_names_;
   std::map<std::string, core::CollisionBodyId> synced_raw_name_to_body_id_;
+  /// Full raw-geometry-name -> body-id map (scene + robot links), rebuilt
+  /// once per synced snapshot revision instead of parsed on every check.
+  std::map<std::string, core::CollisionBodyId> synced_raw_to_body_map_;
   std::set<std::string> builtin_collision_geometry_names_;
   std::optional<pinocchio::GeometryModel> active_collision_model_;
   std::optional<pinocchio::GeometryData> active_collision_data_;
+  /// Reusable FK scratch for collision queries: constructed once per
+  /// engine (the kinematic model never changes after construction);
+  /// pinocchio writes per-query results into it. Accessed only under
+  /// scene_mutex_ like every other check-path member — the engine is
+  /// kSingleContextExclusive by contract.
+  std::optional<pinocchio::Data> reusable_model_data_;
 
   /// Internal mutex serializes concurrent check() calls on the same
   /// instance. Separate instances do not share this mutex.

@@ -226,6 +226,12 @@ class ExecuteRequest:
     # free-move semantics; non-empty arms each scope atomically with
     # dispatch and reaps on every terminal execution state.
     motion_interrupt_scopes: List[MotionInterruptScope] = field(default_factory=list)
+    # Program-run correlation id (spec/500 §2.2): minted once by the
+    # orchestrator runner at program start, optional at the kernel
+    # boundary. When present the kernel stamps it on every kernel
+    # event for the execution so durable history can be joined across
+    # Composer -> kernel -> backend without timestamp guesswork.
+    program_run_id: Optional[str] = None
 
 
 @dataclass
@@ -804,6 +810,17 @@ class KernelClient(ABC):
     @abstractmethod
     def stop(self) -> CommandResult: ...
 
+    def close(self) -> None:
+        """Deterministically release the client's execution resources.
+
+        Optional lifecycle hook called once at process shutdown, after the
+        cycle layer has quiesced. Implementations that own native resources
+        (command gate, backend threads) must make their safety-relevant
+        teardown happen HERE rather than relying on interpreter-exit garbage
+        collection, whose ordering is not guaranteed. Must be idempotent;
+        the client is unusable afterwards. Default: no-op.
+        """
+
     @abstractmethod
     def pause(self) -> CommandResult: ...
 
@@ -1154,6 +1171,8 @@ class MockKernelClient(KernelClient):
             "execution_id": self._execution_id,
             "timestamp_ns": time.monotonic_ns(),
         }
+        if getattr(self, "_active_program_run_id", ""):
+            event["program_run_id"] = self._active_program_run_id
         if from_state is not None:
             event["from_state"] = from_state
         if to_state is not None:
@@ -1217,6 +1236,7 @@ class MockKernelClient(KernelClient):
         self._next_id += 1
         self._execution_id = eid
         self._active_move_id = request.move_id
+        self._active_program_run_id = request.program_run_id or ""
         self._active_goal_positions_rad = self._positions_for_request(request)
         self._emit_kernel_event("plan_started")
         if self._execute_duration_s > 0:

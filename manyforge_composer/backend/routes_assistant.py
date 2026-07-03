@@ -967,6 +967,17 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 error=error_text or "rejected by policy/validation",
                 started_at_ns=live_started_ns,
             )
+            state.event_recorder.record_tool_dispatch(
+                tool_id=tool_id,
+                lane="assistant_bridge",
+                effect=tool_definition.effect,
+                principal_id=request.principal or None,
+                arguments=request.arguments or None,
+                success=False,
+                error=error_text or "rejected by policy/validation",
+                duration_ms=(time.monotonic_ns() - live_started_ns) / 1e6,
+                session_id=request.conversation_id or None,
+            )
             # OpenClaw 2026.4.24+ applies `erroredAssistantResultPolicy:
             # "drop"` (hardcoded in src/agents/embedded-agent-runner/run/
             # attempt.ts:3102-3107 as of 2026.5.22): when the upstream
@@ -1064,6 +1075,19 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 tool_definition.effect == COMPOSER_DRAFT_MUTATING_EFFECT and success
             ),
             started_at_ns=live_started_ns,
+        )
+        # Durable counterpart of the live feed above: the live records are
+        # in-memory only and vanish on restart; this one is the audit trail.
+        state.event_recorder.record_tool_dispatch(
+            tool_id=tool_id,
+            lane="assistant_bridge",
+            effect=tool_definition.effect,
+            principal_id=request.principal or None,
+            arguments=request.arguments or None,
+            success=success,
+            error=error,
+            duration_ms=(time.monotonic_ns() - live_started_ns) / 1e6,
+            session_id=request.conversation_id or None,
         )
 
         # Attach a delta block so the wrapper passes fresh tree+scene

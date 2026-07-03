@@ -1433,3 +1433,97 @@ class TestSession:
         mcp = create_mcp_server(state)
         result = _call(mcp, "manyforge_session", {"action": "invalid"})
         assert "error" in result
+
+
+# =============================================================================
+# Durable tool-dispatch audit
+# =============================================================================
+
+class TestToolDispatchAudit:
+    """Every MCP tool call must land in durable history with actor,
+    hashed arguments, outcome, and duration — on both transports, since
+    the wrapper sits at tool registration."""
+
+    def test_tool_call_records_durable_dispatch_event(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+
+        _call(mcp, "manyforge_cycle_control",
+              {"command": "status", "principal_id": "operator-7"})
+
+        events = state.event_recorder.history(
+            event_types=["tool_dispatch_completed"]
+        )["events"]
+        assert events, "tool dispatch produced no durable event"
+        event = events[-1]
+        details = event["details"]
+        assert details["tool_id"] == "manyforge_cycle_control"
+        assert details["lane"] == "mcp"
+        assert event["principal_id"] == "operator-7"
+        assert "duration_ms" in details
+        # Argument VALUES are hashed, never stored raw; keys stay readable.
+        assert "command" in details["argument_keys"]
+        assert "command" in details["argument_value_hashes"]
+        serialized = json.dumps(event)
+        assert '"status"' not in serialized
+
+    def test_scene_edit_accepts_and_records_principal(self):
+        """manyforge_scene_edit takes the server-injected principal so
+        assistant-caused scene changes are attributable — and an
+        authenticated HTTP session's unconditional principal injection can
+        no longer fail schema validation."""
+        state = _make_state()
+        mcp = create_mcp_server(state)
+
+        result = _call(
+            mcp,
+            "manyforge_scene_edit",
+            {
+                "operation": "add",
+                "object_id": "audit_box",
+                "shape_type": "box",
+                "box_dimensions_m": [0.1, 0.1, 0.1],
+                "pose_position_m": [0.5, 0.0, 0.05],
+                "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                "principal_id": "assistant-lane",
+            },
+        )
+        assert result.get("success") is True
+
+        events = state.event_recorder.history(
+            event_types=["tool_dispatch_completed"]
+        )["events"]
+        scene_edits = [
+            e for e in events if e["details"]["tool_id"] == "manyforge_scene_edit"
+        ]
+        assert scene_edits and scene_edits[-1]["principal_id"] == "assistant-lane"
+
+    def test_tool_schemas_unchanged_by_audit_wrapper(self):
+        """functools.wraps must preserve the signature FastMCP introspects:
+        the wrapper exists for audit, not to change any tool contract."""
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        tools = asyncio.run(mcp.list_tools())
+        by_name = {tool.name: tool for tool in tools}
+        assert "manyforge_cycle_control" in by_name
+        props = by_name["manyforge_cycle_control"].inputSchema["properties"]
+        assert set(props) == {"command", "velocity_scale", "principal_id"}
+
+    def test_tool_json_error_payload_records_failed_dispatch(self):
+        """MCP tools report rejections as JSON payloads, not exceptions —
+        a {"error": ...} result must be a tool_dispatch_failed record or
+        the ERROR-severity/fsync guarantee never fires on this lane."""
+        state = _make_state()
+        mcp = create_mcp_server(state)
+
+        result = _call(mcp, "manyforge_cycle_control", {"command": "run"})
+        assert result.get("error"), "precondition: run with no program rejects"
+
+        failed = state.event_recorder.history(
+            event_types=["tool_dispatch_failed"]
+        )["events"]
+        assert failed, "JSON error payload was audited as a success"
+        event = failed[-1]
+        assert event["details"]["tool_id"] == "manyforge_cycle_control"
+        assert event["details"]["error"]
+        assert event["severity"] == "ERROR"

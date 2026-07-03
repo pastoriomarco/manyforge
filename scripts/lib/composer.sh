@@ -28,7 +28,10 @@ COMPOSER_READY_TIMEOUT_S="${COMPOSER_READY_TIMEOUT_S:-600}"
 # compose service. The launcher sets LANE before sourcing this module's wait
 # callers, so we can switch on it here.
 composer_ready() {
-    curl -fsS "${COMPOSER_URL}/api/health" >/dev/null 2>&1
+    # Heartbeat, not /api/health: /api/health reports "ok" on object
+    # presence alone, so the launcher could declare "ready" over a dead
+    # kernel. The heartbeat computes real kernel state before answering.
+    curl -fsS "${COMPOSER_URL}/api/infra/heartbeat" >/dev/null 2>&1
 }
 
 composer_logs() {

@@ -338,10 +338,10 @@ def test_record_event_does_not_block_on_slow_disk(tmp_path):
     writes = []
     original_write = EventRecorder._write_jsonl_line
 
-    def slow_write(file_path, json_text):
+    def slow_write(file_path, json_text, *, durable=False):
         release_disk.wait(timeout=5.0)
         writes.append(json_text)
-        original_write(file_path, json_text)
+        original_write(file_path, json_text, durable=durable)
 
     recorder._write_jsonl_line = staticmethod(slow_write)
     try:

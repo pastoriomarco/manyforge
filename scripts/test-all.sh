@@ -35,22 +35,33 @@ PASS=0
 FAIL=0
 
 # ── Re-test gate ─────────────────────────────────────────────────────────────
-# Tests run at build time; the code is identical until the next rebuild, so a
-# re-run against the same workspace HEAD is redundant. Record the commit of the
-# last fully-passing run of this filter and skip an identical re-run. --force
-# overrides. MANYFORGE_GIT_COMMIT may be pre-set (e.g. by the build) so the gate
-# also works when the container workspace is not git-aware.
+# A re-run against the same, unmodified workspace HEAD is redundant. Record the
+# commit of the last fully-passing run of this filter and skip an identical
+# re-run. --force overrides. MANYFORGE_GIT_COMMIT may be pre-set (e.g. by the
+# build) so the gate also works when the container workspace is not git-aware.
+# The gate is HEAD-keyed, so it only holds for a clean tree: the interpreted
+# Python suites run straight from the working tree, where an uncommitted edit
+# changes behavior without a rebuild. A dirty tree therefore disables the gate
+# entirely — no skip, no stamp.
 CURRENT_COMMIT="$(git -c safe.directory='*' -C "${WORKSPACE}" rev-parse HEAD 2>/dev/null || true)"
 export MANYFORGE_GIT_COMMIT="${MANYFORGE_GIT_COMMIT:-${CURRENT_COMMIT}}"
 REF_COMMIT="${MANYFORGE_GIT_COMMIT}"
 TEST_STAMP="${MANYFORGE_TEST_STAMP:-${WORKSPACE}/.manyforge-tested-${FILTER}.commit}"
+WORKSPACE_DIRTY=0
+if [[ -n "${CURRENT_COMMIT}" ]] \
+      && [[ -n "$(git -c safe.directory='*' -C "${WORKSPACE}" status --porcelain 2>/dev/null | head -c1)" ]]; then
+    WORKSPACE_DIRTY=1
+fi
 
-if (( FORCE == 0 )) && [[ -n "${REF_COMMIT}" && -f "${TEST_STAMP}" \
+if (( FORCE == 0 && WORKSPACE_DIRTY == 0 )) && [[ -n "${REF_COMMIT}" && -f "${TEST_STAMP}" \
       && "$(cat "${TEST_STAMP}" 2>/dev/null)" == "${REF_COMMIT}" ]]; then
     echo -e "${GREEN}=== test-all (${FILTER}) ===${NC}"
     echo "  Workspace HEAD ${REF_COMMIT:0:12} already passed the '${FILTER}' suite;"
     echo "  code unchanged since (not rebuilt) — skipping re-test. Use --force to run anyway."
     exit 0
+fi
+if (( WORKSPACE_DIRTY == 1 )); then
+    echo -e "${YELLOW}  (workspace has uncommitted changes — re-test gate disabled: running fully, no stamp will be written)${NC}"
 fi
 if [[ -z "${REF_COMMIT}" ]]; then
     echo -e "${YELLOW}  (workspace not git-aware and MANYFORGE_GIT_COMMIT unset — running unconditionally; no stamp written)${NC}"
@@ -242,6 +253,25 @@ run_integration_tests() {
     fi
 }
 
+run_bridge_tests() {
+    section "Assistant bridge tests"
+    cd "$WORKSPACE"
+    setup_pythonpath
+    # Hard failure, not a skip: the bridge suite's own importorskip("fastapi")
+    # already vanishes silently on dep-less hosts, so a skip here would make
+    # the lane green while running zero tests. The dev container has the deps.
+    if ! python_has_modules fastapi httpx; then
+        echo -e "${RED}  FAIL: missing Python deps for assistant bridge tests (need fastapi, httpx) — run in the dev container${NC}"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    if pytest manyforge_assistant_bridge/tests/ -v; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 run_composer_backend_tests() {
     section "Composer backend tests"
     cd "$WORKSPACE"
@@ -281,6 +311,28 @@ run_composer_frontend_build() {
     fi
     cd "$frontend_dir"
     if npm run build; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_composer_frontend_tests() {
+    section "Composer frontend unit tests"
+    local frontend_dir="$WORKSPACE/manyforge_composer/frontend"
+    if ! command -v npm >/dev/null 2>&1; then
+        skip "npm not available"
+        return
+    fi
+    if [ ! -f "$frontend_dir/package.json" ]; then
+        skip "Composer frontend package.json not found"
+        return
+    fi
+    # No node_modules guard beyond the ones above: if npm exists but deps are
+    # missing, `npm test` must fail loudly rather than skip — a silent skip
+    # here would green-light untested frontend logic.
+    cd "$frontend_dir"
+    if npm test; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -368,6 +420,10 @@ case "$FILTER" in
     composer)
         run_composer_backend_tests
         run_composer_frontend_build
+        run_composer_frontend_tests
+        ;;
+    bridge)
+        run_bridge_tests
         ;;
     qualification)
         run_qualification_tests
@@ -395,13 +451,15 @@ case "$FILTER" in
         run_pybind_tests
         run_python_tests
         run_integration_tests
+        run_bridge_tests
         run_composer_backend_tests
         run_composer_frontend_build
+        run_composer_frontend_tests
         run_qualification_tests
         run_qualification_native_tests
         ;;
     *)
-        echo "Usage: $0 [all|cpp|roboplan|bindings|python|composer|qualification|qualification-native|qualification-soak|qualification-all|integration|ros]"
+        echo "Usage: $0 [all|cpp|roboplan|bindings|python|composer|bridge|qualification|qualification-native|qualification-soak|qualification-all|integration|ros]"
         exit 1
         ;;
 esac
@@ -410,8 +468,10 @@ echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo -e "${GREEN}All $PASS test suite(s) passed.${NC}"
     # Record this commit so an identical re-run (same code, not rebuilt) is
-    # skipped by the gate above. Only stamp on a clean pass and a known commit.
-    if [[ -n "${REF_COMMIT}" ]]; then
+    # skipped by the gate above. Only stamp on a clean pass, a known commit,
+    # and a clean tree — a dirty tree can pass now and regress after further
+    # edits without the stamp ever noticing.
+    if [[ -n "${REF_COMMIT}" && "${WORKSPACE_DIRTY}" -eq 0 ]]; then
         if echo "${REF_COMMIT}" > "${TEST_STAMP}" 2>/dev/null; then
             echo "  Recorded '${FILTER}' pass at ${REF_COMMIT:0:12} → re-test skipped until code changes (--force overrides)."
         fi

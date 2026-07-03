@@ -269,7 +269,7 @@ When making changes here, check the boundary you're touching:
 5. **Tests fall into deterministic + assistant lanes.** Run
    `./scripts/test-all.sh` for the deterministic suite. The assistant
    bridge has its own pytest suite under
-   `tests/test_assistant_bridge*.py`.
+   `manyforge_assistant_bridge/tests/`.
 6. **Schema changes are wire-breaking.** If you touch
    `manyforge_assistant_bridge/protocol.py` (the catalog-hash function
    or any shared envelope helper), every running deployment will

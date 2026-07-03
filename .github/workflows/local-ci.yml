@@ -36,6 +36,10 @@ jobs:
               echo "All shell scripts pass bash -n"
               ./scripts/ci/verify-version-sync.sh
               ./scripts/ci/check-private-spec-boundary.sh
+              ./scripts/ci/check-terminal-commit-boundary.sh
+              # Runs inside the dev image already (this whole command executes
+              # in manyforge-dev:latest), so take the direct in-container path.
+              INSIDE_MANYFORGE_DEV_CONTAINER=1 ./scripts/ci/check-public-contracts-fresh.sh
           - name: core-cpp
             suite: core-cpp
             command: ./scripts/test-all.sh cpp
@@ -53,6 +57,9 @@ jobs:
               ./scripts/test-all.sh python
               (cd manyforge_composer/frontend && npm ci && npx tsc --noEmit -p tsconfig.app.json)
               ./scripts/test-all.sh composer
+          - name: integration
+            suite: integration
+            command: ./scripts/test-all.sh integration
           - name: qualification
             suite: qualification
             command: |

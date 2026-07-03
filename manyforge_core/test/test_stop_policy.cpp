@@ -20,9 +20,9 @@ class StopPolicyTest : public ::testing::Test {
   }
 
   void go_to_executing() {
-    sm.try_transition(ExecutionState::kPlanning);
-    sm.try_transition(ExecutionState::kValidating);
-    sm.try_transition(ExecutionState::kExecuting);
+    (void)sm.try_transition(ExecutionState::kPlanning);
+    (void)sm.try_transition(ExecutionState::kValidating);
+    (void)sm.try_transition(ExecutionState::kExecuting);
   }
 
   void go_to_paused() {
@@ -61,7 +61,7 @@ TEST_F(StopPolicyTest, SoftStopFromPaused_Immediate) {
 }
 
 TEST_F(StopPolicyTest, SoftStopFromPlanning_DirectToStopped) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_TRUE(policy.request_soft_stop(500).ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
   EXPECT_EQ(invalidate_count, 1);
@@ -69,8 +69,8 @@ TEST_F(StopPolicyTest, SoftStopFromPlanning_DirectToStopped) {
 }
 
 TEST_F(StopPolicyTest, SoftStopFromValidating_DirectToStopped) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
   EXPECT_TRUE(policy.request_soft_stop(500).ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
   EXPECT_EQ(invalidate_count, 1);
@@ -114,14 +114,14 @@ TEST_F(StopPolicyTest, HardStopFromStopping_UpgradesSoftToHard) {
 }
 
 TEST_F(StopPolicyTest, HardStopFromPlanning_DirectToStopped) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_TRUE(policy.request_hard_stop().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
 }
 
 TEST_F(StopPolicyTest, HardStopFromValidating_DirectToStopped) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
   EXPECT_TRUE(policy.request_hard_stop().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
 }
@@ -141,7 +141,7 @@ TEST_F(StopPolicyTest, PauseFromExecuting_DecelerationToPaused) {
 }
 
 TEST_F(StopPolicyTest, PauseFromNonExecuting_Fails) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_FALSE(policy.request_pause().ok());
 }
 
@@ -163,35 +163,35 @@ TEST_F(StopPolicyTest, ResumeFromNonPaused_Fails) {
 
 // --- Reset ---
 TEST_F(StopPolicyTest, ResetFromTerminalState_ToIdle) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kStopped);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kStopped);
   EXPECT_TRUE(policy.request_reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StopPolicyTest, ResetFromCompleted_ToIdle) {
   go_to_executing();
-  sm.try_transition(ExecutionState::kCompleted);
+  (void)sm.try_transition(ExecutionState::kCompleted);
   EXPECT_TRUE(policy.request_reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StopPolicyTest, ResetFromFailed_ToIdle) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kFailed);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kFailed);
   EXPECT_TRUE(policy.request_reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StopPolicyTest, ResetFromInterventionRequired_ToIdle) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kInterventionRequired);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kInterventionRequired);
   EXPECT_TRUE(policy.request_reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StopPolicyTest, InterventionRequiredTransitionIsIdempotent) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kInterventionRequired).ok());
   EXPECT_TRUE(sm.try_transition(ExecutionState::kInterventionRequired).ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kInterventionRequired);

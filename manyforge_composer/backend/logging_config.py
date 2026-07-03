@@ -8,8 +8,46 @@ import time
 from typing import Any
 
 
+# Attributes every LogRecord carries; anything else on the record was
+# attached by the caller via `extra={...}` and must reach the JSON output.
+_STANDARD_RECORD_ATTRS = frozenset(
+    {
+        "name",
+        "msg",
+        "args",
+        "levelname",
+        "levelno",
+        "pathname",
+        "filename",
+        "module",
+        "exc_info",
+        "exc_text",
+        "stack_info",
+        "lineno",
+        "funcName",
+        "created",
+        "msecs",
+        "relativeCreated",
+        "thread",
+        "threadName",
+        "processName",
+        "process",
+        "taskName",
+        "message",
+        "asctime",
+    }
+)
+
+
 class JSONFormatter(logging.Formatter):
-    """Emit log records as single-line JSON objects."""
+    """Emit log records as single-line JSON objects.
+
+    All caller-attached `extra={...}` fields pass through generically —
+    the structured-logging standard is only worth anything if throttle
+    keys, suppressed counts, and call-site context actually reach the
+    pipeline. An extra whose name collides with a core output field is
+    kept under an `extra_` prefix instead of being dropped.
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         entry: dict[str, Any] = {
@@ -20,12 +58,14 @@ class JSONFormatter(logging.Formatter):
         }
         if record.exc_info and record.exc_info[0] is not None:
             entry["exception"] = self.formatException(record.exc_info)
-        # Merge any extra fields attached via `logging.info("msg", extra={...})`
-        for key in ("method", "path", "status_code", "duration_ms", "client"):
-            val = getattr(record, key, None)
-            if val is not None:
+        for key, val in record.__dict__.items():
+            if key in _STANDARD_RECORD_ATTRS or key.startswith("_") or val is None:
+                continue
+            if key in entry:
+                entry[f"extra_{key}"] = val
+            else:
                 entry[key] = val
-        return json.dumps(entry)
+        return json.dumps(entry, default=str)
 
 
 def setup_logging(level: str = "INFO") -> None:

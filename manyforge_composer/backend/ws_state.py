@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import TYPE_CHECKING, List
@@ -41,10 +42,13 @@ class StateHub:
     async def broadcast(self, data: dict):
         dead = []
         connections = list(self._connections)
+        # Serialize ONCE per frame; send_json would re-encode the same
+        # payload for every connected client.
+        text = json.dumps(data)
 
         async def _send(ws: WebSocket) -> WebSocket | None:
             try:
-                await asyncio.wait_for(ws.send_json(data), timeout=_WS_SEND_TIMEOUT_S)
+                await asyncio.wait_for(ws.send_text(text), timeout=_WS_SEND_TIMEOUT_S)
                 return None
             except Exception:
                 return ws
@@ -72,19 +76,19 @@ class StateHub:
             self._task.cancel()
     
     async def _broadcast_loop(self):
-        """Poll state at ~10Hz and broadcast to all connected clients."""
+        """Poll state at ~10Hz and broadcast to all connected clients.
+
+        The recorder feed (observe + native kernel event drain) runs on
+        every tick regardless of clients — durable history must not
+        depend on a browser being connected. The pydantic StateUpdate
+        construction and the broadcast are skipped with no clients: that
+        is pure per-frame serialization work for an empty audience.
+        """
         while self._running:
             try:
                 has_program = self._state and self._state.program is not None
-                kernel_events = []
                 if self._state is not None and hasattr(self._state, "event_recorder"):
                     self._state.event_recorder.observe(self._state)
-                    kernel_events = self._state.event_recorder.get_events_since(
-                        self._last_broadcast_event_index,
-                        include_node_transitions=False,
-                    )
-                    if kernel_events:
-                        self._last_broadcast_event_index = kernel_events[-1]["event_index"]
                 native_kernel_events = []
                 if self._state and self._state.cycle_manager is not None:
                     self._state.cycle_manager.drain_kernel_events_now()
@@ -99,6 +103,19 @@ class StateHub:
                         self._last_kernel_event_index = native_kernel_events[-1].get(
                             "event_index", self._last_kernel_event_index
                         )
+
+                if not self._connections:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                kernel_events = []
+                if self._state is not None and hasattr(self._state, "event_recorder"):
+                    kernel_events = self._state.event_recorder.get_events_since(
+                        self._last_broadcast_event_index,
+                        include_node_transitions=False,
+                    )
+                    if kernel_events:
+                        self._last_broadcast_event_index = kernel_events[-1]["event_index"]
 
                 if self._state and self._state.cycle_manager is not None:
                     error, error_code, error_details = active_cycle_error_fields(

@@ -97,6 +97,32 @@ def create_kernel_router(state: ComposerState) -> APIRouter:
         """Get kernel performance metrics."""
         return build_kernel_metrics_payload(state)
 
+    @router.post("/stop")
+    def kernel_stop() -> dict[str, Any]:
+        """Issue a kernel-level controlled stop, bypassing the cycle layer.
+
+        Operator backstop: works regardless of what the cycle manager
+        believes its state is, so a cycle-layer fault can never leave the
+        operator without a working stop. The kernel routes the request
+        through its operator-stop profile (controlled stop with hard-stop
+        escalation). A rejection is reported honestly — a kernel already in
+        a terminal state has nothing to stop.
+        """
+        if state.kernel is None:
+            raise HTTPException(status_code=503, detail="Kernel not available")
+        result = state.kernel.stop()
+        try:
+            kernel_state = state.kernel.get_status().state.value
+        except Exception:  # noqa: BLE001 — report the stop result even if status is unreadable
+            kernel_state = None
+        return {
+            "accepted": result.accepted,
+            "error": result.error,
+            "reason_code": result.reason_code,
+            "kernel_state": kernel_state,
+            "timestamp_ns": time.monotonic_ns(),
+        }
+
     @router.get("/events")
     def get_kernel_events(
         since: int = Query(default=0, ge=0),

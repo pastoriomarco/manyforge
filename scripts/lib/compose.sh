@@ -162,6 +162,7 @@ start_composer_dev_container() {
         -v "${vllm_status_dir}:/tmp/manyforge-assistant-e2e:ro" \
         -w /workspace \
         -e MANYFORGE_COMPOSER_PORT="${composer_port}" \
+        -e MANYFORGE_TRACE_DIR="${MANYFORGE_TRACE_DIR:-/workspace/.manyforge-var/traces}" \
         -e CTEST_TEST_TIMEOUT_S="${CTEST_TEST_TIMEOUT_S:-60}" \
         "${assistant_env[@]}" \
         manyforge-dev:latest \

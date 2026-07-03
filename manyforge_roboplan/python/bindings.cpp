@@ -752,6 +752,12 @@ py::dict kernel_event_to_python(const KernelEvent& event) {
     }
     d["details"] = details;
   }
+  // Lift the correlation id to the top level for parity with the mock
+  // kernel's event shape; consumers join on event["program_run_id"].
+  auto run_id_it = event.details.find("program_run_id");
+  if (run_id_it != event.details.end()) {
+    d["program_run_id"] = run_id_it->second;
+  }
   return d;
 }
 
@@ -1361,6 +1367,9 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         req.move_id = request["move_id"].cast<std::string>();
         req.base_frame = request["base_frame"].cast<std::string>();
         req.tcp_frame = request["tcp_frame"].cast<std::string>();
+        if (request.contains("program_run_id")) {
+          req.program_run_id = request["program_run_id"].cast<std::string>();
+        }
 
         // Tolerances
         req.tolerances.joint_position_tol_rad = request.attr("get")("joint_position_tol_rad", 0.05).cast<double>();
@@ -1722,6 +1731,9 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         req.move_id = request["move_id"].cast<std::string>();
         req.base_frame = request["base_frame"].cast<std::string>();
         req.tcp_frame = request["tcp_frame"].cast<std::string>();
+        if (request.contains("program_run_id")) {
+          req.program_run_id = request["program_run_id"].cast<std::string>();
+        }
 
         req.tolerances.joint_position_tol_rad = request.attr("get")("joint_position_tol_rad", 0.05).cast<double>();
         req.tolerances.translation_tol_m = request.attr("get")("translation_tol_m", 0.005).cast<double>();
@@ -1937,6 +1949,9 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         req.move_id = request["move_id"].cast<std::string>();
         req.base_frame = request["base_frame"].cast<std::string>();
         req.tcp_frame = request["tcp_frame"].cast<std::string>();
+        if (request.contains("program_run_id")) {
+          req.program_run_id = request["program_run_id"].cast<std::string>();
+        }
 
         req.tolerances.joint_position_tol_rad = request.attr("get")("joint_position_tol_rad", 0.05).cast<double>();
         req.tolerances.translation_tol_m = request.attr("get")("translation_tol_m", 0.005).cast<double>();

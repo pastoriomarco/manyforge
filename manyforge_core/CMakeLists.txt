@@ -10,6 +10,7 @@ add_compile_options(-Wall -Wextra -Werror -pedantic)
 # Core library
 add_library(manyforge_core
   src/state_machine.cpp
+  src/terminal_committer.cpp
   src/stop_policy.cpp
   src/trajectory_cache.cpp
   src/trajectory_sampler.cpp

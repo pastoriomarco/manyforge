@@ -586,6 +586,7 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
   }
   group_joint_names_ =
       group_joint_names_from_srdf(srdf_path, urdf_path, group_name_);
+  reusable_model_data_.emplace(model_);
 
   capability_.engine_id = engine_id_;
   capability_.engine_version = engine_version_;
@@ -811,10 +812,9 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
             "snapshot collision model is not initialized";
         return result;
       }
-      pinocchio::Data model_data(model_);
       result.in_collision =
           pinocchio::computeCollisions(model_,
-                                       model_data,
+                                       *reusable_model_data_,
                                        *active_collision_model_,
                                        *active_collision_data_,
                                        q,
@@ -824,7 +824,7 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
           request.enable_signed_distance = true;
         }
         pinocchio::computeDistances(model_,
-                                    model_data,
+                                    *reusable_model_data_,
                                     *active_collision_model_,
                                     *active_collision_data_,
                                     q);
@@ -844,21 +844,15 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
       result.raw_diagnostics["cancel_reason"] = cancel->reason();
       return result;
     }
-    const auto raw_to_body =
-        snapshot != nullptr
-            ? build_raw_to_body_map(model_,
-                                    *active_collision_model_,
-                                    *snapshot,
-                                    synced_scene_geometry_names_,
-                                    synced_raw_name_to_body_id_)
-            : std::map<std::string, core::CollisionBodyId>{};
+    const auto& raw_to_body = synced_raw_to_body_map_;
     if (result.in_collision) {
       std::vector<std::pair<std::string, std::string>> raw_pairs;
       if (snapshot != nullptr) {
         if (!needs_distance) {
-          pinocchio::Data model_data(model_);
+          // Re-run without early-exit to enumerate ALL colliding pairs for
+          // diagnostics — same reusable scratch, no second Data build.
           pinocchio::computeCollisions(model_,
-                                       model_data,
+                                       *reusable_model_data_,
                                        *active_collision_model_,
                                        *active_collision_data_,
                                        q,
@@ -1069,6 +1063,7 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
 
   synced_scene_geometry_names_.clear();
   synced_raw_name_to_body_id_.clear();
+  synced_raw_to_body_map_.clear();
   synced_snapshot_revision_.reset();
   active_collision_model_.reset();
   active_collision_data_.reset();
@@ -1319,6 +1314,14 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
     }
   }
   active_collision_data_.emplace(*active_collision_model_);
+
+  // Revision-stable: every input to this map was just rebuilt above, so
+  // build it once here instead of re-parsing body ids on every check.
+  synced_raw_to_body_map_ = build_raw_to_body_map(model_,
+                                                  *active_collision_model_,
+                                                  snapshot,
+                                                  synced_scene_geometry_names_,
+                                                  synced_raw_name_to_body_id_);
 
   synced_snapshot_revision_ = snapshot.revision;
   return std::nullopt;

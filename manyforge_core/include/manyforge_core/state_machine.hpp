@@ -25,7 +25,9 @@ class ExecutionStateMachine {
   /// Attempt to transition to the given state.
   /// @param new_state The target state.
   /// @return Result<void> - Ok() on success, Err(kInvalidStateTransition) if invalid.
-  Result<void> try_transition(ExecutionState new_state);
+  /// Every caller must handle the result: an ignored failed transition is
+  /// how terminal authority gets silently lost (K2).
+  [[nodiscard]] Result<void> try_transition(ExecutionState new_state);
 
   /// Reset the state machine to kIdle.
   /// Valid from ANY non-Idle state (spec 230 §6.3).

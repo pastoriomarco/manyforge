@@ -46,7 +46,7 @@ import {
   SUPPORTED_PROGRAM_PARAMETER_TYPES,
 } from './property/ProgramParameterBindingEditor';
 import { profileSatisfies } from '../utils/profiles';
-import { firstCatalogSchemaValidationMessage } from '../utils/catalogSchema';
+import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
 import { DraftTextInput } from './common/DraftInputs';
 
 const KIND_COLORS: Record<string, string> = {
@@ -553,6 +553,10 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
   const [expandedProgramParameterBinding, setExpandedProgramParameterBinding] = useState<string | null>(null);
   const [rejectedParamValidationErrors, setRejectedParamValidationErrors] = useState<Record<string, string>>({});
   const deploymentModelEndpointSignature = JSON.stringify(deployment?.modelEndpoints ?? {});
+  const sceneAuthoritySignature = JSON.stringify({
+    robot: programInfo?.robot ?? null,
+    grippers: deployment?.grippers ?? {},
+  });
   const sceneContextRequired = SCENE_NODE_IDS_REQUIRING_SCENE_CONTEXT.has(selectedCatalogId);
 
   useEffect(() => {
@@ -602,7 +606,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     return () => {
       cancelled = true;
     };
-  }, [sceneContextRequired, selectedNodeId]);
+  }, [sceneAuthoritySignature, sceneContextRequired, selectedNodeId]);
 
   useEffect(() => {
     if (!sceneContextRequired) {
@@ -624,7 +628,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     return () => {
       cancelled = true;
     };
-  }, [sceneContextRequired, selectedNodeId]);
+  }, [sceneAuthoritySignature, sceneContextRequired, selectedNodeId]);
 
   const sceneReferenceOptions = useMemo(() => {
     const frameNames = Array.from(
@@ -691,9 +695,12 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       if (getProgramParameterReferenceName(value) !== null) {
         return null;
       }
-      return firstCatalogSchemaValidationMessage(param.schema, value, param.name);
+      return firstCatalogParameterValidationMessage(param, value, {
+        namespaces: blackboardNamespaces,
+        keys: blackboardKeys,
+      });
     },
-    [catalogEntry?.parameters],
+    [blackboardKeys, blackboardNamespaces, catalogEntry?.parameters],
   );
 
   const currentParamValidationErrors = useMemo(() => {
@@ -712,17 +719,20 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       if (isOmittedOptionalParam(param.required, rawValue)) {
         continue;
       }
-      const message = firstCatalogSchemaValidationMessage(
-        param.schema,
+      const message = firstCatalogParameterValidationMessage(
+        param,
         rawValue ?? param.default,
-        param.name,
+        {
+          namespaces: blackboardNamespaces,
+          keys: blackboardKeys,
+        },
       );
       if (message) {
         errors[param.name] = message;
       }
     }
     return errors;
-  }, [catalogEntry?.parameters, nodeParams]);
+  }, [blackboardKeys, blackboardNamespaces, catalogEntry?.parameters, nodeParams]);
 
   const paramValidationErrors = useMemo(
     () => ({ ...currentParamValidationErrors, ...rejectedParamValidationErrors }),
@@ -1892,8 +1902,12 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       {/* Node Info */}
       {catalogEntry && (
         <div className="p-3 border-b border-gray-700">
-          <div className="text-sm text-gray-300 mb-1">{catalogEntry.name}</div>
-          <div className="text-xs text-gray-500">{catalogEntry.description}</div>
+          <div className="text-sm text-gray-300 mb-1" title={catalogEntry.description}>
+            {catalogEntry.name}
+          </div>
+          <div className="text-xs text-gray-500" title={catalogEntry.description}>
+            {catalogEntry.description}
+          </div>
         </div>
       )}
 
@@ -1928,7 +1942,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
                 <div key={param.name} className="space-y-3">
                   <div>
                     <div className="flex items-center justify-between mb-1">
-                      <label className="text-xs text-gray-300">
+                      <label className="text-xs text-gray-300" title={param.description}>
                         {param.name}
                         {param.required && <span className="text-red-400 ml-1">*</span>}
                       </label>
@@ -1959,11 +1973,11 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
                             </button>
                           );
                         })()}
-                        <span className="text-xs text-gray-500">{param.type}</span>
+                        <span className="text-xs text-gray-500" title={param.description}>{param.type}</span>
                       </div>
                     </div>
                     {param.description && (
-                      <div className="text-xs text-gray-500 mb-1">{param.description}</div>
+                      <div className="text-xs text-gray-500 mb-1" title={param.description}>{param.description}</div>
                     )}
                     {supportsProgramParameterBinding ? (
                       <ParameterBindingEditor

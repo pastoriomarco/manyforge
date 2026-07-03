@@ -2934,7 +2934,10 @@ entries:
       approach envelopes. The validated sequence is current pose -> approach
       pose -> pick pose -> approach pose. Does not execute motion; writes a
       generated pick-plan candidate to the blackboard before previewing it and
-      preserves the generated poses when feasibility fails.
+      preserves the generated poses when feasibility fails. Planning first
+      anchors the nominal pick point to the selected object, optionally
+      verticalizes the generated TCP orientation, then applies configured
+      pick/approach XYZ offsets in their selected reference bases.
     tags: [planning, pick, deterministic, blackboard]
     profiles:
       min_profile: v0.0
@@ -3013,7 +3016,11 @@ entries:
           type: string
         required: false
         default: tool0
-        description: Target TCP/tool frame for the planned pick.
+        description: >-
+          Target TCP/tool frame for the planned pick. When a pick or approach
+          offset reference is robot_link with this same id, the offset basis is
+          the generated candidate pick TCP orientation, not the robot's live
+          pre-plan TCP pose.
       - name: pick_offset_envelope
         schema_ref: "#/schema_types/pose_offset_envelope"
         required: false
@@ -3024,10 +3031,11 @@ entries:
           orientation_rpy_min_deg: [0.0, 0.0, 0.0]
           orientation_rpy_max_deg: [0.0, 0.0, 0.0]
         description: >-
-          Min/max XYZ and RPY offsets applied to the nominal grasp pose at the
-          object top surface. XYZ offsets are expressed in pick_offset_reference;
-          RPY offsets remain planner-base RPY offsets and are ignored when
-          force_vertical_pick is true.
+          Min/max XYZ and RPY modifiers applied after the nominal object pick
+          point and candidate TCP orientation are computed. XYZ modifiers are
+          expressed in pick_offset_reference. RPY modifiers remain
+          planner-base RPY offsets and are ignored when force_vertical_pick is
+          true.
       - name: pick_offset_reference
         schema_ref: "#/schema_types/relative_move_reference"
         required: false
@@ -3036,10 +3044,11 @@ entries:
           type: frame
           id: ""
         description: >-
-          Reference basis for pick_offset_envelope XYZ values. Empty frame id
-          means the planning base frame. Use object to express offsets in the
-          selected object's axes, robot_link for a live link basis, or pose for
-          an inline/reference pose orientation.
+          Reference basis for pick_offset_envelope XYZ modifiers. Empty frame
+          id means the planning base frame. Use object for the selected
+          object's axes, robot_link matching tcp_frame for the generated
+          candidate pick TCP basis, another robot_link for a live link basis,
+          or pose for an inline/reference pose orientation.
       - name: approach_offset_envelope
         schema_ref: "#/schema_types/pose_offset_envelope"
         required: false
@@ -3050,10 +3059,10 @@ entries:
           orientation_rpy_min_deg: [0.0, 0.0, 0.0]
           orientation_rpy_max_deg: [0.0, 0.0, 0.0]
         description: >-
-          Min/max XYZ and RPY offsets applied to the nominal approach pose
-          relative to the candidate pick pose. XYZ offsets are expressed in
-          approach_offset_reference; RPY offsets remain planner-base RPY offsets
-          and are ignored when force_vertical_pick is true.
+          Min/max XYZ and RPY modifiers applied relative to the final candidate
+          pick pose. XYZ modifiers are expressed in approach_offset_reference;
+          RPY modifiers remain planner-base RPY offsets and are ignored when
+          force_vertical_pick is true.
       - name: approach_offset_reference
         schema_ref: "#/schema_types/relative_move_reference"
         required: false
@@ -3062,18 +3071,22 @@ entries:
           type: frame
           id: ""
         description: >-
-          Reference basis for approach_offset_envelope XYZ values. Empty frame
-          id means the planning base frame. The rotated approach vector is added
-          to the candidate pick pose.
+          Reference basis for approach_offset_envelope XYZ modifiers. Empty
+          frame id means the planning base frame. robot_link matching tcp_frame
+          uses the generated candidate pick TCP basis; another robot_link uses
+          the live link basis. The rotated approach vector is added to the
+          candidate pick pose.
       - name: force_vertical_pick
         schema:
           type: bool
         required: false
         default: false
         description: >-
-          When true, ignore pick/approach RPY offset envelopes and force the
-          planned TCP orientation to a vertical-down Z axis while preserving the
-          selected object's horizontal X-axis heading.
+          When true, force the generated pick TCP orientation to a vertical-down
+          local Z axis while preserving the selected object's horizontal X-axis
+          heading. This changes the candidate TCP orientation used by
+          robot_link=tcp_frame offset references; it does not move or
+          re-orient the object itself.
       - name: enable_min_tcp_z
         schema:
           type: bool
@@ -3081,8 +3094,10 @@ entries:
         default: false
         description: >-
           When true, enforce min_tcp_z_m as a lower bound for generated pick and
-          approach TCP Z. When false, the configured min_tcp_z_m value is kept
-          for editing but ignored by planning.
+          approach TCP Z after reference-basis offsets are applied. The clamp
+          can change the final Z relative to the pure rotated offset. When
+          false, the configured min_tcp_z_m value is kept for editing but
+          ignored by planning.
       - name: min_tcp_z_m
         schema:
           type: float

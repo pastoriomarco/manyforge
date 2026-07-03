@@ -17,6 +17,8 @@ class StopPolicy {
  public:
   using CacheInvalidationCallback = std::function<void()>;
   using StopCallback = std::function<void()>;
+  using TerminalTransitionCallback =
+      std::function<Result<void>(ExecutionState)>;
   /// Fired after the scheduled Stopping → Paused transition completes
   /// inside `request_pause`. Lets the kernel emit the
   /// `state_transition(Paused)` event of the spec/230 §6.1 pause chain
@@ -24,7 +26,8 @@ class StopPolicy {
   using PauseCompletedCallback = std::function<void()>;
 
   StopPolicy(ExecutionStateMachine& sm, IScheduler& scheduler, IClock& clock,
-             CacheInvalidationCallback on_invalidate = nullptr);
+             CacheInvalidationCallback on_invalidate = nullptr,
+             TerminalTransitionCallback terminal_transition = nullptr);
 
   /// Soft stop with deceleration.
   /// From Executing: Executing → Stopping, schedules deferred Stopped.
@@ -64,6 +67,9 @@ class StopPolicy {
   mutable std::mutex mutex_;
   bool stop_requested_{false};
   ScheduleHandle pending_soft_stop_{0};
+  TerminalTransitionCallback terminal_transition_;
+
+  Result<void> transition_terminal(ExecutionState state);
 };
 
 }  // namespace manyforge::core

@@ -1358,7 +1358,32 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
       cache_(cache),
       config_(std::move(config)),
       sm_(clock),
-      stop_policy_(sm_, scheduler, clock, [this]() { cache_.invalidate_all(); }) {
+      stop_policy_(
+          sm_,
+          scheduler,
+          clock,
+          [this]() { cache_.invalidate_all(); },
+          [this](ExecutionState terminal_state) -> Result<void> {
+            auto outcome = commit_terminal(
+                terminal_state, "stop_policy_terminal",
+                TerminalCommitter::Origin::kStopAuthority);
+            return outcome.ok() ? Result<void>::Ok()
+                                : Result<void>::Err(
+                                      ErrorCode::kInvalidStateTransition);
+          }),
+      terminal_committer_(
+          sm_,
+          /*stop_requested=*/[this] { return stop_policy_.stop_requested(); },
+          /*fault_latch_active=*/
+          [this] {
+            return terminal_fault_authority_asserted_.load(
+                       std::memory_order_acquire) ||
+                   interrupt_manager_.active_latch().has_value();
+          },
+          /*trip_stop_active=*/
+          [this] {
+            return motion_trip_stop_active_.load(std::memory_order_acquire);
+          }) {
   if (config_.collision_monitor_period_ns <= 0) {
     throw std::invalid_argument("collision_monitor_period_ns must be > 0");
   }
@@ -1739,7 +1764,9 @@ void ExecutionKernel::run_operator_stop_worker(
     sm_.set_last_error(error_code_from_dto(unsettled_stop_error));
     stop_collision_monitoring();
     cache_.invalidate_all();
-    auto transition = sm_.try_transition(ExecutionState::kInterventionRequired);
+    auto transition = commit_terminal(
+        ExecutionState::kInterventionRequired, "terminal_commit",
+        TerminalCommitter::Origin::kStopAuthority);
     if (!transition.ok()) {
       return;
     }
@@ -1823,7 +1850,9 @@ void ExecutionKernel::run_operator_stop_worker(
     sm_.set_last_error(error_code_from_dto(total_failure));
     stop_collision_monitoring();
     cache_.invalidate_all();
-    auto transition = sm_.try_transition(ExecutionState::kInterventionRequired);
+    auto transition = commit_terminal(
+        ExecutionState::kInterventionRequired, "terminal_commit",
+        TerminalCommitter::Origin::kStopAuthority);
     if (!transition.ok()) {
       return;
     }
@@ -1852,7 +1881,9 @@ void ExecutionKernel::run_operator_stop_worker(
   auto snapshot = execution_backend_.get_execution_snapshot();
   snapshot.timestamp_ns = clock_.now();
 
-  auto transition = sm_.try_transition(ExecutionState::kStopped);
+  auto transition = commit_terminal(ExecutionState::kStopped,
+                                    "terminal_commit",
+                                    TerminalCommitter::Origin::kStopAuthority);
   if (!transition.ok() && sm_.status().state != ExecutionState::kStopped) {
     ErrorDTO err{
         std::string(kErrorMotionInterruptBackendStopFailed),
@@ -1866,7 +1897,9 @@ void ExecutionKernel::run_operator_stop_worker(
     sm_.set_last_error(error_code_from_dto(err));
     auto prev = sm_.status().state;
     auto intervention =
-        sm_.try_transition(ExecutionState::kInterventionRequired);
+        commit_terminal(ExecutionState::kInterventionRequired,
+                        "terminal_commit",
+                        TerminalCommitter::Origin::kStopAuthority);
     if (intervention.ok()) {
       auto failed_snapshot = execution_backend_.get_execution_snapshot();
       failed_snapshot.timestamp_ns = clock_.now();
@@ -1929,8 +1962,39 @@ void ExecutionKernel::run_operator_stop_worker(
   metrics_.stops_issued++;
 }
 
+TerminalCommitter::CommitOutcome ExecutionKernel::commit_terminal(
+    ExecutionState proposed,
+    const char* reason,
+    TerminalCommitter::Origin origin) {
+  auto outcome = terminal_committer_.commit({proposed, reason, origin});
+  if (outcome.ok() && outcome.overrode) {
+    // An authority asserted mid-decision overrode the proposed terminal —
+    // exactly the laundering window the committer exists to close. Emit
+    // the override as a structured event so the incident trail shows why
+    // the terminal differs from what the calling path derived.
+    emit_event({KernelEventType::kStateTransition,
+                sm_.status().execution_id,
+                clock_.now(),
+                {},
+                outcome.committed,
+                std::nullopt,
+                {{"reason", std::string(reason)},
+                 {"terminal_authority_override", "true"},
+                 {"proposed_terminal", std::string(to_string(proposed))}}});
+  }
+  return outcome;
+}
+
 void ExecutionKernel::emit_event(const KernelEvent& event) {
   KernelEvent event_to_emit = event;
+  {
+    // Central correlation stamp (spec/500 §4.1: program_run_id "when
+    // provided by caller"): one funnel instead of forty emit sites.
+    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+    if (!active_program_run_id_.empty()) {
+      event_to_emit.details.emplace("program_run_id", active_program_run_id_);
+    }
+  }
   if (event_to_emit.error.has_value()) {
     for (const auto& [key, value] : event_to_emit.error->details) {
       event_to_emit.details.emplace(key, value);
@@ -2808,9 +2872,13 @@ void ExecutionKernel::handle_motion_trip_latch(
     const auto prev_state_trip = sm_.status().state;
     sm_.set_last_error(ErrorCode::kMotionInterruptBackendStopFailed);
     if (prev_state_trip == ExecutionState::kInterrupted) {
-      sm_.try_transition(ExecutionState::kStopping);
+      // Phase hop toward the controlled stop; if it is not admissible the
+      // InterventionRequired commit below supersedes it either way.
+      (void)sm_.try_transition(ExecutionState::kStopping);
     }
-    sm_.try_transition(ExecutionState::kInterventionRequired);
+    commit_terminal(ExecutionState::kInterventionRequired,
+                    "terminal_commit",
+                    TerminalCommitter::Origin::kMotionTrip);
     ErrorDTO err{
         kErrorMotionInterruptBackendStopFailed,
         "complete_move_on_signal latch missing matching scope/stop_profile",
@@ -2981,7 +3049,9 @@ void ExecutionKernel::handle_motion_trip_latch(
                 ? ErrorCode::kMotionInterruptStopStateInvalid
                 : ErrorCode::kMotionInterruptBackendStopFailed);
         const auto prev = sm_.status().state;
-        sm_.try_transition(ExecutionState::kInterventionRequired);
+        commit_terminal(ExecutionState::kInterventionRequired,
+                        "terminal_commit",
+                        TerminalCommitter::Origin::kMotionTrip);
         ErrorDTO err{
             std::move(error_code), std::move(message),
             {{"reason", std::move(reason)},
@@ -3121,7 +3191,9 @@ void ExecutionKernel::handle_motion_trip_latch(
       return;
     }
 
-    auto completion_transition = sm_.try_transition(ExecutionState::kCompleted);
+    auto completion_transition =
+        commit_terminal(ExecutionState::kCompleted, "terminal_commit",
+                        TerminalCommitter::Origin::kMotionTrip);
     if (!completion_transition.ok()) {
       downgrade_to_intervention(
           "natural_completion_completed_transition_rejected",
@@ -3400,7 +3472,9 @@ void ExecutionKernel::handle_motion_trip_latch(
   // record reflects the terminal state. The latch is cleared after
   // the outcome is durable via the auto_clear_after_motion_outcome
   // disposition path.
-  auto completion_transition = sm_.try_transition(ExecutionState::kCompleted);
+  auto completion_transition =
+      commit_terminal(ExecutionState::kCompleted, "terminal_commit",
+                      TerminalCommitter::Origin::kMotionTrip);
   if (!completion_transition.ok()) {
     downgrade_to_intervention(
         "motion_trip_completed_transition_rejected",
@@ -3480,9 +3554,11 @@ InterruptIngestResult ExecutionKernel::publish_supervisory_interrupt_signal(
       clock_.now());
   request_validation_cancel_from_interrupt(result);
   if (result.latched) {
+    terminal_fault_authority_asserted_.store(true,
+                                             std::memory_order_release);
     const auto prev_state = sm_.status().state;
     if (prev_state != ExecutionState::kInterrupted) {
-      auto transition = sm_.try_transition(ExecutionState::kInterrupted);
+      auto transition = commit_terminal(ExecutionState::kInterrupted, "terminal_commit");
       if (transition.ok()) {
         auto snapshot = get_execution_snapshot();
         snapshot.timestamp_ns = clock_.now();
@@ -3517,9 +3593,11 @@ InterruptIngestResult ExecutionKernel::publish_fast_interrupt_signals(
       clock_.now());
   request_validation_cancel_from_interrupt(result);
   if (result.latched) {
+    terminal_fault_authority_asserted_.store(true,
+                                             std::memory_order_release);
     const auto prev_state = sm_.status().state;
     if (prev_state != ExecutionState::kInterrupted) {
-      auto transition = sm_.try_transition(ExecutionState::kInterrupted);
+      auto transition = commit_terminal(ExecutionState::kInterrupted, "terminal_commit");
       if (transition.ok()) {
         auto snapshot = get_execution_snapshot();
         snapshot.timestamp_ns = clock_.now();
@@ -3554,7 +3632,7 @@ Result<InterruptIngestResult> ExecutionKernel::apply_interrupt_disposition(
   if (!interrupt_manager_.active_latch() &&
       sm_.status().state == ExecutionState::kInterrupted) {
     const auto prev_state = sm_.status().state;
-    auto transition = sm_.try_transition(ExecutionState::kInterventionRequired);
+    auto transition = commit_terminal(ExecutionState::kInterventionRequired, "terminal_commit");
     if (transition.ok()) {
       auto snapshot = get_execution_snapshot();
       snapshot.timestamp_ns = clock_.now();
@@ -3791,6 +3869,52 @@ void ExecutionKernel::async_execute_worker(
     execution_complete_.store(true);
     completion_cv_.notify_all();
   };
+  const auto finalize_overridden_terminal_authority =
+      [&](ExecutionState committed, const char* reason,
+          std::optional<ErrorDTO> error = std::nullopt) -> bool {
+    if (committed != ExecutionState::kStopped &&
+        committed != ExecutionState::kInterrupted &&
+        committed != ExecutionState::kInterventionRequired) {
+      return false;
+    }
+    auto terminal_snapshot = get_execution_snapshot();
+    terminal_snapshot.timestamp_ns = clock_.now();
+    terminal_snapshot.execution_id =
+        committed == ExecutionState::kIdle ? 0 : exec_id;
+    terminal_snapshot.move_id =
+        committed == ExecutionState::kIdle ? std::string{} : request.move_id;
+    terminal_snapshot.state = committed;
+    if (error.has_value()) {
+      terminal_snapshot.error = error;
+    }
+    publish_execution_snapshot(std::move(terminal_snapshot));
+    switch (committed) {
+      case ExecutionState::kStopped:
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kStopped,
+            std::nullopt, std::nullopt, reason);
+        break;
+      case ExecutionState::kInterrupted:
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kInterruptedFault,
+            std::nullopt, std::nullopt, reason);
+        break;
+      case ExecutionState::kInterventionRequired:
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kFailed,
+            error.value_or(ErrorDTO{
+                kErrorStopFailed,
+                "Terminal authority entered intervention without captured "
+                "error",
+                {{"reason", reason}}}),
+            std::nullopt, reason);
+        break;
+      default:
+        return false;
+    }
+    finish_worker();
+    return true;
+  };
 
   try {
     // Capture initial state for correct prev_state in events (B-2)
@@ -3849,16 +3973,25 @@ void ExecutionKernel::async_execute_worker(
         sm_.set_last_error(ErrorCode::kPlanningTimeout);
         emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
                      {}, {}, ErrorDTO{kErrorPlanningTimeout, message, {}}, {}});
-        sm_.try_transition(ExecutionState::kStopped);
+        auto terminal_commit =
+            commit_terminal(ExecutionState::kStopped, "terminal_commit");
+        if (terminal_commit.committed != ExecutionState::kStopped) {
+          if (finalize_overridden_terminal_authority(
+                  terminal_commit.committed,
+                  "planning_stop_overridden_by_terminal_authority",
+                  ErrorDTO{kErrorPlanningTimeout, message, {}})) {
+            return;
+          }
+        }
         auto stopped_snapshot = get_execution_snapshot();
         stopped_snapshot.timestamp_ns = clock_.now();
         stopped_snapshot.execution_id = exec_id;
         stopped_snapshot.move_id = request.move_id;
-        stopped_snapshot.state = ExecutionState::kStopped;
+        stopped_snapshot.state = terminal_commit.committed;
         stopped_snapshot.error = ErrorDTO{kErrorPlanningTimeout, message, {}};
         publish_execution_snapshot(std::move(stopped_snapshot));
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                     prev, ExecutionState::kStopped, std::nullopt, {}});
+                     prev, terminal_commit.committed, std::nullopt, {}});
         finalize_motion_execution_outcome(
             motion_state, MotionExecutionTerminalCause::kStopped,
             std::nullopt, std::nullopt, "planning_stop");
@@ -3898,7 +4031,27 @@ void ExecutionKernel::async_execute_worker(
           metrics_.plans_failed++;
         }
         sm_.set_last_error(error_code_from_dto(plan_result.error()));
-        sm_.try_transition(ExecutionState::kFailed);
+        auto terminal_commit =
+            commit_terminal(ExecutionState::kFailed, "terminal_commit");
+        if (terminal_commit.committed != ExecutionState::kFailed) {
+          if (terminal_commit.committed == ExecutionState::kStopped) {
+            finalize_motion_execution_outcome(
+                motion_state, MotionExecutionTerminalCause::kStopped,
+                std::nullopt, std::nullopt,
+                "planning_failed_overridden_by_stop");
+          } else {
+            finalize_motion_execution_outcome(
+                motion_state,
+                terminal_commit.committed == ExecutionState::kInterrupted
+                    ? MotionExecutionTerminalCause::kInterruptedFault
+                    : MotionExecutionTerminalCause::kFailed,
+                plan_result.error(), std::nullopt,
+                "planning_failed_overridden_by_terminal_authority");
+          }
+          execution_complete_.store(true);
+          completion_cv_.notify_all();
+          return;
+        }
         auto failed_snapshot = get_execution_snapshot();
         failed_snapshot.timestamp_ns = clock_.now();
         failed_snapshot.execution_id = exec_id;
@@ -3928,7 +4081,22 @@ void ExecutionKernel::async_execute_worker(
       auto r2 = sm_.try_transition(ExecutionState::kValidating);
       if (!r2.ok()) {
         sm_.set_last_error(ErrorCode::kInternalError);
-        sm_.try_transition(ExecutionState::kFailed);
+        auto terminal_commit =
+            commit_terminal(ExecutionState::kFailed, "terminal_commit");
+        if (terminal_commit.committed != ExecutionState::kFailed) {
+          finalize_motion_execution_outcome(
+              motion_state,
+              terminal_commit.committed == ExecutionState::kStopped
+                  ? MotionExecutionTerminalCause::kStopped
+                  : (terminal_commit.committed == ExecutionState::kInterrupted
+                         ? MotionExecutionTerminalCause::kInterruptedFault
+                         : MotionExecutionTerminalCause::kFailed),
+              std::nullopt, std::nullopt,
+              "validating_transition_overridden_by_terminal_authority");
+          execution_complete_.store(true);
+          completion_cv_.notify_all();
+          return;
+        }
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                      prev_state2, ExecutionState::kFailed, std::nullopt, {}});
         finalize_motion_execution_outcome(
@@ -4068,7 +4236,7 @@ void ExecutionKernel::async_execute_worker(
         if (current == ExecutionState::kStopped ||
             current == ExecutionState::kStopping) {
           if (current == ExecutionState::kStopping) {
-            (void)sm_.try_transition(ExecutionState::kStopped);
+            (void)commit_terminal(ExecutionState::kStopped, "terminal_commit");
           }
           auto stopped_snapshot = get_execution_snapshot();
           stopped_snapshot.timestamp_ns = clock_.now();
@@ -4086,7 +4254,7 @@ void ExecutionKernel::async_execute_worker(
             interrupt_manager_.active_latch().has_value()) {
           if (current != ExecutionState::kInterrupted) {
             const auto before_interrupt = current;
-            if (sm_.try_transition(ExecutionState::kInterrupted).ok()) {
+            if (commit_terminal(ExecutionState::kInterrupted, "terminal_commit").ok()) {
               emit_event({KernelEventType::kStateTransition,
                           exec_id,
                           clock_.now(),
@@ -4146,12 +4314,24 @@ void ExecutionKernel::async_execute_worker(
                        ErrorDTO{kErrorPlanningTimeout, message, {}},
                        {}});
         }
-        sm_.try_transition(ExecutionState::kStopped);
+        auto terminal_commit =
+            commit_terminal(ExecutionState::kStopped, "terminal_commit");
+        if (terminal_commit.committed != ExecutionState::kStopped) {
+          if (finalize_overridden_terminal_authority(
+                  terminal_commit.committed,
+                  "validation_replan_stop_overridden_by_terminal_authority",
+                  replan_timed_out
+                      ? std::optional<ErrorDTO>{
+                            ErrorDTO{kErrorPlanningTimeout, message, {}}}
+                      : std::nullopt)) {
+            return;
+          }
+        }
         auto stopped_snapshot = get_execution_snapshot();
         stopped_snapshot.timestamp_ns = clock_.now();
         stopped_snapshot.execution_id = exec_id;
         stopped_snapshot.move_id = request.move_id;
-        stopped_snapshot.state = ExecutionState::kStopped;
+        stopped_snapshot.state = terminal_commit.committed;
         if (replan_timed_out) {
           stopped_snapshot.error =
               ErrorDTO{kErrorPlanningTimeout, message, {}};
@@ -4160,7 +4340,7 @@ void ExecutionKernel::async_execute_worker(
         }
         publish_execution_snapshot(std::move(stopped_snapshot));
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                     prev, ExecutionState::kStopped, std::nullopt,
+                     prev, terminal_commit.committed, std::nullopt,
                      {{"reason", "authoritative_validation_replan_stop"}}});
         finalize_motion_execution_outcome(
             motion_state, MotionExecutionTerminalCause::kStopped,
@@ -4200,7 +4380,14 @@ void ExecutionKernel::async_execute_worker(
           metrics_.plans_failed++;
         }
         sm_.set_last_error(error_code_from_dto(replan_result.error()));
-        sm_.try_transition(ExecutionState::kFailed);
+        auto terminal_commit =
+            commit_terminal(ExecutionState::kFailed, "terminal_commit");
+        if (terminal_commit.committed != ExecutionState::kFailed) {
+          if (preserve_replan_terminal_authority(
+                  "validation_replan_failure_overridden_by_terminal_authority")) {
+            return;
+          }
+        }
         auto failed_snapshot = get_execution_snapshot();
         failed_snapshot.timestamp_ns = clock_.now();
         failed_snapshot.execution_id = exec_id;
@@ -4244,7 +4431,14 @@ void ExecutionKernel::async_execute_worker(
           return;
         }
         sm_.set_last_error(ErrorCode::kInternalError);
-        sm_.try_transition(ExecutionState::kFailed);
+        auto terminal_commit =
+            commit_terminal(ExecutionState::kFailed, "terminal_commit");
+        if (terminal_commit.committed != ExecutionState::kFailed) {
+          if (preserve_replan_terminal_authority(
+                  "validation_replan_transition_overridden_by_terminal_authority")) {
+            return;
+          }
+        }
         emit_event({KernelEventType::kStateTransition,
                     exec_id,
                     clock_.now(),
@@ -4314,7 +4508,16 @@ void ExecutionKernel::async_execute_worker(
         metrics_.validations_failed++;
       }
       sm_.set_last_error(error_code_from_dto(val_result.error()));
-      sm_.try_transition(ExecutionState::kFailed);
+      auto terminal_commit =
+          commit_terminal(ExecutionState::kFailed, "terminal_commit");
+      if (terminal_commit.committed != ExecutionState::kFailed) {
+        if (finalize_overridden_terminal_authority(
+                terminal_commit.committed,
+                "validation_failed_overridden_by_terminal_authority",
+                val_result.error())) {
+          return;
+        }
+      }
       auto snapshot = get_execution_snapshot();
       snapshot.timestamp_ns = clock_.now();
       snapshot.execution_id = exec_id;
@@ -4358,16 +4561,27 @@ void ExecutionKernel::async_execute_worker(
       sm_.set_last_error(ErrorCode::kInternalError);
       emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
                    {}, {}, ErrorDTO{kErrorInternalError, "Validation interrupted by stop", {}}, {}});
-      sm_.try_transition(ExecutionState::kStopped);
+      auto terminal_commit =
+          commit_terminal(ExecutionState::kStopped, "terminal_commit");
+      if (terminal_commit.committed != ExecutionState::kStopped) {
+        if (finalize_overridden_terminal_authority(
+                terminal_commit.committed,
+                "validation_stop_overridden_by_terminal_authority",
+                ErrorDTO{kErrorInternalError,
+                         "Validation interrupted by stop",
+                         {}})) {
+          return;
+        }
+      }
       auto snapshot = get_execution_snapshot();
       snapshot.timestamp_ns = clock_.now();
       snapshot.execution_id = exec_id;
       snapshot.move_id = request.move_id;
-      snapshot.state = ExecutionState::kStopped;
+      snapshot.state = terminal_commit.committed;
       snapshot.error = ErrorDTO{kErrorInternalError, "Validation interrupted by stop", {}};
       publish_execution_snapshot(std::move(snapshot));
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                   prev, ExecutionState::kStopped, std::nullopt, {}});
+                   prev, terminal_commit.committed, std::nullopt, {}});
       finalize_motion_execution_outcome(
           motion_state, MotionExecutionTerminalCause::kStopped,
           std::nullopt, std::nullopt, "validation_stop");
@@ -4434,7 +4648,16 @@ void ExecutionKernel::async_execute_worker(
         // (or `motion_interrupt_source_active_at_arm`) rather than a
         // generic `internal_error`.
         sm_.set_last_error(error_code_from_dto(arm_result.error()));
-        sm_.try_transition(ExecutionState::kFailed);
+        auto terminal_commit =
+            commit_terminal(ExecutionState::kFailed, "terminal_commit");
+        if (terminal_commit.committed != ExecutionState::kFailed) {
+          if (finalize_overridden_terminal_authority(
+                  terminal_commit.committed,
+                  "arm_failed_overridden_by_terminal_authority",
+                  arm_result.error())) {
+            return;
+          }
+        }
         emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
                      {}, {}, arm_result.error(), {}});
         auto arm_fail_snapshot = get_execution_snapshot();
@@ -4460,7 +4683,15 @@ void ExecutionKernel::async_execute_worker(
     auto r3 = sm_.try_transition(ExecutionState::kExecuting);
     if (!r3.ok()) {
       sm_.set_last_error(ErrorCode::kInternalError);
-      sm_.try_transition(ExecutionState::kFailed);
+      auto terminal_commit =
+          commit_terminal(ExecutionState::kFailed, "terminal_commit");
+      if (terminal_commit.committed != ExecutionState::kFailed) {
+        if (finalize_overridden_terminal_authority(
+                terminal_commit.committed,
+                "executing_transition_overridden_by_terminal_authority")) {
+          return;
+        }
+      }
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                    prev_state3, ExecutionState::kFailed, std::nullopt, {}});
       finalize_motion_execution_outcome(
@@ -4584,7 +4815,7 @@ void ExecutionKernel::async_execute_worker(
         if (interrupt_manager_.active_latch().has_value() ||
             sm_.status().state == ExecutionState::kInterrupted) {
           if (sm_.status().state != ExecutionState::kInterrupted) {
-            (void)sm_.try_transition(ExecutionState::kInterrupted);
+            (void)commit_terminal(ExecutionState::kInterrupted, "terminal_commit");
           }
           auto interrupted_snapshot = get_execution_snapshot();
           interrupted_snapshot.timestamp_ns = clock_.now();
@@ -4604,9 +4835,32 @@ void ExecutionKernel::async_execute_worker(
         auto prev = sm_.status().state;
         sm_.set_last_error(stop_completed ? ErrorCode::kExecutionTimeout
                                            : ErrorCode::kStopFailed);
-        auto terminal_state = stop_completed ? ExecutionState::kFailed
-                                             : ExecutionState::kInterventionRequired;
-        auto timeout_transition = sm_.try_transition(terminal_state);
+        auto terminal_state = stop_completed
+                                  ? ExecutionState::kFailed
+                                  : ExecutionState::kInterventionRequired;
+        auto timeout_transition =
+            commit_terminal(terminal_state, "execution_timeout_terminal");
+        terminal_state = timeout_transition.committed;
+        if (timeout_transition.committed == ExecutionState::kStopped ||
+            timeout_transition.committed == ExecutionState::kInterrupted) {
+          auto terminal_error = stop_completed
+              ? ErrorDTO{kErrorExecutionTimeout,
+                         "Execution timeout exceeded", {}}
+              : operator_intervention_error(
+                    ErrorCode::kStopFailed,
+                    "Execution timeout exceeded and software stop completion "
+                    "was not observed",
+                    "execution_timeout_stop_drain",
+                    prev,
+                    exec_id,
+                    request.move_id);
+          if (finalize_overridden_terminal_authority(
+                  timeout_transition.committed,
+                  "execution_timeout_overridden_by_terminal_authority",
+                  terminal_error)) {
+            return;
+          }
+        }
         if (!timeout_transition.ok()) {
           const auto current = sm_.status().state;
           if (current == ExecutionState::kStopped ||
@@ -4624,12 +4878,14 @@ void ExecutionKernel::async_execute_worker(
                 motion_state,
                 MotionExecutionTerminalCause::kInterruptedFault,
                 std::nullopt, std::nullopt,
-                "execution_timeout_lost_to_interrupt");
+              "execution_timeout_lost_to_interrupt");
             finish_worker();
             return;
           }
           terminal_state = ExecutionState::kInterventionRequired;
-          auto intervention_transition = sm_.try_transition(terminal_state);
+          auto intervention_transition = commit_terminal(
+              terminal_state, "execution_timeout_intervention_terminal");
+          terminal_state = intervention_transition.committed;
           if (!intervention_transition.ok()) {
             terminal_state = sm_.status().state;
           }
@@ -4721,7 +4977,7 @@ void ExecutionKernel::async_execute_worker(
                                                const char* reap_reason) {
             sm_.set_last_error(error_code_from_dto(error));
             if (terminal_state != sm_.status().state) {
-              sm_.try_transition(terminal_state);
+              (void)commit_terminal(terminal_state, "trip_reap_terminal");
             }
             auto terminal_snapshot = latest_backend_snapshot;
             terminal_snapshot.timestamp_ns = clock_.now();
@@ -4770,13 +5026,23 @@ void ExecutionKernel::async_execute_worker(
             const bool stop_completed =
                 drain_execution_handle_bounded(execution_handle);
             auto prev_state = sm_.status().state;
-            const auto terminal_state = stop_completed
+            auto terminal_state = stop_completed
                 ? ExecutionState::kFailed
                 : ExecutionState::kInterventionRequired;
             if (!stop_completed) {
               sm_.set_last_error(ErrorCode::kStopFailed);
             }
-            sm_.try_transition(terminal_state);
+            auto terminal_commit =
+                commit_terminal(terminal_state, "trip_stop_terminal");
+            if (terminal_commit.committed != terminal_state) {
+              if (finalize_overridden_terminal_authority(
+                      terminal_commit.committed,
+                      "resume_failure_stop_overridden_by_terminal_authority",
+                      error)) {
+                return;
+              }
+            }
+            terminal_state = terminal_commit.committed;
             auto failed_snapshot = latest_backend_snapshot;
             failed_snapshot.timestamp_ns = clock_.now();
             failed_snapshot.execution_id = exec_id;
@@ -4926,26 +5192,35 @@ void ExecutionKernel::async_execute_worker(
           auto resume_transition = sm_.try_transition(ExecutionState::kExecuting);
           if (!resume_transition.ok()) {
             sm_.set_last_error(ErrorCode::kResumeFailed);
+            ErrorDTO resume_error{kErrorResumeFailed,
+                                  "Resume transition to Executing failed", {}};
             emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
                         {}, {},
-                        ErrorDTO{kErrorResumeFailed,
-                                 "Resume transition to Executing failed", {}},
+                        resume_error,
                         {}});
-            sm_.try_transition(ExecutionState::kFailed);
+            auto terminal_commit =
+                commit_terminal(ExecutionState::kFailed, "terminal_commit");
+            if (terminal_commit.committed != ExecutionState::kFailed) {
+              if (finalize_overridden_terminal_authority(
+                      terminal_commit.committed,
+                      "resume_transition_overridden_by_terminal_authority",
+                      resume_error)) {
+                return;
+              }
+            }
             auto failed_snapshot = latest_backend_snapshot;
             failed_snapshot.timestamp_ns = clock_.now();
             failed_snapshot.execution_id = exec_id;
             failed_snapshot.move_id = request.move_id;
-            failed_snapshot.state = ExecutionState::kFailed;
-            failed_snapshot.error = ErrorDTO{kErrorResumeFailed,
-                                             "Resume transition to Executing failed", {}};
+            failed_snapshot.state = terminal_commit.committed;
+            failed_snapshot.error = resume_error;
             publish_execution_snapshot(std::move(failed_snapshot));
             emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                        prev_state, ExecutionState::kFailed, std::nullopt, {}});
+                        prev_state, terminal_commit.committed, std::nullopt,
+                        {}});
             finalize_motion_execution_outcome(
                 motion_state, MotionExecutionTerminalCause::kFailed,
-                ErrorDTO{kErrorResumeFailed,
-                         "Resume transition to Executing failed", {}},
+                resume_error,
                 std::nullopt, "resume_transition_failed");
             execution_complete_.store(true);
             completion_cv_.notify_all();
@@ -5072,7 +5347,7 @@ void ExecutionKernel::async_execute_worker(
           interrupt_manager_.active_latch().has_value()) {
         const auto prev = current;
         if (current != ExecutionState::kInterrupted) {
-          (void)sm_.try_transition(ExecutionState::kInterrupted);
+          (void)commit_terminal(ExecutionState::kInterrupted, "terminal_commit");
         }
         auto interrupted_snapshot = get_execution_snapshot();
         interrupted_snapshot.timestamp_ns = clock_.now();
@@ -5108,7 +5383,7 @@ void ExecutionKernel::async_execute_worker(
         sm_.set_last_error(error_code_from_dto(err));
         const auto prev = sm_.status().state;
         auto transition =
-            sm_.try_transition(ExecutionState::kInterventionRequired);
+            commit_terminal(ExecutionState::kInterventionRequired, "terminal_commit");
         if (transition.ok()) {
           auto snapshot = get_execution_snapshot();
           snapshot.timestamp_ns = clock_.now();
@@ -5227,15 +5502,22 @@ void ExecutionKernel::async_execute_worker(
         sm_.set_last_error(ErrorCode::kInternalError);
       }
       auto prev_state4 = sm_.status().state;
-      sm_.try_transition(ExecutionState::kFailed);
+      auto failed_transition =
+          commit_terminal(ExecutionState::kFailed, "terminal_commit");
+      if (failed_transition.committed != ExecutionState::kFailed) {
+        if (finalize_competing_terminal_authority(
+                "execution_failed_overridden_by_terminal_authority")) {
+          return;
+        }
+      }
       auto snapshot = final_snapshot;
       snapshot.timestamp_ns = clock_.now();
       snapshot.execution_id = exec_id;
       snapshot.move_id = request.move_id;
-      snapshot.state = ExecutionState::kFailed;
+      snapshot.state = failed_transition.committed;
       publish_execution_snapshot(std::move(snapshot));
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                  prev_state4, ExecutionState::kFailed, std::nullopt, {}});
+                  prev_state4, failed_transition.committed, std::nullopt, {}});
       {
         std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
         metrics_.executions_failed++;
@@ -5261,15 +5543,23 @@ void ExecutionKernel::async_execute_worker(
         sm_.set_last_error(ErrorCode::kStopFailed);
       }
       auto prev_state4 = sm_.status().state;
-      sm_.try_transition(ExecutionState::kInterventionRequired);
+      auto intervention_transition = commit_terminal(
+          ExecutionState::kInterventionRequired, "terminal_commit");
+      if (intervention_transition.committed !=
+          ExecutionState::kInterventionRequired) {
+        if (finalize_competing_terminal_authority(
+                "execution_intervention_overridden_by_terminal_authority")) {
+          return;
+        }
+      }
       auto snapshot = final_snapshot;
       snapshot.timestamp_ns = clock_.now();
       snapshot.execution_id = exec_id;
       snapshot.move_id = request.move_id;
-      snapshot.state = ExecutionState::kInterventionRequired;
+      snapshot.state = intervention_transition.committed;
       publish_execution_snapshot(std::move(snapshot));
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                  prev_state4, ExecutionState::kInterventionRequired,
+                  prev_state4, intervention_transition.committed,
                   std::nullopt, {}});
       {
         std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
@@ -5289,7 +5579,13 @@ void ExecutionKernel::async_execute_worker(
     }
 
     auto prev_state4 = sm_.status().state;
-    auto completed_transition = sm_.try_transition(ExecutionState::kCompleted);
+    auto completed_transition = commit_terminal(ExecutionState::kCompleted, "terminal_commit");
+    if (completed_transition.committed != ExecutionState::kCompleted) {
+      if (finalize_competing_terminal_authority(
+              "normal_completion_overridden_by_terminal_authority")) {
+        return;
+      }
+    }
     if (!completed_transition.ok()) {
       if (finalize_competing_terminal_authority(
               "normal_completion_transition_rejected")) {
@@ -5303,7 +5599,7 @@ void ExecutionKernel::async_execute_worker(
            {"from_state", to_string(prev_state4)}}};
       sm_.set_last_error(error_code_from_dto(err));
       auto failure_transition =
-          sm_.try_transition(ExecutionState::kInterventionRequired);
+          commit_terminal(ExecutionState::kInterventionRequired, "terminal_commit");
       auto rejected_snapshot = final_snapshot;
       rejected_snapshot.timestamp_ns = clock_.now();
       rejected_snapshot.execution_id = exec_id;
@@ -5367,24 +5663,34 @@ void ExecutionKernel::async_execute_worker(
     stop_collision_monitoring();
     sm_.set_last_error(ErrorCode::kInternalError);
     auto prev_state = sm_.status().state;
-    sm_.try_transition(ExecutionState::kFailed);
+    auto failure_transition =
+        commit_terminal(ExecutionState::kFailed, "terminal_commit");
+    const ErrorDTO exception_error{
+        kErrorInternalError, e.what(), {{"reason", "worker_exception"}}};
+    if (failure_transition.committed != ExecutionState::kFailed) {
+      if (finalize_overridden_terminal_authority(
+              failure_transition.committed,
+              "worker_exception_overridden_by_terminal_authority",
+              exception_error)) {
+        return;
+      }
+    }
     auto snapshot = get_execution_snapshot();
     snapshot.timestamp_ns = clock_.now();
     snapshot.execution_id = exec_id;
     snapshot.move_id = request.move_id;
-    snapshot.state = ExecutionState::kFailed;
-    snapshot.error = ErrorDTO{kErrorInternalError, e.what(), {}};
+    snapshot.state = failure_transition.committed;
+    snapshot.error = exception_error;
     publish_execution_snapshot(std::move(snapshot));
     emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                 prev_state, ExecutionState::kFailed, std::nullopt, {}});
+                 prev_state, failure_transition.committed, std::nullopt, {}});
     {
       std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
       metrics_.executions_failed++;
     }
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kFailed,
-        ErrorDTO{kErrorInternalError, e.what(),
-                 {{"reason", "worker_exception"}}},
+        exception_error,
         std::nullopt, "worker_exception");
   }
 
@@ -5429,6 +5735,10 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     {
       std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
       active_move_id_.clear();
+      {
+        std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+        active_program_run_id_.clear();
+      }
     }
     auto snapshot = execution_backend_.get_execution_snapshot();
     snapshot.timestamp_ns = clock_.now();
@@ -5446,6 +5756,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     return Result<uint64_t>::Err(ErrorCode::kExecutionRejected);
   }
 
+  terminal_fault_authority_asserted_.store(false, std::memory_order_release);
   uint64_t exec_id = next_execution_id_++;
   auto prev_state = sm_.status().state;
   sm_.set_execution_id(exec_id);
@@ -5453,10 +5764,18 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
     active_move_id_ = request.move_id;
   }
+  {
+    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+    active_program_run_id_ = request.program_run_id;
+  }
   auto transition = sm_.try_transition(ExecutionState::kPlanning);
   if (!transition.ok()) {
     std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
     active_move_id_.clear();
+    {
+      std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+      active_program_run_id_.clear();
+    }
     sm_.set_execution_id(0);
     return Result<uint64_t>::Err(ErrorCode::kInternalError);
   }
@@ -5485,7 +5804,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   const auto fail_admission = [&](ErrorDTO error) -> Result<uint64_t> {
     sm_.set_last_error(error_code_from_dto(error));
     const auto failed_from_state = sm_.status().state;
-    auto fail_transition = sm_.try_transition(ExecutionState::kFailed);
+    auto fail_transition = commit_terminal(ExecutionState::kFailed, "terminal_commit");
     auto failed_snapshot = get_execution_snapshot();
     failed_snapshot.timestamp_ns = clock_.now();
     failed_snapshot.execution_id = exec_id;
@@ -5514,6 +5833,10 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     {
       std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
       active_move_id_.clear();
+      {
+        std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+        active_program_run_id_.clear();
+      }
     }
     sm_.set_execution_id(0);
     auto snapshot = execution_backend_.get_execution_snapshot();
@@ -5641,6 +5964,10 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     {
       std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
       active_move_id_.clear();
+      {
+        std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+        active_program_run_id_.clear();
+      }
     }
     sm_.set_execution_id(0);
     auto snapshot = execution_backend_.get_execution_snapshot();
@@ -5702,6 +6029,10 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     if (!cache_hit_transition.ok()) {
       std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
       active_move_id_.clear();
+      {
+        std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+        active_program_run_id_.clear();
+      }
       sm_.set_execution_id(0);
       finish_admission_without_worker();
       return Result<uint64_t>::Err(ErrorCode::kInternalError);
@@ -5938,7 +6269,7 @@ PauseResultDTO ExecutionKernel::pause() {
       }
       sm_.set_last_error(error_code_from_dto(error));
       auto transition =
-          sm_.try_transition(ExecutionState::kInterventionRequired);
+          commit_terminal(ExecutionState::kInterventionRequired, "terminal_commit");
       auto snapshot = get_execution_snapshot();
       snapshot.timestamp_ns = clock_.now();
       snapshot.state = sm_.status().state;
@@ -6056,7 +6387,7 @@ ResetResultDTO ExecutionKernel::reset() {
                                                  sm_.status().execution_id,
                                                  "");
     sm_.set_last_error(error_code_from_dto(error));
-    sm_.try_transition(ExecutionState::kInterventionRequired);
+    commit_terminal(ExecutionState::kInterventionRequired, "terminal_commit");
 
     auto snapshot = execution_backend_.get_execution_snapshot();
     snapshot.timestamp_ns = clock_.now();
@@ -6078,6 +6409,10 @@ ResetResultDTO ExecutionKernel::reset() {
     {
       std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
       active_move_id_.clear();
+      {
+        std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+        active_program_run_id_.clear();
+      }
     }
     auto snapshot = execution_backend_.get_execution_snapshot();
     snapshot.timestamp_ns = clock_.now();
@@ -6343,6 +6678,13 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
               ExecutionState::kIdle,
               std::nullopt,
               {}});
+  {
+    // Cleared AFTER the acknowledgement events: they are the closing
+    // bracket of this execution's story and must still carry its
+    // program_run_id correlation stamp.
+    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+    active_program_run_id_.clear();
+  }
 
   return AcknowledgeCompletedResultDTO{true, std::nullopt};
 }
@@ -6427,6 +6769,12 @@ AcknowledgeInterventionResultDTO ExecutionKernel::acknowledge_intervention(
               std::nullopt,
               {}});
 
+  {
+    // Cleared AFTER the acknowledgement/recovery boundary events: they are
+    // part of this run's incident story and must carry its program_run_id.
+    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+    active_program_run_id_.clear();
+  }
   return AcknowledgeInterventionResultDTO{true, std::nullopt};
 }
 
@@ -6611,6 +6959,12 @@ ExecutionKernel::acknowledge_intervention_for_retry(
               std::nullopt,
               {{"reason", "intervention_acknowledged_for_retry"}}});
 
+  {
+    // Cleared AFTER the acknowledgement/recovery boundary events: they are
+    // part of this run's incident story and must carry its program_run_id.
+    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+    active_program_run_id_.clear();
+  }
   return AcknowledgeInterventionResultDTO{true, std::nullopt};
 }
 
@@ -6706,6 +7060,12 @@ ExecutionKernel::acknowledge_interrupted_for_retry(
               std::nullopt,
               {{"reason", "interrupted_retry_acknowledged"}}});
 
+  {
+    // Cleared AFTER the acknowledgement/recovery boundary events: they are
+    // part of this run's incident story and must carry its program_run_id.
+    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+    active_program_run_id_.clear();
+  }
   return AcknowledgeInterruptedResultDTO{true, std::nullopt};
 }
 

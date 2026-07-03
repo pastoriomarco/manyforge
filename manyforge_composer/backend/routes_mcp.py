@@ -23,6 +23,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .mcp_server import current_mcp_principal
+
 logger = logging.getLogger(__name__)
 
 # Session eviction: disconnected sessions are purged after this grace period
@@ -320,6 +322,10 @@ async def _handle_jsonrpc(mcp_server, body: dict, session: _McpSession) -> dict:
             }
         if session.principal_id:
             tool_args["principal_id"] = session.principal_id
+        # FastMCP drops args a tool does not declare, so the injection
+        # above never reaches principal-less tools; the contextvar keeps
+        # the audit attribution regardless of tool signature.
+        principal_token = current_mcp_principal.set(session.principal_id or None)
         try:
             result = await mcp_server.call_tool(tool_name, tool_args)
             # Serialize result content
@@ -349,6 +355,8 @@ async def _handle_jsonrpc(mcp_server, body: dict, session: _McpSession) -> dict:
                 },
                 "id": request_id,
             }
+        finally:
+            current_mcp_principal.reset(principal_token)
 
     # Unknown method
     return {

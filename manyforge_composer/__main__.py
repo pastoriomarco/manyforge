@@ -555,7 +555,7 @@ def _run_mcp(args):
         kernel=kernel,
         kernel_factory=_make_kernel,
         kernel_bundle=bundle,
-        trace_dir="/tmp/manyforge-traces",
+        trace_dir=args.trace_dir,
         failure_archive_dir=args.failure_archive_dir,
         failure_archive_enabled=not args.disable_failure_archive,
         failure_archive_max_age_s=args.failure_archive_max_age_s,
@@ -652,6 +652,18 @@ def main():
     parser.add_argument("--mcp-http", action="store_true",
                         help="Enable HTTP/SSE MCP transport on /api/mcp (alongside REST)")
     parser.add_argument(
+        "--trace-dir",
+        default=os.environ.get("MANYFORGE_TRACE_DIR", "/tmp/manyforge-traces"),
+        help=(
+            "Directory for durable execution traces (per-run JSONL, incident "
+            "snapshots, failure archives). Defaults to MANYFORGE_TRACE_DIR or "
+            "/tmp/manyforge-traces. The /tmp fallback does NOT survive a "
+            "reboot — deployments must point this at persistent storage "
+            "(the compose/launcher lanes set /workspace/.manyforge-var/traces "
+            "under the repo bind mount)."
+        ),
+    )
+    parser.add_argument(
         "--failure-archive-dir",
         default=os.environ.get("MANYFORGE_FAILURE_ARCHIVE_DIR"),
         help=(
@@ -689,6 +701,15 @@ def main():
 
     setup_logging(args.log_level)
 
+    if str(args.trace_dir).startswith("/tmp"):
+        logger.warning(
+            "Execution traces at %s are on VOLATILE storage and will not "
+            "survive a reboot — the incident that forces a power-cycle "
+            "erases its own forensics. Set --trace-dir/MANYFORGE_TRACE_DIR "
+            "to a persistent path for deployments.",
+            args.trace_dir,
+        )
+
     if args.mcp and args.mcp_http:
         logger.error("--mcp (stdio) and --mcp-http cannot be used together")
         raise SystemExit(2)
@@ -712,7 +733,7 @@ def main():
             mock_execute_duration_s=args.mock_execute_duration_s,
         ),
         kernel_bundle=bundle,
-        trace_dir="/tmp/manyforge-traces",
+        trace_dir=args.trace_dir,
         failure_archive_dir=args.failure_archive_dir,
         failure_archive_enabled=not args.disable_failure_archive,
         failure_archive_max_age_s=args.failure_archive_max_age_s,

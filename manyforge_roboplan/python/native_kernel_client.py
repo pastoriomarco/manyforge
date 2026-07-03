@@ -464,6 +464,9 @@ class NativeKernelClient(KernelClient):
         if request.max_tcp_linear_speed_mps is not None:
             req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
 
+        if request.program_run_id:
+            req_dict["program_run_id"] = request.program_run_id
+
         dyn_limits = _serialize_per_joint_dynamics_limits(request)
         if dyn_limits is not None:
             req_dict["per_joint_dynamics_limits"] = dyn_limits
@@ -512,6 +515,9 @@ class NativeKernelClient(KernelClient):
 
         if request.max_tcp_linear_speed_mps is not None:
             req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
+
+        if request.program_run_id:
+            req_dict["program_run_id"] = request.program_run_id
 
         dyn_limits = _serialize_per_joint_dynamics_limits(request)
         if dyn_limits is not None:
@@ -599,6 +605,9 @@ class NativeKernelClient(KernelClient):
 
         if request.max_tcp_linear_speed_mps is not None:
             req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
+
+        if request.program_run_id:
+            req_dict["program_run_id"] = request.program_run_id
 
         dyn_limits = _serialize_per_joint_dynamics_limits(request)
         if dyn_limits is not None:
@@ -792,6 +801,45 @@ class NativeKernelClient(KernelClient):
         raw NativeKernelBundle or only the wrapped NativeKernelClient.
         """
         return dict(self._bundle.get_motion_interrupt_stop_capability())
+
+    def close(self) -> None:
+        """Deterministically quiesce and release the native bundle.
+
+        Shutdown-safety sequence (idempotent):
+        1. best-effort stop of any in-flight execution,
+        2. explicit command-gate close — the gate must not depend on the
+           native destructor happening to run at interpreter exit,
+        3. drop the bundle reference so refcounting can destroy the native
+           backend (cancel goals, close gate, join monitor) now instead of
+           at an unspecified GC point.
+
+        The client is unusable afterwards; any further call fails loudly on
+        the missing bundle.
+        """
+        bundle = getattr(self, "_bundle", None)
+        if bundle is None:
+            return
+        try:
+            state = _state_from_native(bundle.get_status())
+            if state in {
+                ExecutionState.PLANNING,
+                ExecutionState.VALIDATING,
+                ExecutionState.EXECUTING,
+                ExecutionState.INTERRUPTED,
+                ExecutionState.PAUSED,
+                ExecutionState.STOPPING,
+            }:
+                bundle.stop()
+        except Exception:  # noqa: BLE001 — best-effort quiesce; gate close still runs
+            pass
+        try:
+            bundle.set_command_gate(False)
+        except RuntimeError:
+            # Non-ros2_control execution backend: no gate surface.
+            pass
+        except Exception:  # noqa: BLE001 — gate close is best-effort by transport
+            pass
+        self._bundle = None
 
     def set_command_gate(self, enabled: bool) -> bool:
         """Request the command-enable gate from the backend gate authority.

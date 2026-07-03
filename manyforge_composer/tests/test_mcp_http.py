@@ -344,3 +344,50 @@ class TestMcpWithAuth:
         payload = resp.json()["result"]
         assert payload["isError"] is True
         assert "principal_id does not match" in payload["content"][0]["text"]
+
+
+class TestToolDispatchPrincipalAttribution:
+
+    def test_authenticated_call_to_principal_less_tool_records_actor(self, state):
+        """FastMCP drops arguments a tool's signature does not declare, so
+        the injected session principal never reaches principal-less tools —
+        the contextvar fallback must keep 'actor on every tool call' true
+        for the whole MCP surface."""
+        sec = SecurityConfig(api_token="test-secret-token")
+        app = create_app(state, security=sec, enable_mcp_http=True)
+        c = TestClient(app)
+        headers = {
+            "Authorization": "Bearer test-secret-token",
+            "X-Principal-ID": "human:alice",
+        }
+
+        init = c.post(
+            "/api/mcp",
+            json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
+            headers=headers,
+        )
+        session_id = init.headers["x-mcp-session-id"]
+
+        resp = c.post(
+            "/api/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "manyforge_scene_state", "arguments": {}},
+                "id": 2,
+            },
+            headers={**headers, "X-MCP-Session-ID": session_id},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["result"]["isError"] is False
+
+        events = state.event_recorder.history(
+            event_types=["tool_dispatch_completed"]
+        )["events"]
+        scene_calls = [
+            e
+            for e in events
+            if e["details"]["tool_id"] == "manyforge_scene_state"
+        ]
+        assert scene_calls, "no durable record for the dispatched tool"
+        assert scene_calls[-1]["principal_id"] == "human:alice"

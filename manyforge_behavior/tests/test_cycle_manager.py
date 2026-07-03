@@ -9,6 +9,7 @@ import pytest
 import py_trees
 import yaml
 
+import manyforge_behavior.cycle_manager as cycle_manager_module
 from manyforge_behavior.capabilities import V0_0_REQUIRED_KEYS
 from manyforge_behavior.kernel_client import (
     CommandResult,
@@ -781,6 +782,58 @@ class TestCycleManagerReset:
         # Kernel reset is not used as a synthetic state-assignment path when already idle.
         assert kernel.reset_count == initial_reset_count
 
+    def test_reset_records_phase_events(self, kernel):
+        """Reset emits durable phase spans so a slow reset is diagnosable."""
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        events: list[dict] = []
+        manager.set_on_reset_phase_event(events.append)
+
+        manager.reset(request_id="req-reset-1")
+
+        by_phase_status = {
+            (event["phase"], event["status"]): event for event in events
+        }
+        assert ("kernel_status", "started") in by_phase_status
+        assert ("kernel_status", "completed") in by_phase_status
+        assert ("scene_clear", "completed") in by_phase_status
+        assert ("tree_rebuild", "completed") in by_phase_status
+        assert ("scene_apply", "completed") in by_phase_status
+        assert (
+            by_phase_status[("scene_apply", "completed")]["request_id"]
+            == "req-reset-1"
+        )
+        assert "duration_ms" in by_phase_status[("scene_apply", "completed")]
+
+    def test_slow_kernel_reset_fails_closed_after_phase_deadline(self, monkeypatch):
+        """A reset phase that exceeds the bounded budget must not report IDLE."""
+
+        class SlowResetKernel(MockKernelClient):
+            def reset(self):  # type: ignore[override]
+                time.sleep(0.02)
+                return super().reset()
+
+        monkeypatch.setattr(cycle_manager_module, "_RESET_PHASE_DEADLINE_S", 0.001)
+        slow_kernel = SlowResetKernel()
+        slow_kernel._state = ExecutionState.STOPPED  # noqa: SLF001
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+        events: list[dict] = []
+        manager.set_on_reset_phase_event(events.append)
+
+        with pytest.raises(RuntimeError, match="kernel_reset"):
+            manager.reset(request_id="req-timeout")
+
+        assert manager.state == CycleState.STOPPED
+        assert manager.error_code == "reset_kernel_reset_timeout"
+        failed = [
+            event
+            for event in events
+            if event["phase"] == "kernel_reset" and event["status"] == "failed"
+        ]
+        assert failed
+        assert failed[-1]["request_id"] == "req-timeout"
+
     def test_reset_refusal_is_not_reported_as_idle(self):
         """A refused kernel reset must stay visible; CycleManager must not
         force a fresh IDLE cycle over an uncleared kernel fault."""
@@ -1301,8 +1354,10 @@ class TestCycleManagerProgramCompletion:
 class TestErrorPropagation:
     """Verify that tick-loop exceptions surface via manager.error and state."""
 
-    def test_tick_exception_sets_error_and_transitions_to_idle(self, kernel):
-        """A tick() exception must populate manager.error and go to IDLE."""
+    def test_tick_exception_sets_error_and_parks_stopped(self, kernel):
+        """A tick() exception must populate manager.error and park on the
+        STOPPED + error surface (spec/410's uniform failure contract), never
+        a bare IDLE that hides the fault."""
         slow_kernel = MockKernelClient(execute_duration_s=2.0)
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
@@ -1311,34 +1366,37 @@ class TestErrorPropagation:
         assert manager.state == CycleState.RUNNING
         time.sleep(0.05)
 
-        # Inject a fault: replace the tree's tick with one that raises
-        original_tick = manager._tree.tick
-
         def exploding_tick():
             raise RuntimeError("sensor fault injected")
 
         manager._tree.tick = exploding_tick
 
         # Wait for the tick loop to encounter the exception
-        time.sleep(0.15)
+        deadline = time.time() + 2.0
+        while manager.state != CycleState.STOPPED and time.time() < deadline:
+            time.sleep(0.01)
 
-        assert manager.state == CycleState.IDLE
+        assert manager.state == CycleState.STOPPED
         assert manager.error is not None
         assert "sensor fault injected" in manager.error
+        assert manager.error_code == "tick_loop_exception"
 
     def test_error_cleared_on_next_run(self, kernel):
-        """run() after an error clears the error field."""
+        """run() resuming a stopped cycle clears a stale error field."""
         slow_kernel = MockKernelClient(execute_duration_s=2.0)
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
         time.sleep(0.05)
+        manager.full_stop()
+        deadline = time.time() + 2.0
+        while manager.state != CycleState.STOPPED and time.time() < deadline:
+            time.sleep(0.01)
+        assert manager.state == CycleState.STOPPED
 
-        manager._tree.tick = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
-        time.sleep(0.15)
-
-        assert manager.error is not None
+        with manager._lock:
+            manager._error = "stale error from a previous incident"
 
         # A new run() must clear the error
         manager.run()
@@ -2523,3 +2581,358 @@ class TestStopQuiescesPreparationPhase:
         self._quiesce(stub)
         assert stub.stop_calls == 0
         assert stub.pause_calls == 0
+
+
+class TestTickLoopContainment:
+    """A tick-loop exception must never leave motion running unsupervised.
+
+    The containment contract: halt the tree (cancelling owned kernel goals),
+    stop the kernel directly as well, and park the cycle on the uniform
+    STOPPED + error surface with the tree dropped, so Run is refused with an
+    explicit reason and Reset rebuilds from the authored program.
+    """
+
+    @staticmethod
+    def _await_state(manager, state, timeout_s=2.0):
+        deadline = time.time() + timeout_s
+        while manager.state != state and time.time() < deadline:
+            time.sleep(0.01)
+        assert manager.state == state
+
+    @staticmethod
+    def _inject_tick_exception(manager):
+        def boom():
+            raise RuntimeError("injected tick failure")
+
+        # Instance attribute shadows the method for the next tick.
+        manager._tree.tick = boom
+
+    def test_tick_exception_stops_kernel_and_parks_stopped(self):
+        slow_kernel = MockKernelClient(execute_duration_s=5.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        manager.run()
+        assert manager.state == CycleState.RUNNING
+        # Let a motion dispatch so the kernel is genuinely executing.
+        deadline = time.time() + 2.0
+        while (
+            slow_kernel.get_status().state != ExecutionState.EXECUTING
+            and time.time() < deadline
+        ):
+            time.sleep(0.01)
+        assert slow_kernel.get_status().state == ExecutionState.EXECUTING
+
+        self._inject_tick_exception(manager)
+        self._await_state(manager, CycleState.STOPPED)
+
+        # The in-flight execution was stopped, not orphaned.
+        assert slow_kernel.stop_count >= 1
+        assert slow_kernel.get_status().state == ExecutionState.STOPPED
+        assert manager.error_code == "tick_loop_exception"
+        assert "injected tick failure" in (manager.error or "")
+
+    def test_tick_exception_refuses_run_and_allows_reset(self):
+        slow_kernel = MockKernelClient(execute_duration_s=5.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        manager.run()
+        time.sleep(0.05)
+        self._inject_tick_exception(manager)
+        self._await_state(manager, CycleState.STOPPED)
+
+        # The post-exception tree cannot be trusted for a resume: Run must
+        # be refused with an explicit reason, never silently restart.
+        with pytest.raises(RuntimeError, match="without a tree"):
+            manager.run()
+        assert manager.state == CycleState.STOPPED
+        # The refusal must not wipe the diagnostic that explains why the
+        # cycle is stopped — the operator still needs the original fault.
+        assert manager.error_code == "tick_loop_exception"
+        assert "injected tick failure" in (manager.error or "")
+
+        # Reset is the documented recovery path and must work.
+        manager.reset()
+        assert manager.state == CycleState.IDLE
+        assert manager.error is None
+
+    def test_tick_exception_parks_stopped_even_if_kernel_stop_raises(self):
+        class StopRaisesKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__(execute_duration_s=5.0)
+
+            def stop(self):  # type: ignore[override]
+                raise RuntimeError("kernel unreachable")
+
+        kernel = StopRaisesKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        manager.run()
+        time.sleep(0.05)
+        self._inject_tick_exception(manager)
+
+        # Containment steps are independent: kernel stop failing must not
+        # prevent the cycle from parking on the STOPPED + error surface.
+        self._await_state(manager, CycleState.STOPPED)
+        assert manager.error_code == "tick_loop_exception"
+
+
+class TestStopWatcherEscalation:
+    """Stop watchers must be deadline-bounded, never wedge the cycle."""
+
+    class _NeverSettlingKernel(MockKernelClient):
+        """Reports STOPPING forever after a stop request."""
+
+        def __init__(self):
+            super().__init__(execute_duration_s=5.0)
+            self.stop_called = threading.Event()
+
+        def stop(self):  # type: ignore[override]
+            self.stop_called.set()
+            return CommandResult(accepted=True)
+
+        def get_status(self):  # type: ignore[override]
+            state = (
+                ExecutionState.STOPPING
+                if self.stop_called.is_set()
+                else ExecutionState.EXECUTING
+            )
+            return ExecutionStatus(
+                state=state,
+                execution_id=self._execution_id,
+                progress=0.0,
+                active_move_id=self._active_move_id,
+            )
+
+    @staticmethod
+    def _await_state(manager, state, timeout_s=3.0):
+        deadline = time.time() + timeout_s
+        while manager.state != state and time.time() < deadline:
+            time.sleep(0.01)
+        assert manager.state == state
+
+    def test_stop_settle_escalates_after_deadline_and_reset_recovers(
+        self, monkeypatch
+    ):
+        import manyforge_behavior.cycle_manager as cm
+
+        monkeypatch.setattr(cm, "_STOP_SETTLE_DEADLINE_S", 0.2)
+        kernel = self._NeverSettlingKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        manager.run()
+        time.sleep(0.05)
+        manager.full_stop()
+        assert manager.state == CycleState.STOPPING
+
+        # Wedged kernel: without the deadline this stays STOPPING forever
+        # and reset() is refused.
+        self._await_state(manager, CycleState.STOPPED)
+        assert manager.error_code == "stop_settle_timeout"
+        assert manager.error_details["kernel_state"] == "stopping"
+
+        # Run must fail closed (no trusted resume fingerprint) …
+        with pytest.raises(RuntimeError):
+            manager.run()
+        # … and Reset must recover.
+        manager.reset()
+        assert manager.state == CycleState.IDLE
+
+    def test_stop_settle_escalates_on_unreadable_status(self, monkeypatch):
+        import manyforge_behavior.cycle_manager as cm
+
+        monkeypatch.setattr(cm, "_STOP_SETTLE_MAX_STATUS_FAILURES", 3)
+
+        class StatusDiesAfterStopKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__(execute_duration_s=5.0)
+                self.stop_called = threading.Event()
+                self.post_stop_reads = 0
+
+            def stop(self):  # type: ignore[override]
+                self.stop_called.set()
+                return CommandResult(accepted=True)
+
+            def get_status(self):  # type: ignore[override]
+                if self.stop_called.is_set():
+                    # Allow full_stop()'s own post-stop read to succeed so
+                    # the settle watcher starts; the watcher's reads fail.
+                    self.post_stop_reads += 1
+                    if self.post_stop_reads > 1:
+                        raise RuntimeError("kernel status unreachable")
+                    return ExecutionStatus(
+                        state=ExecutionState.STOPPING,
+                        execution_id=self._execution_id,
+                        progress=0.0,
+                        active_move_id=self._active_move_id,
+                    )
+                return super().get_status()
+
+        kernel = StatusDiesAfterStopKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        manager.run()
+        time.sleep(0.05)
+        manager.full_stop()
+
+        self._await_state(manager, CycleState.STOPPED)
+        assert manager.error_code == "stop_settle_status_unreadable"
+
+    def test_motion_stop_escalates_after_deadline_and_unblocks_reset(
+        self, monkeypatch
+    ):
+        import manyforge_behavior.cycle_manager as cm
+
+        monkeypatch.setattr(cm, "_STOP_SETTLE_DEADLINE_S", 0.2)
+        kernel = self._NeverSettlingKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        manager.run()
+        time.sleep(0.05)
+        manager.stop()  # motion stop, cycle stays RUNNING
+        assert manager.state == CycleState.RUNNING
+
+        # While the motion stop is in flight, reset is (correctly) refused.
+        with pytest.raises(RuntimeError, match="motion stop is in progress"):
+            manager.reset()
+
+        # After the deadline the watcher escalates to a full stop, which
+        # unblocks reset instead of refusing forever.
+        self._await_state(manager, CycleState.STOPPED)
+        assert manager.error_code == "motion_stop_timeout"
+        manager.reset()
+        assert manager.state == CycleState.IDLE
+
+
+class TestMotionErrorReadAllocation:
+    """The 100 Hz motion-error read must not grow py_trees global state."""
+
+    def test_read_motion_paused_error_does_not_register_new_clients(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        manager._read_motion_paused_error()
+        clients_before = len(py_trees.blackboard.Blackboard.clients)
+        for _ in range(200):
+            manager._read_motion_paused_error()
+        assert len(py_trees.blackboard.Blackboard.clients) == clients_before
+
+
+class TestCycleShutdown:
+    """Process-shutdown quiesce: motion stopped, tick thread joined."""
+
+    def test_shutdown_stops_running_cycle_and_joins_tick_thread(self):
+        slow_kernel = MockKernelClient(execute_duration_s=5.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        manager.run()
+        deadline = time.time() + 2.0
+        while (
+            slow_kernel.get_status().state != ExecutionState.EXECUTING
+            and time.time() < deadline
+        ):
+            time.sleep(0.01)
+        tick_thread = manager._tick_thread
+        assert tick_thread is not None and tick_thread.is_alive()
+
+        assert manager.shutdown(timeout_s=2.0) is True
+
+        assert not tick_thread.is_alive()
+        assert slow_kernel.stop_count >= 1
+        # The in-flight execution was routed through the kernel stop, not
+        # abandoned to interpreter-exit teardown.
+        assert slow_kernel.get_status().state in {
+            ExecutionState.STOPPED,
+            ExecutionState.IDLE,
+        }
+
+    def test_shutdown_joins_tick_thread_even_if_kernel_stop_raises(self):
+        class StopRaisesKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__(execute_duration_s=5.0)
+
+            def stop(self):  # type: ignore[override]
+                raise RuntimeError("kernel unreachable")
+
+        kernel = StopRaisesKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        manager.run()
+        time.sleep(0.05)
+        tick_thread = manager._tick_thread
+
+        # Shutdown steps are independent: a failing kernel stop must not
+        # prevent the tick thread from being signalled and joined.
+        assert manager.shutdown(timeout_s=2.0) is True
+        assert tick_thread is None or not tick_thread.is_alive()
+
+    def test_shutdown_from_idle_is_safe(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        assert manager.shutdown(timeout_s=1.0) is True
+
+
+class TestProgramRunIdThreading:
+    """spec/500 §2.2: the runner mints a program_run_id once per program
+    start; motion nodes attach it to every ExecuteRequest and the kernel
+    stamps it on every kernel event, so history joins on ids, not on
+    timestamp guesswork."""
+
+    def test_run_mints_id_and_threads_it_to_kernel_and_events(self):
+        slow_kernel = MockKernelClient(execute_duration_s=5.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        manager.run()
+        deadline = time.time() + 2.0
+        while (
+            slow_kernel.last_execute_request is None
+            and time.time() < deadline
+        ):
+            time.sleep(0.01)
+        assert slow_kernel.last_execute_request is not None
+
+        run_id = manager._program_run_id
+        assert run_id, "run() must mint a program_run_id at program start"
+
+        bb = py_trees.blackboard.Client(name="test_program_run_id_read")
+        bb.register_key(key="program_run_id", access=py_trees.common.Access.READ)
+        assert bb.get("program_run_id") == run_id
+
+        # The motion node attached the id to its ExecuteRequest …
+        assert slow_kernel.last_execute_request.program_run_id == run_id
+        # … and the kernel stamps it on every event for the execution.
+        events = manager.drain_kernel_events_now() or manager.get_kernel_events_since(0)
+        stamped = [e for e in events if e.get("program_run_id") == run_id]
+        assert stamped, f"no kernel event carried program_run_id: {events[:3]}"
+
+        manager.shutdown(timeout_s=2.0)
+
+    def test_fresh_start_mints_new_id_resume_keeps_it(self):
+        slow_kernel = MockKernelClient(execute_duration_s=5.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        manager.run()
+        first = manager._program_run_id
+        assert first
+        time.sleep(0.05)
+
+        manager.full_stop()
+        deadline = time.time() + 2.0
+        while manager.state != CycleState.STOPPED and time.time() < deadline:
+            time.sleep(0.01)
+        manager.run()  # resume: same program run, same id
+        assert manager._program_run_id == first
+
+        manager.reset()
+        manager.run()  # fresh program start: new id
+        assert manager._program_run_id and manager._program_run_id != first
+        manager.shutdown(timeout_s=2.0)

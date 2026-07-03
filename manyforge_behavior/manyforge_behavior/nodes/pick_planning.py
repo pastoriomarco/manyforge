@@ -271,6 +271,42 @@ def _reference_trace_value(reference: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_candidate_tcp_reference(reference: dict[str, Any], tcp_frame: str) -> bool:
+    """True when a pick-planning reference names the generated TCP frame.
+
+    Other ``robot_link`` references are sampled from the live backend state.
+    The node's own TCP frame is different: at planning time its relevant axes
+    are the candidate TCP pose being synthesized, not the robot's current TCP
+    pose before the pick move has been planned.
+    """
+    frame = str(tcp_frame or "").strip()
+    return (
+        bool(frame)
+        and reference.get("type") == "robot_link"
+        and str(reference.get("id") or "").strip() == frame
+    )
+
+
+def _candidate_pick_orientation_xyzw(
+    *,
+    force_vertical_pick: bool,
+    vertical_orientation_xyzw: list[float] | None,
+    base_orientation_rpy_deg: list[float],
+    pick_orientation_offset_rpy_deg: list[float],
+) -> list[float]:
+    if force_vertical_pick:
+        if vertical_orientation_xyzw is None:
+            raise ValueError("vertical orientation is required")
+        return _normalize_quat(vertical_orientation_xyzw)
+    return _rpy_deg_to_xyzw(
+        [
+            float(base_orientation_rpy_deg[0]) + float(pick_orientation_offset_rpy_deg[0]),
+            float(base_orientation_rpy_deg[1]) + float(pick_orientation_offset_rpy_deg[1]),
+            float(base_orientation_rpy_deg[2]) + float(pick_orientation_offset_rpy_deg[2]),
+        ]
+    )
+
+
 def _reference_orientation_in_base(
     kernel: KernelClient,
     reference: dict[str, Any],
@@ -795,10 +831,17 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                 self._pick_offset_reference,
                 base_frame=self._base_frame,
             )
-            pick_offset_orientation = _reference_orientation_in_base(
-                kernel,
-                pick_offset_reference,
-                base_frame=self._base_frame,
+            pick_offset_orientation = (
+                None
+                if _is_candidate_tcp_reference(
+                    pick_offset_reference,
+                    self._tcp_frame,
+                )
+                else _reference_orientation_in_base(
+                    kernel,
+                    pick_offset_reference,
+                    base_frame=self._base_frame,
+                )
             )
         except ValueError as exc:
             self.feedback_message = f"Invalid pick_offset_reference: {exc}"
@@ -831,10 +874,17 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                 self._approach_offset_reference,
                 base_frame=self._base_frame,
             )
-            approach_offset_orientation = _reference_orientation_in_base(
-                kernel,
-                approach_offset_reference,
-                base_frame=self._base_frame,
+            approach_offset_orientation = (
+                None
+                if _is_candidate_tcp_reference(
+                    approach_offset_reference,
+                    self._tcp_frame,
+                )
+                else _reference_orientation_in_base(
+                    kernel,
+                    approach_offset_reference,
+                    base_frame=self._base_frame,
+                )
             )
         except ValueError as exc:
             self.feedback_message = f"Invalid approach_offset_reference: {exc}"
@@ -852,8 +902,16 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
         last_failure_detail: Optional[str] = None
 
         for (pick_pos_offset, pick_rot_offset) in pick_offsets:
+            candidate_pick_orientation = _candidate_pick_orientation_xyzw(
+                force_vertical_pick=self._force_vertical_pick,
+                vertical_orientation_xyzw=base_orientation_xyzw,
+                base_orientation_rpy_deg=base_orientation,
+                pick_orientation_offset_rpy_deg=pick_rot_offset,
+            )
             pick_pos_offset_base = _quat_rotate_vector(
-                pick_offset_orientation,
+                candidate_pick_orientation
+                if pick_offset_orientation is None
+                else pick_offset_orientation,
                 pick_pos_offset,
             )
             pick_pose = _compose_pose(
@@ -870,7 +928,9 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
             for (approach_pos_offset, approach_rot_offset) in approach_offsets:
                 attempted_candidates += 1
                 approach_pos_offset_base = _quat_rotate_vector(
-                    approach_offset_orientation,
+                    pick_pose["orientation_xyzw"]
+                    if approach_offset_orientation is None
+                    else approach_offset_orientation,
                     approach_pos_offset,
                 )
                 approach_pose = {

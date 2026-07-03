@@ -692,3 +692,21 @@ def _bridge_payload(
             "allowedToolCallStatuses": ["proposed", "skipped", "completed", "failed"],
         },
     }
+
+
+def test_audit_log_rotates_at_size_cap(monkeypatch, tmp_path):
+    """The bridge audit log must roll over instead of growing without bound
+    in whatever directory it lands in."""
+    audit_path = tmp_path / "audit.log"
+    monkeypatch.setattr(bridge, "AUDIT_LOG_PATH", audit_path)
+    monkeypatch.setattr(bridge, "AUDIT_LOG_MAX_BYTES", 200)
+    monkeypatch.setattr(bridge, "AUDIT_LOG_KEEP", 2)
+
+    for index in range(30):
+        bridge._audit_record({"event": "x" * 40, "index": index})
+
+    rotated = audit_path.with_name("audit.log.1")
+    assert rotated.exists(), "no rollover happened at the size cap"
+    assert audit_path.stat().st_size <= 200 + 100  # current file stays small
+    # KEEP=2 means at most .1 and .2 exist, never .3
+    assert not audit_path.with_name("audit.log.3").exists()

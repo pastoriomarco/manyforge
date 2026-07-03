@@ -50,6 +50,20 @@ def _relative_move_object_ids(relative_move: dict[str, Any] | None) -> list[str]
     return object_ids
 
 
+def read_program_run_id(blackboard):
+    """Best-effort program-run correlation id (spec/500 §2.2).
+
+    Shared by every motion-dispatching node (plain and scoped): absent on
+    standalone trees that never went through the cycle manager; execution
+    must proceed identically without it.
+    """
+    try:
+        value = blackboard.get("program_run_id")
+    except (KeyError, AttributeError):
+        return None
+    return str(value) if value else None
+
+
 class MoveManipulatorAction(py_trees.behaviour.Behaviour):
     """Execute a motion request through the kernel (plan + validate + execute)."""
 
@@ -76,6 +90,7 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
             "global_max_tcp_linear_speed_mps",
             "pose_source_apply_callback",
             "pose_source_between_nodes_callback",
+            "program_run_id",
         ):
             self.blackboard.register_key(key=key, access=py_trees.common.Access.READ)
         # Write keys: motion_error_message + motion_paused_due_to_error are
@@ -95,6 +110,9 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
             "resume_after_error_requested",
         ):
             self.blackboard.register_key(key=key, access=py_trees.common.Access.WRITE)
+
+    def _read_program_run_id(self):
+        return read_program_run_id(self.blackboard)
 
     def initialise(self) -> None:
         self._started = False
@@ -342,6 +360,7 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
                     self._params.get("execution_timeout_s", 10.0)
                 ),
                 cache_mode=self._params.get("cache_mode", "default"),
+                program_run_id=self._read_program_run_id(),
             )
 
             global_cap = self._read_optional_blackboard_value(

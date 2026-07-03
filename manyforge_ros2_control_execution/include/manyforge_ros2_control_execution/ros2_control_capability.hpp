@@ -152,6 +152,19 @@ inline constexpr const char* kGripperGoalRejected = "gripper_goal_rejected";
 inline constexpr const char* kGripperInvalidCommand =
     "gripper_invalid_command";
 inline constexpr const char* kGripperNotConfigured = "gripper_not_configured";
+inline constexpr const char* kInvalidGripperSemantics =
+    "invalid_gripper_semantics";
+inline constexpr const char* kGripperRequestFailed =
+    "gripper_request_failed";
+inline constexpr const char* kGripperRequestAckTimeout =
+    "gripper_request_ack_timeout";
+inline constexpr const char* kGripperDwellTimeout =
+    "gripper_dwell_timeout";
+inline constexpr const char* kStaleGripperState = "stale_gripper_state";
+inline constexpr const char* kCommandEstimateAttachRejected =
+    "command_estimate_attach_rejected";
+inline constexpr const char* kGraspConfirmationLost =
+    "grasp_confirmation_lost";
 inline constexpr const char* kGripperResultFailed = "gripper_result_failed";
 inline constexpr const char* kGripperResultTimeout =
     "gripper_result_timeout";

@@ -10,6 +10,7 @@
 #include <manyforge_core/ports/iplanner_backend.hpp>
 #include <manyforge_core/ports/iplanning_context.hpp>
 #include <manyforge_core/state_machine.hpp>
+#include <manyforge_core/terminal_committer.hpp>
 #include <manyforge_core/stop_policy.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
@@ -369,6 +370,14 @@ class ExecutionKernel {
   /// Emit an event to all subscribers.
   void emit_event(const KernelEvent& event);
 
+  /// K3: route a terminal decision through the TerminalCommitter.
+  /// Returns the outcome; `outcome.committed` is the state that must
+  /// appear in any snapshot/event published for this commit.
+  TerminalCommitter::CommitOutcome commit_terminal(
+      ExecutionState proposed,
+      const char* reason,
+      TerminalCommitter::Origin origin = TerminalCommitter::Origin::kGeneric);
+
   /// Publish an observer-safe execution snapshot.
   void publish_execution_snapshot(ExecutionSnapshot snapshot);
   void start_collision_monitoring();
@@ -486,6 +495,9 @@ class ExecutionKernel {
   ExecutionStateMachine sm_;
   StopPolicy stop_policy_;
   InterruptManager interrupt_manager_;
+  /// K3: the only path to terminal states. Declared after the objects its
+  /// probes read so construction order matches the authority dependency.
+  TerminalCommitter terminal_committer_;
   std::atomic<std::int64_t> runtime_collision_fault_sequence_{0};
 
   // Authoritative collision validation pipeline. Missing policy,
@@ -512,6 +524,12 @@ class ExecutionKernel {
   std::optional<std::string> deferred_runtime_velocity_scale_principal_id_;
   mutable std::mutex active_move_id_mutex_;
   std::string active_move_id_;
+  /// Program-run correlation id of the active execution (spec/500 §2.2);
+  /// stamped into every emitted KernelEvent's details. Guarded by its own
+  /// leaf mutex: held only for assignment/copy, never while calling out,
+  /// so it cannot participate in any lock-ordering cycle.
+  mutable std::mutex active_program_run_id_mutex_;
+  std::string active_program_run_id_;
 
   // Event subscription
   std::mutex subscribers_mutex_;
@@ -534,6 +552,11 @@ class ExecutionKernel {
   std::atomic<bool> lifecycle_stop_requested_event_emitted_{false};
   std::atomic<bool> lifecycle_reset_requested_while_busy_{false};
   std::atomic<bool> lifecycle_reset_waiting_for_stop_{false};
+  // Monotonic per-execution terminal authority. Active interrupt latches can
+  // be consumed by preemption/stop machinery before the backend finalizer runs;
+  // this flag preserves the fact that safety authority existed so a later
+  // normal completion cannot launder it.
+  std::atomic<bool> terminal_fault_authority_asserted_{false};
   mutable std::mutex operator_stop_mutex_;
   std::condition_variable operator_stop_cv_;
   std::jthread operator_stop_thread_;

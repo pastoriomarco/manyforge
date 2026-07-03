@@ -36,6 +36,12 @@ struct ExecuteRequestDTO {
   /// behavior. Resolved against model/backend/controller limits and enforced in
   /// time-parameterization; copied into the PlanRequestDTO by the kernel.
   PerJointDynamicsLimitsDTO per_joint_dynamics_limits;
+  /// Program-run correlation id (spec/500 §2.2): minted once by the
+  /// orchestrator runner at program start, optional at the kernel boundary
+  /// (empty = absent). When non-empty the kernel stamps it into the details
+  /// of every kernel event emitted for this execution so durable history
+  /// can be joined across Composer -> kernel -> backend.
+  std::string program_run_id;
 };
 
 }  // namespace manyforge::core

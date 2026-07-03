@@ -37,114 +37,114 @@ TEST_F(StateMachineTest, IdleToValidating) {
 }
 
 TEST_F(StateMachineTest, PlanningToValidating) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
 }
 
 TEST_F(StateMachineTest, PlanningToFailed) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kFailed).ok());
 }
 
 TEST_F(StateMachineTest, PlanningToStopped) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
 }
 
 TEST_F(StateMachineTest, ValidatingToExecuting) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kExecuting).ok());
 }
 
 TEST_F(StateMachineTest, ValidatingToFailed) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kFailed).ok());
 }
 
 TEST_F(StateMachineTest, ValidatingToStopped) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
 }
 
 TEST_F(StateMachineTest, ExecutingToStopping) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kStopping).ok());
 }
 
 TEST_F(StateMachineTest, ExecutingToCompleted) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kCompleted).ok());
 }
 
 TEST_F(StateMachineTest, ExecutingToFailed) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kFailed).ok());
 }
 
 TEST_F(StateMachineTest, PausedToValidating) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
-  sm.try_transition(ExecutionState::kStopping);
-  sm.try_transition(ExecutionState::kPaused);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kStopping);
+  (void)sm.try_transition(ExecutionState::kPaused);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kValidating).ok());
 }
 
 TEST_F(StateMachineTest, PausedToStopping) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
-  sm.try_transition(ExecutionState::kStopping);
-  sm.try_transition(ExecutionState::kPaused);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kStopping);
+  (void)sm.try_transition(ExecutionState::kPaused);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kStopping).ok());
 }
 
 TEST_F(StateMachineTest, StoppingToStopped) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
-  sm.try_transition(ExecutionState::kStopping);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kStopping);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
 }
 
 TEST_F(StateMachineTest, StoppingToPaused) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
-  sm.try_transition(ExecutionState::kStopping);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kStopping);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kPaused).ok());
 }
 
 TEST_F(StateMachineTest, PlanningToInterrupted) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kInterrupted).ok());
 }
 
 TEST_F(StateMachineTest, ValidatingToInterrupted) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kInterrupted).ok());
 }
 
 TEST_F(StateMachineTest, ExecutingToInterrupted) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kInterrupted).ok());
 }
 
 TEST_F(StateMachineTest, InterruptedToInterventionRequired) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kInterrupted);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kInterrupted);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kInterventionRequired).ok());
 }
 
@@ -158,73 +158,73 @@ TEST_F(StateMachineTest, IdleToStoppedInvalid) {
 }
 
 TEST_F(StateMachineTest, PlanningToExecutingInvalid) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
 }
 
 TEST_F(StateMachineTest, PlanningToPausedInvalid) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_FALSE(sm.try_transition(ExecutionState::kPaused).ok());
 }
 
 TEST_F(StateMachineTest, ValidatingToPlanningForAuthoritativeReplan) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kPlanning);
 }
 
 TEST_F(StateMachineTest, ExecutingToPlanningInvalid) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
   EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
 }
 
 TEST_F(StateMachineTest, ExecutingToPausedInvalid) {
   // Executing → Paused is NOT direct — must go through Stopping
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
   EXPECT_FALSE(sm.try_transition(ExecutionState::kPaused).ok());
 }
 
 TEST_F(StateMachineTest, PausedToExecutingInvalid) {
   // Paused → Executing is NOT direct — must go through Validating
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
-  sm.try_transition(ExecutionState::kStopping);
-  sm.try_transition(ExecutionState::kPaused);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kStopping);
+  (void)sm.try_transition(ExecutionState::kPaused);
   EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
 }
 
 TEST_F(StateMachineTest, StoppingToExecutingInvalid) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
-  sm.try_transition(ExecutionState::kStopping);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kStopping);
   EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
 }
 
 TEST_F(StateMachineTest, StoppedToAnyInvalid) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kStopped);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kStopped);
   EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
   EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
 }
 
 TEST_F(StateMachineTest, CompletedToAnyInvalid) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
-  sm.try_transition(ExecutionState::kCompleted);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kCompleted);
   EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
 }
 
 TEST_F(StateMachineTest, FailedToAnyInvalid) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kFailed);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kFailed);
   EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
 }
 
@@ -233,8 +233,8 @@ TEST_F(StateMachineTest, IdleToInterruptedInvalid) {
 }
 
 TEST_F(StateMachineTest, InterruptedToExecutingInvalid) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kInterrupted);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kInterrupted);
   EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
 }
 
@@ -244,81 +244,81 @@ TEST_F(StateMachineTest, ResetFromIdle_Fails) {
 }
 
 TEST_F(StateMachineTest, ResetFromPlanning) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_TRUE(sm.reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StateMachineTest, ResetFromValidating) {
-  sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kValidating);
   EXPECT_TRUE(sm.reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StateMachineTest, ResetFromExecuting) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
   EXPECT_TRUE(sm.reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StateMachineTest, ResetFromPaused) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
-  sm.try_transition(ExecutionState::kStopping);
-  sm.try_transition(ExecutionState::kPaused);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kStopping);
+  (void)sm.try_transition(ExecutionState::kPaused);
   EXPECT_TRUE(sm.reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StateMachineTest, ResetFromStopping) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
-  sm.try_transition(ExecutionState::kStopping);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kStopping);
   EXPECT_TRUE(sm.reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StateMachineTest, ResetFromStopped) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kStopped);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kStopped);
   EXPECT_TRUE(sm.reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StateMachineTest, ResetFromCompleted) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
-  sm.try_transition(ExecutionState::kCompleted);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kCompleted);
   EXPECT_TRUE(sm.reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StateMachineTest, ResetFromFailed) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kFailed);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kFailed);
   EXPECT_TRUE(sm.reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StateMachineTest, ResetFromInterrupted) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kInterrupted);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kInterrupted);
   EXPECT_TRUE(sm.reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
 TEST_F(StateMachineTest, ResetClearsProgressAndError) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
   sm.set_progress(0.5);
   sm.set_last_error(ErrorCode::kExecutionAborted);
-  sm.try_transition(ExecutionState::kFailed);
+  (void)sm.try_transition(ExecutionState::kFailed);
   sm.reset();
   EXPECT_EQ(sm.status().progress, 0.0);
   EXPECT_EQ(sm.status().last_error, ErrorCode::kSuccess);
@@ -341,49 +341,49 @@ TEST_F(StateMachineTest, CacheHitPath) {
 }
 
 TEST_F(StateMachineTest, StopFromPlanningPath) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
 }
 
 TEST_F(StateMachineTest, StopFromValidatingPath) {
-  sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kValidating);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
 }
 
 TEST_F(StateMachineTest, StopFromExecutingPath) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
   EXPECT_TRUE(sm.try_transition(ExecutionState::kStopping).ok());
   EXPECT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
 }
 
 TEST_F(StateMachineTest, PausePath) {
-  sm.try_transition(ExecutionState::kPlanning);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
-  sm.try_transition(ExecutionState::kStopping);
-  sm.try_transition(ExecutionState::kPaused);
-  sm.try_transition(ExecutionState::kValidating);
-  sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
+  (void)sm.try_transition(ExecutionState::kStopping);
+  (void)sm.try_transition(ExecutionState::kPaused);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
   EXPECT_EQ(sm.status().state, ExecutionState::kExecuting);
 }
 
 // --- Callbacks ---
 TEST_F(StateMachineTest, TransitionCallbackFiresWithCorrectStates) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   ASSERT_EQ(transitions.size(), 1u);
   EXPECT_EQ(transitions[0].first, ExecutionState::kIdle);
   EXPECT_EQ(transitions[0].second, ExecutionState::kPlanning);
 }
 
 TEST_F(StateMachineTest, CallbackDoesNotFireOnInvalidTransition) {
-  sm.try_transition(ExecutionState::kExecuting);  // invalid from Idle
+  (void)sm.try_transition(ExecutionState::kExecuting);  // invalid from Idle
   EXPECT_TRUE(transitions.empty());
 }
 
 TEST_F(StateMachineTest, ResetFiresCallback) {
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   transitions.clear();
   sm.reset();
   ASSERT_EQ(transitions.size(), 1u);
@@ -410,10 +410,10 @@ TEST_F(StateMachineTest, SetExecutionId) {
 // --- Timestamp ---
 TEST_F(StateMachineTest, TransitionUpdatesTimestamp) {
   clock.set(1000);
-  sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_EQ(sm.status().last_transition_ns, 1000);
   clock.set(2000);
-  sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kValidating);
   EXPECT_EQ(sm.status().last_transition_ns, 2000);
 }
 
@@ -422,14 +422,14 @@ TEST_F(StateMachineTest, ConcurrentTransitionsDontCorrupt) {
   FakeClock shared_clock;
   ExecutionStateMachine shared_sm(shared_clock);
 
-  shared_sm.try_transition(ExecutionState::kPlanning);
-  shared_sm.try_transition(ExecutionState::kValidating);
-  shared_sm.try_transition(ExecutionState::kExecuting);
+  (void)shared_sm.try_transition(ExecutionState::kPlanning);
+  (void)shared_sm.try_transition(ExecutionState::kValidating);
+  (void)shared_sm.try_transition(ExecutionState::kExecuting);
 
   std::vector<std::jthread> threads;
   for (int i = 0; i < 10; ++i) {
     threads.emplace_back([&shared_sm]() {
-      shared_sm.try_transition(ExecutionState::kCompleted);
+      (void)shared_sm.try_transition(ExecutionState::kCompleted);
     });
   }
   // jthreads auto-join when destroyed
@@ -440,3 +440,36 @@ TEST_F(StateMachineTest, ConcurrentTransitionsDontCorrupt) {
 
 }  // namespace
 }  // namespace manyforge::core
+
+// K1 characterization: normal terminals must be unrepresentable from safety
+// terminals at the transition-table level. A laundering bug therefore has to
+// happen BEFORE the safety terminal commits — which is exactly the window the
+// TerminalCommitter closes; these pins guarantee the table half stays true.
+TEST(StateMachineTerminalAuthority, NormalTerminalCannotOverwriteSafetyTerminal) {
+  using manyforge::core::ExecutionState;
+  manyforge::core::FakeClock clock;
+  {
+    manyforge::core::ExecutionStateMachine sm{clock};
+    ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
+    ASSERT_TRUE(sm.try_transition(ExecutionState::kStopped).ok());
+    EXPECT_FALSE(sm.try_transition(ExecutionState::kFailed).ok());
+    EXPECT_FALSE(sm.try_transition(ExecutionState::kCompleted).ok());
+  }
+  {
+    manyforge::core::ExecutionStateMachine sm{clock};
+    ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
+    ASSERT_TRUE(sm.try_transition(ExecutionState::kInterrupted).ok());
+    EXPECT_FALSE(sm.try_transition(ExecutionState::kCompleted).ok());
+    EXPECT_FALSE(sm.try_transition(ExecutionState::kStopped).ok());
+  }
+  {
+    manyforge::core::ExecutionStateMachine sm{clock};
+    ASSERT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
+    ASSERT_TRUE(
+        sm.try_transition(ExecutionState::kInterventionRequired).ok());
+    EXPECT_FALSE(sm.try_transition(ExecutionState::kCompleted).ok());
+    EXPECT_FALSE(sm.try_transition(ExecutionState::kStopped).ok());
+    EXPECT_FALSE(sm.try_transition(ExecutionState::kFailed).ok());
+    EXPECT_FALSE(sm.try_transition(ExecutionState::kInterrupted).ok());
+  }
+}

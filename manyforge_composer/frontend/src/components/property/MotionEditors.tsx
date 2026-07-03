@@ -300,6 +300,10 @@ function validatePoseEnvelope(value: PoseEnvelopeValue): string | null {
   return null;
 }
 
+function relativeReferenceHelp(label: string): string {
+  return `${label} basis for XYZ offsets. For Plan Pick Sequence, robot_link matching the node tcp_frame uses the generated candidate pick TCP basis; another robot_link uses the live robot link pose before planning.`;
+}
+
 function jointGoalArraysEqual(
   leftNames: string[],
   leftPositions: number[],
@@ -609,10 +613,11 @@ function RelativeMoveReferenceEditor({
       ? 'Select a frame'
       : 'Select an object';
   const hasEmptyFrameOption = value.type === 'frame' && allowEmptyFrameId;
+  const helpText = relativeReferenceHelp(label);
 
   return (
-    <div className="space-y-2 rounded border border-gray-700 p-2">
-      <div className="text-xs font-medium text-gray-300">{label}</div>
+    <div className="space-y-2 rounded border border-gray-700 p-2" title={helpText}>
+      <div className="text-xs font-medium text-gray-300" title={helpText}>{label}</div>
       <select
         value={value.type}
         onChange={(event) => {
@@ -632,6 +637,7 @@ function RelativeMoveReferenceEditor({
           });
         }}
         disabled={isRunMode}
+        title={helpText}
         className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${disabledClasses}`}
       >
         {RELATIVE_MOVE_REFERENCE_TYPES.map((referenceType) => (
@@ -665,11 +671,12 @@ function RelativeMoveReferenceEditor({
         />
       ) : (
         <div>
-          <div className="mb-1 text-[11px] text-gray-500">{idLabel}</div>
+          <div className="mb-1 text-[11px] text-gray-500" title={helpText}>{idLabel}</div>
           <select
             value={currentId}
             onChange={(event) => onChange({ type: value.type, id: event.target.value })}
             disabled={isRunMode || (!hasEmptyFrameOption && selectOptions.length === 0)}
+            title={helpText}
             className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${disabledClasses}`}
           >
             <option value="">{hasEmptyFrameOption ? emptyFrameLabel : placeholder}</option>

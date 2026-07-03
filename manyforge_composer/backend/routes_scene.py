@@ -345,7 +345,10 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
         mark_step("snapshot_read", step_started)
         if visual_snapshot is not None:
             if _visual_snapshot_is_stale(snapshot_meta):
-                visual_snapshot.stale = True
+                # The snapshot is shared read-only; mutate a copy.
+                visual_snapshot = visual_snapshot.model_copy(
+                    update={"stale": True}
+                )
                 visual_route_fallback = (
                     snapshot_meta.get("last_error") or "visual_snapshot_stale"
                 )
@@ -930,7 +933,8 @@ def _scene_state_payload_from_visual_cache(
 
     stale = _visual_snapshot_is_stale(snapshot_meta)
     if stale:
-        visual_state.stale = True
+        # The snapshot is shared read-only; mutate a copy.
+        visual_state = visual_state.model_copy(update={"stale": True})
     diagnostics = _visual_route_diagnostics(
         timings_ms=timings_ms,
         total_ms=total_ms,

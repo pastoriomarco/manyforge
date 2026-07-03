@@ -56,6 +56,27 @@ class ThrottledLog:
         emission for this key) so operators can read the true event rate
         from a bounded stream.
         """
+        return self._emit(logger.warning, key, msg, *args, extra=extra)
+
+    def info(
+        self,
+        logger,
+        key: str,
+        msg: str,
+        *args: Any,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Emit at most one info record per key per window (see warning())."""
+        return self._emit(logger.info, key, msg, *args, extra=extra)
+
+    def _emit(
+        self,
+        log_fn,
+        key: str,
+        msg: str,
+        *args: Any,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> bool:
         now = time.monotonic()
         with self._lock:
             last = self._last_emit_monotonic.get(key, float("-inf"))
@@ -67,7 +88,7 @@ class ThrottledLog:
         payload = dict(extra or {})
         payload["throttle_key"] = key
         payload["suppressed_since_last"] = suppressed
-        logger.warning(
+        log_fn(
             msg + " (suppressed_since_last=%d)",
             *args,
             suppressed,

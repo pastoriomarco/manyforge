@@ -3,16 +3,25 @@
 namespace manyforge::core {
 
 StopPolicy::StopPolicy(ExecutionStateMachine& sm, IScheduler& scheduler, IClock& clock,
-                       CacheInvalidationCallback on_invalidate)
+                       CacheInvalidationCallback on_invalidate,
+                       TerminalTransitionCallback terminal_transition)
     : sm_(sm), scheduler_(scheduler), clock_(clock),
-      on_invalidate_(std::move(on_invalidate)) {}
+      on_invalidate_(std::move(on_invalidate)),
+      terminal_transition_(std::move(terminal_transition)) {}
+
+Result<void> StopPolicy::transition_terminal(ExecutionState state) {
+    if (terminal_transition_) {
+        return terminal_transition_(state);
+    }
+    return sm_.try_transition(state);
+}
 
 Result<void> StopPolicy::request_soft_stop(Duration deceleration_ns) {
     auto current = sm_.status().state;
 
     // From Planning or Validating: direct to Stopped (cancel in-flight).
     if (current == ExecutionState::kPlanning || current == ExecutionState::kValidating) {
-        auto result = sm_.try_transition(ExecutionState::kStopped);
+        auto result = transition_terminal(ExecutionState::kStopped);
         if (!result.ok()) return result;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -35,7 +44,9 @@ Result<void> StopPolicy::request_soft_stop(Duration deceleration_ns) {
 
         auto deadline = clock_.now() + deceleration_ns;
         ScheduleHandle handle = scheduler_.schedule(deadline, [this]() {
-            sm_.try_transition(ExecutionState::kStopped);
+            // Stop authority asserting its own terminal; a failure means a
+            // higher-priority terminal already latched — benign to discard.
+            (void)transition_terminal(ExecutionState::kStopped);
             if (stop_callback_) stop_callback_();
         });
         {
@@ -54,7 +65,7 @@ Result<void> StopPolicy::request_soft_stop(Duration deceleration_ns) {
             stop_requested_ = true;
         }
         if (on_invalidate_) on_invalidate_();
-        auto result2 = sm_.try_transition(ExecutionState::kStopped);
+        auto result2 = transition_terminal(ExecutionState::kStopped);
         if (!result2.ok()) return result2;
         if (stop_callback_) stop_callback_();
         return Result<void>::Ok();
@@ -77,19 +88,19 @@ Result<void> StopPolicy::request_hard_stop() {
 
     // From Planning or Validating: direct to Stopped.
     if (current == ExecutionState::kPlanning || current == ExecutionState::kValidating) {
-        auto result = sm_.try_transition(ExecutionState::kStopped);
+        auto result = transition_terminal(ExecutionState::kStopped);
         if (!result.ok()) return result;
     }
     // From Stopping: upgrade soft → hard (immediate Stopped).
     else if (current == ExecutionState::kStopping) {
-        auto result = sm_.try_transition(ExecutionState::kStopped);
+        auto result = transition_terminal(ExecutionState::kStopped);
         if (!result.ok()) return result;
     }
     // From Executing or Paused: → Stopping → Stopped.
     else if (current == ExecutionState::kExecuting || current == ExecutionState::kPaused) {
         auto result = sm_.try_transition(ExecutionState::kStopping);
         if (!result.ok()) return result;
-        auto result2 = sm_.try_transition(ExecutionState::kStopped);
+        auto result2 = transition_terminal(ExecutionState::kStopped);
         if (!result2.ok()) return result2;
     }
     else {

@@ -768,3 +768,31 @@ def test_probe_search_move_writes_outcome_with_trip_details():
     assert outcome.trip is not None
     assert outcome.trip.executed_stop_mode == "spring_back_hold"
     assert outcome.trip.stop_distance_rad == 0.01
+
+
+def test_scoped_nodes_attach_program_run_id_from_blackboard():
+    """Scoped motion nodes must carry the same spec/500 §2.2 correlation id
+    as plain moves — a probe move's kernel events are part of the run's
+    story too."""
+    kernel = MockKernelClient()
+    node = _move_until_signal()
+    _wire_blackboard(node, kernel)
+
+    bb = py_trees.blackboard.Client(name="test_program_run_id_writer")
+    bb.register_key(key="program_run_id", access=py_trees.common.Access.WRITE)
+    bb.program_run_id = "run-test-cafe0123"
+
+    _tick(node)
+    assert kernel.last_execute_request is not None
+    assert kernel.last_execute_request.program_run_id == "run-test-cafe0123"
+
+
+def test_scoped_nodes_execute_without_program_run_id():
+    """Standalone trees (no cycle manager) must run identically without it."""
+    kernel = MockKernelClient()
+    node = _probe_search_move()
+    _wire_blackboard(node, kernel)
+
+    _tick(node)
+    assert kernel.last_execute_request is not None
+    assert kernel.last_execute_request.program_run_id is None

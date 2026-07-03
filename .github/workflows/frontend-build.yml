@@ -35,5 +35,7 @@ jobs:
           fi
       - name: Type-check
         run: npx tsc --noEmit -p tsconfig.app.json
+      - name: Unit tests
+        run: npm test
       - name: Build
         run: npm run build

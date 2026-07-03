@@ -11,6 +11,8 @@ The server communicates over stdio using the MCP protocol.
 from __future__ import annotations
 
 import base64
+import contextvars
+import functools
 import json
 import logging
 import re
@@ -23,6 +25,39 @@ from .state import ComposerState
 from .security import is_valid_principal_id
 
 logger = logging.getLogger(__name__)
+
+# Actor identity for the in-flight HTTP MCP dispatch. FastMCP drops
+# arguments a tool's signature does not declare, so a principal injected
+# into tool args never reaches the audit wrapper for principal-less tools
+# (e.g. manyforge_scene_state); the HTTP route parks the authenticated
+# session principal here instead.
+current_mcp_principal: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "current_mcp_principal", default=None
+)
+
+
+def _dispatch_outcome(return_value: Any) -> tuple[bool, Optional[str]]:
+    """Best-effort success/error extraction from a tool's JSON payload.
+
+    MCP tools report rejections as structured payloads, not exceptions —
+    an {"error": ...} or {"success": false} result is a FAILED dispatch
+    for audit purposes, or the ERROR-severity/fsync guarantee for failed
+    dispatches would never fire on the MCP lane.
+    """
+    if not isinstance(return_value, str):
+        return True, None
+    try:
+        payload = json.loads(return_value)
+    except ValueError:
+        return True, None
+    if not isinstance(payload, dict):
+        return True, None
+    error = payload.get("error")
+    if payload.get("success") is False:
+        return False, str(error or payload.get("message") or "tool reported success=false")
+    if error:
+        return False, str(error)
+    return True, None
 
 
 def _valid_trigger_reasons() -> set[str]:
@@ -78,9 +113,64 @@ def create_mcp_server(state: ComposerState):
         ),
     )
 
+    def audited_tool():
+        """Tool registration plus a durable dispatch-audit record.
+
+        One choke point for BOTH transports (stdio FastMCP loop and the
+        HTTP /api/mcp bridge dispatch through mcp.call_tool): every tool
+        call lands in durable history with actor, argument hashes,
+        outcome, and duration. functools.wraps preserves the signature
+        FastMCP introspects, so tool schemas are unchanged — the
+        contracts-freshness CI guard verifies that.
+        """
+
+        def decorator(fn):
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                started = time.monotonic()
+                success = True
+                error: Optional[str] = None
+                try:
+                    return_value = fn(*args, **kwargs)
+                    success, error = _dispatch_outcome(return_value)
+                    return return_value
+                except Exception as exc:
+                    success, error = False, str(exc)
+                    raise
+                finally:
+                    recorder = getattr(state, "event_recorder", None)
+                    if recorder is not None:
+                        try:
+                            recorder.record_tool_dispatch(
+                                tool_id=fn.__name__,
+                                lane="mcp",
+                                principal_id=(
+                                    str(kwargs.get("principal_id") or "")
+                                    or current_mcp_principal.get()
+                                    or None
+                                ),
+                                arguments={
+                                    k: v
+                                    for k, v in kwargs.items()
+                                    if k != "principal_id" and v is not None
+                                }
+                                or None,
+                                success=success,
+                                error=error,
+                                duration_ms=(time.monotonic() - started) * 1000,
+                            )
+                        except Exception:  # noqa: BLE001 — audit must not break the tool
+                            logger.exception(
+                                "tool dispatch audit failed for %s", fn.__name__
+                            )
+
+            return mcp.tool()(wrapper)
+
+        return decorator
+
     # ── Scene State ──────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_scene_state() -> str:
         """Get the full scene state including robot joint positions, TCP pose, and all collision objects.
 
@@ -106,10 +196,11 @@ def create_mcp_server(state: ComposerState):
 
     # ── Scene Edit ───────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_scene_edit(
         operation: str,
         object_id: str,
+        principal_id: Optional[str] = None,
         shape_type: Optional[str] = None,
         box_dimensions_m: Optional[list[float]] = None,
         sphere_radius_m: Optional[float] = None,
@@ -122,6 +213,11 @@ def create_mcp_server(state: ComposerState):
         frame_id: Optional[str] = None,
     ) -> str:
         """Edit the collision scene at runtime.
+
+        principal_id: optional actor identity; recorded on the durable
+        per-tool dispatch audit so assistant-caused scene changes are
+        distinguishable from operator ones. Server-injected on
+        authenticated HTTP MCP sessions.
 
         Operations:
         - "add": Add a collision object (requires shape_type, pose)
@@ -204,7 +300,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Program Load ─────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_program_load(
         program_path: str,
         deployment_path: Optional[str] = None,
@@ -272,7 +368,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Program Tree ─────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_program_tree(
         action: str = "read",
         tree: Optional[dict] = None,
@@ -336,7 +432,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Program Validate ─────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_program_validate(tree: dict) -> str:
         """Validate a candidate behavior tree without applying it.
 
@@ -386,7 +482,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Cycle Control ────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_cycle_control(
         command: str,
         velocity_scale: Optional[float] = None,
@@ -500,7 +596,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Capabilities ─────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_capabilities() -> str:
         """Query the deployment-declared capability surface.
 
@@ -516,7 +612,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Skills ───────────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_skills() -> str:
         """Get the skill catalog — validated subtree templates for common operations.
 
@@ -559,7 +655,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Intervention ─────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_intervention(
         action: str,
         tree: Optional[dict] = None,
@@ -739,7 +835,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Runtime Overrides ────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_runtime_override(
         action: str,
         node_name: Optional[str] = None,
@@ -884,7 +980,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Execution Status ─────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_execution_status(
         include: str = "digest",
     ) -> str:
@@ -919,7 +1015,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Debug Export ─────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_debug_export(run_id: Optional[str] = None) -> str:
         """Export a full debug/trace bundle for post-mortem analysis.
 
@@ -934,7 +1030,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Catalog ──────────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_catalog(entry_id: Optional[str] = None) -> str:
         """Query the behavior tree node catalog.
 
@@ -960,7 +1056,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Scene Snapshot ──────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_scene_snapshot(
         width: int = 640,
         height: int = 480,
@@ -1002,7 +1098,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Program Save ────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_program_save(path: Optional[str] = None) -> str:
         """Save the currently loaded program to a YAML file.
 
@@ -1033,7 +1129,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── File Browser ────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_files(
         path: Optional[str] = None,
         kind: Optional[str] = None,
@@ -1100,7 +1196,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Deployment Reader ───────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_deployment() -> str:
         """Get the currently loaded deployment configuration.
 
@@ -1123,7 +1219,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Kernel ─────────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_kernel(include: str = "snapshot") -> str:
         """Get kernel execution state and metrics.
 
@@ -1154,7 +1250,7 @@ def create_mcp_server(state: ComposerState):
 
     # ── Session ────────────────────────────────────────────────────────
 
-    @mcp.tool()
+    @audited_tool()
     def manyforge_session(action: str = "status") -> str:
         """Manage the composer session state.
 

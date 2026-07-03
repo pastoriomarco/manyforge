@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from .models import (
     CycleCommandErrorResponse,
     CycleStatusResponse,
@@ -210,7 +210,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
         }
 
     @router.post("/reset", response_model=CycleCommandResponse, response_model_by_alias=True)
-    def reset_cycle() -> dict:
+    def reset_cycle(request: Request) -> dict:
         """Reset the cycle (any→IDLE)."""
         if state.cycle_manager is None:
             raise HTTPException(
@@ -221,6 +221,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
             )
         override_status = state.runtime_override_status()
         prev = state.cycle_manager.state.value
+        request_id = getattr(request.state, "request_id", None)
         if override_status["has_staged"]:
             try:
                 state.activate_staged_runtime_overrides()
@@ -234,7 +235,15 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                     ),
                 )
         else:
-            state.cycle_manager.reset()
+            try:
+                state.cycle_manager.reset(
+                    request_id=request_id if isinstance(request_id, str) else None
+                )
+            except RuntimeError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_structured_command_error(state, str(exc)),
+                )
         try:
             state.reset_backend_authoritative_sim_if_needed(reason="cycle_reset")
         except RuntimeError as exc:

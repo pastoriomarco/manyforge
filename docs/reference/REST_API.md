@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-06-19 12:07:56 UTC
+  Last regenerated: 2026-07-03 06:45:42 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -36,6 +36,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/catalog` | catalog | Get Catalog |
 | `GET` | `/api/catalog/{entry_id}` | catalog | Get Catalog Entry |
 | `POST` | `/api/cycle/acknowledge-intervention-for-retry` | cycle | Acknowledge Intervention For Retry |
+| `POST` | `/api/cycle/full-stop` | cycle | Full Stop Cycle |
 | `POST` | `/api/cycle/reset` | cycle | Reset Cycle |
 | `POST` | `/api/cycle/run` | cycle | Run Cycle |
 | `GET` | `/api/cycle/status` | cycle | Get Status |
@@ -73,6 +74,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/kernel/events` | kernel | Get Kernel Events |
 | `GET` | `/api/kernel/metrics` | kernel | Get Kernel Metrics |
 | `GET` | `/api/kernel/snapshot` | kernel | Get Kernel Snapshot |
+| `POST` | `/api/kernel/stop` | kernel | Kernel Stop |
 | `GET` | `/api/program` | program | Get Program |
 | `POST` | `/api/program/load` | program | Load Program |
 | `GET` | `/api/program/runtime-overrides` | program | Get Runtime Override Status |
@@ -112,8 +114,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `POST` | `/api/scene/snapshot/upload/{request_id}` | scene-snapshot | Upload Snapshot |
 | `GET` | `/api/scene/snapshots/{snapshot_id}` | scene | Get Published Scene Snapshot |
 | `GET` | `/api/scene/state` | scene | Get Scene State |
+| `GET` | `/api/scene/urdf/collision-meshes/{link_name}/{collision_index}` | scene-urdf | Get Collision Mesh |
 | `GET` | `/api/scene/urdf/manifest` | scene-urdf | Get Manifest |
 | `GET` | `/api/scene/urdf/meshes/{link_name}/{visual_index}` | scene-urdf | Get Mesh |
+| `GET` | `/api/scene/urdf/models/{model_key}/collision-meshes/{link_name}/{collision_index}` | scene-urdf | Get Model Collision Mesh |
 | `GET` | `/api/scene/urdf/models/{model_key}/meshes/{link_name}/{visual_index}` | scene-urdf | Get Model Mesh |
 | `POST` | `/api/session/apply` | program | Apply Session |
 | `POST` | `/api/simulation/entity-state` | simulation | Set Entity State |

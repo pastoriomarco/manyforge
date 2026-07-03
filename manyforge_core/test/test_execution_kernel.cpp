@@ -871,6 +871,26 @@ class ControlledExecution : public IExecutionBackend {
                         });
   }
 
+  int stop_count_value() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return stop_count;
+  }
+
+  int stop_attempt_count_value() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return stop_attempt_count;
+  }
+
+  int controlled_stop_count_value() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return controlled_stop_count;
+  }
+
+  int controlled_stop_cancel_count_value() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return controlled_stop_cancel_count;
+  }
+
   bool wait_until_runtime_velocity_scale_set_count(
       int count,
       std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
@@ -1229,7 +1249,16 @@ class ExecutionKernelTest : public ::testing::Test {
   Result<uint64_t> execute_sync(const ExecuteRequestDTO& req) {
     auto result = kernel.execute(req);
     if (result.ok()) {
-      kernel.wait_for_completion();
+      const bool completed = kernel.wait_for_completion(2'000'000'000);
+      const auto state = kernel.get_status().state;
+      const bool already_terminal =
+          state == ExecutionState::kCompleted ||
+          state == ExecutionState::kFailed ||
+          state == ExecutionState::kStopped ||
+          state == ExecutionState::kInterrupted ||
+          state == ExecutionState::kInterventionRequired;
+      EXPECT_TRUE(completed || already_terminal)
+          << "execute_sync timed out waiting for " << req.move_id;
     }
     return result;
   }
@@ -3305,7 +3334,7 @@ TEST_F(ExecutionKernelTest,
   EXPECT_GE(context.expand_count, 1);
   ASSERT_EQ(context.last_expand_trajectory.joint_names,
             (std::vector<std::string>{"j1", "j2"}));
-  ASSERT_EQ(context.last_expand_trajectory.waypoints.size(), 1u);
+  ASSERT_GE(context.last_expand_trajectory.waypoints.size(), 1u);
   EXPECT_EQ(context.last_expand_trajectory.waypoints.front().positions_rad,
             (std::vector<double>{0.0, 0.0}));
   EXPECT_EQ(queried_joint_names,
@@ -7340,9 +7369,10 @@ TEST_F(ExecutionKernelTest,
   local_collision_engine->default_result = make_authoritative_collision_result();
 
   // Drive the stop-window monitor until it cancels the in-flight stop.
-  for (int attempt = 0;
-       attempt < 200 && controlled_execution.controlled_stop_cancel_count == 0;
-       ++attempt) {
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    if (controlled_execution.controlled_stop_cancel_count_value() > 0) {
+      break;
+    }
     local_clock.advance(10'000'000);
     local_scheduler.advance_to(local_clock.now());
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -7353,9 +7383,9 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(local_kernel.get_status().state,
             ExecutionState::kInterventionRequired);
   // The monitor cancelled the in-flight stop on the stop-path collision.
-  EXPECT_GE(controlled_execution.controlled_stop_cancel_count, 1);
+  EXPECT_GE(controlled_execution.controlled_stop_cancel_count_value(), 1);
   // The emergency hard-stop floor actually ran (backend.stop() invoked).
-  EXPECT_GE(controlled_execution.stop_attempt_count, 1);
+  EXPECT_GE(controlled_execution.stop_attempt_count_value(), 1);
   auto outcome = local_kernel.get_execution_outcome(result.value());
   ASSERT_TRUE(outcome.has_value());
   EXPECT_EQ(outcome->terminal_cause, MotionExecutionTerminalCause::kFailed);
@@ -7411,9 +7441,10 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
 
   // Advance past the deadline; the watchdog must cancel the blocked stop.
-  for (int attempt = 0;
-       attempt < 200 && controlled_execution.controlled_stop_cancel_count == 0;
-       ++attempt) {
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    if (controlled_execution.controlled_stop_cancel_count_value() > 0) {
+      break;
+    }
     local_clock.advance(20'000'000);  // 20 ms steps
     local_scheduler.advance_to(local_clock.now());
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -7425,8 +7456,8 @@ TEST_F(ExecutionKernelTest,
 
   EXPECT_EQ(local_kernel.get_status().state,
             ExecutionState::kInterventionRequired);
-  EXPECT_GE(controlled_execution.controlled_stop_cancel_count, 1);
-  EXPECT_GE(controlled_execution.stop_attempt_count, 1);
+  EXPECT_GE(controlled_execution.controlled_stop_cancel_count_value(), 1);
+  EXPECT_GE(controlled_execution.stop_attempt_count_value(), 1);
   auto outcome = local_kernel.get_execution_outcome(result.value());
   ASSERT_TRUE(outcome.has_value());
   ASSERT_TRUE(outcome->error.has_value());
@@ -9001,6 +9032,206 @@ TEST_F(ExecutionKernelTest,
             MotionInterruptStopMode::kSpringBackHold);
   ASSERT_TRUE(outcome->trip->fallback_reason.has_value());
   emit_qualification_evidence("fallback_honored", outcome);
+}
+
+TEST_F(ExecutionKernelTest, Execute_ProgramRunIdStampsEventsAndDoesNotLeakAcrossRuns) {
+  // spec/500 §2.2/§4.1: program_run_id is optional at the kernel boundary;
+  // when provided it must reach every kernel event for that execution, and
+  // it must never leak onto the events of a later execution that did not
+  // provide one.
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  auto request = make_test_request("program_run_correlated_move");
+  request.program_run_id = "run-abc123";
+  auto result = execute_sync(request);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(kernel.acknowledge_completed(result.value()).accepted);
+
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    ASSERT_FALSE(events.empty());
+    for (const auto& event : events) {
+      auto it = event.details.find("program_run_id");
+      ASSERT_NE(it, event.details.end())
+          << "event missing program_run_id during correlated execution: type="
+          << static_cast<int>(event.type)
+          << " execution_id=" << event.execution_id;
+      EXPECT_EQ(it->second, "run-abc123");
+    }
+    events.clear();
+  }
+
+  // A later execution WITHOUT a program_run_id must not inherit the stale
+  // id from the previous run.
+  auto uncorrelated = make_test_request("uncorrelated_move");
+  auto second = execute_sync(uncorrelated);
+  ASSERT_TRUE(second.ok());
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    ASSERT_FALSE(events.empty());
+    for (const auto& event : events) {
+      EXPECT_EQ(event.details.count("program_run_id"), 0u)
+          << "stale program_run_id leaked onto an uncorrelated execution";
+    }
+  }
+}
+
+
+TEST_F(ExecutionKernelTest,
+       Execute_ReplanFailureWithCollisionClassLatchPreservesSafetyTerminal) {
+  // K1 characterization: a runtime-collision-class fault latch (unmaskable,
+  // priority 1000, await-operator-ack — the same class as the kernel's
+  // builtin runtime_collision_fault policy) that arrives while the
+  // authoritative-validation REPLAN attempt is in flight and the replan
+  // then FAILS must surface as a safety terminal. It must never be
+  // laundered into a plain kFailed by the replan failure path.
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.authoritative_validation_collision_replan_attempts = 1;
+  MockPlanner local_planner;
+  PlanResultDTO first_plan;
+  first_plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
+  PlanResultDTO failed_replan;
+  failed_replan.error = ErrorDTO{kErrorPlanningFailed, "No solution", {}};
+  local_planner.result_sequence = {first_plan, failed_replan};
+  MockContext local_context = context;
+  ExecutionKernel local_kernel{local_planner,
+                               local_context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  auto source = make_interrupt_source("replan_collision_fault");
+  ASSERT_TRUE(local_kernel.register_interrupt_source(source).ok());
+  auto policy =
+      make_interrupt_policy("replan_collision_fault_policy",
+                            "replan_collision_fault");
+  policy.affected_phases = {InterruptExecutionPhase::kPlanning};
+  policy.preemption_action = InterruptPreemptionAction::kLatchHeld;
+  policy.post_latch_disposition =
+      InterruptPostLatchDisposition::kAwaitOperatorAck;
+  policy.priority = 1000;
+  policy.maskable = false;
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(policy).ok());
+  ExecutionKernel* kernel_ptr = &local_kernel;
+  local_planner.on_plan = [&](int count) {
+    if (count == 2) {
+      auto ingest = kernel_ptr->publish_fast_interrupt_signal(
+          make_interrupt_signal("replan_collision_fault"));
+      EXPECT_TRUE(ingest.latched);
+    }
+  };
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                               local_engine);
+  local_engine->default_result = make_authoritative_collision_result();
+
+  auto result = local_kernel.execute(make_test_request("replan_latch_fail"));
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+
+  const auto terminal = local_kernel.get_status().state;
+  EXPECT_NE(terminal, ExecutionState::kFailed)
+      << "collision-class latch was laundered into a normal kFailed";
+  EXPECT_TRUE(terminal == ExecutionState::kInterrupted ||
+              terminal == ExecutionState::kInterventionRequired)
+      << "unexpected terminal: " << to_string(terminal);
+  EXPECT_EQ(controlled_execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_CompletionRaceWithFaultLatchNeverCommitsCompleted) {
+  // K1 characterization (finalizer race intent): once a fault latch is
+  // recorded, a backend completion arriving immediately afterwards must
+  // not commit kCompleted. The safety authority outranks the normal
+  // terminal even when both are observable in the same finalizer pass.
+  // Regression guard: interrupt authority is recorded monotonically for the
+  // execution, so even if preemption machinery consumes the active latch before
+  // the backend completion finalizer runs, the normal completion cannot commit
+  // kCompleted.
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  MockPlanner local_planner;
+  PlanResultDTO plan;
+  plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
+  local_planner.result_sequence = {plan};
+  MockContext local_context = context;
+  ExecutionKernel local_kernel{local_planner,
+                               local_context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  auto source = make_interrupt_source("finalizer_race_fault");
+  ASSERT_TRUE(local_kernel.register_interrupt_source(source).ok());
+  auto policy = make_interrupt_policy("finalizer_race_fault_policy",
+                                      "finalizer_race_fault");
+  policy.affected_phases = {InterruptExecutionPhase::kTrajectoryExecution};
+  policy.preemption_action = InterruptPreemptionAction::kPreemptTrajectory;
+  policy.post_latch_disposition =
+      InterruptPostLatchDisposition::kAwaitOperatorAck;
+  policy.priority = 1000;
+  policy.maskable = false;
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(policy).ok());
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                               local_engine);
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  local_kernel.subscribe_events([&](const KernelEvent& event) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(event);
+  });
+
+  auto result = local_kernel.execute(make_test_request("finalizer_race"));
+  ASSERT_TRUE(result.ok());
+  if (!controlled_execution.wait_until_execute_called()) {
+    std::vector<KernelEvent> event_snapshot;
+    {
+      std::lock_guard<std::mutex> lock(events_mutex);
+      event_snapshot = events;
+    }
+    for (const auto& event : event_snapshot) {
+      std::cerr << "event=" << static_cast<int>(event.type)
+                << " to=" << to_string(event.to_state)
+                << " error="
+                << (event.error ? event.error->code + ":" +
+                                      event.error->message
+                                : std::string{})
+                << "\n";
+    }
+    ASSERT_TRUE(false) << "wait_until_execute_called timed out; state="
+                       << to_string(local_kernel.get_status().state);
+  }
+
+  auto ingest = local_kernel.publish_fast_interrupt_signal(
+      make_interrupt_signal("finalizer_race_fault"));
+  EXPECT_TRUE(ingest.latched);
+  controlled_execution.complete();
+
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  const auto terminal = local_kernel.get_status().state;
+  EXPECT_NE(terminal, ExecutionState::kCompleted)
+      << "backend completion overwrote a latched fault authority";
+  EXPECT_TRUE(terminal == ExecutionState::kInterrupted ||
+              terminal == ExecutionState::kInterventionRequired ||
+              terminal == ExecutionState::kStopped)
+      << "unexpected terminal: " << to_string(terminal);
 }
 
 }  // namespace

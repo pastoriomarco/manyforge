@@ -908,6 +908,9 @@ class ComposerState:
         self.cycle_manager.set_on_delegated_recovery_requested(
             self._record_delegated_recovery_requested,
         )
+        self.cycle_manager.set_on_reset_phase_event(
+            self._record_cycle_reset_phase,
+        )
 
     def _current_or_last_run_id_for_recovery(self) -> Optional[str]:
         self.event_recorder.observe(self, force=True)
@@ -915,6 +918,9 @@ class ComposerState:
 
     def _record_delegated_recovery_requested(self, request) -> None:
         self.event_recorder.record_delegated_recovery_requested(request)
+
+    def _record_cycle_reset_phase(self, event: dict[str, Any]) -> None:
+        self.event_recorder.record_cycle_reset_phase(event)
 
     @property
     def kernel(self) -> Optional[KernelClient]:
@@ -1731,7 +1737,11 @@ class ComposerState:
         not.
         """
         with self._visual_scene_objects_lock:
-            objects = copy.deepcopy(self._visual_scene_objects)
+            # Shallow list copy: the cache list is replaced wholesale on
+            # refresh (never mutated in place) and elements are read-only
+            # by contract — the 15 Hz publish path deep-copied every
+            # object on every tick.
+            objects = list(self._visual_scene_objects)
             timestamp_ns = self._visual_scene_objects_timestamp_ns
             attempt_ns = self._visual_scene_objects_refresh_attempt_ns
             running = self._visual_scene_objects_refresh_running
@@ -1767,7 +1777,9 @@ class ComposerState:
         if not link_poses:
             return objects, meta
         with self._visual_scene_objects_lock:
-            offsets = copy.deepcopy(self._visual_scene_object_attachment_offsets)
+            # Shallow copy: offset pose dicts are read-only downstream
+            # (matrix helpers copy their inputs).
+            offsets = dict(self._visual_scene_object_attachment_offsets)
             for obj in objects:
                 if (
                     not obj.attached
@@ -1799,7 +1811,12 @@ class ComposerState:
                 offsets[obj.object_id] = offset
         composed: list[SceneObjectSnapshot] = []
         for obj in objects:
-            next_obj = copy.deepcopy(obj)
+            # Copy-on-write: only an attached object whose pose is being
+            # recomposed needs its own instance, and a SHALLOW copy at
+            # that — the recomposed pose is assigned as a brand-new dict,
+            # every other field stays shared read-only. Unattached
+            # objects pass through untouched. The previous version
+            # deep-copied every object on every 15 Hz publish tick.
             if obj.attached and obj.frame_id:
                 offset = offsets.get(obj.object_id)
                 frame_pose = link_poses.get(obj.frame_id)
@@ -1816,10 +1833,13 @@ class ComposerState:
                         position, orientation = _matrix_to_pose(
                             _multiply_matrices(frame_matrix, local_matrix)
                         )
+                        next_obj = copy.copy(obj)
                         next_obj.pose_in_universe = {
                             "position_m": position,
                             "orientation_xyzw": orientation,
                         }
+                        composed.append(next_obj)
+                        continue
                     except Exception:
                         logger.debug(
                             "failed to compose visual attached-object pose",
@@ -1830,7 +1850,7 @@ class ComposerState:
                                 "frame_id": obj.frame_id,
                             },
                         )
-            composed.append(next_obj)
+            composed.append(obj)
         return composed, meta
 
     def _visual_scene_world_frame(self) -> str:
@@ -2204,9 +2224,18 @@ class ComposerState:
             self._visual_state_last_reason = reason
 
     def visual_state_snapshot(self) -> tuple[Any | None, dict[str, Any]]:
-        """Return the latest published visual snapshot and freshness metadata."""
+        """Return the latest published visual snapshot and freshness metadata.
+
+        The snapshot is the SHARED published object — read-only by
+        contract. A consumer that needs a mutated variant must use
+        `snapshot.model_copy(update=...)`, never assign to its fields.
+        """
         with self._visual_state_lock:
-            snapshot = copy.deepcopy(self._visual_state_snapshot)
+            # SHARED, not copied: the published snapshot is replaced
+            # wholesale by the publisher and treated read-only by every
+            # consumer (routes needing a variant use model_copy). The
+            # previous per-read deepcopy ran on two 10 Hz poller routes.
+            snapshot = self._visual_state_snapshot
             timestamp_ns = self._visual_state_timestamp_ns
             duration_ms = self._visual_state_last_duration_ms
             error = self._visual_state_last_error

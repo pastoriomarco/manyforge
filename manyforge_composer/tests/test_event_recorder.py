@@ -1010,3 +1010,89 @@ class TestSynthesizedSemanticEvents:
         assert "execute_started" not in types
         assert "validation_failed" in types
         rec.close()
+
+
+class TestDurableFaultWrites:
+    """WARN+ events are fsync'd so a fault survives an immediate power loss."""
+
+    def test_fault_events_fsync_but_steady_state_events_do_not(
+        self, tmp_path, monkeypatch
+    ):
+        import os as os_module
+
+        import manyforge_composer.backend.event_recorder as er
+
+        fsynced: list[int] = []
+        real_fsync = os_module.fsync
+
+        def recording_fsync(fd):
+            fsynced.append(fd)
+            return real_fsync(fd)
+
+        monkeypatch.setattr(er.os, "fsync", recording_fsync)
+
+        rec = EventRecorder(observe_min_interval_s=0.0, trace_dir=tmp_path)
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
+        assert rec.wait_for_jsonl_idle()
+        assert fsynced == []  # steady-state INFO events stay in page cache
+
+        rec.observe(
+            _StubState(
+                cycle_manager=_StubCycleManager(
+                    "stopped", error="collision detected"
+                )
+            )
+        )
+        assert rec.wait_for_jsonl_idle()
+        assert len(fsynced) >= 1  # the fault-grade event hit the platter
+        rec.close()
+
+
+class TestProgramRunIdAdoption:
+    """spec/500 §2.2: the orchestrator runner is the authoritative minter —
+    the recorder adopts its id so durable history, kernel-stamped events,
+    and runner records share one id space."""
+
+    def test_recorder_adopts_runner_minted_run_id(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        manager = _StubCycleManager("idle")
+        rec.observe(_StubState(cycle_manager=manager))
+
+        manager_running = _StubCycleManager("running")
+        manager_running.program_run_id = "run-20260703T000000Z-cafe0123"
+        rec.observe(_StubState(cycle_manager=manager_running))
+
+        assert rec.current_run_id == "run-20260703T000000Z-cafe0123"
+
+    def test_recorder_mints_when_runner_offers_no_id(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
+        assert rec.current_run_id and rec.current_run_id.startswith("run-")
+
+    def test_native_kernel_event_routes_to_its_stamped_run(self):
+        """A kernel-stamped program_run_id is canonical: the durable event
+        carries it top-level and history filters find it — even when the
+        event is drained after a different run became current."""
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "error_raised",
+                    "execution_id": 7,
+                    "event_index": 1,
+                    "timestamp_ns": 123,
+                    "program_run_id": "run-kernel-stamped-01",
+                    "error": {"code": -1, "message": "boom"},
+                    "details": {"program_run_id": "run-kernel-stamped-01"},
+                }
+            ]
+        )
+        result = rec.history(
+            run_id="run-kernel-stamped-01",
+            program_run_id="run-kernel-stamped-01",
+        )
+        events = result["events"]
+        assert events, "programRunId filter missed the kernel-stamped id"
+        assert events[-1]["program_run_id"] == "run-kernel-stamped-01"

@@ -23,6 +23,7 @@ from manyforge_behavior.kernel_client import (
     Trajectory,
     TrajectoryWaypoint,
 )
+import manyforge_behavior.cycle_manager as cycle_manager_module
 from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.deployment import Deployment
 from manyforge_composer.backend.state import ComposerState
@@ -583,6 +584,50 @@ def test_reset_from_running(client, state):
     assert response.status_code == 200
     data = response.json()
     assert data["state"] == "idle"
+
+
+def test_reset_phase_timeout_returns_structured_409(monkeypatch):
+    """A reset phase timeout is operator-visible and request-correlated."""
+
+    class SlowResetKernel(MockKernelClient):
+        def reset(self):  # type: ignore[override]
+            time.sleep(0.02)
+            return super().reset()
+
+    monkeypatch.setattr(cycle_manager_module, "_RESET_PHASE_DEADLINE_S", 0.001)
+    kernel = SlowResetKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as local_client:
+        assert (
+            local_client.post(
+                "/api/program/load", json={"path": _PROGRAM_PATH}
+            ).status_code
+            == 200
+        )
+        assert state.cycle_manager is not None
+        kernel._state = ExecutionState.STOPPED  # noqa: SLF001
+        response = local_client.post(
+            "/api/cycle/reset",
+            headers={"X-Request-ID": "reset-timeout-ticket"},
+        )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["errorCode"] == "reset_kernel_reset_timeout"
+    assert detail["errorDetails"]["phase"] == "kernel_reset"
+    assert "kernel_reset" in detail["message"]
+    events = state.event_recorder.get_events_since(0)
+    failed = [
+        event
+        for event in events
+        if event["type"] == "cycle_reset_phase_failed"
+        and event.get("details", {}).get("phase") == "kernel_reset"
+    ]
+    assert failed
+    assert failed[-1]["details"]["request_id"] == "reset-timeout-ticket"
+    assert failed[-1]["severity"] == "ERROR"
 
 
 def test_reset_refreshes_visual_scene_after_runtime_object_removal(client, state):
@@ -4414,3 +4459,309 @@ def test_kernel_events_have_correct_structure():
             assert "event_index" in event
 
         client.post("/api/cycle/reset")
+
+
+def test_kernel_stop_route_stops_active_kernel_without_cycle_layer():
+    """POST /api/kernel/stop is the operator backstop: it must stop an active
+    kernel regardless of what the cycle layer believes its state is."""
+    kernel = MockKernelClient(execute_duration_s=5.0)
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        # Drive the kernel active directly, bypassing the cycle layer
+        # entirely — the exact situation the backstop exists for.
+        kernel._state = ExecutionState.EXECUTING
+
+        response = client.post("/api/kernel/stop")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["accepted"] is True
+    assert data["kernel_state"] == "stopped"
+    assert kernel.get_status().state == ExecutionState.STOPPED
+
+
+def test_kernel_stop_route_reports_rejection_honestly():
+    """A kernel with nothing to stop must report the rejection, not a fake
+    success."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        response = client.post("/api/kernel/stop")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["accepted"] is False
+    assert data["error"]
+    assert data["kernel_state"] == "idle"
+
+
+def test_lifespan_shutdown_closes_kernel_before_recorder():
+    """Graceful shutdown must quiesce in order: kernel close (motion/gate
+    teardown) strictly before the event recorder flush, so the quiesce's own
+    events reach disk, and the recorder must actually be flushed."""
+    call_order: list[str] = []
+
+    class ClosableKernel(MockKernelClient):
+        def close(self):  # type: ignore[override]
+            call_order.append("kernel_close")
+
+    kernel = ClosableKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+
+    original_recorder_close = state.event_recorder.close
+
+    def recording_recorder_close(timeout_s: float = 5.0) -> bool:
+        call_order.append("recorder_close")
+        return original_recorder_close(timeout_s=timeout_s)
+
+    state.event_recorder.close = recording_recorder_close
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app):
+        pass  # startup + immediate graceful shutdown
+
+    assert call_order == ["kernel_close", "recorder_close"]
+
+
+def test_lifespan_shutdown_quiesces_running_cycle():
+    """A cycle still RUNNING at shutdown must be stopped through the kernel,
+    and the quiesce's own kernel events must be drained into durable history
+    before the recorder closes — not left behind in the kernel buffer."""
+    kernel = MockKernelClient(execute_duration_s=10.0)
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+
+    flush_calls: list[str] = []
+    original_record = state.event_recorder.record_native_kernel_events
+    original_close = state.event_recorder.close
+
+    def recording_record(events):
+        if events:
+            flush_calls.append("record_native_kernel_events")
+        return original_record(events)
+
+    def recording_close(timeout_s: float = 5.0) -> bool:
+        flush_calls.append("recorder_close")
+        return original_close(timeout_s=timeout_s)
+
+    state.event_recorder.record_native_kernel_events = recording_record
+    state.event_recorder.close = recording_close
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/program/load", json={"path": _PROGRAM_PATH}
+        )
+        assert response.status_code == 200
+        response = client.post("/api/cycle/run")
+        assert response.status_code == 200
+        deadline = time.time() + 2.0
+        while (
+            kernel.get_status().state != ExecutionState.EXECUTING
+            and time.time() < deadline
+        ):
+            time.sleep(0.01)
+        assert kernel.get_status().state == ExecutionState.EXECUTING
+        cycle_manager = state.cycle_manager
+        assert cycle_manager is not None
+        tick_thread = cycle_manager._tick_thread
+
+    # Context exit ran the lifespan shutdown: motion stopped, tick joined.
+    assert kernel.get_status().state in {
+        ExecutionState.STOPPED,
+        ExecutionState.IDLE,
+    }
+    assert kernel.stop_count >= 1
+    assert tick_thread is None or not tick_thread.is_alive()
+
+    # The stop's kernel events were drained out of the kernel buffer into
+    # the indexed cycle buffer before the recorder closed; nothing pending.
+    assert kernel.drain_kernel_events() == []
+    drained_types = {
+        str(event.get("type"))
+        for event in cycle_manager.get_kernel_events_since(0)
+    }
+    assert "stop_requested" in drained_types
+    # And the recorder saw the flush strictly before it was closed.
+    assert "record_native_kernel_events" in flush_calls
+    assert flush_calls.index("record_native_kernel_events") < flush_calls.index(
+        "recorder_close"
+    )
+
+
+class TestRequestIdAndLogThrottling:
+    """Request-ID middleware + per-route throttling of poller GET logs."""
+
+    def test_response_carries_generated_request_id(self, client):
+        response = client.get("/api/health")
+        assert response.status_code == 200
+        request_id = response.headers.get("x-request-id")
+        assert request_id and len(request_id) == 16
+
+    def test_incoming_request_id_is_honored_and_sanitized(self, client):
+        response = client.get(
+            "/api/health",
+            headers={"X-Request-ID": "launcher-run-42\n{injected}"},
+        )
+        # Log-injection characters are stripped; the usable identity survives.
+        assert response.headers["x-request-id"] == "launcher-run-42injected"
+
+    def test_successful_get_logs_are_throttled_per_route(self, caplog):
+        kernel = MockKernelClient()
+        state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+        app = create_app(state, security=_TEST_SECURITY)
+        with caplog.at_level(
+            logging.INFO, logger="manyforge_composer.backend.app"
+        ):
+            with TestClient(app) as local_client:
+                for _ in range(5):
+                    assert local_client.get("/api/health").status_code == 200
+        health_records = [
+            r for r in caplog.records if getattr(r, "path", "") == "/api/health"
+        ]
+        # One line per route per window; the rest suppressed with a count.
+        assert len(health_records) == 1
+        assert health_records[0].request_id
+        assert health_records[0].throttle_key == "request:GET:/api/health"
+
+    def test_mutations_and_failures_always_log(self, caplog):
+        kernel = MockKernelClient()
+        state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+        app = create_app(state, security=_TEST_SECURITY)
+        with caplog.at_level(
+            logging.INFO, logger="manyforge_composer.backend.app"
+        ):
+            with TestClient(app) as local_client:
+                local_client.post("/api/cycle/reset")
+                local_client.post("/api/cycle/reset")
+                local_client.get("/api/does-not-exist")
+                local_client.get("/api/does-not-exist")
+        posts = [
+            r
+            for r in caplog.records
+            if getattr(r, "method", "") == "POST"
+            and getattr(r, "path", "") == "/api/cycle/reset"
+        ]
+        missing = [
+            r
+            for r in caplog.records
+            if getattr(r, "path", "") == "/api/does-not-exist"
+        ]
+        # No throttling on the lines an operator greps for.
+        assert len(posts) == 2
+        assert len(missing) == 2
+        assert all(getattr(r, "status_code", 0) == 404 for r in missing)
+
+
+def test_internal_error_response_carries_request_id(caplog):
+    """The 500 path is where ticket correlation matters most: an unhandled
+    route exception must still produce an X-Request-ID header, a JSON body
+    with the id, and a structured traceback log carrying the same id."""
+    class MetricsBoomKernel(MockKernelClient):
+        def get_metrics(self):  # type: ignore[override]
+            raise ValueError("unhandled route failure")
+
+    kernel = MetricsBoomKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with caplog.at_level(logging.ERROR, logger="manyforge_composer.backend.app"):
+        with TestClient(app, raise_server_exceptions=False) as local_client:
+            response = local_client.get(
+                "/api/kernel/metrics",
+                headers={"X-Request-ID": "ticket-777"},
+            )
+
+    assert response.status_code == 500
+    assert response.headers["x-request-id"] == "ticket-777"
+    assert response.json() == {
+        "detail": "Internal Server Error",
+        "request_id": "ticket-777",
+    }
+    error_records = [
+        r for r in caplog.records if getattr(r, "request_id", "") == "ticket-777"
+    ]
+    assert error_records and error_records[0].exc_info is not None
+
+
+class TestVisualCacheReadOnlyContract:
+    """The observer caches are returned SHARED (no per-read deepcopy on the
+    10-15 Hz paths). These tests pin the two invariants that make that
+    safe: composing attached poses never mutates the cache, and routes
+    mutate copies, never the shared snapshot."""
+
+    def _seed_attached_object(self, state):
+        from manyforge_behavior.kernel_client import (
+            SceneObjectSnapshot,
+            SceneShape,
+        )
+
+        obj = SceneObjectSnapshot(
+            object_id="attached_box",
+            shape=SceneShape(type="box", box_dimensions_m=[0.1, 0.1, 0.1]),
+            pose_in_universe={
+                "position_m": [0.5, 0.0, 0.5],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+            attached=True,
+            frame_id="tool0",
+        )
+        with state._visual_scene_objects_lock:
+            state._visual_scene_objects = [obj]
+            state._visual_scene_objects_timestamp_ns = time.monotonic_ns()
+        return obj
+
+    def test_compose_attached_pose_does_not_mutate_cache(self, state):
+        cached = self._seed_attached_object(state)
+        original_pose = dict(cached.pose_in_universe)
+
+        moved_frame = {
+            "tool0": {
+                "position_m": [1.5, 1.0, 1.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
+        }
+        # First call derives the attachment offset; second composes a
+        # genuinely different pose from the moved frame.
+        state.visual_scene_objects_for_link_poses(
+            {
+                "tool0": {
+                    "position_m": [0.5, 0.0, 0.5],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                }
+            }
+        )
+        composed, _ = state.visual_scene_objects_for_link_poses(moved_frame)
+
+        assert composed[0].pose_in_universe != original_pose
+        # Copy-on-write: the recomposed object is a different instance and
+        # the cached object's pose is untouched.
+        assert composed[0] is not cached
+        assert cached.pose_in_universe == original_pose
+
+    def test_unattached_objects_pass_through_shared(self, state):
+        from manyforge_behavior.kernel_client import (
+            SceneObjectSnapshot,
+            SceneShape,
+        )
+
+        obj = SceneObjectSnapshot(
+            object_id="free_box",
+            shape=SceneShape(type="box", box_dimensions_m=[0.1, 0.1, 0.1]),
+            pose_in_universe={
+                "position_m": [0.1, 0.0, 0.05],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+            attached=False,
+        )
+        with state._visual_scene_objects_lock:
+            state._visual_scene_objects = [obj]
+            state._visual_scene_objects_timestamp_ns = time.monotonic_ns()
+
+        composed, _ = state.visual_scene_objects_for_link_poses(
+            {"tool0": {"position_m": [0, 0, 0], "orientation_xyzw": [0, 0, 0, 1]}}
+        )
+        assert composed[0] is obj  # no copy for objects that need none

@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-06-19 12:07:56 UTC
+  Last regenerated: 2026-07-03 06:45:43 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_contract
 -->
 
@@ -641,6 +641,18 @@ Input schema:
     "object_id": {
       "title": "Object Id",
       "type": "string"
+    },
+    "principal_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Principal Id"
     },
     "shape_type": {
       "anyOf": [

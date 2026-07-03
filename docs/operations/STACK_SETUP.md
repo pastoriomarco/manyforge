@@ -74,7 +74,7 @@ Node.js, NemoClaw, or OpenShell, and it does **not** create the first
    ```
 8. Verify the live stack:
    ```bash
-   curl -fsS http://127.0.0.1:9000/api/health
+   curl -fsS http://127.0.0.1:9000/api/infra/heartbeat
    curl -fsS http://127.0.0.1:8000/v1/models
    curl -fsS http://127.0.0.1:8200/healthz
    ```

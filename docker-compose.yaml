@@ -1,8 +1,17 @@
+# Bounded container logs on every service: the request/status logging is
+# chatty and an unbounded json-file log slowly fills the Jetson's eMMC.
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   dev:
     build:
       context: .
       dockerfile: Dockerfile
+    logging: *default-logging
     security_opt:
       # ThreadSanitizer needs personality(ADDR_NO_RANDOMIZE), which Docker's
       # default seccomp profile blocks on this platform. Phase-4 release
@@ -20,6 +29,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    logging: *default-logging
+    restart: unless-stopped
     ports:
       - "9000:9000"
     volumes:
@@ -27,8 +38,22 @@ services:
       - build-cache:/tmp/manyforge-build
     environment:
       MANYFORGE_VALIDATION_COLLISION_WORKERS: ${MANYFORGE_VALIDATION_COLLISION_WORKERS:-}
+      # Traces live under the repo bind mount so they survive reboots and
+      # container recreation with correct (host-user) ownership; a fresh
+      # named volume would be root-owned while Composer runs non-root.
+      MANYFORGE_TRACE_DIR: /workspace/.manyforge-var/traces
     working_dir: /workspace
     command: ["bash", "-lc", "python -m manyforge_composer --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml --host 0.0.0.0 --port 9000"]
+    # Heartbeat, not /api/health: the heartbeat computes real kernel state,
+    # so "healthy" means the app can actually read its kernel. Degraded /
+    # intervention states still return 200 on purpose — a robot waiting for
+    # an operator must never be restart-looped by the supervisor.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/api/infra/heartbeat >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     profiles:
       - composer
 
@@ -37,6 +62,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    logging: *default-logging
     ports:
       - "9000:9000"
     volumes:
@@ -44,6 +70,7 @@ services:
       - build-cache:/tmp/manyforge-build
     environment:
       MANYFORGE_VALIDATION_COLLISION_WORKERS: ${MANYFORGE_VALIDATION_COLLISION_WORKERS:-}
+      MANYFORGE_TRACE_DIR: /workspace/.manyforge-var/traces
     working_dir: /workspace
     command: ["bash", "-lc", "python -m manyforge_composer --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml --host 0.0.0.0 --port 9000"]
     profiles:
@@ -51,6 +78,7 @@ services:
 
   composer-ui:
     image: node:22-slim
+    logging: *default-logging
     ports:
       - "3000:3000"
     volumes:
@@ -66,6 +94,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.ros-jazzy
+    logging: *default-logging
     network_mode: host
     ipc: host
     volumes:
@@ -90,6 +119,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.ros-jazzy-full
+    logging: *default-logging
     network_mode: host
     ipc: host
     volumes:
@@ -115,11 +145,22 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.ros-jazzy-full
+    logging: *default-logging
+    restart: unless-stopped
     network_mode: host
     ipc: host
     volumes:
       - .:/workspace
       - ros-full-build-cache:/tmp/manyforge-build
+    # Heartbeat healthcheck: see the `composer` service note — degraded /
+    # intervention states stay 200 by design so a robot awaiting operator
+    # action is never restart-looped.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${MANYFORGE_COMPOSER_PORT:-9000}/api/infra/heartbeat >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
     # Assistant provider/endpoint env vars are passed through so the unified
     # launcher (scripts/launch.sh) can wire Composer to the bridge of its
     # chosen ASSISTANT_PROVIDER lane (openclaw -> :8200, nemoclaw -> :8100).
@@ -141,6 +182,8 @@ services:
       - MANYFORGE_VALIDATION_COLLISION_WORKERS=${MANYFORGE_VALIDATION_COLLISION_WORKERS:-}
       - MANYFORGE_FRONTEND_SOURCE_MODE=${MANYFORGE_FRONTEND_SOURCE_MODE:-committed}
       - MANYFORGE_FRONTEND_FORCE_REBUILD=${MANYFORGE_FRONTEND_FORCE_REBUILD:-}
+      # See the `composer` service note on trace persistence/ownership.
+      - MANYFORGE_TRACE_DIR=/workspace/.manyforge-var/traces
     working_dir: /workspace
     command: ["bash", "-lc", "./scripts/ros/start-composer-ros.sh"]
     profiles:
@@ -153,6 +196,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.ros-jazzy-full
+    logging: *default-logging
+    restart: unless-stopped
     network_mode: host
     ipc: host
     volumes:

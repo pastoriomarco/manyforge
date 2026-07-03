@@ -91,7 +91,7 @@ Environment overrides:
 | `BRIDGE_UPSTREAM_BASE_URL` | `http://127.0.0.1:8000/v1` | OpenAI-compatible LLM endpoint |
 | `BRIDGE_MANYFORGE_BASE_URL` | `http://127.0.0.1:9000` | ManyForge Composer API base URL for callbacks |
 | `BRIDGE_MODEL` | _auto-discovered_ | model identifier sent in chat-completion requests; auto-discovery picks the first model from `/v1/models` if unset |
-| `BRIDGE_AUDIT_LOG` | `manyforge_assistant_bridge/audit.log` | JSONL audit trail |
+| `BRIDGE_AUDIT_LOG` | `$XDG_STATE_HOME/manyforge/assistant-bridge-audit.log` (`~/.local/state/...`) | JSONL audit trail, size-rotated (`BRIDGE_AUDIT_LOG_MAX_BYTES` × `BRIDGE_AUDIT_LOG_KEEP`) |
 | `BRIDGE_REQUEST_TIMEOUT_S` | `60` | per-upstream-call timeout cap |
 | `BRIDGE_CALLBACK_TIMEOUT_S` | `10` | per-callback timeout |
 | `BRIDGE_MAX_TURNS` | `16` | maximum model turns per request |

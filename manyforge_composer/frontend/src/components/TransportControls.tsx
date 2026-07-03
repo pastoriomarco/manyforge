@@ -228,6 +228,14 @@ export function TransportControls() {
   // state (stopped position, latched errors, run context) — give it an
   // amber accent exactly when it carries that weight.
   const resetMeaningful = state !== 'idle';
+  const resetBlockedByStop = state === 'stopping' || motionStopState === 'stopping' || stopInProgress;
+  const resetTitle = resetBlockedByStop
+    ? 'Wait for the robot to report STOPPED before resetting'
+    : motionHeld
+      ? 'Reset from held stop: clears the held motion branch and rebuilds runtime state'
+      : resetMeaningful
+        ? `Reset the cycle to its initial state (discards the current ${state} state)`
+        : 'Reset the cycle to its initial state';
 
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-3 z-30 flex flex-col items-center gap-2">
@@ -445,14 +453,8 @@ export function TransportControls() {
           onClick={() => {
             runCycleCommand(reset);
           }}
-          disabled={cycleBusy || stopping}
-          title={
-            stopping
-              ? 'Robot is stopping'
-              : resetMeaningful
-              ? `Reset the cycle to its initial state (discards the current ${state} state)`
-              : 'Reset the cycle to its initial state'
-          }
+          disabled={cycleBusy || resetBlockedByStop}
+          title={resetTitle}
           className={`flex items-center gap-1.5 rounded border px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:text-gray-500 ${
             resetMeaningful
               ? 'border-amber-600/70 bg-amber-950/40 text-amber-300 hover:bg-amber-900/50'

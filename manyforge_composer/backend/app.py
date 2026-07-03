@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
+import uuid
 from contextlib import asynccontextmanager
 import asyncio
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .log_throttle import ThrottledLog
 from .security import (
     BearerAuthMiddleware,
     SecurityConfig,
@@ -65,8 +69,54 @@ def create_app(
         hub._task = asyncio.create_task(hub._broadcast_loop())
         yield
         logger.info("ManyForge Composer shutting down")
+        # Ordered quiesce, each step independently guarded. Motion first —
+        # a graceful shutdown must never leave the kernel executing on the
+        # chance that interpreter-exit GC runs the native teardown. The
+        # event recorder closes LAST so the stop/fault events produced by
+        # the quiesce itself reach disk before the writer threads die.
+        if state.cycle_manager is not None:
+            try:
+                await asyncio.to_thread(state.cycle_manager.shutdown)
+            except Exception:  # noqa: BLE001 — continue to the remaining steps
+                logger.exception("Shutdown: cycle quiesce failed")
+        # Final observability flush: the quiesce's own kernel events (stop
+        # request, state transitions) sit in the kernel client's buffer and
+        # nothing drains them once the tick loop is gone. Project them and a
+        # forced status observation into durable history now — before the
+        # kernel client is closed (the drain needs the live bundle) and
+        # before the recorder's writers exit. record_native_kernel_events
+        # dedupes by event_index, so replaying from 0 is safe.
+        recorder = getattr(state, "event_recorder", None)
+        if recorder is not None:
+
+            def _flush_final_events() -> None:
+                if state.cycle_manager is not None:
+                    state.cycle_manager.drain_kernel_events_now()
+                    recorder.record_native_kernel_events(
+                        state.cycle_manager.get_kernel_events_since(0)
+                    )
+                recorder.observe(state, force=True)
+
+            try:
+                await asyncio.to_thread(_flush_final_events)
+            except Exception:  # noqa: BLE001 — continue to the remaining steps
+                logger.exception("Shutdown: final event flush failed")
         state.stop_visual_state_publisher()
         hub.stop()
+        if state.kernel is not None:
+            try:
+                await asyncio.to_thread(state.kernel.close)
+            except Exception:  # noqa: BLE001 — continue to the remaining steps
+                logger.exception("Shutdown: kernel close failed")
+        if recorder is not None:
+            try:
+                flushed = await asyncio.to_thread(recorder.close)
+                if not flushed:
+                    logger.error(
+                        "Shutdown: event recorder writers did not flush within budget"
+                    )
+            except Exception:  # noqa: BLE001 — nothing left to fail after this
+                logger.exception("Shutdown: event recorder close failed")
 
     app = FastAPI(title="ManyForge Composer", lifespan=lifespan)
 
@@ -82,7 +132,7 @@ def create_app(
         allow_headers=["Authorization", "Content-Type"],
     )
 
-    # Request logging middleware.
+    # Request logging + request-ID middleware.
     #
     # Starlette gotcha: `@app.middleware("http")` is `BaseHTTPMiddleware`,
     # which interrupts the normal exception chain. Without the explicit
@@ -95,28 +145,85 @@ def create_app(
     # error has no actionable info). Catching HTTPException here and
     # delegating to FastAPI's built-in handler renders the correct
     # status + JSON body so callers (and LLM agents) see the real reason.
+    #
+    # Log volume: the UI polls several GETs at up to 10 Hz, which at
+    # one INFO line per request is ~1.7M lines/day of steady-state noise.
+    # Successful GETs are therefore throttled per route (one structured
+    # line per route per window, carrying suppressed_since_last so the
+    # true rate stays readable); a one-off GET still logs immediately as
+    # the first hit in its window. Mutations and failures always log
+    # unthrottled — those are the lines an operator greps for.
+    request_log_throttle = ThrottledLog(min_interval_s=5.0)
+
     @app.middleware("http")
     async def log_requests(request: Request, call_next) -> Response:
+        incoming_id = re.sub(
+            r"[^A-Za-z0-9._-]", "", request.headers.get("x-request-id", "")
+        )[:64]
+        request_id = incoming_id or uuid.uuid4().hex[:16]
+        request.state.request_id = request_id
         start = time.monotonic()
         try:
             response: Response = await call_next(request)
         except (HTTPException, StarletteHTTPException) as exc:
             response = await http_exception_handler(request, exc)
+        except Exception:
+            # Without this, an unhandled route exception escapes to
+            # ServerErrorMiddleware, whose 500 is built OUTSIDE this
+            # middleware — no X-Request-ID header, no structured request
+            # log, on exactly the failure path where ticket correlation
+            # matters most. Log the traceback with the ID, answer 500.
+            logger.exception(
+                "Unhandled exception for %s %s",
+                request.method,
+                request.url.path,
+                extra={
+                    "method": request.method,
+                    "path": str(request.url.path),
+                    "request_id": request_id,
+                },
+            )
+            response = JSONResponse(
+                status_code=500,
+                content={
+                    "detail": "Internal Server Error",
+                    "request_id": request_id,
+                },
+            )
         duration_ms = (time.monotonic() - start) * 1000
-        logger.info(
-            "%s %s %d %.1fms",
-            request.method,
-            request.url.path,
-            response.status_code,
-            duration_ms,
-            extra={
-                "method": request.method,
-                "path": str(request.url.path),
-                "status_code": response.status_code,
-                "duration_ms": round(duration_ms, 1),
-                "client": request.client.host if request.client else None,
-            },
-        )
+        response.headers["X-Request-ID"] = request_id
+        fields = {
+            "method": request.method,
+            "path": str(request.url.path),
+            "status_code": response.status_code,
+            "duration_ms": round(duration_ms, 1),
+            "client": request.client.host if request.client else None,
+            "request_id": request_id,
+        }
+        if request.method == "GET" and response.status_code < 400:
+            # Throttle-key on the ROUTE TEMPLATE, not the raw path: paths
+            # embedding ids would grow the throttle table without bound.
+            route = request.scope.get("route")
+            route_key = getattr(route, "path", None) or str(request.url.path)
+            request_log_throttle.info(
+                logger,
+                f"request:GET:{route_key}",
+                "%s %s %d %.1fms",
+                request.method,
+                request.url.path,
+                response.status_code,
+                duration_ms,
+                extra=fields,
+            )
+        else:
+            logger.info(
+                "%s %s %d %.1fms",
+                request.method,
+                request.url.path,
+                response.status_code,
+                duration_ms,
+                extra=fields,
+            )
         return response
 
     # Health endpoint (always public — used by liveness probes)

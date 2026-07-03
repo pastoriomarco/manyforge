@@ -42,7 +42,7 @@ are surfaced through REST.
   `manyforge_assistant_bridge/supervisor.py:33`.
 - **Where (audit JSONL)**: `BRIDGE_AUDIT_LOG` env var
   (`bridge.py:47-52`). Default path is
-  `manyforge_assistant_bridge/audit.log` (in-tree). The launcher
+  `$XDG_STATE_HOME/manyforge/assistant-bridge-audit.log` (size-rotated). The launcher
   overrides to `${LOG_DIR}/known-good-bridge-audit.jsonl` — see below.
 - **What's in the audit JSONL**: every assistant turn, fail-closed
   reject, stuck-loop hint/fail, and upstream-error event, with the
@@ -191,7 +191,7 @@ observability artifacts.
 | --- | --- |
 | `LOG_LEVEL` | Assistant supervisor log level (default INFO). Consumed at `manyforge_assistant_bridge/supervisor.py:33`. |
 | `LOG_DIR` | Launcher log root. Default `/tmp/manyforge-assistant-e2e`. Set in `scripts/lib/assistant.sh:56`. |
-| `BRIDGE_AUDIT_LOG` | Path to the assistant audit JSONL. Default in-tree at `manyforge_assistant_bridge/audit.log`; launcher pins to `$LOG_DIR/known-good-bridge-audit.jsonl`. |
+| `BRIDGE_AUDIT_LOG` | Path to the assistant audit JSONL. Default `$XDG_STATE_HOME/manyforge/assistant-bridge-audit.log`, size-rotated via `BRIDGE_AUDIT_LOG_MAX_BYTES`/`BRIDGE_AUDIT_LOG_KEEP`; launcher pins to `$LOG_DIR/known-good-bridge-audit.jsonl`. |
 | `BRIDGE_LOG`, `SUPERVISOR_LOG` | Per-process stdout/stderr capture paths inside `$LOG_DIR`. |
 | `MANYFORGE_PROGRESS_MODE=plain` | Force plain (no ANSI redraw) launcher progress output for CI logs. |
 | `MANYFORGE_VISUAL_STATE_PUBLISH_HZ` | Visual snapshot publisher cadence (`routes_scene.py:73`). |

@@ -298,6 +298,147 @@ class TestPlanPickSequenceNode:
             "id": "base_link",
         }
 
+    def test_pick_offset_reference_robot_link_rotates_translation_into_base(
+        self,
+        bb_with_kernel,
+    ):
+        class LinkYawKernel(MockKernelClient):
+            def get_link_pose(self, target_frame, base_frame):
+                self.link_pose_calls.append((target_frame, base_frame))
+                if target_frame == "link_tcp":
+                    return {
+                        "position_m": [0.5, 0.0, 0.6],
+                        "orientation_xyzw": rpy_deg_to_xyzw([0.0, 0.0, 90.0]),
+                    }
+                return super().get_link_pose(target_frame, base_frame)
+
+        link_kernel = LinkYawKernel()
+        bb_with_kernel.kernel = link_kernel
+        result = link_kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="part",
+                shape_type="box",
+                box_dimensions_m=[0.10, 0.02, 0.02],
+                pose_position_m=[0.35, -0.12, 0.04],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+        assert result.success is True
+
+        node = PlanPickSequenceNode(
+            name="plan_pick_link_ref",
+            selected_object_id="part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            pick_offset_envelope={
+                "position_min_m": [0.02, 0.0, 0.0],
+                "position_max_m": [0.02, 0.0, 0.0],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            pick_offset_reference={"type": "robot_link", "id": "link_tcp"},
+            approach_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.05],
+                "position_max_m": [0.0, 0.0, 0.05],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            approach_offset_reference={"type": "frame", "id": "base_link"},
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        assert plan_value["pick_pose"]["position_m"] == pytest.approx(
+            [0.35, -0.10, 0.05],
+            abs=1e-6,
+        )
+        assert plan_value["approach_pose"]["position_m"] == pytest.approx(
+            [0.35, -0.10, 0.10],
+            abs=1e-6,
+        )
+        assert ("link_tcp", "base_link") in link_kernel.link_pose_calls
+        assert plan_value["pick_offset_reference"] == {
+            "type": "robot_link",
+            "id": "link_tcp",
+        }
+
+    def test_pick_offset_reference_tcp_frame_uses_candidate_pick_orientation(
+        self,
+        bb_with_kernel,
+    ):
+        class LiveTcpYawKernel(MockKernelClient):
+            def get_link_pose(self, target_frame, base_frame):
+                self.link_pose_calls.append((target_frame, base_frame))
+                if target_frame == "link_tcp":
+                    return {
+                        "position_m": [0.5, 0.0, 0.6],
+                        "orientation_xyzw": rpy_deg_to_xyzw([0.0, 0.0, 90.0]),
+                    }
+                return super().get_link_pose(target_frame, base_frame)
+
+        link_kernel = LiveTcpYawKernel()
+        bb_with_kernel.kernel = link_kernel
+        result = link_kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="part",
+                shape_type="box",
+                box_dimensions_m=[0.10, 0.02, 0.02],
+                pose_position_m=[0.35, -0.12, 0.04],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+        assert result.success is True
+
+        node = PlanPickSequenceNode(
+            name="plan_pick_candidate_tcp_ref",
+            selected_object_id="part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="link_tcp",
+            force_vertical_pick=True,
+            pick_offset_envelope={
+                "position_min_m": [0.02, 0.0, 0.0],
+                "position_max_m": [0.02, 0.0, 0.0],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            pick_offset_reference={"type": "robot_link", "id": "link_tcp"},
+            approach_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.05],
+                "position_max_m": [0.0, 0.0, 0.05],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            approach_offset_reference={"type": "frame", "id": "base_link"},
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        assert plan_value["pick_pose"]["position_m"] == pytest.approx(
+            [0.37, -0.12, 0.05],
+            abs=1e-6,
+        )
+        assert ("link_tcp", "base_link") not in link_kernel.link_pose_calls
+
     def test_approach_offset_reference_object_rotates_translation_into_base(
         self,
         kernel,
@@ -355,6 +496,150 @@ class TestPlanPickSequenceNode:
             [0.35, -0.07, 0.05],
             abs=1e-6,
         )
+
+    def test_approach_offset_reference_robot_link_rotates_translation_into_base(
+        self,
+        bb_with_kernel,
+    ):
+        class LinkYawKernel(MockKernelClient):
+            def get_link_pose(self, target_frame, base_frame):
+                self.link_pose_calls.append((target_frame, base_frame))
+                if target_frame == "link_tcp":
+                    return {
+                        "position_m": [0.5, 0.0, 0.6],
+                        "orientation_xyzw": rpy_deg_to_xyzw([0.0, 0.0, 90.0]),
+                    }
+                return super().get_link_pose(target_frame, base_frame)
+
+        link_kernel = LinkYawKernel()
+        bb_with_kernel.kernel = link_kernel
+        result = link_kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="part",
+                shape_type="box",
+                box_dimensions_m=[0.10, 0.02, 0.02],
+                pose_position_m=[0.35, -0.12, 0.04],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+        assert result.success is True
+
+        node = PlanPickSequenceNode(
+            name="plan_pick_approach_link_ref",
+            selected_object_id="part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            pick_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.0],
+                "position_max_m": [0.0, 0.0, 0.0],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            approach_offset_envelope={
+                "position_min_m": [0.05, 0.0, 0.0],
+                "position_max_m": [0.05, 0.0, 0.0],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            approach_offset_reference={"type": "robot_link", "id": "link_tcp"},
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        assert plan_value["pick_pose"]["position_m"] == pytest.approx(
+            [0.35, -0.12, 0.05],
+            abs=1e-6,
+        )
+        assert plan_value["approach_pose"]["position_m"] == pytest.approx(
+            [0.35, -0.07, 0.05],
+            abs=1e-6,
+        )
+        assert ("link_tcp", "base_link") in link_kernel.link_pose_calls
+        assert plan_value["approach_offset_reference"] == {
+            "type": "robot_link",
+            "id": "link_tcp",
+        }
+
+    def test_approach_offset_reference_tcp_frame_uses_candidate_pick_orientation(
+        self,
+        bb_with_kernel,
+    ):
+        class LiveTcpYawKernel(MockKernelClient):
+            def get_link_pose(self, target_frame, base_frame):
+                self.link_pose_calls.append((target_frame, base_frame))
+                if target_frame == "link_tcp":
+                    return {
+                        "position_m": [0.5, 0.0, 0.6],
+                        "orientation_xyzw": rpy_deg_to_xyzw([0.0, 0.0, 90.0]),
+                    }
+                return super().get_link_pose(target_frame, base_frame)
+
+        link_kernel = LiveTcpYawKernel()
+        bb_with_kernel.kernel = link_kernel
+        result = link_kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="part",
+                shape_type="box",
+                box_dimensions_m=[0.10, 0.02, 0.02],
+                pose_position_m=[0.35, -0.12, 0.04],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+        assert result.success is True
+
+        node = PlanPickSequenceNode(
+            name="plan_pick_approach_candidate_tcp_ref",
+            selected_object_id="part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="link_tcp",
+            force_vertical_pick=True,
+            pick_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.0],
+                "position_max_m": [0.0, 0.0, 0.0],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            pick_offset_reference={"type": "frame", "id": "base_link"},
+            approach_offset_envelope={
+                "position_min_m": [0.05, 0.0, 0.0],
+                "position_max_m": [0.05, 0.0, 0.0],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            approach_offset_reference={"type": "robot_link", "id": "link_tcp"},
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        assert plan_value["pick_pose"]["position_m"] == pytest.approx(
+            [0.35, -0.12, 0.05],
+            abs=1e-6,
+        )
+        assert plan_value["approach_pose"]["position_m"] == pytest.approx(
+            [0.40, -0.12, 0.05],
+            abs=1e-6,
+        )
+        assert ("link_tcp", "base_link") not in link_kernel.link_pose_calls
 
     def test_min_tcp_z_clamps_generated_pick_and_reports_trace(
         self,

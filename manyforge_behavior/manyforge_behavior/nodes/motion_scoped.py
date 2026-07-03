@@ -59,6 +59,7 @@ from manyforge_behavior.motion_runtime import (
 from manyforge_behavior.nodes.motion import (
     _normalize_pose_dict,
     _relative_move_object_ids,
+    read_program_run_id,
 )
 from manyforge_behavior.parameters import resolve_blackboard_value
 
@@ -165,6 +166,7 @@ class _MotionScopedBase(py_trees.behaviour.Behaviour):
             "global_max_tcp_linear_speed_mps",
             "pose_source_apply_callback",
             "pose_source_between_nodes_callback",
+            "program_run_id",
         ):
             self.blackboard.register_key(
                 key=key, access=py_trees.common.Access.READ
@@ -382,6 +384,7 @@ class _MotionScopedBase(py_trees.behaviour.Behaviour):
             planning_timeout_s=self._planning_timeout_s,
             execution_timeout_s=self._execution_timeout_s,
             cache_mode=self._cache_mode,
+            program_run_id=read_program_run_id(self.blackboard),
         )
 
         global_cap = self._read_optional_blackboard_value(

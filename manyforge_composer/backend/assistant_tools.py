@@ -355,6 +355,7 @@ def _scene_resource_from_object(
         "objectId": object_id,
         "shape": shape,
         "pose": pose,
+        "metadata": {},
     }
 
 
