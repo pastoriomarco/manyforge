@@ -23,6 +23,7 @@ from manyforge_behavior.kernel_client import (
     SceneEditRequest,
 )
 from manyforge_behavior.nodes.pick_planning import PlanPickSequenceNode
+from manyforge_behavior.pick_stage_causes import PickStageFailureCause
 
 
 @pytest.fixture(autouse=True)
@@ -102,12 +103,16 @@ class TestPlanPickSequenceNode:
             key="perception/shape_target",
             access=py_trees.common.Access.WRITE,
         )
+        bb_with_kernel.register_key(
+            key="program_run_id", access=py_trees.common.Access.WRITE
+        )
         write_namespace_bundle(
             bb_with_kernel,
             "perception/shape_target",
             value={"selected_object_id": "sphere_part"},
             status="selected",
         )
+        bb_with_kernel.program_run_id = "run-pick-test"
 
         node = PlanPickSequenceNode(
             name="plan_pick",
@@ -139,6 +144,7 @@ class TestPlanPickSequenceNode:
             rotation_step_deg=15.0,
             planning_timeout_s=2.0,
             velocity_scale=0.30,
+            contact_policy_id="contact_grasp/sphere_part",
         )
 
         status = _tick_node(node)
@@ -163,6 +169,22 @@ class TestPlanPickSequenceNode:
         metrics = kernel.get_metrics()
         assert metrics["plans_succeeded"] == 3
         assert metrics["validations_passed"] == 3
+        assert len(kernel.preview_requests) == 3
+        parent_attempts = {
+            request.action_span.parent_node_attempt_id
+            for request in kernel.preview_requests
+            if request.action_span is not None
+        }
+        assert len(parent_attempts) == 1
+        assert next(iter(parent_attempts)).startswith("run-pick-test:")
+        assert {
+            request.contact_policy_id for request in kernel.preview_requests
+        } == {"contact_grasp/sphere_part"}
+        assert all(
+            request.action_span.program_run_id == "run-pick-test"
+            for request in kernel.preview_requests
+            if request.action_span is not None
+        )
 
     def test_force_vertical_pick_preserves_object_heading_and_ignores_rpy_offsets(
         self,
@@ -992,6 +1014,109 @@ class TestPlanPickSequenceNode:
         assert "waypoint=0" in detail
         assert "current_penetration_m=0.021667" in detail
         assert "max_start_penetration_m=0.020000" in detail
+
+    def test_failure_records_stage_reports_for_all_attempted_candidates(
+        self, kernel, bb_with_kernel
+    ):
+        class MultiFailureKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__()
+                self.pick_attempt = 0
+
+            def preview_motion(self, request, start_state=None):
+                if request.move_id == "pick_approach_preview":
+                    return MotionPreviewResult(
+                        ok=True,
+                        final_state=RobotStateSnapshot(),
+                        trajectory_duration_s=0.2,
+                        trajectory_waypoint_count=2,
+                    )
+                if request.move_id == "pick_descend_preview":
+                    self.pick_attempt += 1
+                    if self.pick_attempt == 1:
+                        return MotionPreviewResult(
+                            ok=False,
+                            error="Collision validation rejected trajectory",
+                            error_details={
+                                "failure_stage": "collision_validation",
+                                "collision_result_first_failure_pair": (
+                                    "object/graspable <-> robot/finger"
+                                ),
+                                "collision_result_first_failure_classification": (
+                                    "blocking_collision"
+                                ),
+                                "collision_result_waypoint_index": "3",
+                            },
+                        )
+                    return MotionPreviewResult(
+                        ok=False,
+                        error="IK failed for requested target",
+                        error_details={"failure_stage": "ik"},
+                    )
+                raise AssertionError(f"unexpected preview move: {request.move_id}")
+
+        failure_kernel = MultiFailureKernel()
+        bb_with_kernel.kernel = failure_kernel
+        _seed_scene(failure_kernel)
+        node = PlanPickSequenceNode(
+            name="plan_pick",
+            selected_object_id="sphere_part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="none",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            pick_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.0],
+                "position_max_m": [0.01, 0.0, 0.0],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            approach_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.05],
+                "position_max_m": [0.0, 0.0, 0.05],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            translation_step_m=0.01,
+            contact_policy_id="contact_grasp/sphere_part",
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.FAILURE
+        reader = py_trees.blackboard.Client(name="reader")
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        assert plan_value["outcome"] == "no_feasible_plan"
+        reports = plan_value["candidate_stage_reports"]
+        assert [report["candidate_index"] for report in reports] == [1, 2]
+        assert {
+            report["contact_policy_id"] for report in reports
+        } == {"contact_grasp/sphere_part"}
+
+        first_stages = {stage["stage"]: stage for stage in reports[0]["stages"]}
+        assert first_stages["approach"]["status"] == "success"
+        assert first_stages["pick"]["status"] == "failure"
+        assert first_stages["retreat"]["status"] == "not_run"
+        assert first_stages["pick"]["kinematic_ik"] == "success"
+        assert first_stages["pick"]["collision_check"] == "failure"
+        assert first_stages["pick"]["failures"][0]["cause"] == (
+            PickStageFailureCause.COLLISION_VALIDATION_FAILURE.value
+        )
+        assert first_stages["pick"]["failures"][0]["details"][
+            "collision_result_first_failure_pair"
+        ] == "object/graspable <-> robot/finger"
+
+        second_stages = {stage["stage"]: stage for stage in reports[1]["stages"]}
+        assert second_stages["approach"]["status"] == "success"
+        assert second_stages["pick"]["status"] == "failure"
+        assert second_stages["pick"]["kinematic_ik"] == "failure"
+        assert second_stages["pick"]["collision_check"] == "not_run"
+        assert second_stages["pick"]["failures"][0]["cause"] == (
+            PickStageFailureCause.RAW_IK_FAILURE.value
+        )
 
     def test_failure_populates_linked_move_pose_goals(self, kernel, bb_with_kernel):
         class PickFailureKernel(MockKernelClient):

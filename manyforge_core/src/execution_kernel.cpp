@@ -563,6 +563,8 @@ std::string collision_pair_classification_name(
       return "support_contact_recontact_violation";
     case CollisionPairClassification::kAllowedTouchLink:
       return "allowed_touch_link";
+    case CollisionPairClassification::kAllowedContactGrasp:
+      return "allowed_contact_grasp";
     case CollisionPairClassification::kDiagnosticIncomplete:
       return "diagnostic_incomplete";
   }
@@ -581,6 +583,7 @@ bool collision_pair_classification_blocks_dispatch(
     case CollisionPairClassification::kSupportContactContinued:
     case CollisionPairClassification::kSupportContactSeparated:
     case CollisionPairClassification::kAllowedTouchLink:
+    case CollisionPairClassification::kAllowedContactGrasp:
       return false;
   }
   return true;
@@ -615,6 +618,245 @@ std::optional<double> pair_clearance_for_result(
       canonical_collision_pair(*result.min_clearance_pair) == canonical &&
       result.min_clearance_m) {
     return *result.min_clearance_m;
+  }
+  return std::nullopt;
+}
+
+bool collision_body_contains_segment(const std::string& body,
+                                     const std::string& segment) {
+  return !segment.empty() && body.find(segment) != std::string::npos;
+}
+
+bool runtime_contact_grasp_pair_matches(
+    const CollisionPairId& pair,
+    const ContactGraspPolicyEntry& entry) {
+  auto object_matches = [&](const std::string& body) {
+    return collision_body_contains_segment(
+        body, "object/" + entry.selected_object_id + "/");
+  };
+  auto link_matches = [&](const std::string& body) {
+    for (const auto& link : entry.allowed_robot_links) {
+      if (collision_body_contains_segment(
+              body, "/link/" + link + "/collision/")) {
+        return true;
+      }
+    }
+    return false;
+  };
+  return (object_matches(pair.body_a) && link_matches(pair.body_b)) ||
+         (object_matches(pair.body_b) && link_matches(pair.body_a));
+}
+
+const ContactGraspPolicyEntry* find_contact_grasp_policy(
+    const CollisionPolicySnapshot& policy_snapshot,
+    const std::string& contact_policy_id) {
+  if (contact_policy_id.empty()) {
+    return nullptr;
+  }
+  for (const auto& entry : policy_snapshot.contact_grasps) {
+    if (entry.policy_id == contact_policy_id) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+bool contact_grasp_policy_valid(const ContactGraspPolicyEntry& entry) {
+  return !entry.policy_id.empty() && !entry.selected_object_id.empty() &&
+         !entry.allowed_robot_links.empty() &&
+         std::isfinite(entry.max_penetration_m) &&
+         entry.max_penetration_m >= 0.0 &&
+         std::isfinite(entry.terminal_window_start_fraction) &&
+         entry.terminal_window_start_fraction >= 0.0 &&
+         entry.terminal_window_start_fraction <= 1.0;
+}
+
+CollisionDecisionSeverity severity_for_runtime_collision_decision(
+    CollisionDecisionResult decision) {
+  switch (decision) {
+    case CollisionDecisionResult::kPass:
+      return CollisionDecisionSeverity::kNone;
+    case CollisionDecisionResult::kWarn:
+      return CollisionDecisionSeverity::kWarn;
+    case CollisionDecisionResult::kFail:
+    case CollisionDecisionResult::kStopRequested:
+    case CollisionDecisionResult::kInconclusiveFail:
+      return CollisionDecisionSeverity::kBlock;
+  }
+  return CollisionDecisionSeverity::kBlock;
+}
+
+CollisionDecisionAction action_for_runtime_collision_decision(
+    CollisionDecisionResult decision) {
+  switch (decision) {
+    case CollisionDecisionResult::kPass:
+      return CollisionDecisionAction::kDispatch;
+    case CollisionDecisionResult::kWarn:
+      return CollisionDecisionAction::kWarnOnly;
+    case CollisionDecisionResult::kInconclusiveFail:
+      return CollisionDecisionAction::kInconclusive;
+    case CollisionDecisionResult::kFail:
+    case CollisionDecisionResult::kStopRequested:
+      return CollisionDecisionAction::kReject;
+  }
+  return CollisionDecisionAction::kReject;
+}
+
+void recompute_collision_result_from_classifications(CollisionResult& result) {
+  CollisionPairResult* first_failure = nullptr;
+  bool any_blocking = false;
+  bool any_inconclusive = false;
+  for (auto& classified : result.normalized_pairs_classified) {
+    classified.is_first_failure = false;
+    if (!collision_pair_classification_blocks_dispatch(
+            classified.classification)) {
+      continue;
+    }
+    if (first_failure == nullptr) {
+      first_failure = &classified;
+    }
+    if (classified.classification ==
+        CollisionPairClassification::kDiagnosticIncomplete) {
+      any_inconclusive = true;
+    } else {
+      any_blocking = true;
+    }
+  }
+  if (first_failure != nullptr) {
+    first_failure->is_first_failure = true;
+  }
+  if (any_inconclusive && !any_blocking) {
+    result.decision = CollisionDecisionResult::kInconclusiveFail;
+  } else if (any_blocking) {
+    result.decision = CollisionDecisionResult::kFail;
+  } else {
+    result.decision = CollisionDecisionResult::kPass;
+  }
+}
+
+void recompute_collision_validation_decision(
+    CollisionValidationDecisionBundle& bundle) {
+  CollisionDecisionResult worst_decision = CollisionDecisionResult::kPass;
+  CollisionDecisionSeverity worst_severity = CollisionDecisionSeverity::kNone;
+  std::optional<std::int64_t> first_failing_waypoint;
+  std::optional<std::int64_t> first_failing_time_ns;
+
+  for (const auto& record : bundle.waypoint_records) {
+    const auto severity =
+        severity_for_runtime_collision_decision(record.result.decision);
+    if (severity > worst_severity ||
+        (severity == worst_severity &&
+         record.result.decision != CollisionDecisionResult::kPass &&
+         worst_decision == CollisionDecisionResult::kPass)) {
+      worst_decision = record.result.decision;
+      worst_severity = severity;
+    }
+    if (record.result.decision != CollisionDecisionResult::kPass &&
+        !first_failing_waypoint.has_value()) {
+      first_failing_waypoint = record.waypoint_index;
+      first_failing_time_ns = record.time_from_start_ns;
+    }
+  }
+
+  bundle.decision.accepted =
+      worst_decision == CollisionDecisionResult::kPass && !bundle.cancelled;
+  bundle.decision.severity = worst_severity;
+  bundle.decision.action = action_for_runtime_collision_decision(worst_decision);
+  bundle.decision.first_failing_waypoint = first_failing_waypoint;
+  bundle.decision.first_failing_time_ns = first_failing_time_ns;
+  if (!bundle.borrowed_world_revision.content_hash.empty() ||
+      bundle.borrowed_world_revision.revision_id != 0) {
+    bundle.decision.collision_world_revision = bundle.borrowed_world_revision;
+  }
+}
+
+std::optional<std::map<std::string, std::string>>
+apply_runtime_contact_grasp_constraints(
+    const CollisionPolicySnapshot& policy_snapshot,
+    const std::string& active_contact_policy_id,
+    CollisionValidationDecisionBundle& bundle) {
+  if (active_contact_policy_id.empty()) {
+    return std::nullopt;
+  }
+
+  std::map<std::string, std::string> config_fault{
+      {"reason_code", "runtime_contact_grasp_monitor"},
+      {"contact_policy_id", active_contact_policy_id},
+  };
+  const auto* active =
+      find_contact_grasp_policy(policy_snapshot, active_contact_policy_id);
+  if (active == nullptr) {
+    config_fault["reason"] = "runtime_contact_grasp_unknown_policy";
+    return config_fault;
+  }
+  if (!contact_grasp_policy_valid(*active)) {
+    config_fault["reason"] = "runtime_contact_grasp_invalid_policy";
+    return config_fault;
+  }
+  if (bundle.waypoint_records.empty()) {
+    return std::nullopt;
+  }
+
+  bool mutated = false;
+  for (auto& record : bundle.waypoint_records) {
+    if (record.result.engine_status != CollisionEngineStatus::kOk) {
+      continue;
+    }
+    bool record_mutated = false;
+    for (auto& classified : record.result.normalized_pairs_classified) {
+      if (classified.classification !=
+          CollisionPairClassification::kBlockingCollision) {
+        continue;
+      }
+      if (!runtime_contact_grasp_pair_matches(classified.pair, *active)) {
+        continue;
+      }
+
+      record.result.raw_diagnostics["contact_grasp_policy_id"] =
+          active->policy_id;
+      record.result.raw_diagnostics["contact_grasp_selected_object_id"] =
+          active->selected_object_id;
+      record.result.raw_diagnostics["contact_grasp_pair"] =
+          collision_pair_name(classified.pair);
+      record.result.raw_diagnostics["contact_grasp_max_penetration_m"] =
+          std::to_string(active->max_penetration_m);
+
+      const auto clearance =
+          pair_clearance_for_result(record.result, classified.pair);
+      if (!clearance.has_value() || !std::isfinite(*clearance)) {
+        record.result.raw_diagnostics["contact_grasp_violation"] =
+            "missing_grasp_contact_clearance";
+        continue;
+      }
+      const double depth = std::max(0.0, -*clearance);
+      record.result.raw_diagnostics["contact_grasp_signed_clearance_m"] =
+          std::to_string(*clearance);
+      record.result.raw_diagnostics["contact_grasp_current_penetration_m"] =
+          std::to_string(depth);
+
+      if (depth > active->max_penetration_m + 1e-9) {
+        record.result.raw_diagnostics["contact_grasp_violation"] =
+            "grasp_contact_penetration_exceeded";
+        continue;
+      }
+
+      classified.classification =
+          CollisionPairClassification::kAllowedContactGrasp;
+      classified.is_first_failure = false;
+      record.result.raw_diagnostics["contact_grasp_allowed_pair"] =
+          collision_pair_name(classified.pair);
+      record_mutated = true;
+      mutated = true;
+    }
+    if (record_mutated) {
+      recompute_collision_result_from_classifications(record.result);
+      record.produced_decision_change =
+          record.result.decision != CollisionDecisionResult::kPass;
+    }
+  }
+
+  if (mutated) {
+    recompute_collision_validation_decision(bundle);
   }
   return std::nullopt;
 }
@@ -1987,14 +2229,7 @@ TerminalCommitter::CommitOutcome ExecutionKernel::commit_terminal(
 
 void ExecutionKernel::emit_event(const KernelEvent& event) {
   KernelEvent event_to_emit = event;
-  {
-    // Central correlation stamp (spec/500 §4.1: program_run_id "when
-    // provided by caller"): one funnel instead of forty emit sites.
-    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-    if (!active_program_run_id_.empty()) {
-      event_to_emit.details.emplace("program_run_id", active_program_run_id_);
-    }
-  }
+  stamp_active_request_correlation(event_to_emit.details);
   if (event_to_emit.error.has_value()) {
     for (const auto& [key, value] : event_to_emit.error->details) {
       event_to_emit.details.emplace(key, value);
@@ -2017,6 +2252,96 @@ void ExecutionKernel::emit_event(const KernelEvent& event) {
     } catch (...) {
       // Ignore exceptions from callbacks
     }
+  }
+}
+
+void ExecutionKernel::set_active_request_correlation(
+    const ExecuteRequestDTO& request) {
+  {
+    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
+    active_move_id_ = request.move_id;
+  }
+  {
+    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+    active_program_run_id_ = request.program_run_id;
+  }
+  {
+    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
+    active_action_span_ = request.action_span;
+  }
+  {
+    std::lock_guard<std::mutex> contact_lock(active_contact_policy_id_mutex_);
+    active_contact_policy_id_ = request.contact_policy_id;
+  }
+}
+
+void ExecutionKernel::clear_active_request_correlation() {
+  {
+    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
+    active_move_id_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+    active_program_run_id_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
+    active_action_span_.reset();
+  }
+  {
+    std::lock_guard<std::mutex> contact_lock(active_contact_policy_id_mutex_);
+    active_contact_policy_id_.clear();
+  }
+}
+
+void ExecutionKernel::stamp_active_request_correlation(
+    std::map<std::string, std::string>& details) const {
+  {
+    // Central correlation stamp (spec/500 §4.1: program_run_id "when
+    // provided by caller"): one funnel instead of forty emit sites.
+    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
+    if (!active_program_run_id_.empty()) {
+      details.emplace("program_run_id", active_program_run_id_);
+    }
+  }
+  {
+    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
+    if (active_action_span_) {
+      const auto& span = *active_action_span_;
+      details.emplace("action_source", to_string(span.action_source));
+      details.emplace("action_span_id", span.action_span_id);
+      if (!span.program_run_id.empty()) {
+        details.emplace("action_span_program_run_id", span.program_run_id);
+      }
+      if (!span.node_instance_id.empty()) {
+        details.emplace("node_instance_id", span.node_instance_id);
+      }
+      if (!span.node_attempt_id.empty()) {
+        details.emplace("node_attempt_id", span.node_attempt_id);
+      }
+      if (!span.parent_node_attempt_id.empty()) {
+        details.emplace("parent_node_attempt_id",
+                        span.parent_node_attempt_id);
+      }
+    }
+  }
+  {
+    std::lock_guard<std::mutex> contact_lock(active_contact_policy_id_mutex_);
+    if (!active_contact_policy_id_.empty()) {
+      details.emplace("contact_policy_id", active_contact_policy_id_);
+    }
+  }
+}
+
+void ExecutionKernel::stamp_active_request_correlation(
+    ExecutionSnapshot& snapshot) const {
+  if (!snapshot.action_span) {
+    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
+    snapshot.action_span = active_action_span_;
+  }
+  if (snapshot.contact_policy_id.empty()) {
+    std::lock_guard<std::mutex> contact_lock(active_contact_policy_id_mutex_);
+    snapshot.contact_policy_id = active_contact_policy_id_;
   }
 }
 
@@ -2548,6 +2873,14 @@ void ExecutionKernel::finalize_motion_execution_outcome(
   MotionExecutionOutcomeDTO outcome;
   outcome.execution_id = motion_state.execution_id;
   outcome.move_id = motion_state.move_id;
+  {
+    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
+    outcome.action_span = active_action_span_;
+  }
+  {
+    std::lock_guard<std::mutex> contact_lock(active_contact_policy_id_mutex_);
+    outcome.contact_policy_id = active_contact_policy_id_;
+  }
   outcome.terminal_cause = terminal_cause;
 
   const auto coerce = [&](MotionExecutionTerminalCause to,
@@ -2632,6 +2965,26 @@ void ExecutionKernel::finalize_motion_execution_outcome(
     details.emplace("source_id", outcome.trip->source_id);
     details.emplace("policy_id", outcome.trip->policy_id);
     details.emplace("scope_id", outcome.trip->scope_id);
+  }
+  if (outcome.action_span) {
+    const auto& span = *outcome.action_span;
+    details.emplace("action_source", to_string(span.action_source));
+    details.emplace("action_span_id", span.action_span_id);
+    if (!span.program_run_id.empty()) {
+      details.emplace("action_span_program_run_id", span.program_run_id);
+    }
+    if (!span.node_instance_id.empty()) {
+      details.emplace("node_instance_id", span.node_instance_id);
+    }
+    if (!span.node_attempt_id.empty()) {
+      details.emplace("node_attempt_id", span.node_attempt_id);
+    }
+    if (!span.parent_node_attempt_id.empty()) {
+      details.emplace("parent_node_attempt_id", span.parent_node_attempt_id);
+    }
+  }
+  if (!outcome.contact_policy_id.empty()) {
+    details.emplace("contact_policy_id", outcome.contact_policy_id);
   }
   if (outcome.error) {
     details.emplace("error_code", outcome.error->code);
@@ -3651,6 +4004,7 @@ Result<InterruptIngestResult> ExecutionKernel::apply_interrupt_disposition(
 }
 
 void ExecutionKernel::publish_execution_snapshot(ExecutionSnapshot snapshot) {
+  stamp_active_request_correlation(snapshot);
   std::lock_guard<std::mutex> lock(snapshot_mutex_);
   if (snapshot.timestamp_ns == 0) {
     snapshot.timestamp_ns = clock_.now();
@@ -5732,14 +6086,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     if (!reset_result.ok()) {
       return Result<uint64_t>::Err(reset_result.error());
     }
-    {
-      std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-      active_move_id_.clear();
-      {
-        std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-        active_program_run_id_.clear();
-      }
-    }
+    clear_active_request_correlation();
     auto snapshot = execution_backend_.get_execution_snapshot();
     snapshot.timestamp_ns = clock_.now();
     snapshot.execution_id = 0;
@@ -5760,22 +6107,10 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   uint64_t exec_id = next_execution_id_++;
   auto prev_state = sm_.status().state;
   sm_.set_execution_id(exec_id);
-  {
-    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-    active_move_id_ = request.move_id;
-  }
-  {
-    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-    active_program_run_id_ = request.program_run_id;
-  }
+  set_active_request_correlation(request);
   auto transition = sm_.try_transition(ExecutionState::kPlanning);
   if (!transition.ok()) {
-    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-    active_move_id_.clear();
-    {
-      std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-      active_program_run_id_.clear();
-    }
+    clear_active_request_correlation();
     sm_.set_execution_id(0);
     return Result<uint64_t>::Err(ErrorCode::kInternalError);
   }
@@ -5830,14 +6165,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   const auto reject_admission = [&](ErrorDTO error) -> Result<uint64_t> {
     const auto rejected_from_state = sm_.status().state;
     (void)stop_policy_.request_reset();
-    {
-      std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-      active_move_id_.clear();
-      {
-        std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-        active_program_run_id_.clear();
-      }
-    }
+    clear_active_request_correlation();
     sm_.set_execution_id(0);
     auto snapshot = execution_backend_.get_execution_snapshot();
     snapshot.timestamp_ns = clock_.now();
@@ -5961,14 +6289,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     if (!result.ok()) {
       return fail_admission(result.error());
     }
-    {
-      std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-      active_move_id_.clear();
-      {
-        std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-        active_program_run_id_.clear();
-      }
-    }
+    clear_active_request_correlation();
     sm_.set_execution_id(0);
     auto snapshot = execution_backend_.get_execution_snapshot();
     snapshot.timestamp_ns = clock_.now();
@@ -6027,12 +6348,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   if (initial_state != ExecutionState::kPlanning) {
     auto cache_hit_transition = sm_.try_transition(initial_state);
     if (!cache_hit_transition.ok()) {
-      std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-      active_move_id_.clear();
-      {
-        std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-        active_program_run_id_.clear();
-      }
+      clear_active_request_correlation();
       sm_.set_execution_id(0);
       finish_admission_without_worker();
       return Result<uint64_t>::Err(ErrorCode::kInternalError);
@@ -6406,14 +6722,7 @@ ResetResultDTO ExecutionKernel::reset() {
 
   const auto publish_idle_after_reset =
       [&](ExecutionState from_state, bool emit_transition) -> ResetResultDTO {
-    {
-      std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-      active_move_id_.clear();
-      {
-        std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-        active_program_run_id_.clear();
-      }
-    }
+    clear_active_request_correlation();
     auto snapshot = execution_backend_.get_execution_snapshot();
     snapshot.timestamp_ns = clock_.now();
     snapshot.execution_id = 0;
@@ -6681,9 +6990,17 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
   {
     // Cleared AFTER the acknowledgement events: they are the closing
     // bracket of this execution's story and must still carry its
-    // program_run_id correlation stamp.
+    // request-correlation stamp.
     std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
     active_program_run_id_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
+    active_action_span_.reset();
+  }
+  {
+    std::lock_guard<std::mutex> contact_lock(active_contact_policy_id_mutex_);
+    active_contact_policy_id_.clear();
   }
 
   return AcknowledgeCompletedResultDTO{true, std::nullopt};
@@ -6771,9 +7088,17 @@ AcknowledgeInterventionResultDTO ExecutionKernel::acknowledge_intervention(
 
   {
     // Cleared AFTER the acknowledgement/recovery boundary events: they are
-    // part of this run's incident story and must carry its program_run_id.
+    // part of this run's incident story and must carry request correlation.
     std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
     active_program_run_id_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
+    active_action_span_.reset();
+  }
+  {
+    std::lock_guard<std::mutex> contact_lock(active_contact_policy_id_mutex_);
+    active_contact_policy_id_.clear();
   }
   return AcknowledgeInterventionResultDTO{true, std::nullopt};
 }
@@ -6961,9 +7286,17 @@ ExecutionKernel::acknowledge_intervention_for_retry(
 
   {
     // Cleared AFTER the acknowledgement/recovery boundary events: they are
-    // part of this run's incident story and must carry its program_run_id.
+    // part of this run's incident story and must carry request correlation.
     std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
     active_program_run_id_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
+    active_action_span_.reset();
+  }
+  {
+    std::lock_guard<std::mutex> contact_lock(active_contact_policy_id_mutex_);
+    active_contact_policy_id_.clear();
   }
   return AcknowledgeInterventionResultDTO{true, std::nullopt};
 }
@@ -7062,9 +7395,17 @@ ExecutionKernel::acknowledge_interrupted_for_retry(
 
   {
     // Cleared AFTER the acknowledgement/recovery boundary events: they are
-    // part of this run's incident story and must carry its program_run_id.
+    // part of this run's incident story and must carry request correlation.
     std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
     active_program_run_id_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
+    active_action_span_.reset();
+  }
+  {
+    std::lock_guard<std::mutex> contact_lock(active_contact_policy_id_mutex_);
+    active_contact_policy_id_.clear();
   }
   return AcknowledgeInterruptedResultDTO{true, std::nullopt};
 }
@@ -7111,6 +7452,7 @@ ExecutionSnapshot ExecutionKernel::get_execution_snapshot() const {
             std::max(metrics_.observer_lag_max_ns, lag_ns);
       }
     }
+    stamp_active_request_correlation(backend_snapshot);
     return backend_snapshot;
   }
 
@@ -7154,6 +7496,7 @@ ExecutionSnapshot ExecutionKernel::get_execution_snapshot() const {
           std::max(metrics_.observer_lag_max_ns, lag_ns);
     }
   }
+  stamp_active_request_correlation(snapshot);
   return snapshot;
 }
 
@@ -7172,6 +7515,7 @@ void ExecutionKernel::sync_snapshot_from_context() {
   } catch (...) {
     snapshot.joint_positions_rad.clear();
   }
+  stamp_active_request_correlation(snapshot);
   publish_execution_snapshot(std::move(snapshot));
 }
 
@@ -7273,11 +7617,16 @@ Result<void> ExecutionKernel::collision_check_tick() {
   std::optional<CollisionPolicySnapshot> policy_snapshot;
   ICollisionWorldSnapshotPublisher* snapshot_publisher = nullptr;
   std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines;
+  std::string active_contact_policy_id;
   {
     std::scoped_lock lock(coordinator_mutex_);
     policy_snapshot = coordinator_policy_snapshot_;
     snapshot_publisher = collision_snapshot_publisher_;
     validation_engines = collision_validation_engines_;
+  }
+  {
+    std::lock_guard<std::mutex> contact_lock(active_contact_policy_id_mutex_);
+    active_contact_policy_id = active_contact_policy_id_;
   }
 
   std::map<std::string, std::string> monitor_details;
@@ -7462,6 +7811,17 @@ Result<void> ExecutionKernel::collision_check_tick() {
     return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
   }
 
+  if (auto grasp_fault = apply_runtime_contact_grasp_constraints(
+          *policy_snapshot, active_contact_policy_id, bundle)) {
+    (*grasp_fault)["collision_world_revision_id"] =
+        std::to_string(bundle.borrowed_world_revision.revision_id);
+    (*grasp_fault)["collision_world_content_hash"] =
+        bundle.borrowed_world_revision.content_hash;
+    append_collision_failure_diagnostics(*grasp_fault, bundle);
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{},
+                                         std::move(*grasp_fault));
+  }
+
   if (bundle.decision.accepted) {
     if (auto release_fault =
             update_runtime_contact_release_state(*policy_snapshot, bundle)) {
@@ -7520,6 +7880,8 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
   plan_req.tolerances = request.tolerances;
   plan_req.speed_profile = request.speed_profile;
   plan_req.per_joint_dynamics_limits = request.per_joint_dynamics_limits;
+  plan_req.action_span = request.action_span;
+  plan_req.contact_policy_id = request.contact_policy_id;
   plan_req.planning_timeout_s = request.timeouts.planning_timeout_s;
 
   auto result = planner_.plan(plan_req);
@@ -7741,6 +8103,7 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
     cfg.pose_source_retry = retry;
     cfg.per_state_timeout_ns = per_state_timeout_ns;
     cfg.surface = CollisionSurface::kPreExecutionValidation;
+    cfg.contact_policy_id = request.contact_policy_id;
 
     ParallelCollisionValidationWorkerPool::Config pool_cfg;
     pool_cfg.pass_config = std::move(cfg);

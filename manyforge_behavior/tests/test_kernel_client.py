@@ -6,6 +6,7 @@ import threading
 import pytest
 
 from manyforge_behavior.kernel_client import (
+    ActionSpan,
     ExecuteRequest,
     ExecutionState,
     GripperCommandRequest,
@@ -79,6 +80,41 @@ class TestMockKernelExecute:
         result = kernel.execute(make_request())
         assert not result.ok
         assert kernel.get_status().state == ExecutionState.FAILED
+
+    def test_execute_stamps_action_span_and_contact_policy(self, kernel):
+        request = make_request()
+        request.program_run_id = "run-001"
+        request.action_span = ActionSpan(
+            action_source="program_node",
+            action_span_id="attempt-001",
+            program_run_id="run-001",
+            node_instance_id="sequence/move_to_pick",
+            node_attempt_id="attempt-001",
+            parent_node_attempt_id="plan-attempt-001",
+        )
+        request.contact_policy_id = "contact_grasp/lite6_box"
+
+        result = kernel.execute(request)
+
+        assert result.ok
+        events = kernel.drain_kernel_events()
+        assert events
+        event_details = [event.get("details", {}) for event in events]
+        assert any(
+            details.get("action_span_id") == "attempt-001"
+            and details.get("contact_policy_id") == "contact_grasp/lite6_box"
+            and details.get("parent_node_attempt_id") == "plan-attempt-001"
+            for details in event_details
+        )
+        snapshot = kernel.get_execution_snapshot()
+        assert snapshot.action_span is not None
+        assert snapshot.action_span.action_span_id == "attempt-001"
+        assert snapshot.contact_policy_id == "contact_grasp/lite6_box"
+        outcome = kernel.get_execution_outcome(result.execution_id)
+        assert outcome is not None
+        assert outcome.action_span is not None
+        assert outcome.action_span.action_span_id == "attempt-001"
+        assert outcome.contact_policy_id == "contact_grasp/lite6_box"
 
 
 class TestMockKernelStop:

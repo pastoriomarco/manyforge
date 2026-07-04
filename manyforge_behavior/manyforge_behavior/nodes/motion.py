@@ -7,6 +7,10 @@ from typing import Any
 
 import py_trees
 
+from manyforge_behavior.action_span import (
+    ActionSpanMixin,
+    read_program_run_id,
+)
 from manyforge_behavior.kernel_client import (
     ExecuteRequest,
     KernelClient,
@@ -50,21 +54,7 @@ def _relative_move_object_ids(relative_move: dict[str, Any] | None) -> list[str]
     return object_ids
 
 
-def read_program_run_id(blackboard):
-    """Best-effort program-run correlation id (spec/500 §2.2).
-
-    Shared by every motion-dispatching node (plain and scoped): absent on
-    standalone trees that never went through the cycle manager; execution
-    must proceed identically without it.
-    """
-    try:
-        value = blackboard.get("program_run_id")
-    except (KeyError, AttributeError):
-        return None
-    return str(value) if value else None
-
-
-class MoveManipulatorAction(py_trees.behaviour.Behaviour):
+class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
     """Execute a motion request through the kernel (plan + validate + execute)."""
 
     def __init__(self, name: str, **kwargs: Any):
@@ -115,6 +105,7 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
         return read_program_run_id(self.blackboard)
 
     def initialise(self) -> None:
+        self._reset_action_span()
         self._started = False
         self._execution_id = None
         self._motion_coordinator = None
@@ -311,6 +302,7 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
                     apply_result = apply_callback(
                         object_ids=object_ids,
                         reason=f"motion_node:{self.name}",
+                        action_span=self._current_action_span(self.blackboard),
                     )
                 except Exception as exc:  # noqa: BLE001 - callback boundary
                     return self._enter_soft_fail(
@@ -361,6 +353,14 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
                 ),
                 cache_mode=self._params.get("cache_mode", "default"),
                 program_run_id=self._read_program_run_id(),
+                action_span=self._current_action_span(
+                    self.blackboard,
+                    parent_node_attempt_id=self._params.get(
+                        "parent_node_attempt_id"
+                    )
+                    or None,
+                ),
+                contact_policy_id=self._params.get("contact_policy_id") or None,
             )
 
             global_cap = self._read_optional_blackboard_value(
@@ -447,7 +447,7 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
                 pass
 
 
-class ResetTrajectories(py_trees.behaviour.Behaviour):
+class ResetTrajectories(ActionSpanMixin, py_trees.behaviour.Behaviour):
     """Invalidate all cached trajectories."""
 
     def __init__(self, name: str, **kwargs: Any):
@@ -459,7 +459,12 @@ class ResetTrajectories(py_trees.behaviour.Behaviour):
             key="kernel", access=py_trees.common.Access.READ
         )
 
+    def initialise(self) -> None:
+        self._reset_action_span()
+
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self.blackboard.kernel
-        kernel.invalidate_trajectories()
+        kernel.invalidate_trajectories(
+            action_span=self._current_action_span(self.blackboard)
+        )
         return py_trees.common.Status.SUCCESS

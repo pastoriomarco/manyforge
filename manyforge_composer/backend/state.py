@@ -3824,6 +3824,26 @@ class ComposerState:
             return f"execution_active:{cycle_name}"
         return "scene_mutation_guard_unavailable"
 
+    @staticmethod
+    def _action_span_event_details(action_span: Any | None) -> dict[str, str]:
+        if action_span is None:
+            return {}
+        details: dict[str, str] = {}
+        for attr in (
+            "action_source",
+            "action_span_id",
+            "node_instance_id",
+            "node_attempt_id",
+            "parent_node_attempt_id",
+        ):
+            value = getattr(action_span, attr, None)
+            if value:
+                details[attr] = str(value)
+        program_run_id = getattr(action_span, "program_run_id", None)
+        if program_run_id:
+            details["action_span_program_run_id"] = str(program_run_id)
+        return details
+
     def apply_pose_source_updates(
         self,
         *,
@@ -3831,6 +3851,7 @@ class ComposerState:
         object_ids: list[str] | None = None,
         require_idle: bool = False,
         reason: str = "",
+        action_span: Any | None = None,
     ) -> dict[str, Any]:
         """Apply fresh observed poses to the backend planning scene.
 
@@ -4097,6 +4118,7 @@ class ComposerState:
                             if runtime_freshness_required
                             else None
                         ),
+                        action_span=action_span,
                     )
                     result = self.kernel.scene_edit(scene_request)
                     if not result.success:
@@ -4168,6 +4190,7 @@ class ComposerState:
             "success": success,
             "details": copy.deepcopy(details),
         }
+        event_details.update(self._action_span_event_details(action_span))
         try:
             self.event_recorder.record_pose_source_event(
                 "applied" if success else "apply_failed",
@@ -4309,6 +4332,7 @@ class ComposerState:
         *,
         object_ids: list[str] | None = None,
         reason: str = "",
+        action_span: Any | None = None,
     ) -> dict[str, Any]:
         """Apply `before_planning` source updates at the BT latch point."""
         del object_ids
@@ -4317,6 +4341,7 @@ class ComposerState:
             object_ids=[],
             require_idle=False,
             reason=reason or "before_planning",
+            action_span=action_span,
         )
 
     def apply_pose_sources_between_nodes(
@@ -4324,6 +4349,7 @@ class ComposerState:
         *,
         object_ids: list[str] | None = None,
         reason: str = "",
+        action_span: Any | None = None,
     ) -> dict[str, Any]:
         """Apply `between_nodes` source updates at a BT safe point."""
         return self.apply_pose_source_updates(
@@ -4331,6 +4357,7 @@ class ComposerState:
             object_ids=object_ids,
             require_idle=False,
             reason=reason or "between_nodes",
+            action_span=action_span,
         )
 
     def reset_simulation_for_behavior_node(
@@ -4339,6 +4366,7 @@ class ComposerState:
         reason: str = "",
         source: str = "behavior_node",
         allow_running: bool = True,
+        action_span: Any | None = None,
     ) -> dict[str, Any]:
         """BT callback for the ResetSimulation node."""
         return self.simulation_control_for_behavior_node(
@@ -4346,6 +4374,7 @@ class ComposerState:
             reason=reason or "reset_simulation_node",
             source=source,
             allow_running=allow_running,
+            action_span=action_span,
         )
 
     def simulation_control_for_behavior_node(
@@ -4358,11 +4387,13 @@ class ComposerState:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """BT callback for simulator-control nodes."""
+        action_span = kwargs.get("action_span")
         if operation == "reset":
             return self.reset_simulation(
                 reason=reason or "reset_simulation_node",
                 source=source,
                 allow_running=allow_running,
+                action_span=action_span,
             )
         if operation == "set_state":
             return self.set_simulation_state(
@@ -4370,6 +4401,7 @@ class ComposerState:
                 reason=reason or "set_simulation_state_node",
                 source=source,
                 allow_running=allow_running,
+                action_span=action_span,
             )
         if operation == "step":
             return self.step_simulation(
@@ -4377,6 +4409,7 @@ class ComposerState:
                 reason=reason or "step_simulation_node",
                 source=source,
                 allow_running=allow_running,
+                action_span=action_span,
             )
         if operation == "set_entity_state":
             return self.set_simulation_entity_state(
@@ -4385,6 +4418,7 @@ class ComposerState:
                 reason=reason or "set_entity_state_node",
                 source=source,
                 allow_running=allow_running,
+                action_span=action_span,
             )
         raise RuntimeError(f"Unsupported simulation control operation: {operation}")
 
@@ -4395,6 +4429,7 @@ class ComposerState:
         reason: str = "",
         source: str = "api",
         allow_running: bool = False,
+        action_span: Any | None = None,
     ) -> dict[str, Any]:
         target_state = self._normalize_simulation_state_target(state)
         required_capability = (
@@ -4409,6 +4444,7 @@ class ComposerState:
             source=source,
             allow_running=allow_running,
             payload={"state": target_state},
+            action_span=action_span,
         )
 
     def step_simulation(
@@ -4418,6 +4454,7 @@ class ComposerState:
         reason: str = "",
         source: str = "api",
         allow_running: bool = False,
+        action_span: Any | None = None,
     ) -> dict[str, Any]:
         try:
             step_count = int(steps)
@@ -4432,6 +4469,7 @@ class ComposerState:
             source=source,
             allow_running=allow_running,
             payload={"steps": step_count},
+            action_span=action_span,
         )
 
     def set_simulation_entity_state(
@@ -4442,6 +4480,7 @@ class ComposerState:
         reason: str = "",
         source: str = "api",
         allow_running: bool = False,
+        action_span: Any | None = None,
     ) -> dict[str, Any]:
         entity_name = str(entity or "").strip()
         if not entity_name:
@@ -4455,6 +4494,7 @@ class ComposerState:
             source=source,
             allow_running=allow_running,
             payload={"entity": entity_name, "pose": dict(pose)},
+            action_span=action_span,
         )
 
     def reset_simulation(
@@ -4463,6 +4503,7 @@ class ComposerState:
         reason: str = "",
         source: str = "api",
         allow_running: bool = False,
+        action_span: Any | None = None,
     ) -> dict[str, Any]:
         """Reset simulator state through the deployment-declared control surface."""
         control_id = uuid.uuid4().hex[:12]
@@ -4487,6 +4528,7 @@ class ComposerState:
             "allow_running": bool(allow_running),
             "resume_play_after_reset": bool(resume_play_after_reset),
         }
+        base_details.update(self._action_span_event_details(action_span))
         self.event_recorder.record_simulation_control_event(
             "requested",
             details=base_details,
@@ -4583,6 +4625,7 @@ class ComposerState:
         source: str,
         allow_running: bool,
         payload: dict[str, Any],
+        action_span: Any | None = None,
     ) -> dict[str, Any]:
         control_id = uuid.uuid4().hex[:12]
         control, _execution_config = self._simulation_control_contract(
@@ -4603,6 +4646,7 @@ class ComposerState:
             "allow_running": bool(allow_running),
             **self._simulation_control_audit_payload(payload),
         }
+        base_details.update(self._action_span_event_details(action_span))
         self.event_recorder.record_simulation_control_event(
             "requested",
             details=base_details,

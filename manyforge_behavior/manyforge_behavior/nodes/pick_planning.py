@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import itertools
 import math
 import time
@@ -9,6 +10,7 @@ from typing import Any, Callable, Optional
 
 import py_trees
 
+from manyforge_behavior.action_span import ActionSpanMixin, read_program_run_id
 from manyforge_behavior.geometry import (
     normalize_quat as _normalize_quat,
     quat_mul as _quat_mul,
@@ -18,12 +20,15 @@ from manyforge_behavior.geometry import (
     xyzw_to_rpy_deg as _xyzw_to_rpy_deg,
 )
 from manyforge_behavior.kernel_client import (
+    ActionSpan,
     ExecuteRequest,
     KernelClient,
+    MotionPreviewResult,
     SceneObjectSnapshot,
 )
 from manyforge_behavior.nodes.blackboard_output import BlackboardOutputMixin
 from manyforge_behavior.parameters import resolve_blackboard_value
+from manyforge_behavior.pick_stage_causes import PickStageFailureCause
 
 
 _SCENE_SNAPSHOT_WAIT_TIMEOUT_S = 2.0
@@ -487,7 +492,67 @@ def _preview_failure_message(
     return " | ".join(parts)
 
 
-class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
+def _json_safe_detail_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_detail_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe_detail_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def _preview_failure_causes(
+    *,
+    preview_error: Optional[str],
+    error_details: Optional[dict[str, Any]],
+) -> list[str]:
+    details = error_details or {}
+    causes: list[PickStageFailureCause] = []
+    failure_stage = str(details.get("failure_stage") or "").lower()
+    classification = str(
+        details.get("collision_result_first_failure_classification") or ""
+    ).lower()
+    error_text = str(preview_error or "").lower()
+
+    if _detail_flag(details, "start_in_collision"):
+        causes.append(PickStageFailureCause.START_STATE_IN_COLLISION)
+    if "collision_aware_ik" in failure_stage:
+        causes.append(PickStageFailureCause.COLLISION_AWARE_IK_FAILURE)
+    elif "ik" in failure_stage or "ik failed" in error_text:
+        causes.append(PickStageFailureCause.RAW_IK_FAILURE)
+    if (
+        _detail_flag(details, "goal_in_collision")
+        or "collision_validation" in failure_stage
+        or details.get("collision_result_first_failure_pair") is not None
+        or details.get("collision_pairs") is not None
+    ):
+        causes.append(PickStageFailureCause.COLLISION_VALIDATION_FAILURE)
+    if "support_contact" in failure_stage or "support_contact" in classification:
+        causes.append(PickStageFailureCause.SUPPORT_CONTACT_REJECTION)
+    if (
+        details.get("contact_grasp_violation") is not None
+        or details.get("contact_grasp_policy_id") is not None
+    ):
+        causes.append(PickStageFailureCause.CONTACT_POLICY_REJECTION)
+
+    if not causes:
+        causes.append(PickStageFailureCause.PREVIEW_FAILED)
+    return list(dict.fromkeys(cause.value for cause in causes))
+
+
+def _stage_checks_for_failure(causes: list[str]) -> tuple[str, str]:
+    ik_failures = {
+        PickStageFailureCause.RAW_IK_FAILURE.value,
+        PickStageFailureCause.COLLISION_AWARE_IK_FAILURE.value,
+        PickStageFailureCause.PREVIEW_FAILED.value,
+    }
+    if any(cause in ik_failures for cause in causes):
+        return "failure", "not_run"
+    return "success", "failure"
+
+
+class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.behaviour.Behaviour):
     """Deterministically generate and preview a three-leg pick sequence."""
 
     def __init__(
@@ -516,6 +581,7 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
         velocity_scale: float = 0.35,
         acceleration_scale: float = 1.0,
         max_tcp_linear_speed_mps: Optional[float] = None,
+        contact_policy_id: Optional[str] = None,
         approach_move_node_name: str = "",
         pick_move_node_name: str = "",
         retreat_move_node_name: str = "",
@@ -553,6 +619,7 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
         self._velocity_scale = velocity_scale
         self._acceleration_scale = acceleration_scale
         self._max_tcp_linear_speed_mps = max_tcp_linear_speed_mps
+        self._contact_policy_id = contact_policy_id
         self._approach_move_node_name = approach_move_node_name
         self._pick_move_node_name = pick_move_node_name
         self._retreat_move_node_name = retreat_move_node_name
@@ -581,6 +648,7 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
             key="pose_source_between_nodes_callback",
             access=py_trees.common.Access.READ,
         )
+        self._bb.register_key(key="program_run_id", access=py_trees.common.Access.READ)
         self._output_keys_registered = True
 
     def _apply_pose_source_latches(
@@ -603,6 +671,7 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                 result = callback(
                     object_ids=[selected_object_id],
                     reason=f"pick_sequence:{self.name}",
+                    action_span=self._current_action_span(self._bb),
                 )
             except Exception as exc:  # noqa: BLE001 - callback boundary
                 self.feedback_message = f"{label} pose-source apply raised: {exc}"
@@ -627,6 +696,7 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
 
     def initialise(self) -> None:
         self._ensure_output_keys()
+        self._reset_action_span()
         self._awaiting_scene_snapshot = False
         self._scene_snapshot_wait_started_ns = 0
 
@@ -900,6 +970,7 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
         best_candidate: Optional[dict[str, Any]] = None
         last_candidate_response: Optional[dict[str, Any]] = None
         last_failure_detail: Optional[str] = None
+        candidate_stage_reports: list[dict[str, Any]] = []
 
         for (pick_pos_offset, pick_rot_offset) in pick_offsets:
             candidate_pick_orientation = _candidate_pick_orientation_xyzw(
@@ -962,6 +1033,14 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                     "orientation_xyzw": list(approach_pose["orientation_xyzw"]),
                     "orientation_rpy_deg": list(approach_pose["orientation_rpy_deg"]),
                 }
+                candidate_stage_report = self._new_candidate_stage_report(
+                    selected_object_id=selected_object_id,
+                    candidate_index=attempted_candidates,
+                    approach_pose=approach_pose,
+                    pick_pose=pick_pose,
+                    retreat_pose=retreat_pose,
+                )
+                candidate_stage_reports.append(candidate_stage_report)
                 candidate_response = self._make_candidate_response(
                     selected_object_id=selected_object_id,
                     approach_pose=approach_pose,
@@ -977,6 +1056,8 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                     ),
                     pick_offset_reference=pick_offset_reference,
                     approach_offset_reference=approach_offset_reference,
+                    candidate_stage_report=candidate_stage_report,
+                    candidate_stage_reports=candidate_stage_reports,
                 )
                 last_candidate_response = candidate_response
                 self._write_candidate_response(candidate_response)
@@ -985,6 +1066,11 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                     self._make_pose_goal_request("pick_approach_preview", approach_pose)
                 )
                 if not approach_preview.ok:
+                    self._mark_stage_failure(
+                        candidate_stage_report,
+                        stage="approach",
+                        preview=approach_preview,
+                    )
                     last_failure_detail = _preview_failure_message(
                         stage="approach",
                         preview_error=approach_preview.error,
@@ -1001,15 +1087,26 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                             outcome="start_state_in_collision",
                             failure_detail=last_failure_detail,
                             candidate_response=last_candidate_response,
+                            candidate_stage_reports=candidate_stage_reports,
                         )
                         return py_trees.common.Status.FAILURE
                     continue
+                self._mark_stage_success(
+                    candidate_stage_report,
+                    stage="approach",
+                    preview=approach_preview,
+                )
 
                 pick_preview = kernel.preview_motion(
                     self._make_pose_goal_request("pick_descend_preview", pick_pose),
                     start_state=approach_preview.final_state,
                 )
                 if not pick_preview.ok:
+                    self._mark_stage_failure(
+                        candidate_stage_report,
+                        stage="pick",
+                        preview=pick_preview,
+                    )
                     last_failure_detail = _preview_failure_message(
                         stage="pick",
                         preview_error=pick_preview.error,
@@ -1017,12 +1114,22 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                         attempted_candidates=attempted_candidates,
                     )
                     continue
+                self._mark_stage_success(
+                    candidate_stage_report,
+                    stage="pick",
+                    preview=pick_preview,
+                )
 
                 exit_preview = kernel.preview_motion(
                     self._make_pose_goal_request("pick_exit_preview", approach_pose),
                     start_state=pick_preview.final_state,
                 )
                 if not exit_preview.ok:
+                    self._mark_stage_failure(
+                        candidate_stage_report,
+                        stage="retreat",
+                        preview=exit_preview,
+                    )
                     last_failure_detail = _preview_failure_message(
                         stage="exit",
                         preview_error=exit_preview.error,
@@ -1030,6 +1137,11 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                         attempted_candidates=attempted_candidates,
                     )
                     continue
+                self._mark_stage_success(
+                    candidate_stage_report,
+                    stage="retreat",
+                    preview=exit_preview,
+                )
 
                 duration_s = (
                     float(approach_preview.trajectory_duration_s or 0.0)
@@ -1071,6 +1183,7 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
             outcome="no_feasible_plan",
             failure_detail=last_failure_detail,
             candidate_response=last_candidate_response,
+            candidate_stage_reports=candidate_stage_reports,
         )
         return py_trees.common.Status.FAILURE
 
@@ -1080,6 +1193,96 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
             "position_m": list(pose["position_m"]),
             "orientation_xyzw": list(pose["orientation_xyzw"]),
         }
+
+    def _new_candidate_stage_report(
+        self,
+        *,
+        selected_object_id: str,
+        candidate_index: int,
+        approach_pose: dict[str, Any],
+        pick_pose: dict[str, Any],
+        retreat_pose: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "candidate_index": candidate_index,
+            "selected_object_id": selected_object_id,
+            "contact_policy_id": self._contact_policy_id,
+            "stages": [
+                self._initial_stage_report(
+                    "approach",
+                    "pick_approach_preview",
+                    approach_pose,
+                ),
+                self._initial_stage_report("pick", "pick_descend_preview", pick_pose),
+                self._initial_stage_report("retreat", "pick_exit_preview", retreat_pose),
+            ],
+        }
+
+    def _initial_stage_report(
+        self,
+        stage: str,
+        move_id: str,
+        pose: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "stage": stage,
+            "move_id": move_id,
+            "pose_goal": self._pose_output(pose),
+            "status": "not_run",
+            "kinematic_ik": "not_run",
+            "collision_check": "not_run",
+            "failures": [],
+        }
+
+    @staticmethod
+    def _stage_report(report: dict[str, Any], stage: str) -> dict[str, Any]:
+        for stage_report in report.get("stages", []):
+            if stage_report.get("stage") == stage:
+                return stage_report
+        raise KeyError(f"Unknown pick stage: {stage}")
+
+    def _mark_stage_success(
+        self,
+        report: dict[str, Any],
+        *,
+        stage: str,
+        preview: MotionPreviewResult,
+    ) -> None:
+        stage_report = self._stage_report(report, stage)
+        stage_report["status"] = "success"
+        stage_report["kinematic_ik"] = "success"
+        stage_report["collision_check"] = "success"
+        stage_report["trajectory_duration_s"] = preview.trajectory_duration_s
+        stage_report["trajectory_waypoint_count"] = preview.trajectory_waypoint_count
+
+    def _mark_stage_failure(
+        self,
+        report: dict[str, Any],
+        *,
+        stage: str,
+        preview: MotionPreviewResult,
+    ) -> None:
+        stage_report = self._stage_report(report, stage)
+        causes = _preview_failure_causes(
+            preview_error=preview.error,
+            error_details=preview.error_details,
+        )
+        kinematic_ik, collision_check = _stage_checks_for_failure(causes)
+        stage_report["status"] = "failure"
+        stage_report["kinematic_ik"] = kinematic_ik
+        stage_report["collision_check"] = collision_check
+        failure: dict[str, Any] = {
+            "cause": causes[0],
+            "causes": causes,
+        }
+        if preview.error:
+            failure["message"] = preview.error
+        if preview.error_details:
+            failure["details"] = {
+                str(key): _json_safe_detail_value(value)
+                for key, value in preview.error_details.items()
+            }
+        stage_report["failures"] = [failure]
 
     def _make_candidate_response(
         self,
@@ -1096,8 +1299,10 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
         min_tcp_z_applied: bool,
         pick_offset_reference: dict[str, Any],
         approach_offset_reference: dict[str, Any],
+        candidate_stage_report: Optional[dict[str, Any]] = None,
+        candidate_stage_reports: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
-        return {
+        response = {
             "selected_object_id": selected_object_id,
             "approach_pose": self._pose_output(approach_pose),
             "pick_pose": self._pose_output(pick_pose),
@@ -1114,6 +1319,23 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                 approach_offset_reference
             ),
         }
+        if candidate_stage_report is not None:
+            response["candidate_stage_report"] = candidate_stage_report
+        if candidate_stage_reports is not None:
+            response["candidate_stage_reports"] = list(candidate_stage_reports)
+        return response
+
+    def _child_action_span(self, move_id: str) -> ActionSpan:
+        parent = self._current_action_span(self._bb)
+        child_attempt_id = f"{parent.node_attempt_id}:{move_id}"
+        return ActionSpan(
+            action_source="program_node",
+            action_span_id=child_attempt_id,
+            program_run_id=read_program_run_id(self._bb),
+            node_instance_id=f"{parent.node_instance_id}/{move_id}",
+            node_attempt_id=child_attempt_id,
+            parent_node_attempt_id=parent.node_attempt_id,
+        )
 
     def _make_pose_goal_request(self, move_id: str, pose: dict[str, Any]) -> ExecuteRequest:
         return ExecuteRequest(
@@ -1134,15 +1356,18 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
             planning_timeout_s=self._planning_timeout_s,
             execution_timeout_s=0.0,
             cache_mode="disable",
+            program_run_id=read_program_run_id(self._bb),
+            action_span=self._child_action_span(move_id),
+            contact_policy_id=self._contact_policy_id,
         )
 
     def _write_candidate_response(self, response: dict[str, Any]) -> None:
         self._populate_linked_move_nodes(response)
-        self._write_namespace_output(response, status="candidate")
+        self._write_namespace_output(copy.deepcopy(response), status="candidate")
 
     def _write_response(self, response: dict[str, Any]) -> None:
         self._populate_linked_move_nodes(response)
-        self._write_namespace_output(response, status="planned")
+        self._write_namespace_output(copy.deepcopy(response), status="planned")
 
     def _write_failure_response(
         self,
@@ -1152,6 +1377,7 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
         outcome: str,
         failure_detail: Optional[str] = None,
         candidate_response: Optional[dict[str, Any]] = None,
+        candidate_stage_reports: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         response = dict(candidate_response or {})
         response.setdefault("selected_object_id", selected_object_id)
@@ -1162,9 +1388,13 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
         response["planning_score"] = None
         response["outcome"] = outcome
         response["failure_detail"] = failure_detail
+        if candidate_stage_reports is not None:
+            response["candidate_stage_reports"] = list(candidate_stage_reports)
+            if candidate_stage_reports:
+                response["candidate_stage_report"] = candidate_stage_reports[-1]
         if candidate_response is not None:
             self._populate_linked_move_nodes(response)
-        self._write_namespace_output(response, status="failed")
+        self._write_namespace_output(copy.deepcopy(response), status="failed")
 
     def _populate_linked_move_nodes(self, response: dict[str, Any]) -> None:
         name_to_pose = {
@@ -1193,6 +1423,11 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                 "position_m": list(pose["position_m"]),
                 "orientation_xyzw": list(pose["orientation_xyzw"]),
             }
+            if self._contact_policy_id:
+                params["contact_policy_id"] = self._contact_policy_id
+            params["parent_node_attempt_id"] = self._current_action_span(
+                self._bb
+            ).node_attempt_id
 
     def _iter_tree_behaviours(self):
         root: Any = self

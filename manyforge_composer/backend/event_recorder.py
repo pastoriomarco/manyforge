@@ -98,6 +98,12 @@ _NATIVE_KERNEL_CONTROLLED_STOP_SUCCESS_EVENT_TYPES_TO_RECORD = {
     "motion_trip_completed",
     "stop_issued",
 }
+_GENERIC_TERMINAL_MESSAGES = {
+    "Motion execution ended in stopped",
+    "Motion execution ended in interrupted",
+    "Motion execution ended in failed",
+    "Motion execution rejected",
+}
 
 
 def _is_resume_audit_native_event(native_event: dict[str, Any]) -> bool:
@@ -297,6 +303,7 @@ class _FailureArchiveJob:
     event: dict[str, Any]
     run_id: Optional[str]
     trace_file: Optional[Path]
+    recent_events: list[dict[str, Any]]
 
 
 class EventRecorder:
@@ -721,8 +728,14 @@ class EventRecorder:
         components: Optional[list[str]] = None,
         event_types: Optional[list[str]] = None,
         execution_id: Optional[int] = None,
+        kernel_execution_id: Optional[int] = None,
         program_run_id: Optional[str] = None,
         intervention_run_id: Optional[str] = None,
+        action_span_id: Optional[str] = None,
+        node_instance_id: Optional[str] = None,
+        node_attempt_id: Optional[str] = None,
+        move_id: Optional[str] = None,
+        contact_policy_id: Optional[str] = None,
     ) -> dict[str, Any]:
         selected_run_id = run_id or self.last_run_id
         if limit is None:
@@ -738,8 +751,14 @@ class EventRecorder:
             components=components,
             event_types=event_types,
             execution_id=execution_id,
+            kernel_execution_id=kernel_execution_id,
             program_run_id=program_run_id,
             intervention_run_id=intervention_run_id,
+            action_span_id=action_span_id,
+            node_instance_id=node_instance_id,
+            node_attempt_id=node_attempt_id,
+            move_id=move_id,
+            contact_policy_id=contact_policy_id,
         )
         if effective_limit == 0:
             events = []
@@ -795,8 +814,14 @@ class EventRecorder:
         components: Optional[list[str]] = None,
         event_types: Optional[list[str]] = None,
         execution_id: Optional[int] = None,
+        kernel_execution_id: Optional[int] = None,
         program_run_id: Optional[str] = None,
         intervention_run_id: Optional[str] = None,
+        action_span_id: Optional[str] = None,
+        node_instance_id: Optional[str] = None,
+        node_attempt_id: Optional[str] = None,
+        move_id: Optional[str] = None,
+        contact_policy_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         return self._filter_events(
             self._load_events_for_run(run_id or self.last_run_id),
@@ -806,8 +831,14 @@ class EventRecorder:
             components=components,
             event_types=event_types,
             execution_id=execution_id,
+            kernel_execution_id=kernel_execution_id,
             program_run_id=program_run_id,
             intervention_run_id=intervention_run_id,
+            action_span_id=action_span_id,
+            node_instance_id=node_instance_id,
+            node_attempt_id=node_attempt_id,
+            move_id=move_id,
+            contact_policy_id=contact_policy_id,
         )
 
     def export_ros2_medkit_trace(
@@ -909,8 +940,14 @@ class EventRecorder:
         components: Optional[list[str]] = None,
         event_types: Optional[list[str]] = None,
         execution_id: Optional[int] = None,
+        kernel_execution_id: Optional[int] = None,
         program_run_id: Optional[str] = None,
         intervention_run_id: Optional[str] = None,
+        action_span_id: Optional[str] = None,
+        node_instance_id: Optional[str] = None,
+        node_attempt_id: Optional[str] = None,
+        move_id: Optional[str] = None,
+        contact_policy_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Apply server-side query filters to decoded event dictionaries."""
         normalized_components = [item for item in (components or []) if item]
@@ -940,14 +977,34 @@ class EventRecorder:
                 continue
             if normalized_event_types and event.get("type") not in normalized_event_types:
                 continue
-            if execution_id is not None and int(event.get("execution_id") or 0) != execution_id:
+            requested_execution_id = (
+                execution_id if execution_id is not None else kernel_execution_id
+            )
+            if requested_execution_id is not None and int(event.get("execution_id") or 0) != requested_execution_id:
                 continue
             if program_run_id is not None and event.get("program_run_id") != program_run_id:
                 continue
             if intervention_run_id is not None and event.get("intervention_run_id") != intervention_run_id:
                 continue
+            if action_span_id is not None and self._event_text_field(event, "action_span_id") != action_span_id:
+                continue
+            if node_instance_id is not None and self._event_text_field(event, "node_instance_id") != node_instance_id:
+                continue
+            if node_attempt_id is not None and self._event_text_field(event, "node_attempt_id") != node_attempt_id:
+                continue
+            if move_id is not None and self._event_text_field(event, "move_id") != move_id:
+                continue
+            if contact_policy_id is not None and self._event_text_field(event, "contact_policy_id") != contact_policy_id:
+                continue
             filtered.append(event)
         return filtered
+
+    @staticmethod
+    def _event_text_field(event: dict[str, Any], key: str) -> Optional[str]:
+        value = event.get(key)
+        if value is None and isinstance(event.get("details"), dict):
+            value = event["details"].get(key)
+        return None if value is None else str(value)
 
     @staticmethod
     def _native_event_details(native_event: dict[str, Any]) -> dict[str, Any]:
@@ -962,7 +1019,17 @@ class EventRecorder:
         native_type = native_event.get("type")
         if native_type is not None:
             details["native_kernel_event_type"] = native_type
-        for key in ("from_state", "to_state"):
+        for key in (
+            "from_state",
+            "to_state",
+            "action_source",
+            "action_span_id",
+            "action_span_program_run_id",
+            "node_instance_id",
+            "node_attempt_id",
+            "parent_node_attempt_id",
+            "contact_policy_id",
+        ):
             value = native_event.get(key)
             if value is not None:
                 details[key] = value
@@ -1647,6 +1714,21 @@ class EventRecorder:
                 intervention_run_id = run_id
 
             details_payload = dict(details) if details else None
+            action_span_id = None
+            action_source = None
+            node_instance_id = None
+            node_attempt_id = None
+            parent_node_attempt_id = None
+            contact_policy_id = None
+            if details_payload:
+                action_span_id = details_payload.get("action_span_id")
+                action_source = details_payload.get("action_source")
+                node_instance_id = details_payload.get("node_instance_id")
+                node_attempt_id = details_payload.get("node_attempt_id")
+                parent_node_attempt_id = details_payload.get(
+                    "parent_node_attempt_id"
+                )
+                contact_policy_id = details_payload.get("contact_policy_id")
             channel = _event_channel(event_type, details_payload)
             severity = _severity_for_event(event_type, details_payload)
             event: dict[str, Any] = {
@@ -1666,6 +1748,18 @@ class EventRecorder:
                 "component": _component_for_event(event_type),
                 "channel": channel,
             }
+            if action_span_id:
+                event["action_span_id"] = str(action_span_id)
+            if action_source:
+                event["action_source"] = str(action_source)
+            if node_instance_id:
+                event["node_instance_id"] = str(node_instance_id)
+            if node_attempt_id:
+                event["node_attempt_id"] = str(node_attempt_id)
+            if parent_node_attempt_id:
+                event["parent_node_attempt_id"] = str(parent_node_attempt_id)
+            if contact_policy_id:
+                event["contact_policy_id"] = str(contact_policy_id)
             if intervention_run_id is not None:
                 event["intervention_run_id"] = intervention_run_id
             if move_id:
@@ -1823,6 +1917,10 @@ class EventRecorder:
             self._decode_stored_event(event)
             for event in list(self._events)[-_INCIDENT_ALL_EVENT_LIMIT:]
         ]
+        span_events = self._span_events_for_trigger(trigger_event, all_events)
+        action_span = self._action_span_summary(trigger_event)
+        span_scope = self._span_scope_summary(trigger_event)
+        headline_cause = self._headline_cause(trigger_event, span_events)
         events_by_channel = {
             channel: [
                 self._decode_stored_event(event)
@@ -1839,13 +1937,212 @@ class EventRecorder:
             "triggerChannel": trigger_event.get("channel"),
             "triggerSeverity": trigger_event.get("severity"),
             "triggerEvent": dict(trigger_event),
+            "actionSpan": action_span,
+            "spanScope": span_scope,
+            "headlineCause": headline_cause,
+            "recovery": headline_cause.get("recovery"),
+            "spanEvents": span_events,
             "allEvents": all_events,
             "eventsByChannel": events_by_channel,
+            "contextWindows": {
+                "spanEvents": {
+                    "label": span_scope.get("label"),
+                    "scope": span_scope,
+                    "count": len(span_events),
+                },
+                "allEvents": {
+                    "label": "All-events context window",
+                    "count": len(all_events),
+                },
+                "eventsByChannel": {
+                    "label": "Events grouped by diagnostic channel",
+                    "channels": {
+                        channel: len(events)
+                        for channel, events in events_by_channel.items()
+                    },
+                },
+            },
             "channelEventCounts": {
                 channel: len(events)
                 for channel, events in events_by_channel.items()
             },
         }
+
+    def _span_events_for_trigger(
+        self,
+        trigger_event: dict[str, Any],
+        events: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return the causal span chain for an incident trigger.
+
+        `allEvents` remains the broad chronological window. This narrower list
+        is deliberately keyed by the strongest available span identity so stale
+        sibling/previous-node events do not appear as the incident cause.
+        """
+        for key in ("action_span_id", "node_attempt_id", "node_instance_id"):
+            value = self._event_text_field(trigger_event, key)
+            if value:
+                return [
+                    event
+                    for event in events
+                    if self._event_text_field(event, key) == value
+                ]
+        execution_id = int(trigger_event.get("execution_id") or 0)
+        if execution_id > 0:
+            return [
+                event
+                for event in events
+                if int(event.get("execution_id") or 0) == execution_id
+            ]
+        return []
+
+    def _span_scope_summary(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Describe the strongest identity used for the span-local chain."""
+        for key, label in (
+            ("action_span_id", "action span"),
+            ("node_attempt_id", "node attempt"),
+            ("node_instance_id", "node instance"),
+        ):
+            value = self._event_text_field(event, key)
+            if value:
+                return {
+                    "field": key,
+                    "kind": key.removesuffix("_id"),
+                    "value": value,
+                    "label": f"Span-local chain scoped by {label}",
+                    "attemptExact": key in {"action_span_id", "node_attempt_id"},
+                }
+        execution_id = int(event.get("execution_id") or 0)
+        if execution_id > 0:
+            return {
+                "field": "kernel_execution_id",
+                "kind": "kernel_execution",
+                "value": str(execution_id),
+                "label": "Span-local chain scoped by kernel execution",
+                "attemptExact": False,
+            }
+        return {
+            "field": "",
+            "kind": "none",
+            "value": "",
+            "label": "No span-local identity available",
+            "attemptExact": False,
+        }
+
+    def _headline_cause(
+        self,
+        trigger_event: dict[str, Any],
+        span_events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Build the operator-facing incident headline from the best span event."""
+        cause_event = self._select_headline_event(trigger_event, span_events)
+        details = cause_event.get("details") if isinstance(cause_event.get("details"), dict) else {}
+        details = details if isinstance(details, dict) else {}
+        error_code = (
+            details.get("reason_code")
+            or details.get("error_code")
+            or cause_event.get("type")
+        )
+        raw_message = (
+            details.get("error")
+            if isinstance(details.get("error"), str)
+            else cause_event.get("message")
+        )
+        message = str(raw_message) if raw_message else str(cause_event.get("type") or "incident")
+        move_id = self._event_text_field(cause_event, "move_id")
+        node = (
+            self._event_text_field(cause_event, "node_instance_id")
+            or self._event_text_field(cause_event, "trigger_node_instance")
+            or self._event_text_field(cause_event, "node")
+        )
+        execution_id = int(cause_event.get("execution_id") or 0)
+
+        if (
+            str(error_code) == "planning_timeout"
+            or "planning timed out" in message.lower()
+        ):
+            subject = node or move_id or "motion"
+            if move_id and node and move_id != node:
+                summary = (
+                    f"Planning timed out while planning `{subject}` "
+                    f"(`{move_id}`"
+                    f"{', execution ' + str(execution_id) if execution_id > 0 else ''})."
+                )
+            else:
+                summary = (
+                    f"Planning timed out while planning `{subject}`"
+                    f"{' (execution ' + str(execution_id) + ')' if execution_id > 0 else ''}."
+                )
+            summary += " Cycle stopped and can be resumed."
+            recovery = "resume"
+        else:
+            summary = message
+            recovery = "inspect_then_resume_or_reset"
+
+        return {
+            "eventIndex": cause_event.get("event_index"),
+            "eventType": cause_event.get("type"),
+            "errorCode": str(error_code) if error_code else None,
+            "message": message,
+            "summary": summary,
+            "recovery": recovery,
+            "moveId": move_id,
+            "nodeInstanceId": node,
+            "kernelExecutionId": execution_id if execution_id > 0 else None,
+            "genericWrapperSuppressed": cause_event is not trigger_event,
+        }
+
+    def _select_headline_event(
+        self,
+        trigger_event: dict[str, Any],
+        span_events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Prefer the span-local structured cause over generic cycle wrappers."""
+        candidates = list(span_events) if span_events else [trigger_event]
+        for event in reversed(candidates):
+            message = event.get("message")
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            error = details.get("error") if isinstance(details, dict) else None
+            text = str(error or message or "")
+            event_type = str(event.get("type") or "")
+            if (
+                event_type in {
+                    "error_raised",
+                    "kernel_error",
+                    "plan_failed",
+                    "validation_failed",
+                    "execute_failed",
+                    "collision_detected",
+                    "cycle_error",
+                }
+                and text
+                and text not in _GENERIC_TERMINAL_MESSAGES
+            ):
+                return event
+        return trigger_event
+
+    def _action_span_summary(self, event: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Return a compact camelCase span summary for incident consumers."""
+        fields = {
+            "action_span_id": "actionSpanId",
+            "action_source": "actionSource",
+            "action_span_program_run_id": "actionSpanProgramRunId",
+            "program_run_id": "programRunId",
+            "node_instance_id": "nodeInstanceId",
+            "node_attempt_id": "nodeAttemptId",
+            "parent_node_attempt_id": "parentNodeAttemptId",
+            "contact_policy_id": "contactPolicyId",
+            "move_id": "moveId",
+        }
+        summary: dict[str, Any] = {}
+        for source_key, target_key in fields.items():
+            value = self._event_text_field(event, source_key)
+            if value:
+                summary[target_key] = value
+        execution_id = int(event.get("execution_id") or 0)
+        if execution_id > 0:
+            summary["kernelExecutionId"] = execution_id
+        return summary or None
 
     def _enqueue_jsonl_locked(
         self,
@@ -1952,10 +2249,16 @@ class EventRecorder:
             return
         run_id = event.get("run_id") if isinstance(event.get("run_id"), str) else None
         trace_file = self._path_for_run(run_id)
+        recent_events = [
+            self._decode_stored_event(stored)
+            for stored in self._events
+            if run_id is None or stored.run_id == run_id
+        ][-_FAILURE_ARCHIVE_RECENT_EVENT_LIMIT:]
         job = _FailureArchiveJob(
             event=dict(event),
             run_id=run_id,
             trace_file=trace_file,
+            recent_events=recent_events,
         )
         try:
             queue_.put_nowait(job)
@@ -2061,10 +2364,7 @@ class EventRecorder:
             encoding="utf-8",
         )
         with (archive_path / "recent_events.jsonl").open("w", encoding="utf-8") as handle:
-            for recent in self._load_events_for_run(
-                job.run_id,
-                limit=_FAILURE_ARCHIVE_RECENT_EVENT_LIMIT,
-            ):
+            for recent in job.recent_events:
                 handle.write(json.dumps(recent, sort_keys=True))
                 handle.write("\n")
 

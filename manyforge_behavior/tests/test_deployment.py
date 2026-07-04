@@ -4063,6 +4063,36 @@ class TestAdapterCapabilityKeys:
         reloaded = Deployment.from_dict(deploy.to_dict())
         assert reloaded.baseline_collision_policy_snapshot() == snapshot
 
+    def test_contact_grasp_policy_exports_typed_collision_snapshot_entry(self):
+        data = _minimal_deployment(
+            contact_policies=[
+                {
+                    "policy_id": "contact_grasp/part",
+                    "mode": "contact_grasp",
+                    "sensing": "geometry_only",
+                    "selected_object_id": "part",
+                    "allowed_robot_links": ["left_finger", "right_finger"],
+                    "max_penetration_m": 0.002,
+                    "terminal_window_start_fraction": 0.75,
+                }
+            ]
+        )
+        deploy = Deployment.from_dict(data)
+
+        snapshot = deploy.baseline_collision_policy_snapshot()
+
+        assert snapshot is not None
+        assert snapshot["policy_id"] == "contact_grasp/part"
+        assert snapshot["contact_grasps"] == [
+            {
+                "policy_id": "contact_grasp/part",
+                "selected_object_id": "part",
+                "allowed_robot_links": ["left_finger", "right_finger"],
+                "max_penetration_m": 0.002,
+                "terminal_window_start_fraction": 0.75,
+            }
+        ]
+
 
 class TestValidateCapabilities:
     def test_validate_capabilities_success(self):

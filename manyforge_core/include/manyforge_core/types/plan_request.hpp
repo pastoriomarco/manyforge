@@ -6,6 +6,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/robot_state.hpp>
 #include <manyforge_core/types/motion_spec.hpp>
+#include <manyforge_core/types/action_span.hpp>
 #include <manyforge_core/types/tolerances.hpp>
 #include <manyforge_core/types/speed_profile.hpp>
 #include <manyforge_core/types/joint_dynamics_limits.hpp>
@@ -27,8 +28,11 @@ struct PlanRequestDTO {
   double planning_timeout_s;  // > 0
   /// Per-joint absolute dynamics caps (Phase 4-P5.1K). Empty preserves prior
   /// behavior. Consumed by the planner backend's time-parameterization.
-  /// Kept last so the positional aggregate constructor stays aligned.
   PerJointDynamicsLimitsDTO per_joint_dynamics_limits;
+  /// Optional caller-owned action-span correlation (spec/210 §3.1.1).
+  std::optional<ActionSpanDTO> action_span;
+  /// Effective concrete contact-policy binding for contact-tolerant planning.
+  std::string contact_policy_id;
 };
 
 /// Planning result (spec §3.6)

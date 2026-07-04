@@ -501,6 +501,12 @@ const STOP_CHAIN_KEYS = [
 ];
 
 const INCIDENT_DETAIL_KEYS = [
+  'action_span_id',
+  'node_instance_id',
+  'node_attempt_id',
+  'parent_node_attempt_id',
+  'move_id',
+  'contact_policy_id',
   'requested_stop_mode',
   'executed_stop_mode',
   'fallback_pair',
@@ -686,11 +692,57 @@ function incidentEventDetails(event: Record<string, unknown>): string {
     .join('  ');
 }
 
-function incidentEventSummary(event: Record<string, unknown>): string {
+function stageReportSummaries(event: Record<string, unknown>): string[] {
+  const details = objectField(event, 'details');
+  if (!details) {
+    return [];
+  }
+  const reports = objectArrayField(details, 'candidate_stage_reports');
+  const single = objectField(details, 'candidate_stage_report');
+  const selectedReports = reports.length > 0 ? reports : single ? [single] : [];
+  return selectedReports.slice(-3).map((report) => {
+    const candidateValue =
+      report.candidate_index ??
+      report.candidate_id ??
+      report.candidate;
+    const candidate =
+      candidateValue !== undefined && candidateValue !== null
+        ? String(candidateValue)
+        : '';
+    const fallbackCandidate =
+      stringField(report, 'candidate_index') ||
+      stringField(report, 'candidate_id') ||
+      stringField(report, 'candidate');
+    const stages = objectArrayField(report, 'stages');
+    const failures = stages
+      .filter((stage) => stringField(stage, 'status') === 'failure')
+      .map((stage) => {
+        const stageName = stringField(stage, 'stage') || 'stage';
+        const failuresList = objectArrayField(stage, 'failures');
+        const firstFailure = failuresList[0] ?? null;
+        const cause =
+          stringField(firstFailure, 'cause') ||
+          stringField(stage, 'cause') ||
+          stringField(stage, 'collision_check') ||
+          'failed';
+        return `${stageName}:${cause}`;
+      });
+    const prefix = candidate || fallbackCandidate
+      ? `candidate ${candidate || fallbackCandidate}`
+      : 'candidate';
+    return failures.length > 0
+      ? `${prefix} ${failures.join(', ')}`
+      : `${prefix} stage report`;
+  });
+}
+
+export function incidentEventSummary(event: Record<string, unknown>): string {
   const type = stringField(event, 'type') || stringField(event, 'event') || 'event';
   const message = stringField(event, 'message');
   const details = incidentEventDetails(event);
-  return [type, message, details].filter(Boolean).join(' | ');
+  const stageReports = stageReportSummaries(event);
+  const stageText = stageReports.length > 0 ? `stages: ${stageReports.join(' ; ')}` : '';
+  return [type, message, details, stageText].filter(Boolean).join(' | ');
 }
 
 function IncidentSnapshotSummary({
@@ -702,13 +754,20 @@ function IncidentSnapshotSummary({
     return null;
   }
   const allEvents = objectArrayField(snapshot, 'allEvents');
+  const spanEvents = objectArrayField(snapshot, 'spanEvents');
   const eventsByChannel = objectField(snapshot, 'eventsByChannel');
   const faultEvents = objectArrayField(eventsByChannel, 'fault_safety_stop');
+  const spanScope = objectField(snapshot, 'spanScope');
+  const headlineCause = objectField(snapshot, 'headlineCause');
+  const headlineSummary = stringField(headlineCause, 'summary');
+  const scopeLabel =
+    stringField(spanScope, 'label') ||
+    'Span-local chain scoped by strongest available identity';
   const timeline = allEvents.slice(-16);
   const triggerType = stringField(snapshot, 'triggerType');
   const triggerChannel = stringField(snapshot, 'triggerChannel');
   const triggerSeverity = stringField(snapshot, 'triggerSeverity');
-  if (timeline.length === 0 && faultEvents.length === 0) {
+  if (timeline.length === 0 && faultEvents.length === 0 && spanEvents.length === 0) {
     return null;
   }
   return (
@@ -718,9 +777,30 @@ function IncidentSnapshotSummary({
         {triggerType ? `: ${triggerType}` : ''}
         {triggerChannel ? ` (${triggerChannel}${triggerSeverity ? `, ${triggerSeverity}` : ''})` : ''}
       </summary>
+      {headlineSummary && (
+        <div className="mt-2 rounded border border-red-900/70 bg-red-950/30 p-2">
+          <div className="text-red-300/80">Headline cause</div>
+          <div className="break-words font-mono">{headlineSummary}</div>
+        </div>
+      )}
+      {spanEvents.length > 0 && (
+        <div className="mt-2">
+          <div className="mb-1 text-red-300/80">{scopeLabel}</div>
+          <ol className="space-y-1">
+            {spanEvents.slice(-14).map((event, index) => (
+              <li
+                key={`${stringField(event, 'event_index') || stringField(event, 'sequence') || index}`}
+                className="break-words font-mono"
+              >
+                {incidentEventSummary(event)}
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
       {faultEvents.length > 0 && (
         <div className="mt-2">
-          <div className="mb-1 text-red-300/80">Stop/fault channel</div>
+          <div className="mb-1 text-red-300/80">Stop/fault context channel</div>
           <ol className="space-y-1">
             {faultEvents.slice(-12).map((event, index) => (
               <li
@@ -735,7 +815,7 @@ function IncidentSnapshotSummary({
       )}
       {timeline.length > 0 && (
         <div className="mt-2">
-          <div className="mb-1 text-red-300/80">All-events window</div>
+          <div className="mb-1 text-red-300/80">All-events context window</div>
           <ol className="space-y-1">
             {timeline.map((event, index) => (
               <li

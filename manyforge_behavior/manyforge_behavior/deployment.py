@@ -1655,6 +1655,57 @@ class Deployment:
                 raise DeploymentValidationError(
                     f"contact_policies contains duplicate policy_id '{policy_id}'"
                 )
+            mode = raw_policy.get("mode")
+            if mode is not None and mode != "contact_grasp":
+                raise DeploymentValidationError(
+                    f"{path}.mode must be contact_grasp when specified"
+                )
+            if mode == "contact_grasp":
+                sensing = raw_policy.get("sensing", "geometry_only")
+                if sensing != "geometry_only":
+                    raise DeploymentValidationError(
+                        f"{path}.sensing must be geometry_only for contact_grasp"
+                    )
+                selected_object_id = raw_policy.get("selected_object_id")
+                if not isinstance(selected_object_id, str) or not selected_object_id.strip():
+                    raise DeploymentValidationError(
+                        f"{path}.selected_object_id is required for contact_grasp"
+                    )
+                links = raw_policy.get("allowed_robot_links")
+                if not isinstance(links, list) or not links or not all(
+                    isinstance(link, str) and link.strip() for link in links
+                ):
+                    raise DeploymentValidationError(
+                        f"{path}.allowed_robot_links must be a non-empty list of strings"
+                    )
+                max_penetration = raw_policy.get("max_penetration_m", 0.0)
+                try:
+                    max_penetration_f = float(max_penetration)
+                except (TypeError, ValueError):
+                    raise DeploymentValidationError(
+                        f"{path}.max_penetration_m must be finite and >= 0"
+                    ) from None
+                if not math.isfinite(max_penetration_f) or max_penetration_f < 0.0:
+                    raise DeploymentValidationError(
+                        f"{path}.max_penetration_m must be finite and >= 0"
+                    )
+                terminal_start = raw_policy.get(
+                    "terminal_window_start_fraction", 0.8
+                )
+                try:
+                    terminal_start_f = float(terminal_start)
+                except (TypeError, ValueError):
+                    raise DeploymentValidationError(
+                        f"{path}.terminal_window_start_fraction must be in [0, 1]"
+                    ) from None
+                if (
+                    not math.isfinite(terminal_start_f)
+                    or terminal_start_f < 0.0
+                    or terminal_start_f > 1.0
+                ):
+                    raise DeploymentValidationError(
+                        f"{path}.terminal_window_start_fraction must be in [0, 1]"
+                    )
             seen.add(policy_id)
             parsed.append(ContactPolicyConfig(policy_id=policy_id, raw=dict(raw_policy)))
         return parsed
@@ -3623,6 +3674,21 @@ class Deployment:
             "require_full_diagnostics": bool(
                 policy.raw.get("require_full_diagnostics", True)
             ),
+            "contact_grasps": [
+                {
+                    "policy_id": p.policy_id,
+                    "selected_object_id": str(p.raw["selected_object_id"]).strip(),
+                    "allowed_robot_links": [
+                        str(link).strip() for link in p.raw["allowed_robot_links"]
+                    ],
+                    "max_penetration_m": float(p.raw.get("max_penetration_m", 0.0)),
+                    "terminal_window_start_fraction": float(
+                        p.raw.get("terminal_window_start_fraction", 0.8)
+                    ),
+                }
+                for p in self.contact_policies
+                if p.raw.get("mode") == "contact_grasp"
+            ],
         }
 
     def _validate_adapter_capability_manifests(self) -> None:

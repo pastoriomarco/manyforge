@@ -696,6 +696,37 @@ class TestNativeKernelBasics:
         assert result.execution_id > 0
         wait_for_terminal(native_kernel)
 
+    def test_execute_accepts_explicit_null_optional_correlation_fields(
+        self, native_kernel
+    ):
+        result = native_kernel._bundle.execute({
+            "robot_id": "robot1",
+            "group_id": "arm",
+            "move_id": "native_null_optional_correlation",
+            "base_frame": "base_link",
+            "tcp_frame": "tool0",
+            "motion_type": "joint_goal",
+            "joint_goal_names": UR5_JOINTS,
+            "joint_goal_positions_rad": GOAL_A,
+            "velocity_scale": 1.0,
+            "acceleration_scale": 1.0,
+            "planning_timeout_s": 10.0,
+            "execution_timeout_s": 30.0,
+            "cache_mode": "default",
+            "program_run_id": None,
+            "action_span": {
+                "action_source": None,
+                "action_span_id": None,
+                "program_run_id": None,
+                "node_instance_id": None,
+                "node_attempt_id": None,
+                "parent_node_attempt_id": None,
+            },
+            "contact_policy_id": None,
+        })
+        assert result["ok"] is True
+        wait_for_terminal(native_kernel)
+
     def test_state_after_execute(self, native_kernel):
         native_kernel.execute(make_request("native_state", GOAL_A))
         status = wait_for_non_idle(native_kernel)

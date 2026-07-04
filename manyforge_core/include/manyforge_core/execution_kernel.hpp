@@ -369,6 +369,11 @@ class ExecutionKernel {
 
   /// Emit an event to all subscribers.
   void emit_event(const KernelEvent& event);
+  void set_active_request_correlation(const ExecuteRequestDTO& request);
+  void clear_active_request_correlation();
+  void stamp_active_request_correlation(
+      std::map<std::string, std::string>& details) const;
+  void stamp_active_request_correlation(ExecutionSnapshot& snapshot) const;
 
   /// K3: route a terminal decision through the TerminalCommitter.
   /// Returns the outcome; `outcome.committed` is the state that must
@@ -530,6 +535,10 @@ class ExecutionKernel {
   /// so it cannot participate in any lock-ordering cycle.
   mutable std::mutex active_program_run_id_mutex_;
   std::string active_program_run_id_;
+  mutable std::mutex active_action_span_mutex_;
+  std::optional<ActionSpanDTO> active_action_span_;
+  mutable std::mutex active_contact_policy_id_mutex_;
+  std::string active_contact_policy_id_;
 
   // Event subscription
   std::mutex subscribers_mutex_;

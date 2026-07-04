@@ -575,8 +575,14 @@ def test_pose_source_apply_callback_invoked_for_object_relative_move():
     kernel = MockKernelClient()
     apply_calls: list[dict] = []
 
-    def apply_callback(*, object_ids, reason):
-        apply_calls.append({"object_ids": list(object_ids), "reason": reason})
+    def apply_callback(*, object_ids, reason, action_span):
+        apply_calls.append(
+            {
+                "object_ids": list(object_ids),
+                "reason": reason,
+                "action_span": action_span,
+            }
+        )
         return {"success": True}
 
     node = _move_until_signal(
@@ -600,6 +606,10 @@ def test_pose_source_apply_callback_invoked_for_object_relative_move():
     _tick(node)
     assert apply_calls, "pose-source apply callback must be invoked"
     assert apply_calls[0]["object_ids"] == []
+    assert apply_calls[0]["action_span"].action_source == "program_node"
+    assert "MoveUntilSignal" in (
+        apply_calls[0]["action_span"].node_instance_id or ""
+    )
 
 
 def test_pose_source_apply_callback_failure_surfaces_as_failure():
@@ -608,7 +618,8 @@ def test_pose_source_apply_callback_failure_surfaces_as_failure():
     # stale scene pose.
     kernel = MockKernelClient()
 
-    def failing_callback(*, object_ids, reason):
+    def failing_callback(*, object_ids, reason, action_span):
+        _ = (object_ids, reason, action_span)
         return {"success": False, "error": "pose source disconnected"}
 
     node = _move_until_signal(
@@ -785,6 +796,15 @@ def test_scoped_nodes_attach_program_run_id_from_blackboard():
     _tick(node)
     assert kernel.last_execute_request is not None
     assert kernel.last_execute_request.program_run_id == "run-test-cafe0123"
+    assert kernel.last_execute_request.action_span is not None
+    assert (
+        kernel.last_execute_request.action_span.program_run_id
+        == "run-test-cafe0123"
+    )
+    assert (
+        kernel.last_execute_request.action_span.action_source
+        == "program_node"
+    )
 
 
 def test_scoped_nodes_execute_without_program_run_id():

@@ -71,6 +71,9 @@ struct CollisionValidationPassConfig {
   /// every CollisionQuery so downstream engines / failure archives can tag
   /// the diagnostic chain. Defaults to kPreExecuteValidation.
   CollisionSurface surface = CollisionSurface::kPreExecutionValidation;
+
+  /// Concrete per-request contact policy. Empty means free-space validation.
+  std::string contact_policy_id;
 };
 
 /// Per-waypoint diagnostic record produced during a coordinator pass.
@@ -188,6 +191,10 @@ class CollisionValidationCoordinator {
       CollisionDecisionSeverity& worst_severity,
       std::optional<std::int64_t>& first_failing_waypoint,
       std::optional<std::int64_t>& first_failing_time_ns) const;
+
+  void apply_contact_grasp_constraints(
+      const TrajectoryDTO& trajectory,
+      CollisionValidationDecisionBundle& bundle) const;
 
   /// Merge an engine-level CollisionDecisionResult with a policy-level one.
   /// kInconclusiveFail / kStopRequested cannot be downgraded.

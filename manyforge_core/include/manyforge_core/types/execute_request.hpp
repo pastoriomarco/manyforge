@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -8,6 +9,7 @@
 #include <manyforge_core/types/joint_dynamics_limits.hpp>
 #include <manyforge_core/types/timeouts.hpp>
 #include <manyforge_core/types/execution_status.hpp>
+#include <manyforge_core/types/action_span.hpp>
 #include <manyforge_core/types/motion_spec.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 
@@ -42,6 +44,13 @@ struct ExecuteRequestDTO {
   /// of every kernel event emitted for this execution so durable history
   /// can be joined across Composer -> kernel -> backend.
   std::string program_run_id;
+  /// Causal action-span envelope for this motion request (spec/210 §3.1.1).
+  /// Empty means the caller has no span context; the kernel does not mint
+  /// behavior-node attempts.
+  std::optional<ActionSpanDTO> action_span;
+  /// Effective concrete contact-policy binding for this move. Empty means
+  /// free-space validation/execution.
+  std::string contact_policy_id;
 };
 
 }  // namespace manyforge::core

@@ -123,6 +123,7 @@ def test_collision_pair_classification_enum():
         "kSupportContactSeparated",
         "kSupportContactRecontactViolation",
         "kAllowedTouchLink",
+        "kAllowedContactGrasp",
         "kDiagnosticIncomplete",
     ):
         assert getattr(e, name) is not None
@@ -312,9 +313,16 @@ def test_collision_policy_revision_and_snapshot_round_trip():
     support.pair = manyforge_core_py.CollisionPairId(
         body_a="object/part/shape/0", body_b="fixture/table/shape/0"
     )
+    contact_grasp = manyforge_core_py.ContactGraspPolicyEntry()
+    contact_grasp.policy_id = "contact_grasp/part"
+    contact_grasp.selected_object_id = "part"
+    contact_grasp.allowed_robot_links = ["left_finger", "right_finger"]
+    contact_grasp.max_penetration_m = 0.002
+    contact_grasp.terminal_window_start_fraction = 0.75
     snapshot.allowed_static_static_pairs = [static_pair]
     snapshot.allowed_touch_link_pairs = [touch_pair]
     snapshot.support_contacts = [support]
+    snapshot.contact_grasps = [contact_grasp]
     snapshot.require_full_diagnostics = False
 
     assert snapshot.policy_id == "pick_with_support"
@@ -323,6 +331,11 @@ def test_collision_policy_revision_and_snapshot_round_trip():
     assert snapshot.allowed_static_static_pairs[0].body_a == "fixture/a/shape/0"
     assert snapshot.allowed_touch_link_pairs[0].body_b.startswith("robot/")
     assert snapshot.support_contacts[0].pair.body_b == "fixture/table/shape/0"
+    assert snapshot.contact_grasps[0].policy_id == "contact_grasp/part"
+    assert snapshot.contact_grasps[0].allowed_robot_links == [
+        "left_finger",
+        "right_finger",
+    ]
     assert snapshot.require_full_diagnostics is False
 
 

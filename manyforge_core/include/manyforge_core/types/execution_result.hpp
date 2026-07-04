@@ -7,6 +7,7 @@
 
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_status.hpp>
+#include <manyforge_core/types/action_span.hpp>
 
 namespace manyforge::core {
 
@@ -27,6 +28,8 @@ struct ExecutionSnapshot {
   int64_t source_timestamp_ns = 0;
   int64_t source_age_ns = 0;
   std::optional<ErrorDTO> error;
+  std::optional<ActionSpanDTO> action_span;
+  std::string contact_policy_id;
 };
 
 /// Execution handle for tracking trajectory execution (spec 220 §4.2)

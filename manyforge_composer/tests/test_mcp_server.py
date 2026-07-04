@@ -594,6 +594,44 @@ class TestExecutionStatus:
         result = _call(mcp, "manyforge_execution_status", {"include": "history"})
         assert "history" in result
 
+    def test_incidents(self):
+        state = _make_state()
+        state.event_recorder._record_event(
+            event_type="plan_completed",
+            execution_id=3,
+            move_id="sibling_probe",
+            details={
+                "action_span_id": "span-sibling",
+                "node_instance_id": "root/parallel/sibling_probe",
+                "node_attempt_id": "attempt-sibling-1",
+            },
+        )
+        state.event_recorder._record_event(
+            event_type="plan_failed",
+            execution_id=4,
+            move_id="drop_approach",
+            details={
+                "error": "Planning timed out",
+                "reason_code": "planning_timeout",
+                "action_span_id": "span-drop",
+                "node_instance_id": "root/parallel/drop_approach",
+                "node_attempt_id": "attempt-drop-1",
+            },
+        )
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_execution_status", {"include": "incidents"})
+        assert "incidents" in result
+        assert result["incidents"]["incident_snapshots"]
+        snapshot = result["incidents"]["incident_snapshots"][-1]
+        assert snapshot["headline_cause"]["error_code"] == "planning_timeout"
+        assert snapshot["span_scope"]["field"] == "action_span_id"
+        assert [
+            event["action_span_id"] for event in snapshot["span_events"]
+        ] == ["span-drop"]
+        assert {
+            event["action_span_id"] for event in snapshot["all_events"]
+        } == {"span-sibling", "span-drop"}
+
     def test_all(self):
         state = _make_state()
         state.load_program(_PROGRAM_PATH, _DEPLOYMENT_PATH)
@@ -601,6 +639,7 @@ class TestExecutionStatus:
         result = _call(mcp, "manyforge_execution_status", {"include": "all"})
         assert "digest" in result
         assert "history" in result
+        assert "incidents" in result
         assert "blackboard" in result
 
     def test_unknown_include(self):

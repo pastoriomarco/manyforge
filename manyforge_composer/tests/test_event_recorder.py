@@ -215,6 +215,32 @@ class TestSemanticEvents:
         semantic_types = [e["type"] for e in events]
         assert "execute_started" in semantic_types
 
+    def test_record_event_lifts_action_span_and_contact_policy_fields(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+
+        rec._record_event(
+            event_type="execute_started",
+            run_id="run-001",
+            execution_id=7,
+            details={
+                "action_source": "program_node",
+                "action_span_id": "attempt-001",
+                "node_instance_id": "sequence/move_to_pick",
+                "node_attempt_id": "attempt-001",
+                "parent_node_attempt_id": "plan-attempt-001",
+                "contact_policy_id": "contact_grasp/lite6_box",
+            },
+        )
+
+        event = _memory_events(rec)[-1]
+        assert event["action_source"] == "program_node"
+        assert event["action_span_id"] == "attempt-001"
+        assert event["node_instance_id"] == "sequence/move_to_pick"
+        assert event["node_attempt_id"] == "attempt-001"
+        assert event["parent_node_attempt_id"] == "plan-attempt-001"
+        assert event["contact_policy_id"] == "contact_grasp/lite6_box"
+        assert event["details"]["contact_policy_id"] == "contact_grasp/lite6_box"
+
     def test_executing_to_completed(self):
         rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
@@ -727,6 +753,45 @@ class TestJSONLSink:
         assert len(result["events"]) == 1
         assert result["events"][0]["type"] == "cycle_error"
 
+    def test_history_filters_by_span_and_move_identity(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec._record_event(
+            event_type="plan_started",
+            execution_id=7,
+            move_id="move_to_pick",
+            details={
+                "action_span_id": "span-pick",
+                "action_source": "program_node",
+                "node_instance_id": "node-pick",
+                "node_attempt_id": "attempt-pick-1",
+                "contact_policy_id": "contact-pick",
+            },
+        )
+        rec._record_event(
+            event_type="plan_completed",
+            execution_id=8,
+            move_id="move_to_drop",
+            details={
+                "action_span_id": "span-drop",
+                "node_instance_id": "node-drop",
+                "node_attempt_id": "attempt-drop-1",
+                "contact_policy_id": "contact-drop",
+            },
+        )
+
+        by_span = rec.history(action_span_id="span-pick")["events"]
+        assert [event["move_id"] for event in by_span] == ["move_to_pick"]
+        assert by_span[0]["node_attempt_id"] == "attempt-pick-1"
+
+        by_node_attempt = rec.history(node_attempt_id="attempt-drop-1")["events"]
+        assert [event["action_span_id"] for event in by_node_attempt] == ["span-drop"]
+
+        by_move = rec.export_events(move_id="move_to_pick")
+        assert [event["action_span_id"] for event in by_move] == ["span-pick"]
+
+        by_kernel_execution = rec.history(kernel_execution_id=8)["events"]
+        assert [event["move_id"] for event in by_kernel_execution] == ["move_to_drop"]
+
 
 class TestBoundedRetention:
     """Ring buffer eviction."""
@@ -915,6 +980,232 @@ class TestEventChannelsAndIncidents:
             == "pose_source_applied"
         )
 
+    def test_incident_snapshot_separates_span_chain_from_context(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec._record_event(
+            event_type="plan_started",
+            move_id="foundationpose_pick",
+            details={
+                "action_span_id": "span-foundationpose",
+                "node_instance_id": "node-foundationpose",
+                "node_attempt_id": "attempt-foundationpose-1",
+            },
+        )
+        rec._record_event(
+            event_type="plan_started",
+            move_id="drop_approach",
+            details={
+                "action_span_id": "span-drop",
+                "node_instance_id": "node-drop",
+                "node_attempt_id": "attempt-drop-1",
+                "parent_node_attempt_id": "attempt-pick-sequence-1",
+            },
+        )
+        rec._record_event(
+            event_type="error_raised",
+            move_id="drop_approach",
+            details={
+                "error": "Planning timed out",
+                "action_span_id": "span-drop",
+                "node_instance_id": "node-drop",
+                "node_attempt_id": "attempt-drop-1",
+                "parent_node_attempt_id": "attempt-pick-sequence-1",
+            },
+        )
+
+        snapshot = rec.incident_snapshots()[-1]
+        assert snapshot["actionSpan"] == {
+            "actionSpanId": "span-drop",
+            "nodeInstanceId": "node-drop",
+            "nodeAttemptId": "attempt-drop-1",
+            "parentNodeAttemptId": "attempt-pick-sequence-1",
+            "moveId": "drop_approach",
+        }
+        assert snapshot["spanScope"] == {
+            "field": "action_span_id",
+            "kind": "action_span",
+            "value": "span-drop",
+            "label": "Span-local chain scoped by action span",
+            "attemptExact": True,
+        }
+        assert [event["move_id"] for event in snapshot["allEvents"]] == [
+            "foundationpose_pick",
+            "drop_approach",
+            "drop_approach",
+        ]
+        assert [event["move_id"] for event in snapshot["spanEvents"]] == [
+            "drop_approach",
+            "drop_approach",
+        ]
+        assert {
+            event["action_span_id"] for event in snapshot["spanEvents"]
+        } == {"span-drop"}
+        assert snapshot["contextWindows"]["spanEvents"]["count"] == 2
+
+    def test_incident_headline_prefers_span_local_cause_over_generic_wrapper(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec._record_event(
+            event_type="plan_failed",
+            execution_id=6,
+            move_id="lite6_drop_approach",
+            details={
+                "error": "Planning timed out",
+                "reason_code": "planning_timeout",
+                "action_span_id": "span-drop",
+                "node_instance_id": "move_to_drop_approach",
+                "node_attempt_id": "attempt-drop-1",
+            },
+        )
+        rec._record_event(
+            event_type="cycle_error",
+            execution_id=6,
+            move_id="lite6_drop_approach",
+            details={
+                "error": "Motion execution ended in stopped",
+                "action_span_id": "span-drop",
+                "node_instance_id": "move_to_drop_approach",
+                "node_attempt_id": "attempt-drop-1",
+            },
+        )
+
+        snapshot = rec.incident_snapshots()[-1]
+        headline = snapshot["headlineCause"]
+        assert headline["eventType"] == "plan_failed"
+        assert headline["errorCode"] == "planning_timeout"
+        assert headline["genericWrapperSuppressed"] is True
+        assert headline["summary"] == (
+            "Planning timed out while planning `move_to_drop_approach` "
+            "(`lite6_drop_approach`, execution 6). Cycle stopped and can be resumed."
+        )
+
+    def test_stale_foundationpose_previous_run_is_context_not_headline(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec._record_event(
+            event_type="pose_source_apply_failed",
+            run_id="run-foundationpose-stale",
+            move_id="foundationpose_pick",
+            details={
+                "error": "no fresh pose-source update for: graspable",
+                "reason": "pick_sequence:plan_foundationpose_trocar_pick",
+                "action_span_id": "span-foundationpose",
+                "node_instance_id": "plan_foundationpose_trocar_pick",
+                "node_attempt_id": "attempt-foundationpose-1",
+            },
+        )
+        rec._record_event(
+            event_type="plan_failed",
+            run_id="run-drop-timeout",
+            execution_id=6,
+            move_id="lite6_drop_approach",
+            details={
+                "error": "Planning timed out",
+                "reason_code": "planning_timeout",
+                "action_span_id": "span-drop",
+                "node_instance_id": "move_to_drop_approach",
+                "node_attempt_id": "attempt-drop-1",
+            },
+        )
+        rec._record_event(
+            event_type="cycle_error",
+            run_id="run-drop-timeout",
+            execution_id=6,
+            move_id="lite6_drop_approach",
+            details={
+                "error": "Motion execution ended in stopped",
+                "action_span_id": "span-drop",
+                "node_instance_id": "move_to_drop_approach",
+                "node_attempt_id": "attempt-drop-1",
+            },
+        )
+
+        snapshot = rec.incident_snapshots()[-1]
+        assert snapshot["headlineCause"]["eventType"] == "plan_failed"
+        assert snapshot["headlineCause"]["errorCode"] == "planning_timeout"
+        assert snapshot["actionSpan"]["actionSpanId"] == "span-drop"
+        assert {
+            event["action_span_id"] for event in snapshot["spanEvents"]
+        } == {"span-drop"}
+        assert "span-foundationpose" not in {
+            event.get("action_span_id") for event in snapshot["spanEvents"]
+        }
+        assert "span-foundationpose" in {
+            event.get("action_span_id") for event in snapshot["allEvents"]
+        }
+        assert {
+            event.get("run_id") for event in snapshot["spanEvents"]
+        } == {"run-drop-timeout"}
+
+    def test_parallel_sibling_events_are_context_not_causal_chain(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec._record_event(
+            event_type="plan_completed",
+            run_id="run-parallel",
+            execution_id=10,
+            move_id="parallel_benign_probe",
+            details={
+                "action_span_id": "span-sibling",
+                "node_instance_id": "root/parallel/benign_probe",
+                "node_attempt_id": "attempt-sibling-1",
+            },
+        )
+        rec._record_event(
+            event_type="validation_failed",
+            run_id="run-parallel",
+            execution_id=11,
+            move_id="drop_approach",
+            details={
+                "error": "Collision validation rejected trajectory",
+                "reason_code": "validation_collision",
+                "action_span_id": "span-drop",
+                "node_instance_id": "root/parallel/drop_branch/move",
+                "node_attempt_id": "attempt-drop-1",
+            },
+        )
+
+        snapshot = rec.incident_snapshots()[-1]
+        assert [event["action_span_id"] for event in snapshot["spanEvents"]] == [
+            "span-drop"
+        ]
+        assert {
+            event.get("action_span_id") for event in snapshot["allEvents"]
+        } == {"span-sibling", "span-drop"}
+        assert snapshot["spanScope"]["attemptExact"] is True
+
+    def test_duplicate_display_names_disambiguate_by_node_instance_id(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        for branch, span_id, attempt_id, event_type in (
+            ("left", "span-left-move", "attempt-left-1", "plan_completed"),
+            ("right", "span-right-move", "attempt-right-1", "plan_failed"),
+        ):
+            rec._record_event(
+                event_type=event_type,
+                run_id="run-duplicate-display-name",
+                execution_id=20 if branch == "left" else 21,
+                move_id="move",
+                details={
+                    "error": "Planning timed out" if event_type == "plan_failed" else "",
+                    "reason_code": "planning_timeout"
+                    if event_type == "plan_failed"
+                    else "",
+                    "display_name": "Move",
+                    "action_span_id": span_id,
+                    "node_instance_id": f"root/parallel/{branch}/move",
+                    "node_attempt_id": attempt_id,
+                },
+            )
+
+        snapshot = rec.incident_snapshots()[-1]
+        assert snapshot["actionSpan"]["nodeInstanceId"] == "root/parallel/right/move"
+        assert [event["node_instance_id"] for event in snapshot["spanEvents"]] == [
+            "root/parallel/right/move"
+        ]
+        assert rec.history(node_instance_id="root/parallel/left/move")["events"][
+            0
+        ]["action_span_id"] == "span-left-move"
+        assert rec.history(node_instance_id="root/parallel/right/move")["events"][
+            0
+        ]["action_span_id"] == "span-right-move"
+
 
 class TestGetEventsSince:
     """Incremental event polling."""
@@ -1096,3 +1387,41 @@ class TestProgramRunIdAdoption:
         events = result["events"]
         assert events, "programRunId filter missed the kernel-stamped id"
         assert events[-1]["program_run_id"] == "run-kernel-stamped-01"
+
+    def test_native_kernel_event_preserves_top_level_action_span_fields(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "error_raised",
+                    "execution_id": 8,
+                    "event_index": 2,
+                    "timestamp_ns": 124,
+                    "program_run_id": "run-kernel-stamped-02",
+                    "action_source": "program_node",
+                    "action_span_id": "span-move-002",
+                    "action_span_program_run_id": "run-kernel-stamped-02",
+                    "node_instance_id": "root/sequence/move_to_place",
+                    "node_attempt_id": "attempt-move-002",
+                    "parent_node_attempt_id": "attempt-plan-002",
+                    "contact_policy_id": "contact_grasp/lite6_box",
+                    "error": {"code": -1, "message": "boom"},
+                }
+            ]
+        )
+
+        events = rec.history(
+            run_id="run-kernel-stamped-02",
+            program_run_id="run-kernel-stamped-02",
+        )["events"]
+        assert len(events) == 1
+        event = events[0]
+        assert event["action_source"] == "program_node"
+        assert event["action_span_id"] == "span-move-002"
+        assert event["node_instance_id"] == "root/sequence/move_to_place"
+        assert event["node_attempt_id"] == "attempt-move-002"
+        assert event["parent_node_attempt_id"] == "attempt-plan-002"
+        assert event["contact_policy_id"] == "contact_grasp/lite6_box"
+        assert event["details"]["action_span_program_run_id"] == (
+            "run-kernel-stamped-02"
+        )

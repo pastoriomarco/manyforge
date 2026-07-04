@@ -1078,6 +1078,38 @@ ExecuteRequestDTO make_test_request(const std::string& move_id = "move_1") {
   return req;
 }
 
+ActionSpanDTO make_test_action_span() {
+  ActionSpanDTO span;
+  span.action_source = ActionSource::kProgramNode;
+  span.action_span_id = "span-move-001";
+  span.program_run_id = "run-action-span-001";
+  span.node_instance_id = "root/sequence/move_to_pick";
+  span.node_attempt_id = "attempt-move-001";
+  span.parent_node_attempt_id = "attempt-plan-001";
+  return span;
+}
+
+void expect_detail(const std::map<std::string, std::string>& details,
+                   const std::string& key,
+                   const std::string& expected_value) {
+  auto it = details.find(key);
+  ASSERT_NE(it, details.end()) << "missing detail key " << key;
+  EXPECT_EQ(it->second, expected_value) << "detail key " << key;
+}
+
+void expect_action_span_details(
+    const std::map<std::string, std::string>& details,
+    const ActionSpanDTO& span) {
+  expect_detail(details, "program_run_id", span.program_run_id);
+  expect_detail(details, "action_source", to_string(span.action_source));
+  expect_detail(details, "action_span_id", span.action_span_id);
+  expect_detail(details, "action_span_program_run_id", span.program_run_id);
+  expect_detail(details, "node_instance_id", span.node_instance_id);
+  expect_detail(details, "node_attempt_id", span.node_attempt_id);
+  expect_detail(details, "parent_node_attempt_id",
+                span.parent_node_attempt_id);
+}
+
 CollisionWorldSnapshot make_test_collision_world_snapshot() {
   CollisionWorldSnapshot snapshot;
   snapshot.publisher_id = "mock_kernel_collision_world";
@@ -1141,6 +1173,29 @@ CollisionResult make_support_contact_collision_result(
   result.engine_status = CollisionEngineStatus::kOk;
   result.pair_clearances = {CollisionPairClearance{pair, signed_clearance_m}};
   return result;
+}
+
+CollisionResult make_contact_grasp_collision_result(
+    const CollisionPairId& pair,
+    double signed_clearance_m) {
+  return make_support_contact_collision_result(pair, signed_clearance_m);
+}
+
+CollisionPolicySnapshot make_contact_grasp_policy_snapshot(
+    const std::string& policy_id,
+    const std::string& selected_object_id,
+    std::vector<std::string> allowed_robot_links,
+    double max_penetration_m) {
+  auto policy = make_test_collision_policy_snapshot();
+  policy.require_full_diagnostics = true;
+  ContactGraspPolicyEntry entry;
+  entry.policy_id = policy_id;
+  entry.selected_object_id = selected_object_id;
+  entry.allowed_robot_links = std::move(allowed_robot_links);
+  entry.max_penetration_m = max_penetration_m;
+  entry.terminal_window_start_fraction = 0.75;
+  policy.contact_grasps.push_back(std::move(entry));
+  return policy;
 }
 
 InterruptSourceDefinition make_interrupt_source(std::string source_id) {
@@ -2349,16 +2404,27 @@ TEST_F(ExecutionKernelTest,
     return std::make_optional(CollisionResult{});
   };
 
-  auto result = local_kernel.execute(make_test_request("replan_stop"));
+  const auto span = make_test_action_span();
+  auto request = make_test_request("replan_stop");
+  request.program_run_id = span.program_run_id;
+  request.action_span = span;
+  auto result = local_kernel.execute(request);
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
 
   EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kStopped);
   EXPECT_EQ(local_planner.plan_count, 2);
   EXPECT_EQ(controlled_execution.execute_count, 0);
+  auto snapshot = local_kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.action_span.has_value());
+  EXPECT_EQ(snapshot.action_span->action_span_id, span.action_span_id);
+  EXPECT_EQ(snapshot.action_span->node_attempt_id, span.node_attempt_id);
   auto outcome = local_kernel.get_execution_outcome(result.value());
   ASSERT_TRUE(outcome.has_value());
   EXPECT_EQ(outcome->terminal_cause, MotionExecutionTerminalCause::kStopped);
+  ASSERT_TRUE(outcome->action_span.has_value());
+  EXPECT_EQ(outcome->action_span->action_span_id, span.action_span_id);
+  EXPECT_EQ(outcome->action_span->node_attempt_id, span.node_attempt_id);
 }
 
 TEST_F(ExecutionKernelTest,
@@ -2411,7 +2477,11 @@ TEST_F(ExecutionKernelTest,
     return std::make_optional(CollisionResult{});
   };
 
-  auto result = local_kernel.execute(make_test_request("replan_interrupt"));
+  const auto span = make_test_action_span();
+  auto request = make_test_request("replan_interrupt");
+  request.program_run_id = span.program_run_id;
+  request.action_span = span;
+  auto result = local_kernel.execute(request);
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
 
@@ -2422,10 +2492,17 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->source_id, "replan_fault");
   EXPECT_EQ(latch->execution_phase_at_latch, InterruptExecutionPhase::kPlanning);
+  auto snapshot = local_kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.action_span.has_value());
+  EXPECT_EQ(snapshot.action_span->action_span_id, span.action_span_id);
+  EXPECT_EQ(snapshot.action_span->node_attempt_id, span.node_attempt_id);
   auto outcome = local_kernel.get_execution_outcome(result.value());
   ASSERT_TRUE(outcome.has_value());
   EXPECT_EQ(outcome->terminal_cause,
             MotionExecutionTerminalCause::kInterruptedFault);
+  ASSERT_TRUE(outcome->action_span.has_value());
+  EXPECT_EQ(outcome->action_span->action_span_id, span.action_span_id);
+  EXPECT_EQ(outcome->action_span->node_attempt_id, span.node_attempt_id);
 }
 
 TEST_F(ExecutionKernelTest,
@@ -5332,6 +5409,259 @@ TEST_F(ExecutionKernelTest,
             "runtime_contact_release_penetration_increased");
   EXPECT_EQ(latch->signal_snapshot.metadata.at("contact_a"), pair.body_a);
   EXPECT_EQ(latch->signal_snapshot.metadata.at("contact_b"), pair.body_b);
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_ContactGraspAllowsBoundedRuntimeContact) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  constexpr const char* kPolicyId = "contact_grasp/graspable";
+  const CollisionPairId pair{"object/graspable/shape/0",
+                             "robot/robot1/link/right_finger/collision/0"};
+  auto policy = make_contact_grasp_policy_snapshot(
+      kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
+  local_collision_world.current_policy = policy;
+  controlled_kernel.set_collision_validation_policy_snapshot(policy);
+
+  auto request = make_test_request("runtime_contact_grasp_allowed");
+  request.contact_policy_id = kPolicyId;
+  auto result = controlled_kernel.execute(request);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  local_collision_engine->result_by_waypoint.clear();
+  local_collision_engine->default_result =
+      make_contact_grasp_collision_result(pair, -0.001);
+  controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
+  const int baseline_stop_count = controlled_execution.stop_count;
+
+  auto tick = controlled_kernel.collision_check_tick();
+  ASSERT_TRUE(tick.ok());
+  EXPECT_EQ(controlled_execution.stop_count, baseline_stop_count);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kExecuting);
+
+  controlled_execution.complete();
+  controlled_kernel.wait_for_completion();
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_ContactGraspPenetrationExceededFailsClosed) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  constexpr const char* kPolicyId = "contact_grasp/graspable";
+  const CollisionPairId pair{"object/graspable/shape/0",
+                             "robot/robot1/link/right_finger/collision/0"};
+  auto policy = make_contact_grasp_policy_snapshot(
+      kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
+  local_collision_world.current_policy = policy;
+  controlled_kernel.set_collision_validation_policy_snapshot(policy);
+
+  auto request = make_test_request("runtime_contact_grasp_over_limit");
+  request.contact_policy_id = kPolicyId;
+  auto result = controlled_kernel.execute(request);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  local_collision_engine->result_by_waypoint.clear();
+  local_collision_engine->default_result =
+      make_contact_grasp_collision_result(pair, -0.006);
+  controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
+
+  auto tick = controlled_kernel.collision_check_tick();
+  ASSERT_TRUE(tick.ok());
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  auto latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->signal_snapshot.metadata.at("reason"),
+            "runtime_collision_detected");
+  EXPECT_EQ(latch->signal_snapshot.metadata.at(
+                "collision_result_raw_contact_grasp_violation"),
+            "grasp_contact_penetration_exceeded");
+  EXPECT_EQ(latch->signal_snapshot.metadata.at(
+                "collision_result_raw_contact_grasp_policy_id"),
+            kPolicyId);
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_ContactGraspMixedAllowedAndViolationKeepsViolation) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  constexpr const char* kPolicyId = "contact_grasp/graspable";
+  const CollisionPairId violating_pair{
+      "object/graspable/shape/0",
+      "robot/robot1/link/right_finger/collision/0"};
+  const CollisionPairId allowed_pair{
+      "object/graspable/shape/0",
+      "robot/robot1/link/left_finger/collision/0"};
+  auto policy = make_contact_grasp_policy_snapshot(
+      kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
+  local_collision_world.current_policy = policy;
+  controlled_kernel.set_collision_validation_policy_snapshot(policy);
+
+  auto request = make_test_request("runtime_contact_grasp_mixed_pairs");
+  request.contact_policy_id = kPolicyId;
+  auto result = controlled_kernel.execute(request);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  CollisionResult runtime_result;
+  runtime_result.in_collision = true;
+  runtime_result.decision = CollisionDecisionResult::kFail;
+  runtime_result.engine_status = CollisionEngineStatus::kOk;
+  runtime_result.normalized_pairs = {violating_pair, allowed_pair};
+  runtime_result.pair_clearances = {
+      CollisionPairClearance{violating_pair, -0.006},
+      CollisionPairClearance{allowed_pair, -0.001},
+  };
+  local_collision_engine->result_by_waypoint.clear();
+  local_collision_engine->default_result = runtime_result;
+  controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
+
+  auto tick = controlled_kernel.collision_check_tick();
+  ASSERT_TRUE(tick.ok());
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  auto latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->signal_snapshot.metadata.at(
+                "collision_result_raw_contact_grasp_violation"),
+            "grasp_contact_penetration_exceeded");
+  EXPECT_EQ(latch->signal_snapshot.metadata.at(
+                "collision_result_first_failure_pair"),
+            "object/graspable/shape/0 <-> "
+            "robot/robot1/link/right_finger/collision/0");
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_ContactGraspMissingClearanceFailsClosed) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  constexpr const char* kPolicyId = "contact_grasp/graspable";
+  const CollisionPairId pair{"object/graspable/shape/0",
+                             "robot/robot1/link/right_finger/collision/0"};
+  auto policy = make_contact_grasp_policy_snapshot(
+      kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
+  local_collision_world.current_policy = policy;
+  controlled_kernel.set_collision_validation_policy_snapshot(policy);
+
+  auto request = make_test_request("runtime_contact_grasp_missing_clearance");
+  request.contact_policy_id = kPolicyId;
+  auto result = controlled_kernel.execute(request);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  auto runtime_result = make_contact_grasp_collision_result(pair, -0.001);
+  runtime_result.pair_clearances.clear();
+  runtime_result.min_clearance_m.reset();
+  runtime_result.min_clearance_pair.reset();
+  local_collision_engine->result_by_waypoint.clear();
+  local_collision_engine->default_result = runtime_result;
+  controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
+
+  auto tick = controlled_kernel.collision_check_tick();
+  ASSERT_TRUE(tick.ok());
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  auto latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->signal_snapshot.metadata.at(
+                "collision_result_raw_contact_grasp_violation"),
+            "missing_grasp_contact_clearance");
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_ContactGraspUnexpectedPairFailsClosed) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  constexpr const char* kPolicyId = "contact_grasp/graspable";
+  const CollisionPairId unexpected_pair{
+      "object/other_part/shape/0",
+      "robot/robot1/link/right_finger/collision/0"};
+  auto policy = make_contact_grasp_policy_snapshot(
+      kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
+  local_collision_world.current_policy = policy;
+  controlled_kernel.set_collision_validation_policy_snapshot(policy);
+
+  auto request = make_test_request("runtime_contact_grasp_unexpected_pair");
+  request.contact_policy_id = kPolicyId;
+  auto result = controlled_kernel.execute(request);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  local_collision_engine->result_by_waypoint.clear();
+  local_collision_engine->default_result =
+      make_contact_grasp_collision_result(unexpected_pair, -0.001);
+  controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
+
+  auto tick = controlled_kernel.collision_check_tick();
+  ASSERT_TRUE(tick.ok());
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  auto latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->signal_snapshot.metadata.at(
+                "collision_result_first_failure_classification"),
+            "blocking_collision");
+  EXPECT_EQ(latch->signal_snapshot.metadata.at(
+                "collision_result_first_failure_pair"),
+            "object/other_part/shape/0 <-> "
+            "robot/robot1/link/right_finger/collision/0");
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
@@ -9081,6 +9411,128 @@ TEST_F(ExecutionKernelTest, Execute_ProgramRunIdStampsEventsAndDoesNotLeakAcross
   }
 }
 
+TEST_F(ExecutionKernelTest,
+       Execute_ActionSpanStampsEventsSnapshotAndOutcome) {
+  // K6: behavior-owned action spans become the execution-layer correlation
+  // key. The kernel must stamp the complete span tuple onto emitted events,
+  // observer snapshots, and the immutable terminal outcome, then clear it at
+  // the acknowledgement boundary so the next action cannot inherit it.
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  const auto span = make_test_action_span();
+  auto request = make_test_request("span_correlated_move");
+  request.program_run_id = span.program_run_id;
+  request.action_span = span;
+
+  auto result = execute_sync(request);
+  ASSERT_TRUE(result.ok());
+
+  auto snapshot = kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.action_span.has_value());
+  EXPECT_EQ(snapshot.action_span->action_source, span.action_source);
+  EXPECT_EQ(snapshot.action_span->action_span_id, span.action_span_id);
+  EXPECT_EQ(snapshot.action_span->program_run_id, span.program_run_id);
+  EXPECT_EQ(snapshot.action_span->node_instance_id, span.node_instance_id);
+  EXPECT_EQ(snapshot.action_span->node_attempt_id, span.node_attempt_id);
+  EXPECT_EQ(snapshot.action_span->parent_node_attempt_id,
+            span.parent_node_attempt_id);
+  EXPECT_TRUE(snapshot.contact_policy_id.empty());
+
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->action_span.has_value());
+  EXPECT_EQ(outcome->action_span->action_source, span.action_source);
+  EXPECT_EQ(outcome->action_span->action_span_id, span.action_span_id);
+  EXPECT_EQ(outcome->action_span->program_run_id, span.program_run_id);
+  EXPECT_EQ(outcome->action_span->node_instance_id, span.node_instance_id);
+  EXPECT_EQ(outcome->action_span->node_attempt_id, span.node_attempt_id);
+  EXPECT_EQ(outcome->action_span->parent_node_attempt_id,
+            span.parent_node_attempt_id);
+  EXPECT_TRUE(outcome->contact_policy_id.empty());
+
+  ASSERT_TRUE(kernel.acknowledge_completed(result.value()).accepted);
+
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    ASSERT_FALSE(events.empty());
+    for (const auto& event : events) {
+      expect_action_span_details(event.details, span);
+    }
+    events.clear();
+  }
+
+  auto uncorrelated = make_test_request("span_uncorrelated_move");
+  auto second = execute_sync(uncorrelated);
+  ASSERT_TRUE(second.ok());
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    ASSERT_FALSE(events.empty());
+    for (const auto& event : events) {
+      EXPECT_EQ(event.details.count("action_source"), 0u)
+          << "stale action source leaked onto uncorrelated execution";
+      EXPECT_EQ(event.details.count("action_span_id"), 0u)
+          << "stale action span leaked onto uncorrelated execution";
+      EXPECT_EQ(event.details.count("node_attempt_id"), 0u)
+          << "stale node attempt leaked onto uncorrelated execution";
+      EXPECT_EQ(event.details.count("contact_policy_id"), 0u)
+          << "stale contact policy leaked onto uncorrelated execution";
+    }
+  }
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ContactPolicyStampsEventsSnapshotAndFailedOutcome) {
+  // K6: contact policy ids are part of the same action-correlation envelope.
+  // Unknown policies fail validation by design, but the failure still needs to
+  // carry the originating behavior span and concrete policy id for incident
+  // grouping and operator diagnostics.
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  const auto span = make_test_action_span();
+  constexpr const char* kContactPolicyId = "contact_grasp/lite6_box";
+  auto request = make_test_request("contact_policy_correlated_move");
+  request.program_run_id = span.program_run_id;
+  request.action_span = span;
+  request.contact_policy_id = kContactPolicyId;
+
+  auto result = execute_sync(request);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+
+  auto snapshot = kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.action_span.has_value());
+  EXPECT_EQ(snapshot.action_span->action_span_id, span.action_span_id);
+  EXPECT_EQ(snapshot.action_span->node_attempt_id, span.node_attempt_id);
+  EXPECT_EQ(snapshot.contact_policy_id, kContactPolicyId);
+
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause, MotionExecutionTerminalCause::kFailed);
+  ASSERT_TRUE(outcome->action_span.has_value());
+  EXPECT_EQ(outcome->action_span->action_span_id, span.action_span_id);
+  EXPECT_EQ(outcome->action_span->node_attempt_id, span.node_attempt_id);
+  EXPECT_EQ(outcome->contact_policy_id, kContactPolicyId);
+
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    ASSERT_FALSE(events.empty());
+    for (const auto& event : events) {
+      expect_action_span_details(event.details, span);
+      expect_detail(event.details, "contact_policy_id", kContactPolicyId);
+    }
+  }
+}
+
 
 TEST_F(ExecutionKernelTest,
        Execute_ReplanFailureWithCollisionClassLatchPreservesSafetyTerminal) {
@@ -9136,7 +9588,11 @@ TEST_F(ExecutionKernelTest,
                                                local_engine);
   local_engine->default_result = make_authoritative_collision_result();
 
-  auto result = local_kernel.execute(make_test_request("replan_latch_fail"));
+  const auto span = make_test_action_span();
+  auto request = make_test_request("replan_latch_fail");
+  request.program_run_id = span.program_run_id;
+  request.action_span = span;
+  auto result = local_kernel.execute(request);
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
 
@@ -9147,6 +9603,15 @@ TEST_F(ExecutionKernelTest,
               terminal == ExecutionState::kInterventionRequired)
       << "unexpected terminal: " << to_string(terminal);
   EXPECT_EQ(controlled_execution.execute_count, 0);
+  auto snapshot = local_kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.action_span.has_value());
+  EXPECT_EQ(snapshot.action_span->action_span_id, span.action_span_id);
+  EXPECT_EQ(snapshot.action_span->node_attempt_id, span.node_attempt_id);
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->action_span.has_value());
+  EXPECT_EQ(outcome->action_span->action_span_id, span.action_span_id);
+  EXPECT_EQ(outcome->action_span->node_attempt_id, span.node_attempt_id);
 }
 
 TEST_F(ExecutionKernelTest,

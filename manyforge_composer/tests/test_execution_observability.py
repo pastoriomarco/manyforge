@@ -115,6 +115,55 @@ def test_execution_digest_reports_structured_backend_fault_details():
         assert data["errorDetails"]["joint_name"] == "shoulder_pan_joint"
 
 
+def test_execution_digest_reports_latest_incident_headline_cause():
+    class PlanningTimeoutKernel(MockKernelClient):
+        def get_execution_snapshot(self):
+            snapshot = super().get_execution_snapshot()
+            snapshot.error = "Motion execution ended in stopped"
+            snapshot.error_code = "planning_failed"
+            snapshot.error_details = {"reason_code": "planning_timeout"}
+            return snapshot
+
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=PlanningTimeoutKernel())
+    app = create_app(state, security=_TEST_SECURITY)
+    state.event_recorder._record_event(
+        event_type="plan_failed",
+        execution_id=6,
+        move_id="lite6_drop_approach",
+        details={
+            "error": "Planning timed out",
+            "reason_code": "planning_timeout",
+            "action_span_id": "span-drop",
+            "node_instance_id": "move_to_drop_approach",
+            "node_attempt_id": "attempt-drop-1",
+        },
+    )
+    state.event_recorder._record_event(
+        event_type="cycle_error",
+        execution_id=6,
+        move_id="lite6_drop_approach",
+        details={
+            "error": "Motion execution ended in stopped",
+            "action_span_id": "span-drop",
+            "node_instance_id": "move_to_drop_approach",
+            "node_attempt_id": "attempt-drop-1",
+        },
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/execution/digest")
+        assert response.status_code == 200
+        data = response.json()
+
+    assert data["activeActionSpan"]["actionSpanId"] == "span-drop"
+    assert data["headlineCause"]["eventType"] == "plan_failed"
+    assert data["headlineCause"]["summary"] == (
+        "Planning timed out while planning `move_to_drop_approach` "
+        "(`lite6_drop_approach`, execution 6). Cycle stopped and can be resumed."
+    )
+    assert data["recovery"] == "resume"
+
+
 def test_execution_history_and_export_use_trace_sink(tmp_path):
     kernel = MockKernelClient(execute_duration_s=1.0)
     state = ComposerState(

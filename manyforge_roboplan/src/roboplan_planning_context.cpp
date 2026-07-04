@@ -2372,6 +2372,16 @@ RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
             entry.require_strictly_decreasing_penetration ? 1 : 0))
         .mix(static_cast<std::int64_t>(entry.allow_recontact ? 1 : 0));
   }
+  for (const auto& entry : policy.contact_grasps) {
+    h.mix("contact_grasp")
+        .mix(entry.policy_id)
+        .mix(entry.selected_object_id)
+        .mix(entry.max_penetration_m)
+        .mix(entry.terminal_window_start_fraction);
+    for (const auto& link : entry.allowed_robot_links) {
+      h.mix("link").mix(link);
+    }
+  }
   policy.revision.revision_id = world_revision_id_;
   policy.revision.content_hash = h.finalize();
   return policy;

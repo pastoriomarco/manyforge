@@ -112,6 +112,9 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
 
   const bool support_contact_present =
       !config_.pass_config.policy_snapshot.support_contacts.empty();
+  const bool contact_grasp_present =
+      !config_.pass_config.contact_policy_id.empty() &&
+      !config_.pass_config.policy_snapshot.contact_grasps.empty();
   const int waypoint_count = static_cast<int>(trajectory.waypoints.size());
   const int worker_count_requested = config_.worker_count;
   const int worker_count_available = static_cast<int>(available_engines.size());
@@ -186,6 +189,10 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
   if (has_support_contacts) {
     return run_engine_serial_fallback(*available_engines[0],
                                       "support_contact_policy_active");
+  }
+  if (contact_grasp_present) {
+    return run_engine_serial_fallback(*available_engines[0],
+                                      "contact_grasp_policy_active");
   }
 
   const int per_worker = waypoint_count / desired_workers;

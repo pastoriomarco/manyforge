@@ -72,20 +72,26 @@ CollisionPairId canonicalize(CollisionPairId pair) {
 }
 
 std::vector<std::string> required_capabilities_for(
-    const CollisionPolicySnapshot& snapshot) {
+    const CollisionPolicySnapshot& snapshot,
+    const std::string& active_contact_policy_id) {
   std::vector<std::string> capabilities;
   const bool has_support_contacts = !snapshot.support_contacts.empty();
-  if (!snapshot.require_full_diagnostics && !has_support_contacts) {
+  const bool has_contact_grasps =
+      !active_contact_policy_id.empty() && !snapshot.contact_grasps.empty();
+  if (!snapshot.require_full_diagnostics && !has_support_contacts &&
+      !has_contact_grasps) {
     return capabilities;
   }
   if (!snapshot.allowed_static_static_pairs.empty() ||
       !snapshot.allowed_touch_link_pairs.empty() ||
-      has_support_contacts) {
+      has_support_contacts || has_contact_grasps) {
     capabilities.push_back("body_pair_only");
   }
-  if (has_support_contacts) {
+  if (has_support_contacts || has_contact_grasps) {
     capabilities.push_back("distance");
     capabilities.push_back("penetration_depth");
+  }
+  if (has_support_contacts) {
     for (const auto& entry : snapshot.support_contacts) {
       if (entry.mode == CollisionContactPolicyMode::kContactProcess) {
         capabilities.push_back("contact_process");
@@ -155,6 +161,83 @@ void set_contact_release_diagnostic(CollisionValidationWaypointRecord& record,
       break;
     }
   }
+}
+
+bool contains_segment(const std::string& text, const std::string& segment) {
+  return !segment.empty() && text.find(segment) != std::string::npos;
+}
+
+bool contact_grasp_pair_matches(const CollisionPairId& pair,
+                                const ContactGraspPolicyEntry& entry) {
+  auto object_matches = [&](const std::string& body) {
+    return contains_segment(body, "object/" + entry.selected_object_id + "/");
+  };
+  auto link_matches = [&](const std::string& body) {
+    for (const auto& link : entry.allowed_robot_links) {
+      if (contains_segment(body, "/link/" + link + "/collision/")) {
+        return true;
+      }
+    }
+    return false;
+  };
+  return (object_matches(pair.body_a) && link_matches(pair.body_b)) ||
+         (object_matches(pair.body_b) && link_matches(pair.body_a));
+}
+
+void set_contact_grasp_diagnostic(CollisionValidationWaypointRecord& record,
+                                  const ContactGraspPolicyEntry& entry,
+                                  const CollisionPairId& pair,
+                                  std::string reason,
+                                  std::optional<double> clearance) {
+  record.result.raw_diagnostics["contact_grasp_violation"] = reason;
+  record.result.raw_diagnostics["contact_grasp_policy_id"] = entry.policy_id;
+  record.result.raw_diagnostics["contact_grasp_selected_object_id"] =
+      entry.selected_object_id;
+  record.result.raw_diagnostics["contact_grasp_pair"] = pair_text(pair);
+  record.result.raw_diagnostics["contact_grasp_max_penetration_m"] =
+      std::to_string(entry.max_penetration_m);
+  record.result.raw_diagnostics["contact_grasp_terminal_window_start_fraction"] =
+      std::to_string(entry.terminal_window_start_fraction);
+  if (clearance) {
+    record.result.raw_diagnostics["contact_grasp_signed_clearance_m"] =
+        std::to_string(*clearance);
+  }
+  for (auto& classified : record.result.normalized_pairs_classified) {
+    if (canonicalize(classified.pair) == canonicalize(pair)) {
+      classified.is_first_failure = true;
+      break;
+    }
+  }
+}
+
+bool classification_blocks(CollisionPairClassification classification) {
+  switch (classification) {
+    case CollisionPairClassification::kBlockingCollision:
+    case CollisionPairClassification::kSupportContactRecontactViolation:
+    case CollisionPairClassification::kDiagnosticIncomplete:
+      return true;
+    case CollisionPairClassification::kAllowedStaticStatic:
+    case CollisionPairClassification::kSupportContactStart:
+    case CollisionPairClassification::kSupportContactContinued:
+    case CollisionPairClassification::kSupportContactSeparated:
+    case CollisionPairClassification::kAllowedTouchLink:
+    case CollisionPairClassification::kAllowedContactGrasp:
+      return false;
+  }
+  return true;
+}
+
+CollisionDecisionResult decision_from_classifications(
+    const CollisionResult& result) {
+  if (result.engine_status != CollisionEngineStatus::kOk) {
+    return result.decision;
+  }
+  for (const auto& classified : result.normalized_pairs_classified) {
+    if (classification_blocks(classified.classification)) {
+      return CollisionDecisionResult::kFail;
+    }
+  }
+  return CollisionDecisionResult::kPass;
 }
 
 }  // namespace
@@ -416,6 +499,117 @@ void CollisionValidationCoordinator::apply_contact_release_constraints(
   (void)trajectory;
 }
 
+void CollisionValidationCoordinator::apply_contact_grasp_constraints(
+    const TrajectoryDTO& trajectory,
+    CollisionValidationDecisionBundle& bundle) const {
+  if (config_.contact_policy_id.empty() || bundle.waypoint_records.empty()) {
+    return;
+  }
+
+  const ContactGraspPolicyEntry* active = nullptr;
+  for (const auto& entry : config_.policy_snapshot.contact_grasps) {
+    if (entry.policy_id == config_.contact_policy_id) {
+      active = &entry;
+      break;
+    }
+  }
+  if (active == nullptr) {
+    auto& first = bundle.waypoint_records.front();
+    first.result.decision = CollisionDecisionResult::kInconclusiveFail;
+    first.produced_decision_change = true;
+    first.result.raw_diagnostics["contact_grasp_violation"] =
+        "unknown_contact_policy_id";
+    first.result.raw_diagnostics["contact_grasp_policy_id"] =
+        config_.contact_policy_id;
+    return;
+  }
+  if (active->selected_object_id.empty() || active->allowed_robot_links.empty() ||
+      !std::isfinite(active->max_penetration_m) ||
+      active->max_penetration_m < 0.0 ||
+      !std::isfinite(active->terminal_window_start_fraction) ||
+      active->terminal_window_start_fraction < 0.0 ||
+      active->terminal_window_start_fraction > 1.0) {
+    auto& first = bundle.waypoint_records.front();
+    first.result.decision = CollisionDecisionResult::kInconclusiveFail;
+    first.produced_decision_change = true;
+    first.result.raw_diagnostics["contact_grasp_violation"] =
+        "invalid_contact_grasp_policy";
+    first.result.raw_diagnostics["contact_grasp_policy_id"] = active->policy_id;
+    return;
+  }
+
+  const auto last_index =
+      bundle.waypoint_records.size() > 1 ? bundle.waypoint_records.size() - 1 : 1;
+  for (std::size_t i = 0; i < bundle.waypoint_records.size(); ++i) {
+    auto& record = bundle.waypoint_records[i];
+    if (record.result.engine_status != CollisionEngineStatus::kOk) {
+      continue;
+    }
+    const double fraction =
+        bundle.waypoint_records.size() <= 1
+            ? 1.0
+            : static_cast<double>(i) / static_cast<double>(last_index);
+    bool changed = false;
+    for (auto& classified : record.result.normalized_pairs_classified) {
+      if (classified.classification !=
+          CollisionPairClassification::kBlockingCollision) {
+        continue;
+      }
+      if (!contact_grasp_pair_matches(classified.pair, *active)) {
+        continue;
+      }
+      const auto clearance = clearance_for_pair(record.result, classified.pair);
+      if (!clearance || !std::isfinite(*clearance)) {
+        set_contact_grasp_diagnostic(record,
+                                     *active,
+                                     classified.pair,
+                                     "missing_signed_clearance",
+                                     std::nullopt);
+        continue;
+      }
+      const double depth = std::max(0.0, -*clearance);
+      if (i == 0) {
+        set_contact_grasp_diagnostic(record,
+                                     *active,
+                                     classified.pair,
+                                     "initial_sample_in_contact",
+                                     clearance);
+        continue;
+      }
+      if (fraction + 1e-12 < active->terminal_window_start_fraction) {
+        set_contact_grasp_diagnostic(record,
+                                     *active,
+                                     classified.pair,
+                                     "contact_before_terminal_window",
+                                     clearance);
+        continue;
+      }
+      if (depth > active->max_penetration_m + 1e-9) {
+        set_contact_grasp_diagnostic(record,
+                                     *active,
+                                     classified.pair,
+                                     "penetration_exceeds_policy",
+                                     clearance);
+        continue;
+      }
+      classified.classification =
+          CollisionPairClassification::kAllowedContactGrasp;
+      classified.is_first_failure = false;
+      record.result.raw_diagnostics["contact_grasp_policy_id"] =
+          active->policy_id;
+      record.result.raw_diagnostics["contact_grasp_allowed_pair"] =
+          pair_text(classified.pair);
+      changed = true;
+    }
+    if (changed) {
+      record.result.decision = decision_from_classifications(record.result);
+      record.produced_decision_change =
+          record.result.decision != CollisionDecisionResult::kPass;
+    }
+  }
+  (void)trajectory;
+}
+
 CollisionQuery CollisionValidationCoordinator::make_query(
     const RobotStateDTO& state, std::int64_t waypoint_index,
     std::optional<std::int64_t> time_from_start_ns,
@@ -430,7 +624,8 @@ CollisionQuery CollisionValidationCoordinator::make_query(
   query.waypoint_index = waypoint_index;
   query.query_id = "validation_coordinator_w" + std::to_string(waypoint_index);
   query.required_capabilities =
-      required_capabilities_for(config_.policy_snapshot);
+      required_capabilities_for(config_.policy_snapshot,
+                                config_.contact_policy_id);
   if (config_.per_state_timeout_ns > 0) {
     query.timeout_budget_ns = config_.per_state_timeout_ns;
   }
@@ -520,6 +715,29 @@ CollisionValidationCoordinator::run_pass_once(
       mark_cancelled(bundle, cancelled_index, cancelled_reason);
       bundle.final_world_revision = snapshot.revision;
       return bundle;
+    }
+  }
+
+  apply_contact_grasp_constraints(trajectory, bundle);
+
+  worst_decision = CollisionDecisionResult::kPass;
+  worst_severity = CollisionDecisionSeverity::kNone;
+  first_failing_waypoint.reset();
+  first_failing_time_ns.reset();
+  for (auto& record : bundle.waypoint_records) {
+    const auto wp_decision = record.result.decision;
+    const auto wp_severity = severity_for(wp_decision);
+    if (wp_severity > worst_severity ||
+        (wp_severity == worst_severity &&
+         wp_decision != CollisionDecisionResult::kPass &&
+         worst_decision == CollisionDecisionResult::kPass)) {
+      worst_decision = wp_decision;
+      worst_severity = wp_severity;
+    }
+    if (wp_decision != CollisionDecisionResult::kPass &&
+        !first_failing_waypoint.has_value()) {
+      first_failing_waypoint = record.waypoint_index;
+      first_failing_time_ns = record.time_from_start_ns;
     }
   }
 

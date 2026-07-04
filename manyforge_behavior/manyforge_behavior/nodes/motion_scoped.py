@@ -46,6 +46,7 @@ from typing import Any, Optional
 
 import py_trees
 
+from manyforge_behavior.action_span import ActionSpanMixin, read_program_run_id
 from manyforge_behavior.kernel_client import (
     ExecuteRequest,
     KernelClient,
@@ -59,12 +60,11 @@ from manyforge_behavior.motion_runtime import (
 from manyforge_behavior.nodes.motion import (
     _normalize_pose_dict,
     _relative_move_object_ids,
-    read_program_run_id,
 )
 from manyforge_behavior.parameters import resolve_blackboard_value
 
 
-class _MotionScopedBase(py_trees.behaviour.Behaviour):
+class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
     """Shared lifecycle for motion-scoped trip nodes. Subclasses
     populate `_node_category` and `_not_found_default`; the rest of
     the execute/await/outcome loop is identical."""
@@ -181,6 +181,7 @@ class _MotionScopedBase(py_trees.behaviour.Behaviour):
         )
 
     def initialise(self) -> None:
+        self._reset_action_span()
         self._execution_id = None
         self._terminal_outcome = None
         self._error_message = None
@@ -332,6 +333,7 @@ class _MotionScopedBase(py_trees.behaviour.Behaviour):
                 apply_result = apply_callback(
                     object_ids=object_ids,
                     reason=f"motion_node:{self.name}",
+                    action_span=self._current_action_span(self.blackboard),
                 )
             except Exception as exc:  # noqa: BLE001 — callback boundary
                 return f"{label} pose-source apply raised: {exc}"
@@ -385,6 +387,8 @@ class _MotionScopedBase(py_trees.behaviour.Behaviour):
             execution_timeout_s=self._execution_timeout_s,
             cache_mode=self._cache_mode,
             program_run_id=read_program_run_id(self.blackboard),
+            action_span=self._current_action_span(self.blackboard),
+            contact_policy_id=self._params.get("contact_policy_id") or None,
         )
 
         global_cap = self._read_optional_blackboard_value(

@@ -170,10 +170,24 @@ class MotionExecutionOutcome:
     # One of "completed_normally" | "signal_trip" | "no_signal_trip" |
     # "stopped" | "failed" | "interrupted_fault".
     terminal_cause: str = "completed_normally"
+    action_span: Optional["ActionSpan"] = None
+    contact_policy_id: Optional[str] = None
     trip: Optional[MotionTripOutcome] = None
     error_code: Optional[str] = None
     error_message: Optional[str] = None
     error_reason: Optional[str] = None
+
+
+@dataclass
+class ActionSpan:
+    """Causal action-span envelope for kernel/planner/execution events."""
+
+    action_source: str = "system"
+    action_span_id: str = ""
+    program_run_id: Optional[str] = None
+    node_instance_id: Optional[str] = None
+    node_attempt_id: Optional[str] = None
+    parent_node_attempt_id: Optional[str] = None
 
 
 @dataclass
@@ -232,6 +246,8 @@ class ExecuteRequest:
     # event for the execution so durable history can be joined across
     # Composer -> kernel -> backend without timestamp guesswork.
     program_run_id: Optional[str] = None
+    action_span: Optional[ActionSpan] = None
+    contact_policy_id: Optional[str] = None
 
 
 @dataclass
@@ -257,6 +273,8 @@ class ExecutionSnapshot:
     error: Optional[str] = None
     error_code: Optional[str] = None
     error_details: Dict[str, str] = field(default_factory=dict)
+    action_span: Optional[ActionSpan] = None
+    contact_policy_id: Optional[str] = None
 
 
 @dataclass
@@ -317,6 +335,7 @@ class SceneEditRequest:
     support_contacts: Optional[List[Dict[str, Any]]] = None
     source_timestamp_ns: Optional[int] = None
     source_freshness_budget_ns: Optional[int] = None
+    action_span: Optional[ActionSpan] = None
 
 
 @dataclass
@@ -382,6 +401,7 @@ class GripperCommandRequest:
     closed_state_ref: str = ""
     srdf_presets: Dict[str, float] = field(default_factory=dict)
     commanded_state: str = ""
+    action_span: Optional[ActionSpan] = None
 
 
 @dataclass
@@ -923,7 +943,9 @@ class KernelClient(ABC):
         return None
 
     @abstractmethod
-    def invalidate_trajectories(self) -> None: ...
+    def invalidate_trajectories(
+        self, action_span: Optional[ActionSpan] = None
+    ) -> None: ...
 
     @abstractmethod
     def preview_motion(
@@ -1083,6 +1105,9 @@ class MockKernelClient(KernelClient):
         self._state = ExecutionState.IDLE
         self._execution_id = 0
         self._active_move_id = ""
+        self._active_program_run_id = ""
+        self._active_action_span: Optional[ActionSpan] = None
+        self._active_contact_policy_id = ""
         self._next_id = 1
         self._snapshot_sequence = 0
         self._execute_duration_s = execute_duration_s
@@ -1093,6 +1118,7 @@ class MockKernelClient(KernelClient):
         self.command_gate_requests: List[bool] = []
         self._command_gate_enabled = False
         self.last_execute_request: Optional[ExecuteRequest] = None
+        self.preview_requests: List[ExecuteRequest] = []
         self.execute_count = 0
         self.stop_count = 0
         self.pause_count = 0
@@ -1102,6 +1128,7 @@ class MockKernelClient(KernelClient):
         self.acknowledge_intervention_for_retry_count = 0
         self.acknowledge_interrupted_for_retry_count = 0
         self.invalidate_count = 0
+        self.last_invalidate_action_span: Optional[ActionSpan] = None
         self.runtime_velocity_scale = 1.0
         self.runtime_velocity_scale_updates: List[float] = []
         self.runtime_velocity_scale_principal_ids: List[Optional[str]] = []
@@ -1173,14 +1200,39 @@ class MockKernelClient(KernelClient):
         }
         if getattr(self, "_active_program_run_id", ""):
             event["program_run_id"] = self._active_program_run_id
+        details_payload = dict(details or {})
+        active_action_span = getattr(self, "_active_action_span", None)
+        if active_action_span is not None:
+            details_payload.setdefault("action_source", active_action_span.action_source)
+            details_payload.setdefault("action_span_id", active_action_span.action_span_id)
+            if active_action_span.program_run_id:
+                details_payload.setdefault(
+                    "action_span_program_run_id", active_action_span.program_run_id
+                )
+            if active_action_span.node_instance_id:
+                details_payload.setdefault(
+                    "node_instance_id", active_action_span.node_instance_id
+                )
+            if active_action_span.node_attempt_id:
+                details_payload.setdefault(
+                    "node_attempt_id", active_action_span.node_attempt_id
+                )
+            if active_action_span.parent_node_attempt_id:
+                details_payload.setdefault(
+                    "parent_node_attempt_id",
+                    active_action_span.parent_node_attempt_id,
+                )
+        active_contact_policy_id = getattr(self, "_active_contact_policy_id", "")
+        if active_contact_policy_id:
+            details_payload.setdefault("contact_policy_id", active_contact_policy_id)
         if from_state is not None:
             event["from_state"] = from_state
         if to_state is not None:
             event["to_state"] = to_state
         if error is not None:
             event["error"] = {"code": -1, "message": error}
-        if details:
-            event["details"] = dict(details)
+        if details_payload:
+            event["details"] = details_payload
         self._kernel_events.append(event)
 
     def drain_kernel_events(self) -> List[Dict[str, Any]]:
@@ -1223,6 +1275,9 @@ class MockKernelClient(KernelClient):
             self._state = ExecutionState.IDLE
             self._execution_id = 0
             self._active_move_id = None
+            self._active_program_run_id = ""
+            self._active_action_span = None
+            self._active_contact_policy_id = ""
         if self._state != ExecutionState.IDLE:
             return ExecuteResult(ok=False, error="Not in IDLE state")
         if self.fail_next_execute:
@@ -1237,6 +1292,8 @@ class MockKernelClient(KernelClient):
         self._execution_id = eid
         self._active_move_id = request.move_id
         self._active_program_run_id = request.program_run_id or ""
+        self._active_action_span = request.action_span
+        self._active_contact_policy_id = request.contact_policy_id or ""
         self._active_goal_positions_rad = self._positions_for_request(request)
         self._emit_kernel_event("plan_started")
         if self._execute_duration_s > 0:
@@ -1280,11 +1337,15 @@ class MockKernelClient(KernelClient):
                 execution_id=execution_id,
                 move_id=request.move_id,
                 terminal_cause="no_signal_trip",
+                action_span=request.action_span,
+                contact_policy_id=request.contact_policy_id,
             )
         return MotionExecutionOutcome(
             execution_id=execution_id,
             move_id=request.move_id,
             terminal_cause="completed_normally",
+            action_span=request.action_span,
+            contact_policy_id=request.contact_policy_id,
         )
 
     def get_execution_outcome(
@@ -1305,6 +1366,7 @@ class MockKernelClient(KernelClient):
         need a specific structured outcome (IK failure, joint-limit, collision)
         set ``next_preview_result`` to a prebuilt MotionPreviewResult.
         """
+        self.preview_requests.append(request)
         if self.next_preview_result is not None:
             result = self.next_preview_result
             self.next_preview_result = None
@@ -1553,9 +1615,14 @@ class MockKernelClient(KernelClient):
             state=status.state,
             progress=status.progress,
             joint_positions_rad=list(self._last_joint_positions_rad),
+            action_span=getattr(self, "_active_action_span", None),
+            contact_policy_id=getattr(self, "_active_contact_policy_id", None) or None,
         )
 
-    def invalidate_trajectories(self) -> None:
+    def invalidate_trajectories(
+        self, action_span: Optional[ActionSpan] = None
+    ) -> None:
+        self.last_invalidate_action_span = action_span
         self.invalidate_count += 1
         self._metrics["cache_invalidations"] += 1
 

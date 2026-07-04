@@ -789,6 +789,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                    kSupportContactRecontactViolation)
         .value("kAllowedTouchLink",
                manyforge::core::CollisionPairClassification::kAllowedTouchLink)
+        .value("kAllowedContactGrasp",
+               manyforge::core::CollisionPairClassification::kAllowedContactGrasp)
         .value("kDiagnosticIncomplete",
                manyforge::core::CollisionPairClassification::kDiagnosticIncomplete);
 
@@ -856,6 +858,20 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                 require_strictly_decreasing_penetration)
         .def_readwrite("allow_recontact",
                        &manyforge::core::SupportContactPolicyEntry::allow_recontact);
+    py::class_<manyforge::core::ContactGraspPolicyEntry>(m,
+                                                         "ContactGraspPolicyEntry")
+        .def(py::init<>())
+        .def_readwrite("policy_id",
+                       &manyforge::core::ContactGraspPolicyEntry::policy_id)
+        .def_readwrite("selected_object_id",
+                       &manyforge::core::ContactGraspPolicyEntry::selected_object_id)
+        .def_readwrite("allowed_robot_links",
+                       &manyforge::core::ContactGraspPolicyEntry::allowed_robot_links)
+        .def_readwrite("max_penetration_m",
+                       &manyforge::core::ContactGraspPolicyEntry::max_penetration_m)
+        .def_readwrite("terminal_window_start_fraction",
+                       &manyforge::core::ContactGraspPolicyEntry::
+                           terminal_window_start_fraction);
 
     py::class_<manyforge::core::CollisionPolicyRevision>(m,
                                                          "CollisionPolicyRevision")
@@ -883,6 +899,9 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite(
             "support_contacts",
             &manyforge::core::CollisionPolicySnapshot::support_contacts)
+        .def_readwrite(
+            "contact_grasps",
+            &manyforge::core::CollisionPolicySnapshot::contact_grasps)
         .def_readwrite(
             "require_full_diagnostics",
             &manyforge::core::CollisionPolicySnapshot::require_full_diagnostics);

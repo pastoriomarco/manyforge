@@ -27,6 +27,11 @@ namespace ros2_exec = manyforge::ros2_control_execution;
 
 namespace {
 
+py::dict action_span_to_python(const ActionSpanDTO& span);
+std::optional<ActionSpanDTO> action_span_from_python(const py::dict& request);
+void populate_request_correlation(ExecuteRequestDTO& req,
+                                  const py::dict& request);
+
 std::string canonical_joint_name(const NativeKernelBundle& bundle,
                                  const std::string& view_joint_name) {
   const auto it = bundle.view_to_canonical_joint_names.find(view_joint_name);
@@ -230,6 +235,8 @@ const char* collision_pair_classification_to_string(
       return "support_contact_recontact_violation";
     case CollisionPairClassification::kAllowedTouchLink:
       return "allowed_touch_link";
+    case CollisionPairClassification::kAllowedContactGrasp:
+      return "allowed_contact_grasp";
     case CollisionPairClassification::kDiagnosticIncomplete:
       return "diagnostic_incomplete";
   }
@@ -354,6 +361,16 @@ py::dict snapshot_to_python(const ExecutionSnapshot& snapshot) {
     d["error"] = py::none();
     d["error_code"] = py::none();
     d["error_details"] = py::dict();
+  }
+  if (snapshot.action_span) {
+    d["action_span"] = action_span_to_python(*snapshot.action_span);
+  } else {
+    d["action_span"] = py::none();
+  }
+  if (!snapshot.contact_policy_id.empty()) {
+    d["contact_policy_id"] = snapshot.contact_policy_id;
+  } else {
+    d["contact_policy_id"] = py::none();
   }
   return d;
 }
@@ -752,11 +769,22 @@ py::dict kernel_event_to_python(const KernelEvent& event) {
     }
     d["details"] = details;
   }
-  // Lift the correlation id to the top level for parity with the mock
-  // kernel's event shape; consumers join on event["program_run_id"].
-  auto run_id_it = event.details.find("program_run_id");
-  if (run_id_it != event.details.end()) {
-    d["program_run_id"] = run_id_it->second;
+  // Lift correlation fields to the top level for parity with the mock kernel's
+  // event shape; durable history and UI filters join on these keys without
+  // needing to parse the free-form details map.
+  for (const auto* key :
+       {"program_run_id",
+        "action_source",
+        "action_span_id",
+        "action_span_program_run_id",
+        "node_instance_id",
+        "node_attempt_id",
+        "parent_node_attempt_id",
+        "contact_policy_id"}) {
+    auto it = event.details.find(key);
+    if (it != event.details.end()) {
+      d[key] = it->second;
+    }
   }
   return d;
 }
@@ -843,6 +871,73 @@ double finite_scale_from_python(const py::handle& value, const char* field_name)
     throw std::invalid_argument(std::string(field_name) + " must be finite");
   }
   return result;
+}
+
+py::dict action_span_to_python(const ActionSpanDTO& span) {
+  py::dict d;
+  d["action_source"] = to_string(span.action_source);
+  d["action_span_id"] = span.action_span_id;
+  if (!span.program_run_id.empty()) {
+    d["program_run_id"] = span.program_run_id;
+  }
+  if (!span.node_instance_id.empty()) {
+    d["node_instance_id"] = span.node_instance_id;
+  }
+  if (!span.node_attempt_id.empty()) {
+    d["node_attempt_id"] = span.node_attempt_id;
+  }
+  if (!span.parent_node_attempt_id.empty()) {
+    d["parent_node_attempt_id"] = span.parent_node_attempt_id;
+  }
+  return d;
+}
+
+std::string optional_string_from_python_dict(const py::dict& dict,
+                                             const char* key) {
+  if (!dict.contains(key) || dict[key].is_none()) {
+    return {};
+  }
+  return dict[key].cast<std::string>();
+}
+
+std::optional<ActionSpanDTO> action_span_from_python(const py::dict& request) {
+  if (!request.contains("action_span") || request["action_span"].is_none()) {
+    return std::nullopt;
+  }
+  const auto span_dict = request["action_span"].cast<py::dict>();
+  ActionSpanDTO span;
+  std::string source = optional_string_from_python_dict(span_dict,
+                                                        "action_source");
+  if (source.empty()) {
+    source = "system";
+  }
+  auto parsed_source = action_source_from_string(source);
+  if (!parsed_source) {
+    throw std::invalid_argument("action_span.action_source is invalid");
+  }
+  span.action_source = *parsed_source;
+  span.action_span_id = optional_string_from_python_dict(span_dict,
+                                                         "action_span_id");
+  span.program_run_id = optional_string_from_python_dict(span_dict,
+                                                        "program_run_id");
+  span.node_instance_id = optional_string_from_python_dict(span_dict,
+                                                          "node_instance_id");
+  span.node_attempt_id = optional_string_from_python_dict(span_dict,
+                                                         "node_attempt_id");
+  span.parent_node_attempt_id = optional_string_from_python_dict(
+      span_dict, "parent_node_attempt_id");
+  return span;
+}
+
+void populate_request_correlation(ExecuteRequestDTO& req,
+                                  const py::dict& request) {
+  req.program_run_id = optional_string_from_python_dict(request,
+                                                       "program_run_id");
+  req.action_span = action_span_from_python(request);
+  if (request.contains("contact_policy_id") &&
+      !request["contact_policy_id"].is_none()) {
+    req.contact_policy_id = request["contact_policy_id"].cast<std::string>();
+  }
 }
 
 // Parse the optional per_joint_dynamics_limits map (Phase 4-P5.1K) from a
@@ -996,6 +1091,79 @@ CollisionPolicySnapshot collision_policy_snapshot_from_python(
       !policy_dict["require_full_diagnostics"].is_none()) {
     policy.require_full_diagnostics =
         policy_dict["require_full_diagnostics"].cast<bool>();
+  }
+  if (policy_dict.contains("contact_grasps") &&
+      !policy_dict["contact_grasps"].is_none()) {
+    if (!py::isinstance<py::list>(policy_dict["contact_grasps"])) {
+      throw std::invalid_argument(
+          std::string(context) + ".contact_grasps must be a list");
+    }
+    for (const auto item : policy_dict["contact_grasps"].cast<py::list>()) {
+      if (!py::isinstance<py::dict>(item)) {
+        throw std::invalid_argument(
+            std::string(context) + ".contact_grasps entries must be dictionaries");
+      }
+      py::dict raw = item.cast<py::dict>();
+      ContactGraspPolicyEntry entry;
+      if (!raw.contains("policy_id") || raw["policy_id"].is_none()) {
+        throw std::invalid_argument(
+            std::string(context) + ".contact_grasps[].policy_id is required");
+      }
+      entry.policy_id = raw["policy_id"].cast<std::string>();
+      if (entry.policy_id.empty()) {
+        throw std::invalid_argument(
+            std::string(context) + ".contact_grasps[].policy_id must not be empty");
+      }
+      if (!raw.contains("selected_object_id") ||
+          raw["selected_object_id"].is_none()) {
+        throw std::invalid_argument(
+            std::string(context) +
+            ".contact_grasps[].selected_object_id is required");
+      }
+      entry.selected_object_id = raw["selected_object_id"].cast<std::string>();
+      if (entry.selected_object_id.empty()) {
+        throw std::invalid_argument(
+            std::string(context) +
+            ".contact_grasps[].selected_object_id must not be empty");
+      }
+      if (!raw.contains("allowed_robot_links") ||
+          !py::isinstance<py::list>(raw["allowed_robot_links"])) {
+        throw std::invalid_argument(
+            std::string(context) +
+            ".contact_grasps[].allowed_robot_links must be a list");
+      }
+      for (const auto link : raw["allowed_robot_links"].cast<py::list>()) {
+        entry.allowed_robot_links.push_back(link.cast<std::string>());
+      }
+      if (entry.allowed_robot_links.empty()) {
+        throw std::invalid_argument(
+            std::string(context) +
+            ".contact_grasps[].allowed_robot_links must not be empty");
+      }
+      if (raw.contains("max_penetration_m") &&
+          !raw["max_penetration_m"].is_none()) {
+        entry.max_penetration_m = raw["max_penetration_m"].cast<double>();
+      }
+      if (!std::isfinite(entry.max_penetration_m) ||
+          entry.max_penetration_m < 0.0) {
+        throw std::invalid_argument(
+            std::string(context) +
+            ".contact_grasps[].max_penetration_m must be finite and >= 0");
+      }
+      if (raw.contains("terminal_window_start_fraction") &&
+          !raw["terminal_window_start_fraction"].is_none()) {
+        entry.terminal_window_start_fraction =
+            raw["terminal_window_start_fraction"].cast<double>();
+      }
+      if (!std::isfinite(entry.terminal_window_start_fraction) ||
+          entry.terminal_window_start_fraction < 0.0 ||
+          entry.terminal_window_start_fraction > 1.0) {
+        throw std::invalid_argument(
+            std::string(context) +
+            ".contact_grasps[].terminal_window_start_fraction must be in [0, 1]");
+      }
+      policy.contact_grasps.push_back(std::move(entry));
+    }
   }
   return policy;
 }
@@ -1367,9 +1535,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         req.move_id = request["move_id"].cast<std::string>();
         req.base_frame = request["base_frame"].cast<std::string>();
         req.tcp_frame = request["tcp_frame"].cast<std::string>();
-        if (request.contains("program_run_id")) {
-          req.program_run_id = request["program_run_id"].cast<std::string>();
-        }
+        populate_request_correlation(req, request);
 
         // Tolerances
         req.tolerances.joint_position_tol_rad = request.attr("get")("joint_position_tol_rad", 0.05).cast<double>();
@@ -1583,6 +1749,16 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
              py::dict d;
              d["execution_id"] = outcome.execution_id;
              d["move_id"] = outcome.move_id;
+             if (outcome.action_span) {
+               d["action_span"] = action_span_to_python(*outcome.action_span);
+             } else {
+               d["action_span"] = py::none();
+             }
+             if (!outcome.contact_policy_id.empty()) {
+               d["contact_policy_id"] = outcome.contact_policy_id;
+             } else {
+               d["contact_policy_id"] = py::none();
+             }
              const char* cause = "completed_normally";
              switch (outcome.terminal_cause) {
                using enum MotionExecutionTerminalCause;
@@ -1731,9 +1907,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         req.move_id = request["move_id"].cast<std::string>();
         req.base_frame = request["base_frame"].cast<std::string>();
         req.tcp_frame = request["tcp_frame"].cast<std::string>();
-        if (request.contains("program_run_id")) {
-          req.program_run_id = request["program_run_id"].cast<std::string>();
-        }
+        populate_request_correlation(req, request);
 
         req.tolerances.joint_position_tol_rad = request.attr("get")("joint_position_tol_rad", 0.05).cast<double>();
         req.tolerances.translation_tol_m = request.attr("get")("translation_tol_m", 0.005).cast<double>();
@@ -1949,9 +2123,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         req.move_id = request["move_id"].cast<std::string>();
         req.base_frame = request["base_frame"].cast<std::string>();
         req.tcp_frame = request["tcp_frame"].cast<std::string>();
-        if (request.contains("program_run_id")) {
-          req.program_run_id = request["program_run_id"].cast<std::string>();
-        }
+        populate_request_correlation(req, request);
 
         req.tolerances.joint_position_tol_rad = request.attr("get")("joint_position_tol_rad", 0.05).cast<double>();
         req.tolerances.translation_tol_m = request.attr("get")("translation_tol_m", 0.005).cast<double>();

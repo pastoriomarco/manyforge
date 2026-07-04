@@ -128,6 +128,7 @@ enum class CollisionPairClassification {
   kSupportContactSeparated,
   kSupportContactRecontactViolation,
   kAllowedTouchLink,
+  kAllowedContactGrasp,
   kDiagnosticIncomplete,
 };
 
@@ -374,6 +375,20 @@ struct SupportContactPolicyEntry {
   bool allow_recontact = false;
 };
 
+/// Geometry-only grasp-contact policy for detached pick approaches.
+///
+/// This is intentionally narrower than contact_process. It allows only the
+/// configured robot gripper links to contact one selected detached object, and
+/// only in the terminal portion of a trajectory. Post-attach contact is handled
+/// by attached-object touch links, not by this policy.
+struct ContactGraspPolicyEntry {
+  std::string policy_id;
+  std::string selected_object_id;
+  std::vector<std::string> allowed_robot_links;
+  double max_penetration_m = 0.0;
+  double terminal_window_start_fraction = 0.8;
+};
+
 /// Policy-revision twin of CollisionWorldRevision (spec §3.8.1, added in
 /// Chunk 3).
 struct CollisionPolicyRevision {
@@ -405,6 +420,10 @@ struct CollisionPolicySnapshot {
   std::vector<CollisionPairId> allowed_touch_link_pairs;
 
   std::vector<SupportContactPolicyEntry> support_contacts;
+
+  /// Declared contact_grasp policies. At validation time the execute request's
+  /// concrete contact_policy_id selects at most one of these entries.
+  std::vector<ContactGraspPolicyEntry> contact_grasps;
 
   /// When true, missing diagnostic fields produce kDiagnosticIncomplete;
   /// when false, the evaluator classifies opportunistically with the

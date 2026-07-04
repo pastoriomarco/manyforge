@@ -276,8 +276,14 @@ run_composer_backend_tests() {
     section "Composer backend tests"
     cd "$WORKSPACE"
     setup_pythonpath
+    # Hard failure, not a skip: many Composer backend tests use
+    # pytest.importorskip("fastapi") and related imports, so a dep-less host can
+    # otherwise turn this lane green while running only a frontend subset. The
+    # dev container has these declared dependencies; local lightweight runs
+    # should use a narrower filter instead of shrinking the Composer lane.
     if ! python_has_modules fastapi py_trees httpx; then
-        skip "Missing Python deps for composer backend tests (need fastapi, py_trees, httpx)"
+        echo -e "${RED}  FAIL: missing Python deps for composer backend tests (need fastapi, py_trees, httpx) — run in the dev container${NC}"
+        FAIL=$((FAIL + 1))
         return
     fi
     # The full Composer lane runs ALL backend tests, including MCP. `mcp` is a

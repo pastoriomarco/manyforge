@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional
 
 import py_trees
 
+from manyforge_behavior.action_span import ActionSpanMixin
 from manyforge_behavior.geometry import rpy_deg_to_xyzw as _rpy_deg_to_xyzw
 from manyforge_behavior.kernel_client import (
     GripperCommandState,
@@ -136,7 +137,7 @@ def _shape_fields_from_registry(obj_info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-class AddCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
+class AddCollisionObject(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviour.Behaviour):
     """Add a collision object to the backend scene via the kernel."""
 
     def __init__(self, name: str, **kwargs: Any):
@@ -150,6 +151,9 @@ class AddCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         )
         self._register_scene_callback_key()
 
+    def initialise(self) -> None:
+        self._reset_action_span()
+
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self.blackboard.kernel
         try:
@@ -158,6 +162,7 @@ class AddCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
                 self._params,
                 operation="add",
             )
+            request.action_span = self._current_action_span(self.blackboard)
         except (AttributeError, KeyError) as exc:
             self.feedback_message = str(exc)
             return py_trees.common.Status.FAILURE
@@ -168,7 +173,7 @@ class AddCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         return py_trees.common.Status.FAILURE
 
 
-class UpsertCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
+class UpsertCollisionObject(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviour.Behaviour):
     """Insert or replace a collision object in the backend scene via the kernel."""
 
     def __init__(self, name: str, **kwargs: Any):
@@ -182,6 +187,9 @@ class UpsertCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         )
         self._register_scene_callback_key()
 
+    def initialise(self) -> None:
+        self._reset_action_span()
+
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self.blackboard.kernel
         try:
@@ -190,6 +198,7 @@ class UpsertCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
                 self._params,
                 operation="upsert",
             )
+            request.action_span = self._current_action_span(self.blackboard)
         except (AttributeError, KeyError) as exc:
             self.feedback_message = str(exc)
             return py_trees.common.Status.FAILURE
@@ -200,7 +209,7 @@ class UpsertCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         return py_trees.common.Status.FAILURE
 
 
-class RemoveCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
+class RemoveCollisionObject(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviour.Behaviour):
     """Remove a collision object from the backend scene."""
 
     def __init__(self, name: str, **kwargs: Any):
@@ -214,6 +223,9 @@ class RemoveCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         )
         self._register_scene_callback_key()
 
+    def initialise(self) -> None:
+        self._reset_action_span()
+
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self.blackboard.kernel
         try:
@@ -226,6 +238,7 @@ class RemoveCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         request = SceneEditRequest(
             operation="remove",
             object_id=object_id,
+            action_span=self._current_action_span(self.blackboard),
         )
         result = kernel.scene_edit(request)
         if result.success:
@@ -234,7 +247,7 @@ class RemoveCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         return py_trees.common.Status.FAILURE
 
 
-class UpdateCollisionObjectPose(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
+class UpdateCollisionObjectPose(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviour.Behaviour):
     """Update the pose of an existing collision object."""
 
     def __init__(self, name: str, **kwargs: Any):
@@ -247,6 +260,9 @@ class UpdateCollisionObjectPose(_SceneCallbackMixin, py_trees.behaviour.Behaviou
             key="kernel", access=py_trees.common.Access.READ
         )
         self._register_scene_callback_key()
+
+    def initialise(self) -> None:
+        self._reset_action_span()
 
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self.blackboard.kernel
@@ -273,6 +289,7 @@ class UpdateCollisionObjectPose(_SceneCallbackMixin, py_trees.behaviour.Behaviou
             pose_position_m=pose.get("position_m"),
             pose_orientation_xyzw=orient,
             frame_id=frame_id,
+            action_span=self._current_action_span(self.blackboard),
         )
         result = kernel.scene_edit(request)
         if result.success:
@@ -281,7 +298,7 @@ class UpdateCollisionObjectPose(_SceneCallbackMixin, py_trees.behaviour.Behaviou
         return py_trees.common.Status.FAILURE
 
 
-class AttachObjectToLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
+class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviour.Behaviour):
     """Attach a scene object to a robot link.
 
     Delegates the authoritative attach operation to the backend so the
@@ -307,6 +324,7 @@ class AttachObjectToLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         self._register_scene_callback_key()
 
     def initialise(self) -> None:
+        self._reset_action_span()
         try:
             self.blackboard.set("gripper_fault_details", None)
         except (KeyError, AttributeError):
@@ -579,6 +597,7 @@ class AttachObjectToLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
             **_shape_fields_from_registry(obj_info),
             frame_id=link_frame,
             touch_links=touch_links,
+            action_span=self._current_action_span(self.blackboard),
         )
         result = kernel.scene_edit(request)
         if not result.success:
@@ -618,7 +637,7 @@ class AttachObjectToLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
 
-class DetachObjectFromLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
+class DetachObjectFromLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviour.Behaviour):
     """Detach an object from a robot link and place it in the world frame.
 
     Delegates the authoritative detach/reparent operation to the backend.
@@ -637,6 +656,9 @@ class DetachObjectFromLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         self.blackboard.register_key(key="kernel", access=py_trees.common.Access.READ)
         self.blackboard.register_key(key="scene_objects", access=py_trees.common.Access.READ)
         self._register_scene_callback_key()
+
+    def initialise(self) -> None:
+        self._reset_action_span()
 
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self.blackboard.kernel
@@ -658,6 +680,7 @@ class DetachObjectFromLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
             object_id=object_id,
             **_shape_fields_from_registry(obj_info),
             frame_id=target_frame,
+            action_span=self._current_action_span(self.blackboard),
         )
         result = kernel.scene_edit(request)
         if not result.success:

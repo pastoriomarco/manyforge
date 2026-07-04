@@ -14,6 +14,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/geometry.hpp>
 #include <manyforge_core/types/interrupt.hpp>
+#include <manyforge_core/types/action_span.hpp>
 #include <manyforge_core/types/robot_state.hpp>
 
 namespace manyforge::core {
@@ -471,6 +472,8 @@ enum class MotionExecutionTerminalCause {
 struct MotionExecutionOutcomeDTO {
   std::uint64_t execution_id = 0;
   std::string move_id;
+  std::optional<ActionSpanDTO> action_span;
+  std::string contact_policy_id;
   MotionExecutionTerminalCause terminal_cause =
       MotionExecutionTerminalCause::kCompletedNormally;
   /// Present iff `terminal_cause == kSignalTrip`.

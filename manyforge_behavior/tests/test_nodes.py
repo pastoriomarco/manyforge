@@ -83,6 +83,10 @@ def _tick_node(node):
 
 class TestMoveManipulatorAction:
     def test_success(self, kernel, bb_with_kernel):
+        bb_with_kernel.register_key(
+            key="program_run_id", access=py_trees.common.Access.WRITE
+        )
+        bb_with_kernel.program_run_id = "run-node-test"
         node = MoveManipulatorAction(
             name="test_move",
             move_id="m1",
@@ -94,6 +98,12 @@ class TestMoveManipulatorAction:
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
         assert kernel.execute_count == 1
+        assert kernel.last_execute_request.action_span is not None
+        assert (
+            kernel.last_execute_request.action_span.program_run_id
+            == "run-node-test"
+        )
+        assert "test_move" in kernel.last_execute_request.action_span.node_instance_id
 
     def test_failure(self, kernel, bb_with_kernel):
         # Motion soft-fail: instead of returning FAILURE and propagating
@@ -265,12 +275,14 @@ class TestMoveManipulatorAction:
         status = _tick_node(node)
 
         assert status == py_trees.common.Status.SUCCESS
-        assert calls == [
-            {
-                "object_ids": [],
-                "reason": "motion_node:test_relative_move_apply_source",
-            }
-        ]
+        assert len(calls) == 1
+        span = calls[0].pop("action_span")
+        assert span.action_source == "program_node"
+        assert "test_relative_move_apply_source" in (span.node_instance_id or "")
+        assert calls[0] == {
+            "object_ids": [],
+            "reason": "motion_node:test_relative_move_apply_source",
+        }
 
     def test_pose_goal_applies_all_pose_sources_before_planning(self, kernel, bb_with_kernel):
         calls = []
@@ -299,12 +311,14 @@ class TestMoveManipulatorAction:
         status = _tick_node(node)
 
         assert status == py_trees.common.Status.SUCCESS
-        assert calls == [
-            {
-                "object_ids": [],
-                "reason": "motion_node:test_pose_goal_apply_source",
-            }
-        ]
+        assert len(calls) == 1
+        span = calls[0].pop("action_span")
+        assert span.action_source == "program_node"
+        assert "test_pose_goal_apply_source" in (span.node_instance_id or "")
+        assert calls[0] == {
+            "object_ids": [],
+            "reason": "motion_node:test_pose_goal_apply_source",
+        }
 
     def test_relative_move_holds_when_before_planning_pose_source_fails(
         self,
@@ -363,12 +377,17 @@ class TestMoveManipulatorAction:
         status = _tick_node(node)
 
         assert status == py_trees.common.Status.SUCCESS
-        assert calls == [
-            {
-                "object_ids": ["graspable"],
-                "reason": "motion_node:test_relative_move_between_nodes_source",
-            }
-        ]
+        assert len(calls) == 1
+        between_nodes = calls[0]
+        span = between_nodes.pop("action_span")
+        assert span.action_source == "program_node"
+        assert "test_relative_move_between_nodes_source" in (
+            span.node_instance_id or ""
+        )
+        assert between_nodes == {
+            "object_ids": ["graspable"],
+            "reason": "motion_node:test_relative_move_between_nodes_source",
+        }
 
     def test_relative_move_pose_reference_normalizes_inline_pose_orientation(self, kernel, bb_with_kernel):
         node = MoveManipulatorAction(
@@ -580,14 +599,16 @@ class TestResetSimulation:
         node = ResetSimulation(name="reset_sim", reason="program_reset")
 
         assert _tick_node(node) == py_trees.common.Status.SUCCESS
-        assert calls == [
-            {
-                "operation": "reset",
-                "reason": "program_reset",
-                "source": "behavior_node",
-                "allow_running": True,
-            }
-        ]
+        assert len(calls) == 1
+        span = calls[0].pop("action_span")
+        assert span.action_source == "program_node"
+        assert "reset_sim" in (span.node_instance_id or "")
+        assert calls[0] == {
+            "operation": "reset",
+            "reason": "program_reset",
+            "source": "behavior_node",
+            "allow_running": True,
+        }
 
     def test_fails_without_callback(self):
         self._install_callback(None)
@@ -619,15 +640,17 @@ class TestSimulationControlNodes:
         node = SetSimulationState(name="pause_sim", state="paused", reason="pause")
 
         assert _tick_node(node) == py_trees.common.Status.SUCCESS
-        assert calls == [
-            {
-                "operation": "set_state",
-                "reason": "pause",
-                "source": "behavior_node",
-                "allow_running": True,
-                "state": "paused",
-            }
-        ]
+        assert len(calls) == 1
+        span = calls[0].pop("action_span")
+        assert span.action_source == "program_node"
+        assert "pause_sim" in (span.node_instance_id or "")
+        assert calls[0] == {
+            "operation": "set_state",
+            "reason": "pause",
+            "source": "behavior_node",
+            "allow_running": True,
+            "state": "paused",
+        }
 
     def test_step_simulation_calls_composer_callback(self):
         calls = []
@@ -635,15 +658,17 @@ class TestSimulationControlNodes:
         node = StepSimulation(name="step_sim", steps=3)
 
         assert _tick_node(node) == py_trees.common.Status.SUCCESS
-        assert calls == [
-            {
-                "operation": "step",
-                "reason": "step_sim",
-                "source": "behavior_node",
-                "allow_running": True,
-                "steps": 3,
-            }
-        ]
+        assert len(calls) == 1
+        span = calls[0].pop("action_span")
+        assert span.action_source == "program_node"
+        assert "step_sim" in (span.node_instance_id or "")
+        assert calls[0] == {
+            "operation": "step",
+            "reason": "step_sim",
+            "source": "behavior_node",
+            "allow_running": True,
+            "steps": 3,
+        }
 
     def test_set_entity_state_calls_composer_callback(self):
         calls = []
@@ -656,16 +681,18 @@ class TestSimulationControlNodes:
         node = SetEntityState(name="set_entity", entity="/World/box", pose=pose)
 
         assert _tick_node(node) == py_trees.common.Status.SUCCESS
-        assert calls == [
-            {
-                "operation": "set_entity_state",
-                "reason": "set_entity",
-                "source": "behavior_node",
-                "allow_running": True,
-                "entity": "/World/box",
-                "pose": pose,
-            }
-        ]
+        assert len(calls) == 1
+        span = calls[0].pop("action_span")
+        assert span.action_source == "program_node"
+        assert "set_entity" in (span.node_instance_id or "")
+        assert calls[0] == {
+            "operation": "set_entity_state",
+            "reason": "set_entity",
+            "source": "behavior_node",
+            "allow_running": True,
+            "entity": "/World/box",
+            "pose": pose,
+        }
 
 
 class TestResetTrajectories:
@@ -674,6 +701,11 @@ class TestResetTrajectories:
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
         assert kernel.invalidate_count == 1
+        assert kernel.last_invalidate_action_span is not None
+        assert kernel.last_invalidate_action_span.action_source == "program_node"
+        assert "test_reset" in (
+            kernel.last_invalidate_action_span.node_instance_id or ""
+        )
 
 
 class TestAddCollisionObject:
@@ -694,6 +726,9 @@ class TestAddCollisionObject:
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
         assert len(kernel.scene_edits) == 1
+        assert kernel.scene_edits[0].action_span is not None
+        assert kernel.scene_edits[0].action_span.action_source == "program_node"
+        assert "add_box" in (kernel.scene_edits[0].action_span.node_instance_id or "")
 
     def test_accepts_schema_backed_nested_shape(self, kernel, bb_with_kernel):
         node = AddCollisionObject(
@@ -1457,6 +1492,11 @@ class TestCommandGripper:
         assert kernel.last_gripper_command_request.gripper_id == "primary"
         assert kernel.last_gripper_command_request.target_position == pytest.approx(0.42)
         assert kernel.last_gripper_command_request.max_effort == pytest.approx(35.0)
+        assert kernel.last_gripper_command_request.action_span is not None
+        assert kernel.last_gripper_command_request.action_span.action_source == "program_node"
+        assert "move_gripper" in (
+            kernel.last_gripper_command_request.action_span.node_instance_id or ""
+        )
 
     def test_command_gripper_derives_default_timeout_from_motion_time(self, kernel, bb_with_kernel):
         writer = py_trees.blackboard.Client(name="gripper_setup")

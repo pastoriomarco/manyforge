@@ -35,8 +35,14 @@ def build_execution_history_payload(
     components: list[str] | None = None,
     event_types: list[str] | None = None,
     execution_id: int | None = None,
+    kernel_execution_id: int | None = None,
     program_run_id: str | None = None,
     intervention_run_id: str | None = None,
+    action_span_id: str | None = None,
+    node_instance_id: str | None = None,
+    node_attempt_id: str | None = None,
+    move_id: str | None = None,
+    contact_policy_id: str | None = None,
 ) -> dict[str, Any]:
     """Build the execution history payload."""
     state.event_recorder.observe(state)
@@ -50,8 +56,14 @@ def build_execution_history_payload(
             components=components,
             event_types=event_types,
             execution_id=execution_id,
+            kernel_execution_id=kernel_execution_id,
             program_run_id=program_run_id,
             intervention_run_id=intervention_run_id,
+            action_span_id=action_span_id,
+            node_instance_id=node_instance_id,
+            node_attempt_id=node_attempt_id,
+            move_id=move_id,
+            contact_policy_id=contact_policy_id,
         ),
     ).model_dump(by_alias=True)
 
@@ -289,6 +301,40 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
     )
     if required_operator_action != "none":
         warnings.append(f"Operator action required: {required_operator_action}")
+    latest_incident_snapshots = (
+        state.event_recorder.incident_snapshots(limit=8)
+        if error_message or error_code
+        else []
+    )
+    latest_incident = None
+    for candidate in reversed(latest_incident_snapshots):
+        if not isinstance(candidate, dict):
+            continue
+        headline = candidate.get("headlineCause")
+        if candidate.get("actionSpan") or (
+            isinstance(headline, dict) and headline.get("genericWrapperSuppressed")
+        ):
+            latest_incident = candidate
+            break
+    if latest_incident is None and latest_incident_snapshots:
+        latest_incident = latest_incident_snapshots[-1]
+    active_action_span = (
+        latest_incident.get("actionSpan")
+        if isinstance(latest_incident, dict)
+        and isinstance(latest_incident.get("actionSpan"), dict)
+        else None
+    )
+    headline_cause = (
+        latest_incident.get("headlineCause")
+        if isinstance(latest_incident, dict)
+        and isinstance(latest_incident.get("headlineCause"), dict)
+        else None
+    )
+    recovery = (
+        str(latest_incident.get("recovery"))
+        if isinstance(latest_incident, dict) and latest_incident.get("recovery")
+        else None
+    )
 
     return ExecutionDigestResponse(
         state=cycle_state,
@@ -306,6 +352,9 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
         error=error_message,
         errorCode=error_code,
         errorDetails=error_details,
+        activeActionSpan=active_action_span,
+        headlineCause=headline_cause,
+        recovery=recovery,
         warnings=warnings,
         runtimeOverrideState=runtime_override_state,
         delegatedRecoveryRequest=delegated_recovery_request,
@@ -331,8 +380,14 @@ def create_execution_router(state: ComposerState) -> APIRouter:
         components: str | None = Query(default=None),
         event_types: str | None = Query(default=None, alias="eventTypes"),
         execution_id: int | None = Query(default=None, alias="executionId"),
+        kernel_execution_id: int | None = Query(default=None, alias="kernelExecutionId"),
         program_run_id: str | None = Query(default=None, alias="programRunId"),
         intervention_run_id: str | None = Query(default=None, alias="interventionRunId"),
+        action_span_id: str | None = Query(default=None, alias="actionSpanId"),
+        node_instance_id: str | None = Query(default=None, alias="nodeInstanceId"),
+        node_attempt_id: str | None = Query(default=None, alias="nodeAttemptId"),
+        move_id: str | None = Query(default=None, alias="moveId"),
+        contact_policy_id: str | None = Query(default=None, alias="contactPolicyId"),
     ) -> dict[str, Any]:
         """Return execution history for the current or most recent run."""
         return build_execution_history_payload(
@@ -345,8 +400,14 @@ def create_execution_router(state: ComposerState) -> APIRouter:
             components=_split_csv_query(components),
             event_types=_split_csv_query(event_types),
             execution_id=execution_id,
+            kernel_execution_id=kernel_execution_id,
             program_run_id=program_run_id,
             intervention_run_id=intervention_run_id,
+            action_span_id=action_span_id,
+            node_instance_id=node_instance_id,
+            node_attempt_id=node_attempt_id,
+            move_id=move_id,
+            contact_policy_id=contact_policy_id,
         )
 
     @router.get("/channels")

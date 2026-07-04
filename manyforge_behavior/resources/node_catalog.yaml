@@ -667,6 +667,15 @@ entries:
         required: false
         default: default
         description: Trajectory cache mode.
+      - name: contact_policy_id
+        schema:
+          type: string
+        required: false
+        advanced: true
+        parameterizable: true
+        description: >-
+          Concrete contact policy binding for contact-tolerant planning and
+          validation diagnostics. Omit for free-space motion.
     required_capabilities:
       - planning.motion.joint_goal
       - planning.motion.pose_goal
@@ -3171,6 +3180,15 @@ entries:
         required: false
         parameterizable: true
         description: Optional TCP speed cap enforced during preview validation.
+      - name: contact_policy_id
+        schema:
+          type: string
+        required: false
+        advanced: true
+        parameterizable: true
+        description: >-
+          Concrete contact policy to tag generated approach/pick/retreat
+          previews and linked motion nodes. Omit for free-space validation.
       - name: approach_move_node_name
         schema:
           type: string

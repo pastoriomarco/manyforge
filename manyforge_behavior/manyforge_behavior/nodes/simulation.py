@@ -6,10 +6,11 @@ from typing import Any
 
 import py_trees
 
+from manyforge_behavior.action_span import ActionSpanMixin
 from manyforge_behavior.parameters import resolve_blackboard_value
 
 
-class _SimulationControlNode(py_trees.behaviour.Behaviour):
+class _SimulationControlNode(ActionSpanMixin, py_trees.behaviour.Behaviour):
     """Base node that delegates simulator control to Composer."""
 
     operation: str = ""
@@ -25,6 +26,9 @@ class _SimulationControlNode(py_trees.behaviour.Behaviour):
             key="simulation_control_callback",
             access=py_trees.common.Access.READ,
         )
+
+    def initialise(self) -> None:
+        self._reset_action_span()
 
     def _callback(self) -> Any:
         try:
@@ -47,6 +51,7 @@ class _SimulationControlNode(py_trees.behaviour.Behaviour):
                 reason=self._reason,
                 source="behavior_node",
                 allow_running=True,
+                action_span=self._current_action_span(self.blackboard),
                 **self._operation_payload(),
             )
         except Exception as exc:

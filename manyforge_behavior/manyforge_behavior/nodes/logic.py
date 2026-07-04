@@ -7,6 +7,7 @@ from typing import Any
 
 import py_trees
 
+from manyforge_behavior.action_span import ActionSpanMixin
 from manyforge_behavior.blackboard_namespace import (
     read_blackboard_binding_value,
     register_blackboard_binding_read,
@@ -202,7 +203,7 @@ class SetGripperState(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
 
-class CommandGripper(py_trees.behaviour.Behaviour):
+class CommandGripper(ActionSpanMixin, py_trees.behaviour.Behaviour):
     """Command an actuated gripper and block until the command completes."""
 
     def __init__(self, name: str, **kwargs: Any):
@@ -234,6 +235,7 @@ class CommandGripper(py_trees.behaviour.Behaviour):
         )
 
     def initialise(self) -> None:
+        self._reset_action_span()
         self._started = False
         self._deadline = 0.0
         try:
@@ -436,6 +438,7 @@ class CommandGripper(py_trees.behaviour.Behaviour):
                 target_position=target_position,
                 duration_s=duration_s,
                 max_effort=max_effort,
+                action_span=self._current_action_span(self.blackboard),
                 **semantic,
             )
             result = kernel.command_gripper(

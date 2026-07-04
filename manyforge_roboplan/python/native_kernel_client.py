@@ -10,6 +10,7 @@ import time
 from typing import Any, Dict, Optional
 
 from manyforge_behavior.kernel_client import (
+    ActionSpan,
     KernelClient,
     GripperCommandRequest,
     GripperCommandState,
@@ -164,6 +165,8 @@ def _deserialize_motion_execution_outcome(
         execution_id=int(raw.get("execution_id", 0)),
         move_id=str(raw.get("move_id", "")),
         terminal_cause=str(raw.get("terminal_cause", "completed_normally")),
+        action_span=_deserialize_action_span(raw.get("action_span")),
+        contact_policy_id=raw.get("contact_policy_id"),
     )
     trip = raw.get("trip")
     if trip:
@@ -248,6 +251,47 @@ def _serialize_per_joint_dynamics_limits(
         if entry:
             out[str(joint_name)] = entry
     return out or None
+
+
+def _serialize_action_span(span: Optional[ActionSpan]) -> Optional[Dict[str, str]]:
+    if span is None:
+        return None
+    payload: Dict[str, str] = {
+        "action_source": str(span.action_source),
+        "action_span_id": str(span.action_span_id),
+    }
+    if span.program_run_id:
+        payload["program_run_id"] = str(span.program_run_id)
+    if span.node_instance_id:
+        payload["node_instance_id"] = str(span.node_instance_id)
+    if span.node_attempt_id:
+        payload["node_attempt_id"] = str(span.node_attempt_id)
+    if span.parent_node_attempt_id:
+        payload["parent_node_attempt_id"] = str(span.parent_node_attempt_id)
+    return payload
+
+
+def _deserialize_action_span(raw: Any) -> Optional[ActionSpan]:
+    if not isinstance(raw, dict):
+        return None
+    return ActionSpan(
+        action_source=str(raw.get("action_source", "system")),
+        action_span_id=str(raw.get("action_span_id", "")),
+        program_run_id=raw.get("program_run_id"),
+        node_instance_id=raw.get("node_instance_id"),
+        node_attempt_id=raw.get("node_attempt_id"),
+        parent_node_attempt_id=raw.get("parent_node_attempt_id"),
+    )
+
+
+def _add_request_correlation(req_dict: Dict[str, Any], request: ExecuteRequest) -> None:
+    if request.program_run_id:
+        req_dict["program_run_id"] = request.program_run_id
+    action_span = _serialize_action_span(getattr(request, "action_span", None))
+    if action_span:
+        req_dict["action_span"] = action_span
+    if getattr(request, "contact_policy_id", None):
+        req_dict["contact_policy_id"] = str(request.contact_policy_id)
 
 
 def _normalize_pose_dict(pose: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -464,8 +508,7 @@ class NativeKernelClient(KernelClient):
         if request.max_tcp_linear_speed_mps is not None:
             req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
 
-        if request.program_run_id:
-            req_dict["program_run_id"] = request.program_run_id
+        _add_request_correlation(req_dict, request)
 
         dyn_limits = _serialize_per_joint_dynamics_limits(request)
         if dyn_limits is not None:
@@ -516,8 +559,7 @@ class NativeKernelClient(KernelClient):
         if request.max_tcp_linear_speed_mps is not None:
             req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
 
-        if request.program_run_id:
-            req_dict["program_run_id"] = request.program_run_id
+        _add_request_correlation(req_dict, request)
 
         dyn_limits = _serialize_per_joint_dynamics_limits(request)
         if dyn_limits is not None:
@@ -606,8 +648,7 @@ class NativeKernelClient(KernelClient):
         if request.max_tcp_linear_speed_mps is not None:
             req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
 
-        if request.program_run_id:
-            req_dict["program_run_id"] = request.program_run_id
+        _add_request_correlation(req_dict, request)
 
         dyn_limits = _serialize_per_joint_dynamics_limits(request)
         if dyn_limits is not None:
@@ -887,6 +928,8 @@ class NativeKernelClient(KernelClient):
             error=s.get("error"),
             error_code=s.get("error_code"),
             error_details=dict(s.get("error_details", {})),
+            action_span=_deserialize_action_span(s.get("action_span")),
+            contact_policy_id=s.get("contact_policy_id"),
         )
 
     def get_scene_object_ids(self) -> list[str]:
@@ -1220,7 +1263,8 @@ class NativeKernelClient(KernelClient):
     def clear_scene_trace(self) -> None:
         self._bundle.clear_scene_trace()
 
-    def invalidate_trajectories(self) -> None:
+    def invalidate_trajectories(self, action_span: Optional[ActionSpan] = None) -> None:
+        _ = action_span
         self._bundle.invalidate_trajectories()
 
     def set_robot_base_pose(self, pose: Optional[Dict[str, Any]]) -> None:
@@ -1237,7 +1281,11 @@ class NativeKernelClient(KernelClient):
             # the scene trace and forces the planner to churn pairs unnecessarily.
             if state.exists:
                 remove_result = self.scene_edit(
-                    SceneEditRequest(operation="remove", object_id=request.object_id)
+                    SceneEditRequest(
+                        operation="remove",
+                        object_id=request.object_id,
+                        action_span=request.action_span,
+                    )
                 )
                 if not remove_result.success:
                     return remove_result

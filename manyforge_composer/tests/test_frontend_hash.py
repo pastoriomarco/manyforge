@@ -26,6 +26,7 @@ def _parse_env(output: str) -> dict[str, str]:
 
 def _run_hash(repo: Path, *args: str, env: dict[str, str] | None = None) -> dict[str, str]:
     merged_env = os.environ.copy()
+    merged_env.pop("MANYFORGE_FRONTEND_SOURCE_MODE", None)
     if env:
         merged_env.update(env)
     result = subprocess.run(

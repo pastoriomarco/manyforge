@@ -987,7 +987,8 @@ def create_mcp_server(state: ComposerState):
         """Get execution status information.
 
         Args:
-            include: What to return — "digest", "history", "blackboard", or "all"
+            include: What to return — "digest", "history", "incidents",
+                "blackboard", or "all"
 
         - digest: High-level polling summary (state, current node, progress,
           completed/remaining nodes, object positions, errors, warnings)
@@ -999,6 +1000,7 @@ def create_mcp_server(state: ComposerState):
             build_execution_digest_payload,
             build_execution_history_payload,
             build_blackboard_snapshot_payload,
+            build_execution_channels_payload,
         )
 
         result: dict[str, Any] = {}
@@ -1006,6 +1008,8 @@ def create_mcp_server(state: ComposerState):
             result["digest"] = _snakecase_keys(build_execution_digest_payload(state))
         if include in ("history", "all"):
             result["history"] = _snakecase_keys(build_execution_history_payload(state))
+        if include in ("incidents", "all"):
+            result["incidents"] = _snakecase_keys(build_execution_channels_payload(state))
         if include in ("blackboard", "all"):
             result["blackboard"] = _snakecase_keys(build_blackboard_snapshot_payload(state))
 

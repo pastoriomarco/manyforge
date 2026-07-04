@@ -1589,6 +1589,13 @@ class ExecutionEventResponse(BaseModel):
     execution_id: int = 0
     type: str
     move_id: Optional[str] = None
+    action_source: Optional[str] = None
+    action_span_id: Optional[str] = None
+    action_span_program_run_id: Optional[str] = None
+    node_instance_id: Optional[str] = None
+    node_attempt_id: Optional[str] = None
+    parent_node_attempt_id: Optional[str] = None
+    contact_policy_id: Optional[str] = None
     details: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -1649,6 +1656,15 @@ class ExecutionDigestResponse(BaseModel):
         default=None,
         alias="errorDetails",
     )
+    active_action_span: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="activeActionSpan",
+    )
+    headline_cause: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="headlineCause",
+    )
+    recovery: Optional[str] = None
     warnings: List[str] = Field(default_factory=list)
     runtime_override_state: Dict[str, Any] = Field(default_factory=dict, alias="runtimeOverrideState")
     delegated_recovery_request: Optional[Dict[str, Any]] = Field(

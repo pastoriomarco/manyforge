@@ -1,7 +1,13 @@
 /// <reference types="node" />
 
 import { describe, expect, it } from 'vitest';
-import { headlineForError, hintForError, prettyBodyId, prettyPair } from './KernelErrorPanel';
+import {
+  headlineForError,
+  hintForError,
+  incidentEventSummary,
+  prettyBodyId,
+  prettyPair,
+} from './KernelErrorPanel';
 
 describe('KernelErrorPanel mapping', () => {
   describe('prettyPair', () => {
@@ -240,6 +246,56 @@ describe('KernelErrorPanel mapping', () => {
         'Motion execution ended in interrupted',
       );
       expect(headline).toBe('Motion interrupted by an active fault policy');
+    });
+  });
+
+  describe('incidentEventSummary', () => {
+    it('includes node identity fields so duplicate display names stay disambiguated', () => {
+      const summary = incidentEventSummary({
+        type: 'plan_failed',
+        message: 'Planning timed out',
+        details: {
+          display_name: 'Move',
+          action_span_id: 'span-right-move',
+          node_instance_id: 'root/parallel/right/move',
+          node_attempt_id: 'attempt-right-1',
+          reason_code: 'planning_timeout',
+        },
+      });
+
+      expect(summary).toContain('plan_failed');
+      expect(summary).toContain('node_instance_id=root/parallel/right/move');
+      expect(summary).toContain('node_attempt_id=attempt-right-1');
+      expect(summary).toContain('action_span_id=span-right-move');
+    });
+
+    it('includes pick-stage failure reports inside the span-local event line', () => {
+      const summary = incidentEventSummary({
+        type: 'plan_failed',
+        message: 'pick plan failed',
+        details: {
+          candidate_stage_reports: [
+            {
+              candidate_index: 1,
+              stages: [
+                {
+                  stage: 'approach',
+                  status: 'failure',
+                  failures: [{ cause: 'collision_validation_failure' }],
+                },
+                {
+                  stage: 'pick',
+                  status: 'pending',
+                },
+              ],
+            },
+          ],
+        },
+      });
+
+      expect(summary).toContain('plan_failed');
+      expect(summary).toContain('pick plan failed');
+      expect(summary).toContain('candidate 1 approach:collision_validation_failure');
     });
   });
 });
