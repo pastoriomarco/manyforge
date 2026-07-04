@@ -140,6 +140,12 @@ Program YAML --> Behavior Runner --> ExecutionKernel (C++) --> Planner/Execution
                                     Collision Policy
 ```
 
+The kernel owns terminal authority, stop semantics, and collision validation;
+the behavior layer owns program orchestration and run-correlation identity;
+Composer observes and presents. For the full component map, authority
+boundaries, deployment lanes, and observability model, see
+[`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md).
+
 - **manyforge_core** is ROS-free, pure C++20. All robot-framework-specific code lives in adapter packages.
 - **manyforge_roboplan** provides motion planning via RoboPlan (RRT + TOPPRA + IK).
 - Python code calls C++ through pybind11 bindings -- no duplicate state machines.

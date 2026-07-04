@@ -20,13 +20,11 @@ namespace manyforge::core {
 /// inspect+commit under one lock so the decided terminal reflects every
 /// authority active at commit time.
 ///
-/// Lock discipline: `commit_mutex_` is one lock level above the probe locks.
-/// It is acquired ONLY by `commit()`, which then calls the authority probes
-/// (which may take their own leaf locks: stop policy, interrupt manager,
-/// state machine). No code path takes `commit_mutex_` while already holding
-/// any of those locks — probes and state-machine internals never call back
-/// into the committer. Keep it that way: the committer must stay a top-level
-/// entry point, never a callee of subsystem internals.
+/// Lock discipline: `commit_mutex_` is acquired ONLY by `commit()`. Authority
+/// probes must be lock-free reads of pushed kernel records / atomics; they must
+/// not acquire subsystem locks or call back into the committer. Keep it that
+/// way: the committer must stay a top-level leaf decision point, never a callee
+/// of subsystem internals.
 class TerminalCommitter {
  public:
   enum class Origin {
@@ -40,8 +38,8 @@ class TerminalCommitter {
   };
 
   /// Authority probes, supplied by the kernel. Each returns whether that
-  /// authority is currently asserted. Probes must be safe to call while
-  /// holding no kernel locks and must not call back into the committer.
+  /// authority is currently asserted. Probes must be lock-free and must not
+  /// call back into the committer.
   using Probe = std::function<bool()>;
 
   struct CommitRequest {

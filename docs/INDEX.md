@@ -77,10 +77,16 @@ branch/commit workflow).
     Detailed flows for collision rejection, motion interrupted,
     assistant mock-fallback, and ros2_control discovery failures.
 
-## Reference contracts (`docs/reference/`)
+## Reference (`docs/reference/`)
 
-These are auto-generated from code (FastAPI's `openapi()` output and the
-FastMCP tool registry). Regenerate with
+- [`reference/ARCHITECTURE.md`](reference/ARCHITECTURE.md)
+  - **Start here for the big picture.** Component map, authority
+    boundaries (who owns terminal/stop/collision decisions), the three
+    deployment lanes, execution lifecycle, and the observability model.
+    Hand-maintained; keep in sync with material architecture changes.
+
+The remaining reference docs are auto-generated from code (FastAPI's
+`openapi()` output and the FastMCP tool registry). Regenerate with
 `scripts/regen-public-contracts.py`; CI guards staleness via
 `scripts/ci/check-public-contracts-fresh.sh`.
 

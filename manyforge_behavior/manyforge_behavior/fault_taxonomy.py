@@ -68,6 +68,7 @@ ROS2_CONTROL_BACKEND_FAULT_CLASSES: dict[str, BackendFaultClass] = {
         _fault_class("stale_controller_state", "ERROR"),
         _fault_class("start_state_mismatch", "ERROR"),
         _fault_class("tracking_error_exceeded", "ERROR"),
+        _fault_class("tracking_sample_invalid", "ERROR"),
         # Gripper classes. All ERROR: a gripper fault aborts the tree
         # fail-closed but does not leave arm motion unconfirmed (CRITICAL is
         # reserved for unconfirmed-stop / stuck-lifecycle classes).

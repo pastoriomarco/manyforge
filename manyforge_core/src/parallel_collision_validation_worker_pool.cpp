@@ -9,6 +9,8 @@
 #include <string>
 #include <utility>
 
+#include <manyforge_core/types/reason_codes.hpp>
+
 namespace manyforge::core {
 
 namespace {
@@ -57,6 +59,31 @@ CollisionValidationDecisionBundle inconclusive_bundle() {
   bundle.decision.accepted = false;
   bundle.decision.severity = CollisionDecisionSeverity::kBlock;
   bundle.decision.action = CollisionDecisionAction::kInconclusive;
+  return bundle;
+}
+
+CollisionValidationDecisionBundle exception_bundle(
+    const CollisionWorldSnapshot& snapshot,
+    const char* reason_code,
+    const char* exception_type,
+    const char* exception_message) {
+  CollisionValidationDecisionBundle bundle = inconclusive_bundle();
+  bundle.borrowed_world_revision = snapshot.revision;
+  bundle.final_world_revision = snapshot.revision;
+  bundle.decision.first_failing_waypoint = 0;
+  bundle.decision.collision_world_revision = snapshot.revision;
+
+  CollisionValidationWaypointRecord record;
+  record.waypoint_index = 0;
+  record.produced_decision_change = true;
+  record.result.engine_status = CollisionEngineStatus::kEngineError;
+  record.result.decision = CollisionDecisionResult::kInconclusiveFail;
+  record.result.engine_id = "parallel_collision_validation_worker_pool";
+  record.result.raw_diagnostics["reason_code"] = reason_code;
+  record.result.raw_diagnostics["exception_type"] = exception_type;
+  record.result.raw_diagnostics["exception"] = exception_message;
+  record.result.collision_world_revision = snapshot.revision;
+  bundle.waypoint_records.push_back(std::move(record));
   return bundle;
 }
 
@@ -127,10 +154,18 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
     CollisionValidationDecisionBundle bundle;
     try {
       bundle = coord.validate_trajectory(snapshot, engine, trajectory, cancel);
+    } catch (const std::exception& e) {
+      bundle = exception_bundle(
+          snapshot,
+          reason_codes::kCollisionValidationSerialFallbackException,
+          "std_exception",
+          e.what());
     } catch (...) {
-      bundle = inconclusive_bundle();
-      bundle.borrowed_world_revision = snapshot.revision;
-      bundle.final_world_revision = snapshot.revision;
+      bundle = exception_bundle(
+          snapshot,
+          reason_codes::kCollisionValidationSerialFallbackException,
+          reason_codes::kUnknownNonStdException,
+          reason_codes::kUnknownNonStdException);
     }
     const auto t1 = steady_now_ns();
     last_telemetry_.workers_actually_used = 1;
@@ -226,8 +261,18 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
     try {
       out.bundle =
           coord.validate_trajectory(snapshot, *engine, sub_traj, cancel);
+    } catch (const std::exception& e) {
+      out.bundle =
+          exception_bundle(snapshot,
+                           reason_codes::kCollisionValidationWorkerException,
+                           "std_exception",
+                           e.what());
     } catch (...) {
-      out.bundle = inconclusive_bundle();
+      out.bundle =
+          exception_bundle(snapshot,
+                           reason_codes::kCollisionValidationWorkerException,
+                           reason_codes::kUnknownNonStdException,
+                           reason_codes::kUnknownNonStdException);
     }
     out.wall_ns = steady_now_ns() - t0;
     return out;
@@ -421,6 +466,9 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
     try {
       (void)ref_coord.validate_trajectory(snapshot, *available_engines[0],
                                           trajectory, cancel);
+    } catch (const std::exception&) {
+      last_telemetry_.serial_reference_wall_ns.reset();
+      return merged;
     } catch (...) {
       last_telemetry_.serial_reference_wall_ns.reset();
       return merged;
@@ -452,7 +500,7 @@ int env_validation_collision_workers(int default_value, int max_workers) {
       return clamp(default_value);
     }
     return clamp(parsed);
-  } catch (...) {
+  } catch (const std::exception&) {
     return clamp(default_value);
   }
 }

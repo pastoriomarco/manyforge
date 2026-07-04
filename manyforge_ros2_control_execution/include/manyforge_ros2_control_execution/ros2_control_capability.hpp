@@ -134,6 +134,8 @@ inline constexpr const char* kStaleControllerState =
 inline constexpr const char* kStartStateMismatch = "start_state_mismatch";
 inline constexpr const char* kTrackingErrorExceeded =
     "tracking_error_exceeded";
+inline constexpr const char* kTrackingSampleInvalid =
+    "tracking_sample_invalid";
 // Gripper fault classes. Same taxonomy contract as the
 // FollowJointTrajectory classes above: the stable token travels in
 // `reason_code` next to the prose error so digest promotion and the

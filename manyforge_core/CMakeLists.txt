@@ -11,8 +11,16 @@ add_compile_options(-Wall -Wextra -Werror -pedantic)
 add_library(manyforge_core
   src/state_machine.cpp
   src/terminal_committer.cpp
+  src/error_code_mapping.cpp
+  src/execution_worker_signals.cpp
+  src/kernel_event_factories.cpp
+  src/motion_trip_stop_coordinator.cpp
+  src/operator_stop_worker.cpp
+  src/pose_math.cpp
+  src/runtime_collision_monitor.cpp
   src/stop_policy.cpp
   src/trajectory_cache.cpp
+  src/trajectory_cache_compatibility.cpp
   src/trajectory_sampler.cpp
   src/collision_policy_evaluator.cpp
   src/collision_validation_coordinator.cpp
@@ -77,9 +85,65 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_stop_policy
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_runtime_collision_monitor
+    test/test_runtime_collision_monitor.cpp)
+  target_link_libraries(test_runtime_collision_monitor PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_runtime_collision_monitor
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_motion_trip_stop_coordinator
+    test/test_motion_trip_stop_coordinator.cpp)
+  target_link_libraries(test_motion_trip_stop_coordinator PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_motion_trip_stop_coordinator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_execution_worker_signals
+    test/test_execution_worker_signals.cpp)
+  target_link_libraries(test_execution_worker_signals PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_execution_worker_signals
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_error_code_mapping
+    test/test_error_code_mapping.cpp)
+  target_link_libraries(test_error_code_mapping PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_error_code_mapping
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_kernel_event_factories
+    test/test_kernel_event_factories.cpp)
+  target_link_libraries(test_kernel_event_factories PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_kernel_event_factories
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_pose_math
+    test/test_pose_math.cpp)
+  target_link_libraries(test_pose_math PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_pose_math
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_operator_stop_worker
+    test/test_operator_stop_worker.cpp)
+  target_link_libraries(test_operator_stop_worker PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_operator_stop_worker
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_cache test/test_cache.cpp)
   target_link_libraries(test_cache PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_cache
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_trajectory_cache_compatibility
+    test/test_trajectory_cache_compatibility.cpp)
+  target_link_libraries(test_trajectory_cache_compatibility PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_trajectory_cache_compatibility
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_trajectory_sampler test/test_trajectory_sampler.cpp)

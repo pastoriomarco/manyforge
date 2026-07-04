@@ -16,9 +16,10 @@ enum class StopType { kSoft, kHard };
 class StopPolicy {
  public:
   using CacheInvalidationCallback = std::function<void()>;
-  using StopCallback = std::function<void()>;
+  using StopCallback = std::function<Result<void>()>;
   using TerminalTransitionCallback =
       std::function<Result<void>(ExecutionState)>;
+  using StopRequestedChangedCallback = std::function<void(bool)>;
   /// Fired after the scheduled Stopping → Paused transition completes
   /// inside `request_pause`. Lets the kernel emit the
   /// `state_transition(Paused)` event of the spec/230 §6.1 pause chain
@@ -27,7 +28,9 @@ class StopPolicy {
 
   StopPolicy(ExecutionStateMachine& sm, IScheduler& scheduler, IClock& clock,
              CacheInvalidationCallback on_invalidate = nullptr,
-             TerminalTransitionCallback terminal_transition = nullptr);
+             TerminalTransitionCallback terminal_transition = nullptr,
+             StopRequestedChangedCallback on_stop_requested_changed = nullptr);
+  ~StopPolicy();
 
   /// Soft stop with deceleration.
   /// From Executing: Executing → Stopping, schedules deferred Stopped.
@@ -55,6 +58,7 @@ class StopPolicy {
 
   void set_stop_callback(StopCallback callback);
   void set_pause_completed_callback(PauseCompletedCallback callback);
+  void cancel_pending_callbacks();
   bool stop_requested() const;
 
  private:
@@ -62,14 +66,20 @@ class StopPolicy {
   IScheduler& scheduler_;
   IClock& clock_;
   CacheInvalidationCallback on_invalidate_;
+  TerminalTransitionCallback terminal_transition_;
   StopCallback stop_callback_;
   PauseCompletedCallback pause_completed_callback_;
+  StopRequestedChangedCallback on_stop_requested_changed_;
   mutable std::mutex mutex_;
   bool stop_requested_{false};
   ScheduleHandle pending_soft_stop_{0};
-  TerminalTransitionCallback terminal_transition_;
+  ScheduleHandle pending_pause_{0};
 
   Result<void> transition_terminal(ExecutionState state);
+  Result<void> invoke_stop_callback();
+  Result<void> transition_intervention_after_stop_failure(
+      const Result<void>& stop_result);
+  void update_stop_requested(bool requested);
 };
 
 }  // namespace manyforge::core

@@ -5,6 +5,7 @@
 
 #include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
+#include <manyforge_core/types/reason_codes.hpp>
 
 #include <gtest/gtest.h>
 
@@ -310,6 +311,13 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   ASSERT_TRUE(bundle.final_world_revision.has_value());
   EXPECT_EQ(bundle.final_world_revision->revision_id,
             snapshot.revision.revision_id);
+  ASSERT_FALSE(bundle.waypoint_records.empty());
+  EXPECT_EQ(bundle.waypoint_records.front().result.engine_status,
+            CollisionEngineStatus::kEngineError);
+  EXPECT_EQ(bundle.waypoint_records.front().result.raw_diagnostics.at("reason_code"),
+            reason_codes::kCollisionValidationSerialFallbackException);
+  EXPECT_EQ(bundle.waypoint_records.front().result.raw_diagnostics.at("exception"),
+            "mock engine failure");
   EXPECT_EQ(pool.last_telemetry().workers_actually_used, 1);
   EXPECT_EQ(pool.last_telemetry().fallback_reason, "worker_count_one");
 }

@@ -16,7 +16,10 @@ class StopPolicyTest : public ::testing::Test {
   StopPolicy policy{sm, scheduler, clock, [this]() { ++invalidate_count; }};
 
   void SetUp() override {
-    policy.set_stop_callback([this]() { ++stop_callback_count; });
+    policy.set_stop_callback([this]() {
+      ++stop_callback_count;
+      return Result<void>::Ok();
+    });
   }
 
   void go_to_executing() {
@@ -74,6 +77,7 @@ TEST_F(StopPolicyTest, SoftStopFromValidating_DirectToStopped) {
   EXPECT_TRUE(policy.request_soft_stop(500).ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
   EXPECT_EQ(invalidate_count, 1);
+  EXPECT_EQ(stop_callback_count, 1);
 }
 
 TEST_F(StopPolicyTest, SoftStopFromIdle_Fails) {
@@ -117,6 +121,7 @@ TEST_F(StopPolicyTest, HardStopFromPlanning_DirectToStopped) {
   (void)sm.try_transition(ExecutionState::kPlanning);
   EXPECT_TRUE(policy.request_hard_stop().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
+  EXPECT_EQ(stop_callback_count, 1);
 }
 
 TEST_F(StopPolicyTest, HardStopFromValidating_DirectToStopped) {
@@ -124,6 +129,7 @@ TEST_F(StopPolicyTest, HardStopFromValidating_DirectToStopped) {
   (void)sm.try_transition(ExecutionState::kValidating);
   EXPECT_TRUE(policy.request_hard_stop().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
+  EXPECT_EQ(stop_callback_count, 1);
 }
 
 TEST_F(StopPolicyTest, HardStopFromIdle_Fails) {
@@ -138,6 +144,25 @@ TEST_F(StopPolicyTest, PauseFromExecuting_DecelerationToPaused) {
 
   scheduler.advance_to(clock.now());
   EXPECT_EQ(sm.status().state, ExecutionState::kPaused);
+}
+
+TEST_F(StopPolicyTest,
+       HardStopCallbackFailureFromExecutingEntersInterventionRequired) {
+  go_to_executing();
+  policy.set_stop_callback([this]() {
+    ++stop_callback_count;
+    return Result<void>::Err(ErrorDTO{kErrorStopFailed,
+                                      "injected stop failure",
+                                      {{"reason", "test_stop_failure"}}});
+  });
+
+  auto result = policy.request_hard_stop();
+
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(sm.status().state, ExecutionState::kInterventionRequired);
+  EXPECT_TRUE(policy.stop_requested());
+  EXPECT_EQ(invalidate_count, 1);
+  EXPECT_EQ(stop_callback_count, 1);
 }
 
 TEST_F(StopPolicyTest, PauseFromNonExecuting_Fails) {
@@ -213,6 +238,33 @@ TEST_F(StopPolicyTest, ResetClearsStopRequested) {
   EXPECT_TRUE(policy.stop_requested());
   policy.request_reset();
   EXPECT_FALSE(policy.stop_requested());
+}
+
+TEST(StopPolicyCallbackTest, StopRequestedChangedCallbackTracksStopAndReset) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  ExecutionStateMachine sm{clock};
+  bool pushed_stop_requested = false;
+  StopPolicy policy{
+      sm,
+      scheduler,
+      clock,
+      nullptr,
+      nullptr,
+      [&](bool requested) { pushed_stop_requested = requested; }};
+  policy.set_stop_callback([]() { return Result<void>::Ok(); });
+
+  (void)sm.try_transition(ExecutionState::kPlanning);
+  (void)sm.try_transition(ExecutionState::kValidating);
+  (void)sm.try_transition(ExecutionState::kExecuting);
+
+  ASSERT_TRUE(policy.request_hard_stop().ok());
+  EXPECT_TRUE(policy.stop_requested());
+  EXPECT_TRUE(pushed_stop_requested);
+
+  ASSERT_TRUE(policy.request_reset().ok());
+  EXPECT_FALSE(policy.stop_requested());
+  EXPECT_FALSE(pushed_stop_requested);
 }
 
 // --- Stop callback ---

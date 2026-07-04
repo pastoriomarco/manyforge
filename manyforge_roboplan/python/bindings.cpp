@@ -819,6 +819,7 @@ py::dict metrics_to_python(const MetricsSnapshot& metrics) {
   d["stops_issued"] = metrics.stops_issued;
   d["collision_detections"] = metrics.collision_detections;
   d["snapshots_published"] = metrics.snapshots_published;
+  d["event_subscriber_exceptions"] = metrics.event_subscriber_exceptions;
   d["observer_lag_max_ns"] = metrics.observer_lag_max_ns;
   return d;
 }

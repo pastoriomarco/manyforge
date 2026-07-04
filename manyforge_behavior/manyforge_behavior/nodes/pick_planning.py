@@ -28,7 +28,7 @@ from manyforge_behavior.kernel_client import (
 )
 from manyforge_behavior.nodes.blackboard_output import BlackboardOutputMixin
 from manyforge_behavior.parameters import resolve_blackboard_value
-from manyforge_behavior.pick_stage_causes import PickStageFailureCause
+from manyforge_behavior.reason_codes import ReasonCode
 
 
 _SCENE_SNAPSHOT_WAIT_TIMEOUT_S = 2.0
@@ -508,7 +508,7 @@ def _preview_failure_causes(
     error_details: Optional[dict[str, Any]],
 ) -> list[str]:
     details = error_details or {}
-    causes: list[PickStageFailureCause] = []
+    causes: list[ReasonCode] = []
     failure_stage = str(details.get("failure_stage") or "").lower()
     classification = str(
         details.get("collision_result_first_failure_classification") or ""
@@ -516,36 +516,36 @@ def _preview_failure_causes(
     error_text = str(preview_error or "").lower()
 
     if _detail_flag(details, "start_in_collision"):
-        causes.append(PickStageFailureCause.START_STATE_IN_COLLISION)
+        causes.append(ReasonCode.START_STATE_IN_COLLISION)
     if "collision_aware_ik" in failure_stage:
-        causes.append(PickStageFailureCause.COLLISION_AWARE_IK_FAILURE)
+        causes.append(ReasonCode.COLLISION_AWARE_IK_FAILURE)
     elif "ik" in failure_stage or "ik failed" in error_text:
-        causes.append(PickStageFailureCause.RAW_IK_FAILURE)
+        causes.append(ReasonCode.RAW_IK_FAILURE)
     if (
         _detail_flag(details, "goal_in_collision")
         or "collision_validation" in failure_stage
         or details.get("collision_result_first_failure_pair") is not None
         or details.get("collision_pairs") is not None
     ):
-        causes.append(PickStageFailureCause.COLLISION_VALIDATION_FAILURE)
+        causes.append(ReasonCode.COLLISION_VALIDATION_FAILURE)
     if "support_contact" in failure_stage or "support_contact" in classification:
-        causes.append(PickStageFailureCause.SUPPORT_CONTACT_REJECTION)
+        causes.append(ReasonCode.SUPPORT_CONTACT_REJECTION)
     if (
         details.get("contact_grasp_violation") is not None
         or details.get("contact_grasp_policy_id") is not None
     ):
-        causes.append(PickStageFailureCause.CONTACT_POLICY_REJECTION)
+        causes.append(ReasonCode.CONTACT_POLICY_REJECTION)
 
     if not causes:
-        causes.append(PickStageFailureCause.PREVIEW_FAILED)
+        causes.append(ReasonCode.PREVIEW_FAILED)
     return list(dict.fromkeys(cause.value for cause in causes))
 
 
 def _stage_checks_for_failure(causes: list[str]) -> tuple[str, str]:
     ik_failures = {
-        PickStageFailureCause.RAW_IK_FAILURE.value,
-        PickStageFailureCause.COLLISION_AWARE_IK_FAILURE.value,
-        PickStageFailureCause.PREVIEW_FAILED.value,
+        ReasonCode.RAW_IK_FAILURE.value,
+        ReasonCode.COLLISION_AWARE_IK_FAILURE.value,
+        ReasonCode.PREVIEW_FAILED.value,
     }
     if any(cause in ik_failures for cause in causes):
         return "failure", "not_run"

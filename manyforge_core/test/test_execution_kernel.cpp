@@ -3282,7 +3282,8 @@ TEST_F(ExecutionKernelTest,
   local_collision_world.current_snapshot =
       std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
   local_collision_engine->default_result = make_authoritative_collision_result();
-  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "runtime collision monitor did not schedule its first tick";
 
   local_clock.advance(10'000'000);
   local_scheduler.advance_to(local_clock.now());
@@ -3396,6 +3397,8 @@ TEST_F(ExecutionKernelTest,
   local_collision_world.current_snapshot =
       std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
 
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "runtime collision monitor did not schedule its first tick";
   local_clock.advance(10'000'000);
   local_scheduler.advance_to(local_clock.now());
   for (int attempt = 0;
@@ -3473,7 +3476,8 @@ TEST_F(ExecutionKernelTest,
       std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
   local_collision_engine->default_result =
       make_authoritative_collision_result();
-  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "runtime collision monitor did not schedule its first tick";
   local_clock.advance(10'000'000);
   local_scheduler.advance_to(local_clock.now());
   for (int attempt = 0;
@@ -3804,6 +3808,25 @@ TEST_F(ExecutionKernelTest,
 
   controlled_execution.release_controlled_stop();
   ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopped));
+  // The operator-stop worker commits kStopped before it emits kStopIssued.
+  // Poll the event explicitly so this assertion does not race the final event
+  // delivery under TSAN/full-suite load.
+  std::optional<KernelEvent> stop_event;
+  for (int attempt = 0; attempt < 2000; ++attempt) {
+    {
+      std::lock_guard<std::mutex> lock(events_mutex);
+      auto it = std::find_if(events.begin(), events.end(),
+                             [](const KernelEvent& event) {
+                               return event.type == KernelEventType::kStopIssued;
+                             });
+      if (it != events.end()) {
+        stop_event = *it;
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(stop_event.has_value());
   {
     std::lock_guard<std::mutex> lock(events_mutex);
     EXPECT_EQ(std::count_if(events.begin(), events.end(),
@@ -3812,10 +3835,6 @@ TEST_F(ExecutionKernelTest,
                                      KernelEventType::kExecuteCompleted;
                             }),
               0);
-    EXPECT_TRUE(std::any_of(events.begin(), events.end(),
-                            [](const KernelEvent& event) {
-                              return event.type == KernelEventType::kStopIssued;
-                            }));
   }
 }
 
@@ -4053,8 +4072,19 @@ TEST_F(ExecutionKernelTest,
   controlled_execution.release_controlled_stop();
   ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopped))
       << "state=" << to_string(local_kernel.get_status().state);
-  const auto snapshot = local_kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
+  ExecutionSnapshot snapshot;
+  bool terminal_error_seen = false;
+  for (int attempt = 0; attempt < 2000; ++attempt) {
+    snapshot = local_kernel.get_execution_snapshot();
+    if (snapshot.state == ExecutionState::kStopped &&
+        snapshot.error.has_value()) {
+      terminal_error_seen = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(terminal_error_seen)
+      << "state=" << to_string(snapshot.state);
   EXPECT_EQ(snapshot.error->details.at("hard_stop_transitioned"), "true");
   EXPECT_EQ(snapshot.error->details.at("emergency_fallback"),
             "legacy_stop_succeeded");
@@ -4986,7 +5016,8 @@ TEST_F(ExecutionKernelTest,
   local_publisher.current_snapshot =
       std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
   local_engine->default_result = make_authoritative_collision_result();
-  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "runtime collision monitor did not schedule its first tick";
   local_clock.advance(20'000'000);
   local_scheduler.advance_to(local_clock.now());
   for (int attempt = 0;
@@ -5068,7 +5099,8 @@ TEST_F(ExecutionKernelTest,
   local_publisher.current_snapshot =
       std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
   local_engine->default_result = make_authoritative_collision_result();
-  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "runtime collision monitor did not schedule its first tick";
   local_clock.advance(10'000'000);
   local_scheduler.advance_to(local_clock.now());
   for (int attempt = 0;
@@ -5121,6 +5153,137 @@ TEST_F(ExecutionKernelTest,
   // Once the preempt event is observed, the latch result it accompanies is
   // guaranteed set (marked on the same lane just before the event is emitted),
   // so this read is no longer racy.
+  auto latch = local_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->preemption_result, InterruptPreemptionResult::kSucceeded);
+}
+
+TEST_F(ExecutionKernelTest,
+       FaultStopProfile_DeadlineWatchdogCancelsControlledStopAndFallsBack) {
+  ControlledExecution controlled_execution;
+  controlled_execution.block_controlled_stop = true;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_query_timeout_ns = 10'000'000;
+  MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.profile_id = "fault_spring_back";
+  fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  fault_profile.deceleration_time_s = 0.05;
+  fault_profile.max_stop_time_s = 0.1;
+  config.default_fault_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(fault_profile);
+
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  auto result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision =
+      CollisionWorldRevision{99, "live-scene-after-dispatch"};
+  local_publisher.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+  local_engine->default_result = make_authoritative_collision_result();
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "runtime collision monitor did not schedule its first tick";
+
+  std::jthread monitor_tick([&]() {
+    local_clock.advance(10'000'000);
+    local_scheduler.advance_to(local_clock.now());
+  });
+
+  ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1))
+      << "fault preempt did not enter execute_controlled_stop";
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "fault preempt deadline watchdog was not scheduled";
+
+  bool watchdog_cancel_seen = false;
+  for (int attempt = 0; attempt < 200 && !watchdog_cancel_seen; ++attempt) {
+    local_clock.advance(20'000'000);
+    local_scheduler.advance_to(local_clock.now());
+    watchdog_cancel_seen =
+        controlled_execution.wait_until_controlled_stop_cancel_count(
+            1, std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(watchdog_cancel_seen)
+      << "fault preempt deadline watchdog must cancel the blocked stop";
+  ASSERT_TRUE(controlled_execution.wait_until_stop_attempt_count(1))
+      << "fault preempt deadline watchdog must issue the hard-stop floor";
+  if (monitor_tick.joinable()) {
+    monitor_tick.join();
+  }
+
+  bool completed = local_kernel.wait_for_completion(200'000'000);
+  if (!completed) {
+    controlled_execution.release();
+    completed = local_kernel.wait_for_completion(1'000'000'000);
+  }
+  EXPECT_TRUE(completed);
+
+  EXPECT_EQ(controlled_execution.controlled_stop_count_value(), 1);
+  EXPECT_EQ(controlled_execution.controlled_stop_cancel_count_value(), 1);
+  EXPECT_GE(controlled_execution.stop_attempt_count_value(), 1);
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kInterrupted);
+
+  const auto has_watchdog_event = [&]() {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    return std::any_of(
+        events.begin(), events.end(), [](const KernelEvent& e) {
+          return e.type == KernelEventType::kErrorRaised &&
+                 e.details.contains("phase") &&
+                 e.details.at("phase") ==
+                     "fault_preempt_deadline_watchdog" &&
+                 e.details.contains("hard_stop_transitioned") &&
+                 e.details.at("hard_stop_transitioned") == "true" &&
+                 e.details.contains("emergency_fallback") &&
+                 e.details.at("emergency_fallback") == "legacy_stop_succeeded";
+        });
+  };
+  const auto has_preempt_event = [&]() {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    return std::any_of(
+        events.begin(), events.end(), [](const KernelEvent& e) {
+          return e.type == KernelEventType::kInterruptPreemptApplied &&
+                 e.details.contains("preempt_path") &&
+                 e.details.at("preempt_path") ==
+                     "controlled_stop_failed_legacy_fallback_succeeded" &&
+                 e.details.contains("hard_stop_transitioned") &&
+                 e.details.at("hard_stop_transitioned") == "true";
+        });
+  };
+  bool saw_watchdog_event = false;
+  bool saw_preempt_event = false;
+  for (int attempt = 0; attempt < 500; ++attempt) {
+    saw_watchdog_event = saw_watchdog_event || has_watchdog_event();
+    saw_preempt_event = saw_preempt_event || has_preempt_event();
+    if (saw_watchdog_event && saw_preempt_event) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(saw_watchdog_event);
+  EXPECT_TRUE(saw_preempt_event);
+
   auto latch = local_kernel.get_active_interrupt_latch();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->preemption_result, InterruptPreemptionResult::kSucceeded);
@@ -6735,6 +6898,26 @@ TEST_F(ExecutionKernelTest, Metrics_CollisionDetections) {
   // So we need to test it separately
 }
 
+TEST_F(ExecutionKernelTest,
+       EventSubscriberExceptionDoesNotBlockOtherSubscribers) {
+  int delivered_to_healthy_subscriber = 0;
+  bool threw_once = false;
+  kernel.subscribe_events([&](const KernelEvent&) {
+    if (!threw_once) {
+      threw_once = true;
+      throw std::runtime_error("subscriber failed");
+    }
+  });
+  kernel.subscribe_events([&](const KernelEvent&) {
+    ++delivered_to_healthy_subscriber;
+  });
+
+  execute_sync(make_test_request("subscriber_exception_metrics"));
+
+  EXPECT_GT(delivered_to_healthy_subscriber, 0);
+  EXPECT_EQ(kernel.get_metrics().event_subscriber_exceptions, 1u);
+}
+
 // =============================================================================
 // Timeout Tests (W-1, W-2)
 // =============================================================================
@@ -7008,8 +7191,20 @@ TEST_F(ExecutionKernelTest, ConcurrentStress_RapidExecuteStopCycles) {
     // hanging until the 2 s timeout fires with a less-specific message.
     // This is the diagnostic-quality fix; the hang itself is bounded by
     // the 2 s wait_for_completion timeout below.
+    const auto state_before_stop = local_kernel.get_status().state;
     auto stop_result = local_kernel.stop();
-    ASSERT_TRUE(stop_result.accepted) << "Cycle " << i << " stop failed";
+    ASSERT_TRUE(stop_result.accepted)
+        << "Cycle " << i << " stop failed"
+        << " before_state=" << to_string(state_before_stop)
+        << " state=" << to_string(local_kernel.get_status().state)
+        << " error_code="
+        << (stop_result.error ? stop_result.error->code : std::string("<none>"))
+        << " error_message="
+        << (stop_result.error ? stop_result.error->message : std::string("<none>"))
+        << " reason="
+        << (stop_result.error && stop_result.error->details.contains("reason")
+                ? stop_result.error->details.at("reason")
+                : std::string("<none>"));
     ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000))
         << "Cycle " << i << " did not complete after stop()";
 
@@ -7620,6 +7815,8 @@ TEST_F(ExecutionKernelTest,
   local_kernel.set_collision_validation_pipeline(
       local_collision_world,
       std::vector<std::shared_ptr<ICollisionQueryEngine>>{});
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "stop-window collision monitor did not schedule its next tick";
   bool saw_monitor_unavailable = false;
   for (int attempt = 0; attempt < 200 && !saw_monitor_unavailable; ++attempt) {
     local_clock.advance(10'000'000);
@@ -7699,6 +7896,8 @@ TEST_F(ExecutionKernelTest,
   local_collision_engine->default_result = make_authoritative_collision_result();
 
   // Drive the stop-window monitor until it cancels the in-flight stop.
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "stop-window collision monitor did not schedule its next tick";
   for (int attempt = 0; attempt < 200; ++attempt) {
     if (controlled_execution.controlled_stop_cancel_count_value() > 0) {
       break;
@@ -7771,6 +7970,8 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
 
   // Advance past the deadline; the watchdog must cancel the blocked stop.
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "controlled-stop deadline watchdog did not schedule";
   for (int attempt = 0; attempt < 200; ++attempt) {
     if (controlled_execution.controlled_stop_cancel_count_value() > 0) {
       break;

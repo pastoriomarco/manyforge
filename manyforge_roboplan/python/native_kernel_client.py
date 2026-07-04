@@ -39,6 +39,7 @@ from manyforge_behavior.kernel_client import (
     Trajectory,
     TrajectoryWaypoint,
 )
+from manyforge_behavior.reason_codes import ReasonCode
 
 # Native bindings expose a stable state_name. Do not decode by numeric enum
 # value: inserting a C++ enum member must not silently remap terminal states in
@@ -1025,6 +1026,12 @@ class NativeKernelClient(KernelClient):
 
         self.update_gripper_commands()
         current = self.get_gripper_status(request.gripper_id)
+        if current.state == GripperCommandState.FAILED and current.reason_code:
+            return CommandResult(
+                accepted=False,
+                error=current.error or "Gripper state is unavailable",
+                reason_code=current.reason_code,
+            )
         if current.state == GripperCommandState.EXECUTING:
             return CommandResult(
                 accepted=False,
@@ -1039,7 +1046,11 @@ class NativeKernelClient(KernelClient):
             )
             group_positions = self._get_group_joint_positions(request.group_id)
         except Exception as exc:
-            return CommandResult(accepted=False, error=str(exc))
+            return CommandResult(
+                accepted=False,
+                error=str(exc),
+                reason_code=ReasonCode.GRIPPER_STATE_UNAVAILABLE.value,
+            )
 
         start_position = float(group_positions[joint_index])
         if request.duration_s <= 0.0:
@@ -1097,8 +1108,13 @@ class NativeKernelClient(KernelClient):
         if hasattr(self._bundle, "get_ros_gripper_status"):
             try:
                 status = self._bundle.get_ros_gripper_status(gripper_id)
-            except RuntimeError:
-                status = None
+            except RuntimeError as exc:
+                return GripperCommandStatus(
+                    state=GripperCommandState.FAILED,
+                    gripper_id=gripper_id,
+                    error=str(exc),
+                    reason_code=ReasonCode.GRIPPER_STATE_UNAVAILABLE.value,
+                )
             if status is not None:
                 metadata = self._gripper_semantic_metadata.get(gripper_id, {})
                 current_position = status.get("current_position")

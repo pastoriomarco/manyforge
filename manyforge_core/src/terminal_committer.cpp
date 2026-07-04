@@ -73,6 +73,12 @@ TerminalCommitter::CommitOutcome TerminalCommitter::commit(
   CommitOutcome outcome;
   const ExecutionState current = sm_.status().state;
   ExecutionState decided = decide(request, current);
+  if (current == decided) {
+    outcome.committed = decided;
+    outcome.overrode = decided != request.proposed;
+    outcome.accepted = true;
+    return outcome;
+  }
   auto attempt = sm_.try_transition(decided);
   if (!attempt.ok() && decided != request.proposed) {
     // The escalated terminal is not reachable from the current phase

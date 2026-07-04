@@ -5,10 +5,14 @@
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
 #include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
+#include <manyforge_core/execution_worker_signals.hpp>
 #include <manyforge_core/interrupt/interrupt_manager.hpp>
+#include <manyforge_core/motion_trip_stop_coordinator.hpp>
+#include <manyforge_core/operator_stop_worker.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iplanner_backend.hpp>
 #include <manyforge_core/ports/iplanning_context.hpp>
+#include <manyforge_core/runtime_collision_monitor.hpp>
 #include <manyforge_core/state_machine.hpp>
 #include <manyforge_core/terminal_committer.hpp>
 #include <manyforge_core/stop_policy.hpp>
@@ -23,7 +27,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -386,18 +389,14 @@ class ExecutionKernel {
   /// Publish an observer-safe execution snapshot.
   void publish_execution_snapshot(ExecutionSnapshot snapshot);
   void start_collision_monitoring();
-  void stop_collision_monitoring();
-  void schedule_next_collision_monitor_tick(uint64_t generation);
-  void reset_runtime_contact_release_state();
-  std::optional<std::map<std::string, std::string>>
-  update_runtime_contact_release_state(
-      const CollisionPolicySnapshot& policy_snapshot,
-      const CollisionValidationDecisionBundle& bundle);
+  void stop_collision_monitoring(bool drain_callbacks = false);
   CollisionWorldRevision current_authoritative_collision_world_revision() const;
   std::shared_ptr<CollisionCancellationToken> install_validation_cancel_token();
   void clear_validation_cancel_token(
       const std::shared_ptr<CollisionCancellationToken>& token);
   void request_validation_cancel_from_interrupt(
+      const InterruptIngestResult& result);
+  void record_terminal_fault_authority(
       const InterruptIngestResult& result);
   void mark_active_interrupt_preemption_result(
       InterruptPreemptionResult result,
@@ -408,6 +407,7 @@ class ExecutionKernel {
       const std::map<std::string, std::string>& metadata = {});
   void apply_latched_interrupt_preemption(
       const InterruptIngestResult& result);
+  void request_fault_preempt_controlled_stop();
   InterruptRuntimeContext current_interrupt_context() const;
   void emit_interrupt_events(const InterruptIngestResult& result);
 
@@ -443,6 +443,77 @@ class ExecutionKernel {
     bool outcome_emitted = false;
     std::optional<InterruptLatch> motion_trip_latch;
   };
+
+  enum class ExecuteWorkerPhaseStatus {
+    kContinue,
+    kTerminal,
+  };
+
+  struct ExecuteWorkerPlanPhaseResult {
+    ExecuteWorkerPhaseStatus status = ExecuteWorkerPhaseStatus::kContinue;
+    TrajectoryDTO trajectory;
+    bool active_trajectory_from_cache = false;
+  };
+
+  struct ExecuteWorkerValidationPhaseResult {
+    ExecuteWorkerPhaseStatus status = ExecuteWorkerPhaseStatus::kContinue;
+    CollisionWorldRevision collision_world_revision;
+  };
+
+  struct ExecuteWorkerDispatchPhaseResult {
+    ExecuteWorkerPhaseStatus status = ExecuteWorkerPhaseStatus::kContinue;
+    ExecutionHandle execution_handle;
+    std::int64_t exec_start_ns = 0;
+    std::int64_t exec_timeout_ns = 0;
+    ExecutionSnapshot latest_backend_snapshot;
+  };
+
+  void finish_execute_worker();
+  void notify_execution_waiters();
+
+  bool finalize_overridden_terminal_authority(
+      const ExecuteRequestDTO& request,
+      std::uint64_t exec_id,
+      ActiveMotionExecution& motion_state,
+      ExecutionState committed,
+      const char* reason,
+      std::optional<ErrorDTO> error = std::nullopt);
+
+  bool finalize_competing_terminal_authority(
+      const ExecuteRequestDTO& request,
+      std::uint64_t exec_id,
+      ActiveMotionExecution& motion_state,
+      const char* reason);
+
+  ExecuteWorkerPlanPhaseResult execute_worker_plan_phase(
+      std::stop_token st,
+      const ExecuteRequestDTO& request,
+      std::uint64_t exec_id,
+      std::optional<TrajectoryDTO> cached_trajectory,
+      ExecutionState worker_entry_state,
+      ActiveMotionExecution& motion_state);
+
+  ExecuteWorkerValidationPhaseResult execute_worker_validate_replan_phase(
+      std::stop_token st,
+      const ExecuteRequestDTO& request,
+      std::uint64_t exec_id,
+      TrajectoryDTO& trajectory,
+      bool& active_trajectory_from_cache,
+      ActiveMotionExecution& motion_state);
+
+  ExecuteWorkerDispatchPhaseResult execute_worker_dispatch_phase(
+      const ExecuteRequestDTO& request,
+      std::uint64_t exec_id,
+      const TrajectoryDTO& trajectory,
+      bool active_trajectory_from_cache,
+      const CollisionWorldRevision& validation_world_revision,
+      ActiveMotionExecution& motion_state);
+
+  void execute_worker_finalize_phase(
+      const ExecuteRequestDTO& request,
+      std::uint64_t exec_id,
+      ExecutionHandle& execution_handle,
+      ActiveMotionExecution& motion_state);
 
   /// Arm scopes carried by `request.motion_interrupt_scopes` atomically
   /// with dispatch (spec/230 §3.4): all scopes succeed or none do. On
@@ -537,8 +608,6 @@ class ExecutionKernel {
   std::string active_program_run_id_;
   mutable std::mutex active_action_span_mutex_;
   std::optional<ActionSpanDTO> active_action_span_;
-  mutable std::mutex active_contact_policy_id_mutex_;
-  std::string active_contact_policy_id_;
 
   // Event subscription
   std::mutex subscribers_mutex_;
@@ -552,10 +621,7 @@ class ExecutionKernel {
 
   // Async execution state
   std::jthread worker_thread_;
-  std::condition_variable completion_cv_;
-  std::mutex completion_mutex_;
-  std::atomic<bool> execution_complete_{false};
-  std::atomic<bool> resume_requested_{false};
+  ExecutionWorkerSignals worker_signals_;
   std::atomic<bool> execute_admission_interruptible_{false};
   std::atomic<bool> lifecycle_stop_requested_while_busy_{false};
   std::atomic<bool> lifecycle_stop_requested_event_emitted_{false};
@@ -565,42 +631,24 @@ class ExecutionKernel {
   // be consumed by preemption/stop machinery before the backend finalizer runs;
   // this flag preserves the fact that safety authority existed so a later
   // normal completion cannot launder it.
+  std::atomic<bool> terminal_stop_authority_asserted_{false};
   std::atomic<bool> terminal_fault_authority_asserted_{false};
-  mutable std::mutex operator_stop_mutex_;
-  std::condition_variable operator_stop_cv_;
-  std::jthread operator_stop_thread_;
-  std::uint64_t operator_stop_generation_{0};
-  std::atomic<bool> operator_stop_worker_active_{false};
-  mutable std::mutex operator_stop_error_mutex_;
-  std::optional<ErrorDTO> operator_stop_terminal_error_;
-  std::optional<ErrorDTO> operator_stop_intervention_error_;
+  OperatorStopWorker operator_stop_worker_;
 
-  mutable std::mutex collision_monitor_mutex_;
-  std::condition_variable collision_monitor_cv_;
-  ScheduleHandle collision_monitor_handle_{0};
-  uint64_t collision_monitor_generation_ = 0;
-  bool collision_monitor_active_ = false;
-  std::uint64_t collision_monitor_callbacks_in_flight_ = 0;
-  // Stop-path collision monitoring. While a motion-trip controlled stop is in
-  // flight, `motion_trip_stop_active_` is true and the runtime collision
-  // monitor keeps running over the decelerating robot. On a collision the
-  // monitor does NOT latch a new fault or touch the state machine (no race
-  // with the trip handler) — it sets `motion_trip_stop_collision_` and cancels
-  // the in-flight stop via `motion_trip_stop_source_`. The trip handler then
-  // escalates to the hard-stop floor. Monitor signals; worker acts.
-  std::atomic<bool> motion_trip_stop_active_{false};
-  std::atomic<bool> motion_trip_stop_collision_{false};
-  std::mutex motion_trip_stop_mutex_;
-  std::optional<std::stop_source> motion_trip_stop_source_;
-  struct RuntimeContactReleasePairState {
-    double initial_penetration_m = 0.0;
-    double last_penetration_m = 0.0;
-    bool separated = false;
-  };
-  mutable std::mutex runtime_contact_release_mutex_;
-  std::map<std::string, RuntimeContactReleasePairState>
-      runtime_contact_release_state_;
+  // Stop-path collision boundary. While a motion-trip controlled stop is in
+  // flight, the runtime collision monitor keeps running over the decelerating
+  // robot. On a collision the monitor does NOT latch a new fault or touch the
+  // state machine; it only signals this coordinator. The trip handler then owns
+  // the hard-stop escalation and terminal decision. Monitor signals; worker
+  // acts.
+  MotionTripStopCoordinator motion_trip_stop_;
 
+  // Cancellable stop source for fault-latch preemption. Runtime collision /
+  // supervisory faults can execute a configured controlled stop outside the
+  // main execute-worker path, so teardown/reset/watchdogs need an explicit
+  // owner they can signal without relying on the caller's thread lifetime.
+  std::mutex fault_preempt_stop_mutex_;
+  std::shared_ptr<std::stop_source> fault_preempt_stop_source_;
   // Metrics (atomic counters for thread safety)
   mutable std::mutex metrics_mutex_;
   mutable MetricsSnapshot metrics_;
@@ -616,6 +664,12 @@ class ExecutionKernel {
   mutable std::mutex motion_outcomes_mutex_;
   std::map<std::uint64_t, MotionExecutionOutcomeDTO> motion_execution_outcomes_;
   std::vector<std::uint64_t> motion_outcome_order_;
+
+  // Declared last so its destructor runs first after the kernel destructor body.
+  // The destructor body already stops/drains it explicitly; this member order is
+  // a second guard that prevents scheduled callbacks from observing partially
+  // destroyed kernel state if future teardown code changes.
+  RuntimeCollisionMonitor runtime_collision_monitor_;
 };
 
 }  // namespace manyforge::core

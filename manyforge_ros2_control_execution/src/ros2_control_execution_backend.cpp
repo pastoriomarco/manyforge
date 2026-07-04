@@ -2089,6 +2089,8 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
 
     std::vector<double> snapshot_positions = predicted_positions;
     std::optional<std::string> tracking_failure;
+    std::string tracking_failure_reason_code =
+        ros2_control_fault_reason::kTrackingErrorExceeded;
     std::map<std::string, std::string> tracking_failure_details;
     // Audit 6C (findings 2.14 + 2.15): copy the sample under a short
     // state_mutex_ hold, run joint mapping and the tracking-error math
@@ -2179,9 +2181,24 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
             }
           }
         }
-      } catch (const std::exception&) {
-        // A malformed/incomplete sample is ignored here; start gate already
-        // proves that at least one complete controller sample existed.
+      } catch (const std::exception& e) {
+        tracking_failure =
+            "Controller tracking sample was malformed or incomplete";
+        tracking_failure_reason_code =
+            ros2_control_fault_reason::kTrackingSampleInvalid;
+        tracking_failure_details["reason_code"] =
+            ros2_control_fault_reason::kTrackingSampleInvalid;
+        tracking_failure_details["sample_source"] = sample->source;
+        tracking_failure_details["sample_topic"] = sample->topic;
+        tracking_failure_details["sample_joint_count"] =
+            std::to_string(sample->joint_names.size());
+        tracking_failure_details["sample_position_count"] =
+            std::to_string(sample->positions.size());
+        tracking_failure_details["sample_velocity_count"] =
+            std::to_string(sample->velocities.size());
+        tracking_failure_details["required_joint_count"] =
+            std::to_string(trajectory.joint_names.size());
+        tracking_failure_details["exception"] = e.what();
       }
     }
     if (tracking_failure.has_value()) {
@@ -2197,7 +2214,7 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
       cancel_goal_if_known(handle_to_cancel);
       fail_execution(*tracking_failure,
                      core::ErrorCode::kExecutionAborted,
-                     ros2_control_fault_reason::kTrackingErrorExceeded,
+                     tracking_failure_reason_code,
                      std::move(tracking_failure_details));
       return;
     }

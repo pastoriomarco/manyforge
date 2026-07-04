@@ -7,6 +7,8 @@
 #include <set>
 #include <utility>
 
+#include <manyforge_core/types/reason_codes.hpp>
+
 namespace manyforge::core {
 
 namespace {
@@ -518,7 +520,7 @@ void CollisionValidationCoordinator::apply_contact_grasp_constraints(
     first.result.decision = CollisionDecisionResult::kInconclusiveFail;
     first.produced_decision_change = true;
     first.result.raw_diagnostics["contact_grasp_violation"] =
-        "unknown_contact_policy_id";
+        reason_codes::kUnknownContactPolicyId;
     first.result.raw_diagnostics["contact_grasp_policy_id"] =
         config_.contact_policy_id;
     return;
@@ -533,7 +535,7 @@ void CollisionValidationCoordinator::apply_contact_grasp_constraints(
     first.result.decision = CollisionDecisionResult::kInconclusiveFail;
     first.produced_decision_change = true;
     first.result.raw_diagnostics["contact_grasp_violation"] =
-        "invalid_contact_grasp_policy";
+        reason_codes::kInvalidContactGraspPolicy;
     first.result.raw_diagnostics["contact_grasp_policy_id"] = active->policy_id;
     return;
   }
@@ -563,7 +565,7 @@ void CollisionValidationCoordinator::apply_contact_grasp_constraints(
         set_contact_grasp_diagnostic(record,
                                      *active,
                                      classified.pair,
-                                     "missing_signed_clearance",
+                                     reason_codes::kMissingSignedClearance,
                                      std::nullopt);
         continue;
       }
@@ -572,7 +574,7 @@ void CollisionValidationCoordinator::apply_contact_grasp_constraints(
         set_contact_grasp_diagnostic(record,
                                      *active,
                                      classified.pair,
-                                     "initial_sample_in_contact",
+                                     reason_codes::kInitialSampleInContact,
                                      clearance);
         continue;
       }
@@ -580,7 +582,7 @@ void CollisionValidationCoordinator::apply_contact_grasp_constraints(
         set_contact_grasp_diagnostic(record,
                                      *active,
                                      classified.pair,
-                                     "contact_before_terminal_window",
+                                     reason_codes::kContactBeforeTerminalWindow,
                                      clearance);
         continue;
       }
@@ -588,7 +590,7 @@ void CollisionValidationCoordinator::apply_contact_grasp_constraints(
         set_contact_grasp_diagnostic(record,
                                      *active,
                                      classified.pair,
-                                     "penetration_exceeds_policy",
+                                     reason_codes::kPenetrationExceedsPolicy,
                                      clearance);
         continue;
       }
