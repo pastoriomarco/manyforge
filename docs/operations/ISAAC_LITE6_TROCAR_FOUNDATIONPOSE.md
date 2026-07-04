@@ -26,6 +26,26 @@ laptop, the Isaac ROS 4.4 container on Thor, and the ManyForge launcher shell on
 Thor.
 
 ```bash
+source /home/tndlux/workspaces/dev_ws/src/manyforge/config/ros/isaac_lite6_trocar_foundationpose.env.sh
+```
+
+That profile expands to the known-good commissioning environment:
+`ROS_DOMAIN_ID=0`, `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`,
+`ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`, and
+`ROS_STATIC_PEERS='192.168.1.136;192.168.1.132'`, while unsetting stale Fast
+DDS discovery-server/profile and Cyclone DDS variables. If the Thor/Jetson or
+laptop IP changes, override `MANYFORGE_THOR_IP` and
+`MANYFORGE_ISAAC_SIM_IP` before sourcing the profile. The profile overwrites
+stale ROS environment values by design; use `MANYFORGE_ROS_DOMAIN_ID`,
+`MANYFORGE_RMW_IMPLEMENTATION`, `MANYFORGE_ROS_AUTOMATIC_DISCOVERY_RANGE`, or
+`MANYFORGE_ROS_STATIC_PEERS` only when intentionally qualifying a different
+topology.
+
+If the ManyForge checkout is not visible inside a container, mount or copy
+`config/ros/isaac_lite6_trocar_foundationpose.env.sh` into that container, or
+apply the equivalent values manually:
+
+```bash
 unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE
 unset ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI
 export ROS_DOMAIN_ID=0
@@ -55,12 +75,7 @@ Open a fresh shell on the laptop and export the DDS variables before launching
 Isaac Sim:
 
 ```bash
-unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE
-unset ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI
-export ROS_DOMAIN_ID=0
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
-export ROS_STATIC_PEERS='192.168.1.136;192.168.1.132'
+source /home/tndlux/workspaces/dev_ws/src/manyforge/config/ros/isaac_lite6_trocar_foundationpose.env.sh
 cd ~/isaac-sim
 ./isaac-sim.sh
 ```
@@ -103,14 +118,15 @@ cd /workspaces/isaac_ros-dev
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash 2>/dev/null || true
 
-export ROS_DOMAIN_ID=0
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
-export ROS_STATIC_PEERS='192.168.1.136;192.168.1.132'
+source /workspaces/manyforge/config/ros/isaac_lite6_trocar_foundationpose.env.sh
 
 colcon build --packages-select isaac_ros_custom_bringup
 source install/setup.bash
 ```
+
+If ManyForge is mounted somewhere else in the Isaac ROS container, source the
+same profile from that mount path. If it is not mounted, use the manual exports
+from the Network and DDS Baseline section.
 
 Start the perception graph:
 
@@ -167,12 +183,7 @@ the ROS-capable services.
 
 ```bash
 cd /home/tndlux/workspaces/dev_ws/src/manyforge
-unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE
-unset ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI
-export ROS_DOMAIN_ID=0
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
-export ROS_STATIC_PEERS='192.168.1.136;192.168.1.132'
+source config/ros/isaac_lite6_trocar_foundationpose.env.sh
 
 ./scripts/launch.sh --lane isaac-sim --assistant off \
   --scenario isaac-lite6-trocar-foundationpose --non-interactive --yes start

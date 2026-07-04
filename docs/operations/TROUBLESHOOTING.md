@@ -223,6 +223,13 @@ as the primary runbook. The short diagnostic order is:
    echo "$ROS_STATIC_PEERS"
    ```
 
+   If any value is empty or different from the runbook baseline, source the
+   profile before launching that participant:
+
+   ```bash
+   source /home/tndlux/workspaces/dev_ws/src/manyforge/config/ros/isaac_lite6_trocar_foundationpose.env.sh
+   ```
+
 2. Check low-payload graph info before subscribing to raw image topics:
 
    ```bash

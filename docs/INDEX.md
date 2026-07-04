@@ -57,6 +57,12 @@ branch/commit workflow).
     YOLOv8/FoundationPose perception, ManyForge ROS control, DDS/QoS
     isolation, TF checks, and smoke qualification.
 
+- [`../config/ros/isaac_lite6_trocar_foundationpose.env.sh`](../config/ros/isaac_lite6_trocar_foundationpose.env.sh)
+  - Sourceable ROS/DDS environment profile for that workflow. Source it in
+    the Isaac Sim laptop shell, the Isaac ROS perception container, and the
+    ManyForge launcher shell so all ROS participants share the same domain,
+    Fast DDS RMW, localhost discovery range, and static peers.
+
 - [`operations/ADDING_A_ROBOT.md`](operations/ADDING_A_ROBOT.md)
   - Operator runbook for adding a new robot deployment: URDF/SRDF
     requirements, deployment-YAML schema (arm + gripper), capability
