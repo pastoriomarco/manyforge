@@ -47,7 +47,18 @@ class RoboPlanExecutionStateSink final : public core::IExecutionStateSink {
       core::ExecutionStateUpdateMode mode) override;
 
  private:
+  struct CommandableGroupMapping {
+    std::vector<std::string> commandable_view_joint_names;
+    std::vector<size_t> expanded_group_indices;
+  };
+
   std::string view_joint_name_locked(const std::string& joint_name) const;
+  std::string commandable_group_cache_key_locked(
+      const std::string& group_id,
+      const std::vector<std::string>& group_joint_names) const;
+  std::optional<CommandableGroupMapping> commandable_group_mapping_locked(
+      const std::string& group_id,
+      const std::vector<std::string>& group_joint_names) const;
   std::vector<std::string> commandable_view_joint_names_locked(
       const std::string& group_id,
       const std::vector<std::string>& group_joint_names) const;
@@ -58,6 +69,8 @@ class RoboPlanExecutionStateSink final : public core::IExecutionStateSink {
   std::map<std::string, std::string> view_to_canonical_joint_names_;
   std::map<std::string, std::vector<std::string>>
       group_commandable_joint_names_;
+  mutable std::map<std::string, CommandableGroupMapping>
+      commandable_group_cache_;
 };
 
 }  // namespace manyforge::roboplan_backend

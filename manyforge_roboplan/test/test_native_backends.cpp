@@ -56,6 +56,18 @@ TEST_F(NativeKernelTest, InitialStateIsIdle) {
   EXPECT_EQ(status.state, ExecutionState::kIdle);
 }
 
+TEST_F(NativeKernelTest, CloseRejectsNewKernelSnapshotsButPreservesInFlightSnapshot) {
+  auto kernel = bundle_->kernel_snapshot();
+  ASSERT_NE(kernel, nullptr);
+
+  bundle_->close();
+
+  EXPECT_TRUE(bundle_->closed());
+  EXPECT_EQ(bundle_->kernel, nullptr);
+  EXPECT_THROW((void)bundle_->kernel_snapshot(), std::runtime_error);
+  EXPECT_EQ(kernel->get_status().state, ExecutionState::kIdle);
+}
+
 TEST_F(NativeKernelTest, NativeExecutionBackendRejectsInvalidLifecycleTimeouts) {
   RoboPlanExecutionBackendConfig config;
   config.reset_completion_timeout_s = 0.0;
@@ -143,6 +155,74 @@ TEST(NativeSchedulerTest, MonitoringLaneFiresWhileSafetyLaneIsBlocked) {
   // does not race with a still-running task.
   safety_can_exit.store(true);
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
+}
+
+TEST(NativeSchedulerTest, DrainWaitsForDequeuedSafetyCallback) {
+  SimpleScheduler scheduler;
+  std::promise<void> callback_entered;
+  auto callback_entered_future = callback_entered.get_future();
+  std::promise<void> release_callback;
+  auto release_callback_future = release_callback.get_future();
+
+  const auto now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  scheduler.schedule(
+      now_ns,
+      [&]() {
+        callback_entered.set_value();
+        release_callback_future.wait();
+      },
+      SchedulerPriority::Safety);
+
+  ASSERT_EQ(callback_entered_future.wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+
+  auto drain_future = std::async(std::launch::async, [&]() {
+    scheduler.drain(SchedulerPriority::Safety);
+  });
+  EXPECT_EQ(drain_future.wait_for(std::chrono::milliseconds(20)),
+            std::future_status::timeout);
+
+  release_callback.set_value();
+  EXPECT_EQ(drain_future.wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+}
+
+TEST(NativeSchedulerTest, DrainForTimesOutWhileSafetyCallbackIsBlocked) {
+  SimpleScheduler scheduler;
+  std::promise<void> callback_entered;
+  auto callback_entered_future = callback_entered.get_future();
+  std::promise<void> release_callback;
+  auto release_callback_future = release_callback.get_future();
+
+  const auto now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  scheduler.schedule(
+      now_ns,
+      [&]() {
+        callback_entered.set_value();
+        release_callback_future.wait();
+      },
+      SchedulerPriority::Safety);
+
+  ASSERT_EQ(callback_entered_future.wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_FALSE(
+      scheduler.drain_for(SchedulerPriority::Safety, std::chrono::milliseconds(20)));
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count(),
+            250);
+
+  release_callback.set_value();
+  EXPECT_TRUE(
+      scheduler.drain_for(SchedulerPriority::Safety, std::chrono::seconds(1)));
 }
 
 // --- Planning Context ---
@@ -717,8 +797,71 @@ TEST_F(NativeKernelTest, PlannerUsesPerRequestPlanningTimeout) {
   auto result = planner.plan(req);
   ASSERT_FALSE(result.trajectory.has_value());
   ASSERT_TRUE(result.error.has_value());
-  EXPECT_EQ(result.error->code, kErrorPlanningFailed);
+  EXPECT_EQ(result.error->code, kErrorPlanningTimeout);
+  EXPECT_EQ(result.error->details.at("reason"), "planning_timeout");
   EXPECT_NE(result.error->message.find("timed out"), std::string::npos);
+}
+
+TEST_F(NativeKernelTest, PlannerDoesNotHoldSceneMutexDuringLongRrt) {
+  auto scene_mutex = std::make_shared<std::mutex>();
+  RoboPlanPlanningContext context(bundle_->scene, "arm", scene_mutex);
+
+  roboplan::RRTOptions rrt_opts;
+  rrt_opts.group_name = "arm";
+  rrt_opts.max_planning_time = 0.5;
+  rrt_opts.max_nodes = 5'000'000;
+  rrt_opts.max_connection_distance = 1e-9;
+  rrt_opts.collision_check_step_size = 1e-9;
+  rrt_opts.goal_biasing_probability = 0.0;
+
+  roboplan::SimpleIkOptions ik_opts;
+  ik_opts.group_name = "arm";
+  ik_opts.step_size = 0.25;
+  ik_opts.max_restarts = 50;
+  ik_opts.max_time = 1.0;
+  auto single_shot_ik_opts = ik_opts;
+  single_shot_ik_opts.max_time = 0.05;
+
+  RoboPlanPlannerBackend planner(bundle_->scene, rrt_opts, bundle_->shortcutter,
+                                 bundle_->toppra, bundle_->ik, scene_mutex,
+                                 bundle_->single_shot_ik, ik_opts,
+                                 single_shot_ik_opts);
+
+  PlanRequestDTO req;
+  req.robot_id = "robot1";
+  req.group_id = "arm";
+  req.move_id = "native_long_rrt_lock_scope";
+  req.base_frame = "base_link";
+  req.tcp_frame = "tool0";
+  req.start_state = context.get_current_state();
+  req.tolerances = {0.05, 0.005, 0.05};
+  req.speed_profile = {1.0, 1.0, std::nullopt};
+  req.planning_timeout_s = 0.5;
+
+  JointGoalDTO goal;
+  goal.joint_names = req.start_state.joint_names;
+  goal.positions_rad = {2.6, -2.4, 2.2, -2.0, -1.8, 1.6};
+  req.motion = goal;
+
+  auto plan_future = std::async(std::launch::async,
+                                [&]() { return planner.plan(req); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ASSERT_EQ(plan_future.wait_for(std::chrono::milliseconds(0)),
+            std::future_status::timeout)
+      << "test setup expected RRT to still be active";
+
+  const auto read_started = std::chrono::steady_clock::now();
+  auto state = context.get_current_state();
+  const auto read_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - read_started);
+  EXPECT_FALSE(state.joint_names.empty());
+  EXPECT_LT(read_elapsed.count(), 150)
+      << "planner held scene_mutex across long RRT work";
+
+  auto result = plan_future.get();
+  ASSERT_FALSE(result.trajectory.has_value());
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorPlanningTimeout);
 }
 
 TEST_F(NativeKernelTest, PlannerRejectsUnsatisfiedTcpSpeedLimit) {
@@ -731,7 +874,8 @@ TEST_F(NativeKernelTest, PlannerRejectsUnsatisfiedTcpSpeedLimit) {
   req.start_state = bundle_->context->get_current_state();
   req.tolerances = {0.05, 0.005, 0.05};
   req.speed_profile = {1.0, 1.0, 1e-9};
-  req.planning_timeout_s = 10.0;
+  // This test exercises the TCP limit diagnostics, not the planner deadline.
+  req.planning_timeout_s = std::numeric_limits<double>::infinity();
 
   JointGoalDTO goal;
   goal.joint_names = req.start_state.joint_names;
@@ -1800,6 +1944,137 @@ TEST_F(NativeKernelTest,
   ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
   auto stopped = bundle_->execution->get_execution_snapshot();
   EXPECT_EQ(stopped.state, ExecutionState::kStopped);
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_SoftOnPathReplayStopsOnBackendStop) {
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.8;
+  if (goal.size() > 1) {
+    goal[1] += 0.3;
+  }
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{3.0, goal, {}, {}});
+
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  std::this_thread::sleep_for(std::chrono::milliseconds(180));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "native_soft_on_path_backend_stop";
+  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  profile.deceleration_time_s = 0.7;
+  profile.max_stop_time_s = 1.5;
+  profile.allowed_fallback_modes = {MotionInterruptStopMode::kSpringBackHold};
+  for (const auto& joint_name : start_state.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
+
+  auto stop_future = std::async(std::launch::async, [&]() {
+    return bundle_->execution->execute_controlled_stop(profile);
+  });
+
+  bool observed_replay = false;
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    if (bundle_->execution->get_execution_snapshot().state ==
+        ExecutionState::kStopping) {
+      observed_replay = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(observed_replay);
+
+  const auto cancel_start = std::chrono::steady_clock::now();
+  auto stop = bundle_->execution->stop();
+  ASSERT_TRUE(stop.accepted);
+  if (stop_future.wait_for(std::chrono::milliseconds(200)) !=
+      std::future_status::ready) {
+    auto late_result = stop_future.get();
+    (void)late_result;
+    FAIL() << "backend stop did not cancel native soft_on_path replay";
+  }
+  const auto cancel_elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - cancel_start);
+  auto result = stop_future.get();
+  EXPECT_TRUE(result.accepted);
+  EXPECT_FALSE(result.backend_stop_confirmed);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"), "controlled_stop_cancelled");
+  EXPECT_LT(cancel_elapsed, std::chrono::milliseconds(200));
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_SpringBackReplayStopsOnBackendStop) {
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.8;
+  if (goal.size() > 1) {
+    goal[1] -= 0.3;
+  }
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{3.0, goal, {}, {}});
+
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  std::this_thread::sleep_for(std::chrono::milliseconds(180));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "native_spring_back_backend_stop";
+  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.deceleration_time_s = 1.0;
+  profile.max_stop_time_s = 2.0;
+  for (const auto& joint_name : traj.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
+
+  auto stop_future = std::async(std::launch::async, [&]() {
+    return bundle_->execution->execute_controlled_stop(profile);
+  });
+
+  bool observed_replay = false;
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    if (bundle_->execution->get_execution_snapshot().state ==
+        ExecutionState::kStopping) {
+      observed_replay = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(observed_replay);
+
+  const auto cancel_start = std::chrono::steady_clock::now();
+  auto stop = bundle_->execution->stop();
+  ASSERT_TRUE(stop.accepted);
+  if (stop_future.wait_for(std::chrono::milliseconds(200)) !=
+      std::future_status::ready) {
+    auto late_result = stop_future.get();
+    (void)late_result;
+    FAIL() << "backend stop did not cancel native spring_back replay";
+  }
+  const auto cancel_elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - cancel_start);
+  auto result = stop_future.get();
+  EXPECT_TRUE(result.accepted);
+  EXPECT_FALSE(result.backend_stop_confirmed);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"), "controlled_stop_cancelled");
+  EXPECT_LT(cancel_elapsed, std::chrono::milliseconds(200));
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
 }
 
 TEST_F(NativeKernelTest,

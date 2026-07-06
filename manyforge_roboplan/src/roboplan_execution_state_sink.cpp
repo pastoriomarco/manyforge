@@ -37,29 +37,6 @@ bool try_lock_for_mode(std::unique_lock<std::mutex>& lock,
   return true;
 }
 
-std::optional<Eigen::VectorXd> compact_positions_from_expanded_group(
-    const std::vector<std::string>& group_joint_names,
-    const std::vector<std::string>& commandable_view_joint_names,
-    const std::vector<double>& expanded_positions) {
-  if (expanded_positions.size() != group_joint_names.size()) {
-    return std::nullopt;
-  }
-  Eigen::VectorXd compact(
-      static_cast<Eigen::Index>(commandable_view_joint_names.size()));
-  for (size_t i = 0; i < commandable_view_joint_names.size(); ++i) {
-    const auto joint_it =
-        std::find(group_joint_names.begin(), group_joint_names.end(),
-                  commandable_view_joint_names[i]);
-    if (joint_it == group_joint_names.end()) {
-      return std::nullopt;
-    }
-    const auto expanded_index =
-        static_cast<size_t>(std::distance(group_joint_names.begin(), joint_it));
-    compact[static_cast<Eigen::Index>(i)] = expanded_positions[expanded_index];
-  }
-  return compact;
-}
-
 }  // namespace
 
 RoboPlanExecutionStateSink::RoboPlanExecutionStateSink(
@@ -83,6 +60,7 @@ void RoboPlanExecutionStateSink::set_robot_model_authority_metadata(
   canonical_to_view_joint_names_ = std::move(canonical_to_view_joint_names);
   view_to_canonical_joint_names_ = std::move(view_to_canonical_joint_names);
   group_commandable_joint_names_ = std::move(group_commandable_joint_names);
+  commandable_group_cache_.clear();
 }
 
 std::string RoboPlanExecutionStateSink::view_joint_name_locked(
@@ -91,47 +69,86 @@ std::string RoboPlanExecutionStateSink::view_joint_name_locked(
   return it == canonical_to_view_joint_names_.end() ? joint_name : it->second;
 }
 
-std::vector<std::string>
-RoboPlanExecutionStateSink::commandable_view_joint_names_locked(
+std::string RoboPlanExecutionStateSink::commandable_group_cache_key_locked(
     const std::string& group_id,
     const std::vector<std::string>& group_joint_names) const {
+  std::string key = group_id;
+  key.push_back('\0');
+  for (const auto& joint_name : group_joint_names) {
+    key.append(joint_name);
+    key.push_back('\0');
+  }
+  return key;
+}
+
+std::optional<RoboPlanExecutionStateSink::CommandableGroupMapping>
+RoboPlanExecutionStateSink::commandable_group_mapping_locked(
+    const std::string& group_id,
+    const std::vector<std::string>& group_joint_names) const {
+  const auto cache_key =
+      commandable_group_cache_key_locked(group_id, group_joint_names);
+  const auto cache_it = commandable_group_cache_.find(cache_key);
+  if (cache_it != commandable_group_cache_.end()) {
+    return cache_it->second;
+  }
+
+  CommandableGroupMapping mapping;
   const auto metadata_it = group_commandable_joint_names_.find(group_id);
   if (metadata_it != group_commandable_joint_names_.end() &&
       !metadata_it->second.empty()) {
-    std::vector<std::string> result;
-    result.reserve(metadata_it->second.size());
+    mapping.commandable_view_joint_names.reserve(metadata_it->second.size());
+    mapping.expanded_group_indices.reserve(metadata_it->second.size());
     for (const auto& canonical_joint_name : metadata_it->second) {
       const auto view_joint_name = view_joint_name_locked(canonical_joint_name);
-      if (std::find(group_joint_names.begin(), group_joint_names.end(),
-                    view_joint_name) == group_joint_names.end()) {
-        return {};
+      const auto group_it =
+          std::find(group_joint_names.begin(), group_joint_names.end(),
+                    view_joint_name);
+      if (group_it == group_joint_names.end()) {
+        return std::nullopt;
       }
       const auto maybe_joint_info = scene_->getJointInfo(view_joint_name);
       if (!maybe_joint_info || maybe_joint_info->mimic_info.has_value() ||
           maybe_joint_info->num_position_dofs != 1) {
-        return {};
+        return std::nullopt;
       }
-      result.push_back(view_joint_name);
+      mapping.commandable_view_joint_names.push_back(view_joint_name);
+      mapping.expanded_group_indices.push_back(static_cast<size_t>(
+          std::distance(group_joint_names.begin(), group_it)));
     }
-    return result;
+    commandable_group_cache_[cache_key] = mapping;
+    return mapping;
   }
 
-  std::vector<std::string> result;
-  for (const auto& view_joint_name : group_joint_names) {
+  for (size_t i = 0; i < group_joint_names.size(); ++i) {
+    const auto& view_joint_name = group_joint_names[i];
     const auto maybe_joint_info = scene_->getJointInfo(view_joint_name);
     if (!maybe_joint_info) {
-      return {};
+      return std::nullopt;
     }
     if (maybe_joint_info->mimic_info.has_value() ||
         maybe_joint_info->num_position_dofs == 0) {
       continue;
     }
     if (maybe_joint_info->num_position_dofs != 1) {
-      return {};
+      return std::nullopt;
     }
-    result.push_back(view_joint_name);
+    mapping.commandable_view_joint_names.push_back(view_joint_name);
+    mapping.expanded_group_indices.push_back(i);
   }
-  return result;
+  commandable_group_cache_[cache_key] = mapping;
+  return mapping;
+}
+
+std::vector<std::string>
+RoboPlanExecutionStateSink::commandable_view_joint_names_locked(
+    const std::string& group_id,
+    const std::vector<std::string>& group_joint_names) const {
+  const auto mapping =
+      commandable_group_mapping_locked(group_id, group_joint_names);
+  if (!mapping.has_value()) {
+    return {};
+  }
+  return mapping->commandable_view_joint_names;
 }
 
 ExecutionStateSinkResult RoboPlanExecutionStateSink::apply_group_joint_positions(
@@ -162,9 +179,10 @@ ExecutionStateSinkResult RoboPlanExecutionStateSink::apply_group_joint_positions
         return {ExecutionStateSinkStatus::kInvalidGroup};
       }
       const auto& group_info = *maybe_group_info;
-      const auto commandable_view_joint_names =
-          commandable_view_joint_names_locked(group_id, group_info.joint_names);
-      if (commandable_view_joint_names.size() !=
+      const auto commandable_mapping =
+          commandable_group_mapping_locked(group_id, group_info.joint_names);
+      if (!commandable_mapping.has_value() ||
+          commandable_mapping->commandable_view_joint_names.size() !=
           static_cast<size_t>(group_info.q_indices.size())) {
         return {ExecutionStateSinkStatus::kInvalidPositions};
       }
@@ -172,12 +190,21 @@ ExecutionStateSinkResult RoboPlanExecutionStateSink::apply_group_joint_positions
           static_cast<size_t>(group_info.q_indices.size())) {
         q = vector_from_std(positions_rad);
       } else if (positions_rad.size() == group_info.joint_names.size()) {
-        const auto compact = compact_positions_from_expanded_group(
-            group_info.joint_names, commandable_view_joint_names, positions_rad);
-        if (!compact.has_value()) {
+        if (commandable_mapping->expanded_group_indices.size() !=
+            commandable_mapping->commandable_view_joint_names.size()) {
           return {ExecutionStateSinkStatus::kInvalidPositions};
         }
-        q = *compact;
+        q = Eigen::VectorXd(static_cast<Eigen::Index>(
+            commandable_mapping->expanded_group_indices.size()));
+        for (size_t i = 0; i < commandable_mapping->expanded_group_indices.size();
+             ++i) {
+          const auto expanded_index =
+              commandable_mapping->expanded_group_indices[i];
+          if (expanded_index >= positions_rad.size()) {
+            return {ExecutionStateSinkStatus::kInvalidPositions};
+          }
+          q[static_cast<Eigen::Index>(i)] = positions_rad[expanded_index];
+        }
       } else {
         return {ExecutionStateSinkStatus::kInvalidPositions};
       }

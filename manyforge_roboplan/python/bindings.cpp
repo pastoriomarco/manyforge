@@ -4,6 +4,8 @@
 
 #include <cstdint>
 #include <cmath>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -31,6 +33,17 @@ py::dict action_span_to_python(const ActionSpanDTO& span);
 std::optional<ActionSpanDTO> action_span_from_python(const py::dict& request);
 void populate_request_correlation(ExecuteRequestDTO& req,
                                   const py::dict& request);
+
+std::shared_ptr<ExecutionKernel> require_open_kernel(NativeKernelBundle& bundle) {
+  return bundle.kernel_snapshot();
+}
+
+std::unique_lock<std::mutex> lock_bundle_scene(NativeKernelBundle& bundle) {
+  if (!bundle.scene_mutex) {
+    return {};
+  }
+  return std::unique_lock<std::mutex>(*bundle.scene_mutex);
+}
 
 std::string canonical_joint_name(const NativeKernelBundle& bundle,
                                  const std::string& view_joint_name) {
@@ -608,13 +621,15 @@ py::dict robot_state_to_python(const RobotStateDTO& state) {
 }
 
 RobotStateDTO observer_robot_state(NativeKernelBundle& self) {
-  if (self.kernel) {
-    const auto snapshot = self.kernel->get_execution_snapshot();
+  try {
+    const auto kernel = require_open_kernel(self);
+    const auto snapshot = kernel->get_execution_snapshot();
     if (!snapshot.joint_positions_rad.empty()) {
       RobotStateDTO state;
       state.positions_rad = snapshot.joint_positions_rad;
       return state;
     }
+  } catch (const std::runtime_error&) {
   }
   return self.context->get_current_state();
 }
@@ -802,6 +817,22 @@ py::dict command_result(bool accepted, const std::optional<ErrorDTO>& error) {
     d["error_details"] = py::dict();
   }
   return d;
+}
+
+std::optional<std::uint64_t> optional_uint64_from_python(py::object value) {
+  if (value.is_none()) {
+    return std::nullopt;
+  }
+  return value.cast<std::uint64_t>();
+}
+
+[[maybe_unused]] bool error_reason_is_stale_control_command(
+    const std::optional<ErrorDTO>& error) {
+  if (!error.has_value()) {
+    return false;
+  }
+  const auto it = error->details.find("reason_code");
+  return it != error->details.end() && it->second == "stale_control_command";
 }
 
 // Helper: convert MetricsSnapshot to Python dict
@@ -1528,6 +1559,13 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
            },
            py::arg("metadata"),
            "Attach Robot Model Authority metadata for canonical public readout.")
+      .def("close",
+           [](NativeKernelBundle& self) {
+             py::gil_scoped_release release;
+             self.close();
+           },
+           "Close the native kernel and join owned workers with the GIL released.")
+      .def("closed", [](NativeKernelBundle& self) { return self.closed(); })
       .def("execute", [](NativeKernelBundle& self, py::dict request) -> py::dict {
         // Build ExecuteRequestDTO from Python dict
         ExecuteRequestDTO req;
@@ -1725,9 +1763,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           }
         }
 
+        auto kernel = require_open_kernel(self);
         auto result = [&]() {
           py::gil_scoped_release release;
-          return self.kernel->execute(req);
+          return kernel->execute(req);
         }();
         return result_to_python(result);
       })
@@ -1739,9 +1778,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
              // py_trees Status. Returns None when no outcome is
              // recorded (e.g., the execution id was never seen or
              // FIFO-evicted).
+             auto kernel = require_open_kernel(self);
              auto outcome_opt = [&]() {
                py::gil_scoped_release release;
-               return self.kernel->get_execution_outcome(execution_id);
+               return kernel->get_execution_outcome(execution_id);
              }();
              if (!outcome_opt) {
                return py::none();
@@ -2334,37 +2374,55 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       }, py::arg("request"), py::arg("start_state") = py::none(),
       "Plan and validate a motion, returning the time-parameterized trajectory.")
       .def("stop", [](NativeKernelBundle& self) -> py::dict {
+        auto kernel = require_open_kernel(self);
         auto r = [&]() {
           py::gil_scoped_release release;
-          return self.kernel->stop();
+          return kernel->stop();
         }();
         return command_result(r.accepted, r.error);
       })
       .def("pause", [](NativeKernelBundle& self) -> py::dict {
+        auto kernel = require_open_kernel(self);
         auto r = [&]() {
           py::gil_scoped_release release;
-          return self.kernel->pause();
+          return kernel->pause();
         }();
         return command_result(r.accepted, r.error);
       })
-      .def("resume", [](NativeKernelBundle& self) -> py::dict {
+      .def("control_command_epoch", [](NativeKernelBundle& self) {
+        auto kernel = require_open_kernel(self);
+        py::gil_scoped_release release;
+        return kernel->control_command_epoch();
+      })
+      .def("bump_control_command_epoch", [](NativeKernelBundle& self) {
+        auto kernel = require_open_kernel(self);
+        py::gil_scoped_release release;
+        return kernel->bump_control_command_epoch();
+      })
+      .def("resume", [](NativeKernelBundle& self,
+                        py::object expected_epoch) -> py::dict {
+        auto kernel = require_open_kernel(self);
+        auto epoch = optional_uint64_from_python(expected_epoch);
         auto r = [&]() {
           py::gil_scoped_release release;
-          return self.kernel->resume();
+          return kernel->resume(epoch);
         }();
         return command_result(r.accepted, r.error);
-      })
-      .def("reset", [](NativeKernelBundle& self) -> py::dict {
+      }, py::arg("expected_epoch") = py::none())
+      .def("reset", [](NativeKernelBundle& self,
+                       py::object expected_epoch) -> py::dict {
+        auto kernel = require_open_kernel(self);
+        auto epoch = optional_uint64_from_python(expected_epoch);
         auto r = [&]() {
           py::gil_scoped_release release;
-          return self.kernel->reset();
+          return kernel->reset(epoch);
         }();
 #ifdef MANYFORGE_ROS2_CONTROL_ENABLED
         // The kernel rejects reset while already idle, but ROS-side auxiliary
         // channels such as JointState gripper commands can still hold adapter
         // state when used directly from the native bundle. Keep the low-level
         // binding idempotent so reset reliably clears the deployment adapter.
-        if (!r.accepted) {
+        if (!r.accepted && !error_reason_is_stale_control_command(r.error)) {
           try {
             auto backend_result = [&]() {
               py::gil_scoped_release release;
@@ -2380,131 +2438,149 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }
 #endif
         return command_result(r.accepted, r.error);
-      })
+      }, py::arg("expected_epoch") = py::none())
       .def("get_motion_interrupt_stop_capability",
            [](NativeKernelBundle& self) -> py::dict {
              // Read-only view of the active execution backend's advertised
              // stop capability, used by the composer's deployment load-time
              // gate to fail closed when a configured stop profile names an
              // unsupported mode. Backend-agnostic (native + ros2_control).
+             auto kernel = require_open_kernel(self);
              py::dict d;
              py::list modes;
-             if (self.kernel) {
-               const auto cap =
-                   self.kernel->get_motion_interrupt_stop_capability();
-               const auto mode_to_string =
-                   [](MotionInterruptStopMode m) -> const char* {
-                 switch (m) {
-                   case MotionInterruptStopMode::kSpringBackHold:
-                     return "spring_back_hold";
-                   case MotionInterruptStopMode::kSoftOnPath:
-                     return "soft_on_path";
-                   case MotionInterruptStopMode::kHardDeceleration:
-                     return "hard_deceleration";
-                 }
-                 return "unknown";
-               };
-               for (const auto& m : cap.supported_stop_modes) {
-                 modes.append(std::string(mode_to_string(m)));
+             const auto cap = kernel->get_motion_interrupt_stop_capability();
+             const auto mode_to_string =
+                 [](MotionInterruptStopMode m) -> const char* {
+               switch (m) {
+                 case MotionInterruptStopMode::kSpringBackHold:
+                   return "spring_back_hold";
+                 case MotionInterruptStopMode::kSoftOnPath:
+                   return "soft_on_path";
+                 case MotionInterruptStopMode::kHardDeceleration:
+                   return "hard_deceleration";
                }
-               if (cap.capability_profile_id) {
-                 d["capability_profile_id"] = *cap.capability_profile_id;
-               } else {
-                 d["capability_profile_id"] = py::none();
-               }
-               const auto set_optional_string =
-                   [&](const char* key,
-                       const std::optional<std::string>& value) {
-                     if (value) {
-                       d[key] = *value;
-                     } else {
-                       d[key] = py::none();
-                     }
-                   };
-               set_optional_string("hard_stop_level", cap.hard_stop_level);
-               set_optional_string("derivative_proof_level",
-                                   cap.derivative_proof_level);
-               set_optional_string("scaling_source_visibility",
-                                   cap.scaling_source_visibility);
-               set_optional_string("scaling_source_probe_status",
-                                   cap.scaling_source_probe_status);
-               py::dict unsupported_reasons;
-               for (const auto& [mode, reason] : cap.unsupported_reasons) {
-                 unsupported_reasons[py::str(mode)] = reason;
-               }
-               d["unsupported_reasons"] = unsupported_reasons;
+               return "unknown";
+             };
+             for (const auto& m : cap.supported_stop_modes) {
+               modes.append(std::string(mode_to_string(m)));
+             }
+             if (cap.capability_profile_id) {
+               d["capability_profile_id"] = *cap.capability_profile_id;
              } else {
                d["capability_profile_id"] = py::none();
-               d["hard_stop_level"] = py::none();
-               d["derivative_proof_level"] = py::none();
-               d["scaling_source_visibility"] = py::none();
-               d["scaling_source_probe_status"] = py::none();
-               d["unsupported_reasons"] = py::dict();
              }
+             const auto set_optional_string =
+                 [&](const char* key, const std::optional<std::string>& value) {
+                   if (value) {
+                     d[key] = *value;
+                   } else {
+                     d[key] = py::none();
+                   }
+                 };
+             set_optional_string("hard_stop_level", cap.hard_stop_level);
+             set_optional_string("derivative_proof_level",
+                                 cap.derivative_proof_level);
+             set_optional_string("scaling_source_visibility",
+                                 cap.scaling_source_visibility);
+             set_optional_string("scaling_source_probe_status",
+                                 cap.scaling_source_probe_status);
+             py::dict unsupported_reasons;
+             for (const auto& [mode, reason] : cap.unsupported_reasons) {
+               unsupported_reasons[py::str(mode)] = reason;
+             }
+             d["unsupported_reasons"] = unsupported_reasons;
              d["supported_stop_modes"] = modes;
              return d;
            })
       .def("acknowledge_completed", [](NativeKernelBundle& self,
-                                        uint64_t execution_id) -> py::dict {
-        auto r = self.kernel->acknowledge_completed(execution_id);
+                                        uint64_t execution_id,
+                                        py::object expected_epoch) -> py::dict {
+        auto kernel = require_open_kernel(self);
+        auto epoch = optional_uint64_from_python(expected_epoch);
+        auto r = [&]() {
+          py::gil_scoped_release release;
+          return kernel->acknowledge_completed(execution_id, epoch);
+        }();
         return command_result(r.accepted, r.error);
-      })
+      }, py::arg("execution_id"), py::arg("expected_epoch") = py::none())
       .def("acknowledge_intervention",
            [](NativeKernelBundle& self, std::string principal_id,
-              std::string reason) -> py::dict {
-             auto r = self.kernel->acknowledge_intervention(
-                 std::move(principal_id), std::move(reason));
+              std::string reason, py::object expected_epoch) -> py::dict {
+             auto kernel = require_open_kernel(self);
+             auto epoch = optional_uint64_from_python(expected_epoch);
+             auto r = [&]() {
+               py::gil_scoped_release release;
+               return kernel->acknowledge_intervention(
+                   std::move(principal_id), std::move(reason), epoch);
+             }();
              return command_result(r.accepted, r.error);
            },
            py::arg("principal_id"),
-           py::arg("reason"))
+           py::arg("reason"),
+           py::arg("expected_epoch") = py::none())
       .def("acknowledge_intervention_for_retry",
            [](NativeKernelBundle& self, std::string principal_id,
-              std::string reason) -> py::dict {
-             auto r = self.kernel->acknowledge_intervention_for_retry(
-                 std::move(principal_id), std::move(reason));
+              std::string reason, py::object expected_epoch) -> py::dict {
+             auto kernel = require_open_kernel(self);
+             auto epoch = optional_uint64_from_python(expected_epoch);
+             auto r = [&]() {
+               py::gil_scoped_release release;
+               return kernel->acknowledge_intervention_for_retry(
+                   std::move(principal_id), std::move(reason), epoch);
+             }();
              return command_result(r.accepted, r.error);
            },
            py::arg("principal_id"),
-           py::arg("reason"))
+           py::arg("reason"),
+           py::arg("expected_epoch") = py::none())
       .def("acknowledge_interrupted_for_retry",
            [](NativeKernelBundle& self, std::string principal_id,
-              std::string reason) -> py::dict {
-             auto r = self.kernel->acknowledge_interrupted_for_retry(
-                 std::move(principal_id), std::move(reason));
+              std::string reason, py::object expected_epoch) -> py::dict {
+             auto kernel = require_open_kernel(self);
+             auto epoch = optional_uint64_from_python(expected_epoch);
+             auto r = [&]() {
+               py::gil_scoped_release release;
+               return kernel->acknowledge_interrupted_for_retry(
+                   std::move(principal_id), std::move(reason), epoch);
+             }();
              return command_result(r.accepted, r.error);
            },
            py::arg("principal_id"),
-           py::arg("reason"))
+           py::arg("reason"),
+           py::arg("expected_epoch") = py::none())
       .def("set_runtime_velocity_scale",
            [](NativeKernelBundle& self, double scale, py::object principal_id) {
              std::optional<std::string> principal;
              if (!principal_id.is_none()) {
                principal = principal_id.cast<std::string>();
              }
+             auto kernel = require_open_kernel(self);
              py::gil_scoped_release release;
-             self.kernel->set_runtime_velocity_scale(scale, std::move(principal));
+             kernel->set_runtime_velocity_scale(scale, std::move(principal));
            },
            py::arg("scale"),
            py::arg("principal_id") = py::none())
       .def("get_status", [](NativeKernelBundle& self) -> py::dict {
+        auto kernel = require_open_kernel(self);
         const auto status = [&]() {
           py::gil_scoped_release release;
-          return self.kernel->get_status();
+          return kernel->get_status();
         }();
         return status_to_python(status);
       })
       .def("get_execution_snapshot", [](NativeKernelBundle& self) -> py::dict {
+        auto kernel = require_open_kernel(self);
         const auto snapshot = [&]() {
           py::gil_scoped_release release;
-          return self.kernel->get_execution_snapshot();
+          return kernel->get_execution_snapshot();
         }();
         return snapshot_to_python(snapshot);
       })
       .def("get_metrics", [](NativeKernelBundle& self) -> py::dict {
+        auto kernel = require_open_kernel(self);
         const auto metrics = [&]() {
           py::gil_scoped_release release;
-          return self.kernel->get_metrics();
+          return kernel->get_metrics();
         }();
         auto out = metrics_to_python(metrics);
         if (auto* native_execution =
@@ -2947,58 +3023,85 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       })
       .def("set_joint_positions", [](NativeKernelBundle& self,
                                       const std::vector<double>& positions) {
+        auto kernel = require_open_kernel(self);
         Eigen::VectorXd q(positions.size());
         for (size_t i = 0; i < positions.size(); ++i) {
           q[i] = positions[i];
         }
-        if (self.scene && q.size() != self.scene->getCurrentJointPositions().size()) {
-          q = self.scene->toFullJointPositions(self.group_name, q);
+        {
+          py::gil_scoped_release release;
+          auto scene_lock = lock_bundle_scene(self);
+          if (self.scene &&
+              q.size() != self.scene->getCurrentJointPositions().size()) {
+            q = self.scene->toFullJointPositions(self.group_name, q);
+          }
+          self.scene->setJointPositions(q);
         }
-        self.scene->setJointPositions(q);
-        if (self.kernel) {
-          self.kernel->sync_snapshot_from_context();
+        {
+          py::gil_scoped_release release;
+          kernel->sync_snapshot_from_context();
         }
       }, py::arg("positions"),
       "Set the robot's current joint positions in the planning scene.")
       .def("get_group_joint_names", [](NativeKernelBundle& self,
                                         const std::string& group_name) {
-        const auto maybe_group_info = self.scene->getJointGroupInfo(group_name);
-        if (!maybe_group_info) {
-          throw std::runtime_error(
-              "Failed to get joint names for group '" + group_name + "': " +
-              maybe_group_info.error());
+        std::vector<std::string> joint_names;
+        {
+          py::gil_scoped_release release;
+          auto scene_lock = lock_bundle_scene(self);
+          const auto maybe_group_info = self.scene->getJointGroupInfo(group_name);
+          if (!maybe_group_info) {
+            throw std::runtime_error(
+                "Failed to get joint names for group '" + group_name + "': " +
+                maybe_group_info.error());
+          }
+          joint_names = maybe_group_info->joint_names;
         }
-        return canonical_joint_names(self, maybe_group_info->joint_names);
+        return canonical_joint_names(self, joint_names);
       }, py::arg("group_name"),
       "Get ordered joint names for a specific SRDF group.")
       .def("get_group_joint_positions", [](NativeKernelBundle& self,
                                            const std::string& group_name) {
+        py::gil_scoped_release release;
+        auto scene_lock = lock_bundle_scene(self);
         return group_joint_positions_with_mimics(self, group_name);
       }, py::arg("group_name"),
       "Get current canonical joint positions for a specific SRDF group, including mimics.")
       .def("get_group_commandable_joint_positions",
            [](NativeKernelBundle& self, const std::string& group_name) {
+             py::gil_scoped_release release;
+             auto scene_lock = lock_bundle_scene(self);
              return compact_group_joint_positions(self, group_name);
            }, py::arg("group_name"),
            "Get compact commandable q-slot positions for a specific SRDF group.")
       .def("set_group_joint_positions", [](NativeKernelBundle& self,
                                            const std::string& group_name,
                                            const std::vector<double>& positions) {
-        Eigen::VectorXd q =
-            compact_group_positions_from_public_input(self, group_name, positions);
-        if (self.scene && q.size() != self.scene->getCurrentJointPositions().size()) {
-          q = self.scene->toFullJointPositions(group_name, q);
+        auto kernel = require_open_kernel(self);
+        {
+          py::gil_scoped_release release;
+          auto scene_lock = lock_bundle_scene(self);
+          Eigen::VectorXd q =
+              compact_group_positions_from_public_input(self, group_name, positions);
+          if (self.scene &&
+              q.size() != self.scene->getCurrentJointPositions().size()) {
+            q = self.scene->toFullJointPositions(group_name, q);
+          }
+          self.scene->setJointPositions(q);
         }
-        self.scene->setJointPositions(q);
-        if (self.kernel) {
-          self.kernel->sync_snapshot_from_context();
+        {
+          py::gil_scoped_release release;
+          kernel->sync_snapshot_from_context();
         }
       }, py::arg("group_name"), py::arg("positions"),
       "Set joint positions for a specific SRDF group in the planning scene.")
       .def("collision_check_positions", [](NativeKernelBundle& self,
                                             const std::vector<double>& positions) {
         RobotStateDTO state;
-        state.joint_names = self.context->get_joint_names();
+        state.joint_names = [&]() {
+          py::gil_scoped_release release;
+          return self.context->get_joint_names();
+        }();
         state.positions_rad = positions;
         CollisionCheckRequestDTO request;
         request.robot_state = state;
@@ -3026,7 +3129,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               const std::vector<double>& positions,
               std::optional<std::int64_t> waypoint_index) {
         RobotStateDTO state;
-        state.joint_names = self.context->get_joint_names();
+        state.joint_names = [&]() {
+          py::gil_scoped_release release;
+          return self.context->get_joint_names();
+        }();
         state.positions_rad = positions;
 
         CollisionQuery query;
@@ -3036,7 +3142,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         query.waypoint_index = waypoint_index;
         query.sampling_mode = CollisionSamplingMode::kWaypointOnly;
 
-        auto snapshot = self.context->snapshot();
+        auto snapshot = [&]() {
+          py::gil_scoped_release release;
+          return self.context->snapshot();
+        }();
         py::dict result;
         if (!snapshot) {
           result["ok"] = false;
@@ -3045,8 +3154,11 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }
         query.collision_world_revision = snapshot->revision;
 
-        auto policy = self.context->collision_policy_snapshot()
-                          .value_or(CollisionPolicySnapshot{});
+        auto policy = [&]() {
+          py::gil_scoped_release release;
+          return self.context->collision_policy_snapshot()
+              .value_or(CollisionPolicySnapshot{});
+        }();
 
         CollisionResult legacy_result = [&]() {
           py::gil_scoped_release release;

@@ -25,7 +25,7 @@ struct PlanRequestDTO {
   MotionSpecDTO motion;
   TolerancesDTO tolerances;
   SpeedProfileDTO speed_profile;
-  double planning_timeout_s;  // > 0
+  double planning_timeout_s = 5.0;  // > 0
   /// Per-joint absolute dynamics caps (Phase 4-P5.1K). Empty preserves prior
   /// behavior. Consumed by the planner backend's time-parameterization.
   PerJointDynamicsLimitsDTO per_joint_dynamics_limits;

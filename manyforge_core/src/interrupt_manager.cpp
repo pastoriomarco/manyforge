@@ -61,6 +61,17 @@ std::string preemption_action_string(InterruptPreemptionAction action) {
   return "unknown";
 }
 
+std::string fault_kind_string(InterruptFaultKind kind) {
+  switch (kind) {
+    using enum InterruptFaultKind;
+    case kStale: return "stale";
+    case kDisconnected: return "disconnected";
+    case kIngestOverflow: return "ingest_overflow";
+    case kSourceClassViolation: return "source_class_violation";
+  }
+  return "unknown";
+}
+
 bool result_binding_key_first_char_ok(char c) {
   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
 }
@@ -431,7 +442,121 @@ InterruptIngestResult InterruptManager::ingest(
     InterruptSourceClass attempted_lane,
     const InterruptRuntimeContext& context,
     std::int64_t kernel_now_ns) {
-  return ingest_batch({update}, attempted_lane, context, kernel_now_ns);
+  return ingest_range(&update, 1, attempted_lane, context, kernel_now_ns);
+}
+
+InterruptIngestResult InterruptManager::seed_samples(
+    const std::vector<InterruptSignalUpdate>& updates,
+    InterruptSourceClass attempted_lane,
+    std::int64_t kernel_now_ns) {
+  InterruptIngestResult result;
+  if (updates.empty()) {
+    result.rejected = true;
+    result.reason = "empty_batch";
+    return result;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (const auto& update : updates) {
+    const auto src_it = sources_.find(update.source_id);
+    if (src_it == sources_.end()) {
+      result.rejected = true;
+      result.reason = "unknown_source_id";
+      continue;
+    }
+    if (auto source_validation = validate_source_sample_locked(
+            update, attempted_lane, src_it->second, kernel_now_ns);
+        !source_validation.ok()) {
+      result.rejected = true;
+      result.reason = source_validation.error().details.contains("reason")
+                          ? source_validation.error().details.at("reason")
+                          : source_validation.error().code;
+      continue;
+    }
+    update_source_sample_locked(update, src_it->second);
+    result.accepted = true;
+  }
+  result.active_latch = active_latch_;
+  return result;
+}
+
+InterruptIngestResult InterruptManager::sweep_stale_sources(
+    InterruptSourceClass attempted_lane,
+    const InterruptRuntimeContext& context,
+    std::int64_t kernel_now_ns) {
+  InterruptIngestResult result;
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (const auto& [source_id, source] : sources_) {
+    if (source.source_class != attempted_lane ||
+        !source.freshness_budget_ns.has_value()) {
+      continue;
+    }
+    const auto sample_it = last_sample_by_source_.find(source_id);
+    if (sample_it == last_sample_by_source_.end() ||
+        sample_it->second.timestamp_ns <= 0) {
+      continue;
+    }
+    const auto age_ns = kernel_now_ns - sample_it->second.timestamp_ns;
+    if (age_ns < 0 || age_ns <= *source.freshness_budget_ns) {
+      continue;
+    }
+    if (active_latch_ && active_latch_->source_id == source_id &&
+        active_latch_->signal_snapshot.fault_kind == InterruptFaultKind::kStale) {
+      continue;
+    }
+    const bool stale_fault_already_queued =
+        std::any_of(queue_.begin(), queue_.end(),
+                    [&](const QueuedUpdate& queued) {
+                      return queued.update.source_id == source_id &&
+                             queued.update.fault_kind ==
+                                 InterruptFaultKind::kStale;
+                    });
+    if (stale_fault_already_queued) {
+      continue;
+    }
+    InterruptSignalUpdate stale;
+    stale.source_id = source_id;
+    stale.sequence_id = sample_it->second.sequence_id + 1;
+    stale.timestamp_ns = kernel_now_ns;
+    stale.freshness_ns = 0;
+    stale.value = true;
+    stale.fault_kind = InterruptFaultKind::kStale;
+    stale.metadata["reason"] = "source_freshness_budget_exceeded";
+    stale.metadata["last_sequence_id"] =
+        std::to_string(sample_it->second.sequence_id);
+    stale.metadata["age_ns"] = std::to_string(age_ns);
+
+    auto resolved = resolve_policy_locked(stale, context, source);
+    if (!resolved.ok()) {
+      continue;
+    }
+    auto validation = validate_update_locked(
+        stale, attempted_lane, resolved.value(), kernel_now_ns);
+    if (!validation.ok()) {
+      continue;
+    }
+    auto latched = ingest_resolved_locked(stale,
+                                          resolved.value(),
+                                          context,
+                                          kernel_now_ns,
+                                          std::nullopt);
+    result.accepted = result.accepted || latched.accepted;
+    result.latched = result.latched || latched.latched;
+    result.queued = result.queued || latched.queued;
+    result.suppressed = result.suppressed || latched.suppressed;
+    result.rejected = result.rejected || latched.rejected;
+    if (!latched.reason.empty()) {
+      result.reason = latched.reason;
+    }
+    result.events.insert(result.events.end(),
+                         latched.events.begin(),
+                         latched.events.end());
+    if (latched.latched) {
+      break;
+    }
+  }
+  result.active_latch = active_latch_;
+  return result;
 }
 
 InterruptIngestResult InterruptManager::ingest_batch(
@@ -439,8 +564,18 @@ InterruptIngestResult InterruptManager::ingest_batch(
     InterruptSourceClass attempted_lane,
     const InterruptRuntimeContext& context,
     std::int64_t kernel_now_ns) {
+  return ingest_range(updates.data(), updates.size(), attempted_lane, context,
+                      kernel_now_ns);
+}
+
+InterruptIngestResult InterruptManager::ingest_range(
+    const InterruptSignalUpdate* updates,
+    std::size_t update_count,
+    InterruptSourceClass attempted_lane,
+    const InterruptRuntimeContext& context,
+    std::int64_t kernel_now_ns) {
   InterruptIngestResult result;
-  if (updates.empty()) {
+  if (update_count == 0) {
     result.rejected = true;
     result.reason = "empty_batch";
     return result;
@@ -453,7 +588,8 @@ InterruptIngestResult InterruptManager::ingest_batch(
   std::vector<Candidate> candidates;
 
   std::lock_guard<std::mutex> lock(mutex_);
-  for (const auto& update : updates) {
+  for (std::size_t update_idx = 0; update_idx < update_count; ++update_idx) {
+    const auto& update = updates[update_idx];
     // Source-level data-quality gates (lane + freshness)
     // run before sample seeding so a stale or wrong-lane update can
     // never shift the baseline that drives activation-mode decisions
@@ -471,26 +607,21 @@ InterruptIngestResult InterruptManager::ingest_batch(
            std::nullopt});
       continue;
     }
-    if (attempted_lane != src_it->second.source_class) {
+    if (auto source_validation = validate_source_sample_locked(
+            update, attempted_lane, src_it->second, kernel_now_ns);
+        !source_validation.ok()) {
       result.rejected = true;
-      result.reason = "source_class_violation";
+      result.reason = source_validation.error().details.contains("reason")
+                          ? source_validation.error().details.at("reason")
+                          : source_validation.error().code;
+      const std::string event_type =
+          result.reason == "stale" ? "interrupt_signal_rejected_stale"
+                                   : (result.reason == "source_class_violation"
+                                          ? "interrupt_signal_rejected_class_violation"
+                                          : "interrupt_signal_rejected");
       const auto fresh = freshness_ns(update, kernel_now_ns);
       result.events.push_back(
-          {"interrupt_signal_rejected_class_violation",
-           {{"source_id", update.source_id},
-            {"sequence_id", std::to_string(update.sequence_id)},
-            {"freshness_ns", fresh ? std::to_string(*fresh) : ""},
-            {"reason", result.reason}},
-           std::nullopt});
-      continue;
-    }
-    const auto fresh = freshness_ns(update, kernel_now_ns);
-    if (src_it->second.freshness_budget_ns && fresh &&
-        *fresh > *src_it->second.freshness_budget_ns) {
-      result.rejected = true;
-      result.reason = "stale";
-      result.events.push_back(
-          {"interrupt_signal_rejected_stale",
+          {event_type,
            {{"source_id", update.source_id},
             {"sequence_id", std::to_string(update.sequence_id)},
             {"freshness_ns", fresh ? std::to_string(*fresh) : ""},
@@ -501,9 +632,14 @@ InterruptIngestResult InterruptManager::ingest_batch(
     // Data-quality OK: seed the baseline so an inactive sample arriving
     // before arming is observable to subsequent arm calls. Out-of-order
     // replays are filtered inside update_source_sample_locked.
-    update_source_sample_locked(update);
+    update_source_sample_locked(update, src_it->second);
 
-    auto resolved = resolve_policy_locked(update, context);
+    if (!signal_requests_latch(src_it->second, update) &&
+        clear_active_on_release_locked(update, kernel_now_ns, result)) {
+      continue;
+    }
+
+    auto resolved = resolve_policy_locked(update, context, src_it->second);
     if (!resolved.ok()) {
       result.rejected = true;
       result.reason = resolved.error().details.contains("reason")
@@ -537,27 +673,8 @@ InterruptIngestResult InterruptManager::ingest_batch(
            std::nullopt});
       continue;
     }
-    if (!signal_requests_latch(resolved.value().source, update)) {
-      if (active_latch_ &&
-          active_latch_->source_id == update.source_id &&
-          signal_requests_release(resolved.value().source, update) &&
-          resolved.value().policy.post_latch_disposition ==
-              InterruptPostLatchDisposition::kAutoClearOnSignalRelease) {
-        auto clear = clear_active_latch_locked("auto_signal_release", kernel_now_ns);
-        result.events.insert(result.events.end(),
-                             clear.value().events.begin(),
-                             clear.value().events.end());
-        result.accepted = true;
-        result.active_latch = active_latch_;
-        continue;
-      }
+    if (!signal_requests_latch(*resolved.value().source, update)) {
       result.accepted = true;
-      result.events.push_back(
-          {"interrupt_signal_ingested", {{"source_id", update.source_id},
-                                         {"sequence_id", std::to_string(update.sequence_id)},
-                                         {"accepted", "true"},
-                                         {"latch_requested", "false"}},
-           std::nullopt});
       continue;
     }
     candidates.push_back({update, resolved.value()});
@@ -614,8 +731,8 @@ InterruptIngestResult InterruptManager::ingest_batch(
   for (std::size_t idx = 1; idx < candidates.size(); ++idx) {
     const auto& cand = candidates[idx];
     const bool cand_is_move_trip =
-        cand.resolved.policy.scope_kind == InterruptPolicyScopeKind::kMove &&
-        cand.resolved.policy.preemption_action ==
+        cand.resolved.policy->scope_kind == InterruptPolicyScopeKind::kMove &&
+        cand.resolved.policy->preemption_action ==
             InterruptPreemptionAction::kCompleteMoveOnSignal;
     if (winning_is_move_trip && cand_is_move_trip && active_latch_) {
       const auto& winner_resolved = candidates.front().resolved;
@@ -631,7 +748,7 @@ InterruptIngestResult InterruptManager::ingest_batch(
           {"motion_trip_secondary_signal",
            {{"winning_latch_id", active_latch_->latch_id},
             {"losing_source_id", cand.update.source_id},
-            {"losing_policy_id", cand.resolved.policy.policy_id},
+            {"losing_policy_id", cand.resolved.policy->policy_id},
             {"losing_sequence_id", std::to_string(cand.update.sequence_id)},
             {"arbitration_reason", arbitration_reason}},
            *active_latch_});
@@ -697,6 +814,12 @@ Result<InterruptIngestResult> InterruptManager::apply_disposition(
         {"result", "accepted"}},
        *active_latch_});
 
+  if (disposition.action == InterruptDispositionAction::kHold) {
+    result.accepted = true;
+    result.active_latch = active_latch_;
+    return Result<InterruptIngestResult>::Ok(std::move(result));
+  }
+
   std::string clear_reason = "operator_ack";
   switch (disposition.action) {
     case InterruptDispositionAction::kReset:
@@ -713,6 +836,12 @@ Result<InterruptIngestResult> InterruptManager::apply_disposition(
   }
   auto clear = clear_active_latch_locked(std::move(clear_reason), kernel_now_ns);
   result.accepted = true;
+  result.latched = clear.value().latched;
+  result.queued = clear.value().queued;
+  result.suppressed = clear.value().suppressed;
+  result.rejected = result.rejected || clear.value().rejected;
+  result.reason = clear.value().reason.empty() ? result.reason
+                                               : clear.value().reason;
   result.events.insert(result.events.end(),
                        clear.value().events.begin(),
                        clear.value().events.end());
@@ -730,12 +859,32 @@ Result<InterruptIngestResult> InterruptManager::clear_active_latch(
 Result<InterruptIngestResult> InterruptManager::mark_active_preemption_result(
     InterruptPreemptionResult result,
     std::int64_t preemption_latency_ns,
+    std::int64_t kernel_now_ns) {
+  auto latch = active_latch();
+  if (!latch) {
+    return Result<InterruptIngestResult>::Err(
+        interrupt_error("no_active_latch",
+                        "Cannot mark interrupt preemption without an active latch"));
+  }
+  return mark_preemption_result(
+      latch->latch_id, result, preemption_latency_ns, kernel_now_ns);
+}
+
+Result<InterruptIngestResult> InterruptManager::mark_preemption_result(
+    const std::string& latch_id,
+    InterruptPreemptionResult result,
+    std::int64_t preemption_latency_ns,
     std::int64_t /*kernel_now_ns*/) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!active_latch_) {
     return Result<InterruptIngestResult>::Err(
         interrupt_error("no_active_latch",
                         "Cannot mark interrupt preemption without an active latch"));
+  }
+  if (active_latch_->latch_id != latch_id) {
+    return Result<InterruptIngestResult>::Err(
+        interrupt_error("stale_latch",
+                        "Cannot mark interrupt preemption for a stale latch"));
   }
 
   active_latch_->preemption_result = result;
@@ -755,6 +904,17 @@ Result<InterruptIngestResult> InterruptManager::mark_active_preemption_result(
          std::to_string(active_latch_->preemption_latency_ns.value_or(0))}},
        active_latch_});
   return Result<InterruptIngestResult>::Ok(std::move(ingest_result));
+}
+
+bool InterruptManager::stamp_active_latch_collision_world_revision(
+    const std::string& latch_id,
+    const CollisionWorldRevision& revision) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!active_latch_ || active_latch_->latch_id != latch_id) {
+    return false;
+  }
+  active_latch_->borrowed_collision_world_revision = revision;
+  return true;
 }
 
 Result<InterruptIngestResult> InterruptManager::clear_active_latch_locked(
@@ -790,19 +950,45 @@ Result<InterruptIngestResult> InterruptManager::clear_active_latch_locked(
     if (!next) {
       break;
     }
-    if (next->resolved.policy.scope_kind == InterruptPolicyScopeKind::kMove) {
+    if (next->resolved.policy->scope_kind == InterruptPolicyScopeKind::kMove) {
       const auto it = active_scope_id_by_policy_id_.find(
-          next->resolved.policy.policy_id);
+          next->resolved.policy->policy_id);
       if (it == active_scope_id_by_policy_id_.end()) {
-        InterruptStructuredValue drop_details{
-            {"source_id", next->update.source_id},
-            {"sequence_id", std::to_string(next->update.sequence_id)},
-            {"policy_id", next->resolved.policy.policy_id},
-            {"reason", "scope_reaped_before_replay"},
-        };
-        result.events.push_back({"motion_interrupt_queued_update_dropped",
-                                 std::move(drop_details), std::nullopt});
+        append_replay_drop_event_locked(
+            result, *next, "scope_reaped_before_replay");
         continue;
+      }
+    }
+    auto validation = validate_update_locked(next->update,
+                                             next->resolved.source->source_class,
+                                             next->resolved,
+                                             kernel_now_ns);
+    if (!validation.ok()) {
+      const auto reason = validation.error().details.contains("reason")
+                              ? validation.error().details.at("reason")
+                              : validation.error().code;
+      append_replay_drop_event_locked(result, *next, reason);
+      result.rejected = true;
+      if (result.reason.empty()) {
+        result.reason = reason;
+      }
+      continue;
+    }
+    if (!signal_requests_latch(*next->resolved.source, next->update)) {
+      append_replay_drop_event_locked(result, *next, "inactive_before_replay");
+      continue;
+    }
+    if (next->resolved.policy->scope_kind == InterruptPolicyScopeKind::kMove) {
+      const auto it = active_scope_id_by_policy_id_.find(
+          next->resolved.policy->policy_id);
+      if (it != active_scope_id_by_policy_id_.end()) {
+        const auto& binding =
+            active_scope_bindings_by_scope_id_.at(it->second);
+        if (!scope_binding_allows_latch_locked(binding, next->update)) {
+          append_replay_drop_event_locked(
+              result, *next, "activation_mode_rejected_before_replay");
+          continue;
+        }
       }
     }
     auto latched = ingest_resolved_locked(next->update,
@@ -814,7 +1000,13 @@ Result<InterruptIngestResult> InterruptManager::clear_active_latch_locked(
                          latched.events.begin(),
                          latched.events.end());
     result.accepted = true;
-    result.latched = latched.latched;
+    result.latched = result.latched || latched.latched;
+    result.queued = result.queued || latched.queued;
+    result.suppressed = result.suppressed || latched.suppressed;
+    result.rejected = result.rejected || latched.rejected;
+    if (!latched.reason.empty()) {
+      result.reason = latched.reason;
+    }
     result.active_latch = active_latch_;
     break;
   }
@@ -839,6 +1031,13 @@ Result<InterruptManager::ResolvedPolicy> InterruptManager::resolve_policy_locked
     return Result<ResolvedPolicy>::Err(
         interrupt_error("unknown_source_id", "interrupt update source is unknown"));
   }
+  return resolve_policy_locked(update, context, source_it->second);
+}
+
+Result<InterruptManager::ResolvedPolicy> InterruptManager::resolve_policy_locked(
+    const InterruptSignalUpdate& update,
+    const InterruptRuntimeContext& context,
+    const InterruptSourceDefinition& source) const {
   const auto policy_ids_it = policy_ids_by_source_.find(update.source_id);
   if (policy_ids_it == policy_ids_by_source_.end()) {
     return Result<ResolvedPolicy>::Err(
@@ -876,14 +1075,15 @@ Result<InterruptManager::ResolvedPolicy> InterruptManager::resolve_policy_locked
       }
     }
     ResolvedPolicy candidate;
-    candidate.source = source_it->second;
-    candidate.policy = policy;
-    candidate.effective_priority = policy.priority.value_or(candidate.source.priority);
+    candidate.source = &source;
+    candidate.policy = &policy;
+    candidate.effective_priority =
+        policy.priority.value_or(candidate.source->priority);
     candidate.effective_maskable =
-        policy.maskable.value_or(candidate.source.maskable.value_or(false));
+        policy.maskable.value_or(candidate.source->maskable.value_or(false));
     if (!best || candidate.effective_priority > best->effective_priority ||
         (candidate.effective_priority == best->effective_priority &&
-         candidate.policy.policy_id < best->policy.policy_id)) {
+         candidate.policy->policy_id < best->policy->policy_id)) {
       best = candidate;
     }
   }
@@ -898,12 +1098,18 @@ Result<InterruptManager::ResolvedPolicy> InterruptManager::resolve_policy_locked
 bool InterruptManager::signal_requests_latch(
     const InterruptSourceDefinition& source,
     const InterruptSignalUpdate& update) const {
+  if (update.fault_kind.has_value()) {
+    return true;
+  }
   return value_is_active(update.value, source.hysteresis_value);
 }
 
 bool InterruptManager::signal_requests_release(
     const InterruptSourceDefinition& source,
     const InterruptSignalUpdate& update) const {
+  if (update.fault_kind.has_value()) {
+    return false;
+  }
   return value_is_release(update.value, source.hysteresis_value);
 }
 
@@ -916,7 +1122,31 @@ std::optional<std::int64_t> InterruptManager::freshness_ns(
   if (update.timestamp_ns <= 0) {
     return std::nullopt;
   }
-  return std::max<std::int64_t>(0, kernel_now_ns - update.timestamp_ns);
+  return kernel_now_ns - update.timestamp_ns;
+}
+
+Result<void> InterruptManager::validate_source_sample_locked(
+    const InterruptSignalUpdate& update,
+    InterruptSourceClass attempted_lane,
+    const InterruptSourceDefinition& source,
+    std::int64_t kernel_now_ns) const {
+  if (attempted_lane != source.source_class) {
+    return Result<void>::Err(interrupt_error(
+        "source_class_violation",
+        "interrupt update used the wrong ingestion lane"));
+  }
+  const auto fresh = freshness_ns(update, kernel_now_ns);
+  if (fresh && *fresh < 0) {
+    return Result<void>::Err(interrupt_error(
+        "clock_domain_mismatch",
+        "interrupt update timestamp is newer than the kernel clock"));
+  }
+  if (!update.fault_kind && source.freshness_budget_ns && fresh &&
+      *fresh > *source.freshness_budget_ns) {
+    return Result<void>::Err(
+        interrupt_error("stale", "interrupt update exceeded freshness budget"));
+  }
+  return Result<void>::Ok();
 }
 
 Result<void> InterruptManager::validate_update_locked(
@@ -924,27 +1154,61 @@ Result<void> InterruptManager::validate_update_locked(
     InterruptSourceClass attempted_lane,
     const ResolvedPolicy& resolved,
     std::int64_t kernel_now_ns) const {
-  if (attempted_lane != resolved.source.source_class) {
+  if (attempted_lane != resolved.source->source_class) {
     return Result<void>::Err(interrupt_error(
         "source_class_violation",
         "interrupt update used the wrong ingestion lane"));
   }
-  const auto fresh = freshness_ns(update, kernel_now_ns);
-  if (resolved.source.freshness_budget_ns && fresh &&
-      *fresh > *resolved.source.freshness_budget_ns) {
-    return Result<void>::Err(
-        interrupt_error("stale", "interrupt update exceeded freshness budget"));
+  if (auto source_validation = validate_source_sample_locked(
+          update, attempted_lane, *resolved.source, kernel_now_ns);
+      !source_validation.ok()) {
+    return source_validation;
   }
-  if (resolved.source.kind == InterruptSourceKind::kEdge &&
-      resolved.source.debounce_ns && signal_requests_latch(resolved.source, update)) {
+  if (resolved.source->kind == InterruptSourceKind::kEdge &&
+      resolved.source->debounce_ns &&
+      signal_requests_latch(*resolved.source, update)) {
     const auto last_it = last_latch_time_by_source_.find(update.source_id);
     if (last_it != last_latch_time_by_source_.end() &&
-        kernel_now_ns - last_it->second < *resolved.source.debounce_ns) {
+        kernel_now_ns - last_it->second < *resolved.source->debounce_ns) {
       return Result<void>::Err(
           interrupt_error("debounced", "interrupt edge rejected by debounce"));
     }
   }
   return Result<void>::Ok();
+}
+
+bool InterruptManager::clear_active_on_release_locked(
+    const InterruptSignalUpdate& update,
+    std::int64_t kernel_now_ns,
+    InterruptIngestResult& result) {
+  if (!active_latch_ || active_latch_->source_id != update.source_id) {
+    return false;
+  }
+  const auto source_it = sources_.find(active_latch_->source_id);
+  if (source_it == sources_.end() ||
+      !signal_requests_release(source_it->second, update)) {
+    return false;
+  }
+  const auto policy = active_policy_locked();
+  if (!policy ||
+      policy->post_latch_disposition !=
+          InterruptPostLatchDisposition::kAutoClearOnSignalRelease) {
+    return false;
+  }
+  auto clear = clear_active_latch_locked("auto_signal_release", kernel_now_ns);
+  result.accepted = true;
+  result.latched = result.latched || clear.value().latched;
+  result.queued = result.queued || clear.value().queued;
+  result.suppressed = result.suppressed || clear.value().suppressed;
+  result.rejected = result.rejected || clear.value().rejected;
+  if (!clear.value().reason.empty()) {
+    result.reason = clear.value().reason;
+  }
+  result.events.insert(result.events.end(),
+                       clear.value().events.begin(),
+                       clear.value().events.end());
+  result.active_latch = active_latch_;
+  return true;
 }
 
 InterruptIngestResult InterruptManager::ingest_resolved_locked(
@@ -955,15 +1219,13 @@ InterruptIngestResult InterruptManager::ingest_resolved_locked(
     std::optional<InterruptTieBreak> tie_break) {
   InterruptIngestResult result;
   result.accepted = true;
+  const auto fresh = freshness_ns(update, kernel_now_ns);
   result.events.push_back(
       {"interrupt_signal_ingested",
        {{"source_id", update.source_id},
         {"sequence_id", std::to_string(update.sequence_id)},
         {"accepted", "true"},
-        {"freshness_ns",
-         freshness_ns(update, kernel_now_ns)
-             ? std::to_string(*freshness_ns(update, kernel_now_ns))
-             : ""}},
+        {"freshness_ns", fresh ? std::to_string(*fresh) : ""}},
        std::nullopt});
 
   if (!active_latch_) {
@@ -992,8 +1254,8 @@ InterruptIngestResult InterruptManager::ingest_resolved_locked(
       active_policy->preemption_action ==
           InterruptPreemptionAction::kCompleteMoveOnSignal;
   const bool candidate_is_move_trip =
-      resolved.policy.scope_kind == InterruptPolicyScopeKind::kMove &&
-      resolved.policy.preemption_action ==
+      resolved.policy->scope_kind == InterruptPolicyScopeKind::kMove &&
+      resolved.policy->preemption_action ==
           InterruptPreemptionAction::kCompleteMoveOnSignal;
   if (active_is_move_trip && candidate_is_move_trip &&
       resolved.effective_priority <= active_priority) {
@@ -1008,7 +1270,7 @@ InterruptIngestResult InterruptManager::ingest_resolved_locked(
         {"motion_trip_secondary_signal",
          {{"winning_latch_id", active_latch_->latch_id},
           {"losing_source_id", update.source_id},
-          {"losing_policy_id", resolved.policy.policy_id},
+          {"losing_policy_id", resolved.policy->policy_id},
           {"losing_sequence_id", std::to_string(update.sequence_id)},
           {"arbitration_reason", arbitration_reason}},
          *active_latch_});
@@ -1035,15 +1297,16 @@ InterruptIngestResult InterruptManager::ingest_resolved_locked(
   }
 
   if (resolved.effective_maskable &&
-      std::find(resolved.policy.maskable_by.begin(),
-                resolved.policy.maskable_by.end(),
-                active_latch_->policy_id) != resolved.policy.maskable_by.end()) {
+      std::find(resolved.policy->maskable_by.begin(),
+                resolved.policy->maskable_by.end(),
+                active_latch_->policy_id) !=
+          resolved.policy->maskable_by.end()) {
     result.suppressed = true;
     result.reason = "suppressed_by_active_mask";
     result.events.push_back(
         {"interrupt_suppressed_by_active_mask",
          {{"source_id", update.source_id},
-          {"policy_id", resolved.policy.policy_id},
+          {"policy_id", resolved.policy->policy_id},
           {"active_latch_id", active_latch_->latch_id}},
          *active_latch_});
     result.active_latch = active_latch_;
@@ -1064,18 +1327,18 @@ InterruptLatch InterruptManager::make_latch_locked(
   InterruptLatch latch;
   latch.latch_id = "interrupt-" + std::to_string(next_latch_id_++);
   latch.source_id = update.source_id;
-  latch.policy_id = resolved.policy.policy_id;
+  latch.policy_id = resolved.policy->policy_id;
   latch.latched_at_ns = kernel_now_ns;
   latch.execution_phase_at_latch = context.phase;
   latch.active_execution_id = context.execution_id;
   latch.active_move_id = context.move_id;
   latch.signal_snapshot = update;
-  latch.preemption_action_requested = resolved.policy.preemption_action;
+  latch.preemption_action_requested = resolved.policy->preemption_action;
   latch.borrowed_collision_world_revision =
       context.borrowed_collision_world_revision;
   latch.tie_break = tie_break;
-  if (resolved.policy.preemption_action == InterruptPreemptionAction::kLatchHeld ||
-      resolved.policy.preemption_action == InterruptPreemptionAction::kLatchFaulted) {
+  if (resolved.policy->preemption_action == InterruptPreemptionAction::kLatchHeld ||
+      resolved.policy->preemption_action == InterruptPreemptionAction::kLatchFaulted) {
     latch.preemption_result = InterruptPreemptionResult::kNoneRequired;
     latch.preemption_latency_ns = 0;
   } else {
@@ -1084,8 +1347,9 @@ InterruptLatch InterruptManager::make_latch_locked(
   // When the matched policy is move-scoped, link the latch
   // to its armed binding via scope_id so the kernel can correlate the
   // outcome record (spec/260 §2.4).
-  if (resolved.policy.scope_kind == InterruptPolicyScopeKind::kMove) {
-    const auto it = active_scope_id_by_policy_id_.find(resolved.policy.policy_id);
+  if (resolved.policy->scope_kind == InterruptPolicyScopeKind::kMove) {
+    const auto it =
+        active_scope_id_by_policy_id_.find(resolved.policy->policy_id);
     if (it != active_scope_id_by_policy_id_.end()) {
       latch.motion_interrupt_scope_id = it->second;
     }
@@ -1150,6 +1414,19 @@ InterruptManager::pop_next_queued_locked() {
   const auto it = std::min_element(queue_.begin(), queue_.end(),
                                    [](const QueuedUpdate& a,
                                       const QueuedUpdate& b) {
+                                     if (a.resolved.effective_priority !=
+                                         b.resolved.effective_priority) {
+                                       return a.resolved.effective_priority >
+                                              b.resolved.effective_priority;
+                                     }
+                                     if (a.update.source_id != b.update.source_id) {
+                                       return a.update.source_id < b.update.source_id;
+                                     }
+                                     if (a.update.sequence_id !=
+                                         b.update.sequence_id) {
+                                       return a.update.sequence_id <
+                                              b.update.sequence_id;
+                                     }
                                      return a.order < b.order;
                                    });
   QueuedUpdate value = *it;
@@ -1171,6 +1448,10 @@ void InterruptManager::append_latched_events_locked(
   if (latch.tie_break) {
     details.emplace("tie_break", "lexicographic");
   }
+  if (latch.signal_snapshot.fault_kind) {
+    details.emplace("fault_kind",
+                    fault_kind_string(*latch.signal_snapshot.fault_kind));
+  }
   result.events.push_back({"interrupt_latched", details, latch});
   if (latch.preemption_result != InterruptPreemptionResult::kPending) {
     result.events.push_back(
@@ -1181,6 +1462,20 @@ void InterruptManager::append_latched_events_locked(
           {"preemption_latency_ns", std::to_string(latch.preemption_latency_ns.value_or(0))}},
          latch});
   }
+}
+
+void InterruptManager::append_replay_drop_event_locked(
+    InterruptIngestResult& result,
+    const QueuedUpdate& queued,
+    std::string reason) const {
+  InterruptStructuredValue drop_details{
+      {"source_id", queued.update.source_id},
+      {"sequence_id", std::to_string(queued.update.sequence_id)},
+      {"policy_id", queued.resolved.policy->policy_id},
+      {"reason", std::move(reason)},
+  };
+  result.events.push_back({"motion_interrupt_queued_update_dropped",
+                           std::move(drop_details), std::nullopt});
 }
 
 bool InterruptManager::disposition_allowed(
@@ -1205,10 +1500,12 @@ bool InterruptManager::disposition_allowed(
              disposition.action == InterruptDispositionAction::kHold;
     case kAutoClearAfterMotionOutcome:
       // Per spec/260 §5.6: the latch clears automatically
-      // after the motion-outcome record is durable. Operator
-      // disposition is not used; only Reset is accepted from the
-      // disposition surface (it's the kernel-level escape hatch).
-      return disposition.action == InterruptDispositionAction::kReset;
+      // after the motion-outcome record is durable. Reset and
+      // acknowledge remain accepted as explicit escape hatches for
+      // terminal-arbitration races where the motion outcome has already
+      // won but the latch is still visible to the operator surface.
+      return disposition.action == InterruptDispositionAction::kAcknowledge ||
+             disposition.action == InterruptDispositionAction::kReset;
     case kFaultTerminal:
       return disposition.action == InterruptDispositionAction::kReset ||
              disposition.action == InterruptDispositionAction::kFaultTerminal;
@@ -1232,31 +1529,44 @@ std::optional<InterruptPolicyDefinition> InterruptManager::active_policy() const
   return active_policy_locked();
 }
 
+std::optional<InterruptPolicyDefinition> InterruptManager::policy_by_id(
+    const std::string& policy_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = policies_by_id_.find(policy_id);
+  if (it == policies_by_id_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
 // ----- Motion-scoped binding lifecycle (spec/260 §2.6) -----
 
 void InterruptManager::update_source_sample_locked(
-    const InterruptSignalUpdate& update) {
-  auto& slot = last_sample_by_source_[update.source_id];
+    const InterruptSignalUpdate& update,
+    const InterruptSourceDefinition& source) {
   // Only advance the recorded sample if this update is fresher (higher
   // monotonic sequence_id). Out-of-order replays are ignored for
   // baseline-tracking purposes; this matches how the rest of the
   // manager treats sequence_id as the canonical ordering.
-  if (update.sequence_id < slot.sequence_id) {
+  const auto existing = last_sample_by_source_.find(update.source_id);
+  if (existing != last_sample_by_source_.end() &&
+      update.sequence_id <= existing->second.sequence_id) {
     return;
   }
-  const auto src_it = sources_.find(update.source_id);
-  std::optional<InterruptSignalValue> hysteresis;
-  if (src_it != sources_.end()) {
-    hysteresis = src_it->second.hysteresis_value;
-  }
+  auto& slot = last_sample_by_source_[update.source_id];
   slot.sequence_id = update.sequence_id;
   slot.timestamp_ns = update.timestamp_ns;
-  slot.active = value_is_active(update.value, hysteresis);
+  slot.active = value_is_active(update.value, source.hysteresis_value);
   // Mirror the sample into any armed binding tracking the source so
   // diagnostics and activation-mode evaluation stay current.
-  for (auto& [_, binding] : active_scope_bindings_by_scope_id_) {
-    if (binding.source_id == update.source_id) {
-      binding.last_signal_sequence_id = update.sequence_id;
+  const auto ids_it = active_scope_ids_by_source_id_.find(update.source_id);
+  if (ids_it == active_scope_ids_by_source_id_.end()) {
+    return;
+  }
+  for (const auto& scope_id : ids_it->second) {
+    auto binding_it = active_scope_bindings_by_scope_id_.find(scope_id);
+    if (binding_it != active_scope_bindings_by_scope_id_.end()) {
+      binding_it->second.last_signal_sequence_id = update.sequence_id;
     }
   }
 }
@@ -1274,7 +1584,11 @@ bool InterruptManager::scope_binding_allows_latch_locked(
   switch (binding.activation_mode) {
     case kRequireInactiveAtArm:
       // Arming already verified the baseline was inactive; latch on
-      // any active value.
+      // any newer active value.
+      if (binding.baseline_sequence_id &&
+          update.sequence_id <= *binding.baseline_sequence_id) {
+        return false;
+      }
       return incoming_active;
     case kFreshEdgeAfterArm:
       // Only latch on an active value whose sequence_id is strictly
@@ -1438,7 +1752,12 @@ InterruptManager::build_scope_binding_locked(
     binding.baseline_active = sample_it->second.active;
     binding.last_signal_sequence_id = sample_it->second.sequence_id;
     const auto sample_age_ns =
-        std::max<std::int64_t>(0, kernel_now_ns - sample_it->second.timestamp_ns);
+        kernel_now_ns - sample_it->second.timestamp_ns;
+    if (sample_age_ns < 0) {
+      return Result<ActiveScopeBinding>::Err(interrupt_error(
+          "clock_domain_mismatch",
+          "baseline sample timestamp is newer than the kernel clock"));
+    }
     binding.arm_baseline_age_ns = sample_age_ns;
     if (arm_timeout_ns > 0 && sample_age_ns > arm_timeout_ns) {
       return Result<ActiveScopeBinding>::Err(interrupt_error(
@@ -1511,6 +1830,7 @@ Result<InterruptIngestResult> InterruptManager::arm_motion_interrupt_scopes(
   // All scopes validated; commit atomically.
   for (auto& binding : staged) {
     active_scope_id_by_policy_id_[binding.policy_id] = binding.scope_id;
+    const auto committed_binding = binding;
     InterruptStructuredValue details{
         {"scope_id", binding.scope_id},
         {"policy_id", binding.policy_id},
@@ -1531,9 +1851,52 @@ Result<InterruptIngestResult> InterruptManager::arm_motion_interrupt_scopes(
     }
     result.events.push_back(
         {"motion_interrupt_scope_armed", std::move(details), std::nullopt});
+    active_scope_ids_by_source_id_[committed_binding.source_id].push_back(
+        committed_binding.scope_id);
     active_scope_bindings_by_scope_id_[binding.scope_id] = std::move(binding);
+
+    if (committed_binding.activation_mode ==
+            MotionInterruptActivationMode::kTripIfAlreadyActive &&
+        committed_binding.baseline_active) {
+      const auto sample_it =
+          last_sample_by_source_.find(committed_binding.source_id);
+      if (sample_it == last_sample_by_source_.end()) {
+        continue;
+      }
+      InterruptSignalUpdate arm_trip;
+      arm_trip.source_id = committed_binding.source_id;
+      arm_trip.sequence_id = sample_it->second.sequence_id;
+      arm_trip.timestamp_ns = sample_it->second.timestamp_ns;
+      arm_trip.value = sample_it->second.active;
+      arm_trip.metadata["reason"] = "trip_if_already_active_at_arm";
+      InterruptRuntimeContext context;
+      context.phase = InterruptExecutionPhase::kTrajectoryExecution;
+      context.execution_id = committed_binding.execution_id;
+      context.move_id = committed_binding.move_id;
+      auto resolved = resolve_policy_locked(arm_trip, context);
+      if (!resolved.ok()) {
+        continue;
+      }
+      auto latched = ingest_resolved_locked(arm_trip,
+                                            resolved.value(),
+                                            context,
+                                            kernel_now_ns,
+                                            std::nullopt);
+      result.latched = result.latched || latched.latched;
+      result.queued = result.queued || latched.queued;
+      result.suppressed = result.suppressed || latched.suppressed;
+      result.rejected = result.rejected || latched.rejected;
+      if (!latched.reason.empty()) {
+        result.reason = latched.reason;
+      }
+      result.events.insert(result.events.end(),
+                           latched.events.begin(),
+                           latched.events.end());
+      result.active_latch = active_latch_;
+    }
   }
   result.accepted = true;
+  result.active_latch = active_latch_;
   return Result<InterruptIngestResult>::Ok(result);
 }
 
@@ -1568,6 +1931,16 @@ InterruptIngestResult InterruptManager::reap_motion_interrupt_scopes(
     };
     result.events.push_back(
         {"motion_interrupt_scope_reaped", std::move(details), std::nullopt});
+    auto source_index_it =
+        active_scope_ids_by_source_id_.find(it->second.source_id);
+    if (source_index_it != active_scope_ids_by_source_id_.end()) {
+      auto& scope_ids = source_index_it->second;
+      scope_ids.erase(std::remove(scope_ids.begin(), scope_ids.end(), scope_id),
+                      scope_ids.end());
+      if (scope_ids.empty()) {
+        active_scope_ids_by_source_id_.erase(source_index_it);
+      }
+    }
     active_scope_id_by_policy_id_.erase(it->second.policy_id);
     active_scope_bindings_by_scope_id_.erase(it);
   }
@@ -1581,7 +1954,7 @@ InterruptIngestResult InterruptManager::reap_motion_interrupt_scopes(
   if (!reaped_policy_ids.empty()) {
     auto queue_it = queue_.begin();
     while (queue_it != queue_.end()) {
-      const auto& policy_id = queue_it->resolved.policy.policy_id;
+      const auto& policy_id = queue_it->resolved.policy->policy_id;
       const bool policy_reaped =
           std::find(reaped_policy_ids.begin(), reaped_policy_ids.end(),
                     policy_id) != reaped_policy_ids.end();

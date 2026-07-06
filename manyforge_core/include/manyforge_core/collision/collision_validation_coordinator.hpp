@@ -50,9 +50,16 @@ struct PoseSourceRetryConfig {
 /// invocation. Coordinators are constructed per-pass so support-contact state
 /// does not leak across moves.
 struct CollisionValidationPassConfig {
-  /// Active collision policy snapshot. The coordinator owns the evaluator;
-  /// the snapshot is copied into the evaluator at construction.
+  /// Active collision policy snapshot for simple/legacy call sites.
+  /// Production hot paths should prefer `policy_snapshot_ref` +
+  /// `policy_index` to share immutable policy data across workers.
   CollisionPolicySnapshot policy_snapshot;
+
+  /// Optional shared immutable policy snapshot and prebuilt index. When set,
+  /// coordinators use these instead of copying `policy_snapshot`. The value
+  /// member remains for simple tests and legacy call sites.
+  std::shared_ptr<const CollisionPolicySnapshot> policy_snapshot_ref;
+  std::shared_ptr<const CollisionPolicyIndex> policy_index;
 
   /// Pose-source borrow + retry knobs.
   PoseSourceRetryConfig pose_source_retry;
@@ -74,6 +81,10 @@ struct CollisionValidationPassConfig {
 
   /// Concrete per-request contact policy. Empty means free-space validation.
   std::string contact_policy_id;
+
+  const CollisionPolicySnapshot& effective_policy_snapshot() const {
+    return policy_snapshot_ref ? *policy_snapshot_ref : policy_snapshot;
+  }
 };
 
 /// Per-waypoint diagnostic record produced during a coordinator pass.
@@ -150,9 +161,21 @@ class CollisionValidationCoordinator {
       const TrajectoryDTO& trajectory,
       const CollisionCancellationToken& cancel);
 
+  /// Validate a contiguous waypoint range against `trajectory` without
+  /// copying the waypoint chunk. Waypoint indices in the returned records are
+  /// local to the range, matching the chunk semantics used by
+  /// ParallelCollisionValidationWorkerPool before it applies global offsets.
+  CollisionValidationDecisionBundle validate_trajectory_range(
+      const CollisionWorldSnapshot& snapshot,
+      ICollisionQueryEngine& engine,
+      const TrajectoryDTO& trajectory,
+      std::size_t begin_index,
+      std::size_t end_index,
+      const CollisionCancellationToken& cancel);
+
   /// Snapshot view of the active policy.
   const CollisionPolicySnapshot& policy_snapshot() const {
-    return config_.policy_snapshot;
+    return *policy_snapshot_;
   }
 
  private:
@@ -160,6 +183,8 @@ class CollisionValidationCoordinator {
       const CollisionWorldSnapshot& snapshot,
       ICollisionQueryEngine& engine,
       const TrajectoryDTO& trajectory,
+      std::size_t begin_index,
+      std::size_t end_index,
       const CollisionCancellationToken& cancel);
 
   /// Classify a single waypoint and update support-contact state.
@@ -203,8 +228,12 @@ class CollisionValidationCoordinator {
       CollisionDecisionResult policy_decision);
 
   CollisionValidationPassConfig config_;
+  std::shared_ptr<const CollisionPolicySnapshot> policy_snapshot_;
+  std::shared_ptr<const CollisionPolicyIndex> policy_index_;
   CollisionPolicyEvaluator evaluator_;
   ClockNow clock_now_;
+  std::string policy_revision_string_;
+  std::vector<std::string> required_capabilities_;
 };
 
 }  // namespace manyforge::core

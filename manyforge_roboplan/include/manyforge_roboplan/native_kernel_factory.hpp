@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -61,6 +62,11 @@ class SimpleScheduler final : public core::IScheduler {
       core::SchedulerPriority priority =
           core::SchedulerPriority::Safety) override;
   void cancel(core::ScheduleHandle handle) override;
+  void drain(core::SchedulerPriority priority) override;
+  bool drain_for(core::SchedulerPriority priority,
+                 std::chrono::nanoseconds timeout) override;
+  void drain_all() override;
+  bool drain_all_for(std::chrono::nanoseconds timeout) override;
 
  private:
   struct ScheduledTask {
@@ -73,11 +79,15 @@ class SimpleScheduler final : public core::IScheduler {
     SimpleScheduler* owner = nullptr;
     std::mutex mutex;
     std::condition_variable cv;
+    std::condition_variable drain_cv;
     std::map<core::ScheduleHandle, ScheduledTask> tasks;
     std::jthread thread;
+    std::size_t callbacks_in_flight = 0;
 
     void worker_loop(std::stop_token st);
     void ensure_started_locked(Worker* self);
+    void drain();
+    bool drain_for(std::chrono::nanoseconds timeout);
   };
 
   /// Pick the worker that should own a callback for the given priority.
@@ -133,6 +143,7 @@ struct NativeKernelBundle {
 
   // Owned components — order matters for destruction
   std::shared_ptr<roboplan::Scene> scene;
+  std::shared_ptr<std::mutex> scene_mutex;
   std::shared_ptr<roboplan::RRT> rrt;
   std::shared_ptr<roboplan::PathShortcutter> shortcutter;
   std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra;
@@ -149,12 +160,21 @@ struct NativeKernelBundle {
   std::vector<std::shared_ptr<core::ICollisionQueryEngine>>
       collision_validation_engines;
 
+ private:
+  mutable std::mutex close_mutex_;
+  bool closed_{false};
+
+ public:
   // Event collector — subscribes to kernel, must be destroyed before kernel
   KernelEventCollector event_collector;
 
-  // Kernel MUST be last — it holds references to everything above
-  std::unique_ptr<core::ExecutionKernel> kernel;
+  // Kernel holds references to everything above. close() resets the bundle's
+  // owner before component teardown; in-flight bindings hold short snapshots.
+  std::shared_ptr<core::ExecutionKernel> kernel;
 
+  void close();
+  bool closed() const;
+  std::shared_ptr<core::ExecutionKernel> kernel_snapshot() const;
   ~NativeKernelBundle();
 };
 

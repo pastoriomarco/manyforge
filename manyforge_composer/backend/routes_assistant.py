@@ -888,22 +888,17 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             # tool call on program_read. Coerce a string detail into
             # a dict envelope when needed; the dict form is safe for
             # the bridge MCP wrapper.
+            recovery_snapshot = _program_snapshot_payload(state)
             if (
                 failure_index >= assistant_recovery.ATTACH_SNAPSHOT_AFTER_FAILURES
-                and state.program is not None
+                and recovery_snapshot["program"] is not None
             ):
                 snapshot_envelope: dict[str, Any]
                 if isinstance(enriched_detail, dict):
                     snapshot_envelope = enriched_detail
                 else:
                     snapshot_envelope = {"message": enriched_detail}
-                snapshot_envelope["programSnapshot"] = {
-                    "programLoaded": True,
-                    "programSourcePath": state.program_source_path,
-                    "programSessionGeneration": state.program_session_generation,
-                    "programTreeHash": state.program_tree_hash,
-                    "program": state.program.to_dict(),
-                }
+                snapshot_envelope["programSnapshot"] = recovery_snapshot
                 snapshot_envelope["snapshotReason"] = (
                     "Attached after repeated failures so the next call "
                     "can plan against current state without a separate "
@@ -1100,9 +1095,7 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
         # verbatim into its MCP tool-result content, so the model sees
         # `result.delta.{rootName, rootKind, sinceCallStart, …}`.
         try:
-            current_program = (
-                state.program.to_dict() if state.program is not None else None
-            )
+            current_program = _program_snapshot_payload(state)["program"]
             delta_block = _assistant_delta.compute_delta(
                 conversation_id=request.conversation_id or "",
                 current_program_dict=current_program,
@@ -1690,6 +1683,45 @@ async def _execute_bridge_read_only_tool(
     tool_id: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
+    if tool_id == "inspect_isaac_scene":
+        request = AssistantInspectIsaacSceneRequest.model_validate(arguments or {})
+        try:
+            report = await run_in_threadpool(inspect_isaac_scene_report, request)
+        except AssistantToolError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        return {
+            "report": report,
+            "summary": report.get("summary", {}) if isinstance(report, dict) else {},
+            "warnings": report.get("warnings", []) if isinstance(report, dict) else [],
+        }
+    return await run_in_threadpool(
+        _execute_bridge_read_only_tool_sync,
+        state,
+        tool_id=tool_id,
+        arguments=arguments,
+    )
+
+
+def _program_snapshot_payload(state: ComposerState) -> dict[str, Any]:
+    with state._program_edit_lock:
+        program = state.program
+        return {
+            "programLoaded": program is not None,
+            "programSourcePath": state.program_source_path,
+            "programSessionGeneration": state.program_session_generation,
+            "programTreeHash": state.program_tree_hash,
+            "program": program.to_dict() if program is not None else None,
+        }
+
+
+def _execute_bridge_read_only_tool_sync(
+    state: ComposerState,
+    *,
+    tool_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
     if tool_id == "catalog_read":
         entry_ids = arguments.get("entryIds") or arguments.get("entry_ids") or []
         if entry_ids is None:
@@ -1746,24 +1778,20 @@ async def _execute_bridge_read_only_tool(
         return _deployment_capabilities_payload(state)
 
     if tool_id == "program_read":
-        return {
-            "programLoaded": state.program is not None,
-            "programSourcePath": state.program_source_path,
-            "programSessionGeneration": state.program_session_generation,
-            "programTreeHash": state.program_tree_hash,
-            "program": state.program.to_dict() if state.program is not None else None,
-        }
+        return _program_snapshot_payload(state)
 
     if tool_id == "program_validate":
         issues: list[dict[str, str]] = []
-        if state.program is None:
+        snapshot = _program_snapshot_payload(state)
+        program_data = snapshot["program"]
+        if program_data is None:
             issues.append({"path": "program", "message": "No program loaded"})
         else:
             try:
                 candidate = Program.from_dict(
-                    state.program.to_dict(),
+                    program_data,
                     state.catalog,
-                    path=state.program_source_path or "<memory>",
+                    path=snapshot["programSourcePath"] or "<memory>",
                     skill_catalog=state.skill_catalog,
                     deployment_capability_keys=_deployment_capability_keys(state),
                 )
@@ -1794,18 +1822,10 @@ async def _execute_bridge_read_only_tool(
         return augment_pose_orientation_rpy_deg(build_scene_state_payload(state))
 
     if tool_id == "inspect_isaac_scene":
-        request = AssistantInspectIsaacSceneRequest.model_validate(arguments or {})
-        try:
-            report = await run_in_threadpool(inspect_isaac_scene_report, request)
-        except AssistantToolError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        except TimeoutError as exc:
-            raise HTTPException(status_code=504, detail=str(exc)) from exc
-        return {
-            "report": report,
-            "summary": report.get("summary", {}) if isinstance(report, dict) else {},
-            "warnings": report.get("warnings", []) if isinstance(report, dict) else [],
-        }
+        raise HTTPException(
+            status_code=500,
+            detail="inspect_isaac_scene must be executed by the async bridge wrapper",
+        )
 
     raise HTTPException(
         status_code=404,
@@ -2254,7 +2274,8 @@ async def _execute_bridge_tool(
             arguments=arguments,
         )
     if effect == COMPOSER_DRAFT_MUTATING_EFFECT:
-        return _execute_bridge_composer_draft_tool(
+        return await run_in_threadpool(
+            _execute_bridge_composer_draft_tool,
             state,
             tool_id=tool_id,
             arguments=arguments,
@@ -2268,6 +2289,24 @@ async def _execute_bridge_tool(
 
 
 def _execute_bridge_composer_draft_tool(
+    state: ComposerState,
+    *,
+    tool_id: str,
+    arguments: dict[str, Any],
+    assistant_mode: str | None = None,
+    node_allowlist: set[str] | None = None,
+) -> dict[str, Any]:
+    with state._program_edit_lock:
+        return _execute_bridge_composer_draft_tool_locked(
+            state,
+            tool_id=tool_id,
+            arguments=arguments,
+            assistant_mode=assistant_mode,
+            node_allowlist=node_allowlist,
+        )
+
+
+def _execute_bridge_composer_draft_tool_locked(
     state: ComposerState,
     *,
     tool_id: str,
@@ -2789,7 +2828,9 @@ def _draft_object_orientation_xyzw(state: ComposerState, object_id: Any) -> list
     if not isinstance(object_id, str) or not object_id.strip() or state.program is None:
         return None
     try:
-        scene = state.program.to_dict().get("scene") or []
+        with state._program_edit_lock:
+            scene = state.program.to_dict().get("scene") if state.program is not None else []
+        scene = scene or []
     except Exception:  # pragma: no cover - defensive against draft shape drift
         return None
     target = object_id.strip()
@@ -4870,14 +4911,9 @@ def _assistant_provider_context(
         # schema descriptions for those tools have been updated to
         # spell that out.
         _program_snapshot: dict[str, Any] | None = None
-        if state.program is not None:
-            _program_snapshot = {
-                "programLoaded": True,
-                "programSourcePath": state.program_source_path,
-                "programSessionGeneration": state.program_session_generation,
-                "programTreeHash": state.program_tree_hash,
-                "program": state.program.to_dict(),
-            }
+        snapshot_payload = _program_snapshot_payload(state)
+        if snapshot_payload["program"] is not None:
+            _program_snapshot = snapshot_payload
         _scene_snapshot: dict[str, Any] | None = None
         try:
             _scene_snapshot = augment_pose_orientation_rpy_deg(
@@ -5087,14 +5123,15 @@ def _materialize_scene_resource_add(
     state: ComposerState,
     proposal: dict[str, Any],
 ) -> dict[str, Any]:
-    if state.program is None:
+    snapshot = _program_snapshot_payload(state)
+    if snapshot["program"] is None:
         raise HTTPException(status_code=404, detail="No program loaded")
     payload = proposal.get("payload")
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="scene_resource_add payload must be an object")
     resource = ProgramSceneResourceResponse.model_validate(payload.get("sceneResource"))
 
-    program_data = state.program.to_dict()
+    program_data = snapshot["program"]
     scene = list(program_data.get("scene") or [])
     if any(item.get("object_id") == resource.object_id for item in scene):
         raise HTTPException(
@@ -5108,7 +5145,7 @@ def _materialize_scene_resource_add(
         candidate = Program.from_dict(
             program_data,
             state.catalog,
-            path=state.program_source_path or "<memory>",
+            path=snapshot["programSourcePath"] or "<memory>",
             skill_catalog=state.skill_catalog,
             deployment_capability_keys=_deployment_capability_keys(state),
         )

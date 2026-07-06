@@ -1,10 +1,12 @@
 """Tests for Composer assistant routes."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -486,6 +488,70 @@ def test_assistant_bridge_field_policy_rejects_disallowed_orientation_field(
     assert violations == [
         {"path": "$.pose.rotate_local_rpy_deg", "field": "rotate_local_rpy_deg"}
     ]
+
+
+def test_assistant_bridge_read_only_dispatch_offloads_sync_body(
+    monkeypatch: pytest.MonkeyPatch,
+    state: ComposerState,
+) -> None:
+    seen: dict[str, int] = {}
+
+    def fake_sync_tool(*_args, **_kwargs):
+        seen["worker_thread"] = threading.get_ident()
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        routes_assistant,
+        "_execute_bridge_read_only_tool_sync",
+        fake_sync_tool,
+    )
+
+    async def run_tool() -> int:
+        loop_thread = threading.get_ident()
+        result = await routes_assistant._execute_bridge_tool(
+            state,
+            tool_id="program_read",
+            effect=routes_assistant.READ_ONLY_EFFECT,
+            arguments={},
+        )
+        assert result == {"ok": True}
+        return loop_thread
+
+    loop_thread = asyncio.run(run_tool())
+
+    assert seen["worker_thread"] != loop_thread
+
+
+def test_assistant_bridge_draft_dispatch_offloads_sync_body(
+    monkeypatch: pytest.MonkeyPatch,
+    state: ComposerState,
+) -> None:
+    seen: dict[str, int] = {}
+
+    def fake_draft_tool(*_args, **_kwargs):
+        seen["worker_thread"] = threading.get_ident()
+        return {"mutated": True}
+
+    monkeypatch.setattr(
+        routes_assistant,
+        "_execute_bridge_composer_draft_tool",
+        fake_draft_tool,
+    )
+
+    async def run_tool() -> int:
+        loop_thread = threading.get_ident()
+        result = await routes_assistant._execute_bridge_tool(
+            state,
+            tool_id="scene_draft_add_object",
+            effect=routes_assistant.COMPOSER_DRAFT_MUTATING_EFFECT,
+            arguments={},
+        )
+        assert result == {"mutated": True}
+        return loop_thread
+
+    loop_thread = asyncio.run(run_tool())
+
+    assert seen["worker_thread"] != loop_thread
 
 
 def test_assistant_bridge_read_only_callback_returns_program_state(
@@ -1078,6 +1144,66 @@ def test_assistant_bridge_composer_draft_callback_upserts_scene_resources(
     scene_by_id = {resource.object_id: resource for resource in state.program.scene}
     assert scene_by_id["sim_soup_can"].shape["type"] == "sphere"
     assert scene_by_id["sim_marker"].shape["box_dimensions_m"] == [0.03, 0.04, 0.05]
+
+
+def test_assistant_bridge_draft_program_edits_are_serialized(
+    state: ComposerState,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    before_generation = state.program_session_generation
+    original_apply_models = state.apply_models
+    apply_barrier = threading.Barrier(2)
+
+    def delayed_apply_models(*args, **kwargs):
+        try:
+            apply_barrier.wait(timeout=0.05)
+        except threading.BrokenBarrierError:
+            pass
+        return original_apply_models(*args, **kwargs)
+
+    monkeypatch.setattr(state, "apply_models", delayed_apply_models)
+
+    def resource(object_id: str, x: float) -> dict[str, object]:
+        return {
+            "objectId": object_id,
+            "shape": {"type": "box", "box_dimensions_m": [0.03, 0.04, 0.05]},
+            "pose": {
+                "frame_id": "universe",
+                "position_m": [x, 0.0, 0.025],
+                "orientation_rpy_deg": [0.0, 0.0, 0.0],
+            },
+        }
+
+    errors: list[BaseException] = []
+
+    def run_tool(object_id: str, x: float) -> None:
+        try:
+            routes_assistant._execute_bridge_composer_draft_tool(
+                state,
+                tool_id="scene_draft_upsert_objects",
+                arguments={"sceneResources": [resource(object_id, x)]},
+            )
+        except BaseException as exc:  # pragma: no cover - test aid
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=run_tool, args=("race_box_a", 0.1)),
+        threading.Thread(target=run_tool, args=("race_box_b", 0.2)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert not errors
+    assert state.program is not None
+    scene_ids = {resource.object_id for resource in state.program.scene}
+    assert {"race_box_a", "race_box_b"} <= scene_ids
+    assert state.program_session_generation == before_generation + 2
 
 
 def test_assistant_bridge_composer_draft_callback_rejects_duplicate_upsert_ids(

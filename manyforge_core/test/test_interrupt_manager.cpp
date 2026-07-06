@@ -134,6 +134,50 @@ TEST(InterruptManager, StaleSignalCannotTriggerLatch) {
   EXPECT_TRUE(has_event(result, "interrupt_signal_rejected_stale"));
 }
 
+TEST(InterruptManager, InactiveAcceptedSignalDoesNotEmitIngestedEvent) {
+  InterruptManager manager;
+  ASSERT_TRUE(manager.register_source(source("heartbeat")).ok());
+  ASSERT_TRUE(manager.register_policy(policy("heartbeat_policy", "heartbeat")).ok());
+
+  auto result = manager.ingest(update("heartbeat", 1, false),
+                               InterruptSourceClass::kFastExecutionRelevant,
+                               validation_context(),
+                               2'000);
+
+  EXPECT_TRUE(result.accepted);
+  EXPECT_FALSE(result.latched);
+  EXPECT_TRUE(result.events.empty());
+  EXPECT_FALSE(manager.active_latch().has_value());
+}
+
+TEST(InterruptManager, ActiveLatchCollisionWorldRevisionCanBeStamped) {
+  InterruptManager manager;
+  ASSERT_TRUE(manager.register_source(source("revision_source")).ok());
+  ASSERT_TRUE(manager.register_policy(
+                  policy("revision_policy", "revision_source"))
+                  .ok());
+
+  auto result = manager.ingest(update("revision_source"),
+                               InterruptSourceClass::kFastExecutionRelevant,
+                               validation_context(),
+                               2'000);
+  ASSERT_TRUE(result.latched);
+  ASSERT_TRUE(result.active_latch.has_value());
+  EXPECT_FALSE(result.active_latch->borrowed_collision_world_revision.has_value());
+
+  CollisionWorldRevision revision;
+  revision.revision_id = 42;
+  revision.content_hash = "world-hash";
+  EXPECT_TRUE(manager.stamp_active_latch_collision_world_revision(
+      result.active_latch->latch_id, revision));
+  auto latch = manager.active_latch();
+  ASSERT_TRUE(latch.has_value());
+  ASSERT_TRUE(latch->borrowed_collision_world_revision.has_value());
+  EXPECT_EQ(latch->borrowed_collision_world_revision->revision_id, 42u);
+  EXPECT_EQ(latch->borrowed_collision_world_revision->content_hash,
+            "world-hash");
+}
+
 TEST(InterruptManager, SameWindowEqualPriorityUsesLexicographicTieBreak) {
   InterruptManager manager;
   ASSERT_TRUE(manager.register_source(source("z_source", 100)).ok());
@@ -428,6 +472,201 @@ TEST(InterruptManager, EdgeDebounceRejectsSecondLatch) {
   EXPECT_EQ(result.reason, "debounced");
 }
 
+TEST(InterruptManager, HoldDispositionKeepsLatchActive) {
+  InterruptManager manager;
+  ASSERT_TRUE(manager.register_source(source("fault")).ok());
+  ASSERT_TRUE(manager.register_policy(policy("fault_policy", "fault")).ok());
+
+  auto latched = manager.ingest(update("fault"),
+                                InterruptSourceClass::kFastExecutionRelevant,
+                                validation_context(),
+                                2'000);
+  ASSERT_TRUE(latched.latched);
+
+  InterruptDisposition hold;
+  hold.latch_id = latched.active_latch->latch_id;
+  hold.action = InterruptDispositionAction::kHold;
+  hold.principal_id = "operator";
+  auto result = manager.apply_disposition(hold, 3'000);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_TRUE(result.value().accepted);
+  ASSERT_TRUE(manager.active_latch().has_value());
+  EXPECT_EQ(manager.active_latch()->latch_id, latched.active_latch->latch_id);
+  EXPECT_FALSE(has_event(result.value(), "interrupt_cleared"));
+}
+
+TEST(InterruptManager, QueuedReplayPrefersHigherPriorityOverOlderCandidate) {
+  InterruptManager manager;
+  ASSERT_TRUE(manager.register_source(source("active", 500)).ok());
+  ASSERT_TRUE(manager.register_source(source("queued_low", 10)).ok());
+  ASSERT_TRUE(manager.register_source(source("queued_mid", 20)).ok());
+  ASSERT_TRUE(manager.register_policy(policy("active_policy", "active", 500)).ok());
+  ASSERT_TRUE(manager.register_policy(policy("low_policy", "queued_low", 10)).ok());
+  ASSERT_TRUE(manager.register_policy(policy("mid_policy", "queued_mid", 20)).ok());
+
+  auto active = manager.ingest(update("active", 1),
+                               InterruptSourceClass::kFastExecutionRelevant,
+                               validation_context(),
+                               2'000);
+  ASSERT_TRUE(active.latched);
+  ASSERT_TRUE(manager.ingest(update("queued_low", 2),
+                             InterruptSourceClass::kFastExecutionRelevant,
+                             validation_context(),
+                             2'100)
+                  .queued);
+  ASSERT_TRUE(manager.ingest(update("queued_mid", 3),
+                             InterruptSourceClass::kFastExecutionRelevant,
+                             validation_context(),
+                             2'200)
+                  .queued);
+
+  InterruptDisposition ack;
+  ack.latch_id = active.active_latch->latch_id;
+  ack.action = InterruptDispositionAction::kAcknowledge;
+  ack.principal_id = "operator";
+  auto result = manager.apply_disposition(ack, 2'300);
+
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(result.value().latched);
+  ASSERT_TRUE(manager.active_latch().has_value());
+  EXPECT_EQ(manager.active_latch()->source_id, "queued_mid");
+}
+
+TEST(InterruptManager, QueuedReplayRevalidatesFreshnessAtClearTime) {
+  InterruptManager manager;
+  ASSERT_TRUE(manager.register_source(source("active", 500)).ok());
+  auto stale_source = source("queued", 10);
+  stale_source.freshness_budget_ns = 50;
+  ASSERT_TRUE(manager.register_source(stale_source).ok());
+  ASSERT_TRUE(manager.register_policy(policy("active_policy", "active", 500)).ok());
+  ASSERT_TRUE(manager.register_policy(policy("queued_policy", "queued", 10)).ok());
+
+  auto active = manager.ingest(update("active", 1),
+                               InterruptSourceClass::kFastExecutionRelevant,
+                               validation_context(),
+                               1'000);
+  ASSERT_TRUE(active.latched);
+  auto queued_update = update("queued", 2);
+  queued_update.timestamp_ns = 1'010;
+  ASSERT_TRUE(manager.ingest(queued_update,
+                             InterruptSourceClass::kFastExecutionRelevant,
+                             validation_context(),
+                             1'020)
+                  .queued);
+
+  InterruptDisposition ack;
+  ack.latch_id = active.active_latch->latch_id;
+  ack.action = InterruptDispositionAction::kAcknowledge;
+  ack.principal_id = "operator";
+  auto result = manager.apply_disposition(ack, 2'000);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_FALSE(result.value().latched);
+  EXPECT_FALSE(manager.active_latch().has_value());
+  bool saw_stale_drop = false;
+  for (const auto& event : result.value().events) {
+    if (event.type == "motion_interrupt_queued_update_dropped" &&
+        event.details.at("reason") == "stale") {
+      saw_stale_drop = true;
+    }
+  }
+  EXPECT_TRUE(saw_stale_drop);
+}
+
+TEST(InterruptManager, AutoClearReleaseUsesActiveLatchPolicyInHeldPhase) {
+  InterruptManager manager;
+  auto src = source("guard", 100);
+  src.kind = InterruptSourceKind::kLevel;
+  ASSERT_TRUE(manager.register_source(src).ok());
+  auto p = policy("guard_policy", "guard", 100);
+  p.affected_phases = {InterruptExecutionPhase::kValidation};
+  p.post_latch_disposition =
+      InterruptPostLatchDisposition::kAutoClearOnSignalRelease;
+  ASSERT_TRUE(manager.register_policy(p).ok());
+
+  auto latched = manager.ingest(update("guard", 1, true),
+                                InterruptSourceClass::kFastExecutionRelevant,
+                                validation_context(),
+                                2'000);
+  ASSERT_TRUE(latched.latched);
+
+  InterruptRuntimeContext held;
+  held.phase = InterruptExecutionPhase::kHeld;
+  held.execution_id = 42;
+  held.move_id = "move";
+  auto release = manager.ingest(update("guard", 2, false),
+                                InterruptSourceClass::kFastExecutionRelevant,
+                                held,
+                                3'000);
+
+  EXPECT_TRUE(release.accepted);
+  EXPECT_FALSE(manager.active_latch().has_value());
+  EXPECT_TRUE(has_event(release, "interrupt_cleared"));
+}
+
+TEST(InterruptManager, FaultKindLatchesEvenWhenSignalValueIsInactive) {
+  InterruptManager manager;
+  ASSERT_TRUE(manager.register_source(source("adapter")).ok());
+  ASSERT_TRUE(manager.register_policy(policy("adapter_policy", "adapter")).ok());
+
+  auto sig = update("adapter", 1, false);
+  sig.fault_kind = InterruptFaultKind::kDisconnected;
+  auto result = manager.ingest(sig,
+                               InterruptSourceClass::kFastExecutionRelevant,
+                               validation_context(),
+                               2'000);
+
+  ASSERT_TRUE(result.latched);
+  ASSERT_TRUE(result.active_latch.has_value());
+  EXPECT_EQ(result.active_latch->signal_snapshot.fault_kind,
+            InterruptFaultKind::kDisconnected);
+}
+
+TEST(InterruptManager, StaleSourceSweepLatchesSyntheticFault) {
+  InterruptManager manager;
+  auto src = source("watchdog");
+  src.freshness_budget_ns = 50;
+  ASSERT_TRUE(manager.register_source(src).ok());
+  ASSERT_TRUE(manager.register_policy(policy("watchdog_policy", "watchdog")).ok());
+
+  auto baseline = update("watchdog", 1, false);
+  baseline.timestamp_ns = 1'000;
+  ASSERT_FALSE(manager.ingest(baseline,
+                              InterruptSourceClass::kFastExecutionRelevant,
+                              validation_context(),
+                              1'010)
+                   .latched);
+
+  auto swept = manager.sweep_stale_sources(
+      InterruptSourceClass::kFastExecutionRelevant,
+      validation_context(),
+      1'100);
+
+  ASSERT_TRUE(swept.latched);
+  ASSERT_TRUE(swept.active_latch.has_value());
+  EXPECT_EQ(swept.active_latch->source_id, "watchdog");
+  EXPECT_EQ(swept.active_latch->signal_snapshot.fault_kind,
+            InterruptFaultKind::kStale);
+}
+
+TEST(InterruptManager, FutureTimestampIsRejectedAsClockDomainMismatch) {
+  InterruptManager manager;
+  ASSERT_TRUE(manager.register_source(source("clocked")).ok());
+  ASSERT_TRUE(manager.register_policy(policy("clocked_policy", "clocked")).ok());
+
+  auto sig = update("clocked", 1, true);
+  sig.timestamp_ns = 10'000;
+  auto result = manager.ingest(sig,
+                               InterruptSourceClass::kFastExecutionRelevant,
+                               validation_context(),
+                               2'000);
+
+  EXPECT_TRUE(result.rejected);
+  EXPECT_EQ(result.reason, "clock_domain_mismatch");
+  EXPECT_FALSE(manager.active_latch().has_value());
+}
+
 // ---------- Motion-scoped policy + manager semantics ----------
 
 InterruptPolicyDefinition trip_policy(
@@ -718,6 +957,77 @@ TEST(InterruptManagerMotionScopedTest,
   ASSERT_TRUE(manager.active_latch().has_value());
   EXPECT_EQ(manager.active_latch()->motion_interrupt_scope_id.value_or(""),
             "probe_scope_a");
+}
+
+TEST(InterruptManagerMotionScopedTest,
+     RequireInactiveAtArmRequiresNewerActiveSequenceAfterArm) {
+  InterruptManager manager;
+  ASSERT_TRUE(manager.register_source(source("probe")).ok());
+  ASSERT_TRUE(manager.register_policy(trip_policy("probe_trip", "probe")).ok());
+
+  ASSERT_FALSE(manager
+                   .ingest(probe_baseline("probe", 5, 1'000, false),
+                           InterruptSourceClass::kFastExecutionRelevant,
+                           executing_context(),
+                           1'010)
+                   .latched);
+
+  MotionInterruptScopeDTO scope;
+  scope.scope_id = "probe_scope_a";
+  scope.policy_id = "probe_trip";
+  scope.stop_profile = trip_stop_profile();
+  scope.activation_mode = MotionInterruptActivationMode::kRequireInactiveAtArm;
+  ASSERT_TRUE(
+      manager.arm_motion_interrupt_scopes(100, "probe_move", {scope}, 1'020)
+          .ok());
+
+  auto replayed_active = manager.ingest(
+      probe_baseline("probe", 5, 1'030, true),
+      InterruptSourceClass::kFastExecutionRelevant,
+      executing_context(),
+      1'040);
+  EXPECT_FALSE(replayed_active.latched);
+  EXPECT_FALSE(manager.active_latch().has_value());
+
+  auto newer_active = manager.ingest(
+      probe_baseline("probe", 6, 1'050, true),
+      InterruptSourceClass::kFastExecutionRelevant,
+      executing_context(),
+      1'060);
+  EXPECT_TRUE(newer_active.latched);
+}
+
+TEST(InterruptManagerMotionScopedTest,
+     TripIfAlreadyActiveLatchesAtArmTime) {
+  InterruptManager manager;
+  ASSERT_TRUE(manager.register_source(source("probe")).ok());
+  ASSERT_TRUE(manager
+                  .register_policy(trip_policy(
+                      "probe_trip", "probe", /*priority=*/700,
+                      {MotionInterruptActivationMode::kTripIfAlreadyActive}))
+                  .ok());
+
+  ASSERT_FALSE(manager
+                   .ingest(probe_baseline("probe", 7, 1'000, true),
+                           InterruptSourceClass::kFastExecutionRelevant,
+                           executing_context(),
+                           1'010)
+                   .latched);
+
+  MotionInterruptScopeDTO scope;
+  scope.scope_id = "probe_scope_a";
+  scope.policy_id = "probe_trip";
+  scope.stop_profile = trip_stop_profile();
+  scope.activation_mode = MotionInterruptActivationMode::kTripIfAlreadyActive;
+  auto arm = manager.arm_motion_interrupt_scopes(100, "probe_move", {scope}, 1'020);
+
+  ASSERT_TRUE(arm.ok());
+  EXPECT_TRUE(arm.value().latched);
+  ASSERT_TRUE(manager.active_latch().has_value());
+  EXPECT_EQ(manager.active_latch()->motion_interrupt_scope_id.value_or(""),
+            "probe_scope_a");
+  EXPECT_EQ(manager.active_latch()->preemption_action_requested,
+            InterruptPreemptionAction::kCompleteMoveOnSignal);
 }
 
 TEST(InterruptManagerMotionScopedTest,

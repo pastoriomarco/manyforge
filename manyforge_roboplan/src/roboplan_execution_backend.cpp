@@ -210,7 +210,8 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
       0.0, std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    state_.active_trajectory = trajectory;
+    state_.active_trajectory =
+        std::make_shared<const core::TrajectoryDTO>(trajectory);
     state_.active_trajectory_time_s = trajectory_time_s;
     state_.active_runtime_velocity_scale = applied_runtime_scale;
   }
@@ -339,7 +340,8 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
                                                  std::memory_order_release);
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    state_.active_trajectory = trajectory;
+    state_.active_trajectory =
+        std::make_shared<const core::TrajectoryDTO>(trajectory);
     state_.active_trajectory_time_s = 0.0;
     state_.active_runtime_velocity_scale = std::max(
         0.0, std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
@@ -381,9 +383,21 @@ core::StopResultDTO RoboPlanExecutionBackend::stop() {
   state_.pause_requested.store(false);
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
+  request_active_controlled_stop();
   worker_thread_.request_stop();
   execution_cv_.notify_all();
   return core::StopResultDTO{true, std::nullopt};
+}
+
+void RoboPlanExecutionBackend::request_active_controlled_stop() {
+  std::shared_ptr<std::stop_source> source;
+  {
+    std::lock_guard<std::mutex> lock(controlled_stop_mutex_);
+    source = active_controlled_stop_source_;
+  }
+  if (source) {
+    source->request_stop();
+  }
 }
 
 // Controlled-stop capability + result surface.
@@ -442,6 +456,22 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   // silently producing a hold for a path-preserving request.
   core::ControlledStopResultDTO result;
   result.executed_stop_mode = profile.stop_mode;
+  auto backend_stop_source = std::make_shared<std::stop_source>();
+  {
+    std::lock_guard<std::mutex> lock(controlled_stop_mutex_);
+    active_controlled_stop_source_ = backend_stop_source;
+  }
+  const auto clear_active_controlled_stop =
+      std::shared_ptr<void>(nullptr, [this, backend_stop_source](void*) {
+        std::lock_guard<std::mutex> lock(controlled_stop_mutex_);
+        if (active_controlled_stop_source_ == backend_stop_source) {
+          active_controlled_stop_source_.reset();
+        }
+      });
+  const auto controlled_stop_requested = [&]() {
+    return stop_token.stop_requested() ||
+           backend_stop_source->stop_requested();
+  };
 
   const auto cancelled_result = [&](std::string phase) {
     state_.running.store(false);
@@ -466,24 +496,22 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   });
 
   if (profile.stop_mode == core::MotionInterruptStopMode::kSoftOnPath) {
-    if (stop_token.stop_requested()) {
+    if (controlled_stop_requested()) {
       return cancelled_result("soft_on_path_entry");
     }
-    core::TrajectoryDTO active_trajectory;
+    std::shared_ptr<const core::TrajectoryDTO> active_trajectory;
     core::ExecutionSnapshot active_snapshot;
     double active_time_s = 0.0;
     double active_runtime_scale = 1.0;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       active_snapshot = state_.snapshot;
-      if (state_.active_trajectory.has_value()) {
-        active_trajectory = *state_.active_trajectory;
-      }
+      active_trajectory = state_.active_trajectory;
       active_time_s = state_.active_trajectory_time_s;
       active_runtime_scale = state_.active_runtime_velocity_scale;
     }
 
-    if (active_trajectory.waypoints.empty() ||
+    if (!active_trajectory || active_trajectory->waypoints.empty() ||
         active_snapshot.joint_positions_rad.empty()) {
       result.accepted = false;
       result.backend_stop_confirmed = false;
@@ -496,7 +524,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     }
 
     core::SoftOnPathInitialStateDTO initial;
-    initial.state.joint_names = active_trajectory.joint_names;
+    initial.state.joint_names = active_trajectory->joint_names;
     initial.state.positions_rad = active_snapshot.joint_positions_rad;
     initial.trajectory_time_from_start_s = active_time_s;
     initial.position_source = core::SoftOnPathStateSource::kMeasuredFeedback;
@@ -517,7 +545,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
         config_.soft_on_path_max_jerk_rad_s3;
 
     auto planned = core::plan_soft_on_path_stop(
-        active_trajectory, profile, initial, planner_config);
+        *active_trajectory, profile, initial, planner_config);
     if (!planned.ok()) {
       if (profile.allow_natural_completion_on_short_path &&
           core::soft_on_path_error_recommends_natural_completion(
@@ -543,7 +571,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
         bool completed = false;
         {
           std::unique_lock<std::mutex> lock(execution_mutex_);
-          while (!stop_token.stop_requested()) {
+          while (!controlled_stop_requested()) {
             completed = !state_.running.load();
             if (completed) {
               break;
@@ -555,7 +583,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
             }
           }
         }
-        if (stop_token.stop_requested()) {
+        if (controlled_stop_requested()) {
           return cancelled_result("soft_on_path_natural_completion_wait");
         }
         const auto call_end_ns = clock_.now();
@@ -654,7 +682,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
                                         profile,
                                         config_.soft_on_path_sample_period_s)));
       bool stopped = false;
-      while (!stop_token.stop_requested()) {
+      while (!controlled_stop_requested()) {
         stopped = !state_.running.load();
         if (stopped) {
           break;
@@ -665,7 +693,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
           break;
         }
       }
-      if (stop_token.stop_requested()) {
+      if (controlled_stop_requested()) {
         return cancelled_result("soft_on_path_worker_stop_wait");
       }
       if (!stopped) {
@@ -692,7 +720,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
       const auto wake_time =
           steady_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                              std::chrono::duration<double>(waypoint.time_from_start_s));
-      while (!stop_token.stop_requested() &&
+      while (!controlled_stop_requested() &&
              std::chrono::steady_clock::now() < wake_time) {
         const auto remaining = wake_time - std::chrono::steady_clock::now();
         const auto max_slice =
@@ -700,7 +728,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
                 kExecutionTick);
         std::this_thread::sleep_for(std::min(remaining, max_slice));
       }
-      if (stop_token.stop_requested()) {
+      if (controlled_stop_requested()) {
         return cancelled_result("soft_on_path_replay");
       }
       const double progress =
@@ -728,7 +756,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
       std::lock_guard<std::mutex> velocity_lock(state_mutex_);
       state_.snapshot.joint_velocities_rad_s = final_wp.velocities_rad_s;
     }
-    update_scene_positions(final_wp.positions_rad, SceneUpdateMode::kBlocking,
+    update_scene_positions(final_wp.positions_rad, SceneUpdateMode::kBestEffort,
                            stopped_snapshot_ns);
     state_.running.store(false);
     state_.natural_completion_stop_requested.store(false,
@@ -777,16 +805,14 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     return result;
   }
 
-  core::TrajectoryDTO active_trajectory;
+  std::shared_ptr<const core::TrajectoryDTO> active_trajectory;
   core::ExecutionSnapshot active_snapshot;
   double active_time_s = 0.0;
   double active_runtime_scale = 1.0;
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     active_snapshot = state_.snapshot;
-    if (state_.active_trajectory.has_value()) {
-      active_trajectory = *state_.active_trajectory;
-    }
+    active_trajectory = state_.active_trajectory;
     active_time_s = state_.active_trajectory_time_s;
     active_runtime_scale = state_.active_runtime_velocity_scale;
   }
@@ -819,7 +845,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     return result;
   }
 
-  if (active_trajectory.waypoints.empty() ||
+  if (!active_trajectory || active_trajectory->waypoints.empty() ||
       active_snapshot.joint_positions_rad.empty()) {
     result.accepted = false;
     result.backend_stop_confirmed = false;
@@ -832,7 +858,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   }
 
   core::SoftOnPathInitialStateDTO initial;
-  initial.state.joint_names = active_trajectory.joint_names;
+  initial.state.joint_names = active_trajectory->joint_names;
   initial.state.positions_rad = active_snapshot.joint_positions_rad;
   initial.trajectory_time_from_start_s = active_time_s;
   initial.position_source = core::SoftOnPathStateSource::kMeasuredFeedback;
@@ -856,7 +882,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   spring_profile.deceleration_time_s =
       core::motion_interrupt_deceleration_time_or_default(profile);
   auto planned = core::plan_spring_back_on_path_stop(
-      active_trajectory, spring_profile, initial, planner_config);
+      *active_trajectory, spring_profile, initial, planner_config);
   if (!planned.ok()) {
     result.accepted = false;
     result.backend_stop_confirmed = false;
@@ -865,7 +891,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   }
 
   const auto call_start_ns = clock_.now();
-  if (stop_token.stop_requested()) {
+  if (controlled_stop_requested()) {
     return cancelled_result("spring_back_entry");
   }
   // Request the regular worker to stop, then replay the spring-back replacement
@@ -886,7 +912,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
                             std::chrono::steady_clock::duration>(
                             std::chrono::duration<double>(wait_deadline_s));
   bool stopped = false;
-  while (!stop_token.stop_requested()) {
+  while (!controlled_stop_requested()) {
     stopped = !state_.running.load();
     if (stopped) {
       break;
@@ -898,7 +924,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     }
   }
   lock.unlock();
-  if (stop_token.stop_requested()) {
+  if (controlled_stop_requested()) {
     return cancelled_result("spring_back_wait");
   }
 
@@ -931,7 +957,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
         steady_start +
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(waypoint.time_from_start_s));
-    while (!stop_token.stop_requested() &&
+    while (!controlled_stop_requested() &&
            std::chrono::steady_clock::now() < wake_time) {
       const auto remaining = wake_time - std::chrono::steady_clock::now();
       const auto max_slice =
@@ -939,7 +965,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
               kExecutionTick);
       std::this_thread::sleep_for(std::min(remaining, max_slice));
     }
-    if (stop_token.stop_requested()) {
+    if (controlled_stop_requested()) {
       return cancelled_result("spring_back_replay");
     }
     const double progress =
@@ -968,7 +994,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     std::lock_guard<std::mutex> velocity_lock(state_mutex_);
     state_.snapshot.joint_velocities_rad_s = final_wp.velocities_rad_s;
   }
-  update_scene_positions(final_wp.positions_rad, SceneUpdateMode::kBlocking,
+  update_scene_positions(final_wp.positions_rad, SceneUpdateMode::kBestEffort,
                          stopped_snapshot_ns);
   state_.running.store(false);
   state_.natural_completion_stop_requested.store(false,
@@ -1024,6 +1050,7 @@ core::ExecutionHandle RoboPlanExecutionBackend::resume(
     state_.pause_requested.store(false);
     state_.natural_completion_stop_requested.store(false,
                                                    std::memory_order_release);
+    request_active_controlled_stop();
     if (worker_thread_.joinable()) {
       worker_thread_.request_stop();
     }
@@ -1041,6 +1068,7 @@ core::ResetResultDTO RoboPlanExecutionBackend::reset() {
   state_.pause_requested.store(false);
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
+  request_active_controlled_stop();
   if (worker_thread_.joinable()) {
     worker_thread_.request_stop();
   }

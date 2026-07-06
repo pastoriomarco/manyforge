@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -75,7 +76,10 @@ class TrajectoryCache {
 
  private:
   struct Entry {
-    TrajectoryDTO trajectory;
+    /// Immutable shared trajectory: lookups grab the pointer under the
+    /// mutex and copy the payload after releasing it, so the lock hold
+    /// time is O(1) instead of O(waypoints).
+    std::shared_ptr<const TrajectoryDTO> trajectory;
     /// Revision the trajectory was validated against.
     CollisionWorldRevision revision;
   };

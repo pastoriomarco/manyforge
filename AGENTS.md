@@ -264,13 +264,23 @@ When making changes here, check the boundary you're touching:
 3. **Sibling-repo paths use env-var defaults**: `MANYFORGE_ROOT`,
    `NEMOCLAW_THOR`, `MANYFORGE_SPECS_ROOT`. Never hard-code another
    user's home directory.
-4. **The C++ core builds inside the dev container.** Don't try to
-   build it on the host; the entrypoint handles paths and pybind11.
-5. **Tests fall into deterministic + assistant lanes.** Run
-   `./scripts/test-all.sh` for the deterministic suite. The assistant
-   bridge has its own pytest suite under
-   `manyforge_assistant_bridge/tests/`.
-6. **Schema changes are wire-breaking.** If you touch
+4. **Builds and tests run in containers, not on the host.** Host
+   `cmake`, `pytest`, `npm`, or ROS setup is inspection-only and does
+   not count as qualification evidence. Use `docker compose run --rm dev`
+   for ROS-free core/RoboPlan/pybind11/Python/Composer checks; use
+   `docker compose --profile ros run --rm ros-jazzy ...` for minimal ROS
+   adapter checks; use `docker compose --profile ros-full run --rm
+   ros-jazzy-full ...` or the launcher `isaac-sim` lane for full
+   ROS/Isaac/ros2_control checks.
+5. **Launcher lane matters.** `manyforge-only` / native
+   `manyforge-e2e-composer` containers are ROS-free. They are valid for
+   deterministic native tests only. ROS packages require the
+   `isaac-sim` lane or the `ros-full` compose profile.
+6. **Tests fall into deterministic + assistant lanes.** Run
+   `./scripts/test-all.sh` inside the `dev` container for the
+   deterministic suite. The assistant bridge has its own pytest suite
+   under `manyforge_assistant_bridge/tests/`.
+7. **Schema changes are wire-breaking.** If you touch
    `manyforge_assistant_bridge/protocol.py` (the catalog-hash function
    or any shared envelope helper), every running deployment will
    recompute hashes — treat as a wire-version bump.

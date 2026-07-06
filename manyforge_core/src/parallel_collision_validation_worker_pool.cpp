@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
-#include <future>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <manyforge_core/types/reason_codes.hpp>
@@ -89,6 +92,14 @@ CollisionValidationDecisionBundle exception_bundle(
 
 }  // namespace
 
+struct ParallelCollisionValidationWorkerPool::WorkerSlot {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool stop = false;
+  std::function<void()> job;
+  std::thread thread;
+};
+
 ParallelCollisionValidationWorkerPool::ParallelCollisionValidationWorkerPool(
     Config config)
     : config_(std::move(config)) {
@@ -97,6 +108,82 @@ ParallelCollisionValidationWorkerPool::ParallelCollisionValidationWorkerPool(
       std::max(1, config_.min_waypoints_for_parallel);
   if (config_.fallback_log_window < std::chrono::nanoseconds::zero()) {
     config_.fallback_log_window = std::chrono::nanoseconds::zero();
+  }
+}
+
+ParallelCollisionValidationWorkerPool::~ParallelCollisionValidationWorkerPool() {
+  stop_worker_threads();
+}
+
+void ParallelCollisionValidationWorkerPool::ensure_worker_threads(int count) {
+  if (count <= 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(worker_slots_mutex_);
+  while (static_cast<int>(worker_slots_.size()) < count) {
+    auto slot = std::make_unique<WorkerSlot>();
+    WorkerSlot* slot_ptr = slot.get();
+    slot->thread =
+        std::thread([this, slot_ptr]() { worker_loop(*slot_ptr); });
+    worker_slots_.push_back(std::move(slot));
+  }
+}
+
+void ParallelCollisionValidationWorkerPool::stop_worker_threads() {
+  std::vector<std::unique_ptr<WorkerSlot>> slots;
+  {
+    std::lock_guard<std::mutex> lock(worker_slots_mutex_);
+    slots.swap(worker_slots_);
+  }
+  for (auto& slot : slots) {
+    {
+      std::lock_guard<std::mutex> lock(slot->mutex);
+      slot->stop = true;
+      slot->job = nullptr;
+    }
+    slot->cv.notify_one();
+  }
+  for (auto& slot : slots) {
+    if (slot->thread.joinable()) {
+      slot->thread.join();
+    }
+  }
+}
+
+void ParallelCollisionValidationWorkerPool::worker_loop(WorkerSlot& slot) {
+  for (;;) {
+    std::function<void()> job;
+    {
+      std::unique_lock<std::mutex> lock(slot.mutex);
+      slot.cv.wait(lock, [&slot]() {
+        return slot.stop || static_cast<bool>(slot.job);
+      });
+      if (slot.stop && !slot.job) {
+        return;
+      }
+      job = std::move(slot.job);
+      slot.job = nullptr;
+    }
+    try {
+      if (job) {
+        job();
+      }
+    } catch (...) {
+      // Worker jobs catch engine/coordinator failures and encode them in their
+      // output bundle. This guard preserves the pool's liveness if a future
+      // bug lets an exception escape.
+    }
+    signal_job_complete();
+  }
+}
+
+void ParallelCollisionValidationWorkerPool::signal_job_complete() {
+  std::lock_guard<std::mutex> lock(completion_mutex_);
+  if (pending_jobs_ > 0) {
+    --pending_jobs_;
+  }
+  if (pending_jobs_ == 0) {
+    completion_cv_.notify_all();
   }
 }
 
@@ -121,12 +208,37 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
     const std::vector<ICollisionQueryEngine*>& worker_engines,
     const TrajectoryDTO& trajectory,
     const CollisionCancellationToken& cancel) {
+  return validate_trajectory(snapshot,
+                             worker_engines,
+                             trajectory,
+                             cancel,
+                             config_.pass_config);
+}
+
+CollisionValidationDecisionBundle
+ParallelCollisionValidationWorkerPool::validate_trajectory(
+    const CollisionWorldSnapshot& snapshot,
+    const std::vector<ICollisionQueryEngine*>& worker_engines,
+    const TrajectoryDTO& trajectory,
+    const CollisionCancellationToken& cancel,
+    CollisionValidationPassConfig pass_config) {
+  std::lock_guard<std::mutex> call_lock(validation_call_mutex_);
+
   std::vector<ICollisionQueryEngine*> available_engines;
   available_engines.reserve(worker_engines.size());
+  bool skipped_duplicate_single_context_engine = false;
   for (ICollisionQueryEngine* engine : worker_engines) {
-    if (engine != nullptr) {
-      available_engines.push_back(engine);
+    if (engine == nullptr) {
+      continue;
     }
+    if (engine->capability().thread_safety ==
+            CollisionEngineThreadSafetyClass::kSingleContextExclusive &&
+        std::find(available_engines.begin(), available_engines.end(),
+                  engine) != available_engines.end()) {
+      skipped_duplicate_single_context_engine = true;
+      continue;
+    }
+    available_engines.push_back(engine);
   }
 
   const auto previous_geometry_count = config_.collision_geometry_count;
@@ -137,11 +249,12 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
   } restore{config_, previous_geometry_count};
   config_.collision_geometry_count = snapshot.geometry_count;
 
+  const auto& effective_policy = pass_config.effective_policy_snapshot();
   const bool support_contact_present =
-      !config_.pass_config.policy_snapshot.support_contacts.empty();
+      !effective_policy.support_contacts.empty();
   const bool contact_grasp_present =
-      !config_.pass_config.contact_policy_id.empty() &&
-      !config_.pass_config.policy_snapshot.contact_grasps.empty();
+      !pass_config.contact_policy_id.empty() &&
+      !effective_policy.contact_grasps.empty();
   const int waypoint_count = static_cast<int>(trajectory.waypoints.size());
   const int worker_count_requested = config_.worker_count;
   const int worker_count_available = static_cast<int>(available_engines.size());
@@ -149,10 +262,10 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
   auto run_engine_serial_fallback =
       [&](ICollisionQueryEngine& engine, std::string fallback_reason)
       -> CollisionValidationDecisionBundle {
-    CollisionValidationCoordinator coord(config_.pass_config);
     const auto t0 = steady_now_ns();
     CollisionValidationDecisionBundle bundle;
     try {
+      CollisionValidationCoordinator coord(pass_config);
       bundle = coord.validate_trajectory(snapshot, engine, trajectory, cancel);
     } catch (const std::exception& e) {
       bundle = exception_bundle(
@@ -214,8 +327,11 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
       std::min(desired_workers, static_cast<int>(available_engines.size()));
 
   if (desired_workers <= 1) {
-    return run_engine_serial_fallback(*available_engines[0],
-                                      "worker_count_one");
+    return run_engine_serial_fallback(
+        *available_engines[0],
+        skipped_duplicate_single_context_engine
+            ? "single_context_duplicate_engine"
+            : "worker_count_one");
   }
   if (waypoint_count < config_.min_waypoints_for_parallel) {
     return run_engine_serial_fallback(*available_engines[0],
@@ -247,20 +363,25 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
     std::int64_t wall_ns = 0;
   };
 
-  auto run_worker = [this, &snapshot, &cancel](
+  auto run_worker = [&snapshot, &trajectory, &cancel, &pass_config](
                         int worker_index,
                         ICollisionQueryEngine* engine,
-                        TrajectoryDTO sub_traj,
-                        int range_begin) -> WorkerOut {
+                        int range_begin,
+                        int range_end) -> WorkerOut {
     WorkerOut out;
     out.worker_index = worker_index;
     out.range_begin = range_begin;
-    CollisionValidationPassConfig per_worker_cfg = config_.pass_config;
-    CollisionValidationCoordinator coord(per_worker_cfg);
     const auto t0 = steady_now_ns();
     try {
-      out.bundle =
-          coord.validate_trajectory(snapshot, *engine, sub_traj, cancel);
+      CollisionValidationPassConfig per_worker_cfg = pass_config;
+      CollisionValidationCoordinator coord(std::move(per_worker_cfg));
+      out.bundle = coord.validate_trajectory_range(
+          snapshot,
+          *engine,
+          trajectory,
+          static_cast<std::size_t>(range_begin),
+          static_cast<std::size_t>(range_end),
+          cancel);
     } catch (const std::exception& e) {
       out.bundle =
           exception_bundle(snapshot,
@@ -279,22 +400,32 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
   };
 
   const auto pool_t0 = steady_now_ns();
-  std::vector<std::future<WorkerOut>> futures;
-  futures.reserve(desired_workers);
-  for (int w = 0; w < desired_workers; ++w) {
-    TrajectoryDTO sub;
-    sub.joint_names = trajectory.joint_names;
-    sub.waypoints.assign(trajectory.waypoints.begin() + ranges[w].first,
-                         trajectory.waypoints.begin() + ranges[w].second);
-    futures.push_back(std::async(std::launch::async, run_worker, w,
-                                  available_engines[w], std::move(sub),
-                                  ranges[w].first));
+  std::vector<WorkerOut> outputs(static_cast<std::size_t>(desired_workers));
+  ensure_worker_threads(desired_workers);
+  {
+    std::lock_guard<std::mutex> lock(completion_mutex_);
+    pending_jobs_ = desired_workers;
   }
-
-  std::vector<WorkerOut> outputs;
-  outputs.reserve(desired_workers);
-  for (auto& f : futures) {
-    outputs.push_back(f.get());
+  {
+    std::lock_guard<std::mutex> slots_lock(worker_slots_mutex_);
+    for (int w = 0; w < desired_workers; ++w) {
+      auto& slot = *worker_slots_[static_cast<std::size_t>(w)];
+      const auto range_begin = ranges[static_cast<std::size_t>(w)].first;
+      const auto range_end = ranges[static_cast<std::size_t>(w)].second;
+      {
+        std::lock_guard<std::mutex> slot_lock(slot.mutex);
+        slot.job = [&, w, range_begin, range_end]() {
+          outputs[static_cast<std::size_t>(w)] =
+              run_worker(w, available_engines[static_cast<std::size_t>(w)],
+                         range_begin, range_end);
+        };
+      }
+      slot.cv.notify_one();
+    }
+  }
+  {
+    std::unique_lock<std::mutex> lock(completion_mutex_);
+    completion_cv_.wait(lock, [this]() { return pending_jobs_ == 0; });
   }
   const auto pool_t1 = steady_now_ns();
 
@@ -323,7 +454,22 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
   std::optional<std::int64_t> first_failing_time_ns;
   bool cancelled = false;
   std::optional<std::int64_t> cancelled_at_waypoint_index;
+  std::optional<std::int64_t> cancelled_at_time_ns;
   std::optional<std::string> cancellation_reason;
+
+  auto waypoint_time_ns =
+      [&trajectory](std::int64_t waypoint_index)
+      -> std::optional<std::int64_t> {
+    if (waypoint_index < 0 ||
+        static_cast<std::size_t>(waypoint_index) >=
+            trajectory.waypoints.size()) {
+      return std::nullopt;
+    }
+    return static_cast<std::int64_t>(
+        trajectory.waypoints[static_cast<std::size_t>(waypoint_index)]
+            .time_from_start_s *
+        1e9);
+  };
 
   std::sort(outputs.begin(), outputs.end(),
             [](const WorkerOut& a, const WorkerOut& b) {
@@ -340,6 +486,7 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
       if (!cancelled_at_waypoint_index ||
           candidate < *cancelled_at_waypoint_index) {
         cancelled_at_waypoint_index = candidate;
+        cancelled_at_time_ns = waypoint_time_ns(candidate);
         cancellation_reason = out.bundle.cancellation_reason;
       }
     }
@@ -364,25 +511,29 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
             out.bundle.decision.first_failing_waypoint
                 ? (*out.bundle.decision.first_failing_waypoint + out.range_begin)
                 : static_cast<std::int64_t>(out.range_begin);
-        if (out.bundle.decision.first_failing_time_ns) {
-          first_failing_time_ns = out.bundle.decision.first_failing_time_ns;
-        }
+        first_failing_time_ns =
+            out.bundle.decision.first_failing_time_ns
+                ? out.bundle.decision.first_failing_time_ns
+                : waypoint_time_ns(*first_failing_wp);
       }
     }
     for (auto& rec : out.bundle.waypoint_records) {
       rec.waypoint_index += out.range_begin;
-      merged.waypoint_records.push_back(rec);
-      if (rec.result.decision != CollisionDecisionResult::kPass &&
+      const auto rec_waypoint_index = rec.waypoint_index;
+      const auto rec_time_from_start_ns = rec.time_from_start_ns;
+      const auto rec_decision = rec.result.decision;
+      merged.waypoint_records.push_back(std::move(rec));
+      if (rec_decision != CollisionDecisionResult::kPass &&
           !first_failing_wp.has_value()) {
-        first_failing_wp = rec.waypoint_index;
-        first_failing_time_ns = rec.time_from_start_ns;
+        first_failing_wp = rec_waypoint_index;
+        first_failing_time_ns = rec_time_from_start_ns;
       }
-      const auto rec_sev = severity_for(rec.result.decision);
+      const auto rec_sev = severity_for(rec_decision);
       if (rec_sev > worst_sev ||
           (rec_sev == worst_sev &&
-           rec.result.decision != CollisionDecisionResult::kPass &&
+           rec_decision != CollisionDecisionResult::kPass &&
            worst == CollisionDecisionResult::kPass)) {
-        worst = rec.result.decision;
+        worst = rec_decision;
         worst_sev = rec_sev;
       }
     }
@@ -408,13 +559,23 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
   merged.decision.first_failing_waypoint = first_failing_wp;
   merged.decision.first_failing_time_ns = first_failing_time_ns;
   merged.decision.collision_world_revision = snapshot.revision;
+  if (!cancelled && cancel.is_cancel_requested()) {
+    cancelled = true;
+    const auto late_cancel_index =
+        trajectory.waypoints.empty()
+            ? std::int64_t{0}
+            : static_cast<std::int64_t>(trajectory.waypoints.size() - 1);
+    cancelled_at_waypoint_index = late_cancel_index;
+    cancelled_at_time_ns = waypoint_time_ns(late_cancel_index);
+    cancellation_reason = cancel.reason();
+  }
   if (cancelled) {
     merged.cancelled = true;
     merged.cancellation_reason = cancellation_reason;
     merged.cancelled_at_waypoint_index = cancelled_at_waypoint_index;
     merged.decision.accepted = false;
     const bool earlier_reject =
-        merged.decision.action == CollisionDecisionAction::kReject &&
+        merged.decision.action != CollisionDecisionAction::kDispatch &&
         first_failing_wp && cancelled_at_waypoint_index &&
         *first_failing_wp < *cancelled_at_waypoint_index;
     if (!earlier_reject) {
@@ -423,6 +584,7 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
     }
     if (!earlier_reject && cancelled_at_waypoint_index) {
       merged.decision.first_failing_waypoint = cancelled_at_waypoint_index;
+      merged.decision.first_failing_time_ns = cancelled_at_time_ns;
     }
   }
   if (revision_mismatch) {
@@ -461,9 +623,9 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
   }
 
   if (config_.serial_reference_mode == SerialReferenceMode::kQualification) {
-    CollisionValidationCoordinator ref_coord(config_.pass_config);
     const auto ref_t0 = steady_now_ns();
     try {
+      CollisionValidationCoordinator ref_coord(pass_config);
       (void)ref_coord.validate_trajectory(snapshot, *available_engines[0],
                                           trajectory, cancel);
     } catch (const std::exception&) {

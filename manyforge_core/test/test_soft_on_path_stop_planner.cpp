@@ -3,6 +3,7 @@
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 
 #include <algorithm>
+#include <limits>
 
 namespace manyforge::core {
 namespace {
@@ -867,6 +868,17 @@ TEST(SoftOnPathMinStopTimeTest, RejectsInvalidInputs) {
   EXPECT_FALSE(compute_soft_on_path_min_stop_time(linear_trajectory_1d(), 0.0,
                                                   -1.0, {{"joint_1", 4.0}})
                    .ok());  // negative rate
+  auto nan_time = compute_soft_on_path_min_stop_time(
+      linear_trajectory_1d(), std::numeric_limits<double>::quiet_NaN(), 1.0,
+      {{"joint_1", 4.0}});
+  ASSERT_FALSE(nan_time.ok());
+  EXPECT_EQ(nan_time.error().details.at("reason"), "invalid_trip_path_time");
+  EXPECT_FALSE(compute_soft_on_path_min_stop_time(linear_trajectory_1d(), -0.1,
+                                                  1.0, {{"joint_1", 4.0}})
+                   .ok());  // start before trajectory
+  EXPECT_FALSE(compute_soft_on_path_min_stop_time(linear_trajectory_1d(), 1.1,
+                                                  1.0, {{"joint_1", 4.0}})
+                   .ok());  // start after trajectory
   EXPECT_FALSE(
       compute_soft_on_path_min_stop_time(linear_trajectory_1d(), 0.0, 1.0, {})
           .ok());  // missing per-joint limit
@@ -1066,6 +1078,114 @@ TEST(JerkLimitedStopProfileTest, RejectsInvalidInputs) {
                                                  {{"joint_1", 4.0}},
                                                  {{"joint_1", 50.0}})
                    .ok());  // start path time outside trajectory
+}
+
+TEST(SoftOnPathStopPlannerTest,
+     NonFiniteCommandCursorIsRejectedInsteadOfEmittingZeroTrajectory) {
+  auto trajectory = linear_trajectory_1d();
+  auto profile = soft_profile(0.5);
+  profile.allow_natural_completion_on_short_path = true;
+
+  SoftOnPathInitialStateDTO state;
+  state.state.joint_names = {"joint_1"};
+  state.state.positions_rad = {0.2};
+  state.trajectory_time_from_start_s =
+      std::numeric_limits<double>::quiet_NaN();
+  state.position_source = SoftOnPathStateSource::kModelDerived;
+  state.velocity_source = SoftOnPathStateSource::kModelDerived;
+  state.runtime_velocity_scale_at_trip = 1.0;
+
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+  config.sample_period_s = 0.01;
+  config.allow_model_velocity_fallback = true;
+
+  auto planned = plan_soft_on_path_stop(trajectory, profile, state, config);
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("reason"), "non_finite_command_cursor");
+}
+
+TEST(SoftOnPathStopPlannerTest,
+     CommandCursorOutsideTrajectoryRangeIsRejected) {
+  auto trajectory = linear_trajectory_1d();
+  auto profile = soft_profile(0.5);
+  profile.allow_natural_completion_on_short_path = true;
+
+  SoftOnPathInitialStateDTO state;
+  state.state.joint_names = {"joint_1"};
+  state.state.positions_rad = {0.2};
+  state.trajectory_time_from_start_s = -0.1;
+  state.position_source = SoftOnPathStateSource::kModelDerived;
+  state.velocity_source = SoftOnPathStateSource::kModelDerived;
+  state.runtime_velocity_scale_at_trip = 1.0;
+
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+  config.sample_period_s = 0.01;
+  config.allow_model_velocity_fallback = true;
+
+  auto planned = plan_soft_on_path_stop(trajectory, profile, state, config);
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("reason"), "command_cursor_out_of_range");
+  EXPECT_EQ(planned.error().details.at("recommended_disposition"), "hard_stop");
+
+  state.trajectory_time_from_start_s = 1.1;
+  planned = plan_soft_on_path_stop(trajectory, profile, state, config);
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("reason"), "command_cursor_out_of_range");
+}
+
+TEST(SoftOnPathStopPlannerTest,
+     NonFiniteObservedFeedbackIsRejectedBeforeProjection) {
+  auto trajectory = linear_trajectory_1d();
+  auto profile = soft_profile(0.5);
+  auto state = measured_state_1d(std::numeric_limits<double>::quiet_NaN(), 0.5);
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+  config.sample_period_s = 0.01;
+
+  auto planned = plan_soft_on_path_stop(trajectory, profile, state, config);
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("reason"), "observed_position_not_finite");
+
+  SoftOnPathInitialStateDTO unnamed_state;
+  unnamed_state.state.positions_rad = {0.2};
+  unnamed_state.state.velocities_rad_s = {
+      std::numeric_limits<double>::infinity()};
+  planned = plan_soft_on_path_stop(
+      trajectory, profile, unnamed_state, config);
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("reason"), "observed_velocity_not_finite");
+}
+
+TEST(SoftOnPathStopPlannerTest,
+     NonFiniteTrajectoryValuesAreRejectedByShapeValidation) {
+  auto trajectory = linear_trajectory_1d();
+  trajectory.waypoints[1].positions_rad[0] =
+      std::numeric_limits<double>::quiet_NaN();
+  auto profile = soft_profile(0.5);
+  auto state = measured_state_1d(0.2, 0.5);
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+  config.sample_period_s = 0.01;
+
+  auto planned = plan_soft_on_path_stop(trajectory, profile, state, config);
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("reason"),
+            "trajectory_value_not_finite");
+
+  // Velocity and acceleration poisoning is rejected identically.
+  auto vel_poisoned = linear_trajectory_1d();
+  vel_poisoned.waypoints[0].velocities_rad_s[0] =
+      std::numeric_limits<double>::infinity();
+  EXPECT_FALSE(
+      plan_soft_on_path_stop(vel_poisoned, profile, state, config).ok());
+
+  auto accel_poisoned = linear_trajectory_1d();
+  accel_poisoned.waypoints[0].accelerations_rad_s2[0] =
+      -std::numeric_limits<double>::infinity();
+  EXPECT_FALSE(
+      plan_soft_on_path_stop(accel_poisoned, profile, state, config).ok());
 }
 
 }  // namespace

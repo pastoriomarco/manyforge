@@ -81,6 +81,23 @@ class InterruptManager {
       const InterruptRuntimeContext& context,
       std::int64_t kernel_now_ns);
 
+  /// Record lane/freshness-valid samples without resolving policies or
+  /// latching. Used by the kernel while no execution phase is active so
+  /// fast inactive samples can seed move-scope arm baselines without
+  /// letting an Idle-time active sample trip a policy.
+  InterruptIngestResult seed_samples(
+      const std::vector<InterruptSignalUpdate>& updates,
+      InterruptSourceClass attempted_lane,
+      std::int64_t kernel_now_ns);
+
+  /// Evaluate registered sources with freshness budgets against the current
+  /// runtime context and latch a synthetic stale-source fault when the latest
+  /// accepted sample has aged past its budget.
+  InterruptIngestResult sweep_stale_sources(
+      InterruptSourceClass attempted_lane,
+      const InterruptRuntimeContext& context,
+      std::int64_t kernel_now_ns);
+
   Result<InterruptIngestResult> apply_disposition(
       const InterruptDisposition& disposition,
       std::int64_t kernel_now_ns);
@@ -93,6 +110,15 @@ class InterruptManager {
       InterruptPreemptionResult result,
       std::int64_t preemption_latency_ns,
       std::int64_t kernel_now_ns);
+
+  Result<InterruptIngestResult> mark_preemption_result(
+      const std::string& latch_id,
+      InterruptPreemptionResult result,
+      std::int64_t preemption_latency_ns,
+      std::int64_t kernel_now_ns);
+  bool stamp_active_latch_collision_world_revision(
+      const std::string& latch_id,
+      const CollisionWorldRevision& revision);
 
   /// Atomically arm every `MotionInterruptScopeDTO` in `scopes` for the
   /// given `execution_id` / `move_id`. Fails closed: if any scope is
@@ -132,10 +158,13 @@ class InterruptManager {
   /// manager never deletes registered policies during a session).
   std::optional<InterruptPolicyDefinition> active_policy() const;
 
+  std::optional<InterruptPolicyDefinition> policy_by_id(
+      const std::string& policy_id) const;
+
  private:
   struct ResolvedPolicy {
-    InterruptSourceDefinition source;
-    InterruptPolicyDefinition policy;
+    const InterruptSourceDefinition* source = nullptr;
+    const InterruptPolicyDefinition* policy = nullptr;
     int effective_priority = 0;
     bool effective_maskable = false;
   };
@@ -152,6 +181,16 @@ class InterruptManager {
   Result<ResolvedPolicy> resolve_policy_locked(
       const InterruptSignalUpdate& update,
       const InterruptRuntimeContext& context) const;
+  Result<ResolvedPolicy> resolve_policy_locked(
+      const InterruptSignalUpdate& update,
+      const InterruptRuntimeContext& context,
+      const InterruptSourceDefinition& source) const;
+  InterruptIngestResult ingest_range(
+      const InterruptSignalUpdate* updates,
+      std::size_t update_count,
+      InterruptSourceClass attempted_lane,
+      const InterruptRuntimeContext& context,
+      std::int64_t kernel_now_ns);
   bool signal_requests_latch(const InterruptSourceDefinition& source,
                              const InterruptSignalUpdate& update) const;
   bool signal_requests_release(const InterruptSourceDefinition& source,
@@ -164,6 +203,15 @@ class InterruptManager {
       InterruptSourceClass attempted_lane,
       const ResolvedPolicy& resolved,
       std::int64_t kernel_now_ns) const;
+  Result<void> validate_source_sample_locked(
+      const InterruptSignalUpdate& update,
+      InterruptSourceClass attempted_lane,
+      const InterruptSourceDefinition& source,
+      std::int64_t kernel_now_ns) const;
+  bool clear_active_on_release_locked(
+      const InterruptSignalUpdate& update,
+      std::int64_t kernel_now_ns,
+      InterruptIngestResult& result);
 
   InterruptIngestResult ingest_resolved_locked(
       const InterruptSignalUpdate& update,
@@ -192,6 +240,9 @@ class InterruptManager {
   std::optional<QueuedUpdate> pop_next_queued_locked();
   void append_latched_events_locked(InterruptIngestResult& result,
                                     const InterruptLatch& latch);
+  void append_replay_drop_event_locked(InterruptIngestResult& result,
+                                       const QueuedUpdate& queued,
+                                       std::string reason) const;
   bool disposition_allowed(const InterruptLatch& latch,
                            const InterruptDisposition& disposition) const;
   std::optional<InterruptPolicyDefinition> active_policy_locked() const;
@@ -231,7 +282,8 @@ class InterruptManager {
       std::uint64_t execution_id,
       const std::string& move_id,
       std::int64_t kernel_now_ns) const;
-  void update_source_sample_locked(const InterruptSignalUpdate& update);
+  void update_source_sample_locked(const InterruptSignalUpdate& update,
+                                   const InterruptSourceDefinition& source);
   bool scope_binding_allows_latch_locked(
       const ActiveScopeBinding& binding,
       const InterruptSignalUpdate& update) const;
@@ -245,6 +297,7 @@ class InterruptManager {
   std::map<std::string, LastSourceSample> last_sample_by_source_;
   std::map<std::string, ActiveScopeBinding> active_scope_bindings_by_scope_id_;
   std::map<std::string, std::string> active_scope_id_by_policy_id_;
+  std::map<std::string, std::vector<std::string>> active_scope_ids_by_source_id_;
   std::optional<InterruptLatch> active_latch_;
   std::vector<QueuedUpdate> queue_;
   std::uint64_t next_latch_id_ = 1;

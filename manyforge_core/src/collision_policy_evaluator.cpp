@@ -1,7 +1,9 @@
 #include <manyforge_core/collision/collision_policy_evaluator.hpp>
 
 #include <algorithm>
+#include <memory>
 #include <string>
+#include <utility>
 
 namespace manyforge::core {
 
@@ -18,25 +20,44 @@ CollisionPairId canonicalize(const CollisionPairId& pair) {
 
 }  // namespace
 
+std::shared_ptr<const CollisionPolicyIndex> build_collision_policy_index(
+    const CollisionPolicySnapshot& snapshot) {
+  auto index = std::make_shared<CollisionPolicyIndex>();
+  for (const auto& entry : snapshot.support_contacts) {
+    index->support_contact_index[canonicalize(entry.pair)] = entry;
+  }
+  for (const auto& pair : snapshot.allowed_static_static_pairs) {
+    index->static_static_index[canonicalize(pair)] = true;
+  }
+  for (const auto& pair : snapshot.allowed_touch_link_pairs) {
+    index->touch_link_index[canonicalize(pair)] = true;
+  }
+  return index;
+}
+
 CollisionPolicyEvaluator::CollisionPolicyEvaluator(
     CollisionPolicySnapshot snapshot)
-    : snapshot_(std::move(snapshot)) {
-  for (const auto& entry : snapshot_.support_contacts) {
-    const auto canonical = canonicalize(entry.pair);
-    support_contact_index_[canonical] = entry;
-    support_contact_state_[canonical] = SupportContactState::kNotInContact;
+    : CollisionPolicyEvaluator(
+          std::make_shared<CollisionPolicySnapshot>(std::move(snapshot))) {}
+
+CollisionPolicyEvaluator::CollisionPolicyEvaluator(
+    std::shared_ptr<const CollisionPolicySnapshot> snapshot,
+    std::shared_ptr<const CollisionPolicyIndex> index)
+    : snapshot_(std::move(snapshot)),
+      index_(std::move(index)) {
+  if (!snapshot_) {
+    snapshot_ = std::make_shared<CollisionPolicySnapshot>();
   }
-  for (const auto& pair : snapshot_.allowed_static_static_pairs) {
-    static_static_index_[canonicalize(pair)] = true;
+  if (!index_) {
+    index_ = build_collision_policy_index(*snapshot_);
   }
-  for (const auto& pair : snapshot_.allowed_touch_link_pairs) {
-    touch_link_index_[canonicalize(pair)] = true;
-  }
+  reset();
 }
 
 void CollisionPolicyEvaluator::reset() {
-  for (auto& [pair, state] : support_contact_state_) {
-    state = SupportContactState::kNotInContact;
+  support_contact_state_.clear();
+  for (const auto& [pair, _] : index_->support_contact_index) {
+    support_contact_state_[pair] = SupportContactState::kNotInContact;
   }
 }
 
@@ -71,7 +92,7 @@ EvaluatedPairs CollisionPolicyEvaluator::classify(
   out.pairs.reserve(canonical.size());
 
   const bool fail_closed_diagnostics =
-      snapshot_.require_full_diagnostics && !diagnostics_complete;
+      snapshot_->require_full_diagnostics && !diagnostics_complete;
 
   for (const auto& pair : canonical) {
     CollisionPairResult entry;
@@ -86,8 +107,8 @@ EvaluatedPairs CollisionPolicyEvaluator::classify(
     // Touch-link allowances classify first: they are the explicit
     // attached-object exemption that "do not mask unrelated collisions"
     // applies to — only the listed pairs are touched.
-    auto touch_it = touch_link_index_.find(pair);
-    if (touch_it != touch_link_index_.end()) {
+    auto touch_it = index_->touch_link_index.find(pair);
+    if (touch_it != index_->touch_link_index.end()) {
       entry.classification = CollisionPairClassification::kAllowedTouchLink;
       out.pairs.push_back(entry);
       continue;
@@ -99,8 +120,8 @@ EvaluatedPairs CollisionPolicyEvaluator::classify(
     // is a guarantee the snapshot publisher must honor (a body that
     // becomes attached or pose-source driven gets a new body id and so
     // does not match a stale allowance).
-    auto static_it = static_static_index_.find(pair);
-    if (static_it != static_static_index_.end()) {
+    auto static_it = index_->static_static_index.find(pair);
+    if (static_it != index_->static_static_index.end()) {
       entry.classification = CollisionPairClassification::kAllowedStaticStatic;
       out.pairs.push_back(entry);
       continue;
@@ -108,8 +129,8 @@ EvaluatedPairs CollisionPolicyEvaluator::classify(
 
     // Support contact: stateful transitions per the plan's explicit
     // state machine spec.
-    auto support_it = support_contact_index_.find(pair);
-    if (support_it != support_contact_index_.end()) {
+    auto support_it = index_->support_contact_index.find(pair);
+    if (support_it != index_->support_contact_index.end()) {
       auto& state = support_contact_state_[pair];
       switch (state) {
         case SupportContactState::kNotInContact:

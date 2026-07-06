@@ -50,11 +50,37 @@ std::vector<core::KernelEvent> KernelEventCollector::drain() {
 
 // --- NativeKernelBundle ---
 
-NativeKernelBundle::~NativeKernelBundle() {
-  // Unsubscribe before kernel destruction to avoid dangling callback
-  if (kernel) {
-    event_collector.unsubscribe(*kernel);
+void NativeKernelBundle::close() {
+  std::shared_ptr<core::ExecutionKernel> kernel_to_close;
+  {
+    std::lock_guard<std::mutex> lock(close_mutex_);
+    if (closed_) {
+      return;
+    }
+    closed_ = true;
+    if (kernel) {
+      event_collector.unsubscribe(*kernel);
+    }
+    kernel_to_close = std::move(kernel);
   }
+  kernel_to_close.reset();
+}
+
+bool NativeKernelBundle::closed() const {
+  std::lock_guard<std::mutex> lock(close_mutex_);
+  return closed_;
+}
+
+std::shared_ptr<core::ExecutionKernel> NativeKernelBundle::kernel_snapshot() const {
+  std::lock_guard<std::mutex> lock(close_mutex_);
+  if (closed_ || !kernel) {
+    throw std::runtime_error("NativeKernelBundle is closed");
+  }
+  return kernel;
+}
+
+NativeKernelBundle::~NativeKernelBundle() {
+  close();
 }
 
 // --- WallClock ---
@@ -148,6 +174,44 @@ void SimpleScheduler::cancel(core::ScheduleHandle handle) {
   w.cv.notify_all();
 }
 
+void SimpleScheduler::Worker::drain() {
+  std::unique_lock<std::mutex> lock(mutex);
+  if (thread.joinable() && std::this_thread::get_id() == thread.get_id()) {
+    return;
+  }
+  drain_cv.wait(lock, [this]() { return callbacks_in_flight == 0; });
+}
+
+bool SimpleScheduler::Worker::drain_for(std::chrono::nanoseconds timeout) {
+  std::unique_lock<std::mutex> lock(mutex);
+  if (thread.joinable() && std::this_thread::get_id() == thread.get_id()) {
+    return true;
+  }
+  return drain_cv.wait_for(
+      lock, timeout, [this]() { return callbacks_in_flight == 0; });
+}
+
+void SimpleScheduler::drain(core::SchedulerPriority priority) {
+  worker_for(priority).drain();
+}
+
+bool SimpleScheduler::drain_for(core::SchedulerPriority priority,
+                                std::chrono::nanoseconds timeout) {
+  return worker_for(priority).drain_for(timeout);
+}
+
+void SimpleScheduler::drain_all() {
+  safety_worker_.drain();
+  monitoring_worker_.drain();
+}
+
+bool SimpleScheduler::drain_all_for(std::chrono::nanoseconds timeout) {
+  bool drained = true;
+  drained = safety_worker_.drain_for(timeout) && drained;
+  drained = monitoring_worker_.drain_for(timeout) && drained;
+  return drained;
+}
+
 void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
   while (!st.stop_requested()) {
     core::ScheduleHandle fired_handle = 0;
@@ -175,6 +239,7 @@ void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
       callback = std::move(next_it->second.callback);
       fired_handle = next_it->first;
       tasks.erase(next_it);
+      ++callbacks_in_flight;
     }
 
     if (owner != nullptr && fired_handle != 0) {
@@ -183,8 +248,27 @@ void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
     }
 
     if (callback) {
-      callback();
+      try {
+        callback();
+      } catch (...) {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          if (callbacks_in_flight > 0) {
+            --callbacks_in_flight;
+          }
+        }
+        drain_cv.notify_all();
+        throw;
+      }
     }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (callbacks_in_flight > 0) {
+        --callbacks_in_flight;
+      }
+    }
+    drain_cv.notify_all();
   }
 }
 
@@ -279,18 +363,20 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
       std::make_shared<roboplan::SimpleIk>(bundle->scene, single_shot_ik_opts);
 
   // Create native backends
-  auto scene_mutex = std::make_shared<std::mutex>();
+  bundle->scene_mutex = std::make_shared<std::mutex>();
   bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
       bundle->scene, rrt_opts, bundle->shortcutter, bundle->toppra, bundle->ik,
-      scene_mutex, bundle->single_shot_ik);
+      bundle->scene_mutex, bundle->single_shot_ik, ik_opts,
+      single_shot_ik_opts);
   bundle->context = std::make_unique<RoboPlanPlanningContext>(
-      bundle->scene, group_name, scene_mutex);
+      bundle->scene, group_name, bundle->scene_mutex);
   bundle->clock = std::make_unique<WallClock>();
   RoboPlanExecutionBackendConfig execution_config;
   execution_config.reset_completion_timeout_s =
       kernel_config.native_reset_completion_timeout_s;
   bundle->execution = std::make_unique<RoboPlanExecutionBackend>(
-      bundle->scene, group_name, *bundle->clock, scene_mutex, execution_config);
+      bundle->scene, group_name, *bundle->clock, bundle->scene_mutex,
+      execution_config);
   bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->cache = std::make_unique<core::TrajectoryCache>();
 
@@ -316,7 +402,7 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   resolved_kernel_config.validation_collision_workers = collision_worker_count;
 
   // Wire kernel — references to owned components
-  bundle->kernel = std::make_unique<core::ExecutionKernel>(
+  bundle->kernel = std::make_shared<core::ExecutionKernel>(
       *bundle->planner, *bundle->context, *bundle->execution,
       *bundle->clock, *bundle->scheduler, *bundle->cache,
       resolved_kernel_config);

@@ -80,7 +80,7 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
     std::atomic<bool> running{false};
     std::atomic<bool> pause_requested{false};
     std::atomic<bool> natural_completion_stop_requested{false};
-    std::optional<core::TrajectoryDTO> active_trajectory;
+    std::shared_ptr<const core::TrajectoryDTO> active_trajectory;
     double active_trajectory_time_s = 0.0;
     double active_runtime_velocity_scale = 1.0;
   };
@@ -105,6 +105,7 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
                               SceneUpdateMode mode = SceneUpdateMode::kBlocking,
                               std::int64_t source_timestamp_ns = 0);
   void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory);
+  void request_active_controlled_stop();
   void begin_controlled_stop_runtime_scale_freeze();
   bool end_controlled_stop_runtime_scale_freeze();
   void record_scene_projection_success(std::int64_t source_timestamp_ns);
@@ -121,6 +122,8 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   std::condition_variable execution_cv_;
   std::jthread worker_thread_;
   ExecutionStateData state_;
+  mutable std::mutex controlled_stop_mutex_;
+  std::shared_ptr<std::stop_source> active_controlled_stop_source_;
 
   // Runtime velocity scale read on every worker tick. std::atomic<double> is
   // lock-free on all supported targets; memory_order_release on the setter pairs

@@ -1,6 +1,10 @@
 #include <manyforge_core/execution_kernel.hpp>
 
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
+#include <manyforge_core/execution_admission_support.hpp>
+#include <manyforge_core/execution_collision_support.hpp>
+#include <manyforge_core/execution_interrupt_support.hpp>
+#include <manyforge_core/execution_stop_support.hpp>
 #include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 #include <manyforge_core/types/error_code_mapping.hpp>
@@ -8,15 +12,12 @@
 #include <manyforge_core/types/reason_codes.hpp>
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cmath>
 #include <exception>
-#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -24,909 +25,67 @@
 namespace manyforge::core {
 namespace {
 
-// Forward declarations of the controlled-stop string helpers defined
-// later in this file (in the anonymous namespace that starts near
-// line 1735). They are needed earlier, in the fault-stop preempt path
-// inside `apply_latched_interrupt_preemption`, so the
-// emitted error events can carry the same `requested_stop_mode` /
-// `executed_stop_mode` / `stop_command_source` strings the desired-
-// trip path uses.
-const char* stop_mode_string(MotionInterruptStopMode mode);
-const char* stop_command_source_string(MotionInterruptStopCommandSource s);
-
-constexpr int64_t kExecutionPollNs = 10'000'000;  // 10 ms
-constexpr int kExecutionDrainMaxPolls = 100;      // bounded 1 s software drain
-constexpr double kExecutionDrainTimeoutS =
-    static_cast<double>(kExecutionPollNs * kExecutionDrainMaxPolls) / 1e9;
-
-struct HardStopFloorAttempt {
-  std::mutex mutex;
-  bool attempted = false;
-  StopResultDTO result;
-};
-
-StopResultDTO request_hard_stop_floor_once(
-    IExecutionBackend& backend,
-    const std::shared_ptr<HardStopFloorAttempt>& attempt) {
-  std::lock_guard<std::mutex> lock(attempt->mutex);
-  if (!attempt->attempted) {
-    attempt->result = backend.stop();
-    attempt->attempted = true;
-  }
-  return attempt->result;
-}
-
-std::optional<StopResultDTO> hard_stop_floor_result_if_attempted(
-    const std::shared_ptr<HardStopFloorAttempt>& attempt) {
-  std::lock_guard<std::mutex> lock(attempt->mutex);
-  if (!attempt->attempted) {
-    return std::nullopt;
-  }
-  return attempt->result;
-}
-
-std::string backend_hard_stop_level(IExecutionBackend& backend) {
-  try {
-    const auto cap = backend.get_motion_interrupt_stop_capability();
-    return cap.hard_stop_level.value_or("unknown");
-  } catch (const std::exception&) {
-    return "unknown";
-  }
-}
-
-std::string hard_stop_floor_role_from_level(const std::string& level) {
-  if (level == "hard_deceleration") {
-    return "hard_deceleration";
-  }
-  if (level == "native_immediate_hold" ||
-      level == "jtc_cancel_unprofiled_hold") {
-    return "immediate_hard_stop";
-  }
-  return "immediate_hard_stop";
-}
-
-std::string hard_stop_floor_command_source_from_level(
-    const std::string& level) {
-  if (level == "hard_deceleration") {
-    return "jtc_cancel_decelerate_on_cancel";
-  }
-  if (level == "native_immediate_hold") {
-    return "native_simulated_stop";
-  }
-  if (level == "jtc_cancel_unprofiled_hold") {
-    return "jtc_cancel_unprofiled_hold";
-  }
-  return "backend_stop";
-}
-
-void add_hard_stop_floor_details(
-    std::map<std::string, std::string>& details,
-    IExecutionBackend& backend) {
-  const auto level = backend_hard_stop_level(backend);
-  details["hard_stop_level"] = level;
-  details["hard_stop_floor"] = hard_stop_floor_role_from_level(level);
-  details["hard_stop_floor_command_source"] =
-      hard_stop_floor_command_source_from_level(level);
-}
-
-void add_optional_double_detail(std::map<std::string, std::string>& details,
-                                const char* key,
-                                const std::optional<double>& value) {
-  if (value.has_value()) {
-    details[key] = std::to_string(*value);
-  }
-}
-
-void merge_controlled_stop_diagnostics(
-    std::map<std::string, std::string>& details,
-    const InterruptStructuredValue& diagnostics) {
-  for (const auto& [key, value] : diagnostics) {
-    if (details.contains(key)) {
-      details["controlled_stop_detail_" + key] = value;
-    } else {
-      details[key] = value;
-    }
-  }
-}
-
-std::map<std::string, std::string> controlled_stop_success_event_details(
-    const MotionInterruptStopProfileDTO& profile,
-    const ControlledStopResultDTO& result,
-    IExecutionBackend& backend,
-    const std::string& phase) {
-  std::map<std::string, std::string> details{
-      {"phase", phase},
-      {"controlled_stop_success", "true"},
-      {"requested_stop_profile_id", profile.profile_id},
-      {"requested_stop_mode", stop_mode_string(profile.stop_mode)},
-      {"executed_stop_mode", stop_mode_string(result.executed_stop_mode)},
-      {"stop_command_source",
-       stop_command_source_string(result.stop_command_source)},
-      {"backend_stop_confirmed",
-       result.backend_stop_confirmed ? "true" : "false"},
-      {"completed_by_natural_completion",
-       result.completed_by_natural_completion ? "true" : "false"},
-      {"confirmation_latency_ns",
-       std::to_string(result.confirmation_latency_ns)},
-      {"deceleration_time_s",
-       std::to_string(motion_interrupt_deceleration_time_or_default(profile))},
-      {"emergency_fallback", "none"},
-      {"hard_stop_transitioned", "false"}};
-  if (profile.max_stop_time_s.has_value()) {
-    details["max_stop_time_s"] = std::to_string(*profile.max_stop_time_s);
-  }
-  if (result.fallback_reason.has_value()) {
-    details["fallback_reason"] = *result.fallback_reason;
-  }
-  add_optional_double_detail(details, "stop_distance_rad",
-                             result.stop_distance_rad);
-  add_optional_double_detail(details, "path_deviation_max_rad",
-                             result.path_deviation_max_rad);
-  add_optional_double_detail(details, "initial_path_deviation_rad",
-                             result.initial_path_deviation_rad);
-  merge_controlled_stop_diagnostics(details, result.diagnostics);
-  add_hard_stop_floor_details(details, backend);
-  return details;
-}
-
-std::int64_t effective_controlled_stop_deadline_ns(
-    const MotionInterruptStopProfileDTO& profile,
-    Duration stop_completion_tolerance_ns) {
-  if (profile.max_stop_time_s.has_value()) {
-    return static_cast<std::int64_t>(*profile.max_stop_time_s * 1e9);
-  }
-  const auto deceleration_ns = static_cast<std::int64_t>(
-      motion_interrupt_deceleration_time_or_default(profile) * 1e9);
-  return deceleration_ns + std::max<Duration>(0, stop_completion_tolerance_ns);
-}
-
-std::chrono::steady_clock::duration effective_controlled_stop_deadline_duration(
-    const MotionInterruptStopProfileDTO& profile,
-    Duration stop_completion_tolerance_ns) {
-  const auto deadline_ns =
-      std::max<std::int64_t>(
-          0, effective_controlled_stop_deadline_ns(
-                 profile, stop_completion_tolerance_ns));
-  return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-      std::chrono::nanoseconds(deadline_ns));
-}
-
-std::optional<double> measured_max_abs_velocity_from_snapshot(
-    const ExecutionSnapshot& snapshot) {
-  if (snapshot.joint_velocities_rad_s.empty() ||
-      snapshot.joint_velocities_rad_s.size() !=
-          snapshot.joint_positions_rad.size()) {
-    return std::nullopt;
-  }
-  double max_abs = 0.0;
-  for (double v : snapshot.joint_velocities_rad_s) {
-    max_abs = std::max(max_abs, std::abs(v));
-  }
-  return max_abs;
-}
-
-bool all_joint_positions_finite(const ExecutionSnapshot& snapshot) {
-  if (snapshot.joint_positions_rad.empty()) {
-    return false;
-  }
-  for (double q : snapshot.joint_positions_rad) {
-    if (!std::isfinite(q)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool all_joint_velocities_finite_when_present(
-    const ExecutionSnapshot& snapshot) {
-  for (double v : snapshot.joint_velocities_rad_s) {
-    if (!std::isfinite(v)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-std::optional<double> parse_positive_double_detail(
-    const std::map<std::string, std::string>& details,
-    const std::string& key) {
-  const auto it = details.find(key);
-  if (it == details.end()) {
-    return std::nullopt;
-  }
-  try {
-    std::size_t parsed = 0;
-    const double value = std::stod(it->second, &parsed);
-    if (parsed != it->second.size() || !std::isfinite(value) ||
-        value <= 0.0) {
-      return std::nullopt;
-    }
-    return value;
-  } catch (const std::exception&) {
-    return std::nullopt;
-  }
-}
-
-bool is_classified_stop_intervention(
-    const std::map<std::string, std::string>& details) {
-  const auto reason_it = details.find("reason");
-  const std::string reason =
-      reason_it != details.end() ? reason_it->second : std::string{};
-  if (reason == "stop_not_settled_measured_velocity" ||
-      reason == "operator_stop_total_failure" ||
-      reason == "in_stop_completion_timeout" ||
-      reason == "stop_path_collision" ||
-      reason == "hard_deceleration_not_settled") {
-    return true;
-  }
-  const auto phase_it = details.find("phase");
-  const bool stop_phase =
-      phase_it != details.end() &&
-      (phase_it->second == "operator_stop" ||
-       phase_it->second == "motion_trip_stop" ||
-       phase_it->second == "motion_trip_stop_path_collision");
-  const bool has_stop_mode =
-      details.contains("requested_stop_mode") ||
-      details.contains("executed_stop_mode") ||
-      details.contains("hard_stop_transitioned");
-  return stop_phase && has_stop_mode;
-}
-
-struct MeasuredRestWaitResult {
-  std::optional<double> max_abs_velocity_rad_s;
-  bool settle_signal_available = false;
-  bool at_rest = true;
-  bool timed_out = false;
-};
-
-bool is_command_authoritative_stop_snapshot(const ExecutionSnapshot& snapshot) {
-  return snapshot.state_source.rfind("commanded_sim", 0) == 0 ||
-         snapshot.state_source == "controlled_stop_command_reference";
-}
-
-MeasuredRestWaitResult wait_for_measured_rest_after_confirmed_stop(
-    IExecutionBackend& backend,
-    double settle_velocity_threshold_rad_s,
-    std::chrono::steady_clock::time_point deadline,
-    std::stop_token stop_token) {
-  MeasuredRestWaitResult result;
-  while (true) {
-    const auto snapshot = backend.get_execution_snapshot();
-    if (is_command_authoritative_stop_snapshot(snapshot)) {
-      // In commanded-sim lanes the backend command/reference trajectory is the
-      // execution authority; measured velocities are diagnostic evidence and
-      // can lag the accepted command stream. Tracking/path-deviation monitors
-      // remain responsible for proving the simulated/real plant followed the
-      // command within tolerance.
-      result.at_rest = true;
-      return result;
-    }
-    const auto max_abs_velocity =
-        measured_max_abs_velocity_from_snapshot(snapshot);
-    if (!max_abs_velocity.has_value()) {
-      // Settle UNKNOWN falls back to the backend's own confirmation. Never
-      // fabricate a failed measured-rest verdict from absent velocity data.
-      return result;
-    }
-    result.settle_signal_available = true;
-    result.max_abs_velocity_rad_s = *max_abs_velocity;
-    result.at_rest = *max_abs_velocity <= settle_velocity_threshold_rad_s;
-    if (result.at_rest) {
-      return result;
-    }
-    if (stop_token.stop_requested()) {
-      result.timed_out = true;
-      return result;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) {
-      result.timed_out = true;
-      return result;
-    }
-    const auto remaining = deadline - now;
-    const auto sleep_for =
-        std::min(std::chrono::milliseconds(10),
-                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                     remaining));
-    std::this_thread::sleep_for(
-        sleep_for > std::chrono::milliseconds(0)
-            ? sleep_for
-            : std::chrono::milliseconds(1));
-  }
+ErrorDTO stale_control_command_error() {
+  return ErrorDTO{kErrorInvalidRequest,
+                  "Control command was superseded",
+                  {{"reason_code", "stale_control_command"}}};
 }
 
 double clamp_unit_interval(double value) {
   return std::max(0.0, std::min(1.0, value));
 }
 
-bool operator_controlled_stop_allowed(ExecutionState state) {
-  return state == ExecutionState::kExecuting ||
-         state == ExecutionState::kPaused ||
-         state == ExecutionState::kStopping;
-}
+}  // namespace
 
-std::string comma_join_strings(const std::vector<std::string>& values) {
-  std::ostringstream out;
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    if (i != 0) {
-      out << ",";
+class ExecutionKernel::EventDeferralScope {
+ public:
+  explicit EventDeferralScope(ExecutionKernel& kernel)
+      : kernel_(kernel), previous_(active_event_deferral_) {
+    active_event_deferral_ = this;
+  }
+
+  EventDeferralScope(const EventDeferralScope&) = delete;
+  EventDeferralScope& operator=(const EventDeferralScope&) = delete;
+
+  ~EventDeferralScope() {
+    flush();
+  }
+
+  void flush() {
+    if (flushed_) {
+      return;
     }
-    out << values[i];
-  }
-  return out.str();
-}
-
-std::string comma_join_doubles(const std::vector<double>& values) {
-  std::ostringstream out;
-  out << std::setprecision(17);
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    if (i != 0) {
-      out << ",";
+    flushed_ = true;
+    active_event_deferral_ = previous_;
+    if (previous_ != nullptr) {
+      previous_->append(std::move(events_));
+      return;
     }
-    out << values[i];
-  }
-  return out.str();
-}
-
-std::string format_double(double value) {
-  std::ostringstream out;
-  out << std::setprecision(17) << value;
-  return out.str();
-}
-
-std::string collision_engine_status_name(CollisionEngineStatus status) {
-  switch (status) {
-    case CollisionEngineStatus::kOk:
-      return "ok";
-    case CollisionEngineStatus::kTimeout:
-      return "timeout";
-    case CollisionEngineStatus::kUnsupportedGeometry:
-      return "unsupported_geometry";
-    case CollisionEngineStatus::kDiagnosticIncomplete:
-      return "diagnostic_incomplete";
-    case CollisionEngineStatus::kCancelled:
-      return "cancelled";
-    case CollisionEngineStatus::kEngineError:
-      return "engine_error";
-  }
-  return "unknown";
-}
-
-std::string collision_decision_result_name(CollisionDecisionResult decision) {
-  switch (decision) {
-    case CollisionDecisionResult::kPass:
-      return "pass";
-    case CollisionDecisionResult::kFail:
-      return "fail";
-    case CollisionDecisionResult::kWarn:
-      return "warn";
-    case CollisionDecisionResult::kStopRequested:
-      return "stop_requested";
-    case CollisionDecisionResult::kInconclusiveFail:
-      return "inconclusive_fail";
-  }
-  return "unknown";
-}
-
-std::string collision_pair_classification_name(
-    CollisionPairClassification classification) {
-  switch (classification) {
-    case CollisionPairClassification::kBlockingCollision:
-      return "blocking_collision";
-    case CollisionPairClassification::kAllowedStaticStatic:
-      return "allowed_static_static";
-    case CollisionPairClassification::kSupportContactStart:
-      return "support_contact_start";
-    case CollisionPairClassification::kSupportContactContinued:
-      return "support_contact_continued";
-    case CollisionPairClassification::kSupportContactSeparated:
-      return "support_contact_separated";
-    case CollisionPairClassification::kSupportContactRecontactViolation:
-      return "support_contact_recontact_violation";
-    case CollisionPairClassification::kAllowedTouchLink:
-      return "allowed_touch_link";
-    case CollisionPairClassification::kAllowedContactGrasp:
-      return "allowed_contact_grasp";
-    case CollisionPairClassification::kDiagnosticIncomplete:
-      return "diagnostic_incomplete";
-  }
-  return "unknown";
-}
-
-bool collision_pair_classification_blocks_dispatch(
-    CollisionPairClassification classification) {
-  switch (classification) {
-    case CollisionPairClassification::kBlockingCollision:
-    case CollisionPairClassification::kSupportContactRecontactViolation:
-    case CollisionPairClassification::kDiagnosticIncomplete:
-      return true;
-    case CollisionPairClassification::kAllowedStaticStatic:
-    case CollisionPairClassification::kSupportContactStart:
-    case CollisionPairClassification::kSupportContactContinued:
-    case CollisionPairClassification::kSupportContactSeparated:
-    case CollisionPairClassification::kAllowedTouchLink:
-    case CollisionPairClassification::kAllowedContactGrasp:
-      return false;
-  }
-  return true;
-}
-
-std::string collision_pair_name(const CollisionPairId& pair) {
-  return pair.body_a + " <-> " + pair.body_b;
-}
-
-bool snapshot_too_old(std::int64_t now_ns,
-                      std::int64_t timestamp_ns,
-                      std::int64_t max_age_ns,
-                      std::map<std::string, std::string>& details,
-                      const std::string& timestamp_key,
-                      const std::string& age_key,
-                      const std::string& budget_key) {
-  if (max_age_ns <= 0) {
-    return false;
-  }
-  details[timestamp_key] = std::to_string(timestamp_ns);
-  details[budget_key] = std::to_string(max_age_ns);
-  if (timestamp_ns < 0) {
-    details[age_key] = "invalid_negative_timestamp";
-    return true;
-  }
-  if (timestamp_ns > now_ns) {
-    details[age_key] = "timestamp_in_future";
-    details["clock_skew_ns"] = std::to_string(timestamp_ns - now_ns);
-    return true;
-  }
-  const auto age_ns = now_ns - timestamp_ns;
-  details[age_key] = std::to_string(age_ns);
-  return age_ns > max_age_ns;
-}
-
-std::optional<std::string> validate_dynamic_body_freshness(
-    const CollisionWorldSnapshot& snapshot,
-    std::int64_t now_ns,
-    std::int64_t runtime_cap_ns,
-    std::map<std::string, std::string>& details) {
-  for (const auto& body : snapshot.bodies) {
-    if (!body.source_freshness_budget_ns.has_value()) {
-      continue;
-    }
-    details["dynamic_body_id"] = body.body_id;
-    details["dynamic_body_declared_freshness_budget_ns"] =
-        std::to_string(*body.source_freshness_budget_ns);
-    const auto effective_budget_ns =
-        runtime_cap_ns > 0
-            ? std::min(*body.source_freshness_budget_ns, runtime_cap_ns)
-            : *body.source_freshness_budget_ns;
-    details["dynamic_body_effective_freshness_budget_ns"] =
-        std::to_string(effective_budget_ns);
-    if (!body.source_timestamp_ns.has_value()) {
-      return "dynamic_body_missing_source_timestamp";
-    }
-    details["dynamic_body_source_timestamp_ns"] =
-        std::to_string(*body.source_timestamp_ns);
-    if (*body.source_timestamp_ns < 0) {
-      details["dynamic_body_age_ns"] = "invalid_negative_timestamp";
-      return "stale_dynamic_collision_body";
-    }
-    if (*body.source_timestamp_ns > now_ns) {
-      details["dynamic_body_age_ns"] = "timestamp_in_future";
-      details["dynamic_body_clock_skew_ns"] =
-          std::to_string(*body.source_timestamp_ns - now_ns);
-      return "stale_dynamic_collision_body";
-    }
-    const auto age_ns = now_ns - *body.source_timestamp_ns;
-    details["dynamic_body_age_ns"] = std::to_string(age_ns);
-    if (effective_budget_ns <= 0 || age_ns > effective_budget_ns) {
-      return "stale_dynamic_collision_body";
+    for (auto& event : events_) {
+      kernel_.dispatch_prepared_event(event);
     }
   }
-  return std::nullopt;
-}
 
-void append_collision_failure_diagnostics(
-    std::map<std::string, std::string>& details,
-    const CollisionValidationDecisionBundle& bundle) {
-  const CollisionValidationWaypointRecord* selected = nullptr;
-  if (bundle.decision.first_failing_waypoint) {
-    for (const auto& record : bundle.waypoint_records) {
-      if (record.waypoint_index == *bundle.decision.first_failing_waypoint) {
-        selected = &record;
-        break;
-      }
+  void defer(KernelEvent event) {
+    events_.push_back(std::move(event));
+  }
+
+ private:
+  void append(std::vector<KernelEvent>&& events) {
+    events_.reserve(events_.size() + events.size());
+    for (auto& event : events) {
+      events_.push_back(std::move(event));
     }
   }
-  if (selected == nullptr) {
-    for (const auto& record : bundle.waypoint_records) {
-      if (record.result.decision != CollisionDecisionResult::kPass ||
-          record.result.engine_status != CollisionEngineStatus::kOk) {
-        selected = &record;
-        break;
-      }
-    }
-  }
-  if (selected == nullptr) {
-    return;
-  }
 
-  const auto& result = selected->result;
-  details["collision_result_waypoint_index"] =
-      std::to_string(selected->waypoint_index);
-  if (result.query_id) {
-    details["collision_result_query_id"] = *result.query_id;
-  }
-  details["collision_result_engine_id"] = result.engine_id;
-  details["collision_result_engine_version"] = result.engine_version;
-  details["collision_result_engine_status"] =
-      collision_engine_status_name(result.engine_status);
-  details["collision_result_decision"] =
-      collision_decision_result_name(result.decision);
-  details["collision_result_in_collision"] =
-      result.in_collision ? "true" : "false";
-  details["collision_result_normalized_pair_count"] =
-      std::to_string(result.normalized_pairs.size());
-  if (!result.normalized_pairs.empty()) {
-    details["collision_result_first_pair"] =
-        collision_pair_name(result.normalized_pairs.front());
-  }
-  details["collision_result_classified_pair_count"] =
-      std::to_string(result.normalized_pairs_classified.size());
-  const CollisionPairResult* first_failure_pair = nullptr;
-  for (const auto& classified : result.normalized_pairs_classified) {
-    if (classified.is_first_failure) {
-      first_failure_pair = &classified;
-      break;
-    }
-  }
-  if (first_failure_pair == nullptr) {
-    for (const auto& classified : result.normalized_pairs_classified) {
-      if (collision_pair_classification_blocks_dispatch(
-              classified.classification)) {
-        first_failure_pair = &classified;
-        break;
-      }
-    }
-  }
-  if (first_failure_pair != nullptr) {
-    details["collision_result_first_failure_pair"] =
-        collision_pair_name(first_failure_pair->pair);
-    details["collision_result_first_failure_classification"] =
-        collision_pair_classification_name(first_failure_pair->classification);
-  }
-  std::size_t emitted = 0;
-  for (const auto& [key, value] : result.raw_diagnostics) {
-    if (emitted >= 8) {
-      details["collision_result_raw_diagnostics_truncated"] = "true";
-      break;
-    }
-    details["collision_result_raw_" + key] = value;
-    ++emitted;
-  }
-}
-
-const CollisionValidationWaypointRecord* select_collision_failure_record(
-    const CollisionValidationDecisionBundle& bundle) {
-  if (bundle.decision.first_failing_waypoint) {
-    for (const auto& record : bundle.waypoint_records) {
-      if (record.waypoint_index == *bundle.decision.first_failing_waypoint) {
-        return &record;
-      }
-    }
-  }
-  for (const auto& record : bundle.waypoint_records) {
-    if (record.result.decision != CollisionDecisionResult::kPass ||
-        record.result.engine_status != CollisionEngineStatus::kOk) {
-      return &record;
-    }
-  }
-  return nullptr;
-}
-
-void append_legacy_collision_compare_diagnostics(
-    std::map<std::string, std::string>& details,
-    const CollisionValidationDecisionBundle& bundle,
-    const TrajectoryDTO& trajectory,
-    IPlanningContext& context) {
-  const auto* selected = select_collision_failure_record(bundle);
-  if (selected == nullptr || selected->waypoint_index < 0) {
-    return;
-  }
-  const auto waypoint_index = static_cast<std::size_t>(selected->waypoint_index);
-  if (waypoint_index >= trajectory.waypoints.size()) {
-    return;
-  }
-
-  const auto& waypoint = trajectory.waypoints[waypoint_index];
-  CollisionQuery query;
-  query.query_id = "legacy_compare_" +
-                   (selected->result.query_id
-                        ? *selected->result.query_id
-                        : std::to_string(selected->waypoint_index));
-  query.surface = CollisionSurface::kDiagnosticCompare;
-  query.collision_world_revision = bundle.borrowed_world_revision;
-  query.policy_revision = selected->result.policy_revision_used;
-  query.robot_state.joint_names = trajectory.joint_names;
-  query.robot_state.positions_rad = waypoint.positions_rad;
-  query.robot_state.velocities_rad_s = waypoint.velocities_rad_s;
-  query.waypoint_index = selected->waypoint_index;
-  query.state_time_ns = selected->time_from_start_ns;
-  query.sampling_mode = CollisionSamplingMode::kWaypointOnly;
-
-  try {
-    const auto legacy = context.collision_check_normalized(query);
-    details["legacy_collision_compare_engine_id"] = legacy.engine_id;
-    details["legacy_collision_compare_engine_status"] =
-        collision_engine_status_name(legacy.engine_status);
-    details["legacy_collision_compare_decision"] =
-        collision_decision_result_name(legacy.decision);
-    details["legacy_collision_compare_in_collision"] =
-        legacy.in_collision ? "true" : "false";
-    details["legacy_collision_compare_normalized_pair_count"] =
-        std::to_string(legacy.normalized_pairs.size());
-    details["legacy_collision_compare_in_collision_match"] =
-        legacy.in_collision == selected->result.in_collision ? "true" : "false";
-    details["legacy_collision_compare_decision_match"] =
-        legacy.decision == selected->result.decision ? "true" : "false";
-    details["legacy_collision_compare_normalized_pairs_match"] =
-        legacy.normalized_pairs == selected->result.normalized_pairs ? "true"
-                                                                     : "false";
-    if (legacy.collision_world_revision.has_value()) {
-      details["legacy_collision_compare_world_revision_id"] =
-          std::to_string(legacy.collision_world_revision->revision_id);
-      details["legacy_collision_compare_world_content_hash"] =
-          legacy.collision_world_revision->content_hash;
-    }
-    if (!legacy.normalized_pairs.empty()) {
-      details["legacy_collision_compare_first_pair"] =
-          collision_pair_name(legacy.normalized_pairs.front());
-    }
-    const CollisionPairResult* legacy_failure = nullptr;
-    for (const auto& classified : legacy.normalized_pairs_classified) {
-      if (classified.is_first_failure) {
-        legacy_failure = &classified;
-        break;
-      }
-    }
-    if (legacy_failure == nullptr) {
-      for (const auto& classified : legacy.normalized_pairs_classified) {
-        if (collision_pair_classification_blocks_dispatch(
-                classified.classification)) {
-          legacy_failure = &classified;
-          break;
-        }
-      }
-    }
-    if (legacy_failure != nullptr) {
-      details["legacy_collision_compare_first_failure_pair"] =
-          collision_pair_name(legacy_failure->pair);
-      details["legacy_collision_compare_first_failure_classification"] =
-          collision_pair_classification_name(legacy_failure->classification);
-    }
-  } catch (const std::exception& e) {
-    details["legacy_collision_compare_error"] = e.what();
-  } catch (...) {
-    details["legacy_collision_compare_error"] =
-        reason_codes::kUnknownNonStdException;
-  }
-}
-
-CollisionCheckResultDTO collision_check_result_from_bundle(
-    const CollisionValidationDecisionBundle& bundle) {
-  CollisionCheckResultDTO check;
-  const auto* record = select_collision_failure_record(bundle);
-  if (record == nullptr) {
-    return check;
-  }
-
-  check.in_collision = record->result.in_collision;
-  if (!record->result.normalized_pairs.empty()) {
-    check.contact_body_a = record->result.normalized_pairs.front().body_a;
-    check.contact_body_b = record->result.normalized_pairs.front().body_b;
-  }
-  for (const auto& classified : record->result.normalized_pairs_classified) {
-    if (!collision_pair_classification_blocks_dispatch(
-            classified.classification)) {
-      continue;
-    }
-    check.contact_body_a = classified.pair.body_a;
-    check.contact_body_b = classified.pair.body_b;
-    break;
-  }
-  if (record->result.min_clearance_m &&
-      *record->result.min_clearance_m < 0.0) {
-    check.penetration_depth_m = -*record->result.min_clearance_m;
-  }
-  return check;
-}
-
-bool collision_world_revision_is_set(const CollisionWorldRevision& revision) {
-  return revision.revision_id != 0 || !revision.content_hash.empty();
-}
-
-constexpr const char* kRuntimeCollisionFaultSourceId =
-    "manyforge.kernel.runtime_collision_fault";
-constexpr const char* kRuntimeCollisionFaultPolicyId =
-    "manyforge.kernel.runtime_collision_fault.preempt_trajectory";
-
-bool validation_cancelled_by_interrupt(const ErrorDTO& error) {
-  if (error.code != kErrorValidationCollision) {
-    return false;
-  }
-  const auto it = error.details.find("reason");
-  return it != error.details.end() &&
-         it->second == "collision_validation_cancelled";
-}
-
-bool authoritative_collision_replan_candidate(const ErrorDTO& error) {
-  if (error.code != kErrorValidationCollision ||
-      validation_cancelled_by_interrupt(error)) {
-    return false;
-  }
-  const auto decision_it = error.details.find("collision_result_decision");
-  if (decision_it == error.details.end() || decision_it->second != "fail") {
-    return false;
-  }
-  const auto status_it = error.details.find("collision_result_engine_status");
-  return status_it != error.details.end() && status_it->second == "ok";
-}
-
-std::optional<KernelEventType> interrupt_event_type_from_name(
-    const std::string& name) {
-  static const std::map<std::string, KernelEventType> kMap{
-      {"interrupt_signal_ingested", KernelEventType::kInterruptSignalIngested},
-      {"interrupt_signal_rejected_stale",
-       KernelEventType::kInterruptSignalRejectedStale},
-      {"interrupt_signal_rejected_class_violation",
-       KernelEventType::kInterruptSignalRejectedClassViolation},
-      {"interrupt_signal_rejected", KernelEventType::kInterruptSignalRejected},
-      {"interrupt_latched", KernelEventType::kInterruptLatched},
-      {"interrupt_suppressed_by_active_mask",
-       KernelEventType::kInterruptSuppressedByActiveMask},
-      {"interrupt_queued", KernelEventType::kInterruptQueued},
-      {"interrupt_dropped_queue_overflow",
-       KernelEventType::kInterruptDroppedQueueOverflow},
-      {"interrupt_preempt_applied", KernelEventType::kInterruptPreemptApplied},
-      {"interrupt_disposition_applied",
-       KernelEventType::kInterruptDispositionApplied},
-      {"interrupt_cleared", KernelEventType::kInterruptCleared},
-      {"interrupt_ingest_overflow", KernelEventType::kInterruptIngestOverflow},
-      {"interrupt_source_class_violation",
-       KernelEventType::kInterruptSourceClassViolation},
-      {"interrupt_recovery_handler_started",
-       KernelEventType::kInterruptRecoveryHandlerStarted},
-      {"interrupt_recovery_handler_completed",
-       KernelEventType::kInterruptRecoveryHandlerCompleted},
-      // Motion-scoped interrupt event surface (spec/260 §7).
-      // Manager emits the names; the kernel maps them
-      // to typed events for subscribers (Composer, BT runtime, audit).
-      {"motion_interrupt_scope_armed",
-       KernelEventType::kMotionInterruptScopeArmed},
-      {"motion_interrupt_scope_reaped",
-       KernelEventType::kMotionInterruptScopeReaped},
-      {"motion_interrupt_queued_update_dropped",
-       KernelEventType::kMotionInterruptQueuedUpdateDropped},
-      {"motion_trip_secondary_signal",
-       KernelEventType::kMotionTripSecondarySignal},
-      {"motion_trip_failed", KernelEventType::kMotionTripFailed},
-      {"motion_trip_completed", KernelEventType::kMotionTripCompleted},
-  };
-  const auto it = kMap.find(name);
-  if (it == kMap.end()) {
-    return std::nullopt;
-  }
-  return it->second;
-}
-
-InterruptIngestResult reject_interrupts_without_active_phase(
-    const std::vector<InterruptSignalUpdate>& updates) {
-  InterruptIngestResult result;
-  result.rejected = true;
-  result.reason = "no_active_execution_phase";
-  for (const auto& update : updates) {
-    result.events.push_back(
-        {"interrupt_signal_rejected",
-         {{"source_id", update.source_id},
-          {"sequence_id", std::to_string(update.sequence_id)},
-          {"reason", result.reason}},
-         std::nullopt});
-  }
-  return result;
-}
-
-ErrorDTO authoritative_collision_validation_config_error(
-    std::string reason,
-    std::map<std::string, std::string> details = {},
-    std::string phase = "pre_execution_validation") {
-  details.emplace("reason", std::move(reason));
-  details.emplace("phase", std::move(phase));
-  return ErrorDTO{
-      kErrorInvariantViolation,
-      "Authoritative collision validation pipeline is not configured",
-      std::move(details)};
-}
-
-InterruptSourceDefinition runtime_collision_fault_source_definition() {
-  InterruptSourceDefinition source;
-  source.source_id = kRuntimeCollisionFaultSourceId;
-  source.adapter = InterruptAdapter::kKernel;
-  source.signal = "runtime_collision_fault";
-  source.source_class = InterruptSourceClass::kFastExecutionRelevant;
-  source.kind = InterruptSourceKind::kEdge;
-  source.priority = 1000;
-  source.maskable = false;
-  source.freshness_budget_ns = 1'000'000;
-  source.description =
-      "Kernel-owned runtime collision monitor fault source";
-  return source;
-}
-
-InterruptPolicyDefinition runtime_collision_fault_policy_definition() {
-  InterruptPolicyDefinition policy;
-  policy.policy_id = kRuntimeCollisionFaultPolicyId;
-  policy.source_id = kRuntimeCollisionFaultSourceId;
-  policy.priority = 1000;
-  policy.maskable = false;
-  policy.affected_phases = {InterruptExecutionPhase::kTrajectoryExecution};
-  policy.preemption_action = InterruptPreemptionAction::kPreemptTrajectory;
-  policy.post_latch_disposition =
-      InterruptPostLatchDisposition::kAwaitOperatorAck;
-  policy.description =
-      "Preempt trajectory execution when runtime collision monitoring detects a collision";
-  return policy;
-}
-
-bool drain_execution_handle_bounded(ExecutionHandle& handle) {
-  if (!handle.wait_for_completion) {
-    return true;
-  }
-  for (int poll = 0; poll < kExecutionDrainMaxPolls; ++poll) {
-    if (handle.wait_for_completion(kExecutionPollNs)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-ErrorDTO operator_intervention_error(ErrorCode code,
-                                     std::string message,
-                                     std::string phase,
-                                     ExecutionState previous_state,
-                                     uint64_t execution_id,
-                                     const std::string& move_id) {
-  return ErrorDTO{
-      std::string(to_string(code)),
-      std::move(message),
-      {{"requires_operator_intervention", "true"},
-       {"phase", std::move(phase)},
-       {"previous_state", to_string(previous_state)},
-       {"execution_id", std::to_string(execution_id)},
-       {"move_id", move_id},
-       {"stop_completion_timeout_s", std::to_string(kExecutionDrainTimeoutS)}}};
-}
-
-ErrorDTO ensure_operator_intervention_details(ErrorDTO error,
-                                              std::string phase,
-                                              ExecutionState previous_state,
-                                              uint64_t execution_id,
-                                              const std::string& move_id) {
-  error.details.try_emplace("requires_operator_intervention", "true");
-  error.details.try_emplace("phase", std::move(phase));
-  error.details.try_emplace("previous_state", to_string(previous_state));
-  error.details.try_emplace("execution_id", std::to_string(execution_id));
-  error.details.try_emplace("move_id", move_id);
-  error.details.try_emplace("stop_completion_timeout_s",
-                            std::to_string(kExecutionDrainTimeoutS));
-  return error;
-}
-
-struct PreparedExecutionStart {
-  bool cache_hit = false;
-  bool cache_miss = false;
-  bool cache_invalidated = false;
-  std::string cache_invalidation_reason;
-  TrajectoryDTO trajectory;
+  ExecutionKernel& kernel_;
+  EventDeferralScope* previous_ = nullptr;
+  std::vector<KernelEvent> events_;
+  bool flushed_ = false;
 };
 
-}  // namespace
+thread_local ExecutionKernel::EventDeferralScope*
+    ExecutionKernel::active_event_deferral_ = nullptr;
 
 ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
                                  IPlanningContext& context,
@@ -1059,12 +218,33 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
 }
 
 ExecutionKernel::~ExecutionKernel() {
+  const auto drain_scheduler_or_terminate = [this](const char* phase) {
+    constexpr auto kSchedulerDrainTimeout = std::chrono::seconds(1);
+    if (!scheduler_.drain_all_for(kSchedulerDrainTimeout)) {
+      // Fail closed: these scheduler callbacks can capture `this`. Once
+      // teardown starts, continuing after a missed drain risks UAF, while
+      // waiting forever can hang process shutdown.
+      std::cerr << "manyforge_execution_kernel_scheduler_drain_timeout"
+                << " phase=" << phase
+                << " timeout_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                       kSchedulerDrainTimeout)
+                       .count()
+                << '\n';
+      std::terminate();
+    }
+  };
+
   stop_policy_.cancel_pending_callbacks();
+  drain_scheduler_or_terminate("stop_policy_cancel");
   request_fault_preempt_controlled_stop();
+  motion_trip_stop_.request_stop();
   // Scheduled collision callbacks capture `this`; cancel them before any
   // member teardown so destruction cannot race a monitor tick.
   stop_collision_monitoring(/*drain_callbacks=*/true);
+  drain_scheduler_or_terminate("collision_monitor_stop");
 
+  fault_preempt_worker_.stop_and_join();
   operator_stop_worker_.stop_and_join();
 
   // Join before member destruction so worker callbacks cannot notify the
@@ -1072,7 +252,8 @@ ExecutionKernel::~ExecutionKernel() {
   // explicit instead of relying on std::jthread member teardown order.
   if (worker_thread_.joinable()) {
     worker_thread_.request_stop();
-    notify_execution_waiters();
+    motion_trip_stop_.request_stop();
+    worker_signals_.abandon();
     worker_thread_.join();
   }
 }
@@ -1125,6 +306,7 @@ void ExecutionKernel::run_operator_stop_worker(
   auto hard_stop_floor_attempt = std::make_shared<HardStopFloorAttempt>();
   auto controlled_stop_source = std::make_shared<std::stop_source>();
   auto deadline_watchdog_fired = std::make_shared<std::atomic_bool>(false);
+  auto stop_session_complete = std::make_shared<std::atomic_bool>(false);
   std::stop_callback worker_stop_notify(stop_token, [controlled_stop_source]() {
     controlled_stop_source->request_stop();
   });
@@ -1134,7 +316,10 @@ void ExecutionKernel::run_operator_stop_worker(
     stop_deadline_handle = scheduler_.schedule(
         clock_.now() + effective_deadline_ns,
         [this, controlled_stop_source, hard_stop_floor_attempt,
-         deadline_watchdog_fired, requested_mode]() {
+         deadline_watchdog_fired, stop_session_complete, requested_mode]() {
+          if (stop_session_complete->load(std::memory_order_acquire)) {
+            return;
+          }
           deadline_watchdog_fired->store(true, std::memory_order_release);
           const auto legacy =
               request_hard_stop_floor_once(execution_backend_,
@@ -1173,6 +358,7 @@ void ExecutionKernel::run_operator_stop_worker(
   auto controlled_result =
       execution_backend_.execute_controlled_stop(
           profile, controlled_stop_source->get_token());
+  stop_session_complete->store(true, std::memory_order_release);
   if (stop_deadline_handle != 0) {
     scheduler_.cancel(stop_deadline_handle);
   }
@@ -1302,6 +488,7 @@ void ExecutionKernel::run_operator_stop_worker(
                 escalation_details});
   }
 
+  EventDeferralScope event_scope(*this);
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
   if (!operator_stop_worker_is_current(generation, stop_token)) {
     return;
@@ -1447,6 +634,48 @@ void ExecutionKernel::run_operator_stop_worker(
   auto snapshot = execution_backend_.get_execution_snapshot();
   snapshot.timestamp_ns = clock_.now();
 
+  // Build the degraded-stop error and publish it to the terminal-error
+  // fallback BEFORE the state machine becomes observably kStopped. A consumer
+  // that polls the terminal state and then reads the snapshot must never see
+  // kStopped without the error explaining the downgraded stop. get_execution_
+  // snapshot() falls back to operator_stop_worker_.terminal_error() for a
+  // kStopped snapshot that lacks an error, so this must be set before the
+  // commit; setting it afterward (as the state-transition-lost and total-
+  // failure branches do NOT — they set their fallback before committing)
+  // opens a window where the fallback is still empty.
+  std::optional<ErrorDTO> degraded_stop_error;
+  if (!controlled_ok && fallback_legacy_result &&
+      fallback_legacy_result->accepted) {
+    ErrorDTO error{
+        std::string(kErrorMotionInterruptBackendStopFailed),
+        stop_failure_message,
+        {{"reason", stop_failure_reason},
+         {"requested_stop_mode", requested_mode},
+         {"executed_stop_mode", executed_mode},
+         {"emergency_fallback", "legacy_stop_succeeded"},
+         {"hard_stop_transitioned", "true"}}};
+    add_hard_stop_floor_details(error.details, execution_backend_);
+    for (const auto& [key, value] : settle_details) {
+      error.details[key] = value;
+    }
+    operator_stop_worker_.set_terminal_error(error);
+    degraded_stop_error = std::move(error);
+  }
+
+  // Publish the post-stop snapshot BEFORE the state machine becomes
+  // observably kStopped, for the same reason as the degraded-stop error
+  // above: while kStopping, observers are served a live backend read, but
+  // the moment the state flips to a terminal state they are served the
+  // published snapshot. Publishing after the commit leaves a window where a
+  // consumer that saw kStopped reads a stale snapshot without the post-stop
+  // joint state. If the commit is lost to another terminal authority, the
+  // intervention branch below publishes its own corrected snapshot.
+  snapshot.state = ExecutionState::kStopped;
+  if (degraded_stop_error.has_value()) {
+    snapshot.error = degraded_stop_error;
+  }
+  publish_execution_snapshot(std::move(snapshot));
+
   auto transition = commit_terminal(ExecutionState::kStopped,
                                     "terminal_commit",
                                     TerminalCommitter::Origin::kStopAuthority);
@@ -1490,26 +719,6 @@ void ExecutionKernel::run_operator_stop_worker(
     return;
   }
 
-  snapshot.state = sm_.status().state;
-  if (!controlled_ok && fallback_legacy_result &&
-      fallback_legacy_result->accepted) {
-    ErrorDTO degraded_stop_error{
-        std::string(kErrorMotionInterruptBackendStopFailed),
-        stop_failure_message,
-        {{"reason", stop_failure_reason},
-         {"requested_stop_mode", requested_mode},
-         {"executed_stop_mode", executed_mode},
-         {"emergency_fallback", "legacy_stop_succeeded"},
-         {"hard_stop_transitioned", "true"}}};
-    add_hard_stop_floor_details(degraded_stop_error.details,
-                                execution_backend_);
-    for (const auto& [key, value] : settle_details) {
-      degraded_stop_error.details[key] = value;
-    }
-    operator_stop_worker_.set_terminal_error(degraded_stop_error);
-    snapshot.error = std::move(degraded_stop_error);
-  }
-  publish_execution_snapshot(std::move(snapshot));
   std::map<std::string, std::string> stop_issued_details;
   if (controlled_ok) {
     stop_issued_details = controlled_stop_success_event_details(
@@ -1548,65 +757,41 @@ TerminalCommitter::CommitOutcome ExecutionKernel::commit_terminal(
   return outcome;
 }
 
-void ExecutionKernel::emit_event(const KernelEvent& event) {
-  KernelEvent event_to_emit = event;
-  stamp_active_request_correlation(event_to_emit.details);
-  if (event_to_emit.error.has_value()) {
-    for (const auto& [key, value] : event_to_emit.error->details) {
-      event_to_emit.details.emplace(key, value);
+void ExecutionKernel::emit_event(KernelEvent event) {
+  prepare_event(event);
+  if (active_event_deferral_ != nullptr) {
+    active_event_deferral_->defer(std::move(event));
+    return;
+  }
+  dispatch_prepared_event(event);
+}
+
+void ExecutionKernel::emit_event_immediate(KernelEvent event) {
+  prepare_event(event);
+  dispatch_prepared_event(event);
+}
+
+void ExecutionKernel::prepare_event(KernelEvent& event) const {
+  stamp_active_request_correlation(event.details);
+  if (event.error.has_value()) {
+    for (const auto& [key, value] : event.error->details) {
+      event.details.emplace(key, value);
     }
   }
+}
 
-  std::vector<std::pair<uint64_t, EventCallback>> callbacks;
-  {
-    std::lock_guard<std::mutex> lock(subscribers_mutex_);
-    callbacks.reserve(subscribers_.size());
-    for (const auto& [id, callback] : subscribers_) {
-      callbacks.emplace_back(id, callback);
-    }
-  }
-
-  auto record_subscriber_exception = [this](uint64_t subscriber_id,
-                                            const char* exception_type,
-                                            const char* exception_message) {
-    {
-      std::lock_guard<std::mutex> lock(metrics_mutex_);
-      metrics_.event_subscriber_exceptions++;
-    }
-    std::cerr << "manyforge_kernel_event_subscriber_exception"
-              << " reason_code=" << reason_codes::kEventSubscriberException
-              << " subscriber_id=" << subscriber_id
-              << " exception_type=" << exception_type
-              << " exception=" << exception_message << '\n';
-  };
-
-  for (const auto& [subscriber_id, callback] : callbacks) {
-    try {
-      callback(event_to_emit);
-    } catch (const std::exception& e) {
-      record_subscriber_exception(subscriber_id, "std_exception", e.what());
-    } catch (...) {
-      record_subscriber_exception(subscriber_id,
-                                  reason_codes::kUnknownNonStdException,
-                                  reason_codes::kUnknownNonStdException);
-    }
+void ExecutionKernel::dispatch_prepared_event(const KernelEvent& event_to_emit) {
+  const auto subscriber_exceptions =
+      event_publisher_.dispatch(event_to_emit);
+  if (subscriber_exceptions > 0) {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    metrics_.event_subscriber_exceptions += subscriber_exceptions;
   }
 }
 
 void ExecutionKernel::set_active_request_correlation(
     const ExecuteRequestDTO& request) {
-  {
-    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-    active_move_id_ = request.move_id;
-  }
-  {
-    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-    active_program_run_id_ = request.program_run_id;
-  }
-  {
-    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
-    active_action_span_ = request.action_span;
-  }
+  active_correlation_.set_from_request(request);
   {
     runtime_collision_monitor_.set_active_contact_policy_id(
         request.contact_policy_id);
@@ -1614,18 +799,7 @@ void ExecutionKernel::set_active_request_correlation(
 }
 
 void ExecutionKernel::clear_active_request_correlation() {
-  {
-    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-    active_move_id_.clear();
-  }
-  {
-    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-    active_program_run_id_.clear();
-  }
-  {
-    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
-    active_action_span_.reset();
-  }
+  active_correlation_.clear_all();
   {
     runtime_collision_monitor_.clear_active_contact_policy_id();
   }
@@ -1633,35 +807,7 @@ void ExecutionKernel::clear_active_request_correlation() {
 
 void ExecutionKernel::stamp_active_request_correlation(
     std::map<std::string, std::string>& details) const {
-  {
-    // Central correlation stamp (spec/500 §4.1: program_run_id "when
-    // provided by caller"): one funnel instead of forty emit sites.
-    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-    if (!active_program_run_id_.empty()) {
-      details.emplace("program_run_id", active_program_run_id_);
-    }
-  }
-  {
-    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
-    if (active_action_span_) {
-      const auto& span = *active_action_span_;
-      details.emplace("action_source", to_string(span.action_source));
-      details.emplace("action_span_id", span.action_span_id);
-      if (!span.program_run_id.empty()) {
-        details.emplace("action_span_program_run_id", span.program_run_id);
-      }
-      if (!span.node_instance_id.empty()) {
-        details.emplace("node_instance_id", span.node_instance_id);
-      }
-      if (!span.node_attempt_id.empty()) {
-        details.emplace("node_attempt_id", span.node_attempt_id);
-      }
-      if (!span.parent_node_attempt_id.empty()) {
-        details.emplace("parent_node_attempt_id",
-                        span.parent_node_attempt_id);
-      }
-    }
-  }
+  active_correlation_.stamp_details(details);
   {
     const auto contact_policy_id =
         runtime_collision_monitor_.active_contact_policy_id();
@@ -1673,10 +819,7 @@ void ExecutionKernel::stamp_active_request_correlation(
 
 void ExecutionKernel::stamp_active_request_correlation(
     ExecutionSnapshot& snapshot) const {
-  if (!snapshot.action_span) {
-    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
-    snapshot.action_span = active_action_span_;
-  }
+  active_correlation_.stamp_snapshot(snapshot);
   if (snapshot.contact_policy_id.empty()) {
     snapshot.contact_policy_id =
         runtime_collision_monitor_.active_contact_policy_id();
@@ -1684,15 +827,11 @@ void ExecutionKernel::stamp_active_request_correlation(
 }
 
 SubscriptionHandle ExecutionKernel::subscribe_events(EventCallback callback) {
-  std::lock_guard<std::mutex> lock(subscribers_mutex_);
-  uint64_t id = next_subscription_id_++;
-  subscribers_[id] = std::move(callback);
-  return SubscriptionHandle{id};
+  return event_publisher_.subscribe(std::move(callback));
 }
 
 void ExecutionKernel::unsubscribe_events(SubscriptionHandle handle) {
-  std::lock_guard<std::mutex> lock(subscribers_mutex_);
-  subscribers_.erase(handle.id);
+  event_publisher_.unsubscribe(handle);
 }
 
 Result<void> ExecutionKernel::register_interrupt_source(
@@ -1772,9 +911,22 @@ void ExecutionKernel::request_validation_cancel_from_interrupt(
   }
 }
 
+void ExecutionKernel::request_planning_cancel_from_interrupt(
+    const InterruptIngestResult& result) {
+  if (!result.latched || !result.active_latch ||
+      result.active_latch->preemption_action_requested !=
+          InterruptPreemptionAction::kCancelPlanning) {
+    return;
+  }
+  planner_.request_cancel();
+}
+
 void ExecutionKernel::record_terminal_fault_authority(
     const InterruptIngestResult& result) {
-  if (result.latched || result.active_latch.has_value()) {
+  if ((result.latched || result.active_latch.has_value()) &&
+      (!result.active_latch ||
+       result.active_latch->preemption_action_requested !=
+           InterruptPreemptionAction::kCompleteMoveOnSignal)) {
     terminal_fault_authority_asserted_.store(true,
                                              std::memory_order_release);
   }
@@ -1787,9 +939,16 @@ void ExecutionKernel::mark_active_interrupt_preemption_result(
   if (!latch) {
     return;
   }
+  mark_interrupt_preemption_result(*latch, result, extra_details);
+}
+
+void ExecutionKernel::mark_interrupt_preemption_result(
+    const InterruptLatch& latch,
+    InterruptPreemptionResult result,
+    const std::map<std::string, std::string>& extra_details) {
   const auto now = clock_.now();
-  auto marked = interrupt_manager_.mark_active_preemption_result(
-      result, now - latch->latched_at_ns, now);
+  auto marked = interrupt_manager_.mark_preemption_result(
+      latch.latch_id, result, now - latch.latched_at_ns, now);
   if (marked.ok()) {
     auto marked_result = marked.value();
     record_terminal_fault_authority(marked_result);
@@ -1803,6 +962,47 @@ void ExecutionKernel::mark_active_interrupt_preemption_result(
       }
     }
     emit_interrupt_events(marked_result);
+  }
+}
+
+void ExecutionKernel::apply_interrupt_ingest_effects(
+    const InterruptIngestResult& result,
+    bool apply_preemption_inline) {
+  record_terminal_fault_authority(result);
+  // Commit the observable kInterrupted state BEFORE requesting the in-flight
+  // planner/validation cancel. request_*_cancel_from_interrupt unblocks the
+  // worker's plan()/validate() with a cancellation error; if the state flip
+  // came after, the worker could reach its cancel-outcome path (which is gated
+  // on state == kInterrupted) and read the state before this thread committed
+  // it, fall through to the generic-failed path, and lose the interrupt
+  // preemption bookkeeping (preemption_result and the error snapshot) to a
+  // terminal-authority override. Flipping first makes the worker's read
+  // happen-after this commit through the cancel-flag synchronization.
+  if (result.latched) {
+    const auto prev_state = sm_.status().state;
+    if (prev_state != ExecutionState::kInterrupted) {
+      auto transition =
+          commit_terminal(ExecutionState::kInterrupted, "terminal_commit");
+      if (transition.ok()) {
+        auto snapshot = get_execution_snapshot();
+        snapshot.timestamp_ns = clock_.now();
+        snapshot.state = ExecutionState::kInterrupted;
+        publish_execution_snapshot(std::move(snapshot));
+        emit_event({KernelEventType::kStateTransition,
+                    sm_.status().execution_id,
+                    clock_.now(),
+                    prev_state,
+                    ExecutionState::kInterrupted,
+                    std::nullopt,
+                    {{"reason", "interrupt_latched"}}});
+      }
+    }
+  }
+  request_validation_cancel_from_interrupt(result);
+  request_planning_cancel_from_interrupt(result);
+  emit_interrupt_events(result);
+  if (apply_preemption_inline) {
+    apply_latched_interrupt_preemption(result);
   }
 }
 
@@ -1846,17 +1046,76 @@ ExecutionKernel::publish_runtime_collision_fault_interrupt(
   for (const auto& [key, value] : metadata) {
     signal.metadata[key] = value;
   }
-  return publish_fast_interrupt_signal(signal);
+  auto result = publish_fast_interrupt_signals_internal(
+      std::vector<InterruptSignalUpdate>{std::move(signal)},
+      /*apply_preemption_inline=*/false);
+  schedule_latched_interrupt_preemption(result);
+  return result;
+}
+
+void ExecutionKernel::schedule_latched_interrupt_preemption(
+    InterruptIngestResult result) {
+  if (!result.latched || !result.active_latch ||
+      result.active_latch->preemption_action_requested !=
+          InterruptPreemptionAction::kPreemptTrajectory) {
+    return;
+  }
+  const auto latch_id = result.active_latch->latch_id;
+  const auto source_id = result.active_latch->source_id;
+  const auto policy_id = result.active_latch->policy_id;
+  fault_preempt_worker_.join_finished();
+  const bool started = fault_preempt_worker_.start(
+      [this, result = std::move(result), latch_id](
+          std::uint64_t generation, std::stop_token stop_token) mutable {
+        if (!fault_preempt_worker_.is_current(generation, stop_token)) {
+          return;
+        }
+        auto active_latch = interrupt_manager_.active_latch();
+        if (!active_latch || active_latch->latch_id != latch_id ||
+            active_latch->preemption_result !=
+                InterruptPreemptionResult::kPending) {
+          return;
+        }
+        apply_latched_interrupt_preemption(result, stop_token);
+      });
+  if (started) {
+    return;
+  }
+
+  request_fault_preempt_controlled_stop();
+  std::map<std::string, std::string> details{
+      {"reason", "fault_preempt_worker_busy"},
+      {"phase", "fault_preempt_worker_start"},
+      {"latch_id", latch_id},
+      {"source_id", source_id},
+      {"policy_id", policy_id},
+      {"preemption_result", "pending"}};
+  emit_event({KernelEventType::kErrorRaised,
+              sm_.status().execution_id,
+              clock_.now(),
+              {},
+              {},
+              ErrorDTO{std::string(kErrorMotionInterruptBackendStopFailed),
+                       "fault preempt worker was already active; pending "
+                       "preempt watchdog remains armed",
+                       details},
+              details});
 }
 
 void ExecutionKernel::apply_latched_interrupt_preemption(
-    const InterruptIngestResult& result) {
+    const InterruptIngestResult& result,
+    std::stop_token worker_stop_token) {
   if (!result.latched || !result.active_latch) {
     return;
   }
   const auto& latch = *result.active_latch;
   if (latch.preemption_action_requested !=
       InterruptPreemptionAction::kPreemptTrajectory) {
+    return;
+  }
+  auto active_latch = interrupt_manager_.active_latch();
+  if (!active_latch || active_latch->latch_id != latch.latch_id ||
+      active_latch->preemption_result != InterruptPreemptionResult::kPending) {
     return;
   }
   stop_collision_monitoring();
@@ -1874,9 +1133,9 @@ void ExecutionKernel::apply_latched_interrupt_preemption(
   // policy doesn't carry one but the deployment configured a kernel-
   // level `default_fault_stop_profile`, use that. Falls through to the
   // legacy `execution_backend_.stop()` only when both are unset.
-  if (auto active = interrupt_manager_.active_policy();
-      active.has_value() && active->stop_profile) {
-    fault_stop_profile = *active->stop_profile;
+  if (auto policy = interrupt_manager_.policy_by_id(latch.policy_id);
+      policy.has_value() && policy->stop_profile) {
+    fault_stop_profile = *policy->stop_profile;
   } else if (config_.default_fault_stop_profile) {
     fault_stop_profile = *config_.default_fault_stop_profile;
   }
@@ -1899,6 +1158,10 @@ void ExecutionKernel::apply_latched_interrupt_preemption(
         });
     auto hard_stop_floor_attempt = std::make_shared<HardStopFloorAttempt>();
     auto deadline_watchdog_fired = std::make_shared<std::atomic_bool>(false);
+    auto stop_session_complete = std::make_shared<std::atomic_bool>(false);
+    std::stop_callback worker_stop_callback(
+        worker_stop_token,
+        [fault_stop_source]() { fault_stop_source->request_stop(); });
     ScheduleHandle stop_deadline_handle = 0;
     const auto effective_deadline_ns =
         effective_controlled_stop_deadline_ns(
@@ -1913,8 +1176,11 @@ void ExecutionKernel::apply_latched_interrupt_preemption(
       stop_deadline_handle = scheduler_.schedule(
           clock_.now() + effective_deadline_ns,
           [this, fault_stop_source, hard_stop_floor_attempt,
-           deadline_watchdog_fired, requested_mode, fault_profile_id, latch_id,
-           source_id, policy_id]() {
+           deadline_watchdog_fired, stop_session_complete, requested_mode,
+           fault_profile_id, latch_id, source_id, policy_id]() {
+            if (stop_session_complete->load(std::memory_order_acquire)) {
+              return;
+            }
             deadline_watchdog_fired->store(true, std::memory_order_release);
             const auto legacy =
                 request_hard_stop_floor_once(execution_backend_,
@@ -1951,6 +1217,7 @@ void ExecutionKernel::apply_latched_interrupt_preemption(
     }
     controlled_stop = execution_backend_.execute_controlled_stop(
         *fault_stop_profile, fault_stop_source->get_token());
+    stop_session_complete->store(true, std::memory_order_release);
     if (stop_deadline_handle != 0) {
       scheduler_.cancel(stop_deadline_handle);
     }
@@ -2039,13 +1306,17 @@ void ExecutionKernel::apply_latched_interrupt_preemption(
       add_hard_stop_floor_details(preempt_event_details, execution_backend_);
     }
   } else {
+    if (worker_stop_token.stop_requested()) {
+      return;
+    }
     auto stop = execution_backend_.stop();
     preempt_accepted = stop.accepted;
     preempt_error = stop.error;
     preempt_event_details["preempt_path"] = "legacy_backend_stop";
   }
 
-  mark_active_interrupt_preemption_result(
+  mark_interrupt_preemption_result(
+      latch,
       preempt_accepted ? InterruptPreemptionResult::kSucceeded
                        : InterruptPreemptionResult::kBackendPreemptFailed,
       preempt_event_details);
@@ -2085,21 +1356,33 @@ InterruptRuntimeContext ExecutionKernel::current_interrupt_context() const {
   if (status.execution_id != 0) {
     context.execution_id = status.execution_id;
   }
-  {
-    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-    if (!active_move_id_.empty()) {
-      context.move_id = active_move_id_;
-    }
-  }
-  // Interrupt latches record the publisher's live revision at signal time.
-  // A validation bundle that is cancelled by this latch may carry an older
-  // borrowed revision because validation intentionally runs against one
-  // immutable snapshot per pass.
-  const auto revision = current_authoritative_collision_world_revision();
-  if (collision_world_revision_is_set(revision)) {
-    context.borrowed_collision_world_revision = revision;
+  if (auto move_id = active_correlation_.move_id(); !move_id.empty()) {
+    context.move_id = std::move(move_id);
   }
   return context;
+}
+
+void ExecutionKernel::stamp_interrupt_latch_collision_world_revision(
+    InterruptIngestResult& result) {
+  if (!result.latched || !result.active_latch ||
+      result.active_latch->borrowed_collision_world_revision.has_value()) {
+    return;
+  }
+  const auto revision = current_authoritative_collision_world_revision();
+  if (!collision_world_revision_is_set(revision)) {
+    return;
+  }
+  const auto latch_id = result.active_latch->latch_id;
+  if (!interrupt_manager_.stamp_active_latch_collision_world_revision(
+          latch_id, revision)) {
+    return;
+  }
+  result.active_latch->borrowed_collision_world_revision = revision;
+  for (auto& event : result.events) {
+    if (event.latch && event.latch->latch_id == latch_id) {
+      event.latch->borrowed_collision_world_revision = revision;
+    }
+  }
 }
 
 void ExecutionKernel::emit_interrupt_events(const InterruptIngestResult& result) {
@@ -2283,8 +1566,15 @@ Result<void> ExecutionKernel::arm_motion_scopes_for_dispatch(
     return Result<void>::Err(std::move(err));
   }
   // Surface scope_armed events; the manager has already validated each
-  // binding atomically, so we just relay.
-  emit_interrupt_manager_events(arm.value().events, execution_id);
+  // binding atomically. If arming itself tripped a scope, route the
+  // returned latch through the same side-effect helper as signal ingest.
+  auto arm_result = std::move(arm).value();
+  if (arm_result.latched) {
+    stamp_interrupt_latch_collision_world_revision(arm_result);
+    apply_interrupt_ingest_effects(arm_result, /*apply_preemption_inline=*/true);
+  } else {
+    emit_interrupt_manager_events(arm_result.events, execution_id);
+  }
   motion_state.arm_succeeded = true;
   return Result<void>::Ok();
 }
@@ -2317,11 +1607,14 @@ void ExecutionKernel::finalize_motion_execution_outcome(
   MotionExecutionOutcomeDTO outcome;
   outcome.execution_id = motion_state.execution_id;
   outcome.move_id = motion_state.move_id;
-  {
-    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
-    outcome.action_span = active_action_span_;
+  if (motion_state.correlation_captured) {
+    outcome.action_span = motion_state.action_span;
+  } else {
+    outcome.action_span = active_correlation_.action_span();
   }
-  {
+  if (motion_state.correlation_captured) {
+    outcome.contact_policy_id = motion_state.contact_policy_id;
+  } else {
     outcome.contact_policy_id =
         runtime_collision_monitor_.active_contact_policy_id();
   }
@@ -2383,20 +1676,6 @@ void ExecutionKernel::finalize_motion_execution_outcome(
     outcome.error = std::move(error);
   }
 
-  // Store and evict FIFO when over the retention bound.
-  {
-    std::lock_guard<std::mutex> lock(motion_outcomes_mutex_);
-    motion_execution_outcomes_.insert_or_assign(
-        outcome.execution_id, outcome);
-    motion_outcome_order_.push_back(outcome.execution_id);
-    while (motion_outcome_order_.size() >
-           config_.motion_execution_outcome_retention) {
-      const auto evict_id = motion_outcome_order_.front();
-      motion_outcome_order_.erase(motion_outcome_order_.begin());
-      motion_execution_outcomes_.erase(evict_id);
-    }
-  }
-
   std::map<std::string, std::string> details{
       {"execution_id", std::to_string(outcome.execution_id)},
       {"move_id", outcome.move_id},
@@ -2436,218 +1715,36 @@ void ExecutionKernel::finalize_motion_execution_outcome(
       details.emplace("error_reason", outcome.error->details.at("reason"));
     }
   }
+
+  const auto outcome_execution_id = outcome.execution_id;
+  auto outcome_error = outcome.error;
+
+  // Store and evict FIFO when over the retention bound.
+  {
+    std::lock_guard<std::mutex> lock(motion_outcomes_mutex_);
+    motion_execution_outcomes_.insert_or_assign(
+        outcome_execution_id, std::move(outcome));
+    motion_outcome_order_.push_back(outcome_execution_id);
+    while (motion_outcome_order_.size() >
+           config_.motion_execution_outcome_retention) {
+      const auto evict_id = motion_outcome_order_.front();
+      motion_outcome_order_.erase(motion_outcome_order_.begin());
+      motion_execution_outcomes_.erase(evict_id);
+    }
+  }
+
   emit_event({KernelEventType::kMotionExecutionOutcomeRecorded,
-              outcome.execution_id, clock_.now(), {}, {}, outcome.error,
+              outcome_execution_id, clock_.now(), {}, {}, std::move(outcome_error),
               std::move(details)});
 }
-
-namespace {
-
-const char* stop_mode_string(MotionInterruptStopMode mode) {
-  switch (mode) {
-    using enum MotionInterruptStopMode;
-    case kSpringBackHold: return "spring_back_hold";
-    case kSoftOnPath: return "soft_on_path";
-    case kHardDeceleration: return "hard_deceleration";
-  }
-  return "unknown";
-}
-
-const char* stop_command_source_string(MotionInterruptStopCommandSource s) {
-  switch (s) {
-    using enum MotionInterruptStopCommandSource;
-    case kFjtPreemptHold: return "fjt_preempt_hold";
-    case kFjtPreemptPathRamp: return "fjt_preempt_path_ramp";
-    case kJtcSpeedScalingRamp: return "jtc_speed_scaling_ramp";
-    case kJtcCancelDecelerateOnCancel: return "jtc_cancel_decelerate_on_cancel";
-    case kJtcCancelUnprofiledHold: return "jtc_cancel_unprofiled_hold";
-    case kNativeSimulatedStop: return "native_simulated_stop";
-    case kNativeSimulatedPathRamp: return "native_simulated_path_ramp";
-    case kRobotNativeStop: return "robot_native_stop";
-    case kDiagnosticOther: return "diagnostic_other";
-  }
-  return "unknown";
-}
-
-struct StopFallbackQualificationRow {
-  MotionInterruptStopMode requested;
-  MotionInterruptStopMode executed;
-  MotionInterruptNodeCategory node_category;
-  std::array<MotionInterruptStopCommandSource, 5> allowed_command_sources;
-  std::size_t allowed_command_source_count;
-  const char* qualification_id;
-  const char* rationale;
-  const char* telemetry;
-  const char* evidence_status;
-};
-
-constexpr std::array<StopFallbackQualificationRow, 1>
-    kStopFallbackQualificationMatrix{{
-        {MotionInterruptStopMode::kSoftOnPath,
-         MotionInterruptStopMode::kSpringBackHold,
-         MotionInterruptNodeCategory::kGeneric,
-         {MotionInterruptStopCommandSource::kDiagnosticOther,
-          MotionInterruptStopCommandSource::kFjtPreemptHold,
-          MotionInterruptStopCommandSource::kNativeSimulatedStop,
-          MotionInterruptStopCommandSource::kFjtPreemptPathRamp,
-          MotionInterruptStopCommandSource::kNativeSimulatedPathRamp},
-         5,
-         "4.5G-soft_on_path-to-spring_back_hold-generic-v1",
-         "path-preserving soft stop unavailable; generic node accepts the qualified spring-back stop",
-         "fallback_reason, requested/executed modes, command source, stop snapshot, stop timing",
-         "in_tree_qualified; live_adapter_evidence_required_for_release"},
-    }};
-
-const StopFallbackQualificationRow* qualified_stop_fallback_pair(
-    MotionInterruptStopMode requested,
-    MotionInterruptStopMode executed,
-    MotionInterruptNodeCategory node_category) {
-  for (const auto& row : kStopFallbackQualificationMatrix) {
-    if (row.requested == requested && row.executed == executed &&
-        row.node_category == node_category) {
-      return &row;
-    }
-  }
-  return nullptr;
-}
-
-bool fallback_row_allows_command_source(
-    const StopFallbackQualificationRow& row,
-    MotionInterruptStopCommandSource source) {
-  for (std::size_t i = 0; i < row.allowed_command_source_count; ++i) {
-    if (row.allowed_command_sources[i] == source) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/// Spec/210 §3.7 RobotStateDTO size/ordering invariant: joint_names and
-/// positions_rad MUST have the same non-zero length and no empty
-/// joint names. Used as the spec/210 §3.11 ExecutionStopSnapshotDTO
-/// validation gate.
-bool robot_state_size_ordering_ok(const RobotStateDTO& state) {
-  if (state.joint_names.empty()) {
-    return false;
-  }
-  if (state.joint_names.size() != state.positions_rad.size()) {
-    return false;
-  }
-  for (const auto& name : state.joint_names) {
-    if (name.empty()) {
-      return false;
-    }
-  }
-  return true;
-}
-
-/// Spec/210 §3.11 ExecutionStopSnapshotDTO source-priority capture.
-/// The post-stop snapshot is fetched FRESH after the backend confirms
-/// the controlled stop and
-/// `joint_names` are recovered from the planning context so spec/210
-/// §3.7 size/ordering validation can actually run.
-///
-/// Returns the snapshot if validation succeeds; populates
-/// `failure_reason` when the snapshot is invalid for the node category
-/// (e.g. `planning_context_state` source for a precision-contact node,
-/// or invalid `robot_state`).
-std::optional<ExecutionStopSnapshotDTO> capture_stop_snapshot(
-    const ExecutionSnapshot& post_stop_backend_snapshot,
-    const std::optional<RobotStateDTO>& planning_context_state,
-    bool backend_stop_confirmed,
-    MotionInterruptNodeCategory node_category,
-    std::int64_t captured_at_ns,
-    double settle_velocity_threshold_rad_s,
-    std::string& failure_reason) {
-  ExecutionStopSnapshotDTO snap;
-  snap.captured_at_ns = captured_at_ns;
-  snap.backend_stop_confirmed = backend_stop_confirmed;
-  const bool command_authoritative =
-      is_command_authoritative_stop_snapshot(post_stop_backend_snapshot);
-
-  // Settle signal: derive max |velocity| and the at-rest verdict from whatever
-  // measured velocities the chosen state source carries. Absent velocities
-  // leave both fields unset (settle UNKNOWN) — never silently "at rest".
-  const auto apply_settle_signal = [&](ExecutionStopSnapshotDTO& s) {
-    if (s.robot_state.velocities_rad_s.empty() ||
-        s.robot_state.velocities_rad_s.size() !=
-            s.robot_state.positions_rad.size()) {
-      return;
-    }
-    double max_abs = 0.0;
-    for (double v : s.robot_state.velocities_rad_s) {
-      max_abs = std::max(max_abs, std::abs(v));
-    }
-    s.max_abs_velocity_rad_s = max_abs;
-    s.at_rest = command_authoritative ||
-                max_abs <= settle_velocity_threshold_rad_s;
-  };
-
-  // Priority 1: execution-backend feedback (preferred). Joint names
-  // come from the planning context (the IExecutionBackend's snapshot
-  // DTO does not carry them); we MUST be able to align name-by-name
-  // for spec/210 §3.7 validation.
-  if (!post_stop_backend_snapshot.joint_positions_rad.empty() &&
-      planning_context_state &&
-      planning_context_state->joint_names.size() ==
-          post_stop_backend_snapshot.joint_positions_rad.size()) {
-    snap.source = ExecutionStopSnapshotSource::kExecutionBackendFeedback;
-    snap.robot_state.joint_names = planning_context_state->joint_names;
-    snap.robot_state.positions_rad =
-        post_stop_backend_snapshot.joint_positions_rad;
-    if (post_stop_backend_snapshot.joint_velocities_rad_s.size() ==
-        snap.robot_state.positions_rad.size()) {
-      snap.robot_state.velocities_rad_s =
-          post_stop_backend_snapshot.joint_velocities_rad_s;
-    }
-    if (post_stop_backend_snapshot.progress > 0.0 &&
-        post_stop_backend_snapshot.progress <= 1.0) {
-      snap.trajectory_progress = post_stop_backend_snapshot.progress;
-    }
-    if (!robot_state_size_ordering_ok(snap.robot_state)) {
-      failure_reason = "stop_snapshot_robot_state_size_ordering_invalid";
-      return std::nullopt;
-    }
-    apply_settle_signal(snap);
-    return snap;
-  }
-
-  // Priority 2: kernel execution snapshot. Same source path as
-  // Priority 1 — the worker's `get_execution_snapshot()` proxies the
-  // backend's snapshot — but if the backend snapshot was unusable we
-  // fall through to the planning-context fallback rather than
-  // synthesizing a partial RobotStateDTO.
-
-  // Priority 3: planning-context state is rejected for precision-
-  // contact node categories (spec/210 §3.11 ExecutionStopSnapshotDTO
-  // semantic rules). Generic nodes may accept it as a last resort
-  // when the backend snapshot is unusable.
-  if (node_category == MotionInterruptNodeCategory::kPrecisionContact) {
-    failure_reason = "stop_snapshot_planning_context_rejected_for_precision_contact";
-    return std::nullopt;
-  }
-  if (planning_context_state) {
-    snap.source = ExecutionStopSnapshotSource::kPlanningContextState;
-    snap.robot_state = *planning_context_state;
-    if (!robot_state_size_ordering_ok(snap.robot_state)) {
-      failure_reason = "stop_snapshot_robot_state_size_ordering_invalid";
-      return std::nullopt;
-    }
-    apply_settle_signal(snap);
-    return snap;
-  }
-  failure_reason = "stop_snapshot_no_usable_state_available";
-  return std::nullopt;
-}
-
-}  // namespace
 
 void ExecutionKernel::handle_motion_trip_latch(
     const ExecuteRequestDTO& request,
     const InterruptLatch& latch,
     std::uint64_t exec_id,
     const ExecutionSnapshot& /*latest_backend_snapshot*/,
-    ActiveMotionExecution& motion_state) {
+    ActiveMotionExecution& motion_state,
+    std::stop_token worker_stop_token) {
   // Locate the originating scope so we can recover the
   // MotionInterruptStopProfileDTO and node_category. The latch carries
   // the scope id; the request carries the scope vector. A trip latch
@@ -2727,6 +1824,10 @@ void ExecutionKernel::handle_motion_trip_latch(
           profile, config_.complete_move_on_signal_timeout_ns);
 
   std::stop_source trip_stop_source;
+  std::stop_callback worker_stop_bridge(worker_stop_token,
+                                        [&trip_stop_source]() {
+                                          trip_stop_source.request_stop();
+                                        });
   motion_trip_stop_.begin(trip_stop_source);
   start_collision_monitoring();
   begin_runtime_velocity_scale_freeze();
@@ -2736,6 +1837,7 @@ void ExecutionKernel::handle_motion_trip_latch(
       });
   auto hard_stop_floor_attempt = std::make_shared<HardStopFloorAttempt>();
   auto deadline_watchdog_fired = std::make_shared<std::atomic_bool>(false);
+  auto stop_session_complete = std::make_shared<std::atomic_bool>(false);
 
   // Kernel-enforced stop deadline. If the backend blocks past the effective
   // deadline, the Monitoring lane requests cancellation AND issues the
@@ -2752,7 +1854,11 @@ void ExecutionKernel::handle_motion_trip_latch(
     stop_deadline_handle = scheduler_.schedule(
         clock_.now() + effective_deadline_ns,
         [this, hard_stop_floor_attempt, requested_mode, latch_id, source_id,
-         policy_id, scope_id, deadline_watchdog_fired]() {
+         policy_id, scope_id, deadline_watchdog_fired,
+         stop_session_complete]() {
+          if (stop_session_complete->load(std::memory_order_acquire)) {
+            return;
+          }
           deadline_watchdog_fired->store(true, std::memory_order_release);
           const auto legacy =
               request_hard_stop_floor_once(execution_backend_,
@@ -2795,6 +1901,7 @@ void ExecutionKernel::handle_motion_trip_latch(
   auto stop_result = execution_backend_.execute_controlled_stop(
       profile, trip_stop_source.get_token());
   const auto call_end_ns = clock_.now();
+  stop_session_complete->store(true, std::memory_order_release);
   const bool deadline_watchdog_expired =
       deadline_watchdog_fired->load(std::memory_order_acquire);
   if (deadline_watchdog_expired) {
@@ -3340,35 +2447,23 @@ InterruptIngestResult ExecutionKernel::publish_supervisory_interrupt_signal(
       InterruptSourceClass::kLowRateSupervisory,
       current_interrupt_context(),
       clock_.now());
-  record_terminal_fault_authority(result);
-  request_validation_cancel_from_interrupt(result);
-  if (result.latched) {
-    const auto prev_state = sm_.status().state;
-    if (prev_state != ExecutionState::kInterrupted) {
-      auto transition = commit_terminal(ExecutionState::kInterrupted, "terminal_commit");
-      if (transition.ok()) {
-        auto snapshot = get_execution_snapshot();
-        snapshot.timestamp_ns = clock_.now();
-        snapshot.state = ExecutionState::kInterrupted;
-        publish_execution_snapshot(std::move(snapshot));
-        emit_event({KernelEventType::kStateTransition,
-                    sm_.status().execution_id,
-                    clock_.now(),
-                    prev_state,
-                    ExecutionState::kInterrupted,
-                    std::nullopt,
-                    {{"reason", "interrupt_latched"}}});
-      }
-    }
-  }
-  emit_interrupt_events(result);
-  apply_latched_interrupt_preemption(result);
+  stamp_interrupt_latch_collision_world_revision(result);
+  apply_interrupt_ingest_effects(result, /*apply_preemption_inline=*/true);
   return result;
 }
 
 InterruptIngestResult ExecutionKernel::publish_fast_interrupt_signals(
     const std::vector<InterruptSignalUpdate>& updates) {
+  return publish_fast_interrupt_signals_internal(
+      updates, /*apply_preemption_inline=*/true);
+}
+
+InterruptIngestResult ExecutionKernel::publish_fast_interrupt_signals_internal(
+    const std::vector<InterruptSignalUpdate>& updates,
+    bool apply_preemption_inline) {
   if (!interrupt_phase_from_state(sm_.status().state)) {
+    interrupt_manager_.seed_samples(
+        updates, InterruptSourceClass::kFastExecutionRelevant, clock_.now());
     auto result = reject_interrupts_without_active_phase(updates);
     emit_interrupt_events(result);
     return result;
@@ -3378,29 +2473,8 @@ InterruptIngestResult ExecutionKernel::publish_fast_interrupt_signals(
       InterruptSourceClass::kFastExecutionRelevant,
       current_interrupt_context(),
       clock_.now());
-  record_terminal_fault_authority(result);
-  request_validation_cancel_from_interrupt(result);
-  if (result.latched) {
-    const auto prev_state = sm_.status().state;
-    if (prev_state != ExecutionState::kInterrupted) {
-      auto transition = commit_terminal(ExecutionState::kInterrupted, "terminal_commit");
-      if (transition.ok()) {
-        auto snapshot = get_execution_snapshot();
-        snapshot.timestamp_ns = clock_.now();
-        snapshot.state = ExecutionState::kInterrupted;
-        publish_execution_snapshot(std::move(snapshot));
-        emit_event({KernelEventType::kStateTransition,
-                    sm_.status().execution_id,
-                    clock_.now(),
-                    prev_state,
-                    ExecutionState::kInterrupted,
-                    std::nullopt,
-                    {{"reason", "interrupt_latched"}}});
-      }
-    }
-  }
-  emit_interrupt_events(result);
-  apply_latched_interrupt_preemption(result);
+  stamp_interrupt_latch_collision_world_revision(result);
+  apply_interrupt_ingest_effects(result, apply_preemption_inline);
   return result;
 }
 
@@ -3414,8 +2488,9 @@ Result<InterruptIngestResult> ExecutionKernel::apply_interrupt_disposition(
   if (!result.ok()) {
     return result;
   }
-  record_terminal_fault_authority(result.value());
-  emit_interrupt_events(result.value());
+  stamp_interrupt_latch_collision_world_revision(result.value());
+  apply_interrupt_ingest_effects(result.value(),
+                                 /*apply_preemption_inline=*/true);
   if (!interrupt_manager_.active_latch() &&
       sm_.status().state == ExecutionState::kInterrupted) {
     const auto prev_state = sm_.status().state;
@@ -3439,12 +2514,9 @@ Result<InterruptIngestResult> ExecutionKernel::apply_interrupt_disposition(
 
 void ExecutionKernel::publish_execution_snapshot(ExecutionSnapshot snapshot) {
   stamp_active_request_correlation(snapshot);
-  std::lock_guard<std::mutex> lock(snapshot_mutex_);
-  if (snapshot.timestamp_ns == 0) {
-    snapshot.timestamp_ns = clock_.now();
-  }
-  snapshot.sequence_number = next_snapshot_sequence_++;
-  published_snapshot_ = std::move(snapshot);
+  const auto fallback_timestamp_ns =
+      snapshot.timestamp_ns == 0 ? clock_.now() : std::int64_t{0};
+  snapshot_publisher_.publish(std::move(snapshot), fallback_timestamp_ns);
 
   {
     std::lock_guard<std::mutex> mlock(metrics_mutex_);
@@ -3472,6 +2544,29 @@ void ExecutionKernel::finish_execute_worker() {
 
 void ExecutionKernel::notify_execution_waiters() {
   worker_signals_.notify();
+}
+
+bool ExecutionKernel::retire_execute_worker(
+    std::unique_lock<std::mutex>& lifecycle_lock) {
+  if (!worker_thread_.joinable()) {
+    return true;
+  }
+  if (worker_thread_.get_id() == std::this_thread::get_id()) {
+    worker_thread_.request_stop();
+    worker_signals_.notify();
+    return false;
+  }
+
+  lifecycle_worker_retirement_in_progress_.store(true,
+                                                 std::memory_order_release);
+  worker_thread_.request_stop();
+  worker_signals_.notify();
+  lifecycle_lock.unlock();
+  worker_thread_.join();
+  lifecycle_lock.lock();
+  lifecycle_worker_retirement_in_progress_.store(false,
+                                                 std::memory_order_release);
+  return true;
 }
 
 bool ExecutionKernel::finalize_overridden_terminal_authority(
@@ -3806,6 +2901,27 @@ ExecutionKernel::execute_worker_plan_phase(
   }
 
   if (!plan_result.ok()) {
+    if (planning_cancelled_by_interrupt(plan_result.error()) &&
+        sm_.status().state == ExecutionState::kInterrupted) {
+      emit_event(make_error_raised_event(
+          exec_id, clock_.now(), plan_result.error()));
+      mark_active_interrupt_preemption_result(
+          InterruptPreemptionResult::kSucceeded,
+          {{"phase", "cancel_planning"}});
+      auto interrupted_snapshot = get_execution_snapshot();
+      interrupted_snapshot.timestamp_ns = clock_.now();
+      interrupted_snapshot.execution_id = exec_id;
+      interrupted_snapshot.move_id = request.move_id;
+      interrupted_snapshot.state = ExecutionState::kInterrupted;
+      interrupted_snapshot.error = plan_result.error();
+      publish_execution_snapshot(std::move(interrupted_snapshot));
+      finalize_motion_execution_outcome(
+          motion_state, MotionExecutionTerminalCause::kInterruptedFault,
+          std::nullopt, std::nullopt, "planning_cancelled_by_interrupt");
+      finish_execute_worker();
+      result.status = ExecuteWorkerPhaseStatus::kTerminal;
+      return result;
+    }
     emit_event(make_error_raised_event(
         exec_id, clock_.now(), plan_result.error()));
     {
@@ -4167,6 +3283,28 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       return phase_result;
     }
     if (!replan_result.ok()) {
+      if (planning_cancelled_by_interrupt(replan_result.error()) &&
+          sm_.status().state == ExecutionState::kInterrupted) {
+        emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                    {}, {}, replan_result.error(), {}});
+        mark_active_interrupt_preemption_result(
+            InterruptPreemptionResult::kSucceeded,
+            {{"phase", "cancel_planning"}});
+        auto interrupted_snapshot = get_execution_snapshot();
+        interrupted_snapshot.timestamp_ns = clock_.now();
+        interrupted_snapshot.execution_id = exec_id;
+        interrupted_snapshot.move_id = request.move_id;
+        interrupted_snapshot.state = ExecutionState::kInterrupted;
+        interrupted_snapshot.error = replan_result.error();
+        publish_execution_snapshot(std::move(interrupted_snapshot));
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kInterruptedFault,
+            std::nullopt, std::nullopt,
+            "validation_replan_cancelled_by_interrupt");
+        finish_execute_worker();
+        phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+        return phase_result;
+      }
       if (preserve_replan_terminal_authority(
               "validation_replan_failure_lost_to_terminal_authority")) {
         phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
@@ -4435,6 +3573,64 @@ ExecutionKernel::execute_worker_dispatch_phase(
     ActiveMotionExecution& motion_state) {
   ExecuteWorkerDispatchPhaseResult phase_result;
 
+  if (collision_world_revision_is_set(validation_world_revision)) {
+    const auto live_revision =
+        current_authoritative_collision_world_revision();
+    const bool live_revision_available =
+        collision_world_revision_is_set(live_revision);
+    if (!live_revision_available ||
+        !collision_world_revisions_equal(live_revision,
+                                         validation_world_revision)) {
+      std::map<std::string, std::string> details;
+      details["reason"] = live_revision_available
+                              ? "collision_world_changed_after_validation"
+                              : "collision_world_revision_unavailable_before_dispatch";
+      details["validation_collision_world_revision_id"] =
+          std::to_string(validation_world_revision.revision_id);
+      details["validation_collision_world_content_hash"] =
+          validation_world_revision.content_hash;
+      details["live_collision_world_revision_id"] =
+          std::to_string(live_revision.revision_id);
+      details["live_collision_world_content_hash"] =
+          live_revision.content_hash;
+      ErrorDTO stale_error{
+          kErrorSceneChangedDuringValidation,
+          "Collision world changed after validation and before dispatch",
+          std::move(details)};
+      const auto prev = sm_.status().state;
+      sm_.set_last_error(error_code_from_dto(stale_error));
+      auto terminal_commit =
+          commit_terminal(ExecutionState::kFailed, "terminal_commit");
+      if (terminal_commit.committed != ExecutionState::kFailed) {
+        if (finalize_overridden_terminal_authority(
+                request, exec_id, motion_state, terminal_commit.committed,
+                "dispatch_revision_changed_overridden_by_terminal_authority",
+                stale_error)) {
+          phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+          return phase_result;
+        }
+      }
+      emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                   {}, {}, stale_error, {}});
+      auto stale_snapshot = get_execution_snapshot();
+      stale_snapshot.timestamp_ns = clock_.now();
+      stale_snapshot.execution_id = exec_id;
+      stale_snapshot.move_id = request.move_id;
+      stale_snapshot.state = ExecutionState::kFailed;
+      stale_snapshot.error = stale_error;
+      publish_execution_snapshot(std::move(stale_snapshot));
+      emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                   prev, ExecutionState::kFailed, std::nullopt,
+                   {{"reason", "dispatch_revision_changed"}}});
+      finalize_motion_execution_outcome(
+          motion_state, MotionExecutionTerminalCause::kFailed,
+          stale_error, std::nullopt, "dispatch_revision_changed");
+      finish_execute_worker();
+      phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+      return phase_result;
+    }
+  }
+
   // Store in cache.
   //
   // Per-joint dynamics caps (Phase 4-P5.1K) disable BOTH cache lookup (the
@@ -4492,6 +3688,30 @@ ExecutionKernel::execute_worker_dispatch_phase(
       finish_execute_worker();
       phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return phase_result;
+    }
+    if (sm_.status().state == ExecutionState::kInterrupted) {
+      auto latch = interrupt_manager_.active_latch();
+      if (latch && latch->active_execution_id == exec_id &&
+          latch->preemption_action_requested ==
+              InterruptPreemptionAction::kCompleteMoveOnSignal) {
+        auto latest_snapshot = get_execution_snapshot();
+        latest_snapshot.timestamp_ns = clock_.now();
+        latest_snapshot.execution_id = exec_id;
+        latest_snapshot.move_id = request.move_id;
+        handle_motion_trip_latch(request, *latch, exec_id,
+                                 latest_snapshot, motion_state,
+                                 std::stop_token{});
+        phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+        return phase_result;
+      }
+      if (latch && latch->active_execution_id == exec_id) {
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kInterruptedFault,
+            std::nullopt, std::nullopt, "arm_time_interrupt_latched");
+        finish_execute_worker();
+        phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+        return phase_result;
+      }
     }
   }
 
@@ -4919,6 +4139,24 @@ void ExecutionKernel::async_execute_worker(
                          : "worker_stop_token_backend_stop_failed");
       finish_worker();
     };
+    const auto fault_preempt_pending_budget_ns = [&]() -> int64_t {
+      std::optional<MotionInterruptStopProfileDTO> profile;
+      if (auto active = interrupt_manager_.active_policy();
+          active.has_value() && active->stop_profile) {
+        profile = *active->stop_profile;
+      } else if (config_.default_fault_stop_profile) {
+        profile = *config_.default_fault_stop_profile;
+      }
+      const auto base_ns =
+          profile.has_value()
+              ? effective_controlled_stop_deadline_ns(
+                    *profile, config_.complete_move_on_signal_timeout_ns)
+              : 0;
+      return std::max<int64_t>(base_ns, kExecutionPollNs) +
+             kFaultPreemptPendingSlackNs;
+    };
+    std::optional<std::string> pending_fault_preempt_latch_id;
+    int64_t pending_fault_preempt_deadline_ns = 0;
 
     while (true) {
       if (st.stop_requested()) {
@@ -4939,6 +4177,17 @@ void ExecutionKernel::async_execute_worker(
       }
 
       const auto now_ns = clock_.now();
+      for (const auto lane :
+           {InterruptSourceClass::kFastExecutionRelevant,
+            InterruptSourceClass::kLowRateSupervisory}) {
+        auto stale_sources = interrupt_manager_.sweep_stale_sources(
+            lane, current_interrupt_context(), now_ns);
+        if (!stale_sources.events.empty() || stale_sources.latched) {
+          stamp_interrupt_latch_collision_world_revision(stale_sources);
+          apply_interrupt_ingest_effects(stale_sources,
+                                         /*apply_preemption_inline=*/true);
+        }
+      }
       const bool paused =
           latest_backend_snapshot.state == ExecutionState::kPaused ||
           sm_.status().state == ExecutionState::kPaused;
@@ -5132,6 +4381,80 @@ void ExecutionKernel::async_execute_worker(
         if (latch &&
             latch->preemption_action_requested ==
                 InterruptPreemptionAction::kPreemptTrajectory) {
+          if (latch->preemption_result == InterruptPreemptionResult::kPending) {
+            stop_collision_monitoring();
+            const auto now = clock_.now();
+            if (!pending_fault_preempt_latch_id.has_value() ||
+                *pending_fault_preempt_latch_id != latch->latch_id) {
+              pending_fault_preempt_latch_id = latch->latch_id;
+              pending_fault_preempt_deadline_ns =
+                  now + fault_preempt_pending_budget_ns();
+            }
+            if (pending_fault_preempt_deadline_ns > 0 &&
+                now >= pending_fault_preempt_deadline_ns) {
+              request_fault_preempt_controlled_stop();
+              auto hard_stop = execution_backend_.stop();
+              std::map<std::string, std::string> details{
+                  {"reason", "fault_preempt_pending_timeout"},
+                  {"phase", "fault_preempt_pending_watchdog"},
+                  {"latch_id", latch->latch_id},
+                  {"source_id", latch->source_id},
+                  {"policy_id", latch->policy_id},
+                  {"emergency_fallback",
+                   hard_stop.accepted ? "legacy_stop_succeeded"
+                                      : "legacy_stop_failed"},
+                  {"hard_stop_transitioned", "true"}};
+              add_hard_stop_floor_details(details, execution_backend_);
+              mark_interrupt_preemption_result(
+                  *latch, InterruptPreemptionResult::kBackendPreemptFailed,
+                  details);
+              ErrorDTO terminal_error{
+                  std::string(kErrorMotionInterruptBackendStopFailed),
+                  "fault preempt remained pending past its effective stop "
+                  "deadline; emergency hard-stop floor issued and operator "
+                  "intervention is required",
+                  details};
+              sm_.set_last_error(error_code_from_dto(terminal_error));
+              const auto prev_state = sm_.status().state;
+              auto terminal_commit = commit_terminal(
+                  ExecutionState::kInterventionRequired,
+                  "fault_preempt_pending_timeout");
+              auto terminal_state = terminal_commit.committed;
+              if (!terminal_commit.ok()) {
+                terminal_state = sm_.status().state;
+              }
+              auto terminal_snapshot = latest_backend_snapshot;
+              terminal_snapshot.timestamp_ns = clock_.now();
+              terminal_snapshot.execution_id = exec_id;
+              terminal_snapshot.move_id = request.move_id;
+              terminal_snapshot.state = terminal_state;
+              terminal_snapshot.error = terminal_error;
+              publish_execution_snapshot(std::move(terminal_snapshot));
+              emit_event({KernelEventType::kErrorRaised,
+                          exec_id,
+                          clock_.now(),
+                          {},
+                          {},
+                          terminal_error,
+                          details});
+              if (terminal_state != prev_state) {
+                emit_event({KernelEventType::kStateTransition,
+                            exec_id,
+                            clock_.now(),
+                            prev_state,
+                            terminal_state,
+                            std::nullopt,
+                            details});
+              }
+              finalize_motion_execution_outcome(
+                  motion_state, MotionExecutionTerminalCause::kFailed,
+                  terminal_error, std::nullopt,
+                  "fault_preempt_pending_timeout");
+              finish_worker();
+              return;
+            }
+            continue;
+          }
           // Fault session policy preempted the move. The scope (if
           // any) is reaped as part of finalize; terminal_cause is
           // `interrupted_fault` (spec/260 §B.4). The fault's own
@@ -5154,7 +4477,8 @@ void ExecutionKernel::async_execute_worker(
           // enforces the conjunctive fallback rule, and transitions
           // Stopping -> Completed (signal_trip) or Stopping -> Failed.
           handle_motion_trip_latch(request, *latch, exec_id,
-                                     latest_backend_snapshot, motion_state);
+                                     latest_backend_snapshot, motion_state,
+                                     st);
           finish_worker();
           return;
         }
@@ -5506,17 +4830,43 @@ void ExecutionKernel::async_execute_worker(
 }
 
 Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
-  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  EventDeferralScope event_scope(*this);
+  std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
   lifecycle_stop_requested_while_busy_.store(false,
                                              std::memory_order_seq_cst);
   lifecycle_stop_requested_event_emitted_.store(false,
                                                std::memory_order_seq_cst);
   lifecycle_reset_requested_while_busy_.store(false, std::memory_order_release);
+  if (lifecycle_worker_retirement_in_progress_.load(
+          std::memory_order_acquire)) {
+    return Result<uint64_t>::Err(ErrorDTO{
+        kErrorExecutionRejected,
+        "Execution worker retirement is in progress",
+        {{"reason_code", "worker_retirement_in_progress"}}});
+  }
   if (lifecycle_reset_waiting_for_stop_.load(std::memory_order_acquire)) {
     return Result<uint64_t>::Err(ErrorDTO{
         kErrorExecutionRejected,
         "Reset is waiting for stop completion",
         {{"reason_code", "reset_waiting_for_stop"}}});
+  }
+
+  switch (sm_.status().state) {
+    using enum ExecutionState;
+    case kIdle:
+    case kCompleted:
+    case kStopped:
+    case kFailed:
+    case kInterventionRequired:
+      if (!retire_execute_worker(lifecycle_lock)) {
+        return Result<uint64_t>::Err(ErrorDTO{
+            kErrorExecutionRejected,
+            "Execution cannot be started from the active execution worker",
+            {{"reason_code", "worker_retirement_self_thread"}}});
+      }
+      break;
+    default:
+      break;
   }
 
   // `kInterventionRequired` MUST be cleared by an explicit recovery action,
@@ -5556,6 +4906,25 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     return Result<uint64_t>::Err(ErrorCode::kExecutionRejected);
   }
 
+  if (!std::isfinite(request.timeouts.planning_timeout_s) ||
+      request.timeouts.planning_timeout_s <= 0.0) {
+    return Result<uint64_t>::Err(ErrorDTO{
+        kErrorInvalidRequest,
+        "planning_timeout_s must be finite and strictly positive",
+        {{"reason_code", "invalid_planning_timeout"},
+         {"planning_timeout_s",
+          std::to_string(request.timeouts.planning_timeout_s)}}});
+  }
+  if (!std::isfinite(request.timeouts.execution_timeout_s) ||
+      request.timeouts.execution_timeout_s <= 0.0) {
+    return Result<uint64_t>::Err(ErrorDTO{
+        kErrorInvalidRequest,
+        "execution_timeout_s must be finite and strictly positive",
+        {{"reason_code", "invalid_execution_timeout"},
+         {"execution_timeout_s",
+          std::to_string(request.timeouts.execution_timeout_s)}}});
+  }
+
   terminal_stop_authority_asserted_.store(false, std::memory_order_release);
   terminal_fault_authority_asserted_.store(false, std::memory_order_release);
   uint64_t exec_id = next_execution_id_++;
@@ -5587,6 +4956,20 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     execute_admission_interruptible_.store(false, std::memory_order_seq_cst);
     finish_execute_worker();
   };
+
+  const auto finalize_admitted_without_worker =
+      [&](MotionExecutionTerminalCause terminal_cause, std::string reap_reason) {
+        ActiveMotionExecution motion_state;
+        motion_state.execution_id = exec_id;
+        motion_state.move_id = request.move_id;
+        motion_state.had_scopes = !request.motion_interrupt_scopes.empty();
+        motion_state.correlation_captured = true;
+        motion_state.action_span = request.action_span;
+        motion_state.contact_policy_id = request.contact_policy_id;
+        finalize_motion_execution_outcome(
+            motion_state, terminal_cause, std::nullopt, std::nullopt,
+            std::move(reap_reason));
+      };
 
   const auto fail_admission = [&](ErrorDTO error) -> Result<uint64_t> {
     sm_.set_last_error(error_code_from_dto(error));
@@ -5758,6 +5141,9 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
                 ExecutionState::kIdle,
                 std::nullopt,
                 {{"reason", "pending_reset_during_execute_admission"}}});
+    finalize_admitted_without_worker(
+        MotionExecutionTerminalCause::kStopped,
+        "pending_reset_during_execute_admission");
     finish_admission_without_worker();
     return Result<uint64_t>::Ok(exec_id);
   }
@@ -5790,6 +5176,9 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
                 sm_.status().state,
                 std::nullopt,
                 {{"reason", "pending_stop_during_execute_admission"}}});
+    finalize_admitted_without_worker(
+        MotionExecutionTerminalCause::kStopped,
+        "pending_stop_during_execute_admission");
     finish_admission_without_worker();
     return Result<uint64_t>::Ok(exec_id);
   }
@@ -5851,21 +5240,74 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   }
   publish_execution_snapshot(std::move(snapshot));
 
+  auto worker_start_gate = std::make_shared<WorkerStartGate>();
+  const auto worker_generation = ++execute_worker_generation_;
   worker_thread_ = std::jthread(
-      [this, request_copy = ExecuteRequestDTO(resolved_request),
+      [this, request_copy = std::move(resolved_request),
        exec_id,
        cached_trajectory = prepared.cache_hit
                                ? std::make_optional(std::move(prepared.trajectory))
-                               : std::nullopt](std::stop_token st) mutable {
+                               : std::nullopt,
+       worker_start_gate](std::stop_token st) mutable {
+        if (!worker_start_gate->wait(st)) {
+          return;
+        }
         async_execute_worker(st, std::move(request_copy), exec_id,
                              std::move(cached_trajectory));
       });
 
   execute_admission_interruptible_.store(false, std::memory_order_seq_cst);
+  lifecycle_lock.unlock();
+  event_scope.flush();
+  bool finalize_pre_dispatch_stop = false;
+  {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    const auto status = sm_.status();
+    const bool should_start_worker =
+        status.execution_id == exec_id &&
+        (status.state == ExecutionState::kPlanning ||
+         status.state == ExecutionState::kValidating);
+    if (!should_start_worker) {
+      const bool same_worker =
+          worker_generation == execute_worker_generation_;
+      if (same_worker && worker_thread_.joinable()) {
+        worker_thread_.request_stop();
+      }
+      if (same_worker) {
+        worker_signals_.mark_complete();
+      }
+      finalize_pre_dispatch_stop = true;
+    }
+    worker_start_gate->release();
+  }
+  if (finalize_pre_dispatch_stop) {
+    finalize_admitted_without_worker(
+        MotionExecutionTerminalCause::kStopped,
+        "execute_admission_cancelled_before_worker_start");
+  }
   return Result<uint64_t>::Ok(exec_id);
 }
 
+std::uint64_t ExecutionKernel::control_command_epoch() const {
+  return control_command_epoch_.load(std::memory_order_acquire);
+}
+
+std::uint64_t ExecutionKernel::bump_control_command_epoch() {
+  return control_command_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+bool ExecutionKernel::control_command_epoch_matches(
+    std::optional<std::uint64_t> expected_epoch) const {
+  return !expected_epoch.has_value() ||
+         *expected_epoch == control_command_epoch_.load(std::memory_order_acquire);
+}
+
 StopResultDTO ExecutionKernel::stop() {
+  EventDeferralScope event_scope(*this);
+  const auto accepted_stop = [this]() {
+    bump_control_command_epoch();
+    return StopResultDTO{true, std::nullopt};
+  };
   join_finished_operator_stop_worker();
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_,
                                               std::try_to_lock);
@@ -5883,7 +5325,7 @@ StopResultDTO ExecutionKernel::stop() {
                   std::nullopt,
                   {{"reason", "lifecycle_busy"}}});
       if (execute_admission_interruptible_.load(std::memory_order_seq_cst)) {
-        return StopResultDTO{true, std::nullopt};
+        return accepted_stop();
       }
     }
     lifecycle_lock.lock();
@@ -5892,7 +5334,7 @@ StopResultDTO ExecutionKernel::stop() {
           false, std::memory_order_seq_cst) &&
       !lifecycle_stop_requested_while_busy_.load(std::memory_order_seq_cst) &&
       sm_.status().state == ExecutionState::kStopped) {
-    return StopResultDTO{true, std::nullopt};
+    return accepted_stop();
   }
   lifecycle_stop_requested_while_busy_.store(false, std::memory_order_seq_cst);
 
@@ -5934,11 +5376,18 @@ StopResultDTO ExecutionKernel::stop() {
   // Repeated Stop while an operator controlled stop is already in flight is
   // idempotent. Escalation to hard stop is an explicit reset/timeout path, not
   // an accidental semantic change from a second Stop button press.
-  if (prev_state == ExecutionState::kStopping &&
-      operator_stop_worker_.active()) {
-    lifecycle_stop_requested_while_busy_.store(false,
-                                               std::memory_order_seq_cst);
-    return StopResultDTO{true, std::nullopt};
+  if (prev_state == ExecutionState::kStopping) {
+    if (operator_stop_worker_.active()) {
+      lifecycle_stop_requested_while_busy_.store(false,
+                                                 std::memory_order_seq_cst);
+      return accepted_stop();
+    }
+    if (motion_trip_stop_.active()) {
+      (void)motion_trip_stop_.request_stop();
+      lifecycle_stop_requested_while_busy_.store(false,
+                                                 std::memory_order_seq_cst);
+      return accepted_stop();
+    }
   }
 
   if (operator_profile_applicable) {
@@ -5969,7 +5418,7 @@ StopResultDTO ExecutionKernel::stop() {
     }
     lifecycle_stop_requested_while_busy_.store(false,
                                                std::memory_order_seq_cst);
-    return StopResultDTO{true, std::nullopt};
+    return accepted_stop();
   }
 
   auto result = stop_policy_.request_hard_stop();
@@ -5997,10 +5446,11 @@ StopResultDTO ExecutionKernel::stop() {
   metrics_.stops_issued++;
   lifecycle_stop_requested_while_busy_.store(false,
                                              std::memory_order_seq_cst);
-  return StopResultDTO{true, std::nullopt};
+  return accepted_stop();
 }
 
 PauseResultDTO ExecutionKernel::pause() {
+  EventDeferralScope event_scope(*this);
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_,
                                               std::try_to_lock);
   if (!lifecycle_lock.owns_lock()) {
@@ -6083,9 +5533,14 @@ PauseResultDTO ExecutionKernel::pause() {
   return PauseResultDTO{false, error};
 }
 
-ResumeResultDTO ExecutionKernel::resume() {
+ResumeResultDTO ExecutionKernel::resume(
+    std::optional<std::uint64_t> expected_epoch) {
+  EventDeferralScope event_scope(*this);
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
 
+  if (!control_command_epoch_matches(expected_epoch)) {
+    return ResumeResultDTO{false, stale_control_command_error()};
+  }
   auto prev_state = sm_.status().state;
   auto result = stop_policy_.request_resume();
   if (result.ok()) {
@@ -6113,10 +5568,24 @@ ExecutionKernel::get_motion_interrupt_stop_capability() const {
   return execution_backend_.get_motion_interrupt_stop_capability();
 }
 
-ResetResultDTO ExecutionKernel::reset() {
+ResetResultDTO ExecutionKernel::reset(
+    std::optional<std::uint64_t> expected_epoch) {
+  EventDeferralScope event_scope(*this);
+  const auto reject_if_stale = [&]() -> std::optional<ResetResultDTO> {
+    if (!control_command_epoch_matches(expected_epoch)) {
+      return ResetResultDTO{false, stale_control_command_error()};
+    }
+    return std::nullopt;
+  };
+  if (auto stale = reject_if_stale()) {
+    return *stale;
+  }
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_,
                                               std::try_to_lock);
   if (!lifecycle_lock.owns_lock()) {
+    if (auto stale = reject_if_stale()) {
+      return *stale;
+    }
     if (execute_admission_interruptible_.load(std::memory_order_seq_cst)) {
       lifecycle_reset_requested_while_busy_.store(true,
                                                   std::memory_order_release);
@@ -6125,13 +5594,28 @@ ResetResultDTO ExecutionKernel::reset() {
       }
     }
     lifecycle_lock.lock();
+    if (auto stale = reject_if_stale()) {
+      return *stale;
+    }
+  }
+  if (auto stale = reject_if_stale()) {
+    return *stale;
   }
   lifecycle_stop_requested_while_busy_.store(false,
                                              std::memory_order_seq_cst);
   lifecycle_stop_requested_event_emitted_.store(false,
                                                std::memory_order_seq_cst);
   lifecycle_reset_requested_while_busy_.store(false, std::memory_order_release);
+  if (lifecycle_worker_retirement_in_progress_.load(
+          std::memory_order_acquire)) {
+    return ResetResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Execution worker retirement is already in progress",
+                 {{"reason_code", "worker_retirement_in_progress"}}}};
+  }
   request_fault_preempt_controlled_stop();
+  fault_preempt_worker_.cancel(/*invalidate_generation=*/true);
 
   auto prev_state = sm_.status().state;
   if (get_active_interrupt_latch()) {
@@ -6144,6 +5628,22 @@ ResetResultDTO ExecutionKernel::reset() {
 
   const auto clear_operator_stop_errors = [&]() {
     operator_stop_worker_.clear_errors();
+  };
+
+  const auto retire_worker_if_quiescent = [&]() -> bool {
+    switch (sm_.status().state) {
+      using enum ExecutionState;
+      case kIdle:
+      case kCompleted:
+      case kStopped:
+      case kFailed:
+      case kInterventionRequired:
+      case kInterrupted:
+        return retire_execute_worker(lifecycle_lock);
+      default:
+        break;
+    }
+    return true;
   };
 
   const auto enter_reset_intervention =
@@ -6173,6 +5673,9 @@ ResetResultDTO ExecutionKernel::reset() {
 
   const auto publish_idle_after_reset =
       [&](ExecutionState from_state, bool emit_transition) -> ResetResultDTO {
+    if (auto stale = reject_if_stale()) {
+      return *stale;
+    }
     clear_active_request_correlation();
     auto snapshot = execution_backend_.get_execution_snapshot();
     snapshot.timestamp_ns = clock_.now();
@@ -6199,6 +5702,19 @@ ResetResultDTO ExecutionKernel::reset() {
 
   const auto reset_backend_and_state =
       [&](ExecutionState from_state, bool emit_transition) -> ResetResultDTO {
+    if (auto stale = reject_if_stale()) {
+      return *stale;
+    }
+    if (!retire_worker_if_quiescent()) {
+      return ResetResultDTO{
+          false,
+          ErrorDTO{kErrorInvalidRequest,
+                   "Execution worker cannot be retired from its own callback",
+                   {{"reason_code", "worker_retirement_self_thread"}}}};
+    }
+    if (auto stale = reject_if_stale()) {
+      return *stale;
+    }
     auto backend_reset = execution_backend_.reset();
     if (!backend_reset.accepted) {
       return enter_reset_intervention(
@@ -6212,20 +5728,39 @@ ResetResultDTO ExecutionKernel::reset() {
           from_state);
     }
 
+    if (auto stale = reject_if_stale()) {
+      return *stale;
+    }
     if (sm_.status().state != ExecutionState::kIdle) {
       auto result = stop_policy_.request_reset();
       if (!result.ok()) {
         return ResetResultDTO{false, result.error()};
       }
     }
+    if (auto stale = reject_if_stale()) {
+      return *stale;
+    }
     sm_.set_execution_id(0);
     return publish_idle_after_reset(from_state, emit_transition);
   };
 
   if (prev_state == ExecutionState::kIdle) {
+    if (!retire_worker_if_quiescent()) {
+      return ResetResultDTO{
+          false,
+          ErrorDTO{kErrorInvalidRequest,
+                   "Execution worker cannot be retired from its own callback",
+                   {{"reason_code", "worker_retirement_self_thread"}}}};
+    }
+    if (auto stale = reject_if_stale()) {
+      return *stale;
+    }
     auto backend_reset = execution_backend_.reset();
     if (!backend_reset.accepted) {
       return backend_reset;
+    }
+    if (auto stale = reject_if_stale()) {
+      return *stale;
     }
     return publish_idle_after_reset(prev_state, /*emit_transition=*/false);
   }
@@ -6377,9 +5912,14 @@ ResetResultDTO ExecutionKernel::reset() {
 }
 
 AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
-    uint64_t execution_id) {
+    uint64_t execution_id,
+    std::optional<std::uint64_t> expected_epoch) {
+  EventDeferralScope event_scope(*this);
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
 
+  if (!control_command_epoch_matches(expected_epoch)) {
+    return AcknowledgeCompletedResultDTO{false, stale_control_command_error()};
+  }
   const auto status = sm_.status();
   if (status.state != ExecutionState::kCompleted) {
     return AcknowledgeCompletedResultDTO{
@@ -6403,16 +5943,9 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
   if (!result.ok()) {
     return AcknowledgeCompletedResultDTO{false, result.error()};
   }
-  ExecutionSnapshot last_completed_snapshot;
-  {
-    std::lock_guard<std::mutex> snapshot_lock(snapshot_mutex_);
-    last_completed_snapshot = published_snapshot_;
-  }
+  ExecutionSnapshot last_completed_snapshot = snapshot_publisher_.latest();
   sm_.set_execution_id(0);
-  {
-    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-    active_move_id_.clear();
-  }
+  active_correlation_.clear_move_id();
 
   ExecutionSnapshot snapshot;
   snapshot.timestamp_ns = clock_.now();
@@ -6440,12 +5973,7 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
     // Cleared AFTER the acknowledgement events: they are the closing
     // bracket of this execution's story and must still carry its
     // request-correlation stamp.
-    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-    active_program_run_id_.clear();
-  }
-  {
-    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
-    active_action_span_.reset();
+    active_correlation_.clear_program_run_and_action_span();
   }
   {
     runtime_collision_monitor_.clear_active_contact_policy_id();
@@ -6455,9 +5983,23 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
 }
 
 AcknowledgeInterventionResultDTO ExecutionKernel::acknowledge_intervention(
-    std::string principal_id, std::string reason) {
+    std::string principal_id,
+    std::string reason,
+    std::optional<std::uint64_t> expected_epoch) {
+  EventDeferralScope event_scope(*this);
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  const auto reject_if_stale =
+      [&]() -> std::optional<AcknowledgeInterventionResultDTO> {
+    if (!control_command_epoch_matches(expected_epoch)) {
+      return AcknowledgeInterventionResultDTO{false,
+                                             stale_control_command_error()};
+    }
+    return std::nullopt;
+  };
 
+  if (auto stale = reject_if_stale()) {
+    return *stale;
+  }
   const auto status = sm_.status();
   if (status.state != ExecutionState::kInterventionRequired) {
     return AcknowledgeInterventionResultDTO{
@@ -6471,6 +6013,9 @@ AcknowledgeInterventionResultDTO ExecutionKernel::acknowledge_intervention(
   // a downstream `execute()` call would race against backend state that
   // still reflects the pre-intervention error. Mirrors the previous implicit
   // path in execute() but with explicit operator authority.
+  if (auto stale = reject_if_stale()) {
+    return *stale;
+  }
   auto backend_reset = execution_backend_.reset();
   if (!backend_reset.accepted) {
     return AcknowledgeInterventionResultDTO{
@@ -6483,6 +6028,9 @@ AcknowledgeInterventionResultDTO ExecutionKernel::acknowledge_intervention(
                       {"phase", "acknowledge_intervention_resync"}}})};
   }
 
+  if (auto stale = reject_if_stale()) {
+    return *stale;
+  }
   // Use `stop_policy_.request_reset()` rather than `sm_.reset()` directly
   // (which is what `acknowledge_completed` does) because intervention can
   // be entered with a pending scheduled soft-stop or a sticky `stop_requested_`
@@ -6498,10 +6046,7 @@ AcknowledgeInterventionResultDTO ExecutionKernel::acknowledge_intervention(
   const auto prev_state = status.state;
   const auto prev_execution_id = status.execution_id;
   sm_.set_execution_id(0);
-  {
-    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-    active_move_id_.clear();
-  }
+  active_correlation_.clear_move_id();
 
   ExecutionSnapshot snapshot = execution_backend_.get_execution_snapshot();
   snapshot.timestamp_ns = clock_.now();
@@ -6535,12 +6080,7 @@ AcknowledgeInterventionResultDTO ExecutionKernel::acknowledge_intervention(
   {
     // Cleared AFTER the acknowledgement/recovery boundary events: they are
     // part of this run's incident story and must carry request correlation.
-    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-    active_program_run_id_.clear();
-  }
-  {
-    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
-    active_action_span_.reset();
+    active_correlation_.clear_program_run_and_action_span();
   }
   {
     runtime_collision_monitor_.clear_active_contact_policy_id();
@@ -6550,9 +6090,23 @@ AcknowledgeInterventionResultDTO ExecutionKernel::acknowledge_intervention(
 
 AcknowledgeInterventionResultDTO
 ExecutionKernel::acknowledge_intervention_for_retry(
-    std::string principal_id, std::string reason) {
+    std::string principal_id,
+    std::string reason,
+    std::optional<std::uint64_t> expected_epoch) {
+  EventDeferralScope event_scope(*this);
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  const auto reject_if_stale =
+      [&]() -> std::optional<AcknowledgeInterventionResultDTO> {
+    if (!control_command_epoch_matches(expected_epoch)) {
+      return AcknowledgeInterventionResultDTO{false,
+                                             stale_control_command_error()};
+    }
+    return std::nullopt;
+  };
 
+  if (auto stale = reject_if_stale()) {
+    return *stale;
+  }
   const auto status = sm_.status();
   if (principal_id.empty()) {
     return AcknowledgeInterventionResultDTO{
@@ -6681,6 +6235,9 @@ ExecutionKernel::acknowledge_intervention_for_retry(
                  {{"reason", "settle_signal_unavailable"}}}};
   }
 
+  if (auto stale = reject_if_stale()) {
+    return *stale;
+  }
   auto reset_result = stop_policy_.request_reset();
   if (!reset_result.ok()) {
     return AcknowledgeInterventionResultDTO{false, reset_result.error()};
@@ -6689,10 +6246,7 @@ ExecutionKernel::acknowledge_intervention_for_retry(
   const auto prev_state = status.state;
   const auto prev_execution_id = status.execution_id;
   sm_.set_execution_id(0);
-  {
-    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-    active_move_id_.clear();
-  }
+  active_correlation_.clear_move_id();
 
   snapshot.timestamp_ns = clock_.now();
   snapshot.execution_id = 0;
@@ -6727,12 +6281,7 @@ ExecutionKernel::acknowledge_intervention_for_retry(
   {
     // Cleared AFTER the acknowledgement/recovery boundary events: they are
     // part of this run's incident story and must carry request correlation.
-    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-    active_program_run_id_.clear();
-  }
-  {
-    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
-    active_action_span_.reset();
+    active_correlation_.clear_program_run_and_action_span();
   }
   {
     runtime_collision_monitor_.clear_active_contact_policy_id();
@@ -6742,9 +6291,23 @@ ExecutionKernel::acknowledge_intervention_for_retry(
 
 AcknowledgeInterruptedResultDTO
 ExecutionKernel::acknowledge_interrupted_for_retry(
-    std::string principal_id, std::string reason) {
+    std::string principal_id,
+    std::string reason,
+    std::optional<std::uint64_t> expected_epoch) {
+  EventDeferralScope event_scope(*this);
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  const auto reject_if_stale =
+      [&]() -> std::optional<AcknowledgeInterruptedResultDTO> {
+    if (!control_command_epoch_matches(expected_epoch)) {
+      return AcknowledgeInterruptedResultDTO{false,
+                                            stale_control_command_error()};
+    }
+    return std::nullopt;
+  };
 
+  if (auto stale = reject_if_stale()) {
+    return *stale;
+  }
   const auto status = sm_.status();
   if (principal_id.empty()) {
     return AcknowledgeInterruptedResultDTO{
@@ -6785,13 +6348,17 @@ ExecutionKernel::acknowledge_interrupted_for_retry(
   disposition.principal_id = std::move(principal_id);
   disposition.reason = std::move(reason);
 
+  if (auto stale = reject_if_stale()) {
+    return *stale;
+  }
   auto disposition_result =
       interrupt_manager_.apply_disposition(disposition, clock_.now());
   if (!disposition_result.ok()) {
     return AcknowledgeInterruptedResultDTO{false, disposition_result.error()};
   }
-  record_terminal_fault_authority(disposition_result.value());
-  emit_interrupt_events(disposition_result.value());
+  stamp_interrupt_latch_collision_world_revision(disposition_result.value());
+  apply_interrupt_ingest_effects(disposition_result.value(),
+                                 /*apply_preemption_inline=*/true);
   if (disposition_result.value().rejected) {
     return AcknowledgeInterruptedResultDTO{
         false,
@@ -6800,10 +6367,21 @@ ExecutionKernel::acknowledge_interrupted_for_retry(
                  {{"reason", disposition_result.value().reason},
                   {"latch_id", disposition.latch_id}}}};
   }
+  if (interrupt_manager_.active_latch()) {
+    return AcknowledgeInterruptedResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Interrupt acknowledgement replayed another active latch; retry is not yet admissible",
+                 {{"reason", "interrupted_retry_replayed_latch"},
+                  {"latch_id", disposition.latch_id}}}};
+  }
 
   // Important: do not call execution_backend_.reset() here. This path is an
   // operator retry after the collision condition was corrected; the robot must
   // stay at its observed stopped pose so the next execute plans from there.
+  if (auto stale = reject_if_stale()) {
+    return *stale;
+  }
   auto reset_result = stop_policy_.request_reset();
   if (!reset_result.ok()) {
     return AcknowledgeInterruptedResultDTO{false, reset_result.error()};
@@ -6811,10 +6389,7 @@ ExecutionKernel::acknowledge_interrupted_for_retry(
 
   const auto prev_execution_id = status.execution_id;
   sm_.set_execution_id(0);
-  {
-    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-    active_move_id_.clear();
-  }
+  active_correlation_.clear_move_id();
 
   auto snapshot = execution_backend_.get_execution_snapshot();
   snapshot.timestamp_ns = clock_.now();
@@ -6836,12 +6411,7 @@ ExecutionKernel::acknowledge_interrupted_for_retry(
   {
     // Cleared AFTER the acknowledgement/recovery boundary events: they are
     // part of this run's incident story and must carry request correlation.
-    std::lock_guard<std::mutex> run_lock(active_program_run_id_mutex_);
-    active_program_run_id_.clear();
-  }
-  {
-    std::lock_guard<std::mutex> span_lock(active_action_span_mutex_);
-    active_action_span_.reset();
+    active_correlation_.clear_program_run_and_action_span();
   }
   {
     runtime_collision_monitor_.clear_active_contact_policy_id();
@@ -6851,10 +6421,7 @@ ExecutionKernel::acknowledge_interrupted_for_retry(
 
 ExecutionStatus ExecutionKernel::get_status() const {
   auto status = sm_.status();
-  {
-    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-    status.active_move_id = active_move_id_;
-  }
+  status.active_move_id = active_correlation_.move_id();
   return status;
 }
 
@@ -6874,10 +6441,7 @@ ExecutionSnapshot ExecutionKernel::get_execution_snapshot() const {
     auto backend_snapshot = execution_backend_.get_execution_snapshot();
     backend_snapshot.state = kernel_state;
     backend_snapshot.execution_id = kernel_status.execution_id;
-    {
-      std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-      backend_snapshot.move_id = active_move_id_;
-    }
+    backend_snapshot.move_id = active_correlation_.move_id();
     if (backend_snapshot.timestamp_ns == 0) {
       backend_snapshot.timestamp_ns = clock_.now();
     }
@@ -6895,11 +6459,7 @@ ExecutionSnapshot ExecutionKernel::get_execution_snapshot() const {
     return backend_snapshot;
   }
 
-  ExecutionSnapshot snapshot;
-  {
-    std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    snapshot = published_snapshot_;
-  }
+  ExecutionSnapshot snapshot = snapshot_publisher_.latest();
   if (kernel_state == ExecutionState::kStopped ||
       kernel_state == ExecutionState::kCompleted ||
       kernel_state == ExecutionState::kFailed ||
@@ -6908,10 +6468,7 @@ ExecutionSnapshot ExecutionKernel::get_execution_snapshot() const {
       kernel_state == ExecutionState::kIdle) {
     snapshot.state = kernel_state;
     snapshot.execution_id = kernel_status.execution_id;
-    {
-      std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-      snapshot.move_id = active_move_id_;
-    }
+    snapshot.move_id = active_correlation_.move_id();
   }
   if (!snapshot.error.has_value() &&
       (kernel_state == ExecutionState::kStopped ||
@@ -6940,10 +6497,7 @@ void ExecutionKernel::sync_snapshot_from_context() {
   ExecutionSnapshot snapshot;
   snapshot.timestamp_ns = clock_.now();
   snapshot.execution_id = sm_.status().execution_id;
-  {
-    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-    snapshot.move_id = active_move_id_;
-  }
+  snapshot.move_id = active_correlation_.move_id();
   snapshot.state = sm_.status().state;
   snapshot.progress = sm_.status().progress;
   try {
@@ -7043,7 +6597,7 @@ Result<void> ExecutionKernel::collision_check_tick() {
     return Result<void>::Ok();
   };
 
-  std::optional<CollisionPolicySnapshot> policy_snapshot;
+  std::shared_ptr<const CollisionPolicySnapshot> policy_snapshot;
   ICollisionWorldSnapshotPublisher* snapshot_publisher = nullptr;
   std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines;
   {
@@ -7084,7 +6638,8 @@ Result<void> ExecutionKernel::collision_check_tick() {
   try {
     if (auto publisher_policy =
             snapshot_publisher->collision_policy_snapshot()) {
-      policy_snapshot = std::move(publisher_policy);
+      policy_snapshot =
+          std::make_shared<CollisionPolicySnapshot>(std::move(*publisher_policy));
     }
   } catch (const std::exception& e) {
     monitor_details["reason"] = "policy_publisher_exception";
@@ -7199,11 +6754,12 @@ Result<void> ExecutionKernel::collision_check_tick() {
   }
   one_state = std::move(expanded_one_state_result.value());
 
-  auto runtime_policy_snapshot =
-      runtime_collision_monitor_.runtime_policy_snapshot(*policy_snapshot);
+  auto runtime_policy =
+      runtime_collision_monitor_.runtime_policy_snapshot(policy_snapshot);
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = runtime_policy_snapshot;
+  cfg.policy_snapshot_ref = runtime_policy.snapshot;
+  cfg.policy_index = runtime_policy.index;
   cfg.require_pose_source_borrow = false;
   cfg.surface = CollisionSurface::kObservedRuntimeMonitor;
   cfg.per_state_timeout_ns =
@@ -7395,7 +6951,8 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
     }
   }
 
-  std::optional<CollisionPolicySnapshot> snapshot;
+  std::shared_ptr<const CollisionPolicySnapshot> snapshot;
+  std::shared_ptr<const CollisionPolicyIndex> snapshot_index;
   PoseSourceRetryConfig retry;
   std::int64_t per_state_timeout_ns = 0;
   ICollisionWorldSnapshotPublisher* snapshot_publisher = nullptr;
@@ -7403,6 +6960,7 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
   {
     std::scoped_lock lock(coordinator_mutex_);
     snapshot = coordinator_policy_snapshot_;
+    snapshot_index = coordinator_policy_index_;
     retry = coordinator_retry_config_;
     per_state_timeout_ns = coordinator_per_state_timeout_ns_;
     snapshot_publisher = collision_snapshot_publisher_;
@@ -7456,6 +7014,28 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
         "missing_collision_query_engines"));
   }
 
+  const auto validation_start_state = sm_.status().state;
+  const bool drain_runtime_monitor_for_validation =
+      engines_require_single_context_exclusivity(validation_engines) &&
+      runtime_monitor_may_hold_collision_engine(validation_start_state);
+  struct RuntimeMonitorValidationGuard {
+    ExecutionKernel* kernel = nullptr;
+    bool restart_if_still_executing = false;
+    ~RuntimeMonitorValidationGuard() {
+      if (kernel && restart_if_still_executing &&
+          kernel->sm_.status().state == ExecutionState::kExecuting &&
+          !kernel->stop_policy_.stop_requested()) {
+        kernel->start_collision_monitoring();
+      }
+    }
+  } runtime_monitor_guard{
+      this,
+      drain_runtime_monitor_for_validation &&
+          validation_start_state == ExecutionState::kExecuting};
+  if (drain_runtime_monitor_for_validation) {
+    stop_collision_monitoring(/*drain_callbacks=*/true);
+  }
+
   auto cancel = install_validation_cancel_token();
   struct ValidationCancelTokenGuard {
     ExecutionKernel* kernel = nullptr;
@@ -7495,10 +7075,13 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
     }
 
     auto active_policy = snapshot;
+    auto active_policy_index = snapshot_index;
     try {
       if (auto publisher_policy =
               snapshot_publisher->collision_policy_snapshot()) {
-        active_policy = std::move(publisher_policy);
+        active_policy =
+            std::make_shared<CollisionPolicySnapshot>(std::move(*publisher_policy));
+        active_policy_index = build_collision_policy_index(*active_policy);
       }
     } catch (const std::exception& e) {
       return Result<AuthoritativeValidationAttempt>::Err(
@@ -7516,26 +7099,41 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
           authoritative_collision_validation_config_error(
               "missing_collision_policy_snapshot"));
     }
+    if (!active_policy_index) {
+      active_policy_index = build_collision_policy_index(*active_policy);
+    }
 
     CollisionValidationPassConfig cfg;
-    cfg.policy_snapshot = *active_policy;
+    cfg.policy_snapshot_ref = active_policy;
+    cfg.policy_index = active_policy_index;
     cfg.pose_source_retry = retry;
-    cfg.per_state_timeout_ns = per_state_timeout_ns;
+    cfg.per_state_timeout_ns =
+        per_state_timeout_ns > 0
+            ? per_state_timeout_ns
+            : static_cast<std::int64_t>(
+                  config_.runtime_collision_query_timeout_ns);
     cfg.surface = CollisionSurface::kPreExecutionValidation;
     cfg.contact_policy_id = request.contact_policy_id;
 
     ParallelCollisionValidationWorkerPool::Config pool_cfg;
-    pool_cfg.pass_config = std::move(cfg);
+    pool_cfg.pass_config = cfg;
     pool_cfg.worker_count = config_.validation_collision_workers;
     pool_cfg.min_waypoints_for_parallel =
         config_.validation_collision_min_waypoints_for_parallel;
-    ParallelCollisionValidationWorkerPool pool(std::move(pool_cfg));
+    if (!collision_validation_worker_pool_) {
+      collision_validation_worker_pool_ =
+          std::make_unique<ParallelCollisionValidationWorkerPool>(
+              std::move(pool_cfg));
+    }
 
     AuthoritativeValidationAttempt attempt;
-    attempt.bundle =
-        pool.validate_trajectory(*world_snapshot, engine_ptrs,
-                                 collision_trajectory, *cancel);
-    attempt.telemetry = pool.last_telemetry();
+    attempt.bundle = collision_validation_worker_pool_->validate_trajectory(
+        *world_snapshot,
+        engine_ptrs,
+        collision_trajectory,
+        *cancel,
+        cfg);
+    attempt.telemetry = collision_validation_worker_pool_->last_telemetry();
     return Result<AuthoritativeValidationAttempt>::Ok(std::move(attempt));
   };
 
@@ -7616,7 +7214,15 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
 void ExecutionKernel::set_collision_validation_policy_snapshot(
     std::optional<CollisionPolicySnapshot> snapshot) {
   std::scoped_lock lock(coordinator_mutex_);
-  coordinator_policy_snapshot_ = std::move(snapshot);
+  if (snapshot) {
+    auto shared_snapshot =
+        std::make_shared<CollisionPolicySnapshot>(std::move(*snapshot));
+    coordinator_policy_index_ = build_collision_policy_index(*shared_snapshot);
+    coordinator_policy_snapshot_ = std::move(shared_snapshot);
+    return;
+  }
+  coordinator_policy_snapshot_.reset();
+  coordinator_policy_index_.reset();
 }
 
 void ExecutionKernel::set_collision_validation_pipeline(

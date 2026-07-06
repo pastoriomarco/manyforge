@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -20,6 +21,19 @@ struct EvaluatedPairs {
   std::vector<CollisionPairResult> pairs;
   CollisionDecision decision;
 };
+
+/// Immutable lookup indexes derived from one CollisionPolicySnapshot. Safe to
+/// share across per-pass evaluators; evaluators still own their mutable
+/// support-contact state machines.
+struct CollisionPolicyIndex {
+  std::map<CollisionPairId, SupportContactPolicyEntry, std::less<>>
+      support_contact_index;
+  std::map<CollisionPairId, bool, std::less<>> static_static_index;
+  std::map<CollisionPairId, bool, std::less<>> touch_link_index;
+};
+
+std::shared_ptr<const CollisionPolicyIndex> build_collision_policy_index(
+    const CollisionPolicySnapshot& snapshot);
 
 /// CollisionPolicyEvaluator (spec §3.8.1, added in Chunk 3 of the
 /// collision-ownership plan).
@@ -45,6 +59,9 @@ struct EvaluatedPairs {
 class CollisionPolicyEvaluator {
  public:
   explicit CollisionPolicyEvaluator(CollisionPolicySnapshot snapshot);
+  explicit CollisionPolicyEvaluator(
+      std::shared_ptr<const CollisionPolicySnapshot> snapshot,
+      std::shared_ptr<const CollisionPolicyIndex> index = nullptr);
 
   /// Clear support-contact state machine entries. Call between
   /// independent validation passes.
@@ -69,7 +86,7 @@ class CollisionPolicyEvaluator {
 
   /// Read-only access to the snapshot. Useful for callers that want to
   /// echo the policy revision into a CollisionResult.
-  const CollisionPolicySnapshot& snapshot() const { return snapshot_; }
+  const CollisionPolicySnapshot& snapshot() const { return *snapshot_; }
 
  private:
   /// Support-contact state machine states (per the plan's explicit
@@ -82,16 +99,13 @@ class CollisionPolicyEvaluator {
     kRecontactViolation,
   };
 
-  CollisionPolicySnapshot snapshot_;
+  std::shared_ptr<const CollisionPolicySnapshot> snapshot_;
+  std::shared_ptr<const CollisionPolicyIndex> index_;
 
   /// Pair lookups built from `snapshot_` at construction so classify()
   /// runs in O(N log N) where N is the number of observed pairs.
-  std::map<CollisionPairId, SupportContactPolicyEntry, std::less<>>
-      support_contact_index_;
   std::map<CollisionPairId, SupportContactState, std::less<>>
       support_contact_state_;
-  std::map<CollisionPairId, bool, std::less<>> static_static_index_;
-  std::map<CollisionPairId, bool, std::less<>> touch_link_index_;
 };
 
 }  // namespace manyforge::core

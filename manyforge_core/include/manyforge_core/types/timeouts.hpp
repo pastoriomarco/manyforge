@@ -4,8 +4,8 @@ namespace manyforge::core {
 
 /// Timeouts DTO (spec §3.4)
 struct TimeoutsDTO {
-    double planning_timeout_s;   // > 0
-    double execution_timeout_s;  // > 0
+    double planning_timeout_s = 5.0;    // > 0
+    double execution_timeout_s = 10.0;  // > 0
 };
 
 }  // namespace manyforge::core

@@ -9,11 +9,17 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 
 namespace manyforge::core {
+
+struct RuntimeCollisionPolicyView {
+  std::shared_ptr<const CollisionPolicySnapshot> snapshot;
+  std::shared_ptr<const CollisionPolicyIndex> index;
+};
 
 /// Owns runtime-collision monitor scheduling, cancellation, and teardown
 /// quiescence. Collision semantics remain with ExecutionKernel; this collaborator
@@ -25,6 +31,10 @@ class RuntimeCollisionMonitor {
   };
 
   using TickCallback = std::function<Result<void>()>;
+  /// Called from the monitor's scheduled callback while the monitor mutex is
+  /// held. Implementations must not re-enter RuntimeCollisionMonitor
+  /// start/stop, and scheduler cancel/drain implementations must not wait on a
+  /// callback that is blocked trying to reacquire the same monitor mutex.
   using ShouldContinueCallback = std::function<bool()>;
 
   RuntimeCollisionMonitor(IClock& clock,
@@ -49,8 +59,8 @@ class RuntimeCollisionMonitor {
   /// Runtime ticks are single observed states, not full trajectories. Return a
   /// policy snapshot adjusted for runtime semantics while preserving the
   /// authoritatively configured policy data.
-  CollisionPolicySnapshot runtime_policy_snapshot(
-      CollisionPolicySnapshot policy_snapshot) const;
+  RuntimeCollisionPolicyView runtime_policy_snapshot(
+      std::shared_ptr<const CollisionPolicySnapshot> policy_snapshot) const;
 
   /// Apply the currently armed contact_grasp policy to the observed-state
   /// validation bundle. Returns a fault details map only for configuration
@@ -92,6 +102,10 @@ class RuntimeCollisionMonitor {
   mutable std::mutex contact_policy_mutex_;
   std::string active_contact_policy_id_;
   std::map<std::string, ContactReleasePairState> contact_release_state_;
+
+  mutable std::mutex runtime_policy_cache_mutex_;
+  mutable std::optional<CollisionPolicyRevision> runtime_policy_cache_revision_;
+  mutable RuntimeCollisionPolicyView runtime_policy_cache_view_;
 };
 
 }  // namespace manyforge::core

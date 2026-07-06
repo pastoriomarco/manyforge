@@ -235,33 +235,47 @@ Result<TrajectorySampleResult> make_error(TrajectorySampleError code) {
   return Result<TrajectorySampleResult>::Err(std::move(dto));
 }
 
+Result<void> make_void_error(TrajectorySampleError code) {
+  ErrorDTO dto;
+  dto.code = std::string(to_string(code));
+  return Result<void>::Err(std::move(dto));
+}
+
+// Fill `out` with a clamped hold at `positions` (or an empty clamp when
+// `positions == nullptr`). Every field is written so `out` can be reused
+// across calls without leaking prior state.
+void fill_clamped(const std::vector<double>* positions,
+                  std::size_t joint_count, TrajectorySampleResult& out) {
+  if (positions != nullptr) {
+    out.positions_rad = *positions;
+    out.velocities_rad_s.assign(joint_count, 0.0);
+    out.accelerations_rad_s2.assign(joint_count, 0.0);
+  } else {
+    out.positions_rad.clear();
+    out.velocities_rad_s.clear();
+    out.accelerations_rad_s2.clear();
+  }
+  out.segment_index = std::nullopt;
+  out.degree = 0;
+  out.clamped = true;
+  out.fallback_reason = TrajectorySampleFallback::kNone;
+}
+
 }  // namespace
 
-Result<TrajectorySampleResult> sample_trajectory(
-    const TrajectoryDTO& trajectory, double time_s) {
-  // Reject non-finite sample times before any comparison runs. NaN
-  // compares false against everything (including the clamp predicates
-  // below), which would otherwise let the call fall through to
-  // out-of-range segment indexing.
-  if (!std::isfinite(time_s)) {
-    return make_error(TrajectorySampleError::kNonFiniteSampleTime);
-  }
-
-  // Empty trajectory: produce a clamped empty result.
+Result<void> validate_trajectory_for_sampling(const TrajectoryDTO& trajectory) {
+  // Empty trajectory: sampling yields the clamped empty result, so there
+  // is nothing to validate (matching sample_trajectory's precedence, where
+  // the empty check runs before the joint_names check).
   if (trajectory.waypoints.empty()) {
-    TrajectorySampleResult out;
-    out.segment_index = std::nullopt;
-    out.degree = 0;
-    out.clamped = true;
-    out.fallback_reason = TrajectorySampleFallback::kNone;
-    return Result<TrajectorySampleResult>::Ok(std::move(out));
+    return Result<void>::Ok();
   }
 
   // joint_names declares the per-joint column count. Required for any
   // non-empty trajectory because every consumer downstream of the
   // sampler keys on the joint set.
   if (trajectory.joint_names.empty()) {
-    return make_error(TrajectorySampleError::kEmptyJointNames);
+    return make_void_error(TrajectorySampleError::kEmptyJointNames);
   }
 
   const std::size_t joint_count = trajectory.joint_names.size();
@@ -271,10 +285,10 @@ Result<TrajectorySampleResult> sample_trajectory(
   // uniform widths and finite times.
   for (const auto& wp : trajectory.waypoints) {
     if (wp.positions_rad.size() != joint_count) {
-      return make_error(TrajectorySampleError::kPositionJointCountMismatch);
+      return make_void_error(TrajectorySampleError::kPositionJointCountMismatch);
     }
     if (!std::isfinite(wp.time_from_start_s)) {
-      return make_error(TrajectorySampleError::kNonFiniteWaypointTime);
+      return make_void_error(TrajectorySampleError::kNonFiniteWaypointTime);
     }
   }
 
@@ -284,26 +298,39 @@ Result<TrajectorySampleResult> sample_trajectory(
     const double t_prev = trajectory.waypoints[i - 1].time_from_start_s;
     const double t_curr = trajectory.waypoints[i].time_from_start_s;
     if (t_curr < t_prev) {
-      return make_error(TrajectorySampleError::kNonMonotonicWaypointTimes);
+      return make_void_error(TrajectorySampleError::kNonMonotonicWaypointTimes);
     }
     if (t_curr == t_prev) {
-      return make_error(TrajectorySampleError::kDuplicateWaypointTimes);
+      return make_void_error(TrajectorySampleError::kDuplicateWaypointTimes);
     }
   }
+  return Result<void>::Ok();
+}
+
+Result<void> sample_trajectory_prevalidated(const TrajectoryDTO& trajectory,
+                                            double time_s,
+                                            TrajectorySampleResult& out) {
+  // Reject non-finite sample times before any comparison runs. NaN
+  // compares false against everything (including the clamp predicates
+  // below), which would otherwise let the call fall through to
+  // out-of-range segment indexing.
+  if (!std::isfinite(time_s)) {
+    return make_void_error(TrajectorySampleError::kNonFiniteSampleTime);
+  }
+
+  // Empty trajectory: produce a clamped empty result.
+  if (trajectory.waypoints.empty()) {
+    fill_clamped(nullptr, 0, out);
+    return Result<void>::Ok();
+  }
+
+  const std::size_t joint_count = trajectory.joint_names.size();
 
   // Single-waypoint trajectories hold that waypoint's position with zero
   // velocity / acceleration at all times.
   if (trajectory.waypoints.size() == 1) {
-    const auto& only = trajectory.waypoints.front();
-    TrajectorySampleResult out;
-    out.positions_rad = only.positions_rad;
-    out.velocities_rad_s.assign(joint_count, 0.0);
-    out.accelerations_rad_s2.assign(joint_count, 0.0);
-    out.segment_index = std::nullopt;
-    out.degree = 0;
-    out.clamped = true;
-    out.fallback_reason = TrajectorySampleFallback::kNone;
-    return Result<TrajectorySampleResult>::Ok(std::move(out));
+    fill_clamped(&trajectory.waypoints.front().positions_rad, joint_count, out);
+    return Result<void>::Ok();
   }
 
   const double t_first = trajectory.waypoints.front().time_from_start_s;
@@ -311,28 +338,14 @@ Result<TrajectorySampleResult> sample_trajectory(
 
   // Pre-start clamp.
   if (time_s < t_first) {
-    TrajectorySampleResult out;
-    out.positions_rad = trajectory.waypoints.front().positions_rad;
-    out.velocities_rad_s.assign(joint_count, 0.0);
-    out.accelerations_rad_s2.assign(joint_count, 0.0);
-    out.segment_index = std::nullopt;
-    out.degree = 0;
-    out.clamped = true;
-    out.fallback_reason = TrajectorySampleFallback::kNone;
-    return Result<TrajectorySampleResult>::Ok(std::move(out));
+    fill_clamped(&trajectory.waypoints.front().positions_rad, joint_count, out);
+    return Result<void>::Ok();
   }
 
   // Post-end clamp.
   if (time_s > t_last) {
-    TrajectorySampleResult out;
-    out.positions_rad = trajectory.waypoints.back().positions_rad;
-    out.velocities_rad_s.assign(joint_count, 0.0);
-    out.accelerations_rad_s2.assign(joint_count, 0.0);
-    out.segment_index = std::nullopt;
-    out.degree = 0;
-    out.clamped = true;
-    out.fallback_reason = TrajectorySampleFallback::kNone;
-    return Result<TrajectorySampleResult>::Ok(std::move(out));
+    fill_clamped(&trajectory.waypoints.back().positions_rad, joint_count, out);
+    return Result<void>::Ok();
   }
 
   // We are inside [t_first, t_last]. Pick a segment index using the
@@ -372,7 +385,6 @@ Result<TrajectorySampleResult> sample_trajectory(
 
   EndpointSamples classification = classify_endpoints(a, b, joint_count);
 
-  TrajectorySampleResult out;
   out.segment_index = seg_idx;
   out.clamped = false;
 
@@ -400,6 +412,25 @@ Result<TrajectorySampleResult> sample_trajectory(
     }
   }
 
+  return Result<void>::Ok();
+}
+
+Result<TrajectorySampleResult> sample_trajectory(
+    const TrajectoryDTO& trajectory, double time_s) {
+  // Time-first precedence: a non-finite time_s is rejected before any
+  // structural validation, matching the original single-call contract.
+  if (!std::isfinite(time_s)) {
+    return make_error(TrajectorySampleError::kNonFiniteSampleTime);
+  }
+  auto valid = validate_trajectory_for_sampling(trajectory);
+  if (!valid.ok()) {
+    return Result<TrajectorySampleResult>::Err(valid.error());
+  }
+  TrajectorySampleResult out;
+  auto sampled = sample_trajectory_prevalidated(trajectory, time_s, out);
+  if (!sampled.ok()) {
+    return Result<TrajectorySampleResult>::Err(sampled.error());
+  }
   return Result<TrajectorySampleResult>::Ok(std::move(out));
 }
 

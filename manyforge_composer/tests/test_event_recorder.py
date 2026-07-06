@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -112,6 +113,20 @@ class _StubState:
         self._kernel = kernel
 
 
+class _RaceWideningEventRecorder(EventRecorder):
+    def _handle_cycle_state_transition(self, *args, **kwargs) -> None:
+        time.sleep(0.0001)
+        super()._handle_cycle_state_transition(*args, **kwargs)
+
+    def _handle_kernel_transition(self, *args, **kwargs) -> None:
+        time.sleep(0.0001)
+        super()._handle_kernel_transition(*args, **kwargs)
+
+    def _handle_node_status_changes(self, *args, **kwargs) -> None:
+        time.sleep(0.0001)
+        super()._handle_node_status_changes(*args, **kwargs)
+
+
 def _memory_events(rec: EventRecorder) -> list[dict[str, Any]]:
     return [rec._decode_stored_event(event) for event in rec._events]
 
@@ -163,6 +178,71 @@ class TestRunLifecycle:
 
         assert run1 != run2
         assert rec.last_run_id == run2
+
+
+class TestObserveConcurrency:
+    def test_concurrent_observe_records_each_transition_once(self):
+        for _ in range(500):
+            rec = _RaceWideningEventRecorder(observe_min_interval_s=0.0)
+            status = _StubStatus(
+                state=ExecutionState.PLANNING,
+                execution_id=7,
+                active_move_id="move-race",
+            )
+            snapshot = _StubSnapshot()
+            cycle_manager = _StubCycleManager(
+                "running",
+                kernel_status=status,
+                kernel_snapshot=snapshot,
+            )
+            cycle_manager.get_node_statuses = lambda: {"root": "RUNNING"}
+            state = _StubState(
+                cycle_manager=cycle_manager,
+                kernel=_StubKernel(status=status, snapshot=snapshot),
+            )
+            barrier = threading.Barrier(3)
+            errors: list[BaseException] = []
+
+            def observe_once() -> None:
+                try:
+                    barrier.wait(timeout=1.0)
+                    rec.observe(state, force=True)
+                except BaseException as exc:  # pragma: no cover - test aid
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=observe_once, name=f"observe-race-{i}")
+                for i in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            barrier.wait(timeout=1.0)
+            for thread in threads:
+                thread.join(timeout=1.0)
+
+            assert all(not thread.is_alive() for thread in threads)
+            assert not errors
+            events = _memory_events(rec)
+            cycle_events = [
+                event for event in events if event["type"] == "cycle_state_changed"
+            ]
+            kernel_events = [
+                event for event in events if event["type"] == "kernel_state_transition"
+            ]
+            node_events = [
+                event for event in events if event["type"] == "node_status_transition"
+            ]
+            assert [(event["details"]["from"], event["details"]["to"]) for event in cycle_events] == [
+                (None, "running")
+            ]
+            assert [
+                (event["details"]["from"], event["details"]["to"])
+                for event in kernel_events
+            ] == [(None, "planning")]
+            assert [
+                (event["from"], event["to"])
+                for event in node_events
+            ] == [(None, "RUNNING")]
 
 
 class TestSemanticEvents:

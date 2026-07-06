@@ -9,11 +9,16 @@ TrajectoryCache::TrajectoryCache(CacheConfig config)
 
 void TrajectoryCache::store(const std::string& move_id, TrajectoryDTO trajectory,
                             CollisionWorldRevision revision) {
+  // Build the shared payload outside the lock; the critical section only
+  // swaps pointers and maintains the FIFO index.
+  auto shared_trajectory =
+      std::make_shared<const TrajectoryDTO>(std::move(trajectory));
+
   std::lock_guard<std::mutex> lock(mutex_);
 
   auto it = entries_.find(move_id);
   if (it != entries_.end()) {
-    it->second.trajectory = std::move(trajectory);
+    it->second.trajectory = std::move(shared_trajectory);
     it->second.revision = std::move(revision);
     return;
   }
@@ -24,7 +29,8 @@ void TrajectoryCache::store(const std::string& move_id, TrajectoryDTO trajectory
     insertion_order_.pop_front();
   }
 
-  entries_.emplace(move_id, Entry{std::move(trajectory), std::move(revision)});
+  entries_.emplace(move_id,
+                   Entry{std::move(shared_trajectory), std::move(revision)});
   insertion_order_.push_back(move_id);
 }
 
@@ -35,12 +41,17 @@ bool TrajectoryCache::contains(const std::string& move_id) const {
 
 std::optional<TrajectoryDTO> TrajectoryCache::peek_unvalidated(
     const std::string& move_id) const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto it = entries_.find(move_id);
-  if (it == entries_.end()) {
-    return std::nullopt;
+  std::shared_ptr<const TrajectoryDTO> found;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = entries_.find(move_id);
+    if (it == entries_.end()) {
+      return std::nullopt;
+    }
+    found = it->second.trajectory;
   }
-  return it->second.trajectory;
+  // Deep copy outside the lock.
+  return *found;
 }
 
 std::optional<TrajectoryDTO> TrajectoryCache::lookup_with_revision(
@@ -49,7 +60,7 @@ std::optional<TrajectoryDTO> TrajectoryCache::lookup_with_revision(
   const bool expected_is_unset = expected_revision.revision_id == 0 &&
                                  expected_revision.content_hash.empty();
 
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   auto it = entries_.find(move_id);
   if (it == entries_.end()) {
     return std::nullopt;
@@ -83,7 +94,11 @@ std::optional<TrajectoryDTO> TrajectoryCache::lookup_with_revision(
     erase_locked(move_id);
     return std::nullopt;
   }
-  return it->second.trajectory;
+  // Hold the shared payload, then deep-copy outside the lock so the hit
+  // path's lock hold time stays O(1).
+  std::shared_ptr<const TrajectoryDTO> found = it->second.trajectory;
+  lock.unlock();
+  return *found;
 }
 
 std::optional<CollisionWorldRevision> TrajectoryCache::revision_of(

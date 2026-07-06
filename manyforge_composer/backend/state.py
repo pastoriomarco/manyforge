@@ -317,6 +317,14 @@ class ComposerState:
             self.refresh_drivable_joint_names(kernel=kernel)
         self.allowed_fs_roots = normalize_allowed_roots(allowed_fs_roots)
         self._runtime_overrides: dict[str, RuntimeOverrideRecord] = {}
+        self._runtime_override_lock = threading.RLock()
+        self._runtime_override_revision = 0
+        self._runtime_override_next_tree_cache_key: tuple[int, str, int] | None = None
+        self._runtime_override_next_tree_cache: dict[str, Any] | None = None
+        # Serializes read-modify-write edits of self.program. Draft/tool
+        # handlers may hold this while calling apply_models(), so it must be
+        # reentrant.
+        self._program_edit_lock = threading.RLock()
         self._program_tree_hash: str = ""
         self._program_session_generation: int = 0
         self._scene_snapshot_lock = threading.Lock()
@@ -945,7 +953,8 @@ class ComposerState:
     @property
     def runtime_overrides(self) -> dict[str, RuntimeOverrideRecord]:
         """Return a shallow copy of the runtime override ledger keyed by node name."""
-        return dict(self._runtime_overrides)
+        with self._runtime_override_lock:
+            return dict(self._runtime_overrides)
 
     def _update_program_tree_hash(self) -> None:
         """Recompute and cache the program tree hash from the current base program."""
@@ -953,6 +962,13 @@ class ComposerState:
             self._program_tree_hash = compute_program_tree_hash(self.program.tree)
         else:
             self._program_tree_hash = ""
+        with self._runtime_override_lock:
+            self._mark_runtime_overrides_changed_locked()
+
+    def _mark_runtime_overrides_changed_locked(self) -> None:
+        self._runtime_override_revision += 1
+        self._runtime_override_next_tree_cache_key = None
+        self._runtime_override_next_tree_cache = None
 
     def _override_is_stale(self, record: RuntimeOverrideRecord) -> bool:
         """An override is stale when its base_program_hash doesn't match the current program."""
@@ -962,13 +978,15 @@ class ComposerState:
         )
 
     def _has_stale_overrides(self) -> bool:
-        return any(self._override_is_stale(r) for r in self._runtime_overrides.values())
+        with self._runtime_override_lock:
+            return any(self._override_is_stale(r) for r in self._runtime_overrides.values())
 
     def _stale_override_names(self) -> list[str]:
-        return [
-            name for name, r in self._runtime_overrides.items()
-            if self._override_is_stale(r)
-        ]
+        with self._runtime_override_lock:
+            return [
+                name for name, r in self._runtime_overrides.items()
+                if self._override_is_stale(r)
+            ]
 
     def _deployment_capability_keys(self) -> set[str] | None:
         if self.deployment is None:
@@ -983,22 +1001,23 @@ class ComposerState:
         if self.program is None or self.program.tree is None:
             raise RuntimeError("No program loaded")
 
-        stale_names = [
-            r.node_name for r in self._runtime_overrides.values()
-            if self._override_is_stale(r)
-            and (include_staged or r.activation_state == "active")
-        ]
+        with self._runtime_override_lock:
+            stale_names = [
+                r.node_name for r in self._runtime_overrides.values()
+                if self._override_is_stale(r)
+                and (include_staged or r.activation_state == "active")
+            ]
+            overrides_by_name = {
+                record.node_name: dict(record.params)
+                for record in self._runtime_overrides.values()
+                if include_staged or record.activation_state == "active"
+            }
         if stale_names:
             raise RuntimeError(
                 f"Cannot build effective program: stale overrides must be "
                 f"revalidated or discarded first: {', '.join(stale_names)}"
             )
 
-        overrides_by_name = {
-            record.node_name: dict(record.params)
-            for record in self._runtime_overrides.values()
-            if include_staged or record.activation_state == "active"
-        }
         effective_tree = apply_tree_param_overrides(self.program.tree, overrides_by_name)
         program_data = self.program.to_dict()
         program_data["tree"] = effective_tree.to_dict()
@@ -1012,21 +1031,24 @@ class ComposerState:
 
     def _set_runtime_override_states(self, activation_state: str) -> None:
         now_ns = time.monotonic_ns()
-        for record in self._runtime_overrides.values():
-            record.activation_state = activation_state
-            if activation_state == "active":
-                record.activated_at_ns = now_ns
+        with self._runtime_override_lock:
+            for record in self._runtime_overrides.values():
+                record.activation_state = activation_state
+                if activation_state == "active":
+                    record.activated_at_ns = now_ns
+            self._mark_runtime_overrides_changed_locked()
 
     def _selected_runtime_override_records(
         self,
         *,
         include_staged: bool,
     ) -> list[RuntimeOverrideRecord]:
-        records = [
-            record
-            for record in self._runtime_overrides.values()
-            if include_staged or record.activation_state == "active"
-        ]
+        with self._runtime_override_lock:
+            records = [
+                record
+                for record in self._runtime_overrides.values()
+                if include_staged or record.activation_state == "active"
+            ]
         if not records:
             selected = "active/staged" if include_staged else "active"
             raise RuntimeError(f"No {selected} runtime overrides selected")
@@ -1084,7 +1106,9 @@ class ComposerState:
         return run_id, authority_source, trigger_node_instance
 
     def _clear_runtime_overrides(self) -> None:
-        self._runtime_overrides.clear()
+        with self._runtime_override_lock:
+            self._runtime_overrides.clear()
+            self._mark_runtime_overrides_changed_locked()
 
     def _override_entry_dict(self, record: RuntimeOverrideRecord) -> dict[str, Any]:
         """Serialize a single override record for REST/MCP consumption."""
@@ -1106,30 +1130,49 @@ class ComposerState:
     def runtime_override_status(self) -> dict[str, Any]:
         """Return ledger state optimized for REST/MCP/UI consumption."""
         cycle_state = self.cycle_manager.state.value if self.cycle_manager is not None else "idle"
-        active = [
-            record for record in self._runtime_overrides.values()
-            if record.activation_state == "active"
-        ]
-        staged = [
-            record for record in self._runtime_overrides.values()
-            if record.activation_state == "staged"
-        ]
-        stale = [
-            record for record in self._runtime_overrides.values()
-            if self._override_is_stale(record)
-        ]
-        requires_reset_to_activate = bool(staged) and cycle_state == "stopped"
-        can_activate_now = (
-            bool(staged) and cycle_state == "idle" and not stale
-        )
-        next_effective_tree = None
-        if self.program is not None and staged and not stale:
-            try:
-                next_effective_tree = self._build_program_with_overrides(
-                    include_staged=True
-                ).tree.to_dict()
-            except Exception:
-                next_effective_tree = None
+        with self._runtime_override_lock:
+            active = [
+                record for record in self._runtime_overrides.values()
+                if record.activation_state == "active"
+            ]
+            staged = [
+                record for record in self._runtime_overrides.values()
+                if record.activation_state == "staged"
+            ]
+            stale = [
+                record for record in self._runtime_overrides.values()
+                if self._override_is_stale(record)
+            ]
+            requires_reset_to_activate = bool(staged) and cycle_state == "stopped"
+            can_activate_now = (
+                bool(staged) and cycle_state == "idle" and not stale
+            )
+            next_effective_tree = None
+            if self.program is not None and staged and not stale:
+                cache_key = (
+                    self._runtime_override_revision,
+                    self._program_tree_hash,
+                    self._program_session_generation,
+                )
+                if (
+                    self._runtime_override_next_tree_cache_key == cache_key
+                    and self._runtime_override_next_tree_cache is not None
+                ):
+                    next_effective_tree = copy.deepcopy(
+                        self._runtime_override_next_tree_cache
+                    )
+                else:
+                    try:
+                        next_effective_tree = self._build_program_with_overrides(
+                            include_staged=True
+                        ).tree.to_dict()
+                    except Exception:
+                        next_effective_tree = None
+                    if next_effective_tree is not None:
+                        self._runtime_override_next_tree_cache_key = cache_key
+                        self._runtime_override_next_tree_cache = copy.deepcopy(
+                            next_effective_tree
+                        )
         return {
             "active": [self._override_entry_dict(r) for r in active],
             "staged": [self._override_entry_dict(r) for r in staged],
@@ -1156,7 +1199,9 @@ class ComposerState:
         """Return the program snapshot produced by materializing runtime overrides."""
         if self.program is None or self.program.tree is None:
             raise RuntimeError("No program loaded")
-        if not self._runtime_overrides:
+        with self._runtime_override_lock:
+            has_runtime_overrides = bool(self._runtime_overrides)
+        if not has_runtime_overrides:
             return self.program
         return self._build_program_with_overrides(include_staged=include_staged)
 
@@ -1174,10 +1219,12 @@ class ComposerState:
             raise RuntimeError(
                 "Runtime overrides may only be promoted into the loaded program in IDLE or STOPPED"
             )
-        if not include_staged and any(
-            record.activation_state == "staged"
-            for record in self._runtime_overrides.values()
-        ):
+        with self._runtime_override_lock:
+            has_staged_overrides = any(
+                record.activation_state == "staged"
+                for record in self._runtime_overrides.values()
+            )
+        if not include_staged and has_staged_overrides:
             raise RuntimeError(
                 "Staged runtime overrides exist; either include staged overrides in the promotion or clear them first"
             )
@@ -1249,19 +1296,22 @@ class ComposerState:
 
     def activate_staged_runtime_overrides(self) -> None:
         """Promote staged overrides into the runtime by rebuilding the effective program."""
-        if not any(
-            record.activation_state == "staged"
-            for record in self._runtime_overrides.values()
-        ):
+        with self._runtime_override_lock:
+            has_staged_overrides = any(
+                record.activation_state == "staged"
+                for record in self._runtime_overrides.values()
+            )
+        if not has_staged_overrides:
             return
         cycle_state = self.cycle_manager.state.value if self.cycle_manager is not None else "idle"
         if cycle_state != "idle":
             raise RuntimeError("Staged runtime overrides can only be activated from IDLE")
         effective_program = self._build_program_with_overrides(include_staged=True)
-        previous_states = {
-            node_name: (record.activation_state, record.activated_at_ns)
-            for node_name, record in self._runtime_overrides.items()
-        }
+        with self._runtime_override_lock:
+            previous_states = {
+                node_name: (record.activation_state, record.activated_at_ns)
+                for node_name, record in self._runtime_overrides.items()
+            }
         self._set_runtime_override_states("active")
         try:
             self._rebuild_runtime(
@@ -1270,14 +1320,18 @@ class ComposerState:
                 effective_program=effective_program,
             )
         except Exception:
-            for node_name, (activation_state, activated_at_ns) in previous_states.items():
-                record = self._runtime_overrides.get(node_name)
-                if record is None:
-                    continue
-                record.activation_state = activation_state
-                record.activated_at_ns = activated_at_ns
+            with self._runtime_override_lock:
+                for node_name, (activation_state, activated_at_ns) in previous_states.items():
+                    record = self._runtime_overrides.get(node_name)
+                    if record is None:
+                        continue
+                    record.activation_state = activation_state
+                    record.activated_at_ns = activated_at_ns
+                self._mark_runtime_overrides_changed_locked()
             raise
-        for record in self._runtime_overrides.values():
+        with self._runtime_override_lock:
+            activated_records = list(self._runtime_overrides.values())
+        for record in activated_records:
             run_id, authority_source, trigger_node_instance = self._runtime_override_run_context(
                 record.session_id
             )
@@ -1296,18 +1350,25 @@ class ComposerState:
     def remove_runtime_override(self, node_name: str) -> bool:
         """Remove a runtime override and rebuild immediately if it was active."""
         cycle_state = self._ensure_runtime_override_mutation_allowed()
-        record = self._runtime_overrides.pop(node_name, None)
+        with self._runtime_override_lock:
+            record = self._runtime_overrides.pop(node_name, None)
+            if record is not None:
+                self._mark_runtime_overrides_changed_locked()
         if record is None:
             return False
         if cycle_state == "direct_control" and record.activation_state == "active":
-            self._runtime_overrides[node_name] = record
+            with self._runtime_override_lock:
+                self._runtime_overrides[node_name] = record
+                self._mark_runtime_overrides_changed_locked()
             raise RuntimeError(
                 "Cannot remove an active runtime override during DIRECT_CONTROL; return to IDLE first"
             )
         if record.activation_state == "active":
+            with self._runtime_override_lock:
+                has_remaining_overrides = bool(self._runtime_overrides)
             effective_program = (
                 self._build_program_with_overrides(include_staged=False)
-                if self._runtime_overrides
+                if has_remaining_overrides
                 else self.program
             )
             try:
@@ -1317,7 +1378,9 @@ class ComposerState:
                     effective_program=effective_program,
                 )
             except Exception:
-                self._runtime_overrides[node_name] = record
+                with self._runtime_override_lock:
+                    self._runtime_overrides[node_name] = record
+                    self._mark_runtime_overrides_changed_locked()
                 raise
         run_id, authority_source, trigger_node_instance = self._runtime_override_run_context(
             record.session_id
@@ -1338,17 +1401,15 @@ class ComposerState:
     def clear_runtime_overrides(self) -> None:
         """Drop all runtime overrides and return the runtime to the base program."""
         cycle_state = self._ensure_runtime_override_mutation_allowed()
-        removed = list(self._runtime_overrides.values())
+        with self._runtime_override_lock:
+            removed = list(self._runtime_overrides.values())
         if cycle_state == "direct_control" and any(
             record.activation_state == "active" for record in removed
         ):
             raise RuntimeError(
                 "Cannot clear active runtime overrides during DIRECT_CONTROL; return to IDLE first"
             )
-        had_active = any(
-            record.activation_state == "active"
-            for record in self._runtime_overrides.values()
-        )
+        had_active = any(record.activation_state == "active" for record in removed)
         self._clear_runtime_overrides()
         if had_active and self.program is not None:
             try:
@@ -1358,10 +1419,12 @@ class ComposerState:
                     effective_program=self.program,
                 )
             except Exception:
-                self._runtime_overrides = {
-                    record.node_name: record
-                    for record in removed
-                }
+                with self._runtime_override_lock:
+                    self._runtime_overrides = {
+                        record.node_name: record
+                        for record in removed
+                    }
+                    self._mark_runtime_overrides_changed_locked()
                 raise
         for record in removed:
             run_id, authority_source, trigger_node_instance = self._runtime_override_run_context(
@@ -1388,11 +1451,12 @@ class ComposerState:
         if self.program is None or self.program.tree is None:
             raise RuntimeError("No program loaded")
 
-        stale = [
-            (name, record)
-            for name, record in self._runtime_overrides.items()
-            if self._override_is_stale(record)
-        ]
+        with self._runtime_override_lock:
+            stale = [
+                (name, record)
+                for name, record in self._runtime_overrides.items()
+                if self._override_is_stale(record)
+            ]
         if not stale:
             return {}
 
@@ -1423,10 +1487,12 @@ class ComposerState:
         results: dict[str, str] = {}
         for name, outcome, record in outcomes:
             old_hash = record.base_program_hash
-            if outcome == "revalidated":
-                record.base_program_hash = self._program_tree_hash
-            else:
-                self._runtime_overrides.pop(name, None)
+            with self._runtime_override_lock:
+                if outcome == "revalidated":
+                    record.base_program_hash = self._program_tree_hash
+                else:
+                    self._runtime_overrides.pop(name, None)
+                self._mark_runtime_overrides_changed_locked()
             results[name] = outcome
 
             run_id, authority_source, trigger_node_instance = (
@@ -1467,10 +1533,12 @@ class ComposerState:
         cycle_state = self.cycle_manager.state.value if self.cycle_manager is not None else "idle"
         if cycle_state not in {"idle", "direct_control"}:
             raise RuntimeError("Runtime overrides may only be changed in IDLE or DIRECT_CONTROL")
-        if cycle_state == "direct_control" and any(
-            record.activation_state == "active"
-            for record in self._runtime_overrides.values()
-        ):
+        with self._runtime_override_lock:
+            has_active_override = any(
+                record.activation_state == "active"
+                for record in self._runtime_overrides.values()
+            )
+        if cycle_state == "direct_control" and has_active_override:
             raise RuntimeError(
                 "Cannot stage additional runtime overrides during DIRECT_CONTROL while active overrides are already bound into the runner; return to IDLE first"
             )
@@ -1493,7 +1561,8 @@ class ComposerState:
         if policy == "human_approval" and authority_source != "human":
             raise RuntimeError(f"Node '{node_name}' requires human approval for runtime override")
 
-        existing = self._runtime_overrides.get(node_name)
+        with self._runtime_override_lock:
+            existing = self._runtime_overrides.get(node_name)
         merged_params = merge_param_patch(
             existing.params if existing is not None else {},
             params,
@@ -1511,14 +1580,18 @@ class ComposerState:
             activation_state="active" if cycle_state == "idle" else "staged",
             activated_at_ns=time.monotonic_ns() if cycle_state == "idle" else None,
         )
-        self._runtime_overrides[node_name] = candidate
+        with self._runtime_override_lock:
+            self._runtime_overrides[node_name] = candidate
+            self._mark_runtime_overrides_changed_locked()
         try:
             effective_program = self._build_program_with_overrides(include_staged=True)
         except Exception:
-            if existing is None:
-                self._runtime_overrides.pop(node_name, None)
-            else:
-                self._runtime_overrides[node_name] = existing
+            with self._runtime_override_lock:
+                if existing is None:
+                    self._runtime_overrides.pop(node_name, None)
+                else:
+                    self._runtime_overrides[node_name] = existing
+                self._mark_runtime_overrides_changed_locked()
             raise
 
         if cycle_state == "idle":
@@ -1529,10 +1602,12 @@ class ComposerState:
                     effective_program=effective_program,
                 )
             except Exception:
-                if existing is None:
-                    self._runtime_overrides.pop(node_name, None)
-                else:
-                    self._runtime_overrides[node_name] = existing
+                with self._runtime_override_lock:
+                    if existing is None:
+                        self._runtime_overrides.pop(node_name, None)
+                    else:
+                        self._runtime_overrides[node_name] = existing
+                    self._mark_runtime_overrides_changed_locked()
                 raise
         run_id, event_authority_source, event_trigger_node_instance = self._runtime_override_run_context(
             candidate.session_id
@@ -2775,13 +2850,29 @@ class ComposerState:
         *,
         force_discard_overrides: bool = False,
     ) -> None:
+        with self._program_edit_lock:
+            self._apply_models_locked(
+                program,
+                deployment,
+                force_discard_overrides=force_discard_overrides,
+            )
+
+    def _apply_models_locked(
+        self,
+        program: Program,
+        deployment: Optional[Deployment],
+        *,
+        force_discard_overrides: bool = False,
+    ) -> None:
         """Apply validated program/deployment models to the runtime session.
 
         If runtime overrides exist, this method rejects by default.
         Pass ``force_discard_overrides=True`` to explicitly discard them,
         or materialize/clear them before calling this method.
         """
-        if self._runtime_overrides:
+        with self._runtime_override_lock:
+            has_runtime_overrides = bool(self._runtime_overrides)
+        if has_runtime_overrides:
             if force_discard_overrides:
                 self._clear_runtime_overrides()
             else:
@@ -2816,7 +2907,9 @@ class ComposerState:
         by default.  Pass ``force_discard_overrides=True`` to explicitly discard
         them.
         """
-        if self._runtime_overrides:
+        with self._runtime_override_lock:
+            has_runtime_overrides = bool(self._runtime_overrides)
+        if has_runtime_overrides:
             if not force_discard_overrides:
                 raise RuntimeError(
                     "Active or staged runtime overrides exist; "

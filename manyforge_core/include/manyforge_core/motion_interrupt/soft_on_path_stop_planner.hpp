@@ -244,6 +244,11 @@ struct JerkLimitedStopProfileDTO {
   /// pre-slow for a future path bottleneck.
   bool used_backward_envelope = false;
   double target_decel_path_rate = 0.0;  // the time-fit's converged target (diag)
+  /// The derivative-complete joint trajectory built from `samples` during
+  /// dispatch validation (times are ramp-relative, 1:1 with `samples`).
+  /// Consumers that turn a dispatchable profile into a replacement
+  /// trajectory can reuse these waypoints instead of resampling the path.
+  TrajectoryDTO emitted_trajectory;
 };
 
 /// Jerk-limited exact-time re-timing of the soft stop's ramp. Forward-integrates

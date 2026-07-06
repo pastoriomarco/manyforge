@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <exception>
+#include <iostream>
+#include <memory>
 #include <utility>
 
 #include <manyforge_core/types/reason_codes.hpp>
@@ -11,6 +14,25 @@ namespace manyforge::core {
 namespace {
 
 thread_local bool t_inside_runtime_collision_monitor_callback = false;
+thread_local RuntimeCollisionMonitor* t_runtime_collision_monitor_instance =
+    nullptr;
+thread_local std::uint64_t t_runtime_collision_monitor_generation = 0;
+
+constexpr auto kDrainCallbacksTimeout = std::chrono::seconds(1);
+
+[[noreturn]] void terminate_runtime_monitor_drain_timeout(const char* phase) {
+  // Fail closed: monitor callbacks can own borrowed kernel state. Once stop()
+  // is draining for teardown, continuing after the bound risks UAF and an
+  // unbounded wait can hang shutdown.
+  std::cerr << "manyforge_runtime_collision_monitor_drain_timeout"
+            << " phase=" << phase
+            << " timeout_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   kDrainCallbacksTimeout)
+                   .count()
+            << '\n';
+  std::terminate();
+}
 
 CollisionPairId canonical_collision_pair(CollisionPairId pair) {
   if (pair.body_b < pair.body_a) {
@@ -48,6 +70,15 @@ std::optional<double> pair_clearance_for_result(
 bool collision_body_contains_segment(const std::string& body,
                                      const std::string& segment) {
   return !segment.empty() && body.find(segment) != std::string::npos;
+}
+
+bool policy_revisions_equal(const CollisionPolicyRevision& a,
+                            const CollisionPolicyRevision& b) {
+  return a.revision_id == b.revision_id && a.content_hash == b.content_hash;
+}
+
+bool policy_revision_is_set(const CollisionPolicyRevision& revision) {
+  return revision.revision_id != 0 || !revision.content_hash.empty();
 }
 
 bool contact_grasp_pair_matches(const CollisionPairId& pair,
@@ -240,22 +271,44 @@ void RuntimeCollisionMonitor::start() {
 }
 
 void RuntimeCollisionMonitor::stop(bool drain_callbacks) {
-  std::unique_lock<std::mutex> lock(mutex_);
-  active_ = false;
-  ++generation_;
-  if (handle_ != 0) {
-    scheduler_.cancel(handle_);
-    handle_ = 0;
-  }
   if (!t_inside_runtime_collision_monitor_callback) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      active_ = false;
+      ++generation_;
+      if (handle_ != 0) {
+        scheduler_.cancel(handle_);
+        handle_ = 0;
+      }
+    }
+    if (drain_callbacks) {
+      if (!scheduler_.drain_for(SchedulerPriority::Safety,
+                                kDrainCallbacksTimeout)) {
+        terminate_runtime_monitor_drain_timeout("scheduler_safety_lane");
+      }
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
     auto no_callbacks_in_flight = [this]() {
       return callbacks_in_flight_ == 0;
     };
     if (drain_callbacks) {
-      cv_.wait(lock, no_callbacks_in_flight);
+      if (!cv_.wait_for(lock, kDrainCallbacksTimeout, no_callbacks_in_flight)) {
+        terminate_runtime_monitor_drain_timeout("monitor_callbacks");
+      }
     } else {
       (void)cv_.wait_for(lock, std::chrono::milliseconds(250),
                          no_callbacks_in_flight);
+    }
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    active_ = false;
+    ++generation_;
+    if (handle_ != 0) {
+      scheduler_.cancel(handle_);
+      handle_ = 0;
     }
   }
 }
@@ -276,9 +329,29 @@ std::string RuntimeCollisionMonitor::active_contact_policy_id() const {
   return active_contact_policy_id_;
 }
 
-CollisionPolicySnapshot RuntimeCollisionMonitor::runtime_policy_snapshot(
-    CollisionPolicySnapshot policy_snapshot) const {
-  for (auto& entry : policy_snapshot.support_contacts) {
+RuntimeCollisionPolicyView RuntimeCollisionMonitor::runtime_policy_snapshot(
+    std::shared_ptr<const CollisionPolicySnapshot> policy_snapshot) const {
+  RuntimeCollisionPolicyView empty_view;
+  if (!policy_snapshot) {
+    auto empty_snapshot = std::make_shared<CollisionPolicySnapshot>();
+    empty_view.snapshot = empty_snapshot;
+    empty_view.index = build_collision_policy_index(*empty_snapshot);
+    return empty_view;
+  }
+
+  const bool cacheable = policy_revision_is_set(policy_snapshot->revision);
+  if (cacheable) {
+    std::lock_guard<std::mutex> lock(runtime_policy_cache_mutex_);
+    if (runtime_policy_cache_revision_ &&
+        policy_revisions_equal(*runtime_policy_cache_revision_,
+                               policy_snapshot->revision)) {
+      return runtime_policy_cache_view_;
+    }
+  }
+
+  auto adjusted =
+      std::make_shared<CollisionPolicySnapshot>(*policy_snapshot);
+  for (auto& entry : adjusted->support_contacts) {
     if (entry.mode == CollisionContactPolicyMode::kContactRelease) {
       // Runtime ticks are single observed states, not complete trajectories.
       // The per-move validation proves final separation; the runtime monitor
@@ -287,7 +360,16 @@ CollisionPolicySnapshot RuntimeCollisionMonitor::runtime_policy_snapshot(
       entry.require_strictly_decreasing_penetration = false;
     }
   }
-  return policy_snapshot;
+  RuntimeCollisionPolicyView view;
+  view.snapshot = adjusted;
+  view.index = build_collision_policy_index(*adjusted);
+  if (!cacheable) {
+    return view;
+  }
+  std::lock_guard<std::mutex> lock(runtime_policy_cache_mutex_);
+  runtime_policy_cache_revision_ = policy_snapshot->revision;
+  runtime_policy_cache_view_ = view;
+  return runtime_policy_cache_view_;
 }
 
 std::optional<std::map<std::string, std::string>>
@@ -394,29 +476,42 @@ RuntimeCollisionMonitor::update_contact_release_state(
     return std::nullopt;
   }
   const auto& result = bundle.waypoint_records.front().result;
+  if (t_inside_runtime_collision_monitor_callback &&
+      t_runtime_collision_monitor_instance == this) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!active_ ||
+        generation_ != t_runtime_collision_monitor_generation) {
+      return std::nullopt;
+    }
+  }
   std::lock_guard<std::mutex> lock(contact_policy_mutex_);
   for (const auto& entry : policy_snapshot.support_contacts) {
-    std::map<std::string, std::string> details;
-    details["reason_code"] = "runtime_contact_release_monitor";
-    details["contact_release_pair"] = collision_pair_name(entry.pair);
-    details["contact_a"] = entry.pair.body_a;
-    details["contact_b"] = entry.pair.body_b;
-    details["contact_release_tolerance_m"] =
-        std::to_string(entry.release_tolerance_m);
-    details["contact_release_enforce_max_start_penetration"] =
-        entry.enforce_max_start_penetration ? "true" : "false";
-    details["contact_release_max_start_penetration_m"] =
-        std::to_string(entry.max_start_penetration_m);
-    details["contact_release_min_separation_clearance_m"] =
-        std::to_string(entry.min_separation_clearance_m);
+    auto make_details = [&]() {
+      std::map<std::string, std::string> details;
+      details["reason_code"] = "runtime_contact_release_monitor";
+      details["contact_release_pair"] = collision_pair_name(entry.pair);
+      details["contact_a"] = entry.pair.body_a;
+      details["contact_b"] = entry.pair.body_b;
+      details["contact_release_tolerance_m"] =
+          std::to_string(entry.release_tolerance_m);
+      details["contact_release_enforce_max_start_penetration"] =
+          entry.enforce_max_start_penetration ? "true" : "false";
+      details["contact_release_max_start_penetration_m"] =
+          std::to_string(entry.max_start_penetration_m);
+      details["contact_release_min_separation_clearance_m"] =
+          std::to_string(entry.min_separation_clearance_m);
+      return details;
+    };
 
     if (entry.mode == CollisionContactPolicyMode::kContactProcess) {
+      auto details = make_details();
       details["reason"] = "runtime_contact_process_policy_not_implemented";
       return details;
     }
 
     auto clearance = pair_clearance_for_result(result, entry.pair);
     if (!clearance.has_value() || !std::isfinite(*clearance)) {
+      auto details = make_details();
       details["reason"] = "runtime_contact_release_missing_clearance";
       return details;
     }
@@ -424,15 +519,21 @@ RuntimeCollisionMonitor::update_contact_release_state(
     const double depth = *clearance < 0.0 ? -*clearance : 0.0;
     const bool separated =
         *clearance >= std::max(0.0, entry.min_separation_clearance_m);
-    details["contact_release_signed_clearance_m"] =
-        std::to_string(*clearance);
-    details["contact_release_current_penetration_m"] = std::to_string(depth);
+    auto make_depth_details = [&]() {
+      auto details = make_details();
+      details["contact_release_signed_clearance_m"] =
+          std::to_string(*clearance);
+      details["contact_release_current_penetration_m"] =
+          std::to_string(depth);
+      return details;
+    };
 
     const auto key = collision_pair_key(entry.pair);
     auto it = contact_release_state_.find(key);
     if (it == contact_release_state_.end()) {
       if (entry.enforce_max_start_penetration &&
           depth > std::max(0.0, entry.max_start_penetration_m) + tolerance) {
+        auto details = make_depth_details();
         details["reason"] =
             "runtime_contact_release_initial_penetration_exceeds_policy";
         return details;
@@ -446,16 +547,22 @@ RuntimeCollisionMonitor::update_contact_release_state(
     }
 
     auto& state = it->second;
-    details["contact_release_initial_penetration_m"] =
-        std::to_string(state.initial_penetration_m);
-    details["contact_release_previous_penetration_m"] =
-        std::to_string(state.last_penetration_m);
+    auto make_state_details = [&]() {
+      auto details = make_depth_details();
+      details["contact_release_initial_penetration_m"] =
+          std::to_string(state.initial_penetration_m);
+      details["contact_release_previous_penetration_m"] =
+          std::to_string(state.last_penetration_m);
+      return details;
+    };
 
     if (state.separated && depth > tolerance && !entry.allow_recontact) {
+      auto details = make_state_details();
       details["reason"] = "runtime_contact_release_recontact";
       return details;
     }
     if (depth > state.last_penetration_m + tolerance) {
+      auto details = make_state_details();
       details["reason"] = "runtime_contact_release_penetration_increased";
       return details;
     }
@@ -480,14 +587,23 @@ void RuntimeCollisionMonitor::schedule_next_locked(std::uint64_t generation) {
         struct CallbackGuard {
           RuntimeCollisionMonitor* self;
           bool was_inside = t_inside_runtime_collision_monitor_callback;
+          RuntimeCollisionMonitor* previous_instance =
+              t_runtime_collision_monitor_instance;
+          std::uint64_t previous_generation =
+              t_runtime_collision_monitor_generation;
 
-          explicit CallbackGuard(RuntimeCollisionMonitor* monitor)
+          explicit CallbackGuard(RuntimeCollisionMonitor* monitor,
+                                 std::uint64_t generation)
               : self(monitor) {
             t_inside_runtime_collision_monitor_callback = true;
+            t_runtime_collision_monitor_instance = monitor;
+            t_runtime_collision_monitor_generation = generation;
           }
 
           ~CallbackGuard() {
             t_inside_runtime_collision_monitor_callback = was_inside;
+            t_runtime_collision_monitor_instance = previous_instance;
+            t_runtime_collision_monitor_generation = previous_generation;
             {
               std::lock_guard<std::mutex> lock(self->mutex_);
               if (self->callbacks_in_flight_ > 0) {
@@ -496,7 +612,7 @@ void RuntimeCollisionMonitor::schedule_next_locked(std::uint64_t generation) {
             }
             self->cv_.notify_all();
           }
-        } callback_guard{this};
+        } callback_guard{this, generation};
 
         if (tick_callback_) {
           (void)tick_callback_();

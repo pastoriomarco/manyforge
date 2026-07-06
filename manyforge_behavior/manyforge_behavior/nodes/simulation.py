@@ -2,12 +2,29 @@
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+import threading
 from typing import Any
 
 import py_trees
 
 from manyforge_behavior.action_span import ActionSpanMixin
 from manyforge_behavior.parameters import resolve_blackboard_value
+
+
+_SIMULATION_CONTROL_EXECUTOR: ThreadPoolExecutor | None = None
+_SIMULATION_CONTROL_EXECUTOR_LOCK = threading.Lock()
+
+
+def _get_simulation_control_executor() -> ThreadPoolExecutor:
+    global _SIMULATION_CONTROL_EXECUTOR
+    with _SIMULATION_CONTROL_EXECUTOR_LOCK:
+        if _SIMULATION_CONTROL_EXECUTOR is None:
+            _SIMULATION_CONTROL_EXECUTOR = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="manyforge_sim_control",
+            )
+        return _SIMULATION_CONTROL_EXECUTOR
 
 
 class _SimulationControlNode(ActionSpanMixin, py_trees.behaviour.Behaviour):
@@ -19,6 +36,7 @@ class _SimulationControlNode(ActionSpanMixin, py_trees.behaviour.Behaviour):
         super().__init__(name=name)
         self._params = kwargs
         self._reason = str(kwargs.get("reason", "") or name)
+        self._future: Future | None = None
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
@@ -28,7 +46,10 @@ class _SimulationControlNode(ActionSpanMixin, py_trees.behaviour.Behaviour):
         )
 
     def initialise(self) -> None:
+        if self._future is not None and not self._future.done():
+            self._future.cancel()
         self._reset_action_span()
+        self._future = None
 
     def _callback(self) -> Any:
         try:
@@ -41,26 +62,60 @@ class _SimulationControlNode(ActionSpanMixin, py_trees.behaviour.Behaviour):
         return {}
 
     def update(self) -> py_trees.common.Status:
-        callback = self._callback()
-        if callback is None:
-            self.feedback_message = "simulation control callback is not configured"
-            return py_trees.common.Status.FAILURE
-        try:
-            result = callback(
-                operation=self.operation,
-                reason=self._reason,
-                source="behavior_node",
-                allow_running=True,
-                action_span=self._current_action_span(self.blackboard),
-                **self._operation_payload(),
+        if self._future is None:
+            callback = self._callback()
+            if callback is None:
+                self.feedback_message = "simulation control callback is not configured"
+                return py_trees.common.Status.FAILURE
+            try:
+                payload = {
+                    "operation": self.operation,
+                    "reason": self._reason,
+                    "source": "behavior_node",
+                    "allow_running": True,
+                    "action_span": self._current_action_span(self.blackboard),
+                    **self._operation_payload(),
+                }
+            except Exception as exc:
+                self.feedback_message = str(exc)
+                return py_trees.common.Status.FAILURE
+            self._future = _get_simulation_control_executor().submit(
+                callback,
+                **payload,
             )
+            self.feedback_message = "simulation control in progress"
+            return py_trees.common.Status.RUNNING
+
+        if not self._future.done():
+            return py_trees.common.Status.RUNNING
+
+        try:
+            if self._future.cancelled():
+                self.feedback_message = "simulation control cancelled"
+                return py_trees.common.Status.FAILURE
+            result = self._future.result()
+        except CancelledError:
+            self.feedback_message = "simulation control cancelled"
+            return py_trees.common.Status.FAILURE
         except Exception as exc:
             self.feedback_message = str(exc)
             return py_trees.common.Status.FAILURE
+        finally:
+            self._future = None
+
         if isinstance(result, dict) and result.get("success") is False:
             self.feedback_message = str(result.get("error") or "simulation control failed")
             return py_trees.common.Status.FAILURE
         return py_trees.common.Status.SUCCESS
+
+    def terminate(self, new_status: py_trees.common.Status) -> None:
+        if (
+            self._future is not None
+            and not self._future.done()
+            and new_status != py_trees.common.Status.RUNNING
+        ):
+            self._future.cancel()
+            self._future = None
 
 
 class ResetSimulation(_SimulationControlNode):

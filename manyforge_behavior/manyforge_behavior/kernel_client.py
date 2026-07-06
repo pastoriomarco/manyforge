@@ -845,17 +845,35 @@ class KernelClient(ABC):
     def pause(self) -> CommandResult: ...
 
     @abstractmethod
-    def resume(self) -> CommandResult: ...
+    def resume(self, *, expected_epoch: Optional[int] = None) -> CommandResult: ...
 
     @abstractmethod
-    def reset(self) -> CommandResult: ...
+    def reset(self, *, expected_epoch: Optional[int] = None) -> CommandResult: ...
+
+    def control_command_epoch(self) -> int:
+        """Return the kernel lifecycle/recovery command epoch.
+
+        Implementations that do not support epoch-guarded commands fail closed
+        by exposing epoch 0 and no-op bumping; production native clients
+        override this with the C++ kernel authority.
+        """
+        return 0
+
+    def bump_control_command_epoch(self) -> int:
+        return 0
 
     @abstractmethod
-    def acknowledge_completed(self, execution_id: int) -> CommandResult: ...
+    def acknowledge_completed(
+        self, execution_id: int, *, expected_epoch: Optional[int] = None
+    ) -> CommandResult: ...
 
     @abstractmethod
     def acknowledge_intervention(
-        self, principal_id: str, reason: str
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: Optional[int] = None,
     ) -> CommandResult:
         """Explicitly clear `kInterventionRequired`.
 
@@ -867,7 +885,11 @@ class KernelClient(ABC):
         ...
 
     def acknowledge_intervention_for_retry(
-        self, principal_id: str, reason: str
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: Optional[int] = None,
     ) -> CommandResult:
         """Clear a classified stop/fault intervention without backend reset.
 
@@ -882,7 +904,11 @@ class KernelClient(ABC):
         )
 
     def acknowledge_interrupted_for_retry(
-        self, principal_id: str, reason: str
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: Optional[int] = None,
     ) -> CommandResult:
         """Clear an interrupted runtime-collision latch for operator retry.
 
@@ -1124,6 +1150,7 @@ class MockKernelClient(KernelClient):
         self.pause_count = 0
         self.resume_count = 0
         self.reset_count = 0
+        self._control_command_epoch = 0
         self.acknowledge_intervention_count = 0
         self.acknowledge_intervention_for_retry_count = 0
         self.acknowledge_interrupted_for_retry_count = 0
@@ -1239,6 +1266,27 @@ class MockKernelClient(KernelClient):
         events = list(self._kernel_events)
         self._kernel_events.clear()
         return events
+
+    def control_command_epoch(self) -> int:
+        return self._control_command_epoch
+
+    def bump_control_command_epoch(self) -> int:
+        self._control_command_epoch += 1
+        return self._control_command_epoch
+
+    def _stale_control_command(
+        self,
+        expected_epoch: Optional[int],
+    ) -> Optional[CommandResult]:
+        if expected_epoch is None:
+            return None
+        if int(expected_epoch) == self._control_command_epoch:
+            return None
+        return CommandResult(
+            accepted=False,
+            error="Control command was superseded",
+            reason_code="stale_control_command",
+        )
 
     def _record_scene_trace(
         self,
@@ -1414,6 +1462,7 @@ class MockKernelClient(KernelClient):
         }
         if self._state not in stoppable:
             return CommandResult(accepted=False, error="Cannot stop from current state")
+        self.bump_control_command_epoch()
         prev = self._state.value
         self._metrics["stops_issued"] += 1
         self._state = ExecutionState.STOPPED
@@ -1432,7 +1481,9 @@ class MockKernelClient(KernelClient):
         self._emit_kernel_event("state_transition", from_state="executing", to_state="paused")
         return CommandResult(accepted=True)
 
-    def resume(self) -> CommandResult:
+    def resume(self, *, expected_epoch: Optional[int] = None) -> CommandResult:
+        if stale := self._stale_control_command(expected_epoch):
+            return stale
         self.resume_count += 1
         if self._state != ExecutionState.PAUSED:
             return CommandResult(
@@ -1443,7 +1494,9 @@ class MockKernelClient(KernelClient):
         self._emit_kernel_event("state_transition", from_state="paused", to_state="executing")
         return CommandResult(accepted=True)
 
-    def reset(self) -> CommandResult:
+    def reset(self, *, expected_epoch: Optional[int] = None) -> CommandResult:
+        if stale := self._stale_control_command(expected_epoch):
+            return stale
         self.reset_count += 1
         if self._state == ExecutionState.IDLE:
             return CommandResult(
@@ -1455,7 +1508,11 @@ class MockKernelClient(KernelClient):
         self._emit_kernel_event("state_transition", from_state=prev, to_state="idle")
         return CommandResult(accepted=True)
 
-    def acknowledge_completed(self, execution_id: int) -> CommandResult:
+    def acknowledge_completed(
+        self, execution_id: int, *, expected_epoch: Optional[int] = None
+    ) -> CommandResult:
+        if stale := self._stale_control_command(expected_epoch):
+            return stale
         status = self.get_status()
         if status.state != ExecutionState.COMPLETED:
             return CommandResult(
@@ -1481,8 +1538,14 @@ class MockKernelClient(KernelClient):
         return CommandResult(accepted=True)
 
     def acknowledge_intervention(
-        self, principal_id: str, reason: str
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: Optional[int] = None,
     ) -> CommandResult:
+        if stale := self._stale_control_command(expected_epoch):
+            return stale
         self.acknowledge_intervention_count += 1
         if self._state != ExecutionState.INTERVENTION_REQUIRED:
             return CommandResult(
@@ -1509,8 +1572,14 @@ class MockKernelClient(KernelClient):
         return CommandResult(accepted=True)
 
     def acknowledge_intervention_for_retry(
-        self, principal_id: str, reason: str
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: Optional[int] = None,
     ) -> CommandResult:
+        if stale := self._stale_control_command(expected_epoch):
+            return stale
         self.acknowledge_intervention_for_retry_count += 1
         if self._state != ExecutionState.INTERVENTION_REQUIRED:
             return CommandResult(
@@ -1540,8 +1609,14 @@ class MockKernelClient(KernelClient):
         return CommandResult(accepted=True)
 
     def acknowledge_interrupted_for_retry(
-        self, principal_id: str, reason: str
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: Optional[int] = None,
     ) -> CommandResult:
+        if stale := self._stale_control_command(expected_epoch):
+            return stale
         self.acknowledge_interrupted_for_retry_count += 1
         if self._state != ExecutionState.INTERRUPTED:
             return CommandResult(

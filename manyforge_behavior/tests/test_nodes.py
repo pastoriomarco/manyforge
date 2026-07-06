@@ -1,5 +1,6 @@
 """Tests for py_trees behavior node implementations."""
 
+import threading
 import time
 
 import pytest
@@ -79,6 +80,23 @@ def _tick_node(node):
     node.setup()
     node.initialise()
     return node.update()
+
+
+def _tick_node_until_terminal(node, *, timeout_s: float = 1.0):
+    """Setup and tick a node until it leaves RUNNING."""
+    node.setup()
+    node.initialise()
+    return _poll_node_until_terminal(node, timeout_s=timeout_s)
+
+
+def _poll_node_until_terminal(node, *, timeout_s: float = 1.0):
+    """Poll an already-initialised node until it leaves RUNNING."""
+    deadline = time.monotonic() + timeout_s
+    status = node.update()
+    while status == py_trees.common.Status.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+        status = node.update()
+    return status
 
 
 class TestMoveManipulatorAction:
@@ -598,7 +616,7 @@ class TestResetSimulation:
         self._install_callback(callback)
         node = ResetSimulation(name="reset_sim", reason="program_reset")
 
-        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        assert _tick_node_until_terminal(node) == py_trees.common.Status.SUCCESS
         assert len(calls) == 1
         span = calls[0].pop("action_span")
         assert span.action_source == "program_node"
@@ -621,8 +639,32 @@ class TestResetSimulation:
         self._install_callback(lambda **_kwargs: {"success": False, "error": "denied"})
         node = ResetSimulation(name="reset_sim")
 
-        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        assert _tick_node_until_terminal(node) == py_trees.common.Status.FAILURE
         assert node.feedback_message == "denied"
+
+    def test_slow_callback_does_not_block_tick_thread(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def callback(**_kwargs):
+            entered.set()
+            release.wait(timeout=1.0)
+            return {"success": True}
+
+        self._install_callback(callback)
+        node = ResetSimulation(name="reset_sim")
+        node.setup()
+        node.initialise()
+
+        start = time.monotonic()
+        status = node.update()
+        elapsed = time.monotonic() - start
+
+        assert status == py_trees.common.Status.RUNNING
+        assert elapsed < 0.05
+        assert entered.wait(timeout=1.0)
+        release.set()
+        assert _poll_node_until_terminal(node) == py_trees.common.Status.SUCCESS
 
 
 class TestSimulationControlNodes:
@@ -639,7 +681,7 @@ class TestSimulationControlNodes:
         self._install_callback(lambda **kwargs: calls.append(kwargs) or {"success": True})
         node = SetSimulationState(name="pause_sim", state="paused", reason="pause")
 
-        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        assert _tick_node_until_terminal(node) == py_trees.common.Status.SUCCESS
         assert len(calls) == 1
         span = calls[0].pop("action_span")
         assert span.action_source == "program_node"
@@ -657,7 +699,7 @@ class TestSimulationControlNodes:
         self._install_callback(lambda **kwargs: calls.append(kwargs) or {"success": True})
         node = StepSimulation(name="step_sim", steps=3)
 
-        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        assert _tick_node_until_terminal(node) == py_trees.common.Status.SUCCESS
         assert len(calls) == 1
         span = calls[0].pop("action_span")
         assert span.action_source == "program_node"
@@ -680,7 +722,7 @@ class TestSimulationControlNodes:
         }
         node = SetEntityState(name="set_entity", entity="/World/box", pose=pose)
 
-        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        assert _tick_node_until_terminal(node) == py_trees.common.Status.SUCCESS
         assert len(calls) == 1
         span = calls[0].pop("action_span")
         assert span.action_source == "program_node"

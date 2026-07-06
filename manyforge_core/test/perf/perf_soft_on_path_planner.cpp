@@ -1,6 +1,8 @@
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -8,11 +10,60 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
+
+namespace {
+
+std::atomic<bool> g_count_allocations{false};
+std::atomic<std::size_t> g_allocation_count{0};
+
+[[gnu::noinline]] void* allocate_bytes(std::size_t size) {
+  return std::malloc(size == 0 ? 1 : size);
+}
+
+[[gnu::noinline]] void free_bytes(void* ptr) {
+  std::free(ptr);
+}
+
+}  // namespace
+
+void* operator new(std::size_t size) {
+  if (g_count_allocations.load(std::memory_order_relaxed)) {
+    g_allocation_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void* ptr = allocate_bytes(size);
+  if (ptr == nullptr) {
+    throw std::bad_alloc();
+  }
+  return ptr;
+}
+
+void* operator new[](std::size_t size) {
+  return operator new(size);
+}
+
+void operator delete(void* ptr) noexcept {
+  free_bytes(ptr);
+}
+
+void operator delete[](void* ptr) noexcept {
+  free_bytes(ptr);
+}
+
+void operator delete(void* ptr, std::size_t) noexcept {
+  free_bytes(ptr);
+}
+
+void operator delete[](void* ptr, std::size_t) noexcept {
+  free_bytes(ptr);
+}
 
 namespace {
 
@@ -23,6 +74,7 @@ using manyforge::core::SoftOnPathInitialStateDTO;
 using manyforge::core::SoftOnPathPlannerConfig;
 using manyforge::core::SoftOnPathStateSource;
 using manyforge::core::TrajectoryDTO;
+using manyforge::core::TrajectorySampleResult;
 using manyforge::core::TrajectoryWaypointDTO;
 
 constexpr std::size_t kJointCount = 6;
@@ -37,6 +89,18 @@ std::size_t read_size_env(const char* name, std::size_t fallback) {
     return parsed == 0 ? fallback : static_cast<std::size_t>(parsed);
   } catch (...) {
     return fallback;
+  }
+}
+
+std::optional<std::size_t> read_optional_size_env(const char* name) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') {
+    return std::nullopt;
+  }
+  try {
+    return static_cast<std::size_t>(std::stoull(raw));
+  } catch (...) {
+    return std::nullopt;
   }
 }
 
@@ -165,6 +229,15 @@ struct Percentiles {
   double mean_us = 0.0;
 };
 
+struct AllocationProbeResult {
+  std::size_t iterations = 0;
+  std::size_t allocations = 0;
+  double allocations_per_iteration = 0.0;
+  double total_us = 0.0;
+  double mean_us = 0.0;
+  std::size_t checksum = 0;
+};
+
 double percentile(const std::vector<double>& sorted, double q) {
   if (sorted.empty()) {
     return 0.0;
@@ -205,6 +278,168 @@ std::string percentiles_json(const Percentiles& p) {
   return out.str();
 }
 
+std::string allocation_probe_json(const AllocationProbeResult& p) {
+  std::ostringstream out;
+  out << "\"iterations\":" << p.iterations
+      << ",\"allocations\":" << p.allocations
+      << ",\"allocations_per_iteration\":"
+      << format_double(p.allocations_per_iteration)
+      << ",\"total_us\":" << format_double(p.total_us)
+      << ",\"mean_us\":" << format_double(p.mean_us)
+      << ",\"checksum\":" << p.checksum;
+  return out.str();
+}
+
+template <typename Fn>
+AllocationProbeResult measure_allocations(std::size_t iterations, Fn&& fn) {
+  g_allocation_count.store(0, std::memory_order_relaxed);
+  g_count_allocations.store(true, std::memory_order_release);
+  const auto start = std::chrono::steady_clock::now();
+  const std::size_t checksum = fn();
+  const auto end = std::chrono::steady_clock::now();
+  g_count_allocations.store(false, std::memory_order_release);
+
+  AllocationProbeResult result;
+  result.iterations = iterations;
+  result.allocations = g_allocation_count.load(std::memory_order_relaxed);
+  result.allocations_per_iteration =
+      iterations == 0 ? 0.0
+                      : static_cast<double>(result.allocations) /
+                            static_cast<double>(iterations);
+  result.total_us = std::chrono::duration<double, std::micro>(end - start).count();
+  result.mean_us = iterations == 0 ? 0.0
+                                   : result.total_us /
+                                         static_cast<double>(iterations);
+  result.checksum = checksum;
+  return result;
+}
+
+AllocationProbeResult measure_prevalidated_sampler_allocations(
+    const TrajectoryDTO& trajectory, std::size_t iterations) {
+  auto valid = manyforge::core::validate_trajectory_for_sampling(trajectory);
+  if (!valid.ok()) {
+    std::cerr << "reference trajectory failed sampler validation: "
+              << valid.error().code << "\n";
+    std::exit(2);
+  }
+  TrajectorySampleResult reused;
+  auto warm = manyforge::core::sample_trajectory_prevalidated(
+      trajectory, 0.0, reused);
+  if (!warm.ok()) {
+    std::cerr << "prevalidated sampler warmup failed: "
+              << warm.error().code << "\n";
+    std::exit(2);
+  }
+  const double duration_s = trajectory.waypoints.back().time_from_start_s;
+  return measure_allocations(iterations, [&]() {
+    std::size_t checksum = 0;
+    for (std::size_t i = 0; i < iterations; ++i) {
+      const double t =
+          duration_s * static_cast<double>((i * 37) %
+                                           (trajectory.waypoints.size() - 1)) /
+          static_cast<double>(trajectory.waypoints.size() - 1);
+      auto sampled = manyforge::core::sample_trajectory_prevalidated(
+          trajectory, t, reused);
+      if (!sampled.ok()) {
+        std::cerr << "prevalidated sampler failed at iteration " << i
+                  << ": " << sampled.error().code << "\n";
+        std::exit(2);
+      }
+      checksum += reused.positions_rad.size();
+      checksum += reused.velocities_rad_s.size();
+      checksum += reused.accelerations_rad_s2.size();
+    }
+    return checksum;
+  });
+}
+
+AllocationProbeResult measure_classic_sampler_allocations(
+    const TrajectoryDTO& trajectory, std::size_t iterations) {
+  const double duration_s = trajectory.waypoints.back().time_from_start_s;
+  return measure_allocations(iterations, [&]() {
+    std::size_t checksum = 0;
+    for (std::size_t i = 0; i < iterations; ++i) {
+      const double t =
+          duration_s * static_cast<double>((i * 37) %
+                                           (trajectory.waypoints.size() - 1)) /
+          static_cast<double>(trajectory.waypoints.size() - 1);
+      auto sampled = manyforge::core::sample_trajectory(trajectory, t);
+      if (!sampled.ok()) {
+        std::cerr << "classic sampler failed at iteration " << i
+                  << ": " << sampled.error().code << "\n";
+        std::exit(2);
+      }
+      checksum += sampled.value().positions_rad.size();
+      checksum += sampled.value().velocities_rad_s.size();
+      checksum += sampled.value().accelerations_rad_s2.size();
+    }
+    return checksum;
+  });
+}
+
+AllocationProbeResult measure_shared_reference_snapshot_allocations(
+    const TrajectoryDTO& trajectory, std::size_t iterations) {
+  auto shared = std::make_shared<const TrajectoryDTO>(trajectory);
+  std::mutex mutex;
+  std::shared_ptr<const TrajectoryDTO> active = shared;
+  std::shared_ptr<const TrajectoryDTO> snapshot;
+  return measure_allocations(iterations, [&]() {
+    std::size_t checksum = 0;
+    for (std::size_t i = 0; i < iterations; ++i) {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        snapshot = active;
+      }
+      checksum += snapshot->waypoints.size();
+      checksum += snapshot->joint_names.size();
+    }
+    return checksum;
+  });
+}
+
+AllocationProbeResult measure_legacy_deep_copy_snapshot_allocations(
+    const TrajectoryDTO& trajectory, std::size_t iterations) {
+  std::mutex mutex;
+  TrajectoryDTO active = trajectory;
+  return measure_allocations(iterations, [&]() {
+    std::size_t checksum = 0;
+    for (std::size_t i = 0; i < iterations; ++i) {
+      TrajectoryDTO snapshot;
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        snapshot = active;
+      }
+      checksum += snapshot.waypoints.size();
+      checksum += snapshot.joint_names.size();
+    }
+    return checksum;
+  });
+}
+
+AllocationProbeResult measure_path_deviation_allocations(
+    const TrajectoryDTO& trajectory, std::size_t iterations) {
+  RobotStateDTO observed;
+  observed.joint_names = trajectory.joint_names;
+  observed.positions_rad = trajectory.waypoints[trajectory.waypoints.size() / 2]
+                               .positions_rad;
+  return measure_allocations(iterations, [&]() {
+    std::size_t checksum = 0;
+    for (std::size_t i = 0; i < iterations; ++i) {
+      auto measured =
+          manyforge::core::measure_soft_on_path_path_deviation(trajectory,
+                                                               observed);
+      if (!measured.ok()) {
+        std::cerr << "path deviation failed at iteration " << i << ": "
+                  << measured.error().code << "\n";
+        std::exit(2);
+      }
+      checksum += static_cast<std::size_t>(measured.value() * 1'000'000.0);
+      checksum += observed.positions_rad.size();
+    }
+    return checksum;
+  });
+}
+
 }  // namespace
 
 int main() {
@@ -219,6 +454,12 @@ int main() {
       read_double_env("MANYFORGE_SOFT_ON_PATH_PLAN_P999_BUDGET_US");
   const auto envelope_p99_budget_us =
       read_double_env("MANYFORGE_SOFT_ON_PATH_ENVELOPE_P99_BUDGET_US");
+  const std::size_t allocation_iterations =
+      read_size_env("MANYFORGE_SOFT_ON_PATH_ALLOCATION_ITERATIONS", 1000);
+  const auto prevalidated_allocation_budget =
+      read_optional_size_env("MANYFORGE_SOFT_ON_PATH_PREVALIDATED_ALLOC_BUDGET");
+  const auto shared_reference_allocation_budget =
+      read_optional_size_env("MANYFORGE_SOFT_ON_PATH_SHARED_REFERENCE_ALLOC_BUDGET");
 
   std::vector<double> plan_samples_us;
   plan_samples_us.reserve(plan_iterations);
@@ -283,6 +524,19 @@ int main() {
   }
   const auto envelope_percentiles = summarize(std::move(envelope_samples_us));
 
+  const auto prevalidated_sampler_allocations =
+      measure_prevalidated_sampler_allocations(trajectory, allocation_iterations);
+  const auto classic_sampler_allocations =
+      measure_classic_sampler_allocations(trajectory, allocation_iterations);
+  const auto shared_reference_allocations =
+      measure_shared_reference_snapshot_allocations(trajectory,
+                                                    allocation_iterations);
+  const auto legacy_deep_copy_allocations =
+      measure_legacy_deep_copy_snapshot_allocations(trajectory,
+                                                    allocation_iterations);
+  const auto path_deviation_allocations =
+      measure_path_deviation_allocations(trajectory, allocation_iterations);
+
   bool budget_pass = true;
   if (plan_p999_budget_us.has_value() &&
       plan_percentiles.p999_us > *plan_p999_budget_us) {
@@ -290,6 +544,16 @@ int main() {
   }
   if (envelope_p99_budget_us.has_value() &&
       envelope_percentiles.p99_us > *envelope_p99_budget_us) {
+    budget_pass = false;
+  }
+  if (prevalidated_allocation_budget.has_value() &&
+      prevalidated_sampler_allocations.allocations >
+          *prevalidated_allocation_budget) {
+    budget_pass = false;
+  }
+  if (shared_reference_allocation_budget.has_value() &&
+      shared_reference_allocations.allocations >
+          *shared_reference_allocation_budget) {
     budget_pass = false;
   }
 
@@ -311,7 +575,17 @@ int main() {
       << envelope_natural_completion_samples
       << ",\"qualified_fallback_rejections\":"
       << envelope_rejections << "," << percentiles_json(envelope_percentiles)
-      << "},\"budgets\":{\"plan_p999_us\":";
+      << "},\"allocation_counts\":{\"prevalidated_sampling\":{"
+      << allocation_probe_json(prevalidated_sampler_allocations)
+      << "},\"classic_sampling\":{"
+      << allocation_probe_json(classic_sampler_allocations)
+      << "},\"active_reference_snapshot_shared_ptr\":{"
+      << allocation_probe_json(shared_reference_allocations)
+      << "},\"legacy_deep_copy_snapshot_baseline\":{"
+      << allocation_probe_json(legacy_deep_copy_allocations)
+      << "},\"path_deviation_measurement\":{"
+      << allocation_probe_json(path_deviation_allocations)
+      << "}},\"budgets\":{\"plan_p999_us\":";
   if (plan_p999_budget_us.has_value()) {
     out << format_double(*plan_p999_budget_us);
   } else {
@@ -320,6 +594,18 @@ int main() {
   out << ",\"envelope_p99_us\":";
   if (envelope_p99_budget_us.has_value()) {
     out << format_double(*envelope_p99_budget_us);
+  } else {
+    out << "null";
+  }
+  out << ",\"prevalidated_sampling_allocations\":";
+  if (prevalidated_allocation_budget.has_value()) {
+    out << *prevalidated_allocation_budget;
+  } else {
+    out << "null";
+  }
+  out << ",\"active_reference_snapshot_shared_ptr_allocations\":";
+  if (shared_reference_allocation_budget.has_value()) {
+    out << *shared_reference_allocation_budget;
   } else {
     out << "null";
   }

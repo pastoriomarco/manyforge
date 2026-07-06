@@ -12,7 +12,14 @@ add_library(manyforge_core
   src/state_machine.cpp
   src/terminal_committer.cpp
   src/error_code_mapping.cpp
+  src/execution_admission_support.cpp
+  src/execution_collision_support.cpp
+  src/execution_correlation_tracker.cpp
+  src/execution_interrupt_support.cpp
+  src/execution_snapshot_publisher.cpp
+  src/execution_stop_support.cpp
   src/execution_worker_signals.cpp
+  src/kernel_event_publisher.cpp
   src/kernel_event_factories.cpp
   src/motion_trip_stop_coordinator.cpp
   src/operator_stop_worker.cpp
@@ -106,6 +113,20 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_execution_worker_signals
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_execution_correlation_tracker
+    test/test_execution_correlation_tracker.cpp)
+  target_link_libraries(test_execution_correlation_tracker PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_execution_correlation_tracker
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_execution_snapshot_publisher
+    test/test_execution_snapshot_publisher.cpp)
+  target_link_libraries(test_execution_snapshot_publisher PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_execution_snapshot_publisher
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_error_code_mapping
     test/test_error_code_mapping.cpp)
   target_link_libraries(test_error_code_mapping PRIVATE
@@ -118,6 +139,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_kernel_event_factories PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_kernel_event_factories
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_kernel_event_publisher
+    test/test_kernel_event_publisher.cpp)
+  target_link_libraries(test_kernel_event_publisher PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_kernel_event_publisher
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_pose_math

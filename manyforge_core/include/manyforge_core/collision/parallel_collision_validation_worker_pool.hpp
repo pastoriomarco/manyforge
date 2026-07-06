@@ -1,8 +1,11 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -110,13 +113,10 @@ struct FallbackLogEvent {
 ///   - the caller did not provide enough worker_engines to back the requested
 ///     worker count.
 ///
-/// The pool is stateless across calls EXCEPT for the fallback-log rate
-/// limiter (a small map of last-emit timestamps per cause). Instantiate
-/// once per call site if you want isolated telemetry; reuse and read
-/// last_telemetry() after each run. A pool instance is not a concurrent
-/// multi-caller object: validation calls on the same instance MUST be
-/// serialized by the caller. The parallelism is inside one validation
-/// call, across worker contexts.
+/// The pool owns persistent worker threads and fallback-log rate limiter state.
+/// Reuse one instance per validation call site to avoid per-call thread spawn
+/// overhead. Calls on one pool are serialized internally; the parallelism is
+/// inside one validation call, across worker contexts.
 class ParallelCollisionValidationWorkerPool {
  public:
   /// Whether the pool should also run a serial-reference pass for
@@ -169,6 +169,16 @@ class ParallelCollisionValidationWorkerPool {
   };
 
   explicit ParallelCollisionValidationWorkerPool(Config config);
+  ~ParallelCollisionValidationWorkerPool();
+
+  ParallelCollisionValidationWorkerPool(
+      const ParallelCollisionValidationWorkerPool&) = delete;
+  ParallelCollisionValidationWorkerPool& operator=(
+      const ParallelCollisionValidationWorkerPool&) = delete;
+  ParallelCollisionValidationWorkerPool(
+      ParallelCollisionValidationWorkerPool&&) = delete;
+  ParallelCollisionValidationWorkerPool& operator=(
+      ParallelCollisionValidationWorkerPool&&) = delete;
 
   /// Production engine-backed validation path. `worker_engines` must contain
   /// one independent engine per worker for engines that report
@@ -187,18 +197,41 @@ class ParallelCollisionValidationWorkerPool {
       const TrajectoryDTO& trajectory,
       const CollisionCancellationToken& cancel);
 
+  /// Same as the primary overload, but with pass-scoped collision policy and
+  /// retry settings supplied by the caller for this validation attempt. This
+  /// lets long-lived pools keep worker threads while each request still uses
+  /// its own immutable policy snapshot/index.
+  CollisionValidationDecisionBundle validate_trajectory(
+      const CollisionWorldSnapshot& snapshot,
+      const std::vector<ICollisionQueryEngine*>& worker_engines,
+      const TrajectoryDTO& trajectory,
+      const CollisionCancellationToken& cancel,
+      CollisionValidationPassConfig pass_config);
+
   const ParallelValidationTelemetry& last_telemetry() const {
     return last_telemetry_;
   }
 
  private:
+  struct WorkerSlot;
+
   /// Emit a fallback-log event through the sink, rate-limited.
   void maybe_emit_fallback_log(const FallbackLogEvent& event);
+  void ensure_worker_threads(int count);
+  void stop_worker_threads();
+  void worker_loop(WorkerSlot& slot);
+  void signal_job_complete();
 
   Config config_;
   ParallelValidationTelemetry last_telemetry_{};
   std::unordered_map<std::string, std::chrono::steady_clock::time_point>
       last_fallback_log_at_;
+  std::mutex validation_call_mutex_;
+  std::mutex worker_slots_mutex_;
+  std::vector<std::unique_ptr<WorkerSlot>> worker_slots_;
+  std::mutex completion_mutex_;
+  std::condition_variable completion_cv_;
+  int pending_jobs_ = 0;
 };
 
 /// Read the `MANYFORGE_VALIDATION_COLLISION_WORKERS` env var. Returns the

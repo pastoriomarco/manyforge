@@ -250,6 +250,78 @@ void append_shape_entries(std::vector<std::string>& entries,
       shape);
 }
 
+std::string collision_world_body_cache_fingerprint(
+    const core::CollisionWorldBody& body) {
+  std::vector<std::string> entries;
+  entries.push_back("body=" + body.body_id);
+  entries.push_back("owner=" +
+                    std::to_string(static_cast<int>(body.owner_kind)));
+  entries.push_back("parent=" + body.parent_link.value_or(""));
+  entries.push_back("frame=" + body.frame_id);
+  append_pose_entries(entries, "pose", body.pose);
+  entries.push_back(
+      "freshness_set=" +
+      std::string(body.source_freshness_budget_ns.has_value() ? "1" : "0"));
+  if (body.source_freshness_budget_ns.has_value()) {
+    entries.push_back(
+        "freshness=" + std::to_string(*body.source_freshness_budget_ns));
+  }
+  for (size_t i = 0; i < body.geometries.size(); ++i) {
+    const auto& geom = body.geometries[i];
+    const std::string prefix = "geom." + std::to_string(i);
+    entries.push_back(prefix + ".body=" + geom.body_id);
+    entries.push_back(prefix + ".owner=" +
+                      std::to_string(static_cast<int>(geom.owner_kind)));
+    entries.push_back(prefix + ".kind=" +
+                      std::to_string(static_cast<int>(geom.geometry_kind)));
+    append_pose_entries(entries, prefix + ".local_pose", geom.local_pose);
+    if (geom.box_dimensions_m.has_value()) {
+      entries.push_back(prefix + ".box.x=" +
+                        stable_double(geom.box_dimensions_m->x_m));
+      entries.push_back(prefix + ".box.y=" +
+                        stable_double(geom.box_dimensions_m->y_m));
+      entries.push_back(prefix + ".box.z=" +
+                        stable_double(geom.box_dimensions_m->z_m));
+    }
+    entries.push_back(prefix + ".sphere_r=" +
+                      stable_double(geom.sphere_radius_m.value_or(-1.0)));
+    entries.push_back(prefix + ".cylinder_r=" +
+                      stable_double(geom.cylinder_radius_m.value_or(-1.0)));
+    entries.push_back(prefix + ".cylinder_h=" +
+                      stable_double(geom.cylinder_height_m.value_or(-1.0)));
+    entries.push_back(prefix + ".capsule_r=" +
+                      stable_double(geom.capsule_radius_m.value_or(-1.0)));
+    entries.push_back(prefix + ".capsule_h=" +
+                      stable_double(geom.capsule_height_m.value_or(-1.0)));
+    if (geom.mesh_scale.has_value()) {
+      entries.push_back(prefix + ".mesh_sx=" +
+                        stable_double(geom.mesh_scale->x_m));
+      entries.push_back(prefix + ".mesh_sy=" +
+                        stable_double(geom.mesh_scale->y_m));
+      entries.push_back(prefix + ".mesh_sz=" +
+                        stable_double(geom.mesh_scale->z_m));
+    }
+    entries.push_back(prefix + ".source_uri=" + geom.source_uri.value_or(""));
+    entries.push_back(prefix + ".source_hash=" + geom.source_hash.value_or(""));
+    std::vector<std::string> labels = geom.quality_labels;
+    std::sort(labels.begin(), labels.end());
+    for (const auto& label : labels) {
+      entries.push_back(prefix + ".quality=" + label);
+    }
+    entries.push_back(prefix + ".triangles=" +
+                      std::to_string(geom.triangle_count.value_or(-1)));
+    entries.push_back(prefix + ".convex_parts=" +
+                      std::to_string(geom.convex_part_count.value_or(-1)));
+    entries.push_back(prefix + ".memory=" +
+                      std::to_string(geom.memory_estimate_bytes.value_or(-1)));
+  }
+  std::ostringstream oss;
+  for (const auto& entry : entries) {
+    oss << entry << '\n';
+  }
+  return oss.str();
+}
+
 std::string robot_link_parent_body_id(const std::string& robot_id,
                                       const std::string& link_name) {
   return "robot/" + robot_id + "/link/" + link_name;
@@ -2008,6 +2080,7 @@ RoboPlanPlanningContext::object_snapshot_bodies_locked(
     const std::string& robot_id) const {
   std::vector<core::CollisionWorldBody> bodies;
   bodies.reserve(object_states_.size());
+  std::set<std::string> live_body_ids;
 
   for (const auto& [object_id, tracked] : object_states_) {
     const auto body_ids = object_body_ids_for_state_locked(object_id, tracked);
@@ -2032,7 +2105,30 @@ RoboPlanPlanningContext::object_snapshot_bodies_locked(
     body.source_freshness_budget_ns = tracked.source_freshness_budget_ns;
     body.geometries.push_back(geometry_descriptor_for_shape_locked(
         body.body_id, body.owner_kind, tracked.shape));
+    const auto fingerprint = collision_world_body_cache_fingerprint(body);
+    const auto cache_it = object_body_hash_cache_.find(body.body_id);
+    if (cache_it != object_body_hash_cache_.end() &&
+        cache_it->second.first == fingerprint) {
+      body.body_content_hash = cache_it->second.second;
+    } else {
+      body.body_content_hash =
+          core::compute_collision_world_body_content_hash(body);
+      object_body_hash_cache_[body.body_id] = {
+          fingerprint,
+          body.body_content_hash,
+      };
+    }
+    live_body_ids.insert(body.body_id);
     bodies.push_back(std::move(body));
+  }
+
+  for (auto it = object_body_hash_cache_.begin();
+       it != object_body_hash_cache_.end();) {
+    if (live_body_ids.find(it->first) == live_body_ids.end()) {
+      it = object_body_hash_cache_.erase(it);
+    } else {
+      ++it;
+    }
   }
 
   return bodies;

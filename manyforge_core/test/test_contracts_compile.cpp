@@ -77,6 +77,8 @@ TEST(ContractsCompile, DefaultDTOs) {
 
   // Timeouts DTO
   manyforge::core::TimeoutsDTO timeouts;
+  EXPECT_EQ(timeouts.planning_timeout_s, 5.0);
+  EXPECT_EQ(timeouts.execution_timeout_s, 10.0);
   timeouts.planning_timeout_s = 10.0;
   EXPECT_EQ(timeouts.planning_timeout_s, 10.0);
 

@@ -641,4 +641,74 @@ TEST(TrajectorySampler, ClampResultDropsSegmentIndex) {
   }
 }
 
+TEST(TrajectorySampler, PrevalidatedSamplingIsBitIdenticalWithReusedBuffer) {
+  using manyforge::core::sample_trajectory_prevalidated;
+  using manyforge::core::validate_trajectory_for_sampling;
+
+  // Mixed-degree trajectory: quintic-capable middle segment, cubic tail
+  // (missing accelerations), so the sweep crosses every emit path plus
+  // both clamps and exact endpoints.
+  TrajectoryDTO traj;
+  traj.joint_names = {"j1", "j2"};
+  traj.waypoints.push_back(
+      WaypointPVA(0.0, {0.0, 1.0}, {0.4, -0.2}, {0.1, 0.0}));
+  traj.waypoints.push_back(
+      WaypointPVA(0.7, {0.5, 0.6}, {0.9, 0.3}, {-0.2, 0.05}));
+  traj.waypoints.push_back(TrajectoryWaypointDTO{
+      1.4, {1.0, 0.2}, {0.0, 0.0}, {}});
+
+  ASSERT_TRUE(validate_trajectory_for_sampling(traj).ok());
+
+  // One reused output across the whole sweep, deliberately pre-poisoned so
+  // stale state would be caught if any field were left unwritten.
+  TrajectorySampleResult reused;
+  reused.positions_rad = {99.0, 99.0, 99.0};
+  reused.segment_index = 7;
+  reused.degree = 9;
+  reused.fallback_reason =
+      TrajectorySampleFallback::kJointCountMismatchVelocity;
+
+  for (double t = -0.2; t <= 1.6; t += 0.05) {
+    auto classic = sample_trajectory(traj, t);
+    ASSERT_TRUE(classic.ok()) << "t=" << t;
+    ASSERT_TRUE(sample_trajectory_prevalidated(traj, t, reused).ok())
+        << "t=" << t;
+    EXPECT_EQ(classic.value().positions_rad, reused.positions_rad)
+        << "t=" << t;
+    EXPECT_EQ(classic.value().velocities_rad_s, reused.velocities_rad_s)
+        << "t=" << t;
+    EXPECT_EQ(classic.value().accelerations_rad_s2,
+              reused.accelerations_rad_s2)
+        << "t=" << t;
+    EXPECT_EQ(classic.value().segment_index, reused.segment_index)
+        << "t=" << t;
+    EXPECT_EQ(classic.value().degree, reused.degree) << "t=" << t;
+    EXPECT_EQ(classic.value().clamped, reused.clamped) << "t=" << t;
+    EXPECT_EQ(classic.value().fallback_reason, reused.fallback_reason)
+        << "t=" << t;
+  }
+
+  // Per-call rejections still apply on the prevalidated path.
+  EXPECT_FALSE(sample_trajectory_prevalidated(
+                   traj, std::numeric_limits<double>::quiet_NaN(), reused)
+                   .ok());
+}
+
+TEST(TrajectorySampler, ValidateForSamplingMatchesClassicRejections) {
+  using manyforge::core::validate_trajectory_for_sampling;
+
+  // Empty trajectory validates Ok (sampling yields the empty clamp).
+  EXPECT_TRUE(validate_trajectory_for_sampling(TrajectoryDTO{}).ok());
+
+  TrajectoryDTO no_names;
+  no_names.waypoints.push_back(Waypoint(0.0, {0.0}));
+  EXPECT_FALSE(validate_trajectory_for_sampling(no_names).ok());
+
+  TrajectoryDTO duplicate_times;
+  duplicate_times.joint_names = {"j1"};
+  duplicate_times.waypoints.push_back(Waypoint(0.0, {0.0}));
+  duplicate_times.waypoints.push_back(Waypoint(0.0, {1.0}));
+  EXPECT_FALSE(validate_trajectory_for_sampling(duplicate_times).ok());
+}
+
 }  // namespace

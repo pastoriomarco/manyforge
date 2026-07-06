@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List
 
 from fastapi import WebSocket, WebSocketDisconnect
 from .cycle_diagnostics import active_cycle_error_fields
@@ -74,7 +74,88 @@ class StateHub:
         self._running = False
         if self._task:
             self._task.cancel()
-    
+
+    def _collect_frame(self, *, include_payload: bool) -> dict[str, Any] | None:
+        state = self._state
+        has_program = state is not None and state.program is not None
+        if state is not None and hasattr(state, "event_recorder"):
+            state.event_recorder.observe(state)
+        native_kernel_events = []
+        if state is not None and state.cycle_manager is not None:
+            state.cycle_manager.drain_kernel_events_now()
+            native_kernel_events = state.cycle_manager.get_kernel_events_since(
+                self._last_kernel_event_index
+            )
+            if native_kernel_events:
+                if hasattr(state, "event_recorder"):
+                    state.event_recorder.record_native_kernel_events(
+                        native_kernel_events
+                    )
+                self._last_kernel_event_index = native_kernel_events[-1].get(
+                    "event_index", self._last_kernel_event_index
+                )
+
+        if not include_payload:
+            return None
+
+        kernel_events = []
+        if state is not None and hasattr(state, "event_recorder"):
+            kernel_events = state.event_recorder.get_events_since(
+                self._last_broadcast_event_index,
+                include_node_transitions=False,
+            )
+            if kernel_events:
+                self._last_broadcast_event_index = kernel_events[-1]["event_index"]
+
+        if state is not None and state.cycle_manager is not None:
+            error, error_code, error_details = active_cycle_error_fields(
+                state.cycle_manager
+            )
+            runtime_override_status = None
+            if state.program is not None:
+                runtime_override_status = RuntimeOverrideStatusResponse(
+                    **state.runtime_override_status()
+                ).model_dump(by_alias=True)
+            return StateUpdate(
+                state=state.cycle_manager.state.value,
+                motionStopState=getattr(
+                    state.cycle_manager,
+                    "motion_stop_state",
+                    "idle",
+                ),
+                velocityScale=state.cycle_manager.velocity_scale,
+                nodeStatuses=state.cycle_manager.get_node_statuses(),
+                kernelEvents=kernel_events,
+                nativeKernelEvents=native_kernel_events,
+                error=error,
+                errorCode=error_code,
+                errorDetails=error_details,
+                programLoaded=bool(has_program),
+                programSessionGeneration=state.program_session_generation,
+                runtimeOverrideStatus=runtime_override_status,
+                timestamp=time.time(),
+            ).model_dump(by_alias=True)
+
+        runtime_override_status = None
+        if state is not None and state.program is not None:
+            runtime_override_status = RuntimeOverrideStatusResponse(
+                **state.runtime_override_status()
+            ).model_dump(by_alias=True)
+        return StateUpdate(
+            state="idle",
+            motionStopState="idle",
+            velocityScale=1.0,
+            nodeStatuses={},
+            kernelEvents=kernel_events,
+            nativeKernelEvents=[],
+            programLoaded=bool(has_program),
+            programSessionGeneration=(
+                state.program_session_generation if state is not None else 0
+            ),
+            runtimeOverrideStatus=runtime_override_status,
+            timestamp=time.time(),
+        ).model_dump(by_alias=True)
+
     async def _broadcast_loop(self):
         """Poll state at ~10Hz and broadcast to all connected clients.
 
@@ -86,88 +167,15 @@ class StateHub:
         """
         while self._running:
             try:
-                has_program = self._state and self._state.program is not None
-                if self._state is not None and hasattr(self._state, "event_recorder"):
-                    self._state.event_recorder.observe(self._state)
-                native_kernel_events = []
-                if self._state and self._state.cycle_manager is not None:
-                    self._state.cycle_manager.drain_kernel_events_now()
-                    native_kernel_events = self._state.cycle_manager.get_kernel_events_since(
-                        self._last_kernel_event_index
-                    )
-                    if native_kernel_events:
-                        if hasattr(self._state, "event_recorder"):
-                            self._state.event_recorder.record_native_kernel_events(
-                                native_kernel_events
-                            )
-                        self._last_kernel_event_index = native_kernel_events[-1].get(
-                            "event_index", self._last_kernel_event_index
-                        )
-
-                if not self._connections:
+                data = await asyncio.to_thread(
+                    self._collect_frame,
+                    include_payload=bool(self._connections),
+                )
+                if data is None:
                     await asyncio.sleep(0.1)
                     continue
-
-                kernel_events = []
-                if self._state is not None and hasattr(self._state, "event_recorder"):
-                    kernel_events = self._state.event_recorder.get_events_since(
-                        self._last_broadcast_event_index,
-                        include_node_transitions=False,
-                    )
-                    if kernel_events:
-                        self._last_broadcast_event_index = kernel_events[-1]["event_index"]
-
-                if self._state and self._state.cycle_manager is not None:
-                    error, error_code, error_details = active_cycle_error_fields(
-                        self._state.cycle_manager
-                    )
-                    runtime_override_status = None
-                    if self._state.program is not None:
-                        runtime_override_status = RuntimeOverrideStatusResponse(
-                            **self._state.runtime_override_status()
-                        ).model_dump(by_alias=True)
-                    data = StateUpdate(
-                        state=self._state.cycle_manager.state.value,
-                        motionStopState=getattr(
-                            self._state.cycle_manager,
-                            "motion_stop_state",
-                            "idle",
-                        ),
-                        velocityScale=self._state.cycle_manager.velocity_scale,
-                        nodeStatuses=self._state.cycle_manager.get_node_statuses(),
-                        kernelEvents=kernel_events,
-                        nativeKernelEvents=native_kernel_events,
-                        error=error,
-                        errorCode=error_code,
-                        errorDetails=error_details,
-                        programLoaded=bool(has_program),
-                        programSessionGeneration=self._state.program_session_generation,
-                        runtimeOverrideStatus=runtime_override_status,
-                        timestamp=time.time(),
-                    ).model_dump(by_alias=True)
-                else:
-                    runtime_override_status = None
-                    if self._state is not None and self._state.program is not None:
-                        runtime_override_status = RuntimeOverrideStatusResponse(
-                            **self._state.runtime_override_status()
-                        ).model_dump(by_alias=True)
-                    data = StateUpdate(
-                        state="idle",
-                        motionStopState="idle",
-                        velocityScale=1.0,
-                        nodeStatuses={},
-                        kernelEvents=kernel_events,
-                        nativeKernelEvents=[],
-                        programLoaded=bool(has_program),
-                        programSessionGeneration=(
-                            self._state.program_session_generation
-                            if self._state is not None
-                            else 0
-                        ),
-                        runtimeOverrideStatus=runtime_override_status,
-                        timestamp=time.time(),
-                    ).model_dump(by_alias=True)
-                await self.broadcast(data)
+                if self._connections:
+                    await self.broadcast(data)
                 await asyncio.sleep(0.1)  # 10 Hz
             except asyncio.CancelledError:
                 raise

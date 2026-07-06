@@ -385,6 +385,9 @@ class EventRecorder:
             "timestamp_ns": None,
         }
 
+        # Lock order: EventRecorder.observe() may hold this lock while reading
+        # CycleManager snapshots. Do not call observe() while holding
+        # CycleManager._lock; use recorder -> cycle-manager order only.
         self._lock = threading.RLock()
         self._failure_archive_queue: queue.Queue[_FailureArchiveJob | None] | None = None
         self._failure_archive_worker: threading.Thread | None = None
@@ -498,110 +501,111 @@ class EventRecorder:
         exactness-sensitive callers (debug export, recovery correlation)
         pass ``force=True`` to bypass the budget (audit 6B, finding 2.16).
         """
-        now = time.monotonic()
-        if not force:
-            if now - self._last_observe_monotonic < self._observe_min_interval_s:
-                return
-        self._last_observe_monotonic = now
-        cycle_manager = getattr(state, "cycle_manager", None)
-        kernel = getattr(state, "_kernel", None)
+        with self._lock:
+            now = time.monotonic()
+            if not force:
+                if now - self._last_observe_monotonic < self._observe_min_interval_s:
+                    return
+            self._last_observe_monotonic = now
+            cycle_manager = getattr(state, "cycle_manager", None)
+            kernel = getattr(state, "_kernel", None)
 
-        cycle_state = cycle_manager.state.value if cycle_manager is not None else None
-        if cycle_state != self._last_cycle_state:
-            self._handle_cycle_state_transition(
-                self._last_cycle_state,
-                cycle_state,
-                runner_run_id=getattr(cycle_manager, "program_run_id", None),
-            )
-            self._last_cycle_state = cycle_state
-
-        status = None
-        snapshot = None
-        if kernel is not None:
-            status = (
-                cycle_manager.get_status()
-                if cycle_manager is not None
-                else kernel.get_status()
-            )
-            snapshot = (
-                cycle_manager.get_execution_snapshot()
-                if cycle_manager is not None
-                else kernel.get_execution_snapshot()
-            )
-            self._handle_kernel_transition(status, snapshot)
-
-        if cycle_manager is not None:
-            self._handle_intervention_events(cycle_manager.intervention)
-            self._handle_node_status_changes(
-                cycle_manager.get_node_statuses(),
-                status,
-                cycle_state=cycle_state,
-                intervention_session=cycle_manager.intervention,
-            )
-            cycle_error = cycle_manager.error
-            if cycle_error != self._last_cycle_error and cycle_error:
-                self._record_event(
-                    event_type="cycle_error",
-                    execution_id=status.execution_id if status is not None else 0,
-                    move_id=status.active_move_id if status is not None else None,
-                    details={"error": cycle_error},
-                    session_id=(
-                        cycle_manager.intervention.session_id
-                        if cycle_state == "direct_control"
-                        and cycle_manager.intervention is not None
-                        else None
-                    ),
-                    session_kind=(
-                        cycle_manager.intervention.session_kind
-                        if cycle_state == "direct_control"
-                        and cycle_manager.intervention is not None
-                        else None
-                    ),
-                    authority_source=(
-                        cycle_manager.intervention.authority_source
-                        if cycle_state == "direct_control"
-                        and cycle_manager.intervention is not None
-                        else None
-                    ),
-                    principal_id=(
-                        getattr(cycle_manager.intervention, "principal_id", None)
-                        if cycle_state == "direct_control"
-                        and cycle_manager.intervention is not None
-                        else None
-                    ),
-                    grant_type=(
-                        getattr(cycle_manager.intervention, "grant_type", None)
-                        if cycle_state == "direct_control"
-                        and cycle_manager.intervention is not None
-                        else None
-                    ),
-                    parent_run_id=(
-                        cycle_manager.intervention.parent_run_id
-                        if cycle_state == "direct_control"
-                        and cycle_manager.intervention is not None
-                        else None
-                    ),
-                    trigger_reason=(
-                        cycle_manager.intervention.trigger_reason
-                        if cycle_state == "direct_control"
-                        and cycle_manager.intervention is not None
-                        else None
-                    ),
-                    trigger_node_instance=(
-                        cycle_manager.intervention.trigger_node_instance
-                        if cycle_state == "direct_control"
-                        and cycle_manager.intervention is not None
-                        else None
-                    ),
-                    execution_mode="intervention" if cycle_state == "direct_control" else None,
-                    run_id=(
-                        self._intervention_run_id(cycle_manager.intervention)
-                        if cycle_state == "direct_control"
-                        and cycle_manager.intervention is not None
-                        else None
-                    ),
+            cycle_state = cycle_manager.state.value if cycle_manager is not None else None
+            if cycle_state != self._last_cycle_state:
+                self._handle_cycle_state_transition(
+                    self._last_cycle_state,
+                    cycle_state,
+                    runner_run_id=getattr(cycle_manager, "program_run_id", None),
                 )
-            self._last_cycle_error = cycle_error
+                self._last_cycle_state = cycle_state
+
+            status = None
+            snapshot = None
+            if kernel is not None:
+                status = (
+                    cycle_manager.get_status()
+                    if cycle_manager is not None
+                    else kernel.get_status()
+                )
+                snapshot = (
+                    cycle_manager.get_execution_snapshot()
+                    if cycle_manager is not None
+                    else kernel.get_execution_snapshot()
+                )
+                self._handle_kernel_transition(status, snapshot)
+
+            if cycle_manager is not None:
+                self._handle_intervention_events(cycle_manager.intervention)
+                self._handle_node_status_changes(
+                    cycle_manager.get_node_statuses(),
+                    status,
+                    cycle_state=cycle_state,
+                    intervention_session=cycle_manager.intervention,
+                )
+                cycle_error = cycle_manager.error
+                if cycle_error != self._last_cycle_error and cycle_error:
+                    self._record_event(
+                        event_type="cycle_error",
+                        execution_id=status.execution_id if status is not None else 0,
+                        move_id=status.active_move_id if status is not None else None,
+                        details={"error": cycle_error},
+                        session_id=(
+                            cycle_manager.intervention.session_id
+                            if cycle_state == "direct_control"
+                            and cycle_manager.intervention is not None
+                            else None
+                        ),
+                        session_kind=(
+                            cycle_manager.intervention.session_kind
+                            if cycle_state == "direct_control"
+                            and cycle_manager.intervention is not None
+                            else None
+                        ),
+                        authority_source=(
+                            cycle_manager.intervention.authority_source
+                            if cycle_state == "direct_control"
+                            and cycle_manager.intervention is not None
+                            else None
+                        ),
+                        principal_id=(
+                            getattr(cycle_manager.intervention, "principal_id", None)
+                            if cycle_state == "direct_control"
+                            and cycle_manager.intervention is not None
+                            else None
+                        ),
+                        grant_type=(
+                            getattr(cycle_manager.intervention, "grant_type", None)
+                            if cycle_state == "direct_control"
+                            and cycle_manager.intervention is not None
+                            else None
+                        ),
+                        parent_run_id=(
+                            cycle_manager.intervention.parent_run_id
+                            if cycle_state == "direct_control"
+                            and cycle_manager.intervention is not None
+                            else None
+                        ),
+                        trigger_reason=(
+                            cycle_manager.intervention.trigger_reason
+                            if cycle_state == "direct_control"
+                            and cycle_manager.intervention is not None
+                            else None
+                        ),
+                        trigger_node_instance=(
+                            cycle_manager.intervention.trigger_node_instance
+                            if cycle_state == "direct_control"
+                            and cycle_manager.intervention is not None
+                            else None
+                        ),
+                        execution_mode="intervention" if cycle_state == "direct_control" else None,
+                        run_id=(
+                            self._intervention_run_id(cycle_manager.intervention)
+                            if cycle_state == "direct_control"
+                            and cycle_manager.intervention is not None
+                            else None
+                        ),
+                    )
+                self._last_cycle_error = cycle_error
 
     def get_events_since(
         self,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 
@@ -56,6 +57,34 @@ class IScheduler {
 
   /// Cancel a previously scheduled callback. No-op if already fired or invalid.
   virtual void cancel(ScheduleHandle handle) = 0;
+
+  /// Wait until callbacks already dequeued on the given priority lane have
+  /// returned. Test schedulers that invoke callbacks synchronously may keep the
+  /// default no-op implementation.
+  virtual void drain(SchedulerPriority /*priority*/) {}
+
+  /// Bounded form of drain(). Returns false when callbacks already dequeued on
+  /// the given lane did not return before the timeout. Synchronous test
+  /// schedulers may keep the default no-op implementation.
+  virtual bool drain_for(SchedulerPriority priority,
+                         std::chrono::nanoseconds /*timeout*/) {
+    drain(priority);
+    return true;
+  }
+
+  /// Drain every priority lane known to the scheduler.
+  virtual void drain_all() {
+    drain(SchedulerPriority::Safety);
+    drain(SchedulerPriority::Monitoring);
+  }
+
+  /// Bounded form of drain_all().
+  virtual bool drain_all_for(std::chrono::nanoseconds timeout) {
+    bool drained = true;
+    drained = drain_for(SchedulerPriority::Safety, timeout) && drained;
+    drained = drain_for(SchedulerPriority::Monitoring, timeout) && drained;
+    return drained;
+  }
 };
 
 }  // namespace manyforge::core

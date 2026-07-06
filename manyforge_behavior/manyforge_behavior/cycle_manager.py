@@ -6,6 +6,7 @@ import logging
 import json
 import math
 import os
+import queue
 import sys
 import threading
 import time
@@ -33,6 +34,9 @@ _STOP_SETTLE_DEADLINE_S = float(os.environ.get("MANYFORGE_STOP_SETTLE_DEADLINE_S
 # cadence) means the kernel is unreachable, not busy — escalate instead of
 # retrying forever.
 _STOP_SETTLE_MAX_STATUS_FAILURES = 100
+_KERNEL_CONTROL_CALL_TIMEOUT_S = float(
+    os.environ.get("MANYFORGE_KERNEL_CONTROL_CALL_TIMEOUT_S", "1.0")
+)
 _RESET_PHASE_DEADLINE_S = float(
     os.environ.get("MANYFORGE_RESET_PHASE_DEADLINE_S", "20.0")
 )
@@ -385,7 +389,13 @@ class CycleManager:
         self._tick_exit_event = threading.Event()
         self._tick_pause_event = threading.Event()  # cleared = paused, set = running
         self._velocity_scale = 1.0
+        # Lock order with Composer's EventRecorder is recorder -> cycle-manager:
+        # EventRecorder.observe() may hold its RLock while reading these
+        # snapshots. Never call event_recorder.observe() while holding _lock.
         self._lock = threading.Lock()
+        self._run_transition_lock = threading.Lock()
+        self._run_transition_in_progress = False
+        self._pending_run_stop: Optional[str] = None
         self._on_run_from_idle: Optional[Callable[[], None]] = None
         self._error: Optional[str] = None
         # Structured cause for the viewer: when the cycle's `_error` is set from
@@ -452,6 +462,90 @@ class CycleManager:
             ExecutionState.INTERVENTION_REQUIRED,
         }
 
+    def _call_with_timeout(
+        self,
+        label: str,
+        fn: Callable[[], Any],
+        timeout_s: float,
+    ) -> Any:
+        result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+        def worker() -> None:
+            try:
+                result_queue.put((True, fn()))
+            except BaseException as exc:  # noqa: BLE001 - propagate worker result.
+                result_queue.put((False, exc))
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"manyforge_cycle_{label}",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            ok, value = result_queue.get(timeout=max(0.0, timeout_s))
+        except queue.Empty as exc:
+            raise TimeoutError(
+                f"{label} did not return within {timeout_s:g}s"
+            ) from exc
+        if ok:
+            return value
+        raise value
+
+    def _kernel_control_command(
+        self,
+        label: str,
+        fn_with_epoch: Callable[[int], Any],
+        timeout_s: Optional[float] = None,
+    ) -> Any:
+        timeout = _KERNEL_CONTROL_CALL_TIMEOUT_S if timeout_s is None else timeout_s
+        epoch = self._kernel.control_command_epoch()
+        try:
+            return self._call_with_timeout(
+                label,
+                lambda: fn_with_epoch(epoch),
+                timeout,
+            )
+        except TimeoutError:
+            try:
+                self._kernel.bump_control_command_epoch()
+            except Exception:  # noqa: BLE001 - preserve original timeout surface.
+                logger.exception(
+                    "Failed to invalidate timed-out kernel control command %s",
+                    label,
+                )
+            raise
+
+    def _kernel_status_with_timeout(self, label: str) -> ExecutionStatus:
+        return self._call_with_timeout(
+            label,
+            self._kernel.get_status,
+            _KERNEL_CONTROL_CALL_TIMEOUT_S,
+        )
+
+    def _kernel_state_with_timeout(self, label: str) -> ExecutionState:
+        return self._kernel_status_with_timeout(label).state
+
+    def _request_kernel_stop_best_effort(self, label: str) -> None:
+        try:
+            self._call_with_timeout(
+                label,
+                self._kernel.stop,
+                _KERNEL_CONTROL_CALL_TIMEOUT_S,
+            )
+        except Exception:  # noqa: BLE001 - escalation must still park the cycle.
+            logger.warning("Best-effort kernel.stop() timed out or failed during %s", label)
+
+    def _record_pending_run_stop_locked(self, kind: str) -> None:
+        if kind == "full_stop" or self._pending_run_stop != "full_stop":
+            self._pending_run_stop = kind
+
+    def _finish_run_transition_locked(self, *, committed: bool) -> Optional[str]:
+        pending = self._pending_run_stop if committed else None
+        self._run_transition_in_progress = False
+        self._pending_run_stop = None
+        return pending
+
     def _escalate_stop_settle(
         self,
         generation: int,
@@ -467,12 +561,9 @@ class CycleManager:
         stop state leaves the cycle in STOPPING forever with reset refused.
         """
         kernel_state_name = kernel_state.value if kernel_state is not None else "unreadable"
-        try:
-            # Best-effort repeat of the stop request; the kernel owns the
-            # actual escalation (hard-stop floor) internally.
-            self._kernel.stop()
-        except Exception:  # noqa: BLE001 — kernel may be unreachable; park anyway
-            pass
+        # Best-effort repeat of the stop request; the kernel owns the actual
+        # escalation (hard-stop floor) internally.
+        self._request_kernel_stop_best_effort("stop_settle_escalation_stop")
         with self._lock:
             if self._stop_settle_generation != generation:
                 return
@@ -506,7 +597,14 @@ class CycleManager:
         status_failures = 0
         while True:
             try:
-                kernel_state = self._kernel.get_status().state
+                kernel_state = self._kernel_state_with_timeout("stop_settle_status")
+            except TimeoutError:
+                self._escalate_stop_settle(
+                    generation,
+                    kernel_state=None,
+                    error_code="stop_settle_status_timeout",
+                )
+                return
             except Exception:
                 status_failures += 1
                 logger.exception("Failed while waiting for kernel stop terminal state")
@@ -534,11 +632,6 @@ class CycleManager:
                         self._state == CycleState.STOPPING
                         and self._stop_settle_generation == generation
                     )
-                fingerprint, fingerprint_error = (
-                    self._capture_scene_resume_fingerprint()
-                    if should_capture
-                    else (None, None)
-                )
                 with self._lock:
                     if (
                         self._state == CycleState.STOPPING
@@ -546,11 +639,13 @@ class CycleManager:
                     ):
                         self._state = CycleState.STOPPED
                         self._store_resumable_stop_scene_fingerprint_locked(
-                            fingerprint,
-                            fingerprint_error,
+                            None,
+                            "scene fingerprint capture pending",
                         )
                     if self._stop_settle_generation == generation:
                         self._stop_settle_thread = None
+                if should_capture:
+                    self._start_stop_terminal_fingerprint_capture(generation)
                 return
             time.sleep(0.02)
 
@@ -563,6 +658,25 @@ class CycleManager:
             daemon=True,
         )
         self._stop_settle_thread.start()
+
+    def _start_stop_terminal_fingerprint_capture(self, generation: int) -> None:
+        def worker() -> None:
+            fingerprint, fingerprint_error = self._capture_scene_resume_fingerprint()
+            with self._lock:
+                if (
+                    self._state == CycleState.STOPPED
+                    and self._stop_settle_generation == generation
+                ):
+                    self._store_resumable_stop_scene_fingerprint_locked(
+                        fingerprint,
+                        fingerprint_error,
+                    )
+
+        threading.Thread(
+            target=worker,
+            name="manyforge_cycle_stop_scene_fingerprint",
+            daemon=True,
+        ).start()
 
     def _escalate_motion_stop(
         self,
@@ -579,10 +693,7 @@ class CycleManager:
         "motion stop is in progress".
         """
         kernel_state_name = kernel_state.value if kernel_state is not None else "unreadable"
-        try:
-            self._kernel.stop()
-        except Exception:  # noqa: BLE001 — kernel may be unreachable; park anyway
-            pass
+        self._request_kernel_stop_best_effort("motion_stop_escalation_stop")
         clear_motion_stop_flag = False
         set_stop_requested = False
         with self._lock:
@@ -632,7 +743,14 @@ class CycleManager:
         status_failures = 0
         while True:
             try:
-                kernel_state = self._kernel.get_status().state
+                kernel_state = self._kernel_state_with_timeout("motion_stop_status")
+            except TimeoutError:
+                self._escalate_motion_stop(
+                    generation,
+                    kernel_state=None,
+                    error_code="motion_stop_status_timeout",
+                )
+                return
             except Exception:
                 status_failures += 1
                 logger.exception("Failed while waiting for motion stop terminal state")
@@ -751,8 +869,13 @@ class CycleManager:
 
     def _capture_scene_resume_fingerprint(self) -> tuple[Optional[str], Optional[str]]:
         try:
+            objects = self._call_with_timeout(
+                "scene_resume_fingerprint_objects",
+                self._kernel.get_scene_objects,
+                _KERNEL_CONTROL_CALL_TIMEOUT_S,
+            )
             return (
-                _scene_resume_fingerprint_from_objects(self._kernel.get_scene_objects()),
+                _scene_resume_fingerprint_from_objects(objects),
                 None,
             )
         except Exception as exc:  # noqa: BLE001 - unreadable scene must fail closed
@@ -960,6 +1083,8 @@ class CycleManager:
         *,
         request_id: Optional[str],
         fail_closed: bool = True,
+        emit_completed: bool = True,
+        bounded_by_callee: bool = False,
     ) -> Any:
         self._emit_reset_phase_event(
             phase=phase,
@@ -968,29 +1093,16 @@ class CycleManager:
         )
         started = time.monotonic()
         try:
-            result = fn()
-        except Exception as exc:
-            duration_s = time.monotonic() - started
-            error = str(exc) or type(exc).__name__
-            error_code = f"reset_{phase}_failed"
-            if fail_closed:
-                self._mark_reset_phase_failed(
-                    phase=phase,
-                    error=error,
-                    error_code=error_code,
-                    duration_s=duration_s,
+            if bounded_by_callee:
+                result = fn()
+            else:
+                result = self._call_with_timeout(
+                    f"reset_{phase}",
+                    fn,
+                    _RESET_PHASE_DEADLINE_S,
                 )
-            self._emit_reset_phase_event(
-                phase=phase,
-                status="failed",
-                request_id=request_id,
-                duration_s=duration_s,
-                error=error,
-                error_code=error_code,
-            )
-            raise
-        duration_s = time.monotonic() - started
-        if duration_s > _RESET_PHASE_DEADLINE_S:
+        except TimeoutError as exc:
+            duration_s = time.monotonic() - started
             error_code = f"reset_{phase}_timeout"
             error = (
                 f"Reset phase '{phase}' exceeded "
@@ -1012,13 +1124,35 @@ class CycleManager:
                 error=error,
                 error_code=error_code,
             )
-            raise RuntimeError(error)
-        self._emit_reset_phase_event(
-            phase=phase,
-            status="completed",
-            request_id=request_id,
-            duration_s=duration_s,
-        )
+            raise RuntimeError(error) from exc
+        except Exception as exc:
+            duration_s = time.monotonic() - started
+            error = str(exc) or type(exc).__name__
+            error_code = f"reset_{phase}_failed"
+            if fail_closed:
+                self._mark_reset_phase_failed(
+                    phase=phase,
+                    error=error,
+                    error_code=error_code,
+                    duration_s=duration_s,
+                )
+            self._emit_reset_phase_event(
+                phase=phase,
+                status="failed",
+                request_id=request_id,
+                duration_s=duration_s,
+                error=error,
+                error_code=error_code,
+            )
+            raise
+        duration_s = time.monotonic() - started
+        if emit_completed:
+            self._emit_reset_phase_event(
+                phase=phase,
+                status="completed",
+                request_id=request_id,
+                duration_s=duration_s,
+            )
         return result
 
     def _prepare_fresh_cycle(
@@ -1763,7 +1897,11 @@ class CycleManager:
         """Enter a quiesced runtime mode shared by stop and reset paths."""
         self._set_stop_requested_flag(True, client_name=client_name)
 
-        kernel_status = self._kernel.get_status()
+        kernel_status = self._call_with_timeout(
+            f"{client_name}_status",
+            self._kernel.get_status,
+            _KERNEL_CONTROL_CALL_TIMEOUT_S,
+        )
         if kernel_action == "pause_if_executing":
             # The in-flight execution may still be in its preparation phase
             # (planning/validating). Pausing only EXECUTING leaves the
@@ -1776,15 +1914,27 @@ class CycleManager:
             # because the kernel can cross the preparation->executing
             # boundary between the status read and the action.
             for _ in range(3):
-                kernel_status = self._kernel.get_status()
+                kernel_status = self._call_with_timeout(
+                    f"{client_name}_poll_status",
+                    self._kernel.get_status,
+                    _KERNEL_CONTROL_CALL_TIMEOUT_S,
+                )
                 if kernel_status.state == ExecutionState.EXECUTING:
-                    self._kernel.pause()
+                    self._call_with_timeout(
+                        f"{client_name}_pause",
+                        self._kernel.pause,
+                        _KERNEL_CONTROL_CALL_TIMEOUT_S,
+                    )
                     break
                 if kernel_status.state in (
                     ExecutionState.PLANNING,
                     ExecutionState.VALIDATING,
                 ):
-                    self._kernel.stop()
+                    self._call_with_timeout(
+                        f"{client_name}_prep_stop",
+                        self._kernel.stop,
+                        _KERNEL_CONTROL_CALL_TIMEOUT_S,
+                    )
                     continue
                 break
         elif kernel_action == "stop_if_active":
@@ -1797,7 +1947,11 @@ class CycleManager:
                 ExecutionState.STOPPING,
             }
             if kernel_status.state in stoppable:
-                self._kernel.stop()
+                self._call_with_timeout(
+                    f"{client_name}_stop",
+                    self._kernel.stop,
+                    _KERNEL_CONTROL_CALL_TIMEOUT_S,
+                )
         else:
             raise ValueError(f"unsupported kernel_action: {kernel_action}")
 
@@ -1924,36 +2078,67 @@ class CycleManager:
         lease is still active and keeps the cycle STOPPED so the next Run
         replans from the current backend pose.
         """
-        with self._lock:
-            if self._state != CycleState.STOPPED:
-                raise RuntimeError(
-                    "Cannot acknowledge intervention for retry unless the "
-                    f"cycle is STOPPED (current state={self._state.value})"
-                )
-            if self._intervention is not None and self._intervention.status == "running":
-                raise RuntimeError(
-                    "Cannot acknowledge intervention for retry while a "
-                    "direct-control intervention session is running"
-                )
-            kernel_status = self._kernel.get_status()
+        with self._run_transition_lock:
+            with self._lock:
+                if self._state != CycleState.STOPPED:
+                    raise RuntimeError(
+                        "Cannot acknowledge intervention for retry unless the "
+                        f"cycle is STOPPED (current state={self._state.value})"
+                    )
+                if (
+                    self._intervention is not None
+                    and self._intervention.status == "running"
+                ):
+                    raise RuntimeError(
+                        "Cannot acknowledge intervention for retry while a "
+                        "direct-control intervention session is running"
+                    )
+
+            kernel_status = self._call_with_timeout(
+                "ack_intervention_retry_status",
+                self._kernel.get_status,
+                _KERNEL_CONTROL_CALL_TIMEOUT_S,
+            )
+
+            with self._lock:
+                if self._state != CycleState.STOPPED:
+                    raise RuntimeError(
+                        "Cannot acknowledge intervention for retry: cycle "
+                        f"changed to {self._state.value}"
+                    )
+                if (
+                    self._intervention is not None
+                    and self._intervention.status == "running"
+                ):
+                    raise RuntimeError(
+                        "Cannot acknowledge intervention for retry while a "
+                        "direct-control intervention session is running"
+                    )
             if kernel_status.state != ExecutionState.INTERVENTION_REQUIRED:
                 raise RuntimeError(
                     "Cannot acknowledge intervention for retry: kernel is "
                     f"{kernel_status.state.value}, not intervention_required"
                 )
-            ack = self._kernel.acknowledge_intervention_for_retry(
-                principal_id=principal_id,
-                reason=reason,
+            ack = self._kernel_control_command(
+                "ack_intervention_retry",
+                lambda epoch: self._kernel.acknowledge_intervention_for_retry(
+                    principal_id=principal_id,
+                    reason=reason,
+                    expected_epoch=epoch,
+                ),
             )
             if not ack.accepted:
                 raise RuntimeError(
                     "kernel.acknowledge_intervention_for_retry rejected: "
                     f"{ack.error}"
                 )
-            self._error = None
-            self._error_code = None
-            self._error_details = None
-            self._set_resume_after_error_flag(True)
+            with self._lock:
+                if self._state != CycleState.STOPPED:
+                    return
+                self._error = None
+                self._error_code = None
+                self._error_details = None
+                self._set_resume_after_error_flag(True)
 
     def run(self) -> None:
         """
@@ -1970,183 +2155,227 @@ class CycleManager:
                     If kernel is PAUSED, call kernel.resume().
         If RUNNING: no-op.
         """
-        prepare_fresh = False
-        start_from_idle = False
-        on_run_from_idle: Optional[Callable[[], None]] = None
+        with self._run_transition_lock:
+            prepare_fresh = False
+            start_from_idle = False
+            resume_from_stopped = False
+            resume_motion_stop = False
+            on_run_from_idle: Optional[Callable[[], None]] = None
+            run_transition_started = False
+            run_committed = False
 
-        self._assert_resumable_stop_scene_unchanged()
-        with self._lock:
-            if self._state == CycleState.RUNNING:
-                if self._motion_stop_state == "held":
-                    kernel_status = self._kernel.get_status()
+            def finish_run_transition(committed: bool) -> None:
+                pending_stop: Optional[str] = None
+                with self._lock:
+                    if self._run_transition_in_progress:
+                        pending_stop = self._finish_run_transition_locked(
+                            committed=committed
+                        )
+                if pending_stop == "full_stop":
+                    self.full_stop()
+                elif pending_stop == "motion_stop":
+                    self.stop()
+
+            try:
+                with self._lock:
+                    if self._state in {CycleState.IDLE, CycleState.STOPPED}:
+                        self._run_transition_in_progress = True
+                        self._pending_run_stop = None
+                        run_transition_started = True
+
+                self._assert_resumable_stop_scene_unchanged()
+                with self._lock:
+                    current_state = self._state
+                    motion_stop_state = self._motion_stop_state
+                    if current_state == CycleState.RUNNING:
+                        if motion_stop_state == "held":
+                            resume_motion_stop = True
+                        elif motion_stop_state == "stopping":
+                            raise RuntimeError("Cannot run: motion stop is still in progress")
+                        else:
+                            return
+                    elif current_state == CycleState.IDLE:
+                        if self._tick_thread is not None and self._tick_thread.is_alive():
+                            raise RuntimeError(
+                                "Cannot start new cycle: previous tick thread is still alive"
+                            )
+                        if self._tree is None:
+                            prepare_fresh = True
+                        elif self._tree_is_terminal():
+                            return
+                        start_from_idle = True
+                        self._program_run_id = (
+                            f"run-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+                            f"-{uuid.uuid4().hex[:8]}"
+                        )
+                        on_run_from_idle = self._on_run_from_idle
+                    elif current_state == CycleState.STOPPED:
+                        resume_from_stopped = True
+                    else:
+                        return
+
+                if resume_motion_stop:
+                    kernel_status = self._kernel_status_with_timeout(
+                        "run_resume_motion_stop_status"
+                    )
                     if kernel_status.state == ExecutionState.COMPLETED:
-                        ack_completed = self._kernel.acknowledge_completed(
-                            kernel_status.execution_id
+                        ack_completed = self._kernel_control_command(
+                            "run_ack_completed_after_motion_stop",
+                            lambda epoch: self._kernel.acknowledge_completed(
+                                kernel_status.execution_id,
+                                expected_epoch=epoch,
+                            ),
                         )
                         if not ack_completed.accepted:
                             raise RuntimeError(
                                 "kernel.acknowledge_completed rejected: "
                                 f"{ack_completed.error}"
                             )
-                    self._motion_stop_state = "idle"
-                    self._set_resume_after_error_flag(True)
+                    with self._lock:
+                        if (
+                            self._state != CycleState.RUNNING
+                            or self._motion_stop_state != "held"
+                        ):
+                            return
+                        self._motion_stop_state = "idle"
+                        self._set_resume_after_error_flag(True)
+                        self._set_motion_stop_active_flag(
+                            False,
+                            client_name="cycle_manager_resume_motion_stop",
+                        )
+                        self._error = None
+                        self._error_code = None
+                        self._error_details = None
+                    return
+
+                if resume_from_stopped:
+                    with self._lock:
+                        if self._state != CycleState.STOPPED:
+                            return
+                        self._pending_delegated_recovery = None
+                        self._motion_stop_state = "idle"
+
+                    bb = py_trees.blackboard.Client(name="cycle_manager_resume")
+                    bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
+                    bb.stop_requested = False
                     self._set_motion_stop_active_flag(
                         False,
-                        client_name="cycle_manager_resume_motion_stop",
+                        client_name="cycle_manager_resume",
                     )
-                    self._error = None
-                    self._error_code = None
-                    self._error_details = None
-                elif self._motion_stop_state == "stopping":
-                    raise RuntimeError("Cannot run: motion stop is still in progress")
-                return  # Already running, no-op
 
-            # Stale error fields are cleared only once the run/resume is known
-            # valid (at the RUNNING transition below). A refused Run must not
-            # wipe the diagnostic that explains WHY the cycle is stopped —
-            # e.g. a tick_loop_exception whose only recovery is Reset.
+                    motion_paused_error = self._read_motion_paused_error()
+                    kernel_status = self._kernel_status_with_timeout(
+                        "run_resume_status"
+                    )
+                    if (
+                        motion_paused_error is not None
+                        and kernel_status.state == ExecutionState.INTERRUPTED
+                    ):
+                        ack_interrupted = self._kernel_control_command(
+                            "run_ack_interrupted_for_retry",
+                            lambda epoch: self._kernel.acknowledge_interrupted_for_retry(
+                                principal_id="cycle_manager_run",
+                                reason="run_retry_after_motion_fault",
+                                expected_epoch=epoch,
+                            ),
+                        )
+                        if not ack_interrupted.accepted:
+                            raise RuntimeError(
+                                "kernel.acknowledge_interrupted_for_retry rejected: "
+                                f"{ack_interrupted.error}"
+                            )
+                        kernel_status = self._kernel_status_with_timeout(
+                            "run_post_interrupted_ack_status"
+                        )
 
-            if self._state == CycleState.IDLE:
-                # Guard: refuse to start if a zombie tick thread is still alive
-                if self._tick_thread is not None and self._tick_thread.is_alive():
-                    raise RuntimeError("Cannot start new cycle: previous tick thread is still alive")
-                if self._tree is None:
-                    prepare_fresh = True
-                elif self._tree_is_terminal():
+                    if kernel_status.state == ExecutionState.COMPLETED:
+                        ack_completed = self._kernel_control_command(
+                            "run_ack_completed",
+                            lambda epoch: self._kernel.acknowledge_completed(
+                                kernel_status.execution_id,
+                                expected_epoch=epoch,
+                            ),
+                        )
+                        if not ack_completed.accepted:
+                            raise RuntimeError(
+                                "kernel.acknowledge_completed rejected: "
+                                f"{ack_completed.error}"
+                            )
+                        kernel_status = self._kernel_status_with_timeout(
+                            "run_post_completed_ack_status"
+                        )
+
+                    if kernel_status.state == ExecutionState.INTERVENTION_REQUIRED:
+                        _, recovery_reason = self._can_auto_acknowledge_leftover_state()
+                        raise RuntimeError(
+                            "Kernel INTERVENTION_REQUIRED blocks Run. Choose "
+                            "Acknowledge and continue or Reset cycle before "
+                            f"running. reason={recovery_reason}"
+                        )
+
+                    if kernel_status.state == ExecutionState.PAUSED:
+                        resume = self._kernel_control_command(
+                            "run_resume",
+                            lambda epoch: self._kernel.resume(expected_epoch=epoch),
+                        )
+                        if not resume.accepted:
+                            raise RuntimeError(
+                                "kernel.resume rejected: "
+                                f"{resume.error}"
+                            )
+
+                    self._set_resume_after_error_flag(True)
+                    if motion_paused_error is not None:
+                        self._clear_motion_paused_blackboard()
+
+                    with self._lock:
+                        if self._state != CycleState.STOPPED:
+                            return
+                        self._tick_pause_event.set()
+                        if self._tick_thread is None or not self._tick_thread.is_alive():
+                            if self._tree is None:
+                                raise RuntimeError("Cannot resume stopped cycle without a tree")
+                            self._start_tick_thread(self._tick_loop)
+                        self._error = None
+                        self._error_code = None
+                        self._error_details = None
+                        self._state = CycleState.RUNNING
+                        self._resumable_stop_scene_fingerprint = None
+                        self._resumable_stop_scene_fingerprint_error = None
+                        run_committed = True
                     return
-                start_from_idle = True
-                # Spec/500 §2.2: mint once per program start. The format
-                # stays in the recorder's familiar run-id family — the
-                # recorder ADOPTS this id as its durable-history run_id so
-                # runner, kernel events, and history share one id space.
-                self._program_run_id = (
-                    f"run-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
-                    f"-{uuid.uuid4().hex[:8]}"
-                )
-                on_run_from_idle = self._on_run_from_idle
 
-            elif self._state == CycleState.STOPPED:
-                # Resuming from stopped state
-                self._pending_delegated_recovery = None
-                bb = py_trees.blackboard.Client(name="cycle_manager_resume")
-                bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
-                bb.stop_requested = False
-                self._set_motion_stop_active_flag(
-                    False,
-                    client_name="cycle_manager_resume",
-                )
-                self._motion_stop_state = "idle"
+                if start_from_idle:
+                    if prepare_fresh:
+                        self._prepare_fresh_cycle()
+                    else:
+                        self._write_bb_keys()
 
-                motion_paused_error = self._read_motion_paused_error()
-                kernel_status = self._kernel.get_status()
+                    if on_run_from_idle:
+                        on_run_from_idle()
 
-                # If we're resuming from a motion soft-fail (the cycle
-                # was put into STOPPED by _enter_motion_paused_state),
-                # Run is an explicit operator retry. A runtime collision
-                # fault leaves the kernel in INTERRUPTED with a latched
-                # ManyForge-owned interrupt; clearing the scene object alone
-                # does not clear that latch. Acknowledge only the interrupted
-                # execution boundary before re-ticking the held motion node;
-                # do not call kernel.reset(), because ROS/Isaac reset may
-                # command the backend back to its initial/home pose. If the
-                # obstacle is still present, the fresh execute/monitor pass
-                # will latch a new collision immediately.
-                if (
-                    motion_paused_error is not None
-                    and kernel_status.state == ExecutionState.INTERRUPTED
-                ):
-                    ack_interrupted = self._kernel.acknowledge_interrupted_for_retry(
-                        principal_id="cycle_manager_run",
-                        reason="run_retry_after_motion_fault",
-                    )
-                    if not ack_interrupted.accepted:
-                        raise RuntimeError(
-                            "kernel.acknowledge_interrupted_for_retry rejected: "
-                            f"{ack_interrupted.error}"
-                        )
-                    kernel_status = self._kernel.get_status()
-
-                # A controlled stop issued within the deceleration budget of a
-                # move's natural end lets the original motion finish on-path
-                # (recommends_natural_completion); the kernel then rests in
-                # COMPLETED — the move reached its goal — rather than STOPPED.
-                # execute() only auto-clears STOPPED, so re-dispatching the held
-                # motion node against a COMPLETED kernel is rejected and the
-                # stop becomes unresumable without a Reset. Acknowledge the
-                # completed execution boundary here so Run clears it, mirroring the
-                # INTERRUPTED/INTERVENTION acks. The held move actually finished,
-                # so the subsequent re-dispatch from the reached goal is trivial
-                # and advances the program.
-                if kernel_status.state == ExecutionState.COMPLETED:
-                    ack_completed = self._kernel.acknowledge_completed(
-                        kernel_status.execution_id
-                    )
-                    if not ack_completed.accepted:
-                        raise RuntimeError(
-                            "kernel.acknowledge_completed rejected: "
-                            f"{ack_completed.error}"
-                        )
-                    kernel_status = self._kernel.get_status()
-
-                # Signal the held motion node to re-dispatch its goal from fresh
-                # state on the next tick instead of re-reading the already-terminal
-                # execution. This covers both a collision soft-fail and a plain
-                # operator stop, which leaves the kernel in STOPPED with no
-                # motion_paused_error; execute() from STOPPED clears the stop and
-                # replans, so Run from STOPPED resumes rather than re-surfacing
-                # "Motion execution ended in stopped".
-                self._set_resume_after_error_flag(True)
-                if motion_paused_error is not None:
-                    self._clear_motion_paused_blackboard()
-
-                # M5.5: Run must not silently acknowledge
-                # `INTERVENTION_REQUIRED`. The operator must explicitly choose
-                # acknowledge-and-continue (no backend reset) or reset. That
-                # preserves the stopped pose and makes reset-to-home a visible
-                # operator choice, never a side effect of pressing Run.
-                if kernel_status.state == ExecutionState.INTERVENTION_REQUIRED:
-                    _, recovery_reason = self._can_auto_acknowledge_leftover_state()
-                    raise RuntimeError(
-                        "Kernel INTERVENTION_REQUIRED blocks Run. Choose "
-                        "Acknowledge and continue or Reset cycle before "
-                        f"running. reason={recovery_reason}"
-                    )
-
-                if kernel_status.state == ExecutionState.PAUSED:
-                    self._kernel.resume()
-
-                self._tick_pause_event.set()
-                if self._tick_thread is None or not self._tick_thread.is_alive():
-                    if self._tree is None:
-                        raise RuntimeError("Cannot resume stopped cycle without a tree")
-                    self._start_tick_thread(self._tick_loop)
-                self._error = None
-                self._error_code = None
-                self._error_details = None
-                self._state = CycleState.RUNNING
-                self._resumable_stop_scene_fingerprint = None
-                self._resumable_stop_scene_fingerprint_error = None
-
-        if start_from_idle:
-            if prepare_fresh:
-                self._prepare_fresh_cycle()
-            else:
-                self._write_bb_keys()
-
-            if on_run_from_idle:
-                on_run_from_idle()
-
-            with self._lock:
-                self._start_tick_thread(self._tick_loop)
-                self._error = None
-                self._error_code = None
-                self._error_details = None
-                self._state = CycleState.RUNNING
+                    with self._lock:
+                        if self._state != CycleState.IDLE:
+                            return
+                        self._start_tick_thread(self._tick_loop)
+                        self._error = None
+                        self._error_code = None
+                        self._error_details = None
+                        self._state = CycleState.RUNNING
+                        run_committed = True
+            finally:
+                if run_transition_started:
+                    finish_run_transition(run_committed)
 
     def stop(self) -> None:
         """Stop active robot motion while keeping the behavior tree ticking."""
         with self._lock:
             if self._state != CycleState.RUNNING:
+                if (
+                    self._run_transition_in_progress
+                    and self._state in {CycleState.IDLE, CycleState.STOPPED}
+                ):
+                    self._record_pending_run_stop_locked("motion_stop")
                 return
             if self._motion_stop_state in {"stopping", "held"}:
                 return
@@ -2158,7 +2387,11 @@ class CycleManager:
         )
 
         try:
-            kernel_status = self._kernel.get_status()
+            kernel_status = self._call_with_timeout(
+                "motion_stop_initial_status",
+                self._kernel.get_status,
+                _KERNEL_CONTROL_CALL_TIMEOUT_S,
+            )
             stoppable = {
                 ExecutionState.EXECUTING,
                 ExecutionState.PLANNING,
@@ -2168,8 +2401,18 @@ class CycleManager:
                 ExecutionState.STOPPING,
             }
             if kernel_status.state in stoppable:
-                self._kernel.stop()
-            kernel_state = self._kernel.get_status().state
+                self._call_with_timeout(
+                    "motion_stop_stop",
+                    self._kernel.stop,
+                    _KERNEL_CONTROL_CALL_TIMEOUT_S,
+                )
+            kernel_state = self._kernel_state_with_timeout("motion_stop_post_status")
+        except TimeoutError:
+            with self._lock:
+                if self._motion_stop_state == "stopping":
+                    self._start_motion_stop_watcher_locked()
+                    return
+            return
         except Exception:
             with self._lock:
                 self._motion_stop_state = "idle"
@@ -2202,6 +2445,11 @@ class CycleManager:
         """
         with self._lock:
             if self._state != CycleState.RUNNING:
+                if (
+                    self._run_transition_in_progress
+                    and self._state in {CycleState.IDLE, CycleState.STOPPED}
+                ):
+                    self._record_pending_run_stop_locked("full_stop")
                 return  # Not running, no-op
             self._state = CycleState.STOPPING
             self._motion_stop_state = "idle"
@@ -2226,6 +2474,12 @@ class CycleManager:
                 client_name="cycle_manager_stop",
                 kernel_action="stop_if_active",
             )
+        except TimeoutError:
+            self._request_kernel_stop_best_effort("full_stop_quiesce_timeout_stop")
+            with self._lock:
+                if self._state == CycleState.STOPPING:
+                    self._start_stop_settle_watcher_locked()
+            return
         except Exception:
             with self._lock:
                 if self._state == CycleState.STOPPING:
@@ -2233,7 +2487,7 @@ class CycleManager:
             raise
 
         try:
-            kernel_state = self._kernel.get_status().state
+            kernel_state = self._kernel_state_with_timeout("full_stop_post_status")
         except Exception:
             logger.exception("Failed to read kernel state after operator stop")
             kernel_state = ExecutionState.STOPPING
@@ -2406,32 +2660,18 @@ class CycleManager:
             request_id=request_id,
         )
         if kernel_status.state != ExecutionState.IDLE:
-            self._emit_reset_phase_event(
-                phase="kernel_reset",
-                status="started",
-                request_id=request_id,
-            )
             kernel_reset_started = time.monotonic()
-            try:
-                reset_result = self._kernel.reset()
-            except Exception as exc:
-                duration_s = time.monotonic() - kernel_reset_started
-                error = str(exc) or type(exc).__name__
-                self._mark_reset_phase_failed(
-                    phase="kernel_reset",
-                    error=error,
-                    error_code="reset_kernel_reset_failed",
-                    duration_s=duration_s,
-                )
-                self._emit_reset_phase_event(
-                    phase="kernel_reset",
-                    status="failed",
-                    request_id=request_id,
-                    duration_s=duration_s,
-                    error=error,
-                    error_code="reset_kernel_reset_failed",
-                )
-                raise
+            reset_result = self._run_reset_phase(
+                "kernel_reset",
+                lambda: self._kernel_control_command(
+                    "kernel_reset",
+                    lambda epoch: self._kernel.reset(expected_epoch=epoch),
+                    timeout_s=_RESET_PHASE_DEADLINE_S,
+                ),
+                request_id=request_id,
+                emit_completed=False,
+                bounded_by_callee=True,
+            )
             kernel_reset_duration_s = time.monotonic() - kernel_reset_started
             if not reset_result.accepted:
                 reason_code = (
@@ -2462,28 +2702,6 @@ class CycleManager:
                     error_code=reason_code,
                 )
                 return
-            if kernel_reset_duration_s > _RESET_PHASE_DEADLINE_S:
-                error_code = "reset_kernel_reset_timeout"
-                error_message = (
-                    f"Reset phase 'kernel_reset' exceeded "
-                    f"{_RESET_PHASE_DEADLINE_S:.0f}s deadline "
-                    f"({kernel_reset_duration_s:.1f}s). Cycle left STOPPED; retry Reset."
-                )
-                self._mark_reset_phase_failed(
-                    phase="kernel_reset",
-                    error=error_message,
-                    error_code=error_code,
-                    duration_s=kernel_reset_duration_s,
-                )
-                self._emit_reset_phase_event(
-                    phase="kernel_reset",
-                    status="failed",
-                    request_id=request_id,
-                    duration_s=kernel_reset_duration_s,
-                    error=error_message,
-                    error_code=error_code,
-                )
-                raise RuntimeError(error_message)
             self._emit_reset_phase_event(
                 phase="kernel_reset",
                 status="completed",
@@ -3284,71 +3502,89 @@ class CycleManager:
 
         pending_request: Optional[DelegatedRecoveryRequest] = None
         thread_to_join = None
-        with self._lock:
-            if self._state not in (CycleState.IDLE, CycleState.STOPPED):
-                raise RuntimeError(
-                    f"Cannot start intervention from state {self._state.value}"
-                )
+        with self._run_transition_lock:
+            with self._lock:
+                if self._state not in (CycleState.IDLE, CycleState.STOPPED):
+                    raise RuntimeError(
+                        f"Cannot start intervention from state {self._state.value}"
+                    )
 
-            entry_state = self._state.value
-            if (
-                entry_state == CycleState.IDLE.value
-                and (session_kind != "manual_intervention"
-                     or authority_source != "human"
-                     or approval_mode != "human_approved")
-            ):
-                raise RuntimeError(
-                    "Entering DIRECT_CONTROL from IDLE requires explicit human-approved manual intervention"
+                entry_state = self._state.value
+                if (
+                    entry_state == CycleState.IDLE.value
+                    and (
+                        session_kind != "manual_intervention"
+                        or authority_source != "human"
+                        or approval_mode != "human_approved"
+                    )
+                ):
+                    raise RuntimeError(
+                        "Entering DIRECT_CONTROL from IDLE requires explicit human-approved manual intervention"
+                    )
+                pending_request = self._pending_delegated_recovery
+                if session_kind == "delegated_recovery":
+                    if entry_state != CycleState.STOPPED.value:
+                        raise RuntimeError(
+                            "delegated_recovery may only start from STOPPED"
+                        )
+                    if pending_request is None:
+                        raise RuntimeError(
+                            "No delegated recovery request is pending"
+                        )
+                    if authority_source not in pending_request.allowed_authority_sources:
+                        allowed = ", ".join(pending_request.allowed_authority_sources) or "none"
+                        raise RuntimeError(
+                            "delegated_recovery authority_source must be one of: "
+                            f"{allowed}"
+                        )
+                    if trigger_node_instance is not None and (
+                        trigger_node_instance != pending_request.trigger_node_instance
+                    ):
+                        raise RuntimeError(
+                            "trigger_node_instance does not match the pending delegated recovery request"
+                        )
+                    if trigger_reason is not None and (
+                        trigger_reason != "manual_request"
+                        and trigger_reason != pending_request.trigger_reason.value
+                    ):
+                        raise RuntimeError(
+                            "trigger_reason does not match the pending delegated recovery request"
+                        )
+                    if resume_target is not None and (
+                        resume_target not in pending_request.allowed_resume_targets
+                    ):
+                        raise RuntimeError(
+                            "resume_target is not allowed for the pending delegated recovery request"
+                        )
+
+            kernel_state = self._kernel_state_with_timeout("intervention_entry_status")
+
+            with self._lock:
+                if self._state.value != entry_state:
+                    raise RuntimeError(
+                        "Cannot start intervention: cycle state changed to "
+                        f"{self._state.value}"
+                    )
+                if (
+                    session_kind == "delegated_recovery"
+                    and self._pending_delegated_recovery is not pending_request
+                ):
+                    raise RuntimeError(
+                        "Cannot start intervention: delegated recovery request changed"
+                    )
+                if entry_state == CycleState.STOPPED.value and kernel_state == ExecutionState.PAUSED:
+                    raise RuntimeError(
+                        "Cannot start intervention from STOPPED while the kernel holds a paused motion; reset the cycle first"
+                    )
+                saved_context = _InterventionContext(
+                    tree=self._tree,
+                    node_statuses=dict(self._node_statuses),
+                    stop_requested=self._current_stop_requested(),
+                    velocity_scale=self._velocity_scale,
                 )
-            pending_request = self._pending_delegated_recovery
-            if session_kind == "delegated_recovery":
-                if entry_state != CycleState.STOPPED.value:
-                    raise RuntimeError(
-                        "delegated_recovery may only start from STOPPED"
-                    )
-                if pending_request is None:
-                    raise RuntimeError(
-                        "No delegated recovery request is pending"
-                    )
-                if authority_source not in pending_request.allowed_authority_sources:
-                    allowed = ", ".join(pending_request.allowed_authority_sources) or "none"
-                    raise RuntimeError(
-                        "delegated_recovery authority_source must be one of: "
-                        f"{allowed}"
-                    )
-                if trigger_node_instance is not None and (
-                    trigger_node_instance != pending_request.trigger_node_instance
-                ):
-                    raise RuntimeError(
-                        "trigger_node_instance does not match the pending delegated recovery request"
-                    )
-                if trigger_reason is not None and (
-                    trigger_reason != "manual_request"
-                    and trigger_reason != pending_request.trigger_reason.value
-                ):
-                    raise RuntimeError(
-                        "trigger_reason does not match the pending delegated recovery request"
-                    )
-                if resume_target is not None and (
-                    resume_target not in pending_request.allowed_resume_targets
-                ):
-                    raise RuntimeError(
-                        "resume_target is not allowed for the pending delegated recovery request"
-                    )
-            kernel_state = self._kernel.get_status().state
-            if entry_state == CycleState.STOPPED.value and kernel_state == ExecutionState.PAUSED:
-                raise RuntimeError(
-                    "Cannot start intervention from STOPPED while the kernel holds a paused motion; reset the cycle first"
-                )
-            saved_context = _InterventionContext(
-                tree=self._tree,
-                node_statuses=dict(self._node_statuses),
-                stop_requested=self._current_stop_requested(),
-                velocity_scale=self._velocity_scale,
-            )
-            if self._tick_thread is not None and self._tick_thread.is_alive():
-                self._tick_stop_event.set()
-                thread_to_join = self._tick_thread
+                if self._tick_thread is not None and self._tick_thread.is_alive():
+                    self._tick_stop_event.set()
+                    thread_to_join = self._tick_thread
 
         if thread_to_join is not None:
             thread_to_join.join(timeout=2.0)

@@ -20,6 +20,7 @@ from manyforge_composer.backend.routes_pointcloud import PointCloudPublisher
 from manyforge_composer.backend.routes_snapshot import SnapshotBroker
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
+from manyforge_composer.backend.ws_state import StateHub
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CATALOG_PATH = str(
@@ -232,6 +233,48 @@ def test_pointcloud_publisher_removes_dead_client_after_send_failure() -> None:
         assert not publisher.has_clients()
     finally:
         loop_thread.stop()
+
+
+def test_statehub_broadcast_collection_runs_off_event_loop() -> None:
+    release_observe = threading.Event()
+    observe_entered = threading.Event()
+
+    class BlockingRecorder:
+        def observe(self, _state: Any) -> None:
+            observe_entered.set()
+            release_observe.wait(timeout=5.0)
+
+    class FakeState:
+        program = None
+        cycle_manager = None
+        program_session_generation = 0
+        event_recorder = BlockingRecorder()
+
+    async def run_probe() -> None:
+        hub = StateHub()
+        hub.start(FakeState())  # type: ignore[arg-type]
+        task = asyncio.create_task(hub._broadcast_loop())
+        try:
+            await asyncio.wait_for(asyncio.to_thread(observe_entered.wait, 1.0), 1.0)
+            marker_ran = False
+
+            async def marker() -> None:
+                nonlocal marker_ran
+                await asyncio.sleep(0.01)
+                marker_ran = True
+
+            await asyncio.wait_for(marker(), 0.2)
+            assert marker_ran is True
+        finally:
+            hub.stop()
+            release_observe.set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(run_probe())
 
 
 def test_assistant_request_store_prunes_completed_records(

@@ -1,8 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include <roboplan/core/scene.hpp>
@@ -58,9 +60,14 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
                          std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra,
                          std::shared_ptr<roboplan::SimpleIk> ik,
                          std::shared_ptr<std::mutex> scene_mutex = nullptr,
-                         std::shared_ptr<roboplan::SimpleIk> single_shot_ik = nullptr);
+                         std::shared_ptr<roboplan::SimpleIk> single_shot_ik = nullptr,
+                         std::optional<roboplan::SimpleIkOptions> ik_options = std::nullopt,
+                         std::optional<roboplan::SimpleIkOptions> single_shot_ik_options =
+                             std::nullopt);
 
   core::PlanResultDTO plan(const core::PlanRequestDTO& request) override;
+
+  void request_cancel() override;
 
   core::IkResultDTO solve_ik(const core::IkRequestDTO& request) override;
 
@@ -74,6 +81,9 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
   std::shared_ptr<roboplan::SimpleIk> ik_;
   std::shared_ptr<roboplan::SimpleIk> single_shot_ik_;
   std::shared_ptr<std::mutex> scene_mutex_;
+  roboplan::SimpleIkOptions ik_options_;
+  roboplan::SimpleIkOptions single_shot_ik_options_;
+  std::atomic_bool cancel_requested_{false};
 };
 
 }  // namespace manyforge::roboplan_backend

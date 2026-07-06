@@ -62,6 +62,13 @@ class IPlannerBackend {
     /// @return PlanResultDTO containing the trajectory or error
     virtual PlanResultDTO plan(const PlanRequestDTO& request) = 0;
 
+    /// Request cancellation of the currently active Plan() call, if any.
+    /// Backends that can interrupt planning work should honor this
+    /// cooperatively at their natural polling/checkpoint boundaries. The
+    /// default no-op preserves source compatibility for simple deterministic
+    /// test backends.
+    virtual void request_cancel() {}
+
     /// Single-shot IK for Cartesian-target resolution. Returns a joint target
     /// matching the requested pose, or an IK error if no solution is
     /// reachable. Does NOT plan a trajectory, run collision checks, or honor

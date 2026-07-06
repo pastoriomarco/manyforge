@@ -20,6 +20,7 @@ class ExecutionWorkerSignals {
 
   void mark_started();
   void mark_complete();
+  void abandon();
   bool wait_for_completion(std::int64_t timeout_ns);
 
   void request_resume();
@@ -41,6 +42,7 @@ class ExecutionWorkerSignals {
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   bool execution_complete_{false};
+  bool abandoned_{false};
   bool resume_requested_{false};
 };
 

@@ -1,15 +1,19 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stop_token>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <control_msgs/action/follow_joint_trajectory.hpp>
@@ -29,6 +33,7 @@
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
 #include <manyforge_core/time/iclock.hpp>
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
 
 namespace manyforge::ros2_control_execution {
@@ -177,6 +182,112 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   // error when they required gating).
   bool request_command_gate(bool enabled);
 
+#ifdef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
+  using TestingFollowJointTrajectory =
+      control_msgs::action::FollowJointTrajectory;
+  using TestingGoalHandleFJT =
+      rclcpp_action::ClientGoalHandle<TestingFollowJointTrajectory>;
+  struct TestingNoRosStartupTag {};
+
+  Ros2ControlExecutionBackend(
+      TestingNoRosStartupTag,
+      std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+      std::string group_name,
+      core::IClock& clock,
+      Ros2ControlExecutionBackendConfig config)
+      : execution_state_sink_(std::move(execution_state_sink)),
+        group_name_(std::move(group_name)),
+        clock_(clock),
+        config_(std::move(config)) {
+    if (!execution_state_sink_) {
+      throw std::invalid_argument("execution state sink must not be null");
+    }
+    validate_config();
+    snapshot_.timestamp_ns = clock_.now();
+  }
+
+  void testing_begin_managed_fjt_terminal_session(
+      std::uint64_t generation,
+      std::optional<rclcpp_action::GoalUUID> goal_id) {
+    std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
+    managed_fjt_generation_ = generation;
+    managed_fjt_terminal_goal_id_ = std::move(goal_id);
+    managed_fjt_terminal_result_received_ = false;
+    managed_fjt_terminal_result_success_ = false;
+    managed_fjt_terminal_error_.reset();
+  }
+
+  void testing_on_managed_fjt_terminal_result(
+      const TestingGoalHandleFJT::WrappedResult& result,
+      std::uint64_t generation) {
+    on_managed_fjt_terminal_result(result, generation);
+  }
+
+  bool testing_managed_fjt_terminal_received() const {
+    std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
+    return managed_fjt_terminal_result_received_;
+  }
+
+  bool testing_managed_fjt_terminal_success() const {
+    std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
+    return managed_fjt_terminal_result_success_;
+  }
+
+  bool testing_install_controlled_stop_command_reference(
+      const core::TrajectoryDTO& trajectory,
+      std::chrono::steady_clock::time_point started_at) {
+    return install_controlled_stop_command_reference(trajectory, started_at);
+  }
+
+  bool testing_publish_controlled_stop_command_reference_snapshot(
+      std::chrono::steady_clock::time_point now) {
+    return publish_controlled_stop_command_reference_snapshot(now);
+  }
+
+  void testing_store_latest_joint_sample(
+      std::vector<std::string> joint_names,
+      std::vector<double> positions,
+      std::chrono::steady_clock::time_point received_at) {
+    testing_store_latest_joint_sample_impl(
+        std::move(joint_names), std::move(positions), received_at);
+  }
+
+  void testing_sync_idle_scene_from_latest_sample() {
+    sync_idle_scene_from_latest_sample();
+  }
+
+  void testing_set_running_state(bool running) {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    set_running_locked(running);
+    terminal_ = !running;
+  }
+
+  void testing_store_action_feedback_sample(
+      std::vector<std::string> joint_names,
+      std::vector<double> positions,
+      std::vector<double> velocities,
+      std::chrono::steady_clock::time_point received_at) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!latest_action_feedback_.has_value()) {
+      latest_action_feedback_.emplace();
+    }
+    assign_joint_sample(*latest_action_feedback_,
+                        joint_names,
+                        positions,
+                        velocities,
+                        received_at,
+                        "action_feedback",
+                        config_.action_name);
+  }
+
+  std::size_t testing_latest_action_feedback_position_capacity() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return latest_action_feedback_.has_value()
+               ? latest_action_feedback_->positions.capacity()
+               : 0;
+  }
+#endif
+
  private:
   using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
   using GoalHandleFJT = rclcpp_action::ClientGoalHandle<FollowJointTrajectory>;
@@ -208,6 +319,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   struct ControlledStopCommandReference {
     core::TrajectoryDTO trajectory;
     std::chrono::steady_clock::time_point started_at;
+    core::TrajectorySampleResult sample;
   };
 
   struct PostStopObservation {
@@ -266,6 +378,9 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
 
   std::optional<JointSample> select_latest_sample_locked(
       std::chrono::steady_clock::time_point now) const;
+  std::optional<JointSample> select_latest_sample_after_locked(
+      std::chrono::steady_clock::time_point now,
+      std::chrono::steady_clock::time_point not_before) const;
   std::optional<JointSample> wait_for_fresh_sample(double timeout_s);
   std::optional<JointSample> wait_for_fresh_sample_after(
       double timeout_s,
@@ -275,7 +390,19 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       const std::vector<std::string>& joints) const;
   std::vector<double> positions_for_joints(const JointSample& sample,
                                            const std::vector<std::string>& joints) const;
+  static void assign_joint_sample(JointSample& sample,
+                                  const std::vector<std::string>& joint_names,
+                                  const std::vector<double>& positions,
+                                  const std::vector<double>& velocities,
+                                  std::chrono::steady_clock::time_point received_at,
+                                  const std::string& source,
+                                  const std::string& topic);
   void sync_idle_scene_from_latest_sample();
+  void set_running_locked(bool running) noexcept;
+  void testing_store_latest_joint_sample_impl(
+      std::vector<std::string> joint_names,
+      std::vector<double> positions,
+      std::chrono::steady_clock::time_point received_at);
   bool is_commanded_sim_mode() const;
   bool uses_authored_backend_state() const;
   void set_command_gate(bool enabled);
@@ -283,7 +410,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   void begin_controlled_stop_runtime_scale_freeze(bool assert_unit_scale);
   void assert_controlled_stop_unit_runtime_scale();
   bool end_controlled_stop_runtime_scale_freeze();
-  void install_controlled_stop_command_reference(
+  bool install_controlled_stop_command_reference(
       const core::TrajectoryDTO& trajectory,
       std::chrono::steady_clock::time_point started_at);
   void clear_managed_controlled_stop_state();
@@ -318,6 +445,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
                         const std::vector<double>& joint_positions,
                         std::optional<core::ErrorDTO> error = std::nullopt,
                         std::string state_source = "");
+  bool publish_passive_idle_snapshot(const std::vector<double>& joint_positions);
   core::ErrorDTO operator_intervention_error(
       core::ErrorCode code,
       std::string message,
@@ -326,6 +454,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       std::map<std::string, std::string> details = {})
       const;
   core::Result<void> resync_after_intervention_if_needed(std::string phase);
+  void cancel_all_fjt_goals() noexcept;
   void cancel_goal_if_known(const GoalHandleFJT::SharedPtr& goal_handle) noexcept;
   std::string latest_feedback_error_summary() const;
   std::optional<TrackingErrorPeak> update_tracking_error_peak_locked(
@@ -377,6 +506,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
   std::thread spin_thread_;
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr action_client_;
+  rclcpp::CallbackGroup::SharedPtr state_callback_group_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
       controller_state_sub_;
@@ -403,6 +533,8 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   std::thread monitor_thread_;
   std::atomic<bool> monitor_active_{false};
   bool running_ = false;
+  std::atomic<bool> running_flag_{false};
+  std::atomic<std::uint64_t> running_generation_{0};
   bool terminal_ = true;
   bool stop_requested_ = false;
   bool natural_completion_stop_requested_ = false;
@@ -439,14 +571,15 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       const core::TrajectoryDTO& trajectory,
       bool track_terminal_goal = false);
   void begin_controlled_stop_path_deviation_tracking(
-      const core::TrajectoryDTO& accepted_trajectory,
+      std::shared_ptr<const core::TrajectoryDTO> accepted_trajectory,
       double initial_path_deviation_rad);
   void record_controlled_stop_path_deviation_feedback(
       const std::vector<std::string>& joint_names,
       const std::vector<double>& positions);
   void clear_controlled_stop_path_deviation_tracking();
   void on_managed_fjt_terminal_result(
-      const GoalHandleFJT::WrappedResult& result);
+      const GoalHandleFJT::WrappedResult& result,
+      std::uint64_t generation);
 
   mutable std::mutex managed_fjt_mutex_;
   std::condition_variable managed_fjt_cv_;
@@ -458,20 +591,27 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   bool controlled_stop_unit_scale_asserted_ = false;
   std::optional<double> controlled_stop_runtime_scale_restore_;
   std::optional<double> deferred_runtime_velocity_scale_;
-  std::optional<core::TrajectoryDTO> active_trajectory_;
-  std::optional<ControlledStopCommandReference>
+  std::shared_ptr<const core::TrajectoryDTO> active_trajectory_;
+  std::shared_ptr<ControlledStopCommandReference>
       controlled_stop_command_reference_;
+  std::uint64_t idle_scene_sync_generation_ = 0;
+  std::optional<std::chrono::steady_clock::time_point>
+      last_idle_scene_sample_received_at_;
+  std::chrono::steady_clock::time_point last_idle_scene_projection_at_{};
   double active_trajectory_time_s_ = 0.0;
   double active_runtime_velocity_scale_ = 1.0;
   // The most-recent managed FJT goal handle issued by a controlled-stop
   // preempt. Subsequent dispatches preempt it via async_send_goal; the
   // on_managed_fjt_terminal_result callback handles its terminal state.
   GoalHandleFJT::SharedPtr managed_fjt_goal_;
+  std::uint64_t managed_fjt_generation_ = 0;
   std::optional<rclcpp_action::GoalUUID> managed_fjt_terminal_goal_id_;
   bool managed_fjt_terminal_result_received_ = true;
   bool managed_fjt_terminal_result_success_ = true;
   std::optional<core::ErrorDTO> managed_fjt_terminal_error_;
-  std::optional<core::TrajectoryDTO> controlled_stop_path_deviation_reference_;
+  std::shared_ptr<const core::TrajectoryDTO>
+      controlled_stop_path_deviation_reference_;
+  std::atomic<bool> controlled_stop_path_deviation_tracking_active_{false};
   std::optional<double> controlled_stop_path_deviation_max_rad_;
   std::size_t controlled_stop_path_deviation_feedback_samples_ = 0;
   std::optional<core::ErrorDTO> controlled_stop_path_deviation_error_;

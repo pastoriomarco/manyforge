@@ -4,6 +4,7 @@
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fmt/format.h>
@@ -375,7 +376,9 @@ RoboPlanPlannerBackend::RoboPlanPlannerBackend(
     std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra,
     std::shared_ptr<roboplan::SimpleIk> ik,
     std::shared_ptr<std::mutex> scene_mutex,
-    std::shared_ptr<roboplan::SimpleIk> single_shot_ik)
+    std::shared_ptr<roboplan::SimpleIk> single_shot_ik,
+    std::optional<roboplan::SimpleIkOptions> ik_options,
+    std::optional<roboplan::SimpleIkOptions> single_shot_ik_options)
     : scene_(std::move(scene)),
       rrt_options_(rrt_options),
       shortcutter_(std::move(shortcutter)),
@@ -386,16 +389,77 @@ RoboPlanPlannerBackend::RoboPlanPlannerBackend(
   if (!scene_mutex_) {
     scene_mutex_ = std::make_shared<std::mutex>();
   }
+  ik_options_ = ik_options.value_or([&] {
+    roboplan::SimpleIkOptions opts;
+    opts.group_name = rrt_options_.group_name;
+    return opts;
+  }());
+  single_shot_ik_options_ =
+      single_shot_ik_options.value_or(ik_options_);
   if (!single_shot_ik_) {
     single_shot_ik_ = ik_;
   }
 }
 
+void RoboPlanPlannerBackend::request_cancel() {
+  cancel_requested_.store(true, std::memory_order_release);
+}
+
 core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& request) {
   core::PlanResultDTO result;
-  std::unique_lock<std::mutex> scene_lock(*scene_mutex_);
+  cancel_requested_.store(false, std::memory_order_release);
+  const auto plan_started_at = std::chrono::steady_clock::now();
+  const bool has_planning_deadline =
+      std::isfinite(request.planning_timeout_s) && request.planning_timeout_s > 0.0;
 
   try {
+    std::shared_ptr<roboplan::Scene> planning_scene;
+    {
+      std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+      planning_scene = std::make_shared<roboplan::Scene>(*scene_);
+    }
+    auto planning_ik =
+        std::make_shared<roboplan::SimpleIk>(planning_scene, ik_options_);
+    auto planning_shortcutter =
+        std::make_shared<roboplan::PathShortcutter>(
+            planning_scene, rrt_options_.group_name);
+    auto planning_toppra =
+        std::make_shared<roboplan::PathParameterizerTOPPRA>(
+            planning_scene, rrt_options_.group_name);
+
+    const auto fail_if_cancelled = [&](const std::string& stage) {
+      if (!cancel_requested_.load(std::memory_order_acquire)) {
+        return false;
+      }
+      result.error = core::ErrorDTO{
+          core::kErrorPlanningFailed,
+          "planning cancelled by interrupt",
+          {{"reason", "planning_cancelled_by_interrupt"},
+           {"failure_stage", stage}}};
+      return true;
+    };
+    const auto fail_if_timed_out = [&](const std::string& stage) {
+      if (!has_planning_deadline) {
+        return false;
+      }
+      const auto elapsed = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - plan_started_at);
+      if (elapsed.count() < request.planning_timeout_s) {
+        return false;
+      }
+      result.error = core::ErrorDTO{
+          core::kErrorPlanningTimeout,
+          "planning timed out",
+          {{"reason", "planning_timeout"},
+           {"failure_stage", stage},
+           {"timeout_s", std::to_string(request.planning_timeout_s)},
+           {"elapsed_s", std::to_string(elapsed.count())}}};
+      return true;
+    };
+    const auto fail_if_cancelled_or_timed_out = [&](const std::string& stage) {
+      return fail_if_cancelled(stage) || fail_if_timed_out(stage);
+    };
+
     planner_debug("[PLANNER] plan() called, move_id={}, motion_type={}\n",
             request.move_id,
             std::holds_alternative<core::JointGoalDTO>(request.motion) ? "joint" : "pose");
@@ -417,26 +481,31 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     start_config.positions = start_positions;
 
     const Eigen::VectorXd start_positions_full =
-        scene_->toFullJointPositions(rrt_options_.group_name, start_positions);
+        planning_scene->toFullJointPositions(rrt_options_.group_name,
+                                             start_positions);
 
     // Check start for self-collision
-    bool start_collision = scene_->hasCollisions(start_positions_full);
+    bool start_collision = planning_scene->hasCollisions(start_positions_full);
     bool goal_collision = false;
+    if (fail_if_cancelled_or_timed_out("start_collision_check")) {
+      return result;
+    }
 
     // FK of start pose
     {
-      Eigen::Matrix4d start_fk =
-          scene_->forwardKinematics(start_positions_full, request.tcp_frame);
+      Eigen::Matrix4d start_fk = planning_scene->forwardKinematics(
+          start_positions_full, request.tcp_frame);
       double r, p, ya;
       matrix_to_rpy_deg(start_fk, r, p, ya);
-      planner_debug("[PLANNER] start pose:  pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f}) collision={}\n",
-              start_fk(0, 3), start_fk(1, 3), start_fk(2, 3), r, p, ya,
-              start_collision ? "YES" : "no");
+      planner_debug(
+          "[PLANNER] start pose:  pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f}) collision={}\n",
+          start_fk(0, 3), start_fk(1, 3), start_fk(2, 3), r, p, ya,
+          start_collision ? "YES" : "no");
     }
 
     if (start_collision) {
       auto diagnostics =
-          collect_collision_diagnostics(scene_, start_positions_full);
+          collect_collision_diagnostics(planning_scene, start_positions_full);
       const std::string message = collision_message_with_pairs(
           "Planning preview rejected: start state is already in collision",
           diagnostics);
@@ -484,8 +553,9 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       {
         double r, p, ya;
         matrix_to_rpy_deg(tform, r, p, ya);
-        planner_debug("[PLANNER] goal pose:   pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f})\n",
-                tform(0, 3), tform(1, 3), tform(2, 3), r, p, ya);
+        planner_debug(
+            "[PLANNER] goal pose:   pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f})\n",
+            tform(0, 3), tform(1, 3), tform(2, 3), r, p, ya);
       }
 
       roboplan::CartesianConfiguration cart_config;
@@ -496,15 +566,18 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       goal_config.joint_names = start.joint_names;
       goal_config.positions = start_positions;  // seed with current
 
-      if (!ik_->solveIk(cart_config, start_config, goal_config)) {
+      if (!planning_ik->solveIk(cart_config, start_config, goal_config)) {
         double r, p, ya;
         matrix_to_rpy_deg(tform, r, p, ya);
         auto str = fmt::format(
-                 "IK failed: goal pos=({:.3f},{:.3f},{:.3f}) rpy=({:.1f},{:.1f},{:.1f}) frame={}->{}",
-                 tform(0,3), tform(1,3), tform(2,3), r, p, ya,
-                 request.base_frame, request.tcp_frame);
+            "IK failed: goal pos=({:.3f},{:.3f},{:.3f}) rpy=({:.1f},{:.1f},{:.1f}) frame={}->{}",
+            tform(0, 3), tform(1, 3), tform(2, 3), r, p, ya,
+            request.base_frame, request.tcp_frame);
         result.error = core::ErrorDTO{core::kErrorIkFailed, str, {}};
         planner_debug("[PLANNER] IK FAILED\n");
+        return result;
+      }
+      if (fail_if_cancelled_or_timed_out("ik")) {
         return result;
       }
 
@@ -514,17 +587,23 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       planner_debug("]\n");
 
       normalize_ik_goal_for_rrt_limits(
-          scene_, rrt_options_.group_name, start_config.positions, goal_config.positions);
+          planning_scene, rrt_options_.group_name, start_config.positions,
+          goal_config.positions);
 
       // Check goal for self-collision
       const Eigen::VectorXd goal_positions_full =
-          scene_->toFullJointPositions(rrt_options_.group_name, goal_config.positions);
-      goal_collision = scene_->hasCollisions(goal_positions_full);
-      planner_debug("[PLANNER] goal in collision: {}\n", goal_collision ? "YES" : "no");
+          planning_scene->toFullJointPositions(
+              rrt_options_.group_name, goal_config.positions);
+      goal_collision = planning_scene->hasCollisions(goal_positions_full);
+      planner_debug("[PLANNER] goal in collision: {}\n",
+                    goal_collision ? "YES" : "no");
+      if (fail_if_cancelled_or_timed_out("goal_collision_check")) {
+        return result;
+      }
 
       if (goal_collision) {
         auto diagnostics =
-            collect_collision_diagnostics(scene_, goal_positions_full);
+            collect_collision_diagnostics(planning_scene, goal_positions_full);
         const std::string message = collision_message_with_pairs(
             "Planning preview rejected: goal state is in collision",
             diagnostics);
@@ -653,11 +732,17 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
         request_rrt_options.max_planning_time = request.planning_timeout_s;
       }
     }
-    roboplan::RRT request_rrt(scene_, request_rrt_options);
+    roboplan::RRT request_rrt(planning_scene, request_rrt_options);
 
     // Plan path with RRT
+    if (fail_if_cancelled_or_timed_out("before_rrt")) {
+      return result;
+    }
     planner_debug("[PLANNER] calling RRT...\n");
     auto path_result = request_rrt.plan(start_config, goal_config);
+    if (fail_if_cancelled_or_timed_out("rrt")) {
+      return result;
+    }
     if (!path_result.has_value()) {
       planner_debug("[PLANNER] RRT FAILED: {}\n", path_result.error());
 
@@ -689,7 +774,13 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     planner_debug("[PLANNER] RRT succeeded\n");
 
     // Shortcut the path
-    auto smoothed_path = shortcutter_->shortcut(path_result.value(), 0.05);
+    if (fail_if_cancelled_or_timed_out("before_shortcut")) {
+      return result;
+    }
+    auto smoothed_path = planning_shortcutter->shortcut(path_result.value(), 0.05);
+    if (fail_if_cancelled_or_timed_out("shortcut")) {
+      return result;
+    }
 
     // Time-parameterize with TOPPRA. TOPP-RA itself takes only SCALAR velocity
     // and acceleration scales — there is no per-joint vector-limit input on this
@@ -727,8 +818,11 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     double final_acc_cap_peak = 0.0;
 
     for (int iter = 0; iter < kMaxRetimeIterations; ++iter) {
+      if (fail_if_cancelled_or_timed_out("retime")) {
+        return result;
+      }
       retime_iterations_used = iter + 1;
-      auto traj_result = toppra_->generate(
+      auto traj_result = planning_toppra->generate(
           smoothed_path, 0.01,
           roboplan::SplineFittingMode::Hermite,
           vel_scale,
@@ -739,16 +833,25 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
                                        "TOPPRA failed: " + traj_result.error(), {}};
         return result;
       }
+      if (fail_if_cancelled_or_timed_out("retime_generate")) {
+        return result;
+      }
 
       final_traj = traj_result.value();
       anchor_trajectory_endpoints(
           final_traj, start_config.positions, goal_config.positions);
+      if (fail_if_cancelled_or_timed_out("retime_verify")) {
+        return result;
+      }
 
       // --- Global TCP linear speed ---
       bool tcp_ok = true;
       if (has_tcp_limit) {
         final_tcp_check = compute_tcp_speed_check(
-            scene_, rrt_options_.group_name, final_traj, tcp_frame);
+            planning_scene, rrt_options_.group_name, final_traj, tcp_frame);
+        if (fail_if_cancelled_or_timed_out("tcp_speed_verify")) {
+          return result;
+        }
         tcp_ok = final_tcp_check.max_speed_mps <= tcp_limit;
       }
 
@@ -766,6 +869,9 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       if (has_joint_dynamics_caps) {
         const JointCapMeasurement meas =
             measure_joint_cap_peaks(final_traj, vel_cap_by_name, acc_cap_by_name);
+        if (fail_if_cancelled_or_timed_out("joint_dynamics_verify")) {
+          return result;
+        }
         if (!meas.samples_complete) {
           result.error = core::ErrorDTO{
               core::kErrorUnsupportedCapability,
@@ -874,6 +980,10 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
           "per-joint dynamics cap could not be enforced by conservative "
           "retiming within the iteration budget",
           details};
+      return result;
+    }
+
+    if (fail_if_cancelled_or_timed_out("trajectory_conversion")) {
       return result;
     }
 
@@ -995,17 +1105,21 @@ core::IkResultDTO RoboPlanPlannerBackend::solve_ik(
   goal_config.joint_names = start_config.joint_names;
   goal_config.positions = start_config.positions;  // seed with start
 
+  std::shared_ptr<roboplan::Scene> ik_scene;
   {
     std::lock_guard<std::mutex> lock(*scene_mutex_);
-    if (!single_shot_ik_->solveIk(cart_config, start_config, goal_config)) {
-      result.ok = false;
-      result.error = core::ErrorDTO{
-          std::string(core::to_string(core::ErrorCode::kIkFailed)),
-          "IK failed for requested target",
-          {{"base_frame", request.base_frame},
-           {"tcp_frame", request.tcp_frame}}};
-      return result;
-    }
+    ik_scene = std::make_shared<roboplan::Scene>(*scene_);
+  }
+  auto single_shot_ik =
+      std::make_shared<roboplan::SimpleIk>(ik_scene, single_shot_ik_options_);
+  if (!single_shot_ik->solveIk(cart_config, start_config, goal_config)) {
+    result.ok = false;
+    result.error = core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kIkFailed)),
+        "IK failed for requested target",
+        {{"base_frame", request.base_frame},
+         {"tcp_frame", request.tcp_frame}}};
+    return result;
   }
 
   result.ok = true;

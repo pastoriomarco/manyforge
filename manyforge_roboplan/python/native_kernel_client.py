@@ -783,45 +783,78 @@ class NativeKernelClient(KernelClient):
 
     def stop(self) -> CommandResult:
         r = self._bundle.stop()
-        return CommandResult(accepted=r["accepted"], error=r.get("error"))
+        return self._command_result(r)
 
     def pause(self) -> CommandResult:
         r = self._bundle.pause()
-        return CommandResult(accepted=r["accepted"], error=r.get("error"))
+        return self._command_result(r)
 
-    def resume(self) -> CommandResult:
-        r = self._bundle.resume()
-        return CommandResult(accepted=r["accepted"], error=r.get("error"))
+    def control_command_epoch(self) -> int:
+        return int(self._bundle.control_command_epoch())
 
-    def reset(self) -> CommandResult:
-        r = self._bundle.reset()
-        return CommandResult(accepted=r["accepted"], error=r.get("error"))
+    def bump_control_command_epoch(self) -> int:
+        return int(self._bundle.bump_control_command_epoch())
 
-    def acknowledge_completed(self, execution_id: int) -> CommandResult:
-        r = self._bundle.acknowledge_completed(int(execution_id))
-        return CommandResult(accepted=r["accepted"], error=r.get("error"))
+    def _command_result(self, result: dict) -> CommandResult:
+        details = result.get("error_details") or {}
+        reason_code = details.get("reason_code") or details.get("reason")
+        return CommandResult(
+            accepted=result["accepted"],
+            error=result.get("error"),
+            reason_code=reason_code,
+        )
+
+    def resume(self, *, expected_epoch: int | None = None) -> CommandResult:
+        r = self._bundle.resume(expected_epoch=expected_epoch)
+        return self._command_result(r)
+
+    def reset(self, *, expected_epoch: int | None = None) -> CommandResult:
+        r = self._bundle.reset(expected_epoch=expected_epoch)
+        return self._command_result(r)
+
+    def acknowledge_completed(
+        self, execution_id: int, *, expected_epoch: int | None = None
+    ) -> CommandResult:
+        r = self._bundle.acknowledge_completed(
+            int(execution_id), expected_epoch=expected_epoch
+        )
+        return self._command_result(r)
 
     def acknowledge_intervention(
-        self, principal_id: str, reason: str
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: int | None = None,
     ) -> CommandResult:
-        r = self._bundle.acknowledge_intervention(str(principal_id), str(reason))
-        return CommandResult(accepted=r["accepted"], error=r.get("error"))
+        r = self._bundle.acknowledge_intervention(
+            str(principal_id), str(reason), expected_epoch=expected_epoch
+        )
+        return self._command_result(r)
 
     def acknowledge_intervention_for_retry(
-        self, principal_id: str, reason: str
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: int | None = None,
     ) -> CommandResult:
         r = self._bundle.acknowledge_intervention_for_retry(
-            str(principal_id), str(reason)
+            str(principal_id), str(reason), expected_epoch=expected_epoch
         )
-        return CommandResult(accepted=r["accepted"], error=r.get("error"))
+        return self._command_result(r)
 
     def acknowledge_interrupted_for_retry(
-        self, principal_id: str, reason: str
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: int | None = None,
     ) -> CommandResult:
         r = self._bundle.acknowledge_interrupted_for_retry(
-            str(principal_id), str(reason)
+            str(principal_id), str(reason), expected_epoch=expected_epoch
         )
-        return CommandResult(accepted=r["accepted"], error=r.get("error"))
+        return self._command_result(r)
 
     def set_runtime_velocity_scale(
         self, scale: float, principal_id: str | None = None
@@ -881,7 +914,10 @@ class NativeKernelClient(KernelClient):
             pass
         except Exception:  # noqa: BLE001 — gate close is best-effort by transport
             pass
-        self._bundle = None
+        try:
+            bundle.close()
+        finally:
+            self._bundle = None
 
     def set_command_gate(self, enabled: bool) -> bool:
         """Request the command-enable gate from the backend gate authority.

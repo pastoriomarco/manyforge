@@ -140,4 +140,20 @@ struct TrajectorySampleResult {
 Result<TrajectorySampleResult> sample_trajectory(
     const TrajectoryDTO& trajectory, double time_s);
 
+/// Run the structural validation `sample_trajectory` performs on every call,
+/// once. Ok for empty trajectories (sampling them yields the empty clamp
+/// result). Callers that sample the same immutable trajectory many times can
+/// validate once and then use `sample_trajectory_prevalidated`.
+Result<void> validate_trajectory_for_sampling(const TrajectoryDTO& trajectory);
+
+/// Sample a trajectory that `validate_trajectory_for_sampling` has already
+/// accepted, writing into `out`. Outputs are identical to
+/// `sample_trajectory`; only the per-call structural re-validation is
+/// skipped, and `out`'s vectors are reused across calls (zero allocation in
+/// steady state). The only per-call rejection is a non-finite `time_s`.
+/// The trajectory must not be mutated between validation and sampling.
+Result<void> sample_trajectory_prevalidated(const TrajectoryDTO& trajectory,
+                                            double time_s,
+                                            TrajectorySampleResult& out);
+
 }  // namespace manyforge::core

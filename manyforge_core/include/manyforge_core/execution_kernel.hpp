@@ -5,8 +5,11 @@
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
 #include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
+#include <manyforge_core/execution_correlation_tracker.hpp>
+#include <manyforge_core/execution_snapshot_publisher.hpp>
 #include <manyforge_core/execution_worker_signals.hpp>
 #include <manyforge_core/interrupt/interrupt_manager.hpp>
+#include <manyforge_core/kernel_event_publisher.hpp>
 #include <manyforge_core/motion_trip_stop_coordinator.hpp>
 #include <manyforge_core/operator_stop_worker.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
@@ -183,16 +186,26 @@ class ExecutionKernel {
   Result<uint64_t> execute(const ExecuteRequestDTO& request);
 
   /// Non-blocking stop from any non-terminal state.
+  /// Accepted stop invalidates older lifecycle/recovery commands by bumping
+  /// `control_command_epoch()`. Stop is never rejectable by epoch staleness.
   StopResultDTO stop();
 
   /// Non-blocking pause. Only valid from Executing.
   PauseResultDTO pause();
 
   /// Non-blocking resume. Only valid from Paused.
-  ResumeResultDTO resume();
+  ResumeResultDTO resume(
+      std::optional<std::uint64_t> expected_epoch = std::nullopt);
 
   /// Non-blocking reset. Valid from any state except Idle.
-  ResetResultDTO reset();
+  ResetResultDTO reset(
+      std::optional<std::uint64_t> expected_epoch = std::nullopt);
+
+  /// Monotonic lifecycle/recovery command epoch. Python control surfaces use
+  /// this only to stamp bounded control calls; the C++ kernel owns the actual
+  /// stale-command rejection at side-effect boundaries.
+  std::uint64_t control_command_epoch() const;
+  std::uint64_t bump_control_command_epoch();
 
   /// Backend-agnostic accessor for the active execution backend's
   /// motion-interrupt stop capability (the advertised supported stop modes
@@ -208,7 +221,9 @@ class ExecutionKernel {
   ///
   /// Valid only when the kernel is currently Completed for exactly the supplied
   /// execution_id. Failed and Stopped executions require Reset/recovery instead.
-  AcknowledgeCompletedResultDTO acknowledge_completed(uint64_t execution_id);
+  AcknowledgeCompletedResultDTO acknowledge_completed(
+      uint64_t execution_id,
+      std::optional<std::uint64_t> expected_epoch = std::nullopt);
 
   /// Acknowledge an `kInterventionRequired` state and return to Idle.
   ///
@@ -218,7 +233,9 @@ class ExecutionKernel {
   /// with `kErrorInvalidRequest` while `kInterventionRequired`, requiring an
   /// explicit recovery action first. See `spec/200` and ADR-0005.
   AcknowledgeInterventionResultDTO acknowledge_intervention(
-      std::string principal_id, std::string reason);
+      std::string principal_id,
+      std::string reason,
+      std::optional<std::uint64_t> expected_epoch = std::nullopt);
 
   /// Acknowledge a stop/fault intervention for retry without backend reset.
   ///
@@ -229,7 +246,9 @@ class ExecutionKernel {
   /// `execution_backend.reset()`: it preserves the current robot pose so the
   /// next execute replans from where the robot actually stopped.
   AcknowledgeInterventionResultDTO acknowledge_intervention_for_retry(
-      std::string principal_id, std::string reason);
+      std::string principal_id,
+      std::string reason,
+      std::optional<std::uint64_t> expected_epoch = std::nullopt);
 
   /// Acknowledge a kernel-owned runtime collision interrupt for retry.
   ///
@@ -240,7 +259,9 @@ class ExecutionKernel {
   /// pose so the next execute plans from that pose instead of commanding the
   /// simulator/controller back to its reset/home state.
   AcknowledgeInterruptedResultDTO acknowledge_interrupted_for_retry(
-      std::string principal_id, std::string reason);
+      std::string principal_id,
+      std::string reason,
+      std::optional<std::uint64_t> expected_epoch = std::nullopt);
 
   /// ADR-0018: update the runtime velocity scale for active execution.
   ///
@@ -371,7 +392,12 @@ class ExecutionKernel {
                             std::optional<TrajectoryDTO> cached_trajectory);
 
   /// Emit an event to all subscribers.
-  void emit_event(const KernelEvent& event);
+  void emit_event(KernelEvent event);
+  void emit_event_immediate(KernelEvent event);
+  void prepare_event(KernelEvent& event) const;
+  void dispatch_prepared_event(const KernelEvent& event);
+  class EventDeferralScope;
+  static thread_local EventDeferralScope* active_event_deferral_;
   void set_active_request_correlation(const ExecuteRequestDTO& request);
   void clear_active_request_correlation();
   void stamp_active_request_correlation(
@@ -396,19 +422,38 @@ class ExecutionKernel {
       const std::shared_ptr<CollisionCancellationToken>& token);
   void request_validation_cancel_from_interrupt(
       const InterruptIngestResult& result);
+  void request_planning_cancel_from_interrupt(
+      const InterruptIngestResult& result);
   void record_terminal_fault_authority(
       const InterruptIngestResult& result);
   void mark_active_interrupt_preemption_result(
       InterruptPreemptionResult result,
       const std::map<std::string, std::string>& extra_details = {});
+  void mark_interrupt_preemption_result(
+      const InterruptLatch& latch,
+      InterruptPreemptionResult result,
+      const std::map<std::string, std::string>& extra_details = {});
+  void apply_interrupt_ingest_effects(
+      const InterruptIngestResult& result,
+      bool apply_preemption_inline);
   void install_builtin_interrupt_sources();
   InterruptIngestResult publish_runtime_collision_fault_interrupt(
       const CollisionCheckResultDTO& check,
       const std::map<std::string, std::string>& metadata = {});
+  InterruptIngestResult publish_fast_interrupt_signals_internal(
+      const std::vector<InterruptSignalUpdate>& updates,
+      bool apply_preemption_inline);
+  void schedule_latched_interrupt_preemption(
+      InterruptIngestResult result);
   void apply_latched_interrupt_preemption(
-      const InterruptIngestResult& result);
+      const InterruptIngestResult& result,
+      std::stop_token worker_stop_token = {});
   void request_fault_preempt_controlled_stop();
+  bool control_command_epoch_matches(
+      std::optional<std::uint64_t> expected_epoch) const;
   InterruptRuntimeContext current_interrupt_context() const;
+  void stamp_interrupt_latch_collision_world_revision(
+      InterruptIngestResult& result);
   void emit_interrupt_events(const InterruptIngestResult& result);
 
   /// Operator-stop worker lifecycle. Operator stops can run a
@@ -441,6 +486,9 @@ class ExecutionKernel {
     bool had_scopes = false;
     bool arm_succeeded = false;
     bool outcome_emitted = false;
+    bool correlation_captured = false;
+    std::optional<ActionSpanDTO> action_span;
+    std::string contact_policy_id;
     std::optional<InterruptLatch> motion_trip_latch;
   };
 
@@ -470,6 +518,7 @@ class ExecutionKernel {
 
   void finish_execute_worker();
   void notify_execution_waiters();
+  bool retire_execute_worker(std::unique_lock<std::mutex>& lifecycle_lock);
 
   bool finalize_overridden_terminal_authority(
       const ExecuteRequestDTO& request,
@@ -554,7 +603,8 @@ class ExecutionKernel {
       const InterruptLatch& latch,
       std::uint64_t exec_id,
       const ExecutionSnapshot& latest_backend_snapshot,
-      ActiveMotionExecution& motion_state);
+      ActiveMotionExecution& motion_state,
+      std::stop_token worker_stop_token);
 
   void emit_interrupt_manager_events(
       const std::vector<InterruptManagerEvent>& events,
@@ -581,52 +631,45 @@ class ExecutionKernel {
   // the previous planner-context collision_check fallback is not a supported
   // execution path.
   mutable std::mutex coordinator_mutex_;
-  std::optional<CollisionPolicySnapshot> coordinator_policy_snapshot_;
+  std::shared_ptr<const CollisionPolicySnapshot> coordinator_policy_snapshot_;
+  std::shared_ptr<const CollisionPolicyIndex> coordinator_policy_index_;
   PoseSourceRetryConfig coordinator_retry_config_{};
   std::int64_t coordinator_per_state_timeout_ns_ = 0;
   ICollisionWorldSnapshotPublisher* collision_snapshot_publisher_ = nullptr;
   std::vector<std::shared_ptr<ICollisionQueryEngine>> collision_validation_engines_;
+  std::unique_ptr<ParallelCollisionValidationWorkerPool>
+      collision_validation_worker_pool_;
   mutable std::mutex validation_cancel_mutex_;
   std::weak_ptr<CollisionCancellationToken> active_validation_cancel_token_;
 
   // Serializes low-rate lifecycle authority transitions across execute, stop,
   // pause, resume, reset, and acknowledge.
   std::mutex lifecycle_mutex_;
+  std::atomic<std::uint64_t> control_command_epoch_{0};
   std::atomic<uint64_t> next_execution_id_{1};
   std::atomic<double> runtime_velocity_scale_{1.0};
   mutable std::mutex runtime_velocity_scale_mutex_;
   int runtime_velocity_scale_freeze_depth_ = 0;
   std::optional<double> deferred_runtime_velocity_scale_;
   std::optional<std::string> deferred_runtime_velocity_scale_principal_id_;
-  mutable std::mutex active_move_id_mutex_;
-  std::string active_move_id_;
-  /// Program-run correlation id of the active execution (spec/500 §2.2);
-  /// stamped into every emitted KernelEvent's details. Guarded by its own
-  /// leaf mutex: held only for assignment/copy, never while calling out,
-  /// so it cannot participate in any lock-ordering cycle.
-  mutable std::mutex active_program_run_id_mutex_;
-  std::string active_program_run_id_;
-  mutable std::mutex active_action_span_mutex_;
-  std::optional<ActionSpanDTO> active_action_span_;
+  ExecutionCorrelationTracker active_correlation_;
 
-  // Event subscription
-  std::mutex subscribers_mutex_;
-  std::map<uint64_t, EventCallback> subscribers_;
-  std::atomic<uint64_t> next_subscription_id_{1};
+  // Event subscription and copy-on-write callback dispatch.
+  KernelEventPublisher event_publisher_;
 
-  // Observer-facing execution snapshot
-  mutable std::mutex snapshot_mutex_;
-  ExecutionSnapshot published_snapshot_;
-  uint64_t next_snapshot_sequence_ = 1;
+  // Observer-facing execution snapshot storage and sequence owner.
+  ExecutionSnapshotPublisher snapshot_publisher_;
 
   // Async execution state
   std::jthread worker_thread_;
+  std::uint64_t execute_worker_generation_ = 0;  // guarded by lifecycle_mutex_
   ExecutionWorkerSignals worker_signals_;
   std::atomic<bool> execute_admission_interruptible_{false};
   std::atomic<bool> lifecycle_stop_requested_while_busy_{false};
   std::atomic<bool> lifecycle_stop_requested_event_emitted_{false};
   std::atomic<bool> lifecycle_reset_requested_while_busy_{false};
   std::atomic<bool> lifecycle_reset_waiting_for_stop_{false};
+  std::atomic<bool> lifecycle_worker_retirement_in_progress_{false};
   // Monotonic per-execution terminal authority. Active interrupt latches can
   // be consumed by preemption/stop machinery before the backend finalizer runs;
   // this flag preserves the fact that safety authority existed so a later
@@ -647,6 +690,7 @@ class ExecutionKernel {
   // supervisory faults can execute a configured controlled stop outside the
   // main execute-worker path, so teardown/reset/watchdogs need an explicit
   // owner they can signal without relying on the caller's thread lifetime.
+  OperatorStopWorker fault_preempt_worker_;
   std::mutex fault_preempt_stop_mutex_;
   std::shared_ptr<std::stop_source> fault_preempt_stop_source_;
   // Metrics (atomic counters for thread safety)

@@ -301,6 +301,8 @@ class RoboPlanPlanningContext final
   std::string group_name_;
   std::shared_ptr<std::mutex> scene_mutex_;
   std::map<std::string, TrackedObjectState> object_states_;
+  mutable std::map<std::string, std::pair<std::string, std::string>>
+      object_body_hash_cache_;
   Eigen::Matrix4d world_from_robot_base_ = Eigen::Matrix4d::Identity();
   std::set<std::pair<std::string, std::string>> disabled_static_collision_pairs_;
   std::set<std::pair<std::string, std::string>> disabled_support_contact_pairs_;

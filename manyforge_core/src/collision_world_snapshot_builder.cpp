@@ -254,6 +254,11 @@ Result<CollisionWorldSnapshot> err(std::string detail) {
 
 }  // namespace
 
+std::string compute_collision_world_body_content_hash(
+    const CollisionWorldBody& body) {
+  return compute_body_content_hash(body);
+}
+
 CollisionWorldSnapshotBuilder& CollisionWorldSnapshotBuilder::set_publisher_id(
     std::string id) {
   publisher_id_ = std::move(id);
@@ -447,7 +452,10 @@ Result<CollisionWorldSnapshot> CollisionWorldSnapshotBuilder::build() {
   snapshot.all_bodies_have_geometry = true;
 
   for (auto& body : snapshot.bodies) {
-    body.body_content_hash = compute_body_content_hash(body);
+    if (body.body_content_hash.empty()) {
+      body.body_content_hash =
+          compute_collision_world_body_content_hash(body);
+    }
     snapshot.geometry_count +=
         static_cast<std::int64_t>(body.geometries.size());
     switch (body.owner_kind) {

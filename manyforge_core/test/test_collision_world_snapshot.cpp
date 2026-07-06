@@ -259,6 +259,18 @@ TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenFreshnessBudgetChanges
   EXPECT_NE(r1.value().revision.content_hash, r2.value().revision.content_hash);
 }
 
+TEST(CollisionWorldSnapshotBuilder, ReusesPrecomputedBodyContentHash) {
+  CollisionWorldBody body = make_robot_link("link1");
+  const auto body_hash = compute_collision_world_body_content_hash(body);
+  body.body_content_hash = body_hash;
+
+  auto result = fresh_builder().add_body(std::move(body)).build();
+
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_EQ(result.value().bodies.size(), 1u);
+  EXPECT_EQ(result.value().bodies.front().body_content_hash, body_hash);
+}
+
 TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenMeshScaleChanges) {
   CollisionWorldBody a = make_robot_link("mesh_link");
   a.geometries.front().geometry_kind = CollisionGeometryKind::kTriangleMesh;

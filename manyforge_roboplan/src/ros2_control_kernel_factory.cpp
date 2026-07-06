@@ -65,15 +65,17 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
   bundle->single_shot_ik =
       std::make_shared<roboplan::SimpleIk>(bundle->scene, single_shot_ik_opts);
 
-  auto scene_mutex = std::make_shared<std::mutex>();
+  bundle->scene_mutex = std::make_shared<std::mutex>();
   bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
       bundle->scene, rrt_opts, bundle->shortcutter, bundle->toppra, bundle->ik,
-      scene_mutex, bundle->single_shot_ik);
+      bundle->scene_mutex, bundle->single_shot_ik, ik_opts,
+      single_shot_ik_opts);
   bundle->context = std::make_unique<RoboPlanPlanningContext>(
-      bundle->scene, group_name, scene_mutex);
+      bundle->scene, group_name, bundle->scene_mutex);
   bundle->clock = std::make_unique<WallClock>();
   bundle->execution_state_sink =
-      std::make_shared<RoboPlanExecutionStateSink>(bundle->scene, scene_mutex);
+      std::make_shared<RoboPlanExecutionStateSink>(
+          bundle->scene, bundle->scene_mutex);
   bundle->execution = std::make_unique<ros2_exec::Ros2ControlExecutionBackend>(
       bundle->execution_state_sink, group_name, *bundle->clock, ros_config);
   bundle->scheduler = std::make_unique<SimpleScheduler>();
@@ -98,7 +100,7 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
 
   core::ExecutionKernelConfig resolved_kernel_config = kernel_config;
   resolved_kernel_config.validation_collision_workers = collision_worker_count;
-  bundle->kernel = std::make_unique<core::ExecutionKernel>(
+  bundle->kernel = std::make_shared<core::ExecutionKernel>(
       *bundle->planner, *bundle->context, *bundle->execution,
       *bundle->clock, *bundle->scheduler, *bundle->cache,
       resolved_kernel_config);

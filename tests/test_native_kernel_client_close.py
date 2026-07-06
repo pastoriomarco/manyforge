@@ -23,13 +23,21 @@ class _StubBundle:
     # the real payload carries `state` as an INT and the stable name in
     # `state_name` — close() must decode via _state_from_native, not the
     # numeric field.
-    def __init__(self, state_name: str = "Executing", gate_raises: bool = False):
+    def __init__(
+        self,
+        state_name: str = "Executing",
+        gate_raises: bool = False,
+        status_raises: bool = False,
+    ):
         self.calls: list[str] = []
         self._state_name = state_name
         self._gate_raises = gate_raises
+        self._status_raises = status_raises
 
     def get_status(self):
         self.calls.append("get_status")
+        if self._status_raises:
+            raise RuntimeError("status unavailable")
         return {
             "state": 3,
             "state_name": self._state_name,
@@ -49,6 +57,9 @@ class _StubBundle:
             raise RuntimeError("no gate surface")
         return True
 
+    def close(self):
+        self.calls.append("close")
+
 
 def test_close_stops_active_execution_then_closes_gate_then_drops_bundle():
     bundle = _StubBundle(state_name="Executing")
@@ -56,7 +67,7 @@ def test_close_stops_active_execution_then_closes_gate_then_drops_bundle():
 
     client.close()
 
-    assert bundle.calls == ["get_status", "stop", "set_command_gate:False"]
+    assert bundle.calls == ["get_status", "stop", "set_command_gate:False", "close"]
     assert client._bundle is None
 
 
@@ -68,6 +79,7 @@ def test_close_skips_stop_when_kernel_terminal_but_still_closes_gate():
 
     assert "stop" not in bundle.calls
     assert "set_command_gate:False" in bundle.calls
+    assert bundle.calls[-1] == "close"
     assert client._bundle is None
 
 
@@ -79,4 +91,15 @@ def test_close_is_idempotent_and_survives_gateless_backend():
     client.close()  # second call must be a no-op, not an AttributeError
 
     assert bundle.calls.count("stop") == 1
+    assert bundle.calls.count("close") == 1
+    assert client._bundle is None
+
+
+def test_close_still_closes_native_bundle_when_status_probe_fails():
+    bundle = _StubBundle(status_raises=True)
+    client = NativeKernelClient(bundle)
+
+    client.close()
+
+    assert bundle.calls == ["get_status", "set_command_gate:False", "close"]
     assert client._bundle is None

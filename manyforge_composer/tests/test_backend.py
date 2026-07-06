@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import threading
 import time
 import pytest
 from pathlib import Path
@@ -26,7 +27,7 @@ from manyforge_behavior.kernel_client import (
 import manyforge_behavior.cycle_manager as cycle_manager_module
 from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.deployment import Deployment
-from manyforge_composer.backend.state import ComposerState
+from manyforge_composer.backend.state import ComposerState, RuntimeOverrideRecord
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.models import (
     SceneObjectResponse,
@@ -34,6 +35,7 @@ from manyforge_composer.backend.models import (
     VisualSceneSnapshotResponse,
 )
 from manyforge_composer.backend.security import SecurityConfig
+from manyforge_composer.backend.ws_state import StateHub
 from manyforge_composer.__main__ import build_program_loaded_callback
 from manyforge_composer.backend import routes_filesystem, routes_infra, routes_runtime
 
@@ -77,6 +79,48 @@ class _FakeCycleManager:
     def abort_intervention(self) -> None:
         self.aborted = True
         self.state = _FakeCycleState("idle")
+
+
+class _ExecutorProbeCycleManager:
+    def __init__(self) -> None:
+        self.state = _FakeCycleState("idle")
+        self.motion_stop_state = "idle"
+        self.velocity_scale = 1.0
+        self.error = None
+        self.error_code = None
+        self.error_details = None
+        self.intervention = None
+        self.thread_names: dict[str, str] = {}
+        self.run_entered = [threading.Event(), threading.Event()]
+        self.release_run = threading.Event()
+        self._run_calls = 0
+        self._lock = threading.Lock()
+
+    def run(self) -> None:
+        self.thread_names["run"] = threading.current_thread().name
+        with self._lock:
+            index = self._run_calls
+            self._run_calls += 1
+        if index < len(self.run_entered):
+            self.run_entered[index].set()
+            self.release_run.wait(timeout=5.0)
+        self.state = _FakeCycleState("running")
+
+    def reset(self, *, request_id=None) -> None:
+        self.thread_names["reset"] = threading.current_thread().name
+        self.state = _FakeCycleState("idle")
+
+    def acknowledge_intervention_for_retry(self, **_kwargs) -> None:
+        self.thread_names["ack"] = threading.current_thread().name
+        self.state = _FakeCycleState("stopped")
+
+    def stop(self) -> None:
+        self.thread_names["stop"] = threading.current_thread().name
+        self.motion_stop_state = "held"
+
+    def full_stop(self) -> None:
+        self.thread_names["full_stop"] = threading.current_thread().name
+        self.state = _FakeCycleState("stopped")
 
 
 class _KernelSnapshotFaultCycleManager:
@@ -586,13 +630,77 @@ def test_reset_from_running(client, state):
     assert data["state"] == "idle"
 
 
+def test_cycle_lifecycle_routes_use_lifecycle_executor():
+    manager = _ExecutorProbeCycleManager()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state.cycle_manager = manager
+    state.reset_backend_authoritative_sim_if_needed = lambda **_kwargs: None
+    state.clear_visual_state_snapshot = lambda: None
+    state.clear_visual_scene_objects_snapshot = lambda: None
+    state.refresh_visual_scene_objects_sync = (
+        lambda **_kwargs: {"success": True}
+    )
+    state.request_visual_state_publish = lambda **_kwargs: None
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as local_client:
+        manager.release_run.set()
+        assert local_client.post("/api/cycle/run").status_code == 200
+        assert local_client.post("/api/cycle/reset").status_code == 200
+        assert (
+            local_client.post("/api/cycle/acknowledge-intervention-for-retry").status_code
+            == 200
+        )
+
+    assert manager.thread_names["run"].startswith("manyforge_cycle_lifecycle")
+    assert manager.thread_names["reset"].startswith("manyforge_cycle_lifecycle")
+    assert manager.thread_names["ack"].startswith("manyforge_cycle_lifecycle")
+
+
+def test_full_stop_uses_reserved_control_executor_when_lifecycle_pool_blocked():
+    manager = _ExecutorProbeCycleManager()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state.cycle_manager = manager
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as local_client:
+        responses: list[int] = []
+
+        def post_run() -> None:
+            responses.append(local_client.post("/api/cycle/run").status_code)
+
+        threads = [
+            threading.Thread(target=post_run, daemon=True),
+            threading.Thread(target=post_run, daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            assert manager.run_entered[0].wait(timeout=1.0)
+            assert manager.run_entered[1].wait(timeout=1.0)
+            started = time.monotonic()
+            full_stop = local_client.post("/api/cycle/full-stop")
+            elapsed_s = time.monotonic() - started
+            assert full_stop.status_code == 200
+            assert elapsed_s < 0.5
+            assert manager.thread_names["full_stop"].startswith(
+                "manyforge_cycle_control"
+            )
+        finally:
+            manager.release_run.set()
+            for thread in threads:
+                thread.join(timeout=1.0)
+
+    assert responses == [200, 200]
+
+
 def test_reset_phase_timeout_returns_structured_409(monkeypatch):
     """A reset phase timeout is operator-visible and request-correlated."""
 
     class SlowResetKernel(MockKernelClient):
-        def reset(self):  # type: ignore[override]
+        def reset(self, *, expected_epoch=None):  # type: ignore[override]
             time.sleep(0.02)
-            return super().reset()
+            return super().reset(expected_epoch=expected_epoch)
 
     monkeypatch.setattr(cycle_manager_module, "_RESET_PHASE_DEADLINE_S", 0.001)
     kernel = SlowResetKernel()
@@ -1780,6 +1888,118 @@ def test_runtime_override_activate_from_idle_promotes_staged_override(tmp_path):
 
         runtime_tree = client.get("/api/program/tree").json()["tree"]
         assert runtime_tree["children"][0]["params"]["planning_timeout_s"] == 4.0
+
+
+def test_runtime_override_status_caches_staged_effective_tree(
+    tmp_path,
+    monkeypatch,
+):
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    state.load_program(program_path)
+    state.cycle_manager._state = CycleState.DIRECT_CONTROL
+    state.apply_runtime_override(
+        node_name="move_to_pick",
+        params={"planning_timeout_s": 4.0},
+        authority_source="llm",
+        approval_mode="not_required",
+    )
+
+    original_builder = state._build_program_with_overrides
+    calls = 0
+
+    def counted_builder(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(state, "_build_program_with_overrides", counted_builder)
+
+    first = state.runtime_override_status()
+    assert first["next_effective_tree"]["children"][0]["params"]["planning_timeout_s"] == 4.0
+    first["next_effective_tree"]["children"][0]["params"]["planning_timeout_s"] = 99.0
+    second = state.runtime_override_status()
+
+    assert calls == 1
+    assert second["next_effective_tree"]["children"][0]["params"]["planning_timeout_s"] == 4.0
+
+
+def test_runtime_override_status_is_safe_during_concurrent_mutation(tmp_path):
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    state.load_program(program_path)
+    state.cycle_manager._state = CycleState.DIRECT_CONTROL
+    with state._runtime_override_lock:
+        for index in range(64):
+            state._runtime_overrides[f"seed_override_{index}"] = RuntimeOverrideRecord(
+                node_name=f"seed_override_{index}",
+                params={"planning_timeout_s": float(index + 1)},
+                authority_source="llm",
+                approval_mode="not_required",
+                reason="pb5 seeded race coverage",
+                session_id=None,
+                trigger_node_instance=None,
+                base_program_hash=state.program_tree_hash,
+                activation_state="staged",
+                activated_at_ns=None,
+            )
+        state._mark_runtime_overrides_changed_locked()
+
+    hub = StateHub()
+    hub.start(state)
+    start = threading.Barrier(5)
+    errors: list[BaseException] = []
+
+    def mutate_overrides(offset: int) -> None:
+        try:
+            start.wait(timeout=1.0)
+            for iteration in range(250):
+                if iteration % 2 == 0:
+                    state.apply_runtime_override(
+                        node_name="move_to_pick",
+                        params={"planning_timeout_s": 3.0 + offset + iteration / 1000.0},
+                        authority_source="llm",
+                        approval_mode="not_required",
+                        reason="pb5 race regression",
+                    )
+                else:
+                    state.remove_runtime_override("move_to_pick")
+        except BaseException as exc:  # pragma: no cover - test aid
+            errors.append(exc)
+
+    def collect_status_frames() -> None:
+        try:
+            start.wait(timeout=1.0)
+            for _ in range(500):
+                status = state.runtime_override_status()
+                assert status["active_count"] >= 0
+                frame = hub._collect_frame(include_payload=True)
+                assert frame is not None
+                runtime_status = frame.get("runtimeOverrideStatus")
+                assert runtime_status is None or runtime_status["activeCount"] >= 0
+        except BaseException as exc:  # pragma: no cover - test aid
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=mutate_overrides, args=(0,), name="pb5-mutator-a"),
+        threading.Thread(target=mutate_overrides, args=(1,), name="pb5-mutator-b"),
+        threading.Thread(target=collect_status_frames, name="pb5-reader-a"),
+        threading.Thread(target=collect_status_frames, name="pb5-reader-b"),
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=1.0)
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    hub.stop()
+    assert all(not thread.is_alive() for thread in threads)
+    assert not errors
+    final_status = state.runtime_override_status()
+    assert final_status["staged_count"] >= 64
+    assert final_status["stale_count"] == 0
 
 
 def test_runtime_override_materialized_tree_supports_staged_view(tmp_path):

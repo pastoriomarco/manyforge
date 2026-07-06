@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <memory>
 #include <thread>
 
 namespace manyforge::core {
@@ -219,6 +220,40 @@ TEST(RuntimeCollisionMonitorTest, StopFromInsideCallbackDoesNotDeadlock) {
 }
 
 TEST(RuntimeCollisionMonitorTest,
+     RuntimePolicySnapshotReusesCachedSharedViewForStableRevision) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  RuntimeCollisionMonitor monitor{
+      clock,
+      scheduler,
+      RuntimeCollisionMonitor::Config{10'000'000},
+      []() { return Result<void>::Ok(); },
+      []() { return true; }};
+
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  auto policy = std::make_shared<CollisionPolicySnapshot>(
+      make_runtime_contact_release_policy(pair));
+  policy->revision = CollisionPolicyRevision{42, "runtime-policy-42"};
+  policy->support_contacts.front().require_separation_by_end = true;
+  policy->support_contacts.front().require_strictly_decreasing_penetration =
+      true;
+
+  auto first = monitor.runtime_policy_snapshot(policy);
+  auto second = monitor.runtime_policy_snapshot(policy);
+
+  ASSERT_TRUE(first.snapshot);
+  ASSERT_TRUE(first.index);
+  EXPECT_EQ(first.snapshot.get(), second.snapshot.get());
+  EXPECT_EQ(first.index.get(), second.index.get());
+  EXPECT_NE(first.snapshot.get(), policy.get());
+  EXPECT_FALSE(first.snapshot->support_contacts.front()
+                   .require_separation_by_end);
+  EXPECT_FALSE(first.snapshot->support_contacts.front()
+                   .require_strictly_decreasing_penetration);
+}
+
+TEST(RuntimeCollisionMonitorTest,
      ContactGraspPolicyAllowsMatchingBoundedRuntimeContact) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -277,6 +312,57 @@ TEST(RuntimeCollisionMonitorTest,
   EXPECT_EQ(fault->at("contact_release_pair"),
             "object/part/shape/0 <-> "
             "robot/robot1/link/finger_left/collision/0");
+}
+
+TEST(RuntimeCollisionMonitorTest,
+     StragglerTickCannotSeedContactReleaseStateAfterRestart) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  auto policy = make_runtime_contact_release_policy(pair);
+  auto old_tick_bundle = make_runtime_collision_bundle(pair, -0.001);
+  auto next_move_bundle = make_runtime_collision_bundle(pair, -0.003);
+
+  std::promise<void> callback_entered;
+  auto callback_entered_future = callback_entered.get_future();
+  std::promise<void> release_callback;
+  auto release_callback_future = release_callback.get_future().share();
+  std::atomic<bool> callback_update_ran{false};
+  RuntimeCollisionMonitor* monitor_ptr = nullptr;
+
+  RuntimeCollisionMonitor monitor{
+      clock,
+      scheduler,
+      RuntimeCollisionMonitor::Config{10'000'000},
+      [&]() {
+        callback_entered.set_value();
+        release_callback_future.wait();
+        (void)monitor_ptr->update_contact_release_state(policy,
+                                                        old_tick_bundle);
+        callback_update_ran.store(true, std::memory_order_release);
+        return Result<void>::Ok();
+      },
+      []() { return true; }};
+  monitor_ptr = &monitor;
+
+  monitor.start();
+  clock.advance(10'000'000);
+  std::thread scheduler_thread([&]() { scheduler.advance_to(clock.now()); });
+  ASSERT_EQ(callback_entered_future.wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+
+  monitor.stop(/*drain_callbacks=*/false);
+  monitor.reset_contact_release_state();
+  monitor.start();
+  release_callback.set_value();
+  scheduler_thread.join();
+  ASSERT_TRUE(callback_update_ran.load(std::memory_order_acquire));
+
+  auto fault =
+      monitor.update_contact_release_state(policy, next_move_bundle);
+  EXPECT_FALSE(fault.has_value())
+      << "old-generation tick seeded contact-release baseline after restart";
 }
 
 }  // namespace

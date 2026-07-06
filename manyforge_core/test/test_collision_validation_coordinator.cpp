@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <map>
 #include <queue>
@@ -20,6 +21,7 @@ class MockCollisionQueryEngine : public ICollisionQueryEngine {
  public:
   CollisionResult default_result;
   std::map<std::int64_t, CollisionResult> result_by_waypoint;
+  std::function<void(const CollisionQuery&)> after_check;
   int check_count = 0;
 
   MockCollisionQueryEngine() {
@@ -65,6 +67,9 @@ class MockCollisionQueryEngine : public ICollisionQueryEngine {
       result.engine_status = CollisionEngineStatus::kCancelled;
       result.decision = CollisionDecisionResult::kInconclusiveFail;
       result.raw_diagnostics["cancel_reason"] = cancel.reason();
+    }
+    if (after_check) {
+      after_check(query);
     }
     return result;
   }
@@ -291,6 +296,88 @@ TEST(CollisionValidationCoordinatorTest,
   ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
   EXPECT_EQ(*bundle.decision.first_failing_waypoint, 0);
   ASSERT_EQ(bundle.waypoint_records.size(), 3u);
+}
+
+TEST(CollisionValidationCoordinatorTest,
+     EngineBackedCancellationCarriesWaypointTimeWhenNoPriorFailure) {
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[2] = make_cancelled_result("operator_stop");
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_freespace_snapshot();
+  CollisionValidationCoordinator coord(cfg);
+
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(4), cancel);
+
+  EXPECT_TRUE(bundle.cancelled);
+  ASSERT_TRUE(bundle.cancelled_at_waypoint_index.has_value());
+  EXPECT_EQ(*bundle.cancelled_at_waypoint_index, 2);
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 2);
+  ASSERT_TRUE(bundle.decision.first_failing_time_ns.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_time_ns, 200'000'000);
+}
+
+TEST(CollisionValidationCoordinatorTest,
+     EngineBackedCancelAfterPriorRejectPreservesRejectTimeAndReason) {
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[1] =
+      make_colliding_result(CollisionPairId{"robot/link", "object/part"});
+  engine.result_by_waypoint[3] = make_cancelled_result("operator_stop");
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_freespace_snapshot();
+  CollisionValidationCoordinator coord(cfg);
+
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(5), cancel);
+
+  EXPECT_TRUE(bundle.cancelled);
+  ASSERT_TRUE(bundle.cancellation_reason.has_value());
+  EXPECT_EQ(*bundle.cancellation_reason, "operator_stop");
+  ASSERT_TRUE(bundle.cancelled_at_waypoint_index.has_value());
+  EXPECT_EQ(*bundle.cancelled_at_waypoint_index, 3);
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kReject);
+  ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 1);
+  ASSERT_TRUE(bundle.decision.first_failing_time_ns.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_time_ns, 100'000'000);
+}
+
+TEST(CollisionValidationCoordinatorTest,
+     LateCancelAfterPolicyPostPassCannotEscapeAccepted) {
+  MockCollisionQueryEngine engine;
+  CollisionCancellationToken cancel;
+  engine.after_check = [&cancel](const CollisionQuery& query) {
+    if (query.waypoint_index && *query.waypoint_index == 2) {
+      cancel.request_cancel("late_operator_stop");
+    }
+  };
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_freespace_snapshot();
+  CollisionValidationCoordinator coord(cfg);
+
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(3), cancel);
+
+  EXPECT_TRUE(bundle.cancelled);
+  ASSERT_TRUE(bundle.cancellation_reason.has_value());
+  EXPECT_EQ(*bundle.cancellation_reason, "late_operator_stop");
+  ASSERT_TRUE(bundle.cancelled_at_waypoint_index.has_value());
+  EXPECT_EQ(*bundle.cancelled_at_waypoint_index, 2);
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 2);
+  ASSERT_TRUE(bundle.decision.first_failing_time_ns.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_time_ns, 200'000'000);
 }
 
 // --- Contact-release on the engine-backed mock -----------------

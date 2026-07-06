@@ -809,9 +809,9 @@ class TestCycleManagerReset:
         """A reset phase that exceeds the bounded budget must not report IDLE."""
 
         class SlowResetKernel(MockKernelClient):
-            def reset(self):  # type: ignore[override]
+            def reset(self, *, expected_epoch=None):  # type: ignore[override]
                 time.sleep(0.02)
-                return super().reset()
+                return super().reset(expected_epoch=expected_epoch)
 
         monkeypatch.setattr(cycle_manager_module, "_RESET_PHASE_DEADLINE_S", 0.001)
         slow_kernel = SlowResetKernel()
@@ -839,8 +839,10 @@ class TestCycleManagerReset:
         force a fresh IDLE cycle over an uncleared kernel fault."""
 
         class RefusingResetKernel(MockKernelClient):
-            def reset(self):  # type: ignore[override]
+            def reset(self, *, expected_epoch=None):  # type: ignore[override]
                 self.reset_count += 1
+                if stale := self._stale_control_command(expected_epoch):
+                    return stale
                 return CommandResult(
                     accepted=False,
                     error="reset refused by test",
@@ -2808,6 +2810,489 @@ class TestStopWatcherEscalation:
         manager.reset()
         assert manager.state == CycleState.IDLE
 
+    def test_reset_status_phase_timeout_is_wall_clock_bounded(self, monkeypatch):
+        import manyforge_behavior.cycle_manager as cm
+
+        release_status = threading.Event()
+        status_entered = threading.Event()
+
+        class BlockingStatusKernel(MockKernelClient):
+            def get_status(self):  # type: ignore[override]
+                status_entered.set()
+                release_status.wait(timeout=5.0)
+                return super().get_status()
+
+        monkeypatch.setattr(cm, "_RESET_PHASE_DEADLINE_S", 0.02)
+        kernel = BlockingStatusKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        started = time.monotonic()
+        try:
+            with pytest.raises(RuntimeError, match="kernel_status"):
+                manager.reset(request_id="req-blocked-status")
+        finally:
+            release_status.set()
+
+        assert status_entered.is_set()
+        assert time.monotonic() - started < 0.5
+        assert manager.state == CycleState.STOPPED
+        assert manager.error_code == "reset_kernel_status_timeout"
+
+    def test_full_stop_blocked_status_arms_settle_watcher(self, monkeypatch):
+        import manyforge_behavior.cycle_manager as cm
+
+        release_status = threading.Event()
+
+        class BlockingStatusKernel(MockKernelClient):
+            def get_status(self):  # type: ignore[override]
+                release_status.wait(timeout=5.0)
+                return ExecutionStatus(
+                    state=ExecutionState.STOPPING,
+                    execution_id=1,
+                    progress=0.0,
+                    active_move_id="blocked_status",
+                )
+
+            def stop(self):  # type: ignore[override]
+                return CommandResult(accepted=True)
+
+        monkeypatch.setattr(cm, "_KERNEL_CONTROL_CALL_TIMEOUT_S", 0.02)
+        kernel = BlockingStatusKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager._state = CycleState.RUNNING
+
+        try:
+            started = time.monotonic()
+            manager.full_stop()
+            assert time.monotonic() - started < 0.5
+            self._await_state(manager, CycleState.STOPPED, timeout_s=1.0)
+            assert manager.error_code == "stop_settle_status_timeout"
+        finally:
+            release_status.set()
+
+    def test_motion_stop_blocked_post_status_arms_watcher(self, monkeypatch):
+        import manyforge_behavior.cycle_manager as cm
+
+        release_status = threading.Event()
+
+        class BlockingPostStopStatusKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__(execute_duration_s=5.0)
+                self.reads = 0
+
+            def get_status(self):  # type: ignore[override]
+                self.reads += 1
+                if self.reads == 1:
+                    return ExecutionStatus(
+                        state=ExecutionState.EXECUTING,
+                        execution_id=1,
+                        progress=0.0,
+                        active_move_id="blocked_motion_stop",
+                    )
+                release_status.wait(timeout=5.0)
+                return ExecutionStatus(
+                    state=ExecutionState.STOPPING,
+                    execution_id=1,
+                    progress=0.0,
+                    active_move_id="blocked_motion_stop",
+                )
+
+            def stop(self):  # type: ignore[override]
+                return CommandResult(accepted=True)
+
+        monkeypatch.setattr(cm, "_KERNEL_CONTROL_CALL_TIMEOUT_S", 0.02)
+        kernel = BlockingPostStopStatusKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager._state = CycleState.RUNNING
+
+        try:
+            started = time.monotonic()
+            manager.stop()
+            assert time.monotonic() - started < 0.5
+            self._await_state(manager, CycleState.STOPPED, timeout_s=1.0)
+            assert manager.error_code == "motion_stop_status_timeout"
+        finally:
+            release_status.set()
+
+
+class TestCycleManagerStopLivenessResiduals:
+    """Regression tests for WS4 F1/F2/F3 stop-liveness residuals."""
+
+    @staticmethod
+    def _await_state(manager, state, timeout_s=1.0):
+        deadline = time.monotonic() + timeout_s
+        while manager.state != state and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert manager.state == state
+
+    @staticmethod
+    def _stopped_manager(kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager.run()
+        deadline = time.monotonic() + 1.0
+        while kernel.execute_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        manager.full_stop()
+        assert manager.state == CycleState.STOPPED
+        return manager
+
+    @staticmethod
+    def _simple_intervention_tree():
+        return {
+            "id": "timer",
+            "name": "ws4_liveness_timer",
+            "params": {"duration_s": 0.05},
+        }
+
+    def test_ack_retry_blocked_status_does_not_hold_cycle_lock(self, monkeypatch):
+        release_status = threading.Event()
+        status_entered = threading.Event()
+
+        class BlockingStatusKernel(MockKernelClient):
+            def get_status(self):  # type: ignore[override]
+                status_entered.set()
+                release_status.wait(timeout=5.0)
+                return ExecutionStatus(
+                    state=ExecutionState.INTERVENTION_REQUIRED,
+                    execution_id=1,
+                    progress=0.0,
+                    active_move_id="blocked_ack_status",
+                )
+
+        monkeypatch.setattr(
+            cycle_manager_module,
+            "_KERNEL_CONTROL_CALL_TIMEOUT_S",
+            0.02,
+        )
+        kernel = BlockingStatusKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager._state = CycleState.STOPPED
+
+        errors: list[BaseException] = []
+
+        def acknowledge() -> None:
+            try:
+                manager.acknowledge_intervention_for_retry()
+            except BaseException as exc:  # noqa: BLE001 - inspected below.
+                errors.append(exc)
+
+        thread = threading.Thread(target=acknowledge, daemon=True)
+        thread.start()
+        try:
+            assert status_entered.wait(timeout=1.0)
+            started = time.monotonic()
+            assert manager.motion_stop_state == "idle"
+            manager.full_stop()
+            assert time.monotonic() - started < 0.2
+            thread.join(timeout=1.0)
+            assert any(isinstance(exc, TimeoutError) for exc in errors)
+        finally:
+            release_status.set()
+            thread.join(timeout=1.0)
+
+    def test_ack_retry_blocked_ack_does_not_hold_cycle_lock(self, monkeypatch):
+        release_ack = threading.Event()
+        ack_entered = threading.Event()
+
+        class BlockingAckKernel(MockKernelClient):
+            def get_status(self):  # type: ignore[override]
+                return ExecutionStatus(
+                    state=ExecutionState.INTERVENTION_REQUIRED,
+                    execution_id=1,
+                    progress=0.0,
+                    active_move_id="blocked_ack",
+                )
+
+            def acknowledge_intervention_for_retry(  # type: ignore[override]
+                self,
+                principal_id,
+                reason,
+                *,
+                expected_epoch=None,
+            ):
+                ack_entered.set()
+                release_ack.wait(timeout=5.0)
+                return super().acknowledge_intervention_for_retry(
+                    principal_id,
+                    reason,
+                    expected_epoch=expected_epoch,
+                )
+
+        monkeypatch.setattr(
+            cycle_manager_module,
+            "_KERNEL_CONTROL_CALL_TIMEOUT_S",
+            0.02,
+        )
+        kernel = BlockingAckKernel()
+        kernel._state = ExecutionState.INTERVENTION_REQUIRED
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager._state = CycleState.STOPPED
+
+        errors: list[BaseException] = []
+
+        def acknowledge() -> None:
+            try:
+                manager.acknowledge_intervention_for_retry()
+            except BaseException as exc:  # noqa: BLE001 - inspected below.
+                errors.append(exc)
+
+        thread = threading.Thread(target=acknowledge, daemon=True)
+        thread.start()
+        try:
+            assert ack_entered.wait(timeout=1.0)
+            started = time.monotonic()
+            assert manager.motion_stop_state == "idle"
+            manager.full_stop()
+            assert time.monotonic() - started < 0.2
+            thread.join(timeout=1.0)
+            assert any(isinstance(exc, TimeoutError) for exc in errors)
+        finally:
+            release_ack.set()
+            thread.join(timeout=1.0)
+
+    def test_start_intervention_blocked_status_does_not_hold_cycle_lock(self, monkeypatch):
+        release_status = threading.Event()
+        status_entered = threading.Event()
+
+        class BlockingStatusKernel(MockKernelClient):
+            def get_status(self):  # type: ignore[override]
+                status_entered.set()
+                release_status.wait(timeout=5.0)
+                return ExecutionStatus(
+                    state=ExecutionState.IDLE,
+                    execution_id=0,
+                    progress=0.0,
+                    active_move_id="blocked_intervention_status",
+                )
+
+        monkeypatch.setattr(
+            cycle_manager_module,
+            "_KERNEL_CONTROL_CALL_TIMEOUT_S",
+            0.02,
+        )
+        kernel = BlockingStatusKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        errors: list[BaseException] = []
+
+        def start_intervention() -> None:
+            try:
+                manager.execute_intervention(
+                    self._simple_intervention_tree(),
+                    session_kind="manual_intervention",
+                    authority_source="human",
+                    principal_id="human:test",
+                    approval_mode="human_approved",
+                )
+            except BaseException as exc:  # noqa: BLE001 - inspected below.
+                errors.append(exc)
+
+        thread = threading.Thread(target=start_intervention, daemon=True)
+        thread.start()
+        try:
+            assert status_entered.wait(timeout=1.0)
+            started = time.monotonic()
+            assert manager.motion_stop_state == "idle"
+            manager.full_stop()
+            assert time.monotonic() - started < 0.2
+            thread.join(timeout=1.0)
+            assert any(isinstance(exc, TimeoutError) for exc in errors)
+        finally:
+            release_status.set()
+            thread.join(timeout=1.0)
+
+    def test_full_stop_scene_fingerprint_timeout_is_bounded(self, monkeypatch):
+        release_scene = threading.Event()
+        scene_entered = threading.Event()
+
+        class BlockingSceneKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__(execute_duration_s=5.0)
+                self.block_scene = False
+
+            def get_scene_objects(self):  # type: ignore[override]
+                if self.block_scene:
+                    scene_entered.set()
+                    release_scene.wait(timeout=5.0)
+                return super().get_scene_objects()
+
+        monkeypatch.setattr(
+            cycle_manager_module,
+            "_KERNEL_CONTROL_CALL_TIMEOUT_S",
+            0.02,
+        )
+        kernel = BlockingSceneKernel()
+        manager = self._stopped_manager(kernel)
+
+        manager.run()
+        assert manager.state == CycleState.RUNNING
+        kernel.block_scene = True
+        try:
+            started = time.monotonic()
+            manager.full_stop()
+            assert time.monotonic() - started < 0.5
+            assert scene_entered.is_set()
+            assert manager.state == CycleState.STOPPED
+            assert manager._resumable_stop_scene_fingerprint is None
+            assert "TimeoutError" in (
+                manager._resumable_stop_scene_fingerprint_error or ""
+            )
+        finally:
+            release_scene.set()
+
+    def test_stop_settle_watcher_does_not_wait_for_scene_fingerprint(
+        self,
+        monkeypatch,
+    ):
+        release_scene = threading.Event()
+        scene_entered = threading.Event()
+
+        class TerminalThenBlockingSceneKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__(execute_duration_s=5.0)
+                self.stop_called = threading.Event()
+                self.post_stop_reads = 0
+
+            def stop(self):  # type: ignore[override]
+                self.stop_called.set()
+                return CommandResult(accepted=True)
+
+            def get_status(self):  # type: ignore[override]
+                if not self.stop_called.is_set():
+                    return ExecutionStatus(
+                        state=ExecutionState.EXECUTING,
+                        execution_id=1,
+                        progress=0.0,
+                        active_move_id="watcher_scene",
+                    )
+                self.post_stop_reads += 1
+                state = (
+                    ExecutionState.STOPPING
+                    if self.post_stop_reads == 1
+                    else ExecutionState.STOPPED
+                )
+                return ExecutionStatus(
+                    state=state,
+                    execution_id=1,
+                    progress=0.0,
+                    active_move_id="watcher_scene",
+                )
+
+            def get_scene_objects(self):  # type: ignore[override]
+                scene_entered.set()
+                release_scene.wait(timeout=5.0)
+                return super().get_scene_objects()
+
+        monkeypatch.setattr(
+            cycle_manager_module,
+            "_KERNEL_CONTROL_CALL_TIMEOUT_S",
+            0.02,
+        )
+        kernel = TerminalThenBlockingSceneKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner.load()
+        manager = CycleManager(runner, kernel)
+        manager._state = CycleState.RUNNING
+        manager._tree = runner.build_tree()
+
+        try:
+            manager.full_stop()
+            assert manager.state == CycleState.STOPPING
+            assert scene_entered.wait(timeout=1.0)
+            self._await_state(manager, CycleState.STOPPED, timeout_s=0.5)
+            fingerprint_error = manager._resumable_stop_scene_fingerprint_error or ""
+            assert (
+                fingerprint_error == "scene fingerprint capture pending"
+                or "TimeoutError" in fingerprint_error
+            )
+        finally:
+            release_scene.set()
+
+    def test_full_stop_during_run_transition_is_honored(self):
+        release_status = threading.Event()
+        status_entered = threading.Event()
+
+        class BlockingResumeStatusKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__(execute_duration_s=5.0)
+                self.block_resume_status = False
+
+            def get_status(self):  # type: ignore[override]
+                if self.block_resume_status:
+                    status_entered.set()
+                    release_status.wait(timeout=5.0)
+                    self.block_resume_status = False
+                    return ExecutionStatus(
+                        state=ExecutionState.IDLE,
+                        execution_id=0,
+                        progress=0.0,
+                        active_move_id="resume_full_stop",
+                    )
+                return super().get_status()
+
+        kernel = BlockingResumeStatusKernel()
+        manager = self._stopped_manager(kernel)
+        kernel.block_resume_status = True
+
+        run_thread = threading.Thread(target=manager.run, daemon=True)
+        run_thread.start()
+        assert status_entered.wait(timeout=1.0)
+
+        manager.full_stop()
+        release_status.set()
+        run_thread.join(timeout=1.0)
+
+        assert not run_thread.is_alive()
+        assert manager.state == CycleState.STOPPED
+        assert manager._pending_run_stop is None
+
+    def test_motion_stop_during_run_transition_is_honored(self):
+        release_status = threading.Event()
+        status_entered = threading.Event()
+
+        class BlockingResumeStatusKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__(execute_duration_s=5.0)
+                self.block_resume_status = False
+
+            def get_status(self):  # type: ignore[override]
+                if self.block_resume_status:
+                    status_entered.set()
+                    release_status.wait(timeout=5.0)
+                    self.block_resume_status = False
+                    return ExecutionStatus(
+                        state=ExecutionState.IDLE,
+                        execution_id=0,
+                        progress=0.0,
+                        active_move_id="resume_motion_stop",
+                    )
+                return super().get_status()
+
+        kernel = BlockingResumeStatusKernel()
+        manager = self._stopped_manager(kernel)
+        kernel.block_resume_status = True
+
+        run_thread = threading.Thread(target=manager.run, daemon=True)
+        run_thread.start()
+        assert status_entered.wait(timeout=1.0)
+
+        manager.stop()
+        release_status.set()
+        run_thread.join(timeout=1.0)
+
+        assert not run_thread.is_alive()
+        assert manager.state == CycleState.RUNNING
+        assert manager.motion_stop_state == "held"
+        assert manager._pending_run_stop is None
+        manager.full_stop()
+
 
 class TestMotionErrorReadAllocation:
     """The 100 Hz motion-error read must not grow py_trees global state."""
@@ -2936,3 +3421,174 @@ class TestProgramRunIdThreading:
         manager.run()  # fresh program start: new id
         assert manager._program_run_id and manager._program_run_id != first
         manager.shutdown(timeout_s=2.0)
+
+
+class TestControlCommandEpoch:
+    def test_timed_out_resume_invalidates_abandoned_worker(self, monkeypatch):
+        release_resume = threading.Event()
+        resume_entered = threading.Event()
+        resume_done = threading.Event()
+
+        class BlockingResumeKernel(MockKernelClient):
+            def get_status(self):  # type: ignore[override]
+                return ExecutionStatus(
+                    state=ExecutionState.PAUSED,
+                    execution_id=1,
+                    progress=0.0,
+                    active_move_id="late_resume",
+                )
+
+            def resume(self, *, expected_epoch=None):  # type: ignore[override]
+                resume_entered.set()
+                release_resume.wait(timeout=5.0)
+                try:
+                    return super().resume(expected_epoch=expected_epoch)
+                finally:
+                    resume_done.set()
+
+        monkeypatch.setattr(
+            cycle_manager_module,
+            "_KERNEL_CONTROL_CALL_TIMEOUT_S",
+            0.02,
+        )
+        kernel = BlockingResumeKernel(execute_duration_s=5.0)
+        kernel._state = ExecutionState.PAUSED  # noqa: SLF001
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner.load()
+        manager = CycleManager(runner, kernel)
+        manager._tree = runner.build_tree()  # noqa: SLF001
+        manager._state = CycleState.STOPPED  # noqa: SLF001
+        with manager._lock:  # noqa: SLF001
+            manager._store_resumable_stop_scene_fingerprint_locked(  # noqa: SLF001
+                _scene_resume_fingerprint_from_objects(kernel.get_scene_objects()),
+                None,
+            )
+
+        with pytest.raises(TimeoutError):
+            manager.run()
+
+        assert resume_entered.is_set()
+        assert kernel.control_command_epoch() == 1
+        release_resume.set()
+        assert resume_done.wait(timeout=1.0)
+        assert kernel.resume_count == 0
+        assert kernel.get_status().state == ExecutionState.PAUSED
+        assert manager.state == CycleState.STOPPED
+
+    def test_ack_retry_during_wedged_run_transition_is_bounded(self, monkeypatch):
+        release_status = threading.Event()
+        status_entered = threading.Event()
+
+        class FirstRunStatusBlocksKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__(execute_duration_s=5.0)
+                self._status_calls = 0
+                self._status_lock = threading.Lock()
+
+            def get_status(self):  # type: ignore[override]
+                with self._status_lock:
+                    self._status_calls += 1
+                    status_call = self._status_calls
+                if status_call == 1:
+                    status_entered.set()
+                    release_status.wait(timeout=5.0)
+                    return ExecutionStatus(
+                        state=ExecutionState.PAUSED,
+                        execution_id=1,
+                        progress=0.0,
+                        active_move_id="wedged_run",
+                    )
+                return ExecutionStatus(
+                    state=ExecutionState.INTERVENTION_REQUIRED,
+                    execution_id=1,
+                    progress=0.0,
+                    active_move_id="ack_after_wedged_run",
+                )
+
+        monkeypatch.setattr(
+            cycle_manager_module,
+            "_KERNEL_CONTROL_CALL_TIMEOUT_S",
+            0.02,
+        )
+        kernel = FirstRunStatusBlocksKernel()
+        kernel._state = ExecutionState.INTERVENTION_REQUIRED  # noqa: SLF001
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner.load()
+        manager = CycleManager(runner, kernel)
+        manager._tree = runner.build_tree()  # noqa: SLF001
+        manager._state = CycleState.STOPPED  # noqa: SLF001
+        with manager._lock:  # noqa: SLF001
+            manager._store_resumable_stop_scene_fingerprint_locked(  # noqa: SLF001
+                _scene_resume_fingerprint_from_objects(kernel.get_scene_objects()),
+                None,
+            )
+
+        run_errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                manager.run()
+            except BaseException as exc:  # noqa: BLE001 - inspected below.
+                run_errors.append(exc)
+
+        run_thread = threading.Thread(target=run, daemon=True)
+        run_thread.start()
+        try:
+            assert status_entered.wait(timeout=1.0)
+            ack_errors: list[BaseException] = []
+            ack_elapsed: list[float] = []
+
+            def acknowledge() -> None:
+                started = time.monotonic()
+                try:
+                    manager.acknowledge_intervention_for_retry()
+                except BaseException as exc:  # noqa: BLE001 - inspected below.
+                    ack_errors.append(exc)
+                finally:
+                    ack_elapsed.append(time.monotonic() - started)
+
+            ack_thread = threading.Thread(target=acknowledge, daemon=True)
+            ack_thread.start()
+            ack_thread.join(timeout=0.5)
+            assert not ack_thread.is_alive()
+            assert not ack_errors
+            assert ack_elapsed and ack_elapsed[0] < 0.3
+            run_thread.join(timeout=1.0)
+            assert not run_thread.is_alive()
+            assert any(isinstance(exc, TimeoutError) for exc in run_errors)
+            assert kernel.acknowledge_intervention_for_retry_count == 1
+            assert manager.state == CycleState.STOPPED
+        finally:
+            release_status.set()
+            run_thread.join(timeout=1.0)
+
+    def test_timed_out_reset_invalidates_abandoned_worker(self, monkeypatch):
+        release_reset = threading.Event()
+        reset_entered = threading.Event()
+        reset_done = threading.Event()
+
+        class BlockingResetKernel(MockKernelClient):
+            def reset(self, *, expected_epoch=None):  # type: ignore[override]
+                reset_entered.set()
+                release_reset.wait(timeout=5.0)
+                try:
+                    return super().reset(expected_epoch=expected_epoch)
+                finally:
+                    reset_done.set()
+
+        monkeypatch.setattr(cycle_manager_module, "_RESET_PHASE_DEADLINE_S", 0.02)
+        kernel = BlockingResetKernel()
+        kernel._state = ExecutionState.STOPPED  # noqa: SLF001
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        with pytest.raises(RuntimeError, match="kernel_reset"):
+            manager.reset(request_id="reset-epoch-timeout")
+
+        assert reset_entered.is_set()
+        assert kernel.control_command_epoch() == 1
+        release_reset.set()
+        assert reset_done.wait(timeout=1.0)
+        assert kernel.reset_count == 0
+        assert kernel.get_status().state == ExecutionState.STOPPED
+        assert manager.state == CycleState.STOPPED

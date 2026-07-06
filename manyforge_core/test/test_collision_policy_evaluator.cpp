@@ -7,6 +7,8 @@
 
 #include <gtest/gtest.h>
 
+#include <memory>
+
 namespace manyforge::core {
 namespace {
 
@@ -242,6 +244,31 @@ TEST(CollisionPolicyEvaluator, ResetClearsSupportContactStateMachine) {
   EXPECT_EQ(after_reset.pairs[0].classification,
             CollisionPairClassification::kSupportContactStart);
   EXPECT_TRUE(after_reset.decision.accepted);
+}
+
+TEST(CollisionPolicyEvaluator,
+     SharedPolicyIndexDoesNotShareSupportContactStateMachine) {
+  const auto p = pair("object/cheese_box/shape/0",
+                      "robot/ur10e/attached/cheese_box/shape/0");
+  auto snapshot = std::make_shared<CollisionPolicySnapshot>(
+      make_support_contact_policy(p, /*allow_recontact=*/false));
+  auto index = build_collision_policy_index(*snapshot);
+  CollisionPolicyEvaluator first(snapshot, index);
+  CollisionPolicyEvaluator second(snapshot, index);
+
+  first.classify({p}, rev(2, "world-r2"));
+  first.classify({}, rev(2, "world-r2"));
+  auto first_recontact = first.classify({p}, rev(2, "world-r2"));
+  ASSERT_EQ(first_recontact.pairs.size(), 1u);
+  EXPECT_EQ(first_recontact.pairs[0].classification,
+            CollisionPairClassification::kSupportContactRecontactViolation);
+  EXPECT_FALSE(first_recontact.decision.accepted);
+
+  auto second_first_contact = second.classify({p}, rev(2, "world-r2"));
+  ASSERT_EQ(second_first_contact.pairs.size(), 1u);
+  EXPECT_EQ(second_first_contact.pairs[0].classification,
+            CollisionPairClassification::kSupportContactStart);
+  EXPECT_TRUE(second_first_contact.decision.accepted);
 }
 
 // --- Diagnostic-incomplete fail-closed -------------------------------------
