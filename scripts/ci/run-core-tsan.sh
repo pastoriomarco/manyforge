@@ -6,6 +6,21 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build/tsan-manyforge-core}"
 PARALLEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 GTEST_TIMEOUT_SECONDS="${MANYFORGE_TSAN_GTEST_TIMEOUT_SECONDS:-300}"
+TSAN_SUPPRESSIONS="${TSAN_SUPPRESSIONS:-${REPO_ROOT}/scripts/ci/tsan.supp}"
+
+if [[ ! -f "${TSAN_SUPPRESSIONS}" ]]; then
+  echo "TSan suppression file not found: ${TSAN_SUPPRESSIONS}" >&2
+  exit 2
+fi
+
+TSAN_OPTIONS="${TSAN_OPTIONS:-halt_on_error=1 second_deadlock_stack=1 history_size=7}"
+if [[ "${TSAN_OPTIONS}" != *"exitcode="* ]]; then
+  TSAN_OPTIONS="${TSAN_OPTIONS} exitcode=66"
+fi
+if [[ "${TSAN_OPTIONS}" != *"suppressions="* ]]; then
+  TSAN_OPTIONS="${TSAN_OPTIONS} suppressions=${TSAN_SUPPRESSIONS}"
+fi
+export TSAN_OPTIONS
 
 # `-Wno-error=array-bounds` works around a known gcc-13 false positive on
 # `std::vector<T>::push_back` where the inner element is itself a small

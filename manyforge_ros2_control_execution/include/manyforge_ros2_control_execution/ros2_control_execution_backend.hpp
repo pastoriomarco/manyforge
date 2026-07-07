@@ -82,6 +82,17 @@ struct Ros2GripperStatus {
   std::string reason_code;
 };
 
+struct Ros2ControlSceneProjectionMetrics {
+  std::uint64_t misses_total = 0;
+  std::uint64_t successful_updates_total = 0;
+  std::uint64_t lag_max_ns = 0;
+  std::int64_t last_success_timestamp_ns = 0;
+  std::uint64_t last_success_age_ns = 0;
+  std::uint64_t terminal_retries_scheduled_total = 0;
+  std::uint64_t terminal_retry_successes_total = 0;
+  std::uint64_t terminal_retry_exhausted_total = 0;
+};
+
 /// Controller-backed execution backend for ros2_control/JTC deployments.
 ///
 /// This class owns the timing-sensitive ROS boundary: action lifecycle,
@@ -181,6 +192,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   // configured for this deployment (callers must treat that as a contract
   // error when they required gating).
   bool request_command_gate(bool enabled);
+  Ros2ControlSceneProjectionMetrics scene_projection_metrics() const;
 
 #ifdef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
   using TestingFollowJointTrajectory =
@@ -263,9 +275,9 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   }
 
   void testing_store_action_feedback_sample(
-      std::vector<std::string> joint_names,
-      std::vector<double> positions,
-      std::vector<double> velocities,
+      const std::vector<std::string>& joint_names,
+      const std::vector<double>& positions,
+      const std::vector<double>& velocities,
       std::chrono::steady_clock::time_point received_at) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (!latest_action_feedback_.has_value()) {
@@ -285,6 +297,10 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
     return latest_action_feedback_.has_value()
                ? latest_action_feedback_->positions.capacity()
                : 0;
+  }
+
+  void testing_complete_execution() {
+    complete_execution();
   }
 #endif
 
@@ -332,6 +348,11 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
     std::chrono::steady_clock::time_point observed_at;
   };
 
+  struct PendingTerminalSceneProjection {
+    std::vector<double> joint_positions;
+    std::int64_t source_timestamp_ns = 0;
+  };
+
   enum class SceneUpdateMode {
     kBlocking,
     kBestEffort,
@@ -377,6 +398,8 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   void on_action_result(const GoalHandleFJT::WrappedResult& result);
 
   std::optional<JointSample> select_latest_sample_locked(
+      std::chrono::steady_clock::time_point now) const;
+  const JointSample* select_latest_sample_ptr_locked(
       std::chrono::steady_clock::time_point now) const;
   std::optional<JointSample> select_latest_sample_after_locked(
       std::chrono::steady_clock::time_point now,
@@ -426,8 +449,20 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       std::chrono::steady_clock::time_point deadline);
   void complete_managed_controlled_stop_execution();
   core::Result<void> command_sim_initial_state(std::string phase);
-  bool update_scene_positions(const std::vector<double>& joint_positions,
-                              SceneUpdateMode mode = SceneUpdateMode::kBlocking);
+  bool update_scene_positions(
+      const std::vector<double>& joint_positions,
+      SceneUpdateMode mode = SceneUpdateMode::kBlocking,
+      std::int64_t source_timestamp_ns = 0);
+  void project_terminal_scene_positions(
+      const std::vector<double>& joint_positions,
+      std::int64_t source_timestamp_ns);
+  void schedule_terminal_scene_projection_retry(
+      std::vector<double> joint_positions,
+      std::int64_t source_timestamp_ns);
+  void terminal_scene_projection_retry_worker(std::stop_token stop_token);
+  void stop_terminal_scene_projection_retry_worker() noexcept;
+  void record_scene_projection_success(std::int64_t source_timestamp_ns);
+  void record_scene_projection_miss();
   std::optional<double> scene_group_joint_position(
       const std::string& group_id,
       const std::string& joint_name) const;
@@ -615,6 +650,17 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   std::optional<double> controlled_stop_path_deviation_max_rad_;
   std::size_t controlled_stop_path_deviation_feedback_samples_ = 0;
   std::optional<core::ErrorDTO> controlled_stop_path_deviation_error_;
+  std::atomic<std::uint64_t> scene_projection_misses_total_{0};
+  std::atomic<std::uint64_t> scene_projection_successes_total_{0};
+  std::atomic<std::uint64_t> scene_projection_lag_max_ns_{0};
+  std::atomic<std::int64_t> scene_projection_last_success_timestamp_ns_{0};
+  std::atomic<std::uint64_t> terminal_scene_projection_retries_scheduled_total_{0};
+  std::atomic<std::uint64_t> terminal_scene_projection_retry_successes_total_{0};
+  std::atomic<std::uint64_t> terminal_scene_projection_retry_exhausted_total_{0};
+  mutable std::mutex terminal_scene_projection_retry_mutex_;
+  std::condition_variable_any terminal_scene_projection_retry_cv_;
+  std::optional<PendingTerminalSceneProjection> pending_terminal_scene_projection_;
+  std::jthread terminal_scene_projection_retry_thread_;
 };
 
 }  // namespace manyforge::ros2_control_execution

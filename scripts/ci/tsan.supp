@@ -1,0 +1,9 @@
+# ThreadSanitizer suppressions for known non-ManyForge middleware teardown noise.
+#
+# Keep these narrow. The observed report (2026-07-06) was entirely inside
+# Fast-DDS/rmw_fastrtps participant destruction, with no manyforge frames.
+# Do not add broad package-wide or wildcard suppressions here.
+race:eprosima::fastrtps::rtps::ReaderProxy::stop
+race:eprosima::fastdds::rtps::ReaderProxy::stop
+race:eprosima::fastrtps::rtps::RTPSReader
+race:eprosima::fastdds::rtps::RTPSReader

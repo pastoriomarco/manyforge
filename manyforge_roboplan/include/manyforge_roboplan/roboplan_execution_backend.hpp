@@ -35,6 +35,9 @@ struct RoboPlanSceneProjectionMetrics {
   std::uint64_t lag_max_ns = 0;
   std::int64_t last_success_timestamp_ns = 0;
   std::uint64_t last_success_age_ns = 0;
+  std::uint64_t terminal_retries_scheduled_total = 0;
+  std::uint64_t terminal_retry_successes_total = 0;
+  std::uint64_t terminal_retry_exhausted_total = 0;
 };
 
 /// Simulated execution backend that updates the planning scene
@@ -101,7 +104,7 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   // monitor reads the published snapshot as the authoritative robot state;
   // the scene projection is for visualization/planning convergence and may
   // skip intermediate samples under contention.
-  void update_scene_positions(const std::vector<double>& joint_positions,
+  bool update_scene_positions(const std::vector<double>& joint_positions,
                               SceneUpdateMode mode = SceneUpdateMode::kBlocking,
                               std::int64_t source_timestamp_ns = 0);
   void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory);
@@ -110,6 +113,16 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   bool end_controlled_stop_runtime_scale_freeze();
   void record_scene_projection_success(std::int64_t source_timestamp_ns);
   void record_scene_projection_miss();
+  void schedule_terminal_scene_projection_retry(
+      std::vector<double> joint_positions,
+      std::int64_t source_timestamp_ns);
+  void terminal_scene_projection_retry_worker(std::stop_token stop_token);
+  void stop_terminal_scene_projection_retry_worker() noexcept;
+
+  struct PendingTerminalSceneProjection {
+    std::vector<double> joint_positions;
+    std::int64_t source_timestamp_ns = 0;
+  };
 
   std::shared_ptr<roboplan::Scene> scene_;
   std::string group_name_;
@@ -136,6 +149,13 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   std::atomic<std::uint64_t> scene_projection_successes_total_{0};
   std::atomic<std::uint64_t> scene_projection_lag_max_ns_{0};
   std::atomic<std::int64_t> scene_projection_last_success_timestamp_ns_{0};
+  std::atomic<std::uint64_t> terminal_scene_projection_retries_scheduled_total_{0};
+  std::atomic<std::uint64_t> terminal_scene_projection_retry_successes_total_{0};
+  std::atomic<std::uint64_t> terminal_scene_projection_retry_exhausted_total_{0};
+  mutable std::mutex terminal_scene_projection_retry_mutex_;
+  std::condition_variable_any terminal_scene_projection_retry_cv_;
+  std::optional<PendingTerminalSceneProjection> pending_terminal_scene_projection_;
+  std::jthread terminal_scene_projection_retry_thread_;
 };
 
 }  // namespace manyforge::roboplan_backend

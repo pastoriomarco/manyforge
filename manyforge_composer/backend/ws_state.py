@@ -89,7 +89,12 @@ class StateHub:
             if native_kernel_events:
                 if hasattr(state, "event_recorder"):
                     state.event_recorder.record_native_kernel_events(
-                        native_kernel_events
+                        native_kernel_events,
+                        pipeline_status=(
+                            state.cycle_manager.kernel_event_pipeline_status()
+                            if state.cycle_manager is not None
+                            else None
+                        ),
                     )
                 self._last_kernel_event_index = native_kernel_events[-1].get(
                     "event_index", self._last_kernel_event_index
@@ -167,6 +172,11 @@ class StateHub:
         """
         while self._running:
             try:
+                # Keep a fresh monotonic<->wall clock anchor near every event
+                # window (rate-limited inside; observability plan OW2).
+                refresh_anchor = getattr(self._state, "refresh_clock_anchor", None)
+                if refresh_anchor is not None:
+                    await asyncio.to_thread(refresh_anchor)
                 data = await asyncio.to_thread(
                     self._collect_frame,
                     include_payload=bool(self._connections),

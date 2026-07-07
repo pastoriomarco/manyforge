@@ -93,7 +93,10 @@ def create_app(
                 if state.cycle_manager is not None:
                     state.cycle_manager.drain_kernel_events_now()
                     recorder.record_native_kernel_events(
-                        state.cycle_manager.get_kernel_events_since(0)
+                        state.cycle_manager.get_kernel_events_since(0),
+                        pipeline_status=(
+                            state.cycle_manager.kernel_event_pipeline_status()
+                        ),
                     )
                 recorder.observe(state, force=True)
 

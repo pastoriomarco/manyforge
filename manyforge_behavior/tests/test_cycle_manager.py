@@ -21,6 +21,7 @@ from manyforge_behavior.kernel_client import (
     SceneShape,
 )
 from manyforge_behavior.runner import OrchestratorRunner
+from manyforge_behavior.signals import SignalUpdate
 from manyforge_behavior.cycle_manager import (
     ROS2_CONTROL_BACKEND_FAULT_CLASSES,
     CycleManager,
@@ -513,6 +514,23 @@ class TestCycleManagerStop:
             "tick loop must sleep via _tick_stop_event.wait(timeout=...), "
             "not time.sleep()"
         )
+
+    def test_paused_tick_loop_uses_bounded_event_wait(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager._tick_pause_event.clear()
+        manager._tick_stop_event.clear()
+        wait_timeouts = []
+
+        def recording_wait(timeout=None):
+            wait_timeouts.append(timeout)
+            manager._tick_stop_event.set()
+            return False
+
+        manager._tick_pause_event.wait = recording_wait
+        manager._tick_loop()
+
+        assert wait_timeouts == [cycle_manager_module._PAUSED_TICK_WAIT_S]
 
     def test_stop_from_stopped_is_noop(self, kernel):
         """stop() from STOPPED is a no-op."""
@@ -1124,6 +1142,24 @@ class TestCycleManagerReset:
 
 
 class TestCycleManagerSignalRegistry:
+    class _CountingProvider:
+        adapter_id = "plc"
+
+        def __init__(self) -> None:
+            self.poll_count = 0
+
+        def poll_signal_updates(self, now_ns: int):
+            self.poll_count += 1
+            return [
+                SignalUpdate(
+                    adapter="plc",
+                    signal="cell.ready",
+                    value=True,
+                    observed_at_ns=100,
+                    mirror_key="cell/ready",
+                )
+            ]
+
     def test_external_signal_mirrors_to_blackboard_and_clears_when_stale(self, kernel):
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
@@ -1145,6 +1181,39 @@ class TestCycleManagerSignalRegistry:
             py_trees.blackboard.Blackboard.get("cell/ready")
         snapshot = manager.get_signal_snapshot()
         assert snapshot["signals"]["plc:cell.ready"]["freshness"] == "stale"
+
+    def test_refresh_signal_registry_skips_sync_until_provider_or_signal_changes(
+        self,
+        kernel,
+    ):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager._signal_provider_poll_ticks = 3
+        provider = self._CountingProvider()
+        manager.register_signal_provider(provider)
+
+        sync_calls = []
+        original_sync = manager._sync_signal_blackboard
+
+        def recording_sync(now_ns: int) -> None:
+            sync_calls.append(now_ns)
+            original_sync(now_ns)
+
+        manager._sync_signal_blackboard = recording_sync
+
+        manager._refresh_signal_registry()
+        assert provider.poll_count == 1
+        assert len(sync_calls) == 1
+        assert py_trees.blackboard.Blackboard.get("cell/ready") is True
+
+        manager._refresh_signal_registry()
+        manager._refresh_signal_registry()
+        assert provider.poll_count == 1
+        assert len(sync_calls) == 1
+
+        manager._refresh_signal_registry()
+        assert provider.poll_count == 2
+        assert len(sync_calls) == 1
 
     def test_force_current_evidence_publishes_bounded_boolean_signal(self, kernel):
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
@@ -1707,6 +1776,60 @@ class TestIntervention:
         assert session.principal_id == "human:test-operator"
         assert session.grant_type == "human_approved"
 
+    def test_intervention_session_events_are_bounded(self, kernel):
+        session = InterventionSession(
+            session_id="sess-bounded",
+            parent_run_id=None,
+            entry_state="idle",
+            lease_timeout_ms=10_000,
+            lease_expires_at_ns=time.monotonic_ns() + 10_000_000_000,
+            resume_target="stay_idle",
+        )
+
+        for index in range(cycle_manager_module._INTERVENTION_SESSION_EVENT_LIMIT + 17):
+            session.record_event("session_progress", value=index)
+
+        assert len(session.events) == cycle_manager_module._INTERVENTION_SESSION_EVENT_LIMIT
+        assert session.events[0]["event_index"] == 18
+        assert session.events[-1]["event_index"] == (
+            cycle_manager_module._INTERVENTION_SESSION_EVENT_LIMIT + 17
+        )
+
+    def test_paused_intervention_tick_loop_uses_bounded_event_wait(
+        self,
+        kernel,
+        monkeypatch,
+    ):
+        manager = self._make_manager(kernel)
+        session = InterventionSession(
+            session_id="sess-paused",
+            parent_run_id=None,
+            entry_state="idle",
+            lease_timeout_ms=10_000,
+            lease_expires_at_ns=time.monotonic_ns() + 10_000_000_000,
+            resume_target="stay_idle",
+        )
+        manager._tick_pause_event.clear()
+        manager._tick_stop_event.clear()
+        wait_timeouts = []
+
+        def recording_wait(timeout=None):
+            wait_timeouts.append(timeout)
+            manager._tick_stop_event.set()
+            return False
+
+        monkeypatch.setattr(manager._tick_pause_event, "wait", recording_wait)
+        monkeypatch.setattr(manager, "_finish_intervention", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            manager,
+            "_restore_after_intervention",
+            lambda *args, **kwargs: None,
+        )
+
+        manager._intervention_tick_loop(session)
+
+        assert wait_timeouts == [cycle_manager_module._PAUSED_TICK_WAIT_S]
+
     def test_grant_type_human_approved_requires_human_authority(self, kernel):
         """grant_type=human_approved is invalid with non-human authority_source."""
         manager = self._make_manager(kernel)
@@ -2111,6 +2234,32 @@ class TestKernelEventBridge:
         assert len(new_events) == 0
 
         manager.reset()
+
+    def test_get_kernel_events_since_matches_full_scan_after_ring_wrap(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        with manager._lock:
+            for index in range(1, 5001):
+                manager._kernel_events.append(
+                    {"event_index": index, "type": "fixture", "payload": index}
+                )
+            buffered = list(manager._kernel_events)
+
+        for event_index in (
+            0,
+            buffered[0]["event_index"] - 1,
+            buffered[0]["event_index"],
+            buffered[len(buffered) // 2]["event_index"],
+            buffered[-1]["event_index"] - 1,
+            buffered[-1]["event_index"],
+        ):
+            expected = [
+                dict(event)
+                for event in buffered
+                if event["event_index"] > event_index
+            ]
+            assert manager.get_kernel_events_since(event_index) == expected
 
     def test_cycle_manager_drains_direct_kernel_events_on_demand(self, kernel):
         """Direct kernel calls can be surfaced without waiting for a tree tick."""
@@ -3592,3 +3741,35 @@ class TestControlCommandEpoch:
         assert kernel.reset_count == 0
         assert kernel.get_status().state == ExecutionState.STOPPED
         assert manager.state == CycleState.STOPPED
+
+
+class TestKernelEventPipelineStatus:
+    """OW1: pipeline loss accounting is monotonic and observable."""
+
+    def test_collector_and_manager_drops_are_reported(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        status = manager.kernel_event_pipeline_status()
+        assert status == {
+            "collector_dropped_total": 0,
+            "manager_dropped_total": 0,
+            "last_sequence_seen": 0,
+        }
+
+        # Overflow the mock collector ring (maxlen 4096) without draining:
+        # the collector must count its own drop-oldest evictions.
+        for i in range(5000):
+            kernel._emit_kernel_event("state_transition")
+        manager.drain_kernel_events_now()
+        status = manager.kernel_event_pipeline_status()
+        assert status["collector_dropped_total"] == 5000 - 4096
+        assert status["last_sequence_seen"] == 5000
+
+        # Overflow the manager-side deque with undrained events: evictions
+        # count as manager drops.
+        for i in range(5000):
+            kernel._emit_kernel_event("state_transition")
+        manager.drain_kernel_events_now()
+        status = manager.kernel_event_pipeline_status()
+        assert status["manager_dropped_total"] > 0

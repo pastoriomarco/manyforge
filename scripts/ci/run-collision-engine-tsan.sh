@@ -13,6 +13,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build/tsan-collision-engine}"
 PARALLEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
+TSAN_SUPPRESSIONS="${TSAN_SUPPRESSIONS:-${REPO_ROOT}/scripts/ci/tsan.supp}"
+
+if [[ ! -f "${TSAN_SUPPRESSIONS}" ]]; then
+  echo "TSan suppression file not found: ${TSAN_SUPPRESSIONS}" >&2
+  exit 2
+fi
+
+TSAN_OPTIONS="${TSAN_OPTIONS:-halt_on_error=1 second_deadlock_stack=1 history_size=7}"
+if [[ "${TSAN_OPTIONS}" != *"exitcode="* ]]; then
+  TSAN_OPTIONS="${TSAN_OPTIONS} exitcode=66"
+fi
+if [[ "${TSAN_OPTIONS}" != *"suppressions="* ]]; then
+  TSAN_OPTIONS="${TSAN_OPTIONS} suppressions=${TSAN_SUPPRESSIONS}"
+fi
+export TSAN_OPTIONS
 
 if [[ -f /opt/ros/jazzy/setup.bash ]]; then
   # CMake's ament package templates import ament_package from the ROS Python

@@ -142,6 +142,9 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
             return sm_.status().state == ExecutionState::kExecuting ||
                    motion_trip_stop_.active();
           }) {
+  runtime_collision_monitor_.set_fail_closed_dump_hook([this]() {
+    (void)flight_recorder_.dump_now("runtime_monitor_drain_timeout");
+  });
   if (config_.collision_monitor_period_ns <= 0) {
     throw std::invalid_argument("collision_monitor_period_ns must be > 0");
   }
@@ -231,6 +234,10 @@ ExecutionKernel::~ExecutionKernel() {
                        kSchedulerDrainTimeout)
                        .count()
                 << '\n';
+      // Flush the flight ring before dying: the event history of the last
+      // seconds is exactly the evidence a fail-closed teardown needs to be
+      // diagnosable post-mortem.
+      (void)flight_recorder_.dump_now("scheduler_drain_timeout");
       std::terminate();
     }
   };
@@ -780,13 +787,24 @@ void ExecutionKernel::prepare_event(KernelEvent& event) const {
   }
 }
 
-void ExecutionKernel::dispatch_prepared_event(const KernelEvent& event_to_emit) {
+void ExecutionKernel::dispatch_prepared_event(KernelEvent& event_to_emit) {
+  event_to_emit.sequence =
+      event_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
+  flight_recorder_.record(event_to_emit);
   const auto subscriber_exceptions =
       event_publisher_.dispatch(event_to_emit);
   if (subscriber_exceptions > 0) {
     std::lock_guard<std::mutex> lock(metrics_mutex_);
     metrics_.event_subscriber_exceptions += subscriber_exceptions;
   }
+}
+
+void ExecutionKernel::set_flight_recorder_directory(std::string directory) {
+  flight_recorder_.set_dump_directory(std::move(directory));
+}
+
+std::string ExecutionKernel::dump_flight_record(const char* reason) noexcept {
+  return flight_recorder_.dump_now(reason);
 }
 
 void ExecutionKernel::set_active_request_correlation(
@@ -2516,7 +2534,12 @@ void ExecutionKernel::publish_execution_snapshot(ExecutionSnapshot snapshot) {
   stamp_active_request_correlation(snapshot);
   const auto fallback_timestamp_ns =
       snapshot.timestamp_ns == 0 ? clock_.now() : std::int64_t{0};
-  snapshot_publisher_.publish(std::move(snapshot), fallback_timestamp_ns);
+  const auto published =
+      snapshot_publisher_.publish(std::move(snapshot), fallback_timestamp_ns);
+  flight_recorder_.note_published_snapshot(published.sequence_number,
+                                           published.timestamp_ns,
+                                           published.execution_id,
+                                           published.state);
 
   {
     std::lock_guard<std::mutex> mlock(metrics_mutex_);
@@ -6510,8 +6533,15 @@ void ExecutionKernel::sync_snapshot_from_context() {
 }
 
 MetricsSnapshot ExecutionKernel::get_metrics() const {
-  std::lock_guard<std::mutex> lock(metrics_mutex_);
-  return metrics_;
+  MetricsSnapshot snapshot;
+  {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    snapshot = metrics_;
+  }
+  snapshot.events_emitted =
+      event_sequence_.load(std::memory_order_relaxed);
+  snapshot.flight_recorder_records = flight_recorder_.recorded_total();
+  return snapshot;
 }
 
 Result<void> ExecutionKernel::collision_check_tick() {

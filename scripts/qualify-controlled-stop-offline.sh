@@ -55,6 +55,8 @@ run_in_container() {
   run_step "${core_build}/test_interrupt_manager"
   run_step "${core_build}/test_execution_kernel"
   run_step "${core_build}/perf_soft_on_path_planner"
+  run_step "${workspace}/scripts/run-ros2-control-hot-path-qualification.sh" \
+    --in-container
 
   local ros_distro="${ROS_DISTRO:-jazzy}"
   set +u

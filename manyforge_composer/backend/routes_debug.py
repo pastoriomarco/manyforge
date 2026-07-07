@@ -146,6 +146,8 @@ def build_debug_export_payload(state: ComposerState, *, run_id: str | None = Non
         ),
         modelEvents=model_events,
         medkitTrace=medkit_trace,
+        latencyHistograms=state.event_recorder.latency_histograms(),
+        runIndex=state.event_recorder.list_runs(),
     ).model_dump(by_alias=True)
 
 

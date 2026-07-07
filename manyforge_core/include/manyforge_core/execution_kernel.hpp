@@ -10,6 +10,7 @@
 #include <manyforge_core/execution_worker_signals.hpp>
 #include <manyforge_core/interrupt/interrupt_manager.hpp>
 #include <manyforge_core/kernel_event_publisher.hpp>
+#include <manyforge_core/kernel_flight_recorder.hpp>
 #include <manyforge_core/motion_trip_stop_coordinator.hpp>
 #include <manyforge_core/operator_stop_worker.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
@@ -376,6 +377,16 @@ class ExecutionKernel {
   /// Get current metrics snapshot.
   MetricsSnapshot get_metrics() const;
 
+  /// Configure where the in-process flight ring is dumped when the kernel
+  /// dies fail-closed (empty = stderr). Startup wiring, not a hot path.
+  void set_flight_recorder_directory(std::string directory);
+
+  /// Best-effort JSONL dump of the flight ring (the fail-closed teardown
+  /// paths call this automatically; exposed for bindings, diagnostics, and
+  /// tests). Returns the written path, or empty when the dump went to
+  /// stderr.
+  std::string dump_flight_record(const char* reason) noexcept;
+
  private:
   Result<MotionSpecDTO> resolve_motion_spec(const ExecuteRequestDTO& request);
   Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request);
@@ -395,7 +406,7 @@ class ExecutionKernel {
   void emit_event(KernelEvent event);
   void emit_event_immediate(KernelEvent event);
   void prepare_event(KernelEvent& event) const;
-  void dispatch_prepared_event(const KernelEvent& event);
+  void dispatch_prepared_event(KernelEvent& event);
   class EventDeferralScope;
   static thread_local EventDeferralScope* active_event_deferral_;
   void set_active_request_correlation(const ExecuteRequestDTO& request);
@@ -656,9 +667,16 @@ class ExecutionKernel {
 
   // Event subscription and copy-on-write callback dispatch.
   KernelEventPublisher event_publisher_;
+  // Dispatch-order event sequence (loss detection downstream); wait-free.
+  std::atomic<std::uint64_t> event_sequence_{0};
 
   // Observer-facing execution snapshot storage and sequence owner.
   ExecutionSnapshotPublisher snapshot_publisher_;
+
+  // Bounded in-process flight ring of recent events, dumped by the
+  // fail-closed teardown paths. Telemetry only: fixed-cost recording behind
+  // its own leaf mutex, never held across I/O or callbacks.
+  KernelFlightRecorder flight_recorder_;
 
   // Async execution state
   std::jthread worker_thread_;

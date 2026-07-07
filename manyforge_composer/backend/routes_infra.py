@@ -203,6 +203,63 @@ def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
             if top_status == "ok":
                 top_status = "degraded"
 
+    pipeline_status = {}
+    if state.cycle_manager is not None:
+        try:
+            pipeline_status = state.cycle_manager.kernel_event_pipeline_status()
+            if recorder is not None:
+                pipeline_status.update(recorder.kernel_event_gap_status())
+            pipeline_dropped = (
+                int(pipeline_status.get("collector_dropped_total") or 0)
+                + int(pipeline_status.get("manager_dropped_total") or 0)
+                # A sequence-gap record without a drop-counter advance is
+                # unexplained loss; it degrades the component just the same.
+                + int(pipeline_status.get("gap_records_total") or 0)
+            )
+            pipeline_status["status"] = (
+                "degraded" if pipeline_dropped > 0 else "healthy"
+            )
+            if pipeline_dropped > 0 and top_status == "ok":
+                top_status = "degraded"
+        except Exception as exc:  # pragma: no cover - defensive status surface
+            pipeline_status = {"status": "error", "error": str(exc)}
+            if top_status == "ok":
+                top_status = "degraded"
+
+    stop_latency = {}
+    if recorder is not None:
+        try:
+            # Informational only: stop latency is a performance signal, not a
+            # health fault, so it never degrades the deployment status.
+            stop_latency = recorder.stop_latency_summary()
+        except Exception as exc:  # pragma: no cover - defensive status surface
+            stop_latency = {"error": str(exc)}
+
+    trace_storage = {}
+    if recorder is not None:
+        try:
+            trace_storage = recorder.trace_storage_status()
+            storage_degraded = bool(trace_storage.get("enabled")) and (
+                bool((trace_storage.get("last_prune") or {}).get("error"))
+                or (
+                    trace_storage.get("max_bytes") is not None
+                    and int(trace_storage.get("total_bytes") or 0)
+                    > int(trace_storage["max_bytes"])
+                )
+            )
+            # `volatile` (e.g. /tmp) is reported on the component but does
+            # not degrade the deployment: every dev/test lane runs on /tmp
+            # and a permanently degraded heartbeat would drown real signals.
+            trace_storage["status"] = (
+                "degraded" if storage_degraded else "healthy"
+            )
+            if storage_degraded and top_status == "ok":
+                top_status = "degraded"
+        except Exception as exc:  # pragma: no cover - defensive status surface
+            trace_storage = {"enabled": False, "status": "error", "error": str(exc)}
+            if top_status == "ok":
+                top_status = "degraded"
+
     return {
         "schema_version": "manyforge.infra_heartbeat.v1",
         "status": top_status,
@@ -222,6 +279,9 @@ def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
             },
             "kernel": kernel_payload,
             "failure_archive": archive_status,
+            "kernel_event_pipeline": pipeline_status,
+            "trace_storage": trace_storage,
+            "stop_latency": stop_latency,
         },
     }
 

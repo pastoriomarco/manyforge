@@ -862,6 +862,38 @@ class KernelClient(ABC):
     def bump_control_command_epoch(self) -> int:
         return 0
 
+    def clock_anchor(self) -> dict:
+        """Return a monotonic<->wall clock anchor pair.
+
+        The pair is sampled back-to-back so downstream recorders can convert
+        kernel-monotonic event timestamps to wall time without drain-latency
+        skew. Non-native implementations sample the process clocks; the
+        native client overrides this with the kernel's IClock instance.
+        """
+        return {
+            "monotonic_ns": time.monotonic_ns(),
+            "wall_time_ns": time.time_ns(),
+        }
+
+    def set_flight_recorder_dir(self, directory: str) -> None:
+        """Configure the kernel flight-ring dump directory (no-op default)."""
+
+    def dump_flight_record(self, reason: str) -> str:
+        """Best-effort kernel flight-ring dump; returns the written path.
+
+        Non-native implementations have no flight ring and return "".
+        """
+        return ""
+
+    def drain_kernel_events_with_stats(self) -> dict:
+        """Drain buffered kernel events plus loss counters.
+
+        Loss anywhere in the event pipeline must be countable, never silent.
+        Implementations without an overflow-counting buffer report a zero
+        monotonic drop total alongside the plain drain.
+        """
+        return {"events": self.drain_kernel_events(), "dropped_total": 0}
+
     @abstractmethod
     def acknowledge_completed(
         self, execution_id: int, *, expected_epoch: Optional[int] = None
@@ -1209,7 +1241,10 @@ class MockKernelClient(KernelClient):
         # get_gripper_status.
         self._gripper_lock = threading.RLock()
         # Kernel event buffer (mirrors C++ KernelEventCollector)
+        self._kernel_events_lock = threading.Lock()
         self._kernel_events: Deque[Dict[str, Any]] = deque(maxlen=4096)
+        self._kernel_event_sequence = 0
+        self._kernel_events_dropped_total = 0
 
     def _emit_kernel_event(
         self,
@@ -1260,12 +1295,27 @@ class MockKernelClient(KernelClient):
             event["error"] = {"code": -1, "message": error}
         if details_payload:
             event["details"] = details_payload
-        self._kernel_events.append(event)
+        with self._kernel_events_lock:
+            self._kernel_event_sequence += 1
+            event["sequence"] = self._kernel_event_sequence
+            if (
+                len(self._kernel_events) == self._kernel_events.maxlen
+            ):
+                self._kernel_events_dropped_total += 1
+            self._kernel_events.append(event)
 
     def drain_kernel_events(self) -> List[Dict[str, Any]]:
-        events = list(self._kernel_events)
-        self._kernel_events.clear()
+        with self._kernel_events_lock:
+            events = list(self._kernel_events)
+            self._kernel_events.clear()
         return events
+
+    def drain_kernel_events_with_stats(self) -> dict:
+        with self._kernel_events_lock:
+            events = list(self._kernel_events)
+            self._kernel_events.clear()
+            dropped = self._kernel_events_dropped_total
+        return {"events": events, "dropped_total": dropped}
 
     def control_command_epoch(self) -> int:
         return self._control_command_epoch

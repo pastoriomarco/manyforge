@@ -4758,10 +4758,10 @@ def test_lifespan_shutdown_quiesces_running_cycle():
     original_record = state.event_recorder.record_native_kernel_events
     original_close = state.event_recorder.close
 
-    def recording_record(events):
+    def recording_record(events, **kwargs):
         if events:
             flush_calls.append("record_native_kernel_events")
-        return original_record(events)
+        return original_record(events, **kwargs)
 
     def recording_close(timeout_s: float = 5.0) -> bool:
         flush_calls.append("recorder_close")
@@ -4985,3 +4985,63 @@ class TestVisualCacheReadOnlyContract:
             {"tool0": {"position_m": [0, 0, 0], "orientation_xyzw": [0, 0, 0, 1]}}
         )
         assert composed[0] is obj  # no copy for objects that need none
+
+
+def test_kernel_events_route_records_drop_gap_evidence():
+    """OW1 regression: /api/kernel/events must pass pipeline loss counters to
+    the recorder so collector-overflow loss becomes durable gap evidence even
+    when no websocket client ever connects."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        # Overflow the mock collector ring (maxlen 4096) before any drain:
+        # the first drained batch starts past the dropped prefix, so the
+        # drop counter is the only loss signal.
+        for _ in range(4200):
+            kernel._emit_kernel_event("state_transition")
+        response = client.get("/api/kernel/events?since=0")
+        assert response.status_code == 200
+
+    # The gap record lands FIRST and is then pushed out of the bounded
+    # in-memory ring by the 4096 full-fidelity records that follow it, so
+    # assert through the accounting surface (the durable JSONL retains it).
+    status = state.event_recorder.kernel_event_gap_status()
+    assert status["gap_records_total"] >= 1, (
+        "collector drop advance must produce durable gap evidence"
+    )
+    assert status["last_gap_wall"]
+    pipeline = state.cycle_manager.kernel_event_pipeline_status()
+    assert pipeline["collector_dropped_total"] == 4200 - 4096
+
+
+def test_heartbeat_degrades_on_kernel_event_pipeline_drops():
+    """OW1 regression: nonzero pipeline drop totals degrade the heartbeat and
+    the component carries the gap-record accounting fields."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+
+        healthy = client.get("/api/infra/heartbeat").json()
+        storage = healthy["components"]["trace_storage"]
+        if storage.get("enabled"):
+            assert "volatile" in storage and "total_bytes" in storage
+        assert storage["status"] == "healthy"
+        component = healthy["components"]["kernel_event_pipeline"]
+        assert component["status"] == "healthy"
+        assert component["collector_dropped_total"] == 0
+        assert "gap_records_total" in component
+        assert "last_gap_wall" in component
+
+        for _ in range(4200):
+            kernel._emit_kernel_event("state_transition")
+        state.cycle_manager.drain_kernel_events_now()
+
+        degraded = client.get("/api/infra/heartbeat").json()
+        component = degraded["components"]["kernel_event_pipeline"]
+        assert component["status"] == "degraded"
+        assert component["collector_dropped_total"] == 4200 - 4096
+        assert degraded["status"] == "degraded"

@@ -64,7 +64,11 @@ jobs:
             suite: qualification
             command: |
               ./scripts/test-all.sh qualification
-              ./scripts/run-soft-on-path-planner-qualification.sh --in-container
+              python3 manyforge_core/tools/collect_qualification_evidence.py \
+                --lane local-ci/qualification \
+                --source soft-on-path-planner \
+                --require-evidence \
+                -- ./scripts/run-soft-on-path-planner-qualification.sh --in-container
           - name: core-tsan
             suite: core-tsan
             command: bash scripts/ci/run-core-tsan.sh
@@ -122,6 +126,14 @@ jobs:
             -w /workspace \
             "${image}" \
             bash -lc "set -euo pipefail; ${LOCAL_CI_COMMAND}"
+
+      - name: Upload qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-evidence-${{ matrix.suite }}
+          path: ${{ steps.checkout.outputs.worktree }}/qualification/*.jsonl
+          if-no-files-found: ignore
 
       - name: Remove local clone
         if: always()

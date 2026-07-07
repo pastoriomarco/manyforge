@@ -5,12 +5,14 @@ on:
     paths:
       - "manyforge_core/**"
       - "scripts/ci/run-core-tsan.sh"
+      - "scripts/ci/tsan.supp"
       - ".github/workflows/cpp-tsan.yml"
   push:
     branches: [main, dev]
     paths:
       - "manyforge_core/**"
       - "scripts/ci/run-core-tsan.sh"
+      - "scripts/ci/tsan.supp"
       - ".github/workflows/cpp-tsan.yml"
   workflow_dispatch:
 
@@ -19,7 +21,7 @@ jobs:
     name: manyforge_core ThreadSanitizer
     runs-on: ubuntu-24.04
     env:
-      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 history_size=7
+      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 history_size=7 exitcode=66
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
     steps:
       - uses: actions/checkout@v4

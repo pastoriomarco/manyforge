@@ -1621,6 +1621,14 @@ class NodeStatusTransitionResponse(BaseModel):
 class ExecutionHistoryResponse(BaseModel):
     model_config = _ALIAS_CFG
     run_id: Optional[str] = Field(default=None, alias="runId")
+    # Populated only by cross-run wall-window queries (OW7): the runs, oldest
+    # first, that contributed to the returned page. Empty for single-run reads.
+    run_ids: List[str] = Field(default_factory=list, alias="runIds")
+    # Cross-run scan metadata. Additive and empty/zero for single-run reads; if
+    # runs_truncated is true, older indexed runs may exist beyond the scan cap.
+    runs_truncated: bool = Field(default=False, alias="runsTruncated")
+    scanned_run_count: int = Field(default=0, alias="scannedRunCount")
+    cross_run_scan_limit: int = Field(default=0, alias="crossRunScanLimit")
     execution_id: int = Field(default=0, alias="executionId")
     events: List[ExecutionEventResponse] = Field(default_factory=list)
     node_status_transitions: List[NodeStatusTransitionResponse] = Field(
@@ -1675,6 +1683,13 @@ class ExecutionDigestResponse(BaseModel):
     resume_allowed: bool = Field(alias="resumeAllowed")
     reset_required: bool = Field(alias="resetRequired")
     ack_required: bool = Field(alias="ackRequired")
+    # OW4: latest assembled stop-decision chain (trigger, latch/policy,
+    # preemption, override, timings) — additive; external digest consumers
+    # access by .get() and ignore unknown keys.
+    last_stop_decision: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="lastStopDecision",
+    )
     timestamp_ns: int = Field(alias="timestampNs")
 
 
@@ -1767,6 +1782,14 @@ class DebugExportResponse(BaseModel):
     runtime_overrides: Dict[str, Any] = Field(default_factory=dict, alias="runtimeOverrides")
     model_events: List[Dict[str, Any]] = Field(default_factory=list, alias="modelEvents")
     medkit_trace: Dict[str, Any] = Field(default_factory=dict, alias="medkitTrace")
+    latency_histograms: Dict[str, Any] = Field(
+        default_factory=dict,
+        alias="latencyHistograms",
+    )
+    run_index: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        alias="runIndex",
+    )
 
 
 class DebugSignalPublishRequest(BaseModel):

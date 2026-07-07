@@ -92,6 +92,30 @@ def test_runtime_signal_registry_marks_signal_stale_after_timeout():
     assert stale.freshness == "stale"
 
 
+def test_runtime_signal_registry_change_counter_advances_only_on_visible_changes():
+    registry = RuntimeSignalRegistry()
+    assert registry.change_counter(now_ns=1_000) == 0
+
+    update = SignalUpdate(
+        adapter="plc",
+        signal="fixture_present",
+        value=True,
+        observed_at_ns=1_000,
+        stale_after_ns=100,
+        mirror_key="fixture/present",
+    )
+    registry.publish(update)
+    first_counter = registry.change_counter(now_ns=1_050)
+    assert first_counter > 0
+
+    registry.publish(update)
+    assert registry.change_counter(now_ns=1_050) == first_counter
+
+    stale_counter = registry.change_counter(now_ns=1_101)
+    assert stale_counter > first_counter
+    assert registry.change_counter(now_ns=1_200) == stale_counter
+
+
 def test_runtime_signal_registry_marks_provider_disconnected_on_poll_error():
     registry = RuntimeSignalRegistry()
     registry.register_provider(_FailingProvider(adapter_id="roxsie"))

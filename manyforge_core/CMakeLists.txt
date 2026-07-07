@@ -20,6 +20,7 @@ add_library(manyforge_core
   src/execution_stop_support.cpp
   src/execution_worker_signals.cpp
   src/kernel_event_publisher.cpp
+  src/kernel_flight_recorder.cpp
   src/kernel_event_factories.cpp
   src/motion_trip_stop_coordinator.cpp
   src/operator_stop_worker.cpp
@@ -141,6 +142,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_kernel_event_factories
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_kernel_flight_recorder
+    test/test_kernel_flight_recorder.cpp)
+  target_link_libraries(test_kernel_flight_recorder PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_kernel_flight_recorder
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_kernel_event_publisher
     test/test_kernel_event_publisher.cpp)
   target_link_libraries(test_kernel_event_publisher PRIVATE
@@ -255,6 +263,10 @@ if(BUILD_TESTING)
   add_executable(perf_soft_on_path_planner
     test/perf/perf_soft_on_path_planner.cpp)
   target_link_libraries(perf_soft_on_path_planner PRIVATE manyforge_core)
+
+  add_executable(perf_kernel_event_pipeline
+    test/perf/perf_kernel_event_pipeline.cpp)
+  target_link_libraries(perf_kernel_event_pipeline PRIVATE manyforge_core)
 
   add_executable(test_execution_kernel test/test_execution_kernel.cpp)
   target_link_libraries(test_execution_kernel PRIVATE manyforge_core GTest::gtest_main)

@@ -1891,6 +1891,65 @@ TEST_F(NativeKernelTest,
 }
 
 TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_TerminalSceneProjectionMissRetries) {
+  auto* backend =
+      dynamic_cast<RoboPlanExecutionBackend*>(bundle_->execution.get());
+  ASSERT_NE(backend, nullptr);
+
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.6;
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{2.0, goal, {}, {}});
+
+  std::unique_lock<std::mutex> scene_lock(*bundle_->scene_mutex);
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "native_soft_on_path_scene_retry";
+  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  profile.deceleration_time_s = 0.15;
+  profile.max_stop_time_s = 1.0;
+  profile.allowed_fallback_modes = {MotionInterruptStopMode::kSpringBackHold};
+  for (const auto& joint_name : start_state.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
+
+  auto result = bundle_->execution->execute_controlled_stop(profile);
+  ASSERT_TRUE(result.accepted) << (result.error ? result.error->message : "");
+  ASSERT_TRUE(result.backend_stop_confirmed)
+      << (result.error ? result.error->message : "");
+
+  const auto metrics_while_locked = backend->scene_projection_metrics();
+  EXPECT_GT(metrics_while_locked.misses_total, 0u);
+  EXPECT_GT(metrics_while_locked.terminal_retries_scheduled_total, 0u);
+  EXPECT_EQ(metrics_while_locked.terminal_retry_successes_total, 0u);
+
+  scene_lock.unlock();
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+
+  auto metrics_after_unlock = backend->scene_projection_metrics();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (metrics_after_unlock.terminal_retry_successes_total == 0u &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    metrics_after_unlock = backend->scene_projection_metrics();
+  }
+
+  EXPECT_GT(metrics_after_unlock.terminal_retry_successes_total, 0u);
+  EXPECT_EQ(metrics_after_unlock.terminal_retry_exhausted_total, 0u);
+  EXPECT_GT(metrics_after_unlock.successful_updates_total, 0u);
+}
+
+TEST_F(NativeKernelTest,
        NativeBackend_ControlledStop_SoftOnPathReplayIsCancellable) {
   auto start_state = bundle_->context->get_current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());

@@ -795,6 +795,26 @@ class NativeKernelClient(KernelClient):
     def bump_control_command_epoch(self) -> int:
         return int(self._bundle.bump_control_command_epoch())
 
+    def clock_anchor(self) -> dict:
+        anchor = self._bundle.clock_anchor()
+        return {
+            "monotonic_ns": int(anchor["monotonic_ns"]),
+            "wall_time_ns": int(anchor["wall_time_ns"]),
+        }
+
+    def set_flight_recorder_dir(self, directory: str) -> None:
+        self._bundle.set_flight_recorder_dir(str(directory))
+
+    def dump_flight_record(self, reason: str) -> str:
+        return str(self._bundle.dump_flight_record(str(reason)))
+
+    def drain_kernel_events_with_stats(self) -> dict:
+        stats = self._bundle.drain_kernel_events_with_stats()
+        return {
+            "events": list(stats["events"]),
+            "dropped_total": int(stats["dropped_total"]),
+        }
+
     def _command_result(self, result: dict) -> CommandResult:
         details = result.get("error_details") or {}
         reason_code = details.get("reason_code") or details.get("reason")

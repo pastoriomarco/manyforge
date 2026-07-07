@@ -7948,6 +7948,8 @@ TEST_F(ExecutionKernelTest, MetricsCounters) {
   EXPECT_EQ(metrics.plans_succeeded, 1u);
   EXPECT_EQ(metrics.validations_passed, 1u);
   EXPECT_EQ(metrics.executions_completed, 1u);
+  EXPECT_GT(metrics.events_emitted, 0u);
+  EXPECT_EQ(metrics.flight_recorder_records, metrics.events_emitted);
 }
 
 TEST_F(ExecutionKernelTest, MetricsAfterCacheHitAndMiss) {
@@ -11322,6 +11324,47 @@ TEST_F(ExecutionKernelTest,
               terminal == ExecutionState::kInterventionRequired ||
               terminal == ExecutionState::kStopped)
       << "unexpected terminal: " << to_string(terminal);
+}
+
+
+// Every dispatched kernel event carries a contiguous, strictly increasing
+// dispatch-order sequence. Downstream pipelines rely on gaps meaning LOSS,
+// never renumbering, so contiguity across a full lifecycle is the contract.
+TEST_F(ExecutionKernelTest, KernelEventSequenceIsContiguousAcrossLifecycle) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner,        context,
+                               controlled_execution, local_clock,
+                               local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+
+  std::mutex sequences_mutex;
+  std::vector<std::uint64_t> sequences;
+  auto handle = local_kernel.subscribe_events(
+      [&](const KernelEvent& event) {
+        std::lock_guard<std::mutex> lock(sequences_mutex);
+        sequences.push_back(event.sequence);
+      });
+
+  auto result = local_kernel.execute(make_test_request("sequence_contiguity"));
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  controlled_execution.complete();
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  ASSERT_TRUE(local_kernel.reset().accepted);
+  local_kernel.unsubscribe_events(handle);
+
+  std::lock_guard<std::mutex> lock(sequences_mutex);
+  ASSERT_GE(sequences.size(), 4u);
+  for (std::size_t i = 0; i < sequences.size(); ++i) {
+    EXPECT_EQ(sequences[i], static_cast<std::uint64_t>(i + 1))
+        << "dispatch sequence must be contiguous from 1; index " << i;
+  }
 }
 
 }  // namespace

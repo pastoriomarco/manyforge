@@ -103,16 +103,28 @@ class RuntimeSignalRegistry:
         self._providers: dict[str, SignalProvider] = {}
         self._provider_health: dict[str, SignalProviderHealth] = {}
         self._signals: dict[tuple[str, str], SignalRecord] = {}
+        self._change_counter = 0
+
+    def _bump_change_counter_locked(self) -> None:
+        self._change_counter += 1
 
     def register_provider(self, provider: SignalProvider) -> None:
         with self._lock:
+            changed = provider.adapter_id not in self._providers
             self._providers[provider.adapter_id] = provider
             self._provider_health[provider.adapter_id] = SignalProviderHealth(
                 adapter_id=provider.adapter_id
             )
+            if changed:
+                self._bump_change_counter_locked()
 
     def unregister_provider(self, adapter_id: str) -> None:
         with self._lock:
+            changed = (
+                adapter_id in self._providers
+                or adapter_id in self._provider_health
+                or any(record.adapter == adapter_id for record in self._signals.values())
+            )
             self._providers.pop(adapter_id, None)
             self._provider_health.pop(adapter_id, None)
             self._signals = {
@@ -120,10 +132,14 @@ class RuntimeSignalRegistry:
                 for key, record in self._signals.items()
                 if record.adapter != adapter_id
             }
+            if changed:
+                self._bump_change_counter_locked()
 
     def publish(self, update: SignalUpdate, *, provider_id: str | None = None) -> None:
         with self._lock:
-            self._signals[(update.adapter, update.signal)] = SignalRecord(
+            key = (update.adapter, update.signal)
+            existing = self._signals.get(key)
+            record = SignalRecord(
                 adapter=update.adapter,
                 signal=update.signal,
                 value=update.value,
@@ -135,6 +151,9 @@ class RuntimeSignalRegistry:
                 provider_id=provider_id,
                 freshness="fresh",
             )
+            self._signals[key] = record
+            if existing != record:
+                self._bump_change_counter_locked()
 
     def publish_many(
         self,
@@ -186,10 +205,24 @@ class RuntimeSignalRegistry:
     def expire(self, *, now_ns: int | None = None) -> None:
         now_ns = now_ns or time.monotonic_ns()
         with self._lock:
+            changed = False
             for record in self._signals.values():
                 expires_at_ns = record.expires_at_ns
-                if expires_at_ns is not None and now_ns >= expires_at_ns:
+                if (
+                    expires_at_ns is not None
+                    and now_ns >= expires_at_ns
+                    and record.freshness != "stale"
+                ):
                     record.freshness = "stale"
+                    changed = True
+            if changed:
+                self._bump_change_counter_locked()
+
+    def change_counter(self, *, now_ns: int | None = None) -> int:
+        """Return the monotonic counter for mirrored signal/provider changes."""
+        self.expire(now_ns=now_ns)
+        with self._lock:
+            return self._change_counter
 
     def get_signal(
         self,

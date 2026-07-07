@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/functional.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cmath>
 #include <memory>
@@ -766,6 +767,7 @@ py::dict kernel_event_to_python(const KernelEvent& event) {
   d["type"] = kernel_event_type_to_string(event.type);
   d["execution_id"] = event.execution_id;
   d["timestamp_ns"] = event.timestamp_ns;
+  d["sequence"] = event.sequence;
   if (event.type == KernelEventType::kStateTransition) {
     d["from_state"] = to_string(event.from_state);
     d["to_state"] = to_string(event.to_state);
@@ -852,6 +854,8 @@ py::dict metrics_to_python(const MetricsSnapshot& metrics) {
   d["snapshots_published"] = metrics.snapshots_published;
   d["event_subscriber_exceptions"] = metrics.event_subscriber_exceptions;
   d["observer_lag_max_ns"] = metrics.observer_lag_max_ns;
+  d["events_emitted"] = metrics.events_emitted;
+  d["flight_recorder_records"] = metrics.flight_recorder_records;
   return d;
 }
 
@@ -2576,6 +2580,38 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }();
         return snapshot_to_python(snapshot);
       })
+      .def("clock_anchor", [](NativeKernelBundle& self) -> py::dict {
+        // Monotonic<->wall anchor for the observability pipeline (plan OW2):
+        // sample the SAME IClock instance that stamps kernel events, and wall
+        // time, back-to-back so no drain latency sits between them.
+        (void)require_open_kernel(self);
+        std::int64_t monotonic_ns = 0;
+        std::int64_t wall_time_ns = 0;
+        {
+          py::gil_scoped_release release;
+          monotonic_ns = self.clock->now();
+          wall_time_ns =
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::system_clock::now().time_since_epoch())
+                  .count();
+        }
+        py::dict out;
+        out["monotonic_ns"] = monotonic_ns;
+        out["wall_time_ns"] = wall_time_ns;
+        return out;
+      })
+      .def("set_flight_recorder_dir", [](NativeKernelBundle& self,
+                                         const std::string& directory) {
+        auto kernel = require_open_kernel(self);
+        py::gil_scoped_release release;
+        kernel->set_flight_recorder_directory(directory);
+      }, py::arg("directory"))
+      .def("dump_flight_record", [](NativeKernelBundle& self,
+                                    const std::string& reason) -> std::string {
+        auto kernel = require_open_kernel(self);
+        py::gil_scoped_release release;
+        return kernel->dump_flight_record(reason.c_str());
+      }, py::arg("reason"))
       .def("get_metrics", [](NativeKernelBundle& self) -> py::dict {
         auto kernel = require_open_kernel(self);
         const auto metrics = [&]() {
@@ -2599,7 +2635,39 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               projection_metrics.last_success_timestamp_ns;
           out["scene_projection_last_success_age_ns"] =
               projection_metrics.last_success_age_ns;
+          out["scene_projection_terminal_retries_scheduled_total"] =
+              projection_metrics.terminal_retries_scheduled_total;
+          out["scene_projection_terminal_retry_successes_total"] =
+              projection_metrics.terminal_retry_successes_total;
+          out["scene_projection_terminal_retry_exhausted_total"] =
+              projection_metrics.terminal_retry_exhausted_total;
         }
+#ifdef MANYFORGE_ROS2_CONTROL_ENABLED
+        if (auto* ros_execution =
+                dynamic_cast<ros2_exec::Ros2ControlExecutionBackend*>(
+                    self.execution.get())) {
+          const auto projection_metrics = [&]() {
+            py::gil_scoped_release release;
+            return ros_execution->scene_projection_metrics();
+          }();
+          out["scene_projection_misses_total"] =
+              projection_metrics.misses_total;
+          out["scene_projection_successful_updates_total"] =
+              projection_metrics.successful_updates_total;
+          out["scene_projection_lag_max_ns"] =
+              projection_metrics.lag_max_ns;
+          out["scene_projection_last_success_timestamp_ns"] =
+              projection_metrics.last_success_timestamp_ns;
+          out["scene_projection_last_success_age_ns"] =
+              projection_metrics.last_success_age_ns;
+          out["scene_projection_terminal_retries_scheduled_total"] =
+              projection_metrics.terminal_retries_scheduled_total;
+          out["scene_projection_terminal_retry_successes_total"] =
+              projection_metrics.terminal_retry_successes_total;
+          out["scene_projection_terminal_retry_exhausted_total"] =
+              projection_metrics.terminal_retry_exhausted_total;
+        }
+#endif
         return out;
       })
 #ifdef MANYFORGE_ROS2_CONTROL_ENABLED
@@ -3299,6 +3367,18 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           result.append(kernel_event_to_python(event));
         }
         return result;
+      })
+      .def("drain_kernel_events_with_stats",
+           [](NativeKernelBundle& self) -> py::dict {
+        auto stats = self.event_collector.drain_with_stats();
+        py::list events;
+        for (const auto& event : stats.events) {
+          events.append(kernel_event_to_python(event));
+        }
+        py::dict out;
+        out["events"] = std::move(events);
+        out["dropped_total"] = stats.dropped_total;
+        return out;
       })
       // Compute all link poses at a hypothetical robot configuration, for the
       // Composer Move-To / validated Robot Control candidate "ghost robot"

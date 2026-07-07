@@ -75,5 +75,14 @@ if(BUILD_TESTING)
     target_link_libraries(test_ros2_control_execution_backend PRIVATE
       manyforge_ros2_control_execution GTest::gtest_main)
     gtest_discover_tests(test_ros2_control_execution_backend)
+
+    # WS8 hot-path qualification probe. This executable is intentionally not a
+    # ctest case: unit tests prove behavior, while
+    # scripts/run-ros2-control-hot-path-qualification.sh runs this probe in a
+    # release build and emits archival JSON allocation/latency evidence.
+    add_executable(perf_ros2_control_hot_paths
+      test/perf/perf_ros2_control_hot_paths.cpp)
+    target_link_libraries(perf_ros2_control_hot_paths PRIVATE
+      manyforge_ros2_control_execution)
   endif()
 endif()

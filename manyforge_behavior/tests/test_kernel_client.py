@@ -116,6 +116,54 @@ class TestMockKernelExecute:
         assert outcome.action_span.action_span_id == "attempt-001"
         assert outcome.contact_policy_id == "contact_grasp/lite6_box"
 
+    def test_kernel_event_drain_is_atomic_with_concurrent_emit(self):
+        kernel = MockKernelClient()
+        event_count = 2000
+        drained: list[dict] = []
+        errors: list[BaseException] = []
+        start = threading.Event()
+        done = threading.Event()
+
+        def emit_events() -> None:
+            try:
+                start.wait(timeout=1.0)
+                for index in range(event_count):
+                    kernel._emit_kernel_event(
+                        "fixture_event",
+                        details={"sequence": index},
+                    )
+            except BaseException as exc:  # pragma: no cover - test aid
+                errors.append(exc)
+            finally:
+                done.set()
+
+        def drain_events() -> None:
+            try:
+                start.wait(timeout=1.0)
+                while not done.is_set():
+                    drained.extend(kernel.drain_kernel_events())
+                drained.extend(kernel.drain_kernel_events())
+            except BaseException as exc:  # pragma: no cover - test aid
+                errors.append(exc)
+
+        emitter = threading.Thread(target=emit_events, name="emit-kernel-events")
+        drainer = threading.Thread(target=drain_events, name="drain-kernel-events")
+        emitter.start()
+        drainer.start()
+        start.set()
+        emitter.join(timeout=2.0)
+        drainer.join(timeout=2.0)
+
+        assert not emitter.is_alive()
+        assert not drainer.is_alive()
+        assert errors == []
+        sequences = sorted(
+            int(event.get("details", {}).get("sequence"))
+            for event in drained
+            if event.get("type") == "fixture_event"
+        )
+        assert sequences == list(range(event_count))
+
 
 class TestMockKernelStop:
     def test_stop_from_idle_rejected(self, kernel):

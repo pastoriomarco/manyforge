@@ -119,9 +119,20 @@ class KernelEventCollector {
   /// Drain all buffered events (returns and clears the buffer).
   std::vector<core::KernelEvent> drain();
 
+  struct DrainStats {
+    std::vector<core::KernelEvent> events;
+    std::uint64_t dropped_total = 0;  // monotonic overflow-drop count
+  };
+
+  /// Drain plus the monotonic count of events dropped to ring overflow.
+  /// Loss anywhere in the pipeline must be countable, never silent
+  /// (observability plan P4).
+  DrainStats drain_with_stats();
+
  private:
   std::mutex mutex_;
   std::deque<core::KernelEvent> buffer_;
+  std::uint64_t dropped_total_ = 0;
   core::SubscriptionHandle subscription_{0};
   bool subscribed_ = false;
 };

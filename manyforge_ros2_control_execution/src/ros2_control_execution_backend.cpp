@@ -20,6 +20,8 @@ namespace {
 
 constexpr double kRuntimeScaleSlewPerSecond = 4.0;  // 0→1 in 250 ms.
 constexpr auto kIdleSceneProjectionMinPeriod = std::chrono::milliseconds(100);
+constexpr int kTerminalSceneProjectionRetryAttempts = 10;
+constexpr auto kTerminalSceneProjectionRetryDelay = std::chrono::milliseconds(20);
 
 double controlled_stop_wait_timeout_s(
     const core::MotionInterruptStopProfileDTO& profile,
@@ -33,6 +35,16 @@ double controlled_stop_wait_timeout_s(
 
 double clamp_progress(double progress) {
   return std::max(0.0, std::min(1.0, progress));
+}
+
+void atomic_max(std::atomic<std::uint64_t>& target, std::uint64_t value) {
+  auto current = target.load(std::memory_order_relaxed);
+  while (current < value &&
+         !target.compare_exchange_weak(current,
+                                       value,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+  }
 }
 
 std::string format_double(double value) {
@@ -166,6 +178,7 @@ Ros2ControlExecutionBackend::~Ros2ControlExecutionBackend() {
   if (monitor_thread_.joinable()) {
     monitor_thread_.join();
   }
+  stop_terminal_scene_projection_retry_worker();
   stop_ros();
 }
 
@@ -488,11 +501,16 @@ void Ros2ControlExecutionBackend::on_action_result(
       active_trajectory_time_s_ = 0.0;
       active_runtime_velocity_scale_ = 1.0;
     }
+    const auto terminal_scene_source_ns = clock_.now();
     publish_snapshot(pause_requested ? core::ExecutionState::kPaused
                                      : core::ExecutionState::kStopped,
                      snapshot.progress,
                      snapshot.joint_positions_rad);
     execution_cv_.notify_all();
+    if (!pause_requested && !snapshot.joint_positions_rad.empty()) {
+      project_terminal_scene_positions(snapshot.joint_positions_rad,
+                                       terminal_scene_source_ns);
+    }
     return;
   }
 
@@ -539,20 +557,30 @@ void Ros2ControlExecutionBackend::on_action_result(
 std::optional<Ros2ControlExecutionBackend::JointSample>
 Ros2ControlExecutionBackend::select_latest_sample_locked(
     std::chrono::steady_clock::time_point now) const {
+  const JointSample* sample = select_latest_sample_ptr_locked(now);
+  if (sample != nullptr) {
+    return *sample;
+  }
+  return std::nullopt;
+}
+
+const Ros2ControlExecutionBackend::JointSample*
+Ros2ControlExecutionBackend::select_latest_sample_ptr_locked(
+    std::chrono::steady_clock::time_point now) const {
   const auto is_fresh = [&](const std::optional<JointSample>& sample) {
     return sample.has_value() &&
            seconds_since(sample->received_at, now) <= config_.joint_state_max_age_s;
   };
   if (is_fresh(latest_action_feedback_)) {
-    return latest_action_feedback_;
+    return &*latest_action_feedback_;
   }
   if (is_fresh(latest_controller_state_)) {
-    return latest_controller_state_;
+    return &*latest_controller_state_;
   }
   if (is_fresh(latest_joint_state_)) {
-    return latest_joint_state_;
+    return &*latest_joint_state_;
   }
-  return std::nullopt;
+  return nullptr;
 }
 
 std::optional<Ros2ControlExecutionBackend::JointSample>
@@ -583,7 +611,7 @@ void Ros2ControlExecutionBackend::sync_idle_scene_from_latest_sample() {
     return;
   }
 
-  std::optional<JointSample> sample;
+  std::vector<double> positions;
   const auto now = std::chrono::steady_clock::now();
   const auto generation =
       running_generation_.load(std::memory_order_acquire);
@@ -592,8 +620,8 @@ void Ros2ControlExecutionBackend::sync_idle_scene_from_latest_sample() {
     if (snapshot_.state != core::ExecutionState::kIdle) {
       return;
     }
-    sample = select_latest_sample_locked(now);
-    if (!sample.has_value()) {
+    const JointSample* sample = select_latest_sample_ptr_locked(now);
+    if (sample == nullptr) {
       return;
     }
     if (idle_scene_sync_generation_ != generation) {
@@ -612,14 +640,13 @@ void Ros2ControlExecutionBackend::sync_idle_scene_from_latest_sample() {
     }
     last_idle_scene_sample_received_at_ = sample->received_at;
     last_idle_scene_projection_at_ = now;
+    try {
+      positions = positions_for_joints(*sample, config_.required_joints);
+    } catch (const std::exception&) {
+      return;
+    }
   }
 
-  std::vector<double> positions;
-  try {
-    positions = positions_for_joints(*sample, config_.required_joints);
-  } catch (const std::exception&) {
-    return;
-  }
   if (running_flag_.load(std::memory_order_acquire)) {
     return;
   }
@@ -1033,9 +1060,58 @@ void Ros2ControlExecutionBackend::testing_store_latest_joint_sample_impl(
   state_cv_.notify_all();
 }
 
+Ros2ControlSceneProjectionMetrics
+Ros2ControlExecutionBackend::scene_projection_metrics() const {
+  Ros2ControlSceneProjectionMetrics metrics;
+  metrics.misses_total =
+      scene_projection_misses_total_.load(std::memory_order_relaxed);
+  metrics.successful_updates_total =
+      scene_projection_successes_total_.load(std::memory_order_relaxed);
+  metrics.lag_max_ns =
+      scene_projection_lag_max_ns_.load(std::memory_order_relaxed);
+  metrics.last_success_timestamp_ns =
+      scene_projection_last_success_timestamp_ns_.load(std::memory_order_relaxed);
+  metrics.terminal_retries_scheduled_total =
+      terminal_scene_projection_retries_scheduled_total_.load(
+          std::memory_order_relaxed);
+  metrics.terminal_retry_successes_total =
+      terminal_scene_projection_retry_successes_total_.load(
+          std::memory_order_relaxed);
+  metrics.terminal_retry_exhausted_total =
+      terminal_scene_projection_retry_exhausted_total_.load(
+          std::memory_order_relaxed);
+  const auto now_ns = clock_.now();
+  if (metrics.last_success_timestamp_ns > 0 &&
+      now_ns >= metrics.last_success_timestamp_ns) {
+    metrics.last_success_age_ns =
+        static_cast<std::uint64_t>(now_ns - metrics.last_success_timestamp_ns);
+  }
+  return metrics;
+}
+
+void Ros2ControlExecutionBackend::record_scene_projection_success(
+    std::int64_t source_timestamp_ns) {
+  const auto now_ns = clock_.now();
+  scene_projection_successes_total_.fetch_add(1, std::memory_order_relaxed);
+  scene_projection_last_success_timestamp_ns_.store(
+      now_ns, std::memory_order_relaxed);
+  if (source_timestamp_ns > 0 && now_ns >= source_timestamp_ns) {
+    atomic_max(scene_projection_lag_max_ns_,
+               static_cast<std::uint64_t>(now_ns - source_timestamp_ns));
+  }
+}
+
+void Ros2ControlExecutionBackend::record_scene_projection_miss() {
+  scene_projection_misses_total_.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool Ros2ControlExecutionBackend::update_scene_positions(
     const std::vector<double>& joint_positions,
-    SceneUpdateMode mode) {
+    SceneUpdateMode mode,
+    std::int64_t source_timestamp_ns) {
+  if (joint_positions.empty()) {
+    return true;
+  }
   const auto sink_mode =
       mode == SceneUpdateMode::kBestEffort
           ? core::ExecutionStateUpdateMode::kBestEffort
@@ -1043,14 +1119,110 @@ bool Ros2ControlExecutionBackend::update_scene_positions(
   const auto result = execution_state_sink_->apply_group_joint_positions(
       group_name_, joint_positions, sink_mode);
   if (result.applied()) {
+    record_scene_projection_success(source_timestamp_ns);
     return true;
   }
+  record_scene_projection_miss();
   if (mode == SceneUpdateMode::kBestEffort) {
     return false;
   }
   throw std::runtime_error(
       "failed to update execution state sink: " +
       std::string(core::execution_state_sink_status_reason(result.status)));
+}
+
+void Ros2ControlExecutionBackend::project_terminal_scene_positions(
+    const std::vector<double>& joint_positions,
+    std::int64_t source_timestamp_ns) {
+  if (!update_scene_positions(joint_positions,
+                              SceneUpdateMode::kBestEffort,
+                              source_timestamp_ns)) {
+    schedule_terminal_scene_projection_retry(joint_positions,
+                                             source_timestamp_ns);
+  }
+}
+
+void Ros2ControlExecutionBackend::schedule_terminal_scene_projection_retry(
+    std::vector<double> joint_positions,
+    std::int64_t source_timestamp_ns) {
+  if (joint_positions.empty()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(terminal_scene_projection_retry_mutex_);
+    pending_terminal_scene_projection_ =
+        PendingTerminalSceneProjection{std::move(joint_positions),
+                                       source_timestamp_ns};
+    terminal_scene_projection_retries_scheduled_total_.fetch_add(
+        1, std::memory_order_relaxed);
+    if (!terminal_scene_projection_retry_thread_.joinable()) {
+      terminal_scene_projection_retry_thread_ = std::jthread(
+          [this](std::stop_token stop_token) {
+            terminal_scene_projection_retry_worker(stop_token);
+          });
+    }
+  }
+  terminal_scene_projection_retry_cv_.notify_one();
+}
+
+void Ros2ControlExecutionBackend::terminal_scene_projection_retry_worker(
+    std::stop_token stop_token) {
+  while (!stop_token.stop_requested()) {
+    PendingTerminalSceneProjection pending;
+    {
+      std::unique_lock<std::mutex> lock(
+          terminal_scene_projection_retry_mutex_);
+      // Token-aware wait: a plain condition_variable whose predicate reads
+      // stop_requested() (state that flips outside this mutex) can lose the
+      // stop wakeup between predicate evaluation and enqueue, deadlocking the
+      // destructor join. The (lock, stoken, pred) overload re-checks the stop
+      // state under the lock and cannot lose it.
+      terminal_scene_projection_retry_cv_.wait(
+          lock, stop_token, [this]() {
+            return pending_terminal_scene_projection_.has_value();
+          });
+      if (stop_token.stop_requested()) {
+        return;
+      }
+      pending = std::move(*pending_terminal_scene_projection_);
+      pending_terminal_scene_projection_.reset();
+    }
+
+    bool projected = false;
+    for (int attempt = 0; attempt < kTerminalSceneProjectionRetryAttempts;
+         ++attempt) {
+      if (stop_token.stop_requested()) {
+        return;
+      }
+      if (update_scene_positions(pending.joint_positions,
+                                 SceneUpdateMode::kBestEffort,
+                                 pending.source_timestamp_ns)) {
+        projected = true;
+        terminal_scene_projection_retry_successes_total_.fetch_add(
+            1, std::memory_order_relaxed);
+        break;
+      }
+      if (attempt + 1 < kTerminalSceneProjectionRetryAttempts) {
+        std::this_thread::sleep_for(kTerminalSceneProjectionRetryDelay);
+      }
+    }
+    if (!projected && !stop_token.stop_requested()) {
+      terminal_scene_projection_retry_exhausted_total_.fetch_add(
+          1, std::memory_order_relaxed);
+    }
+  }
+}
+
+void Ros2ControlExecutionBackend::stop_terminal_scene_projection_retry_worker()
+    noexcept {
+  if (terminal_scene_projection_retry_thread_.joinable()) {
+    // request_stop() wakes the token-aware wait through the jthread's
+    // internal stop_callback; no manual notify is needed (and a manual
+    // notify without the mutex would be the lost-wakeup pattern this
+    // codebase has already fixed twice).
+    terminal_scene_projection_retry_thread_.request_stop();
+    terminal_scene_projection_retry_thread_.join();
+  }
 }
 
 std::optional<double> Ros2ControlExecutionBackend::scene_group_joint_position(
@@ -1738,11 +1910,13 @@ void Ros2ControlExecutionBackend::complete_execution() {
       }
     }
   }
-  if (!final_positions.empty()) {
-    update_scene_positions(final_positions, SceneUpdateMode::kBestEffort);
-  }
+  const auto terminal_scene_source_ns = clock_.now();
   publish_snapshot(core::ExecutionState::kCompleted, 1.0, final_positions);
   execution_cv_.notify_all();
+  if (!final_positions.empty()) {
+    project_terminal_scene_positions(final_positions,
+                                     terminal_scene_source_ns);
+  }
 }
 
 bool Ros2ControlExecutionBackend::start_state_matches(
@@ -3293,12 +3467,14 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
     }
     const auto snapshot_before_publish = get_execution_snapshot();
     complete_managed_controlled_stop_execution();
-    update_scene_positions(snapshot_positions, SceneUpdateMode::kBestEffort);
+    const auto terminal_scene_source_ns = clock_.now();
     publish_snapshot(core::ExecutionState::kStopped,
                      snapshot_before_publish.progress,
                      snapshot_positions,
                      std::nullopt,
                      snapshot_source);
+    project_terminal_scene_positions(snapshot_positions,
+                                     terminal_scene_source_ns);
     if (!post_stop_velocities.empty()) {
       std::lock_guard<std::mutex> lock(state_mutex_);
       snapshot_.joint_velocities_rad_s = post_stop_velocities;
@@ -3700,12 +3876,14 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
     }
     const auto snapshot_before_publish = get_execution_snapshot();
     complete_managed_controlled_stop_execution();
-    update_scene_positions(snapshot_positions, SceneUpdateMode::kBestEffort);
+    const auto terminal_scene_source_ns = clock_.now();
     publish_snapshot(core::ExecutionState::kStopped,
                      snapshot_before_publish.progress,
                      snapshot_positions,
                      std::nullopt,
                      snapshot_source);
+    project_terminal_scene_positions(snapshot_positions,
+                                     terminal_scene_source_ns);
     if (!post_stop_velocities.empty()) {
       std::lock_guard<std::mutex> lock(state_mutex_);
       snapshot_.joint_velocities_rad_s = post_stop_velocities;
@@ -3986,10 +4164,13 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
     // endpoint — `decelerate_on_cancel` stopped it mid-flight, and
     // an off-path interrupt with progress=1.0 would falsely signal
     // trajectory completion to downstream stop-snapshot consumers.
+    const auto terminal_scene_source_ns = clock_.now();
     publish_snapshot(core::ExecutionState::kStopped,
                      observed_progress_at_stop, post_stop_positions,
                      std::nullopt,
                      "measured_hard_deceleration_feedback");
+    project_terminal_scene_positions(post_stop_positions,
+                                     terminal_scene_source_ns);
     if (!post_stop_velocities.empty()) {
       std::lock_guard<std::mutex> lock(state_mutex_);
       snapshot_.joint_velocities_rad_s = post_stop_velocities;

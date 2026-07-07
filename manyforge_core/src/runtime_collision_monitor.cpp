@@ -20,7 +20,8 @@ thread_local std::uint64_t t_runtime_collision_monitor_generation = 0;
 
 constexpr auto kDrainCallbacksTimeout = std::chrono::seconds(1);
 
-[[noreturn]] void terminate_runtime_monitor_drain_timeout(const char* phase) {
+[[noreturn]] void terminate_runtime_monitor_drain_timeout(
+    const char* phase, const std::function<void()>& dump_hook) {
   // Fail closed: monitor callbacks can own borrowed kernel state. Once stop()
   // is draining for teardown, continuing after the bound risks UAF and an
   // unbounded wait can hang shutdown.
@@ -31,6 +32,14 @@ constexpr auto kDrainCallbacksTimeout = std::chrono::seconds(1);
                    kDrainCallbacksTimeout)
                    .count()
             << '\n';
+  if (dump_hook) {
+    // Best-effort flight-evidence flush before dying; never let the hook
+    // turn a fail-closed teardown into an exception escape.
+    try {
+      dump_hook();
+    } catch (...) {
+    }
+  }
   std::terminate();
 }
 
@@ -259,6 +268,11 @@ RuntimeCollisionMonitor::~RuntimeCollisionMonitor() {
   stop(/*drain_callbacks=*/true);
 }
 
+void RuntimeCollisionMonitor::set_fail_closed_dump_hook(
+    std::function<void()> hook) {
+  fail_closed_dump_hook_ = std::move(hook);
+}
+
 void RuntimeCollisionMonitor::start() {
   std::lock_guard<std::mutex> lock(mutex_);
   active_ = true;
@@ -284,7 +298,8 @@ void RuntimeCollisionMonitor::stop(bool drain_callbacks) {
     if (drain_callbacks) {
       if (!scheduler_.drain_for(SchedulerPriority::Safety,
                                 kDrainCallbacksTimeout)) {
-        terminate_runtime_monitor_drain_timeout("scheduler_safety_lane");
+        terminate_runtime_monitor_drain_timeout("scheduler_safety_lane",
+                                                 fail_closed_dump_hook_);
       }
     }
     std::unique_lock<std::mutex> lock(mutex_);
@@ -293,7 +308,8 @@ void RuntimeCollisionMonitor::stop(bool drain_callbacks) {
     };
     if (drain_callbacks) {
       if (!cv_.wait_for(lock, kDrainCallbacksTimeout, no_callbacks_in_flight)) {
-        terminate_runtime_monitor_drain_timeout("monitor_callbacks");
+        terminate_runtime_monitor_drain_timeout("monitor_callbacks",
+                                                 fail_closed_dump_hook_);
       }
     } else {
       (void)cv_.wait_for(lock, std::chrono::milliseconds(250),

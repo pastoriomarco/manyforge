@@ -16,6 +16,8 @@ namespace manyforge::roboplan_backend {
 namespace {
 
 constexpr auto kExecutionTick = std::chrono::milliseconds(10);
+constexpr int kTerminalSceneProjectionRetryAttempts = 10;
+constexpr auto kTerminalSceneProjectionRetryDelay = std::chrono::milliseconds(20);
 constexpr double kRuntimeScaleSlewPerSecond = 4.0;  // 0→1 in 250 ms.
 
 double controlled_stop_wait_timeout_s(
@@ -99,6 +101,7 @@ RoboPlanExecutionBackend::RoboPlanExecutionBackend(
 }
 
 RoboPlanExecutionBackend::~RoboPlanExecutionBackend() {
+  stop_terminal_scene_projection_retry_worker();
   (void)reset();
   // jthread auto-joins
 }
@@ -118,12 +121,12 @@ std::int64_t RoboPlanExecutionBackend::publish_snapshot(
   return timestamp_ns;
 }
 
-void RoboPlanExecutionBackend::update_scene_positions(
+bool RoboPlanExecutionBackend::update_scene_positions(
     const std::vector<double>& joint_positions,
     SceneUpdateMode mode,
     std::int64_t source_timestamp_ns) {
   if (joint_positions.empty()) {
-    return;
+    return true;
   }
 
   std::unique_lock<std::mutex> scene_lock(*scene_mutex_, std::defer_lock);
@@ -131,7 +134,7 @@ void RoboPlanExecutionBackend::update_scene_positions(
     scene_lock.lock();
   } else if (!scene_lock.try_lock()) {
     record_scene_projection_miss();
-    return;
+    return false;
   }
 
   Eigen::VectorXd q(joint_positions.size());
@@ -145,6 +148,7 @@ void RoboPlanExecutionBackend::update_scene_positions(
 
   scene_->setJointPositions(q);
   record_scene_projection_success(source_timestamp_ns);
+  return true;
 }
 
 void RoboPlanExecutionBackend::record_scene_projection_success(
@@ -174,6 +178,15 @@ RoboPlanExecutionBackend::scene_projection_metrics() const {
       scene_projection_lag_max_ns_.load(std::memory_order_relaxed);
   metrics.last_success_timestamp_ns =
       scene_projection_last_success_timestamp_ns_.load(std::memory_order_relaxed);
+  metrics.terminal_retries_scheduled_total =
+      terminal_scene_projection_retries_scheduled_total_.load(
+          std::memory_order_relaxed);
+  metrics.terminal_retry_successes_total =
+      terminal_scene_projection_retry_successes_total_.load(
+          std::memory_order_relaxed);
+  metrics.terminal_retry_exhausted_total =
+      terminal_scene_projection_retry_exhausted_total_.load(
+          std::memory_order_relaxed);
   const auto now_ns = clock_.now();
   if (metrics.last_success_timestamp_ns > 0 &&
       now_ns >= metrics.last_success_timestamp_ns) {
@@ -181,6 +194,89 @@ RoboPlanExecutionBackend::scene_projection_metrics() const {
         static_cast<std::uint64_t>(now_ns - metrics.last_success_timestamp_ns);
   }
   return metrics;
+}
+
+void RoboPlanExecutionBackend::schedule_terminal_scene_projection_retry(
+    std::vector<double> joint_positions,
+    std::int64_t source_timestamp_ns) {
+  if (joint_positions.empty()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(terminal_scene_projection_retry_mutex_);
+    pending_terminal_scene_projection_ =
+        PendingTerminalSceneProjection{std::move(joint_positions),
+                                       source_timestamp_ns};
+    terminal_scene_projection_retries_scheduled_total_.fetch_add(
+        1, std::memory_order_relaxed);
+    if (!terminal_scene_projection_retry_thread_.joinable()) {
+      terminal_scene_projection_retry_thread_ = std::jthread(
+          [this](std::stop_token stop_token) {
+            terminal_scene_projection_retry_worker(stop_token);
+          });
+    }
+  }
+  terminal_scene_projection_retry_cv_.notify_one();
+}
+
+void RoboPlanExecutionBackend::terminal_scene_projection_retry_worker(
+    std::stop_token stop_token) {
+  while (!stop_token.stop_requested()) {
+    PendingTerminalSceneProjection pending;
+    {
+      std::unique_lock<std::mutex> lock(
+          terminal_scene_projection_retry_mutex_);
+      // Token-aware wait: a plain condition_variable whose predicate reads
+      // stop_requested() (state that flips outside this mutex) can lose the
+      // stop wakeup between predicate evaluation and enqueue, deadlocking the
+      // destructor join. The (lock, stoken, pred) overload re-checks the stop
+      // state under the lock and cannot lose it.
+      terminal_scene_projection_retry_cv_.wait(
+          lock, stop_token, [this]() {
+            return pending_terminal_scene_projection_.has_value();
+          });
+      if (stop_token.stop_requested()) {
+        return;
+      }
+      pending = std::move(*pending_terminal_scene_projection_);
+      pending_terminal_scene_projection_.reset();
+    }
+
+    bool projected = false;
+    for (int attempt = 0; attempt < kTerminalSceneProjectionRetryAttempts;
+         ++attempt) {
+      if (stop_token.stop_requested()) {
+        return;
+      }
+      if (update_scene_positions(pending.joint_positions,
+                                 SceneUpdateMode::kBestEffort,
+                                 pending.source_timestamp_ns)) {
+        projected = true;
+        terminal_scene_projection_retry_successes_total_.fetch_add(
+            1, std::memory_order_relaxed);
+        break;
+      }
+      if (attempt + 1 < kTerminalSceneProjectionRetryAttempts) {
+        std::this_thread::sleep_for(kTerminalSceneProjectionRetryDelay);
+      }
+    }
+    if (!projected && !stop_token.stop_requested()) {
+      terminal_scene_projection_retry_exhausted_total_.fetch_add(
+          1, std::memory_order_relaxed);
+    }
+  }
+}
+
+void RoboPlanExecutionBackend::stop_terminal_scene_projection_retry_worker()
+    noexcept {
+  if (terminal_scene_projection_retry_thread_.joinable()) {
+    // request_stop() wakes the token-aware wait through the jthread's
+    // internal stop_callback; no manual notify is needed (and a manual
+    // notify without the mutex would be the lost-wakeup pattern this
+    // codebase has already fixed twice).
+    terminal_scene_projection_retry_thread_.request_stop();
+    terminal_scene_projection_retry_thread_.join();
+  }
 }
 
 void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::TrajectoryDTO trajectory) {
@@ -220,8 +316,15 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
     const bool pause_requested = state_.pause_requested.load();
 
     if (st.stop_requested()) {
-      publish_snapshot(core::ExecutionState::kStopped,
-                       get_execution_snapshot().progress, latest_positions);
+      const auto stopped_snapshot_ns =
+          publish_snapshot(core::ExecutionState::kStopped,
+                           get_execution_snapshot().progress, latest_positions);
+      if (!update_scene_positions(latest_positions,
+                                  SceneUpdateMode::kBestEffort,
+                                  stopped_snapshot_ns)) {
+        schedule_terminal_scene_projection_retry(latest_positions,
+                                                 stopped_snapshot_ns);
+      }
       break;
     }
 
@@ -478,9 +581,16 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     state_.natural_completion_stop_requested.store(false,
                                                    std::memory_order_release);
     const auto latest = get_execution_snapshot();
-    publish_snapshot(core::ExecutionState::kStopped,
-                     latest.progress,
-                     latest.joint_positions_rad);
+    const auto stopped_snapshot_ns =
+        publish_snapshot(core::ExecutionState::kStopped,
+                         latest.progress,
+                         latest.joint_positions_rad);
+    if (!update_scene_positions(latest.joint_positions_rad,
+                                SceneUpdateMode::kBestEffort,
+                                stopped_snapshot_ns)) {
+      schedule_terminal_scene_projection_retry(latest.joint_positions_rad,
+                                               stopped_snapshot_ns);
+    }
     execution_cv_.notify_all();
     result.accepted = true;
     result.backend_stop_confirmed = false;
@@ -756,8 +866,12 @@ RoboPlanExecutionBackend::execute_controlled_stop(
       std::lock_guard<std::mutex> velocity_lock(state_mutex_);
       state_.snapshot.joint_velocities_rad_s = final_wp.velocities_rad_s;
     }
-    update_scene_positions(final_wp.positions_rad, SceneUpdateMode::kBestEffort,
-                           stopped_snapshot_ns);
+    if (!update_scene_positions(final_wp.positions_rad,
+                                SceneUpdateMode::kBestEffort,
+                                stopped_snapshot_ns)) {
+      schedule_terminal_scene_projection_retry(final_wp.positions_rad,
+                                               stopped_snapshot_ns);
+    }
     state_.running.store(false);
     state_.natural_completion_stop_requested.store(false,
                                                    std::memory_order_release);
@@ -994,8 +1108,12 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     std::lock_guard<std::mutex> velocity_lock(state_mutex_);
     state_.snapshot.joint_velocities_rad_s = final_wp.velocities_rad_s;
   }
-  update_scene_positions(final_wp.positions_rad, SceneUpdateMode::kBestEffort,
-                         stopped_snapshot_ns);
+  if (!update_scene_positions(final_wp.positions_rad,
+                              SceneUpdateMode::kBestEffort,
+                              stopped_snapshot_ns)) {
+    schedule_terminal_scene_projection_retry(final_wp.positions_rad,
+                                             stopped_snapshot_ns);
+  }
   state_.running.store(false);
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);

@@ -15,6 +15,7 @@ import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import islice
 from typing import Any, Callable, Optional
 
 import py_trees
@@ -40,6 +41,12 @@ _KERNEL_CONTROL_CALL_TIMEOUT_S = float(
 _RESET_PHASE_DEADLINE_S = float(
     os.environ.get("MANYFORGE_RESET_PHASE_DEADLINE_S", "20.0")
 )
+_SIGNAL_PROVIDER_POLL_TICKS = max(
+    1,
+    int(os.environ.get("MANYFORGE_SIGNAL_PROVIDER_POLL_TICKS", "10")),
+)
+_PAUSED_TICK_WAIT_S = 0.050
+_INTERVENTION_SESSION_EVENT_LIMIT = 4096
 
 from manyforge_behavior.blackboard_bindings import key_ref_id
 from manyforge_behavior.blackboard_namespace import write_namespace_bundle
@@ -195,7 +202,9 @@ class InterventionSession:
     error: Optional[str] = None
     started_at_ns: int = field(default_factory=time.monotonic_ns)
     finished_at_ns: Optional[int] = None
-    events: list[dict[str, Any]] = field(default_factory=list)
+    events: deque[dict[str, Any]] = field(
+        default_factory=lambda: deque(maxlen=_INTERVENTION_SESSION_EVENT_LIMIT)
+    )
     promotions: list[dict[str, Any]] = field(default_factory=list)
     _event_index: int = field(default=0, init=False, repr=False)
 
@@ -423,8 +432,16 @@ class CycleManager:
         self._parent_run_id_provider: Optional[Callable[[], Optional[str]]] = None
         self._kernel_events: deque[dict[str, Any]] = deque(maxlen=4096)
         self._kernel_event_index: int = 0
+        self._kernel_collector_dropped_total: int = 0
+        self._kernel_manager_dropped_total: int = 0
+        self._kernel_last_sequence_seen: int = 0
         self._signal_registry = RuntimeSignalRegistry()
         self._signal_managed_keys: set[str] = set()
+        self._signal_provider_poll_ticks = _SIGNAL_PROVIDER_POLL_TICKS
+        self._signal_provider_poll_countdown = 0
+        self._last_signal_registry_change_counter = (
+            self._signal_registry.change_counter()
+        )
         self._resumable_stop_scene_fingerprint: Optional[str] = None
         self._resumable_stop_scene_fingerprint_error: Optional[str] = None
         # Program-run correlation id (spec/500 §2.2): minted once per
@@ -1348,16 +1365,44 @@ class CycleManager:
             return dict(self._node_statuses)
 
     def _drain_kernel_events(self) -> list[dict[str, Any]]:
-        """Pull native kernel events from the kernel and buffer them."""
-        events = self._kernel.drain_kernel_events()
-        if not events:
-            return []
+        """Pull native kernel events from the kernel and buffer them.
+
+        Loss accounting (observability plan OW1): the collector-side
+        overflow-drop total rides along with every drain, and evictions of
+        events that were buffered here but never served to a consumer are
+        counted as manager-side drops. Both totals are monotonic and exposed
+        via kernel_event_pipeline_status().
+        """
+        stats = self._kernel.drain_kernel_events_with_stats()
+        events = stats.get("events") or []
+        collector_dropped = int(stats.get("dropped_total") or 0)
         with self._lock:
+            self._kernel_collector_dropped_total = collector_dropped
+            if not events:
+                return []
+            maxlen = self._kernel_events.maxlen or 0
+            overflow = max(
+                0, len(self._kernel_events) + len(events) - maxlen
+            ) if maxlen else 0
+            if overflow:
+                self._kernel_manager_dropped_total += overflow
             for event in events:
                 self._kernel_event_index += 1
                 event["event_index"] = self._kernel_event_index
                 self._kernel_events.append(event)
+            last_sequence = int(events[-1].get("sequence") or 0)
+            if last_sequence:
+                self._kernel_last_sequence_seen = last_sequence
         return events
+
+    def kernel_event_pipeline_status(self) -> dict[str, int]:
+        """Monotonic loss counters for the kernel->Python event pipeline."""
+        with self._lock:
+            return {
+                "collector_dropped_total": self._kernel_collector_dropped_total,
+                "manager_dropped_total": self._kernel_manager_dropped_total,
+                "last_sequence_seen": self._kernel_last_sequence_seen,
+            }
 
     def drain_kernel_events_now(self) -> list[dict[str, Any]]:
         """Pull pending native kernel events into the indexed event buffer.
@@ -1372,10 +1417,19 @@ class CycleManager:
     def get_kernel_events_since(self, event_index: int) -> list[dict[str, Any]]:
         """Return kernel events with event_index greater than the given value."""
         with self._lock:
+            if not self._kernel_events:
+                return []
+            first_index = int(self._kernel_events[0].get("event_index", 0) or 0)
+            last_index = int(self._kernel_events[-1].get("event_index", 0) or 0)
+            if event_index < first_index:
+                start_offset = 0
+            elif event_index >= last_index:
+                return []
+            else:
+                start_offset = event_index - first_index + 1
             return [
                 dict(event)
-                for event in self._kernel_events
-                if event.get("event_index", 0) > event_index
+                for event in islice(self._kernel_events, start_offset, None)
             ]
 
     @staticmethod
@@ -1449,6 +1503,9 @@ class CycleManager:
         """Remove an external signal provider and clear its mirrored keys."""
         self._signal_registry.unregister_provider(adapter_id)
         self._sync_signal_blackboard(time.monotonic_ns())
+        self._last_signal_registry_change_counter = (
+            self._signal_registry.change_counter()
+        )
 
     def publish_signal(
         self,
@@ -1477,6 +1534,9 @@ class CycleManager:
             )
         )
         self._sync_signal_blackboard(time.monotonic_ns())
+        self._last_signal_registry_change_counter = (
+            self._signal_registry.change_counter()
+        )
 
     def publish_force_current_evidence(
         self,
@@ -2543,6 +2603,7 @@ class CycleManager:
         with self._lock:
             thread = self._tick_thread
             self._tick_stop_event.set()
+            self._tick_pause_event.set()
         joined = True
         if thread is not None and thread.is_alive():
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -2589,6 +2650,7 @@ class CycleManager:
             # Stop tick thread if running
             if self._tick_thread is not None and self._tick_thread.is_alive():
                 self._tick_stop_event.set()
+                self._tick_pause_event.set()
                 thread_to_join = self._tick_thread
 
         if thread_to_join is not None:
@@ -2777,8 +2839,20 @@ class CycleManager:
     def _refresh_signal_registry(self) -> None:
         """Poll external signal providers and mirror fresh values to blackboard."""
         now_ns = time.monotonic_ns()
-        self._signal_registry.poll_providers(now_ns=now_ns)
+        if self._signal_provider_poll_countdown <= 0:
+            self._signal_registry.poll_providers(now_ns=now_ns)
+            self._signal_provider_poll_countdown = self._signal_provider_poll_ticks - 1
+        else:
+            self._signal_registry.expire(now_ns=now_ns)
+            self._signal_provider_poll_countdown -= 1
+
+        counter = self._signal_registry.change_counter(now_ns=now_ns)
+        if counter == self._last_signal_registry_change_counter:
+            return
         self._sync_signal_blackboard(now_ns)
+        self._last_signal_registry_change_counter = (
+            self._signal_registry.change_counter(now_ns=now_ns)
+        )
 
     def _sync_signal_blackboard(self, now_ns: int) -> None:
         snapshot = self._signal_registry.snapshot(now_ns=now_ns)
@@ -2810,7 +2884,7 @@ class CycleManager:
         
         while not self._tick_stop_event.is_set():
             # Wait for pause event (blocks when paused)
-            if not self._tick_pause_event.wait(timeout=0.001):
+            if not self._tick_pause_event.wait(timeout=_PAUSED_TICK_WAIT_S):
                 continue  # Paused, loop again
 
             self._refresh_signal_registry()
@@ -3584,6 +3658,7 @@ class CycleManager:
                 )
                 if self._tick_thread is not None and self._tick_thread.is_alive():
                     self._tick_stop_event.set()
+                    self._tick_pause_event.set()
                     thread_to_join = self._tick_thread
 
         if thread_to_join is not None:
@@ -3715,7 +3790,7 @@ class CycleManager:
                 )
                 return
 
-            if not self._tick_pause_event.wait(timeout=0.001):
+            if not self._tick_pause_event.wait(timeout=_PAUSED_TICK_WAIT_S):
                 continue
 
             start_time = time.monotonic()
@@ -3784,6 +3859,7 @@ class CycleManager:
             if self._state != CycleState.DIRECT_CONTROL:
                 return
             self._tick_stop_event.set()
+            self._tick_pause_event.set()
             thread_to_join = self._tick_thread
 
         if thread_to_join is not None:

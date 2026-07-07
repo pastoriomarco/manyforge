@@ -19,6 +19,12 @@ struct MetricsSnapshot {
   uint64_t snapshots_published = 0;
   uint64_t event_subscriber_exceptions = 0;
   uint64_t observer_lag_max_ns = 0;
+  // Total events dispatched (== the dispatch-order sequence high-water mark)
+  // and total records absorbed by the flight ring. Populated at
+  // get_metrics() time from their owning counters — no additional hot-path
+  // work (observability plan OW6).
+  uint64_t events_emitted = 0;
+  uint64_t flight_recorder_records = 0;
 };
 
 }  // namespace manyforge::core

@@ -15,7 +15,17 @@ namespace manyforge::core {
 /// counter.
 class ExecutionSnapshotPublisher {
  public:
-  void publish(ExecutionSnapshot snapshot, std::int64_t fallback_timestamp_ns);
+  /// Compact identity of a published snapshot, for callers that need the
+  /// assigned sequence without copying the full snapshot back out.
+  struct PublishedIdentity {
+    std::uint64_t sequence_number = 0;
+    std::int64_t timestamp_ns = 0;
+    std::uint64_t execution_id = 0;
+    ExecutionState state{};
+  };
+
+  PublishedIdentity publish(ExecutionSnapshot snapshot,
+                            std::int64_t fallback_timestamp_ns);
 
   ExecutionSnapshot latest() const;
 

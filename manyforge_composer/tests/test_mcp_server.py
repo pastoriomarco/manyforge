@@ -629,7 +629,9 @@ class TestExecutionStatus:
             event["action_span_id"] for event in snapshot["span_events"]
         ] == ["span-drop"]
         assert {
-            event["action_span_id"] for event in snapshot["all_events"]
+            event["action_span_id"]
+            for event in snapshot["all_events"]
+            if "action_span_id" in event
         } == {"span-sibling", "span-drop"}
 
     def test_all(self):

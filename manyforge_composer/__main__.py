@@ -560,6 +560,8 @@ def _run_mcp(args):
         failure_archive_enabled=not args.disable_failure_archive,
         failure_archive_max_age_s=args.failure_archive_max_age_s,
         failure_archive_max_bytes=args.failure_archive_max_bytes,
+        trace_max_age_s=args.trace_max_age_s,
+        trace_max_bytes=args.trace_max_bytes,
         allowed_fs_roots=security.allowed_fs_roots,
     )
     _configure_assistant_provider(
@@ -692,6 +694,26 @@ def main():
         ),
     )
     parser.add_argument(
+        "--trace-max-age-s",
+        type=float,
+        default=_optional_float_env("MANYFORGE_TRACE_MAX_AGE_S"),
+        help=(
+            "Per-run trace JSONL retention age in seconds. Defaults to "
+            "MANYFORGE_TRACE_MAX_AGE_S or 2592000 (30 days)."
+        ),
+    )
+    parser.add_argument(
+        "--trace-max-bytes",
+        type=int,
+        default=_optional_int_env("MANYFORGE_TRACE_MAX_BYTES"),
+        help=(
+            "Trace directory disk budget in bytes. Defaults to "
+            "MANYFORGE_TRACE_MAX_BYTES or 2147483648 (2 GiB). Oldest "
+            "INFO-only runs are pruned first; ERROR/CRITICAL runs are "
+            "preferred-kept."
+        ),
+    )
+    parser.add_argument(
         "--disable-failure-archive",
         action="store_true",
         default=_bool_env("MANYFORGE_DISABLE_FAILURE_ARCHIVE", False),
@@ -738,6 +760,8 @@ def main():
         failure_archive_enabled=not args.disable_failure_archive,
         failure_archive_max_age_s=args.failure_archive_max_age_s,
         failure_archive_max_bytes=args.failure_archive_max_bytes,
+        trace_max_age_s=args.trace_max_age_s,
+        trace_max_bytes=args.trace_max_bytes,
         allowed_fs_roots=security.allowed_fs_roots,
     )
     _configure_assistant_provider(

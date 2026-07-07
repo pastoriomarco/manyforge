@@ -94,6 +94,10 @@ class RecordingExecutionStateSink final : public core::IExecutionStateSink {
       core::ExecutionStateUpdateMode mode) override {
     std::lock_guard<std::mutex> lock(mutex_);
     group_updates_.push_back({group_id, positions_rad, mode});
+    if (fail_group_updates_remaining_ > 0) {
+      --fail_group_updates_remaining_;
+      return {fail_group_update_status_};
+    }
     return {group_status_};
   }
 
@@ -147,12 +151,24 @@ class RecordingExecutionStateSink final : public core::IExecutionStateSink {
     return group_updates_;
   }
 
+  void fail_next_group_updates(
+      std::size_t count,
+      core::ExecutionStateSinkStatus status =
+          core::ExecutionStateSinkStatus::kBusy) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fail_group_updates_remaining_ = count;
+    fail_group_update_status_ = status;
+  }
+
  private:
   mutable std::mutex mutex_;
   std::map<std::pair<std::string, std::string>, double> joint_positions_;
   mutable std::vector<SingleJointRead> reads_;
   std::vector<SingleJointUpdate> single_updates_;
   std::vector<GroupUpdate> group_updates_;
+  std::size_t fail_group_updates_remaining_ = 0;
+  core::ExecutionStateSinkStatus fail_group_update_status_ =
+      core::ExecutionStateSinkStatus::kBusy;
   core::ExecutionStateSinkStatus group_status_ =
       core::ExecutionStateSinkStatus::kApplied;
   core::ExecutionStateSinkStatus single_update_status_ =
@@ -618,6 +634,55 @@ TEST(Ros2ControlExecutionBackendTest,
       {"joint_1"}, {1.0}, {}, t0 + 1ms);
   EXPECT_GE(backend.testing_latest_action_feedback_position_capacity(),
             first_capacity);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     TerminalSceneProjectionMissIsMetricedAndRetriedAfterSnapshot) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  clock.set(1'000'000);
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      base_config());
+
+  const auto t0 = std::chrono::steady_clock::now();
+  backend.testing_store_action_feedback_sample(
+      {"joint_1"}, {0.42}, {}, t0);
+  sink->fail_next_group_updates(1);
+
+  backend.testing_complete_execution();
+
+  const auto terminal = backend.get_execution_snapshot();
+  EXPECT_EQ(terminal.state, core::ExecutionState::kCompleted);
+  ASSERT_EQ(terminal.joint_positions_rad.size(), 1u);
+  EXPECT_NEAR(terminal.joint_positions_rad.front(), 0.42, 1e-9);
+
+  auto metrics = backend.scene_projection_metrics();
+  EXPECT_EQ(metrics.misses_total, 1u);
+  EXPECT_EQ(metrics.terminal_retries_scheduled_total, 1u);
+  EXPECT_EQ(metrics.terminal_retry_exhausted_total, 0u);
+
+  const auto deadline = std::chrono::steady_clock::now() + 1s;
+  while (metrics.terminal_retry_successes_total == 0u &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(5ms);
+    metrics = backend.scene_projection_metrics();
+  }
+
+  EXPECT_EQ(metrics.terminal_retry_successes_total, 1u);
+  EXPECT_EQ(metrics.terminal_retry_exhausted_total, 0u);
+  EXPECT_GE(metrics.successful_updates_total, 1u);
+  EXPECT_GT(metrics.last_success_timestamp_ns, 0);
+
+  const auto updates = sink->group_updates();
+  ASSERT_GE(updates.size(), 2u);
+  EXPECT_EQ(updates.front().mode, core::ExecutionStateUpdateMode::kBestEffort);
+  EXPECT_EQ(updates.back().mode, core::ExecutionStateUpdateMode::kBestEffort);
+  ASSERT_EQ(updates.back().positions_rad.size(), 1u);
+  EXPECT_NEAR(updates.back().positions_rad.front(), 0.42, 1e-9);
 }
 
 TEST(Ros2ControlExecutionBackendTest,

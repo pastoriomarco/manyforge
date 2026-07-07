@@ -6,6 +6,7 @@ import copy
 import hashlib
 import logging
 import math
+import os
 import threading
 import time
 import uuid
@@ -265,6 +266,8 @@ class ComposerState:
         failure_archive_enabled: bool = True,
         failure_archive_max_age_s: float | None = None,
         failure_archive_max_bytes: int | None = None,
+        trace_max_age_s: float | None = None,
+        trace_max_bytes: int | None = None,
         allowed_fs_roots: list[str] | None = None,
     ):
         self.catalog = NodeCatalog(catalog_path)
@@ -287,7 +290,10 @@ class ComposerState:
             failure_archive_enabled=failure_archive_enabled,
             failure_archive_max_age_s=failure_archive_max_age_s,
             failure_archive_max_bytes=failure_archive_max_bytes,
+            trace_max_age_s=trace_max_age_s,
+            trace_max_bytes=trace_max_bytes,
         )
+        self._initialize_kernel_observability(trace_dir)
         self.scene_edit_lock = threading.Lock()
         # Viewer-side visibility state. ComposerState is the source of truth
         # for the native viewer. Robot/tool frames default visible. Object
@@ -919,6 +925,49 @@ class ComposerState:
         self.cycle_manager.set_on_reset_phase_event(
             self._record_cycle_reset_phase,
         )
+
+    def _initialize_kernel_observability(self, trace_dir: str) -> None:
+        """Wire the kernel flight-ring dump directory, ingest dumps left by a
+        previous fail-closed death, and install the monotonic<->wall clock
+        anchor. Best-effort by design: observability wiring failure must
+        never block Composer startup (spec 500 §1)."""
+        flight_dir = os.path.join(str(trace_dir), "flight")
+        try:
+            os.makedirs(flight_dir, exist_ok=True)
+            self._kernel.set_flight_recorder_dir(flight_dir)
+        except Exception:  # noqa: BLE001 - telemetry wiring is best-effort.
+            logger.warning("kernel flight recorder wiring failed", exc_info=True)
+        try:
+            ingested = self.event_recorder.ingest_kernel_flight_dumps(flight_dir)
+            if ingested:
+                logger.warning(
+                    "ingested kernel flight dumps from a previous fail-closed "
+                    "termination",
+                    extra={"count": ingested, "flight_dir": flight_dir},
+                )
+        except Exception:  # noqa: BLE001 - telemetry wiring is best-effort.
+            logger.warning("kernel flight dump ingest failed", exc_info=True)
+        self.refresh_clock_anchor(min_interval_s=0.0)
+
+    def refresh_clock_anchor(self, *, min_interval_s: float = 3600.0) -> None:
+        """Record a fresh kernel monotonic<->wall anchor, rate-limited.
+
+        Called at startup and periodically from the state hub so long-running
+        deployments keep an anchor near every event in the retained window.
+        """
+        now = time.monotonic()
+        last = getattr(self, "_last_clock_anchor_monotonic", 0.0)
+        if min_interval_s > 0.0 and now - last < min_interval_s:
+            return
+        try:
+            anchor = self._kernel.clock_anchor()
+            self.event_recorder.set_clock_anchor(
+                monotonic_ns=anchor["monotonic_ns"],
+                wall_time_ns=anchor["wall_time_ns"],
+            )
+            self._last_clock_anchor_monotonic = now
+        except Exception:  # noqa: BLE001 - telemetry wiring is best-effort.
+            logger.warning("clock anchor refresh failed", exc_info=True)
 
     def _current_or_last_run_id_for_recovery(self) -> Optional[str]:
         self.event_recorder.observe(self, force=True)

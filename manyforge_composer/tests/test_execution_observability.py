@@ -480,3 +480,174 @@ def test_observe_is_rate_limited_and_force_bypasses(tmp_path):
         assert state.reads == 3
     finally:
         recorder.close()
+
+
+def test_latency_histograms_endpoint_and_debug_export(tmp_path):
+    """OW6: a real cycle populates the execute-duration histogram, and the
+    per-run payload is reachable via its endpoint and the debug export."""
+    kernel = MockKernelClient(execute_duration_s=0.2)
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=kernel,
+        trace_dir=str(tmp_path),
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        assert client.post("/api/program/load", json={"path": _PROGRAM_PATH}).status_code == 200
+        assert client.post("/api/cycle/run").status_code == 200
+        # Bound the wait on at least one execute start/complete pair landing.
+        deadline = time.monotonic() + 3.0
+        execute_count = 0
+        while time.monotonic() < deadline:
+            payload = client.get("/api/execution/latency-histograms").json()
+            execute_count = payload["current_run"]["metrics"]["execute"]["count"]
+            if execute_count >= 1:
+                break
+            time.sleep(0.05)
+
+        payload = client.get("/api/execution/latency-histograms").json()
+        assert payload["schema_version"] == "manyforge.latency_histograms.v1"
+        metrics = payload["current_run"]["metrics"]
+        assert set(metrics) == {"stop", "plan", "validate", "execute"}
+        assert metrics["execute"]["count"] >= 1
+        assert metrics["execute"]["sum_ns"] > 0
+        assert metrics["execute"]["p50_ns"] is not None
+        assert "bucket_bounds_ns" in metrics["execute"]
+        assert payload["current_run"]["run_id"] is not None
+
+        exported = client.get("/api/debug/export").json()
+        assert "latencyHistograms" in exported
+        assert (
+            exported["latencyHistograms"]["schema_version"]
+            == "manyforge.latency_histograms.v1"
+        )
+        assert (
+            exported["latencyHistograms"]["current_run"]["metrics"]["execute"][
+                "count"
+            ]
+            >= 1
+        )
+
+
+def test_heartbeat_reports_stop_latency_component(tmp_path):
+    """OW6: the heartbeat carries an informational stop-latency summary."""
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        trace_dir=str(tmp_path),
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        assert client.post("/api/program/load", json={"path": _PROGRAM_PATH}).status_code == 200
+        heartbeat = client.get("/api/infra/heartbeat").json()
+        assert "stop_latency" in heartbeat["components"]
+        stop_latency = heartbeat["components"]["stop_latency"]
+        assert "count" in stop_latency
+        # No stops yet: informational summary reports zero, never degrades.
+        assert stop_latency["count"] == 0
+        assert heartbeat["status"] in {"ok", "degraded"}
+
+
+def _seed_runs_at_walls(rec, monkeypatch, runs):
+    """Seed (run_id, wall_iso) runs onto a recorder with controlled wall time."""
+    from manyforge_composer.backend import event_recorder as er_mod
+
+    wall = {"v": runs[0][1]}
+    monkeypatch.setattr(er_mod, "_wall_timestamp_iso", lambda: wall["v"])
+    for run_id, wall_iso in runs:
+        wall["v"] = wall_iso
+        rec._handle_cycle_state_transition(None, "running", run_id)
+        rec._record_event(event_type="pose_source_applied", execution_id=1)
+        rec._handle_cycle_state_transition("running", "idle")
+    rec._jsonl_queue.join()
+
+
+def test_cross_run_history_endpoint_windows_by_wall(tmp_path, monkeypatch):
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        trace_dir=str(tmp_path),
+    )
+    _seed_runs_at_walls(
+        state.event_recorder,
+        monkeypatch,
+        [
+            ("run-1", "2026-07-07T01:00:00Z"),
+            ("run-2", "2026-07-07T02:00:00Z"),
+            ("run-3", "2026-07-07T03:00:00Z"),
+        ],
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        resp = client.get(
+            "/api/execution/history",
+            params={
+                "fromWall": "2026-07-07T01:30:00Z",
+                "toWall": "2026-07-07T02:30:00Z",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["runIds"] == ["run-2"]
+        assert data["runsTruncated"] is False
+        assert data["scannedRunCount"] >= 1
+        assert data["crossRunScanLimit"] == 2000
+        assert data["events"]
+        assert all(e["run_id"] == "run-2" for e in data["events"])
+
+        # A wall window spanning runs 2 and 3, oldest first.
+        spanning = client.get(
+            "/api/execution/history",
+            params={"fromWall": "2026-07-07T01:30:00Z"},
+        ).json()
+        assert spanning["runIds"] == ["run-2", "run-3"]
+
+        selected = client.get(
+            "/api/execution/history",
+            params={
+                "run_id": "run-1",
+                "fromWall": "2026-07-07T00:30:00Z",
+                "toWall": "2026-07-07T03:30:00Z",
+            },
+        ).json()
+        assert selected["runIds"] == ["run-1"]
+        assert selected["crossRunScanLimit"] == 1
+
+        # Malformed wall bound is a client error, not a 500.
+        bad = client.get(
+            "/api/execution/history", params={"fromWall": "not-a-timestamp"}
+        )
+        assert bad.status_code == 400
+
+        mixed_clocks = client.get(
+            "/api/execution/history",
+            params={
+                "fromWall": "2026-07-07T01:30:00Z",
+                "startNs": 1,
+            },
+        )
+        assert mixed_clocks.status_code == 400
+
+
+def test_debug_export_includes_run_index(tmp_path, monkeypatch):
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        trace_dir=str(tmp_path),
+    )
+    _seed_runs_at_walls(
+        state.event_recorder,
+        monkeypatch,
+        [
+            ("run-1", "2026-07-07T01:00:00Z"),
+            ("run-2", "2026-07-07T02:00:00Z"),
+        ],
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        exported = client.get("/api/debug/export").json()
+        assert "runIndex" in exported
+        run_ids = {entry["run_id"] for entry in exported["runIndex"]}
+        assert {"run-1", "run-2"} <= run_ids

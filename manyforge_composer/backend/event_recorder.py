@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import heapq
+from itertools import islice
 import json
+import logging
 import os
 import queue
 import shutil
@@ -14,8 +18,11 @@ import threading
 import time
 from typing import Any, Optional
 
+logger = logging.getLogger(__name__)
+
 _ALLOWED_EVENT_TYPES = {
     "cache_hit",
+    "clock_anchor",
     "cycle_error",
     "cycle_started",
     "cycle_state_changed",
@@ -28,6 +35,10 @@ _ALLOWED_EVENT_TYPES = {
     "execute_started",
     "intervention_required",
     "kernel_error",
+    "kernel_event_gap",
+    "stop_decision_chain",
+    "trace_pruned",
+    "kernel_flight_dump",
     "kernel_state_transition",
     "node_status_transition",
     "pause_completed",
@@ -41,6 +52,7 @@ _ALLOWED_EVENT_TYPES = {
 }
 _ALLOWED_EVENT_PREFIXES = (
     "cycle_reset_",
+    "kernel_native_",
     "intervention_",
     "model_call_",
     "pose_source_",
@@ -48,9 +60,144 @@ _ALLOWED_EVENT_PREFIXES = (
     "simulation_control_",
     "tool_dispatch_",
 )
+# INFO-severity events whose loss would break restart continuity or violate
+# spec 520 §4.3 (the act of pruning must itself survive): these fsync like
+# WARN+ events despite their severity. Keep this set tiny — every entry is a
+# synchronous disk barrier on the writer thread.
+_DURABLE_INFO_EVENT_TYPES = frozenset(
+    {"clock_anchor", "stop_decision_chain", "trace_pruned"}
+)
+_RUNS_INDEX_FILENAME = "runs.index.jsonl"
+# Durable events recorded before any run exists (startup clock anchor,
+# startup prune evidence) land here instead of vanishing: no run file can
+# receive them yet, but their loss would break restart forensics.
+_NO_RUN_FILENAME = "_norun.events.jsonl"
+_RUNS_INDEX_REHYDRATE_LINES = 4000
+_DEFAULT_TRACE_MAX_AGE_S = 30 * 24 * 3600.0
+_DEFAULT_TRACE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_KERNEL_NATIVE_CHANNEL = "kernel_native"
+_RUNTIME_COLLISION_FAULT_SOURCE_ID = "manyforge.kernel.runtime_collision_fault"
+# OW6: fixed log-scale latency buckets (ns). Percentiles are interpolated
+# within the winning bucket; the overflow bucket reports its lower bound.
+_LATENCY_BUCKET_BOUNDS_NS = (
+    1_000_000,       # 1 ms
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    20_000_000,
+    50_000_000,
+    100_000_000,
+    200_000_000,
+    500_000_000,
+    1_000_000_000,   # 1 s
+    2_000_000_000,
+    5_000_000_000,
+    10_000_000_000,  # 10 s
+)
+_LATENCY_METRICS = ("stop", "plan", "validate", "execute")
+# Bounded start-timestamp tracking per metric: interleaved executions are
+# keyed by execution_id; the cap only matters if completions are lost.
+_LATENCY_PENDING_CAP = 64
+
+
+class _LatencyHistogram:
+    """Fixed-bucket latency histogram fed on the recorder thread — derived
+    from event timestamps the pipeline already carries, so no new hot-path
+    instrumentation (observability plan OW6)."""
+
+    __slots__ = ("counts", "count", "sum_ns", "min_ns", "max_ns")
+
+    def __init__(self) -> None:
+        self.counts = [0] * (len(_LATENCY_BUCKET_BOUNDS_NS) + 1)
+        self.count = 0
+        self.sum_ns = 0
+        self.min_ns: Optional[int] = None
+        self.max_ns: Optional[int] = None
+
+    def observe(self, duration_ns: int) -> None:
+        if duration_ns < 0:
+            return
+        index = len(_LATENCY_BUCKET_BOUNDS_NS)
+        for i, bound in enumerate(_LATENCY_BUCKET_BOUNDS_NS):
+            if duration_ns <= bound:
+                index = i
+                break
+        self.counts[index] += 1
+        self.count += 1
+        self.sum_ns += duration_ns
+        if self.min_ns is None or duration_ns < self.min_ns:
+            self.min_ns = duration_ns
+        if self.max_ns is None or duration_ns > self.max_ns:
+            self.max_ns = duration_ns
+
+    def percentile_ns(self, fraction: float) -> Optional[int]:
+        if self.count == 0:
+            return None
+        target = fraction * self.count
+        cumulative = 0
+        for i, bucket_count in enumerate(self.counts):
+            if bucket_count == 0:
+                continue
+            if cumulative + bucket_count >= target:
+                lo = _LATENCY_BUCKET_BOUNDS_NS[i - 1] if i > 0 else 0
+                if i >= len(_LATENCY_BUCKET_BOUNDS_NS):
+                    return _LATENCY_BUCKET_BOUNDS_NS[-1]
+                hi = _LATENCY_BUCKET_BOUNDS_NS[i]
+                within = (target - cumulative) / bucket_count
+                return int(lo + (hi - lo) * within)
+            cumulative += bucket_count
+        return self.max_ns
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "count": self.count,
+            "sum_ns": self.sum_ns,
+            "min_ns": self.min_ns,
+            "max_ns": self.max_ns,
+            "p50_ns": self.percentile_ns(0.50),
+            "p95_ns": self.percentile_ns(0.95),
+            "p99_ns": self.percentile_ns(0.99),
+            "bucket_bounds_ns": list(_LATENCY_BUCKET_BOUNDS_NS),
+            "bucket_counts": list(self.counts),
+        }
+
+
+# Incident-embed proximity window (recorder event indices): a chain older
+# than this many recorder events is never attached by the channel fallback.
+_STOP_DECISION_EMBED_WINDOW = 500
+_STOP_TERMINAL_STATES = frozenset({"Stopped", "Interrupted", "InterventionRequired"})
+_EPISODE_ABANDON_STATES = frozenset(
+    {"Executing", "Planning", "Validating", "Idle", "Completed"}
+)
+# Curated subset of stop/preempt detail keys carried into the decision chain.
+_STOP_CHAIN_DETAIL_KEYS = (
+    "requested_stop_mode",
+    "executed_stop_mode",
+    "controlled_stop_success",
+    "emergency_fallback",
+    "hard_stop_transitioned",
+    "stop_command_source",
+)
+_KERNEL_NATIVE_CHANNEL_LIMIT = 2000
+_KERNEL_NATIVE_ERROR_TYPES = {
+    "error_raised",
+    "collision_detected",
+    "motion_trip_failed",
+}
+_KERNEL_NATIVE_WARN_TYPES = {
+    "interrupt_latched",
+    "interrupt_preempt_applied",
+    "interrupt_dropped_queue_overflow",
+    "interrupt_ingest_overflow",
+    "stop_requested",
+    "stop_issued",
+    "motion_trip_secondary_signal",
+}
+
 _SEVERITY_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
 _FAILURE_ARCHIVE_EVENT_TYPES = {
     "cycle_error",
+    "kernel_flight_dump",
     "execute_failed",
     "intervention_required",
     "plan_failed",
@@ -76,6 +223,8 @@ _INCIDENT_ALL_EVENT_LIMIT = 200
 _INCIDENT_CHANNEL_EVENT_LIMIT = 80
 _EVENT_CHANNEL_LIMITS = {
     "controlled_stop": 500,
+    "stop_decision": 200,
+    _KERNEL_NATIVE_CHANNEL: _KERNEL_NATIVE_CHANNEL_LIMIT,
     "fault_safety_stop": 1000,
     "command_runtime": 800,
     "execution_lifecycle": 1000,
@@ -133,6 +282,109 @@ def _wall_timestamp_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _wall_iso_to_ns(value: Any) -> Optional[int]:
+    """Parse an ISO-8601 wall timestamp (as emitted by _wall_timestamp_iso)
+    into epoch nanoseconds. Returns None for anything unparseable.
+
+    Lexicographic comparison of these strings is unsafe — fractional seconds
+    are variable-width — so wall-window filtering parses to an integer instead
+    of comparing text. Computed via timedelta (not float * 1e9) so the result
+    is exact to the microsecond resolution the strings actually carry.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    delta = parsed - _EPOCH_UTC
+    return (
+        (delta.days * 86_400 + delta.seconds) * 1_000_000_000
+        + delta.microseconds * 1_000
+    )
+
+
+# Cross-run query (OW7): bound how many index runs a single wall-window query
+# will scan, independent of the per-query event limit.
+_MAX_CROSS_RUN_RUNS = 2000
+
+
+def _run_overlaps_wall_window(
+    started_ns: Optional[int],
+    effective_end_ns: Optional[int],
+    from_wall_ns: Optional[int],
+    to_wall_ns: Optional[int],
+) -> bool:
+    """True if a run's wall territory can intersect the window.
+
+    Only the start-after-window case is safe to reject from the run index.
+    The upper bound is advisory only: wall clocks can step backward between
+    runs, and native/kernel evidence can be explicitly attributed to an older
+    run after a newer run starts. Per-event wall filtering is therefore the
+    authority for upper bounds; pruning on effective_end would silently drop
+    evidence (P4). A run with no parseable start is not excluded."""
+    _ = effective_end_ns
+    if (
+        to_wall_ns is not None
+        and started_ns is not None
+        and started_ns > to_wall_ns
+    ):
+        return False
+    return True
+
+
+def _event_in_wall_window(
+    event: dict[str, Any],
+    from_wall_ns: Optional[int],
+    to_wall_ns: Optional[int],
+) -> bool:
+    """True if an event's wall timestamp falls within the window. Events whose
+    wall time cannot be parsed are included rather than dropped — they come
+    from a run the index already placed in-window, and silently discarding
+    evidence would violate loud-loss (P4)."""
+    wall_ns = _wall_iso_to_ns(
+        event.get("timestamp_wall") or event.get("timestamp")
+    )
+    if wall_ns is None:
+        return True
+    if from_wall_ns is not None and wall_ns < from_wall_ns:
+        return False
+    if to_wall_ns is not None and wall_ns > to_wall_ns:
+        return False
+    return True
+
+
+def _event_wall_sort_ns(
+    event: dict[str, Any],
+    from_wall_ns: Optional[int],
+    to_wall_ns: Optional[int],
+) -> int:
+    """Sort key for cross-run wall pages.
+
+    An unparseable event wall stamp is still evidence accepted by the run-index
+    window. Keep it at the recent edge of the requested window instead of
+    giving it a zero timestamp that would be evicted first from the bounded
+    heap.
+    """
+    wall_ns = _wall_iso_to_ns(
+        event.get("timestamp_wall") or event.get("timestamp")
+    )
+    if wall_ns is not None:
+        return wall_ns
+    _ = from_wall_ns
+    if to_wall_ns is not None:
+        return to_wall_ns
+    return (1 << 63) - 1
+
+
 def _validate_event_type(event_type: str) -> None:
     if event_type in _ALLOWED_EVENT_TYPES:
         return
@@ -145,11 +397,21 @@ def _severity_for_event(event_type: str, details: Optional[dict[str, Any]]) -> s
     if event_type in {
         "cycle_error",
         "kernel_error",
+        "kernel_flight_dump",
         "intervention_required",
         "error_raised",
         "collision_detected",
     }:
         return "ERROR"
+    if event_type == "kernel_event_gap":
+        return "WARN"
+    if event_type.startswith("kernel_native_"):
+        native_type = event_type[len("kernel_native_"):]
+        if native_type in _KERNEL_NATIVE_ERROR_TYPES:
+            return "ERROR"
+        if native_type in _KERNEL_NATIVE_WARN_TYPES:
+            return "WARN"
+        return "INFO"
     if event_type.endswith("_failed"):
         return "ERROR"
     if details and details.get("error"):
@@ -221,6 +483,10 @@ def _message_for_event(
 def _event_channel(event_type: str, details: Optional[dict[str, Any]]) -> str:
     """Classify an event into an independently retained diagnostic stream."""
     details = details or {}
+    if event_type.startswith("kernel_native_") or event_type == "kernel_event_gap":
+        return _KERNEL_NATIVE_CHANNEL
+    if event_type == "stop_decision_chain":
+        return "stop_decision"
     if (
         event_type == "controlled_stop_completed"
         or str(details.get("controlled_stop_success", "")).lower() == "true"
@@ -319,6 +585,8 @@ class EventRecorder:
         failure_archive_max_age_s: float | None = None,
         failure_archive_max_bytes: int | None = None,
         observe_min_interval_s: float | None = None,
+        trace_max_age_s: float | None = None,
+        trace_max_bytes: int | None = None,
     ) -> None:
         self._trace_dir = Path(trace_dir) if trace_dir is not None else None
         if self._trace_dir is not None:
@@ -350,8 +618,32 @@ class EventRecorder:
             )
         )
 
+        # OW5 trace retention budgets (None = disabled, e.g. no trace dir).
+        self._trace_max_age_s = (
+            trace_max_age_s
+            if trace_max_age_s is not None
+            else (_DEFAULT_TRACE_MAX_AGE_S if self._trace_dir is not None else None)
+        )
+        self._trace_max_bytes = (
+            trace_max_bytes
+            if trace_max_bytes is not None
+            else (_DEFAULT_TRACE_MAX_BYTES if self._trace_dir is not None else None)
+        )
+        self._last_trace_prune: dict[str, Any] = {}
+        self._run_index_severities: dict[str, str] = {}
+        self._current_run_event_count = 0
+        self._current_run_max_severity = "INFO"
+        self._current_run_program_run_id: Optional[str] = None
+
         self._events: deque[_StoredEvent] = deque(maxlen=max_events)
+        self._decoded_recent_events: deque[dict[str, Any]] = deque(
+            maxlen=min(max_events, _INCIDENT_ALL_EVENT_LIMIT)
+        )
         self._events_by_channel: dict[str, deque[_StoredEvent]] = {
+            channel: deque(maxlen=limit)
+            for channel, limit in _EVENT_CHANNEL_LIMITS.items()
+        }
+        self._decoded_events_by_channel: dict[str, deque[dict[str, Any]]] = {
             channel: deque(maxlen=limit)
             for channel, limit in _EVENT_CHANNEL_LIMITS.items()
         }
@@ -430,6 +722,185 @@ class EventRecorder:
             else _OBSERVE_MIN_INTERVAL_S
         )
         self._last_observe_monotonic = 0.0
+        # OW1 loss-visibility state: last kernel dispatch sequence seen, the
+        # last pipeline drop totals, and the full-fidelity dedup cursor.
+        self._last_kernel_sequence = 0
+        self._last_pipeline_drop_totals = (0, 0)
+        self._last_full_fidelity_kernel_event_index = 0
+        self._kernel_gap_records_total = 0
+        self._last_kernel_gap_wall: Optional[str] = None
+        # OW4 stop-decision assembler: one open "stop episode" at a time,
+        # built from the full-fidelity native event stream and closed into a
+        # durable stop_decision_chain record on a terminal transition.
+        self._stop_episode: Optional[dict[str, Any]] = None
+        self._last_stop_decision: Optional[dict[str, Any]] = None
+        # OW6 per-run latency histograms + bounded pending-start tracking.
+        self._latency_histograms: dict[str, _LatencyHistogram] = {
+            metric: _LatencyHistogram() for metric in _LATENCY_METRICS
+        }
+        self._latency_pending: dict[str, dict[int, int]] = {
+            metric: {} for metric in ("plan", "validate", "execute")
+        }
+        self._last_run_latency: Optional[dict[str, Any]] = None
+        self._latency_run_id: Optional[str] = None
+        self._stop_chain_execution_marker: Optional[tuple[int, str]] = None
+        # Monotonic<->wall clock anchor for kernel-stamped timestamps
+        # (observability plan OW2). None until the kernel client provides one;
+        # without it, kernel-event wall times fall back to receipt time.
+        self._clock_anchor: Optional[tuple[int, int]] = None
+        # OW5: restart continuity — recover last_run_id, the run counter, and
+        # per-run severity knowledge from the append-only run index so
+        # post-restart forensics does not need out-of-band run ids and
+        # synthesized ids cannot collide with pre-restart ones.
+        self._rehydrate_from_run_index()
+        self._enqueue_trace_prune()
+
+    def _runs_index_path(self) -> Optional[Path]:
+        if self._trace_dir is None:
+            return None
+        return self._trace_dir / _RUNS_INDEX_FILENAME
+
+    def _rehydrate_from_run_index(self) -> None:
+        index_path = self._runs_index_path()
+        if index_path is None or not index_path.exists():
+            return
+        try:
+            entries = self._tail_jsonl(index_path, _RUNS_INDEX_REHYDRATE_LINES)
+        except OSError:
+            return
+        last_run_id: Optional[str] = None
+        max_counter = 0
+        for entry in entries:
+            run_id = str(entry.get("run_id") or "")
+            if not run_id:
+                continue
+            kind = entry.get("kind")
+            if kind == "run_started":
+                last_run_id = run_id
+                max_counter = max(max_counter, int(entry.get("run_counter") or 0))
+            elif kind == "run_ended":
+                severity = str(entry.get("max_severity") or "INFO")
+                self._run_index_severities[run_id] = severity
+        if last_run_id is not None:
+            self._last_run = _RunInfo(
+                run_id=last_run_id,
+                started_at_ns=0,
+                file_path=self._path_for_run(last_run_id),
+            )
+        self._run_counter = max(self._run_counter, max_counter)
+
+    def _append_run_index_line(self, payload: dict[str, Any]) -> None:
+        index_path = self._runs_index_path()
+        queue_ = self._jsonl_queue
+        if index_path is None or queue_ is None:
+            return
+        try:
+            # Index lines are rare and load-bearing for rehydration: durable.
+            queue_.put_nowait((index_path, json.dumps(payload, sort_keys=True), True))
+        except queue.Full:
+            self._jsonl_dropped += 1
+            self._last_jsonl_error = "jsonl writer queue full"
+
+    def list_runs(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Most-recent-first run listing from the append-only run index."""
+        index_path = self._runs_index_path()
+        if index_path is None or not index_path.exists():
+            return []
+        entries = self._tail_jsonl(index_path, _RUNS_INDEX_REHYDRATE_LINES)
+        runs: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for entry in entries:
+            run_id = str(entry.get("run_id") or "")
+            if not run_id:
+                continue
+            if run_id not in runs:
+                runs[run_id] = {"run_id": run_id}
+                order.append(run_id)
+            runs[run_id].update(
+                {k: v for k, v in entry.items() if k not in {"kind"}}
+            )
+        return [runs[r] for r in reversed(order[-limit:])]
+
+    def set_clock_anchor(self, monotonic_ns: int, wall_time_ns: int) -> None:
+        """Install the kernel monotonic<->wall anchor and record it durably.
+
+        `monotonic_ns` must come from the same IClock instance that stamps
+        kernel events (the native bundle samples both clocks back-to-back).
+        Kernel-stamped event wall times are then derived as
+        `anchor_wall + (event_mono - anchor_mono)` instead of being skewed by
+        drain latency.
+        """
+        with self._lock:
+            self._clock_anchor = (int(monotonic_ns), int(wall_time_ns))
+        self._record_event(
+            event_type="clock_anchor",
+            execution_id=0,
+            details={
+                "monotonic_ns": str(int(monotonic_ns)),
+                "wall_time_ns": str(int(wall_time_ns)),
+            },
+            system_event=True,
+        )
+
+    def _wall_iso_from_kernel_ns(self, kernel_monotonic_ns: int) -> Optional[str]:
+        with self._lock:
+            anchor = self._clock_anchor
+        if anchor is None or kernel_monotonic_ns <= 0:
+            return None
+        wall_ns = anchor[1] + (int(kernel_monotonic_ns) - anchor[0])
+        return (
+            datetime.fromtimestamp(wall_ns / 1e9, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    def ingest_kernel_flight_dumps(self, flight_dir: str) -> int:
+        """Ingest fail-closed kernel flight dumps left by a previous process.
+
+        Each `flight-*.jsonl` becomes one durable ERROR `kernel_flight_dump`
+        event (which also triggers a failure archive), then the file is
+        renamed `*.ingested` so restarts are idempotent. Returns the number
+        of dumps ingested. Malformed files are ingested with a parse-error
+        note rather than skipped — a torn dump from a dying kernel is still
+        evidence.
+        """
+        ingested = 0
+        try:
+            entries = sorted(os.listdir(flight_dir))
+        except OSError:
+            return 0
+        for name in entries:
+            if not name.startswith("flight-") or not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(flight_dir, name)
+            details: dict[str, Any] = {"dump_path": path}
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    header_line = handle.readline().strip()
+                    record_count = sum(1 for _ in handle)
+                header = json.loads(header_line) if header_line else {}
+                details["reason"] = str(header.get("reason") or "unknown")
+                details["records"] = str(record_count)
+                details["dumped_wall_ns"] = str(header.get("dumped_wall_ns") or 0)
+                details["torn"] = str(header.get("torn"))
+                details["schema_version"] = str(
+                    header.get("schema_version") or "unknown"
+                )
+            except (OSError, ValueError) as exc:
+                details["parse_error"] = str(exc)
+            self._record_event(
+                event_type="kernel_flight_dump",
+                execution_id=0,
+                details=details,
+            )
+            try:
+                os.replace(path, path + ".ingested")
+            except OSError:
+                logger.warning(
+                    "failed to rename ingested flight dump", extra={"path": path}
+                )
+            ingested += 1
+        return ingested
 
     @property
     def current_run_id(self) -> Optional[str]:
@@ -662,16 +1133,431 @@ class EventRecorder:
             snapshots = [dict(snapshot) for snapshot in self._incident_snapshots]
         return [] if effective_limit == 0 else snapshots[-effective_limit:]
 
-    def record_native_kernel_events(self, events: list[dict[str, Any]]) -> None:
-        """Project selected native kernel events into durable history.
+    def _observe_latency_event_locked(
+        self, native_type: str, native_event: dict[str, Any]
+    ) -> None:
+        """Feed plan/validate/execute duration histograms from lifecycle
+        event pairs (started -> completed), keyed by execution_id so
+        interleaved executions cannot cross-contaminate. Only kernel-stamped
+        timestamps are trusted for durations."""
+        timestamp_ns = int(native_event.get("timestamp_ns") or 0)
+        if timestamp_ns <= 0:
+            return
+        execution_id = int(native_event.get("execution_id") or 0)
+        starts = {
+            "plan_started": "plan",
+            "validation_started": "validate",
+            "execute_started": "execute",
+        }
+        completions = {
+            "plan_completed": "plan",
+            "validation_passed": "validate",
+            "validation_failed": "validate",
+            "execute_completed": "execute",
+        }
+        metric = starts.get(native_type)
+        if metric is not None:
+            pending = self._latency_pending[metric]
+            if len(pending) >= _LATENCY_PENDING_CAP:
+                pending.pop(next(iter(pending)))
+            pending[execution_id] = timestamp_ns
+            return
+        metric = completions.get(native_type)
+        if metric is not None:
+            started = self._latency_pending[metric].pop(execution_id, None)
+            if started is not None and timestamp_ns >= started:
+                self._latency_histograms[metric].observe(
+                    timestamp_ns - started
+                )
 
-        The native kernel event buffer is intentionally fine-grained and may
-        include high-rate target-received/dispatched events. The recorder keeps
-        durable trace volume bounded by recording session lifecycle, explicit
-        hazard/error events, and resume-scoped replanning audit events only.
+    def _latency_payload_locked(self) -> dict[str, Any]:
+        return {
+            "run_id": self._latency_run_id,
+            "metrics": {
+                metric: histogram.to_payload()
+                for metric, histogram in self._latency_histograms.items()
+            },
+        }
+
+    def latency_histograms(self) -> dict[str, Any]:
+        """Per-run latency histograms (spec 500 §5; observability plan OW6)."""
+        with self._lock:
+            return {
+                "schema_version": "manyforge.latency_histograms.v1",
+                "current_run": self._latency_payload_locked(),
+                "last_run": (
+                    dict(self._last_run_latency)
+                    if self._last_run_latency
+                    else None
+                ),
+            }
+
+    def stop_latency_summary(self) -> dict[str, Any]:
+        """p50/p99 stop latency for the heartbeat (current run, falling back
+        to the last finished run)."""
+        with self._lock:
+            histogram = self._latency_histograms["stop"]
+            if histogram.count:
+                return {
+                    "source_run": self._latency_run_id,
+                    "count": histogram.count,
+                    "p50_ns": histogram.percentile_ns(0.50),
+                    "p99_ns": histogram.percentile_ns(0.99),
+                }
+            last = self._last_run_latency or {}
+            stop = (last.get("metrics") or {}).get("stop") or {}
+            return {
+                "source_run": last.get("run_id"),
+                "count": stop.get("count", 0),
+                "p50_ns": stop.get("p50_ns"),
+                "p99_ns": stop.get("p99_ns"),
+            }
+
+    def last_stop_decision(self) -> Optional[dict[str, Any]]:
+        """Latest assembled stop-decision chain (digest/incident surface)."""
+        with self._lock:
+            return dict(self._last_stop_decision) if self._last_stop_decision else None
+
+    def _observe_stop_decision_event_locked(
+        self,
+        native_type: str,
+        native_event: dict[str, Any],
+        details: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Advance the stop-episode state machine by one native event.
+
+        Returns the finished chain payload when this event closed an episode
+        (caller records it outside this locked section). Pure assembly over
+        evidence the kernel already emits (plan OW4): opens on stop intent or
+        an interrupt latch, accumulates preemption/issue evidence, closes on
+        a terminal transition, abandons silently when execution resumes
+        without a terminal stop. Terminal transitions with no visible cause
+        still produce a chain (trigger="unobserved") — partial evidence is
+        reported loudly, never dropped.
+        """
+        timestamp_ns = int(native_event.get("timestamp_ns") or 0)
+        execution_id = int(native_event.get("execution_id") or 0)
+        sequence = int(native_event.get("sequence") or 0)
+
+        def _open_episode() -> dict[str, Any]:
+            if self._stop_episode is None:
+                self._stop_episode = {
+                    "started_ts_ns": timestamp_ns,
+                    "execution_id": execution_id,
+                    "first_sequence": sequence,
+                }
+            return self._stop_episode
+
+        if native_type == "stop_requested":
+            episode = _open_episode()
+            episode.setdefault("requested_ts_ns", timestamp_ns)
+            reason = str(details.get("reason") or "")
+            if reason:
+                episode.setdefault("stop_reason", reason)
+            return None
+        if native_type == "interrupt_latched":
+            episode = _open_episode()
+            for key in ("latch_id", "source_id", "policy_id"):
+                value = details.get(key)
+                if value:
+                    episode.setdefault(key, str(value))
+            episode.setdefault("latched_ts_ns", timestamp_ns)
+            return None
+        if native_type == "interrupt_preempt_applied":
+            if self._stop_episode is not None:
+                for key in ("preemption_action", "preemption_result"):
+                    value = details.get(key)
+                    if value:
+                        self._stop_episode[key] = str(value)
+                for key in _STOP_CHAIN_DETAIL_KEYS:
+                    value = details.get(key)
+                    if value:
+                        self._stop_episode.setdefault(key, str(value))
+            return None
+        if native_type == "stop_issued":
+            # stop_issued is direct stop-intent evidence and must be able to
+            # OPEN an episode: the pending-stop execute-admission path emits
+            # only kStopIssued (no second kStopRequested), and the racing
+            # ->Planning transition may have just abandoned the busy-path
+            # episode.
+            episode = _open_episode()
+            episode.setdefault("issued_ts_ns", timestamp_ns)
+            for key in _STOP_CHAIN_DETAIL_KEYS:
+                value = details.get(key)
+                if value:
+                    episode.setdefault(key, str(value))
+            return None
+        if native_type != "state_transition":
+            return None
+
+        to_state = str(details.get("to_state") or "")
+        if to_state in _EPISODE_ABANDON_STATES:
+            # Execution resumed / completed / reset to idle without a stop
+            # terminal: the episode (if any) never became a stop decision.
+            self._stop_episode = None
+            self._stop_chain_execution_marker = None
+            return None
+        if to_state == "Failed" and self._stop_episode is None:
+            # A plain planning/validation failure is not a stop decision.
+            return None
+        if to_state != "Failed" and to_state not in _STOP_TERMINAL_STATES:
+            return None
+
+        episode = self._stop_episode
+        abandoned_episode_execution: Optional[str] = None
+        if (
+            episode is not None
+            and execution_id
+            and int(episode.get("execution_id") or 0)
+            and int(episode["execution_id"]) != execution_id
+        ):
+            # Terminal from a DIFFERENT execution than the open episode:
+            # never merge cross-execution evidence into one chain. Abandon
+            # the stale episode loudly (its id rides the new chain) and
+            # treat this terminal on its own evidence.
+            abandoned_episode_execution = str(episode["execution_id"])
+            episode = None
+            self._stop_episode = None
+        if episode is None:
+            if self._stop_chain_execution_marker == (execution_id, to_state):
+                # A duplicate terminal for a stop already explained (the
+                # commit-override event followed by the regular transition
+                # emits the SAME to_state for the SAME execution). A LATER
+                # terminal with a different state (e.g. Stopped ->
+                # InterventionRequired after a failed reset) is a new
+                # decision and must produce its own chain.
+                return None
+            episode = {
+                "started_ts_ns": timestamp_ns,
+                "execution_id": execution_id,
+                "first_sequence": sequence,
+            }
+        self._stop_episode = None
+        chain_execution_id = execution_id or int(episode.get("execution_id") or 0)
+        self._stop_chain_execution_marker = (chain_execution_id, to_state)
+
+        source_id = str(episode.get("source_id") or "")
+        stop_reason = str(episode.get("stop_reason") or "")
+        if source_id == _RUNTIME_COLLISION_FAULT_SOURCE_ID:
+            trigger = "fault"
+        elif source_id or episode.get("latch_id"):
+            trigger = "interrupt"
+        elif "reset" in stop_reason:
+            trigger = "reset"
+        elif "requested_ts_ns" in episode or "issued_ts_ns" in episode:
+            trigger = "operator"
+        else:
+            trigger = "unobserved"
+
+        chain: dict[str, Any] = {
+            "trigger": trigger,
+            "terminal_state": to_state,
+            "kernel_execution_id": str(chain_execution_id),
+        }
+        if abandoned_episode_execution is not None:
+            chain["abandoned_episode_execution_id"] = abandoned_episode_execution
+        terminal_reason = str(details.get("reason") or "")
+        if terminal_reason:
+            chain["terminal_reason"] = terminal_reason
+        if str(details.get("terminal_authority_override") or "") == "true":
+            chain["override"] = "true"
+            proposed = str(details.get("proposed_terminal") or "")
+            if proposed:
+                chain["proposed_terminal"] = proposed
+        for key in (
+            "stop_reason",
+            "latch_id",
+            "source_id",
+            "policy_id",
+            "preemption_action",
+            "preemption_result",
+            *_STOP_CHAIN_DETAIL_KEYS,
+        ):
+            value = episode.get(key)
+            if value:
+                chain[key] = str(value)
+        requested = episode.get("requested_ts_ns")
+        issued = episode.get("issued_ts_ns")
+        latched = episode.get("latched_ts_ns")
+        if requested and issued and issued >= requested:
+            chain["request_to_issued_ns"] = str(issued - requested)
+        if issued and timestamp_ns >= issued:
+            chain["issued_to_terminal_ns"] = str(timestamp_ns - issued)
+        if requested and timestamp_ns >= requested:
+            chain["request_to_terminal_ns"] = str(timestamp_ns - requested)
+        if latched and timestamp_ns >= latched:
+            chain["latch_to_terminal_ns"] = str(timestamp_ns - latched)
+        if episode.get("first_sequence"):
+            chain["first_kernel_sequence"] = str(episode["first_sequence"])
+        if sequence:
+            chain["terminal_kernel_sequence"] = str(sequence)
+        return chain
+
+    def _record_kernel_event_gaps(
+        self,
+        events: list[dict[str, Any]],
+        pipeline_status: Optional[dict[str, int]],
+    ) -> None:
+        """Turn sequence gaps and pipeline drop-counter advances into durable
+        WARN evidence (observability plan P4: loud loss, never silent)."""
+        gap_details: dict[str, str] = {}
+        with self._lock:
+            for native_event in events:
+                sequence = int(native_event.get("sequence") or 0)
+                if sequence <= 0:
+                    continue
+                if (
+                    self._last_kernel_sequence
+                    and sequence > self._last_kernel_sequence + 1
+                ):
+                    gap_details.setdefault(
+                        "missed_min", str(self._last_kernel_sequence + 1)
+                    )
+                    gap_details["missed_max"] = str(sequence - 1)
+                if sequence > self._last_kernel_sequence:
+                    self._last_kernel_sequence = sequence
+            if pipeline_status:
+                collector = int(
+                    pipeline_status.get("collector_dropped_total") or 0
+                )
+                manager = int(pipeline_status.get("manager_dropped_total") or 0)
+                last_collector, last_manager = self._last_pipeline_drop_totals
+                if collector > last_collector or manager > last_manager:
+                    gap_details["collector_dropped_total"] = str(collector)
+                    gap_details["manager_dropped_total"] = str(manager)
+                    gap_details["collector_dropped_delta"] = str(
+                        collector - last_collector
+                    )
+                    gap_details["manager_dropped_delta"] = str(
+                        manager - last_manager
+                    )
+                self._last_pipeline_drop_totals = (collector, manager)
+        if gap_details:
+            with self._lock:
+                self._kernel_gap_records_total += 1
+                self._last_kernel_gap_wall = _wall_timestamp_iso()
+                # Loss invalidates the open stop episode: evidence between
+                # its events may be missing, so a chain assembled across the
+                # gap could conflate decisions. The raw kernel_native lane
+                # still carries whatever survived.
+                self._stop_episode = None
+                self._stop_chain_execution_marker = None
+            self._record_event(
+                event_type="kernel_event_gap",
+                execution_id=0,
+                details=gap_details,
+            )
+
+    def kernel_event_gap_status(self) -> dict[str, Any]:
+        """Gap-record accounting for the heartbeat surface."""
+        with self._lock:
+            return {
+                "gap_records_total": self._kernel_gap_records_total,
+                "last_gap_wall": self._last_kernel_gap_wall,
+            }
+
+    def record_native_kernel_events(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        pipeline_status: Optional[dict[str, int]] = None,
+    ) -> None:
+        """Project native kernel events into durable history.
+
+        Two lanes (observability plan OW1):
+        - FULL-FIDELITY: every native event becomes a durable
+          ``kernel_native_<type>`` record on the ``kernel_native`` channel
+          (batched-INFO durability; WARN/ERROR types fsync per the existing
+          severity tiers), so the post-restart record contains the complete
+          kernel timeline, not a curated subset.
+        - CURATED (below, unchanged): UI-focused projections keep their
+          existing types/channels.
+
+        Loss is itself evidence: kernel dispatch sequences that skip, or
+        pipeline drop counters that advance (``pipeline_status`` from
+        ``CycleManager.kernel_event_pipeline_status()``), produce a durable
+        WARN ``kernel_event_gap`` record.
+
         `event_index` dedupes events drained through both `/api/kernel/events`
         and the websocket hub.
         """
+        self._record_kernel_event_gaps(events, pipeline_status)
+        for native_event in events:
+            native_type = str(native_event.get("type") or "")
+            native_index = int(native_event.get("event_index") or 0)
+            with self._lock:
+                if (
+                    native_index > 0
+                    and native_index <= self._last_full_fidelity_kernel_event_index
+                ):
+                    record_full = False
+                else:
+                    record_full = bool(native_type)
+                    if native_index > 0:
+                        self._last_full_fidelity_kernel_event_index = native_index
+            if record_full:
+                details = self._native_event_details(native_event)
+                error_message = details.pop("_error_message", None)
+                if error_message:
+                    details["error"] = error_message
+                sequence = int(native_event.get("sequence") or 0)
+                if sequence:
+                    details["kernel_sequence"] = str(sequence)
+                native_run_id = native_event.get("program_run_id")
+                if not native_run_id and isinstance(
+                    native_event.get("details"), dict
+                ):
+                    native_run_id = native_event["details"].get("program_run_id")
+                self._record_event(
+                    event_type=f"kernel_native_{native_type}",
+                    execution_id=int(native_event.get("execution_id") or 0),
+                    details=details or None,
+                    run_id=str(native_run_id) if native_run_id else None,
+                    timestamp_ns=int(
+                        native_event.get("timestamp_ns") or time.monotonic_ns()
+                    ),
+                    kernel_timestamp=bool(native_event.get("timestamp_ns")),
+                )
+                # OW4: advance the stop-decision assembler on the deduped
+                # native stream; a closed episode becomes one durable chain.
+                # OW6: the same deduped stream feeds the per-run latency
+                # histograms (recorder-thread work only).
+                with self._lock:
+                    self._observe_latency_event_locked(
+                        native_type, native_event
+                    )
+                    finished_chain = self._observe_stop_decision_event_locked(
+                        native_type, native_event, details
+                    )
+                    if finished_chain is not None:
+                        # Prefer request->terminal, then latch->terminal, then
+                        # issued->terminal. The last covers the pending-stop
+                        # execute-admission path, which opens an episode on
+                        # stop_issued alone (no stop_requested, no
+                        # interrupt_latched) and would otherwise be silently
+                        # excluded from the stop-latency histogram. All three
+                        # are non-negative durations by assembler construction.
+                        stop_latency = (
+                            finished_chain.get("request_to_terminal_ns")
+                            or finished_chain.get("latch_to_terminal_ns")
+                            or finished_chain.get("issued_to_terminal_ns")
+                        )
+                        if stop_latency is not None:
+                            self._latency_histograms["stop"].observe(
+                                int(stop_latency)
+                            )
+                if finished_chain is not None:
+                    self._record_event(
+                        event_type="stop_decision_chain",
+                        execution_id=int(native_event.get("execution_id") or 0),
+                        details=finished_chain,
+                        timestamp_ns=int(
+                            native_event.get("timestamp_ns")
+                            or time.monotonic_ns()
+                        ),
+                        kernel_timestamp=bool(native_event.get("timestamp_ns")),
+                        system_event=True,
+                    )
         for native_event in events:
             native_type = str(native_event.get("type") or "")
             native_index = int(native_event.get("event_index") or 0)
@@ -719,6 +1605,7 @@ class EventRecorder:
                 run_id=str(native_run_id) if native_run_id else None,
                 execution_mode=None,
                 timestamp_ns=int(native_event.get("timestamp_ns") or time.monotonic_ns()),
+                kernel_timestamp=bool(native_event.get("timestamp_ns")),
             )
 
     def history(
@@ -740,7 +1627,30 @@ class EventRecorder:
         node_attempt_id: Optional[str] = None,
         move_id: Optional[str] = None,
         contact_policy_id: Optional[str] = None,
+        from_wall_ns: Optional[int] = None,
+        to_wall_ns: Optional[int] = None,
     ) -> dict[str, Any]:
+        # OW7: a wall-time window turns this into a cross-run query resolved
+        # through the run index rather than a single-run read.
+        if from_wall_ns is not None or to_wall_ns is not None:
+            return self._history_across_runs(
+                run_id=run_id,
+                from_wall_ns=from_wall_ns,
+                to_wall_ns=to_wall_ns,
+                limit=limit,
+                min_severity=min_severity,
+                components=components,
+                event_types=event_types,
+                execution_id=execution_id,
+                kernel_execution_id=kernel_execution_id,
+                program_run_id=program_run_id,
+                intervention_run_id=intervention_run_id,
+                action_span_id=action_span_id,
+                node_instance_id=node_instance_id,
+                node_attempt_id=node_attempt_id,
+                move_id=move_id,
+                contact_policy_id=contact_policy_id,
+            )
         selected_run_id = run_id or self.last_run_id
         if limit is None:
             effective_limit = _DEFAULT_HISTORY_LIMIT
@@ -768,7 +1678,21 @@ class EventRecorder:
             events = []
         else:
             events = events[-effective_limit:]
+        return self._shape_history_payload(events, selected_run_id)
 
+    @staticmethod
+    def _shape_history_payload(
+        events: list[dict[str, Any]],
+        selected_run_id: Optional[str],
+        run_ids: Optional[list[str]] = None,
+        *,
+        runs_truncated: bool = False,
+        scanned_run_count: int = 0,
+        cross_run_scan_limit: int = 0,
+    ) -> dict[str, Any]:
+        """Split a materialized, already-limited event list into the history
+        response shape (regular events + node-status transitions + the trailing
+        execution id). Shared by single-run and cross-run queries."""
         regular_events = [event for event in events if event["type"] != "node_status_transition"]
         node_transitions = [
             {
@@ -802,11 +1726,141 @@ class EventRecorder:
 
         return {
             "run_id": selected_run_id,
+            "run_ids": run_ids if run_ids is not None else [],
+            "runs_truncated": runs_truncated,
+            "scanned_run_count": scanned_run_count,
+            "cross_run_scan_limit": cross_run_scan_limit,
             "execution_id": execution_id,
             "events": regular_events,
             "node_status_transitions": node_transitions,
             "timestamp_ns": time.monotonic_ns(),
         }
+
+    def _history_across_runs(
+        self,
+        *,
+        run_id: Optional[str],
+        from_wall_ns: Optional[int],
+        to_wall_ns: Optional[int],
+        limit: Optional[int],
+        min_severity: Optional[str],
+        components: Optional[list[str]],
+        event_types: Optional[list[str]],
+        execution_id: Optional[int],
+        kernel_execution_id: Optional[int],
+        program_run_id: Optional[str],
+        intervention_run_id: Optional[str],
+        action_span_id: Optional[str],
+        node_instance_id: Optional[str],
+        node_attempt_id: Optional[str],
+        move_id: Optional[str],
+        contact_policy_id: Optional[str],
+    ) -> dict[str, Any]:
+        """Resolve a wall-time window across runs via the run index (OW7).
+
+        Runs that start after the upper wall bound are skipped from the index
+        alone, without touching their JSONL. No index-derived upper bound is
+        trusted: wall clocks can step backward between runs, and native/kernel
+        evidence can be explicitly attributed to an older run after a newer run
+        starts. Surviving runs are streamed one event at a time (bounded
+        memory, torn-line tolerant) through the same filter stack as single-run
+        history plus a wall-window predicate.
+
+        The returned page is the MOST RECENT ``limit`` in-window events ordered
+        by wall time (tie-broken by recorder event index) — kept in a bounded
+        min-heap of size ``limit`` so memory is O(limit) regardless of how many
+        events the window spans. Wall order (not index order) is used precisely
+        because a wall-clock step between runs can put a later-started run's
+        events earlier in wall time; sorting the collected page by wall is
+        robust to that, where a newest-run-first early-stop was not."""
+        if limit is None:
+            effective_limit = _DEFAULT_HISTORY_LIMIT
+        else:
+            effective_limit = max(0, min(int(limit), _MAX_HISTORY_LIMIT))
+        if effective_limit == 0:
+            return self._shape_history_payload(
+                [],
+                None,
+                run_ids=[],
+                cross_run_scan_limit=1 if run_id else _MAX_CROSS_RUN_RUNS,
+            )
+
+        predicate = self._event_filter_predicate(
+            min_severity=min_severity,
+            components=components,
+            event_types=event_types,
+            execution_id=execution_id,
+            kernel_execution_id=kernel_execution_id,
+            program_run_id=program_run_id,
+            intervention_run_id=intervention_run_id,
+            action_span_id=action_span_id,
+            node_instance_id=node_instance_id,
+            node_attempt_id=node_attempt_id,
+            move_id=move_id,
+            contact_policy_id=contact_policy_id,
+        )
+        if run_id:
+            runs = [{"run_id": run_id}]
+            runs_truncated = False
+            scan_limit = 1
+        else:
+            runs = self.list_runs(limit=_MAX_CROSS_RUN_RUNS)  # newest-first
+            runs_truncated = len(runs) >= _MAX_CROSS_RUN_RUNS
+            scan_limit = _MAX_CROSS_RUN_RUNS
+        # Bounded min-heap of (key, event); key = (wall_ns, event_index,
+        # scan_seq). scan_seq guarantees the key is unique so the heap never
+        # falls back to comparing event dicts.
+        heap: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
+        scan_seq = 0
+        scanned_run_count = 0
+        for index, run in enumerate(runs):
+            run_id = str(run.get("run_id") or "")
+            if not run_id:
+                continue
+            started_ns = _wall_iso_to_ns(run.get("started_wall"))
+            # The next-newer run start is advisory only. It is passed so the
+            # helper can document why upper-bound pruning is intentionally not
+            # performed here.
+            effective_end_ns = (
+                _wall_iso_to_ns(runs[index - 1].get("started_wall"))
+                if index > 0
+                else None
+            )
+            if not run_id:
+                if not _run_overlaps_wall_window(
+                    started_ns, effective_end_ns, from_wall_ns, to_wall_ns
+                ):
+                    continue
+            scanned_run_count += 1
+            for event in self._stream_run_events(run_id):
+                if not _event_in_wall_window(event, from_wall_ns, to_wall_ns):
+                    continue
+                if not predicate(event):
+                    continue
+                wall_ns = _event_wall_sort_ns(event, from_wall_ns, to_wall_ns)
+                key = (wall_ns, int(event.get("event_index") or 0), scan_seq)
+                scan_seq += 1
+                if len(heap) < effective_limit:
+                    heapq.heappush(heap, (key, event))
+                elif key > heap[0][0]:
+                    heapq.heapreplace(heap, (key, event))
+
+        events = [event for _key, event in sorted(heap, key=lambda item: item[0])]
+        run_ids: list[str] = list(
+            dict.fromkeys(
+                str(event.get("run_id"))
+                for event in events
+                if event.get("run_id")
+            )
+        )
+        return self._shape_history_payload(
+            events,
+            None,
+            run_ids=run_ids,
+            runs_truncated=runs_truncated,
+            scanned_run_count=scanned_run_count,
+            cross_run_scan_limit=scan_limit,
+        )
 
     def export_events(
         self,
@@ -954,6 +2008,45 @@ class EventRecorder:
         contact_policy_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Apply server-side query filters to decoded event dictionaries."""
+        predicate = self._event_filter_predicate(
+            start_ns=start_ns,
+            end_ns=end_ns,
+            min_severity=min_severity,
+            components=components,
+            event_types=event_types,
+            execution_id=execution_id,
+            kernel_execution_id=kernel_execution_id,
+            program_run_id=program_run_id,
+            intervention_run_id=intervention_run_id,
+            action_span_id=action_span_id,
+            node_instance_id=node_instance_id,
+            node_attempt_id=node_attempt_id,
+            move_id=move_id,
+            contact_policy_id=contact_policy_id,
+        )
+        return [event for event in events if predicate(event)]
+
+    def _event_filter_predicate(
+        self,
+        *,
+        start_ns: Optional[int] = None,
+        end_ns: Optional[int] = None,
+        min_severity: Optional[str] = None,
+        components: Optional[list[str]] = None,
+        event_types: Optional[list[str]] = None,
+        execution_id: Optional[int] = None,
+        kernel_execution_id: Optional[int] = None,
+        program_run_id: Optional[str] = None,
+        intervention_run_id: Optional[str] = None,
+        action_span_id: Optional[str] = None,
+        node_instance_id: Optional[str] = None,
+        node_attempt_id: Optional[str] = None,
+        move_id: Optional[str] = None,
+        contact_policy_id: Optional[str] = None,
+    ):
+        """Build a single-event predicate for the query filters. Normalization
+        (and rejection of a bad severity level) happens once, so it can be
+        applied per-event while streaming a run without materializing it."""
         normalized_components = [item for item in (components or []) if item]
         normalized_event_types = {item for item in (event_types or []) if item}
         severity_floor = None
@@ -961,47 +2054,47 @@ class EventRecorder:
             severity_floor = _SEVERITY_ORDER.get(min_severity.upper())
             if severity_floor is None:
                 raise ValueError(f"Unsupported severity level: {min_severity}")
+        requested_execution_id = (
+            execution_id if execution_id is not None else kernel_execution_id
+        )
 
-        filtered: list[dict[str, Any]] = []
-        for event in events:
+        def predicate(event: dict[str, Any]) -> bool:
             timestamp_ns = event.get("timestamp_ns")
             if start_ns is not None and (not isinstance(timestamp_ns, int) or timestamp_ns < start_ns):
-                continue
+                return False
             if end_ns is not None and (not isinstance(timestamp_ns, int) or timestamp_ns > end_ns):
-                continue
+                return False
             if severity_floor is not None:
                 current = _SEVERITY_ORDER.get(str(event.get("severity", "")).upper(), 0)
                 if current < severity_floor:
-                    continue
+                    return False
             component = str(event.get("component", ""))
             if normalized_components and not any(
                 component == prefix or component.startswith(f"{prefix}.")
                 for prefix in normalized_components
             ):
-                continue
+                return False
             if normalized_event_types and event.get("type") not in normalized_event_types:
-                continue
-            requested_execution_id = (
-                execution_id if execution_id is not None else kernel_execution_id
-            )
+                return False
             if requested_execution_id is not None and int(event.get("execution_id") or 0) != requested_execution_id:
-                continue
+                return False
             if program_run_id is not None and event.get("program_run_id") != program_run_id:
-                continue
+                return False
             if intervention_run_id is not None and event.get("intervention_run_id") != intervention_run_id:
-                continue
+                return False
             if action_span_id is not None and self._event_text_field(event, "action_span_id") != action_span_id:
-                continue
+                return False
             if node_instance_id is not None and self._event_text_field(event, "node_instance_id") != node_instance_id:
-                continue
+                return False
             if node_attempt_id is not None and self._event_text_field(event, "node_attempt_id") != node_attempt_id:
-                continue
+                return False
             if move_id is not None and self._event_text_field(event, "move_id") != move_id:
-                continue
+                return False
             if contact_policy_id is not None and self._event_text_field(event, "contact_policy_id") != contact_policy_id:
-                continue
-            filtered.append(event)
-        return filtered
+                return False
+            return True
+
+        return predicate
 
     @staticmethod
     def _event_text_field(event: dict[str, Any], key: str) -> Optional[str]:
@@ -1332,6 +2425,66 @@ class EventRecorder:
             execution_mode=effective_mode,
         )
 
+    def _stream_run_events(self, run_id: Optional[str]):
+        """Yield a run's events one at a time.
+
+        For a run persisted to disk, the file path is snapshotted under the
+        lock and then streamed OUTSIDE the lock (I/O off the recording path,
+        P1), one line at a time, skipping torn lines (crash-truncated final
+        line is expected evidence). For the current run, the in-memory tail is
+        merged after the disk stream so a just-recorded event is visible even
+        before the writer thread flushes it."""
+        with self._lock:
+            if run_id is None:
+                snapshot = [self._decode_stored_event(e) for e in self._events]
+                path = None
+                memory_tail: list[dict[str, Any]] = []
+            else:
+                path = self._path_for_run(run_id)
+                current_run = (
+                    self._current_run is not None
+                    and self._current_run.run_id == run_id
+                )
+                memory_tail = (
+                    [
+                        self._decode_stored_event(e)
+                        for e in self._events
+                        if e.run_id == run_id
+                    ]
+                    if current_run
+                    else []
+                )
+                if path is None or not path.exists():
+                    snapshot = memory_tail or [
+                        self._decode_stored_event(e)
+                        for e in self._events
+                        if e.run_id == run_id
+                    ]
+                else:
+                    snapshot = None
+        if snapshot is not None:
+            yield from snapshot
+            return
+        seen_indices: set[int] = set()
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        event = json.loads(stripped)
+                    except ValueError:
+                        continue
+                    seen_indices.add(int(event.get("event_index") or 0))
+                    yield event
+        except OSError:
+            pass
+        for event in memory_tail:
+            event_index = int(event.get("event_index") or 0)
+            if event_index not in seen_indices:
+                yield event
+
     def _load_events_for_run(
         self,
         run_id: Optional[str],
@@ -1355,10 +2508,19 @@ class EventRecorder:
                 if limit is not None and limit >= 0:
                     return self._tail_jsonl(path, limit)
                 events: list[dict[str, Any]] = []
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    if not line.strip():
-                        continue
-                    events.append(json.loads(line))
+                # Stream line-by-line (not read_text of the whole file) and skip
+                # torn lines: a crashed run's torn final line is expected
+                # evidence and must not fail a read — the same tolerance
+                # _tail_jsonl already applies on the limited path.
+                with path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        try:
+                            events.append(json.loads(stripped))
+                        except ValueError:
+                            continue
                 return events
             events = [
                 self._decode_stored_event(event)
@@ -1383,7 +2545,13 @@ class EventRecorder:
                 stripped = line.strip()
                 if not stripped:
                     continue
-                window.append(json.loads(stripped))
+                try:
+                    window.append(json.loads(stripped))
+                except ValueError:
+                    # A torn line (crash mid-append) must not poison the
+                    # valid prefix: restart continuity and history reads
+                    # recover everything that was written whole.
+                    continue
         return list(window)
 
     def _handle_cycle_state_transition(
@@ -1692,15 +2860,26 @@ class EventRecorder:
         trigger_node_instance: Optional[str] = None,
         execution_mode: Optional[str] = None,
         timestamp_ns: Optional[int] = None,
+        kernel_timestamp: bool = False,
+        system_event: bool = False,
     ) -> None:
         _validate_event_type(event_type)
         timestamp_ns = timestamp_ns or time.monotonic_ns()
-        wall_timestamp = _wall_timestamp_iso()
+        # Kernel-stamped timestamps convert to wall time through the clock
+        # anchor (no drain-latency skew); receipt time is the fallback.
+        wall_timestamp = (
+            self._wall_iso_from_kernel_ns(timestamp_ns) if kernel_timestamp else None
+        ) or _wall_timestamp_iso()
         with self._lock:
             if run_id is None:
-                run_id = self._current_run.run_id if self._current_run is not None else (
-                    self._last_run.run_id if self._last_run is not None else None
-                )
+                if self._current_run is not None:
+                    run_id = self._current_run.run_id
+                elif not system_event and self._last_run is not None:
+                    # System/durable events (prune evidence, startup anchors)
+                    # must NOT attach to a finished or rehydrated run: a
+                    # startup prune would otherwise record its evidence into
+                    # the very run file it just deleted, recreating it.
+                    run_id = self._last_run.run_id
             elif self._current_run is None and (
                 self._last_run is None or self._last_run.run_id != run_id
             ):
@@ -1718,6 +2897,14 @@ class EventRecorder:
                 intervention_run_id = run_id
 
             details_payload = dict(details) if details else None
+            if event_type == "stop_decision_chain":
+                details_payload = details_payload or {}
+                # Correlation anchors for the incident-embed selector. Stamp
+                # them before serialization so durable trace records and the
+                # in-memory latest-chain view carry identical evidence.
+                details_payload["recorded_event_index"] = str(self._event_index)
+                details_payload["recorded_run_id"] = str(run_id or "")
+                self._last_stop_decision = dict(details_payload)
             action_span_id = None
             action_source = None
             node_instance_id = None
@@ -1735,6 +2922,15 @@ class EventRecorder:
                 contact_policy_id = details_payload.get("contact_policy_id")
             channel = _event_channel(event_type, details_payload)
             severity = _severity_for_event(event_type, details_payload)
+            if (
+                self._current_run is not None
+                and run_id == self._current_run.run_id
+            ):
+                self._current_run_event_count += 1
+                if _SEVERITY_ORDER.get(severity, 20) > _SEVERITY_ORDER.get(
+                    self._current_run_max_severity, 20
+                ):
+                    self._current_run_max_severity = severity
             event: dict[str, Any] = {
                 "event_index": self._event_index,
                 "sequence": self._event_index,
@@ -1810,10 +3006,16 @@ class EventRecorder:
                 json_text=json_text,
             )
             self._events.append(stored)
+            decoded_event = deepcopy(event)
+            self._decoded_recent_events.append(decoded_event)
             self._events_by_channel.setdefault(
                 channel,
                 deque(maxlen=_DEFAULT_CHANNEL_EVENT_LIMIT),
             ).append(stored)
+            self._decoded_events_by_channel.setdefault(
+                channel,
+                deque(maxlen=_DEFAULT_CHANNEL_EVENT_LIMIT),
+            ).append(decoded_event)
             if _event_should_create_incident(
                 event_type,
                 details_payload,
@@ -1826,8 +3028,11 @@ class EventRecorder:
             self._enqueue_jsonl_locked(
                 run_id=run_id,
                 json_text=json_text,
-                durable=_SEVERITY_ORDER.get(str(severity).upper(), 0)
-                >= _SEVERITY_ORDER["WARN"],
+                durable=(
+                    _SEVERITY_ORDER.get(str(severity).upper(), 0)
+                    >= _SEVERITY_ORDER["WARN"]
+                    or event_type in _DURABLE_INFO_EVENT_TYPES
+                ),
             )
             self._maybe_write_failure_archive_locked(event)
 
@@ -1846,11 +3051,19 @@ class EventRecorder:
                 self._last_intervention_event_index = 0
 
             run_id = self._intervention_run_id(session)
-            new_events = [
-                event
-                for event in session.events
-                if event.get("event_index", 0) > self._last_intervention_event_index
-            ]
+            session_events = session.events
+            event_count = len(session_events)
+            if event_count == 0:
+                return
+            first_index = int(session_events[0].get("event_index", 0) or 0)
+            last_index = int(session_events[-1].get("event_index", 0) or 0)
+            if self._last_intervention_event_index < first_index:
+                start_offset = 0
+            elif self._last_intervention_event_index >= last_index:
+                return
+            else:
+                start_offset = self._last_intervention_event_index - first_index + 1
+            new_events = list(islice(session_events, start_offset, None))
             if not new_events:
                 return
 
@@ -1896,10 +3109,77 @@ class EventRecorder:
         file_path = self._path_for_run(run_id)
         self._current_run = _RunInfo(run_id=run_id, started_at_ns=now_ns, file_path=file_path)
         self._last_run = self._current_run
+        self._current_run_event_count = 0
+        self._current_run_max_severity = "INFO"
+        self._current_run_program_run_id = runner_run_id
+        with self._lock:
+            # Stash the OUTGOING run's histograms here, not at run-finish, so a
+            # trailing completion observed in the window between finish and the
+            # next start still lands in the run it belongs to before the
+            # snapshot is taken. The cycle-state poll (which drives finish/start)
+            # and the native event stream (which pairs durations) are distinct
+            # entry points with no ordering guarantee, so a run's final
+            # execute/stop sample can arrive after finish. The first run has no
+            # predecessor to stash.
+            if self._latency_run_id is not None:
+                self._last_run_latency = self._latency_payload_locked()
+            self._latency_histograms = {
+                metric: _LatencyHistogram() for metric in _LATENCY_METRICS
+            }
+            self._latency_pending = {
+                metric: {} for metric in ("plan", "validate", "execute")
+            }
+            self._latency_run_id = run_id
+        self._append_run_index_line(
+            {
+                "kind": "run_started",
+                "run_id": run_id,
+                "program_run_id": runner_run_id,
+                "run_counter": self._run_counter,
+                "started_wall": _wall_timestamp_iso(),
+                "started_at_ns": now_ns,
+            }
+        )
+        # Re-record the stored clock anchor as the first event of the new run
+        # so every run file is self-contained for wall-time derivation — no
+        # reader has to hunt an earlier file for the anchor. The pair itself
+        # never goes stale (it is a fact: "monotonic X was wall Y"), so
+        # re-emitting the cached value costs one recorder-thread event and no
+        # kernel call.
+        with self._lock:
+            anchor = self._clock_anchor
+        if anchor is not None:
+            self._record_event(
+                event_type="clock_anchor",
+                execution_id=0,
+                details={
+                    "monotonic_ns": str(anchor[0]),
+                    "wall_time_ns": str(anchor[1]),
+                },
+            )
 
     def _finish_current_run(self) -> None:
         if self._current_run is not None:
             self._last_run = self._current_run
+            # Latency histograms are stashed at the NEXT run's start (not here)
+            # so a trailing sample landing after finish is still attributed to
+            # this run — see _start_run.
+            self._run_index_severities[self._current_run.run_id] = (
+                self._current_run_max_severity
+            )
+            self._append_run_index_line(
+                {
+                    "kind": "run_ended",
+                    "run_id": self._current_run.run_id,
+                    "program_run_id": self._current_run_program_run_id,
+                    "ended_wall": _wall_timestamp_iso(),
+                    "event_count": self._current_run_event_count,
+                    "max_severity": self._current_run_max_severity,
+                }
+            )
+            # A finished run is a natural, cheap moment to enforce the trace
+            # retention budgets off the recording path.
+            self._enqueue_trace_prune()
         self._current_run = None
 
     def _path_for_run(self, run_id: Optional[str]) -> Optional[Path]:
@@ -1917,20 +3197,55 @@ class EventRecorder:
 
     def _build_incident_snapshot_locked(self, trigger_event: dict[str, Any]) -> dict[str, Any]:
         """Freeze recent chronology + protected channels for an incident."""
-        all_events = [
-            self._decode_stored_event(event)
-            for event in list(self._events)[-_INCIDENT_ALL_EVENT_LIMIT:]
-        ]
+        all_events = [deepcopy(event) for event in self._decoded_recent_events]
+        # OW4: embed the latest stop-decision chain only when it can be
+        # CORRELATED to this incident — a mislabeled association in a
+        # postmortem artifact is interpretation, not evidence (P2/P3):
+        # - exact: the trigger carries the chain's execution id;
+        # - fallback (covers execution_id=0 triggers): the trigger is on a
+        #   stop/fault channel AND the chain was recorded in the SAME run
+        #   within the last _STOP_DECISION_EMBED_WINDOW recorder events.
+        # The applied rule ships alongside the payload as
+        # stopDecisionCorrelation so consumers never mistake a proximity
+        # match for an exact one.
+        stop_decision = None
+        stop_decision_correlation = None
+        if self._last_stop_decision is not None:
+            chain = self._last_stop_decision
+            trigger_exec = str(trigger_event.get("execution_id") or "")
+            chain_exec = str(chain.get("kernel_execution_id") or "")
+            if trigger_exec not in ("", "0") and trigger_exec == chain_exec:
+                stop_decision_correlation = "execution_id_match"
+            elif trigger_exec in ("", "0") and trigger_event.get("channel") in {
+                "controlled_stop",
+                "fault_safety_stop",
+                "stop_decision",
+            }:
+                chain_run = str(chain.get("recorded_run_id") or "")
+                trigger_run = str(trigger_event.get("run_id") or "")
+                chain_index = int(chain.get("recorded_event_index") or 0)
+                trigger_index = int(
+                    trigger_event.get("event_index") or self._event_index
+                )
+                distance = trigger_index - chain_index
+                if (
+                    chain_run
+                    and chain_run == trigger_run
+                    and 0 <= distance <= _STOP_DECISION_EMBED_WINDOW
+                ):
+                    stop_decision_correlation = "same_run_recent_stop_channel"
+            if stop_decision_correlation is not None:
+                stop_decision = dict(chain)
         span_events = self._span_events_for_trigger(trigger_event, all_events)
         action_span = self._action_span_summary(trigger_event)
         span_scope = self._span_scope_summary(trigger_event)
         headline_cause = self._headline_cause(trigger_event, span_events)
         events_by_channel = {
             channel: [
-                self._decode_stored_event(event)
+                deepcopy(event)
                 for event in list(events)[-_INCIDENT_CHANNEL_EVENT_LIMIT:]
             ]
-            for channel, events in self._events_by_channel.items()
+            for channel, events in self._decoded_events_by_channel.items()
         }
         return {
             "incidentId": f"incident-{trigger_event.get('event_index', 0)}",
@@ -1970,6 +3285,8 @@ class EventRecorder:
                 channel: len(events)
                 for channel, events in events_by_channel.items()
             },
+            "stopDecision": stop_decision,
+            "stopDecisionCorrelation": stop_decision_correlation,
         }
 
     def _span_events_for_trigger(
@@ -2168,7 +3485,13 @@ class EventRecorder:
             return
         file_path = self._path_for_run(run_id)
         if file_path is None:
-            return
+            # No run to attach to (e.g. startup anchor before the first run).
+            # Durable events must still reach disk; non-durable steady-state
+            # events keep their memory-only behavior.
+            if durable and self._trace_dir is not None:
+                file_path = self._trace_dir / _NO_RUN_FILENAME
+            else:
+                return
         try:
             queue_.put_nowait((file_path, json_text, durable))
         except queue.Full:
@@ -2228,9 +3551,14 @@ class EventRecorder:
         call more than once.
         """
         ok = True
+        # Order matters: the failure-archive/prune worker emits durable
+        # evidence (trace_pruned, archives) through the JSONL writer. Joining
+        # it FIRST guarantees a queued prune cannot delete run files after
+        # the writer has exited and then enqueue evidence nobody will write —
+        # the self-erasing-prune case spec 520 §7.3 exists to prevent.
         for queue_, worker in (
-            (self._jsonl_queue, self._jsonl_worker),
             (self._failure_archive_queue, self._failure_archive_worker),
+            (self._jsonl_queue, self._jsonl_worker),
         ):
             if queue_ is None or worker is None:
                 continue
@@ -2286,6 +3614,151 @@ class EventRecorder:
             time.sleep(0.01)
         return queue_.unfinished_tasks == 0
 
+    def _enqueue_trace_prune(self) -> None:
+        queue_ = self._failure_archive_queue
+        if queue_ is None or self._trace_dir is None:
+            return
+        try:
+            queue_.put_nowait("prune_traces")
+        except queue.Full:
+            # Retention is best-effort per attempt; the next run-end retries.
+            pass
+
+    def _prune_trace_files(self) -> dict[str, Any]:
+        """Enforce trace-dir retention budgets (spec 520 §4.3/4.4, plan OW5).
+
+        Whole-run JSONL files are the pruning unit. Age pruning removes runs
+        older than `trace_max_age_s`; size pruning removes oldest-first while
+        the directory exceeds `trace_max_bytes`, preferring to evict
+        INFO-only runs before runs whose index entry recorded ERROR/CRITICAL
+        (protected severity tiers, spec 520 §5; runs with no index entry —
+        e.g. a crash before run-end — are treated as protected). The current
+        run's open file and the run index are never pruned. Every removal is
+        recorded as a durable `trace_pruned` event so consumers know data
+        was pruned rather than lost.
+        """
+        summary: dict[str, Any] = {
+            "pruned_files": 0,
+            "pruned_bytes": 0,
+            "error": None,
+        }
+        if self._trace_dir is None:
+            return summary
+        try:
+            with self._lock:
+                current_path = (
+                    self._current_run.file_path
+                    if self._current_run is not None
+                    else None
+                )
+                severities = dict(self._run_index_severities)
+            candidates = []
+            total_bytes = 0
+            for path in self._trace_dir.glob("*.events.jsonl"):
+                if current_path is not None and path == current_path:
+                    continue
+                if path.name == _NO_RUN_FILENAME:
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                run_id = path.name[: -len(".events.jsonl")]
+                severity = severities.get(run_id)
+                protected = severity is None or _SEVERITY_ORDER.get(
+                    severity, 20
+                ) >= _SEVERITY_ORDER.get("ERROR", 40)
+                candidates.append(
+                    (stat.st_mtime, path, stat.st_size, run_id, protected)
+                )
+                total_bytes += stat.st_size
+            candidates.sort()  # oldest first
+
+            now = time.time()
+            pruned: list[tuple[Path, int, str, str]] = []
+            survivors = []
+            for mtime, path, size, run_id, protected in candidates:
+                if (
+                    self._trace_max_age_s is not None
+                    and now - mtime > self._trace_max_age_s
+                ):
+                    pruned.append((path, size, run_id, "age"))
+                    total_bytes -= size
+                else:
+                    survivors.append((mtime, path, size, run_id, protected))
+            if self._trace_max_bytes is not None:
+                for pass_protected in (False, True):
+                    if total_bytes <= self._trace_max_bytes:
+                        break
+                    for mtime, path, size, run_id, protected in list(survivors):
+                        if total_bytes <= self._trace_max_bytes:
+                            break
+                        if protected != pass_protected:
+                            continue
+                        pruned.append((path, size, run_id, "size"))
+                        survivors.remove((mtime, path, size, run_id, protected))
+                        total_bytes -= size
+            for path, size, run_id, reason in pruned:
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    summary["error"] = str(exc)
+                    continue
+                summary["pruned_files"] += 1
+                summary["pruned_bytes"] += size
+                self._record_event(
+                    event_type="trace_pruned",
+                    execution_id=0,
+                    details={
+                        "pruned_run_id": run_id,
+                        "bytes": str(size),
+                        "reason": reason,
+                    },
+                    system_event=True,
+                )
+            summary["total_bytes_after"] = total_bytes
+        except Exception as exc:  # noqa: BLE001 - retention must not raise
+            summary["error"] = str(exc)
+        with self._lock:
+            self._last_trace_prune = summary
+        return summary
+
+    def trace_storage_status(self) -> dict[str, Any]:
+        """Trace-directory storage accounting for the heartbeat surface."""
+        if self._trace_dir is None:
+            return {"enabled": False}
+        total_bytes = 0
+        file_count = 0
+        oldest_mtime: Optional[float] = None
+        try:
+            for path in self._trace_dir.glob("*.events.jsonl"):
+                stat = path.stat()
+                total_bytes += stat.st_size
+                file_count += 1
+                if oldest_mtime is None or stat.st_mtime < oldest_mtime:
+                    oldest_mtime = stat.st_mtime
+        except OSError:
+            pass
+        with self._lock:
+            last_prune = dict(self._last_trace_prune)
+        return {
+            "enabled": True,
+            "trace_dir": str(self._trace_dir),
+            "total_bytes": total_bytes,
+            "run_file_count": file_count,
+            "oldest_run_wall": (
+                datetime.fromtimestamp(oldest_mtime, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+                if oldest_mtime is not None
+                else None
+            ),
+            "volatile": str(self._trace_dir).startswith("/tmp"),
+            "max_age_s": self._trace_max_age_s,
+            "max_bytes": self._trace_max_bytes,
+            "last_prune": last_prune,
+        }
+
     def _failure_archive_worker_loop(self) -> None:
         queue_ = self._failure_archive_queue
         if queue_ is None:  # pragma: no cover - defensive
@@ -2298,6 +3771,12 @@ class EventRecorder:
                 # blocking on get() forever.
                 if job is None:
                     return
+                if job == "prune_traces":
+                    try:
+                        self._prune_trace_files()
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                    continue
                 try:
                     archive_path = self._write_failure_archive(job)
                     cleanup = self._prune_failure_archives()

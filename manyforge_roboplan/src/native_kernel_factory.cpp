@@ -24,6 +24,7 @@ void KernelEventCollector::subscribe(core::ExecutionKernel& kernel) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (buffer_.size() >= kMaxBufferedEvents) {
           buffer_.pop_front();
+          ++dropped_total_;
         }
         buffer_.push_back(event);
       });
@@ -46,6 +47,15 @@ std::vector<core::KernelEvent> KernelEventCollector::drain() {
   std::vector<core::KernelEvent> result(buffer_.begin(), buffer_.end());
   buffer_.clear();
   return result;
+}
+
+KernelEventCollector::DrainStats KernelEventCollector::drain_with_stats() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  DrainStats stats;
+  stats.events.assign(buffer_.begin(), buffer_.end());
+  buffer_.clear();
+  stats.dropped_total = dropped_total_;
+  return stats;
 }
 
 // --- NativeKernelBundle ---

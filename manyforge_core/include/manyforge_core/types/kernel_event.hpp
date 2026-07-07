@@ -89,6 +89,12 @@ struct KernelEvent {
 
   // General-purpose structured key-value data
   std::map<std::string, std::string> details;
+
+  /// Monotonic, contiguous dispatch-order sequence assigned by the kernel at
+  /// dispatch time (1-based; 0 = not yet dispatched). Consumers use gaps to
+  /// detect event loss anywhere in the pipeline (spec 520 §2.2). Declared
+  /// last so the ubiquitous positional aggregate initializers stay valid.
+  uint64_t sequence = 0;
 };
 
 /// Event callback type. Must be thread-safe.

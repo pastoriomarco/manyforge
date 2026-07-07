@@ -4,9 +4,10 @@ from __future__ import annotations
 import time
 from typing import Any, Iterable
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from manyforge_behavior.cycle_manager import preferred_structured_error_code
+from .event_recorder import _wall_iso_to_ns
 
 from .models import (
     BlackboardSnapshotResponse,
@@ -43,8 +44,21 @@ def build_execution_history_payload(
     node_attempt_id: str | None = None,
     move_id: str | None = None,
     contact_policy_id: str | None = None,
+    from_wall_ns: int | None = None,
+    to_wall_ns: int | None = None,
 ) -> dict[str, Any]:
     """Build the execution history payload."""
+    if (
+        (from_wall_ns is not None or to_wall_ns is not None)
+        and (start_ns is not None or end_ns is not None)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "fromWall/toWall cross-run windows cannot be combined with "
+                "startNs/endNs monotonic filters"
+            ),
+        )
     state.event_recorder.observe(state)
     return ExecutionHistoryResponse(
         **state.event_recorder.history(
@@ -64,6 +78,8 @@ def build_execution_history_payload(
             node_attempt_id=node_attempt_id,
             move_id=move_id,
             contact_policy_id=contact_policy_id,
+            from_wall_ns=from_wall_ns,
+            to_wall_ns=to_wall_ns,
         ),
     ).model_dump(by_alias=True)
 
@@ -87,6 +103,19 @@ def _split_csv_query(value: str | None) -> list[str] | None:
         return None
     items = [item.strip() for item in value.split(",") if item.strip()]
     return items or None
+
+
+def _parse_wall_query(name: str, value: str | None) -> int | None:
+    """Parse an ISO-8601 wall-clock query bound to epoch ns, or 400."""
+    if value is None or not value.strip():
+        return None
+    parsed = _wall_iso_to_ns(value)
+    if parsed is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} must be an ISO-8601 timestamp (e.g. 2026-07-07T06:00:00Z)",
+        )
+    return parsed
 
 
 def _operator_action_state(
@@ -362,6 +391,7 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
         resumeAllowed=resume_allowed,
         resetRequired=reset_required,
         ackRequired=ack_required,
+        lastStopDecision=state.event_recorder.last_stop_decision(),
         timestampNs=time.monotonic_ns(),
     ).model_dump(by_alias=True)
 
@@ -369,6 +399,17 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
 def create_execution_router(state: ComposerState) -> APIRouter:
     """Create execution observability routes."""
     router = APIRouter()
+
+    @router.get("/runs")
+    def list_execution_runs(
+        limit: int = Query(default=200, ge=1, le=2000),
+    ) -> dict:
+        """Cross-run listing from the append-only run index (plan OW5).
+
+        Serves run ids, lineage, wall times, event counts, and max severity
+        so post-restart forensics can find a run without out-of-band ids.
+        """
+        return {"runs": state.event_recorder.list_runs(limit=limit)}
 
     @router.get("/history")
     def get_execution_history(
@@ -388,8 +429,14 @@ def create_execution_router(state: ComposerState) -> APIRouter:
         node_attempt_id: str | None = Query(default=None, alias="nodeAttemptId"),
         move_id: str | None = Query(default=None, alias="moveId"),
         contact_policy_id: str | None = Query(default=None, alias="contactPolicyId"),
+        from_wall: str | None = Query(default=None, alias="fromWall"),
+        to_wall: str | None = Query(default=None, alias="toWall"),
     ) -> dict[str, Any]:
-        """Return execution history for the current or most recent run."""
+        """Return execution history for a single run, or — when a wall-time
+        window (fromWall/toWall, ISO-8601) is given — across runs resolved via
+        the run index (OW7)."""
+        from_wall_ns = _parse_wall_query("fromWall", from_wall)
+        to_wall_ns = _parse_wall_query("toWall", to_wall)
         return build_execution_history_payload(
             state,
             run_id=run_id,
@@ -408,6 +455,8 @@ def create_execution_router(state: ComposerState) -> APIRouter:
             node_attempt_id=node_attempt_id,
             move_id=move_id,
             contact_policy_id=contact_policy_id,
+            from_wall_ns=from_wall_ns,
+            to_wall_ns=to_wall_ns,
         )
 
     @router.get("/channels")
@@ -426,5 +475,10 @@ def create_execution_router(state: ComposerState) -> APIRouter:
     def get_blackboard_snapshot() -> dict[str, Any]:
         """Return a JSON-safe blackboard snapshot."""
         return build_blackboard_snapshot_payload(state)
+
+    @router.get("/latency-histograms")
+    def get_latency_histograms() -> dict[str, Any]:
+        """Return per-run sampled latency histograms (spec 500 §5)."""
+        return state.event_recorder.latency_histograms()
 
     return router

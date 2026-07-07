@@ -759,6 +759,8 @@ class TestNativeKernelBasics:
         native_kernel.get_execution_snapshot()
         wait_for_terminal(native_kernel)
         metrics = native_kernel.get_metrics()
+        assert metrics["events_emitted"] > 0
+        assert metrics["flight_recorder_records"] > 0
         assert metrics["snapshots_published"] > 0
         assert metrics["observer_lag_max_ns"] > 0
         assert metrics["scene_projection_successful_updates_total"] > 0
@@ -766,6 +768,9 @@ class TestNativeKernelBasics:
         assert metrics["scene_projection_lag_max_ns"] >= 0
         assert metrics["scene_projection_last_success_timestamp_ns"] > 0
         assert metrics["scene_projection_last_success_age_ns"] >= 0
+        assert metrics["scene_projection_terminal_retries_scheduled_total"] >= 0
+        assert metrics["scene_projection_terminal_retry_successes_total"] >= 0
+        assert metrics["scene_projection_terminal_retry_exhausted_total"] >= 0
 
     def test_set_joint_positions_refreshes_idle_execution_snapshot(self, native_kernel):
         native_kernel._bundle.set_joint_positions(DEMO_REST)
@@ -1819,3 +1824,27 @@ class TestTcpSpeedEnforcement:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short", "-s"])
+
+
+def test_kernel_event_collector_counts_overflow_drops():
+    """OW1: the native event collector counts ring-overflow drops and serves
+    them through drain_kernel_events_with_stats; events carry the kernel
+    dispatch sequence."""
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+    bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
+    # Each velocity-scale change dispatches one kernel event; overflow the
+    # 4096-entry collector ring without draining.
+    for i in range(4200):
+        bundle.set_runtime_velocity_scale(0.5 + (i % 2) * 0.25)
+    stats = bundle.drain_kernel_events_with_stats()
+    assert stats["dropped_total"] == 4200 - 4096
+    events = stats["events"]
+    assert len(events) == 4096
+    sequences = [e["sequence"] for e in events]
+    assert all(s > 0 for s in sequences)
+    assert sequences == sorted(sequences)
+    # Second drain: empty, monotonic counter unchanged.
+    stats2 = bundle.drain_kernel_events_with_stats()
+    assert stats2["events"] == []
+    assert stats2["dropped_total"] == 4200 - 4096
