@@ -45,7 +45,11 @@ MF="$(cd "${SELF_DIR}/.." && pwd)"                                 # standalone 
 VLLM_ENDPOINT="${NEMOCLAW_VLLM_ENDPOINT:-http://host.openshell.internal:8000/v1}"
 VLLM_MODEL="${NEMOCLAW_VLLM_MODEL:-${MODEL_PROFILE:-gemma4-12b-it-gguf}}"
 GATEWAY_PORT="${HERMES_GATEWAY_PORT:-8642}"          # host port --forward -> sandbox gateway
-DASH_INTERNAL="${HERMES_DASHBOARD_INTERNAL_PORT:-18642}"
+# Dashboard public port (passed as NEMOCLAW_DASHBOARD_PORT). Must differ from
+# Hermes' API ports: v0.17 start.sh hardcodes PUBLIC_PORT=8642 and
+# INTERNAL_PORT=18642 and rejects a dashboard port equal to either. 18642
+# worked pre-v0.17 (the API internal port was not 18642 then); use 18643.
+DASH_INTERNAL="${HERMES_DASHBOARD_INTERNAL_PORT:-18643}"
 ASSISTANT_CASE_TIMEOUT_S="${ASSISTANT_TIMEOUT_S:-300}"
 if [[ "${ASSISTANT_CASE_TIMEOUT_S}" =~ ^[0-9]+$ ]]; then
   HERMES_STREAM_TIMEOUT_DEFAULT_S="$((ASSISTANT_CASE_TIMEOUT_S + 60))"
@@ -92,13 +96,25 @@ green "third-party ~/NemoClaw is read-only here (copied into a temp staging cont
 step "1/4 Stage build context (upstream COPY sources + our matrix + bridge)"
 WORK="$(mktemp -d /tmp/hermes-ba.XXXXXX)"; CTX="${WORK}/ctx"
 trap 'rm -rf "${WORK}"' EXIT
-mkdir -p "${CTX}/agents/hermes/host" "${CTX}/scripts/lib"
+mkdir -p "${CTX}/agents/hermes/host" "${CTX}/scripts/lib" "${CTX}/src/lib"
 cp -r "${NEMOCLAW}/agents/hermes/plugin"            "${CTX}/agents/hermes/"
 cp    "${NEMOCLAW}/agents/hermes/generate-config.ts" "${CTX}/agents/hermes/"
 cp -r "${NEMOCLAW}/agents/hermes/config"            "${CTX}/agents/hermes/"
 cp    "${NEMOCLAW}/agents/hermes/start.sh"          "${CTX}/agents/hermes/"
+# Hermes calver v2026.6.19 (semver 0.17.0) added these COPY sources to the
+# upstream agents/hermes/Dockerfile; the build fails without them staged.
+cp    "${NEMOCLAW}/agents/hermes/hermes-wrapper.py"              "${CTX}/agents/hermes/"
+cp    "${NEMOCLAW}/agents/hermes/runtime-config-guard.py"        "${CTX}/agents/hermes/"
+cp    "${NEMOCLAW}/agents/hermes/seed-dashboard-config.py"       "${CTX}/agents/hermes/"
+cp    "${NEMOCLAW}/agents/hermes/validate-env-secret-boundary.py" "${CTX}/agents/hermes/"
 cp -r "${NEMOCLAW}/nemoclaw-blueprint"              "${CTX}/"
 cp    "${NEMOCLAW}/scripts/lib/sandbox-init.sh"     "${CTX}/scripts/lib/"
+cp    "${NEMOCLAW}/scripts/lib/gateway-supervisor.sh" "${CTX}/scripts/lib/"
+cp    "${NEMOCLAW}/scripts/lib/sandbox-rlimits.sh"  "${CTX}/scripts/lib/"
+cp    "${NEMOCLAW}/scripts/gateway-control.sh"      "${CTX}/scripts/"
+cp    "${NEMOCLAW}/scripts/managed-gateway-control.py" "${CTX}/scripts/"
+cp    "${NEMOCLAW}/scripts/state-dir-guard.py"      "${CTX}/scripts/"
+cp -r "${NEMOCLAW}/src/lib/messaging"               "${CTX}/src/lib/"
 cp    "${MATRIX}"  "${CTX}/agents/hermes/host/managed-tool-gateway-matrix.json"   # OUR matrix
 cp    "${BRIDGE}"  "${CTX}/manyforge-mcp-bridge.py"
 green "staged context at ${CTX}"
@@ -145,8 +161,16 @@ openshell sandbox create \
      "NEMOCLAW_DASHBOARD_PORT=${DASH_INTERNAL}" \
      "HERMES_STREAM_STALE_TIMEOUT=${HERMES_STREAM_STALE_TIMEOUT:-${HERMES_STREAM_TIMEOUT_DEFAULT_S}}" \
      "HERMES_STREAM_READ_TIMEOUT=${HERMES_STREAM_READ_TIMEOUT:-${HERMES_STREAM_TIMEOUT_DEFAULT_S}}" \
-     "HERMES_API_TIMEOUT=${HERMES_API_TIMEOUT:-${HERMES_STREAM_TIMEOUT_DEFAULT_S}}" \
      nemoclaw-start
+# HERMES_API_TIMEOUT is intentionally NOT passed: Hermes v0.16+ ships a
+# secret-boundary validator (validate-env-secret-boundary.py) whose
+# SECRET_KEY_RE matches the `API` word-token in the name and refuses Hermes
+# startup for any such env var carrying a raw (non-placeholder) value, and it
+# is not on the validator's allowlist. Hermes falls back to its built-in API
+# timeout. This loses nothing on Thor: run_agent.py only relaxes the read
+# timeout to HERMES_API_TIMEOUT when is_local_endpoint(base_url) is true, and
+# that helper does not recognize the `.openshell.internal` host, so the value
+# was never applied here anyway.
 # NOTE: Hermes streaming timeouts, pinned above the Composer case budget.
 # run_agent.py
 # guards the model stream with HERMES_STREAM_STALE_TIMEOUT (inter-chunk "no chunk
