@@ -494,6 +494,17 @@ wait_for_vllm_proxy() {
 }
 
 configure_nemoclaw() {
+    # configure-local-provider.sh wires the OpenShell `vllm-local` provider +
+    # inference route + in-sandbox OpenClaw gateway: that is the direct/openclaw
+    # lane path. The Hermes lane seeds its own model routing into the sandbox at
+    # setup-hermes.sh create time and runs its own gateway, so this step is not
+    # only unnecessary for Hermes but wrong — it resolves the OpenClaw sandbox
+    # name (my-assistant) and tries to start an OpenClaw gateway inside the
+    # Hermes sandbox.
+    if [[ "${ASSISTANT_PROVIDER}" == "hermes" ]]; then
+        info "Hermes lane self-seeds model routing at sandbox-create time; skipping configure-local-provider (direct/openclaw only)."
+        return 0
+    fi
     step "Configuring NemoClaw/OpenShell provider"
     ensure_log_dir
     local configure_log="${LOG_DIR}/configure-local-provider.log"
@@ -668,14 +679,32 @@ start_bridge_hermes() {
     # fastapi+uvicorn+httpx(+prometheus). HERMES_BRIDGE_PYTHON overrides.
     local python="${HERMES_BRIDGE_PYTHON:-${hermes_root}/lanes/hermes/.venv/bin/python}"
     [[ -x "${python}" ]] || python="python3"
+    local hermes_sandbox="${HERMES_ASSISTANT_SANDBOX:-hermes-assistant}"
+    # Auto-extract the per-sandbox Hermes API_SERVER_KEY (minted by
+    # setup-hermes.sh into /sandbox/.hermes/.env). Read it inside the container
+    # and keep it out of argv/logs: export it so the bridge subshell inherits it
+    # rather than passing it on the `env` command line (which `ps` would expose).
+    if [[ -z "${API_SERVER_KEY:-}" ]]; then
+        local _hermes_cid
+        _hermes_cid="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E "^openshell-${hermes_sandbox}-" | head -1)"
+        if [[ -n "${_hermes_cid}" ]]; then
+            API_SERVER_KEY="$(docker exec -u root "${_hermes_cid}" bash -lc 'set -a; . /sandbox/.hermes/.env 2>/dev/null; set +a; printf "%s" "${API_SERVER_KEY:-}"' 2>/dev/null || true)"
+        fi
+        if [[ -z "${API_SERVER_KEY:-}" ]]; then
+            warn "Could not auto-extract Hermes API_SERVER_KEY from sandbox '${hermes_sandbox}'; bridge will start unauthenticated. Export API_SERVER_KEY to override."
+        else
+            info "Extracted Hermes API_SERVER_KEY from sandbox '${hermes_sandbox}' (kept out of logs)."
+        fi
+    fi
+    export API_SERVER_KEY
     ensure_log_dir
     (
         cd "${hermes_root}"
         env \
             HERMES_BASE_URL="${HERMES_BASE_URL:-http://127.0.0.1:8642}" \
-            API_SERVER_KEY="${API_SERVER_KEY:-}" \
+            SANDBOX_NAME="${hermes_sandbox}" \
             MANYFORGE_MODEL="${MODEL_PROFILE}" \
-            MANYFORGE_PRINCIPAL="${MANYFORGE_PRINCIPAL:-hermes-${OPENCLAW_ASSISTANT_SANDBOX:-hermes-spike}}" \
+            MANYFORGE_PRINCIPAL="${MANYFORGE_PRINCIPAL:-hermes-${hermes_sandbox}}" \
             MANYFORGE_HERMES_RUN_TIMEOUT_S="${ASSISTANT_TIMEOUT_S}" \
             MANYFORGE_HERMES_AUDIT_PATH="${BRIDGE_AUDIT_LOG%/*}/hermes-bridge-audit.jsonl" \
             setsid "${python}" -m uvicorn lanes.hermes.service:app \
