@@ -502,7 +502,16 @@ configure_nemoclaw() {
     # name (my-assistant) and tries to start an OpenClaw gateway inside the
     # Hermes sandbox.
     if [[ "${ASSISTANT_PROVIDER}" == "hermes" ]]; then
-        info "Hermes lane self-seeds model routing at sandbox-create time; skipping configure-local-provider (direct/openclaw only)."
+        # The Hermes lane self-seeds its model routing, so skip the provider /
+        # inference-route config. But the host OpenShell gateway is lane-
+        # independent (setup-hermes's `openshell sandbox create` needs it), so
+        # still ensure it is up — and not stale after an OpenShell upgrade — via
+        # the NemoClaw-Thor gateway-ensure (which restarts a version-drifted
+        # gateway). checks.sh is self-contained (defines its own log helpers).
+        info "Hermes lane self-seeds model routing; skipping provider config, ensuring the host gateway only."
+        if ! (cd "${NEMOCLAW_THOR}" && source setup/checks.sh 2>/dev/null && ensure_openshell_gateway_running); then
+            warn "OpenShell gateway ensure failed; setup-hermes may be unable to reach the gateway."
+        fi
         return 0
     fi
     step "Configuring NemoClaw/OpenShell provider"
