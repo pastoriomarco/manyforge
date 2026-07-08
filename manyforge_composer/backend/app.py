@@ -45,6 +45,7 @@ from .routes_infra import create_infra_router
 from .routes_runtime import create_runtime_router
 from .routes_assistant import create_assistant_router
 from .routes_simulation import create_simulation_router
+from .route_execution import shutdown_route_executors
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,15 @@ def create_app(
                 await asyncio.to_thread(state.cycle_manager.shutdown)
             except Exception:  # noqa: BLE001 — continue to the remaining steps
                 logger.exception("Shutdown: cycle quiesce failed")
+        try:
+            routes_idle = await asyncio.to_thread(
+                shutdown_route_executors,
+                wait_timeout_s=1.0,
+            )
+            if not routes_idle:
+                logger.error("Shutdown: route executors did not drain within budget")
+        except Exception:  # noqa: BLE001 — continue to state teardown
+            logger.exception("Shutdown: route executor quiesce failed")
         # Final observability flush: the quiesce's own kernel events (stop
         # request, state transitions) sit in the kernel client's buffer and
         # nothing drains them once the tick loop is gone. Project them and a

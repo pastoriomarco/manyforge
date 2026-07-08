@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 
 from .models import KernelSnapshotResponse
-from .route_execution import run_cycle_control, run_route_background
+from .route_execution import run_kernel_stop_backstop, run_route_background
 from .state import ComposerState
 
 logger = logging.getLogger(__name__)
@@ -109,6 +109,16 @@ def create_kernel_router(state: ComposerState) -> APIRouter:
         escalation). A rejection is reported honestly — a kernel already in
         a terminal state has nothing to stop.
         """
+        def coalesced() -> dict[str, Any]:
+            return {
+                "accepted": True,
+                "error": None,
+                "reason_code": "kernel_stop_backstop_already_in_flight",
+                "kernel_state": None,
+                "coalesced": True,
+                "timestamp_ns": time.monotonic_ns(),
+            }
+
         def command() -> dict[str, Any]:
             if state.kernel is None:
                 raise HTTPException(status_code=503, detail="Kernel not available")
@@ -122,10 +132,11 @@ def create_kernel_router(state: ComposerState) -> APIRouter:
                 "error": result.error,
                 "reason_code": result.reason_code,
                 "kernel_state": kernel_state,
+                "coalesced": False,
                 "timestamp_ns": time.monotonic_ns(),
             }
 
-        return await run_cycle_control(command)
+        return await run_kernel_stop_backstop(command, coalesced=coalesced)
 
     @router.get("/events")
     async def get_kernel_events(

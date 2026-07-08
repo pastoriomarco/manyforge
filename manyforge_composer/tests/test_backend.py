@@ -10,6 +10,7 @@ from pathlib import Path
 
 pytest.importorskip("fastapi")
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
 import httpx
@@ -18,6 +19,7 @@ import py_trees
 import yaml
 
 from manyforge_behavior.kernel_client import (
+    CommandResult,
     ExecutionState,
     MockKernelClient,
     SceneEditRequest,
@@ -730,6 +732,69 @@ def test_kernel_stop_backstop_uses_reserved_control_executor():
     assert kernel.stop_thread_name.startswith("manyforge_cycle_control")
 
 
+def test_kernel_stop_backstop_singleflight_does_not_starve_full_stop():
+    class BlockingStopKernel(MockKernelClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._state = ExecutionState.EXECUTING  # noqa: SLF001 - test active kernel
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.stop_calls = 0
+            self._stop_lock = threading.Lock()
+
+        def stop(self):  # type: ignore[override]
+            with self._stop_lock:
+                self.stop_calls += 1
+            self.entered.set()
+            self.release.wait(timeout=5.0)
+            return CommandResult(accepted=True)
+
+    kernel = BlockingStopKernel()
+    manager = _ExecutorProbeCycleManager()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.cycle_manager = manager
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as local_client:
+        first_response: list[int] = []
+
+        def post_kernel_stop() -> None:
+            first_response.append(local_client.post("/api/kernel/stop").status_code)
+
+        first_thread = threading.Thread(target=post_kernel_stop, daemon=True)
+        first_thread.start()
+        try:
+            assert kernel.entered.wait(timeout=1.0)
+
+            duplicate_started = time.monotonic()
+            duplicate = local_client.post("/api/kernel/stop")
+            duplicate_elapsed_s = time.monotonic() - duplicate_started
+            assert duplicate.status_code == 200
+            duplicate_body = duplicate.json()
+            assert duplicate_body["accepted"] is True
+            assert duplicate_body["coalesced"] is True
+            assert (
+                duplicate_body["reason_code"]
+                == "kernel_stop_backstop_already_in_flight"
+            )
+            assert duplicate_elapsed_s < 0.25
+
+            full_stop_started = time.monotonic()
+            full_stop = local_client.post("/api/cycle/full-stop")
+            full_stop_elapsed_s = time.monotonic() - full_stop_started
+            assert full_stop.status_code == 200
+            assert full_stop_elapsed_s < 0.5
+            assert manager.thread_names["full_stop"].startswith(
+                "manyforge_cycle_control"
+            )
+        finally:
+            kernel.release.set()
+            first_thread.join(timeout=1.0)
+
+    assert first_response == [200]
+    assert kernel.stop_calls == 1
+
+
 def test_cycle_stop_uses_reserved_control_executor():
     manager = _ExecutorProbeCycleManager()
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
@@ -782,6 +847,66 @@ def test_debug_history_and_snapshot_routes_use_background_executor(monkeypatch):
     assert observed["debug"].startswith("manyforge_route_background")
     assert observed["history"].startswith("manyforge_route_background")
     assert observed["snapshot"].startswith("manyforge_route_background")
+
+
+def test_route_background_executor_rejects_above_admission_limit():
+    async def scenario() -> None:
+        status = route_execution.route_executor_status()["background"]
+        max_admitted = status["max_admitted"]
+        release = threading.Event()
+
+        async def submit_blocking() -> bool:
+            return await route_execution.run_route_background(
+                lambda: release.wait(timeout=5.0)
+            )
+
+        tasks = [asyncio.create_task(submit_blocking()) for _ in range(max_admitted)]
+        try:
+            for _ in range(100):
+                if (
+                    route_execution.route_executor_status()["background"][
+                        "admitted"
+                    ]
+                    == max_admitted
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            assert (
+                route_execution.route_executor_status()["background"]["admitted"]
+                == max_admitted
+            )
+
+            with pytest.raises(HTTPException) as exc_info:
+                await route_execution.run_route_background(lambda: True)
+            assert exc_info.value.status_code == 503
+            assert exc_info.value.detail["error"] == "route_executor_busy"
+            assert exc_info.value.detail["role"] == "background"
+        finally:
+            release.set()
+            await asyncio.gather(*tasks)
+            route_execution.shutdown_route_executors(wait_timeout_s=1.0)
+
+    asyncio.run(scenario())
+
+
+def test_route_executors_restart_after_app_lifespan_shutdown():
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as local_client:
+        assert local_client.get("/api/kernel/snapshot").status_code == 200
+
+    restarts_before = route_execution.route_executor_status()["background"][
+        "restarts"
+    ]
+
+    with TestClient(app) as local_client:
+        assert local_client.get("/api/kernel/snapshot").status_code == 200
+
+    assert (
+        route_execution.route_executor_status()["background"]["restarts"]
+        > restarts_before
+    )
 
 
 def test_full_stop_is_not_blocked_by_saturated_background_routes(monkeypatch):
