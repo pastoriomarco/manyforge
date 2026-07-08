@@ -34,6 +34,7 @@ from manyforge_composer.backend.models import (
     SceneShapeResponse,
     VisualSceneSnapshotResponse,
 )
+from manyforge_composer.backend import route_execution, routes_debug, routes_execution
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.ws_state import StateHub
 from manyforge_composer.__main__ import build_program_loaded_callback
@@ -121,6 +122,16 @@ class _ExecutorProbeCycleManager:
     def full_stop(self) -> None:
         self.thread_names["full_stop"] = threading.current_thread().name
         self.state = _FakeCycleState("stopped")
+
+
+class _ThreadProbeKernel(MockKernelClient):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.stop_thread_name: str | None = None
+
+    def stop(self):  # type: ignore[override]
+        self.stop_thread_name = threading.current_thread().name
+        return super().stop()
 
 
 class _KernelSnapshotFaultCycleManager:
@@ -692,6 +703,141 @@ def test_full_stop_uses_reserved_control_executor_when_lifecycle_pool_blocked():
                 thread.join(timeout=1.0)
 
     assert responses == [200, 200]
+
+
+def test_route_executor_roles_are_explicit():
+    status = route_execution.route_executor_status()
+
+    assert status["control"]["thread_name_prefix"] == "manyforge_cycle_control"
+    assert status["lifecycle"]["thread_name_prefix"] == "manyforge_cycle_lifecycle"
+    assert status["background"]["thread_name_prefix"] == "manyforge_route_background"
+    assert "operator stop" in status["control"]["description"]
+    assert "debug" in status["background"]["description"]
+
+
+def test_kernel_stop_backstop_uses_reserved_control_executor():
+    kernel = _ThreadProbeKernel()
+    kernel._state = ExecutionState.EXECUTING  # noqa: SLF001 - test active kernel
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as local_client:
+        response = local_client.post("/api/kernel/stop")
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is True
+    assert kernel.stop_thread_name is not None
+    assert kernel.stop_thread_name.startswith("manyforge_cycle_control")
+
+
+def test_cycle_stop_uses_reserved_control_executor():
+    manager = _ExecutorProbeCycleManager()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state.cycle_manager = manager
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as local_client:
+        response = local_client.post("/api/cycle/stop")
+
+    assert response.status_code == 200
+    assert manager.thread_names["stop"].startswith("manyforge_cycle_control")
+
+
+def test_debug_history_and_snapshot_routes_use_background_executor(monkeypatch):
+    observed: dict[str, str] = {}
+
+    def fake_debug_export(_state, *, run_id=None):
+        observed["debug"] = threading.current_thread().name
+        return {"ok": True, "run_id": run_id}
+
+    def fake_history_payload(_state, **_kwargs):
+        observed["history"] = threading.current_thread().name
+        return {"events": [], "nextCursor": None}
+
+    class SnapshotBrokerProbe:
+        def has_clients(self) -> bool:
+            return True
+
+        def render_sync(self, _width: int, _height: int, _format: str):
+            observed["snapshot"] = threading.current_thread().name
+            return b"image-bytes"
+
+    monkeypatch.setattr(routes_debug, "build_debug_export_payload", fake_debug_export)
+    monkeypatch.setattr(
+        routes_execution,
+        "build_execution_history_payload",
+        fake_history_payload,
+    )
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state.snapshot_broker = SnapshotBrokerProbe()
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as local_client:
+        assert local_client.get("/api/debug/export").status_code == 200
+        assert local_client.get("/api/execution/history").status_code == 200
+        snapshot = local_client.get("/api/scene/snapshot")
+        assert snapshot.status_code == 200
+        assert snapshot.content == b"image-bytes"
+
+    assert observed["debug"].startswith("manyforge_route_background")
+    assert observed["history"].startswith("manyforge_route_background")
+    assert observed["snapshot"].startswith("manyforge_route_background")
+
+
+def test_full_stop_is_not_blocked_by_saturated_background_routes(monkeypatch):
+    manager = _ExecutorProbeCycleManager()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state.cycle_manager = manager
+    app = create_app(state, security=_TEST_SECURITY)
+    background_workers = route_execution.route_executor_status()["background"][
+        "max_workers"
+    ]
+    entered = [threading.Event() for _ in range(background_workers)]
+    release = threading.Event()
+    enter_lock = threading.Lock()
+    enter_count = 0
+
+    def blocked_debug_export(_state, *, run_id=None):
+        nonlocal enter_count
+        with enter_lock:
+            index = enter_count
+            enter_count += 1
+        if index < len(entered):
+            entered[index].set()
+        release.wait(timeout=5.0)
+        return {"ok": True, "run_id": run_id}
+
+    monkeypatch.setattr(routes_debug, "build_debug_export_payload", blocked_debug_export)
+
+    with TestClient(app) as local_client:
+        responses: list[int] = []
+
+        def get_debug_export() -> None:
+            responses.append(local_client.get("/api/debug/export").status_code)
+
+        threads = [
+            threading.Thread(target=get_debug_export, daemon=True)
+            for _ in range(background_workers)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            for event in entered:
+                assert event.wait(timeout=1.0)
+            started = time.monotonic()
+            full_stop = local_client.post("/api/cycle/full-stop")
+            elapsed_s = time.monotonic() - started
+            assert full_stop.status_code == 200
+            assert elapsed_s < 0.5
+            assert manager.thread_names["full_stop"].startswith(
+                "manyforge_cycle_control"
+            )
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(timeout=1.0)
+
+    assert responses == [200] * background_workers
 
 
 def test_reset_phase_timeout_returns_structured_409(monkeypatch):

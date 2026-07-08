@@ -15,6 +15,7 @@ from .models import (
     ExecutionDigestResponse,
     ExecutionHistoryResponse,
 )
+from .route_execution import run_route_background
 from .routes_scene import build_scene_diagnostics_payload
 from .state import ComposerState
 
@@ -401,7 +402,7 @@ def create_execution_router(state: ComposerState) -> APIRouter:
     router = APIRouter()
 
     @router.get("/runs")
-    def list_execution_runs(
+    async def list_execution_runs(
         limit: int = Query(default=200, ge=1, le=2000),
     ) -> dict:
         """Cross-run listing from the append-only run index (plan OW5).
@@ -409,10 +410,12 @@ def create_execution_router(state: ComposerState) -> APIRouter:
         Serves run ids, lineage, wall times, event counts, and max severity
         so post-restart forensics can find a run without out-of-band ids.
         """
-        return {"runs": state.event_recorder.list_runs(limit=limit)}
+        return await run_route_background(
+            lambda: {"runs": state.event_recorder.list_runs(limit=limit)}
+        )
 
     @router.get("/history")
-    def get_execution_history(
+    async def get_execution_history(
         run_id: str | None = None,
         limit: int | None = Query(default=None, ge=0, le=10000),
         start_ns: int | None = Query(default=None, alias="startNs"),
@@ -435,50 +438,54 @@ def create_execution_router(state: ComposerState) -> APIRouter:
         """Return execution history for a single run, or — when a wall-time
         window (fromWall/toWall, ISO-8601) is given — across runs resolved via
         the run index (OW7)."""
-        from_wall_ns = _parse_wall_query("fromWall", from_wall)
-        to_wall_ns = _parse_wall_query("toWall", to_wall)
-        return build_execution_history_payload(
-            state,
-            run_id=run_id,
-            limit=limit,
-            start_ns=start_ns,
-            end_ns=end_ns,
-            min_severity=min_severity,
-            components=_split_csv_query(components),
-            event_types=_split_csv_query(event_types),
-            execution_id=execution_id,
-            kernel_execution_id=kernel_execution_id,
-            program_run_id=program_run_id,
-            intervention_run_id=intervention_run_id,
-            action_span_id=action_span_id,
-            node_instance_id=node_instance_id,
-            node_attempt_id=node_attempt_id,
-            move_id=move_id,
-            contact_policy_id=contact_policy_id,
-            from_wall_ns=from_wall_ns,
-            to_wall_ns=to_wall_ns,
+        return await run_route_background(
+            lambda: build_execution_history_payload(
+                state,
+                run_id=run_id,
+                limit=limit,
+                start_ns=start_ns,
+                end_ns=end_ns,
+                min_severity=min_severity,
+                components=_split_csv_query(components),
+                event_types=_split_csv_query(event_types),
+                execution_id=execution_id,
+                kernel_execution_id=kernel_execution_id,
+                program_run_id=program_run_id,
+                intervention_run_id=intervention_run_id,
+                action_span_id=action_span_id,
+                node_instance_id=node_instance_id,
+                node_attempt_id=node_attempt_id,
+                move_id=move_id,
+                contact_policy_id=contact_policy_id,
+                from_wall_ns=_parse_wall_query("fromWall", from_wall),
+                to_wall_ns=_parse_wall_query("toWall", to_wall),
+            )
         )
 
     @router.get("/channels")
-    def get_execution_channels(
+    async def get_execution_channels(
         limit: int | None = Query(default=None, ge=0, le=10000),
     ) -> dict[str, Any]:
         """Return independently retained event streams by diagnostic channel."""
-        return build_execution_channels_payload(state, limit=limit)
+        return await run_route_background(
+            lambda: build_execution_channels_payload(state, limit=limit)
+        )
 
     @router.get("/digest")
-    def get_execution_digest() -> dict[str, Any]:
+    async def get_execution_digest() -> dict[str, Any]:
         """Return high-level execution digest."""
-        return build_execution_digest_payload(state)
+        return await run_route_background(lambda: build_execution_digest_payload(state))
 
     @router.get("/blackboard")
-    def get_blackboard_snapshot() -> dict[str, Any]:
+    async def get_blackboard_snapshot() -> dict[str, Any]:
         """Return a JSON-safe blackboard snapshot."""
-        return build_blackboard_snapshot_payload(state)
+        return await run_route_background(lambda: build_blackboard_snapshot_payload(state))
 
     @router.get("/latency-histograms")
-    def get_latency_histograms() -> dict[str, Any]:
+    async def get_latency_histograms() -> dict[str, Any]:
         """Return per-run sampled latency histograms (spec 500 §5)."""
-        return state.event_recorder.latency_histograms()
+        return await run_route_background(
+            lambda: state.event_recorder.latency_histograms()
+        )
 
     return router

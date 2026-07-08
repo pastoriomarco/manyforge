@@ -19,6 +19,7 @@ from .routes_execution import (
     build_execution_history_payload,
 )
 from .routes_kernel import build_kernel_metrics_payload, build_kernel_snapshot_payload
+from .route_execution import run_route_background
 from .routes_scene import build_scene_diagnostics_payload, build_scene_state_payload
 from .state import ComposerState
 
@@ -256,69 +257,83 @@ def create_debug_router(state: ComposerState) -> APIRouter:
     router = APIRouter()
 
     @router.get("/scene-trace")
-    def debug_scene_trace(limit: int = 200) -> dict[str, Any]:
+    async def debug_scene_trace(limit: int = 200) -> dict[str, Any]:
         """Return current backend/native-viewer scene trace data."""
-        return build_scene_trace_payload(state, limit=limit)
+        return await run_route_background(
+            lambda: build_scene_trace_payload(state, limit=limit)
+        )
 
     @router.get("/export")
-    def debug_export(run_id: str | None = None) -> dict[str, Any]:
+    async def debug_export(run_id: str | None = None) -> dict[str, Any]:
         """Return single-call debug export bundle."""
-        return build_debug_export_payload(state, run_id=run_id)
+        return await run_route_background(
+            lambda: build_debug_export_payload(state, run_id=run_id)
+        )
 
     @router.get("/export/ros2-medkit")
-    def debug_export_ros2_medkit(run_id: str | None = None) -> dict[str, Any]:
+    async def debug_export_ros2_medkit(run_id: str | None = None) -> dict[str, Any]:
         """Return normalized trace export for ros2_medkit-style tooling."""
-        return build_ros2_medkit_trace_payload(state, run_id=run_id)
+        return await run_route_background(
+            lambda: build_ros2_medkit_trace_payload(state, run_id=run_id)
+        )
 
     @router.get("/collision/compare-trajectory/{move_id}")
-    def debug_collision_compare_trajectory_waypoint(
+    async def debug_collision_compare_trajectory_waypoint(
         move_id: str,
         waypoint_index: int = 0,
     ) -> dict[str, Any]:
         """Compare legacy and ManyForge collision checks for a cached waypoint."""
-        return build_collision_compare_trajectory_waypoint_payload(
-            state,
-            move_id=move_id,
-            waypoint_index=waypoint_index,
+        return await run_route_background(
+            lambda: build_collision_compare_trajectory_waypoint_payload(
+                state,
+                move_id=move_id,
+                waypoint_index=waypoint_index,
+            )
         )
 
     @router.post("/collision/compare-positions")
-    def debug_collision_compare_positions(request: dict[str, Any]) -> dict[str, Any]:
+    async def debug_collision_compare_positions(request: dict[str, Any]) -> dict[str, Any]:
         """Compare legacy and ManyForge collision checks for explicit positions."""
-        positions = request.get("positions_rad")
-        if not isinstance(positions, list):
-            raise HTTPException(status_code=400, detail="positions_rad must be a list")
-        waypoint_index = request.get("waypoint_index")
-        if waypoint_index is not None:
-            waypoint_index = int(waypoint_index)
-        return build_collision_compare_positions_payload(
-            state,
-            positions_rad=positions,
-            waypoint_index=waypoint_index,
-        )
+        def command() -> dict[str, Any]:
+            positions = request.get("positions_rad")
+            if not isinstance(positions, list):
+                raise HTTPException(status_code=400, detail="positions_rad must be a list")
+            waypoint_index = request.get("waypoint_index")
+            if waypoint_index is not None:
+                waypoint_index = int(waypoint_index)
+            return build_collision_compare_positions_payload(
+                state,
+                positions_rad=positions,
+                waypoint_index=waypoint_index,
+            )
+
+        return await run_route_background(command)
 
     @router.post("/signals/publish")
-    def debug_publish_signal(request: DebugSignalPublishRequest) -> dict[str, Any]:
+    async def debug_publish_signal(request: DebugSignalPublishRequest) -> dict[str, Any]:
         """Publish one manual signal sample into the runtime signal registry."""
-        if state.cycle_manager is None:
-            raise HTTPException(status_code=503, detail="Cycle manager is not available")
+        def command() -> dict[str, Any]:
+            if state.cycle_manager is None:
+                raise HTTPException(status_code=503, detail="Cycle manager is not available")
 
-        adapter = request.adapter.strip()
-        signal = request.signal.strip()
-        if not adapter:
-            raise HTTPException(status_code=400, detail="adapter is required")
-        if not signal:
-            raise HTTPException(status_code=400, detail="signal is required")
+            adapter = request.adapter.strip()
+            signal = request.signal.strip()
+            if not adapter:
+                raise HTTPException(status_code=400, detail="adapter is required")
+            if not signal:
+                raise HTTPException(status_code=400, detail="signal is required")
 
-        state.cycle_manager.publish_signal(
-            adapter=adapter,
-            signal=signal,
-            value=request.value,
-            stale_after_ms=request.stale_after_ms,
-            mirror_key=request.mirror_key,
-            clear_on_stale=request.clear_on_stale,
-            metadata=dict(request.metadata),
-        )
-        return state.cycle_manager.get_signal_snapshot()
+            state.cycle_manager.publish_signal(
+                adapter=adapter,
+                signal=signal,
+                value=request.value,
+                stale_after_ms=request.stale_after_ms,
+                mirror_key=request.mirror_key,
+                clear_on_stale=request.clear_on_stale,
+                metadata=dict(request.metadata),
+            )
+            return state.cycle_manager.get_signal_snapshot()
+
+        return await run_route_background(command)
 
     return router

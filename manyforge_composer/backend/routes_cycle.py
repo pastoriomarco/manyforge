@@ -1,9 +1,7 @@
 """Cycle control routes - /api/cycle/*"""
 from __future__ import annotations
 
-import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -15,27 +13,13 @@ from .models import (
     VelocityScaleResponse,
 )
 from .cycle_diagnostics import active_cycle_error_fields
+from .route_execution import (
+    run_cycle_control as _run_cycle_control,
+    run_cycle_lifecycle as _run_cycle_lifecycle,
+)
 from .state import ComposerState
 
 logger = logging.getLogger(__name__)
-_CYCLE_CONTROL_EXECUTOR = ThreadPoolExecutor(
-    max_workers=2,
-    thread_name_prefix="manyforge_cycle_control",
-)
-_CYCLE_LIFECYCLE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=2,
-    thread_name_prefix="manyforge_cycle_lifecycle",
-)
-
-
-async def _run_cycle_control(fn):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_CYCLE_CONTROL_EXECUTOR, fn)
-
-
-async def _run_cycle_lifecycle(fn):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_CYCLE_LIFECYCLE_EXECUTOR, fn)
 
 
 def _structured_command_error(

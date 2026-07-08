@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 
 from .models import KernelSnapshotResponse
+from .route_execution import run_cycle_control, run_route_background
 from .state import ComposerState
 
 logger = logging.getLogger(__name__)
@@ -88,17 +89,17 @@ def create_kernel_router(state: ComposerState) -> APIRouter:
     router = APIRouter()
 
     @router.get("/snapshot")
-    def get_kernel_snapshot() -> dict[str, Any]:
+    async def get_kernel_snapshot() -> dict[str, Any]:
         """Get current kernel execution snapshot."""
-        return build_kernel_snapshot_payload(state)
+        return await run_route_background(lambda: build_kernel_snapshot_payload(state))
 
     @router.get("/metrics")
-    def get_kernel_metrics() -> dict[str, int]:
+    async def get_kernel_metrics() -> dict[str, int]:
         """Get kernel performance metrics."""
-        return build_kernel_metrics_payload(state)
+        return await run_route_background(lambda: build_kernel_metrics_payload(state))
 
     @router.post("/stop")
-    def kernel_stop() -> dict[str, Any]:
+    async def kernel_stop() -> dict[str, Any]:
         """Issue a kernel-level controlled stop, bypassing the cycle layer.
 
         Operator backstop: works regardless of what the cycle manager
@@ -108,23 +109,26 @@ def create_kernel_router(state: ComposerState) -> APIRouter:
         escalation). A rejection is reported honestly — a kernel already in
         a terminal state has nothing to stop.
         """
-        if state.kernel is None:
-            raise HTTPException(status_code=503, detail="Kernel not available")
-        result = state.kernel.stop()
-        try:
-            kernel_state = state.kernel.get_status().state.value
-        except Exception:  # noqa: BLE001 — report the stop result even if status is unreadable
-            kernel_state = None
-        return {
-            "accepted": result.accepted,
-            "error": result.error,
-            "reason_code": result.reason_code,
-            "kernel_state": kernel_state,
-            "timestamp_ns": time.monotonic_ns(),
-        }
+        def command() -> dict[str, Any]:
+            if state.kernel is None:
+                raise HTTPException(status_code=503, detail="Kernel not available")
+            result = state.kernel.stop()
+            try:
+                kernel_state = state.kernel.get_status().state.value
+            except Exception:  # noqa: BLE001 — report the stop result even if status is unreadable
+                kernel_state = None
+            return {
+                "accepted": result.accepted,
+                "error": result.error,
+                "reason_code": result.reason_code,
+                "kernel_state": kernel_state,
+                "timestamp_ns": time.monotonic_ns(),
+            }
+
+        return await run_cycle_control(command)
 
     @router.get("/events")
-    def get_kernel_events(
+    async def get_kernel_events(
         since: int = Query(default=0, ge=0),
     ) -> dict[str, Any]:
         """Get native kernel events since a given event index.
@@ -133,26 +137,29 @@ def create_kernel_router(state: ComposerState) -> APIRouter:
         transitions, plan/execute lifecycle, cache hits, collisions).
         Pass the last received event_index as `since` to get only new events.
         """
-        if state.cycle_manager is None:
+        def command() -> dict[str, Any]:
+            if state.cycle_manager is None:
+                return {
+                    "events": [],
+                    "last_event_index": 0,
+                    "timestamp_ns": time.monotonic_ns(),
+                }
+            state.cycle_manager.drain_kernel_events_now()
+            events = state.cycle_manager.get_kernel_events_since(since)
+            if events and hasattr(state, "event_recorder"):
+                state.event_recorder.record_native_kernel_events(
+                    events,
+                    pipeline_status=(
+                        state.cycle_manager.kernel_event_pipeline_status()
+                    ),
+                )
+            last_index = events[-1]["event_index"] if events else since
             return {
-                "events": [],
-                "last_event_index": 0,
+                "events": events,
+                "last_event_index": last_index,
                 "timestamp_ns": time.monotonic_ns(),
             }
-        state.cycle_manager.drain_kernel_events_now()
-        events = state.cycle_manager.get_kernel_events_since(since)
-        if events and hasattr(state, "event_recorder"):
-            state.event_recorder.record_native_kernel_events(
-                events,
-                pipeline_status=(
-                    state.cycle_manager.kernel_event_pipeline_status()
-                ),
-            )
-        last_index = events[-1]["event_index"] if events else since
-        return {
-            "events": events,
-            "last_event_index": last_index,
-            "timestamp_ns": time.monotonic_ns(),
-        }
+
+        return await run_route_background(command)
 
     return router

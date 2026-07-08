@@ -55,6 +55,7 @@ from manyforge_behavior.geometry import (
     rpy_deg_to_xyzw as _rpy_deg_to_xyzw,
     xyzw_to_rpy_deg as _xyzw_to_rpy_deg,
 )
+from .route_execution import run_route_background
 from .state import ComposerState
 
 
@@ -1768,7 +1769,7 @@ def create_scene_router(state: ComposerState) -> APIRouter:
         ).model_dump()
 
     @router.get("/snapshot")
-    def get_scene_snapshot(
+    async def get_scene_snapshot(
         width: int = Query(default=640, ge=64, le=1920),
         height: int = Query(default=480, ge=64, le=1080),
         format: str = Query(default="jpeg", pattern="^(jpeg|png)$"),
@@ -1780,44 +1781,50 @@ def create_scene_router(state: ComposerState) -> APIRouter:
         tests can tell "no snapshot source exists" from "a connected source
         timed out".
         """
-        broker = getattr(state, "snapshot_broker", None)
+        def command() -> Response:
+            broker = getattr(state, "snapshot_broker", None)
 
-        if broker is not None and broker.has_clients():
-            image_bytes = broker.render_sync(width, height, format)
-            if image_bytes is None:
+            if broker is not None and broker.has_clients():
+                image_bytes = broker.render_sync(width, height, format)
+                if image_bytes is None:
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "detail": "Scene snapshot source did not return an image in time"
+                        },
+                    )
+            else:
                 return JSONResponse(
                     status_code=503,
                     content={
-                        "detail": "Scene snapshot source did not return an image in time"
+                        "detail": "No native scene snapshot viewer connected",
                     },
                 )
-        else:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "detail": "No native scene snapshot viewer connected",
+
+            media_type = "image/jpeg" if format == "jpeg" else "image/png"
+            return Response(content=image_bytes, media_type=media_type)
+
+        return await run_route_background(command)
+
+    @router.get("/snapshots/{snapshot_id}")
+    async def get_published_scene_snapshot(snapshot_id: str) -> Response:
+        """Serve a previously captured scene snapshot by stable id."""
+        def command() -> Response:
+            snapshot = state.get_published_scene_snapshot(snapshot_id)
+            if snapshot is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"detail": "Snapshot not found"},
+                )
+            return Response(
+                content=snapshot.image_bytes,
+                media_type=snapshot.media_type,
+                headers={
+                    "Cache-Control": "no-store, max-age=0",
+                    "ETag": snapshot.sha256,
                 },
             )
 
-        media_type = "image/jpeg" if format == "jpeg" else "image/png"
-        return Response(content=image_bytes, media_type=media_type)
-
-    @router.get("/snapshots/{snapshot_id}")
-    def get_published_scene_snapshot(snapshot_id: str) -> Response:
-        """Serve a previously captured scene snapshot by stable id."""
-        snapshot = state.get_published_scene_snapshot(snapshot_id)
-        if snapshot is None:
-            return JSONResponse(
-                status_code=404,
-                content={"detail": "Snapshot not found"},
-            )
-        return Response(
-            content=snapshot.image_bytes,
-            media_type=snapshot.media_type,
-            headers={
-                "Cache-Control": "no-store, max-age=0",
-                "ETag": snapshot.sha256,
-            },
-        )
+        return await run_route_background(command)
 
     return router
