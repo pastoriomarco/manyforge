@@ -8,6 +8,11 @@
 
 namespace manyforge::core {
 
+struct CollisionWorldPolicySnapshotBundle {
+  CollisionWorldSnapshotPtr world;
+  std::optional<CollisionPolicySnapshot> policy;
+};
+
 /// Backend-agnostic publisher of `CollisionWorldSnapshot` (spec §3.8.1,
 /// defined by the kernel-architecture sprint P-2-impl-snapshot chunk).
 ///
@@ -64,6 +69,19 @@ class ICollisionWorldSnapshotPublisher {
   /// `CollisionDecisionAction::kInconclusive`.
   [[nodiscard]] virtual CollisionWorldSnapshotPtr snapshot() const = 0;
 
+  /// Return the publisher's current world revision without requiring consumers
+  /// to borrow or rebuild the full snapshot. Runtime monitors use this as a
+  /// cheap coherency probe: if the revision differs from the currently
+  /// published runtime snapshot, they refresh the full world+policy bundle
+  /// before checking live robot state. Implementations should override this
+  /// with a leaf/atomic revision read; the default is correct but may be more
+  /// expensive because it borrows `snapshot()`.
+  [[nodiscard]] virtual CollisionWorldRevision
+  published_collision_world_revision() const {
+    auto current = snapshot();
+    return current ? current->revision : CollisionWorldRevision{};
+  }
+
   /// Return the current immutable collision policy snapshot that belongs with
   /// the current world snapshot. Implementations that publish only geometry may
   /// return nullopt; the kernel will then use an explicitly installed fallback
@@ -77,6 +95,26 @@ class ICollisionWorldSnapshotPublisher {
   collision_policy_snapshot() const {
     return std::nullopt;
   }
+
+  /// Return the coherent world+policy pair for runtime monitor and
+  /// authoritative validation consumers. Implementations with a shared scene
+  /// mutex should override this and publish both values under one lock.
+  [[nodiscard]] virtual CollisionWorldPolicySnapshotBundle
+  collision_world_policy_snapshot_bundle() const {
+    return CollisionWorldPolicySnapshotBundle{snapshot(),
+                                              collision_policy_snapshot()};
+  }
+
+  /// Return the pre-published runtime-monitor world+policy bundle.
+  ///
+  /// This is the RT path. Implementations MUST serve this from an immutable
+  /// publish-on-write cache, atomic pointer, seqlock, or other leaf data
+  /// structure. It must not borrow planner/scene locks, rebuild collision
+  /// geometry, or recompute policy. Writers that mutate the collision world or
+  /// effective collision policy are responsible for publishing a coherent
+  /// bundle before exposing the new revision to runtime monitors.
+  [[nodiscard]] virtual CollisionWorldPolicySnapshotBundle
+  published_runtime_collision_snapshot_bundle() const = 0;
 };
 
 }  // namespace manyforge::core

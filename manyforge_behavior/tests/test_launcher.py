@@ -230,6 +230,10 @@ class TestLauncherKernelCreation:
                 }
             ]
         )
+        data["orchestrator"]["config"] = {
+            "validation_collision_query_timeout_ms": 275.0,
+            "validation_collision_wall_timeout_ms": 3250.0,
+        }
         data["adapters"]["planning"]["config"] = {
             "planner_max_planning_time_s": 9.0
         }
@@ -242,6 +246,8 @@ class TestLauncherKernelCreation:
 
         assert config["planner_max_planning_time_s"] == 9.0
         assert config["single_shot_ik_timeout_s"] == 0.04
+        assert config["validation_collision_query_timeout_ns"] == 275_000_000
+        assert config["validation_collision_wall_timeout_ns"] == 3_250_000_000
         assert config["baseline_collision_policy_snapshot"]["policy_id"] == (
             "deployment_baseline"
         )

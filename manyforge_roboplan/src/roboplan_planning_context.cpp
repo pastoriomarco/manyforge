@@ -181,7 +181,8 @@ tl::expected<std::filesystem::path, std::string> resolve_mesh_resource_uri(
 
 RoboPlanPlanningContext::RoboPlanPlanningContext(
     std::shared_ptr<roboplan::Scene> scene, std::string group_name,
-    std::shared_ptr<std::mutex> scene_mutex)
+    std::shared_ptr<std::mutex> scene_mutex,
+    std::optional<core::CollisionPolicySnapshot> initial_policy_snapshot)
     : scene_(std::move(scene)),
       group_name_(std::move(group_name)),
       scene_mutex_(std::move(scene_mutex)),
@@ -189,6 +190,7 @@ RoboPlanPlanningContext::RoboPlanPlanningContext(
   if (!scene_mutex_) {
     scene_mutex_ = std::make_shared<std::mutex>();
   }
+  policy_snapshot_ = std::move(initial_policy_snapshot);
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
   publish_collision_world_revision_locked(
       core::CollisionWorldMutationSource::kProgramLoad,
@@ -716,8 +718,15 @@ void RoboPlanPlanningContext::set_collision_mapping_robot_id(
 
 void RoboPlanPlanningContext::set_collision_policy_snapshot(
     core::CollisionPolicySnapshot snapshot) {
-  std::scoped_lock lock(evaluator_mutex_);
-  policy_snapshot_ = std::move(snapshot);
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  {
+    std::scoped_lock lock(evaluator_mutex_);
+    policy_snapshot_ = std::move(snapshot);
+  }
+  publish_collision_world_revision_locked(
+      core::CollisionWorldMutationSource::kPolicyUpdate,
+      {},
+      "roboplan_context.set_collision_policy_snapshot");
 }
 
 void RoboPlanPlanningContext::reset_collision_policy_state() {
@@ -747,6 +756,12 @@ RoboPlanPlanningContext::current_collision_world_revision() {
   // truth for the world revision exposed via the IPlanningContext port.
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
   return core::CollisionWorldRevision{world_revision_id_, world_content_hash_};
+}
+
+core::CollisionWorldRevision
+RoboPlanPlanningContext::published_collision_world_revision() const {
+  std::lock_guard<std::mutex> lock(published_revision_mutex_);
+  return published_revision_;
 }
 
 core::CollisionWorldSnapshotPtr RoboPlanPlanningContext::snapshot() const {
@@ -822,6 +837,19 @@ void RoboPlanPlanningContext::publish_collision_world_revision_locked(
   core::CollisionWorldLedgerEntry entry;
   entry.revision.revision_id = world_revision_id_;
   entry.revision.content_hash = world_content_hash_;
+  {
+    std::lock_guard<std::mutex> revision_lock(published_revision_mutex_);
+    published_revision_ = entry.revision;
+  }
+  core::CollisionWorldPolicySnapshotBundle runtime_bundle;
+  runtime_bundle.world = snapshot_cache_;
+  if (runtime_bundle.world) {
+    runtime_bundle.policy = build_collision_policy_snapshot_locked(robot_id);
+  }
+  {
+    std::lock_guard<std::mutex> runtime_lock(published_runtime_bundle_mutex_);
+    published_runtime_bundle_ = std::move(runtime_bundle);
+  }
   entry.previous_revision_id = previous_revision_id;
   entry.mutation_source = mutation_source;
   entry.affected_body_ids = affected_body_ids;
@@ -2216,6 +2244,40 @@ RoboPlanPlanningContext::collision_policy_snapshot() const {
 
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
   return build_collision_policy_snapshot_locked(robot_id);
+}
+
+core::CollisionWorldPolicySnapshotBundle
+RoboPlanPlanningContext::collision_world_policy_snapshot_bundle() const {
+  std::string robot_id;
+  {
+    std::scoped_lock map_lock(mapper_mutex_);
+    robot_id = mapper_robot_id_;
+  }
+
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  if (!snapshot_cache_ ||
+      snapshot_cache_revision_id_ != world_revision_id_ ||
+      snapshot_cache_content_hash_ != world_content_hash_) {
+    auto next = build_collision_world_snapshot_locked();
+    if (!next) {
+      snapshot_cache_.reset();
+      snapshot_cache_revision_id_ = 0;
+      snapshot_cache_content_hash_.clear();
+      return {};
+    }
+    snapshot_cache_revision_id_ = world_revision_id_;
+    snapshot_cache_content_hash_ = world_content_hash_;
+    snapshot_cache_ = std::move(next);
+  }
+  return core::CollisionWorldPolicySnapshotBundle{
+      snapshot_cache_,
+      build_collision_policy_snapshot_locked(robot_id)};
+}
+
+core::CollisionWorldPolicySnapshotBundle
+RoboPlanPlanningContext::published_runtime_collision_snapshot_bundle() const {
+  std::lock_guard<std::mutex> lock(published_runtime_bundle_mutex_);
+  return published_runtime_bundle_;
 }
 
 core::CollisionPolicySnapshot

@@ -1,6 +1,7 @@
 #include <manyforge_roboplan/native_kernel_factory.hpp>
 
 #include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_core/collision/collision_resource_manager.hpp>
 #include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
 
 #include <roboplan_example_models/resources.hpp>
@@ -8,9 +9,14 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+
+#ifdef __linux__
+#include <pthread.h>
+#endif
 
 namespace manyforge::roboplan_backend {
 
@@ -113,18 +119,61 @@ core::TimePoint steady_now_ns() {
       .count();
 }
 
+bool scheduler_priority_terminates_on_exception(
+    core::SchedulerPriority priority) {
+  switch (priority) {
+    case core::SchedulerPriority::ControllerCommand:
+    case core::SchedulerPriority::RuntimeSafety:
+    case core::SchedulerPriority::StopControl:
+      return true;
+    case core::SchedulerPriority::Lifecycle:
+    case core::SchedulerPriority::Monitoring:
+    case core::SchedulerPriority::Background:
+      return false;
+  }
+  return true;
+}
+
+void log_scheduler_callback_exception(core::SchedulerPriority priority,
+                                      const char* exception_text,
+                                      bool terminating) {
+  std::cerr << "manyforge_scheduler_callback_exception"
+            << " priority=" << core::scheduler_priority_name(priority)
+            << " terminating=" << (terminating ? "true" : "false")
+            << " exception=" << exception_text << std::endl;
+}
+
 }  // namespace
 
 SimpleScheduler::SimpleScheduler() {
-  safety_worker_.owner = this;
-  monitoring_worker_.owner = this;
+  for (std::size_t i = 0; i < workers_.size(); ++i) {
+    workers_[i].owner = this;
+    workers_[i].priority = core::scheduler_priority_at(i);
+    workers_[i].thread_name = [&]() -> const char* {
+      switch (core::scheduler_priority_at(i)) {
+        case core::SchedulerPriority::ControllerCommand:
+          return "mf_sched_ctrl";
+        case core::SchedulerPriority::RuntimeSafety:
+          return "mf_sched_safe";
+        case core::SchedulerPriority::StopControl:
+          return "mf_sched_stop";
+        case core::SchedulerPriority::Lifecycle:
+          return "mf_sched_life";
+        case core::SchedulerPriority::Monitoring:
+          return "mf_sched_mon";
+        case core::SchedulerPriority::Background:
+          return "mf_sched_bg";
+      }
+      return "mf_sched";
+    }();
+  }
 }
 
 SimpleScheduler::~SimpleScheduler() {
-  for (Worker* w : {&safety_worker_, &monitoring_worker_}) {
-    if (w->thread.joinable()) {
-      w->thread.request_stop();
-      w->cv.notify_all();
+  for (auto& worker : workers_) {
+    if (worker.thread.joinable()) {
+      worker.thread.request_stop();
+      worker.cv.notify_all();
     }
   }
 }
@@ -138,13 +187,7 @@ void SimpleScheduler::Worker::ensure_started_locked(Worker* self) {
 
 SimpleScheduler::Worker& SimpleScheduler::worker_for(
     core::SchedulerPriority priority) {
-  switch (priority) {
-    case core::SchedulerPriority::Monitoring:
-      return monitoring_worker_;
-    case core::SchedulerPriority::Safety:
-    default:
-      return safety_worker_;
-  }
+  return workers_[core::scheduler_priority_index(priority)];
 }
 
 core::ScheduleHandle SimpleScheduler::schedule(
@@ -159,6 +202,7 @@ core::ScheduleHandle SimpleScheduler::schedule(
   {
     std::lock_guard<std::mutex> lock(w.mutex);
     w.ensure_started_locked(&w);
+    ++w.queue_generation;
     w.tasks.emplace(handle, ScheduledTask{deadline, std::move(callback)});
   }
   w.cv.notify_all();
@@ -179,6 +223,7 @@ void SimpleScheduler::cancel(core::ScheduleHandle handle) {
   Worker& w = worker_for(priority);
   {
     std::lock_guard<std::mutex> lock(w.mutex);
+    ++w.queue_generation;
     w.tasks.erase(handle);
   }
   w.cv.notify_all();
@@ -211,26 +256,32 @@ bool SimpleScheduler::drain_for(core::SchedulerPriority priority,
 }
 
 void SimpleScheduler::drain_all() {
-  safety_worker_.drain();
-  monitoring_worker_.drain();
+  for (auto& worker : workers_) {
+    worker.drain();
+  }
 }
 
 bool SimpleScheduler::drain_all_for(std::chrono::nanoseconds timeout) {
   bool drained = true;
-  drained = safety_worker_.drain_for(timeout) && drained;
-  drained = monitoring_worker_.drain_for(timeout) && drained;
+  for (auto& worker : workers_) {
+    drained = worker.drain_for(timeout) && drained;
+  }
   return drained;
 }
 
 void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
+#ifdef __linux__
+  if (thread_name != nullptr) {
+    (void)pthread_setname_np(pthread_self(), thread_name);
+  }
+#endif
   while (!st.stop_requested()) {
     core::ScheduleHandle fired_handle = 0;
     std::function<void()> callback;
 
     {
       std::unique_lock<std::mutex> lock(mutex);
-      cv.wait(lock, [this, &st]() { return st.stop_requested() || !tasks.empty(); });
-      if (st.stop_requested()) {
+      if (!cv.wait(lock, st, [this]() { return !tasks.empty(); })) {
         return;
       }
 
@@ -242,7 +293,14 @@ void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
 
       const auto now = steady_now_ns();
       if (next_it->second.deadline > now) {
-        cv.wait_for(lock, std::chrono::nanoseconds(next_it->second.deadline - now));
+        const auto observed_generation = queue_generation;
+        (void)cv.wait_for(
+            lock,
+            st,
+            std::chrono::nanoseconds(next_it->second.deadline - now),
+            [this, observed_generation]() {
+              return queue_generation != observed_generation;
+            });
         continue;
       }
 
@@ -257,28 +315,43 @@ void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
       owner->handle_to_priority_.erase(fired_handle);
     }
 
+    const auto finish_callback = [this]() {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (callbacks_in_flight > 0) {
+          --callbacks_in_flight;
+        }
+      }
+      drain_cv.notify_all();
+    };
+
     if (callback) {
       try {
         callback();
-      } catch (...) {
-        {
-          std::lock_guard<std::mutex> lock(mutex);
-          if (callbacks_in_flight > 0) {
-            --callbacks_in_flight;
-          }
+      } catch (const std::exception& e) {
+        finish_callback();
+        const bool terminating =
+            scheduler_priority_terminates_on_exception(priority);
+        log_scheduler_callback_exception(priority, e.what(), terminating);
+        if (terminating) {
+          std::terminate();
         }
-        drain_cv.notify_all();
-        throw;
+        continue;
+      } catch (...) {
+        finish_callback();
+        const bool terminating =
+            scheduler_priority_terminates_on_exception(priority);
+        log_scheduler_callback_exception(priority,
+                                         "unknown_non_std_exception",
+                                         terminating);
+        if (terminating) {
+          std::terminate();
+        }
+        continue;
       }
     }
 
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      if (callbacks_in_flight > 0) {
-        --callbacks_in_flight;
-      }
-    }
-    drain_cv.notify_all();
+    finish_callback();
   }
 }
 
@@ -374,12 +447,14 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
 
   // Create native backends
   bundle->scene_mutex = std::make_shared<std::mutex>();
+  const auto policy = kernel_config.baseline_collision_policy_snapshot.value_or(
+      default_collision_policy_snapshot());
   bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
       bundle->scene, rrt_opts, bundle->shortcutter, bundle->toppra, bundle->ik,
       bundle->scene_mutex, bundle->single_shot_ik, ik_opts,
       single_shot_ik_opts);
   bundle->context = std::make_unique<RoboPlanPlanningContext>(
-      bundle->scene, group_name, bundle->scene_mutex);
+      bundle->scene, group_name, bundle->scene_mutex, policy);
   bundle->clock = std::make_unique<WallClock>();
   RoboPlanExecutionBackendConfig execution_config;
   execution_config.reset_completion_timeout_s =
@@ -390,13 +465,16 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->cache = std::make_unique<core::TrajectoryCache>();
 
-  const auto policy = kernel_config.baseline_collision_policy_snapshot.value_or(
-      default_collision_policy_snapshot());
-  bundle->context->set_collision_policy_snapshot(policy);
-
   const int collision_worker_count =
       core::env_validation_collision_workers(
           std::max(1, kernel_config.validation_collision_workers));
+  bundle->collision_runtime_monitor_engine =
+      std::make_shared<manyforge::collision::ManyForgeCollisionEngine>(
+          model_name,
+          std::filesystem::path(urdf_path),
+          std::filesystem::path(srdf_path),
+          pkg_paths,
+          group_name);
   bundle->collision_validation_engines.reserve(collision_worker_count);
   for (int i = 0; i < collision_worker_count; ++i) {
     bundle->collision_validation_engines.push_back(
@@ -406,6 +484,22 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
             std::filesystem::path(srdf_path),
             pkg_paths,
             group_name));
+  }
+  {
+    core::CollisionPipelineResources collision_resources;
+    collision_resources.snapshot_publisher = bundle->context.get();
+    collision_resources.runtime_monitor_engine =
+        bundle->collision_runtime_monitor_engine;
+    collision_resources.validation_engines =
+        bundle->collision_validation_engines;
+    const auto admission =
+        core::CollisionResourceManager::validate_admission(
+            collision_resources, /*runtime_protection_active=*/true);
+    if (!admission.admitted()) {
+      throw std::runtime_error(
+          "native kernel collision resources are not runtime-safe: " +
+          admission.resource_conflict_reason);
+    }
   }
 
   core::ExecutionKernelConfig resolved_kernel_config = kernel_config;
@@ -417,8 +511,9 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
       *bundle->clock, *bundle->scheduler, *bundle->cache,
       resolved_kernel_config);
   bundle->kernel->set_collision_validation_policy_snapshot(policy);
-  bundle->kernel->set_collision_validation_pipeline(
+  bundle->kernel->set_collision_resources(
       *bundle->context,
+      bundle->collision_runtime_monitor_engine,
       bundle->collision_validation_engines);
 
   // Auto-subscribe event collector

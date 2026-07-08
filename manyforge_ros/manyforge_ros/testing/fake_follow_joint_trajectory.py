@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 from control_msgs.action import FollowJointTrajectory
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.callback_groups import ReentrantCallbackGroup
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 
@@ -27,7 +28,13 @@ class FakeTrajectoryGoalRecord:
 
 @dataclass
 class FakeFollowJointTrajectoryServer:
-    """Small FollowJointTrajectory action server for ROS integration tests."""
+    """Small FollowJointTrajectory action server for ROS integration tests.
+
+    ``reentrant_callbacks=True`` models a controller action server whose cancel
+    path can progress while the goal execution callback is still active. Use it
+    for cancellation-latency probes; leave it false when a test deliberately
+    wants the simpler single-callback-group fake.
+    """
 
     node: object
     action_name: str = "/fake_arm_controller/follow_joint_trajectory"
@@ -37,11 +44,14 @@ class FakeFollowJointTrajectoryServer:
     feedback_error_positions: list[float] | None = None
     actual_position_offsets: list[float] | None = None
     hold_after_first_feedback_s: float = 0.0
+    hold_cancel_poll_period_s: float = 0.01
     abort_error_code: int = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
     abort_error_string: str = "fake path tolerance violation"
+    reentrant_callbacks: bool = False
     goals: list[FakeTrajectoryGoalRecord] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        callback_group = ReentrantCallbackGroup() if self.reentrant_callbacks else None
         self._server = ActionServer(
             self.node,
             FollowJointTrajectory,
@@ -49,6 +59,7 @@ class FakeFollowJointTrajectoryServer:
             execute_callback=self._execute_callback,
             goal_callback=self._goal_callback,
             cancel_callback=self._cancel_callback,
+            callback_group=callback_group,
         )
 
     def destroy(self) -> None:
@@ -112,7 +123,14 @@ class FakeFollowJointTrajectoryServer:
             goal_handle.publish_feedback(feedback)
 
             if index == 0 and self.hold_after_first_feedback_s > 0:
-                time.sleep(self.hold_after_first_feedback_s)
+                deadline = time.monotonic() + self.hold_after_first_feedback_s
+                poll_period = max(0.001, self.hold_cancel_poll_period_s)
+                while time.monotonic() < deadline:
+                    if goal_handle.is_cancel_requested:
+                        record.canceled = True
+                        goal_handle.canceled()
+                        return self._result(0, "canceled")
+                    time.sleep(min(poll_period, deadline - time.monotonic()))
 
             if self.feedback_delay_s > 0:
                 time.sleep(self.feedback_delay_s)

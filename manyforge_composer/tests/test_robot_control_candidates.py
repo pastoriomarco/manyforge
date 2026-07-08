@@ -478,6 +478,33 @@ def test_collision_failure_blocked_with_pair_details(tmp_path: Path) -> None:
     assert body["diagnostics"]["details"]["collision_pair"] == ["wrist_3_link", "table"]
 
 
+def test_validation_deferred_surfaces_distinct_reason(tmp_path: Path) -> None:
+    client, _state, kernel = _loaded_client(tmp_path)
+    kernel.next_preview_result = MotionPreviewResult(
+        ok=False,
+        error=(
+            "Pre-dispatch validation deferred because runtime collision "
+            "monitor owns the collision resource"
+        ),
+        error_details={
+            "reason_code": "validation_deferred_runtime_monitor_active",
+            "resource_conflict_reason": "shared_mutable_context_id",
+            "runtime_protection_generation": "12",
+        },
+    )
+    body = client.post(_BASE, json=_joint_body()).json()
+    assert body["status"] == "blocked"
+    assert (
+        body["diagnostics"]["reasonCode"]
+        == "validation_deferred_runtime_monitor_active"
+    )
+    assert (
+        body["diagnostics"]["details"]["resource_conflict_reason"]
+        == "shared_mutable_context_id"
+    )
+    assert kernel.execute_count == 0
+
+
 def test_unknown_joint_blocked_malformed(tmp_path: Path) -> None:
     client, _state, kernel = _loaded_client(tmp_path)
     body = client.post(

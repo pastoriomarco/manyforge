@@ -93,6 +93,25 @@ struct Ros2ControlSceneProjectionMetrics {
   std::uint64_t terminal_retry_exhausted_total = 0;
 };
 
+struct Ros2ControlControllerProgressMetrics {
+  std::uint64_t executor_thread_count = 0;
+  std::uint64_t state_callbacks_total = 0;
+  std::uint64_t action_feedback_callbacks_total = 0;
+  std::uint64_t action_result_callbacks_total = 0;
+  std::uint64_t command_progress_samples_total = 0;
+  std::uint64_t cancel_confirmations_total = 0;
+  std::uint64_t stop_confirmations_total = 0;
+  std::uint64_t latest_state_sample_age_ns = 0;
+  std::uint64_t last_command_progress_latency_ns = 0;
+  std::uint64_t max_command_progress_latency_ns = 0;
+  std::uint64_t last_action_result_latency_ns = 0;
+  std::uint64_t max_action_result_latency_ns = 0;
+  std::uint64_t last_cancel_latency_ns = 0;
+  std::uint64_t max_cancel_latency_ns = 0;
+  std::uint64_t last_stop_confirmation_latency_ns = 0;
+  std::uint64_t max_stop_confirmation_latency_ns = 0;
+};
+
 /// Controller-backed execution backend for ros2_control/JTC deployments.
 ///
 /// This class owns the timing-sensitive ROS boundary: action lifecycle,
@@ -193,6 +212,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   // error when they required gating).
   bool request_command_gate(bool enabled);
   Ros2ControlSceneProjectionMetrics scene_projection_metrics() const;
+  Ros2ControlControllerProgressMetrics controller_progress_metrics() const;
 
 #ifdef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
   using TestingFollowJointTrajectory =
@@ -301,6 +321,21 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
 
   void testing_complete_execution() {
     complete_execution();
+  }
+
+  bool testing_action_progress_has_dedicated_callback_group() const {
+    return action_callback_group_ && state_callback_group_ &&
+           action_callback_group_.get() != state_callback_group_.get();
+  }
+
+  bool testing_wait_for_managed_terminal_or_stop(
+      std::stop_token stop_token,
+      std::chrono::nanoseconds timeout) {
+    std::unique_lock<std::mutex> lock(managed_fjt_mutex_);
+    managed_fjt_terminal_result_received_ = false;
+    return managed_fjt_cv_.wait_for(
+        lock, stop_token, timeout,
+        [this]() { return managed_fjt_terminal_result_received_; });
   }
 #endif
 
@@ -446,7 +481,8 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   std::optional<PostStopObservation> wait_for_post_stop_observation(
       const std::vector<std::string>& joint_names,
       double settle_velocity_threshold_rad_s,
-      std::chrono::steady_clock::time_point deadline);
+      std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop_token = {});
   void complete_managed_controlled_stop_execution();
   core::Result<void> command_sim_initial_state(std::string phase);
   bool update_scene_positions(
@@ -463,6 +499,10 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   void stop_terminal_scene_projection_retry_worker() noexcept;
   void record_scene_projection_success(std::int64_t source_timestamp_ns);
   void record_scene_projection_miss();
+  void record_command_progress_latency_ns(std::int64_t latency_ns);
+  void record_action_result_latency_ns(std::int64_t latency_ns);
+  void record_cancel_latency_ns(std::int64_t latency_ns);
+  void record_stop_confirmation_latency_ns(std::int64_t latency_ns);
   std::optional<double> scene_group_joint_position(
       const std::string& group_id,
       const std::string& joint_name) const;
@@ -541,6 +581,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
   std::thread spin_thread_;
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr action_client_;
+  rclcpp::CallbackGroup::SharedPtr action_callback_group_;
   rclcpp::CallbackGroup::SharedPtr state_callback_group_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
@@ -556,7 +597,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
 #endif
 
   mutable std::mutex state_mutex_;
-  std::condition_variable state_cv_;
+  std::condition_variable_any state_cv_;
   std::optional<JointSample> latest_joint_state_;
   std::optional<JointSample> latest_controller_state_;
   std::optional<JointSample> latest_action_feedback_;
@@ -564,7 +605,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   core::ExecutionSnapshot snapshot_;
 
   mutable std::mutex execution_mutex_;
-  std::condition_variable execution_cv_;
+  std::condition_variable_any execution_cv_;
   std::thread monitor_thread_;
   std::atomic<bool> monitor_active_{false};
   bool running_ = false;
@@ -591,6 +632,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   // dispatch.
   std::optional<rclcpp_action::ResultCode> last_action_result_code_;
   std::chrono::steady_clock::time_point execution_started_at_;
+  std::chrono::steady_clock::time_point active_goal_accepted_at_;
   std::optional<std::chrono::steady_clock::time_point> stop_requested_at_;
   std::optional<std::chrono::steady_clock::time_point> tracking_error_since_;
   std::optional<TrackingErrorPeak> peak_tracking_error_;
@@ -617,7 +659,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       std::uint64_t generation);
 
   mutable std::mutex managed_fjt_mutex_;
-  std::condition_variable managed_fjt_cv_;
+  std::condition_variable_any managed_fjt_cv_;
   // ADR-0018: runtime velocity scale read by the monitor loop.
   std::atomic<double> runtime_velocity_scale_{1.0};
   std::atomic<double> applied_runtime_velocity_scale_{1.0};
@@ -641,6 +683,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   GoalHandleFJT::SharedPtr managed_fjt_goal_;
   std::uint64_t managed_fjt_generation_ = 0;
   std::optional<rclcpp_action::GoalUUID> managed_fjt_terminal_goal_id_;
+  std::chrono::steady_clock::time_point managed_fjt_goal_accepted_at_{};
   bool managed_fjt_terminal_result_received_ = true;
   bool managed_fjt_terminal_result_success_ = true;
   std::optional<core::ErrorDTO> managed_fjt_terminal_error_;
@@ -657,6 +700,20 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   std::atomic<std::uint64_t> terminal_scene_projection_retries_scheduled_total_{0};
   std::atomic<std::uint64_t> terminal_scene_projection_retry_successes_total_{0};
   std::atomic<std::uint64_t> terminal_scene_projection_retry_exhausted_total_{0};
+  std::atomic<std::uint64_t> state_callbacks_total_{0};
+  std::atomic<std::uint64_t> action_feedback_callbacks_total_{0};
+  std::atomic<std::uint64_t> action_result_callbacks_total_{0};
+  std::atomic<std::uint64_t> command_progress_samples_total_{0};
+  std::atomic<std::uint64_t> cancel_confirmations_total_{0};
+  std::atomic<std::uint64_t> stop_confirmations_total_{0};
+  std::atomic<std::uint64_t> last_command_progress_latency_ns_{0};
+  std::atomic<std::uint64_t> max_command_progress_latency_ns_{0};
+  std::atomic<std::uint64_t> last_action_result_latency_ns_{0};
+  std::atomic<std::uint64_t> max_action_result_latency_ns_{0};
+  std::atomic<std::uint64_t> last_cancel_latency_ns_{0};
+  std::atomic<std::uint64_t> max_cancel_latency_ns_{0};
+  std::atomic<std::uint64_t> last_stop_confirmation_latency_ns_{0};
+  std::atomic<std::uint64_t> max_stop_confirmation_latency_ns_{0};
   mutable std::mutex terminal_scene_projection_retry_mutex_;
   std::condition_variable_any terminal_scene_projection_retry_cv_;
   std::optional<PendingTerminalSceneProjection> pending_terminal_scene_projection_;

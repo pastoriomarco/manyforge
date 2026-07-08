@@ -97,11 +97,28 @@ ErrorDTO authoritative_collision_validation_config_error(
     std::string reason,
     std::map<std::string, std::string> details,
     std::string phase) {
+  std::string message =
+      "Authoritative collision validation pipeline is not configured";
+  if (reason == "missing_collision_world_snapshot_publisher") {
+    message =
+        "Authoritative collision validation snapshot publisher is not configured";
+  } else if (reason == "missing_collision_query_engines") {
+    message =
+        "Authoritative collision validation query engines are not configured";
+  } else if (reason == "snapshot_publisher_exception") {
+    message = "Authoritative collision validation snapshot publisher failed";
+  } else if (reason == "policy_publisher_exception") {
+    message = "Authoritative collision validation policy publisher failed";
+  } else if (reason == "snapshot_unavailable") {
+    message = "Authoritative collision validation snapshot unavailable";
+  } else if (reason == "missing_collision_policy_snapshot") {
+    message = "Authoritative collision validation policy snapshot unavailable";
+  }
   details.emplace("reason", std::move(reason));
   details.emplace("phase", std::move(phase));
   return ErrorDTO{
       kErrorInvariantViolation,
-      "Authoritative collision validation pipeline is not configured",
+      message,
       std::move(details)};
 }
 

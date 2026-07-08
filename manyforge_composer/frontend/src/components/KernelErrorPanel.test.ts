@@ -123,6 +123,152 @@ describe('KernelErrorPanel mapping', () => {
       );
     });
 
+    it('renders validation timeouts as timeout faults rather than pair collisions', () => {
+      const details = {
+        collision_result_engine_status: 'timeout',
+        collision_result_in_collision: 'false',
+        collision_result_normalized_pair_count: '0',
+        collision_result_raw_snapshot_sync_duration_ns: '72112711',
+        collision_result_raw_timeout_budget_ns: '50000000',
+        collision_result_raw_timeout_observed_duration_ns: '72165619',
+      };
+
+      expect(
+        headlineForError(
+          'validation_collision',
+          details,
+          'Collision validation inconclusive',
+        ),
+      ).toBe('Pre-dispatch collision validation timed out (72.2 ms > 50.0 ms)');
+      const hint = hintForError('validation_collision', details) ?? '';
+      expect(hint).toContain('No collision pair was reported');
+      expect(hint).toContain('Snapshot sync took 72.1 ms');
+      expect(hint).toContain('validation_collision_query_timeout_ms');
+    });
+
+    it('renders validation wall-budget timeouts with the wall-budget knob', () => {
+      const details = {
+        reason: 'collision_validation_wall_timeout',
+        collision_result_engine_status: 'timeout',
+        collision_result_in_collision: 'false',
+        collision_result_normalized_pair_count: '0',
+        collision_result_raw_reason_code: 'collision_validation_wall_timeout',
+        collision_result_raw_timeout_ns: '5000000000',
+        collision_result_raw_elapsed_ns: '5100000000',
+      };
+
+      expect(
+        headlineForError(
+          'validation_collision',
+          details,
+          'Collision validation inconclusive',
+        ),
+      ).toBe(
+        'Pre-dispatch collision validation exceeded wall budget (5100 ms > 5000 ms)',
+      );
+      const hint = hintForError('validation_collision', details) ?? '';
+      expect(hint).toContain('whole-validation wall budget');
+      expect(hint).toContain('validation_collision_wall_timeout_ms');
+      expect(hint).not.toContain('validation_collision_query_timeout_ms');
+    });
+
+    it('renders deferred validation distinctly from collision and timeout', () => {
+      const details = {
+        reason: 'validation_deferred_runtime_monitor_active',
+        resource_conflict_reason: 'shared_mutable_context_id',
+        operator_guidance:
+          'retry validation after active motion/stop completes or configure an independent validation collision resource',
+      };
+
+      expect(
+        headlineForError(
+          'validation_deferred',
+          details,
+          'Pre-dispatch collision validation deferred',
+        ),
+      ).toBe(
+        'Pre-dispatch validation deferred: runtime collision monitor owns the collision resource (shared_mutable_context_id)',
+      );
+      expect(hintForError('validation_deferred', details)).toContain(
+        'independent validation collision resource',
+      );
+    });
+
+    it('renders unsupported validation geometry distinctly', () => {
+      const details = {
+        collision_result_engine_status: 'unsupported_geometry',
+        collision_result_raw_snapshot_sync_error:
+          'unsupported scene geometry kind for manyforge_collision: object/mesh/shape/0',
+      };
+
+      expect(
+        headlineForError(
+          'validation_collision',
+          details,
+          'Collision validation inconclusive',
+        ),
+      ).toBe(
+        'Collision validation unsupported geometry: unsupported scene geometry kind for manyforge_collision: object/mesh/shape/0',
+      );
+      expect(hintForError('validation_collision', details)).toContain(
+        'could not ingest',
+      );
+    });
+
+    it('renders incomplete validation diagnostics distinctly', () => {
+      const details = {
+        collision_result_engine_status: 'diagnostic_incomplete',
+        collision_result_raw_required_capability: 'penetration_depth',
+      };
+
+      expect(
+        headlineForError(
+          'validation_collision',
+          details,
+          'Collision validation inconclusive',
+        ),
+      ).toBe('Collision validation diagnostics incomplete: penetration_depth');
+      expect(hintForError('validation_collision', details)).toContain(
+        'required to prove',
+      );
+    });
+
+    it('renders cancelled validation distinctly', () => {
+      const details = {
+        collision_result_engine_status: 'cancelled',
+        cancellation_reason: 'operator_stop',
+      };
+
+      expect(
+        headlineForError(
+          'validation_collision',
+          details,
+          'Collision validation cancelled by interrupt',
+        ),
+      ).toBe('Pre-dispatch collision validation cancelled: operator_stop');
+      expect(hintForError('validation_collision', details)).toContain(
+        'cancelled by a newer stop',
+      );
+    });
+
+    it('renders validation engine exceptions distinctly', () => {
+      const details = {
+        collision_result_engine_status: 'engine_error',
+        collision_result_raw_engine_exception: 'coal failure',
+      };
+
+      expect(
+        headlineForError(
+          'validation_collision',
+          details,
+          'Collision validation inconclusive',
+        ),
+      ).toBe('Collision validation engine error: coal failure');
+      expect(hintForError('validation_collision', details)).toContain(
+        'engine threw',
+      );
+    });
+
     it('falls back gracefully when validation_collision details are missing', () => {
       const headline = headlineForError(
         'validation_collision',

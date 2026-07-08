@@ -124,6 +124,8 @@ def test_ros2_control_adapter_dispatches_to_runtime_factory(monkeypatch):
         deployment,
         collision_monitor_period_ns,
         runtime_collision_query_timeout_ns,
+        validation_collision_query_timeout_ns,
+        validation_collision_wall_timeout_ns,
         runtime_dynamic_body_max_age_cap_ns,
     ):
         calls.append(
@@ -132,6 +134,12 @@ def test_ros2_control_adapter_dispatches_to_runtime_factory(monkeypatch):
                 "collision_monitor_period_ns": collision_monitor_period_ns,
                 "runtime_collision_query_timeout_ns": (
                     runtime_collision_query_timeout_ns
+                ),
+                "validation_collision_query_timeout_ns": (
+                    validation_collision_query_timeout_ns
+                ),
+                "validation_collision_wall_timeout_ns": (
+                    validation_collision_wall_timeout_ns
                 ),
                 "runtime_dynamic_body_max_age_cap_ns": (
                     runtime_dynamic_body_max_age_cap_ns
@@ -156,6 +164,8 @@ def test_ros2_control_adapter_dispatches_to_runtime_factory(monkeypatch):
             "deployment": deployment,
             "collision_monitor_period_ns": 50_000_000,
             "runtime_collision_query_timeout_ns": None,
+            "validation_collision_query_timeout_ns": None,
+            "validation_collision_wall_timeout_ns": None,
             "runtime_dynamic_body_max_age_cap_ns": None,
         }
     ]
@@ -173,6 +183,7 @@ def test_ros2_control_adapter_passes_dynamic_body_max_age_cap(monkeypatch):
             config={
                 "collision_monitor_period_ms": 50.0,
                 "runtime_dynamic_body_max_age_cap_ms": 250.0,
+                "validation_collision_wall_timeout_ms": 1250.0,
             }
         ),
     )
@@ -193,6 +204,60 @@ def test_ros2_control_adapter_passes_dynamic_body_max_age_cap(monkeypatch):
     composer_main._make_kernel(deployment)
 
     assert calls[0]["runtime_dynamic_body_max_age_cap_ns"] == 250_000_000
+    assert calls[0]["validation_collision_wall_timeout_ns"] == 1_250_000_000
+
+
+def test_native_kernel_factory_passes_validation_collision_timeouts(monkeypatch):
+    deployment = SimpleNamespace(
+        adapters={
+            "execution": SimpleNamespace(
+                adapter_id="execution.roboplan_native",
+                config={},
+            )
+        },
+        orchestrator=SimpleNamespace(
+            config={
+                "validation_collision_query_timeout_ms": 275.0,
+                "validation_collision_wall_timeout_ms": 3250.0,
+            }
+        ),
+    )
+    recorded: dict[str, object] = {}
+    fake_bundle = object()
+
+    fake_roboplan = ModuleType("manyforge_roboplan_py")
+
+    def create_native_kernel(model_name, group_name, config):
+        recorded["model_name"] = model_name
+        recorded["group_name"] = group_name
+        recorded["config"] = config
+        return fake_bundle
+
+    fake_roboplan.create_native_kernel = create_native_kernel
+    monkeypatch.setitem(sys.modules, "manyforge_roboplan_py", fake_roboplan)
+
+    fake_client_module = ModuleType("native_kernel_client")
+
+    class FakeNativeKernelClient:
+        def __init__(self, bundle, **kwargs):
+            self.bundle = bundle
+            self.kwargs = kwargs
+
+    fake_client_module.NativeKernelClient = FakeNativeKernelClient
+    monkeypatch.setitem(sys.modules, "native_kernel_client", fake_client_module)
+
+    kernel, bundle = composer_main._make_kernel(deployment)
+
+    assert isinstance(kernel, FakeNativeKernelClient)
+    assert bundle is fake_bundle
+    assert (
+        recorded["config"]["validation_collision_query_timeout_ns"]
+        == 275_000_000
+    )
+    assert (
+        recorded["config"]["validation_collision_wall_timeout_ns"]
+        == 3_250_000_000
+    )
 
 
 def test_runtime_dynamic_body_max_age_cap_zero_is_passed_through():
@@ -206,6 +271,49 @@ def test_runtime_dynamic_body_max_age_cap_zero_is_passed_through():
         composer_main._runtime_dynamic_body_max_age_cap_ns_from_deployment(deployment)
         == 0
     )
+
+
+def test_validation_collision_query_timeout_is_parsed_from_deployment():
+    deployment = SimpleNamespace(
+        adapters={},
+        orchestrator=SimpleNamespace(
+            config={"validation_collision_query_timeout_ms": 275.5}
+        ),
+    )
+    assert (
+        composer_main._validation_collision_query_timeout_ns_from_deployment(
+            deployment
+        )
+        == 275_500_000
+    )
+
+
+def test_validation_collision_wall_timeout_is_parsed_from_deployment():
+    deployment = SimpleNamespace(
+        adapters={},
+        orchestrator=SimpleNamespace(
+            config={"validation_collision_wall_timeout_ms": 3500.25}
+        ),
+    )
+    assert (
+        composer_main._validation_collision_wall_timeout_ns_from_deployment(
+            deployment
+        )
+        == 3_500_250_000
+    )
+
+
+def test_validation_collision_wall_timeout_rejects_nonpositive():
+    deployment = SimpleNamespace(
+        adapters={},
+        orchestrator=SimpleNamespace(
+            config={"validation_collision_wall_timeout_ms": 0}
+        ),
+    )
+    with pytest.raises(ValueError, match="validation_collision_wall_timeout_ms"):
+        composer_main._validation_collision_wall_timeout_ns_from_deployment(
+            deployment
+        )
 
 
 def test_runtime_dynamic_body_max_age_cap_rejects_negative():
@@ -244,6 +352,8 @@ def test_kernel_config_forwards_single_shot_ik_timeout():
         deployment,
         collision_monitor_period_ns=None,
         runtime_collision_query_timeout_ns=None,
+        validation_collision_query_timeout_ns=None,
+        validation_collision_wall_timeout_ns=None,
         runtime_dynamic_body_max_age_cap_ns=None,
     )
     assert config["single_shot_ik_timeout_s"] == 0.08
@@ -267,6 +377,8 @@ def test_kernel_config_forwards_planner_budget_from_planning_adapter():
         deployment,
         collision_monitor_period_ns=None,
         runtime_collision_query_timeout_ns=None,
+        validation_collision_query_timeout_ns=None,
+        validation_collision_wall_timeout_ns=None,
         runtime_dynamic_body_max_age_cap_ns=None,
     )
     assert config["planner_max_planning_time_s"] == 12.0
@@ -290,6 +402,8 @@ def test_kernel_config_forwards_baseline_collision_policy_snapshot():
         deployment,
         collision_monitor_period_ns=None,
         runtime_collision_query_timeout_ns=None,
+        validation_collision_query_timeout_ns=None,
+        validation_collision_wall_timeout_ns=None,
         runtime_dynamic_body_max_age_cap_ns=None,
     )
     assert config["baseline_collision_policy_snapshot"] == snapshot
@@ -308,6 +422,8 @@ def test_kernel_config_omits_single_shot_ik_timeout_when_absent():
         deployment,
         collision_monitor_period_ns=50_000_000,
         runtime_collision_query_timeout_ns=None,
+        validation_collision_query_timeout_ns=None,
+        validation_collision_wall_timeout_ns=None,
         runtime_dynamic_body_max_age_cap_ns=None,
     )
     assert config is not None

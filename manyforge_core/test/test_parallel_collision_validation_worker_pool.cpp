@@ -31,8 +31,13 @@ class MockCollisionQueryEngine : public ICollisionQueryEngine {
   std::atomic<int> call_count{0};
   bool throw_on_check = false;
   bool record_thread_ids = false;
+  bool block_on_check = false;
   std::mutex thread_ids_mutex;
   std::set<std::thread::id> thread_ids;
+  std::mutex block_mutex;
+  std::condition_variable block_cv;
+  bool release_blocked_checks = false;
+  std::atomic<int> blocked_check_count{0};
 
   MockCollisionQueryEngine() {
     default_result.in_collision = false;
@@ -72,6 +77,11 @@ class MockCollisionQueryEngine : public ICollisionQueryEngine {
     if (throw_on_check) {
       throw std::runtime_error("mock engine failure");
     }
+    if (block_on_check) {
+      blocked_check_count.fetch_add(1);
+      std::unique_lock<std::mutex> lock(block_mutex);
+      block_cv.wait(lock, [this]() { return release_blocked_checks; });
+    }
     CollisionResult result = default_result;
     if (query.waypoint_index) {
       auto it = result_by_waypoint.find(*query.waypoint_index);
@@ -97,6 +107,14 @@ class MockCollisionQueryEngine : public ICollisionQueryEngine {
   std::string engine_id() const override { return capability_.engine_id; }
   std::string engine_version() const override {
     return capability_.engine_version;
+  }
+
+  void release_blocked() {
+    {
+      std::lock_guard<std::mutex> lock(block_mutex);
+      release_blocked_checks = true;
+    }
+    block_cv.notify_all();
   }
 
  private:
@@ -484,6 +502,101 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
             reason_codes::kCollisionValidationWorkerException);
   EXPECT_EQ(it->result.raw_diagnostics.at("exception"),
             "mock engine failure");
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     ParallelValidationWallTimeoutReturnsFailClosedAndAbandonsWorkers) {
+  auto engine_a = std::make_shared<MockCollisionQueryEngine>();
+  auto engine_b = std::make_shared<MockCollisionQueryEngine>();
+  engine_a->block_on_check = true;
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = freespace_snapshot();
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 4;
+  cfg.validation_wall_timeout = std::chrono::milliseconds(20);
+  ParallelCollisionValidationWorkerPool pool(cfg);
+
+  auto cancel = std::make_shared<CollisionCancellationToken>();
+  std::vector<std::shared_ptr<ICollisionQueryEngine>> engines{engine_a, engine_b};
+  const auto started = std::chrono::steady_clock::now();
+  auto bundle = pool.validate_trajectory(test_snapshot(), engines,
+                                         long_trajectory(12), cancel);
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+
+  EXPECT_LT(elapsed, std::chrono::milliseconds(500));
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  EXPECT_TRUE(bundle.cancelled);
+  ASSERT_TRUE(bundle.cancellation_reason.has_value());
+  EXPECT_EQ(*bundle.cancellation_reason, "collision_validation_wall_timeout");
+  EXPECT_TRUE(cancel->is_cancel_requested());
+  EXPECT_EQ(cancel->reason(), "collision_validation_wall_timeout");
+  EXPECT_EQ(pool.last_telemetry().fallback_reason,
+            "validation_wall_timeout");
+
+  engine_a->release_blocked();
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     SerialFallbackValidationWallTimeoutReturnsFailClosed) {
+  auto engine = std::make_shared<MockCollisionQueryEngine>();
+  engine->block_on_check = true;
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = freespace_snapshot();
+  cfg.worker_count = 1;
+  cfg.min_waypoints_for_parallel = 4;
+  cfg.validation_wall_timeout = std::chrono::milliseconds(20);
+  ParallelCollisionValidationWorkerPool pool(cfg);
+
+  auto cancel = std::make_shared<CollisionCancellationToken>();
+  std::vector<std::shared_ptr<ICollisionQueryEngine>> engines{engine};
+  const auto started = std::chrono::steady_clock::now();
+  auto bundle = pool.validate_trajectory(test_snapshot(), engines,
+                                         long_trajectory(12), cancel);
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+
+  EXPECT_LT(elapsed, std::chrono::milliseconds(500));
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  EXPECT_TRUE(bundle.cancelled);
+  ASSERT_TRUE(bundle.cancellation_reason.has_value());
+  EXPECT_EQ(*bundle.cancellation_reason, "collision_validation_wall_timeout");
+  EXPECT_TRUE(cancel->is_cancel_requested());
+  EXPECT_EQ(pool.last_telemetry().workers_actually_used, 1);
+  EXPECT_EQ(pool.last_telemetry().fallback_reason, "worker_count_one");
+
+  engine->release_blocked();
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     RawPointerWallTimeoutFailsClosedWithoutBorrowedWorker) {
+  auto engine = std::make_shared<MockCollisionQueryEngine>();
+  engine->block_on_check = true;
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = freespace_snapshot();
+  cfg.worker_count = 1;
+  cfg.validation_wall_timeout = std::chrono::milliseconds(20);
+  ParallelCollisionValidationWorkerPool pool(cfg);
+
+  CollisionCancellationToken cancel;
+  std::vector<ICollisionQueryEngine*> engines{engine.get()};
+  auto bundle = pool.validate_trajectory(test_snapshot(), engines,
+                                         long_trajectory(12), cancel);
+
+  EXPECT_EQ(engine->call_count.load(), 0);
+  EXPECT_FALSE(cancel.is_cancel_requested());
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  ASSERT_FALSE(bundle.waypoint_records.empty());
+  EXPECT_EQ(
+      bundle.waypoint_records.front().result.raw_diagnostics.at("reason_code"),
+      "collision_validation_wall_timeout_requires_owned_lifetimes");
+  EXPECT_EQ(pool.last_telemetry().workers_actually_used, 0);
+  EXPECT_EQ(pool.last_telemetry().fallback_reason,
+            "validation_wall_timeout_requires_owned_lifetimes");
 }
 
 TEST(EnvValidationCollisionWorkers, ReturnsDefaultWhenUnset) {

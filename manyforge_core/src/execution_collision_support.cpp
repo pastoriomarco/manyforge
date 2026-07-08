@@ -2,6 +2,7 @@
 
 #include <manyforge_core/types/reason_codes.hpp>
 
+#include <algorithm>
 #include <iomanip>
 #include <sstream>
 
@@ -205,6 +206,185 @@ std::optional<std::string> validate_dynamic_body_freshness(
     }
   }
   return std::nullopt;
+}
+
+Result<RuntimeCollisionStateProjection> build_runtime_collision_state_projection(
+    const TrajectoryDTO& source_trajectory,
+    const TrajectoryDTO& collision_trajectory) {
+  if (collision_trajectory.joint_names.empty()) {
+    return Result<RuntimeCollisionStateProjection>::Err(ErrorDTO{
+        kErrorValidationCollision,
+        "Runtime collision state projection cannot be built without collision joint names",
+        {{"reason", "runtime_collision_projection_missing_query_joint_names"}}});
+  }
+  if (collision_trajectory.waypoints.empty()) {
+    return Result<RuntimeCollisionStateProjection>::Err(ErrorDTO{
+        kErrorValidationCollision,
+        "Runtime collision state projection cannot be built without a template waypoint",
+        {{"reason", "runtime_collision_projection_missing_template_waypoint"}}});
+  }
+  const auto& template_positions =
+      collision_trajectory.waypoints.front().positions_rad;
+  if (template_positions.size() != collision_trajectory.joint_names.size()) {
+    return Result<RuntimeCollisionStateProjection>::Err(ErrorDTO{
+        kErrorValidationCollision,
+        "Runtime collision state projection template shape is invalid",
+        {{"reason", "runtime_collision_projection_template_shape_mismatch"},
+         {"query_joint_count",
+          std::to_string(collision_trajectory.joint_names.size())},
+         {"template_position_count",
+          std::to_string(template_positions.size())}}});
+  }
+
+  RuntimeCollisionStateProjection projection;
+  projection.query_joint_names = collision_trajectory.joint_names;
+  projection.template_positions_rad = template_positions;
+
+  projection.source_joint_names = source_trajectory.joint_names;
+  if (projection.source_joint_names.empty()) {
+    if (!source_trajectory.waypoints.empty() &&
+        source_trajectory.waypoints.front().positions_rad.size() ==
+            projection.query_joint_names.size()) {
+      projection.source_joint_names = projection.query_joint_names;
+    } else {
+      return Result<RuntimeCollisionStateProjection>::Err(ErrorDTO{
+          kErrorValidationCollision,
+          "Runtime collision state projection cannot map unnamed observed positions",
+          {{"reason", "runtime_collision_projection_missing_source_joint_names"}}});
+    }
+  }
+  if (!source_trajectory.waypoints.empty() &&
+      source_trajectory.waypoints.front().positions_rad.size() !=
+          projection.source_joint_names.size()) {
+    return Result<RuntimeCollisionStateProjection>::Err(ErrorDTO{
+        kErrorValidationCollision,
+        "Runtime collision state projection source shape is invalid",
+        {{"reason", "runtime_collision_projection_source_shape_mismatch"},
+         {"source_joint_count",
+          std::to_string(projection.source_joint_names.size())},
+         {"source_position_count",
+          std::to_string(source_trajectory.waypoints.front()
+                             .positions_rad.size())}}});
+  }
+
+  projection.source_to_query_indices.reserve(
+      projection.source_joint_names.size());
+  for (const auto& source_joint : projection.source_joint_names) {
+    const auto it = std::find(projection.query_joint_names.begin(),
+                              projection.query_joint_names.end(),
+                              source_joint);
+    if (it == projection.query_joint_names.end()) {
+      return Result<RuntimeCollisionStateProjection>::Err(ErrorDTO{
+          kErrorValidationCollision,
+          "Runtime collision state projection source joint is absent from collision query",
+          {{"reason", "runtime_collision_projection_joint_not_in_query"},
+           {"joint", source_joint}}});
+    }
+    projection.source_to_query_indices.push_back(
+        static_cast<std::size_t>(
+            std::distance(projection.query_joint_names.begin(), it)));
+  }
+  return Result<RuntimeCollisionStateProjection>::Ok(std::move(projection));
+}
+
+Result<RobotStateDTO> project_runtime_collision_observed_state(
+    const RuntimeCollisionStateProjection& projection,
+    const std::vector<double>& observed_positions_rad) {
+  RobotStateDTO state;
+  state.joint_names = projection.query_joint_names;
+  if (observed_positions_rad.size() == projection.query_joint_names.size() &&
+      projection.source_joint_names == projection.query_joint_names) {
+    state.positions_rad = observed_positions_rad;
+    return Result<RobotStateDTO>::Ok(std::move(state));
+  }
+  if (observed_positions_rad.size() != projection.source_joint_names.size()) {
+    return Result<RobotStateDTO>::Err(ErrorDTO{
+        kErrorValidationCollision,
+        "Runtime collision monitor observed state shape does not match projection",
+        {{"reason", "runtime_collision_projection_observed_shape_mismatch"},
+         {"observed_position_count",
+          std::to_string(observed_positions_rad.size())},
+         {"source_joint_count",
+          std::to_string(projection.source_joint_names.size())},
+         {"query_joint_count",
+          std::to_string(projection.query_joint_names.size())}}});
+  }
+
+  state.positions_rad = projection.template_positions_rad;
+  for (std::size_t i = 0; i < observed_positions_rad.size(); ++i) {
+    state.positions_rad[projection.source_to_query_indices[i]] =
+        observed_positions_rad[i];
+  }
+  return Result<RobotStateDTO>::Ok(std::move(state));
+}
+
+void PublishedRuntimeCollisionSnapshotStore::publish(
+    CollisionWorldPolicySnapshotBundle bundle) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  bundle_ = std::move(bundle);
+  ++epoch_;
+}
+
+std::uint64_t PublishedRuntimeCollisionSnapshotStore::clear() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  bundle_ = {};
+  return ++epoch_;
+}
+
+PublishedRuntimeCollisionSnapshot PublishedRuntimeCollisionSnapshotStore::snapshot()
+    const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return PublishedRuntimeCollisionSnapshot{bundle_, epoch_};
+}
+
+Result<CollisionWorldPolicySnapshotBundle>
+load_collision_world_policy_snapshot_bundle(
+    const ICollisionWorldSnapshotPublisher& publisher) {
+  CollisionWorldPolicySnapshotBundle bundle;
+  try {
+    bundle = publisher.collision_world_policy_snapshot_bundle();
+  } catch (const std::exception& e) {
+    return Result<CollisionWorldPolicySnapshotBundle>::Err(ErrorDTO{
+        kErrorValidationCollision,
+        "Collision world snapshot publisher failed",
+        {{"reason", "collision_world_snapshot_publisher_exception"},
+         {"exception", e.what()}}});
+  } catch (...) {
+    return Result<CollisionWorldPolicySnapshotBundle>::Err(ErrorDTO{
+        kErrorValidationCollision,
+        "Collision world snapshot publisher failed",
+        {{"reason", "collision_world_snapshot_publisher_exception"},
+         {"exception", reason_codes::kUnknownNonStdException}}});
+  }
+  if (!bundle.world) {
+    return Result<CollisionWorldPolicySnapshotBundle>::Err(ErrorDTO{
+        kErrorValidationCollision,
+        "Collision world snapshot unavailable",
+        {{"reason", "collision_world_snapshot_unavailable"}}});
+  }
+  return Result<CollisionWorldPolicySnapshotBundle>::Ok(std::move(bundle));
+}
+
+Result<CollisionWorldPolicySnapshotBundle>
+load_published_runtime_collision_snapshot_bundle(
+    const ICollisionWorldSnapshotPublisher& publisher) {
+  CollisionWorldPolicySnapshotBundle bundle;
+  try {
+    bundle = publisher.published_runtime_collision_snapshot_bundle();
+  } catch (const std::exception& e) {
+    return Result<CollisionWorldPolicySnapshotBundle>::Err(ErrorDTO{
+        kErrorValidationCollision,
+        "Published runtime collision snapshot unavailable",
+        {{"reason", "published_runtime_collision_snapshot_exception"},
+         {"exception", e.what()}}});
+  } catch (...) {
+    return Result<CollisionWorldPolicySnapshotBundle>::Err(ErrorDTO{
+        kErrorValidationCollision,
+        "Published runtime collision snapshot unavailable",
+        {{"reason", "published_runtime_collision_snapshot_exception"},
+         {"exception", reason_codes::kUnknownNonStdException}}});
+  }
+  return Result<CollisionWorldPolicySnapshotBundle>::Ok(std::move(bundle));
 }
 
 void append_collision_failure_diagnostics(

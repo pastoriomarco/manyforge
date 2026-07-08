@@ -89,7 +89,7 @@ Result<void> StopPolicy::request_soft_stop(Duration deceleration_ns) {
             // Stop authority asserting its own terminal; a failure means a
             // higher-priority terminal already latched — benign to discard.
             (void)transition_terminal(ExecutionState::kStopped);
-        });
+        }, SchedulerPriority::StopControl);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             pending_soft_stop_ = handle;
@@ -210,7 +210,7 @@ Result<void> StopPolicy::request_pause() {
         if (transition_result.ok() && completed_callback) {
             completed_callback();
         }
-    });
+    }, SchedulerPriority::Lifecycle);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         pending_pause_ = handle;

@@ -47,6 +47,26 @@ void atomic_max(std::atomic<std::uint64_t>& target, std::uint64_t value) {
   }
 }
 
+void record_latency_sample(std::atomic<std::uint64_t>& last,
+                           std::atomic<std::uint64_t>& maximum,
+                           std::atomic<std::uint64_t>& count,
+                           std::int64_t latency_ns) {
+  const auto clamped =
+      static_cast<std::uint64_t>(std::max<std::int64_t>(0, latency_ns));
+  last.store(clamped, std::memory_order_relaxed);
+  atomic_max(maximum, clamped);
+  count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void record_latency_value(std::atomic<std::uint64_t>& last,
+                          std::atomic<std::uint64_t>& maximum,
+                          std::int64_t latency_ns) {
+  const auto clamped =
+      static_cast<std::uint64_t>(std::max<std::int64_t>(0, latency_ns));
+  last.store(clamped, std::memory_order_relaxed);
+  atomic_max(maximum, clamped);
+}
+
 std::string format_double(double value) {
   std::ostringstream out;
   out << std::setprecision(17) << value;
@@ -209,6 +229,11 @@ void Ros2ControlExecutionBackend::validate_config() const {
       config_.monitor_period_s <= 0.0) {
     throw std::invalid_argument("ros2_control timing/tolerance config is invalid");
   }
+  if (config_.executor_thread_count < 3) {
+    throw std::invalid_argument(
+        "ros2_control executor_thread_count must be >= 3 so action, state, "
+        "and default callback groups can progress independently");
+  }
   if (config_.soft_on_path_max_initial_path_deviation_rad.has_value() &&
       (!std::isfinite(*config_.soft_on_path_max_initial_path_deviation_rad) ||
        *config_.soft_on_path_max_initial_path_deviation_rad < 0.0)) {
@@ -255,10 +280,12 @@ void Ros2ControlExecutionBackend::start_ros() {
   options.context(context_);
   node_ = std::make_shared<rclcpp::Node>(config_.node_name, options);
 
-  action_client_ =
-      rclcpp_action::create_client<FollowJointTrajectory>(node_, config_.action_name);
+  action_callback_group_ = node_->create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
   state_callback_group_ = node_->create_callback_group(
       rclcpp::CallbackGroupType::MutuallyExclusive);
+  action_client_ = rclcpp_action::create_client<FollowJointTrajectory>(
+      node_, config_.action_name, action_callback_group_);
   rclcpp::SubscriptionOptions state_subscription_options;
   state_subscription_options.callback_group = state_callback_group_;
 
@@ -316,7 +343,7 @@ void Ros2ControlExecutionBackend::start_ros() {
   rclcpp::ExecutorOptions executor_options;
   executor_options.context = context_;
   executor_ = std::make_shared<rclcpp::executors::MultiThreadedExecutor>(
-      executor_options, 2);
+      executor_options, config_.executor_thread_count);
   executor_->add_node(node_);
   spin_thread_ = std::thread([this]() { executor_->spin(); });
 }
@@ -341,6 +368,7 @@ void Ros2ControlExecutionBackend::stop_ros() {
 
 void Ros2ControlExecutionBackend::on_joint_state(
     const sensor_msgs::msg::JointState::SharedPtr msg) {
+  state_callbacks_total_.fetch_add(1, std::memory_order_relaxed);
   JointSample sample;
   sample.joint_names = msg->name;
   sample.positions = msg->position;
@@ -358,6 +386,7 @@ void Ros2ControlExecutionBackend::on_joint_state(
 
 void Ros2ControlExecutionBackend::on_controller_state(
     const control_msgs::msg::JointTrajectoryControllerState::SharedPtr msg) {
+  state_callbacks_total_.fetch_add(1, std::memory_order_relaxed);
   JointSample sample;
   sample.joint_names = msg->joint_names;
   sample.positions = msg->feedback.positions;
@@ -376,6 +405,7 @@ void Ros2ControlExecutionBackend::on_controller_state(
 void Ros2ControlExecutionBackend::on_action_feedback(
     GoalHandleFJT::SharedPtr goal_handle,
     const std::shared_ptr<const FollowJointTrajectory::Feedback> feedback) {
+  action_feedback_callbacks_total_.fetch_add(1, std::memory_order_relaxed);
   const auto now = std::chrono::steady_clock::now();
   double elapsed_s = 0.0;
   bool active_goal_feedback = false;
@@ -401,6 +431,10 @@ void Ros2ControlExecutionBackend::on_action_feedback(
       return;
     }
     if (active_goal_feedback && running_ && !first_feedback_seen_) {
+      record_command_progress_latency_ns(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              now - active_goal_accepted_at_)
+              .count());
       first_feedback_seen_ = true;
       execution_started_at_ = now;
       tracking_error_since_.reset();
@@ -455,9 +489,12 @@ void Ros2ControlExecutionBackend::on_action_feedback(
 
 void Ros2ControlExecutionBackend::on_action_result(
     const GoalHandleFJT::WrappedResult& result) {
+  const auto now = std::chrono::steady_clock::now();
+  action_result_callbacks_total_.fetch_add(1, std::memory_order_relaxed);
   const bool canceled = result.code == rclcpp_action::ResultCode::CANCELED;
   bool stop_requested = false;
   bool pause_requested = false;
+  std::optional<std::chrono::steady_clock::time_point> stop_requested_at;
   {
     std::lock_guard<std::mutex> lock(execution_mutex_);
     if (terminal_ || resync_required_) {
@@ -467,6 +504,10 @@ void Ros2ControlExecutionBackend::on_action_result(
       return;
     }
     result_received_ = true;
+    record_action_result_latency_ns(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now - active_goal_accepted_at_)
+            .count());
     // Persist the raw result code so a parallel
     // `execute_controlled_stop(kHardDeceleration)` can verify the
     // cancel was actually honored. The stop_requested branch below
@@ -475,6 +516,7 @@ void Ros2ControlExecutionBackend::on_action_result(
     last_action_result_code_ = result.code;
     stop_requested = stop_requested_;
     pause_requested = pause_requested_;
+    stop_requested_at = stop_requested_at_;
     if (controlled_stop_preempt_in_progress_ &&
         (stop_requested || pause_requested || canceled)) {
       // A managed controlled stop preempts the active JTC goal with a second
@@ -489,6 +531,14 @@ void Ros2ControlExecutionBackend::on_action_result(
   }
 
   if (stop_requested || pause_requested || canceled) {
+    if (stop_requested_at.has_value()) {
+      const auto latency_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              now - *stop_requested_at)
+              .count();
+      record_cancel_latency_ns(latency_ns);
+      record_stop_confirmation_latency_ns(latency_ns);
+    }
     const auto snapshot = get_execution_snapshot();
     {
       std::lock_guard<std::mutex> lock(execution_mutex_);
@@ -1089,6 +1139,53 @@ Ros2ControlExecutionBackend::scene_projection_metrics() const {
   return metrics;
 }
 
+Ros2ControlControllerProgressMetrics
+Ros2ControlExecutionBackend::controller_progress_metrics() const {
+  Ros2ControlControllerProgressMetrics metrics;
+  metrics.executor_thread_count = config_.executor_thread_count;
+  metrics.state_callbacks_total =
+      state_callbacks_total_.load(std::memory_order_relaxed);
+  metrics.action_feedback_callbacks_total =
+      action_feedback_callbacks_total_.load(std::memory_order_relaxed);
+  metrics.action_result_callbacks_total =
+      action_result_callbacks_total_.load(std::memory_order_relaxed);
+  metrics.command_progress_samples_total =
+      command_progress_samples_total_.load(std::memory_order_relaxed);
+  metrics.cancel_confirmations_total =
+      cancel_confirmations_total_.load(std::memory_order_relaxed);
+  metrics.stop_confirmations_total =
+      stop_confirmations_total_.load(std::memory_order_relaxed);
+  metrics.last_command_progress_latency_ns =
+      last_command_progress_latency_ns_.load(std::memory_order_relaxed);
+  metrics.max_command_progress_latency_ns =
+      max_command_progress_latency_ns_.load(std::memory_order_relaxed);
+  metrics.last_action_result_latency_ns =
+      last_action_result_latency_ns_.load(std::memory_order_relaxed);
+  metrics.max_action_result_latency_ns =
+      max_action_result_latency_ns_.load(std::memory_order_relaxed);
+  metrics.last_cancel_latency_ns =
+      last_cancel_latency_ns_.load(std::memory_order_relaxed);
+  metrics.max_cancel_latency_ns =
+      max_cancel_latency_ns_.load(std::memory_order_relaxed);
+  metrics.last_stop_confirmation_latency_ns =
+      last_stop_confirmation_latency_ns_.load(std::memory_order_relaxed);
+  metrics.max_stop_confirmation_latency_ns =
+      max_stop_confirmation_latency_ns_.load(std::memory_order_relaxed);
+
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  const JointSample* sample = select_latest_sample_ptr_locked(now);
+  if (sample != nullptr) {
+    metrics.latest_state_sample_age_ns =
+        static_cast<std::uint64_t>(
+            std::max<std::int64_t>(
+                0, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       now - sample->received_at)
+                       .count()));
+  }
+  return metrics;
+}
+
 void Ros2ControlExecutionBackend::record_scene_projection_success(
     std::int64_t source_timestamp_ns) {
   const auto now_ns = clock_.now();
@@ -1103,6 +1200,37 @@ void Ros2ControlExecutionBackend::record_scene_projection_success(
 
 void Ros2ControlExecutionBackend::record_scene_projection_miss() {
   scene_projection_misses_total_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Ros2ControlExecutionBackend::record_command_progress_latency_ns(
+    std::int64_t latency_ns) {
+  record_latency_sample(last_command_progress_latency_ns_,
+                        max_command_progress_latency_ns_,
+                        command_progress_samples_total_,
+                        latency_ns);
+}
+
+void Ros2ControlExecutionBackend::record_action_result_latency_ns(
+    std::int64_t latency_ns) {
+  record_latency_value(last_action_result_latency_ns_,
+                       max_action_result_latency_ns_,
+                       latency_ns);
+}
+
+void Ros2ControlExecutionBackend::record_cancel_latency_ns(
+    std::int64_t latency_ns) {
+  record_latency_sample(last_cancel_latency_ns_,
+                        max_cancel_latency_ns_,
+                        cancel_confirmations_total_,
+                        latency_ns);
+}
+
+void Ros2ControlExecutionBackend::record_stop_confirmation_latency_ns(
+    std::int64_t latency_ns) {
+  record_latency_sample(last_stop_confirmation_latency_ns_,
+                        max_stop_confirmation_latency_ns_,
+                        stop_confirmations_total_,
+                        latency_ns);
 }
 
 bool Ros2ControlExecutionBackend::update_scene_positions(
@@ -1427,10 +1555,14 @@ std::optional<Ros2ControlExecutionBackend::PostStopObservation>
 Ros2ControlExecutionBackend::wait_for_post_stop_observation(
     const std::vector<std::string>& joint_names,
     double settle_velocity_threshold_rad_s,
-    std::chrono::steady_clock::time_point deadline) {
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
   std::unique_lock<std::mutex> lock(state_mutex_);
   std::optional<PostStopObservation> best;
   while (true) {
+    if (stop_token.stop_requested()) {
+      return best;
+    }
     const auto now = std::chrono::steady_clock::now();
     const auto consider = [&](const std::optional<JointSample>& sample) {
       if (!sample.has_value() ||
@@ -1487,7 +1619,11 @@ Ros2ControlExecutionBackend::wait_for_post_stop_observation(
     }
     const auto next_wakeup =
         std::min(deadline, now + std::chrono::milliseconds(20));
-    state_cv_.wait_until(lock, next_wakeup);
+    state_cv_.wait_for(
+        lock,
+        stop_token,
+        next_wakeup - now,
+        []() { return false; });
   }
 }
 
@@ -2012,9 +2148,10 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
                      resync_result.error());
     return core::ExecutionHandle{
         [](int64_t) { return true; },
-        [this]() { return get_execution_snapshot(); }};
+      [this]() { return get_execution_snapshot(); }};
   }
 
+  std::uint64_t dispatch_generation = 0;
   {
     std::lock_guard<std::mutex> lock(execution_mutex_);
     if (running_) {
@@ -2035,6 +2172,7 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
       goal_accepted_ = false;
       first_feedback_seen_ = false;
       result_received_ = false;
+      last_action_result_code_.reset();
       active_goal_handle_.reset();
       active_goal_id_.reset();
       active_trajectory_.reset();
@@ -2054,6 +2192,7 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
           std::make_shared<const core::TrajectoryDTO>(trajectory);
       active_trajectory_time_s_ = 0.0;
       active_runtime_velocity_scale_ = initial_runtime_scale;
+      dispatch_generation = running_generation_.load(std::memory_order_acquire);
     }
   }
 
@@ -2145,6 +2284,30 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
   }
 
   rclcpp_action::Client<FollowJointTrajectory>::SendGoalOptions options;
+  const auto record_goal_acceptance =
+      [this, dispatch_generation](GoalHandleFJT::SharedPtr goal_handle) {
+        if (!goal_handle) {
+          return;
+        }
+        const auto accepted_at = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(execution_mutex_);
+        if (!running_ || terminal_ ||
+            running_generation_.load(std::memory_order_acquire) !=
+                dispatch_generation) {
+          return;
+        }
+        const auto goal_id = goal_handle->get_goal_id();
+        if (active_goal_id_.has_value() && *active_goal_id_ != goal_id) {
+          return;
+        }
+        if (!goal_accepted_) {
+          active_goal_accepted_at_ = accepted_at;
+        }
+        active_goal_handle_ = std::move(goal_handle);
+        active_goal_id_ = goal_id;
+        goal_accepted_ = true;
+      };
+  options.goal_response_callback = record_goal_acceptance;
   options.feedback_callback =
       [this](GoalHandleFJT::SharedPtr goal_handle,
              const std::shared_ptr<const FollowJointTrajectory::Feedback> feedback) {
@@ -2207,17 +2370,7 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
         [this]() { return get_execution_snapshot(); }};
   }
 
-  {
-    std::lock_guard<std::mutex> lock(execution_mutex_);
-    active_goal_handle_ = goal_handle;
-    active_goal_id_ = goal_handle->get_goal_id();
-    // Reset the persisted action result code at each new dispatch
-    // so a fresh execute_controlled_stop call doesn't observe
-    // stale codes from the previous trajectory.
-    last_action_result_code_.reset();
-    goal_accepted_ = true;
-    execution_started_at_ = std::chrono::steady_clock::now();
-  }
+  record_goal_acceptance(goal_handle);
   if (is_commanded_sim_mode()) {
     set_command_gate(true);
   }
@@ -2257,7 +2410,10 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
   monitor_active_.store(true);
   const auto monitor_guard =
       std::shared_ptr<void>(nullptr, [this](void*) {
-        monitor_active_.store(false);
+        {
+          std::lock_guard<std::mutex> lock(execution_mutex_);
+          monitor_active_.store(false);
+        }
         execution_cv_.notify_all();
       });
   (void)monitor_guard;
@@ -2625,6 +2781,7 @@ core::StopResultDTO Ros2ControlExecutionBackend::stop() {
             "stop_resync_required",
             snapshot.state)};
   }
+  execution_cv_.notify_all();
   if (cancel_requested && !goal_to_cancel) {
     std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
     goal_to_cancel = managed_fjt_goal_;
@@ -2689,10 +2846,6 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
          {"phase", std::move(phase)}}};
     return result;
   };
-  std::stop_callback stop_notify(stop_token, [this]() {
-    execution_cv_.notify_all();
-    managed_fjt_cv_.notify_all();
-  });
   if (stop_token.stop_requested()) {
     return cancelled_result("entry");
   }
@@ -3138,11 +3291,10 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
           std::unique_lock<std::mutex> lock(execution_mutex_);
           terminal = execution_cv_.wait_for(
               lock,
+              stop_token,
               std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::duration<double>(wait_s)),
-              [this, &stop_token]() {
-                return terminal_ || stop_token.stop_requested();
-              });
+              [this]() { return terminal_; });
         }
         if (stop_token.stop_requested()) {
           return cancelled_result("soft_on_path_natural_completion_wait");
@@ -3335,12 +3487,10 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
       std::unique_lock<std::mutex> lock(managed_fjt_mutex_);
       received = managed_fjt_cv_.wait_for(
           lock,
+          stop_token,
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::duration<double>(wait_s)),
-          [this, &stop_token]() {
-            return managed_fjt_terminal_result_received_ ||
-                   stop_token.stop_requested();
-          });
+          [this]() { return managed_fjt_terminal_result_received_; });
       success = managed_fjt_terminal_result_success_;
       terminal_error = managed_fjt_terminal_error_;
     }
@@ -3749,12 +3899,10 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
       std::unique_lock<std::mutex> lock(managed_fjt_mutex_);
       received = managed_fjt_cv_.wait_for(
           lock,
+          stop_token,
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::duration<double>(wait_s)),
-          [this, &stop_token]() {
-            return managed_fjt_terminal_result_received_ ||
-                   stop_token.stop_requested();
-          });
+          [this]() { return managed_fjt_terminal_result_received_; });
       success = managed_fjt_terminal_result_success_;
       terminal_error = managed_fjt_terminal_error_;
     }
@@ -3971,6 +4119,7 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
       active_goal_to_cancel = active_goal_handle_;
     }
   }
+  execution_cv_.notify_all();
   cancel_goal_if_known(active_goal_to_cancel);
 
   // spec/260 §5.6 hard_deceleration: native JTC deceleration path.
@@ -3990,11 +4139,10 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
       std::unique_lock<std::mutex> lock(execution_mutex_);
       stopped = execution_cv_.wait_for(
           lock,
+          stop_token,
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::duration<double>(wait_s)),
-          [this, &stop_token]() {
-            return !running_ || terminal_ || stop_token.stop_requested();
-          });
+          [this]() { return !running_ || terminal_; });
       observed_result_code = last_action_result_code_;
     }
     if (stop_token.stop_requested()) {
@@ -4075,7 +4223,11 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
         profile.settle_velocity_threshold_rad_s.value_or(
             core::kDefaultSettleVelocityThresholdRadS);
     const auto post_stop_observation = wait_for_post_stop_observation(
-        joint_names, settle_velocity_threshold_rad_s, settle_deadline);
+        joint_names, settle_velocity_threshold_rad_s, settle_deadline,
+        stop_token);
+    if (stop_token.stop_requested()) {
+      return cancelled_result("hard_deceleration_settle_wait");
+    }
     const auto settle_end = std::chrono::steady_clock::now();
     const auto settle_wait_ns =
         std::max<std::int64_t>(
@@ -4230,6 +4382,7 @@ core::PauseResultDTO Ros2ControlExecutionBackend::pause() {
             "pause_resync_required",
             snapshot.state)};
   }
+  execution_cv_.notify_all();
   cancel_goal_if_known(goal_to_cancel);
   publish_snapshot(cancel_requested ? core::ExecutionState::kStopping
                                     : core::ExecutionState::kPaused,
@@ -4287,6 +4440,7 @@ core::ResetResultDTO Ros2ControlExecutionBackend::reset() {
       active_runtime_velocity_scale_ = 1.0;
     }
   }
+  execution_cv_.notify_all();
   cancel_goal_if_known(active_goal_to_cancel);
   if (resync_required) {
     auto resync_result = resync_after_intervention_if_needed("reset_resync");
@@ -5197,6 +5351,7 @@ bool Ros2ControlExecutionBackend::send_fjt_replacement_trajectory(
       managed_fjt_goal_ = goal_handle;
       if (track_terminal_goal) {
         managed_fjt_terminal_goal_id_ = goal_handle->get_goal_id();
+        managed_fjt_goal_accepted_at_ = std::chrono::steady_clock::now();
       }
     }
   }
@@ -5279,6 +5434,8 @@ void Ros2ControlExecutionBackend::clear_controlled_stop_path_deviation_tracking(
 void Ros2ControlExecutionBackend::on_managed_fjt_terminal_result(
     const GoalHandleFJT::WrappedResult& result,
     std::uint64_t generation) {
+  const auto now = std::chrono::steady_clock::now();
+  action_result_callbacks_total_.fetch_add(1, std::memory_order_relaxed);
   const bool controller_success =
       result.result &&
       result.result->error_code == FollowJointTrajectory::Result::SUCCESSFUL;
@@ -5291,6 +5448,10 @@ void Ros2ControlExecutionBackend::on_managed_fjt_terminal_result(
       result.goal_id != *managed_fjt_terminal_goal_id_) {
     return;
   }
+  record_action_result_latency_ns(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          now - managed_fjt_goal_accepted_at_)
+          .count());
   managed_fjt_terminal_result_received_ = true;
   managed_fjt_terminal_result_success_ = terminal_success;
   managed_fjt_goal_.reset();

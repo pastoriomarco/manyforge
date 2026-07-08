@@ -118,6 +118,7 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
                 config={
                     "required_joints": ["joint1"],
                     "arm_action": "/arm_controller/follow_joint_trajectory",
+                    "executor_thread_count": 4,
                 },
             ),
             "planning": SimpleNamespace(
@@ -180,12 +181,73 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
     assert recorded["ros_config"]["action_name"] == (
         "/arm_controller/follow_joint_trajectory"
     )
+    assert recorded["ros_config"]["executor_thread_count"] == 4
     assert kernel.robot_model_authority_metadata["view_changed"] is False
     assert bundle.robot_model_authority_metadata["canonical_urdf_path"] == str(urdf)
     assert kernel.kwargs["robot_model_authority_metadata"] == (
         kernel.robot_model_authority_metadata
     )
     assert kernel.kwargs["robot_model_authority_temp_dir"] is None
+
+
+def test_ros2_control_factory_forwards_validation_collision_timeout(
+    monkeypatch, tmp_path
+):
+    urdf, srdf = _write_one_joint_model(tmp_path)
+    deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(
+            group_id="arm",
+            urdf_path=str(urdf),
+            srdf_path=str(srdf),
+            package_paths=[str(tmp_path)],
+        ),
+        adapters={
+            "execution": SimpleNamespace(
+                adapter_id="execution.ros2_control_follow_joint_trajectory",
+                config={
+                    "required_joints": ["joint1"],
+                    "arm_action": "/arm_controller/follow_joint_trajectory",
+                },
+            )
+        },
+        grippers={},
+        source_path=str(tmp_path / "deployment.yaml"),
+        baseline_collision_policy_snapshot=lambda: None,
+    )
+    recorded: dict[str, object] = {}
+    fake_roboplan = ModuleType("manyforge_roboplan_py")
+
+    def create_ros2_control_kernel_from_paths(*args):
+        recorded["kernel_config"] = args[6]
+        return object()
+
+    fake_roboplan.create_ros2_control_kernel_from_paths = (
+        create_ros2_control_kernel_from_paths
+    )
+    monkeypatch.setitem(sys.modules, "manyforge_roboplan_py", fake_roboplan)
+
+    fake_client_module = ModuleType("native_kernel_client")
+
+    class FakeNativeKernelClient:
+        def __init__(self, bundle, **kwargs):
+            self.bundle = bundle
+            self.kwargs = kwargs
+
+    fake_client_module.NativeKernelClient = FakeNativeKernelClient
+    monkeypatch.setitem(sys.modules, "native_kernel_client", fake_client_module)
+
+    create_ros2_control_kernel(
+        deployment=deployment,
+        validation_collision_query_timeout_ns=275_000_000,
+        validation_collision_wall_timeout_ns=3_000_000_000,
+    )
+
+    assert recorded["kernel_config"]["validation_collision_query_timeout_ns"] == (
+        275_000_000
+    )
+    assert recorded["kernel_config"]["validation_collision_wall_timeout_ns"] == (
+        3_000_000_000
+    )
 
 
 def test_ros2_control_factory_keeps_ros_gripper_config_canonical_and_seeds_scene(

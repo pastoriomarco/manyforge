@@ -88,11 +88,12 @@ class CollisionCancellationToken {
 /// thread-safety contract is published per-engine through the
 /// `CollisionEngineCapabilityDescriptor`'s
 /// `CollisionEngineThreadSafetyClass`. The parallel worker pool reads
-/// that class and may either:
+/// that class plus `mutable_context_id` and may either:
 ///   - share one engine instance across workers when
 ///     `kImmutableModelWorkerData` allows it, or
 ///   - require one engine instance per worker when
-///     `kSingleContextExclusive` is declared.
+///     `kSingleContextExclusive` is declared. Distinct wrapper instances with
+///     the same non-empty mutable context id are still one exclusive resource.
 ///
 /// Engine implementations MUST NOT depend on `IPlanningContext`; they
 /// receive a `CollisionWorldSnapshot` for scene state, a `CollisionQuery`

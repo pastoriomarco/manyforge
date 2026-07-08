@@ -143,6 +143,7 @@ REASON_IK_UNREACHABLE = "ik_unreachable"
 REASON_JOINT_LIMIT = "joint_limit_violation"
 REASON_COLLISION = "collision_detected"
 REASON_VALIDATION_TIMEOUT = "validation_timeout"
+REASON_VALIDATION_DEFERRED = "validation_deferred_runtime_monitor_active"
 REASON_MALFORMED_TARGET = "malformed_target"
 REASON_BACKEND_UNAVAILABLE = "backend_unavailable"
 REASON_NO_PROGRAM = "no_program_loaded"
@@ -172,6 +173,7 @@ _KNOWN_REASON_CODES = frozenset(
         REASON_JOINT_LIMIT,
         REASON_COLLISION,
         REASON_VALIDATION_TIMEOUT,
+        REASON_VALIDATION_DEFERRED,
         REASON_MALFORMED_TARGET,
         REASON_BACKEND_UNAVAILABLE,
         REASON_PLANNING_FAILED,
@@ -809,6 +811,8 @@ def _classify_preview_failure(preview: MotionPreviewResult) -> CandidateDiagnost
         reason = REASON_JOINT_LIMIT
     elif has("ik", "unreachable", "no solution", "no ik", "out of reach", "not reachable"):
         reason = REASON_IK_UNREACHABLE
+    elif has("validation_deferred", "runtime_monitor_lease_active"):
+        reason = REASON_VALIDATION_DEFERRED
     elif has("timeout", "timed out", "deadline"):
         reason = REASON_VALIDATION_TIMEOUT
     elif has("malformed", "invalid target", "invalid request", "bad target"):

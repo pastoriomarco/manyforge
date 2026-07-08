@@ -3,9 +3,11 @@
 #include <manyforge_core/cache/trajectory_cache.hpp>
 #include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
+#include <manyforge_core/collision/collision_resource_manager.hpp>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
 #include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
 #include <manyforge_core/execution_correlation_tracker.hpp>
+#include <manyforge_core/execution_collision_support.hpp>
 #include <manyforge_core/execution_snapshot_publisher.hpp>
 #include <manyforge_core/execution_worker_signals.hpp>
 #include <manyforge_core/interrupt/interrupt_manager.hpp>
@@ -54,6 +56,21 @@ struct ExecutionKernelConfig {
   // must allow contact-rich distance queries to complete within the full
   // configured monitor period before preempting execution.
   Duration runtime_collision_query_timeout_ns = 50'000'000;  // 50 ms
+
+  // Pre-dispatch trajectory collision validation may perform cold
+  // collision-world snapshot synchronization before any robot motion is
+  // dispatched. Keep this separate from the runtime monitor budget: the
+  // runtime monitor runs while motion may be active, while pre-dispatch
+  // validation is allowed a larger bounded proof window.
+  Duration validation_collision_query_timeout_ns = 250'000'000;  // 250 ms
+
+  // Wall-clock budget for one authoritative pre-dispatch collision validation
+  // attempt, including worker scheduling and all per-waypoint engine queries.
+  // This is deliberately distinct from `validation_collision_query_timeout_ns`:
+  // that field is a per-query budget handed to engines, while this field is
+  // the caller liveness bound that lets stop/reset/intervention avoid waiting
+  // forever on a wedged validation worker. Must be > 0.
+  Duration validation_collision_wall_timeout_ns = 5'000'000'000;  // 5 s
 
   // When true, a collision-validation rejection re-runs the failing waypoint
   // through the planning context's normalized collision query and appends
@@ -161,6 +178,21 @@ struct ExecutionKernelConfig {
   // stop is "I am taking back control, decelerate cleanly along the
   // current path" (default soft-on-path).
   std::shared_ptr<MotionInterruptStopProfileDTO> operator_stop_profile;
+};
+
+enum class RuntimeCollisionMonitorRelease {
+  kTerminalQuiesced,
+  kResetOrTeardown,
+  kFailClosedTerminal,
+  kWorkerRetirement,
+};
+
+struct RuntimeCollisionProtectionSnapshot {
+  bool active = false;
+  std::uint64_t generation = 0;
+  std::uint64_t execution_id = 0;
+  ExecutionState state_at_acquire = ExecutionState::kIdle;
+  std::string reason;
 };
 
 /// Execution Kernel — single authority for motion execution governance.
@@ -302,24 +334,25 @@ class ExecutionKernel {
   void set_collision_validation_policy_snapshot(
       std::optional<CollisionPolicySnapshot> snapshot);
 
-  /// Install the authoritative collision validation world publisher and
-  /// query-engine workers. The publisher and engines are backend-agnostic
-  /// ManyForge-owned ports; RoboPlan / MoveIt / Isaac may publish snapshots or
-  /// implement the port, but the kernel never falls back to planner-internal
-  /// collision checks.
-  ///
-  /// `publisher` must outlive the kernel. Engines are retained by shared_ptr
-  /// so the composition root can hand them to the kernel without additional
-  /// lifetime coupling.
-  void set_collision_validation_pipeline(
+  /// Install role-owned collision resources. Production composition roots should
+  /// use this API: runtime monitoring owns `runtime_monitor_engine`, while
+  /// authoritative validation owns `validation_engines`.
+  void set_collision_resources(
       ICollisionWorldSnapshotPublisher& publisher,
-      std::vector<std::shared_ptr<ICollisionQueryEngine>> engines);
+      std::shared_ptr<ICollisionQueryEngine> runtime_monitor_engine,
+      std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines);
 
   /// Optional pose-source / per-state retry configuration for the
   /// CollisionValidationCoordinator. Has no effect until a policy snapshot is
   /// installed via set_collision_validation_policy_snapshot.
   void set_collision_validation_retry_config(
       PoseSourceRetryConfig retry, std::int64_t per_state_timeout_ns = 0);
+
+  /// Check whether a non-dispatch validation surface may run against the
+  /// current collision resources. Preview callers use this before direct
+  /// planner/context work so they defer loudly instead of borrowing a runtime
+  /// monitor resource.
+  std::optional<ErrorDTO> collision_validation_admission_error() const;
 
   // ---------------------------------------------------------------
   // Kernel-native interrupt registration and latch surface (spec/260,
@@ -392,7 +425,13 @@ class ExecutionKernel {
   Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request);
   Result<TrajectoryDTO> plan_resume_trajectory(
       const ExecuteRequestDTO& request);
-  Result<CollisionWorldRevision> validate_trajectory(
+
+  struct CollisionValidationSuccess {
+    CollisionWorldRevision collision_world_revision;
+    TrajectoryDTO collision_trajectory;
+  };
+
+  Result<CollisionValidationSuccess> validate_trajectory(
       const TrajectoryDTO& trajectory,
       const ExecuteRequestDTO& request);
 
@@ -425,8 +464,21 @@ class ExecutionKernel {
 
   /// Publish an observer-safe execution snapshot.
   void publish_execution_snapshot(ExecutionSnapshot snapshot);
-  void start_collision_monitoring();
-  void stop_collision_monitoring(bool drain_callbacks = false);
+  std::uint64_t start_collision_monitoring(std::string reason);
+  void stop_collision_monitoring(
+      RuntimeCollisionMonitorRelease release,
+      std::optional<std::uint64_t> expected_generation = std::nullopt,
+      bool drain_callbacks = false);
+  RuntimeCollisionProtectionSnapshot runtime_collision_protection_snapshot()
+      const;
+  bool refresh_published_runtime_collision_snapshot(
+      std::map<std::string, std::string>* details = nullptr);
+  Result<RobotStateDTO> project_runtime_collision_observed_state(
+      const ExecutionSnapshot& observed_snapshot) const;
+  void set_runtime_collision_state_projection(
+      RuntimeCollisionStateProjection projection);
+  void clear_runtime_collision_state_projection();
+  void clear_runtime_collision_state_projection_unlocked();
   CollisionWorldRevision current_authoritative_collision_world_revision() const;
   std::shared_ptr<CollisionCancellationToken> install_validation_cancel_token();
   void clear_validation_cancel_token(
@@ -435,6 +487,8 @@ class ExecutionKernel {
       const InterruptIngestResult& result);
   void request_planning_cancel_from_interrupt(
       const InterruptIngestResult& result);
+  void request_active_validation_cancel(std::string reason);
+  void request_active_planning_cancel();
   void record_terminal_fault_authority(
       const InterruptIngestResult& result);
   void mark_active_interrupt_preemption_result(
@@ -444,6 +498,7 @@ class ExecutionKernel {
       const InterruptLatch& latch,
       InterruptPreemptionResult result,
       const std::map<std::string, std::string>& extra_details = {});
+  bool active_trajectory_preempt_pending() const;
   void apply_interrupt_ingest_effects(
       const InterruptIngestResult& result,
       bool apply_preemption_inline);
@@ -459,7 +514,22 @@ class ExecutionKernel {
   void apply_latched_interrupt_preemption(
       const InterruptIngestResult& result,
       std::stop_token worker_stop_token = {});
-  void request_fault_preempt_controlled_stop();
+  bool request_fault_preempt_controlled_stop();
+  bool fault_preempt_stop_active() const;
+  bool signal_fault_preempt_stop_path_collision(
+      std::map<std::string, std::string> details);
+  std::optional<std::map<std::string, std::string>>
+  fault_preempt_stop_path_collision_details() const;
+  void clear_fault_preempt_stop_path_collision();
+  void set_fault_preempt_intervention_error(ErrorDTO error);
+  std::optional<ErrorDTO> fault_preempt_intervention_error_for_active_latch()
+      const;
+  void clear_fault_preempt_intervention_error();
+  bool request_operator_stop_controlled_stop();
+  bool signal_operator_stop_path_collision(
+      std::map<std::string, std::string> details);
+  std::optional<std::map<std::string, std::string>>
+  operator_stop_path_collision_details() const;
   bool control_command_epoch_matches(
       std::optional<std::uint64_t> expected_epoch) const;
   InterruptRuntimeContext current_interrupt_context() const;
@@ -474,11 +544,15 @@ class ExecutionKernel {
   bool cancel_operator_stop_worker(bool invalidate_generation);
   void join_finished_operator_stop_worker();
   bool wait_for_operator_stop_worker(std::chrono::steady_clock::duration timeout);
-  bool start_operator_stop_worker(MotionInterruptStopProfileDTO profile,
-                                  ExecutionState pre_completion_state);
+  bool start_operator_stop_worker(
+      MotionInterruptStopProfileDTO profile,
+      ExecutionState pre_completion_state,
+      std::optional<std::uint64_t> runtime_collision_generation);
   void run_operator_stop_worker(std::uint64_t generation,
                                 MotionInterruptStopProfileDTO profile,
                                 ExecutionState pre_completion_state,
+                                std::optional<std::uint64_t>
+                                    runtime_collision_generation,
                                 std::stop_token stop_token);
   bool operator_stop_worker_is_current(std::uint64_t generation,
                                        std::stop_token stop_token) const;
@@ -498,6 +572,7 @@ class ExecutionKernel {
     bool arm_succeeded = false;
     bool outcome_emitted = false;
     bool correlation_captured = false;
+    std::uint64_t runtime_collision_protection_generation = 0;
     std::optional<ActionSpanDTO> action_span;
     std::string contact_policy_id;
     std::optional<InterruptLatch> motion_trip_latch;
@@ -646,10 +721,16 @@ class ExecutionKernel {
   std::shared_ptr<const CollisionPolicyIndex> coordinator_policy_index_;
   PoseSourceRetryConfig coordinator_retry_config_{};
   std::int64_t coordinator_per_state_timeout_ns_ = 0;
-  ICollisionWorldSnapshotPublisher* collision_snapshot_publisher_ = nullptr;
-  std::vector<std::shared_ptr<ICollisionQueryEngine>> collision_validation_engines_;
+  CollisionResourceManager collision_resources_;
   std::unique_ptr<ParallelCollisionValidationWorkerPool>
       collision_validation_worker_pool_;
+  mutable std::mutex runtime_collision_protection_mutex_;
+  RuntimeCollisionProtectionSnapshot runtime_collision_protection_;
+  std::uint64_t runtime_collision_protection_next_generation_ = 0;
+  mutable std::mutex runtime_collision_state_projection_mutex_;
+  std::optional<RuntimeCollisionStateProjection>
+      runtime_collision_state_projection_;
+  PublishedRuntimeCollisionSnapshotStore published_runtime_collision_snapshot_;
   mutable std::mutex validation_cancel_mutex_;
   std::weak_ptr<CollisionCancellationToken> active_validation_cancel_token_;
 
@@ -695,6 +776,11 @@ class ExecutionKernel {
   std::atomic<bool> terminal_stop_authority_asserted_{false};
   std::atomic<bool> terminal_fault_authority_asserted_{false};
   OperatorStopWorker operator_stop_worker_;
+  std::mutex operator_stop_source_mutex_;
+  std::shared_ptr<std::stop_source> operator_stop_source_;
+  std::atomic<bool> operator_stop_path_collision_detected_{false};
+  mutable std::mutex operator_stop_path_collision_mutex_;
+  std::map<std::string, std::string> operator_stop_path_collision_details_;
 
   // Stop-path collision boundary. While a motion-trip controlled stop is in
   // flight, the runtime collision monitor keeps running over the decelerating
@@ -709,8 +795,14 @@ class ExecutionKernel {
   // main execute-worker path, so teardown/reset/watchdogs need an explicit
   // owner they can signal without relying on the caller's thread lifetime.
   OperatorStopWorker fault_preempt_worker_;
-  std::mutex fault_preempt_stop_mutex_;
+  mutable std::mutex fault_preempt_stop_mutex_;
   std::shared_ptr<std::stop_source> fault_preempt_stop_source_;
+  std::atomic<bool> fault_preempt_stop_path_collision_detected_{false};
+  mutable std::mutex fault_preempt_stop_path_collision_mutex_;
+  std::map<std::string, std::string>
+      fault_preempt_stop_path_collision_details_;
+  mutable std::mutex fault_preempt_intervention_error_mutex_;
+  std::optional<ErrorDTO> fault_preempt_intervention_error_;
   // Metrics (atomic counters for thread safety)
   mutable std::mutex metrics_mutex_;
   mutable MetricsSnapshot metrics_;

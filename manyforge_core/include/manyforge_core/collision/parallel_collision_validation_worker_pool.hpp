@@ -166,6 +166,14 @@ class ParallelCollisionValidationWorkerPool {
     /// `CollisionWorldSnapshot` metadata by the caller. Pool does not
     /// scan the scene; 0 means "not sourced".
     std::int64_t collision_geometry_count = 0;
+
+    /// Wall-clock liveness budget for one validation call. Zero preserves the
+    /// historical cooperative-only behavior. Positive values make the pool
+    /// request cancellation and return a structured fail-closed timeout when
+    /// workers do not finish in time; wedged workers are abandoned and future
+    /// calls create fresh worker threads.
+    std::chrono::nanoseconds validation_wall_timeout =
+        std::chrono::nanoseconds::zero();
   };
 
   explicit ParallelCollisionValidationWorkerPool(Config config);
@@ -191,11 +199,24 @@ class ParallelCollisionValidationWorkerPool {
   /// The snapshot is immutable and shared across all workers. Telemetry
   /// collision geometry count is sourced directly from
   /// `snapshot.geometry_count`; the pool never scans `snapshot.bodies`.
+  ///
+  /// This borrowed-lifetime overload is only valid for cooperative, unbounded
+  /// calls (`Config::validation_wall_timeout == 0`). Positive wall budgets must
+  /// use the `shared_ptr` overload below so an abandoned worker cannot outlive
+  /// its engine or cancellation token.
   CollisionValidationDecisionBundle validate_trajectory(
       const CollisionWorldSnapshot& snapshot,
       const std::vector<ICollisionQueryEngine*>& worker_engines,
       const TrajectoryDTO& trajectory,
-      const CollisionCancellationToken& cancel);
+      CollisionCancellationToken& cancel);
+
+  /// Production overload that keeps engine and cancellation-token lifetimes
+  /// valid if a validation call times out and a worker has to be abandoned.
+  CollisionValidationDecisionBundle validate_trajectory(
+      const CollisionWorldSnapshot& snapshot,
+      const std::vector<std::shared_ptr<ICollisionQueryEngine>>& worker_engines,
+      const TrajectoryDTO& trajectory,
+      const std::shared_ptr<CollisionCancellationToken>& cancel);
 
   /// Same as the primary overload, but with pass-scoped collision policy and
   /// retry settings supplied by the caller for this validation attempt. This
@@ -205,7 +226,14 @@ class ParallelCollisionValidationWorkerPool {
       const CollisionWorldSnapshot& snapshot,
       const std::vector<ICollisionQueryEngine*>& worker_engines,
       const TrajectoryDTO& trajectory,
-      const CollisionCancellationToken& cancel,
+      CollisionCancellationToken& cancel,
+      CollisionValidationPassConfig pass_config);
+
+  CollisionValidationDecisionBundle validate_trajectory(
+      const CollisionWorldSnapshot& snapshot,
+      const std::vector<std::shared_ptr<ICollisionQueryEngine>>& worker_engines,
+      const TrajectoryDTO& trajectory,
+      const std::shared_ptr<CollisionCancellationToken>& cancel,
       CollisionValidationPassConfig pass_config);
 
   const ParallelValidationTelemetry& last_telemetry() const {
@@ -213,14 +241,24 @@ class ParallelCollisionValidationWorkerPool {
   }
 
  private:
+  struct EngineRef {
+    ICollisionQueryEngine* ptr = nullptr;
+    std::shared_ptr<ICollisionQueryEngine> owner;
+  };
   struct WorkerSlot;
 
   /// Emit a fallback-log event through the sink, rate-limited.
   void maybe_emit_fallback_log(const FallbackLogEvent& event);
   void ensure_worker_threads(int count);
   void stop_worker_threads();
-  void worker_loop(WorkerSlot& slot);
-  void signal_job_complete();
+  static void worker_loop(std::shared_ptr<WorkerSlot> slot);
+  void abandon_worker_threads();
+  CollisionValidationDecisionBundle validate_trajectory_impl(
+      const CollisionWorldSnapshot& snapshot,
+      const std::vector<EngineRef>& worker_engines,
+      const TrajectoryDTO& trajectory,
+      const std::shared_ptr<CollisionCancellationToken>& cancel,
+      CollisionValidationPassConfig pass_config);
 
   Config config_;
   ParallelValidationTelemetry last_telemetry_{};
@@ -228,10 +266,7 @@ class ParallelCollisionValidationWorkerPool {
       last_fallback_log_at_;
   std::mutex validation_call_mutex_;
   std::mutex worker_slots_mutex_;
-  std::vector<std::unique_ptr<WorkerSlot>> worker_slots_;
-  std::mutex completion_mutex_;
-  std::condition_variable completion_cv_;
-  int pending_jobs_ = 0;
+  std::vector<std::shared_ptr<WorkerSlot>> worker_slots_;
 };
 
 /// Read the `MANYFORGE_VALIDATION_COLLISION_WORKERS` env var. Returns the

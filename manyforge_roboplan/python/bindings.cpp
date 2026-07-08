@@ -198,6 +198,15 @@ py::dict error_details_to_python(
   return d;
 }
 
+py::dict error_result_to_python(const ErrorDTO& error) {
+  py::dict result;
+  result["ok"] = false;
+  result["error"] = error.message;
+  result["error_code"] = error.code;
+  result["error_details"] = error_details_to_python(error.details);
+  return result;
+}
+
 const char* collision_engine_status_to_string(CollisionEngineStatus status) {
   switch (status) {
     case CollisionEngineStatus::kOk:
@@ -851,6 +860,8 @@ py::dict metrics_to_python(const MetricsSnapshot& metrics) {
   d["executions_failed"] = metrics.executions_failed;
   d["stops_issued"] = metrics.stops_issued;
   d["collision_detections"] = metrics.collision_detections;
+  d["runtime_collision_snapshot_refresh_failures"] =
+      metrics.runtime_collision_snapshot_refresh_failures;
   d["snapshots_published"] = metrics.snapshots_published;
   d["event_subscriber_exceptions"] = metrics.event_subscriber_exceptions;
   d["observer_lag_max_ns"] = metrics.observer_lag_max_ns;
@@ -907,6 +918,24 @@ double finite_scale_from_python(const py::handle& value, const char* field_name)
     throw std::invalid_argument(std::string(field_name) + " must be finite");
   }
   return result;
+}
+
+[[maybe_unused]] std::size_t size_t_from_python(const py::handle& value,
+                                                const char* field_name) {
+  if (!py::isinstance<py::int_>(value)) {
+    throw std::invalid_argument(std::string(field_name) + " must be an integer");
+  }
+  std::int64_t parsed = 0;
+  try {
+    parsed = value.cast<std::int64_t>();
+  } catch (const py::cast_error&) {
+    throw std::invalid_argument(
+        std::string(field_name) + " must fit in a signed 64-bit integer");
+  }
+  if (parsed < 0) {
+    throw std::invalid_argument(std::string(field_name) + " must be >= 0");
+  }
+  return static_cast<std::size_t>(parsed);
 }
 
 py::dict action_span_to_python(const ActionSpanDTO& span) {
@@ -1243,6 +1272,28 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
     config.runtime_collision_query_timeout_ns =
         static_cast<int64_t>(timeout_ns);
   }
+  if (config_dict.contains("validation_collision_query_timeout_ns")) {
+    const double timeout_ns = finite_scale_from_python(
+        config_dict["validation_collision_query_timeout_ns"],
+        "validation_collision_query_timeout_ns");
+    if (timeout_ns <= 0.0) {
+      throw std::invalid_argument(
+          "validation_collision_query_timeout_ns must be > 0");
+    }
+    config.validation_collision_query_timeout_ns =
+        static_cast<int64_t>(timeout_ns);
+  }
+  if (config_dict.contains("validation_collision_wall_timeout_ns")) {
+    const double timeout_ns = finite_scale_from_python(
+        config_dict["validation_collision_wall_timeout_ns"],
+        "validation_collision_wall_timeout_ns");
+    if (timeout_ns <= 0.0) {
+      throw std::invalid_argument(
+          "validation_collision_wall_timeout_ns must be > 0");
+    }
+    config.validation_collision_wall_timeout_ns =
+        static_cast<int64_t>(timeout_ns);
+  }
   if (config_dict.contains("runtime_dynamic_body_max_age_cap_ns")) {
     const double cap_ns = finite_scale_from_python(
         config_dict["runtime_dynamic_body_max_age_cap_ns"],
@@ -1347,6 +1398,10 @@ ros2_exec::Ros2ControlExecutionBackendConfig ros2_control_config_from_python(
   if (config_dict.contains("required_joints")) {
     config.required_joints =
         config_dict["required_joints"].cast<std::vector<std::string>>();
+  }
+  if (config_dict.contains("executor_thread_count")) {
+    config.executor_thread_count = size_t_from_python(
+        config_dict["executor_thread_count"], "executor_thread_count");
   }
   auto read_seconds = [&](const char* s_key, const char* ms_key, double current) {
     if (config_dict.contains(s_key)) {
@@ -2050,6 +2105,12 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           req.motion = goal;
         }
 
+        auto kernel = require_open_kernel(self);
+        if (auto admission_error =
+                kernel->collision_validation_admission_error()) {
+          return error_result_to_python(*admission_error);
+        }
+
         RobotStateDTO start_state;
         if (start_state_obj.is_none()) {
           start_state = [&]() {
@@ -2264,6 +2325,12 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           goal.offset.position_m = {pos[0], pos[1], pos[2]};
           goal.offset.orientation = {orient[0], orient[1], orient[2], orient[3]};
           req.motion = goal;
+        }
+
+        auto kernel = require_open_kernel(self);
+        if (auto admission_error =
+                kernel->collision_validation_admission_error()) {
+          return error_result_to_python(*admission_error);
         }
 
         RobotStateDTO start_state;
@@ -2666,6 +2733,42 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               projection_metrics.terminal_retry_successes_total;
           out["scene_projection_terminal_retry_exhausted_total"] =
               projection_metrics.terminal_retry_exhausted_total;
+          const auto progress_metrics = [&]() {
+            py::gil_scoped_release release;
+            return ros_execution->controller_progress_metrics();
+          }();
+          out["controller_executor_thread_count"] =
+              progress_metrics.executor_thread_count;
+          out["controller_state_callbacks_total"] =
+              progress_metrics.state_callbacks_total;
+          out["controller_action_feedback_callbacks_total"] =
+              progress_metrics.action_feedback_callbacks_total;
+          out["controller_action_result_callbacks_total"] =
+              progress_metrics.action_result_callbacks_total;
+          out["controller_command_progress_samples_total"] =
+              progress_metrics.command_progress_samples_total;
+          out["controller_cancel_confirmations_total"] =
+              progress_metrics.cancel_confirmations_total;
+          out["controller_stop_confirmations_total"] =
+              progress_metrics.stop_confirmations_total;
+          out["controller_latest_state_sample_age_ns"] =
+              progress_metrics.latest_state_sample_age_ns;
+          out["controller_last_command_progress_latency_ns"] =
+              progress_metrics.last_command_progress_latency_ns;
+          out["controller_max_command_progress_latency_ns"] =
+              progress_metrics.max_command_progress_latency_ns;
+          out["controller_last_action_result_latency_ns"] =
+              progress_metrics.last_action_result_latency_ns;
+          out["controller_max_action_result_latency_ns"] =
+              progress_metrics.max_action_result_latency_ns;
+          out["controller_last_cancel_latency_ns"] =
+              progress_metrics.last_cancel_latency_ns;
+          out["controller_max_cancel_latency_ns"] =
+              progress_metrics.max_cancel_latency_ns;
+          out["controller_last_stop_confirmation_latency_ns"] =
+              progress_metrics.last_stop_confirmation_latency_ns;
+          out["controller_max_stop_confirmation_latency_ns"] =
+              progress_metrics.max_stop_confirmation_latency_ns;
         }
 #endif
         return out;

@@ -295,9 +295,16 @@ MeasuredRestWaitResult wait_for_measured_rest_after_confirmed_stop(
     IExecutionBackend& backend,
     double settle_velocity_threshold_rad_s,
     std::chrono::steady_clock::time_point deadline,
-    std::stop_token stop_token) {
+    std::stop_token stop_token,
+    std::function<bool()> abort_requested) {
   MeasuredRestWaitResult result;
   while (true) {
+    if (abort_requested && abort_requested()) {
+      result.at_rest = false;
+      result.timed_out = true;
+      result.aborted = true;
+      return result;
+    }
     const auto snapshot = backend.get_execution_snapshot();
     if (is_command_authoritative_stop_snapshot(snapshot)) {
       result.at_rest = true;

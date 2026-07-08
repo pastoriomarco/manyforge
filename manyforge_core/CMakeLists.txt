@@ -208,6 +208,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_collision_validation_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_collision_resource_manager
+    test/test_collision_resource_manager.cpp)
+  target_link_libraries(test_collision_resource_manager PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_collision_resource_manager
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_parallel_collision_validation_worker_pool
     test/test_parallel_collision_validation_worker_pool.cpp)
   target_link_libraries(test_parallel_collision_validation_worker_pool PRIVATE

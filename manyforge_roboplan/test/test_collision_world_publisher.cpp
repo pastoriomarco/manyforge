@@ -292,6 +292,63 @@ TEST_F(CollisionWorldPublisherTest,
 }
 
 TEST_F(CollisionWorldPublisherTest,
+       RuntimePublishedBundleUpdatesOnSceneAndPolicyWrites) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  const auto after_add_revision = context_->current_collision_world_revision();
+  auto after_add_bundle =
+      context_->published_runtime_collision_snapshot_bundle();
+  ASSERT_TRUE(after_add_bundle.world);
+  EXPECT_EQ(after_add_bundle.world->revision.revision_id,
+            after_add_revision.revision_id);
+  ASSERT_TRUE(after_add_bundle.policy.has_value());
+  EXPECT_EQ(after_add_bundle.policy->revision.revision_id,
+            after_add_revision.revision_id);
+  EXPECT_TRUE(std::any_of(after_add_bundle.world->bodies.begin(),
+                          after_add_bundle.world->bodies.end(),
+                          [](const CollisionWorldBody& body) {
+                            return body.body_id == "object/box_a/shape/0";
+                          }));
+
+  UpdateObjectPoseRequestDTO update;
+  update.object_id = "box_a";
+  update.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  update.pose.orientation.w = 1.0;
+  update.frame_id = "universe";
+  update.source_timestamp_ns = 123'000'000;
+  update.source_freshness_budget_ns = 50'000'000;
+  ASSERT_TRUE(context_->update_object_pose(update).success);
+  const auto after_update_revision = context_->current_collision_world_revision();
+  auto after_update_bundle =
+      context_->published_runtime_collision_snapshot_bundle();
+  ASSERT_TRUE(after_update_bundle.world);
+  ASSERT_TRUE(after_update_bundle.policy.has_value());
+  EXPECT_EQ(after_update_bundle.world->revision.revision_id,
+            after_update_revision.revision_id);
+  auto body_it = std::find_if(after_update_bundle.world->bodies.begin(),
+                              after_update_bundle.world->bodies.end(),
+                              [](const CollisionWorldBody& body) {
+                                return body.body_id == "object/box_a/shape/0";
+                              });
+  ASSERT_NE(body_it, after_update_bundle.world->bodies.end());
+  ASSERT_TRUE(body_it->source_timestamp_ns.has_value());
+  EXPECT_EQ(*body_it->source_timestamp_ns, 123'000'000);
+
+  auto policy = *after_update_bundle.policy;
+  policy.policy_id = "runtime_policy_override";
+  context_->set_collision_policy_snapshot(policy);
+  const auto after_policy_revision = context_->current_collision_world_revision();
+  auto after_policy_bundle =
+      context_->published_runtime_collision_snapshot_bundle();
+  ASSERT_TRUE(after_policy_bundle.world);
+  ASSERT_TRUE(after_policy_bundle.policy.has_value());
+  EXPECT_EQ(after_policy_bundle.world->revision.revision_id,
+            after_policy_revision.revision_id);
+  EXPECT_EQ(after_policy_bundle.policy->policy_id, "runtime_policy_override");
+  EXPECT_EQ(after_policy_bundle.policy->revision.revision_id,
+            after_policy_revision.revision_id);
+}
+
+TEST_F(CollisionWorldPublisherTest,
        UpdatePoseRejectsPartialSourceFreshnessMetadataWithoutRevisionBump) {
   ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
   const auto before = context_->current_collision_world_revision();

@@ -13,6 +13,7 @@
 #include <future>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -101,15 +102,15 @@ TEST(NativeSchedulerTest, SimpleSchedulerHonorsFutureDeadline) {
   EXPECT_TRUE(fired.load());
 }
 
-TEST(NativeSchedulerTest, MonitoringLaneFiresWhileSafetyLaneIsBlocked) {
+TEST(NativeSchedulerTest, MonitoringLaneFiresWhileRuntimeSafetyLaneIsBlocked) {
   // Audit K3 regression: with the previous single-worker scheduler a
-  // long-blocking Safety callback (e.g. collision_check_tick stuck
+  // long-blocking runtime-safety callback (e.g. collision_check_tick stuck
   // waiting on the scene mutex) would prevent the Monitoring watchdog
   // from firing — including the watchdog whose job is to abort that
   // stall. With the split scheduler the lanes are independent.
   SimpleScheduler scheduler;
-  std::atomic<bool> safety_can_exit{false};
-  std::atomic<bool> safety_running{false};
+  std::atomic<bool> runtime_safety_can_exit{false};
+  std::atomic<bool> runtime_safety_running{false};
   std::atomic<bool> monitoring_fired{false};
 
   const auto schedule_at = [&](int64_t offset_ns) {
@@ -120,17 +121,17 @@ TEST(NativeSchedulerTest, MonitoringLaneFiresWhileSafetyLaneIsBlocked) {
     return now_ns + offset_ns;
   };
 
-  // Safety callback parks itself until the test releases it; mirrors
+  // Runtime-safety callback parks itself until the test releases it; mirrors
   // a collision_check_tick stalled on `scene_mutex_` during a long RRT.
   scheduler.schedule(
       schedule_at(10'000'000LL),
       [&]() {
-        safety_running.store(true);
-        while (!safety_can_exit.load()) {
+        runtime_safety_running.store(true);
+        while (!runtime_safety_can_exit.load()) {
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
       },
-      SchedulerPriority::Safety);
+      SchedulerPriority::RuntimeSafety);
 
   // Monitoring callback must fire even while Safety is parked.
   scheduler.schedule(
@@ -146,18 +147,213 @@ TEST(NativeSchedulerTest, MonitoringLaneFiresWhileSafetyLaneIsBlocked) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 
-  EXPECT_TRUE(safety_running.load())
-      << "Safety callback did not reach its parking loop";
+  EXPECT_TRUE(runtime_safety_running.load())
+      << "Runtime-safety callback did not reach its parking loop";
   EXPECT_TRUE(monitoring_fired.load())
-      << "Monitoring watchdog did not fire while Safety lane was blocked";
+      << "Monitoring watchdog did not fire while runtime-safety lane was blocked";
 
-  // Release the parked Safety callback so the scheduler destructor
+  // Release the parked runtime-safety callback so the scheduler destructor
   // does not race with a still-running task.
-  safety_can_exit.store(true);
+  runtime_safety_can_exit.store(true);
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
 }
 
-TEST(NativeSchedulerTest, DrainWaitsForDequeuedSafetyCallback) {
+TEST(NativeSchedulerTest, ControllerCommandLaneFiresWhileOtherRolesAreBlocked) {
+  SimpleScheduler scheduler;
+  std::atomic<bool> release_blocked_roles{false};
+  std::atomic<int> blocked_roles_running{0};
+  std::atomic<bool> controller_fired{false};
+
+  const auto schedule_at = [&](int64_t offset_ns) {
+    const auto now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    return now_ns + offset_ns;
+  };
+
+  const auto block_role = [&](SchedulerPriority priority) {
+    scheduler.schedule(
+        schedule_at(10'000'000LL),
+        [&]() {
+          blocked_roles_running.fetch_add(1);
+          while (!release_blocked_roles.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+        },
+        priority);
+  };
+
+  block_role(SchedulerPriority::RuntimeSafety);
+  block_role(SchedulerPriority::StopControl);
+  block_role(SchedulerPriority::Lifecycle);
+  block_role(SchedulerPriority::Monitoring);
+  block_role(SchedulerPriority::Background);
+
+  scheduler.schedule(
+      schedule_at(20'000'000LL),
+      [&]() { controller_fired.store(true); },
+      SchedulerPriority::ControllerCommand);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (!controller_fired.load() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  EXPECT_EQ(blocked_roles_running.load(), 5);
+  EXPECT_TRUE(controller_fired.load())
+      << "Controller-command lane was starved by blocked lower-priority roles";
+
+  release_blocked_roles.store(true);
+  EXPECT_TRUE(scheduler.drain_all_for(std::chrono::seconds(1)));
+}
+
+TEST(NativeSchedulerTest, RuntimeSafetyLaneFiresWhileLifecycleLaneIsBlocked) {
+  SimpleScheduler scheduler;
+  std::atomic<bool> release_lifecycle{false};
+  std::atomic<bool> lifecycle_running{false};
+  std::atomic<bool> runtime_safety_fired{false};
+
+  const auto schedule_at = [&](int64_t offset_ns) {
+    const auto now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    return now_ns + offset_ns;
+  };
+
+  scheduler.schedule(
+      schedule_at(10'000'000LL),
+      [&]() {
+        lifecycle_running.store(true);
+        while (!release_lifecycle.load()) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      },
+      SchedulerPriority::Lifecycle);
+  scheduler.schedule(
+      schedule_at(20'000'000LL),
+      [&]() { runtime_safety_fired.store(true); },
+      SchedulerPriority::RuntimeSafety);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (!runtime_safety_fired.load() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  EXPECT_TRUE(lifecycle_running.load());
+  EXPECT_TRUE(runtime_safety_fired.load())
+      << "Runtime-safety lane was starved by blocked lifecycle work";
+
+  release_lifecycle.store(true);
+  EXPECT_TRUE(scheduler.drain_all_for(std::chrono::seconds(1)));
+}
+
+TEST(NativeSchedulerTest, StopControlLaneFiresWhileLowerRolesAreBlocked) {
+  SimpleScheduler scheduler;
+  std::atomic<bool> release_blocked_roles{false};
+  std::atomic<int> blocked_roles_running{0};
+  std::atomic<bool> stop_control_fired{false};
+
+  const auto schedule_at = [&](int64_t offset_ns) {
+    const auto now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    return now_ns + offset_ns;
+  };
+  const auto block_role = [&](SchedulerPriority priority) {
+    scheduler.schedule(
+        schedule_at(10'000'000LL),
+        [&]() {
+          blocked_roles_running.fetch_add(1);
+          while (!release_blocked_roles.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+        },
+        priority);
+  };
+
+  block_role(SchedulerPriority::Lifecycle);
+  block_role(SchedulerPriority::Monitoring);
+  block_role(SchedulerPriority::Background);
+
+  scheduler.schedule(
+      schedule_at(20'000'000LL),
+      [&]() { stop_control_fired.store(true); },
+      SchedulerPriority::StopControl);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (!stop_control_fired.load() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  EXPECT_EQ(blocked_roles_running.load(), 3);
+  EXPECT_TRUE(stop_control_fired.load())
+      << "Stop-control lane was starved by blocked lower-priority roles";
+
+  release_blocked_roles.store(true);
+  EXPECT_TRUE(scheduler.drain_all_for(std::chrono::seconds(1)));
+}
+
+TEST(NativeSchedulerTest, DestructionWakesParkedWorkersOnAllRoles) {
+  auto scheduler = std::make_unique<SimpleScheduler>();
+  const auto far_future =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          (std::chrono::steady_clock::now() + std::chrono::seconds(60))
+              .time_since_epoch())
+          .count();
+  for (std::size_t i = 0; i < kSchedulerPriorityCount; ++i) {
+    scheduler->schedule(
+        far_future,
+        []() { ADD_FAILURE() << "far-future callback fired during teardown"; },
+        scheduler_priority_at(i));
+  }
+
+  auto destroy_future = std::async(std::launch::async, [&]() {
+    scheduler.reset();
+  });
+  EXPECT_EQ(destroy_future.wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+}
+
+TEST(NativeSchedulerTest, BackgroundCallbackExceptionDoesNotStopWorker) {
+  SimpleScheduler scheduler;
+  std::atomic<bool> followup_fired{false};
+
+  const auto now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  scheduler.schedule(
+      now_ns,
+      []() { throw std::runtime_error("background diagnostic failed"); },
+      SchedulerPriority::Background);
+  scheduler.schedule(
+      now_ns + 1'000'000LL,
+      [&]() { followup_fired.store(true); },
+      SchedulerPriority::Background);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (!followup_fired.load() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  EXPECT_TRUE(followup_fired.load())
+      << "Background worker stopped after a contained callback exception";
+  EXPECT_TRUE(
+      scheduler.drain_for(SchedulerPriority::Background, std::chrono::seconds(1)));
+}
+
+TEST(NativeSchedulerTest, DrainWaitsForDequeuedRuntimeSafetyCallback) {
   SimpleScheduler scheduler;
   std::promise<void> callback_entered;
   auto callback_entered_future = callback_entered.get_future();
@@ -174,13 +370,13 @@ TEST(NativeSchedulerTest, DrainWaitsForDequeuedSafetyCallback) {
         callback_entered.set_value();
         release_callback_future.wait();
       },
-      SchedulerPriority::Safety);
+      SchedulerPriority::RuntimeSafety);
 
   ASSERT_EQ(callback_entered_future.wait_for(std::chrono::seconds(1)),
             std::future_status::ready);
 
   auto drain_future = std::async(std::launch::async, [&]() {
-    scheduler.drain(SchedulerPriority::Safety);
+    scheduler.drain(SchedulerPriority::RuntimeSafety);
   });
   EXPECT_EQ(drain_future.wait_for(std::chrono::milliseconds(20)),
             std::future_status::timeout);
@@ -190,7 +386,7 @@ TEST(NativeSchedulerTest, DrainWaitsForDequeuedSafetyCallback) {
             std::future_status::ready);
 }
 
-TEST(NativeSchedulerTest, DrainForTimesOutWhileSafetyCallbackIsBlocked) {
+TEST(NativeSchedulerTest, DrainForTimesOutWhileRuntimeSafetyCallbackIsBlocked) {
   SimpleScheduler scheduler;
   std::promise<void> callback_entered;
   auto callback_entered_future = callback_entered.get_future();
@@ -207,14 +403,15 @@ TEST(NativeSchedulerTest, DrainForTimesOutWhileSafetyCallbackIsBlocked) {
         callback_entered.set_value();
         release_callback_future.wait();
       },
-      SchedulerPriority::Safety);
+      SchedulerPriority::RuntimeSafety);
 
   ASSERT_EQ(callback_entered_future.wait_for(std::chrono::seconds(1)),
             std::future_status::ready);
 
   const auto start = std::chrono::steady_clock::now();
   EXPECT_FALSE(
-      scheduler.drain_for(SchedulerPriority::Safety, std::chrono::milliseconds(20)));
+      scheduler.drain_for(SchedulerPriority::RuntimeSafety,
+                          std::chrono::milliseconds(20)));
   EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start)
                 .count(),
@@ -222,7 +419,8 @@ TEST(NativeSchedulerTest, DrainForTimesOutWhileSafetyCallbackIsBlocked) {
 
   release_callback.set_value();
   EXPECT_TRUE(
-      scheduler.drain_for(SchedulerPriority::Safety, std::chrono::seconds(1)));
+      scheduler.drain_for(SchedulerPriority::RuntimeSafety,
+                          std::chrono::seconds(1)));
 }
 
 // --- Planning Context ---

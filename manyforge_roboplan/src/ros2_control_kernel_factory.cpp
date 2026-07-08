@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <mutex>
 
+#include <manyforge_core/collision/collision_resource_manager.hpp>
 #include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_roboplan/roboplan_execution_state_sink.hpp>
@@ -66,12 +67,14 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
       std::make_shared<roboplan::SimpleIk>(bundle->scene, single_shot_ik_opts);
 
   bundle->scene_mutex = std::make_shared<std::mutex>();
+  const auto policy = kernel_config.baseline_collision_policy_snapshot.value_or(
+      default_collision_policy_snapshot());
   bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
       bundle->scene, rrt_opts, bundle->shortcutter, bundle->toppra, bundle->ik,
       bundle->scene_mutex, bundle->single_shot_ik, ik_opts,
       single_shot_ik_opts);
   bundle->context = std::make_unique<RoboPlanPlanningContext>(
-      bundle->scene, group_name, bundle->scene_mutex);
+      bundle->scene, group_name, bundle->scene_mutex, policy);
   bundle->clock = std::make_unique<WallClock>();
   bundle->execution_state_sink =
       std::make_shared<RoboPlanExecutionStateSink>(
@@ -81,12 +84,16 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
   bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->cache = std::make_unique<core::TrajectoryCache>();
 
-  const auto policy = kernel_config.baseline_collision_policy_snapshot.value_or(
-      default_collision_policy_snapshot());
-  bundle->context->set_collision_policy_snapshot(policy);
   const int collision_worker_count =
       core::env_validation_collision_workers(
           std::max(1, kernel_config.validation_collision_workers));
+  bundle->collision_runtime_monitor_engine =
+      std::make_shared<manyforge::collision::ManyForgeCollisionEngine>(
+          model_name,
+          std::filesystem::path(urdf_path),
+          std::filesystem::path(srdf_path),
+          pkg_paths,
+          group_name);
   bundle->collision_validation_engines.reserve(collision_worker_count);
   for (int i = 0; i < collision_worker_count; ++i) {
     bundle->collision_validation_engines.push_back(
@@ -97,6 +104,22 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
             pkg_paths,
             group_name));
   }
+  {
+    core::CollisionPipelineResources collision_resources;
+    collision_resources.snapshot_publisher = bundle->context.get();
+    collision_resources.runtime_monitor_engine =
+        bundle->collision_runtime_monitor_engine;
+    collision_resources.validation_engines =
+        bundle->collision_validation_engines;
+    const auto admission =
+        core::CollisionResourceManager::validate_admission(
+            collision_resources, /*runtime_protection_active=*/true);
+    if (!admission.admitted()) {
+      throw std::runtime_error(
+          "ros2_control kernel collision resources are not runtime-safe: " +
+          admission.resource_conflict_reason);
+    }
+  }
 
   core::ExecutionKernelConfig resolved_kernel_config = kernel_config;
   resolved_kernel_config.validation_collision_workers = collision_worker_count;
@@ -105,8 +128,9 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
       *bundle->clock, *bundle->scheduler, *bundle->cache,
       resolved_kernel_config);
   bundle->kernel->set_collision_validation_policy_snapshot(policy);
-  bundle->kernel->set_collision_validation_pipeline(
+  bundle->kernel->set_collision_resources(
       *bundle->context,
+      bundle->collision_runtime_monitor_engine,
       bundle->collision_validation_engines);
   bundle->event_collector.subscribe(*bundle->kernel);
   return bundle;

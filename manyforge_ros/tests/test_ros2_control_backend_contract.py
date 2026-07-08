@@ -48,6 +48,7 @@ def _create_bundle(
     controller_state_topic: str,
     wait_s: float,
     config_overrides: dict | None = None,
+    kernel_config_overrides: dict | None = None,
     model_name: str = "ur5_test",
     urdf_path: Path = URDF_PATH,
     srdf_path: Path = SRDF_PATH,
@@ -77,7 +78,7 @@ def _create_bundle(
         str(srdf_path),
         package_paths,
         config,
-        None,
+        kernel_config_overrides,
     )
 
 
@@ -128,6 +129,21 @@ def test_ros2_control_backend_rejects_sim_tolerance_override_outside_commanded_s
                 "execution_state_source_mode": "observed_robot",
                 "disable_controller_path_tolerances": True,
             },
+        )
+
+
+def test_ros2_control_backend_rejects_negative_executor_thread_count():
+    suffix = uuid.uuid4().hex
+
+    with pytest.raises(ValueError, match="executor_thread_count must be >= 0"):
+        _create_bundle(
+            action_name=f"/manyforge_contract_executor_guard_{suffix}/follow_joint_trajectory",
+            joint_state_topic=f"/manyforge_contract_executor_guard_{suffix}/joint_states",
+            controller_state_topic=(
+                f"/manyforge_contract_executor_guard_{suffix}/controller_state"
+            ),
+            wait_s=0.05,
+            config_overrides={"executor_thread_count": -1},
         )
 
 
@@ -1039,9 +1055,165 @@ def test_ros2_control_monitor_exits_promptly_after_stop_confirmation():
     node = rclpy.create_node(f"manyforge_contract_stopwake_{suffix}")
     stop_event = threading.Event()
     fake_server = None
+    spin_thread = None
+    publish_thread = None
     bundle = None
 
     try:
+        joint_pub = node.create_publisher(JointState, joint_state_topic, 10)
+        state_pub = node.create_publisher(
+            JointTrajectoryControllerState,
+            controller_state_topic,
+            10,
+        )
+
+        def publish_state_loop() -> None:
+            while not stop_event.is_set():
+                joint_state = JointState()
+                joint_state.name = list(JOINTS)
+                joint_state.position = list(START_POSITIONS)
+                joint_pub.publish(joint_state)
+
+                controller_state = JointTrajectoryControllerState()
+                controller_state.joint_names = list(JOINTS)
+                controller_state.feedback = JointTrajectoryPoint()
+                controller_state.feedback.positions = list(START_POSITIONS)
+                controller_state.error = JointTrajectoryPoint()
+                controller_state.error.positions = [0.0] * len(JOINTS)
+                state_pub.publish(controller_state)
+                time.sleep(0.01)
+
+        executor.add_node(node)
+        spin_thread = threading.Thread(target=executor.spin, daemon=True)
+        publish_thread = threading.Thread(target=publish_state_loop, daemon=True)
+        spin_thread.start()
+        publish_thread.start()
+
+        fake_server = FakeFollowJointTrajectoryServer(
+            node,
+            action_name=action_name,
+            hold_after_first_feedback_s=10.0,
+            reentrant_callbacks=True,
+        )
+
+        bundle = _create_bundle(
+            action_name=action_name,
+            joint_state_topic=joint_state_topic,
+            controller_state_topic=controller_state_topic,
+            wait_s=5.0,
+            config_overrides={
+                # Large period makes any sleep-gated path visible; the
+                # condvar fix must keep latencies far below it.
+                "monitor_period_s": 0.5,
+                # The fake server never moves the joints; disable the
+                # tracking fault so it cannot race this latency probe.
+                "tracking_error_timeout_s": 0.0,
+            },
+            kernel_config_overrides={
+                # This test isolates the ros2_control backend monitor wakeup.
+                # The generic UR5 fixture can trip runtime collision monitoring
+                # before reset, which measures fault-preempt reset behavior
+                # instead of the backend monitor-period sleep this regression
+                # is guarding.
+                "collision_monitor_period_ns": 5_000_000_000,
+            },
+        )
+        time.sleep(1.5)
+
+        samples = []
+        # Vary the reset phase within the 0.5 s monitor period.
+        for index, phase_delay_s in enumerate((0.15, 0.35, 0.55)):
+            result = _execute_joint_goal(bundle, f"stop_wake_probe_{index}")
+            assert result["ok"] is True
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                state_name = bundle.get_execution_snapshot().get("state_name")
+                if state_name == "Executing":
+                    break
+                time.sleep(0.01)
+            assert bundle.get_execution_snapshot().get("state_name") == "Executing"
+            time.sleep(phase_delay_s)
+            assert bundle.get_execution_snapshot().get("state_name") == "Executing"
+
+            t0 = time.monotonic()
+            reset_result = bundle.reset()
+            duration_s = time.monotonic() - t0
+            assert reset_result["accepted"] is True, (
+                "reset rejected: %r" % (reset_result,)
+            )
+            samples.append(duration_s)
+            time.sleep(0.2)
+
+        print(
+            "\n6C_LATENCY_EVIDENCE reset_during_execution_s="
+            + ",".join(f"{s:.3f}" for s in samples)
+            + f" max={max(samples):.3f} monitor_period_s=0.5"
+        )
+        # After the condvar fix every sample sits near the cancel round-trip
+        # (tens of ms); before it, the max across phases approaches the full
+        # period. Half the period bounds the max robustly.
+        assert max(samples) < 0.25, (
+            f"reset paid a monitor-period sleep: max={max(samples):.3f}s "
+            "(worker not woken by terminal intent)"
+        )
+    finally:
+        stop_event.set()
+        if bundle is not None:
+            try:
+                bundle.reset()
+            except RuntimeError:
+                pass
+        executor.shutdown()
+        if spin_thread is not None:
+            spin_thread.join(timeout=1.0)
+        if publish_thread is not None:
+            publish_thread.join(timeout=1.0)
+        if fake_server is not None:
+            fake_server.destroy()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_ros2_control_stop_observes_cancel_for_held_active_goal():
+    """RT-3: controller-progress tests must prove cancel can make progress
+    while a goal execute callback is still holding the active goal. This uses
+    the fake server's explicit responsive-controller mode and checks both ends:
+    the fake goal observes cancel, and the backend reports a cancel
+    confirmation metric."""
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("control_msgs")
+    pytest.importorskip("trajectory_msgs")
+
+    from control_msgs.msg import JointTrajectoryControllerState
+    from rclpy.executors import MultiThreadedExecutor
+    from sensor_msgs.msg import JointState
+    from trajectory_msgs.msg import JointTrajectoryPoint
+
+    from manyforge_ros.testing.fake_follow_joint_trajectory import (
+        FakeFollowJointTrajectoryServer,
+    )
+
+    suffix = uuid.uuid4().hex
+    action_name = f"/manyforge_contract_cancel_{suffix}/follow_joint_trajectory"
+    joint_state_topic = f"/manyforge_contract_cancel_{suffix}/joint_states"
+    controller_state_topic = f"/manyforge_contract_cancel_{suffix}/controller_state"
+
+    rclpy.init(args=None)
+    executor = MultiThreadedExecutor(num_threads=2)
+    node = rclpy.create_node(f"manyforge_contract_cancel_{suffix}")
+    stop_event = threading.Event()
+    fake_server = None
+    spin_thread = None
+    publish_thread = None
+    bundle = None
+
+    try:
+        fake_server = FakeFollowJointTrajectoryServer(
+            node,
+            action_name=action_name,
+            hold_after_first_feedback_s=10.0,
+            reentrant_callbacks=True,
+        )
         joint_pub = node.create_publisher(JointState, joint_state_topic, 10)
         state_pub = node.create_publisher(
             JointTrajectoryControllerState,
@@ -1077,66 +1249,51 @@ def test_ros2_control_monitor_exits_promptly_after_stop_confirmation():
             controller_state_topic=controller_state_topic,
             wait_s=5.0,
             config_overrides={
-                # Large period makes any sleep-gated path visible; the
-                # condvar fix must keep latencies far below it.
                 "monitor_period_s": 0.5,
-                # The fake server never moves the joints; disable the
-                # tracking fault so it cannot race this latency probe.
                 "tracking_error_timeout_s": 0.0,
+            },
+            kernel_config_overrides={
+                "collision_monitor_period_ns": 5_000_000_000,
             },
         )
         time.sleep(1.5)
 
-        samples = []
-        # Vary the reset phase within the 0.5 s monitor period; a fresh fake
-        # server per iteration (its hold blocks per goal).
-        for index, phase_delay_s in enumerate((0.15, 0.35, 0.55)):
-            fake_server = FakeFollowJointTrajectoryServer(
-                node,
-                action_name=action_name,
-                hold_after_first_feedback_s=10.0,
+        result = _execute_joint_goal(bundle, "held_goal_cancel_probe")
+        assert result["ok"] is True
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if bundle.get_execution_snapshot().get("state_name") == "Executing":
+                break
+            time.sleep(0.01)
+        assert bundle.get_execution_snapshot().get("state_name") == "Executing"
+
+        metrics_before = bundle.get_metrics()
+        cancel_confirmations_before = metrics_before[
+            "controller_cancel_confirmations_total"
+        ]
+
+        stop_result = bundle.stop()
+        assert stop_result["accepted"] is True, stop_result
+
+        deadline = time.monotonic() + 5.0
+        metrics_after = {}
+        while time.monotonic() < deadline:
+            metrics_after = bundle.get_metrics()
+            goal_canceled = bool(fake_server.goals and fake_server.goals[-1].canceled)
+            cancel_confirmed = (
+                metrics_after["controller_cancel_confirmations_total"]
+                > cancel_confirmations_before
             )
-            try:
-                # Settle: let the recreated action server finish discovery
-                # before dispatching (guards a teardown/recreate race).
-                time.sleep(0.25)
-                result = _execute_joint_goal(bundle, f"stop_wake_probe_{index}")
-                assert result["ok"] is True
-                deadline = time.monotonic() + 5.0
-                while time.monotonic() < deadline:
-                    state_name = bundle.get_execution_snapshot().get("state_name")
-                    if state_name == "Executing":
-                        break
-                    time.sleep(0.01)
-                assert (
-                    bundle.get_execution_snapshot().get("state_name") == "Executing"
-                )
-                time.sleep(phase_delay_s)
+            if goal_canceled and cancel_confirmed:
+                break
+            time.sleep(0.01)
 
-                t0 = time.monotonic()
-                reset_result = bundle.reset()
-                duration_s = time.monotonic() - t0
-                assert reset_result["accepted"] is True, (
-                    "reset rejected: %r" % (reset_result,)
-                )
-                samples.append(duration_s)
-                time.sleep(0.2)
-            finally:
-                fake_server.destroy()
-                fake_server = None
-
-        print(
-            "\n6C_LATENCY_EVIDENCE reset_during_execution_s="
-            + ",".join(f"{s:.3f}" for s in samples)
-            + f" max={max(samples):.3f} monitor_period_s=0.5"
+        assert fake_server.goals and fake_server.goals[-1].canceled
+        assert (
+            metrics_after["controller_cancel_confirmations_total"]
+            > cancel_confirmations_before
         )
-        # After the condvar fix every sample sits near the cancel round-trip
-        # (tens of ms); before it, the max across phases approaches the full
-        # period. Half the period bounds the max robustly.
-        assert max(samples) < 0.25, (
-            f"reset paid a monitor-period sleep: max={max(samples):.3f}s "
-            "(worker not woken by terminal intent)"
-        )
+        assert metrics_after["controller_last_cancel_latency_ns"] > 0
     finally:
         stop_event.set()
         if bundle is not None:
@@ -1144,8 +1301,12 @@ def test_ros2_control_monitor_exits_promptly_after_stop_confirmation():
                 bundle.reset()
             except RuntimeError:
                 pass
+        executor.shutdown()
+        if spin_thread is not None:
+            spin_thread.join(timeout=1.0)
+        if publish_thread is not None:
+            publish_thread.join(timeout=1.0)
         if fake_server is not None:
             fake_server.destroy()
-        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()

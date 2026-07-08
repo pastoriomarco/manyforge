@@ -1,6 +1,7 @@
 #include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -90,12 +91,76 @@ CollisionValidationDecisionBundle exception_bundle(
   return bundle;
 }
 
+CollisionValidationDecisionBundle timeout_bundle(
+    const CollisionWorldSnapshot& snapshot,
+    std::int64_t timeout_ns,
+    std::int64_t elapsed_ns) {
+  CollisionValidationDecisionBundle bundle = inconclusive_bundle();
+  bundle.borrowed_world_revision = snapshot.revision;
+  bundle.final_world_revision = snapshot.revision;
+  bundle.cancelled = true;
+  bundle.cancellation_reason = "collision_validation_wall_timeout";
+  bundle.cancelled_at_waypoint_index = 0;
+  bundle.decision.first_failing_waypoint = 0;
+  bundle.decision.collision_world_revision = snapshot.revision;
+
+  CollisionValidationWaypointRecord record;
+  record.waypoint_index = 0;
+  record.produced_decision_change = true;
+  record.result.engine_status = CollisionEngineStatus::kTimeout;
+  record.result.decision = CollisionDecisionResult::kInconclusiveFail;
+  record.result.engine_id = "parallel_collision_validation_worker_pool";
+  record.result.raw_diagnostics["reason_code"] =
+      "collision_validation_wall_timeout";
+  record.result.raw_diagnostics["timeout_ns"] = std::to_string(timeout_ns);
+  record.result.raw_diagnostics["elapsed_ns"] = std::to_string(elapsed_ns);
+  record.result.collision_world_revision = snapshot.revision;
+  bundle.waypoint_records.push_back(std::move(record));
+  return bundle;
+}
+
+CollisionValidationDecisionBundle non_owning_timeout_unsupported_bundle(
+    const CollisionWorldSnapshot& snapshot) {
+  CollisionValidationDecisionBundle bundle = inconclusive_bundle();
+  bundle.borrowed_world_revision = snapshot.revision;
+  bundle.final_world_revision = snapshot.revision;
+  bundle.decision.first_failing_waypoint = 0;
+  bundle.decision.collision_world_revision = snapshot.revision;
+
+  CollisionValidationWaypointRecord record;
+  record.waypoint_index = 0;
+  record.produced_decision_change = true;
+  record.result.engine_status = CollisionEngineStatus::kEngineError;
+  record.result.decision = CollisionDecisionResult::kInconclusiveFail;
+  record.result.engine_id = "parallel_collision_validation_worker_pool";
+  record.result.raw_diagnostics["reason_code"] =
+      "collision_validation_wall_timeout_requires_owned_lifetimes";
+  record.result.collision_world_revision = snapshot.revision;
+  bundle.waypoint_records.push_back(std::move(record));
+  return bundle;
+}
+
+struct WorkerOut {
+  int worker_index = 0;
+  int range_begin = 0;
+  CollisionValidationDecisionBundle bundle;
+  std::int64_t wall_ns = 0;
+};
+
+struct ValidationCallState {
+  std::mutex mutex;
+  std::condition_variable cv;
+  int pending_jobs = 0;
+  std::vector<WorkerOut> outputs;
+};
+
 }  // namespace
 
 struct ParallelCollisionValidationWorkerPool::WorkerSlot {
   std::mutex mutex;
   std::condition_variable cv;
   bool stop = false;
+  bool abandoned = false;
   std::function<void()> job;
   std::thread thread;
 };
@@ -109,6 +174,9 @@ ParallelCollisionValidationWorkerPool::ParallelCollisionValidationWorkerPool(
   if (config_.fallback_log_window < std::chrono::nanoseconds::zero()) {
     config_.fallback_log_window = std::chrono::nanoseconds::zero();
   }
+  if (config_.validation_wall_timeout < std::chrono::nanoseconds::zero()) {
+    config_.validation_wall_timeout = std::chrono::nanoseconds::zero();
+  }
 }
 
 ParallelCollisionValidationWorkerPool::~ParallelCollisionValidationWorkerPool() {
@@ -121,16 +189,14 @@ void ParallelCollisionValidationWorkerPool::ensure_worker_threads(int count) {
   }
   std::lock_guard<std::mutex> lock(worker_slots_mutex_);
   while (static_cast<int>(worker_slots_.size()) < count) {
-    auto slot = std::make_unique<WorkerSlot>();
-    WorkerSlot* slot_ptr = slot.get();
-    slot->thread =
-        std::thread([this, slot_ptr]() { worker_loop(*slot_ptr); });
+    auto slot = std::make_shared<WorkerSlot>();
+    slot->thread = std::thread([slot]() { worker_loop(slot); });
     worker_slots_.push_back(std::move(slot));
   }
 }
 
 void ParallelCollisionValidationWorkerPool::stop_worker_threads() {
-  std::vector<std::unique_ptr<WorkerSlot>> slots;
+  std::vector<std::shared_ptr<WorkerSlot>> slots;
   {
     std::lock_guard<std::mutex> lock(worker_slots_mutex_);
     slots.swap(worker_slots_);
@@ -145,24 +211,51 @@ void ParallelCollisionValidationWorkerPool::stop_worker_threads() {
   }
   for (auto& slot : slots) {
     if (slot->thread.joinable()) {
-      slot->thread.join();
+      if (slot->abandoned) {
+        slot->thread.detach();
+      } else {
+        slot->thread.join();
+      }
     }
   }
 }
 
-void ParallelCollisionValidationWorkerPool::worker_loop(WorkerSlot& slot) {
+void ParallelCollisionValidationWorkerPool::abandon_worker_threads() {
+  std::vector<std::shared_ptr<WorkerSlot>> slots;
+  {
+    std::lock_guard<std::mutex> lock(worker_slots_mutex_);
+    slots.swap(worker_slots_);
+  }
+  for (auto& slot : slots) {
+    {
+      std::lock_guard<std::mutex> lock(slot->mutex);
+      slot->stop = true;
+      slot->abandoned = true;
+      slot->job = nullptr;
+    }
+    slot->cv.notify_one();
+  }
+  for (auto& slot : slots) {
+    if (slot->thread.joinable()) {
+      slot->thread.detach();
+    }
+  }
+}
+
+void ParallelCollisionValidationWorkerPool::worker_loop(
+    std::shared_ptr<WorkerSlot> slot) {
   for (;;) {
     std::function<void()> job;
     {
-      std::unique_lock<std::mutex> lock(slot.mutex);
-      slot.cv.wait(lock, [&slot]() {
-        return slot.stop || static_cast<bool>(slot.job);
+      std::unique_lock<std::mutex> lock(slot->mutex);
+      slot->cv.wait(lock, [&slot]() {
+        return slot->stop || static_cast<bool>(slot->job);
       });
-      if (slot.stop && !slot.job) {
+      if (slot->stop && !slot->job) {
         return;
       }
-      job = std::move(slot.job);
-      slot.job = nullptr;
+      job = std::move(slot->job);
+      slot->job = nullptr;
     }
     try {
       if (job) {
@@ -173,17 +266,6 @@ void ParallelCollisionValidationWorkerPool::worker_loop(WorkerSlot& slot) {
       // output bundle. This guard preserves the pool's liveness if a future
       // bug lets an exception escape.
     }
-    signal_job_complete();
-  }
-}
-
-void ParallelCollisionValidationWorkerPool::signal_job_complete() {
-  std::lock_guard<std::mutex> lock(completion_mutex_);
-  if (pending_jobs_ > 0) {
-    --pending_jobs_;
-  }
-  if (pending_jobs_ == 0) {
-    completion_cv_.notify_all();
   }
 }
 
@@ -207,7 +289,20 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
     const CollisionWorldSnapshot& snapshot,
     const std::vector<ICollisionQueryEngine*>& worker_engines,
     const TrajectoryDTO& trajectory,
-    const CollisionCancellationToken& cancel) {
+    CollisionCancellationToken& cancel) {
+  return validate_trajectory(snapshot,
+                             worker_engines,
+                             trajectory,
+                             cancel,
+                             config_.pass_config);
+}
+
+CollisionValidationDecisionBundle
+ParallelCollisionValidationWorkerPool::validate_trajectory(
+    const CollisionWorldSnapshot& snapshot,
+    const std::vector<std::shared_ptr<ICollisionQueryEngine>>& worker_engines,
+    const TrajectoryDTO& trajectory,
+    const std::shared_ptr<CollisionCancellationToken>& cancel) {
   return validate_trajectory(snapshot,
                              worker_engines,
                              trajectory,
@@ -220,25 +315,87 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
     const CollisionWorldSnapshot& snapshot,
     const std::vector<ICollisionQueryEngine*>& worker_engines,
     const TrajectoryDTO& trajectory,
-    const CollisionCancellationToken& cancel,
+    CollisionCancellationToken& cancel,
+    CollisionValidationPassConfig pass_config) {
+  if (config_.validation_wall_timeout > std::chrono::nanoseconds::zero()) {
+    std::lock_guard<std::mutex> call_lock(validation_call_mutex_);
+    last_telemetry_ = {};
+    last_telemetry_.workers_actually_used = 0;
+    last_telemetry_.fallback_reason =
+        "validation_wall_timeout_requires_owned_lifetimes";
+    last_telemetry_.collision_geometry_count = snapshot.geometry_count;
+    return non_owning_timeout_unsupported_bundle(snapshot);
+  }
+  std::vector<EngineRef> engine_refs;
+  engine_refs.reserve(worker_engines.size());
+  for (ICollisionQueryEngine* engine : worker_engines) {
+    engine_refs.push_back(EngineRef{engine, {}});
+  }
+  auto cancel_ref =
+      std::shared_ptr<CollisionCancellationToken>(
+          &cancel, [](CollisionCancellationToken*) {});
+  return validate_trajectory_impl(snapshot,
+                                  engine_refs,
+                                  trajectory,
+                                  cancel_ref,
+                                  std::move(pass_config));
+}
+
+CollisionValidationDecisionBundle
+ParallelCollisionValidationWorkerPool::validate_trajectory(
+    const CollisionWorldSnapshot& snapshot,
+    const std::vector<std::shared_ptr<ICollisionQueryEngine>>& worker_engines,
+    const TrajectoryDTO& trajectory,
+    const std::shared_ptr<CollisionCancellationToken>& cancel,
+    CollisionValidationPassConfig pass_config) {
+  std::vector<EngineRef> engine_refs;
+  engine_refs.reserve(worker_engines.size());
+  for (const auto& engine : worker_engines) {
+    engine_refs.push_back(EngineRef{engine.get(), engine});
+  }
+  return validate_trajectory_impl(snapshot,
+                                  engine_refs,
+                                  trajectory,
+                                  cancel,
+                                  std::move(pass_config));
+}
+
+CollisionValidationDecisionBundle
+ParallelCollisionValidationWorkerPool::validate_trajectory_impl(
+    const CollisionWorldSnapshot& snapshot,
+    const std::vector<ParallelCollisionValidationWorkerPool::EngineRef>& worker_engines,
+    const TrajectoryDTO& trajectory,
+    const std::shared_ptr<CollisionCancellationToken>& cancel,
     CollisionValidationPassConfig pass_config) {
   std::lock_guard<std::mutex> call_lock(validation_call_mutex_);
 
-  std::vector<ICollisionQueryEngine*> available_engines;
+  if (!cancel) {
+    CollisionValidationDecisionBundle bundle = inconclusive_bundle();
+    bundle.borrowed_world_revision = snapshot.revision;
+    bundle.final_world_revision = snapshot.revision;
+    bundle.decision.collision_world_revision = snapshot.revision;
+    return bundle;
+  }
+
+  std::vector<EngineRef> available_engines;
   available_engines.reserve(worker_engines.size());
   bool skipped_duplicate_single_context_engine = false;
-  for (ICollisionQueryEngine* engine : worker_engines) {
+  for (const auto& engine_ref : worker_engines) {
+    ICollisionQueryEngine* engine = engine_ref.ptr;
     if (engine == nullptr) {
       continue;
     }
     if (engine->capability().thread_safety ==
             CollisionEngineThreadSafetyClass::kSingleContextExclusive &&
-        std::find(available_engines.begin(), available_engines.end(),
-                  engine) != available_engines.end()) {
+        std::find_if(available_engines.begin(),
+                     available_engines.end(),
+                     [engine](const EngineRef& existing) {
+                       return existing.ptr == engine;
+                     }) != available_engines.end()) {
       skipped_duplicate_single_context_engine = true;
       continue;
     }
-    available_engines.push_back(engine);
+    available_engines.push_back(engine_ref);
   }
 
   const auto previous_geometry_count = config_.collision_geometry_count;
@@ -260,25 +417,101 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
   const int worker_count_available = static_cast<int>(available_engines.size());
 
   auto run_engine_serial_fallback =
-      [&](ICollisionQueryEngine& engine, std::string fallback_reason)
+      [&](EngineRef engine_ref, std::string fallback_reason)
       -> CollisionValidationDecisionBundle {
     const auto t0 = steady_now_ns();
+    auto run_serial = [&]() -> CollisionValidationDecisionBundle {
+      try {
+        CollisionValidationCoordinator coord(pass_config);
+        return coord.validate_trajectory(snapshot,
+                                         *engine_ref.ptr,
+                                         trajectory,
+                                         *cancel);
+      } catch (const std::exception& e) {
+        return exception_bundle(
+            snapshot,
+            reason_codes::kCollisionValidationSerialFallbackException,
+            "std_exception",
+            e.what());
+      } catch (...) {
+        return exception_bundle(
+            snapshot,
+            reason_codes::kCollisionValidationSerialFallbackException,
+            reason_codes::kUnknownNonStdException,
+            reason_codes::kUnknownNonStdException);
+      }
+    };
+
     CollisionValidationDecisionBundle bundle;
-    try {
-      CollisionValidationCoordinator coord(pass_config);
-      bundle = coord.validate_trajectory(snapshot, engine, trajectory, cancel);
-    } catch (const std::exception& e) {
-      bundle = exception_bundle(
-          snapshot,
-          reason_codes::kCollisionValidationSerialFallbackException,
-          "std_exception",
-          e.what());
-    } catch (...) {
-      bundle = exception_bundle(
-          snapshot,
-          reason_codes::kCollisionValidationSerialFallbackException,
-          reason_codes::kUnknownNonStdException,
-          reason_codes::kUnknownNonStdException);
+    const auto wall_timeout = config_.validation_wall_timeout;
+    if (wall_timeout <= std::chrono::nanoseconds::zero()) {
+      bundle = run_serial();
+    } else {
+      auto state = std::make_shared<ValidationCallState>();
+      state->pending_jobs = 1;
+      state->outputs.resize(1);
+      auto snapshot_copy = std::make_shared<CollisionWorldSnapshot>(snapshot);
+      auto trajectory_copy = std::make_shared<TrajectoryDTO>(trajectory);
+      auto pass_config_copy =
+          std::make_shared<CollisionValidationPassConfig>(pass_config);
+      std::thread worker([state,
+                          snapshot_copy,
+                          trajectory_copy,
+                          pass_config_copy,
+                          engine_ref,
+                          cancel]() mutable {
+        WorkerOut out;
+        out.worker_index = 0;
+        out.range_begin = 0;
+        const auto worker_t0 = steady_now_ns();
+        try {
+          CollisionValidationCoordinator coord(*pass_config_copy);
+          out.bundle = coord.validate_trajectory(*snapshot_copy,
+                                                 *engine_ref.ptr,
+                                                 *trajectory_copy,
+                                                 *cancel);
+        } catch (const std::exception& e) {
+          out.bundle = exception_bundle(
+              *snapshot_copy,
+              reason_codes::kCollisionValidationSerialFallbackException,
+              "std_exception",
+              e.what());
+        } catch (...) {
+          out.bundle = exception_bundle(
+              *snapshot_copy,
+              reason_codes::kCollisionValidationSerialFallbackException,
+              reason_codes::kUnknownNonStdException,
+              reason_codes::kUnknownNonStdException);
+        }
+        out.wall_ns = steady_now_ns() - worker_t0;
+        {
+          std::lock_guard<std::mutex> lock(state->mutex);
+          state->outputs[0] = std::move(out);
+          state->pending_jobs = 0;
+        }
+        state->cv.notify_all();
+      });
+      bool completed = false;
+      {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        completed = state->cv.wait_for(
+            lock, wall_timeout, [&state]() { return state->pending_jobs == 0; });
+      }
+      if (completed) {
+        worker.join();
+        bundle = std::move(state->outputs[0].bundle);
+      } else {
+        cancel->request_cancel("collision_validation_wall_timeout");
+        const auto elapsed = steady_now_ns() - t0;
+        bundle = timeout_bundle(
+            snapshot,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(wall_timeout)
+                .count(),
+            elapsed);
+        if (worker.joinable()) {
+          worker.detach();
+        }
+      }
     }
     const auto t1 = steady_now_ns();
     last_telemetry_.workers_actually_used = 1;
@@ -328,21 +561,21 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
 
   if (desired_workers <= 1) {
     return run_engine_serial_fallback(
-        *available_engines[0],
+        available_engines[0],
         skipped_duplicate_single_context_engine
             ? "single_context_duplicate_engine"
             : "worker_count_one");
   }
   if (waypoint_count < config_.min_waypoints_for_parallel) {
-    return run_engine_serial_fallback(*available_engines[0],
+    return run_engine_serial_fallback(available_engines[0],
                                       "trajectory_too_short");
   }
   if (has_support_contacts) {
-    return run_engine_serial_fallback(*available_engines[0],
+    return run_engine_serial_fallback(available_engines[0],
                                       "support_contact_policy_active");
   }
   if (contact_grasp_present) {
-    return run_engine_serial_fallback(*available_engines[0],
+    return run_engine_serial_fallback(available_engines[0],
                                       "contact_grasp_policy_active");
   }
 
@@ -356,16 +589,17 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
     cursor += len;
   }
 
-  struct WorkerOut {
-    int worker_index = 0;
-    int range_begin = 0;
-    CollisionValidationDecisionBundle bundle;
-    std::int64_t wall_ns = 0;
-  };
+  auto snapshot_shared = std::make_shared<CollisionWorldSnapshot>(snapshot);
+  auto trajectory_shared = std::make_shared<TrajectoryDTO>(trajectory);
+  auto pass_config_shared =
+      std::make_shared<CollisionValidationPassConfig>(pass_config);
 
-  auto run_worker = [&snapshot, &trajectory, &cancel, &pass_config](
+  auto run_worker = [snapshot_shared,
+                     trajectory_shared,
+                     pass_config_shared,
+                     cancel](
                         int worker_index,
-                        ICollisionQueryEngine* engine,
+                        EngineRef engine_ref,
                         int range_begin,
                         int range_end) -> WorkerOut {
     WorkerOut out;
@@ -373,24 +607,24 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
     out.range_begin = range_begin;
     const auto t0 = steady_now_ns();
     try {
-      CollisionValidationPassConfig per_worker_cfg = pass_config;
+      CollisionValidationPassConfig per_worker_cfg = *pass_config_shared;
       CollisionValidationCoordinator coord(std::move(per_worker_cfg));
       out.bundle = coord.validate_trajectory_range(
-          snapshot,
-          *engine,
-          trajectory,
+          *snapshot_shared,
+          *engine_ref.ptr,
+          *trajectory_shared,
           static_cast<std::size_t>(range_begin),
           static_cast<std::size_t>(range_end),
-          cancel);
+          *cancel);
     } catch (const std::exception& e) {
       out.bundle =
-          exception_bundle(snapshot,
+          exception_bundle(*snapshot_shared,
                            reason_codes::kCollisionValidationWorkerException,
                            "std_exception",
                            e.what());
     } catch (...) {
       out.bundle =
-          exception_bundle(snapshot,
+          exception_bundle(*snapshot_shared,
                            reason_codes::kCollisionValidationWorkerException,
                            reason_codes::kUnknownNonStdException,
                            reason_codes::kUnknownNonStdException);
@@ -400,34 +634,79 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
   };
 
   const auto pool_t0 = steady_now_ns();
-  std::vector<WorkerOut> outputs(static_cast<std::size_t>(desired_workers));
+  auto call_state = std::make_shared<ValidationCallState>();
+  call_state->pending_jobs = desired_workers;
+  call_state->outputs.resize(static_cast<std::size_t>(desired_workers));
   ensure_worker_threads(desired_workers);
-  {
-    std::lock_guard<std::mutex> lock(completion_mutex_);
-    pending_jobs_ = desired_workers;
-  }
   {
     std::lock_guard<std::mutex> slots_lock(worker_slots_mutex_);
     for (int w = 0; w < desired_workers; ++w) {
-      auto& slot = *worker_slots_[static_cast<std::size_t>(w)];
+      auto slot = worker_slots_[static_cast<std::size_t>(w)];
       const auto range_begin = ranges[static_cast<std::size_t>(w)].first;
       const auto range_end = ranges[static_cast<std::size_t>(w)].second;
+      auto engine_ref = available_engines[static_cast<std::size_t>(w)];
       {
-        std::lock_guard<std::mutex> slot_lock(slot.mutex);
-        slot.job = [&, w, range_begin, range_end]() {
-          outputs[static_cast<std::size_t>(w)] =
-              run_worker(w, available_engines[static_cast<std::size_t>(w)],
-                         range_begin, range_end);
+        std::lock_guard<std::mutex> slot_lock(slot->mutex);
+        slot->job = [call_state,
+                     run_worker,
+                     w,
+                     engine_ref,
+                     range_begin,
+                     range_end]() mutable {
+          auto out = run_worker(w, engine_ref, range_begin, range_end);
+          {
+            std::lock_guard<std::mutex> lock(call_state->mutex);
+            call_state->outputs[static_cast<std::size_t>(w)] =
+                std::move(out);
+            if (call_state->pending_jobs > 0) {
+              --call_state->pending_jobs;
+            }
+          }
+          call_state->cv.notify_all();
         };
       }
-      slot.cv.notify_one();
+      slot->cv.notify_one();
     }
   }
+  bool completed = false;
   {
-    std::unique_lock<std::mutex> lock(completion_mutex_);
-    completion_cv_.wait(lock, [this]() { return pending_jobs_ == 0; });
+    std::unique_lock<std::mutex> lock(call_state->mutex);
+    if (config_.validation_wall_timeout > std::chrono::nanoseconds::zero()) {
+      completed = call_state->cv.wait_for(
+          lock,
+          config_.validation_wall_timeout,
+          [&call_state]() { return call_state->pending_jobs == 0; });
+    } else {
+      call_state->cv.wait(
+          lock, [&call_state]() { return call_state->pending_jobs == 0; });
+      completed = true;
+    }
   }
   const auto pool_t1 = steady_now_ns();
+  if (!completed) {
+    cancel->request_cancel("collision_validation_wall_timeout");
+    abandon_worker_threads();
+    const auto timeout_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            config_.validation_wall_timeout)
+            .count();
+    last_telemetry_.workers_actually_used = desired_workers;
+    last_telemetry_.fallback_reason = "validation_wall_timeout";
+    last_telemetry_.total_wall_ns = pool_t1 - pool_t0;
+    last_telemetry_.total_worker_wall_ns = 0;
+    last_telemetry_.per_worker_waypoint_counts.assign(
+        static_cast<std::size_t>(desired_workers), 0);
+    last_telemetry_.support_contact_active = support_contact_present;
+    last_telemetry_.collision_geometry_count = snapshot.geometry_count;
+    last_telemetry_.validation_wall_time_p95_ns = 0;
+    last_telemetry_.serial_reference_wall_ns.reset();
+    return timeout_bundle(snapshot, timeout_ns, pool_t1 - pool_t0);
+  }
+  std::vector<WorkerOut> outputs;
+  {
+    std::lock_guard<std::mutex> lock(call_state->mutex);
+    outputs = std::move(call_state->outputs);
+  }
 
   CollisionValidationDecisionBundle merged;
   merged.borrowed_world_revision = snapshot.revision;
@@ -559,7 +838,7 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
   merged.decision.first_failing_waypoint = first_failing_wp;
   merged.decision.first_failing_time_ns = first_failing_time_ns;
   merged.decision.collision_world_revision = snapshot.revision;
-  if (!cancelled && cancel.is_cancel_requested()) {
+  if (!cancelled && cancel->is_cancel_requested()) {
     cancelled = true;
     const auto late_cancel_index =
         trajectory.waypoints.empty()
@@ -567,7 +846,7 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
             : static_cast<std::int64_t>(trajectory.waypoints.size() - 1);
     cancelled_at_waypoint_index = late_cancel_index;
     cancelled_at_time_ns = waypoint_time_ns(late_cancel_index);
-    cancellation_reason = cancel.reason();
+    cancellation_reason = cancel->reason();
   }
   if (cancelled) {
     merged.cancelled = true;
@@ -626,8 +905,10 @@ ParallelCollisionValidationWorkerPool::validate_trajectory(
     const auto ref_t0 = steady_now_ns();
     try {
       CollisionValidationCoordinator ref_coord(pass_config);
-      (void)ref_coord.validate_trajectory(snapshot, *available_engines[0],
-                                          trajectory, cancel);
+      (void)ref_coord.validate_trajectory(snapshot,
+                                          *available_engines[0].ptr,
+                                          trajectory,
+                                          *cancel);
     } catch (const std::exception&) {
       last_telemetry_.serial_reference_wall_ns.reset();
       return merged;

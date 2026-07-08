@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <map>
 #include <optional>
 #include <set>
@@ -18,6 +19,12 @@ struct Ros2ControlExecutionBackendConfig {
   std::string joint_state_topic = "/joint_states";
   std::string controller_state_topic;
   std::vector<std::string> required_joints;
+
+  // RT-3: ROS2 controller command/progress callbacks use a dedicated action
+  // callback group, state subscriptions use a dedicated state group, and
+  // non-critical callbacks remain on the default group. Three executor threads
+  // is the safe minimum that lets those groups make progress independently.
+  std::size_t executor_thread_count = 3;
 
   double joint_state_max_age_s = 0.25;
   double wait_for_state_timeout_s = 1.0;

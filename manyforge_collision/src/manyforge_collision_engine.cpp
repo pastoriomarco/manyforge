@@ -5,6 +5,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <map>
@@ -203,6 +204,26 @@ bool timeout_budget_covers_snapshot_sync(core::CollisionSurface surface) {
       return false;
     default:
       return true;
+  }
+}
+
+void record_timeout_budget(core::CollisionResult& result,
+                           const core::CollisionQuery& query) {
+  if (query.timeout_budget_ns) {
+    result.raw_diagnostics["timeout_budget_ns"] =
+        std::to_string(*query.timeout_budget_ns);
+  }
+}
+
+void record_timeout_exceeded(core::CollisionResult& result,
+                             const core::CollisionQuery& query,
+                             bool includes_snapshot_sync) {
+  record_timeout_budget(result, query);
+  result.raw_diagnostics["timeout_includes_snapshot_sync"] =
+      includes_snapshot_sync ? "true" : "false";
+  if (result.query_duration_ns) {
+    result.raw_diagnostics["timeout_observed_duration_ns"] =
+        std::to_string(*result.query_duration_ns);
   }
 }
 
@@ -591,6 +612,9 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
   capability_.engine_id = engine_id_;
   capability_.engine_version = engine_version_;
   capability_.library_lineage = "manyforge_collision_pinocchio_coal";
+  capability_.mutable_context_id =
+      engine_id_ + "/context/" +
+      std::to_string(reinterpret_cast<std::uintptr_t>(this));
   capability_.supported_geometry_kinds = {
       "box", "sphere", "cylinder", "triangle_mesh"};
   capability_.supports_distance_query = true;
@@ -672,6 +696,7 @@ core::CollisionResult ManyForgeCollisionEngine::check(
   }
   if (query.timeout_budget_ns && *query.timeout_budget_ns <= 0) {
     finish_with_duration();
+    record_timeout_budget(result, query);
     result.engine_status = core::CollisionEngineStatus::kTimeout;
     result.decision = core::CollisionDecisionResult::kInconclusiveFail;
     return result;
@@ -700,6 +725,20 @@ core::CollisionResult ManyForgeCollisionEngine::check(
           std::to_string(snapshot_sync_duration_ns);
       return result;
     }
+    if (timeout_budget_covers_snapshot_sync(query.surface) &&
+        query.timeout_budget_ns &&
+        snapshot_sync_duration_ns > *query.timeout_budget_ns) {
+      result.raw_diagnostics["snapshot_sync_duration_ns"] =
+          std::to_string(snapshot_sync_duration_ns);
+      result.raw_diagnostics["total_call_duration_ns"] =
+          std::to_string(elapsed_ns_since(t_start));
+      result.query_duration_ns = snapshot_sync_duration_ns;
+      record_timeout_exceeded(result, query,
+                              /*includes_snapshot_sync=*/true);
+      result.engine_status = core::CollisionEngineStatus::kTimeout;
+      result.decision = core::CollisionDecisionResult::kInconclusiveFail;
+      return result;
+    }
     result = check_locked(query, &snapshot, &cancel);
     const auto total_call_duration_ns = elapsed_ns_since(t_start);
     result.raw_diagnostics["snapshot_sync_duration_ns"] =
@@ -716,10 +755,13 @@ core::CollisionResult ManyForgeCollisionEngine::check(
     if (timeout_budget_covers_snapshot_sync(query.surface)) {
       result.query_duration_ns = total_call_duration_ns;
     }
-    if (result.engine_status == core::CollisionEngineStatus::kOk &&
+    if ((result.engine_status == core::CollisionEngineStatus::kOk ||
+         result.engine_status == core::CollisionEngineStatus::kTimeout) &&
         query.timeout_budget_ns &&
         result.query_duration_ns &&
         *result.query_duration_ns > *query.timeout_budget_ns) {
+      record_timeout_exceeded(
+          result, query, timeout_budget_covers_snapshot_sync(query.surface));
       result.engine_status = core::CollisionEngineStatus::kTimeout;
       result.decision = core::CollisionDecisionResult::kInconclusiveFail;
       return result;
@@ -777,6 +819,7 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
   }
   if (query.timeout_budget_ns && *query.timeout_budget_ns <= 0) {
     finish_with_duration();
+    record_timeout_budget(result, query);
     result.engine_status = core::CollisionEngineStatus::kTimeout;
     result.decision = core::CollisionDecisionResult::kInconclusiveFail;
     return result;
@@ -981,6 +1024,7 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
   if (query.timeout_budget_ns &&
       result.query_duration_ns &&
       *result.query_duration_ns > *query.timeout_budget_ns) {
+    record_timeout_exceeded(result, query, /*includes_snapshot_sync=*/false);
     result.engine_status = core::CollisionEngineStatus::kTimeout;
     result.decision = core::CollisionDecisionResult::kInconclusiveFail;
     return result;

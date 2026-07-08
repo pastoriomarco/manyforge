@@ -28,6 +28,7 @@ enum class ErrorCode {
     kCartesianIncomplete,
     kStartStateMismatch,
     kValidationCollision,
+    kValidationDeferred,
     kValidationLimitsViolation,
     kObjectAlreadyExists,
     kObjectNotFound,
@@ -66,6 +67,7 @@ inline const char* to_string(ErrorCode code) {
         case kCartesianIncomplete: return "cartesian_incomplete";
         case kStartStateMismatch: return "start_state_mismatch";
         case kValidationCollision: return "validation_collision";
+        case kValidationDeferred: return "validation_deferred";
         case kValidationLimitsViolation: return "validation_limits_violation";
         case kObjectAlreadyExists: return "object_already_exists";
         case kObjectNotFound: return "object_not_found";
@@ -255,6 +257,7 @@ inline const char* kErrorCartesianIncomplete = "cartesian_incomplete";
 // Validation (pre-execution gate)
 inline const char* kErrorStartStateMismatch = "start_state_mismatch";
 inline const char* kErrorValidationCollision = "validation_collision";
+inline const char* kErrorValidationDeferred = "validation_deferred";
 inline const char* kErrorValidationLimitsViolation = "validation_limits_violation";
 inline const char* kErrorSceneChangedDuringValidation =
     "scene_changed_during_validation";

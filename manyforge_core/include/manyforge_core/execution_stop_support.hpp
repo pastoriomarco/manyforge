@@ -11,6 +11,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -38,6 +39,7 @@ struct MeasuredRestWaitResult {
   bool settle_signal_available = false;
   bool at_rest = true;
   bool timed_out = false;
+  bool aborted = false;
 };
 
 struct StopFallbackQualificationRow {
@@ -92,7 +94,8 @@ MeasuredRestWaitResult wait_for_measured_rest_after_confirmed_stop(
     IExecutionBackend& backend,
     double settle_velocity_threshold_rad_s,
     std::chrono::steady_clock::time_point deadline,
-    std::stop_token stop_token);
+    std::stop_token stop_token,
+    std::function<bool()> abort_requested = {});
 bool operator_controlled_stop_allowed(ExecutionState state);
 
 const StopFallbackQualificationRow* qualified_stop_fallback_pair(

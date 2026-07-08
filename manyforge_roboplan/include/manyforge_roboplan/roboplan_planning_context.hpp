@@ -53,7 +53,9 @@ class RoboPlanPlanningContext final
 
   explicit RoboPlanPlanningContext(std::shared_ptr<roboplan::Scene> scene,
                                   std::string group_name = "",
-                                  std::shared_ptr<std::mutex> scene_mutex = nullptr);
+                                  std::shared_ptr<std::mutex> scene_mutex = nullptr,
+                                  std::optional<core::CollisionPolicySnapshot>
+                                      initial_policy_snapshot = std::nullopt);
   ~RoboPlanPlanningContext() override;
 
   core::RobotStateDTO get_current_state() override;
@@ -178,6 +180,11 @@ class RoboPlanPlanningContext final
   /// fail-closed diagnostic condition.
   core::CollisionWorldSnapshotPtr snapshot() const override;
 
+  /// Leaf revision probe for runtime monitors. Updated atomically with scene
+  /// mutation publication but readable without borrowing scene_mutex_.
+  core::CollisionWorldRevision published_collision_world_revision()
+      const override;
+
   /// Current policy overlay paired with the collision-world snapshot.
   ///
   /// The snapshot is rebuilt from current scene-object state on every call so
@@ -186,6 +193,12 @@ class RoboPlanPlanningContext final
   /// revision used by the kernel validation pass.
   std::optional<core::CollisionPolicySnapshot>
   collision_policy_snapshot() const override;
+
+  core::CollisionWorldPolicySnapshotBundle
+  collision_world_policy_snapshot_bundle() const override;
+
+  core::CollisionWorldPolicySnapshotBundle
+  published_runtime_collision_snapshot_bundle() const override;
 
  private:
   struct TrackedObjectState {
@@ -340,6 +353,13 @@ class RoboPlanPlanningContext final
   std::string world_content_hash_;
   std::deque<core::CollisionWorldLedgerEntry> world_ledger_;
   static constexpr std::size_t kCollisionWorldLedgerCapacity = 32;
+  mutable std::mutex published_revision_mutex_;
+  core::CollisionWorldRevision published_revision_;
+
+  // Publish-on-write runtime monitor bundle. Writers update this cache while
+  // holding scene_mutex_; runtime ticks read it through this leaf mutex only.
+  mutable std::mutex published_runtime_bundle_mutex_;
+  core::CollisionWorldPolicySnapshotBundle published_runtime_bundle_;
 
   mutable core::CollisionWorldSnapshotPtr snapshot_cache_;
   mutable std::uint64_t snapshot_cache_revision_id_ = 0;

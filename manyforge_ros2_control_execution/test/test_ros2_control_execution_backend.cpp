@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -309,6 +310,24 @@ class FakeFjtServer {
     return true;
   }
 
+  bool publish_feedback(double actual_position) {
+    std::shared_ptr<ServerGoalHandleFJT> goal_handle;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      goal_handle = goal_handle_;
+    }
+    if (!goal_handle) {
+      return false;
+    }
+    auto feedback = std::make_shared<FollowJointTrajectory::Feedback>();
+    feedback->joint_names = {"joint_1"};
+    feedback->desired.positions = {actual_position};
+    feedback->actual.positions = {actual_position};
+    feedback->error.positions = {0.0};
+    goal_handle->publish_feedback(feedback);
+    return true;
+  }
+
  private:
   std::shared_ptr<rclcpp::Context> context_;
   rclcpp::Node::SharedPtr node_;
@@ -324,6 +343,23 @@ TEST(Ros2ControlExecutionBackendTest, RejectsNullExecutionStateSink) {
   core::FakeClock clock;
   EXPECT_THROW(
       Ros2ControlExecutionBackend(nullptr, "arm", clock, base_config()),
+      std::invalid_argument);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     RejectsExecutorThreadCountBelowCallbackGroupMinimum) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  auto config = base_config();
+  config.executor_thread_count = 2;
+
+  EXPECT_THROW(
+      Ros2ControlExecutionBackend(
+          Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+          sink,
+          "arm",
+          clock,
+          config),
       std::invalid_argument);
 }
 
@@ -457,7 +493,9 @@ TEST(Ros2ControlExecutionBackendTest,
   config.joint_state_max_age_s = 5.0;
   config.tracking_error_tolerance_rad = 10.0;
   config.tracking_error_timeout_s = 10.0;
+  config.executor_thread_count = 3;
   Ros2ControlExecutionBackend backend(sink, "arm", clock, config);
+  EXPECT_TRUE(backend.testing_action_progress_has_dedicated_callback_group());
 
   ASSERT_TRUE(publisher.wait_for_subscription());
   bool initial_sample_observed = false;
@@ -516,6 +554,17 @@ TEST(Ros2ControlExecutionBackendTest,
   EXPECT_EQ(snapshot.state, core::ExecutionState::kCompleted);
   ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
   EXPECT_NEAR(snapshot.joint_positions_rad.front(), 0.42, 1e-9);
+
+  const auto metrics = backend.controller_progress_metrics();
+  EXPECT_EQ(metrics.executor_thread_count, 3u);
+  EXPECT_GT(metrics.state_callbacks_total, 0u);
+  EXPECT_GT(metrics.action_feedback_callbacks_total, 0u);
+  EXPECT_GT(metrics.action_result_callbacks_total, 0u);
+  // The fake server publishes its first feedback immediately when accepting the
+  // goal. This must count as command progress even if it races the caller
+  // thread returning from async_send_goal().
+  EXPECT_GT(metrics.command_progress_samples_total, 0u);
+  EXPECT_GT(metrics.last_action_result_latency_ns, 0u);
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -732,6 +781,32 @@ TEST(Ros2ControlExecutionBackendTest,
 
   EXPECT_TRUE(backend.testing_managed_fjt_terminal_received());
   EXPECT_TRUE(backend.testing_managed_fjt_terminal_success());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ManagedTerminalWaitWakesOnStopTokenWithoutNotify) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      base_config());
+
+  std::stop_source stop_source;
+  const auto started = std::chrono::steady_clock::now();
+  auto future = std::async(std::launch::async, [&]() {
+    return backend.testing_wait_for_managed_terminal_or_stop(
+        stop_source.get_token(), 5s);
+  });
+
+  std::this_thread::sleep_for(20ms);
+  stop_source.request_stop();
+  ASSERT_EQ(future.wait_for(500ms), std::future_status::ready)
+      << "token-aware managed-stop waits must not sleep until deadline";
+  EXPECT_FALSE(future.get());
+  EXPECT_LT(std::chrono::steady_clock::now() - started, 1s);
 }
 
 }  // namespace

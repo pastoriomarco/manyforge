@@ -26,7 +26,7 @@ class ManualScheduler final : public IScheduler {
   /// across worker pools; see `SchedulerPriority`.
   ScheduleHandle schedule(
       TimePoint deadline, std::function<void()> callback,
-      SchedulerPriority priority = SchedulerPriority::Safety) override {
+      SchedulerPriority priority = SchedulerPriority::Lifecycle) override {
     std::lock_guard<std::mutex> lock(mutex_);
     ScheduleHandle handle = next_handle_++;
     last_priority_ = priority;
@@ -81,7 +81,7 @@ class ManualScheduler final : public IScheduler {
   /// Allows multiple callbacks at the same deadline; sorted by deadline.
   std::multimap<TimePoint, std::pair<ScheduleHandle, std::function<void()>>> pending_;
   uint64_t next_handle_;
-  SchedulerPriority last_priority_ = SchedulerPriority::Safety;
+  SchedulerPriority last_priority_ = SchedulerPriority::Lifecycle;
 };
 
 }  // namespace manyforge::core

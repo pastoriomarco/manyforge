@@ -296,9 +296,9 @@ void RuntimeCollisionMonitor::stop(bool drain_callbacks) {
       }
     }
     if (drain_callbacks) {
-      if (!scheduler_.drain_for(SchedulerPriority::Safety,
+      if (!scheduler_.drain_for(SchedulerPriority::RuntimeSafety,
                                 kDrainCallbacksTimeout)) {
-        terminate_runtime_monitor_drain_timeout("scheduler_safety_lane",
+        terminate_runtime_monitor_drain_timeout("scheduler_runtime_safety_lane",
                                                  fail_closed_dump_hook_);
       }
     }
@@ -640,7 +640,8 @@ void RuntimeCollisionMonitor::schedule_next_locked(std::uint64_t generation) {
           return;
         }
         schedule_next_locked(generation);
-      });
+      },
+      SchedulerPriority::RuntimeSafety);
 }
 
 }  // namespace manyforge::core

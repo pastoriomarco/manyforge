@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -33,22 +34,12 @@ class WallClock final : public core::IClock {
   core::TimePoint now() const override;
 };
 
-/// Production scheduler with priority-split worker threads.
+/// Production scheduler with role-split worker threads.
 ///
-/// Maintains two independent worker pools, each a single `std::jthread`:
-///
-///   - The Safety lane runs collision-monitor ticks, soft-stop deceleration
-///     timers, and other lifecycle bookkeeping. Callbacks here may take
-///     blocking locks (e.g. RoboPlan's scene lock) and so may be paused
-///     for the duration of a long planner/RRT call.
-///   - The Monitoring lane runs planning-timeout watchdogs and similar
-///     non-blocking probes. By construction it does NOT share a thread
-///     with the Safety lane, so a stalled Safety callback can never
-///     starve the watchdog that exists to abort that stall.
-///
-/// This split is the local fix for audit K3 — the single-worker variant
-/// could deadlock when collision_check_tick blocked on `scene_mutex_`
-/// while the planning_timeout watchdog needed to fire on the same worker.
+/// Each SchedulerPriority owns an independent single-thread worker. This keeps
+/// controller-command progress, runtime collision ticks, stop-control deadlines,
+/// lifecycle work, monitoring, and background callbacks from starving each
+/// other while preserving deterministic per-role drain semantics.
 ///
 /// Cancellation is serialised through a shared registry that records
 /// the worker each handle belongs to.
@@ -60,7 +51,7 @@ class SimpleScheduler final : public core::IScheduler {
   core::ScheduleHandle schedule(
       core::TimePoint deadline, std::function<void()> callback,
       core::SchedulerPriority priority =
-          core::SchedulerPriority::Safety) override;
+          core::SchedulerPriority::Lifecycle) override;
   void cancel(core::ScheduleHandle handle) override;
   void drain(core::SchedulerPriority priority) override;
   bool drain_for(core::SchedulerPriority priority,
@@ -78,11 +69,14 @@ class SimpleScheduler final : public core::IScheduler {
   struct Worker {
     SimpleScheduler* owner = nullptr;
     std::mutex mutex;
-    std::condition_variable cv;
+    std::condition_variable_any cv;
     std::condition_variable drain_cv;
     std::map<core::ScheduleHandle, ScheduledTask> tasks;
     std::jthread thread;
     std::size_t callbacks_in_flight = 0;
+    std::uint64_t queue_generation = 0;
+    core::SchedulerPriority priority = core::SchedulerPriority::Lifecycle;
+    const char* thread_name = nullptr;
 
     void worker_loop(std::stop_token st);
     void ensure_started_locked(Worker* self);
@@ -100,8 +94,7 @@ class SimpleScheduler final : public core::IScheduler {
   std::mutex registry_mutex_;
   std::map<core::ScheduleHandle, core::SchedulerPriority> handle_to_priority_;
 
-  Worker safety_worker_;
-  Worker monitoring_worker_;
+  std::array<Worker, core::kSchedulerPriorityCount> workers_;
 };
 
 /// Thread-safe kernel event collector.
@@ -168,6 +161,7 @@ struct NativeKernelBundle {
   std::unique_ptr<core::TrajectoryCache> cache;
   std::unique_ptr<core::IExecutionBackend> execution;
   std::shared_ptr<core::IExecutionStateSink> execution_state_sink;
+  std::shared_ptr<core::ICollisionQueryEngine> collision_runtime_monitor_engine;
   std::vector<std::shared_ptr<core::ICollisionQueryEngine>>
       collision_validation_engines;
 

@@ -43,6 +43,8 @@ def create_ros2_control_kernel(
     deployment: Deployment,
     collision_monitor_period_ns: int | None = None,
     runtime_collision_query_timeout_ns: int | None = None,
+    validation_collision_query_timeout_ns: int | None = None,
+    validation_collision_wall_timeout_ns: int | None = None,
     runtime_dynamic_body_max_age_cap_ns: int | None = None,
 ):
     """Create a KernelClient that plans with RoboPlan and executes via C++ ROS."""
@@ -82,6 +84,14 @@ def create_ros2_control_kernel(
     if runtime_collision_query_timeout_ns is not None:
         kernel_config["runtime_collision_query_timeout_ns"] = (
             runtime_collision_query_timeout_ns
+        )
+    if validation_collision_query_timeout_ns is not None:
+        kernel_config["validation_collision_query_timeout_ns"] = (
+            validation_collision_query_timeout_ns
+        )
+    if validation_collision_wall_timeout_ns is not None:
+        kernel_config["validation_collision_wall_timeout_ns"] = (
+            validation_collision_wall_timeout_ns
         )
     if runtime_dynamic_body_max_age_cap_ns is not None:
         kernel_config["runtime_dynamic_body_max_age_cap_ns"] = (

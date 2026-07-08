@@ -42,12 +42,84 @@ interface HeadlineMapping {
 }
 
 const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
+  validation_deferred: {
+    headline: (d) => {
+      const reason = stringField(d, 'reason') || stringField(d, 'reason_code');
+      const conflict = stringField(d, 'resource_conflict_reason');
+      if (reason === 'validation_deferred_runtime_monitor_active') {
+        return conflict
+          ? `Pre-dispatch validation deferred: runtime collision monitor owns the collision resource (${conflict})`
+          : 'Pre-dispatch validation deferred: runtime collision monitor owns the collision resource';
+      }
+      return 'Pre-dispatch validation deferred';
+    },
+    hint: (d) => {
+      const guidance = stringField(d, 'operator_guidance');
+      return guidance
+        || 'Runtime collision monitoring is active, so this validation pass was not allowed to borrow its collision engine. Retry after motion/stop completes or configure an independent validation collision resource.';
+    },
+    severity: 'state',
+  },
   validation_collision: {
     headline: (d) => {
       // Pre-execute validation rejection: the planned trajectory was
       // checked against the scene snapshot before dispatch and failed.
-      // Operator action is to fix the scene or re-plan from a different
-      // start state.
+      // Engine-status failures are not necessarily geometric collisions:
+      // a timeout, unsupported geometry, diagnostic gap, cancellation, or
+      // engine exception means the validator failed closed before proving
+      // the trajectory dispatchable.
+      const engineStatus = stringField(d, 'collision_result_engine_status');
+      const reason = stringField(d, 'reason');
+      if (engineStatus === 'timeout') {
+        const timeoutReason = collisionTimeoutReason(d);
+        const observedMs = numberFieldAsMs(
+          d,
+          'collision_result_raw_timeout_observed_duration_ns',
+        )
+          ?? numberFieldAsMs(d, 'collision_result_raw_total_call_duration_ns')
+          ?? numberFieldAsMs(d, 'collision_result_raw_elapsed_ns');
+        const budgetMs = numberFieldAsMs(
+          d,
+          'collision_result_raw_timeout_budget_ns',
+        ) ?? numberFieldAsMs(d, 'collision_result_raw_timeout_ns');
+        if (observedMs !== null && budgetMs !== null) {
+          if (timeoutReason === 'collision_validation_wall_timeout') {
+            return `Pre-dispatch collision validation exceeded wall budget (${observedMs} ms > ${budgetMs} ms)`;
+          }
+          return `Pre-dispatch collision validation timed out (${observedMs} ms > ${budgetMs} ms)`;
+        }
+        if (timeoutReason === 'collision_validation_wall_timeout') {
+          return 'Pre-dispatch collision validation exceeded wall budget';
+        }
+        return 'Pre-dispatch collision validation timed out';
+      }
+      if (engineStatus === 'unsupported_geometry') {
+        const reason = stringField(d, 'collision_result_raw_snapshot_sync_error');
+        return reason
+          ? `Collision validation unsupported geometry: ${reason}`
+          : 'Collision validation hit unsupported scene geometry';
+      }
+      if (engineStatus === 'diagnostic_incomplete') {
+        const capability = stringField(d, 'collision_result_raw_required_capability');
+        const syncError = stringField(d, 'collision_result_raw_snapshot_sync_error');
+        const reason = capability || syncError;
+        return reason
+          ? `Collision validation diagnostics incomplete: ${reason}`
+          : 'Collision validation diagnostics incomplete';
+      }
+      if (engineStatus === 'cancelled' || reason === 'collision_validation_cancelled') {
+        const cancelReason = stringField(d, 'cancellation_reason')
+          || stringField(d, 'collision_result_raw_cancel_reason');
+        return cancelReason
+          ? `Pre-dispatch collision validation cancelled: ${cancelReason}`
+          : 'Pre-dispatch collision validation cancelled';
+      }
+      if (engineStatus === 'engine_error') {
+        const exception = stringField(d, 'collision_result_raw_engine_exception');
+        return exception
+          ? `Collision validation engine error: ${exception}`
+          : 'Collision validation engine error';
+      }
       const pair = stringField(d, 'collision_result_first_failure_pair');
       const wp = stringField(d, 'collision_result_waypoint_index');
       const classification = stringField(d, 'collision_result_first_failure_classification');
@@ -62,14 +134,47 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
       if (pair) {
         return `Trajectory rejected: ${prettyPair(pair)}${suffix}`;
       }
+      if (engineStatus && engineStatus !== 'ok') {
+        return `Pre-dispatch collision validation inconclusive: ${engineStatus}`;
+      }
       return 'Trajectory rejected: pre-dispatch collision validation failed';
     },
     hint: (d) => {
+      const engineStatus = stringField(d, 'collision_result_engine_status');
+      const reason = stringField(d, 'reason');
+      if (engineStatus === 'timeout') {
+        const timeoutReason = collisionTimeoutReason(d);
+        const syncMs = numberFieldAsMs(
+          d,
+          'collision_result_raw_snapshot_sync_duration_ns',
+        );
+        const syncText = syncMs !== null ? ` Snapshot sync took ${syncMs} ms.` : '';
+        if (timeoutReason === 'collision_validation_wall_timeout') {
+          return `No collision pair was reported. The validator exceeded its whole-validation wall budget before proving the trajectory safe.${syncText} Increase validation_collision_wall_timeout_ms for this deployment, reduce validation workload, or retry after the validator has a warm snapshot.`;
+        }
+        return `No collision pair was reported. The validator exceeded its pre-dispatch budget while synchronizing or querying the collision world.${syncText} Increase validation_collision_query_timeout_ms for this deployment, reduce collision-scene complexity, or retry after the validator has a warm snapshot.`;
+      }
+      if (engineStatus === 'unsupported_geometry') {
+        return 'The active collision engine could not ingest one of the scene or robot geometries. Inspect the diagnostic details, simplify or replace the unsupported geometry, then re-plan.';
+      }
+      if (engineStatus === 'diagnostic_incomplete') {
+        return 'The collision engine could not produce the diagnostics required to prove the trajectory safe. Inspect the missing capability or snapshot diagnostic below before retrying.';
+      }
+      if (engineStatus === 'cancelled' || reason === 'collision_validation_cancelled') {
+        return 'Validation was cancelled by a newer stop, reset, or fault path. Retry only after the kernel returns to a stable state.';
+      }
+      if (engineStatus === 'engine_error') {
+        return 'The collision engine threw while validating the trajectory. Inspect the exception and collision-world diagnostics before retrying.';
+      }
       const policy = supportContactPolicyText(d);
       if (policy) {
         return `The trajectory failed support-contact validation with ${policy}. Verify the active Support contacts row in Scene, adjust the contact policy or re-plan from a less penetrating pose, then retry.`;
       }
-      return 'The trajectory failed pre-dispatch validation. Inspect the colliding pair below, adjust the scene or re-plan, then retry.';
+      const pair = stringField(d, 'collision_result_first_failure_pair');
+      if (pair) {
+        return 'The trajectory failed pre-dispatch validation. Inspect the colliding pair below, adjust the scene or re-plan, then retry.';
+      }
+      return 'The trajectory failed pre-dispatch validation without a colliding pair. Inspect the engine-status diagnostics below, adjust the scene/configuration, then retry.';
     },
     severity: 'fault',
   },
@@ -312,6 +417,14 @@ function numberFieldAsMs(
     return ms.toFixed(1);
   }
   return ms.toFixed(2);
+}
+
+function collisionTimeoutReason(
+  details: Record<string, unknown> | null | undefined,
+): string {
+  return stringField(details, 'reason')
+    || stringField(details, 'cancellation_reason')
+    || stringField(details, 'collision_result_raw_reason_code');
 }
 
 /**

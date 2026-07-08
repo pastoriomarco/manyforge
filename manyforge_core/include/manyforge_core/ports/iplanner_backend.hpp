@@ -65,6 +65,10 @@ class IPlannerBackend {
     /// Request cancellation of the currently active Plan() call, if any.
     /// Backends that can interrupt planning work should honor this
     /// cooperatively at their natural polling/checkpoint boundaries. The
+    /// method must be non-blocking, lock-light, and must not call back into the
+    /// kernel: stop/reset/interrupt paths may invoke it while holding lifecycle
+    /// state needed by a wedged plan() call.
+    ///
     /// default no-op preserves source compatibility for simple deterministic
     /// test backends.
     virtual void request_cancel() {}

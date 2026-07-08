@@ -106,20 +106,21 @@ def _bool_env(name: str, default: bool = False) -> bool:
 def _resolved_robot_model_from_deployment(
     deployment: Deployment | None,
 ) -> ResolvedRobotModel | None:
-    if deployment is None or deployment.robot_config is None:
+    robot_config = getattr(deployment, "robot_config", None)
+    if deployment is None or robot_config is None:
         return None
-    if not deployment.robot_config.srdf_path:
+    if not robot_config.srdf_path:
         return None
     extra_package_paths = (
         []
-        if deployment.robot_config.package_paths
+        if robot_config.package_paths
         else default_package_paths()
     )
     return resolve_robot_model(
-        urdf_path=deployment.robot_config.urdf_path,
-        srdf_path=deployment.robot_config.srdf_path,
-        package_paths=deployment.robot_config.package_paths,
-        deployment_path=deployment.source_path,
+        urdf_path=robot_config.urdf_path,
+        srdf_path=robot_config.srdf_path,
+        package_paths=robot_config.package_paths,
+        deployment_path=getattr(deployment, "source_path", None),
         extra_package_paths=extra_package_paths,
     )
 
@@ -234,6 +235,42 @@ def _runtime_collision_query_timeout_ns_from_deployment(
     return int(timeout_ms * 1_000_000.0)
 
 
+def _validation_collision_query_timeout_ns_from_deployment(
+    deployment: Deployment | None,
+) -> int | None:
+    if deployment is None or deployment.orchestrator is None:
+        return None
+    raw_value = deployment.orchestrator.config.get(
+        "validation_collision_query_timeout_ms"
+    )
+    if raw_value is None:
+        return None
+    timeout_ms = float(raw_value)
+    if timeout_ms <= 0.0:
+        raise ValueError(
+            "orchestrator.config.validation_collision_query_timeout_ms must be > 0"
+        )
+    return int(timeout_ms * 1_000_000.0)
+
+
+def _validation_collision_wall_timeout_ns_from_deployment(
+    deployment: Deployment | None,
+) -> int | None:
+    if deployment is None or deployment.orchestrator is None:
+        return None
+    raw_value = deployment.orchestrator.config.get(
+        "validation_collision_wall_timeout_ms"
+    )
+    if raw_value is None:
+        return None
+    timeout_ms = float(raw_value)
+    if timeout_ms <= 0.0:
+        raise ValueError(
+            "orchestrator.config.validation_collision_wall_timeout_ms must be > 0"
+        )
+    return int(timeout_ms * 1_000_000.0)
+
+
 def _runtime_dynamic_body_max_age_cap_ns_from_deployment(
     deployment: Deployment | None,
 ) -> int | None:
@@ -259,6 +296,8 @@ def _kernel_config_from_deployment(
     *,
     collision_monitor_period_ns: int | None,
     runtime_collision_query_timeout_ns: int | None,
+    validation_collision_query_timeout_ns: int | None,
+    validation_collision_wall_timeout_ns: int | None,
     runtime_dynamic_body_max_age_cap_ns: int | None,
 ) -> dict[str, Any] | None:
     config: dict[str, Any] = {}
@@ -267,6 +306,14 @@ def _kernel_config_from_deployment(
     if runtime_collision_query_timeout_ns is not None:
         config["runtime_collision_query_timeout_ns"] = (
             runtime_collision_query_timeout_ns
+        )
+    if validation_collision_query_timeout_ns is not None:
+        config["validation_collision_query_timeout_ns"] = (
+            validation_collision_query_timeout_ns
+        )
+    if validation_collision_wall_timeout_ns is not None:
+        config["validation_collision_wall_timeout_ns"] = (
+            validation_collision_wall_timeout_ns
         )
     if runtime_dynamic_body_max_age_cap_ns is not None:
         config["runtime_dynamic_body_max_age_cap_ns"] = (
@@ -350,6 +397,8 @@ def _make_ros2_control_kernel(
     *,
     collision_monitor_period_ns: int | None,
     runtime_collision_query_timeout_ns: int | None,
+    validation_collision_query_timeout_ns: int | None,
+    validation_collision_wall_timeout_ns: int | None,
     runtime_dynamic_body_max_age_cap_ns: int | None,
 ):
     """Create the ROS 2 controller-backed kernel.
@@ -397,6 +446,12 @@ def _make_ros2_control_kernel(
             deployment=deployment,
             collision_monitor_period_ns=collision_monitor_period_ns,
             runtime_collision_query_timeout_ns=runtime_collision_query_timeout_ns,
+            validation_collision_query_timeout_ns=(
+                validation_collision_query_timeout_ns
+            ),
+            validation_collision_wall_timeout_ns=(
+                validation_collision_wall_timeout_ns
+            ),
             runtime_dynamic_body_max_age_cap_ns=runtime_dynamic_body_max_age_cap_ns,
         )
     except Exception as exc:
@@ -446,6 +501,12 @@ def _make_kernel(
     runtime_collision_query_timeout_ns = (
         _runtime_collision_query_timeout_ns_from_deployment(deployment)
     )
+    validation_collision_query_timeout_ns = (
+        _validation_collision_query_timeout_ns_from_deployment(deployment)
+    )
+    validation_collision_wall_timeout_ns = (
+        _validation_collision_wall_timeout_ns_from_deployment(deployment)
+    )
     runtime_dynamic_body_max_age_cap_ns = (
         _runtime_dynamic_body_max_age_cap_ns_from_deployment(deployment)
     )
@@ -458,6 +519,12 @@ def _make_kernel(
             deployment,
             collision_monitor_period_ns=collision_monitor_period_ns,
             runtime_collision_query_timeout_ns=runtime_collision_query_timeout_ns,
+            validation_collision_query_timeout_ns=(
+                validation_collision_query_timeout_ns
+            ),
+            validation_collision_wall_timeout_ns=(
+                validation_collision_wall_timeout_ns
+            ),
             runtime_dynamic_body_max_age_cap_ns=runtime_dynamic_body_max_age_cap_ns,
         )
     if execution_adapter_id not in {"execution.roboplan_native", "execution.test"}:
@@ -475,6 +542,12 @@ def _make_kernel(
             deployment,
             collision_monitor_period_ns=collision_monitor_period_ns,
             runtime_collision_query_timeout_ns=runtime_collision_query_timeout_ns,
+            validation_collision_query_timeout_ns=(
+                validation_collision_query_timeout_ns
+            ),
+            validation_collision_wall_timeout_ns=(
+                validation_collision_wall_timeout_ns
+            ),
             runtime_dynamic_body_max_age_cap_ns=runtime_dynamic_body_max_age_cap_ns,
         )
         resolved_model = _resolved_robot_model_from_deployment(deployment)

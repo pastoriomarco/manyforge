@@ -18,6 +18,9 @@ ErrorCode error_code_from_dto(const ErrorDTO& error) {
   if (error.code == kErrorValidationCollision) {
     return ErrorCode::kValidationCollision;
   }
+  if (error.code == kErrorValidationDeferred) {
+    return ErrorCode::kValidationDeferred;
+  }
   if (error.code == kErrorSceneChangedDuringValidation) {
     return ErrorCode::kSceneChangedDuringValidation;
   }

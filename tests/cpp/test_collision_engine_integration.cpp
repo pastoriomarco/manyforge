@@ -464,6 +464,13 @@ TEST(ManyForgeCollisionEngineTest,
   EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail);
   ASSERT_TRUE(result.query_duration_ns.has_value());
   EXPECT_GT(*result.query_duration_ns, *q.timeout_budget_ns);
+  EXPECT_EQ(diagnostic_int64(result.raw_diagnostics, "timeout_budget_ns"),
+            *q.timeout_budget_ns);
+  EXPECT_EQ(diagnostic_int64(result.raw_diagnostics,
+                             "timeout_observed_duration_ns"),
+            *result.query_duration_ns);
+  EXPECT_EQ(result.raw_diagnostics.at("timeout_includes_snapshot_sync"),
+            "true");
 }
 
 TEST(ManyForgeCollisionEngineTest,
@@ -865,6 +872,7 @@ TEST(ManyForgeCollisionEngineTest, ZeroTimeoutFailsClosedWithoutQueryPass) {
             manyforge::core::CollisionEngineStatus::kTimeout);
   EXPECT_EQ(result.decision,
             manyforge::core::CollisionDecisionResult::kInconclusiveFail);
+  EXPECT_EQ(diagnostic_int64(result.raw_diagnostics, "timeout_budget_ns"), 0);
 }
 
 TEST(ManyForgeCollisionEngineTest, MalformedQueryFailsClosedWithoutThrowing) {

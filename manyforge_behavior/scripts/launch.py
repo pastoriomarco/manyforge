@@ -51,6 +51,30 @@ def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, A
                 "orchestrator.config.runtime_collision_query_timeout_ms must be > 0"
             )
         config["runtime_collision_query_timeout_ns"] = int(timeout_ms * 1_000_000.0)
+    timeout_ms = deployment.orchestrator.config.get(
+        "validation_collision_query_timeout_ms"
+    )
+    if timeout_ms is not None:
+        timeout_ms = float(timeout_ms)
+        if timeout_ms <= 0.0:
+            raise ValueError(
+                "orchestrator.config.validation_collision_query_timeout_ms must be > 0"
+            )
+        config["validation_collision_query_timeout_ns"] = int(
+            timeout_ms * 1_000_000.0
+        )
+    timeout_ms = deployment.orchestrator.config.get(
+        "validation_collision_wall_timeout_ms"
+    )
+    if timeout_ms is not None:
+        timeout_ms = float(timeout_ms)
+        if timeout_ms <= 0.0:
+            raise ValueError(
+                "orchestrator.config.validation_collision_wall_timeout_ms must be > 0"
+            )
+        config["validation_collision_wall_timeout_ns"] = int(
+            timeout_ms * 1_000_000.0
+        )
     cap_ms = deployment.orchestrator.config.get(
         "runtime_dynamic_body_max_age_cap_ms"
     )

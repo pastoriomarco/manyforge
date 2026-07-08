@@ -495,6 +495,11 @@ struct CollisionEngineCapabilityDescriptor {
   std::string engine_version;
   /// Underlying library lineage: e.g. "coal" / "hpp-fcl" / "moveit_planning_scene".
   std::string library_lineage;
+  /// Identity of the mutable backend/query context, when one exists. Distinct
+  /// C++ wrappers sharing this id must be treated as one
+  /// `kSingleContextExclusive` resource for admission; missing ids fail closed
+  /// for concurrent runtime-monitor/validation use.
+  std::string mutable_context_id;
   std::vector<std::string> supported_geometry_kinds;
   bool supports_distance_query = false;
   bool supports_contact_points = false;
