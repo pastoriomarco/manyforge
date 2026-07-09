@@ -168,38 +168,73 @@ bool snapshot_too_old(std::int64_t now_ns,
 
 std::optional<std::string> validate_dynamic_body_freshness(
     const CollisionWorldSnapshot& snapshot,
+    const std::vector<CollisionWorldBodyFreshness>& body_freshness,
     std::int64_t now_ns,
     std::int64_t runtime_cap_ns,
     std::map<std::string, std::string>& details) {
+  if (!std::is_sorted(body_freshness.begin(),
+                      body_freshness.end(),
+                      [](const auto& lhs, const auto& rhs) {
+                        return lhs.body_id < rhs.body_id;
+                      })) {
+    details["dynamic_body_freshness_sidecar_status"] = "unsorted";
+    return "dynamic_body_freshness_sidecar_not_sorted";
+  }
+
+  const auto find_freshness =
+      [&](const std::string& body_id) -> const CollisionWorldBodyFreshness* {
+    auto it = std::lower_bound(
+        body_freshness.begin(), body_freshness.end(), body_id,
+        [](const CollisionWorldBodyFreshness& lhs, const std::string& rhs) {
+          return lhs.body_id < rhs;
+        });
+    if (it == body_freshness.end() || it->body_id != body_id) {
+      return nullptr;
+    }
+    return &*it;
+  };
+
   for (const auto& body : snapshot.bodies) {
-    if (!body.source_freshness_budget_ns.has_value()) {
+    const auto* freshness = find_freshness(body.body_id);
+    const auto& freshness_budget =
+        freshness != nullptr ? freshness->source_freshness_budget_ns
+                             : body.source_freshness_budget_ns;
+    const auto& source_timestamp =
+        freshness != nullptr ? freshness->source_timestamp_ns
+                             : body.source_timestamp_ns;
+    const auto& source_id =
+        freshness != nullptr ? freshness->source_id : body.source_id;
+    if (!freshness_budget.has_value()) {
       continue;
     }
     details["dynamic_body_id"] = body.body_id;
+    if (source_id.has_value()) {
+      details["dynamic_body_source_id"] = *source_id;
+    }
     details["dynamic_body_declared_freshness_budget_ns"] =
-        std::to_string(*body.source_freshness_budget_ns);
+        std::to_string(*freshness_budget);
     const auto effective_budget_ns =
         runtime_cap_ns > 0
-            ? std::min(*body.source_freshness_budget_ns, runtime_cap_ns)
-            : *body.source_freshness_budget_ns;
+            ? std::min(*freshness_budget, runtime_cap_ns)
+            : *freshness_budget;
     details["dynamic_body_effective_freshness_budget_ns"] =
         std::to_string(effective_budget_ns);
-    if (!body.source_timestamp_ns.has_value()) {
+    if (!source_timestamp.has_value()) {
       return "dynamic_body_missing_source_timestamp";
     }
     details["dynamic_body_source_timestamp_ns"] =
-        std::to_string(*body.source_timestamp_ns);
-    if (*body.source_timestamp_ns < 0) {
+        std::to_string(*source_timestamp);
+    if (*source_timestamp < 0) {
       details["dynamic_body_age_ns"] = "invalid_negative_timestamp";
       return "stale_dynamic_collision_body";
     }
-    if (*body.source_timestamp_ns > now_ns) {
+    if (*source_timestamp > now_ns) {
       details["dynamic_body_age_ns"] = "timestamp_in_future";
       details["dynamic_body_clock_skew_ns"] =
-          std::to_string(*body.source_timestamp_ns - now_ns);
+          std::to_string(*source_timestamp - now_ns);
       return "stale_dynamic_collision_body";
     }
-    const auto age_ns = now_ns - *body.source_timestamp_ns;
+    const auto age_ns = now_ns - *source_timestamp;
     details["dynamic_body_age_ns"] = std::to_string(age_ns);
     if (effective_budget_ns <= 0 || age_ns > effective_budget_ns) {
       return "stale_dynamic_collision_body";

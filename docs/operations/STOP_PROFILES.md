@@ -55,6 +55,47 @@ The backend must also report a valid hard-stop floor:
 If either profile or the hard-stop floor is missing, Composer degrades readiness
 and blocks Run.
 
+## Deployment Configuration Checklist
+
+A stop profile is a request. The backend advertises it only when the deployment
+also declares the lane-specific capability evidence needed to execute it.
+
+For ros2_control / Isaac lanes that use `operator_stop_profile.stop_mode:
+soft_on_path`, configure all of the following under `adapters.execution.config`:
+
+```yaml
+enable_soft_on_path_path_ramp: true
+soft_on_path_sample_period_s: 0.01
+soft_on_path_stop_traj_delta_s: 0.1
+soft_on_path_max_jerk_rad_s3:
+  shoulder_pan_joint: 50.0
+  shoulder_lift_joint: 50.0
+  elbow_joint: 50.0
+  wrist_1_joint: 50.0
+  wrist_2_joint: 50.0
+  wrist_3_joint: 50.0
+operator_stop_profile:
+  profile_id: operator_soft_on_path
+  stop_mode: soft_on_path
+  deceleration_time_s: 1.0
+  per_joint_max_deceleration_rad_s2:
+    shoulder_pan_joint: 10.0
+    shoulder_lift_joint: 10.0
+    elbow_joint: 10.0
+    wrist_1_joint: 10.0
+    wrist_2_joint: 10.0
+    wrist_3_joint: 10.0
+```
+
+Use the robot's actual joint names. If `soft_on_path` is selected but the path
+ramp is not enabled, jerk limits are incomplete, or the backend cannot construct
+the replacement trajectory, capability readiness reports `soft_on_path_not_enabled`
+and Composer blocks Run instead of silently falling back.
+
+The fault profile is intentionally separate. Runtime collision/fault paths should
+normally use `default_fault_stop_profile` with `hard_deceleration` or the backend's
+hard-stop floor. Do not use operator `soft_on_path` as the only fault-stop plan.
+
 ## Velocity Scaling
 
 ManyForge freezes the owned runtime velocity scale during timed controlled stops.

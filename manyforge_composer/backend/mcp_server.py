@@ -291,6 +291,10 @@ def create_mcp_server(state: ComposerState):
                 frame_id=frame_id,
             )
             result = kernel.scene_edit(request)
+            if result.success:
+                state.invalidate_pose_source_applies(
+                    reason=f"mcp_scene_edit_{operation}"
+                )
 
         return json.dumps({
             "success": result.success,

@@ -1335,6 +1335,14 @@ class NativeKernelClient(KernelClient):
     def clear_scene_trace(self) -> None:
         self._bundle.clear_scene_trace()
 
+    def scene_update_status_counters(self) -> Dict[str, int]:
+        if not hasattr(self._bundle, "scene_update_status_counters"):
+            return {}
+        return {
+            str(key): int(value)
+            for key, value in dict(self._bundle.scene_update_status_counters()).items()
+        }
+
     def invalidate_trajectories(self, action_span: Optional[ActionSpan] = None) -> None:
         _ = action_span
         self._bundle.invalidate_trajectories()
@@ -1448,6 +1456,13 @@ class NativeKernelClient(KernelClient):
         return SceneEditResult(
             success=result.get("success", False),
             error=result.get("error"),
+            update_status=result.get("update_status"),
+            collision_world_revision_changed=bool(
+                result.get("collision_world_revision_changed", False)
+            ),
+            collision_world_freshness_changed=bool(
+                result.get("collision_world_freshness_changed", False)
+            ),
         )
 
     def get_cached_trajectory(self, move_id: str) -> Optional[Trajectory]:

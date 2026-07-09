@@ -53,6 +53,7 @@ def _structured_command_error(
 
 def _refresh_visual_scene_after_reset(state: ComposerState) -> None:
     """Drop stale observer state and republish the post-reset scene."""
+    state.clear_pose_source_snapshots()
     state.clear_visual_state_snapshot()
     state.clear_visual_scene_objects_snapshot()
     refresh_result = state.refresh_visual_scene_objects_sync(reason="cycle_reset")
@@ -256,9 +257,11 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                     )
             else:
                 try:
-                    state.cycle_manager.reset(
-                        request_id=request_id if isinstance(request_id, str) else None
-                    )
+                    state.clear_pose_source_snapshots()
+                    with state.scene_edit_lock:
+                        state.cycle_manager.reset(
+                            request_id=request_id if isinstance(request_id, str) else None
+                        )
                 except RuntimeError as exc:
                     raise HTTPException(
                         status_code=409,

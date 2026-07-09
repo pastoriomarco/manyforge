@@ -33,6 +33,7 @@ bool snapshot_too_old(std::int64_t now_ns,
                       const std::string& budget_key);
 std::optional<std::string> validate_dynamic_body_freshness(
     const CollisionWorldSnapshot& snapshot,
+    const std::vector<CollisionWorldBodyFreshness>& body_freshness,
     std::int64_t now_ns,
     std::int64_t runtime_cap_ns,
     std::map<std::string, std::string>& details);

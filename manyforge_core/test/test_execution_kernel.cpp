@@ -2366,6 +2366,29 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest,
+       Execute_ObservedSceneLeaseAcceptsDefaultSnapshotObstacleDrift) {
+  enable_observed_box_lease("box");
+  bool mutated_once = false;
+  collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
+    if (!mutated_once) {
+      mutated_once = true;
+      publish_observed_box_for_lease(
+          "box", 0.25, CollisionWorldRevision{2, "box-world-2"},
+          "box-body-hash-2");
+    }
+  };
+
+  auto result = execute_sync(make_test_request("move_lease_snapshot_obstacle"));
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_TRUE(mutated_once);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(execution.execute_count, 1);
+  const auto snapshot = kernel.get_execution_snapshot();
+  ASSERT_FALSE(snapshot.error.has_value());
+}
+
+TEST_F(ExecutionKernelTest,
        Execute_CachedTrajectoryMissesAfterLeaseWorldRevisionChanges) {
   enable_observed_box_lease("box");
   cache.store("move_lease_cache", make_test_trajectory(),

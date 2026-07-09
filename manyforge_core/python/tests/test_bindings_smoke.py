@@ -323,6 +323,13 @@ def test_scene_edit_result_dto():
     
     r = manyforge_core_py.SceneEditResultDTO()
     assert r.success is False
+    assert r.update_status is None
+    assert r.collision_world_revision_changed is False
+    assert r.collision_world_freshness_changed is False
+    r.update_status = "freshness_only"
+    r.collision_world_freshness_changed = True
+    assert r.update_status == "freshness_only"
+    assert r.collision_world_freshness_changed is True
 
 
 def test_box_shape_dto():

@@ -99,6 +99,7 @@ class RoboPlanPlanningContext final
   std::vector<SceneObjectSnapshot> get_scene_objects();
   std::vector<SceneTraceEvent> get_scene_trace(size_t limit = 0);
   void clear_scene_trace();
+  std::map<std::string, std::uint64_t> scene_update_status_counters() const;
 
   /// Set the robot id namespace used when constructing normalized
   /// CollisionBodyId values for scene objects. Must be called by the kernel
@@ -233,6 +234,12 @@ class RoboPlanPlanningContext final
     bool scene_admission_allow_runtime_dynamic_obstacle = false;
   };
 
+  enum class PoseUpdateClassification {
+    kGeometryChanged,
+    kFreshnessOnly,
+    kNoOp,
+  };
+
   struct CollisionPairDiagnostic {
     std::string body_a;
     std::string body_b;
@@ -342,6 +349,14 @@ class RoboPlanPlanningContext final
       const std::string& robot_id);
   core::CollisionPolicySnapshot build_collision_policy_snapshot_locked(
       const std::string& robot_id) const;
+  std::vector<core::CollisionWorldBodyFreshness>
+  runtime_body_freshness_locked() const;
+  void publish_runtime_body_freshness_locked();
+  PoseUpdateClassification classify_pose_update_locked(
+      const std::string& object_id,
+      const TrackedObjectState& previous_state,
+      const TrackedObjectState& new_state,
+      const std::string& robot_id) const;
 
   tl::expected<void, std::string> add_geometry_locked(
       const std::string& object_id, const TrackedObjectState& state);
@@ -398,6 +413,10 @@ class RoboPlanPlanningContext final
   // holding scene_mutex_; runtime ticks read it through this leaf mutex only.
   mutable std::mutex published_runtime_bundle_mutex_;
   core::CollisionWorldPolicySnapshotBundle published_runtime_bundle_;
+  std::uint64_t scene_update_geometry_changed_count_ = 0;
+  std::uint64_t scene_update_freshness_only_count_ = 0;
+  std::uint64_t scene_update_no_op_count_ = 0;
+  std::uint64_t runtime_bundle_publish_count_ = 0;
 
   mutable core::CollisionWorldSnapshotPtr snapshot_cache_;
   mutable std::uint64_t snapshot_cache_revision_id_ = 0;

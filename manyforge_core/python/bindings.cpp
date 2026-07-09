@@ -656,6 +656,14 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def(py::init<>())
         .def_readwrite("success", &manyforge::core::SceneEditResultDTO::success)
         .def_readwrite("error", &manyforge::core::SceneEditResultDTO::error)
+        .def_readwrite("update_status",
+                       &manyforge::core::SceneEditResultDTO::update_status)
+        .def_readwrite(
+            "collision_world_revision_changed",
+            &manyforge::core::SceneEditResultDTO::collision_world_revision_changed)
+        .def_readwrite(
+            "collision_world_freshness_changed",
+            &manyforge::core::SceneEditResultDTO::collision_world_freshness_changed)
         .def("__repr__", [](const manyforge::core::SceneEditResultDTO& s) {
             return py::str("SceneEditResultDTO(success={})").format(s.success);
         });

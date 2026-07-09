@@ -344,6 +344,14 @@ def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
     ):
         top_status = "degraded"
 
+    try:
+        pose_source_apply = state.pose_source_apply_status()
+        pose_source_apply["status"] = "healthy"
+    except Exception as exc:  # pragma: no cover - defensive status surface
+        pose_source_apply = {"status": "error", "error": str(exc)}
+        if top_status == "ok":
+            top_status = "degraded"
+
     return {
         "schema_version": "manyforge.infra_heartbeat.v1",
         "status": top_status,
@@ -369,6 +377,7 @@ def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
             "scene_snapshot_lease": scene_snapshot_lease,
             "runtime_safety": runtime_safety,
             "route_executors": route_executors,
+            "pose_source_apply": pose_source_apply,
         },
     }
 

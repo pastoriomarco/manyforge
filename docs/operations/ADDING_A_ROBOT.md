@@ -185,6 +185,14 @@ adapters:
   # only the robot-specific identifiers.
 ```
 
+The execution adapter config must also declare controlled-stop capability
+evidence for the lane. In particular, selecting `soft_on_path` in
+`operator_stop_profile.stop_mode` is not enough: ros2_control / Isaac
+deployments must enable the path-ramp fields and provide per-joint jerk/decel
+limits, otherwise Composer reports `soft_on_path_not_enabled` and blocks Run.
+Use [STOP_PROFILES.md](STOP_PROFILES.md) as the checklist when cloning or
+creating a deployment.
+
 ### Field cheat-sheet
 
 | Field | Source | Notes |

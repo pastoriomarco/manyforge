@@ -391,6 +391,157 @@ TEST_F(CollisionWorldPublisherTest,
 }
 
 TEST_F(CollisionWorldPublisherTest,
+       IdenticalUpdatePoseIsNoOpWithoutRevisionBump) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  const auto before = context_->current_collision_world_revision();
+
+  UpdateObjectPoseRequestDTO req;
+  req.object_id = "box_a";
+  req.pose.position_m = Vector3DTO{0.0, 0.0, 0.5};
+  req.pose.orientation.w = 1.0;
+  req.frame_id = "universe";
+  auto result = context_->update_object_pose(req);
+  ASSERT_TRUE(result.success);
+  ASSERT_TRUE(result.update_status.has_value());
+  EXPECT_EQ(*result.update_status, "no_op");
+  EXPECT_FALSE(result.collision_world_revision_changed);
+  EXPECT_FALSE(result.collision_world_freshness_changed);
+
+  const auto after = context_->current_collision_world_revision();
+  EXPECT_EQ(after.revision_id, before.revision_id);
+  EXPECT_EQ(after.content_hash, before.content_hash);
+  const auto counters = context_->scene_update_status_counters();
+  EXPECT_EQ(counters.at("no_op"), 1u);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       FreshnessOnlyUpdateRefreshesRuntimeSidecarWithoutRevisionBump) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+
+  UpdateObjectPoseRequestDTO first;
+  first.object_id = "box_a";
+  first.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  first.pose.orientation.w = 1.0;
+  first.frame_id = "universe";
+  first.source_id = "vision";
+  first.source_timestamp_ns = 123'000'000;
+  first.source_freshness_budget_ns = 50'000'000;
+  auto first_result = context_->update_object_pose(first);
+  ASSERT_TRUE(first_result.success);
+  ASSERT_TRUE(first_result.update_status.has_value());
+  EXPECT_EQ(*first_result.update_status, "geometry_changed");
+
+  const auto before = context_->current_collision_world_revision();
+  auto before_bundle = context_->published_runtime_collision_snapshot_bundle();
+  ASSERT_TRUE(before_bundle.world);
+  ASSERT_EQ(before_bundle.body_freshness.size(), 1u);
+  EXPECT_EQ(before_bundle.body_freshness.front().body_id,
+            "object/box_a/shape/0");
+  ASSERT_TRUE(before_bundle.body_freshness.front().source_timestamp_ns);
+  EXPECT_EQ(*before_bundle.body_freshness.front().source_timestamp_ns,
+            123'000'000);
+
+  UpdateObjectPoseRequestDTO heartbeat = first;
+  heartbeat.source_timestamp_ns = 124'000'000;
+  auto heartbeat_result = context_->update_object_pose(heartbeat);
+  ASSERT_TRUE(heartbeat_result.success);
+  ASSERT_TRUE(heartbeat_result.update_status.has_value());
+  EXPECT_EQ(*heartbeat_result.update_status, "freshness_only");
+  EXPECT_FALSE(heartbeat_result.collision_world_revision_changed);
+  EXPECT_TRUE(heartbeat_result.collision_world_freshness_changed);
+
+  const auto after = context_->current_collision_world_revision();
+  EXPECT_EQ(after.revision_id, before.revision_id);
+  EXPECT_EQ(after.content_hash, before.content_hash);
+  auto after_bundle = context_->published_runtime_collision_snapshot_bundle();
+  ASSERT_TRUE(after_bundle.world);
+  EXPECT_EQ(after_bundle.world->revision.revision_id,
+            before_bundle.world->revision.revision_id);
+  ASSERT_EQ(after_bundle.body_freshness.size(), 1u);
+  ASSERT_TRUE(after_bundle.body_freshness.front().source_timestamp_ns);
+  EXPECT_EQ(*after_bundle.body_freshness.front().source_timestamp_ns,
+            124'000'000);
+
+  const auto body = find_body("object/box_a/shape/0");
+  ASSERT_TRUE(body.has_value());
+  ASSERT_TRUE(body->source_timestamp_ns.has_value());
+  EXPECT_EQ(*body->source_timestamp_ns, 123'000'000)
+      << "the immutable world snapshot is not rebuilt for freshness-only";
+  const auto counters = context_->scene_update_status_counters();
+  EXPECT_EQ(counters.at("geometry_changed"), 1u);
+  EXPECT_EQ(counters.at("freshness_only"), 1u);
+  EXPECT_GE(counters.at("runtime_bundle_published"), 3u);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       FreshnessBudgetChangeRemainsRevisionVisible) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+
+  UpdateObjectPoseRequestDTO first;
+  first.object_id = "box_a";
+  first.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  first.pose.orientation.w = 1.0;
+  first.frame_id = "universe";
+  first.source_id = "vision";
+  first.source_timestamp_ns = 123'000'000;
+  first.source_freshness_budget_ns = 50'000'000;
+  ASSERT_TRUE(context_->update_object_pose(first).success);
+  const auto before = context_->current_collision_world_revision();
+
+  UpdateObjectPoseRequestDTO changed_budget = first;
+  changed_budget.source_timestamp_ns = 124'000'000;
+  changed_budget.source_freshness_budget_ns = 60'000'000;
+  auto result = context_->update_object_pose(changed_budget);
+  ASSERT_TRUE(result.success);
+  ASSERT_TRUE(result.update_status.has_value());
+  EXPECT_EQ(*result.update_status, "geometry_changed");
+  EXPECT_TRUE(result.collision_world_revision_changed);
+
+  const auto after = context_->current_collision_world_revision();
+  EXPECT_EQ(after.revision_id, before.revision_id + 1);
+  const auto body = find_body("object/box_a/shape/0");
+  ASSERT_TRUE(body.has_value());
+  ASSERT_TRUE(body->source_freshness_budget_ns.has_value());
+  EXPECT_EQ(*body->source_freshness_budget_ns, 60'000'000);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       SourceIdChangeRecomputesBodyHashAndBumpsRevision) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+
+  UpdateObjectPoseRequestDTO first;
+  first.object_id = "box_a";
+  first.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  first.pose.orientation.w = 1.0;
+  first.frame_id = "universe";
+  first.source_id = "vision_a";
+  first.source_timestamp_ns = 123'000'000;
+  first.source_freshness_budget_ns = 50'000'000;
+  ASSERT_TRUE(context_->update_object_pose(first).success);
+  const auto before = context_->current_collision_world_revision();
+  const auto before_body = find_body("object/box_a/shape/0");
+  ASSERT_TRUE(before_body.has_value());
+  ASSERT_FALSE(before_body->body_content_hash.empty());
+
+  UpdateObjectPoseRequestDTO changed_source = first;
+  changed_source.source_id = "vision_b";
+  changed_source.source_timestamp_ns = 124'000'000;
+  auto result = context_->update_object_pose(changed_source);
+  ASSERT_TRUE(result.success);
+  ASSERT_TRUE(result.update_status.has_value());
+  EXPECT_EQ(*result.update_status, "geometry_changed");
+  EXPECT_TRUE(result.collision_world_revision_changed);
+
+  const auto after = context_->current_collision_world_revision();
+  EXPECT_EQ(after.revision_id, before.revision_id + 1);
+  const auto after_body = find_body("object/box_a/shape/0");
+  ASSERT_TRUE(after_body.has_value());
+  EXPECT_NE(after_body->body_content_hash, before_body->body_content_hash);
+  ASSERT_TRUE(after_body->source_id.has_value());
+  EXPECT_EQ(*after_body->source_id, "vision_b");
+}
+
+TEST_F(CollisionWorldPublisherTest,
        RuntimePublishedBundleUpdatesOnSceneAndPolicyWrites) {
   ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
   const auto after_add_revision = context_->current_collision_world_revision();
@@ -954,7 +1105,7 @@ TEST_F(CollisionWorldPublisherTest, AttachWithEmptyFrame_DoesNotBumpRevision) {
 // --- Content hash semantics ----------------------------------------------
 
 TEST_F(CollisionWorldPublisherTest,
-       ConsecutiveIdenticalMutationsKeepContentHashButBumpRevision) {
+       ConsecutiveIdenticalPoseUpdatesKeepContentHashAndRevision) {
   ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
 
   UpdateObjectPoseRequestDTO update;
@@ -963,13 +1114,19 @@ TEST_F(CollisionWorldPublisherTest,
   update.pose.orientation.w = 1.0;
   update.frame_id = "universe";
 
-  ASSERT_TRUE(context_->update_object_pose(update).success);
+  auto first_result = context_->update_object_pose(update);
+  ASSERT_TRUE(first_result.success);
+  ASSERT_TRUE(first_result.update_status.has_value());
+  EXPECT_EQ(*first_result.update_status, "geometry_changed");
   const auto rev1 = context_->current_collision_world_revision();
 
-  ASSERT_TRUE(context_->update_object_pose(update).success);
+  auto second_result = context_->update_object_pose(update);
+  ASSERT_TRUE(second_result.success);
+  ASSERT_TRUE(second_result.update_status.has_value());
+  EXPECT_EQ(*second_result.update_status, "no_op");
   const auto rev2 = context_->current_collision_world_revision();
 
-  EXPECT_EQ(rev2.revision_id, rev1.revision_id + 1);
+  EXPECT_EQ(rev2.revision_id, rev1.revision_id);
   EXPECT_EQ(rev2.content_hash, rev1.content_hash);
 }
 

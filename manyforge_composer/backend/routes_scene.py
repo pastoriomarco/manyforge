@@ -1461,7 +1461,7 @@ def create_scene_router(state: ComposerState) -> APIRouter:
                     continuous_object_ids,
                     apply_result.get("error"),
                 )
-        logger.info(
+        logger.debug(
             "pose source snapshot accepted: source=%s status=%s objects=%d",
             pose_source_id,
             request.status,
@@ -1796,6 +1796,9 @@ def create_scene_router(state: ComposerState) -> APIRouter:
             )
             result = kernel.scene_edit(scene_request)
             if result.success:
+                state.invalidate_pose_source_applies(
+                    reason=f"scene_edit_{validated.operation}"
+                )
                 visual_update = state.apply_visual_scene_edit_success(scene_request)
                 if visual_update.get("needs_refresh"):
                     state.request_visual_scene_objects_refresh(reason="scene_edit")

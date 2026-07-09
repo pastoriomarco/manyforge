@@ -533,6 +533,158 @@ def test_continuous_snapshot_applies_planning_scene_without_operator_apply(tmp_p
     ]
 
 
+def test_continuous_duplicate_apply_skips_kernel_scene_edit_and_records_metric(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(box_policy="continuous")
+    )
+    _add_box(client)
+    _post_fresh_box_snapshot(client)
+    first_result = _wait_for_pose_source_apply(state)
+    assert first_result["success"] is True
+    scene_edit_count = len(state.kernel.scene_edits)
+    event_count = len(state.event_recorder.get_events_since(0))
+
+    duplicate = state.apply_pose_source_updates(
+        policy="continuous",
+        object_ids=["box"],
+        expected_generation=state._pose_source_apply_generation_value(),
+        reason="duplicate_probe",
+    )
+
+    assert duplicate["success"] is True
+    assert duplicate["applied_count"] == 0
+    assert duplicate["skipped_count"] == 1
+    assert duplicate["details"][0]["skip_reason"] == "pose_source_duplicate_no_op"
+    assert len(state.kernel.scene_edits) == scene_edit_count
+    assert len(state.event_recorder.get_events_since(0)) == event_count
+    metrics = state.pose_source_apply_status()["counters"]
+    assert metrics["no_op_skipped"] >= 1
+    heartbeat = client.get("/api/infra/heartbeat").json()
+    assert (
+        heartbeat["components"]["pose_source_apply"]["counters"]["no_op_skipped"]
+        >= 1
+    )
+
+
+def test_scene_edit_invalidates_pose_source_duplicate_signature(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(box_policy="continuous")
+    )
+    _add_box(client)
+    _post_fresh_box_snapshot(client)
+    first_result = _wait_for_pose_source_apply(state)
+    assert first_result["success"] is True
+
+    duplicate = state.apply_pose_source_updates(
+        policy="continuous",
+        object_ids=["box"],
+        expected_generation=state._pose_source_apply_generation_value(),
+        reason="duplicate_probe",
+    )
+    assert duplicate["details"][0]["skip_reason"] == "pose_source_duplicate_no_op"
+
+    response = client.post(
+        "/api/scene/edit",
+        json={
+            "operation": "update_pose",
+            "object_id": "box",
+            "pose_position_m": [9.0, 9.0, 9.0],
+            "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "frame_id": "universe",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+    scene_edit_count = len(state.kernel.scene_edits)
+
+    reapplied = state.apply_pose_source_updates(
+        policy="continuous",
+        object_ids=["box"],
+        expected_generation=state._pose_source_apply_generation_value(),
+        reason="after_scene_edit",
+    )
+
+    assert reapplied["success"] is True
+    assert reapplied["applied_count"] == 1
+    assert reapplied["details"][0].get("update_status") == "geometry_changed"
+    assert len(state.kernel.scene_edits) == scene_edit_count + 1
+
+
+def test_continuous_freshness_only_apply_calls_kernel_without_visual_publish(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(box_policy="continuous")
+    )
+    _add_box(client)
+    publish_reasons: list[str] = []
+    state.request_visual_state_publish = (
+        lambda *, reason="": publish_reasons.append(reason)
+    )
+
+    _post_fresh_box_snapshot(client)
+    first_result = _wait_for_pose_source_apply(state)
+    assert first_result["success"] is True
+    assert first_result["details"][0].get("update_status") == "geometry_changed"
+    scene_edit_count = len(state.kernel.scene_edits)
+    publish_reasons.clear()
+    event_count = len(state.event_recorder.get_events_since(0))
+
+    _post_fresh_box_snapshot(client)
+    second_result = _wait_for_pose_source_apply(state)
+
+    assert second_result["success"] is True
+    assert second_result["applied_count"] == 1
+    assert second_result["details"][0].get("update_status") == "freshness_only"
+    assert second_result["details"][0].get("visual_update_skipped") == "freshness_only"
+    assert len(state.kernel.scene_edits) == scene_edit_count + 1
+    assert publish_reasons == []
+    assert len(state.event_recorder.get_events_since(0)) == event_count
+    metrics = state.pose_source_apply_status()["counters"]
+    assert metrics["freshness_only_applied"] >= 1
+
+
+def test_pose_source_clear_invalidates_worker_waiting_for_scene_lock(tmp_path: Path) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(box_policy="continuous_unattached")
+    )
+    _add_box(client)
+
+    state.scene_edit_lock.acquire()
+    try:
+        response = _post_fresh_box_snapshot(client)
+        assert response.json()["continuous_apply"]["queued"] is True
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with state._pose_source_apply_lock:
+                if state._pose_source_apply_running or state._pose_source_apply_pending:
+                    break
+            time.sleep(0.005)
+        state.clear_pose_source_snapshots()
+    finally:
+        state.scene_edit_lock.release()
+
+    result = _wait_for_pose_source_apply(state)
+    assert result["success"] is True
+    assert result["applied_count"] == 0
+    assert result["rejected_count"] == 0
+    assert (
+        result["details"][0]["skip_reason"]
+        == "pose_source_apply_generation_invalidated"
+    )
+    assert [edit.operation for edit in state.kernel.scene_edits] == ["add"]
+    metrics = state.pose_source_apply_status()["counters"]
+    assert metrics["stale_generation_dropped"] >= 1
+
+
 def test_continuous_snapshot_skips_live_mutation_during_resumable_stop(
     tmp_path: Path,
 ) -> None:

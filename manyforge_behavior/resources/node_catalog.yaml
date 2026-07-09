@@ -327,7 +327,9 @@ entries:
     name: Parallel
     category: control_flow
     description: >-
-      Tick all children simultaneously. Succeed when all succeed; fail on any failure.
+      Tick all children simultaneously. Success policy is configurable; failure
+      remains fail-on-any-child-failure. Use a dedicated cleanup/finally pattern
+      for branches that must continue after a fault.
     tags: [control_flow, composite]
     profiles:
       min_profile: v0.0
@@ -335,7 +337,31 @@ entries:
     children:
       min: 1
       max: unbounded
-    parameters: []
+    parameters:
+      - name: success_policy
+        required: false
+        default: success_on_all
+        profiles:
+          min_profile: v0.1
+        description: >-
+          Parallel completion rule. `success_on_all` waits for every child to
+          succeed. `success_on_one` succeeds as soon as any child succeeds while
+          all other children are still running. Child failure remains
+          fail-on-any-child-failure for both modes.
+        schema:
+          type: enum
+          values: [success_on_all, success_on_one]
+        enum_options:
+          - value: success_on_all
+            label: Succeed when all children succeed
+            description: Default. The parallel stays running until every child succeeds; any child failure fails the parallel.
+            profiles:
+              min_profile: v0.1
+          - value: success_on_one
+            label: Succeed when one child succeeds
+            description: The parallel succeeds as soon as any child succeeds, unless another child has failed first.
+            profiles:
+              min_profile: v0.1
     required_capabilities: []
     execution:
       blocking: false

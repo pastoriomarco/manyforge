@@ -7928,6 +7928,7 @@ Result<void> ExecutionKernel::collision_check_tick() {
   const auto dynamic_body_now_ns = clock_.now();
   if (auto freshness_reason = validate_dynamic_body_freshness(
           *world_snapshot,
+          published_bundle.value().body_freshness,
           dynamic_body_now_ns,
           config_.runtime_dynamic_body_max_age_cap_ns,
           monitor_details)) {

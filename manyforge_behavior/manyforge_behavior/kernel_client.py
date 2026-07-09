@@ -350,6 +350,9 @@ class SceneEditRequest:
 class SceneEditResult:
     success: bool = False
     error: Optional[str] = None
+    update_status: Optional[str] = None
+    collision_world_revision_changed: bool = False
+    collision_world_freshness_changed: bool = False
 
 
 @dataclass
@@ -1864,6 +1867,9 @@ class MockKernelClient(KernelClient):
         self.scene_edits.append(request)
         state_before = self.get_object_state(request.object_id)
         pose_before = self.get_object_pose(request.object_id, "universe")
+        update_status: Optional[str] = None
+        revision_changed = False
+        freshness_changed = False
         if self.fail_next_scene_edit:
             self.fail_next_scene_edit = False
             error = "Scene edit failed (injected)"
@@ -1965,12 +1971,80 @@ class MockKernelClient(KernelClient):
                     error=error,
                 )
                 return SceneEditResult(success=False, error=error)
+            next_orientation = (
+                list(request.pose_orientation_xyzw)
+                if request.pose_orientation_xyzw is not None
+                else list(tracked.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0]))
+            )
+            next_frame_id = request.frame_id or tracked.get("frame_id", "universe")
+            previous_geometry = (
+                tuple(tracked.get("position_m", [])),
+                tuple(tracked.get("orientation_xyzw", [])),
+                tracked.get("frame_id", "universe"),
+                tracked.get("_source_id"),
+                tracked.get("_source_freshness_budget_ns"),
+                tracked.get("_scene_admission_role"),
+                tracked.get("_scene_admission_lease_max_age_ns"),
+                tracked.get("_scene_admission_target_drift_tolerance_m"),
+                tracked.get("_scene_admission_target_angular_tolerance_rad"),
+                tracked.get("_scene_admission_obstacle_drift_tolerance_m"),
+                tracked.get("_scene_admission_obstacle_angular_tolerance_rad"),
+                bool(tracked.get("_scene_admission_allow_runtime_dynamic_obstacle")),
+            )
+            next_geometry = (
+                tuple(request.pose_position_m),
+                tuple(next_orientation),
+                next_frame_id,
+                request.source_id,
+                request.source_freshness_budget_ns,
+                request.scene_admission_role,
+                request.scene_admission_lease_max_age_ns,
+                request.scene_admission_target_drift_tolerance_m,
+                request.scene_admission_target_angular_tolerance_rad,
+                request.scene_admission_obstacle_drift_tolerance_m,
+                request.scene_admission_obstacle_angular_tolerance_rad,
+                bool(request.scene_admission_allow_runtime_dynamic_obstacle),
+            )
+            geometry_same = previous_geometry == next_geometry
+            freshness_changed = (
+                tracked.get("_source_timestamp_ns") != request.source_timestamp_ns
+            )
+            if geometry_same and freshness_changed:
+                update_status = "freshness_only"
+            elif geometry_same:
+                update_status = "no_op"
+            else:
+                update_status = "geometry_changed"
+                revision_changed = True
             tracked["position_m"] = list(request.pose_position_m)
-            if request.pose_orientation_xyzw is not None:
-                tracked["orientation_xyzw"] = list(request.pose_orientation_xyzw)
+            tracked["orientation_xyzw"] = next_orientation
             # else: pose-source position-only update — keep the last known
             # orientation (spec 420 §4A.2 mirroring semantics), never identity.
-            tracked["frame_id"] = request.frame_id or tracked.get("frame_id", "universe")
+            tracked["frame_id"] = next_frame_id
+            tracked["_source_id"] = request.source_id
+            tracked["_source_timestamp_ns"] = request.source_timestamp_ns
+            tracked["_source_freshness_budget_ns"] = (
+                request.source_freshness_budget_ns
+            )
+            tracked["_scene_admission_role"] = request.scene_admission_role
+            tracked["_scene_admission_lease_max_age_ns"] = (
+                request.scene_admission_lease_max_age_ns
+            )
+            tracked["_scene_admission_target_drift_tolerance_m"] = (
+                request.scene_admission_target_drift_tolerance_m
+            )
+            tracked["_scene_admission_target_angular_tolerance_rad"] = (
+                request.scene_admission_target_angular_tolerance_rad
+            )
+            tracked["_scene_admission_obstacle_drift_tolerance_m"] = (
+                request.scene_admission_obstacle_drift_tolerance_m
+            )
+            tracked["_scene_admission_obstacle_angular_tolerance_rad"] = (
+                request.scene_admission_obstacle_angular_tolerance_rad
+            )
+            tracked["_scene_admission_allow_runtime_dynamic_obstacle"] = bool(
+                request.scene_admission_allow_runtime_dynamic_obstacle
+            )
         elif request.operation == "remove":
             if request.object_id not in self._objects:
                 error = "Object not found"
@@ -2107,7 +2181,12 @@ class MockKernelClient(KernelClient):
                 error=error,
             )
             return SceneEditResult(success=False, error=error)
-        result = SceneEditResult(success=True)
+        result = SceneEditResult(
+            success=True,
+            update_status=update_status,
+            collision_world_revision_changed=revision_changed,
+            collision_world_freshness_changed=freshness_changed,
+        )
         state_after = self.get_object_state(request.object_id)
         pose_in_frame = None
         pose_in_universe = None

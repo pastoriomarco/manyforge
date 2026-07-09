@@ -3,9 +3,11 @@
 // shared_ptr wrapping.
 
 #include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
+#include <manyforge_core/execution_collision_support.hpp>
 
 #include <gtest/gtest.h>
 
+#include <map>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -619,6 +621,61 @@ TEST(CollisionWorldSnapshotBuilder,
   // World hash differs because link_b changed.
   EXPECT_NE(r1.value().revision.content_hash,
             r2.value().revision.content_hash);
+}
+
+TEST(CollisionWorldSnapshotBuilder,
+     RuntimeFreshnessSidecarOverridesSnapshotTimestamp) {
+  auto body = make_detached_object("dynamic_box");
+  body.source_id = "vision";
+  body.source_timestamp_ns = 0;
+  body.source_freshness_budget_ns = 100;
+  auto result = fresh_builder().add_body(body).build();
+  ASSERT_TRUE(result.ok());
+
+  CollisionWorldBodyFreshness freshness;
+  freshness.body_id = body.body_id;
+  freshness.source_id = "vision";
+  freshness.source_timestamp_ns = 950;
+  freshness.source_freshness_budget_ns = 100;
+  std::vector<CollisionWorldBodyFreshness> sidecar{freshness};
+
+  std::map<std::string, std::string> details;
+  EXPECT_FALSE(validate_dynamic_body_freshness(
+      result.value(), sidecar, 1'000, 1'000, details).has_value());
+  EXPECT_EQ(details.at("dynamic_body_source_timestamp_ns"), "950");
+}
+
+TEST(CollisionWorldSnapshotBuilder,
+     RuntimeFreshnessSidecarFailsClosedWhenUnsorted) {
+  auto body_a = make_detached_object("dynamic_box_a");
+  body_a.source_id = "vision";
+  body_a.source_timestamp_ns = 0;
+  body_a.source_freshness_budget_ns = 100;
+  auto body_b = make_detached_object("dynamic_box_b");
+  body_b.source_id = "vision";
+  body_b.source_timestamp_ns = 0;
+  body_b.source_freshness_budget_ns = 100;
+  auto result = fresh_builder().add_body(body_a).add_body(body_b).build();
+  ASSERT_TRUE(result.ok());
+
+  CollisionWorldBodyFreshness freshness_b;
+  freshness_b.body_id = body_b.body_id;
+  freshness_b.source_id = "vision";
+  freshness_b.source_timestamp_ns = 950;
+  freshness_b.source_freshness_budget_ns = 100;
+  CollisionWorldBodyFreshness freshness_a;
+  freshness_a.body_id = body_a.body_id;
+  freshness_a.source_id = "vision";
+  freshness_a.source_timestamp_ns = 950;
+  freshness_a.source_freshness_budget_ns = 100;
+  std::vector<CollisionWorldBodyFreshness> sidecar{freshness_b, freshness_a};
+
+  std::map<std::string, std::string> details;
+  const auto reason = validate_dynamic_body_freshness(
+      result.value(), sidecar, 1'000, 1'000, details);
+  ASSERT_TRUE(reason.has_value());
+  EXPECT_EQ(*reason, "dynamic_body_freshness_sidecar_not_sorted");
+  EXPECT_EQ(details.at("dynamic_body_freshness_sidecar_status"), "unsorted");
 }
 
 }  // namespace

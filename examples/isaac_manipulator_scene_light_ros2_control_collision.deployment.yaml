@@ -164,9 +164,28 @@ adapters:
         wrist_1_joint: 10.0
         wrist_2_joint: 10.0
         wrist_3_joint: 10.0
-      # Controlled-stop defaults: operator Stop button = soft_on_path
-      # (backend-computed path ramp); fault = hard_deceleration, which rides the
-      # controller decelerate_on_cancel + velocity state interface declared above.
+      initial_joint_positions_rad:
+      - 2.63422544
+      - -0.875980752
+      - 1.551074106
+      - -2.29231544
+      - -1.560498884
+      - -2.038544566
+      joint_state_max_age_ms: 250
+      wait_for_state_timeout_s: 1
+      # Industrial controlled stop. Match the normal Isaac light deployment:
+      # soft_on_path is the operator-stop profile and is explicitly enabled on
+      # this ROS2-control lane through the backend-computed path ramp.
+      enable_soft_on_path_path_ramp: true
+      soft_on_path_sample_period_s: 0.01
+      soft_on_path_stop_traj_delta_s: 0.1
+      soft_on_path_max_jerk_rad_s3:
+        shoulder_pan_joint: 50.0
+        shoulder_lift_joint: 50.0
+        elbow_joint: 50.0
+        wrist_1_joint: 50.0
+        wrist_2_joint: 50.0
+        wrist_3_joint: 50.0
       operator_stop_profile:
         profile_id: "operator_soft_on_path"
         stop_mode: "soft_on_path"
@@ -190,15 +209,6 @@ adapters:
           wrist_1_joint: 10.0
           wrist_2_joint: 10.0
           wrist_3_joint: 10.0
-      initial_joint_positions_rad:
-      - 2.63422544
-      - -0.875980752
-      - 1.551074106
-      - -2.29231544
-      - -1.560498884
-      - -2.038544566
-      joint_state_max_age_ms: 250
-      wait_for_state_timeout_s: 1
       wait_for_action_server_timeout_s: 2
       stop_completion_timeout_s: 0.5
       start_tolerance_rad: 0.15

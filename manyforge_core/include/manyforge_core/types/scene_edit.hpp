@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -121,8 +122,18 @@ struct ObjectStateDTO {
 
 /// Scene edit result (spec §3.9)
 struct SceneEditResultDTO {
+  SceneEditResultDTO() = default;
+  SceneEditResultDTO(bool ok, std::optional<ErrorDTO> maybe_error = std::nullopt)
+      : success(ok), error(std::move(maybe_error)) {}
+
   bool success = false;
   std::optional<ErrorDTO> error;  // present when success is false
+  /// Additive status for successful scene edits. Existing callers should keep
+  /// using `success`; high-rate observed-source paths use this to distinguish
+  /// real geometry writes from freshness-only/no-op updates.
+  std::optional<std::string> update_status;
+  bool collision_world_revision_changed = false;
+  bool collision_world_freshness_changed = false;
 };
 
 }  // namespace manyforge::core

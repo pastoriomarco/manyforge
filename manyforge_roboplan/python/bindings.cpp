@@ -3209,6 +3209,11 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           }();
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
+          if (r.update_status.has_value()) result["update_status"] = *r.update_status;
+          result["collision_world_revision_changed"] =
+              r.collision_world_revision_changed;
+          result["collision_world_freshness_changed"] =
+              r.collision_world_freshness_changed;
         } else if (op == "attach") {
           AttachObjectRequestDTO req;
           req.object_id = request["object_id"].cast<std::string>();
@@ -3511,6 +3516,17 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       }, py::arg("limit") = -1)
       .def("clear_scene_trace", [](NativeKernelBundle& self) {
         self.context->clear_scene_trace();
+      })
+      .def("scene_update_status_counters", [](NativeKernelBundle& self) -> py::dict {
+        const auto counters = [&]() {
+          py::gil_scoped_release release;
+          return self.context->scene_update_status_counters();
+        }();
+        py::dict result;
+        for (const auto& [key, value] : counters) {
+          result[py::str(key)] = value;
+        }
+        return result;
       })
       .def("drain_kernel_events", [](NativeKernelBundle& self) -> py::list {
         py::list result;

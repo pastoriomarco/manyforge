@@ -265,6 +265,7 @@ std::string collision_world_body_cache_fingerprint(
   entries.push_back(
       "freshness_set=" +
       std::string(body.source_freshness_budget_ns.has_value() ? "1" : "0"));
+  entries.push_back("source_id=" + body.source_id.value_or(""));
   if (body.source_freshness_budget_ns.has_value()) {
     entries.push_back(
         "freshness=" + std::to_string(*body.source_freshness_budget_ns));
@@ -395,6 +396,21 @@ bool optional_text_blank(const std::optional<std::string>& value) {
          std::all_of(value->begin(), value->end(), [](unsigned char ch) {
            return std::isspace(ch) != 0;
          });
+}
+
+bool vector3_equal(const core::Vector3DTO& lhs, const core::Vector3DTO& rhs) {
+  return lhs.x_m == rhs.x_m && lhs.y_m == rhs.y_m && lhs.z_m == rhs.z_m;
+}
+
+bool quaternion_equal(const core::QuaternionDTO& lhs,
+                      const core::QuaternionDTO& rhs) {
+  return lhs.x == rhs.x && lhs.y == rhs.y && lhs.z == rhs.z &&
+         lhs.w == rhs.w;
+}
+
+bool pose_equal(const core::Pose3DTO& lhs, const core::Pose3DTO& rhs) {
+  return vector3_equal(lhs.position_m, rhs.position_m) &&
+         quaternion_equal(lhs.orientation, rhs.orientation);
 }
 
 bool link_is_static_wrt_group(const pinocchio::Model& model,
@@ -909,10 +925,12 @@ void RoboPlanPlanningContext::publish_collision_world_revision_locked(
   if (runtime_bundle.world) {
     runtime_bundle.policy = build_collision_policy_snapshot_locked(robot_id);
   }
+  runtime_bundle.body_freshness = runtime_body_freshness_locked();
   {
     std::lock_guard<std::mutex> runtime_lock(published_runtime_bundle_mutex_);
     published_runtime_bundle_ = std::move(runtime_bundle);
   }
+  ++runtime_bundle_publish_count_;
   entry.previous_revision_id = previous_revision_id;
   entry.mutation_source = mutation_source;
   entry.affected_body_ids = affected_body_ids;
@@ -2339,9 +2357,11 @@ RoboPlanPlanningContext::current_collision_world_policy_snapshot_bundle_locked(
     snapshot_cache_content_hash_ = world_content_hash_;
     snapshot_cache_ = std::move(next);
   }
-  return core::CollisionWorldPolicySnapshotBundle{
-      snapshot_cache_,
-      build_collision_policy_snapshot_locked(robot_id)};
+  core::CollisionWorldPolicySnapshotBundle bundle;
+  bundle.world = snapshot_cache_;
+  bundle.policy = build_collision_policy_snapshot_locked(robot_id);
+  bundle.body_freshness = runtime_body_freshness_locked();
+  return bundle;
 }
 
 std::optional<core::CollisionWorldLeaseInventory>
@@ -2441,6 +2461,56 @@ core::CollisionWorldPolicySnapshotBundle
 RoboPlanPlanningContext::published_runtime_collision_snapshot_bundle() const {
   std::lock_guard<std::mutex> lock(published_runtime_bundle_mutex_);
   return published_runtime_bundle_;
+}
+
+std::vector<core::CollisionWorldBodyFreshness>
+RoboPlanPlanningContext::runtime_body_freshness_locked() const {
+  std::vector<core::CollisionWorldBodyFreshness> freshness;
+  for (const auto& [object_id, tracked] : object_states_) {
+    if (!tracked.source_freshness_budget_ns.has_value()) {
+      continue;
+    }
+    for (const auto& body_id :
+         object_body_ids_for_state_locked(object_id, tracked)) {
+      core::CollisionWorldBodyFreshness entry;
+      entry.body_id = body_id;
+      entry.source_id = tracked.source_id;
+      entry.source_timestamp_ns = tracked.source_timestamp_ns;
+      entry.source_freshness_budget_ns = tracked.source_freshness_budget_ns;
+      freshness.push_back(std::move(entry));
+    }
+  }
+  std::sort(freshness.begin(), freshness.end(),
+            [](const auto& lhs, const auto& rhs) {
+              return lhs.body_id < rhs.body_id;
+            });
+  return freshness;
+}
+
+void RoboPlanPlanningContext::publish_runtime_body_freshness_locked() {
+  auto freshness = runtime_body_freshness_locked();
+  std::lock_guard<std::mutex> runtime_lock(published_runtime_bundle_mutex_);
+  published_runtime_bundle_.body_freshness = std::move(freshness);
+  ++runtime_bundle_publish_count_;
+}
+
+RoboPlanPlanningContext::PoseUpdateClassification
+RoboPlanPlanningContext::classify_pose_update_locked(
+    const std::string& object_id,
+    const TrackedObjectState& previous_state,
+    const TrackedObjectState& new_state,
+    const std::string& robot_id) const {
+  const bool geometry_same =
+      pose_equal(previous_state.pose, new_state.pose) &&
+      object_revision_token_locked(object_id, previous_state, robot_id) ==
+          object_revision_token_locked(object_id, new_state, robot_id);
+  if (!geometry_same) {
+    return PoseUpdateClassification::kGeometryChanged;
+  }
+  if (previous_state.source_timestamp_ns != new_state.source_timestamp_ns) {
+    return PoseUpdateClassification::kFreshnessOnly;
+  }
+  return PoseUpdateClassification::kNoOp;
 }
 
 core::CollisionWorldLeaseInventory
@@ -3956,6 +4026,29 @@ core::SceneEditResultDTO RoboPlanPlanningContext::update_object_pose(
     new_state.scene_admission_allow_runtime_dynamic_obstacle =
         request.scene_admission_allow_runtime_dynamic_obstacle;
 
+    std::string robot_id;
+    {
+      std::scoped_lock map_lock(mapper_mutex_);
+      robot_id = mapper_robot_id_;
+    }
+    const auto classification = classify_pose_update_locked(
+        request.object_id, previous_state, new_state, robot_id);
+    if (classification == PoseUpdateClassification::kNoOp) {
+      ++scene_update_no_op_count_;
+      result.success = true;
+      result.update_status = "no_op";
+      return result;
+    }
+    if (classification == PoseUpdateClassification::kFreshnessOnly) {
+      object_states_[request.object_id] = new_state;
+      publish_runtime_body_freshness_locked();
+      ++scene_update_freshness_only_count_;
+      result.success = true;
+      result.update_status = "freshness_only";
+      result.collision_world_freshness_changed = true;
+      return result;
+    }
+
     Eigen::Matrix4d tform = scene_placement_from_tracked_locked(new_state);
     const std::string scene_target_frame =
         is_world_frame(new_state.frame_id) ? "universe" : new_state.frame_id;
@@ -4003,6 +4096,14 @@ core::SceneEditResultDTO RoboPlanPlanningContext::update_object_pose(
         object_body_ids_for_transition_locked(
             request.object_id, previous_state, tracked),
         "scene_edit.update_object_pose");
+    result.update_status = "geometry_changed";
+    result.collision_world_revision_changed = true;
+    result.collision_world_freshness_changed =
+        previous_state.source_timestamp_ns != tracked.source_timestamp_ns ||
+        previous_state.source_freshness_budget_ns !=
+            tracked.source_freshness_budget_ns ||
+        previous_state.source_id != tracked.source_id;
+    ++scene_update_geometry_changed_count_;
     SceneTraceEvent event;
     event.event = "update_pose";
     event.object_id = request.object_id;
@@ -4226,6 +4327,17 @@ RoboPlanPlanningContext::get_scene_trace(size_t limit) {
 void RoboPlanPlanningContext::clear_scene_trace() {
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
   scene_trace_.clear();
+}
+
+std::map<std::string, std::uint64_t>
+RoboPlanPlanningContext::scene_update_status_counters() const {
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  return {
+      {"geometry_changed", scene_update_geometry_changed_count_},
+      {"freshness_only", scene_update_freshness_only_count_},
+      {"no_op", scene_update_no_op_count_},
+      {"runtime_bundle_published", runtime_bundle_publish_count_},
+  };
 }
 
 }  // namespace manyforge::roboplan_backend

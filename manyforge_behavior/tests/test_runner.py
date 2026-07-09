@@ -116,6 +116,64 @@ class TestRunnerLoading:
         assert tree is not None
         assert tree.root.name == "main_sequence"
 
+    @staticmethod
+    def _parallel_program(*, params: dict | None = None) -> Program:
+        catalog = NodeCatalog(CATALOG_PATH)
+        return Program.from_dict(
+            {
+                "api_version": "manyforge.program.v0",
+                "program_profile": "v0.1",
+                "name": "parallel_policy_program",
+                "catalog_version": "0.2.0",
+                "robot": {
+                    "robot_id": "ur5",
+                    "group_id": "arm",
+                    "base_frame": "base_link",
+                    "tcp_frame": "tool0",
+                },
+                "tree": {
+                    "id": "parallel",
+                    "name": "parallel_root",
+                    "params": dict(params or {}),
+                    "children": [
+                        {
+                            "id": "timer",
+                            "name": "timer_a",
+                            "params": {"duration_s": 0.001},
+                        },
+                        {
+                            "id": "timer",
+                            "name": "timer_b",
+                            "params": {"duration_s": 0.001},
+                        },
+                    ],
+                },
+            },
+            catalog,
+        )
+
+    def test_parallel_default_policy_is_success_on_all(self, kernel):
+        program = self._parallel_program()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel, program=program)
+        runner.load()
+        tree = runner.build_tree()
+
+        assert isinstance(
+            tree.root.policy,
+            py_trees.common.ParallelPolicy.SuccessOnAll,
+        )
+
+    def test_parallel_success_on_one_policy_is_honored(self, kernel):
+        program = self._parallel_program(params={"success_policy": "success_on_one"})
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel, program=program)
+        runner.load()
+        tree = runner.build_tree()
+
+        assert isinstance(
+            tree.root.policy,
+            py_trees.common.ParallelPolicy.SuccessOnOne,
+        )
+
 
 class TestRunnerSceneApplication:
     def test_apply_scene(self, kernel):

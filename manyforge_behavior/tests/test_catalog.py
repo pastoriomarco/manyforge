@@ -44,6 +44,18 @@ class TestCatalogLoading:
         assert seq.children_max == -1  # unbounded
         assert "py_trees" in seq.runners
 
+    def test_parallel_exposes_success_policy_without_failure_thresholds(self):
+        catalog = NodeCatalog(CATALOG_PATH)
+        parallel = catalog.get("parallel")
+        success_policy = next(
+            param for param in parallel.parameters if param.name == "success_policy"
+        )
+
+        assert success_policy.default == "success_on_all"
+        assert success_policy.profiles_min == "v0.1"
+        assert success_policy.enum_values == ["success_on_all", "success_on_one"]
+        assert "fail-on-any-child-failure" in success_policy.description
+
     def test_get_move_manipulator(self):
         catalog = NodeCatalog(CATALOG_PATH)
         move = catalog.get("move_manipulator_action")

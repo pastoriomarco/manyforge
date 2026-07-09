@@ -170,6 +170,20 @@ def _catalog_operator_stop_default(node_id: str) -> str:
     return "hold"
 
 
+def _parallel_success_policy_from_params(
+    params: dict[str, Any],
+) -> py_trees.common.ParallelPolicy.Base:
+    """Build the py_trees Parallel success policy from catalog parameters."""
+    success_policy = str(params.get("success_policy", "success_on_all") or "").strip()
+    if success_policy in {"", "success_on_all"}:
+        return py_trees.common.ParallelPolicy.SuccessOnAll()
+    if success_policy == "success_on_one":
+        return py_trees.common.ParallelPolicy.SuccessOnOne()
+    raise ValueError(
+        "Parallel success_policy must be one of: success_on_all, success_on_one"
+    )
+
+
 class OrchestratorRunner:
     """Main entry point: load, build, and run a ManyForge program."""
 
@@ -602,7 +616,7 @@ class OrchestratorRunner:
             return finalize(
                 py_trees.composites.Parallel(
                     name=tree_node.name,
-                    policy=py_trees.common.ParallelPolicy.SuccessOnAll(),
+                    policy=_parallel_success_policy_from_params(resolved_params),
                     children=children,
                 )
             )

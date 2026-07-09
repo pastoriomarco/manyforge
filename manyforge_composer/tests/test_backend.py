@@ -1047,8 +1047,13 @@ def test_reset_refreshes_visual_scene_after_runtime_object_removal(client, state
         ),
         reason="test_stale_wall_snapshot",
     )
+    state.update_pose_source_snapshot(
+        "isaac_scene_objects",
+        {"status": "fresh", "objects": [], "monotonic_s": 1.0},
+    )
     assert any(obj.object_id == "wall" for obj in state.visual_scene_objects_snapshot()[0])
     assert any(obj.object_id == "wall" for obj in state.visual_state_snapshot()[0].objects)
+    assert "isaac_scene_objects" in state.pose_source_snapshots()
 
     response = client.post("/api/cycle/reset")
     assert response.status_code == 200
@@ -1056,6 +1061,7 @@ def test_reset_refreshes_visual_scene_after_runtime_object_removal(client, state
 
     assert all(obj.object_id != "wall" for obj in state.kernel.get_scene_objects())
     assert all(obj.object_id != "wall" for obj in state.visual_scene_objects_snapshot()[0])
+    assert state.pose_source_snapshots() == {}
     visual_state, _meta = state.visual_state_snapshot()
     assert visual_state is None or all(obj.object_id != "wall" for obj in visual_state.objects)
     scene_response = client.get("/api/scene/state")

@@ -916,6 +916,65 @@ class TestNativeSceneEdits:
         ))
         assert result.success is True
 
+    def test_update_pose_reports_geometry_freshness_and_noop_status(self, native_kernel):
+        add_result = native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="fresh_box", shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
+            pose_position_m=[0.5, 0.0, 0.5],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        assert add_result.success is True
+
+        first = native_kernel.scene_edit(SceneEditRequest(
+            operation="update_pose",
+            object_id="fresh_box",
+            pose_position_m=[0.6, 0.0, 0.5],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+            source_id="vision",
+            source_timestamp_ns=123_000_000,
+            source_freshness_budget_ns=50_000_000,
+        ))
+        assert first.success is True
+        assert first.update_status == "geometry_changed"
+        assert first.collision_world_revision_changed is True
+
+        heartbeat = native_kernel.scene_edit(SceneEditRequest(
+            operation="update_pose",
+            object_id="fresh_box",
+            pose_position_m=[0.6, 0.0, 0.5],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+            source_id="vision",
+            source_timestamp_ns=124_000_000,
+            source_freshness_budget_ns=50_000_000,
+        ))
+        assert heartbeat.success is True
+        assert heartbeat.update_status == "freshness_only"
+        assert heartbeat.collision_world_revision_changed is False
+        assert heartbeat.collision_world_freshness_changed is True
+
+        duplicate = native_kernel.scene_edit(SceneEditRequest(
+            operation="update_pose",
+            object_id="fresh_box",
+            pose_position_m=[0.6, 0.0, 0.5],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+            source_id="vision",
+            source_timestamp_ns=124_000_000,
+            source_freshness_budget_ns=50_000_000,
+        ))
+        assert duplicate.success is True
+        assert duplicate.update_status == "no_op"
+        assert duplicate.collision_world_revision_changed is False
+        assert duplicate.collision_world_freshness_changed is False
+        counters = native_kernel.scene_update_status_counters()
+        assert counters["geometry_changed"] == 1
+        assert counters["freshness_only"] == 1
+        assert counters["no_op"] == 1
+        assert counters["runtime_bundle_published"] >= 3
+
     def test_add_sphere(self, native_kernel):
         result = native_kernel.scene_edit(SceneEditRequest(
             operation="add", object_id="sphere1", shape_type="sphere",

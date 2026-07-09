@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <manyforge_core/collision/scene_snapshot_lease.hpp>
@@ -13,9 +14,36 @@
 
 namespace manyforge::core {
 
+struct CollisionWorldBodyFreshness {
+  std::string body_id;
+  std::optional<std::string> source_id;
+  std::optional<std::int64_t> source_timestamp_ns;
+  std::optional<std::int64_t> source_freshness_budget_ns;
+};
+
 struct CollisionWorldPolicySnapshotBundle {
+  CollisionWorldPolicySnapshotBundle() = default;
+  CollisionWorldPolicySnapshotBundle(
+      CollisionWorldSnapshotPtr world_snapshot,
+      std::optional<CollisionPolicySnapshot> policy_snapshot = std::nullopt,
+      std::vector<CollisionWorldBodyFreshness> freshness = {})
+      : world(std::move(world_snapshot)),
+        policy(std::move(policy_snapshot)),
+        body_freshness(std::move(freshness)) {}
+
   CollisionWorldSnapshotPtr world;
   std::optional<CollisionPolicySnapshot> policy;
+
+  /// Freshness sidecar for runtime monitor ticks.
+  ///
+  /// Geometry/topology/policy changes still require a new immutable world
+  /// snapshot and revision. Stationary observed-source heartbeats update this
+  /// sidecar only, allowing dynamic-body freshness checks to see a fresh source
+  /// timestamp without rebuilding collision geometry or policy.
+  ///
+  /// Publishers MUST sort this vector by `body_id` so runtime ticks can perform
+  /// allocation-free lookup while walking snapshot bodies.
+  std::vector<CollisionWorldBodyFreshness> body_freshness;
 };
 
 struct CollisionWorldLeaseInventory {
@@ -122,8 +150,10 @@ class ICollisionWorldSnapshotPublisher {
   /// mutex should override this and publish both values under one lock.
   [[nodiscard]] virtual CollisionWorldPolicySnapshotBundle
   collision_world_policy_snapshot_bundle() const {
-    return CollisionWorldPolicySnapshotBundle{snapshot(),
-                                              collision_policy_snapshot()};
+    CollisionWorldPolicySnapshotBundle bundle;
+    bundle.world = snapshot();
+    bundle.policy = collision_policy_snapshot();
+    return bundle;
   }
 
   /// Return the current world+policy+object-token inventory used to build an
