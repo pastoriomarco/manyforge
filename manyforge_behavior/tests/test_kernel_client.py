@@ -322,6 +322,56 @@ class TestMockKernelSceneEdit:
             "must be provided together"
         )
 
+    def test_scene_edit_rejects_invalid_scene_admission_metadata(self, kernel):
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="update_pose",
+                object_id="box1",
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                scene_admission_role=" ",
+            )
+        )
+        assert result.success is False
+        assert result.error == "scene_admission_role must be non-empty when provided"
+
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="update_pose",
+                object_id="box1",
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                scene_admission_lease_max_age_ns=0,
+            )
+        )
+        assert result.success is False
+        assert (
+            result.error
+            == (
+                "scene_admission_role is required when scene admission "
+                "metadata is provided"
+            )
+        )
+
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="update_pose",
+                object_id="box1",
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                scene_admission_role="snapshot_obstacle",
+                scene_admission_target_drift_tolerance_m=0.01,
+            )
+        )
+        assert result.success is False
+        assert (
+            result.error
+            == (
+                "scene_admission target drift tolerances are only valid "
+                "for observed_target"
+            )
+        )
+
     def test_scene_edit_failure_injection(self, kernel):
         kernel.fail_next_scene_edit = True
         req = SceneEditRequest(

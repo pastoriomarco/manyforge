@@ -82,8 +82,20 @@ struct UpdateObjectPoseRequestDTO {
   /// runtime collision monitoring can fail closed when dynamic object poses go
   /// stale. Authored/manual scene edits leave both fields unset, which clears
   /// any previous source authority for the object.
+  std::optional<std::string> source_id;
   std::optional<std::int64_t> source_timestamp_ns;
   std::optional<std::int64_t> source_freshness_budget_ns;
+
+  /// Optional deployment-authored observed-scene admission policy. These fields
+  /// are evidence/configuration carried with a normal revision-visible scene
+  /// mutation; the kernel still owns lease validation and dispatch admission.
+  std::optional<std::string> scene_admission_role;
+  std::optional<std::int64_t> scene_admission_lease_max_age_ns;
+  std::optional<double> scene_admission_target_drift_tolerance_m;
+  std::optional<double> scene_admission_target_angular_tolerance_rad;
+  std::optional<double> scene_admission_obstacle_drift_tolerance_m;
+  std::optional<double> scene_admission_obstacle_angular_tolerance_rad;
+  bool scene_admission_allow_runtime_dynamic_obstacle = false;
 };
 
 /// Attach an existing object to a frame while preserving its current world pose.

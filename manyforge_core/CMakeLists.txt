@@ -26,6 +26,7 @@ add_library(manyforge_core
   src/operator_stop_worker.cpp
   src/pose_math.cpp
   src/runtime_collision_monitor.cpp
+  src/scene_snapshot_lease.cpp
   src/stop_policy.cpp
   src/trajectory_cache.cpp
   src/trajectory_cache_compatibility.cpp
@@ -247,6 +248,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_collision_world_snapshot PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_collision_world_snapshot
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_scene_snapshot_lease
+    test/test_scene_snapshot_lease.cpp)
+  target_link_libraries(test_scene_snapshot_lease PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_scene_snapshot_lease
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_interrupt_manager

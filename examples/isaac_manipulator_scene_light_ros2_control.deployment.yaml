@@ -275,6 +275,9 @@ pose_sources:
     isaac_cheese_box:
       apply_policy: continuous_unattached
       entity: /mac_n_cheese_centered
+      scene_admission:
+        role: snapshot_obstacle
+        lease_max_age_s: 2.0
       measured_state_ghost:
         enabled: true
         robot_tcp: true

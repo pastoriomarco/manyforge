@@ -98,6 +98,9 @@ pose_sources:
         # not attached, while attached objects remain at their canonical
         # attachment offset.
         apply_policy: continuous_unattached
+        scene_admission:
+          role: snapshot_obstacle
+          lease_max_age_s: 2.0
         measured_state_ghost:
           enabled: true
           robot_tcp: true

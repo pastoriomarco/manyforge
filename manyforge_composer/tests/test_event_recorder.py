@@ -1095,6 +1095,59 @@ class TestEventChannelsAndIncidents:
         assert [event["type"] for event in fault_events] == ["kernel_error"]
         assert fault_events[0]["details"]["reason_code"] == "controller_cancel_timeout"
 
+    def test_scene_snapshot_lease_status_counts_deduped_native_decisions(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "validation_passed",
+                    "event_index": 10,
+                    "execution_id": 1,
+                    "details": {
+                        "reason": "scene_snapshot_lease_live_divergence_accepted",
+                    },
+                },
+                {
+                    "type": "error_raised",
+                    "event_index": 11,
+                    "execution_id": 1,
+                    "error": {
+                        "code": "scene_changed_during_validation",
+                        "message": "Observed target moved",
+                        "details": {
+                            "reason_code": "target_moved_after_validation",
+                            "object_id": "box",
+                            "source_id": "foundationpose",
+                        },
+                    },
+                },
+            ]
+        )
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "error_raised",
+                    "event_index": 11,
+                    "execution_id": 1,
+                    "error": {
+                        "code": "scene_changed_during_validation",
+                        "message": "Observed target moved",
+                        "details": {
+                            "reason_code": "target_moved_after_validation",
+                        },
+                    },
+                }
+            ]
+        )
+
+        status = rec.scene_snapshot_lease_status()
+        counters = status["counters"]
+        assert counters["accepted_bounded_divergence_total"] == 1
+        assert counters["target_drift_rejected_total"] == 1
+        assert counters["obstacle_drift_rejected_total"] == 0
+        assert status["last_reason"] == "target_moved_after_validation"
+
     def test_incident_snapshot_freezes_all_events_and_channels(self):
         rec = EventRecorder(observe_min_interval_s=0.0)
         rec.record_pose_source_event(

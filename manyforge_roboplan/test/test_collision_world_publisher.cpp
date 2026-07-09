@@ -7,13 +7,20 @@
 #include <manyforge_roboplan/native_kernel_factory.hpp>
 #include <manyforge_roboplan/roboplan_planning_context.hpp>
 
+#include <manyforge_core/collision/scene_snapshot_lease.hpp>
+#include <manyforge_core/types/reason_codes.hpp>
+
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -24,14 +31,22 @@ using manyforge::core::CollisionGeometryKind;
 using manyforge::core::CollisionOwnerKind;
 using manyforge::core::CollisionShapeDTO;
 using manyforge::core::CollisionWorldBody;
+using manyforge::core::CollisionWorldLeaseInventory;
 using manyforge::core::CollisionWorldMutationSource;
 using manyforge::core::DetachObjectRequestDTO;
 using manyforge::core::kErrorInvalidRequest;
 using manyforge::core::MeshShapeDTO;
 using manyforge::core::Pose3DTO;
 using manyforge::core::RemoveObjectRequestDTO;
+using manyforge::core::RuntimeDynamicSceneCoverage;
+using manyforge::core::SceneSnapshotLease;
+using manyforge::core::SceneSnapshotLeaseObject;
+using manyforge::core::SceneSnapshotLeaseRejection;
+using manyforge::core::SceneSnapshotLeaseValidationContext;
 using manyforge::core::UpdateObjectPoseRequestDTO;
 using manyforge::core::Vector3DTO;
+using manyforge::core::ObservedSceneObjectRole;
+using manyforge::core::validate_scene_snapshot_lease;
 using manyforge::roboplan_backend::create_native_kernel;
 using manyforge::roboplan_backend::NativeKernelBundle;
 using manyforge::roboplan_backend::RoboPlanPlanningContext;
@@ -98,6 +113,90 @@ class CollisionWorldPublisherTest : public ::testing::Test {
       return std::nullopt;
     }
     return *it;
+  }
+
+  static const manyforge::core::SceneSnapshotLiveObject* find_live_object(
+      const CollisionWorldLeaseInventory& inventory,
+      const std::string& object_id) {
+    auto it = std::find_if(inventory.live_objects.begin(),
+                           inventory.live_objects.end(),
+                           [&](const auto& object) {
+                             return object.object_id == object_id;
+                           });
+    return it == inventory.live_objects.end() ? nullptr : &*it;
+  }
+
+  static const CollisionWorldBody* find_body_in_snapshot(
+      const manyforge::core::CollisionWorldSnapshot& snapshot,
+      const std::string& body_id) {
+    auto it = std::find_if(snapshot.bodies.begin(),
+                           snapshot.bodies.end(),
+                           [&](const CollisionWorldBody& body) {
+                             return body.body_id == body_id;
+                           });
+    return it == snapshot.bodies.end() ? nullptr : &*it;
+  }
+
+  static SceneSnapshotLease lease_from_inventory(
+      const CollisionWorldLeaseInventory& inventory,
+      const std::string& object_id,
+      ObservedSceneObjectRole role = ObservedSceneObjectRole::kObservedTarget) {
+    SceneSnapshotLease lease;
+    lease.lease_id = "lease-" + object_id;
+    lease.validation_epoch = 1;
+    lease.captured_at_ns = inventory.captured_at_ns;
+    lease.lease_max_age_ns = 60'000'000'000LL;
+    lease.world_revision = inventory.bundle.world->revision;
+    lease.policy_revision = inventory.bundle.policy->revision;
+    lease.topology_epoch = inventory.topology_epoch;
+    lease.policy_epoch = inventory.policy_epoch;
+
+    const auto* live = find_live_object(inventory, object_id);
+    EXPECT_NE(live, nullptr);
+    if (live != nullptr) {
+      SceneSnapshotLeaseObject object;
+      object.object_id = live->object_id;
+      object.role = role;
+      object.collision_body_ids = live->collision_body_ids;
+      object.object_revision_token = live->object_revision_token;
+      object.pose = live->pose;
+      object.source_timestamp_ns = live->source_timestamp_ns;
+      object.source_freshness_budget_ns = live->source_freshness_budget_ns;
+      const bool pose_movable_role =
+          role == ObservedSceneObjectRole::kSnapshotObstacle ||
+          role == ObservedSceneObjectRole::kObservedTarget ||
+          role == ObservedSceneObjectRole::kObservedDynamicObstacle;
+      if (!pose_movable_role && inventory.bundle.world) {
+        for (const auto& body_id : object.collision_body_ids) {
+          const auto* body = find_body_in_snapshot(*inventory.bundle.world,
+                                                   body_id);
+          if (body != nullptr) {
+            object.body_content_hashes.emplace(body_id,
+                                               body->body_content_hash);
+          }
+        }
+      }
+      object.target_drift_tolerance_m = 1.0;
+      object.target_angular_tolerance_rad = 1.0;
+      object.obstacle_drift_tolerance_m = 1.0;
+      object.obstacle_angular_tolerance_rad = 1.0;
+      lease.objects.push_back(std::move(object));
+    }
+    return lease;
+  }
+
+  static SceneSnapshotLeaseValidationContext validation_context_from_inventory(
+      const CollisionWorldLeaseInventory& inventory,
+      std::int64_t now_ns) {
+    SceneSnapshotLeaseValidationContext context;
+    context.now_ns = now_ns;
+    context.live_world_revision = inventory.bundle.world->revision;
+    context.live_policy_revision = inventory.bundle.policy->revision;
+    context.topology_epoch = inventory.topology_epoch;
+    context.policy_epoch = inventory.policy_epoch;
+    context.live_objects = inventory.live_objects;
+    context.runtime_dynamic_scene_coverage = RuntimeDynamicSceneCoverage{};
+    return context;
   }
 
   std::shared_ptr<NativeKernelBundle> bundle_;
@@ -301,8 +400,7 @@ TEST_F(CollisionWorldPublisherTest,
   EXPECT_EQ(after_add_bundle.world->revision.revision_id,
             after_add_revision.revision_id);
   ASSERT_TRUE(after_add_bundle.policy.has_value());
-  EXPECT_EQ(after_add_bundle.policy->revision.revision_id,
-            after_add_revision.revision_id);
+  EXPECT_GT(after_add_bundle.policy->revision.revision_id, 0u);
   EXPECT_TRUE(std::any_of(after_add_bundle.world->bodies.begin(),
                           after_add_bundle.world->bodies.end(),
                           [](const CollisionWorldBody& body) {
@@ -324,6 +422,8 @@ TEST_F(CollisionWorldPublisherTest,
   ASSERT_TRUE(after_update_bundle.policy.has_value());
   EXPECT_EQ(after_update_bundle.world->revision.revision_id,
             after_update_revision.revision_id);
+  EXPECT_EQ(after_update_bundle.policy->revision.revision_id,
+            after_add_bundle.policy->revision.revision_id);
   auto body_it = std::find_if(after_update_bundle.world->bodies.begin(),
                               after_update_bundle.world->bodies.end(),
                               [](const CollisionWorldBody& body) {
@@ -344,8 +444,309 @@ TEST_F(CollisionWorldPublisherTest,
   EXPECT_EQ(after_policy_bundle.world->revision.revision_id,
             after_policy_revision.revision_id);
   EXPECT_EQ(after_policy_bundle.policy->policy_id, "runtime_policy_override");
-  EXPECT_EQ(after_policy_bundle.policy->revision.revision_id,
-            after_policy_revision.revision_id);
+  EXPECT_GT(after_policy_bundle.policy->revision.revision_id,
+            after_update_bundle.policy->revision.revision_id);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       RetainedLeaseInventorySurvivesLiveSceneAdvance) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+
+  auto retained =
+      context_->retain_scene_snapshot_lease_inventory("lease-retained");
+  ASSERT_TRUE(retained.has_value());
+  ASSERT_TRUE(retained->bundle.world);
+  const auto retained_revision = retained->bundle.world->revision;
+  const auto* retained_body =
+      find_body_in_snapshot(*retained->bundle.world, "object/box_a/shape/0");
+  ASSERT_NE(retained_body, nullptr);
+  EXPECT_DOUBLE_EQ(retained_body->pose.position_m.x_m, 0.0);
+
+  UpdateObjectPoseRequestDTO update;
+  update.object_id = "box_a";
+  update.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  update.pose.orientation.w = 1.0;
+  update.frame_id = "universe";
+  ASSERT_TRUE(context_->update_object_pose(update).success);
+
+  auto current = context_->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(current.has_value());
+  ASSERT_TRUE(current->bundle.world);
+  EXPECT_NE(current->bundle.world->revision.revision_id,
+            retained_revision.revision_id);
+  EXPECT_EQ(retained->bundle.world->revision.revision_id,
+            retained_revision.revision_id);
+  const auto* current_body =
+      find_body_in_snapshot(*current->bundle.world, "object/box_a/shape/0");
+  ASSERT_NE(current_body, nullptr);
+  EXPECT_DOUBLE_EQ(current_body->pose.position_m.x_m, 0.5);
+  EXPECT_DOUBLE_EQ(retained_body->pose.position_m.x_m, 0.0);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       RetainedLeaseReleaseAndCapacityCleanupWork) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+
+  auto retained = context_->retain_scene_snapshot_lease_inventory("lease-a");
+  ASSERT_TRUE(retained.has_value());
+  auto stats = context_->scene_snapshot_lease_retention_stats();
+  EXPECT_EQ(stats.retained_count, 1u);
+  ASSERT_EQ(stats.retained_ids_oldest_first.size(), 1u);
+  EXPECT_EQ(stats.retained_ids_oldest_first.front(), "lease-a");
+
+  context_->release_scene_snapshot_lease_inventory("lease-a");
+  stats = context_->scene_snapshot_lease_retention_stats();
+  EXPECT_EQ(stats.retained_count, 0u);
+
+  for (std::size_t i = 0; i < stats.retained_capacity + 3; ++i) {
+    auto next = context_->retain_scene_snapshot_lease_inventory(
+        "lease-" + std::to_string(i));
+    ASSERT_TRUE(next.has_value());
+  }
+  stats = context_->scene_snapshot_lease_retention_stats();
+  EXPECT_EQ(stats.retained_count, stats.retained_capacity);
+  ASSERT_FALSE(stats.retained_ids_oldest_first.empty());
+  EXPECT_EQ(stats.retained_ids_oldest_first.front(), "lease-3");
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       GeneratedLeaseRetentionIdsDoNotClobberCallerProvidedIds) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  auto caller = context_->retain_scene_snapshot_lease_inventory(
+      "roboplan_lease_1");
+  ASSERT_TRUE(caller.has_value());
+  auto generated = context_->retain_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(generated.has_value());
+
+  EXPECT_NE(generated->retention_id, caller->retention_id);
+  auto stats = context_->scene_snapshot_lease_retention_stats();
+  EXPECT_EQ(stats.retained_count, 2u);
+  EXPECT_TRUE(std::find(stats.retained_ids_oldest_first.begin(),
+                        stats.retained_ids_oldest_first.end(),
+                        "roboplan_lease_1") !=
+              stats.retained_ids_oldest_first.end());
+  EXPECT_TRUE(std::find(stats.retained_ids_oldest_first.begin(),
+                        stats.retained_ids_oldest_first.end(),
+                        generated->retention_id) !=
+              stats.retained_ids_oldest_first.end());
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       ObjectRevisionTokenIsStableAcrossPoseOnlyUpdates) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  auto before = context_->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(before.has_value());
+  const auto* before_object = find_live_object(*before, "box_a");
+  ASSERT_NE(before_object, nullptr);
+  ASSERT_TRUE(before_object->object_revision_token.has_value());
+  const auto before_token = *before_object->object_revision_token;
+  const auto before_topology_epoch = before->topology_epoch;
+  const auto before_policy_epoch = before->policy_epoch;
+  const auto before_policy_revision = before->bundle.policy->revision;
+
+  UpdateObjectPoseRequestDTO update;
+  update.object_id = "box_a";
+  update.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  update.pose.orientation.w = 1.0;
+  update.frame_id = "universe";
+  ASSERT_TRUE(context_->update_object_pose(update).success);
+
+  auto after = context_->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(after.has_value());
+  const auto* after_object = find_live_object(*after, "box_a");
+  ASSERT_NE(after_object, nullptr);
+  ASSERT_TRUE(after_object->object_revision_token.has_value());
+  EXPECT_EQ(*after_object->object_revision_token, before_token);
+  EXPECT_EQ(after->topology_epoch, before_topology_epoch);
+  EXPECT_EQ(after->policy_epoch, before_policy_epoch);
+  EXPECT_EQ(after->bundle.policy->revision.revision_id,
+            before_policy_revision.revision_id);
+  EXPECT_EQ(after->bundle.policy->revision.content_hash,
+            before_policy_revision.content_hash);
+  EXPECT_NE(after->bundle.world->revision.revision_id,
+            before->bundle.world->revision.revision_id);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       ObjectRevisionTokenChangesOnAttachAndPolicyEpochAdvances) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  auto before = context_->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(before.has_value());
+  const auto* before_object = find_live_object(*before, "box_a");
+  ASSERT_NE(before_object, nullptr);
+  ASSERT_TRUE(before_object->object_revision_token.has_value());
+
+  AttachObjectRequestDTO attach;
+  attach.object_id = "box_a";
+  attach.frame_id = "tool0";
+  ASSERT_TRUE(context_->attach_object(attach).success);
+
+  auto after = context_->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(after.has_value());
+  const auto* after_object = find_live_object(*after, "box_a");
+  ASSERT_NE(after_object, nullptr);
+  ASSERT_TRUE(after_object->object_revision_token.has_value());
+  EXPECT_NE(*after_object->object_revision_token,
+            *before_object->object_revision_token);
+  EXPECT_GT(after->topology_epoch, before->topology_epoch);
+  EXPECT_GT(after->policy_epoch, before->policy_epoch);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       PoseOnlyRevisionDivergenceValidatesAgainstRetainedLease) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  auto retained =
+      context_->retain_scene_snapshot_lease_inventory("lease-validate");
+  ASSERT_TRUE(retained.has_value());
+  auto lease = lease_from_inventory(*retained, "box_a");
+
+  UpdateObjectPoseRequestDTO update;
+  update.object_id = "box_a";
+  update.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  update.pose.orientation.w = 1.0;
+  update.frame_id = "universe";
+  ASSERT_TRUE(context_->update_object_pose(update).success);
+
+  auto current = context_->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(current.has_value());
+  EXPECT_NE(current->bundle.world->revision.revision_id,
+            retained->bundle.world->revision.revision_id);
+  EXPECT_EQ(current->bundle.policy->revision.revision_id,
+            retained->bundle.policy->revision.revision_id);
+  EXPECT_EQ(current->topology_epoch, retained->topology_epoch);
+  EXPECT_EQ(current->policy_epoch, retained->policy_epoch);
+
+  auto context = validation_context_from_inventory(
+      *current, retained->captured_at_ns + 1'000'000);
+  const auto result = validate_scene_snapshot_lease(lease, context);
+  EXPECT_TRUE(result.accepted) << result.reason_code;
+  EXPECT_EQ(result.details.at("accepted_live_world_revision_divergence"),
+            "true");
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       SnapshotObstaclePoseOnlyRevisionDivergenceValidatesAgainstRetainedLease) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  auto retained =
+      context_->retain_scene_snapshot_lease_inventory("lease-snapshot-obstacle");
+  ASSERT_TRUE(retained.has_value());
+  auto lease = lease_from_inventory(
+      *retained, "box_a", ObservedSceneObjectRole::kSnapshotObstacle);
+
+  UpdateObjectPoseRequestDTO update;
+  update.object_id = "box_a";
+  update.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  update.pose.orientation.w = 1.0;
+  update.frame_id = "universe";
+  ASSERT_TRUE(context_->update_object_pose(update).success);
+
+  auto current = context_->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(current.has_value());
+  EXPECT_NE(current->bundle.world->revision.revision_id,
+            retained->bundle.world->revision.revision_id);
+  EXPECT_EQ(current->topology_epoch, retained->topology_epoch);
+  EXPECT_EQ(current->policy_epoch, retained->policy_epoch);
+
+  auto validation = validation_context_from_inventory(
+      *current, retained->captured_at_ns + 1'000'000);
+  const auto result = validate_scene_snapshot_lease(lease, validation);
+  EXPECT_TRUE(result.accepted) << result.reason_code;
+  EXPECT_EQ(result.details.at("accepted_live_world_revision_divergence"),
+            "true");
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       SnapshotObstacleAddRemoveDivergenceValidatesAgainstRetainedLease) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  auto retained =
+      context_->retain_scene_snapshot_lease_inventory("lease-snapshot-topology");
+  ASSERT_TRUE(retained.has_value());
+  auto lease = lease_from_inventory(
+      *retained, "box_a", ObservedSceneObjectRole::kSnapshotObstacle);
+
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_b")).success);
+  RemoveObjectRequestDTO remove;
+  remove.object_id = "box_a";
+  ASSERT_TRUE(context_->remove_object(remove).success);
+
+  auto current = context_->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(current.has_value());
+  EXPECT_GT(current->topology_epoch, retained->topology_epoch);
+  EXPECT_EQ(current->policy_epoch, retained->policy_epoch);
+  EXPECT_NE(current->bundle.world->revision.revision_id,
+            retained->bundle.world->revision.revision_id);
+  EXPECT_EQ(find_live_object(*current, "box_a"), nullptr);
+
+  auto validation = validation_context_from_inventory(
+      *current, retained->captured_at_ns + 1'000'000);
+  const auto result = validate_scene_snapshot_lease(lease, validation);
+  EXPECT_TRUE(result.accepted) << result.reason_code;
+  EXPECT_EQ(result.details.at("accepted_live_world_revision_divergence"),
+            "true");
+  EXPECT_EQ(result.details.at("accepted_live_policy_revision_divergence"),
+            "true");
+  EXPECT_EQ(result.details.at("accepted_live_topology_epoch_divergence"),
+            "true");
+  EXPECT_EQ(result.details.at("accepted_missing_live_snapshot_obstacle"),
+            "true");
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       SnapshotObstacleRejectsSemanticPolicyUpdateAgainstRetainedLease) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  auto retained =
+      context_->retain_scene_snapshot_lease_inventory("lease-policy-update");
+  ASSERT_TRUE(retained.has_value());
+  ASSERT_TRUE(retained->bundle.policy.has_value());
+  auto lease = lease_from_inventory(
+      *retained, "box_a", ObservedSceneObjectRole::kSnapshotObstacle);
+
+  auto policy = *retained->bundle.policy;
+  policy.policy_id = "semantic_policy_override";
+  context_->set_collision_policy_snapshot(policy);
+
+  auto current = context_->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(current.has_value());
+  EXPECT_EQ(current->topology_epoch, retained->topology_epoch);
+  EXPECT_GT(current->policy_epoch, retained->policy_epoch);
+
+  auto validation = validation_context_from_inventory(
+      *current, retained->captured_at_ns + 1'000'000);
+  const auto result = validate_scene_snapshot_lease(lease, validation);
+  EXPECT_FALSE(result.accepted);
+  EXPECT_EQ(result.rejection,
+            SceneSnapshotLeaseRejection::kCollisionPolicyChangedAfterValidation);
+  EXPECT_EQ(result.reason_code,
+            manyforge::core::reason_codes::
+                kCollisionPolicyChangedAfterValidation);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       StaticObstaclePoseOnlyRevisionDivergenceRejectsAgainstRetainedLease) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  auto retained =
+      context_->retain_scene_snapshot_lease_inventory("lease-static-obstacle");
+  ASSERT_TRUE(retained.has_value());
+  auto lease = lease_from_inventory(
+      *retained, "box_a", ObservedSceneObjectRole::kStaticObstacle);
+
+  UpdateObjectPoseRequestDTO update;
+  update.object_id = "box_a";
+  update.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  update.pose.orientation.w = 1.0;
+  update.frame_id = "universe";
+  ASSERT_TRUE(context_->update_object_pose(update).success);
+
+  auto current = context_->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(current.has_value());
+  auto validation = validation_context_from_inventory(
+      *current, retained->captured_at_ns + 1'000'000);
+  const auto result = validate_scene_snapshot_lease(lease, validation);
+  EXPECT_FALSE(result.accepted);
+  EXPECT_EQ(result.reason_code,
+            manyforge::core::reason_codes::
+                kSceneTopologyChangedAfterValidation);
+  EXPECT_EQ(result.details.at("body_content_hash_changed"), "true");
 }
 
 TEST_F(CollisionWorldPublisherTest,
@@ -366,6 +767,104 @@ TEST_F(CollisionWorldPublisherTest,
 
   EXPECT_EQ(context_->current_collision_world_revision().revision_id,
             before.revision_id);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       UpdatePoseRejectsPartialSceneAdmissionMetadataWithoutRevisionBump) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  const auto before = context_->current_collision_world_revision();
+
+  UpdateObjectPoseRequestDTO req;
+  req.object_id = "box_a";
+  req.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  req.pose.orientation.w = 1.0;
+  req.frame_id = "universe";
+  req.scene_admission_lease_max_age_ns = 2'000'000'000;
+  auto result = context_->update_object_pose(req);
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidRequest);
+
+  EXPECT_EQ(context_->current_collision_world_revision().revision_id,
+            before.revision_id);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       UpdatePoseRejectsBlankSourceIdWithoutRevisionBump) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  const auto before = context_->current_collision_world_revision();
+
+  UpdateObjectPoseRequestDTO req;
+  req.object_id = "box_a";
+  req.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  req.pose.orientation.w = 1.0;
+  req.frame_id = "universe";
+  req.source_id = "  ";
+  auto result = context_->update_object_pose(req);
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidRequest);
+
+  EXPECT_EQ(context_->current_collision_world_revision().revision_id,
+            before.revision_id);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       UpdatePoseRejectsRoleInapplicableSceneAdmissionFieldsWithoutRevisionBump) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  const auto before = context_->current_collision_world_revision();
+
+  UpdateObjectPoseRequestDTO req;
+  req.object_id = "box_a";
+  req.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  req.pose.orientation.w = 1.0;
+  req.frame_id = "universe";
+  req.scene_admission_role = "snapshot_obstacle";
+  req.scene_admission_target_drift_tolerance_m = 0.02;
+  auto result = context_->update_object_pose(req);
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidRequest);
+  EXPECT_EQ(result.error->message,
+            "scene_admission target drift tolerances are only valid for "
+            "observed_target");
+
+  EXPECT_EQ(context_->current_collision_world_revision().revision_id,
+            before.revision_id);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       SourceAdmissionMetadataPublishesIntoLeaseInventory) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+
+  UpdateObjectPoseRequestDTO req;
+  req.object_id = "box_a";
+  req.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  req.pose.orientation.w = 1.0;
+  req.frame_id = "universe";
+  req.source_id = "foundationpose";
+  req.source_timestamp_ns = 10'000'000;
+  req.source_freshness_budget_ns = 500'000'000;
+  req.scene_admission_role = "observed_target";
+  req.scene_admission_lease_max_age_ns = 2'000'000'000;
+  req.scene_admission_target_drift_tolerance_m = 0.02;
+  req.scene_admission_target_angular_tolerance_rad = 0.174533;
+  ASSERT_TRUE(context_->update_object_pose(req).success);
+
+  auto inventory = context_->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory.has_value());
+  const auto* live = find_live_object(*inventory, "box_a");
+  ASSERT_NE(live, nullptr);
+  ASSERT_TRUE(live->source_id.has_value());
+  EXPECT_EQ(*live->source_id, "foundationpose");
+  ASSERT_TRUE(live->declared_role.has_value());
+  EXPECT_EQ(*live->declared_role, ObservedSceneObjectRole::kObservedTarget);
+  ASSERT_TRUE(live->lease_max_age_ns.has_value());
+  EXPECT_EQ(*live->lease_max_age_ns, 2'000'000'000);
+  ASSERT_TRUE(live->target_drift_tolerance_m.has_value());
+  EXPECT_DOUBLE_EQ(*live->target_drift_tolerance_m, 0.02);
+  ASSERT_TRUE(live->target_angular_tolerance_rad.has_value());
+  EXPECT_DOUBLE_EQ(*live->target_angular_tolerance_rad, 0.174533);
 }
 
 TEST_F(CollisionWorldPublisherTest, AttachDetachEachBumpRevisionOnce) {

@@ -480,6 +480,9 @@ function PoseSourcesSection({ sources }: { sources: PoseSourceStatusState[] }) {
                   </span>
                   <span className="truncate text-[10px] text-gray-500">
                     {objectState.apply_policy}
+                    {objectState.scene_admission?.role
+                      ? ` · ${objectState.scene_admission.role}`
+                      : ''}
                   </span>
                   <StatusPill status={objectState.status} compact />
                 </div>

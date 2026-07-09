@@ -1424,6 +1424,12 @@ class TestDeploymentLoading:
                         "isaac_cheese_box": {
                             "entity": "/mac_n_cheese_centered",
                             "apply_policy": "before_planning",
+                            "scene_admission": {
+                                "role": "observed_target",
+                                "lease_max_age_s": 2.0,
+                                "target_drift_tolerance_m": 0.02,
+                                "target_angular_tolerance_rad": 0.174533,
+                            },
                             "confidence_min": 0.8,
                             "measured_state_ghost": {
                                 "enabled": True,
@@ -1473,6 +1479,23 @@ class TestDeploymentLoading:
         assert set(source.objects) == {"isaac_cheese_box", "isaac_soup_can"}
         assert source.objects["isaac_cheese_box"].entity == "/mac_n_cheese_centered"
         assert source.objects["isaac_cheese_box"].apply_policy == "before_planning"
+        assert source.objects["isaac_cheese_box"].scene_admission is not None
+        assert (
+            source.objects["isaac_cheese_box"].scene_admission.role
+            == "observed_target"
+        )
+        assert (
+            source.objects[
+                "isaac_cheese_box"
+            ].scene_admission.target_drift_tolerance_m
+            == 0.02
+        )
+        assert (
+            source.objects[
+                "isaac_cheese_box"
+            ].scene_admission.target_angular_tolerance_rad
+            == 0.174533
+        )
         assert source.objects["isaac_cheese_box"].confidence_min == 0.8
         assert source.objects["isaac_cheese_box"].measured_state_ghost is not None
         assert source.objects["isaac_cheese_box"].measured_state_ghost.enabled is True
@@ -1504,6 +1527,13 @@ class TestDeploymentLoading:
         assert (
             reloaded.pose_sources["isaac_scene_objects"]
             .objects["isaac_cheese_box"]
+            .scene_admission
+            .role
+            == "observed_target"
+        )
+        assert (
+            reloaded.pose_sources["isaac_scene_objects"]
+            .objects["isaac_cheese_box"]
             .attached_drift_monitor
             .signal_id
             == "attached_object_drift/isaac_cheese_box"
@@ -1525,6 +1555,141 @@ class TestDeploymentLoading:
             ].measured_robot.joint_state_topic
             == "/joint_states"
         )
+
+    def test_pose_source_observe_only_defaults_to_visualization_admission(self):
+        deploy = Deployment.from_dict(
+            _minimal_deployment(
+                pose_sources=[
+                    {
+                        "id": "tracked_objects",
+                        "kind": "pose_stamped_topic",
+                        "topic": "/tracked_pose",
+                        "objects": {
+                            "box": {
+                                "apply_policy": "observe_only",
+                            }
+                        },
+                    }
+                ]
+            )
+        )
+
+        admission = deploy.pose_sources["tracked_objects"].objects["box"].scene_admission
+        assert admission is not None
+        assert admission.role == "visualization_only"
+        serialized = deploy.to_dict()
+        assert (
+            serialized["pose_sources"][0]["objects"]["box"]["scene_admission"][
+                "role"
+            ]
+            == "visualization_only"
+        )
+
+    def test_pose_source_execution_policy_defaults_to_snapshot_obstacle_admission(self):
+        deploy = Deployment.from_dict(
+            _minimal_deployment(
+                pose_sources=[
+                    {
+                        "id": "tracked_objects",
+                        "kind": "pose_stamped_topic",
+                        "topic": "/tracked_pose",
+                        "objects": {
+                            "box": {
+                                "apply_policy": "continuous",
+                            }
+                        },
+                    }
+                ]
+            )
+        )
+
+        admission = deploy.pose_sources["tracked_objects"].objects["box"].scene_admission
+        assert admission is not None
+        assert admission.role == "snapshot_obstacle"
+        serialized = deploy.to_dict()
+        assert (
+            serialized["pose_sources"][0]["objects"]["box"]["scene_admission"][
+                "role"
+            ]
+            == "snapshot_obstacle"
+        )
+
+    def test_pose_source_rejects_execution_affecting_visualization_admission(self):
+        with pytest.raises(
+            DeploymentValidationError,
+            match="role=visualization_only is only valid with apply_policy=observe_only",
+        ):
+            Deployment.from_dict(
+                _minimal_deployment(
+                    pose_sources=[
+                        {
+                            "id": "tracked_objects",
+                            "kind": "pose_stamped_topic",
+                            "topic": "/tracked_pose",
+                            "objects": {
+                                "box": {
+                                    "apply_policy": "before_planning",
+                                    "scene_admission": {
+                                        "role": "visualization_only",
+                                    },
+                                }
+                            },
+                        }
+                    ]
+                )
+            )
+
+    def test_pose_source_requires_drift_tolerances_for_observed_target_admission(self):
+        with pytest.raises(
+            DeploymentValidationError,
+            match="target_drift_tolerance_m is required",
+        ):
+            Deployment.from_dict(
+                _minimal_deployment(
+                    pose_sources=[
+                        {
+                            "id": "tracked_objects",
+                            "kind": "pose_stamped_topic",
+                            "topic": "/tracked_pose",
+                            "objects": {
+                                "box": {
+                                    "apply_policy": "before_planning",
+                                    "scene_admission": {
+                                        "role": "observed_target",
+                                        "target_angular_tolerance_rad": 0.1,
+                                    },
+                                }
+                            },
+                        }
+                    ]
+                )
+            )
+
+    def test_pose_source_rejects_drift_tolerances_on_snapshot_obstacle(self):
+        with pytest.raises(
+            DeploymentValidationError,
+            match="target drift tolerances are only valid for observed_target",
+        ):
+            Deployment.from_dict(
+                _minimal_deployment(
+                    pose_sources=[
+                        {
+                            "id": "tracked_objects",
+                            "kind": "pose_stamped_topic",
+                            "topic": "/tracked_pose",
+                            "objects": {
+                                "box": {
+                                    "apply_policy": "continuous",
+                                    "scene_admission": {
+                                        "role": "snapshot_obstacle",
+                                        "target_drift_tolerance_m": 0.01,
+                                    },
+                                }
+                            },
+                        }
+                    ]
+                )
+            )
 
     def test_pose_source_rejects_enabled_drift_monitor_without_thresholds(self):
         data = _minimal_deployment(

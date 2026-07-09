@@ -834,6 +834,10 @@ class PoseSourceObjectBindingConfigResponse(BaseModel):
         default=None,
         alias="attachedDriftMonitor",
     )
+    scene_admission: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="sceneAdmission",
+    )
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -1219,6 +1223,10 @@ class PoseSourceObjectStateResponse(BaseModel):
     entity: str = ""
     frame_id: str = Field(default="", alias="frameId")
     apply_policy: str = Field(default="observe_only", alias="applyPolicy")
+    scene_admission: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="sceneAdmission",
+    )
     status: str
     age_s: Optional[float] = Field(default=None, alias="ageS")
     update: Optional[PoseSourceUpdateResponse] = None
@@ -1785,6 +1793,10 @@ class DebugExportResponse(BaseModel):
     latency_histograms: Dict[str, Any] = Field(
         default_factory=dict,
         alias="latencyHistograms",
+    )
+    scene_snapshot_lease_stats: Dict[str, Any] = Field(
+        default_factory=dict,
+        alias="sceneSnapshotLeaseStats",
     )
     run_index: List[Dict[str, Any]] = Field(
         default_factory=list,

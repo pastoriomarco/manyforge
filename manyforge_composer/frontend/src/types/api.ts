@@ -465,6 +465,26 @@ export type PoseSourceApplyPolicy =
   | 'before_planning'
   | 'between_nodes';
 
+export type PoseSourceSceneAdmissionRole =
+  | 'static_obstacle'
+  | 'snapshot_obstacle'
+  | 'observed_target'
+  | 'observed_dynamic_obstacle'
+  | 'attached_object'
+  | 'support_contact'
+  | 'visualization_only'
+  | 'robot_runtime_state';
+
+export interface PoseSourceSceneAdmissionConfig {
+  role: PoseSourceSceneAdmissionRole | string;
+  leaseMaxAgeS?: number | null;
+  targetDriftToleranceM?: number | null;
+  targetAngularToleranceRad?: number | null;
+  obstacleDriftToleranceM?: number | null;
+  obstacleAngularToleranceRad?: number | null;
+  allowRuntimeDynamicObstacle?: boolean;
+}
+
 export interface PoseSourceObjectBindingConfig {
   entity?: string;
   frameId?: string;
@@ -490,6 +510,7 @@ export interface PoseSourceObjectBindingConfig {
     signalId?: string;
     sampleTimeToleranceS?: number;
   } | null;
+  sceneAdmission?: PoseSourceSceneAdmissionConfig | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -912,6 +933,7 @@ export interface PoseSourceObjectState {
   entity: string;
   frame_id: string;
   apply_policy: string;
+  scene_admission?: PoseSourceSceneAdmissionConfig | null;
   status: 'disabled' | 'fresh' | 'stale' | 'rejected' | string;
   age_s?: number | null;
   update?: PoseSourceUpdateState | null;

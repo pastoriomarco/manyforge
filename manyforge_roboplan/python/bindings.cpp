@@ -860,6 +860,16 @@ py::dict metrics_to_python(const MetricsSnapshot& metrics) {
   d["executions_failed"] = metrics.executions_failed;
   d["stops_issued"] = metrics.stops_issued;
   d["collision_detections"] = metrics.collision_detections;
+  d["runtime_collision_ticks_started"] =
+      metrics.runtime_collision_ticks_started;
+  d["runtime_collision_ticks_completed"] =
+      metrics.runtime_collision_ticks_completed;
+  d["runtime_collision_ticks_faulted"] =
+      metrics.runtime_collision_ticks_faulted;
+  d["runtime_collision_tick_max_ns"] =
+      metrics.runtime_collision_tick_max_ns;
+  d["validation_deferred_runtime_monitor_active"] =
+      metrics.validation_deferred_runtime_monitor_active;
   d["runtime_collision_snapshot_refresh_failures"] =
       metrics.runtime_collision_snapshot_refresh_failures;
   d["snapshots_published"] = metrics.snapshots_published;
@@ -3154,6 +3164,44 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               !request["source_freshness_budget_ns"].is_none()) {
             req.source_freshness_budget_ns =
                 request["source_freshness_budget_ns"].cast<int64_t>();
+          }
+          if (request.contains("source_id") && !request["source_id"].is_none()) {
+            req.source_id = request["source_id"].cast<std::string>();
+          }
+          if (request.contains("scene_admission_role") &&
+              !request["scene_admission_role"].is_none()) {
+            req.scene_admission_role =
+                request["scene_admission_role"].cast<std::string>();
+          }
+          if (request.contains("scene_admission_lease_max_age_ns") &&
+              !request["scene_admission_lease_max_age_ns"].is_none()) {
+            req.scene_admission_lease_max_age_ns =
+                request["scene_admission_lease_max_age_ns"].cast<int64_t>();
+          }
+          if (request.contains("scene_admission_target_drift_tolerance_m") &&
+              !request["scene_admission_target_drift_tolerance_m"].is_none()) {
+            req.scene_admission_target_drift_tolerance_m =
+                request["scene_admission_target_drift_tolerance_m"].cast<double>();
+          }
+          if (request.contains("scene_admission_target_angular_tolerance_rad") &&
+              !request["scene_admission_target_angular_tolerance_rad"].is_none()) {
+            req.scene_admission_target_angular_tolerance_rad =
+                request["scene_admission_target_angular_tolerance_rad"].cast<double>();
+          }
+          if (request.contains("scene_admission_obstacle_drift_tolerance_m") &&
+              !request["scene_admission_obstacle_drift_tolerance_m"].is_none()) {
+            req.scene_admission_obstacle_drift_tolerance_m =
+                request["scene_admission_obstacle_drift_tolerance_m"].cast<double>();
+          }
+          if (request.contains("scene_admission_obstacle_angular_tolerance_rad") &&
+              !request["scene_admission_obstacle_angular_tolerance_rad"].is_none()) {
+            req.scene_admission_obstacle_angular_tolerance_rad =
+                request["scene_admission_obstacle_angular_tolerance_rad"].cast<double>();
+          }
+          if (request.contains("scene_admission_allow_runtime_dynamic_obstacle") &&
+              !request["scene_admission_allow_runtime_dynamic_obstacle"].is_none()) {
+            req.scene_admission_allow_runtime_dynamic_obstacle =
+                request["scene_admission_allow_runtime_dynamic_obstacle"].cast<bool>();
           }
           auto r = [&]() {
             py::gil_scoped_release release;

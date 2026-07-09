@@ -56,6 +56,7 @@ struct CollisionWorldBody {
   /// simulator-observed bodies SHOULD set this together with
   /// `source_freshness_budget_ns`; runtime monitors then fail closed when the
   /// body pose has aged beyond its declared budget.
+  std::optional<std::string> source_id;
   std::optional<std::int64_t> source_timestamp_ns;
 
   /// Optional freshness budget for `source_timestamp_ns`. Leave unset for

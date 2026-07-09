@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import APIRouter
 from fastapi.concurrency import run_in_threadpool
 
+from .route_execution import route_executor_status
 from .state import ComposerState
 from .models import ModelEndpointCatalogResponse
 
@@ -44,6 +45,68 @@ def _model_endpoint_capabilities_payload(endpoint) -> dict[str, Any]:
         "supportedImageTransports": list(capabilities.supported_image_transports),
         "toolCallFamily": capabilities.tool_call_family,
         "latencyBudgetMs": capabilities.latency_budget_ms,
+    }
+
+
+def _int_metric(metrics: dict[str, Any], key: str) -> int:
+    try:
+        return int(metrics.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _runtime_safety_status(state: ComposerState) -> dict[str, Any]:
+    if state.kernel is None:
+        return {"status": "unavailable"}
+    try:
+        metrics = state.kernel.get_metrics()
+    except Exception as exc:  # pragma: no cover - defensive status surface
+        return {"status": "error", "error": str(exc)}
+
+    started = _int_metric(metrics, "runtime_collision_ticks_started")
+    completed = _int_metric(metrics, "runtime_collision_ticks_completed")
+    faulted = _int_metric(metrics, "runtime_collision_ticks_faulted")
+    refresh_failures = _int_metric(
+        metrics,
+        "runtime_collision_snapshot_refresh_failures",
+    )
+    validation_deferred = _int_metric(
+        metrics,
+        "validation_deferred_runtime_monitor_active",
+    )
+    status = "degraded" if faulted > 0 or refresh_failures > 0 else "healthy"
+    return {
+        "status": status,
+        "runtime_collision_ticks_started": started,
+        "runtime_collision_ticks_completed": completed,
+        "runtime_collision_ticks_faulted": faulted,
+        "runtime_collision_tick_max_ns": _int_metric(
+            metrics,
+            "runtime_collision_tick_max_ns",
+        ),
+        "collision_detections": _int_metric(metrics, "collision_detections"),
+        "runtime_collision_snapshot_refresh_failures": refresh_failures,
+        "validation_deferred_runtime_monitor_active": validation_deferred,
+        "validation_deferral_status": (
+            "contended" if validation_deferred > 0 else "clear"
+        ),
+    }
+
+
+def _route_executor_heartbeat_status() -> dict[str, Any]:
+    try:
+        roles = route_executor_status()
+    except Exception as exc:  # pragma: no cover - defensive status surface
+        return {"status": "error", "error": str(exc)}
+    control_rejected = int(roles.get("control", {}).get("rejected") or 0)
+    lifecycle_rejected = int(roles.get("lifecycle", {}).get("rejected") or 0)
+    background_rejected = int(roles.get("background", {}).get("rejected") or 0)
+    status = "degraded" if control_rejected > 0 else "healthy"
+    return {
+        "status": status,
+        "roles": roles,
+        "rejected_total": control_rejected + lifecycle_rejected + background_rejected,
+        "control_rejected": control_rejected,
     }
 
 
@@ -227,6 +290,7 @@ def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
                 top_status = "degraded"
 
     stop_latency = {}
+    scene_snapshot_lease = {}
     if recorder is not None:
         try:
             # Informational only: stop latency is a performance signal, not a
@@ -234,6 +298,12 @@ def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
             stop_latency = recorder.stop_latency_summary()
         except Exception as exc:  # pragma: no cover - defensive status surface
             stop_latency = {"error": str(exc)}
+        try:
+            # Informational only: lease counters are forensics/qualification
+            # evidence. Kernel-side admission remains the only authority.
+            scene_snapshot_lease = recorder.scene_snapshot_lease_status()
+        except Exception as exc:  # pragma: no cover - defensive status surface
+            scene_snapshot_lease = {"error": str(exc)}
 
     trace_storage = {}
     if recorder is not None:
@@ -260,6 +330,20 @@ def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
             if top_status == "ok":
                 top_status = "degraded"
 
+    runtime_safety = _runtime_safety_status(state)
+    if (
+        runtime_safety.get("status") in {"degraded", "error"}
+        and top_status == "ok"
+    ):
+        top_status = "degraded"
+
+    route_executors = _route_executor_heartbeat_status()
+    if (
+        route_executors.get("status") in {"degraded", "error"}
+        and top_status == "ok"
+    ):
+        top_status = "degraded"
+
     return {
         "schema_version": "manyforge.infra_heartbeat.v1",
         "status": top_status,
@@ -282,6 +366,9 @@ def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
             "kernel_event_pipeline": pipeline_status,
             "trace_storage": trace_storage,
             "stop_latency": stop_latency,
+            "scene_snapshot_lease": scene_snapshot_lease,
+            "runtime_safety": runtime_safety,
+            "route_executors": route_executors,
         },
     }
 

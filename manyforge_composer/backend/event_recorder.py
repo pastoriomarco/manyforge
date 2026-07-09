@@ -98,6 +98,40 @@ _LATENCY_METRICS = ("stop", "plan", "validate", "execute")
 # Bounded start-timestamp tracking per metric: interleaved executions are
 # keyed by execution_id; the cap only matters if completions are lost.
 _LATENCY_PENDING_CAP = 64
+_SCENE_SNAPSHOT_LEASE_COUNTER_KEYS = (
+    "accepted_bounded_divergence_total",
+    "lease_expired_rejected_total",
+    "stale_source_rejected_total",
+    "topology_invalidated_total",
+    "policy_invalidated_total",
+    "target_drift_rejected_total",
+    "obstacle_drift_rejected_total",
+    "runtime_dynamic_not_qualified_total",
+    "missing_coverage_rejected_total",
+    "missing_lease_rejected_total",
+    "live_snapshot_unavailable_rejected_total",
+)
+_SCENE_SNAPSHOT_LEASE_REASON_COUNTERS = {
+    "scene_snapshot_lease_live_divergence_accepted": (
+        "accepted_bounded_divergence_total"
+    ),
+    "scene_snapshot_lease_expired": "lease_expired_rejected_total",
+    "observed_scene_source_stale": "stale_source_rejected_total",
+    "scene_topology_changed_after_validation": "topology_invalidated_total",
+    "collision_policy_changed_after_validation": "policy_invalidated_total",
+    "target_moved_after_validation": "target_drift_rejected_total",
+    "obstacle_moved_after_validation": "obstacle_drift_rejected_total",
+    "runtime_dynamic_scene_not_qualified": (
+        "runtime_dynamic_not_qualified_total"
+    ),
+    "scene_snapshot_lease_missing_collision_coverage": (
+        "missing_coverage_rejected_total"
+    ),
+    "scene_snapshot_lease_missing": "missing_lease_rejected_total",
+    "live_scene_snapshot_unavailable": (
+        "live_snapshot_unavailable_rejected_total"
+    ),
+}
 
 
 class _LatencyHistogram:
@@ -743,6 +777,13 @@ class EventRecorder:
         }
         self._last_run_latency: Optional[dict[str, Any]] = None
         self._latency_run_id: Optional[str] = None
+        # RT-7E lease accounting is recorder-thread derived from the deduped
+        # native event stream. It is evidence, not admission authority.
+        self._scene_snapshot_lease_stats: dict[str, int] = {
+            key: 0 for key in _SCENE_SNAPSHOT_LEASE_COUNTER_KEYS
+        }
+        self._last_scene_snapshot_lease_reason: Optional[str] = None
+        self._last_scene_snapshot_lease_wall: Optional[str] = None
         self._stop_chain_execution_marker: Optional[tuple[int, str]] = None
         # Monotonic<->wall clock anchor for kernel-stamped timestamps
         # (observability plan OW2). None until the kernel client provides one;
@@ -1213,6 +1254,36 @@ class EventRecorder:
                 "p99_ns": stop.get("p99_ns"),
             }
 
+    def _observe_scene_snapshot_lease_event_locked(
+        self,
+        native_type: str,
+        details: dict[str, Any],
+    ) -> None:
+        if native_type not in {"validation_passed", "error_raised"}:
+            return
+        reason = str(
+            details.get("reason_code")
+            or details.get("reason")
+            or ""
+        )
+        counter = _SCENE_SNAPSHOT_LEASE_REASON_COUNTERS.get(reason)
+        if counter is None:
+            return
+        self._scene_snapshot_lease_stats[counter] += 1
+        self._last_scene_snapshot_lease_reason = reason
+        self._last_scene_snapshot_lease_wall = _wall_timestamp_iso()
+
+    def scene_snapshot_lease_status(self) -> dict[str, Any]:
+        """RT-7E admission-lease counters derived from native events."""
+        with self._lock:
+            return {
+                "schema_version": "manyforge.scene_snapshot_lease_stats.v1",
+                "status": "healthy",
+                "counters": dict(self._scene_snapshot_lease_stats),
+                "last_reason": self._last_scene_snapshot_lease_reason,
+                "last_wall": self._last_scene_snapshot_lease_wall,
+            }
+
     def last_stop_decision(self) -> Optional[dict[str, Any]]:
         """Latest assembled stop-decision chain (digest/incident surface)."""
         with self._lock:
@@ -1523,6 +1594,9 @@ class EventRecorder:
                 # OW6: the same deduped stream feeds the per-run latency
                 # histograms (recorder-thread work only).
                 with self._lock:
+                    self._observe_scene_snapshot_lease_event_locked(
+                        native_type, details
+                    )
                     self._observe_latency_event_locked(
                         native_type, native_event
                     )

@@ -606,11 +606,31 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("object_id", &manyforge::core::UpdateObjectPoseRequestDTO::object_id)
         .def_readwrite("pose", &manyforge::core::UpdateObjectPoseRequestDTO::pose)
         .def_readwrite("frame_id", &manyforge::core::UpdateObjectPoseRequestDTO::frame_id)
+        .def_readwrite("source_id", &manyforge::core::UpdateObjectPoseRequestDTO::source_id)
         .def_readwrite("source_timestamp_ns",
                        &manyforge::core::UpdateObjectPoseRequestDTO::source_timestamp_ns)
         .def_readwrite(
             "source_freshness_budget_ns",
             &manyforge::core::UpdateObjectPoseRequestDTO::source_freshness_budget_ns)
+        .def_readwrite("scene_admission_role",
+                       &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_role)
+        .def_readwrite("scene_admission_lease_max_age_ns",
+                       &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_lease_max_age_ns)
+        .def_readwrite(
+            "scene_admission_target_drift_tolerance_m",
+            &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_target_drift_tolerance_m)
+        .def_readwrite(
+            "scene_admission_target_angular_tolerance_rad",
+            &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_target_angular_tolerance_rad)
+        .def_readwrite(
+            "scene_admission_obstacle_drift_tolerance_m",
+            &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_obstacle_drift_tolerance_m)
+        .def_readwrite(
+            "scene_admission_obstacle_angular_tolerance_rad",
+            &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_obstacle_angular_tolerance_rad)
+        .def_readwrite(
+            "scene_admission_allow_runtime_dynamic_obstacle",
+            &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_allow_runtime_dynamic_obstacle)
         .def("__repr__", [](const manyforge::core::UpdateObjectPoseRequestDTO& u) {
             return py::str("UpdateObjectPoseRequestDTO(object_id='{}')").format(u.object_id);
         });
@@ -964,6 +984,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("frame_id",
                        &manyforge::core::CollisionWorldBody::frame_id)
         .def_readwrite("pose", &manyforge::core::CollisionWorldBody::pose)
+        .def_readwrite("source_id",
+                       &manyforge::core::CollisionWorldBody::source_id)
         .def_readwrite(
             "source_timestamp_ns",
             &manyforge::core::CollisionWorldBody::source_timestamp_ns)

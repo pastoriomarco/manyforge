@@ -1759,7 +1759,17 @@ def test_kernel_metrics_returns_counter_payload():
         "executions_failed",
         "stops_issued",
         "collision_detections",
+        "runtime_collision_ticks_started",
+        "runtime_collision_ticks_completed",
+        "runtime_collision_ticks_faulted",
+        "runtime_collision_tick_max_ns",
+        "validation_deferred_runtime_monitor_active",
+        "runtime_collision_snapshot_refresh_failures",
         "snapshots_published",
+        "event_subscriber_exceptions",
+        "observer_lag_max_ns",
+        "events_emitted",
+        "flight_recorder_records",
     }
     assert expected_keys.issubset(data.keys())
 

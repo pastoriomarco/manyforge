@@ -1414,6 +1414,32 @@ class NativeKernelClient(KernelClient):
             req_dict["source_freshness_budget_ns"] = int(
                 request.source_freshness_budget_ns
             )
+        if request.source_id is not None:
+            req_dict["source_id"] = str(request.source_id)
+        if request.scene_admission_role is not None:
+            req_dict["scene_admission_role"] = str(request.scene_admission_role)
+        if request.scene_admission_lease_max_age_ns is not None:
+            req_dict["scene_admission_lease_max_age_ns"] = int(
+                request.scene_admission_lease_max_age_ns
+            )
+        if request.scene_admission_target_drift_tolerance_m is not None:
+            req_dict["scene_admission_target_drift_tolerance_m"] = float(
+                request.scene_admission_target_drift_tolerance_m
+            )
+        if request.scene_admission_target_angular_tolerance_rad is not None:
+            req_dict["scene_admission_target_angular_tolerance_rad"] = float(
+                request.scene_admission_target_angular_tolerance_rad
+            )
+        if request.scene_admission_obstacle_drift_tolerance_m is not None:
+            req_dict["scene_admission_obstacle_drift_tolerance_m"] = float(
+                request.scene_admission_obstacle_drift_tolerance_m
+            )
+        if request.scene_admission_obstacle_angular_tolerance_rad is not None:
+            req_dict["scene_admission_obstacle_angular_tolerance_rad"] = float(
+                request.scene_admission_obstacle_angular_tolerance_rad
+            )
+        if request.scene_admission_allow_runtime_dynamic_obstacle:
+            req_dict["scene_admission_allow_runtime_dynamic_obstacle"] = True
 
         try:
             result = self._bundle.scene_edit(req_dict)

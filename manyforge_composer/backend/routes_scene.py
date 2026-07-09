@@ -554,6 +554,20 @@ def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse
     drift_states = state.pose_source_drift_states()
     responses: list[PoseSourceStatusResponse] = []
 
+    def scene_admission_payload(binding: Any) -> dict[str, Any] | None:
+        admission = getattr(binding, "scene_admission", None)
+        if admission is None:
+            return None
+        return {
+            "role": admission.role,
+            "leaseMaxAgeS": admission.lease_max_age_s,
+            "targetDriftToleranceM": admission.target_drift_tolerance_m,
+            "targetAngularToleranceRad": admission.target_angular_tolerance_rad,
+            "obstacleDriftToleranceM": admission.obstacle_drift_tolerance_m,
+            "obstacleAngularToleranceRad": admission.obstacle_angular_tolerance_rad,
+            "allowRuntimeDynamicObstacle": admission.allow_runtime_dynamic_obstacle,
+        }
+
     for source_id, source in sorted(pose_sources.items()):
         snapshot = snapshots.get(source_id, {})
         status = str(
@@ -582,6 +596,7 @@ def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse
                     entity=binding.entity,
                     frame_id=binding.frame_id or source.frame_id,
                     apply_policy=binding.apply_policy,
+                    scene_admission=scene_admission_payload(binding),
                     status=object_status,
                     age_s=observed.get("age_s"),
                     update=observed.get("update"),
@@ -1390,6 +1405,28 @@ def create_scene_router(state: ComposerState) -> APIRouter:
             object_state["entity"] = binding.entity
             object_state["frame_id"] = binding.frame_id or source.frame_id
             object_state["apply_policy"] = binding.apply_policy
+            admission = getattr(binding, "scene_admission", None)
+            object_state["scene_admission"] = (
+                None
+                if admission is None
+                else {
+                    "role": admission.role,
+                    "leaseMaxAgeS": admission.lease_max_age_s,
+                    "targetDriftToleranceM": admission.target_drift_tolerance_m,
+                    "targetAngularToleranceRad": (
+                        admission.target_angular_tolerance_rad
+                    ),
+                    "obstacleDriftToleranceM": (
+                        admission.obstacle_drift_tolerance_m
+                    ),
+                    "obstacleAngularToleranceRad": (
+                        admission.obstacle_angular_tolerance_rad
+                    ),
+                    "allowRuntimeDynamicObstacle": (
+                        admission.allow_runtime_dynamic_obstacle
+                    ),
+                }
+            )
             update = object_state.get("update")
             if isinstance(update, dict):
                 update["entity"] = binding.entity

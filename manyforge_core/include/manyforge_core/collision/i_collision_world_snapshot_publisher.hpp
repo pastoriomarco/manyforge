@@ -1,8 +1,13 @@
 #pragma once
 
+#include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <optional>
+#include <string>
+#include <vector>
 
+#include <manyforge_core/collision/scene_snapshot_lease.hpp>
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 
@@ -11,6 +16,22 @@ namespace manyforge::core {
 struct CollisionWorldPolicySnapshotBundle {
   CollisionWorldSnapshotPtr world;
   std::optional<CollisionPolicySnapshot> policy;
+};
+
+struct CollisionWorldLeaseInventory {
+  std::string retention_id;
+  std::int64_t captured_at_ns = 0;
+  CollisionWorldPolicySnapshotBundle bundle;
+  std::uint64_t topology_epoch = 0;
+  std::uint64_t policy_epoch = 0;
+  std::vector<SceneSnapshotLiveObject> live_objects;
+};
+
+struct CollisionWorldLeaseRetentionStats {
+  std::size_t retained_count = 0;
+  std::size_t retained_capacity = 0;
+  std::int64_t retained_max_age_ns = 0;
+  std::vector<std::string> retained_ids_oldest_first;
 };
 
 /// Backend-agnostic publisher of `CollisionWorldSnapshot` (spec §3.8.1,
@@ -103,6 +124,40 @@ class ICollisionWorldSnapshotPublisher {
   collision_world_policy_snapshot_bundle() const {
     return CollisionWorldPolicySnapshotBundle{snapshot(),
                                               collision_policy_snapshot()};
+  }
+
+  /// Return the current world+policy+object-token inventory used to build an
+  /// observed-scene snapshot lease. Unlike the runtime monitor surface below,
+  /// this is an admission/planning surface and may borrow the scene lock to
+  /// capture a coherent MVCC view. Implementations that cannot provide object
+  /// tokens return nullopt so the kernel can fail closed or fall back to the
+  /// strict revision-equality gate until RT-7D wires the new contract.
+  [[nodiscard]] virtual std::optional<CollisionWorldLeaseInventory>
+  current_scene_snapshot_lease_inventory() const {
+    return std::nullopt;
+  }
+
+  /// Retain the current lease inventory so admission can keep using the exact
+  /// immutable world+policy bundle while live scene revisions continue. The
+  /// returned shared pointers remain valid even after release; release only
+  /// removes this publisher's lookup/retention entry.
+  [[nodiscard]] virtual std::optional<CollisionWorldLeaseInventory>
+  retain_scene_snapshot_lease_inventory(std::string retention_id = {}) {
+    (void)retention_id;
+    return std::nullopt;
+  }
+
+  /// Release one retained lease inventory entry. Missing ids are a no-op:
+  /// callers may race cancellation/timeout cleanup without turning cleanup into
+  /// a new failure source.
+  virtual void release_scene_snapshot_lease_inventory(
+      const std::string& retention_id) {
+    (void)retention_id;
+  }
+
+  [[nodiscard]] virtual CollisionWorldLeaseRetentionStats
+  scene_snapshot_lease_retention_stats() const {
+    return {};
   }
 
   /// Return the pre-published runtime-monitor world+policy bundle.

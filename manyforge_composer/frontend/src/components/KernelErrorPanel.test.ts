@@ -332,6 +332,47 @@ describe('KernelErrorPanel mapping', () => {
       );
     });
 
+    it('uses scene-snapshot lease reason when the top-level code is generic', () => {
+      const details = {
+        reason_code: 'target_moved_after_validation',
+        object_id: 'isaac_cheese_box',
+        source_id: 'isaac_scene_objects',
+        target_drift_m: '0.0342',
+        target_angular_drift_rad: '0.1201',
+      };
+
+      expect(
+        headlineForError(
+          'scene_changed_during_validation',
+          details,
+          'Collision world changed after validation and before dispatch',
+        ),
+      ).toBe(
+        'Observed target moved after validation: isaac_cheese_box from isaac_scene_objects (0.0342 m, 0.1201 rad)',
+      );
+      expect(hintForError('scene_changed_during_validation', details)).toContain(
+        'safe-point tolerance',
+      );
+    });
+
+    it('uses details.reason as lease reason when reason_code is absent', () => {
+      const details = {
+        reason: 'observed_scene_source_stale',
+        object_id: 'box',
+        source_id: 'foundationpose',
+        observed_scene_source_age_ns: '750000000',
+        source_freshness_budget_ns: '500000000',
+      };
+
+      expect(
+        headlineForError(
+          'scene_changed_during_validation',
+          details,
+          'Collision world changed after validation and before dispatch',
+        ),
+      ).toBe('Observed scene source stale: box from foundationpose (750 ms > 500 ms)');
+    });
+
     it('renders structured start-state mismatch diagnostics', () => {
       const details = {
         reason_code: 'start_state_mismatch',

@@ -72,6 +72,20 @@ struct ExecutionKernelConfig {
   // forever on a wedged validation worker. Must be > 0.
   Duration validation_collision_wall_timeout_ns = 5'000'000'000;  // 5 s
 
+  // Maximum age of the observed-scene snapshot lease captured at execute
+  // admission. The lease bounds how long validation may tolerate live
+  // pose-source revisions diverging from the immutable world+policy bundle
+  // actually used for planning/validation; structural and policy divergence
+  // still fail closed immediately.
+  Duration scene_snapshot_lease_max_age_ns = 5'000'000'000;  // 5 s
+
+  // Default bounded drift tolerated for request-target observed objects during
+  // one lease window. Composer/deployment metadata can refine roles; the
+  // kernel default is deliberately small and applies only to target pose drift,
+  // never to topology, shape, attachment, support-contact, or policy changes.
+  double scene_snapshot_default_observed_drift_tolerance_m = 0.02;
+  double scene_snapshot_default_observed_angular_tolerance_rad = 0.17453292519943295;  // 10 deg
+
   // When true, a collision-validation rejection re-runs the failing waypoint
   // through the planning context's normalized collision query and appends
   // `legacy_collision_compare_*` engine-parity keys to the error details.
@@ -429,17 +443,25 @@ class ExecutionKernel {
   struct CollisionValidationSuccess {
     CollisionWorldRevision collision_world_revision;
     TrajectoryDTO collision_trajectory;
+    std::optional<SceneSnapshotLease> scene_snapshot_lease;
   };
 
   Result<CollisionValidationSuccess> validate_trajectory(
       const TrajectoryDTO& trajectory,
-      const ExecuteRequestDTO& request);
+      const ExecuteRequestDTO& request,
+      const std::optional<CollisionWorldLeaseInventory>&
+          scene_snapshot_lease_inventory,
+      const std::optional<SceneSnapshotLease>& scene_snapshot_lease);
 
   /// Async execution worker function.
   void async_execute_worker(std::stop_token st,
                             ExecuteRequestDTO request,
                             uint64_t exec_id,
-                            std::optional<TrajectoryDTO> cached_trajectory);
+                            std::optional<TrajectoryDTO> cached_trajectory,
+                            std::optional<CollisionWorldLeaseInventory>
+                                scene_snapshot_lease_inventory,
+                            std::optional<SceneSnapshotLease>
+                                scene_snapshot_lease);
 
   /// Emit an event to all subscribers.
   void emit_event(KernelEvent event);
@@ -480,6 +502,15 @@ class ExecutionKernel {
   void clear_runtime_collision_state_projection();
   void clear_runtime_collision_state_projection_unlocked();
   CollisionWorldRevision current_authoritative_collision_world_revision() const;
+  std::optional<CollisionWorldLeaseInventory>
+  retain_current_scene_snapshot_lease_inventory(std::uint64_t exec_id,
+                                                const std::string& move_id);
+  std::optional<SceneSnapshotLease> build_scene_snapshot_lease(
+      const CollisionWorldLeaseInventory& inventory,
+      const ExecuteRequestDTO& request,
+      std::uint64_t exec_id) const;
+  std::optional<SceneSnapshotLeaseValidationContext>
+  current_scene_snapshot_lease_validation_context() const;
   std::shared_ptr<CollisionCancellationToken> install_validation_cancel_token();
   void clear_validation_cancel_token(
       const std::shared_ptr<CollisionCancellationToken>& token);
@@ -592,6 +623,7 @@ class ExecutionKernel {
   struct ExecuteWorkerValidationPhaseResult {
     ExecuteWorkerPhaseStatus status = ExecuteWorkerPhaseStatus::kContinue;
     CollisionWorldRevision collision_world_revision;
+    std::optional<SceneSnapshotLease> scene_snapshot_lease;
   };
 
   struct ExecuteWorkerDispatchPhaseResult {
@@ -634,6 +666,9 @@ class ExecutionKernel {
       std::uint64_t exec_id,
       TrajectoryDTO& trajectory,
       bool& active_trajectory_from_cache,
+      const std::optional<CollisionWorldLeaseInventory>&
+          scene_snapshot_lease_inventory,
+      const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
       ActiveMotionExecution& motion_state);
 
   ExecuteWorkerDispatchPhaseResult execute_worker_dispatch_phase(
@@ -642,6 +677,7 @@ class ExecutionKernel {
       const TrajectoryDTO& trajectory,
       bool active_trajectory_from_cache,
       const CollisionWorldRevision& validation_world_revision,
+      const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
       ActiveMotionExecution& motion_state);
 
   void execute_worker_finalize_phase(
@@ -803,9 +839,15 @@ class ExecutionKernel {
       fault_preempt_stop_path_collision_details_;
   mutable std::mutex fault_preempt_intervention_error_mutex_;
   std::optional<ErrorDTO> fault_preempt_intervention_error_;
-  // Metrics (atomic counters for thread safety)
+  // Metrics. `metrics_` covers low-rate counters. Runtime-monitor cadence
+  // counters stay atomic so telemetry reads cannot block the safety lane.
   mutable std::mutex metrics_mutex_;
   mutable MetricsSnapshot metrics_;
+  std::atomic<std::uint64_t> runtime_collision_ticks_started_{0};
+  std::atomic<std::uint64_t> runtime_collision_ticks_completed_{0};
+  std::atomic<std::uint64_t> runtime_collision_ticks_faulted_{0};
+  std::atomic<std::uint64_t> runtime_collision_tick_max_ns_{0};
+  std::atomic<std::uint64_t> validation_deferred_runtime_monitor_active_{0};
 
   // Bounded outcome store keyed by execution_id. FIFO
   // eviction beyond `motion_execution_outcome_retention`. The eviction

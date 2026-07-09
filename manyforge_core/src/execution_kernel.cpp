@@ -1,6 +1,7 @@
 #include <manyforge_core/execution_kernel.hpp>
 
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
+#include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
 #include <manyforge_core/execution_admission_support.hpp>
 #include <manyforge_core/execution_collision_support.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
@@ -18,9 +19,12 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace manyforge::core {
 namespace {
@@ -33,6 +37,80 @@ ErrorDTO stale_control_command_error() {
 
 double clamp_unit_interval(double value) {
   return std::max(0.0, std::min(1.0, value));
+}
+
+void update_atomic_max(std::atomic<std::uint64_t>& target,
+                       std::uint64_t value) noexcept {
+  auto current = target.load(std::memory_order_relaxed);
+  while (current < value &&
+         !target.compare_exchange_weak(current,
+                                       value,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+  }
+}
+
+std::string diagnostic_double(double value) {
+  std::ostringstream out;
+  out.precision(17);
+  out << value;
+  return out.str();
+}
+
+std::unordered_set<std::string> observed_target_object_ids(
+    const ExecuteRequestDTO& request,
+    const std::optional<CollisionPolicySnapshot>& policy_snapshot) {
+  std::unordered_set<std::string> out;
+  if (const auto* relative = std::get_if<RelativeMoveDTO>(&request.motion)) {
+    if (relative->target_reference.type == ReferenceDTO::Type::kObject &&
+        !relative->target_reference.id.empty()) {
+      out.insert(relative->target_reference.id);
+    }
+    if (relative->offset_reference.has_value() &&
+        relative->offset_reference->type == ReferenceDTO::Type::kObject &&
+        !relative->offset_reference->id.empty()) {
+      out.insert(relative->offset_reference->id);
+    }
+  }
+  if (!request.contact_policy_id.empty() && policy_snapshot.has_value()) {
+    for (const auto& grasp : policy_snapshot->contact_grasps) {
+      if (grasp.policy_id == request.contact_policy_id &&
+          !grasp.selected_object_id.empty()) {
+        out.insert(grasp.selected_object_id);
+      }
+    }
+  }
+  return out;
+}
+
+std::unordered_map<CollisionBodyId, std::string> body_hashes_by_id(
+    const CollisionWorldSnapshotPtr& snapshot) {
+  std::unordered_map<CollisionBodyId, std::string> out;
+  if (!snapshot) {
+    return out;
+  }
+  out.reserve(snapshot->bodies.size());
+  for (const auto& body : snapshot->bodies) {
+    out.emplace(body.body_id,
+                body.body_content_hash.empty()
+                    ? compute_collision_world_body_content_hash(body)
+                    : body.body_content_hash);
+  }
+  return out;
+}
+
+void enrich_live_objects_with_body_hashes(
+    std::vector<SceneSnapshotLiveObject>& live_objects,
+    const CollisionWorldSnapshotPtr& snapshot) {
+  const auto body_hashes = body_hashes_by_id(snapshot);
+  for (auto& object : live_objects) {
+    for (const auto& body_id : object.collision_body_ids) {
+      const auto it = body_hashes.find(body_id);
+      if (it != body_hashes.end()) {
+        object.body_content_hashes[body_id] = it->second;
+      }
+    }
+  }
 }
 
 std::string pre_dispatch_collision_validation_message(
@@ -279,6 +357,21 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
   if (config_.validation_collision_wall_timeout_ns <= 0) {
     throw std::invalid_argument(
         "validation_collision_wall_timeout_ns must be > 0");
+  }
+  if (config_.scene_snapshot_lease_max_age_ns <= 0) {
+    throw std::invalid_argument(
+        "scene_snapshot_lease_max_age_ns must be > 0");
+  }
+  if (!std::isfinite(config_.scene_snapshot_default_observed_drift_tolerance_m) ||
+      config_.scene_snapshot_default_observed_drift_tolerance_m < 0.0) {
+    throw std::invalid_argument(
+        "scene_snapshot_default_observed_drift_tolerance_m must be finite and >= 0");
+  }
+  if (!std::isfinite(
+          config_.scene_snapshot_default_observed_angular_tolerance_rad) ||
+      config_.scene_snapshot_default_observed_angular_tolerance_rad < 0.0) {
+    throw std::invalid_argument(
+        "scene_snapshot_default_observed_angular_tolerance_rad must be finite and >= 0");
   }
   if (config_.native_reset_completion_timeout_s <= 0.0 ||
       !std::isfinite(config_.native_reset_completion_timeout_s)) {
@@ -1238,6 +1331,180 @@ ExecutionKernel::current_authoritative_collision_world_revision() const {
     // available"; validation itself reports the concrete publisher error.
   }
   return {};
+}
+
+std::optional<CollisionWorldLeaseInventory>
+ExecutionKernel::retain_current_scene_snapshot_lease_inventory(
+    std::uint64_t exec_id,
+    const std::string& move_id) {
+  ICollisionWorldSnapshotPublisher* publisher =
+      collision_resources_.snapshot().snapshot_publisher;
+  if (publisher == nullptr) {
+    return std::nullopt;
+  }
+  std::string retention_id =
+      "execution_" + std::to_string(exec_id);
+  if (!move_id.empty()) {
+    retention_id += "_" + move_id;
+  }
+  try {
+    auto inventory =
+        publisher->retain_scene_snapshot_lease_inventory(retention_id);
+    if (inventory.has_value() && !inventory->retention_id.empty()) {
+      publisher->release_scene_snapshot_lease_inventory(
+          inventory->retention_id);
+    }
+    return inventory;
+  } catch (const std::exception&) {
+    // Lease inventory is an RT-7 publisher extension. Legacy publishers and
+    // exceptional inventory surfaces fall back to the pre-existing strict
+    // revision gate; validation itself still reports concrete bundle errors.
+  } catch (...) {
+  }
+  return std::nullopt;
+}
+
+std::optional<SceneSnapshotLease> ExecutionKernel::build_scene_snapshot_lease(
+    const CollisionWorldLeaseInventory& inventory,
+    const ExecuteRequestDTO& request,
+    std::uint64_t exec_id) const {
+  if (!inventory.bundle.world || !inventory.bundle.policy.has_value()) {
+    return std::nullopt;
+  }
+
+  SceneSnapshotLease lease;
+  lease.lease_id = inventory.retention_id.empty()
+                       ? "execution_" + std::to_string(exec_id)
+                       : inventory.retention_id;
+  lease.validation_epoch = exec_id;
+  lease.captured_at_ns =
+      inventory.captured_at_ns > 0 ? inventory.captured_at_ns : clock_.now();
+  lease.lease_max_age_ns = config_.scene_snapshot_lease_max_age_ns;
+  lease.world_revision = inventory.bundle.world->revision;
+  lease.policy_revision = inventory.bundle.policy->revision;
+  lease.topology_epoch = inventory.topology_epoch;
+  lease.policy_epoch = inventory.policy_epoch;
+
+  const auto tighten_lease_age = [](std::optional<std::int64_t>& current,
+                                    std::optional<std::int64_t> candidate) {
+    if (!candidate.has_value()) {
+      return;
+    }
+    if (!current.has_value() || *candidate < *current) {
+      current = *candidate;
+    }
+  };
+  const auto target_ids =
+      observed_target_object_ids(request, inventory.bundle.policy);
+  const auto body_hashes = body_hashes_by_id(inventory.bundle.world);
+  std::unordered_set<std::string> included_object_ids;
+  lease.objects.reserve(inventory.live_objects.size());
+  for (const auto& live : inventory.live_objects) {
+    if (live.object_id.empty() || live.collision_body_ids.empty()) {
+      continue;
+    }
+    included_object_ids.insert(live.object_id);
+    SceneSnapshotLeaseObject object;
+    object.object_id = live.object_id;
+    object.collision_body_ids = live.collision_body_ids;
+    object.object_revision_token = live.object_revision_token;
+    object.pose = live.pose;
+    object.source_id = live.source_id;
+    object.source_timestamp_ns = live.source_timestamp_ns;
+    object.source_freshness_budget_ns = live.source_freshness_budget_ns;
+    tighten_lease_age(lease.lease_max_age_ns, live.lease_max_age_ns);
+
+    const bool request_target =
+        target_ids.find(live.object_id) != target_ids.end();
+    if (live.declared_role == ObservedSceneObjectRole::kObservedTarget &&
+        request_target) {
+      object.role = ObservedSceneObjectRole::kObservedTarget;
+      object.target_drift_tolerance_m =
+          live.target_drift_tolerance_m.value_or(
+              config_.scene_snapshot_default_observed_drift_tolerance_m);
+      object.target_angular_tolerance_rad =
+          live.target_angular_tolerance_rad.value_or(
+              config_.scene_snapshot_default_observed_angular_tolerance_rad);
+    } else if (live.declared_role ==
+               ObservedSceneObjectRole::kObservedDynamicObstacle) {
+      object.role = ObservedSceneObjectRole::kObservedDynamicObstacle;
+      object.obstacle_drift_tolerance_m =
+          live.obstacle_drift_tolerance_m.value_or(0.0);
+      object.obstacle_angular_tolerance_rad =
+          live.obstacle_angular_tolerance_rad.value_or(0.0);
+      object.runtime_dynamic_obstacle_allowed =
+          live.runtime_dynamic_obstacle_allowed;
+    } else if (live.declared_role == ObservedSceneObjectRole::kObservedTarget) {
+      object.role = ObservedSceneObjectRole::kSnapshotObstacle;
+    } else if (live.declared_role.has_value()) {
+      object.role = *live.declared_role;
+    } else if (request_target) {
+      object.role = ObservedSceneObjectRole::kObservedTarget;
+      object.target_drift_tolerance_m =
+          config_.scene_snapshot_default_observed_drift_tolerance_m;
+      object.target_angular_tolerance_rad =
+          config_.scene_snapshot_default_observed_angular_tolerance_rad;
+    } else {
+      object.role = ObservedSceneObjectRole::kSnapshotObstacle;
+    }
+
+    const bool pose_drift_role =
+        object.role == ObservedSceneObjectRole::kObservedTarget ||
+        object.role == ObservedSceneObjectRole::kObservedDynamicObstacle;
+    const bool body_hash_identity_role =
+        !pose_drift_role &&
+        object.role != ObservedSceneObjectRole::kSnapshotObstacle;
+    if (body_hash_identity_role) {
+      for (const auto& body_id : object.collision_body_ids) {
+        const auto it = body_hashes.find(body_id);
+        if (it != body_hashes.end()) {
+          object.body_content_hashes[body_id] = it->second;
+        }
+      }
+    }
+    lease.objects.push_back(std::move(object));
+  }
+  for (const auto& target_id : target_ids) {
+    if (included_object_ids.find(target_id) != included_object_ids.end()) {
+      continue;
+    }
+    SceneSnapshotLeaseObject missing_target;
+    missing_target.object_id = target_id;
+    missing_target.role = ObservedSceneObjectRole::kObservedTarget;
+    lease.objects.push_back(std::move(missing_target));
+  }
+  return lease;
+}
+
+std::optional<SceneSnapshotLeaseValidationContext>
+ExecutionKernel::current_scene_snapshot_lease_validation_context() const {
+  ICollisionWorldSnapshotPublisher* publisher =
+      collision_resources_.snapshot().snapshot_publisher;
+  if (publisher == nullptr) {
+    return std::nullopt;
+  }
+  try {
+    auto inventory = publisher->current_scene_snapshot_lease_inventory();
+    if (!inventory.has_value() || !inventory->bundle.world ||
+        !inventory->bundle.policy.has_value()) {
+      return std::nullopt;
+    }
+    SceneSnapshotLeaseValidationContext context;
+    context.now_ns = clock_.now();
+    context.default_lease_max_age_ns =
+        config_.scene_snapshot_lease_max_age_ns;
+    context.live_world_revision = inventory->bundle.world->revision;
+    context.live_policy_revision = inventory->bundle.policy->revision;
+    context.topology_epoch = inventory->topology_epoch;
+    context.policy_epoch = inventory->policy_epoch;
+    context.live_objects = std::move(inventory->live_objects);
+    enrich_live_objects_with_body_hashes(context.live_objects,
+                                         inventory->bundle.world);
+    return context;
+  } catch (const std::exception&) {
+  } catch (...) {
+  }
+  return std::nullopt;
 }
 
 std::shared_ptr<CollisionCancellationToken>
@@ -3663,6 +3930,9 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     std::uint64_t exec_id,
     TrajectoryDTO& trajectory,
     bool& active_trajectory_from_cache,
+    const std::optional<CollisionWorldLeaseInventory>&
+        scene_snapshot_lease_inventory,
+    const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
     ActiveMotionExecution& motion_state) {
   ExecuteWorkerValidationPhaseResult phase_result;
   const int max_authoritative_validation_attempts =
@@ -3678,7 +3948,9 @@ ExecutionKernel::execute_worker_validate_replan_phase(
                  {"max_attempts",
                   std::to_string(max_authoritative_validation_attempts)}}});
 
-    val_result = validate_trajectory(trajectory, request);
+    val_result = validate_trajectory(trajectory, request,
+                                     scene_snapshot_lease_inventory,
+                                     scene_snapshot_lease);
     if (val_result.ok()) {
       break;
     }
@@ -4209,6 +4481,8 @@ ExecutionKernel::execute_worker_validate_replan_phase(
 
   phase_result.collision_world_revision =
       val_result.value().collision_world_revision;
+  phase_result.scene_snapshot_lease =
+      std::move(val_result.value().scene_snapshot_lease);
   return phase_result;
 }
 
@@ -4219,64 +4493,215 @@ ExecutionKernel::execute_worker_dispatch_phase(
     const TrajectoryDTO& trajectory,
     bool active_trajectory_from_cache,
     const CollisionWorldRevision& validation_world_revision,
+    const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
     ActiveMotionExecution& motion_state) {
   ExecuteWorkerDispatchPhaseResult phase_result;
 
+  const auto fail_scene_snapshot_gate =
+      [&](ErrorDTO stale_error, const char* override_reason,
+          const char* terminal_reason) -> bool {
+    const auto prev = sm_.status().state;
+    sm_.set_last_error(error_code_from_dto(stale_error));
+    auto terminal_commit =
+        commit_terminal(ExecutionState::kFailed, "terminal_commit");
+    if (terminal_commit.committed != ExecutionState::kFailed) {
+      if (finalize_overridden_terminal_authority(
+              request, exec_id, motion_state, terminal_commit.committed,
+              override_reason, stale_error)) {
+        phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+        return true;
+      }
+    }
+    emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                 {}, {}, stale_error, {}});
+    auto stale_snapshot = get_execution_snapshot();
+    stale_snapshot.timestamp_ns = clock_.now();
+    stale_snapshot.execution_id = exec_id;
+    stale_snapshot.move_id = request.move_id;
+    stale_snapshot.state = ExecutionState::kFailed;
+    stale_snapshot.error = stale_error;
+    publish_execution_snapshot(std::move(stale_snapshot));
+    emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                 prev, ExecutionState::kFailed, std::nullopt,
+                 {{"reason", terminal_reason}}});
+    finalize_motion_execution_outcome(
+        motion_state, MotionExecutionTerminalCause::kFailed,
+        stale_error, std::nullopt, terminal_reason);
+    finish_execute_worker();
+    phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+    return true;
+  };
+
   if (collision_world_revision_is_set(validation_world_revision)) {
-    const auto live_revision =
-        current_authoritative_collision_world_revision();
-    const bool live_revision_available =
-        collision_world_revision_is_set(live_revision);
-    if (!live_revision_available ||
-        !collision_world_revisions_equal(live_revision,
-                                         validation_world_revision)) {
-      std::map<std::string, std::string> details;
-      details["reason"] = live_revision_available
-                              ? "collision_world_changed_after_validation"
-                              : "collision_world_revision_unavailable_before_dispatch";
-      details["validation_collision_world_revision_id"] =
-          std::to_string(validation_world_revision.revision_id);
-      details["validation_collision_world_content_hash"] =
-          validation_world_revision.content_hash;
-      details["live_collision_world_revision_id"] =
-          std::to_string(live_revision.revision_id);
-      details["live_collision_world_content_hash"] =
-          live_revision.content_hash;
-      ErrorDTO stale_error{
-          kErrorSceneChangedDuringValidation,
-          "Collision world changed after validation and before dispatch",
-          std::move(details)};
-      const auto prev = sm_.status().state;
-      sm_.set_last_error(error_code_from_dto(stale_error));
-      auto terminal_commit =
-          commit_terminal(ExecutionState::kFailed, "terminal_commit");
-      if (terminal_commit.committed != ExecutionState::kFailed) {
-        if (finalize_overridden_terminal_authority(
-                request, exec_id, motion_state, terminal_commit.committed,
+    if (scene_snapshot_lease.has_value()) {
+      auto validation_context =
+          current_scene_snapshot_lease_validation_context();
+      SceneSnapshotLeaseValidationContext missing_context;
+      missing_context.now_ns = clock_.now();
+      missing_context.default_lease_max_age_ns =
+          config_.scene_snapshot_lease_max_age_ns;
+      auto lease_result = validate_scene_snapshot_lease(
+          *scene_snapshot_lease,
+          validation_context.has_value() ? *validation_context
+                                         : missing_context);
+      if (!lease_result.accepted) {
+        std::map<std::string, std::string> details =
+            std::move(lease_result.details);
+        details["reason"] =
+            lease_result.reason_code.empty()
+                ? "scene_snapshot_lease_rejected"
+                : lease_result.reason_code;
+        details["reason_code"] = details["reason"];
+        details["scene_snapshot_lease_id"] = lease_result.lease_id;
+        details["validation_collision_world_revision_id"] =
+            std::to_string(
+                lease_result.validated_world_revision.revision_id);
+        details["validation_collision_world_content_hash"] =
+            lease_result.validated_world_revision.content_hash;
+        details["live_collision_world_revision_id"] =
+            std::to_string(lease_result.live_world_revision.revision_id);
+        details["live_collision_world_content_hash"] =
+            lease_result.live_world_revision.content_hash;
+        details["validation_collision_policy_revision_id"] =
+            std::to_string(
+                lease_result.validated_policy_revision.revision_id);
+        details["live_collision_policy_revision_id"] =
+            std::to_string(lease_result.live_policy_revision.revision_id);
+        if (lease_result.object_id.has_value()) {
+          details["object_id"] = *lease_result.object_id;
+        }
+        if (lease_result.source_id.has_value()) {
+          details["source_id"] = *lease_result.source_id;
+        }
+        if (lease_result.lease_age_ns.has_value()) {
+          details["scene_snapshot_lease_age_ns"] =
+              std::to_string(*lease_result.lease_age_ns);
+        }
+        if (lease_result.source_age_ns.has_value()) {
+          details["observed_scene_source_age_ns"] =
+              std::to_string(*lease_result.source_age_ns);
+        }
+        if (lease_result.target_drift_m.has_value()) {
+          details["target_drift_m"] =
+              diagnostic_double(*lease_result.target_drift_m);
+        }
+        if (lease_result.target_angular_drift_rad.has_value()) {
+          details["target_angular_drift_rad"] =
+              diagnostic_double(*lease_result.target_angular_drift_rad);
+        }
+        if (lease_result.obstacle_drift_m.has_value()) {
+          details["obstacle_drift_m"] =
+              diagnostic_double(*lease_result.obstacle_drift_m);
+        }
+        if (lease_result.obstacle_angular_drift_rad.has_value()) {
+          details["obstacle_angular_drift_rad"] =
+              diagnostic_double(*lease_result.obstacle_angular_drift_rad);
+        }
+
+        std::string message =
+            "Collision world changed after validation and before dispatch";
+        if (lease_result.rejection ==
+            SceneSnapshotLeaseRejection::kTargetMovedAfterValidation) {
+          message =
+              "Observed target moved after validation and before dispatch";
+        } else if (lease_result.rejection ==
+                   SceneSnapshotLeaseRejection::kObstacleMovedAfterValidation) {
+          message =
+              "Observed obstacle moved after validation and before dispatch";
+        } else if (lease_result.rejection ==
+                   SceneSnapshotLeaseRejection::
+                       kCollisionPolicyChangedAfterValidation) {
+          message =
+              "Collision policy changed after validation and before dispatch";
+        }
+
+        ErrorDTO stale_error{kErrorSceneChangedDuringValidation,
+                             std::move(message), std::move(details)};
+        if (fail_scene_snapshot_gate(
+                std::move(stale_error),
+                "dispatch_scene_snapshot_lease_overridden_by_terminal_authority",
+                "dispatch_scene_snapshot_lease_rejected")) {
+          return phase_result;
+        }
+      } else if (lease_result.details.find(
+                     "accepted_live_world_revision_divergence") !=
+                 lease_result.details.end() &&
+                 scene_snapshot_lease->objects.empty()) {
+        auto details = std::move(lease_result.details);
+        details["reason"] = "scene_snapshot_lease_missing_collision_coverage";
+        details["reason_code"] = details["reason"];
+        details["scene_snapshot_lease_id"] = lease_result.lease_id;
+        details["validation_collision_world_revision_id"] =
+            std::to_string(
+                lease_result.validated_world_revision.revision_id);
+        details["validation_collision_world_content_hash"] =
+            lease_result.validated_world_revision.content_hash;
+        details["live_collision_world_revision_id"] =
+            std::to_string(lease_result.live_world_revision.revision_id);
+        details["live_collision_world_content_hash"] =
+            lease_result.live_world_revision.content_hash;
+        ErrorDTO stale_error{
+            kErrorSceneChangedDuringValidation,
+            "Collision world changed without lease-covered collision objects",
+            std::move(details)};
+        if (fail_scene_snapshot_gate(
+                std::move(stale_error),
+                "dispatch_scene_snapshot_lease_overridden_by_terminal_authority",
+                "dispatch_scene_snapshot_lease_missing_coverage")) {
+          return phase_result;
+        }
+      } else if (lease_result.details.find(
+                     "accepted_live_world_revision_divergence") !=
+                 lease_result.details.end()) {
+        auto details = std::move(lease_result.details);
+        details["reason"] =
+            "scene_snapshot_lease_live_divergence_accepted";
+        details["reason_code"] = details["reason"];
+        details["scene_snapshot_lease_id"] = lease_result.lease_id;
+        details["validation_collision_world_revision_id"] =
+            std::to_string(
+                lease_result.validated_world_revision.revision_id);
+        details["validation_collision_world_content_hash"] =
+            lease_result.validated_world_revision.content_hash;
+        details["live_collision_world_revision_id"] =
+            std::to_string(lease_result.live_world_revision.revision_id);
+        details["live_collision_world_content_hash"] =
+            lease_result.live_world_revision.content_hash;
+        emit_event({KernelEventType::kValidationPassed, exec_id, clock_.now(),
+                    {}, {}, std::nullopt, std::move(details)});
+      }
+    } else {
+      const auto live_revision =
+          current_authoritative_collision_world_revision();
+      const bool live_revision_available =
+          collision_world_revision_is_set(live_revision);
+      if (!live_revision_available ||
+          !collision_world_revisions_equal(live_revision,
+                                           validation_world_revision)) {
+        std::map<std::string, std::string> details;
+        details["reason"] =
+            live_revision_available
+                ? "collision_world_changed_after_validation"
+                : "collision_world_revision_unavailable_before_dispatch";
+        details["validation_collision_world_revision_id"] =
+            std::to_string(validation_world_revision.revision_id);
+        details["validation_collision_world_content_hash"] =
+            validation_world_revision.content_hash;
+        details["live_collision_world_revision_id"] =
+            std::to_string(live_revision.revision_id);
+        details["live_collision_world_content_hash"] =
+            live_revision.content_hash;
+        ErrorDTO stale_error{
+            kErrorSceneChangedDuringValidation,
+            "Collision world changed after validation and before dispatch",
+            std::move(details)};
+        if (fail_scene_snapshot_gate(
+                std::move(stale_error),
                 "dispatch_revision_changed_overridden_by_terminal_authority",
-                stale_error)) {
-          phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+                "dispatch_revision_changed")) {
           return phase_result;
         }
       }
-      emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                   {}, {}, stale_error, {}});
-      auto stale_snapshot = get_execution_snapshot();
-      stale_snapshot.timestamp_ns = clock_.now();
-      stale_snapshot.execution_id = exec_id;
-      stale_snapshot.move_id = request.move_id;
-      stale_snapshot.state = ExecutionState::kFailed;
-      stale_snapshot.error = stale_error;
-      publish_execution_snapshot(std::move(stale_snapshot));
-      emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                   prev, ExecutionState::kFailed, std::nullopt,
-                   {{"reason", "dispatch_revision_changed"}}});
-      finalize_motion_execution_outcome(
-          motion_state, MotionExecutionTerminalCause::kFailed,
-          stale_error, std::nullopt, "dispatch_revision_changed");
-      finish_execute_worker();
-      phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
-      return phase_result;
     }
   }
 
@@ -4667,7 +5092,10 @@ void ExecutionKernel::execute_worker_finalize_phase(
 
 void ExecutionKernel::async_execute_worker(
     std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,
-    std::optional<TrajectoryDTO> cached_trajectory) {
+    std::optional<TrajectoryDTO> cached_trajectory,
+    std::optional<CollisionWorldLeaseInventory>
+        scene_snapshot_lease_inventory,
+    std::optional<SceneSnapshotLease> scene_snapshot_lease) {
   // Worker-local motion-execution state. Lives on this
   // stack frame so two overlapping workers (should never happen under
   // the lifecycle mutex, but defense in depth) cannot share state.
@@ -4720,7 +5148,7 @@ void ExecutionKernel::async_execute_worker(
 
     auto validation_phase = execute_worker_validate_replan_phase(
         st, request, exec_id, trajectory, active_trajectory_from_cache,
-        motion_state);
+        scene_snapshot_lease_inventory, scene_snapshot_lease, motion_state);
     if (validation_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
       return;
     }
@@ -4729,7 +5157,8 @@ void ExecutionKernel::async_execute_worker(
 
     auto dispatch_phase = execute_worker_dispatch_phase(
         request, exec_id, trajectory, active_trajectory_from_cache,
-        validation_world_revision, motion_state);
+        validation_world_revision, validation_phase.scene_snapshot_lease,
+        motion_state);
     if (dispatch_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
       return;
     }
@@ -5352,7 +5781,8 @@ void ExecutionKernel::async_execute_worker(
                        {"resume_phase", "validation"}}});
 
           Result<CollisionValidationSuccess> resume_validation =
-              validate_trajectory(resumed_trajectory, request);
+              validate_trajectory(resumed_trajectory, request, std::nullopt,
+                                  std::nullopt);
           if (!resume_validation.ok()) {
             if (validation_cancelled_by_interrupt(resume_validation.error()) &&
                 sm_.status().state == ExecutionState::kInterrupted) {
@@ -5763,6 +6193,14 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     return reject_admission(sync_result.error());
   }
 
+  auto scene_snapshot_lease_inventory =
+      retain_current_scene_snapshot_lease_inventory(exec_id, request.move_id);
+  std::optional<SceneSnapshotLease> scene_snapshot_lease;
+  if (scene_snapshot_lease_inventory.has_value()) {
+    scene_snapshot_lease = build_scene_snapshot_lease(
+        *scene_snapshot_lease_inventory, request, exec_id);
+  }
+
   ExecuteRequestDTO resolved_request(request);
   auto resolved_motion = resolve_motion_spec(request);
   if (!resolved_motion.ok()) {
@@ -5981,12 +6419,17 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
        cached_trajectory = prepared.cache_hit
                                ? std::make_optional(std::move(prepared.trajectory))
                                : std::nullopt,
+       scene_snapshot_lease_inventory =
+           std::move(scene_snapshot_lease_inventory),
+       scene_snapshot_lease = std::move(scene_snapshot_lease),
        worker_start_gate](std::stop_token st) mutable {
         if (!worker_start_gate->wait(st)) {
           return;
         }
         async_execute_worker(st, std::move(request_copy), exec_id,
-                             std::move(cached_trajectory));
+                             std::move(cached_trajectory),
+                             std::move(scene_snapshot_lease_inventory),
+                             std::move(scene_snapshot_lease));
       });
 
   execute_admission_interruptible_.store(false, std::memory_order_seq_cst);
@@ -6079,11 +6522,6 @@ StopResultDTO ExecutionKernel::stop() {
   // window (1-2 s for soft-on-path), making the "stopping…" period
   // observable to the UI and to trace reconstruction.
   const auto prev_state = sm_.status().state;
-  if (prev_state == ExecutionState::kPlanning) {
-    request_active_planning_cancel();
-  } else if (prev_state == ExecutionState::kValidating) {
-    request_active_validation_cancel("operator_stop");
-  }
   emit_event({KernelEventType::kStopRequested, sm_.status().execution_id,
               clock_.now(), {}, {}, std::nullopt, {}});
 
@@ -6166,6 +6604,11 @@ StopResultDTO ExecutionKernel::stop() {
   auto result = stop_policy_.request_hard_stop();
   if (!result.ok()) {
     return StopResultDTO{false, result.error()};
+  }
+  if (prev_state == ExecutionState::kPlanning) {
+    request_active_planning_cancel();
+  } else if (prev_state == ExecutionState::kValidating) {
+    request_active_validation_cancel("operator_stop");
   }
 
   stop_collision_monitoring(RuntimeCollisionMonitorRelease::kTerminalQuiesced);
@@ -7269,6 +7712,17 @@ MetricsSnapshot ExecutionKernel::get_metrics() const {
   snapshot.events_emitted =
       event_sequence_.load(std::memory_order_relaxed);
   snapshot.flight_recorder_records = flight_recorder_.recorded_total();
+  snapshot.runtime_collision_ticks_started =
+      runtime_collision_ticks_started_.load(std::memory_order_relaxed);
+  snapshot.runtime_collision_ticks_completed =
+      runtime_collision_ticks_completed_.load(std::memory_order_relaxed);
+  snapshot.runtime_collision_ticks_faulted =
+      runtime_collision_ticks_faulted_.load(std::memory_order_relaxed);
+  snapshot.runtime_collision_tick_max_ns =
+      runtime_collision_tick_max_ns_.load(std::memory_order_relaxed);
+  snapshot.validation_deferred_runtime_monitor_active =
+      validation_deferred_runtime_monitor_active_.load(
+          std::memory_order_relaxed);
   return snapshot;
 }
 
@@ -7287,14 +7741,34 @@ Result<void> ExecutionKernel::collision_check_tick() {
     return Result<void>::Ok();
   }
 
+  const auto tick_start_ns = clock_.now();
+  runtime_collision_ticks_started_.fetch_add(1, std::memory_order_relaxed);
+  const auto record_tick_metric = [this, tick_start_ns](bool faulted) {
+    const auto now_ns = clock_.now();
+    std::uint64_t duration_ns = 0;
+    if (now_ns > tick_start_ns) {
+      duration_ns = static_cast<std::uint64_t>(now_ns - tick_start_ns);
+    }
+    if (faulted) {
+      runtime_collision_ticks_faulted_.fetch_add(1,
+                                                std::memory_order_relaxed);
+    } else {
+      runtime_collision_ticks_completed_.fetch_add(1,
+                                                  std::memory_order_relaxed);
+    }
+    update_atomic_max(runtime_collision_tick_max_ns_, duration_ns);
+  };
+
   auto publish_runtime_monitor_fault =
       [this,
+       &record_tick_metric,
        trip_stop_active,
        operator_stop_active,
        fault_preempt_stop_active,
        stop_path_active](
           CollisionCheckResultDTO check,
           std::map<std::string, std::string> details) -> Result<void> {
+      record_tick_metric(true);
       details["surface"] = "observed_runtime_monitor";
       const auto stop_owner = [&]() -> const char* {
         if (trip_stop_active) {
@@ -7579,6 +8053,7 @@ Result<void> ExecutionKernel::collision_check_tick() {
       }
       return publish_runtime_monitor_fault(check, std::move(*release_fault));
     }
+    record_tick_metric(false);
     return Result<void>::Ok();
   }
 
@@ -7698,7 +8173,11 @@ Result<MotionSpecDTO> ExecutionKernel::resolve_motion_spec(
 
 Result<ExecutionKernel::CollisionValidationSuccess>
 ExecutionKernel::validate_trajectory(
-    const TrajectoryDTO& trajectory, const ExecuteRequestDTO& request) {
+    const TrajectoryDTO& trajectory,
+    const ExecuteRequestDTO& request,
+    const std::optional<CollisionWorldLeaseInventory>&
+        scene_snapshot_lease_inventory,
+    const std::optional<SceneSnapshotLease>& scene_snapshot_lease) {
   // Start-state gate
   auto current_state = context_.get_current_state();
   if (!trajectory.waypoints.empty()) {
@@ -7733,6 +8212,12 @@ ExecutionKernel::validate_trajectory(
       CollisionResourceManager::validate_admission(collision_resources,
                                                   runtime_protection.active);
   if (!validation_admission.admitted()) {
+    if (validation_admission.status ==
+        CollisionValidationAdmissionStatus::
+            kRuntimeMonitorLeaseActiveSharedResource) {
+      validation_deferred_runtime_monitor_active_.fetch_add(
+          1, std::memory_order_relaxed);
+    }
     return Result<CollisionValidationSuccess>::Err(
         validation_admission_error(sm_.status().state,
                                    collision_resources,
@@ -7793,22 +8278,35 @@ ExecutionKernel::validate_trajectory(
     ParallelValidationTelemetry telemetry;
   };
 
+  std::optional<SceneSnapshotLease> effective_scene_snapshot_lease =
+      scene_snapshot_lease;
+  if (!effective_scene_snapshot_lease.has_value() &&
+      scene_snapshot_lease_inventory.has_value()) {
+    effective_scene_snapshot_lease =
+        build_scene_snapshot_lease(*scene_snapshot_lease_inventory, request,
+                                   sm_.status().execution_id);
+  }
+
   auto run_authoritative_validation_once =
       [&]() -> Result<AuthoritativeValidationAttempt> {
     CollisionWorldPolicySnapshotBundle world_policy_bundle;
-    try {
-      world_policy_bundle =
-          snapshot_publisher->collision_world_policy_snapshot_bundle();
-    } catch (const std::exception& e) {
-      return Result<AuthoritativeValidationAttempt>::Err(
-          authoritative_collision_validation_config_error(
-              "snapshot_publisher_exception",
-              {{"exception", e.what()}}));
-    } catch (...) {
-      return Result<AuthoritativeValidationAttempt>::Err(
-          authoritative_collision_validation_config_error(
-              "snapshot_publisher_exception",
-              {{"exception", reason_codes::kUnknownNonStdException}}));
+    if (scene_snapshot_lease_inventory.has_value()) {
+      world_policy_bundle = scene_snapshot_lease_inventory->bundle;
+    } else {
+      try {
+        world_policy_bundle =
+            snapshot_publisher->collision_world_policy_snapshot_bundle();
+      } catch (const std::exception& e) {
+        return Result<AuthoritativeValidationAttempt>::Err(
+            authoritative_collision_validation_config_error(
+                "snapshot_publisher_exception",
+                {{"exception", e.what()}}));
+      } catch (...) {
+        return Result<AuthoritativeValidationAttempt>::Err(
+            authoritative_collision_validation_config_error(
+                "snapshot_publisher_exception",
+                {{"exception", reason_codes::kUnknownNonStdException}}));
+      }
     }
     CollisionWorldSnapshotPtr world_snapshot = world_policy_bundle.world;
     if (!world_snapshot) {
@@ -7881,7 +8379,8 @@ ExecutionKernel::validate_trajectory(
   if (bundle.decision.accepted) {
     return Result<CollisionValidationSuccess>::Ok(
         CollisionValidationSuccess{bundle.borrowed_world_revision,
-                                   std::move(collision_trajectory)});
+                                   std::move(collision_trajectory),
+                                   std::move(effective_scene_snapshot_lease)});
   }
   std::map<std::string, std::string> details;
   if (bundle.decision.first_failing_waypoint) {

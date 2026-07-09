@@ -333,8 +333,16 @@ class SceneEditRequest:
     frame_id: Optional[str] = None
     touch_links: Optional[List[str]] = None
     support_contacts: Optional[List[Dict[str, Any]]] = None
+    source_id: Optional[str] = None
     source_timestamp_ns: Optional[int] = None
     source_freshness_budget_ns: Optional[int] = None
+    scene_admission_role: Optional[str] = None
+    scene_admission_lease_max_age_ns: Optional[int] = None
+    scene_admission_target_drift_tolerance_m: Optional[float] = None
+    scene_admission_target_angular_tolerance_rad: Optional[float] = None
+    scene_admission_obstacle_drift_tolerance_m: Optional[float] = None
+    scene_admission_obstacle_angular_tolerance_rad: Optional[float] = None
+    scene_admission_allow_runtime_dynamic_obstacle: bool = False
     action_span: Optional[ActionSpan] = None
 
 
@@ -801,6 +809,8 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
             return "pose_orientation_xyzw must have exactly 4 elements"
         source_timestamp = request.source_timestamp_ns
         source_budget = request.source_freshness_budget_ns
+        if request.source_id is not None and not str(request.source_id).strip():
+            return "source_id must be non-empty when provided"
         if (source_timestamp is None) != (source_budget is None):
             return (
                 "update_pose source_timestamp_ns and "
@@ -811,6 +821,71 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
                 return "source_timestamp_ns must be a non-negative integer"
             if not isinstance(source_budget, int) or source_budget <= 0:
                 return "source_freshness_budget_ns must be a positive integer"
+        scene_admission_present = any(
+            value is not None
+            for value in (
+                request.scene_admission_role,
+                request.scene_admission_lease_max_age_ns,
+                request.scene_admission_target_drift_tolerance_m,
+                request.scene_admission_target_angular_tolerance_rad,
+                request.scene_admission_obstacle_drift_tolerance_m,
+                request.scene_admission_obstacle_angular_tolerance_rad,
+            )
+        ) or bool(request.scene_admission_allow_runtime_dynamic_obstacle)
+        if scene_admission_present:
+            if request.scene_admission_role is None:
+                return (
+                    "scene_admission_role is required when scene admission "
+                    "metadata is provided"
+                )
+            if not str(request.scene_admission_role).strip():
+                return "scene_admission_role must be non-empty when provided"
+            if (
+                request.scene_admission_lease_max_age_ns is not None
+                and (
+                    not isinstance(request.scene_admission_lease_max_age_ns, int)
+                    or request.scene_admission_lease_max_age_ns <= 0
+                )
+            ):
+                return "scene_admission_lease_max_age_ns must be a positive integer"
+            role = str(request.scene_admission_role).strip()
+            target_fields_present = (
+                request.scene_admission_target_drift_tolerance_m is not None
+                or request.scene_admission_target_angular_tolerance_rad is not None
+            )
+            obstacle_fields_present = (
+                request.scene_admission_obstacle_drift_tolerance_m is not None
+                or request.scene_admission_obstacle_angular_tolerance_rad is not None
+            )
+            if role != "observed_target" and target_fields_present:
+                return (
+                    "scene_admission target drift tolerances are only valid "
+                    "for observed_target"
+                )
+            if role != "observed_dynamic_obstacle" and obstacle_fields_present:
+                return (
+                    "scene_admission obstacle drift tolerances are only valid "
+                    "for observed_dynamic_obstacle"
+                )
+            if (
+                role != "observed_dynamic_obstacle"
+                and request.scene_admission_allow_runtime_dynamic_obstacle
+            ):
+                return (
+                    "scene_admission_allow_runtime_dynamic_obstacle is only "
+                    "valid for observed_dynamic_obstacle"
+                )
+            for field_name in (
+                "scene_admission_target_drift_tolerance_m",
+                "scene_admission_target_angular_tolerance_rad",
+                "scene_admission_obstacle_drift_tolerance_m",
+                "scene_admission_obstacle_angular_tolerance_rad",
+            ):
+                value = getattr(request, field_name)
+                if value is None:
+                    continue
+                if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0.0:
+                    return f"{field_name} must be a finite number >= 0"
 
     if request.operation == "attach" and not request.frame_id:
         return "attach requires frame_id"
@@ -1225,7 +1300,17 @@ class MockKernelClient(KernelClient):
             "executions_failed": 0,
             "stops_issued": 0,
             "collision_detections": 0,
+            "runtime_collision_ticks_started": 0,
+            "runtime_collision_ticks_completed": 0,
+            "runtime_collision_ticks_faulted": 0,
+            "runtime_collision_tick_max_ns": 0,
+            "validation_deferred_runtime_monitor_active": 0,
+            "runtime_collision_snapshot_refresh_failures": 0,
             "snapshots_published": 0,
+            "event_subscriber_exceptions": 0,
+            "observer_lag_max_ns": 0,
+            "events_emitted": 0,
+            "flight_recorder_records": 0,
         }
         # Joint names (configurable for tests)
         self._joint_names = joint_names if joint_names is not None else ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]

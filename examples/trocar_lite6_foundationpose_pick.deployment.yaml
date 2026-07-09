@@ -223,6 +223,9 @@ pose_sources:
   objects:
     graspable:
       apply_policy: before_planning
+      scene_admission:
+        role: snapshot_obstacle
+        lease_max_age_s: 5.0
       confidence_min: 0.0
       metadata:
         selection: first

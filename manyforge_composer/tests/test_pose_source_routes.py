@@ -85,11 +85,33 @@ def _client(tmp_path: Path) -> tuple[TestClient, ComposerState]:
     return TestClient(app), state
 
 
+_POSE_SOURCE_ADMISSION_DEFAULT = object()
+_OBSERVED_TARGET_SCENE_ADMISSION = {
+    "role": "observed_target",
+    "lease_max_age_s": 2.0,
+    "target_drift_tolerance_m": 0.02,
+    "target_angular_tolerance_rad": 0.174533,
+}
+
+
+def _scene_admission_for_policy(
+    policy: str,
+    configured: object,
+) -> dict[str, Any] | None:
+    if configured is _POSE_SOURCE_ADMISSION_DEFAULT:
+        return None
+    if configured is None:
+        return None
+    return dict(configured)  # type: ignore[arg-type]
+
+
 def _pose_sources(
     *,
     enabled: bool = True,
     box_policy: str = "before_planning",
     can_policy: str = "observe_only",
+    box_scene_admission: object = _POSE_SOURCE_ADMISSION_DEFAULT,
+    can_scene_admission: object = _POSE_SOURCE_ADMISSION_DEFAULT,
     measured_grasp: bool = False,
     measured_robot: bool = False,
     drift_action: str = "interrupt",
@@ -99,6 +121,20 @@ def _pose_sources(
         "entity": "/World/box",
         "apply_policy": box_policy,
     }
+    resolved_box_admission = _scene_admission_for_policy(
+        box_policy, box_scene_admission
+    )
+    if resolved_box_admission is not None:
+        box_binding["scene_admission"] = resolved_box_admission
+    can_binding: dict[str, Any] = {
+        "entity": "/World/can",
+        "apply_policy": can_policy,
+    }
+    resolved_can_admission = _scene_admission_for_policy(
+        can_policy, can_scene_admission
+    )
+    if resolved_can_admission is not None:
+        can_binding["scene_admission"] = resolved_can_admission
     if measured_grasp:
         box_binding.update(
             {
@@ -137,10 +173,7 @@ def _pose_sources(
         "frame_id": "universe",
         "objects": {
             "box": box_binding,
-            "can": {
-                "entity": "/World/can",
-                "apply_policy": can_policy,
-            },
+            "can": can_binding,
         },
     }
     if measured_robot:
@@ -276,7 +309,15 @@ def test_scene_state_exposes_configured_pose_sources_as_stale(tmp_path: Path) ->
 def test_full_deployment_exposes_pose_sources_for_gui_editing(tmp_path: Path) -> None:
     client, state = _client(tmp_path)
     state.deployment = _minimal_deployment(
-        pose_sources=_pose_sources(box_policy="between_nodes")
+        pose_sources=_pose_sources(
+            box_policy="between_nodes",
+            box_scene_admission={
+                "role": "observed_target",
+                "lease_max_age_s": 2.0,
+                "target_drift_tolerance_m": 0.02,
+                "target_angular_tolerance_rad": 0.1,
+            },
+        )
     )
 
     response = client.get("/api/deployment/full")
@@ -288,6 +329,15 @@ def test_full_deployment_exposes_pose_sources_for_gui_editing(tmp_path: Path) ->
     assert pose_sources[0]["staleAfterS"] == 1.0
     assert pose_sources[0]["objects"]["box"]["applyPolicy"] == "between_nodes"
     assert pose_sources[0]["objects"]["box"]["entity"] == "/World/box"
+    assert pose_sources[0]["objects"]["box"]["sceneAdmission"] == {
+        "role": "observed_target",
+        "leaseMaxAgeS": 2.0,
+        "targetDriftToleranceM": 0.02,
+        "targetAngularToleranceRad": 0.1,
+        "obstacleDriftToleranceM": None,
+        "obstacleAngularToleranceRad": None,
+        "allowRuntimeDynamicObstacle": False,
+    }
 
 
 def test_pose_source_snapshot_is_observe_only_and_normalizes_policy(tmp_path: Path) -> None:
@@ -307,8 +357,18 @@ def test_pose_source_snapshot_is_observe_only_and_normalizes_policy(tmp_path: Pa
     assert observed["status"] == "fresh"
     assert observed["entity"] == "/World/box"
     assert observed["apply_policy"] == "before_planning"
+    assert observed["scene_admission"] == {
+        "role": "snapshot_obstacle",
+        "leaseMaxAgeS": None,
+        "targetDriftToleranceM": None,
+        "targetAngularToleranceRad": None,
+        "obstacleDriftToleranceM": None,
+        "obstacleAngularToleranceRad": None,
+        "allowRuntimeDynamicObstacle": False,
+    }
     assert observed["update"]["entity"] == "/World/box"
     assert observed["update"]["apply_policy"] == "before_planning"
+    assert observed["update"].get("scene_admission") is None
     assert observed["update"]["pose"]["position_xyz"] == [1.0, 2.0, 3.0]
 
 
@@ -339,6 +399,7 @@ def test_pose_source_snapshot_exposes_measured_robot_state(tmp_path: Path) -> No
         "elbow_joint",
     ]
     assert source["measured_robot"]["joint_positions_rad"] == [0.25, -0.5]
+    assert state.kernel.scene_edits == []
 
 
 def test_pose_source_snapshot_rejects_unknown_objects(tmp_path: Path) -> None:
@@ -456,6 +517,12 @@ def test_continuous_snapshot_applies_planning_scene_without_operator_apply(tmp_p
         state.kernel.scene_edits[-1].source_timestamp_ns
         == snapshot["received_at_ns"] - 50_000_000
     )
+    edit = state.kernel.scene_edits[-1]
+    assert edit.source_id == "isaac_scene_objects"
+    assert edit.scene_admission_role == "snapshot_obstacle"
+    assert edit.scene_admission_lease_max_age_ns is None
+    assert edit.scene_admission_target_drift_tolerance_m is None
+    assert edit.scene_admission_target_angular_tolerance_rad is None
     visual_objects, _meta = state.visual_scene_objects_snapshot()
     assert visual_objects[0].pose_in_universe["position_m"] == [1.0, 2.0, 3.0]
     assert refresh_reasons == []
@@ -520,6 +587,36 @@ def test_continuous_snapshot_fails_closed_when_scene_guard_unavailable(
         == "scene_mutation_guard_unavailable"
     )
     assert state.kernel.scene_edits[-1].operation == "add"
+
+
+def test_continuous_snapshot_without_scene_admission_defaults_to_snapshot_obstacle(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(
+            box_policy="continuous",
+            box_scene_admission=None,
+        )
+    )
+    _add_box(client)
+
+    response = _post_fresh_box_snapshot(client)
+
+    assert response.json()["continuous_apply"]["queued"] is True
+    apply_result = _wait_for_pose_source_apply(state)
+    assert apply_result["success"] is True
+    assert apply_result["applied_count"] == 1
+    assert apply_result["rejected_count"] == 0
+    detail = apply_result["details"][0]
+    assert detail["scene_admission_role"] == "snapshot_obstacle"
+    assert state.kernel.scene_edits[-1].operation == "update_pose"
+    assert state.kernel.scene_edits[-1].scene_admission_role == "snapshot_obstacle"
+    scene = client.get("/api/scene/state").json()
+    assert scene["objects"][0]["pose_in_universe"]["position_m"] == [1.0, 2.0, 3.0]
+    observed = scene["pose_sources"][0]["objects"][0]
+    assert observed["status"] == "fresh"
+    assert observed["update"]["pose"]["position_xyz"] == [1.0, 2.0, 3.0]
 
 
 def test_scene_state_does_not_wait_for_blocked_pose_source_apply(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ import type {
   PoseSourceConfig,
   PoseSourceKind,
   PoseSourceObjectBindingConfig,
+  PoseSourceSceneAdmissionRole,
   SceneFrameState,
   SceneUrdfManifest,
   RobotControlJointLimit,
@@ -308,6 +309,34 @@ const POSE_SOURCE_APPLY_POLICIES: PoseSourceApplyPolicy[] = [
   'between_nodes',
 ];
 
+const POSE_SOURCE_SCENE_ADMISSION_ROLES: PoseSourceSceneAdmissionRole[] = [
+  'static_obstacle',
+  'snapshot_obstacle',
+  'observed_target',
+  'observed_dynamic_obstacle',
+  'attached_object',
+  'support_contact',
+  'visualization_only',
+];
+
+type PoseSourceSceneAdmissionPatch = Partial<
+  NonNullable<PoseSourceObjectBindingConfig['sceneAdmission']>
+>;
+
+function admissionRolePatch(role: PoseSourceSceneAdmissionRole | string): PoseSourceSceneAdmissionPatch {
+  const patch: PoseSourceSceneAdmissionPatch = { role };
+  if (role !== 'observed_target') {
+    patch.targetDriftToleranceM = null;
+    patch.targetAngularToleranceRad = null;
+  }
+  if (role !== 'observed_dynamic_obstacle') {
+    patch.obstacleDriftToleranceM = null;
+    patch.obstacleAngularToleranceRad = null;
+    patch.allowRuntimeDynamicObstacle = false;
+  }
+  return patch;
+}
+
 function modelEndpointCapabilities(
   endpoint: ModelEndpointConfig,
 ): ModelEndpointCapabilities {
@@ -421,6 +450,7 @@ function defaultPoseSourceObject(): PoseSourceObjectBindingConfig {
       signalId: '',
       sampleTimeToleranceS: 0.05,
     },
+    sceneAdmission: null,
     metadata: {},
   };
 }
@@ -1586,7 +1616,21 @@ function PoseSourcesEditor({
                   Add one binding per ManyForge scene object that this source observes.
                 </div>
               )}
-              {Object.entries(objects).map(([objectId, binding]) => (
+              {Object.entries(objects).map(([objectId, binding]) => {
+                const admissionRole = binding.sceneAdmission?.role
+                  ?? ((binding.applyPolicy ?? 'observe_only') === 'observe_only'
+                    ? 'visualization_only'
+                    : 'snapshot_obstacle');
+                const updateAdmission = (
+                  patch: PoseSourceSceneAdmissionPatch,
+                ) => updateObject(sourceIndex, objectId, {
+                  sceneAdmission: {
+                    role: admissionRole,
+                    ...(binding.sceneAdmission ?? {}),
+                    ...patch,
+                  },
+                });
+                return (
                 <div key={objectId} className="rounded border border-gray-800 bg-gray-950/50 p-2">
                   <div className="grid gap-2 md:grid-cols-2">
                     <FieldInput
@@ -1615,6 +1659,97 @@ function PoseSourcesEditor({
                         ))}
                       </select>
                     </label>
+                    <label className="block mb-2">
+                      <span className="text-xs text-gray-400">Admission Role</span>
+                      <select
+                        value={admissionRole}
+                        onChange={(event) => updateAdmission(
+                          admissionRolePatch(event.target.value as PoseSourceSceneAdmissionRole),
+                        )}
+                        disabled={disabled}
+                        className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {POSE_SOURCE_SCENE_ADMISSION_ROLES.map((role) => (
+                          <option key={role} value={role}>{role}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <FieldInput
+                      label="Lease Max Age (s)"
+                      value={binding.sceneAdmission?.leaseMaxAgeS ?? ''}
+                      type="number"
+                      min={0.001}
+                      step={0.1}
+                      onChange={(value) => {
+                        const trimmed = value.trim();
+                        updateAdmission({
+                          leaseMaxAgeS: trimmed === '' ? null : Math.max(0.001, Number(trimmed) || 0.001),
+                        });
+                      }}
+                      disabled={disabled}
+                    />
+                    <FieldInput
+                      label="Target Drift (m)"
+                      value={binding.sceneAdmission?.targetDriftToleranceM ?? ''}
+                      type="number"
+                      min={0}
+                      step={0.001}
+                      onChange={(value) => {
+                        const trimmed = value.trim();
+                        updateAdmission({
+                          targetDriftToleranceM: trimmed === '' ? null : Math.max(0, Number(trimmed) || 0),
+                        });
+                      }}
+                      disabled={disabled}
+                    />
+                    <FieldInput
+                      label="Target Drift (rad)"
+                      value={binding.sceneAdmission?.targetAngularToleranceRad ?? ''}
+                      type="number"
+                      min={0}
+                      step={0.01}
+                      onChange={(value) => {
+                        const trimmed = value.trim();
+                        updateAdmission({
+                          targetAngularToleranceRad: trimmed === '' ? null : Math.max(0, Number(trimmed) || 0),
+                        });
+                      }}
+                      disabled={disabled}
+                    />
+                    <FieldInput
+                      label="Obstacle Drift (m)"
+                      value={binding.sceneAdmission?.obstacleDriftToleranceM ?? ''}
+                      type="number"
+                      min={0}
+                      step={0.001}
+                      onChange={(value) => {
+                        const trimmed = value.trim();
+                        updateAdmission({
+                          obstacleDriftToleranceM: trimmed === '' ? null : Math.max(0, Number(trimmed) || 0),
+                        });
+                      }}
+                      disabled={disabled}
+                    />
+                    <FieldInput
+                      label="Obstacle Drift (rad)"
+                      value={binding.sceneAdmission?.obstacleAngularToleranceRad ?? ''}
+                      type="number"
+                      min={0}
+                      step={0.01}
+                      onChange={(value) => {
+                        const trimmed = value.trim();
+                        updateAdmission({
+                          obstacleAngularToleranceRad: trimmed === '' ? null : Math.max(0, Number(trimmed) || 0),
+                        });
+                      }}
+                      disabled={disabled}
+                    />
+                    <CheckboxInput
+                      label="Runtime dynamic obstacle"
+                      checked={Boolean(binding.sceneAdmission?.allowRuntimeDynamicObstacle)}
+                      onChange={(value) => updateAdmission({ allowRuntimeDynamicObstacle: value })}
+                      disabled={disabled || admissionRole !== 'observed_dynamic_obstacle'}
+                    />
                     <FieldInput
                       label="Object Frame ID"
                       value={binding.frameId ?? ''}
@@ -1759,7 +1894,8 @@ function PoseSourcesEditor({
                     </div>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         );

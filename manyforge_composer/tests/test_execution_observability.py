@@ -550,6 +550,103 @@ def test_heartbeat_reports_stop_latency_component(tmp_path):
         assert heartbeat["status"] in {"ok", "degraded"}
 
 
+def test_heartbeat_reports_realtime_components(tmp_path):
+    """RT-6: heartbeat carries runtime-safety and route-executor evidence."""
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        trace_dir=str(tmp_path),
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        heartbeat = client.get("/api/infra/heartbeat").json()
+
+    runtime_safety = heartbeat["components"]["runtime_safety"]
+    assert runtime_safety["status"] == "healthy"
+    assert runtime_safety["runtime_collision_ticks_started"] == 0
+    assert runtime_safety["validation_deferral_status"] == "clear"
+
+    route_executors = heartbeat["components"]["route_executors"]
+    assert route_executors["status"] == "healthy"
+    assert set(route_executors["roles"]) == {"control", "lifecycle", "background"}
+    assert route_executors["roles"]["control"]["max_admitted"] >= 2
+
+
+def test_heartbeat_degrades_on_runtime_collision_tick_fault(tmp_path):
+    class FaultedRuntimeSafetyKernel(MockKernelClient):
+        def get_metrics(self) -> dict[str, int]:
+            metrics = super().get_metrics()
+            metrics["runtime_collision_ticks_started"] = 3
+            metrics["runtime_collision_ticks_completed"] = 2
+            metrics["runtime_collision_ticks_faulted"] = 1
+            metrics["runtime_collision_tick_max_ns"] = 12_000_000
+            return metrics
+
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=FaultedRuntimeSafetyKernel(),
+        trace_dir=str(tmp_path),
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        heartbeat = client.get("/api/infra/heartbeat").json()
+
+    assert heartbeat["status"] == "degraded"
+    runtime_safety = heartbeat["components"]["runtime_safety"]
+    assert runtime_safety["status"] == "degraded"
+    assert runtime_safety["runtime_collision_ticks_faulted"] == 1
+    assert runtime_safety["runtime_collision_tick_max_ns"] == 12_000_000
+
+
+def test_heartbeat_degrades_when_runtime_safety_metrics_unavailable(tmp_path):
+    class MetricsUnavailableKernel(MockKernelClient):
+        def get_metrics(self) -> dict[str, int]:
+            raise RuntimeError("metrics unavailable")
+
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MetricsUnavailableKernel(),
+        trace_dir=str(tmp_path),
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        heartbeat = client.get("/api/infra/heartbeat").json()
+
+    assert heartbeat["status"] == "degraded"
+    runtime_safety = heartbeat["components"]["runtime_safety"]
+    assert runtime_safety["status"] == "error"
+    assert runtime_safety["error"] == "metrics unavailable"
+
+
+def test_heartbeat_degrades_when_route_executor_status_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    from manyforge_composer.backend import routes_infra
+
+    def raise_status_error():
+        raise RuntimeError("executor status unavailable")
+
+    monkeypatch.setattr(routes_infra, "route_executor_status", raise_status_error)
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        trace_dir=str(tmp_path),
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        heartbeat = client.get("/api/infra/heartbeat").json()
+
+    assert heartbeat["status"] == "degraded"
+    route_executors = heartbeat["components"]["route_executors"]
+    assert route_executors["status"] == "error"
+    assert route_executors["error"] == "executor status unavailable"
+
+
 def _seed_runs_at_walls(rec, monkeypatch, runs):
     """Seed (run_id, wall_iso) runs onto a recorder with controlled wall time."""
     from manyforge_composer.backend import event_recorder as er_mod

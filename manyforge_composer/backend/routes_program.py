@@ -546,6 +546,31 @@ def _deployment_to_full_response(
                                 ),
                             }
                         ),
+                        "sceneAdmission": (
+                            None
+                            if binding.scene_admission is None
+                            else {
+                                "role": binding.scene_admission.role,
+                                "leaseMaxAgeS": (
+                                    binding.scene_admission.lease_max_age_s
+                                ),
+                                "targetDriftToleranceM": (
+                                    binding.scene_admission.target_drift_tolerance_m
+                                ),
+                                "targetAngularToleranceRad": (
+                                    binding.scene_admission.target_angular_tolerance_rad
+                                ),
+                                "obstacleDriftToleranceM": (
+                                    binding.scene_admission.obstacle_drift_tolerance_m
+                                ),
+                                "obstacleAngularToleranceRad": (
+                                    binding.scene_admission.obstacle_angular_tolerance_rad
+                                ),
+                                "allowRuntimeDynamicObstacle": (
+                                    binding.scene_admission.allow_runtime_dynamic_obstacle
+                                ),
+                            }
+                        ),
                         "metadata": dict(binding.metadata),
                     }
                     for object_id, binding in source.objects.items()

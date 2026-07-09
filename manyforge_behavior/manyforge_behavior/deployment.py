@@ -197,6 +197,19 @@ class PoseSourceMeasuredRobotConfig:
 
 
 @dataclass(frozen=True)
+class PoseSourceSceneAdmissionConfig:
+    """Per-object observed-scene admission role and lease budgets."""
+
+    role: str
+    lease_max_age_s: Optional[float] = None
+    target_drift_tolerance_m: Optional[float] = None
+    target_angular_tolerance_rad: Optional[float] = None
+    obstacle_drift_tolerance_m: Optional[float] = None
+    obstacle_angular_tolerance_rad: Optional[float] = None
+    allow_runtime_dynamic_obstacle: bool = False
+
+
+@dataclass(frozen=True)
 class PoseSourceObjectBinding:
     """Deployment binding from an external pose source to a scene object."""
 
@@ -210,6 +223,7 @@ class PoseSourceObjectBinding:
         PoseSourceMeasuredAttachmentBaselineConfig
     ] = None
     attached_drift_monitor: Optional[PoseSourceAttachedDriftMonitorConfig] = None
+    scene_admission: Optional[PoseSourceSceneAdmissionConfig] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -317,6 +331,16 @@ _ALLOWED_POSE_SOURCE_APPLY_POLICIES = {
     "continuous_unattached",
     "before_planning",
     "between_nodes",
+}
+_ALLOWED_POSE_SOURCE_SCENE_ADMISSION_ROLES = {
+    "static_obstacle",
+    "snapshot_obstacle",
+    "observed_target",
+    "observed_dynamic_obstacle",
+    "attached_object",
+    "support_contact",
+    "visualization_only",
+    "robot_runtime_state",
 }
 _ALLOWED_SIMULATION_CONTROL_KINDS = {
     "ros2_simulation_interfaces",
@@ -1030,6 +1054,157 @@ class Deployment:
                 joint_state_topic=joint_state_topic,
             )
 
+        def parse_non_negative_float(
+            raw: Any,
+            field_path: str,
+        ) -> float:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise DeploymentValidationError(
+                    f"{field_path} must be a number"
+                ) from exc
+            if not math.isfinite(value) or value < 0.0:
+                raise DeploymentValidationError(
+                    f"{field_path} must be a finite number >= 0"
+                )
+            return value
+
+        def parse_optional_non_negative_float(
+            raw: Any,
+            field_path: str,
+        ) -> Optional[float]:
+            if raw is None:
+                return None
+            return parse_non_negative_float(raw, field_path)
+
+        def parse_scene_admission_config(
+            raw: Any,
+            field_path: str,
+            *,
+            apply_policy: str,
+        ) -> Optional[PoseSourceSceneAdmissionConfig]:
+            if raw is None:
+                if apply_policy == "observe_only":
+                    return PoseSourceSceneAdmissionConfig(role="visualization_only")
+                return PoseSourceSceneAdmissionConfig(role="snapshot_obstacle")
+            if not isinstance(raw, dict):
+                raise DeploymentValidationError(f"{field_path} must be a mapping")
+            role = self._parse_optional_text(
+                get_alias(raw, "role", "role", ""),
+                f"{field_path}.role",
+            )
+            if role not in _ALLOWED_POSE_SOURCE_SCENE_ADMISSION_ROLES:
+                allowed = ", ".join(sorted(_ALLOWED_POSE_SOURCE_SCENE_ADMISSION_ROLES))
+                raise DeploymentValidationError(
+                    f"{field_path}.role must be one of: {allowed}"
+                )
+            if apply_policy != "observe_only" and role == "visualization_only":
+                raise DeploymentValidationError(
+                    f"{field_path}.role=visualization_only is only valid with apply_policy=observe_only"
+                )
+            if role == "robot_runtime_state":
+                raise DeploymentValidationError(
+                    f"{field_path}.role=robot_runtime_state is reserved for robot feedback and must not be declared on scene-object bindings"
+                )
+            lease_max_age_s = self._parse_positive_float(
+                get_alias(raw, "lease_max_age_s", "leaseMaxAgeS", 0.0),
+                f"{field_path}.lease_max_age_s",
+            ) if (
+                "lease_max_age_s" in raw or "leaseMaxAgeS" in raw
+            ) else None
+            target_drift_tolerance_m = parse_optional_non_negative_float(
+                get_alias(
+                    raw,
+                    "target_drift_tolerance_m",
+                    "targetDriftToleranceM",
+                    None,
+                ),
+                f"{field_path}.target_drift_tolerance_m",
+            )
+            target_angular_tolerance_rad = parse_optional_non_negative_float(
+                get_alias(
+                    raw,
+                    "target_angular_tolerance_rad",
+                    "targetAngularToleranceRad",
+                    None,
+                ),
+                f"{field_path}.target_angular_tolerance_rad",
+            )
+            obstacle_drift_tolerance_m = parse_optional_non_negative_float(
+                get_alias(
+                    raw,
+                    "obstacle_drift_tolerance_m",
+                    "obstacleDriftToleranceM",
+                    None,
+                ),
+                f"{field_path}.obstacle_drift_tolerance_m",
+            )
+            obstacle_angular_tolerance_rad = parse_optional_non_negative_float(
+                get_alias(
+                    raw,
+                    "obstacle_angular_tolerance_rad",
+                    "obstacleAngularToleranceRad",
+                    None,
+                ),
+                f"{field_path}.obstacle_angular_tolerance_rad",
+            )
+            allow_runtime_dynamic_obstacle = parse_bool(
+                get_alias(
+                    raw,
+                    "allow_runtime_dynamic_obstacle",
+                    "allowRuntimeDynamicObstacle",
+                    False,
+                ),
+                f"{field_path}.allow_runtime_dynamic_obstacle",
+            )
+            if role == "observed_target":
+                if target_drift_tolerance_m is None:
+                    raise DeploymentValidationError(
+                        f"{field_path}.target_drift_tolerance_m is required for observed_target"
+                    )
+                if target_angular_tolerance_rad is None:
+                    raise DeploymentValidationError(
+                        f"{field_path}.target_angular_tolerance_rad is required for observed_target"
+                    )
+            elif (
+                target_drift_tolerance_m is not None
+                or target_angular_tolerance_rad is not None
+            ):
+                raise DeploymentValidationError(
+                    f"{field_path}.target drift tolerances are only valid for observed_target"
+                )
+            if role == "observed_dynamic_obstacle":
+                if obstacle_drift_tolerance_m is None:
+                    raise DeploymentValidationError(
+                        f"{field_path}.obstacle_drift_tolerance_m is required for observed_dynamic_obstacle"
+                    )
+                if obstacle_angular_tolerance_rad is None:
+                    raise DeploymentValidationError(
+                        f"{field_path}.obstacle_angular_tolerance_rad is required for observed_dynamic_obstacle"
+                    )
+            else:
+                if (
+                    obstacle_drift_tolerance_m is not None
+                    or obstacle_angular_tolerance_rad is not None
+                ):
+                    raise DeploymentValidationError(
+                        f"{field_path}.obstacle drift tolerances are only valid for observed_dynamic_obstacle"
+                    )
+                if allow_runtime_dynamic_obstacle:
+                    raise DeploymentValidationError(
+                        f"{field_path}.allow_runtime_dynamic_obstacle is only valid for observed_dynamic_obstacle"
+                    )
+            return PoseSourceSceneAdmissionConfig(
+                role=role,
+                lease_max_age_s=lease_max_age_s,
+                target_drift_tolerance_m=target_drift_tolerance_m,
+                target_angular_tolerance_rad=target_angular_tolerance_rad,
+                obstacle_drift_tolerance_m=obstacle_drift_tolerance_m,
+                obstacle_angular_tolerance_rad=obstacle_angular_tolerance_rad,
+                allow_runtime_dynamic_obstacle=allow_runtime_dynamic_obstacle,
+            )
+
         def parse_drift_monitor_config(
             raw: Any,
             field_path: str,
@@ -1298,6 +1473,16 @@ class Deployment:
                     f"{object_path}.attached_drift_monitor",
                     object_id=object_id,
                 )
+                scene_admission = parse_scene_admission_config(
+                    get_alias(
+                        object_data,
+                        "scene_admission",
+                        "sceneAdmission",
+                        None,
+                    ),
+                    f"{object_path}.scene_admission",
+                    apply_policy=apply_policy,
+                )
 
                 objects[object_id] = PoseSourceObjectBinding(
                     object_id=object_id,
@@ -1308,6 +1493,7 @@ class Deployment:
                     measured_state_ghost=measured_state_ghost,
                     measured_attachment_baseline=measured_attachment_baseline,
                     attached_drift_monitor=attached_drift_monitor,
+                    scene_admission=scene_admission,
                     metadata=dict(metadata),
                 )
 
@@ -4053,6 +4239,35 @@ class Deployment:
                                 drift.rotation_threshold_rad
                             )
                         binding_d["attached_drift_monitor"] = drift_d
+                    if binding.scene_admission is not None:
+                        admission = binding.scene_admission
+                        admission_d: dict[str, Any] = {
+                            "role": admission.role,
+                            "allow_runtime_dynamic_obstacle": (
+                                admission.allow_runtime_dynamic_obstacle
+                            ),
+                        }
+                        if admission.lease_max_age_s is not None:
+                            admission_d["lease_max_age_s"] = (
+                                admission.lease_max_age_s
+                            )
+                        if admission.target_drift_tolerance_m is not None:
+                            admission_d["target_drift_tolerance_m"] = (
+                                admission.target_drift_tolerance_m
+                            )
+                        if admission.target_angular_tolerance_rad is not None:
+                            admission_d["target_angular_tolerance_rad"] = (
+                                admission.target_angular_tolerance_rad
+                            )
+                        if admission.obstacle_drift_tolerance_m is not None:
+                            admission_d["obstacle_drift_tolerance_m"] = (
+                                admission.obstacle_drift_tolerance_m
+                            )
+                        if admission.obstacle_angular_tolerance_rad is not None:
+                            admission_d["obstacle_angular_tolerance_rad"] = (
+                                admission.obstacle_angular_tolerance_rad
+                            )
+                        binding_d["scene_admission"] = admission_d
                     if binding.metadata:
                         binding_d["metadata"] = dict(binding.metadata)
                     source_d["objects"][object_id] = binding_d

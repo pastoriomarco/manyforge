@@ -24,7 +24,7 @@ from manyforge_behavior.program import (
     find_tree_node_by_name,
     merge_param_patch,
 )
-from manyforge_behavior.deployment import Deployment
+from manyforge_behavior.deployment import Deployment, PoseSourceSceneAdmissionConfig
 from manyforge_behavior.cycle_manager import CycleManager
 from manyforge_behavior.runner import OrchestratorRunner
 from manyforge_behavior.kernel_client import (
@@ -4110,6 +4110,36 @@ class ComposerState:
                         "policy": policy,
                         "reason": reason,
                     }
+                    scene_admission = getattr(binding, "scene_admission", None)
+                    if scene_admission is None and policy != "observe_only":
+                        scene_admission = PoseSourceSceneAdmissionConfig(
+                            role="snapshot_obstacle"
+                        )
+                    if scene_admission is not None:
+                        detail["scene_admission_role"] = scene_admission.role
+                        if scene_admission.lease_max_age_s is not None:
+                            detail["scene_admission_lease_max_age_s"] = (
+                                scene_admission.lease_max_age_s
+                            )
+                        if scene_admission.target_drift_tolerance_m is not None:
+                            detail["scene_admission_target_drift_tolerance_m"] = (
+                                scene_admission.target_drift_tolerance_m
+                            )
+                        if scene_admission.target_angular_tolerance_rad is not None:
+                            detail[
+                                "scene_admission_target_angular_tolerance_rad"
+                            ] = scene_admission.target_angular_tolerance_rad
+                        if scene_admission.obstacle_drift_tolerance_m is not None:
+                            detail["scene_admission_obstacle_drift_tolerance_m"] = (
+                                scene_admission.obstacle_drift_tolerance_m
+                            )
+                        if scene_admission.obstacle_angular_tolerance_rad is not None:
+                            detail[
+                                "scene_admission_obstacle_angular_tolerance_rad"
+                            ] = scene_admission.obstacle_angular_tolerance_rad
+                        detail["scene_admission_allow_runtime_dynamic_obstacle"] = (
+                            scene_admission.allow_runtime_dynamic_obstacle
+                        )
                     if policy == "before_planning":
                         object_state = self.kernel.get_object_state(object_id)
                         if object_state.attached:
@@ -4252,6 +4282,12 @@ class ComposerState:
                         pose_position_m=edit_position,
                         pose_orientation_xyzw=edit_orientation,
                         frame_id=edit_frame_id,
+                        source_id=(
+                            source_id
+                            if scene_admission is not None
+                            or runtime_freshness_required
+                            else None
+                        ),
                         source_timestamp_ns=(
                             source_timestamp_ns if runtime_freshness_required else None
                         ),
@@ -4259,6 +4295,42 @@ class ComposerState:
                             source_freshness_budget_ns
                             if runtime_freshness_required
                             else None
+                        ),
+                        scene_admission_role=(
+                            scene_admission.role
+                            if scene_admission is not None
+                            else None
+                        ),
+                        scene_admission_lease_max_age_ns=(
+                            int(scene_admission.lease_max_age_s * 1_000_000_000)
+                            if scene_admission is not None
+                            and scene_admission.lease_max_age_s is not None
+                            else None
+                        ),
+                        scene_admission_target_drift_tolerance_m=(
+                            scene_admission.target_drift_tolerance_m
+                            if scene_admission is not None
+                            else None
+                        ),
+                        scene_admission_target_angular_tolerance_rad=(
+                            scene_admission.target_angular_tolerance_rad
+                            if scene_admission is not None
+                            else None
+                        ),
+                        scene_admission_obstacle_drift_tolerance_m=(
+                            scene_admission.obstacle_drift_tolerance_m
+                            if scene_admission is not None
+                            else None
+                        ),
+                        scene_admission_obstacle_angular_tolerance_rad=(
+                            scene_admission.obstacle_angular_tolerance_rad
+                            if scene_admission is not None
+                            else None
+                        ),
+                        scene_admission_allow_runtime_dynamic_obstacle=(
+                            bool(scene_admission.allow_runtime_dynamic_obstacle)
+                            if scene_admission is not None
+                            else False
                         ),
                         action_span=action_span,
                     )

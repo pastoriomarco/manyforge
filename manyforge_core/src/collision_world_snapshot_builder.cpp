@@ -233,6 +233,7 @@ std::string compute_body_content_hash(const CollisionWorldBody& body) {
   h.mix(body.parent_link.value_or(""));
   h.mix(body.frame_id);
   mix_pose(h, body.pose);
+  h.mix(body.source_id.value_or(""));
   h.mix(static_cast<std::int64_t>(
       body.source_freshness_budget_ns.has_value() ? 1 : 0));
   if (body.source_freshness_budget_ns) {

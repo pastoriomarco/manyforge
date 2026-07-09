@@ -5,6 +5,7 @@
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -350,6 +351,50 @@ std::optional<std::string> robot_link_from_collision_body_id(
     return std::nullopt;
   }
   return body_id.substr(begin, collision_pos - begin);
+}
+
+std::optional<core::ObservedSceneObjectRole> observed_scene_role_from_string(
+    const std::optional<std::string>& raw) {
+  if (!raw.has_value()) {
+    return std::nullopt;
+  }
+  if (*raw == "static_obstacle") {
+    return core::ObservedSceneObjectRole::kStaticObstacle;
+  }
+  if (*raw == "snapshot_obstacle") {
+    return core::ObservedSceneObjectRole::kSnapshotObstacle;
+  }
+  if (*raw == "observed_target") {
+    return core::ObservedSceneObjectRole::kObservedTarget;
+  }
+  if (*raw == "observed_dynamic_obstacle") {
+    return core::ObservedSceneObjectRole::kObservedDynamicObstacle;
+  }
+  if (*raw == "attached_object") {
+    return core::ObservedSceneObjectRole::kAttachedObject;
+  }
+  if (*raw == "support_contact") {
+    return core::ObservedSceneObjectRole::kSupportContact;
+  }
+  if (*raw == "visualization_only") {
+    return core::ObservedSceneObjectRole::kVisualizationOnly;
+  }
+  if (*raw == "robot_runtime_state") {
+    return core::ObservedSceneObjectRole::kRobotRuntimeState;
+  }
+  return std::nullopt;
+}
+
+bool non_negative_optional_double(const std::optional<double>& value) {
+  return !value.has_value() ||
+         (std::isfinite(*value) && *value >= 0.0);
+}
+
+bool optional_text_blank(const std::optional<std::string>& value) {
+  return value.has_value() &&
+         std::all_of(value->begin(), value->end(), [](unsigned char ch) {
+           return std::isspace(ch) != 0;
+         });
 }
 
 bool link_is_static_wrt_group(const pinocchio::Model& model,
@@ -815,6 +860,24 @@ void RoboPlanPlanningContext::publish_collision_world_revision_locked(
   // identity for repeated mutations that leave content unchanged.
   const std::uint64_t previous_revision_id = world_revision_id_;
   world_revision_id_ += 1;
+  const bool pose_only_mutation =
+      mutation_source == core::CollisionWorldMutationSource::kPoseSourceApply;
+  const bool policy_only_mutation =
+      mutation_source == core::CollisionWorldMutationSource::kPolicyUpdate;
+  const bool policy_semantics_mutation =
+      policy_only_mutation ||
+      mutation_source == core::CollisionWorldMutationSource::kProgramLoad ||
+      mutation_source == core::CollisionWorldMutationSource::kDeploymentLoad ||
+      mutation_source == core::CollisionWorldMutationSource::kAttach ||
+      mutation_source == core::CollisionWorldMutationSource::kDetach;
+  // Plain geometry add/remove changes the derived live policy snapshot but not
+  // the semantic policy epoch used by frozen snapshot-lease admission.
+  if (!pose_only_mutation && !policy_only_mutation) {
+    ++topology_epoch_;
+  }
+  if (policy_semantics_mutation) {
+    ++policy_epoch_;
+  }
 
   std::string robot_id;
   {
@@ -2129,6 +2192,7 @@ RoboPlanPlanningContext::object_snapshot_bodies_locked(
       body.frame_id = "universe";
       body.pose = pose_in_base_from_tracked_locked(tracked, "universe");
     }
+    body.source_id = tracked.source_id;
     body.source_timestamp_ns = tracked.source_timestamp_ns;
     body.source_freshness_budget_ns = tracked.source_freshness_budget_ns;
     body.geometries.push_back(geometry_descriptor_for_shape_locked(
@@ -2255,6 +2319,12 @@ RoboPlanPlanningContext::collision_world_policy_snapshot_bundle() const {
   }
 
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  return current_collision_world_policy_snapshot_bundle_locked(robot_id);
+}
+
+core::CollisionWorldPolicySnapshotBundle
+RoboPlanPlanningContext::current_collision_world_policy_snapshot_bundle_locked(
+    const std::string& robot_id) const {
   if (!snapshot_cache_ ||
       snapshot_cache_revision_id_ != world_revision_id_ ||
       snapshot_cache_content_hash_ != world_content_hash_) {
@@ -2274,10 +2344,260 @@ RoboPlanPlanningContext::collision_world_policy_snapshot_bundle() const {
       build_collision_policy_snapshot_locked(robot_id)};
 }
 
+std::optional<core::CollisionWorldLeaseInventory>
+RoboPlanPlanningContext::current_scene_snapshot_lease_inventory() const {
+  std::string robot_id;
+  {
+    std::scoped_lock map_lock(mapper_mutex_);
+    robot_id = mapper_robot_id_;
+  }
+
+  const auto now_ns = static_cast<std::int64_t>(steady_now_ns());
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  auto inventory =
+      build_scene_snapshot_lease_inventory_locked(robot_id, {}, now_ns);
+  if (!inventory.bundle.world || !inventory.bundle.policy.has_value()) {
+    return std::nullopt;
+  }
+  return inventory;
+}
+
+std::optional<core::CollisionWorldLeaseInventory>
+RoboPlanPlanningContext::retain_scene_snapshot_lease_inventory(
+    std::string retention_id) {
+  const auto now_ns = static_cast<std::int64_t>(steady_now_ns());
+  if (retention_id.empty()) {
+    std::lock_guard<std::mutex> retained_lock(retained_lease_inventory_mutex_);
+    do {
+      retention_id =
+          "roboplan_lease_" + std::to_string(++next_lease_retention_sequence_);
+    } while (std::any_of(retained_lease_inventories_.begin(),
+                         retained_lease_inventories_.end(),
+                         [&](const auto& retained) {
+                           return retained.retention_id == retention_id;
+                         }));
+  }
+
+  std::string robot_id;
+  {
+    std::scoped_lock map_lock(mapper_mutex_);
+    robot_id = mapper_robot_id_;
+  }
+
+  core::CollisionWorldLeaseInventory inventory;
+  {
+    std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+    inventory =
+        build_scene_snapshot_lease_inventory_locked(robot_id, retention_id, now_ns);
+  }
+  if (!inventory.bundle.world || !inventory.bundle.policy.has_value()) {
+    return std::nullopt;
+  }
+
+  std::lock_guard<std::mutex> retained_lock(retained_lease_inventory_mutex_);
+  prune_scene_snapshot_lease_retention_locked(now_ns);
+  retained_lease_inventories_.erase(
+      std::remove_if(retained_lease_inventories_.begin(),
+                     retained_lease_inventories_.end(),
+                     [&](const auto& retained) {
+                       return retained.retention_id == inventory.retention_id;
+                     }),
+      retained_lease_inventories_.end());
+  retained_lease_inventories_.push_back(inventory);
+  prune_scene_snapshot_lease_retention_locked(now_ns);
+  return inventory;
+}
+
+void RoboPlanPlanningContext::release_scene_snapshot_lease_inventory(
+    const std::string& retention_id) {
+  if (retention_id.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> retained_lock(retained_lease_inventory_mutex_);
+  retained_lease_inventories_.erase(
+      std::remove_if(retained_lease_inventories_.begin(),
+                     retained_lease_inventories_.end(),
+                     [&](const auto& retained) {
+                       return retained.retention_id == retention_id;
+                     }),
+      retained_lease_inventories_.end());
+}
+
+core::CollisionWorldLeaseRetentionStats
+RoboPlanPlanningContext::scene_snapshot_lease_retention_stats() const {
+  std::lock_guard<std::mutex> retained_lock(retained_lease_inventory_mutex_);
+  core::CollisionWorldLeaseRetentionStats stats;
+  stats.retained_count = retained_lease_inventories_.size();
+  stats.retained_capacity = kSceneSnapshotLeaseRetentionCapacity;
+  stats.retained_max_age_ns = kSceneSnapshotLeaseRetentionMaxAgeNs;
+  stats.retained_ids_oldest_first.reserve(retained_lease_inventories_.size());
+  for (const auto& inventory : retained_lease_inventories_) {
+    stats.retained_ids_oldest_first.push_back(inventory.retention_id);
+  }
+  return stats;
+}
+
 core::CollisionWorldPolicySnapshotBundle
 RoboPlanPlanningContext::published_runtime_collision_snapshot_bundle() const {
   std::lock_guard<std::mutex> lock(published_runtime_bundle_mutex_);
   return published_runtime_bundle_;
+}
+
+core::CollisionWorldLeaseInventory
+RoboPlanPlanningContext::build_scene_snapshot_lease_inventory_locked(
+    const std::string& robot_id,
+    std::string retention_id,
+    std::int64_t captured_at_ns) const {
+  core::CollisionWorldLeaseInventory inventory;
+  inventory.retention_id = std::move(retention_id);
+  inventory.captured_at_ns = captured_at_ns;
+  inventory.bundle = current_collision_world_policy_snapshot_bundle_locked(robot_id);
+  inventory.topology_epoch = topology_epoch_;
+  inventory.policy_epoch = policy_epoch_;
+  inventory.live_objects = scene_snapshot_live_objects_locked(robot_id);
+  return inventory;
+}
+
+std::vector<core::SceneSnapshotLiveObject>
+RoboPlanPlanningContext::scene_snapshot_live_objects_locked(
+    const std::string& robot_id) const {
+  std::vector<core::SceneSnapshotLiveObject> live_objects;
+  live_objects.reserve(object_states_.size());
+  for (const auto& [object_id, tracked] : object_states_) {
+    core::SceneSnapshotLiveObject live;
+    live.object_id = object_id;
+    live.collision_body_ids = object_body_ids_for_state_locked(object_id, tracked);
+    live.object_revision_token =
+        object_revision_token_locked(object_id, tracked, robot_id);
+    live.pose = pose_in_base_from_tracked_locked(tracked, "universe");
+    live.declared_role = tracked.scene_admission_role;
+    live.source_id = tracked.source_id;
+    live.source_timestamp_ns = tracked.source_timestamp_ns;
+    live.source_freshness_budget_ns = tracked.source_freshness_budget_ns;
+    live.lease_max_age_ns = tracked.scene_admission_lease_max_age_ns;
+    live.target_drift_tolerance_m =
+        tracked.scene_admission_target_drift_tolerance_m;
+    live.target_angular_tolerance_rad =
+        tracked.scene_admission_target_angular_tolerance_rad;
+    live.obstacle_drift_tolerance_m =
+        tracked.scene_admission_obstacle_drift_tolerance_m;
+    live.obstacle_angular_tolerance_rad =
+        tracked.scene_admission_obstacle_angular_tolerance_rad;
+    live.runtime_dynamic_obstacle_allowed =
+        tracked.scene_admission_allow_runtime_dynamic_obstacle;
+    live_objects.push_back(std::move(live));
+  }
+  return live_objects;
+}
+
+std::string RoboPlanPlanningContext::object_revision_token_locked(
+    const std::string& object_id,
+    const TrackedObjectState& state,
+    const std::string& robot_id) const {
+  std::vector<std::string> entries;
+  entries.push_back("object_id=" + object_id);
+  entries.push_back("robot_id=" + robot_id);
+  entries.push_back("frame_id=" + state.frame_id);
+  entries.push_back("attached=" + std::string(state.attached ? "1" : "0"));
+  for (const auto& body_id : object_body_ids_for_state_locked(object_id, state)) {
+    entries.push_back("body_id=" + body_id);
+  }
+  append_shape_entries(entries, "shape", state.shape);
+
+  std::vector<std::string> touch_links = state.touch_links;
+  std::sort(touch_links.begin(), touch_links.end());
+  for (const auto& link : touch_links) {
+    entries.push_back("touch_link=" + link);
+  }
+
+  std::vector<std::string> support_contacts;
+  support_contacts.reserve(state.support_contacts.size());
+  for (const auto& contact : state.support_contacts) {
+    support_contacts.push_back(
+        contact.support_object_id + ":" +
+        std::to_string(static_cast<int>(contact.mode)) + ":" +
+        (contact.enforce_max_start_penetration ? "1" : "0") + ":" +
+        stable_double(contact.max_start_penetration_m) + ":" +
+        stable_double(contact.release_tolerance_m) + ":" +
+        stable_double(contact.min_release_progress_m) + ":" +
+        stable_double(contact.min_separation_clearance_m) + ":" +
+        (contact.require_separation_by_end ? "1" : "0") + ":" +
+        (contact.require_strictly_decreasing_penetration ? "1" : "0") +
+        ":" + (contact.allow_recontact ? "1" : "0"));
+  }
+  std::sort(support_contacts.begin(), support_contacts.end());
+  for (const auto& contact : support_contacts) {
+    entries.push_back("support_contact=" + contact);
+  }
+
+  entries.push_back(
+      "source_id=" + state.source_id.value_or(""));
+  entries.push_back(
+      "source_freshness_budget_set=" +
+      std::string(state.source_freshness_budget_ns.has_value() ? "1" : "0"));
+  if (state.source_freshness_budget_ns.has_value()) {
+    entries.push_back(
+        "source_freshness_budget_ns=" +
+        std::to_string(*state.source_freshness_budget_ns));
+  }
+  entries.push_back(
+      "scene_admission_role=" +
+      std::string(state.scene_admission_role.has_value()
+                      ? core::to_string(*state.scene_admission_role)
+                      : ""));
+  entries.push_back(
+      "scene_admission_lease_max_age_ns=" +
+      (state.scene_admission_lease_max_age_ns.has_value()
+           ? std::to_string(*state.scene_admission_lease_max_age_ns)
+           : ""));
+  entries.push_back(
+      "scene_admission_target_drift_tolerance_m=" +
+      (state.scene_admission_target_drift_tolerance_m.has_value()
+           ? stable_double(*state.scene_admission_target_drift_tolerance_m)
+           : ""));
+  entries.push_back(
+      "scene_admission_target_angular_tolerance_rad=" +
+      (state.scene_admission_target_angular_tolerance_rad.has_value()
+           ? stable_double(*state.scene_admission_target_angular_tolerance_rad)
+           : ""));
+  entries.push_back(
+      "scene_admission_obstacle_drift_tolerance_m=" +
+      (state.scene_admission_obstacle_drift_tolerance_m.has_value()
+           ? stable_double(*state.scene_admission_obstacle_drift_tolerance_m)
+           : ""));
+  entries.push_back(
+      "scene_admission_obstacle_angular_tolerance_rad=" +
+      (state.scene_admission_obstacle_angular_tolerance_rad.has_value()
+           ? stable_double(*state.scene_admission_obstacle_angular_tolerance_rad)
+           : ""));
+  entries.push_back(
+      "scene_admission_allow_runtime_dynamic_obstacle=" +
+      std::string(state.scene_admission_allow_runtime_dynamic_obstacle ? "1" : "0"));
+
+  std::sort(entries.begin(), entries.end());
+  core::ContentHasher h;
+  h.mix("manyforge_roboplan/scene_snapshot_object_revision_token/v1");
+  for (const auto& entry : entries) {
+    h.mix(entry);
+  }
+  return h.finalize();
+}
+
+void RoboPlanPlanningContext::prune_scene_snapshot_lease_retention_locked(
+    std::int64_t now_ns) {
+  retained_lease_inventories_.erase(
+      std::remove_if(retained_lease_inventories_.begin(),
+                     retained_lease_inventories_.end(),
+                     [&](const auto& inventory) {
+                       return now_ns >= inventory.captured_at_ns &&
+                              now_ns - inventory.captured_at_ns >
+                                  kSceneSnapshotLeaseRetentionMaxAgeNs;
+                     }),
+      retained_lease_inventories_.end());
+  while (retained_lease_inventories_.size() >
+         kSceneSnapshotLeaseRetentionCapacity) {
+    retained_lease_inventories_.pop_front();
+  }
 }
 
 core::CollisionPolicySnapshot
@@ -2502,8 +2822,6 @@ RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
   core::ContentHasher h;
   h.mix("manyforge_roboplan/collision_policy_snapshot")
       .mix(robot_id)
-      .mix(world_revision_id_)
-      .mix(world_content_hash_)
       .mix(policy.policy_id)
       .mix(static_cast<std::int64_t>(
           policy.require_full_diagnostics ? 1 : 0));
@@ -2540,7 +2858,7 @@ RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
       h.mix("link").mix(link);
     }
   }
-  policy.revision.revision_id = world_revision_id_;
+  policy.revision.revision_id = policy_epoch_;
   policy.revision.content_hash = h.finalize();
   return policy;
 }
@@ -3328,16 +3646,12 @@ core::SceneEditResultDTO RoboPlanPlanningContext::add_object(
         is_world_frame(request.frame_id) ? "universe" : request.frame_id;
     const bool attached = infer_attached_from_frame(final_frame_id);
 
-    TrackedObjectState new_state{
-        request.pose,
-        request.shape,
-        final_frame_id,
-        attached,
-        {},
-        request.support_contacts,
-        {},
-        {},
-    };
+    TrackedObjectState new_state;
+    new_state.pose = request.pose;
+    new_state.shape = request.shape;
+    new_state.frame_id = final_frame_id;
+    new_state.attached = attached;
+    new_state.support_contacts = request.support_contacts;
 
     auto add_r = add_geometry_locked(request.object_id, new_state);
     if (!add_r.has_value()) {
@@ -3493,6 +3807,8 @@ core::SceneEditResultDTO RoboPlanPlanningContext::update_object_pose(
     }
 
     const TrackedObjectState previous_state = it->second;
+    const auto previous_static_pairs = disabled_static_collision_pairs_;
+    const auto previous_support_pairs = disabled_support_contact_pairs_;
     TrackedObjectState new_state = it->second;
     new_state.pose = request.pose;
     new_state.frame_id = is_world_frame(request.frame_id) ? "universe" : request.frame_id;
@@ -3522,8 +3838,123 @@ core::SceneEditResultDTO RoboPlanPlanningContext::update_object_pose(
       };
       return result;
     }
+    if (optional_text_blank(request.source_id)) {
+      result.error = core::ErrorDTO{core::kErrorInvalidRequest,
+                                    "source_id must be non-empty when provided",
+                                    {}};
+      return result;
+    }
+    const bool scene_admission_present =
+        request.scene_admission_role.has_value() ||
+        request.scene_admission_lease_max_age_ns.has_value() ||
+        request.scene_admission_target_drift_tolerance_m.has_value() ||
+        request.scene_admission_target_angular_tolerance_rad.has_value() ||
+        request.scene_admission_obstacle_drift_tolerance_m.has_value() ||
+        request.scene_admission_obstacle_angular_tolerance_rad.has_value() ||
+        request.scene_admission_allow_runtime_dynamic_obstacle;
+    if (scene_admission_present &&
+        !request.scene_admission_role.has_value()) {
+      result.error = core::ErrorDTO{
+          core::kErrorInvalidRequest,
+          "scene_admission_role is required when scene admission metadata is "
+          "provided",
+          {}};
+      return result;
+    }
+    auto parsed_scene_admission_role =
+        observed_scene_role_from_string(request.scene_admission_role);
+    if (request.scene_admission_role.has_value() &&
+        !parsed_scene_admission_role.has_value()) {
+      result.error = core::ErrorDTO{
+          core::kErrorInvalidRequest,
+          "scene_admission_role must be one of static_obstacle, "
+          "snapshot_obstacle, observed_target, observed_dynamic_obstacle, "
+          "attached_object, support_contact, visualization_only, "
+          "robot_runtime_state",
+          {}};
+      return result;
+    }
+    if (request.scene_admission_lease_max_age_ns.has_value() &&
+        *request.scene_admission_lease_max_age_ns <= 0) {
+      result.error =
+          core::ErrorDTO{core::kErrorInvalidRequest,
+                         "scene_admission_lease_max_age_ns must be positive",
+                         {}};
+      return result;
+    }
+    if (!non_negative_optional_double(
+            request.scene_admission_target_drift_tolerance_m) ||
+        !non_negative_optional_double(
+            request.scene_admission_target_angular_tolerance_rad) ||
+        !non_negative_optional_double(
+            request.scene_admission_obstacle_drift_tolerance_m) ||
+        !non_negative_optional_double(
+            request.scene_admission_obstacle_angular_tolerance_rad)) {
+      result.error = core::ErrorDTO{
+          core::kErrorInvalidRequest,
+          "scene_admission drift tolerances must be finite and >= 0",
+          {}};
+      return result;
+    }
+    if (parsed_scene_admission_role !=
+            core::ObservedSceneObjectRole::kObservedTarget &&
+        (request.scene_admission_target_drift_tolerance_m.has_value() ||
+         request.scene_admission_target_angular_tolerance_rad.has_value())) {
+      result.error = core::ErrorDTO{
+          core::kErrorInvalidRequest,
+          "scene_admission target drift tolerances are only valid for "
+          "observed_target",
+          {}};
+      return result;
+    }
+    if (parsed_scene_admission_role !=
+            core::ObservedSceneObjectRole::kObservedDynamicObstacle &&
+        (request.scene_admission_obstacle_drift_tolerance_m.has_value() ||
+         request.scene_admission_obstacle_angular_tolerance_rad.has_value())) {
+      result.error = core::ErrorDTO{
+          core::kErrorInvalidRequest,
+          "scene_admission obstacle drift tolerances are only valid for "
+          "observed_dynamic_obstacle",
+          {}};
+      return result;
+    }
+    if (parsed_scene_admission_role !=
+            core::ObservedSceneObjectRole::kObservedDynamicObstacle &&
+        request.scene_admission_allow_runtime_dynamic_obstacle) {
+      result.error = core::ErrorDTO{
+          core::kErrorInvalidRequest,
+          "scene_admission_allow_runtime_dynamic_obstacle is only valid for "
+          "observed_dynamic_obstacle",
+          {}};
+      return result;
+    }
+    if (parsed_scene_admission_role ==
+            core::ObservedSceneObjectRole::kRobotRuntimeState ||
+        parsed_scene_admission_role ==
+            core::ObservedSceneObjectRole::kVisualizationOnly) {
+      result.error = core::ErrorDTO{
+          core::kErrorInvalidRequest,
+          "scene_admission_role for a promoted collision-scene object must not "
+          "be robot_runtime_state or visualization_only",
+          {}};
+      return result;
+    }
     new_state.source_timestamp_ns = request.source_timestamp_ns;
     new_state.source_freshness_budget_ns = request.source_freshness_budget_ns;
+    new_state.source_id = request.source_id;
+    new_state.scene_admission_role = parsed_scene_admission_role;
+    new_state.scene_admission_lease_max_age_ns =
+        request.scene_admission_lease_max_age_ns;
+    new_state.scene_admission_target_drift_tolerance_m =
+        request.scene_admission_target_drift_tolerance_m;
+    new_state.scene_admission_target_angular_tolerance_rad =
+        request.scene_admission_target_angular_tolerance_rad;
+    new_state.scene_admission_obstacle_drift_tolerance_m =
+        request.scene_admission_obstacle_drift_tolerance_m;
+    new_state.scene_admission_obstacle_angular_tolerance_rad =
+        request.scene_admission_obstacle_angular_tolerance_rad;
+    new_state.scene_admission_allow_runtime_dynamic_obstacle =
+        request.scene_admission_allow_runtime_dynamic_obstacle;
 
     Eigen::Matrix4d tform = scene_placement_from_tracked_locked(new_state);
     const std::string scene_target_frame =
@@ -3557,8 +3988,18 @@ core::SceneEditResultDTO RoboPlanPlanningContext::update_object_pose(
 
     const auto& tracked = object_states_.at(request.object_id);
     result.success = true;
+    const bool pose_source_only =
+        previous_state.frame_id == tracked.frame_id &&
+        previous_state.attached == tracked.attached;
+    const bool policy_changed =
+        previous_static_pairs != disabled_static_collision_pairs_ ||
+        previous_support_pairs != disabled_support_contact_pairs_;
     publish_collision_world_revision_locked(
-        core::CollisionWorldMutationSource::kSceneEdit,
+        pose_source_only
+            ? (policy_changed
+                   ? core::CollisionWorldMutationSource::kPolicyUpdate
+                   : core::CollisionWorldMutationSource::kPoseSourceApply)
+            : core::CollisionWorldMutationSource::kSceneEdit,
         object_body_ids_for_transition_locked(
             request.object_id, previous_state, tracked),
         "scene_edit.update_object_pose");
@@ -3647,6 +4088,17 @@ core::SceneEditResultDTO RoboPlanPlanningContext::attach_object(
       }
       return result;
     }
+    auto& attached_state = object_states_.at(request.object_id);
+    attached_state.source_id.reset();
+    attached_state.source_timestamp_ns.reset();
+    attached_state.source_freshness_budget_ns.reset();
+    attached_state.scene_admission_role.reset();
+    attached_state.scene_admission_lease_max_age_ns.reset();
+    attached_state.scene_admission_target_drift_tolerance_m.reset();
+    attached_state.scene_admission_target_angular_tolerance_rad.reset();
+    attached_state.scene_admission_obstacle_drift_tolerance_m.reset();
+    attached_state.scene_admission_obstacle_angular_tolerance_rad.reset();
+    attached_state.scene_admission_allow_runtime_dynamic_obstacle = false;
     if (!request.touch_links.empty()) {
       const auto effective_touch_links =
           normalize_touch_links_locked(request.touch_links);
@@ -3723,6 +4175,17 @@ core::SceneEditResultDTO RoboPlanPlanningContext::detach_object(
     }
     auto result = reparent_object_locked(request.object_id, target_frame);
     if (result.success) {
+      auto& detached_state = object_states_.at(request.object_id);
+      detached_state.source_id.reset();
+      detached_state.source_timestamp_ns.reset();
+      detached_state.source_freshness_budget_ns.reset();
+      detached_state.scene_admission_role.reset();
+      detached_state.scene_admission_lease_max_age_ns.reset();
+      detached_state.scene_admission_target_drift_tolerance_m.reset();
+      detached_state.scene_admission_target_angular_tolerance_rad.reset();
+      detached_state.scene_admission_obstacle_drift_tolerance_m.reset();
+      detached_state.scene_admission_obstacle_angular_tolerance_rad.reset();
+      detached_state.scene_admission_allow_runtime_dynamic_obstacle = false;
       publish_collision_world_revision_locked(
           core::CollisionWorldMutationSource::kDetach,
           object_body_ids_for_transition_locked(

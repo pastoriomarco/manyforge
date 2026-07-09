@@ -60,6 +60,95 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
     },
     severity: 'state',
   },
+  scene_snapshot_lease_missing: {
+    headline: () => 'Scene snapshot lease missing at dispatch',
+    hint: 'The trajectory could not be tied to a retained validation scene snapshot. Re-plan and retry; if this repeats, inspect the collision snapshot retention diagnostics.',
+    severity: 'state',
+  },
+  live_scene_snapshot_unavailable: {
+    headline: () => 'Live collision scene unavailable at dispatch',
+    hint: 'The kernel could not read a live collision-scene snapshot to verify the validation lease. Retry after the scene publisher is healthy.',
+    severity: 'state',
+  },
+  scene_snapshot_lease_expired: {
+    headline: (d) => {
+      const ageMs = numberFieldAsMs(d, 'scene_snapshot_lease_age_ns');
+      const budgetMs = numberFieldAsMs(d, 'scene_snapshot_lease_max_age_ns')
+        ?? numberFieldAsMs(d, 'lease_max_age_ns');
+      if (ageMs && budgetMs) {
+        return `Collision validation lease expired before dispatch (${ageMs} ms > ${budgetMs} ms)`;
+      }
+      if (ageMs) {
+        return `Collision validation lease expired before dispatch (${ageMs} ms old)`;
+      }
+      return 'Collision validation lease expired before dispatch';
+    },
+    hint: 'The scene changed or dispatch waited too long after validation. Re-plan from a fresh scene snapshot.',
+    severity: 'state',
+  },
+  observed_scene_source_stale: {
+    headline: (d) => {
+      const source = sceneLeaseActorText(d);
+      const ageMs = numberFieldAsMs(d, 'observed_scene_source_age_ns');
+      const budgetMs = numberFieldAsMs(d, 'source_freshness_budget_ns')
+        ?? numberFieldAsMs(d, 'observed_scene_source_freshness_budget_ns');
+      const subject = source ? `: ${source}` : '';
+      if (ageMs && budgetMs) {
+        return `Observed scene source stale${subject} (${ageMs} ms > ${budgetMs} ms)`;
+      }
+      return `Observed scene source stale${subject}`;
+    },
+    hint: 'The pose source behind this collision-scene object was not fresh enough at dispatch. Restore the source stream or wait for a fresh observation, then re-plan.',
+    severity: 'state',
+  },
+  scene_topology_changed_after_validation: {
+    headline: (d) => {
+      const object = sceneLeaseActorText(d);
+      return object
+        ? `Scene topology changed after validation: ${object}`
+        : 'Scene topology changed after validation';
+    },
+    hint: 'A collision object was added, removed, attached, detached, or otherwise changed outside the validation lease. Re-plan against the current scene.',
+    severity: 'state',
+  },
+  collision_policy_changed_after_validation: {
+    headline: () => 'Collision policy changed after validation',
+    hint: 'Allowed-contact or runtime-collision policy changed between validation and dispatch. Re-plan so the trajectory is checked under the active policy.',
+    severity: 'state',
+  },
+  target_moved_after_validation: {
+    headline: (d) => {
+      const target = sceneLeaseActorText(d);
+      const drift = sceneLeaseDriftText(d, 'target');
+      return `Observed target moved after validation${target ? `: ${target}` : ''}${drift ? ` (${drift})` : ''}`;
+    },
+    hint: 'The selected target moved beyond its configured safe-point tolerance after validation. Re-plan from the latest observation.',
+    severity: 'fault',
+  },
+  obstacle_moved_after_validation: {
+    headline: (d) => {
+      const obstacle = sceneLeaseActorText(d);
+      const drift = sceneLeaseDriftText(d, 'obstacle');
+      return `Observed obstacle moved after validation${obstacle ? `: ${obstacle}` : ''}${drift ? ` (${drift})` : ''}`;
+    },
+    hint: 'A live obstacle moved beyond its admitted tolerance before dispatch. Re-plan from the latest scene, or qualify runtime dynamic-obstacle coverage before allowing this drift.',
+    severity: 'fault',
+  },
+  runtime_dynamic_scene_not_qualified: {
+    headline: (d) => {
+      const object = sceneLeaseActorText(d);
+      return object
+        ? `Runtime dynamic-obstacle coverage not qualified: ${object}`
+        : 'Runtime dynamic-obstacle coverage not qualified';
+    },
+    hint: 'The object was allowed to move as a runtime dynamic obstacle only if qualified runtime coverage was armed and fresh. The kernel failed closed before dispatch.',
+    severity: 'fault',
+  },
+  scene_snapshot_lease_missing_collision_coverage: {
+    headline: () => 'Collision scene changed without lease-covered objects',
+    hint: 'The world revision changed after validation, but the lease did not cover any collision objects. Re-plan; if this repeats, inspect the pose-source admission policy for the moving object.',
+    severity: 'state',
+  },
   validation_collision: {
     headline: (d) => {
       // Pre-execute validation rejection: the planned trajectory was
@@ -383,6 +472,7 @@ const GENERIC_BACKEND_ERROR_CODES = new Set([
   'execution_aborted',
   'execution_rejected',
   'invalid_request',
+  'scene_changed_during_validation',
   'stop_failed',
 ]);
 
@@ -417,6 +507,33 @@ function numberFieldAsMs(
     return ms.toFixed(1);
   }
   return ms.toFixed(2);
+}
+
+function sceneLeaseActorText(
+  details: Record<string, unknown> | null | undefined,
+): string {
+  const object = stringField(details, 'object_id');
+  const source = stringField(details, 'source_id');
+  if (object && source) {
+    return `${object} from ${source}`;
+  }
+  return object || source;
+}
+
+function sceneLeaseDriftText(
+  details: Record<string, unknown> | null | undefined,
+  prefix: 'target' | 'obstacle',
+): string {
+  const linear = numberField(details, `${prefix}_drift_m`);
+  const angular = numberField(details, `${prefix}_angular_drift_rad`);
+  const parts: string[] = [];
+  if (linear !== null) {
+    parts.push(`${linear.toFixed(4)} m`);
+  }
+  if (angular !== null) {
+    parts.push(`${angular.toFixed(4)} rad`);
+  }
+  return parts.join(', ');
 }
 
 function collisionTimeoutReason(
@@ -533,7 +650,8 @@ function mappingForError(
   errorCode: string | null | undefined,
   errorDetails: Record<string, unknown> | null | undefined,
 ): HeadlineMapping | undefined {
-  const reasonCode = stringField(errorDetails, 'reason_code');
+  const reasonCode =
+    stringField(errorDetails, 'reason_code') || stringField(errorDetails, 'reason');
   if (
     reasonCode
     && ERROR_CODE_MAPPING[reasonCode]

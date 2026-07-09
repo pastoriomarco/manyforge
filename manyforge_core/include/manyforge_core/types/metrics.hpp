@@ -16,6 +16,11 @@ struct MetricsSnapshot {
   uint64_t executions_failed = 0;
   uint64_t stops_issued = 0;
   uint64_t collision_detections = 0;
+  uint64_t runtime_collision_ticks_started = 0;
+  uint64_t runtime_collision_ticks_completed = 0;
+  uint64_t runtime_collision_ticks_faulted = 0;
+  uint64_t runtime_collision_tick_max_ns = 0;
+  uint64_t validation_deferred_runtime_monitor_active = 0;
   uint64_t runtime_collision_snapshot_refresh_failures = 0;
   uint64_t snapshots_published = 0;
   uint64_t event_subscriber_exceptions = 0;

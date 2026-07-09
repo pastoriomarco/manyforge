@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <deque>
 #include <map>
 #include <memory>
@@ -197,6 +198,18 @@ class RoboPlanPlanningContext final
   core::CollisionWorldPolicySnapshotBundle
   collision_world_policy_snapshot_bundle() const override;
 
+  std::optional<core::CollisionWorldLeaseInventory>
+  current_scene_snapshot_lease_inventory() const override;
+
+  std::optional<core::CollisionWorldLeaseInventory>
+  retain_scene_snapshot_lease_inventory(std::string retention_id = {}) override;
+
+  void release_scene_snapshot_lease_inventory(
+      const std::string& retention_id) override;
+
+  core::CollisionWorldLeaseRetentionStats
+  scene_snapshot_lease_retention_stats() const override;
+
   core::CollisionWorldPolicySnapshotBundle
   published_runtime_collision_snapshot_bundle() const override;
 
@@ -208,8 +221,16 @@ class RoboPlanPlanningContext final
     bool attached = false;
     std::vector<std::string> touch_links;
     std::vector<core::SupportContactDTO> support_contacts;
+    std::optional<std::string> source_id;
     std::optional<std::int64_t> source_timestamp_ns;
     std::optional<std::int64_t> source_freshness_budget_ns;
+    std::optional<core::ObservedSceneObjectRole> scene_admission_role;
+    std::optional<std::int64_t> scene_admission_lease_max_age_ns;
+    std::optional<double> scene_admission_target_drift_tolerance_m;
+    std::optional<double> scene_admission_target_angular_tolerance_rad;
+    std::optional<double> scene_admission_obstacle_drift_tolerance_m;
+    std::optional<double> scene_admission_obstacle_angular_tolerance_rad;
+    bool scene_admission_allow_runtime_dynamic_obstacle = false;
   };
 
   struct CollisionPairDiagnostic {
@@ -295,6 +316,21 @@ class RoboPlanPlanningContext final
       core::CollisionOwnerKind owner_kind,
       const core::CollisionShapeDTO& shape) const;
   core::CollisionWorldSnapshotPtr build_collision_world_snapshot_locked() const;
+  core::CollisionWorldPolicySnapshotBundle
+  current_collision_world_policy_snapshot_bundle_locked(
+      const std::string& robot_id) const;
+  core::CollisionWorldLeaseInventory
+  build_scene_snapshot_lease_inventory_locked(
+      const std::string& robot_id,
+      std::string retention_id,
+      std::int64_t captured_at_ns) const;
+  std::vector<core::SceneSnapshotLiveObject>
+  scene_snapshot_live_objects_locked(const std::string& robot_id) const;
+  std::string object_revision_token_locked(
+      const std::string& object_id,
+      const TrackedObjectState& state,
+      const std::string& robot_id) const;
+  void prune_scene_snapshot_lease_retention_locked(std::int64_t now_ns);
   std::vector<std::string> object_body_ids_for_state_locked(
       const std::string& object_id,
       const TrackedObjectState& state) const;
@@ -351,6 +387,8 @@ class RoboPlanPlanningContext final
   // backend write that caused them.
   std::uint64_t world_revision_id_ = 0;
   std::string world_content_hash_;
+  std::uint64_t topology_epoch_ = 0;
+  std::uint64_t policy_epoch_ = 0;
   std::deque<core::CollisionWorldLedgerEntry> world_ledger_;
   static constexpr std::size_t kCollisionWorldLedgerCapacity = 32;
   mutable std::mutex published_revision_mutex_;
@@ -364,6 +402,13 @@ class RoboPlanPlanningContext final
   mutable core::CollisionWorldSnapshotPtr snapshot_cache_;
   mutable std::uint64_t snapshot_cache_revision_id_ = 0;
   mutable std::string snapshot_cache_content_hash_;
+
+  mutable std::mutex retained_lease_inventory_mutex_;
+  std::deque<core::CollisionWorldLeaseInventory> retained_lease_inventories_;
+  std::uint64_t next_lease_retention_sequence_ = 0;
+  static constexpr std::size_t kSceneSnapshotLeaseRetentionCapacity = 8;
+  static constexpr std::int64_t kSceneSnapshotLeaseRetentionMaxAgeNs =
+      30'000'000'000LL;
 
   /// Bump the authoritative collision-world revision after a successful
   /// scene mutation. Must be called under scene_mutex_.
