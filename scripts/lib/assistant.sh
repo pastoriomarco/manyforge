@@ -774,44 +774,55 @@ start_bridge_openclaw() {
         return 1
     fi
     ensure_log_dir
-    # 2026-06-03: ensure the OpenClaw gateway is listening in the sandbox
-    # before starting the bridge. The bridge's CLI shell-out path
-    # invokes `openclaw agent` which expects the gateway at
-    # ws://127.0.0.1:18789. If the gateway is dead (e.g. after an
-    # earlier daemon-kill during tools-mode flip), `openclaw agent`
-    # falls back to embedded mode and most tool calls fail with a
-    # `GatewayTransportError: gateway closed`. Start it lazily here so
-    # the operator doesn't have to remember to do it.
+    # The bridge dispatches via cli_shell_out by default (use_gateway=false):
+    # a fresh `openclaw agent` per turn, which runs its own embedded agent when
+    # no gateway is present. Only start the persistent in-sandbox gateway when it
+    # is actually used (OPENCLAW_ASSISTANT_USE_GATEWAY=true, the gateway-HTTP
+    # dispatch path).
+    #
+    # Why NOT start it for the default cli_shell_out path: on OpenShell 0.0.71 the
+    # egress engine (OPA) authorizes each outbound connection by resolving the
+    # calling binary from /proc/<netns>/net/tcp. It reliably resolves the fresh
+    # `openclaw agent` process (ALLOWED /usr/local/bin/node), but DENIES the
+    # long-lived gateway process's model calls ("failed to resolve peer binary:
+    # No ESTABLISHED TCP connection found"). So a running gateway forces the
+    # fresh `openclaw agent` onto the DENIED gateway transport instead of the
+    # ALLOWED embedded path. (The 2026-06-03 note that `openclaw agent` fails
+    # without a gateway is stale — it now falls back to embedded and succeeds.)
     local sandbox_name="${OPENCLAW_ASSISTANT_SANDBOX:-my-assistant}"
     local cluster_container="${OPENCLAW_ASSISTANT_CLUSTER_CONTAINER:-openshell-cluster-nemoclaw}"
-    # OpenShell typically hosts the sandbox as a single docker container
-    # whose name starts with "openshell-${sandbox_name}-". Find it once.
-    local sandbox_container
-    sandbox_container="$(docker ps --format '{{.Names}}' 2>/dev/null \
-        | grep -E "^openshell-${sandbox_name}-" | head -1)"
-    if [[ -n "${sandbox_container}" ]]; then
-        if ! docker exec "${sandbox_container}" sh -c "ss -tlnp 2>/dev/null | grep -q ':18789'" 2>/dev/null; then
-            info "  OpenClaw gateway not listening in ${sandbox_container} — starting it"
-            docker exec -d "${sandbox_container}" bash -c \
-                'cd /sandbox; exec openclaw gateway --allow-unconfigured --bind loopback --auth token >/sandbox/openclaw-gateway.log 2>&1'
-            # Wait up to 30s for the gateway to come up.
-            local _gateway_attempt
-            for _gateway_attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-                if docker exec "${sandbox_container}" sh -c "ss -tlnp 2>/dev/null | grep -q ':18789'" 2>/dev/null; then
-                    pass "  OpenClaw gateway listening on :18789 in sandbox"
-                    break
-                fi
-                sleep 2
-            done
+    if [[ "${OPENCLAW_ASSISTANT_USE_GATEWAY:-false}" != "true" ]]; then
+        info "  use_gateway=false: not starting the persistent OpenClaw gateway; the bridge shells out a fresh 'openclaw agent' per turn (embedded transport)."
+    else
+        # OpenShell hosts the sandbox as a single docker container whose name
+        # starts with "openshell-${sandbox_name}-". Find it and start the gateway.
+        local sandbox_container
+        sandbox_container="$(docker ps --format '{{.Names}}' 2>/dev/null \
+            | grep -E "^openshell-${sandbox_name}-" | head -1)"
+        if [[ -n "${sandbox_container}" ]]; then
             if ! docker exec "${sandbox_container}" sh -c "ss -tlnp 2>/dev/null | grep -q ':18789'" 2>/dev/null; then
-                fail "  OpenClaw gateway failed to start in ${sandbox_container} (see /sandbox/openclaw-gateway.log)"
-                # Don't return — the bridge can still run; just warn.
+                info "  OpenClaw gateway not listening in ${sandbox_container} — starting it"
+                docker exec -d "${sandbox_container}" bash -c \
+                    'cd /sandbox; exec openclaw gateway --allow-unconfigured --bind loopback --auth token >/sandbox/openclaw-gateway.log 2>&1'
+                # Wait up to 30s for the gateway to come up.
+                local _gateway_attempt
+                for _gateway_attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+                    if docker exec "${sandbox_container}" sh -c "ss -tlnp 2>/dev/null | grep -q ':18789'" 2>/dev/null; then
+                        pass "  OpenClaw gateway listening on :18789 in sandbox"
+                        break
+                    fi
+                    sleep 2
+                done
+                if ! docker exec "${sandbox_container}" sh -c "ss -tlnp 2>/dev/null | grep -q ':18789'" 2>/dev/null; then
+                    fail "  OpenClaw gateway failed to start in ${sandbox_container} (see /sandbox/openclaw-gateway.log)"
+                    # Don't return — the bridge can still run; just warn.
+                fi
+            else
+                pass "  OpenClaw gateway already listening in ${sandbox_container}"
             fi
         else
-            pass "  OpenClaw gateway already listening in ${sandbox_container}"
+            info "  No sandbox container matching openshell-${sandbox_name}-* found; bridge will spawn agents via nemoclaw exec only"
         fi
-    else
-        info "  No sandbox container matching openshell-${sandbox_name}-* found; bridge will spawn agents via nemoclaw exec only"
     fi
     # REVISED 2026-06-03 per THREE-LANE-MIGRATION-PLAN route fix:
     # OPENCLAW_ASSISTANT_USE_GATEWAY defaults to false because OpenClaw
