@@ -119,10 +119,22 @@ def _parse_wall_query(name: str, value: str | None) -> int | None:
     return parsed
 
 
+def _state_token(value: Any) -> str:
+    raw = getattr(value, "state", value)
+    token = getattr(raw, "name", None) or getattr(raw, "value", None) or str(raw)
+    return str(token).split(".")[-1].lower()
+
+
 def _operator_action_state(
     *,
     cycle_state: str,
+    motion_stop_state: str = "idle",
+    kernel_state: Any = None,
 ) -> tuple[str, bool, bool, bool]:
+    if _state_token(kernel_state) == "intervention_required":
+        return ("acknowledge_or_reset", False, True, True)
+    if cycle_state == "running" and motion_stop_state == "held":
+        return ("resume", True, False, False)
     if cycle_state == "stopped":
         return ("resume", True, False, False)
     return ("none", False, False, False)
@@ -143,8 +155,21 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
     """Build high-level execution digest optimized for polling agents."""
     state.event_recorder.observe(state)
 
-    cycle_state = state.cycle_manager.state.value if state.cycle_manager is not None else "idle"
-    velocity_scale = state.cycle_manager.velocity_scale if state.cycle_manager is not None else 1.0
+    cycle_state = (
+        state.cycle_manager.state.value
+        if state.cycle_manager is not None
+        else "idle"
+    )
+    motion_stop_state = (
+        state.cycle_manager.motion_stop_state
+        if state.cycle_manager is not None
+        else "idle"
+    )
+    velocity_scale = (
+        state.cycle_manager.velocity_scale
+        if state.cycle_manager is not None
+        else 1.0
+    )
     node_statuses = state.cycle_manager.get_node_statuses() if state.cycle_manager is not None else {}
     kernel_status = (
         state.cycle_manager.get_status()
@@ -327,7 +352,11 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
         elapsed_s = max(0.0, (time.monotonic_ns() - started_at_ns) / 1_000_000_000.0)
 
     required_operator_action, resume_allowed, reset_required, ack_required = (
-        _operator_action_state(cycle_state=cycle_state)
+        _operator_action_state(
+            cycle_state=cycle_state,
+            motion_stop_state=motion_stop_state,
+            kernel_state=getattr(kernel_status, "state", None),
+        )
     )
     if required_operator_action != "none":
         warnings.append(f"Operator action required: {required_operator_action}")
@@ -368,6 +397,7 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
 
     return ExecutionDigestResponse(
         state=cycle_state,
+        motionStopState=motion_stop_state,
         runId=state.event_recorder.last_run_id,
         executionId=kernel_status.execution_id if kernel_status is not None else 0,
         currentNode=current_node,

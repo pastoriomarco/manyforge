@@ -12,7 +12,7 @@ from .models import (
     VelocityScaleRequest,
     VelocityScaleResponse,
 )
-from .cycle_diagnostics import active_cycle_error_fields
+from .cycle_diagnostics import active_cycle_error_fields, manager_cycle_error_fields
 from .route_execution import (
     run_cycle_control as _run_cycle_control,
     run_cycle_lifecycle as _run_cycle_lifecycle,
@@ -63,6 +63,17 @@ def _refresh_visual_scene_after_reset(state: ComposerState) -> None:
             refresh_result.get("error"),
         )
     state.request_visual_state_publish(reason="cycle_reset")
+
+
+def _cycle_command_payload(manager: Any) -> dict[str, Any]:
+    error, error_code, error_details = manager_cycle_error_fields(manager)
+    return {
+        "state": manager.state.value,
+        "motionStopState": manager.motion_stop_state,
+        "error": error,
+        "errorCode": error_code,
+        "errorDetails": error_details,
+    }
 
 
 def create_cycle_router(state: ComposerState) -> APIRouter:
@@ -171,10 +182,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                     detail=_structured_command_error(state, str(exc)),
                 )
             logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
-            return {
-                "state": state.cycle_manager.state.value,
-                "motionStopState": state.cycle_manager.motion_stop_state,
-            }
+            return _cycle_command_payload(state.cycle_manager)
 
         return await _run_cycle_lifecycle(command)
 
@@ -194,10 +202,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
             prev = state.cycle_manager.state.value
             state.cycle_manager.stop()
             logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
-            return {
-                "state": state.cycle_manager.state.value,
-                "motionStopState": state.cycle_manager.motion_stop_state,
-            }
+            return _cycle_command_payload(state.cycle_manager)
 
         return await _run_cycle_control(command)
 
@@ -221,10 +226,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                 prev,
                 state.cycle_manager.state.value,
             )
-            return {
-                "state": state.cycle_manager.state.value,
-                "motionStopState": state.cycle_manager.motion_stop_state,
-            }
+            return _cycle_command_payload(state.cycle_manager)
 
         return await _run_cycle_control(command)
 
@@ -278,10 +280,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                 )
             _refresh_visual_scene_after_reset(state)
             logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
-            return {
-                "state": state.cycle_manager.state.value,
-                "motionStopState": state.cycle_manager.motion_stop_state,
-            }
+            return _cycle_command_payload(state.cycle_manager)
 
         return await _run_cycle_lifecycle(command)
 
@@ -317,10 +316,43 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                 prev,
                 state.cycle_manager.state.value,
             )
-            return {
-                "state": state.cycle_manager.state.value,
-                "motionStopState": state.cycle_manager.motion_stop_state,
-            }
+            return _cycle_command_payload(state.cycle_manager)
+
+        return await _run_cycle_lifecycle(command)
+
+    @router.post(
+        "/acknowledge-failed-validation-for-retry",
+        response_model=CycleCommandResponse,
+        response_model_by_alias=True,
+    )
+    async def acknowledge_failed_validation_for_retry() -> dict:
+        """Acknowledge a retryable failed validation gate without reset."""
+
+        def command() -> dict:
+            if state.cycle_manager is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_structured_command_error(
+                        state, "No program loaded", error_code="no_program_loaded"
+                    ),
+                )
+            prev = state.cycle_manager.state.value
+            try:
+                state.cycle_manager.acknowledge_failed_validation_for_retry(
+                    principal_id="operator_ui",
+                    reason="ui_acknowledge_failed_validation_and_retry",
+                )
+            except RuntimeError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_structured_command_error(state, str(exc)),
+                )
+            logger.info(
+                "Cycle failed validation acknowledged for retry: %s → %s",
+                prev,
+                state.cycle_manager.state.value,
+            )
+            return _cycle_command_payload(state.cycle_manager)
 
         return await _run_cycle_lifecycle(command)
 

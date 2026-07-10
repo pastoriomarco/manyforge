@@ -30,6 +30,7 @@ enum class KernelEventType {
   kResumeRequested,    // resume requested
   kRuntimeVelocityScaleChanged,  // runtime velocity scale changed
   kCompletedAcknowledged,  // completed terminal outcome acknowledged
+  kFailedValidationAcknowledged,  // retryable validation failure acknowledged
   // Intervention acknowledgement. Emitted when an explicit operator/runtime
   // call clears `kInterventionRequired`. `details` carries `principal_id`
   // and `reason`. `execute()` MUST NOT clear the state implicitly — the

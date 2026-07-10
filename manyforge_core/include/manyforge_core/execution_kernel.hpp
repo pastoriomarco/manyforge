@@ -297,6 +297,19 @@ class ExecutionKernel {
       std::string reason,
       std::optional<std::uint64_t> expected_epoch = std::nullopt);
 
+  /// Acknowledge a retryable failed pre-dispatch validation for retry.
+  ///
+  /// Valid only from `kFailed` when the latched error is a validation gate that
+  /// did not dispatch motion (`validation_collision` or
+  /// `scene_changed_during_validation`). It clears kernel execution
+  /// bookkeeping to Idle and republishes the current backend snapshot without
+  /// calling `execution_backend.reset()`.
+  AcknowledgeFailedValidationResultDTO
+  acknowledge_failed_validation_for_retry(
+      std::string principal_id,
+      std::string reason,
+      std::optional<std::uint64_t> expected_epoch = std::nullopt);
+
   /// Acknowledge a kernel-owned runtime collision interrupt for retry.
   ///
   /// Valid only from `kInterrupted` with the runtime-collision fault latch
@@ -304,7 +317,10 @@ class ExecutionKernel {
   /// and republishes the current backend snapshot without calling
   /// `execution_backend.reset()`. This preserves the robot's actual stopped
   /// pose so the next execute plans from that pose instead of commanding the
-  /// simulator/controller back to its reset/home state.
+  /// simulator/controller back to its reset/home state. Admission is rejected
+  /// unless fault preemption succeeded and its controlled-stop owner is no
+  /// longer active; callers may retry after that narrow containment boundary.
+  /// This does not certify backend stop completion or physical at-rest state.
   AcknowledgeInterruptedResultDTO acknowledge_interrupted_for_retry(
       std::string principal_id,
       std::string reason,

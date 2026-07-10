@@ -11,7 +11,7 @@ import pytest
 
 from manyforge_behavior.kernel_client import (
     ExecuteRequest, ExecutionState, GripperCommandRequest,
-    GripperCommandState, MotionInterruptScope, MotionInterruptStopProfile,
+    GripperCommandState, GripperCommandStatus, MotionInterruptScope, MotionInterruptStopProfile,
     SceneEditRequest,
 )
 
@@ -211,6 +211,34 @@ def test_native_gripper_grasp_loss_marks_cached_status_without_extension():
     assert reopened.state == GripperCommandState.COMPLETED
     assert reopened.commanded_state == "open"
     assert reopened.reason_code is None
+
+
+def test_native_gripper_unrelated_failure_blocks_replacement_command():
+    if not HAS_NATIVE_CLIENT:
+        pytest.skip("native_kernel_client not available")
+
+    kernel = NativeKernelClient(object())
+    kernel._gripper_status_cache["primary"] = GripperCommandStatus(
+        state=GripperCommandState.FAILED,
+        gripper_id="primary",
+        evidence_state="faulted_unverified",
+        error="gripper feedback unavailable",
+        reason_code="gripper_state_unavailable",
+    )
+
+    result = kernel.command_gripper(
+        GripperCommandRequest(
+            gripper_id="primary",
+            group_id="lite_gripper",
+            joint_name="right_finger_joint",
+            target_position=0.0081,
+            duration_s=0.0,
+            transport_kind="native_kinematic",
+        )
+    )
+
+    assert result.accepted is False
+    assert result.reason_code == "gripper_state_unavailable"
 
 
 def test_ros_gripper_grasp_loss_delegates_to_backend_status_sink():

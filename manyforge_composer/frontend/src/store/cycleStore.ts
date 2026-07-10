@@ -4,7 +4,7 @@ import { StateWebSocket } from '../api/websocket';
 import { useProgramStore } from './programStore';
 import { useViewerSelectionStore } from './viewerSelectionStore';
 import { coerceCycleStateFailClosed } from './cycleState';
-import type { CycleStatus } from '../types/api';
+import type { CycleCommand, CycleStatus } from '../types/api';
 
 /**
  * Extract a structured error tuple from a thrown value. `ApiError` carries
@@ -39,16 +39,15 @@ type CycleStatePatch = Pick<
 >;
 
 function cycleStatePatchFromCommand(
-  state: string,
-  motionStopState: CycleStore['motionStopState'] = 'idle',
+  result: CycleCommand,
 ): Pick<CycleStore, 'state' | 'motionStopState' | 'error' | 'errorCode' | 'errorDetails'> {
-  const parsed = coerceCycleStateFailClosed(state);
+  const parsed = coerceCycleStateFailClosed(result.state);
   return {
     state: parsed.state,
-    motionStopState,
-    error: parsed.error,
-    errorCode: null,
-    errorDetails: null,
+    motionStopState: result.motionStopState ?? 'idle',
+    error: parsed.error ?? result.error ?? null,
+    errorCode: result.errorCode ?? null,
+    errorDetails: result.errorDetails ?? null,
   };
 }
 
@@ -126,6 +125,7 @@ interface CycleStore {
   fullStop: () => Promise<void>;
   reset: () => Promise<void>;
   acknowledgeInterventionForRetry: () => Promise<void>;
+  acknowledgeFailedValidationForRetry: () => Promise<void>;
   resetAndRun: () => Promise<void>;
   setVelocityScale: (value: number) => Promise<void>;
   refreshStatus: () => Promise<void>;
@@ -151,7 +151,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   run: async () => {
     try {
       const result = await api.cycle.run();
-      set(cycleStatePatchFromCommand(result.state, result.motionStopState));
+      set(cycleStatePatchFromCommand(result));
     } catch (e) {
       const s = structuredErrorFromException(e);
       set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
@@ -161,7 +161,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   stop: async () => {
     try {
       const result = await api.cycle.stop();
-      set(cycleStatePatchFromCommand(result.state, result.motionStopState));
+      set(cycleStatePatchFromCommand(result));
     } catch (e) {
       const s = structuredErrorFromException(e);
       set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
@@ -171,7 +171,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   fullStop: async () => {
     try {
       const result = await api.cycle.fullStop();
-      set(cycleStatePatchFromCommand(result.state, result.motionStopState));
+      set(cycleStatePatchFromCommand(result));
     } catch (e) {
       const s = structuredErrorFromException(e);
       set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
@@ -181,7 +181,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   reset: async () => {
     try {
       const result = await api.cycle.reset();
-      set(cycleStatePatchFromCommand(result.state, result.motionStopState));
+      set(cycleStatePatchFromCommand(result));
       const programStore = useProgramStore.getState();
       if (get().programLoaded || programStore.programInfo !== null) {
         await Promise.all([
@@ -198,7 +198,18 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   acknowledgeInterventionForRetry: async () => {
     try {
       const result = await api.cycle.acknowledgeInterventionForRetry();
-      set(cycleStatePatchFromCommand(result.state, result.motionStopState));
+      set(cycleStatePatchFromCommand(result));
+    } catch (e) {
+      const s = structuredErrorFromException(e);
+      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
+      throw e;
+    }
+  },
+
+  acknowledgeFailedValidationForRetry: async () => {
+    try {
+      const result = await api.cycle.acknowledgeFailedValidationForRetry();
+      set(cycleStatePatchFromCommand(result));
     } catch (e) {
       const s = structuredErrorFromException(e);
       set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
@@ -209,7 +220,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   resetAndRun: async () => {
     try {
       const resetResult = await api.cycle.reset();
-      set(cycleStatePatchFromCommand(resetResult.state, resetResult.motionStopState));
+      set(cycleStatePatchFromCommand(resetResult));
       const programStore = useProgramStore.getState();
       if (get().programLoaded || programStore.programInfo !== null) {
         await Promise.all([
@@ -218,7 +229,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
         ]);
       }
       const runResult = await api.cycle.run();
-      set(cycleStatePatchFromCommand(runResult.state, runResult.motionStopState));
+      set(cycleStatePatchFromCommand(runResult));
     } catch (e) {
       const s = structuredErrorFromException(e);
       set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });

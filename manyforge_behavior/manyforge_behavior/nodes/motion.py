@@ -85,14 +85,12 @@ class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
             self.blackboard.register_key(key=key, access=py_trees.common.Access.READ)
         # Write keys: motion_error_message + motion_paused_due_to_error are
         # how the motion node signals the cycle manager that it has entered
-        # a recoverable soft-fail state. Cycle manager reads them in its
-        # tick loop and quiesces the runtime (kernel pause + tick suspend +
-        # cycle.STOPPED) so the operator can either retry (Run again) or
-        # reset (Reset button rebuilds the tree). resume_after_error_
-        # requested is bidirectional: cycle_manager.run() sets it on
-        # STOPPED→RUNNING when a soft-fail is in flight, and the motion
-        # node consumes-and-clears it on the next tick so it doesn't
-        # re-fire stale resumes after a successful retry.
+        # a recoverable soft-fail state. Cycle manager converts that signal
+        # into a held motion stop so continue-policy branches keep ticking.
+        # resume_after_error_requested is bidirectional: cycle_manager.run()
+        # sets it when resuming a held soft-fail, and the motion node
+        # consumes-and-clears it on the next tick so it doesn't re-fire
+        # stale resumes after a successful retry.
         for key in (
             "motion_error_message",
             "motion_paused_due_to_error",
@@ -141,8 +139,8 @@ class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
         error (planning failure, collision, execution timeout). Instead
         it stores the cause, signals the cycle manager via blackboard,
         and holds RUNNING. The cycle manager observes the signal in its
-        tick loop and transitions the cycle to STOPPED with the error
-        surfaced, kernel paused, tick thread suspended.
+        tick loop, surfaces the error, and holds motion while
+        continue-policy branches keep ticking.
 
         Two recovery paths:
           - Operator clicks Run again: cycle manager clears the soft-fail
@@ -170,8 +168,7 @@ class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
         self._set_blackboard_value("motion_paused_node_name", None)
         # Consume the resume signal so a subsequent successful tick does
         # not re-trigger another retry from a stale flag. The cycle
-        # manager re-sets it the next time it transitions out of a
-        # motion-paused STOPPED state.
+        # manager re-sets it the next time it resumes a held soft-fail.
         self._set_blackboard_value("resume_after_error_requested", False)
 
     def update(self) -> py_trees.common.Status:
@@ -180,9 +177,8 @@ class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
             return py_trees.common.Status.RUNNING  # block, don't start new motion
 
         # Resume handling. The cycle manager sets resume_after_error_requested on
-        # Run from STOPPED — after either a collision soft-fail or a plain operator
-        # stop, both of which leave our owned execution terminal in the kernel. In
-        # either case we re-dispatch the goal from fresh state rather than
+        # Run from a held motion stop or STOPPED recovery. In either case we
+        # re-dispatch the goal from fresh state rather than
         # re-reading the prior (failed/stopped) execution, which would re-surface
         # its terminal cause ("Motion execution ended in stopped"). Without the
         # signal a captured soft-fail keeps holding RUNNING until the operator acts.

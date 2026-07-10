@@ -161,6 +161,8 @@ export const api = {
     reset: () => request<CycleCommand>('POST', '/api/cycle/reset'),
     acknowledgeInterventionForRetry: () =>
       request<CycleCommand>('POST', '/api/cycle/acknowledge-intervention-for-retry'),
+    acknowledgeFailedValidationForRetry: () =>
+      request<CycleCommand>('POST', '/api/cycle/acknowledge-failed-validation-for-retry'),
     setVelocityScale: (value: number) =>
       request<VelocityScaleResponse>('PUT', '/api/cycle/velocity-scale', { value }),
   },

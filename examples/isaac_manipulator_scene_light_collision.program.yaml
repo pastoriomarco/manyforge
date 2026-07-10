@@ -5,7 +5,7 @@ description: 'Isaac Sim light-scene reproduction for UR10e + Robotiq 2F-140: rob
   base pose and selected table/object meshes are authored from the live Isaac scene.
   The pick-and-place behavior tree is adapted from the known-good Robotiq demo and
   targets the Isaac cheese box instead of the legacy graspable.'
-catalog_version: "0.2.0"
+catalog_version: 0.2.0
 robot:
   robot_id: ur10e
   group_id: arm
@@ -120,12 +120,17 @@ parameters:
     min_exclusive: 0
     max_inclusive: 1
   description: Velocity scale for all moves.
+saved_with_deployment:
+  name: isaac_manipulator_scene_light_ros2_control_collision
+  source_path: /workspace/examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml
+  content_sha256: a9af22559174a1def206f723950f65f01d11dc78f14b9c2393e9e041eb0b6f7f
 tree:
   id: parallel
   name: parallel
   children:
   - id: sequence
     name: sequence
+    operator_stop_policy: continue
     children:
     - id: timer
       name: timer

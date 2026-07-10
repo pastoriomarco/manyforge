@@ -25,11 +25,19 @@ function requiresExplicitInterventionRecovery(
   state: string,
   details: Record<string, unknown> | null | undefined,
 ): boolean {
-  if (state !== 'stopped' || !details) {
+  if (!details) {
+    return false;
+  }
+  const kernelState = stringDetail(details, 'kernel_state');
+  const interventionLatched = kernelState === 'intervention_required';
+  if (state !== 'stopped' && !interventionLatched) {
     return false;
   }
   const reason = stringDetail(details, 'reason') || stringDetail(details, 'reason_code');
+  const motionSoftStopReason = stringDetail(details, 'motion_soft_stop_reason');
   if (
+    interventionLatched ||
+    motionSoftStopReason === 'motion_soft_fail_requires_intervention' ||
     reason === 'stop_not_settled_measured_velocity' ||
     reason === 'operator_stop_total_failure' ||
     reason === 'in_stop_completion_timeout' ||

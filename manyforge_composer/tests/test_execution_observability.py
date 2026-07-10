@@ -17,11 +17,13 @@ from fastapi.testclient import TestClient
 
 from manyforge_behavior.capabilities import V0_0_REQUIRED_KEYS
 from manyforge_behavior.kernel_client import (
+    ExecutionState,
     MockKernelClient,
     SceneEditRequest,
     SceneObjectSnapshot,
     SceneShape,
 )
+from manyforge_behavior.cycle_manager import CycleState
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
@@ -78,6 +80,61 @@ def test_execution_digest_reports_running_state_and_object_summary():
         assert data["activeMoveId"] == "pick_approach"
         assert data["currentNode"] is not None
         assert any(obj["id"] == "table" for obj in data["objectSummary"])
+
+
+def test_execution_digest_reports_held_motion_stop_as_resume_required():
+    kernel = MockKernelClient(execute_duration_s=1.0)
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        assert client.post("/api/program/load", json={"path": _PROGRAM_PATH}).status_code == 200
+        assert client.post("/api/cycle/run").status_code == 200
+
+        deadline = time.time() + 1.0
+        while kernel.execute_count == 0 and time.time() < deadline:
+            time.sleep(0.01)
+
+        stop_response = client.post("/api/cycle/stop")
+        assert stop_response.status_code == 200
+        assert stop_response.json()["motionStopState"] == "held"
+
+        response = client.get("/api/execution/digest")
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["state"] == "running"
+        assert data["motionStopState"] == "held"
+        assert data["requiredOperatorAction"] == "resume"
+        assert data["resumeAllowed"] is True
+        assert "Operator action required: resume" in data["warnings"]
+
+
+def test_execution_digest_reports_held_intervention_as_explicit_recovery_required():
+    kernel = MockKernelClient(execute_duration_s=1.0)
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        assert (
+            client.post("/api/program/load", json={"path": _PROGRAM_PATH}).status_code
+            == 200
+        )
+        assert state.cycle_manager is not None
+        state.cycle_manager._state = CycleState.RUNNING  # noqa: SLF001
+        state.cycle_manager._motion_stop_state = "held"  # noqa: SLF001
+        kernel._state = ExecutionState.INTERVENTION_REQUIRED  # noqa: SLF001
+
+        response = client.get("/api/execution/digest")
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["state"] == "running"
+        assert data["motionStopState"] == "held"
+        assert data["requiredOperatorAction"] == "acknowledge_or_reset"
+        assert data["resumeAllowed"] is False
+        assert data["ackRequired"] is True
+        assert data["resetRequired"] is True
 
 
 def test_execution_digest_reports_structured_backend_fault_details():

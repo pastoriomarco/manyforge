@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <manyforge_core/execution_interrupt_support.hpp>
 #include <manyforge_core/execution_kernel.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
@@ -867,6 +868,10 @@ class ControlledExecution : public IExecutionBackend {
   double last_runtime_velocity_scale = 1.0;
   MotionInterruptStopProfileDTO last_controlled_stop_profile;
   bool block_controlled_stop = false;
+  // Test-only wedged-backend mode: keep the controlled-stop call blocked after
+  // its stop token fires so kernel admission can be exercised while a
+  // definitive watchdog result and an active stop owner coexist.
+  bool ignore_controlled_stop_token_while_blocked = false;
   bool release_blocked_controlled_stop = false;
 
   ControlledStopResultDTO execute_controlled_stop(
@@ -894,10 +899,16 @@ class ControlledExecution : public IExecutionBackend {
       last_controlled_stop_profile = profile;
       cv_.notify_all();
       if (block_controlled_stop) {
-        const bool released = cv_.wait_for(
-            lock, stop_token, std::chrono::seconds(2), [this]() {
-              return release_blocked_controlled_stop;
-            });
+        const bool released = ignore_controlled_stop_token_while_blocked
+                                  ? cv_.wait_for(
+                                        lock, std::chrono::seconds(2), [this]() {
+                                          return release_blocked_controlled_stop;
+                                        })
+                                  : cv_.wait_for(
+                                        lock, stop_token,
+                                        std::chrono::seconds(2), [this]() {
+                                          return release_blocked_controlled_stop;
+                                        });
         if (!released || stop_token.stop_requested()) {
           ++controlled_stop_cancel_count;
           running_ = false;
@@ -2745,6 +2756,46 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitValidationFailure_BlocksExecution) {
   ASSERT_TRUE(snapshot.error.has_value());
   EXPECT_EQ(snapshot.error->code, kErrorValidationCollision);
   EXPECT_EQ(snapshot.error->details.at("failure_stage"), "cached_validation");
+}
+
+TEST_F(ExecutionKernelTest,
+       AcknowledgeFailedValidationForRetry_ClearsFailedWithoutBackendReset) {
+  std::vector<KernelEvent> events;
+  auto sub = kernel.subscribe_events(
+      [&](const KernelEvent& event) { events.push_back(event); });
+  execution.snapshot.joint_positions_rad = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  store_cache("move_cached_invalid_ack", make_test_trajectory());
+  context.next_validation = ValidationResultDTO{
+      false,
+      ErrorDTO{
+          kErrorValidationCollision,
+          "Cached trajectory is no longer valid under current collision policy",
+          {{"failure_stage", "cached_validation"}}}};
+
+  execute_sync(make_test_request("move_cached_invalid_ack"));
+
+  ASSERT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  const auto reset_count_before_ack = execution.reset_count;
+  auto ack = kernel.acknowledge_failed_validation_for_retry(
+      "operator_alice", "ui_acknowledge_failed_validation_and_retry");
+
+  ASSERT_TRUE(ack.accepted)
+      << (ack.error.has_value() ? ack.error->message : std::string{});
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+  EXPECT_EQ(execution.reset_count, reset_count_before_ack);
+  const auto snapshot = kernel.get_execution_snapshot();
+  EXPECT_EQ(snapshot.state, ExecutionState::kIdle);
+  EXPECT_FALSE(snapshot.error.has_value());
+  bool saw_ack = false;
+  for (const auto& event : events) {
+    if (event.type == KernelEventType::kFailedValidationAcknowledged) {
+      saw_ack = true;
+      EXPECT_EQ(event.details.at("principal_id"), "operator_alice");
+      EXPECT_EQ(event.details.at("error_code"), kErrorValidationCollision);
+    }
+  }
+  EXPECT_TRUE(saw_ack);
+  kernel.unsubscribe_events(sub);
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheDisabled_IgnoresCache) {
@@ -5023,6 +5074,464 @@ TEST_F(ExecutionKernelTest,
                            e.details.at("contact_b") ==
                                "robot/robot1/link/link1/collision/0";
                   }));
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_RetryAfterRuntimeCollisionDoesNotRelatchStaleEdge) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_query_timeout_ns = 10'000'000;
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  std::atomic<bool> retry_phase{false};
+  local_runtime_engine->result_for_query =
+      [&retry_phase](const CollisionQuery&) -> std::optional<CollisionResult> {
+    if (!retry_phase.load(std::memory_order_acquire)) {
+      return make_authoritative_collision_result();
+    }
+    CollisionResult clear_result;
+    clear_result.in_collision = false;
+    clear_result.engine_status = CollisionEngineStatus::kOk;
+    clear_result.decision = CollisionDecisionResult::kPass;
+    return clear_result;
+  };
+  ExecutionKernel controlled_kernel{planner,
+                                    context,
+                                    controlled_execution,
+                                    local_clock,
+                                    local_scheduler,
+                                    local_cache,
+                                    config};
+  configure_runtime_collision_monitoring(
+      controlled_kernel, local_collision_world, local_collision_engine,
+      local_runtime_engine);
+
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision = CollisionWorldRevision{120, "collision-then-clear"};
+  local_collision_world.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+
+  auto first = controlled_kernel.execute(make_test_request("retry_after_collision"));
+  ASSERT_TRUE(first.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "runtime collision monitor did not schedule its first tick";
+
+  local_clock.advance(10'000'000);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_TRUE(controlled_execution.wait_until_stop_count(1))
+      << "runtime collision did not preempt the first execution";
+  ASSERT_TRUE(controlled_kernel.wait_for_completion(1'000'000'000));
+  ASSERT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  const auto retry_latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(retry_latch.has_value());
+  ASSERT_EQ(retry_latch->preemption_result,
+            InterruptPreemptionResult::kSucceeded);
+
+  auto ack = controlled_kernel.acknowledge_interrupted_for_retry(
+      "operator", "runtime obstacle cleared");
+  ASSERT_TRUE(ack.accepted) << (ack.error ? ack.error->message : "");
+  ASSERT_EQ(controlled_kernel.get_status().state, ExecutionState::kIdle);
+  ASSERT_FALSE(controlled_kernel.get_active_interrupt_latch().has_value());
+
+  // The retry sees a clear runtime monitor. Before the fix, the built-in
+  // runtime_collision_fault edge source still had a freshness budget, so the
+  // stale-source sweep converted the previous collision pulse into a new
+  // synthetic stale fault and interrupted this second execution immediately.
+  retry_phase.store(true, std::memory_order_release);
+  auto retry = controlled_kernel.execute(make_test_request("retry_after_collision"));
+  ASSERT_TRUE(retry.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_count(2));
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "runtime collision monitor did not schedule its retry tick";
+
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    local_clock.advance(10'000'000);
+    controlled_execution.set_progress(0.0, {0.0, 0.0}, local_clock.now());
+    local_scheduler.advance_to(local_clock.now());
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    if (controlled_kernel.get_status().state != ExecutionState::kExecuting) {
+      break;
+    }
+  }
+
+  const auto final_status = controlled_kernel.get_status();
+  const auto final_latch = controlled_kernel.get_active_interrupt_latch();
+  EXPECT_EQ(final_status.state, ExecutionState::kExecuting);
+  EXPECT_FALSE(final_latch.has_value());
+  controlled_execution.release();
+  EXPECT_TRUE(controlled_kernel.wait_for_completion(1'000'000'000));
+}
+
+TEST_F(ExecutionKernelTest,
+       AcknowledgeInterruptedForRetryRejectsPendingFaultPreemptWithoutSideEffects) {
+  ControlledExecution controlled_execution;
+  controlled_execution.block_controlled_stop = true;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_query_timeout_ns = 10'000'000;
+  MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.profile_id = "pending_retry_guard";
+  fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  config.default_fault_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(fault_profile);
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  ExecutionKernel controlled_kernel{planner,
+                                    context,
+                                    controlled_execution,
+                                    local_clock,
+                                    local_scheduler,
+                                    local_cache,
+                                    config};
+  configure_runtime_collision_monitoring(
+      controlled_kernel, local_collision_world, local_collision_engine,
+      local_runtime_engine);
+  controlled_kernel.subscribe_events([&](const KernelEvent& event) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(event);
+  });
+
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision = CollisionWorldRevision{121, "pending-retry-guard"};
+  local_collision_world.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+
+  auto result = controlled_kernel.execute(make_test_request("pending_retry"));
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  local_runtime_engine->default_result = make_authoritative_collision_result();
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
+
+  local_clock.advance(config.collision_monitor_period_ns);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  ASSERT_EQ(controlled_kernel.get_status().state,
+            ExecutionState::kInterrupted);
+  const auto latch_before = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch_before.has_value());
+  ASSERT_EQ(latch_before->preemption_result,
+            InterruptPreemptionResult::kPending);
+  const auto epoch = controlled_kernel.control_command_epoch();
+
+  const auto ack = controlled_kernel.acknowledge_interrupted_for_retry(
+      "operator_alice", "runtime obstacle cleared", epoch);
+
+  EXPECT_FALSE(ack.accepted);
+  ASSERT_TRUE(ack.error.has_value());
+  EXPECT_EQ(ack.error->code, kErrorInvalidRequest);
+  EXPECT_EQ(ack.error->details.at("reason"),
+            kReasonRuntimeCollisionStopNotYetCertified);
+  EXPECT_EQ(ack.error->details.at("execution_id"),
+            std::to_string(result.value()));
+  EXPECT_EQ(ack.error->details.at("latch_id"), latch_before->latch_id);
+  EXPECT_EQ(ack.error->details.at("preemption_result"), "pending");
+  EXPECT_EQ(ack.error->details.at("fault_preempt_stop_active"), "true");
+  EXPECT_EQ(ack.error->details.at("retryable"), "true");
+  EXPECT_EQ(controlled_kernel.control_command_epoch(), epoch);
+  EXPECT_EQ(controlled_kernel.get_status().state,
+            ExecutionState::kInterrupted);
+  const auto latch_after_rejection =
+      controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch_after_rejection.has_value());
+  EXPECT_EQ(latch_after_rejection->latch_id, latch_before->latch_id);
+  EXPECT_EQ(latch_after_rejection->preemption_result,
+            InterruptPreemptionResult::kPending);
+  EXPECT_EQ(controlled_execution.controlled_stop_count_value(), 1);
+  EXPECT_EQ(controlled_execution.controlled_stop_cancel_count_value(), 0);
+  EXPECT_EQ(controlled_execution.stop_attempt_count_value(), 0);
+  EXPECT_EQ(controlled_execution.reset_count, 0);
+
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    EXPECT_TRUE(std::any_of(
+        events.begin(), events.end(), [&](const KernelEvent& event) {
+          return event.type == KernelEventType::kErrorRaised &&
+                 event.execution_id == result.value() &&
+                 event.details.contains("reason") &&
+                 event.details.at("reason") ==
+                     kReasonRuntimeCollisionStopNotYetCertified &&
+                 event.details.contains("latch_id") &&
+                 event.details.at("latch_id") == latch_before->latch_id;
+        }));
+  }
+
+  controlled_execution.release_controlled_stop();
+  ASSERT_TRUE(controlled_kernel.wait_for_completion(1'000'000'000));
+  const auto completed_latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(completed_latch.has_value());
+  ASSERT_EQ(completed_latch->preemption_result,
+            InterruptPreemptionResult::kSucceeded);
+  EXPECT_EQ(controlled_execution.reset_count, 0);
+}
+
+TEST_F(ExecutionKernelTest,
+       AcknowledgeInterruptedForRetryRejectsDefinitivePreemptWhileStopSourceActive) {
+  ControlledExecution controlled_execution;
+  controlled_execution.block_controlled_stop = true;
+  controlled_execution.ignore_controlled_stop_token_while_blocked = true;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_query_timeout_ns = 10'000'000;
+  MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.profile_id = "active_stop_retry_guard";
+  fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  fault_profile.deceleration_time_s = 0.01;
+  fault_profile.max_stop_time_s = 0.02;
+  config.default_fault_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(fault_profile);
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{planner,
+                                    context,
+                                    controlled_execution,
+                                    local_clock,
+                                    local_scheduler,
+                                    local_cache,
+                                    config};
+  configure_runtime_collision_monitoring(
+      controlled_kernel, local_collision_world, local_collision_engine,
+      local_runtime_engine);
+
+  std::mutex preempt_event_mutex;
+  std::condition_variable preempt_event_cv;
+  bool preempt_event_entered = false;
+  bool release_preempt_event = false;
+  controlled_kernel.subscribe_events([&](const KernelEvent& event) {
+    if (event.type != KernelEventType::kInterruptPreemptApplied ||
+        !event.details.contains("preemption_result") ||
+        event.details.at("preemption_result") != "backend_preempt_failed" ||
+        !event.details.contains("phase") ||
+        event.details.at("phase") != "fault_preempt_pending_watchdog") {
+      return;
+    }
+    std::unique_lock<std::mutex> lock(preempt_event_mutex);
+    preempt_event_entered = true;
+    preempt_event_cv.notify_all();
+    preempt_event_cv.wait(lock, [&]() { return release_preempt_event; });
+  });
+
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision =
+      CollisionWorldRevision{122, "active-stop-retry-guard"};
+  local_collision_world.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+
+  auto result =
+      controlled_kernel.execute(make_test_request("active_stop_retry"));
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  local_runtime_engine->default_result = make_authoritative_collision_result();
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
+
+  local_clock.advance(config.collision_monitor_period_ns);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  bool reached_definitive_event = false;
+  for (int attempt = 0; attempt < 20 && !reached_definitive_event; ++attempt) {
+    local_clock.advance(1'000'000'000);
+    std::unique_lock<std::mutex> lock(preempt_event_mutex);
+    reached_definitive_event = preempt_event_cv.wait_for(
+        lock, std::chrono::milliseconds(100),
+        [&]() { return preempt_event_entered; });
+  }
+  if (!reached_definitive_event) {
+    {
+      std::lock_guard<std::mutex> lock(preempt_event_mutex);
+      release_preempt_event = true;
+    }
+    controlled_execution.release_controlled_stop();
+    preempt_event_cv.notify_all();
+    FAIL() << "pending-preempt watchdog result did not reach the barrier";
+  }
+
+  const auto latch_before = controlled_kernel.get_active_interrupt_latch();
+  if (!latch_before.has_value()) {
+    {
+      std::lock_guard<std::mutex> lock(preempt_event_mutex);
+      release_preempt_event = true;
+    }
+    controlled_execution.release_controlled_stop();
+    preempt_event_cv.notify_all();
+    FAIL() << "preempt-applied event had no active latch";
+  }
+  EXPECT_EQ(latch_before->preemption_result,
+            InterruptPreemptionResult::kBackendPreemptFailed);
+  const auto ack = controlled_kernel.acknowledge_interrupted_for_retry(
+      "operator_alice", "runtime obstacle cleared");
+  const auto latch_after_rejection =
+      controlled_kernel.get_active_interrupt_latch();
+
+  {
+    std::lock_guard<std::mutex> lock(preempt_event_mutex);
+    release_preempt_event = true;
+  }
+  controlled_execution.release_controlled_stop();
+  preempt_event_cv.notify_all();
+
+  EXPECT_FALSE(ack.accepted);
+  ASSERT_TRUE(ack.error.has_value());
+  EXPECT_EQ(ack.error->details.at("reason"),
+            kReasonRuntimeCollisionStopNotYetCertified);
+  EXPECT_EQ(ack.error->details.at("preemption_result"),
+            "backend_preempt_failed");
+  EXPECT_EQ(ack.error->details.at("fault_preempt_stop_active"), "true");
+  EXPECT_EQ(ack.error->details.at("retryable"), "false");
+  ASSERT_TRUE(latch_after_rejection.has_value());
+  EXPECT_EQ(latch_after_rejection->preemption_result,
+            InterruptPreemptionResult::kBackendPreemptFailed);
+  EXPECT_EQ(controlled_execution.reset_count, 0);
+  EXPECT_TRUE(controlled_kernel.wait_for_completion(1'000'000'000));
+  EXPECT_EQ(controlled_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+}
+
+TEST_F(ExecutionKernelTest,
+       AcknowledgeInterruptedForRetryRejectsFailedPreemptAfterStopSourceClears) {
+  ControlledExecution controlled_execution;
+  ControlledStopResultDTO controlled_stop_failure;
+  controlled_stop_failure.accepted = false;
+  controlled_stop_failure.backend_stop_confirmed = false;
+  controlled_stop_failure.error = ErrorDTO{
+      std::string(kErrorMotionInterruptBackendStopFailed),
+      "injected controlled-stop failure",
+      {{"reason", "test_controlled_stop_failure"}}};
+  controlled_execution.next_controlled_stop_result = controlled_stop_failure;
+  controlled_execution.fail_next_legacy_stop = true;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_query_timeout_ns = 10'000'000;
+  MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.profile_id = "failed_preempt_retry_guard";
+  fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  config.default_fault_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(fault_profile);
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{planner,
+                                    context,
+                                    controlled_execution,
+                                    local_clock,
+                                    local_scheduler,
+                                    local_cache,
+                                    config};
+  configure_runtime_collision_monitoring(
+      controlled_kernel, local_collision_world, local_collision_engine,
+      local_runtime_engine);
+
+  std::mutex preempt_event_mutex;
+  std::condition_variable preempt_event_cv;
+  bool preempt_event_entered = false;
+  bool release_preempt_event = false;
+  controlled_kernel.subscribe_events([&](const KernelEvent& event) {
+    if (event.type != KernelEventType::kInterruptPreemptApplied ||
+        !event.details.contains("preemption_result") ||
+        event.details.at("preemption_result") != "backend_preempt_failed" ||
+        !event.details.contains("phase") ||
+        event.details.at("phase") != "preempt_trajectory") {
+      return;
+    }
+    std::unique_lock<std::mutex> lock(preempt_event_mutex);
+    preempt_event_entered = true;
+    preempt_event_cv.notify_all();
+    preempt_event_cv.wait(lock, [&]() { return release_preempt_event; });
+  });
+
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision =
+      CollisionWorldRevision{123, "failed-preempt-retry-guard"};
+  local_collision_world.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+
+  const auto result =
+      controlled_kernel.execute(make_test_request("failed_preempt_retry"));
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  local_runtime_engine->default_result = make_authoritative_collision_result();
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
+
+  local_clock.advance(config.collision_monitor_period_ns);
+  local_scheduler.advance_to(local_clock.now());
+  bool reached_preempt_event = false;
+  {
+    std::unique_lock<std::mutex> lock(preempt_event_mutex);
+    reached_preempt_event = preempt_event_cv.wait_for(
+        lock, std::chrono::seconds(1),
+        [&]() { return preempt_event_entered; });
+  }
+  if (!reached_preempt_event) {
+    {
+      std::lock_guard<std::mutex> lock(preempt_event_mutex);
+      release_preempt_event = true;
+    }
+    preempt_event_cv.notify_all();
+    FAIL() << "failed preemption result did not reach the barrier";
+  }
+
+  const auto latch_before = controlled_kernel.get_active_interrupt_latch();
+  if (!latch_before.has_value()) {
+    {
+      std::lock_guard<std::mutex> lock(preempt_event_mutex);
+      release_preempt_event = true;
+    }
+    preempt_event_cv.notify_all();
+    FAIL() << "failed preemption result had no active latch";
+  }
+  EXPECT_EQ(latch_before->preemption_result,
+            InterruptPreemptionResult::kBackendPreemptFailed);
+  EXPECT_EQ(controlled_kernel.get_status().state,
+            ExecutionState::kInterrupted);
+
+  const auto ack = controlled_kernel.acknowledge_interrupted_for_retry(
+      "operator_alice", "runtime obstacle cleared");
+  const auto latch_after_rejection =
+      controlled_kernel.get_active_interrupt_latch();
+
+  {
+    std::lock_guard<std::mutex> lock(preempt_event_mutex);
+    release_preempt_event = true;
+  }
+  preempt_event_cv.notify_all();
+
+  EXPECT_FALSE(ack.accepted);
+  ASSERT_TRUE(ack.error.has_value());
+  EXPECT_EQ(ack.error->details.at("reason"),
+            kReasonRuntimeCollisionStopNotYetCertified);
+  EXPECT_EQ(ack.error->details.at("preemption_result"),
+            "backend_preempt_failed");
+  EXPECT_EQ(ack.error->details.at("required_preemption_result"), "succeeded");
+  EXPECT_EQ(ack.error->details.at("fault_preempt_stop_active"), "false");
+  EXPECT_EQ(ack.error->details.at("retryable"), "false");
+  ASSERT_TRUE(latch_after_rejection.has_value());
+  EXPECT_EQ(latch_after_rejection->latch_id, latch_before->latch_id);
+  EXPECT_EQ(controlled_execution.reset_count, 0);
+  EXPECT_TRUE(controlled_kernel.wait_for_completion(1'000'000'000));
+  EXPECT_EQ(controlled_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
 }
 
 TEST_F(ExecutionKernelTest,
@@ -7598,6 +8107,14 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(outcome->error.has_value());
   EXPECT_EQ(outcome->error->details.at("reason"),
             "fault_preempt_stop_path_collision");
+
+  auto ack = local_kernel.acknowledge_intervention_for_retry(
+      "operator_alice", "ui_acknowledge_and_continue");
+  ASSERT_TRUE(ack.accepted)
+      << (ack.error.has_value() ? ack.error->message : std::string{});
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kIdle);
+  EXPECT_FALSE(local_kernel.get_active_interrupt_latch().has_value());
+  EXPECT_EQ(controlled_execution.reset_count, 0);
 }
 
 TEST_F(ExecutionKernelTest,
@@ -7666,6 +8183,14 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(outcome.has_value());
   ASSERT_TRUE(outcome->error.has_value());
   EXPECT_EQ(outcome->error->details.at("reason"), "fault_stop_total_failure");
+
+  auto ack = local_kernel.acknowledge_intervention_for_retry(
+      "operator_alice", "ui_acknowledge_and_continue");
+  ASSERT_TRUE(ack.accepted)
+      << (ack.error.has_value() ? ack.error->message : std::string{});
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kIdle);
+  EXPECT_FALSE(local_kernel.get_active_interrupt_latch().has_value());
+  EXPECT_EQ(controlled_execution.reset_count, 0);
 }
 
 TEST_F(ExecutionKernelTest,

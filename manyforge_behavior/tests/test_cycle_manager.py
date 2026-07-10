@@ -57,6 +57,32 @@ def kernel():
     return MockKernelClient()
 
 
+class _ContainmentRejectingKernel(MockKernelClient):
+    """Mock the RT-8P0 authority retaining an interrupted retry."""
+
+    def __init__(self, *args, retryable: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._interrupted_retryable = retryable
+
+    def acknowledge_interrupted_for_retry(
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: int | None = None,
+    ) -> CommandResult:
+        del principal_id, reason, expected_epoch
+        self.acknowledge_interrupted_for_retry_count += 1
+        return CommandResult(
+            accepted=False,
+            error="runtime-collision stop is not yet certified",
+            reason_code="runtime_collision_stop_not_yet_certified",
+            details={
+                "retryable": "true" if self._interrupted_retryable else "false"
+            },
+        )
+
+
 class TestCycleManagerInitialState:
     """Test initial state of CycleManager."""
     
@@ -147,16 +173,19 @@ class TestCycleManagerRun:
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
-        
-        # Run then stop
-        manager.run()
-        time.sleep(0.2)
-        manager.full_stop()
-        assert manager.state == CycleState.STOPPED
-        
-        # Run again — should resume
-        manager.run()
-        assert manager.state == CycleState.RUNNING
+
+        try:
+            # Run then stop
+            manager.run()
+            time.sleep(0.2)
+            manager.full_stop()
+            assert manager.state == CycleState.STOPPED
+
+            # Run again — should resume
+            manager.run()
+            assert manager.state == CycleState.RUNNING
+        finally:
+            manager.reset()
 
     def test_run_from_stopped_rejects_if_live_scene_changed(self, kernel):
         """A resumable STOPPED cycle owns the live scene state.
@@ -264,17 +293,17 @@ class TestCycleManagerRun:
             _scene_resume_fingerprint_from_objects([second])
         )
 
-    def test_run_from_stopped_motion_soft_fail_clears_interrupted_kernel_retry(
+    def test_run_from_held_motion_soft_fail_clears_interrupted_kernel_retry(
         self, kernel
     ):
-        """Run from STOPPED is an explicit retry after a motion soft-fail.
+        """Run from held motion stop is an explicit retry after a motion soft-fail.
 
         Runtime collision faults leave the kernel in INTERRUPTED with an
         active latch. Removing the obstacle fixes the scene but does not clear
-        that execution-local latch. The operator pressing Run means "retry
-        this held motion"; CycleManager must acknowledge the interrupted
-        kernel execution boundary first so the motion node can submit a fresh
-        execute request.
+        that execution-local latch. The cycle keeps ticking with motion held;
+        the operator pressing Run means "retry this held motion". CycleManager
+        must acknowledge the interrupted kernel execution boundary first so the
+        motion node can submit a fresh execute request.
         This must not call kernel.reset(), because ROS/Isaac reset can command
         the robot back to its initial pose. If the obstacle is still present,
         the fresh execute/monitor path will latch a new collision.
@@ -305,11 +334,13 @@ class TestCycleManagerRun:
             slow_kernel._state = ExecutionState.INTERRUPTED
 
             deadline = time.time() + 1.0
-            while manager.state != CycleState.STOPPED and time.time() < deadline:
+            while manager.motion_stop_state != "held" and time.time() < deadline:
                 time.sleep(0.01)
-            assert manager.state == CycleState.STOPPED
-            assert bb.get("motion_paused_due_to_error") is True
-            assert bb.get("motion_error_message") is not None
+            assert manager.state == CycleState.RUNNING
+            assert manager.motion_stop_state == "held"
+            assert manager._tick_pause_event.is_set()
+            assert bb.get("motion_paused_due_to_error") is False
+            assert bb.get("motion_error_message") is None
             previous_execute_count = slow_kernel.execute_count
 
             manager.run()
@@ -327,6 +358,151 @@ class TestCycleManagerRun:
             assert manager.state == CycleState.RUNNING
         finally:
             manager.reset()
+
+    def test_run_keeps_held_motion_recovery_when_kernel_retains_retry_authority(
+        self,
+    ):
+        """A settling preemption stays held without becoming a cycle error."""
+
+        retry_kernel = _ContainmentRejectingKernel(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, retry_kernel)
+        manager = CycleManager(runner, retry_kernel)
+        retry_kernel._state = ExecutionState.INTERRUPTED
+        with manager._lock:
+            manager._state = CycleState.RUNNING
+            manager._motion_stop_state = "held"
+            manager._error = "runtime collision"
+            manager._error_code = "runtime_collision"
+
+        manager.run()
+
+        assert retry_kernel.acknowledge_interrupted_for_retry_count == 1
+        assert retry_kernel.get_status().state == ExecutionState.INTERRUPTED
+        assert manager.state == CycleState.RUNNING
+        assert manager.motion_stop_state == "held"
+        assert manager.error == "runtime collision"
+        assert manager.error_code == "runtime_collision"
+
+    def test_run_keeps_stopped_recovery_when_kernel_retains_retry_authority(
+        self,
+    ):
+        """STOPPED retry remains pending until the kernel changes its offer."""
+
+        retry_kernel = _ContainmentRejectingKernel(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, retry_kernel)
+        manager = CycleManager(runner, retry_kernel)
+        retry_kernel._state = ExecutionState.INTERRUPTED
+        bb = py_trees.blackboard.Client(name="test_stopped_retry_containment")
+        bb.register_key(
+            key="motion_paused_due_to_error",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb.register_key(
+            key="motion_error_message",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb.register_key(
+            key="stop_requested",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb.register_key(
+            key="motion_stop_active",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb.set("motion_paused_due_to_error", True)
+        bb.set("motion_error_message", "runtime collision")
+        bb.set("stop_requested", True)
+        bb.set("motion_stop_active", True)
+        pending_recovery = object()
+        with manager._lock:
+            manager._state = CycleState.STOPPED
+            manager._motion_stop_state = "held"
+            manager._error = "runtime collision"
+            manager._error_code = "runtime_collision"
+            manager._pending_delegated_recovery = pending_recovery
+
+        manager.run()
+
+        assert retry_kernel.acknowledge_interrupted_for_retry_count == 1
+        assert retry_kernel.get_status().state == ExecutionState.INTERRUPTED
+        assert manager.state == CycleState.STOPPED
+        assert manager.motion_stop_state == "held"
+        assert manager.error == "runtime collision"
+        assert manager.error_code == "runtime_collision"
+        assert manager._pending_delegated_recovery is pending_recovery
+        assert bb.get("motion_paused_due_to_error") is True
+        assert bb.get("motion_error_message") == "runtime collision"
+        assert bb.get("stop_requested") is True
+        assert bb.get("motion_stop_active") is True
+
+    def test_run_surfaces_non_retryable_containment_rejection(self):
+        """A definitive failed preemption is not mislabeled as settling."""
+
+        retry_kernel = _ContainmentRejectingKernel(retryable=False)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, retry_kernel)
+        manager = CycleManager(runner, retry_kernel)
+        retry_kernel._state = ExecutionState.INTERRUPTED
+        with manager._lock:
+            manager._state = CycleState.RUNNING
+            manager._motion_stop_state = "held"
+
+        with pytest.raises(
+            RuntimeError,
+            match="kernel.acknowledge_interrupted_for_retry rejected",
+        ):
+            manager.run()
+
+        assert retry_kernel.acknowledge_interrupted_for_retry_count == 1
+        assert manager.state == CycleState.RUNNING
+        assert manager.motion_stop_state == "held"
+
+    def test_run_promotes_pending_motion_soft_fail_before_noop(self, kernel):
+        """Run must not 200/no-op while a retryable motion fault is pending.
+
+        The motion node writes its soft-fail signal on the blackboard, then the
+        cycle-manager tick loop promotes that signal into `motion_stop_state =
+        held`. An operator can press Run in that small window. Treating RUNNING
+        + idle motion-stop as a no-op leaves the collision banner latched even
+        though the operator explicitly requested retry.
+        """
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+        bb = py_trees.blackboard.Client(name="test_pending_motion_soft_fail_run")
+        bb.register_key(
+            key="motion_paused_due_to_error",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb.register_key(key="motion_error_message", access=py_trees.common.Access.WRITE)
+        bb.register_key(
+            key="motion_paused_node_name",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb.register_key(
+            key="resume_after_error_requested",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb.set("motion_paused_due_to_error", True)
+        bb.set("motion_error_message", "Motion execution ended in interrupted")
+        bb.set("motion_paused_node_name", "move_to_pick_approach")
+        bb.set("resume_after_error_requested", False)
+        slow_kernel._state = ExecutionState.INTERRUPTED
+
+        with manager._lock:
+            manager._state = CycleState.RUNNING
+            manager._motion_stop_state = "idle"
+
+        manager.run()
+
+        assert slow_kernel.acknowledge_interrupted_for_retry_count == 1
+        assert manager.state == CycleState.RUNNING
+        assert manager.motion_stop_state == "idle"
+        assert manager.error is None
+        assert manager.error_code is None
+        assert bb.get("motion_paused_due_to_error") is False
+        assert bb.get("motion_error_message") is None
+        assert bb.get("motion_paused_node_name") is None
+        assert bb.get("resume_after_error_requested") is True
 
     def test_node_failure_feedback_is_exposed_as_cycle_error(self, kernel, tmp_path):
         """Clean node failures should surface node feedback in manager.error."""
@@ -577,46 +753,51 @@ class TestCycleManagerMotionStop:
     """Test the cooperative operator Motion Stop path."""
 
     @staticmethod
-    def _parallel_motion_timer_program(timer_duration_s: float = 0.2) -> str:
-        return _write_yaml_file(
-            {
-                "api_version": "manyforge.program.v0",
-                "program_profile": "v0.0",
-                "name": "motion_stop_parallel_test",
-                "description": "Motion stop cooperative ticking test.",
-                "catalog_version": "0.2.0",
-                "robot": {
-                    "robot_id": "ur5",
-                    "group_id": "arm",
-                    "base_frame": "base_link",
-                    "tcp_frame": "tool0",
-                },
-                "tree": {
-                    "id": "parallel",
-                    "name": "root_parallel",
-                    "children": [
-                        {
-                            "id": "move_manipulator_action",
-                            "name": "held_motion",
-                            "params": {
-                                "move_id": "held_motion",
-                                "motion_type": "joint_goal",
-                                "joint_goal_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
-                                "joint_goal_positions_rad": [0.1, -0.8, 0.7, -1.0, -0.9, 0.2],
-                                "planning_timeout_s": 2.0,
-                                "execution_timeout_s": 10.0,
-                            },
+    def _parallel_motion_timer_program(
+        timer_duration_s: float = 0.2,
+        *,
+        success_policy: str | None = None,
+    ) -> str:
+        data = {
+            "api_version": "manyforge.program.v0",
+            "program_profile": "v0.1" if success_policy is not None else "v0.0",
+            "name": "motion_stop_parallel_test",
+            "description": "Motion stop cooperative ticking test.",
+            "catalog_version": "0.2.0",
+            "robot": {
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "base_frame": "base_link",
+                "tcp_frame": "tool0",
+            },
+            "tree": {
+                "id": "parallel",
+                "name": "root_parallel",
+                "children": [
+                    {
+                        "id": "move_manipulator_action",
+                        "name": "held_motion",
+                        "params": {
+                            "move_id": "held_motion",
+                            "motion_type": "joint_goal",
+                            "joint_goal_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
+                            "joint_goal_positions_rad": [0.1, -0.8, 0.7, -1.0, -0.9, 0.2],
+                            "planning_timeout_s": 2.0,
+                            "execution_timeout_s": 10.0,
                         },
-                        {
-                            "id": "timer",
-                            "name": "background_wait",
-                            "operator_stop_policy": "continue",
-                            "params": {"duration_s": timer_duration_s},
-                        },
-                    ],
-                },
-            }
-        )
+                    },
+                    {
+                        "id": "timer",
+                        "name": "background_wait",
+                        "operator_stop_policy": "continue",
+                        "params": {"duration_s": timer_duration_s},
+                    },
+                ],
+            },
+        }
+        if success_policy is not None:
+            data["tree"]["params"] = {"success_policy": success_policy}
+        return _write_yaml_file(data)
 
     def test_motion_stop_keeps_cycle_running_and_holds_motion(self):
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
@@ -752,6 +933,153 @@ class TestCycleManagerMotionStop:
             assert manager.get_node_statuses().get("background_wait") == "SUCCESS"
         finally:
             manager.full_stop()
+            os.unlink(program_path)
+
+    def test_motion_soft_fail_keeps_continue_branch_ticking(self):
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        program_path = self._parallel_motion_timer_program(timer_duration_s=0.3)
+        runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        try:
+            manager.run()
+            deadline = time.time() + 1.0
+            while slow_kernel.execute_count == 0 and time.time() < deadline:
+                time.sleep(0.01)
+            assert slow_kernel.execute_count == 1
+            assert manager.get_node_statuses().get("background_wait") != "SUCCESS"
+
+            slow_kernel._state = ExecutionState.INTERRUPTED
+
+            deadline = time.time() + 1.0
+            while manager.motion_stop_state != "held" and time.time() < deadline:
+                time.sleep(0.01)
+            assert manager.state == CycleState.RUNNING
+            assert manager.motion_stop_state == "held"
+            assert manager._tick_pause_event.is_set()
+
+            deadline = time.time() + 1.0
+            while (
+                manager.get_node_statuses().get("background_wait") != "SUCCESS"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            assert manager.get_node_statuses().get("background_wait") == "SUCCESS"
+        finally:
+            manager.full_stop()
+            os.unlink(program_path)
+
+    def test_motion_soft_fail_terminal_tree_clears_motion_hold(self):
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        program_path = self._parallel_motion_timer_program(
+            timer_duration_s=0.25,
+            success_policy="success_on_one",
+        )
+        runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+        bb = py_trees.blackboard.Client(name="test_terminal_motion_hold_clear")
+        bb.register_key(key="motion_stop_active", access=py_trees.common.Access.READ)
+
+        try:
+            manager.run()
+            deadline = time.time() + 1.0
+            while slow_kernel.execute_count == 0 and time.time() < deadline:
+                time.sleep(0.01)
+
+            slow_kernel._state = ExecutionState.INTERRUPTED
+
+            deadline = time.time() + 1.0
+            while manager.motion_stop_state != "held" and time.time() < deadline:
+                time.sleep(0.01)
+            assert manager.state == CycleState.RUNNING
+            assert manager.motion_stop_state == "held"
+
+            deadline = time.time() + 1.0
+            while manager.state != CycleState.IDLE and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert manager.state == CycleState.IDLE
+            assert manager.motion_stop_state == "idle"
+            assert bb.get("motion_stop_active") is False
+        finally:
+            manager.full_stop()
+            os.unlink(program_path)
+
+    def test_motion_soft_fail_intervention_required_fails_closed(self):
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        program_path = self._parallel_motion_timer_program(timer_duration_s=0.3)
+        runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        try:
+            manager.run()
+            deadline = time.time() + 1.0
+            while slow_kernel.execute_count == 0 and time.time() < deadline:
+                time.sleep(0.01)
+            assert slow_kernel.execute_count == 1
+
+            slow_kernel._state = ExecutionState.INTERVENTION_REQUIRED
+
+            deadline = time.time() + 1.0
+            while manager.state != CycleState.STOPPED and time.time() < deadline:
+                time.sleep(0.01)
+            assert manager.state == CycleState.STOPPED
+            assert manager.motion_stop_state == "idle"
+            assert not manager._tick_pause_event.is_set()
+            assert manager.error is not None
+        finally:
+            manager.reset()
+            os.unlink(program_path)
+
+    def test_held_motion_soft_fail_later_intervention_required_fails_closed(self):
+        """A retryable held motion stop must not stay resumable after escalation.
+
+        The live runtime-collision path can first publish an interrupted soft
+        failure, then later escalate to INTERVENTION_REQUIRED if controlled stop
+        confirmation fails. The cycle must switch from held motion resume to the
+        explicit acknowledge/reset recovery boundary.
+        """
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        program_path = self._parallel_motion_timer_program(timer_duration_s=0.3)
+        runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        try:
+            manager.run()
+            deadline = time.time() + 1.0
+            while slow_kernel.execute_count == 0 and time.time() < deadline:
+                time.sleep(0.01)
+            assert slow_kernel.execute_count == 1
+
+            slow_kernel._state = ExecutionState.INTERRUPTED
+            deadline = time.time() + 1.0
+            while manager.motion_stop_state != "held" and time.time() < deadline:
+                time.sleep(0.01)
+            assert manager.state == CycleState.RUNNING
+            assert manager.motion_stop_state == "held"
+
+            slow_kernel._state = ExecutionState.INTERVENTION_REQUIRED
+            slow_kernel._emit_kernel_event(  # noqa: SLF001 - inject native transition.
+                "state_transition",
+                from_state="interrupted",
+                to_state="intervention_required",
+            )
+
+            deadline = time.time() + 1.0
+            while manager.state != CycleState.STOPPED and time.time() < deadline:
+                time.sleep(0.01)
+            assert manager.state == CycleState.STOPPED
+            assert manager.motion_stop_state == "idle"
+            assert not manager._tick_pause_event.is_set()
+            assert manager.error_code == "motion_soft_fail_requires_intervention"
+            assert manager.error_details is not None
+            assert (
+                manager.error_details["motion_soft_stop_reason"]
+                == "motion_soft_fail_requires_intervention"
+            )
+            assert manager.error_details["kernel_state"] == "intervention_required"
+        finally:
+            manager.reset()
             os.unlink(program_path)
 
 
@@ -1989,17 +2317,15 @@ class TestIntervention:
 
         Operator stop() now preempts via the controlled stop (kernel STOPPED,
         no held motion), so it no longer produces a paused kernel. The guard
-        still protects the motion-soft-fail hold case, where the kernel is
-        genuinely PAUSED with the cycle STOPPED — recreate that condition
-        directly and assert the guard still rejects the wrapper-only
-        intervention."""
+        still protects any STOPPED recovery state where the backend is
+        genuinely PAUSED; recreate that condition directly and assert the
+        guard still rejects the wrapper-only intervention."""
         kernel = MockKernelClient(execute_duration_s=1.0)
         manager = self._make_manager(kernel, execute_duration_s=1.0)
         manager.run()
         time.sleep(0.05)
         manager.full_stop()
-        # Recreate the soft-fail held-motion condition: cycle STOPPED + kernel
-        # PAUSED (the only state the guard protects against now). _make_manager
+        # Recreate a STOPPED recovery state with a paused backend. _make_manager
         # builds its own kernel, so override the manager's actual kernel.
         manager._kernel._state = ExecutionState.PAUSED
 
@@ -2504,6 +2830,185 @@ class TestCycleManagerExplicitInterventionRecovery:
         assert kernel.acknowledge_intervention_for_retry_count == 1
         assert kernel.acknowledge_intervention_count == 0
         assert kernel.reset_count == 0
+
+    def test_acknowledge_intervention_for_retry_accepts_held_motion_intervention(
+        self,
+    ):
+        manager, kernel = self._make_manager()
+        with manager._lock:  # noqa: SLF001 - targeted recovery-state fixture.
+            manager._state = CycleState.RUNNING
+            manager._motion_stop_state = "held"
+            manager._error = "Runtime collision detected during execution"
+            manager._error_code = "runtime_collision"
+            manager._error_details = {
+                "motion_soft_stop_reason": "motion_soft_fail_requires_intervention",
+                "kernel_state": "intervention_required",
+            }
+        kernel._state = ExecutionState.INTERVENTION_REQUIRED
+        before_reset_count = kernel.reset_count
+
+        manager.acknowledge_intervention_for_retry(
+            principal_id="operator:test",
+            reason="test_acknowledge_held_motion_intervention",
+        )
+
+        assert manager.state == CycleState.STOPPED
+        assert manager.motion_stop_state == "idle"
+        assert not manager._tick_pause_event.is_set()
+        assert manager.error is None
+        assert kernel.get_status().state == ExecutionState.IDLE
+        assert kernel.acknowledge_intervention_for_retry_count == 1
+        assert kernel.reset_count == before_reset_count
+
+    def test_acknowledge_failed_validation_for_retry_preserves_backend_reset_count(
+        self,
+    ):
+        manager, kernel = self._make_manager()
+        manager._prepare_fresh_cycle()  # noqa: SLF001 - build a resumable tree.
+        with manager._lock:  # noqa: SLF001 - targeted recovery-state fixture.
+            manager._state = CycleState.STOPPED
+            manager._error = "Observed scene source stale"
+            manager._error_code = "scene_changed_during_validation"
+            manager._error_details = {
+                "reason": "observed_scene_source_stale",
+                "object_id": "isaac_cheese_box",
+                "source_id": "isaac_scene_objects",
+            }
+        kernel._state = ExecutionState.FAILED
+        kernel._last_error_message = "Observed scene source stale"  # noqa: SLF001
+        kernel._last_error_code = "scene_changed_during_validation"  # noqa: SLF001
+        kernel._last_error_details = {  # noqa: SLF001
+            "reason": "observed_scene_source_stale",
+            "object_id": "isaac_cheese_box",
+            "source_id": "isaac_scene_objects",
+        }
+        before_reset_count = kernel.reset_count
+
+        manager.acknowledge_failed_validation_for_retry(
+            principal_id="operator:test",
+            reason="test_acknowledge_failed_validation",
+        )
+
+        assert manager.state == CycleState.STOPPED
+        assert manager.motion_stop_state == "idle"
+        assert manager.error is None
+        assert kernel.get_status().state == ExecutionState.IDLE
+        assert kernel.acknowledge_failed_validation_for_retry_count == 1
+        assert kernel.reset_count == before_reset_count
+
+    def test_acknowledge_failed_validation_for_retry_rejects_non_validation_failed(
+        self,
+    ):
+        manager, kernel = self._make_manager()
+        with manager._lock:  # noqa: SLF001 - targeted recovery-state fixture.
+            manager._state = CycleState.STOPPED
+            manager._error = "Backend failed"
+            manager._error_code = "execution_aborted"
+            manager._error_details = {"reason": "controller_result_failed"}
+        kernel._state = ExecutionState.FAILED
+        kernel._last_error_message = "Backend failed"  # noqa: SLF001
+        kernel._last_error_code = "execution_aborted"  # noqa: SLF001
+        kernel._last_error_details = {  # noqa: SLF001
+            "reason": "controller_result_failed",
+        }
+
+        with pytest.raises(RuntimeError, match="not a retryable validation gate"):
+            manager.acknowledge_failed_validation_for_retry()
+
+        assert kernel.get_status().state == ExecutionState.FAILED
+        assert kernel.acknowledge_failed_validation_for_retry_count == 0
+        assert kernel.reset_count == 0
+
+    def test_acknowledged_failed_validation_run_bypasses_scene_guard_for_replan(
+        self,
+        monkeypatch,
+    ):
+        manager, kernel = self._make_manager()
+        manager._prepare_fresh_cycle()  # noqa: SLF001 - build a resumable tree.
+        with manager._lock:  # noqa: SLF001 - targeted recovery-state fixture.
+            manager._state = CycleState.STOPPED
+            manager._resumable_stop_scene_fingerprint = "stale-scene"
+            manager._error = "Observed scene source stale"
+            manager._error_code = "scene_changed_during_validation"
+            manager._error_details = {"reason": "observed_scene_source_stale"}
+        kernel._state = ExecutionState.FAILED
+        kernel._last_error_message = "Observed scene source stale"  # noqa: SLF001
+        kernel._last_error_code = "scene_changed_during_validation"  # noqa: SLF001
+        kernel._last_error_details = {"reason": "observed_scene_source_stale"}  # noqa: SLF001
+
+        manager.acknowledge_failed_validation_for_retry(
+            principal_id="operator:test",
+            reason="test_acknowledge_failed_validation",
+        )
+
+        with manager._lock:  # noqa: SLF001 - prove the ordinary guard would fail.
+            assert manager._state == CycleState.STOPPED
+            assert manager._allow_next_stopped_retry_replan is True
+        monkeypatch.setattr(
+            manager,
+            "_capture_scene_resume_fingerprint",
+            lambda: ("changed-live-scene", None),
+        )
+        monkeypatch.setattr(manager, "_start_tick_thread", lambda _target: None)
+
+        manager.run()
+
+        bb = py_trees.blackboard.Client(name="test_failed_validation_retry_replan")
+        bb.register_key(
+            key="resume_after_error_requested",
+            access=py_trees.common.Access.READ,
+        )
+        assert manager.state == CycleState.RUNNING
+        assert manager.error is None
+        assert bb.get("resume_after_error_requested") is True
+        with manager._lock:  # noqa: SLF001 - bypass is one-shot.
+            assert manager._allow_next_stopped_retry_replan is False
+
+    def test_acknowledged_held_intervention_run_bypasses_scene_guard_for_replan(
+        self,
+        monkeypatch,
+    ):
+        manager, kernel = self._make_manager()
+        manager._prepare_fresh_cycle()  # noqa: SLF001 - build a resumable tree.
+        with manager._lock:  # noqa: SLF001 - targeted recovery-state fixture.
+            manager._state = CycleState.RUNNING
+            manager._motion_stop_state = "held"
+            manager._error = "Runtime collision detected during execution"
+            manager._error_code = "runtime_collision"
+            manager._error_details = {
+                "motion_soft_stop_reason": "motion_soft_fail_requires_intervention",
+                "kernel_state": "intervention_required",
+            }
+        kernel._state = ExecutionState.INTERVENTION_REQUIRED
+
+        manager.acknowledge_intervention_for_retry(
+            principal_id="operator:test",
+            reason="test_acknowledge_held_motion_intervention",
+        )
+
+        with manager._lock:  # noqa: SLF001 - prove the ordinary guard would fail.
+            assert manager._state == CycleState.STOPPED
+            assert manager._resumable_stop_scene_fingerprint is None
+            assert manager._allow_next_stopped_retry_replan is True
+        monkeypatch.setattr(
+            manager,
+            "_capture_scene_resume_fingerprint",
+            lambda: ("changed-live-scene", None),
+        )
+        monkeypatch.setattr(manager, "_start_tick_thread", lambda _target: None)
+
+        manager.run()
+
+        bb = py_trees.blackboard.Client(name="test_retry_replan_resume_flag")
+        bb.register_key(
+            key="resume_after_error_requested",
+            access=py_trees.common.Access.READ,
+        )
+        assert manager.state == CycleState.RUNNING
+        assert manager.error is None
+        assert bb.get("resume_after_error_requested") is True
+        with manager._lock:  # noqa: SLF001 - bypass is one-shot.
+            assert manager._allow_next_stopped_retry_replan is False
 
     def test_run_from_stopped_with_kernel_intervention_fails_closed_if_intervention_session_running(
         self,

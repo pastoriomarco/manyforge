@@ -117,6 +117,10 @@ class _ExecutorProbeCycleManager:
         self.thread_names["ack"] = threading.current_thread().name
         self.state = _FakeCycleState("stopped")
 
+    def acknowledge_failed_validation_for_retry(self, **_kwargs) -> None:
+        self.thread_names["ack_failed_validation"] = threading.current_thread().name
+        self.state = _FakeCycleState("stopped")
+
     def stop(self) -> None:
         self.thread_names["stop"] = threading.current_thread().name
         self.motion_stop_state = "held"
@@ -183,6 +187,100 @@ class _KernelSnapshotFaultCycleManager:
 
     def get_node_statuses(self):
         return {}
+
+
+class _HeldCollisionInterventionCycleManager:
+    """Fake for RUNNING+held soft-fail after the kernel escalated to intervention."""
+
+    state = _FakeCycleState("running")
+    motion_stop_state = "held"
+    velocity_scale = 1.0
+    error = "Motion execution ended in interrupted"
+    error_code = "runtime_collision"
+    error_details = {
+        "reason": "runtime_collision_detected",
+        "collision_result_first_failure_pair": (
+            "object/wall/shape/0 <-> robot/robot0/link/wrist_1_link/collision/0"
+        ),
+    }
+    intervention = None
+
+    def get_status(self):
+        return type(
+            "KernelStatus",
+            (),
+            {
+                "state": _FakeKernelState("INTERVENTION_REQUIRED"),
+                "execution_id": 2,
+                "active_move_id": "pick_approach",
+                "progress": 0.5,
+            },
+        )()
+
+    def get_execution_snapshot(self):
+        return type(
+            "KernelSnapshot",
+            (),
+            {
+                "error": (
+                    "fault-preempt controlled stop and emergency hard-stop floor "
+                    "both failed; operator intervention is required"
+                ),
+                "error_code": "motion_interrupt_backend_stop_failed",
+                "error_details": {
+                    "phase": "preempt_trajectory",
+                    "reason": "fault_stop_total_failure",
+                    "hard_stop_transitioned": "true",
+                },
+            },
+        )()
+
+    def drain_kernel_events_now(self) -> None:
+        return None
+
+    def get_kernel_events_since(self, _index: int):
+        return []
+
+    def get_node_statuses(self):
+        return {}
+
+
+class _CommandPayloadProbeCycleManager:
+    """Fake that records kernel-visibility probes during command responses."""
+
+    def __init__(self) -> None:
+        self.state = _FakeCycleState("idle")
+        self.motion_stop_state = "idle"
+        self.velocity_scale = 1.0
+        self.error = "latched local error"
+        self.error_code = "local_error_code"
+        self.error_details = {"reason_code": "local_error_code"}
+        self.intervention = None
+        self.status_reads = 0
+        self.snapshot_reads = 0
+
+    def run(self) -> None:
+        self.state = _FakeCycleState("running")
+
+    def get_status(self):
+        self.status_reads += 1
+        return type(
+            "KernelStatus",
+            (),
+            {"state": _FakeKernelState("INTERVENTION_REQUIRED")},
+        )()
+
+    def get_execution_snapshot(self):
+        self.snapshot_reads += 1
+        return type(
+            "KernelSnapshot",
+            (),
+            {
+                "error": "snapshot error",
+                "error_code": "snapshot_error_code",
+                "error_details": {"reason_code": "snapshot_error_code"},
+            },
+        )()
 
 
 def _simulation_control_deployment(
@@ -474,6 +572,12 @@ def test_acknowledge_intervention_for_retry_no_program_409(client):
     assert response.status_code == 409
 
 
+def test_acknowledge_failed_validation_for_retry_no_program_409(client):
+    """POST /api/cycle/acknowledge-failed-validation-for-retry returns 409 without program."""
+    response = client.post("/api/cycle/acknowledge-failed-validation-for-retry")
+    assert response.status_code == 409
+
+
 def test_cycle_status_includes_error_fields_for_hmi(client):
     """Rich error UX (#1 + #3): `/api/cycle/status` always returns the
     error / errorCode / errorDetails fields so the viewer can poll one
@@ -509,6 +613,64 @@ def test_cycle_status_falls_back_to_kernel_snapshot_fault(state):
     assert data["errorCode"] == "controller_cancel_timeout"
     assert data["errorDetails"]["reason_code"] == "controller_cancel_timeout"
     assert data["errorDetails"]["stop_completion_timeout_s"] == "0.5"
+
+
+def test_cycle_status_marks_held_collision_as_intervention_recovery(state):
+    """A held runtime-collision cause must not hide later kernel intervention.
+
+    This is the live failure mode: the HMI had enough information to explain the
+    collision pair, but not enough to know that Resume was no longer admissible.
+    """
+    state.cycle_manager = _HeldCollisionInterventionCycleManager()
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as local_client:
+        response = local_client.get("/api/cycle/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["state"] == "running"
+    assert data["motionStopState"] == "held"
+    assert data["errorCode"] == "runtime_collision"
+    assert data["errorDetails"]["reason"] == "runtime_collision_detected"
+    assert (
+        "object/wall"
+        in data["errorDetails"]["collision_result_first_failure_pair"]
+    )
+    assert data["errorDetails"]["kernel_state"] == "intervention_required"
+    assert (
+        data["errorDetails"]["motion_soft_stop_reason"]
+        == "motion_soft_fail_requires_intervention"
+    )
+    assert data["errorDetails"]["kernel_intervention_reason"] == "fault_stop_total_failure"
+    assert data["errorDetails"]["hard_stop_transitioned"] == "true"
+
+
+def test_cycle_command_response_uses_manager_error_without_kernel_probe(state):
+    """200 command responses must not perform extra kernel snapshot reads.
+
+    /stop and /full-stop run on the reserved control executor. The shared
+    command payload path should therefore report manager-owned error fields
+    only; richer snapshot fallback remains a /status concern.
+    """
+    manager = _CommandPayloadProbeCycleManager()
+    state.cycle_manager = manager
+    app = create_app(state, security=_TEST_SECURITY)
+    local_client = TestClient(app)
+
+    try:
+        response = local_client.post("/api/cycle/run")
+    finally:
+        local_client.close()
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["state"] == "running"
+    assert data["error"] == "latched local error"
+    assert data["errorCode"] == "local_error_code"
+    assert data["errorDetails"]["reason_code"] == "local_error_code"
+    assert manager.status_reads == 0
+    assert manager.snapshot_reads == 0
 
 
 def test_kernel_snapshot_includes_structured_error_fields(client):
@@ -628,6 +790,40 @@ def test_acknowledge_intervention_for_retry_does_not_reset_backend(client, state
     assert kernel.reset_count == before_reset_count
 
 
+def test_acknowledge_failed_validation_for_retry_does_not_reset_backend(client, state):
+    """Failed validation retry clears the gate without backend/scene reset."""
+    assert isinstance(state.kernel, MockKernelClient)
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+    assert state.cycle_manager is not None
+    manager = state.cycle_manager
+    kernel = manager._kernel  # noqa: SLF001 - test fixture introspection
+    assert isinstance(kernel, MockKernelClient)
+
+    manager._state = CycleState.STOPPED  # noqa: SLF001
+    manager._error = "Observed scene source stale"  # noqa: SLF001
+    manager._error_code = "scene_changed_during_validation"  # noqa: SLF001
+    manager._error_details = {  # noqa: SLF001
+        "reason": "observed_scene_source_stale",
+        "object_id": "isaac_cheese_box",
+        "source_id": "isaac_scene_objects",
+    }
+    kernel._state = ExecutionState.FAILED  # noqa: SLF001
+    kernel._last_error_message = "Observed scene source stale"  # noqa: SLF001
+    kernel._last_error_code = "scene_changed_during_validation"  # noqa: SLF001
+    kernel._last_error_details = dict(manager._error_details)  # noqa: SLF001
+    before_reset_count = kernel.reset_count
+
+    response = client.post("/api/cycle/acknowledge-failed-validation-for-retry")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["state"] == "stopped"
+    assert data["error"] is None
+    assert data["errorCode"] is None
+    assert kernel.get_status().state == ExecutionState.IDLE
+    assert kernel.acknowledge_failed_validation_for_retry_count == 1
+    assert kernel.reset_count == before_reset_count
+
+
 def test_reset_from_running(client, state):
     """Run then reset, verify state=idle."""
     # Load program
@@ -664,10 +860,19 @@ def test_cycle_lifecycle_routes_use_lifecycle_executor():
             local_client.post("/api/cycle/acknowledge-intervention-for-retry").status_code
             == 200
         )
+        assert (
+            local_client.post(
+                "/api/cycle/acknowledge-failed-validation-for-retry"
+            ).status_code
+            == 200
+        )
 
     assert manager.thread_names["run"].startswith("manyforge_cycle_lifecycle")
     assert manager.thread_names["reset"].startswith("manyforge_cycle_lifecycle")
     assert manager.thread_names["ack"].startswith("manyforge_cycle_lifecycle")
+    assert manager.thread_names["ack_failed_validation"].startswith(
+        "manyforge_cycle_lifecycle"
+    )
 
 
 def test_full_stop_uses_reserved_control_executor_when_lifecycle_pool_blocked():
@@ -1597,6 +1802,47 @@ def test_run_from_stopped():
         data = response.json()
         assert data["state"] == "running"
         assert data["motionStopState"] == "idle"
+
+
+def test_run_route_keeps_held_collision_offer_while_kernel_retains_authority(
+    client, state
+):
+    """A classified RT-8P0 denial is a 200 held offer, not a route error."""
+
+    load = client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+    assert load.status_code == 200
+    manager = state.cycle_manager
+    kernel = state.kernel
+    assert manager is not None
+    assert isinstance(kernel, MockKernelClient)
+    kernel._state = ExecutionState.INTERRUPTED
+    calls = 0
+
+    def reject_interrupted_retry(**_kwargs) -> CommandResult:
+        nonlocal calls
+        calls += 1
+        return CommandResult(
+            accepted=False,
+            error="runtime-collision stop is not yet certified",
+            reason_code="runtime_collision_stop_not_yet_certified",
+            details={"retryable": "true"},
+        )
+
+    kernel.acknowledge_interrupted_for_retry = reject_interrupted_retry
+    with manager._lock:
+        manager._state = CycleState.RUNNING
+        manager._motion_stop_state = "held"
+        manager._error = "runtime collision"
+        manager._error_code = "runtime_collision"
+
+    response = client.post("/api/cycle/run")
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "running"
+    assert response.json()["motionStopState"] == "held"
+    assert calls == 1
+    assert manager.error == "runtime collision"
+    assert manager.error_code == "runtime_collision"
 
 
 def test_velocity_scale(client, state):

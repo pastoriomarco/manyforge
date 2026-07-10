@@ -488,6 +488,10 @@ InterruptIngestResult InterruptManager::sweep_stale_sources(
   std::lock_guard<std::mutex> lock(mutex_);
   for (const auto& [source_id, source] : sources_) {
     if (source.source_class != attempted_lane ||
+        // Edge sources are event pulses, not continuously refreshed health
+        // samples. A past edge must not turn into a synthetic stale fault on
+        // the next execution after the operator acknowledged it.
+        source.kind == InterruptSourceKind::kEdge ||
         !source.freshness_budget_ns.has_value()) {
       continue;
     }

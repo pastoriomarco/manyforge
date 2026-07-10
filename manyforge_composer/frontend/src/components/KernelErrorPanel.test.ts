@@ -7,6 +7,7 @@ import {
   incidentEventSummary,
   prettyBodyId,
   prettyPair,
+  recoveryActionForError,
 } from './KernelErrorPanel';
 
 describe('KernelErrorPanel mapping', () => {
@@ -371,6 +372,30 @@ describe('KernelErrorPanel mapping', () => {
           'Collision world changed after validation and before dispatch',
         ),
       ).toBe('Observed scene source stale: box from foundationpose (750 ms > 500 ms)');
+    });
+
+    it('routes failed validation gates to validation retry, not intervention ack', () => {
+      expect(
+        recoveryActionForError('scene_changed_during_validation', {
+          reason: 'observed_scene_source_stale',
+          phase: 'fault_preempt',
+          requested_stop_mode: 'spring_back_hold',
+        }),
+      ).toBe('failed_validation');
+      expect(
+        recoveryActionForError('validation_collision', {
+          collision_result_engine_status: 'timeout',
+        }),
+      ).toBe('failed_validation');
+    });
+
+    it('keeps intervention recovery on the stop/fault route', () => {
+      expect(
+        recoveryActionForError('runtime_collision', {
+          motion_soft_stop_reason: 'motion_soft_fail_requires_intervention',
+          kernel_state: 'intervention_required',
+        }),
+      ).toBe('stop_intervention');
     });
 
     it('renders structured start-state mismatch diagnostics', () => {

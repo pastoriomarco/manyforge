@@ -16,6 +16,9 @@ export interface CycleStatus {
 export interface CycleCommand {
   state: string;
   motionStopState?: 'idle' | 'stopping' | 'held';
+  error?: string | null;
+  errorCode?: string | null;
+  errorDetails?: Record<string, unknown> | null;
 }
 
 export interface VelocityScaleResponse {

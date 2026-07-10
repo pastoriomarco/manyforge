@@ -626,6 +626,7 @@ TEST(InterruptManager, FaultKindLatchesEvenWhenSignalValueIsInactive) {
 TEST(InterruptManager, StaleSourceSweepLatchesSyntheticFault) {
   InterruptManager manager;
   auto src = source("watchdog");
+  src.kind = InterruptSourceKind::kLevel;
   src.freshness_budget_ns = 50;
   ASSERT_TRUE(manager.register_source(src).ok());
   ASSERT_TRUE(manager.register_policy(policy("watchdog_policy", "watchdog")).ok());
@@ -648,6 +649,41 @@ TEST(InterruptManager, StaleSourceSweepLatchesSyntheticFault) {
   EXPECT_EQ(swept.active_latch->source_id, "watchdog");
   EXPECT_EQ(swept.active_latch->signal_snapshot.fault_kind,
             InterruptFaultKind::kStale);
+}
+
+TEST(InterruptManager, StaleSourceSweepSkipsEdgeSources) {
+  InterruptManager manager;
+  auto src = source("edge_fault");
+  src.kind = InterruptSourceKind::kEdge;
+  src.freshness_budget_ns = 50;
+  ASSERT_TRUE(manager.register_source(src).ok());
+  ASSERT_TRUE(manager.register_policy(policy("edge_fault_policy", "edge_fault")).ok());
+
+  auto pulse = update("edge_fault", 1, true);
+  pulse.timestamp_ns = 1'000;
+  auto latched = manager.ingest(pulse,
+                                InterruptSourceClass::kFastExecutionRelevant,
+                                validation_context(),
+                                1'010);
+  ASSERT_TRUE(latched.latched);
+  ASSERT_TRUE(latched.active_latch.has_value());
+
+  InterruptDisposition ack;
+  ack.latch_id = latched.active_latch->latch_id;
+  ack.action = InterruptDispositionAction::kAcknowledge;
+  ack.principal_id = "operator";
+  auto clear = manager.apply_disposition(ack, 1'020);
+  ASSERT_TRUE(clear.ok());
+  ASSERT_FALSE(manager.active_latch().has_value());
+
+  auto swept = manager.sweep_stale_sources(
+      InterruptSourceClass::kFastExecutionRelevant,
+      validation_context(),
+      1'100);
+
+  EXPECT_FALSE(swept.latched);
+  EXPECT_FALSE(swept.active_latch.has_value());
+  EXPECT_FALSE(manager.active_latch().has_value());
 }
 
 TEST(InterruptManager, FutureTimestampIsRejectedAsClockDomainMismatch) {

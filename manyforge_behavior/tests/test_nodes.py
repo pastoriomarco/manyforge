@@ -127,9 +127,9 @@ class TestMoveManipulatorAction:
         # Motion soft-fail: instead of returning FAILURE and propagating
         # up the tree, the node holds Status.RUNNING and writes the
         # cause to the blackboard. The CycleManager observes the
-        # `motion_paused_due_to_error` signal and quiesces the runtime;
-        # the operator's STOPPED->RUNNING transition clears the soft-
-        # fail state and signals retry. See spec 410 §motion-soft-fail.
+        # `motion_paused_due_to_error` signal and holds motion while
+        # continue-policy branches keep ticking; Run clears the soft-fail
+        # state and signals retry. See spec 410 §motion-soft-fail.
         kernel.fail_next_execute = True
         node = MoveManipulatorAction(
             name="test_move_fail",

@@ -822,6 +822,7 @@ class NativeKernelClient(KernelClient):
             accepted=result["accepted"],
             error=result.get("error"),
             reason_code=reason_code,
+            details=dict(details),
         )
 
     def resume(self, *, expected_epoch: int | None = None) -> CommandResult:
@@ -860,6 +861,18 @@ class NativeKernelClient(KernelClient):
         expected_epoch: int | None = None,
     ) -> CommandResult:
         r = self._bundle.acknowledge_intervention_for_retry(
+            str(principal_id), str(reason), expected_epoch=expected_epoch
+        )
+        return self._command_result(r)
+
+    def acknowledge_failed_validation_for_retry(
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: int | None = None,
+    ) -> CommandResult:
+        r = self._bundle.acknowledge_failed_validation_for_retry(
             str(principal_id), str(reason), expected_epoch=expected_epoch
         )
         return self._command_result(r)
@@ -1082,7 +1095,16 @@ class NativeKernelClient(KernelClient):
 
         self.update_gripper_commands()
         current = self.get_gripper_status(request.gripper_id)
-        if current.state == GripperCommandState.FAILED and current.reason_code:
+        supersedable_grasp_loss = (
+            current.state == GripperCommandState.FAILED
+            and current.evidence_state == "pressure_or_part_lost"
+            and current.reason_code == "grasp_confirmation_lost"
+        )
+        if (
+            current.state == GripperCommandState.FAILED
+            and current.reason_code
+            and not supersedable_grasp_loss
+        ):
             return CommandResult(
                 accepted=False,
                 error=current.error or "Gripper state is unavailable",

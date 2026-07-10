@@ -101,7 +101,9 @@ export function HeaderBar() {
     error,
     errorCode: cycleErrorCode,
     errorDetails: cycleErrorDetails,
+    run,
     acknowledgeInterventionForRetry,
+    acknowledgeFailedValidationForRetry,
     refreshStatus,
   } = useCycleStore();
   const {
@@ -785,6 +787,19 @@ export function HeaderBar() {
               setBusy(true);
               try {
                 await acknowledgeInterventionForRetry();
+                setActionError(null);
+                await refreshStatus();
+              } catch (e) {
+                setActionError(e);
+              } finally {
+                setBusy(false);
+              }
+            }}
+            onAcknowledgeFailedValidationForRetry={async () => {
+              setBusy(true);
+              try {
+                await acknowledgeFailedValidationForRetry();
+                await run();
                 setActionError(null);
                 await refreshStatus();
               } catch (e) {

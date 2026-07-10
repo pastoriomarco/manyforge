@@ -7357,8 +7357,17 @@ ExecutionKernel::acknowledge_intervention_for_retry(
 
   std::optional<ErrorDTO> intervention_error =
       operator_stop_worker_.intervention_error();
+  if (!intervention_error.has_value()) {
+    intervention_error = fault_preempt_intervention_error_for_active_latch();
+  }
   if (!intervention_error.has_value() && snapshot.error.has_value()) {
     intervention_error = snapshot.error;
+  }
+  if (!intervention_error.has_value()) {
+    auto kernel_snapshot = get_execution_snapshot();
+    if (kernel_snapshot.error.has_value()) {
+      intervention_error = kernel_snapshot.error;
+    }
   }
   if (!intervention_error.has_value()) {
     return AcknowledgeInterventionResultDTO{
@@ -7437,6 +7446,23 @@ ExecutionKernel::acknowledge_intervention_for_retry(
     return AcknowledgeInterventionResultDTO{false, reset_result.error()};
   }
 
+  if (interrupt_manager_.active_latch()) {
+    auto clear = interrupt_manager_.clear_active_latch(
+        "intervention_retry_acknowledged", clock_.now());
+    if (clear.ok()) {
+      record_terminal_fault_authority(clear.value());
+      emit_interrupt_events(clear.value());
+    }
+    if (interrupt_manager_.active_latch()) {
+      return AcknowledgeInterventionResultDTO{
+          false,
+          ErrorDTO{kErrorInvalidRequest,
+                   "Interrupt acknowledgement replayed another active latch; "
+                   "retry is not yet admissible",
+                   {{"reason", "intervention_retry_replayed_latch"}}}};
+    }
+  }
+
   const auto prev_state = status.state;
   const auto prev_execution_id = status.execution_id;
   sm_.set_execution_id(0);
@@ -7451,6 +7477,8 @@ ExecutionKernel::acknowledge_intervention_for_retry(
   publish_execution_snapshot(std::move(snapshot));
   {
     operator_stop_worker_.clear_errors();
+    clear_fault_preempt_intervention_error();
+    clear_fault_preempt_stop_path_collision();
   }
 
   emit_event({KernelEventType::kInterventionAcknowledged,
@@ -7481,6 +7509,147 @@ ExecutionKernel::acknowledge_intervention_for_retry(
     runtime_collision_monitor_.clear_active_contact_policy_id();
   }
   return AcknowledgeInterventionResultDTO{true, std::nullopt};
+}
+
+namespace {
+
+bool is_retryable_failed_validation_error(const ErrorDTO& error) {
+  if (error.code == kErrorSceneChangedDuringValidation ||
+      error.code == kErrorValidationCollision) {
+    return true;
+  }
+  const auto reason_it = error.details.find("reason");
+  const std::string reason =
+      reason_it != error.details.end() ? reason_it->second : std::string{};
+  const auto reason_code_it = error.details.find("reason_code");
+  const std::string reason_code =
+      reason_code_it != error.details.end() ? reason_code_it->second
+                                            : std::string{};
+  return reason == "validation_failed" || reason_code == "validation_failed";
+}
+
+}  // namespace
+
+AcknowledgeFailedValidationResultDTO
+ExecutionKernel::acknowledge_failed_validation_for_retry(
+    std::string principal_id,
+    std::string reason,
+    std::optional<std::uint64_t> expected_epoch) {
+  EventDeferralScope event_scope(*this);
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  const auto reject_if_stale =
+      [&]() -> std::optional<AcknowledgeFailedValidationResultDTO> {
+    if (!control_command_epoch_matches(expected_epoch)) {
+      return AcknowledgeFailedValidationResultDTO{
+          false, stale_control_command_error()};
+    }
+    return std::nullopt;
+  };
+
+  if (auto stale = reject_if_stale()) {
+    return *stale;
+  }
+  const auto status = sm_.status();
+  if (principal_id.empty()) {
+    return AcknowledgeFailedValidationResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "acknowledge_failed_validation_for_retry requires principal_id",
+                 {{"state", to_string(status.state)}}}};
+  }
+  if (status.state != ExecutionState::kFailed) {
+    return AcknowledgeFailedValidationResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "acknowledge_failed_validation_for_retry is valid only from Failed",
+                 {{"state", to_string(status.state)}}}};
+  }
+
+  const auto failed_snapshot = get_execution_snapshot();
+  if (!failed_snapshot.error.has_value()) {
+    return AcknowledgeFailedValidationResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge failed validation for retry: missing "
+                 "classified validation error",
+                 {{"reason", "failed_validation_error_missing"}}}};
+  }
+  if (!is_retryable_failed_validation_error(*failed_snapshot.error)) {
+    return AcknowledgeFailedValidationResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge failed validation for retry: failure is "
+                 "not a retryable pre-dispatch validation boundary",
+                 {{"reason", "failed_validation_not_retryable"},
+                  {"error_code", failed_snapshot.error->code}}}};
+  }
+
+  ExecutionSnapshot backend_snapshot;
+  try {
+    backend_snapshot = execution_backend_.get_execution_snapshot();
+  } catch (const std::exception& exc) {
+    return AcknowledgeFailedValidationResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge failed validation for retry: backend "
+                 "state is unreadable",
+                 {{"reason", "backend_snapshot_unreadable"},
+                  {"exception", exc.what()}}}};
+  }
+  if (!all_joint_positions_finite(backend_snapshot)) {
+    return AcknowledgeFailedValidationResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge failed validation for retry: backend "
+                 "pose is missing or non-finite",
+                 {{"reason", "backend_pose_unreadable"}}}};
+  }
+
+  if (auto stale = reject_if_stale()) {
+    return *stale;
+  }
+  auto reset_result = stop_policy_.request_reset();
+  if (!reset_result.ok()) {
+    return AcknowledgeFailedValidationResultDTO{false, reset_result.error()};
+  }
+
+  const auto prev_execution_id = status.execution_id;
+  sm_.set_execution_id(0);
+  active_correlation_.clear_move_id();
+
+  backend_snapshot.timestamp_ns = clock_.now();
+  backend_snapshot.execution_id = 0;
+  backend_snapshot.move_id.clear();
+  backend_snapshot.state = ExecutionState::kIdle;
+  backend_snapshot.progress = 0.0;
+  backend_snapshot.error.reset();
+  publish_execution_snapshot(std::move(backend_snapshot));
+
+  emit_event({KernelEventType::kFailedValidationAcknowledged,
+              prev_execution_id,
+              clock_.now(),
+              {},
+              {},
+              std::nullopt,
+              {{"principal_id", principal_id},
+               {"reason", reason},
+               {"prev_state", to_string(status.state)},
+               {"error_code", failed_snapshot.error->code}}});
+  emit_event({KernelEventType::kStateTransition,
+              prev_execution_id,
+              clock_.now(),
+              ExecutionState::kFailed,
+              ExecutionState::kIdle,
+              std::nullopt,
+              {{"reason", "failed_validation_retry_acknowledged"}}});
+
+  {
+    active_correlation_.clear_program_run_and_action_span();
+  }
+  {
+    runtime_collision_monitor_.clear_active_contact_policy_id();
+  }
+  return AcknowledgeFailedValidationResultDTO{true, std::nullopt};
 }
 
 AcknowledgeInterruptedResultDTO
@@ -7534,6 +7703,39 @@ ExecutionKernel::acknowledge_interrupted_for_retry(
                  {{"latch_id", latch->latch_id},
                   {"source_id", latch->source_id},
                   {"policy_id", latch->policy_id}}}};
+  }
+
+  // Lock order for this admission boundary is lifecycle_mutex_ (held here)
+  // -> InterruptManager leaf operations -> fault_preempt_stop_mutex_. The leaf
+  // locks are never held simultaneously, and the fault-preempt worker never
+  // acquires lifecycle_mutex_ while holding either leaf lock. Keep the
+  // lifecycle lock through the final checks and disposition so another
+  // lifecycle command cannot clear or replace this recovery boundary.
+  const auto admission_latch = interrupt_manager_.active_latch();
+  if (!admission_latch || admission_latch->latch_id != latch->latch_id) {
+    return AcknowledgeInterruptedResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Runtime-collision retry latch changed during admission",
+                 {{"reason", "interrupted_retry_latch_changed"},
+                  {"expected_latch_id", latch->latch_id},
+                  {"active_latch_id",
+                   admission_latch ? admission_latch->latch_id : ""}}}};
+  }
+  const bool fault_stop_active = fault_preempt_stop_active();
+  if (admission_latch->preemption_result !=
+          InterruptPreemptionResult::kSucceeded ||
+      fault_stop_active) {
+    auto error = runtime_collision_stop_not_yet_certified_error(
+        *admission_latch, status.execution_id, fault_stop_active);
+    emit_event({KernelEventType::kErrorRaised,
+                status.execution_id,
+                clock_.now(),
+                {},
+                {},
+                error,
+                error.details});
+    return AcknowledgeInterruptedResultDTO{false, std::move(error)};
   }
 
   InterruptDisposition disposition;

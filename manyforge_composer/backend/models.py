@@ -58,6 +58,11 @@ class CycleCommandResponse(BaseModel):
     model_config = _ALIAS_CFG
     state: str
     motion_stop_state: str = Field(default="idle", alias="motionStopState")
+    error: Optional[str] = None
+    error_code: Optional[str] = Field(default=None, alias="errorCode")
+    error_details: Optional[Dict[str, Any]] = Field(
+        default=None, alias="errorDetails"
+    )
 
 
 class SimulationResetResponse(BaseModel):
@@ -1655,6 +1660,7 @@ class ExecutionDigestObjectResponse(BaseModel):
 class ExecutionDigestResponse(BaseModel):
     model_config = _ALIAS_CFG
     state: str
+    motion_stop_state: str = Field(default="idle", alias="motionStopState")
     run_id: Optional[str] = Field(default=None, alias="runId")
     execution_id: int = Field(default=0, alias="executionId")
     current_node: Optional[str] = Field(default=None, alias="currentNode")

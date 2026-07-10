@@ -727,6 +727,8 @@ const char* kernel_event_type_to_string(KernelEventType type) {
     case KernelEventType::kRuntimeVelocityScaleChanged:
       return "runtime_velocity_scale_changed";
     case KernelEventType::kCompletedAcknowledged: return "acknowledge_completed";
+    case KernelEventType::kFailedValidationAcknowledged:
+      return "acknowledge_failed_validation";
     case KernelEventType::kInterventionAcknowledged: return "acknowledge_intervention";
     case KernelEventType::kErrorRaised: return "error_raised";
     case KernelEventType::kCollisionDetected: return "collision_detected";
@@ -2607,6 +2609,21 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
              auto r = [&]() {
                py::gil_scoped_release release;
                return kernel->acknowledge_intervention_for_retry(
+                   std::move(principal_id), std::move(reason), epoch);
+             }();
+             return command_result(r.accepted, r.error);
+           },
+           py::arg("principal_id"),
+           py::arg("reason"),
+           py::arg("expected_epoch") = py::none())
+      .def("acknowledge_failed_validation_for_retry",
+           [](NativeKernelBundle& self, std::string principal_id,
+              std::string reason, py::object expected_epoch) -> py::dict {
+             auto kernel = require_open_kernel(self);
+             auto epoch = optional_uint64_from_python(expected_epoch);
+             auto r = [&]() {
+               py::gil_scoped_release release;
+               return kernel->acknowledge_failed_validation_for_retry(
                    std::move(principal_id), std::move(reason), epoch);
              }();
              return command_result(r.accepted, r.error);

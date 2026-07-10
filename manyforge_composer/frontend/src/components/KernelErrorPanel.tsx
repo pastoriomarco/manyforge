@@ -28,6 +28,8 @@ export interface KernelErrorPanelProps {
   incidentSnapshot?: Record<string, unknown> | null;
   /** Explicit non-reset recovery for retryable stop/fault interventions. */
   onAcknowledgeAndContinue?: () => void | Promise<void>;
+  /** Explicit non-reset retry for failed pre-dispatch validation gates. */
+  onAcknowledgeFailedValidationForRetry?: () => void | Promise<void>;
   /** Optional close handler for a dismissible banner. */
   onDismiss?: () => void;
 }
@@ -762,12 +764,22 @@ function hasStopChain(details: Record<string, unknown> | null | undefined): bool
   return STOP_CHAIN_KEYS.some((key) => details[key] !== undefined && details[key] !== null);
 }
 
-function isRetryableStopIntervention(details: Record<string, unknown> | null | undefined): boolean {
+function isRetryableStopIntervention(
+  errorCode: string | null | undefined,
+  details: Record<string, unknown> | null | undefined,
+): boolean {
   if (!details) {
     return false;
   }
+  if (errorCode === 'scene_changed_during_validation' || errorCode === 'validation_collision') {
+    return false;
+  }
   const reason = stringField(details, 'reason') || stringField(details, 'reason_code');
+  const kernelState = stringField(details, 'kernel_state');
+  const motionSoftStopReason = stringField(details, 'motion_soft_stop_reason');
   if (
+    kernelState === 'intervention_required' ||
+    motionSoftStopReason === 'motion_soft_fail_requires_intervention' ||
     reason === 'stop_not_settled_measured_velocity' ||
     reason === 'operator_stop_total_failure' ||
     reason === 'in_stop_completion_timeout' ||
@@ -786,6 +798,25 @@ function isRetryableStopIntervention(details: Record<string, unknown> | null | u
       stringField(details, 'executed_stop_mode') !== null ||
       stringField(details, 'hard_stop_transitioned') !== null)
   );
+}
+
+function isRetryableFailedValidation(
+  errorCode: string | null | undefined,
+): boolean {
+  return errorCode === 'scene_changed_during_validation' || errorCode === 'validation_collision';
+}
+
+export function recoveryActionForError(
+  errorCode: string | null | undefined,
+  details: Record<string, unknown> | null | undefined,
+): 'stop_intervention' | 'failed_validation' | null {
+  if (isRetryableStopIntervention(errorCode, details)) {
+    return 'stop_intervention';
+  }
+  if (isRetryableFailedValidation(errorCode)) {
+    return 'failed_validation';
+  }
+  return null;
 }
 
 function stopChainRows(details: Record<string, unknown>): Array<[string, string]> {
@@ -1069,6 +1100,7 @@ export function KernelErrorPanel({
   errorDetails,
   incidentSnapshot,
   onAcknowledgeAndContinue,
+  onAcknowledgeFailedValidationForRetry,
   onDismiss,
 }: KernelErrorPanelProps) {
   const [showDetails, setShowDetails] = useState(false);
@@ -1085,8 +1117,12 @@ export function KernelErrorPanel({
     ? Object.entries(errorDetails).filter(([, v]) => v !== null && v !== undefined)
     : [];
   const showStopChain = hasStopChain(errorDetails);
+  const recoveryAction = recoveryActionForError(errorCode, errorDetails);
   const canAcknowledgeAndContinue =
-    Boolean(onAcknowledgeAndContinue) && isRetryableStopIntervention(errorDetails);
+    Boolean(onAcknowledgeAndContinue) && recoveryAction === 'stop_intervention';
+  const canAcknowledgeFailedValidation =
+    Boolean(onAcknowledgeFailedValidationForRetry) &&
+    recoveryAction === 'failed_validation';
   return (
     <div className={`mb-2 rounded border px-3 py-2 text-sm text-red-200 ${classes.border}`}>
       <div className="flex items-start justify-between gap-2">
@@ -1121,6 +1157,18 @@ export function KernelErrorPanel({
                 title="Clear this classified stop/fault intervention without resetting the backend. The kernel will refuse if fresh backend state is unreadable or still moving."
               >
                 Acknowledge error
+              </button>
+            </div>
+          )}
+          {canAcknowledgeFailedValidation && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void onAcknowledgeFailedValidationForRetry?.()}
+                className="rounded border border-amber-300/50 bg-amber-900/40 px-2.5 py-1 text-xs font-semibold text-amber-100 hover:bg-amber-800/60"
+                title="Clear this failed pre-dispatch validation gate without resetting the backend. Run will re-plan against the current live scene."
+              >
+                Acknowledge and retry
               </button>
             </div>
           )}

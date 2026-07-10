@@ -292,6 +292,10 @@ class CommandResult:
     # Stable fault token from the backend fault taxonomy; None when accepted
     # or when the rejecting surface has no classified cause.
     reason_code: Optional[str] = None
+    # Preserve authority-owned structured evidence across Python adapters.
+    # Callers must use explicit fields (for example `retryable`) rather than
+    # parsing the human-readable error string.
+    details: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -1013,6 +1017,26 @@ class KernelClient(ABC):
             error="acknowledge_intervention_for_retry not supported by this kernel client",
         )
 
+    def acknowledge_failed_validation_for_retry(
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: Optional[int] = None,
+    ) -> CommandResult:
+        """Clear a retryable failed pre-dispatch validation without reset.
+
+        The production kernel accepts only validation-gate failures that did
+        not dispatch motion. Unsupported clients fail closed.
+        """
+        return CommandResult(
+            accepted=False,
+            error=(
+                "acknowledge_failed_validation_for_retry not supported by "
+                "this kernel client"
+            ),
+        )
+
     def acknowledge_interrupted_for_retry(
         self,
         principal_id: str,
@@ -1263,6 +1287,7 @@ class MockKernelClient(KernelClient):
         self._control_command_epoch = 0
         self.acknowledge_intervention_count = 0
         self.acknowledge_intervention_for_retry_count = 0
+        self.acknowledge_failed_validation_for_retry_count = 0
         self.acknowledge_interrupted_for_retry_count = 0
         self.invalidate_count = 0
         self.last_invalidate_action_span: Optional[ActionSpan] = None
@@ -1315,6 +1340,9 @@ class MockKernelClient(KernelClient):
             "events_emitted": 0,
             "flight_recorder_records": 0,
         }
+        self._last_error_message: Optional[str] = None
+        self._last_error_code: Optional[str] = None
+        self._last_error_details: Dict[str, str] = {}
         # Joint names (configurable for tests)
         self._joint_names = joint_names if joint_names is not None else ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
         self._last_joint_positions_rad = [0.0 for _ in self._joint_names]
@@ -1464,11 +1492,17 @@ class MockKernelClient(KernelClient):
             self._active_program_run_id = ""
             self._active_action_span = None
             self._active_contact_policy_id = ""
+            self._last_error_message = None
+            self._last_error_code = None
+            self._last_error_details = {}
         if self._state != ExecutionState.IDLE:
             return ExecuteResult(ok=False, error="Not in IDLE state")
         if self.fail_next_execute:
             self.fail_next_execute = False
             self._state = ExecutionState.FAILED
+            self._last_error_message = "Execution failed (injected)"
+            self._last_error_code = "internal_error"
+            self._last_error_details = {"reason_code": "injected_failure"}
             self._metrics["executions_failed"] += 1
             self._emit_kernel_event("state_transition", from_state="idle", to_state="failed")
             self._emit_kernel_event("error_raised", error="Execution failed (injected)")
@@ -1643,6 +1677,9 @@ class MockKernelClient(KernelClient):
         prev = self._state.value
         self._state = ExecutionState.IDLE
         self._active_move_id = ""
+        self._last_error_message = None
+        self._last_error_code = None
+        self._last_error_details = {}
         self._emit_kernel_event("state_transition", from_state=prev, to_state="idle")
         return CommandResult(accepted=True)
 
@@ -1668,6 +1705,9 @@ class MockKernelClient(KernelClient):
         prev = self._state.value
         self._state = ExecutionState.IDLE
         self._active_move_id = ""
+        self._last_error_message = None
+        self._last_error_code = None
+        self._last_error_details = {}
         self._emit_kernel_event(
             "acknowledge_completed",
             details={"acknowledged_execution_id": int(execution_id)},
@@ -1696,6 +1736,9 @@ class MockKernelClient(KernelClient):
         prev = self._state.value
         self._state = ExecutionState.IDLE
         self._active_move_id = ""
+        self._last_error_message = None
+        self._last_error_code = None
+        self._last_error_details = {}
         self._emit_kernel_event(
             "acknowledge_intervention",
             details={
@@ -1731,6 +1774,9 @@ class MockKernelClient(KernelClient):
         self._state = ExecutionState.IDLE
         self._execution_id = 0
         self._active_move_id = ""
+        self._last_error_message = None
+        self._last_error_code = None
+        self._last_error_details = {}
         self._emit_kernel_event(
             "acknowledge_intervention",
             details={
@@ -1739,6 +1785,56 @@ class MockKernelClient(KernelClient):
                 "prev_state": prev,
                 "recovery_mode": "acknowledge_and_continue",
                 "backend_reset_performed": "false",
+            },
+        )
+        self._emit_kernel_event(
+            "state_transition", from_state=prev, to_state="idle"
+        )
+        return CommandResult(accepted=True)
+
+    def acknowledge_failed_validation_for_retry(
+        self,
+        principal_id: str,
+        reason: str,
+        *,
+        expected_epoch: Optional[int] = None,
+    ) -> CommandResult:
+        if stale := self._stale_control_command(expected_epoch):
+            return stale
+        self.acknowledge_failed_validation_for_retry_count += 1
+        if self._state != ExecutionState.FAILED:
+            return CommandResult(
+                accepted=False,
+                error=(
+                    "acknowledge_failed_validation_for_retry is valid only "
+                    f"from FAILED; current state={self._state.value}"
+                ),
+            )
+        if self._last_error_code not in {
+            "scene_changed_during_validation",
+            "validation_collision",
+        }:
+            return CommandResult(
+                accepted=False,
+                error=(
+                    "acknowledge_failed_validation_for_retry requires a "
+                    "retryable validation error"
+                ),
+                reason_code="failed_validation_not_retryable",
+            )
+        prev = self._state.value
+        self._state = ExecutionState.IDLE
+        self._execution_id = 0
+        self._active_move_id = ""
+        self._last_error_message = None
+        self._last_error_code = None
+        self._last_error_details = {}
+        self._emit_kernel_event(
+            "acknowledge_failed_validation",
+            details={
+                "principal_id": principal_id,
+                "reason": reason,
+                "prev_state": prev,
             },
         )
         self._emit_kernel_event(
@@ -1768,6 +1864,9 @@ class MockKernelClient(KernelClient):
         self._state = ExecutionState.IDLE
         self._execution_id = 0
         self._active_move_id = ""
+        self._last_error_message = None
+        self._last_error_code = None
+        self._last_error_details = {}
         self._emit_kernel_event(
             "acknowledge_interrupted_for_retry",
             details={
@@ -1828,6 +1927,9 @@ class MockKernelClient(KernelClient):
             state=status.state,
             progress=status.progress,
             joint_positions_rad=list(self._last_joint_positions_rad),
+            error=self._last_error_message,
+            error_code=self._last_error_code,
+            error_details=dict(self._last_error_details),
             action_span=getattr(self, "_active_action_span", None),
             contact_policy_id=getattr(self, "_active_contact_policy_id", None) or None,
         )

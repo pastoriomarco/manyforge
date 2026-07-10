@@ -103,3 +103,27 @@ def test_close_still_closes_native_bundle_when_status_probe_fails():
 
     assert bundle.calls == ["get_status", "set_command_gate:False", "close"]
     assert client._bundle is None
+
+
+def test_command_result_preserves_structured_error_details():
+    client = object.__new__(NativeKernelClient)
+
+    result = client._command_result(
+        {
+            "accepted": False,
+            "error": "runtime-collision stop is not yet certified",
+            "error_details": {
+                "reason_code": "runtime_collision_stop_not_yet_certified",
+                "retryable": "false",
+                "preemption_result": "backend_preempt_failed",
+            },
+        }
+    )
+
+    assert result.accepted is False
+    assert result.reason_code == "runtime_collision_stop_not_yet_certified"
+    assert result.details == {
+        "reason_code": "runtime_collision_stop_not_yet_certified",
+        "retryable": "false",
+        "preemption_result": "backend_preempt_failed",
+    }

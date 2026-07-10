@@ -53,6 +53,7 @@ from manyforge_behavior.blackboard_namespace import write_namespace_bundle
 from manyforge_behavior.signals import RuntimeSignalRegistry, SignalProvider, SignalUpdate
 
 from manyforge_behavior.kernel_client import (
+    CommandResult,
     ExecutionSnapshot,
     ExecutionState,
     ExecutionStatus,
@@ -144,6 +145,15 @@ _GENERIC_BACKEND_ERROR_CODES = frozenset({
     "stop_failed",
 })
 
+_RETRYABLE_FAILED_VALIDATION_ERROR_CODES = frozenset({
+    "scene_changed_during_validation",
+    "validation_collision",
+})
+
+_RUNTIME_COLLISION_STOP_NOT_YET_CERTIFIED = (
+    "runtime_collision_stop_not_yet_certified"
+)
+
 
 def canonical_recovery_trigger_values() -> set[str]:
     """Return live-authoring recovery trigger values.
@@ -178,6 +188,25 @@ def preferred_structured_error_code(
         ):
             return reason_code
     return error_code
+
+
+def _kernel_retains_interrupted_retry_authority(result: CommandResult) -> bool:
+    """Return whether a denied retry remains owned by the kernel transition.
+
+    RT-8P0 uses one classified denial for settling and definitive failure. Only
+    the authority-owned `retryable` detail identifies the settling case; a
+    failed result falls through to the normal error path. Run is an explicit
+    operator retry, not a polling loop: leave the held/stopped cycle state
+    unchanged and let the next kernel status decide which recovery offer is
+    valid.
+    """
+
+    retryable = result.details.get("retryable")
+    return (
+        not result.accepted
+        and result.reason_code == _RUNTIME_COLLISION_STOP_NOT_YET_CERTIFIED
+        and (retryable is True or retryable == "true")
+    )
 
 
 @dataclass
@@ -444,6 +473,7 @@ class CycleManager:
         )
         self._resumable_stop_scene_fingerprint: Optional[str] = None
         self._resumable_stop_scene_fingerprint_error: Optional[str] = None
+        self._allow_next_stopped_retry_replan: bool = False
         # Program-run correlation id (spec/500 §2.2): minted once per
         # program start (run from IDLE), written to the blackboard so
         # motion nodes attach it to every ExecuteRequest. Resume from
@@ -850,6 +880,14 @@ class CycleManager:
                 client_name="cycle_manager_motion_stop_failed",
             )
 
+    def _clear_motion_stop_after_tree_terminal_locked(self) -> bool:
+        if self._motion_stop_state == "idle":
+            return False
+        self._motion_stop_generation += 1
+        self._motion_stop_thread = None
+        self._motion_stop_state = "idle"
+        return True
+
     def _tree_is_terminal(self) -> bool:
         """True when the current tree has already reached a terminal status."""
         if self._tree is None:
@@ -903,6 +941,7 @@ class CycleManager:
         fingerprint: Optional[str],
         error: Optional[str],
     ) -> None:
+        self._allow_next_stopped_retry_replan = False
         if not self._has_resumable_execution_context_locked():
             self._resumable_stop_scene_fingerprint = None
             self._resumable_stop_scene_fingerprint_error = None
@@ -913,6 +952,13 @@ class CycleManager:
     def _assert_resumable_stop_scene_unchanged(self) -> None:
         with self._lock:
             if not self._has_resumable_execution_context_locked():
+                return
+            if (
+                self._state == CycleState.STOPPED
+                and self._allow_next_stopped_retry_replan
+                and self._error is None
+                and self._motion_stop_state == "idle"
+            ):
                 return
         current, current_error = self._capture_scene_resume_fingerprint()
         with self._lock:
@@ -1092,6 +1138,7 @@ class CycleManager:
             self._pending_delegated_recovery = None
             self._resumable_stop_scene_fingerprint = None
             self._resumable_stop_scene_fingerprint_error = None
+            self._allow_next_stopped_retry_replan = False
 
     def _run_reset_phase(
         self,
@@ -1227,6 +1274,7 @@ class CycleManager:
             self._pending_delegated_recovery = None
             self._resumable_stop_scene_fingerprint = None
             self._resumable_stop_scene_fingerprint_error = None
+            self._allow_next_stopped_retry_replan = False
 
     def seed_authored_scene(self) -> None:
         """Seed the live planning scene with the program's authored objects.
@@ -1681,34 +1729,195 @@ class CycleManager:
         return "Motion failed without a cause string"
 
     def _enter_motion_paused_state(self, error_message: str) -> None:
-        """Quiesce the runtime in response to a motion soft-fail.
+        """Convert a motion soft-fail into a held motion-stop state.
 
-        Mirrors stop() with two differences: the error string is
-        recorded on ``self._error`` so the cycle status surfaces the
-        cause, and the tick thread is suspended (via _tick_pause_event)
-        rather than terminated, so a subsequent run() can resume the
-        same tree with the same node holding its position.
-
-        Also captures the kernel's structured error_code / error_details
-        from the latest execution snapshot when available, so the viewer can
-        render the actual cause (collision pair, classification, waypoint
-        index, fault reason code) instead of only the blackboard string.
+        A runtime motion fault is not, by itself, a behavior-tree failure:
+        the motion branch should hold while continue-policy branches keep
+        ticking. Only backend states that require operator intervention fail
+        closed by pausing the whole tick loop.
         """
-        self._quiesce_runtime(
-            client_name="cycle_manager_motion_paused",
-            kernel_action="pause_if_executing",
-        )
         structured_code, structured_details = self._capture_kernel_error_diagnostics()
-        fingerprint, fingerprint_error = self._capture_scene_resume_fingerprint()
+        clear_motion_signal = False
         with self._lock:
-            self._error = error_message
-            self._error_code = structured_code
-            self._error_details = structured_details
-            self._state = CycleState.STOPPED
-            self._store_resumable_stop_scene_fingerprint_locked(
-                fingerprint,
-                fingerprint_error,
+            if self._state != CycleState.RUNNING:
+                return
+            if self._motion_stop_state in {"stopping", "held"}:
+                self._error = error_message
+                self._error_code = structured_code
+                self._error_details = structured_details
+                clear_motion_signal = True
+            else:
+                self._motion_stop_state = "stopping"
+                self._error = error_message
+                self._error_code = structured_code
+                self._error_details = structured_details
+
+        if clear_motion_signal:
+            self._clear_motion_paused_blackboard()
+            return
+
+        self._set_motion_stop_active_flag(
+            True,
+            client_name="cycle_manager_motion_soft_fail",
+        )
+        self._clear_motion_paused_blackboard()
+
+        try:
+            kernel_status = self._call_with_timeout(
+                "motion_soft_fail_initial_status",
+                self._kernel.get_status,
+                _KERNEL_CONTROL_CALL_TIMEOUT_S,
             )
+        except TimeoutError:
+            with self._lock:
+                if self._motion_stop_state == "stopping":
+                    self._start_motion_stop_watcher_locked()
+            return
+        except Exception as exc:  # noqa: BLE001 - fail closed, but keep diagnostics
+            self._fail_motion_soft_stop_closed(
+                error_message,
+                structured_code,
+                structured_details,
+                reason_code="motion_soft_fail_status_unreadable",
+                kernel_state=None,
+                detail=str(exc) or type(exc).__name__,
+            )
+            return
+
+        if kernel_status.state in {
+            ExecutionState.FAILED,
+            ExecutionState.INTERVENTION_REQUIRED,
+        }:
+            self._fail_motion_soft_stop_closed(
+                error_message,
+                structured_code,
+                structured_details,
+                reason_code="motion_soft_fail_requires_intervention",
+                kernel_state=kernel_status.state,
+            )
+            return
+
+        if kernel_status.state == ExecutionState.INTERRUPTED:
+            with self._lock:
+                if self._motion_stop_state == "stopping":
+                    self._motion_stop_state = "held"
+            return
+
+        stoppable = {
+            ExecutionState.EXECUTING,
+            ExecutionState.PLANNING,
+            ExecutionState.VALIDATING,
+            ExecutionState.PAUSED,
+            ExecutionState.STOPPING,
+        }
+        if kernel_status.state in stoppable:
+            try:
+                self._call_with_timeout(
+                    "motion_soft_fail_stop",
+                    self._kernel.stop,
+                    _KERNEL_CONTROL_CALL_TIMEOUT_S,
+                )
+                kernel_state = self._kernel_state_with_timeout(
+                    "motion_soft_fail_post_status"
+                )
+            except TimeoutError:
+                with self._lock:
+                    if self._motion_stop_state == "stopping":
+                        self._start_motion_stop_watcher_locked()
+                return
+            except Exception as exc:  # noqa: BLE001 - fail closed, but keep diagnostics
+                self._fail_motion_soft_stop_closed(
+                    error_message,
+                    structured_code,
+                    structured_details,
+                    reason_code="motion_soft_fail_stop_failed",
+                    kernel_state=None,
+                    detail=str(exc) or type(exc).__name__,
+                )
+                return
+            self._complete_motion_stop_from_kernel_state(kernel_state)
+            return
+
+        with self._lock:
+            if self._motion_stop_state == "stopping":
+                self._motion_stop_state = "held"
+
+    def _fail_motion_soft_stop_closed(
+        self,
+        error_message: str,
+        structured_code: Optional[str],
+        structured_details: Optional[dict[str, Any]],
+        *,
+        reason_code: str,
+        kernel_state: Optional[ExecutionState],
+        detail: Optional[str] = None,
+    ) -> None:
+        details = dict(structured_details or {})
+        details["motion_soft_stop_reason"] = reason_code
+        if kernel_state is not None:
+            details["kernel_state"] = kernel_state.value
+        if detail:
+            details["detail"] = detail
+        with self._lock:
+            self._motion_stop_state = "idle"
+            self._state = CycleState.STOPPED
+            self._error = error_message
+            self._error_code = structured_code or reason_code
+            self._error_details = details or None
+            self._tick_pause_event.clear()
+            self._store_resumable_stop_scene_fingerprint_locked(
+                None,
+                f"motion soft-stop escalation: {reason_code}",
+            )
+        self._set_motion_stop_active_flag(
+            False,
+            client_name="cycle_manager_motion_soft_fail_failed",
+        )
+        self._set_stop_requested_flag(
+            True,
+            client_name="cycle_manager_motion_soft_fail_failed",
+        )
+
+    def _kernel_events_require_intervention(self, events: list[dict[str, Any]]) -> bool:
+        """True when freshly drained kernel events prove intervention is latched.
+
+        This is intentionally event-driven instead of a 100 Hz status poll.
+        A held motion-soft-stop may be entered while the kernel is still
+        `INTERRUPTED`; if the kernel later escalates the same stop/fault to
+        `INTERVENTION_REQUIRED`, the cycle must fail closed instead of
+        continuing to advertise plain Resume.
+        """
+
+        for event in events:
+            event_type = event.get("type") or event.get("event_type")
+            if event_type != "state_transition":
+                continue
+            to_state = str(event.get("to_state") or event.get("to") or "").lower()
+            if to_state == ExecutionState.INTERVENTION_REQUIRED.value:
+                return True
+        return False
+
+    def _fail_held_motion_stop_closed_if_intervention_latched(
+        self,
+        events: list[dict[str, Any]],
+    ) -> bool:
+        if not events or not self._kernel_events_require_intervention(events):
+            return False
+        with self._lock:
+            if self._state != CycleState.RUNNING or self._motion_stop_state != "held":
+                return False
+            error_message = self._error or (
+                "Motion stop entered operator intervention; cycle was fully stopped"
+            )
+        structured_code, structured_details = self._capture_kernel_error_diagnostics()
+        self._fail_motion_soft_stop_closed(
+            error_message,
+            structured_code,
+            structured_details,
+            reason_code="motion_soft_fail_requires_intervention",
+            kernel_state=ExecutionState.INTERVENTION_REQUIRED,
+        )
+        return True
 
     def raise_runtime_condition_fault(
         self,
@@ -1911,10 +2120,9 @@ class CycleManager:
     def _set_resume_after_error_flag(self, value: bool) -> None:
         """Toggle the blackboard signal that tells the motion node to retry.
 
-        Set to True before transitioning STOPPED→RUNNING when a motion
-        soft-fail is in flight. The motion node consumes the flag on its
-        next tick, clears its internal soft-fail state, and re-issues
-        the same kernel goal.
+        Set to True before resuming a held motion stop or STOPPED recovery.
+        The motion node consumes the flag on its next tick, clears its
+        internal soft-fail state, and re-issues the same kernel goal.
         """
         try:
             bb = py_trees.blackboard.Client(name="cycle_manager_resume_after_error")
@@ -2139,11 +2347,21 @@ class CycleManager:
         replans from the current backend pose.
         """
         with self._run_transition_lock:
+            normalize_held_motion_intervention = False
             with self._lock:
-                if self._state != CycleState.STOPPED:
+                normalize_held_motion_intervention = (
+                    self._state == CycleState.RUNNING
+                    and self._motion_stop_state == "held"
+                )
+                if (
+                    self._state != CycleState.STOPPED
+                    and not normalize_held_motion_intervention
+                ):
                     raise RuntimeError(
                         "Cannot acknowledge intervention for retry unless the "
-                        f"cycle is STOPPED (current state={self._state.value})"
+                        "cycle is STOPPED or holding a motion stop "
+                        f"(current state={self._state.value}, "
+                        f"motion_stop_state={self._motion_stop_state})"
                     )
                 if (
                     self._intervention is not None
@@ -2161,10 +2379,18 @@ class CycleManager:
             )
 
             with self._lock:
-                if self._state != CycleState.STOPPED:
+                normalize_held_motion_intervention = (
+                    self._state == CycleState.RUNNING
+                    and self._motion_stop_state == "held"
+                )
+                if (
+                    self._state != CycleState.STOPPED
+                    and not normalize_held_motion_intervention
+                ):
                     raise RuntimeError(
                         "Cannot acknowledge intervention for retry: cycle "
-                        f"changed to {self._state.value}"
+                        f"changed to {self._state.value} / "
+                        f"{self._motion_stop_state}"
                     )
                 if (
                     self._intervention is not None
@@ -2192,12 +2418,97 @@ class CycleManager:
                     "kernel.acknowledge_intervention_for_retry rejected: "
                     f"{ack.error}"
                 )
+            clear_motion_stop_flag = False
+            with self._lock:
+                normalize_held_motion_intervention = (
+                    self._state == CycleState.RUNNING
+                    and self._motion_stop_state == "held"
+                )
+                if (
+                    self._state != CycleState.STOPPED
+                    and not normalize_held_motion_intervention
+                ):
+                    return
+                if normalize_held_motion_intervention:
+                    self._state = CycleState.STOPPED
+                    self._motion_stop_state = "idle"
+                    self._tick_pause_event.clear()
+                    clear_motion_stop_flag = True
+                self._error = None
+                self._error_code = None
+                self._error_details = None
+                self._allow_next_stopped_retry_replan = True
+                self._set_resume_after_error_flag(True)
+            if clear_motion_stop_flag:
+                self._set_motion_stop_active_flag(
+                    False,
+                    client_name="cycle_manager_ack_intervention_retry",
+                )
+
+    def _has_retryable_failed_validation_error_locked(self) -> bool:
+        return self._error_code in _RETRYABLE_FAILED_VALIDATION_ERROR_CODES
+
+    def acknowledge_failed_validation_for_retry(
+        self,
+        *,
+        principal_id: str = "operator",
+        reason: str = "operator_acknowledge_failed_validation_and_retry",
+    ) -> None:
+        """Clear a retryable failed validation gate without backend reset."""
+
+        with self._run_transition_lock:
+            with self._lock:
+                if self._state != CycleState.STOPPED:
+                    raise RuntimeError(
+                        "Cannot acknowledge failed validation for retry unless "
+                        f"the cycle is STOPPED (current state={self._state.value})"
+                    )
+                if (
+                    self._intervention is not None
+                    and self._intervention.status == "running"
+                ):
+                    raise RuntimeError(
+                        "Cannot acknowledge failed validation for retry while "
+                        "a direct-control intervention session is running"
+                    )
+                if not self._has_retryable_failed_validation_error_locked():
+                    raise RuntimeError(
+                        "Cannot acknowledge failed validation for retry: active "
+                        "error is not a retryable validation gate"
+                    )
+
+            kernel_status = self._call_with_timeout(
+                "ack_failed_validation_retry_status",
+                self._kernel.get_status,
+                _KERNEL_CONTROL_CALL_TIMEOUT_S,
+            )
+            if kernel_status.state != ExecutionState.FAILED:
+                raise RuntimeError(
+                    "Cannot acknowledge failed validation for retry: kernel is "
+                    f"{kernel_status.state.value}, not failed"
+                )
+
+            ack = self._kernel_control_command(
+                "ack_failed_validation_retry",
+                lambda epoch: self._kernel.acknowledge_failed_validation_for_retry(
+                    principal_id=principal_id,
+                    reason=reason,
+                    expected_epoch=epoch,
+                ),
+            )
+            if not ack.accepted:
+                raise RuntimeError(
+                    "kernel.acknowledge_failed_validation_for_retry rejected: "
+                    f"{ack.error}"
+                )
+
             with self._lock:
                 if self._state != CycleState.STOPPED:
                     return
                 self._error = None
                 self._error_code = None
                 self._error_details = None
+                self._allow_next_stopped_retry_replan = True
                 self._set_resume_after_error_flag(True)
 
     def run(self) -> None:
@@ -2216,6 +2527,15 @@ class CycleManager:
         If RUNNING: no-op.
         """
         with self._run_transition_lock:
+            # A motion node publishes its soft-fail on the blackboard from the
+            # tick thread, then the cycle manager promotes that signal into a
+            # held motion-stop state. If the operator presses Run in that small
+            # window, do the promotion here first; a successful Run must not be
+            # a silent no-op while a retryable motion fault is already visible.
+            pending_motion_error = self._read_motion_paused_error()
+            if pending_motion_error is not None:
+                self._enter_motion_paused_state(pending_motion_error)
+
             prepare_fresh = False
             start_from_idle = False
             resume_from_stopped = False
@@ -2278,6 +2598,27 @@ class CycleManager:
                     kernel_status = self._kernel_status_with_timeout(
                         "run_resume_motion_stop_status"
                     )
+                    if kernel_status.state == ExecutionState.INTERRUPTED:
+                        ack_interrupted = self._kernel_control_command(
+                            "run_ack_interrupted_after_motion_stop",
+                            lambda epoch: self._kernel.acknowledge_interrupted_for_retry(
+                                principal_id="cycle_manager_run",
+                                reason="run_retry_after_motion_fault",
+                                expected_epoch=epoch,
+                            ),
+                        )
+                        if not ack_interrupted.accepted:
+                            if _kernel_retains_interrupted_retry_authority(
+                                ack_interrupted
+                            ):
+                                return
+                            raise RuntimeError(
+                                "kernel.acknowledge_interrupted_for_retry rejected: "
+                                f"{ack_interrupted.error}"
+                            )
+                        kernel_status = self._kernel_status_with_timeout(
+                            "run_post_motion_stop_interrupted_ack_status"
+                        )
                     if kernel_status.state == ExecutionState.COMPLETED:
                         ack_completed = self._kernel_control_command(
                             "run_ack_completed_after_motion_stop",
@@ -2291,6 +2632,28 @@ class CycleManager:
                                 "kernel.acknowledge_completed rejected: "
                                 f"{ack_completed.error}"
                             )
+                        kernel_status = self._kernel_status_with_timeout(
+                            "run_post_motion_stop_completed_ack_status"
+                        )
+                    if kernel_status.state == ExecutionState.INTERVENTION_REQUIRED:
+                        _, recovery_reason = self._can_auto_acknowledge_leftover_state()
+                        raise RuntimeError(
+                            "Kernel INTERVENTION_REQUIRED blocks Run. Choose "
+                            "Acknowledge and continue or Reset cycle before "
+                            f"running. reason={recovery_reason}"
+                        )
+                    if kernel_status.state == ExecutionState.PAUSED:
+                        resume = self._kernel_control_command(
+                            "run_resume_after_motion_stop",
+                            lambda epoch: self._kernel.resume(expected_epoch=epoch),
+                        )
+                        if not resume.accepted:
+                            raise RuntimeError(
+                                "kernel.resume rejected: "
+                                f"{resume.error}"
+                            )
+                    set_resume_after_error = False
+                    clear_motion_stop_flag = False
                     with self._lock:
                         if (
                             self._state != CycleState.RUNNING
@@ -2298,30 +2661,24 @@ class CycleManager:
                         ):
                             return
                         self._motion_stop_state = "idle"
+                        set_resume_after_error = True
+                        clear_motion_stop_flag = True
+                        self._error = None
+                        self._error_code = None
+                        self._error_details = None
+                    if set_resume_after_error:
                         self._set_resume_after_error_flag(True)
+                    if clear_motion_stop_flag:
                         self._set_motion_stop_active_flag(
                             False,
                             client_name="cycle_manager_resume_motion_stop",
                         )
-                        self._error = None
-                        self._error_code = None
-                        self._error_details = None
                     return
 
                 if resume_from_stopped:
                     with self._lock:
                         if self._state != CycleState.STOPPED:
                             return
-                        self._pending_delegated_recovery = None
-                        self._motion_stop_state = "idle"
-
-                    bb = py_trees.blackboard.Client(name="cycle_manager_resume")
-                    bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
-                    bb.stop_requested = False
-                    self._set_motion_stop_active_flag(
-                        False,
-                        client_name="cycle_manager_resume",
-                    )
 
                     motion_paused_error = self._read_motion_paused_error()
                     kernel_status = self._kernel_status_with_timeout(
@@ -2340,6 +2697,10 @@ class CycleManager:
                             ),
                         )
                         if not ack_interrupted.accepted:
+                            if _kernel_retains_interrupted_retry_authority(
+                                ack_interrupted
+                            ):
+                                return
                             raise RuntimeError(
                                 "kernel.acknowledge_interrupted_for_retry rejected: "
                                 f"{ack_interrupted.error}"
@@ -2388,9 +2749,22 @@ class CycleManager:
                     if motion_paused_error is not None:
                         self._clear_motion_paused_blackboard()
 
+                    bb = py_trees.blackboard.Client(name="cycle_manager_resume")
+                    bb.register_key(
+                        key="stop_requested",
+                        access=py_trees.common.Access.WRITE,
+                    )
+                    bb.stop_requested = False
+                    self._set_motion_stop_active_flag(
+                        False,
+                        client_name="cycle_manager_resume",
+                    )
+
                     with self._lock:
                         if self._state != CycleState.STOPPED:
                             return
+                        self._pending_delegated_recovery = None
+                        self._motion_stop_state = "idle"
                         self._tick_pause_event.set()
                         if self._tick_thread is None or not self._tick_thread.is_alive():
                             if self._tree is None:
@@ -2402,6 +2776,7 @@ class CycleManager:
                         self._state = CycleState.RUNNING
                         self._resumable_stop_scene_fingerprint = None
                         self._resumable_stop_scene_fingerprint_error = None
+                        self._allow_next_stopped_retry_replan = False
                         run_committed = True
                     return
 
@@ -2527,8 +2902,8 @@ class CycleManager:
         # profile is set). This also subsumes the planning-phase stop (a stop
         # during PLANNING/VALIDATING stops preparation) with no prep->executing
         # slip, since kernel.stop() handles whatever state the kernel is in.
-        # The motion-soft-fail hold path keeps the pause semantics — see
-        # `_enter_motion_paused_state`.
+        # Motion soft-fail uses the cooperative motion-stop hold path so
+        # continue-policy branches can keep ticking.
         try:
             self._quiesce_runtime(
                 client_name="cycle_manager_stop",
@@ -2685,6 +3060,7 @@ class CycleManager:
                     self._pending_delegated_recovery = None
                     self._resumable_stop_scene_fingerprint = None
                     self._resumable_stop_scene_fingerprint_error = None
+                    self._allow_next_stopped_retry_replan = False
                     cleanup_alive = (
                         self._tick_cleanup_thread is not None
                         and self._tick_cleanup_thread.is_alive()
@@ -2755,6 +3131,7 @@ class CycleManager:
                     self._pending_delegated_recovery = None
                     self._resumable_stop_scene_fingerprint = None
                     self._resumable_stop_scene_fingerprint_error = None
+                    self._allow_next_stopped_retry_replan = False
                 self._emit_reset_phase_event(
                     phase="kernel_reset",
                     status="failed",
@@ -2786,6 +3163,7 @@ class CycleManager:
             self._pending_delegated_recovery = None
             self._resumable_stop_scene_fingerprint = None
             self._resumable_stop_scene_fingerprint_error = None
+            self._allow_next_stopped_retry_replan = False
 
     def set_velocity_scale(
         self, scale: float, principal_id: str | None = None
@@ -2931,10 +3309,13 @@ class CycleManager:
                     self._tick_thread = None
                     self._resumable_stop_scene_fingerprint = None
                     self._resumable_stop_scene_fingerprint_error = None
+                    self._allow_next_stopped_retry_replan = False
                 break
             
             # Drain native kernel events
             kernel_events = self._drain_kernel_events()
+            if self._fail_held_motion_stop_closed_if_intervention_latched(kernel_events):
+                continue
 
             # Collect node statuses atomically (F-6: thread-safe observer snapshot)
             statuses: dict[str, str] = {}
@@ -2945,11 +3326,10 @@ class CycleManager:
             # Motion soft-fail: a motion node has captured a runtime
             # failure (collision, planning timeout, execution rejection,
             # etc.) and is holding Status.RUNNING with the cause stored
-            # on the blackboard. Quiesce the runtime so the operator can
-            # see the error and decide between Run-again (retry the same
-            # motion) and Reset (clear the cycle). Without this branch
-            # the motion node would hold RUNNING forever and the
-            # operator would have no signal that anything went wrong.
+            # on the blackboard. Convert it into a held motion stop so
+            # continue-policy branches keep ticking and the operator can
+            # Run again to retry the same motion. Backend intervention
+            # states still fail closed.
             motion_error = self._read_motion_paused_error()
             if motion_error is not None:
                 self._enter_motion_paused_state(motion_error)
@@ -2989,6 +3369,7 @@ class CycleManager:
                             fingerprint, fingerprint_error = (
                                 self._capture_scene_resume_fingerprint()
                             )
+                            clear_motion_stop_flag = False
                             with self._lock:
                                 self._error = failure_feedback
                                 self._error_code = (
@@ -3000,6 +3381,14 @@ class CycleManager:
                                 self._store_resumable_stop_scene_fingerprint_locked(
                                     fingerprint,
                                     fingerprint_error,
+                                )
+                                clear_motion_stop_flag = (
+                                    self._clear_motion_stop_after_tree_terminal_locked()
+                                )
+                            if clear_motion_stop_flag:
+                                self._set_motion_stop_active_flag(
+                                    False,
+                                    client_name="cycle_manager_recovery_exhausted",
                                 )
                             self._notify_recovery_exhausted(
                                 delegated_candidate, trigger
@@ -3021,6 +3410,7 @@ class CycleManager:
                         fingerprint, fingerprint_error = (
                             self._capture_scene_resume_fingerprint()
                         )
+                        clear_motion_stop_flag = False
                         with self._lock:
                             self._error = failure_feedback
                             self._error_code = (
@@ -3034,6 +3424,14 @@ class CycleManager:
                                 fingerprint,
                                 fingerprint_error,
                             )
+                            clear_motion_stop_flag = (
+                                self._clear_motion_stop_after_tree_terminal_locked()
+                            )
+                        if clear_motion_stop_flag:
+                            self._set_motion_stop_active_flag(
+                                False,
+                                client_name="cycle_manager_delegate_stop",
+                            )
                         self._notify_delegated_recovery_requested(request)
                         break
                 terminal_code, terminal_details = (
@@ -3041,6 +3439,7 @@ class CycleManager:
                     if status != py_trees.common.Status.FAILURE
                     else self._capture_kernel_error_diagnostics()
                 )
+                clear_motion_stop_flag = False
                 with self._lock:
                     if status == py_trees.common.Status.FAILURE:
                         self._error = failure_feedback
@@ -3056,6 +3455,15 @@ class CycleManager:
                     self._tick_thread = None
                     self._resumable_stop_scene_fingerprint = None
                     self._resumable_stop_scene_fingerprint_error = None
+                    self._allow_next_stopped_retry_replan = False
+                    clear_motion_stop_flag = (
+                        self._clear_motion_stop_after_tree_terminal_locked()
+                    )
+                if clear_motion_stop_flag:
+                    self._set_motion_stop_active_flag(
+                        False,
+                        client_name="cycle_manager_tree_terminal",
+                    )
                 break
             
             # Sleep remainder of period
@@ -3440,6 +3848,7 @@ class CycleManager:
             elif base_state != CycleState.STOPPED:
                 self._resumable_stop_scene_fingerprint = None
                 self._resumable_stop_scene_fingerprint_error = None
+                self._allow_next_stopped_retry_replan = False
 
         if forced_state is not None:
             if session.actual_outcome is None:
