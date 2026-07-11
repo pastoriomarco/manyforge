@@ -73,6 +73,15 @@ enum class KernelEventType {
   kMotionTripFailed,
   kMotionTripCompleted,
   kMotionExecutionOutcomeRecorded,
+  // RT-8B recovery authority evidence (spec/200 §recovery, spec/230 §3.7.1).
+  kStopCertificatePublished,
+  kRecoveryAssessmentChanged,
+  kRecoveryActionAccepted,
+  kRecoveryActionRejected,
+  // Generation-bound effective runtime collision coverage summary. Emitted
+  // once when a controlled-stop monitor window closes; details retain exact
+  // attempts/queries/unavailable gaps without creating a new runtime fault.
+  kRuntimeCollisionCoverage,
 };
 
 /// Kernel event structure (spec §6.1)

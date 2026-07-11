@@ -247,6 +247,7 @@ inline const char* kErrorInvalidRequest = "invalid_request";
 inline const char* kErrorMissingReference = "missing_reference";
 inline const char* kErrorAmbiguousReference = "ambiguous_reference";
 inline const char* kErrorUnsupportedCapability = "unsupported_capability";
+inline const char* kErrorRecoveryActionRejected = "recovery_action_rejected";
 
 // Planning
 inline const char* kErrorPlanningFailed = "planning_failed";

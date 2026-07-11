@@ -10,6 +10,7 @@
 #include <manyforge_core/types/tolerances.hpp>
 #include <manyforge_core/types/speed_profile.hpp>
 #include <manyforge_core/types/joint_dynamics_limits.hpp>
+#include <manyforge_core/types/scene_authority.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 
 namespace manyforge::core {
@@ -33,12 +34,19 @@ struct PlanRequestDTO {
   std::optional<ActionSpanDTO> action_span;
   /// Effective concrete contact-policy binding for contact-tolerant planning.
   std::string contact_policy_id;
+  /// Exact planner-native scene projection retained by scene authority for
+  /// this request. Production planners must reject an invalid or unavailable
+  /// binding; silently planning against the latest scene is not permitted.
+  SceneRevisionBindingDTO scene_binding;
 };
 
 /// Planning result (spec §3.6)
 struct PlanResultDTO {
   std::optional<TrajectoryDTO> trajectory;  // present on success
   std::optional<ErrorDTO> error;             // present on failure; absent on success
+  /// Exact scene revision consumed by the planner. Required whenever
+  /// `trajectory` is present and must equal the request binding revision.
+  SceneRevisionDTO scene_revision;
 };
 
 }  // namespace manyforge::core

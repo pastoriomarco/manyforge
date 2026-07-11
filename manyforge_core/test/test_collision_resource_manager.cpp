@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <manyforge_core/collision/collision_resource_manager.hpp>
+#include <manyforge_core/execution_collision_support.hpp>
 
 #include <string>
 #include <optional>
@@ -14,9 +15,11 @@ class DummyPublisher final : public ICollisionWorldSnapshotPublisher {
     return std::make_shared<const CollisionWorldSnapshot>();
   }
 
-  CollisionWorldPolicySnapshotBundle
-  published_runtime_collision_snapshot_bundle() const override {
-    return {snapshot(), std::nullopt};
+  RuntimeCollisionQueryBundlePtr published_runtime_collision_query_bundle()
+      const override {
+    return build_runtime_collision_query_bundle(
+        CollisionWorldPolicySnapshotBundle{snapshot(), CollisionPolicySnapshot{}},
+        1);
   }
 };
 
@@ -32,6 +35,14 @@ class DummyEngine final : public ICollisionQueryEngine {
     capability_.library_lineage = "unit_test";
     capability_.thread_safety = thread_safety;
     capability_.mutable_context_id = std::move(mutable_context_id);
+    capability_.runtime_query_memory_model =
+        RuntimeCollisionQueryMemoryModel::kMeasuredBounded;
+    capability_.runtime_query_max_joints = 256;
+    capability_.runtime_query_max_world_bodies = 4096;
+    capability_.runtime_query_max_collision_pairs = 4096;
+    capability_.runtime_query_clean_allocation_upper_bound = 1;
+    capability_.runtime_query_qualified_wcet_ns = 10'000'000;
+    capability_.runtime_query_snapshot_change_qualified_wcet_ns = 10'000'000;
   }
 
   const CollisionEngineCapabilityDescriptor& capability() const override {
@@ -52,6 +63,11 @@ class DummyEngine final : public ICollisionQueryEngine {
   std::string engine_id() const override { return capability_.engine_id; }
   std::string engine_version() const override {
     return capability_.engine_version;
+  }
+
+  void disable_runtime_query() {
+    capability_.runtime_query_memory_model =
+        RuntimeCollisionQueryMemoryModel::kUnsupported;
   }
 
  private:
@@ -230,6 +246,25 @@ TEST(CollisionResourceManagerTest, AdmissionReportsMissingResources) {
       resources, /*runtime_protection_active=*/true);
   EXPECT_EQ(admission.status,
             CollisionValidationAdmissionStatus::kMissingRuntimeResource);
+}
+
+TEST(CollisionResourceManagerTest,
+     RuntimeUnsupportedEngineFailsCapabilityAdmission) {
+  DummyPublisher publisher;
+  auto runtime = std::make_shared<DummyEngine>("runtime");
+  runtime->disable_runtime_query();
+  auto validation = std::make_shared<DummyEngine>("validation");
+  CollisionResourceManager manager;
+  manager.configure(publisher, runtime, {validation});
+
+  const auto admission = CollisionResourceManager::validate_admission(
+      manager.snapshot(), /*runtime_protection_active=*/false);
+
+  EXPECT_EQ(admission.status,
+            CollisionValidationAdmissionStatus::
+                kRuntimeQueryCapabilityUnsupported);
+  EXPECT_EQ(admission.resource_conflict_reason,
+            "unsupported_memory_model");
 }
 
 }  // namespace manyforge::core

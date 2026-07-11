@@ -3,6 +3,7 @@
 #include <pybind11/functional.h>
 
 #include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <cmath>
 #include <memory>
@@ -15,6 +16,9 @@
 
 #include <manyforge_roboplan/native_kernel_factory.hpp>
 #include <manyforge_roboplan/roboplan_execution_state_sink.hpp>
+#include <manyforge_core/collision/collision_validation_coordinator.hpp>
+#include <manyforge_core/execution_collision_support.hpp>
+#include <manyforge_core/execution_interrupt_support.hpp>
 #ifdef MANYFORGE_ROS2_CONTROL_ENABLED
 #include <manyforge_roboplan/ros2_control_kernel_factory.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
@@ -38,6 +42,61 @@ void populate_request_correlation(ExecuteRequestDTO& req,
 std::shared_ptr<ExecutionKernel> require_open_kernel(NativeKernelBundle& bundle) {
   return bundle.kernel_snapshot();
 }
+
+class PlannerProjectionLeaseGuard {
+ public:
+  explicit PlannerProjectionLeaseGuard(NativeKernelBundle& bundle)
+      : bundle_(&bundle) {}
+  ~PlannerProjectionLeaseGuard() {
+    if (bundle_ && !retention_id_.empty() && bundle_->scene_authority) {
+      bundle_->scene_authority->release_scene_snapshot_lease_inventory(
+          retention_id_);
+    }
+  }
+  PlannerProjectionLeaseGuard(const PlannerProjectionLeaseGuard&) = delete;
+  PlannerProjectionLeaseGuard& operator=(const PlannerProjectionLeaseGuard&) =
+      delete;
+
+  Result<void> bind(PlanRequestDTO& request) {
+    static std::atomic<std::uint64_t> next_id{1};
+    if (!bundle_->scene_authority) {
+      return Result<void>::Err(ErrorDTO{
+          kErrorExecutionRejected,
+          "Planner scene projection authority is unavailable",
+          {{"reason", "scene_projection_authority_unavailable"}}});
+    }
+    retention_id_ =
+        "direct_plan_" +
+        std::to_string(next_id.fetch_add(1, std::memory_order_relaxed));
+    auto retained =
+        bundle_->scene_authority->retain_scene_snapshot_lease_inventory(
+            retention_id_);
+    if (!retained || !retained->bundle.world ||
+        retained->retention_id.empty()) {
+      retention_id_.clear();
+      return Result<void>::Err(ErrorDTO{
+          kErrorExecutionRejected,
+          "Could not retain an exact scene projection for planning",
+          {{"reason", "planner_projection_retention_failed"}}});
+    }
+    request.scene_binding = SceneRevisionBindingDTO{
+        retained->bundle.world->revision, retained->retention_id};
+    inventory_ = std::move(*retained);
+    return Result<void>::Ok();
+  }
+
+  const CollisionWorldLeaseInventory& inventory() const {
+    if (!inventory_.has_value()) {
+      throw std::logic_error("Planner projection lease was not acquired");
+    }
+    return *inventory_;
+  }
+
+ private:
+  NativeKernelBundle* bundle_;
+  std::string retention_id_;
+  std::optional<CollisionWorldLeaseInventory> inventory_;
+};
 
 std::unique_lock<std::mutex> lock_bundle_scene(NativeKernelBundle& bundle) {
   if (!bundle.scene_mutex) {
@@ -458,18 +517,21 @@ Pose3DTO pose_with_position_and_orientation_for_direct_plan(
 std::optional<ErrorDTO> resolve_motion_spec_for_direct_plan(
     NativeKernelBundle& bundle,
     const ExecuteRequestDTO& request,
+    const SceneRevisionBindingDTO& scene_binding,
     MotionSpecDTO& resolved_motion) {
   if (const auto* relative_move = std::get_if<RelativeMoveDTO>(&request.motion)) {
-    auto target_pose = bundle.context->resolve_reference_pose(
-        relative_move->target_reference, request.base_frame);
+    auto target_pose = bundle.reference_resolver->resolve_reference_pose(
+        relative_move->target_reference, request.base_frame, scene_binding);
     if (!target_pose.ok()) {
       return target_pose.error();
     }
 
     Pose3DTO offset_basis_pose = target_pose.value();
     if (relative_move->offset_reference.has_value()) {
-      auto offset_reference_pose = bundle.context->resolve_reference_pose(
-          *relative_move->offset_reference, request.base_frame);
+      auto offset_reference_pose =
+          bundle.reference_resolver->resolve_reference_pose(
+              *relative_move->offset_reference, request.base_frame,
+              scene_binding);
       if (!offset_reference_pose.ok()) {
         return offset_reference_pose.error();
       }
@@ -488,6 +550,86 @@ std::optional<ErrorDTO> resolve_motion_spec_for_direct_plan(
 
   resolved_motion = request.motion;
   return std::nullopt;
+}
+
+ValidationResultDTO validate_direct_planned_trajectory(
+    NativeKernelBundle& bundle, const TrajectoryDTO& trajectory,
+    const ExecuteRequestDTO& request,
+    const CollisionWorldLeaseInventory& retained_scene) {
+  ValidationOptionsDTO options;
+  options.tcp_frame = request.tcp_frame;
+  options.base_frame = request.base_frame;
+  options.max_tcp_linear_speed_mps =
+      request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
+  options.run_collision_checks = false;
+
+  CollisionCancellationToken cancel;
+  auto noncollision = bundle.trajectory_validator->validate_non_collision(
+      trajectory, options, cancel);
+  if (!noncollision.valid) {
+    return noncollision;
+  }
+
+  auto observed = bundle.observed_state_provider->current_state(
+      bundle.clock->now());
+  if (!observed.ok()) {
+    return ValidationResultDTO{false, observed.error()};
+  }
+  auto projected = bundle.collision_trajectory_projector->expand_for_collision(
+      trajectory, observed.value());
+  if (!projected.ok()) {
+    return ValidationResultDTO{false, projected.error()};
+  }
+  if (!retained_scene.bundle.world ||
+      !retained_scene.bundle.policy.has_value()) {
+    return ValidationResultDTO{
+        false,
+        ErrorDTO{kErrorExecutionRejected,
+                 "Retained collision scene is incomplete",
+                 {{"reason", "direct_validation_scene_incomplete"}}}};
+  }
+  if (bundle.collision_validation_engines.empty() ||
+      !bundle.collision_validation_engines.front()) {
+    return ValidationResultDTO{
+        false,
+        ErrorDTO{kErrorExecutionRejected,
+                 "Authoritative collision validation engine is unavailable",
+                 {{"reason", "direct_validation_engine_unavailable"}}}};
+  }
+
+  CollisionValidationPassConfig config;
+  config.policy_snapshot = *retained_scene.bundle.policy;
+  config.require_pose_source_borrow = false;
+  config.surface = CollisionSurface::kPreExecutionValidation;
+  config.contact_policy_id = request.contact_policy_id;
+  CollisionValidationCoordinator coordinator(std::move(config));
+  auto collision = coordinator.validate_trajectory(
+      *retained_scene.bundle.world,
+      *bundle.collision_validation_engines.front(), projected.value(), cancel);
+  if (!collision.decision.accepted) {
+    std::map<std::string, std::string> details{
+        {"reason", "direct_authoritative_collision_validation_failed"},
+        {"collision_world_revision_id",
+         std::to_string(collision.borrowed_world_revision.revision_id)},
+        {"collision_world_content_hash",
+         collision.borrowed_world_revision.content_hash}};
+    if (collision.decision.first_failing_waypoint.has_value()) {
+      details["first_failing_waypoint"] = std::to_string(
+          *collision.decision.first_failing_waypoint);
+    }
+    if (collision.decision.first_failing_time_ns.has_value()) {
+      details["first_failing_time_ns"] =
+          std::to_string(*collision.decision.first_failing_time_ns);
+    }
+    append_collision_failure_diagnostics(details, collision);
+    return ValidationResultDTO{
+        false,
+        ErrorDTO{kErrorValidationCollision,
+                 pre_dispatch_collision_validation_message(
+                     details, collision.decision.action),
+                 std::move(details)}};
+  }
+  return ValidationResultDTO{true, std::nullopt};
 }
 
 Pose3DTO pose_from_python(const py::dict& pose_dict) {
@@ -631,17 +773,26 @@ py::dict robot_state_to_python(const RobotStateDTO& state) {
 }
 
 RobotStateDTO observer_robot_state(NativeKernelBundle& self) {
-  try {
-    const auto kernel = require_open_kernel(self);
-    const auto snapshot = kernel->get_execution_snapshot();
-    if (!snapshot.joint_positions_rad.empty()) {
-      RobotStateDTO state;
-      state.positions_rad = snapshot.joint_positions_rad;
-      return state;
-    }
-  } catch (const std::runtime_error&) {
+  if (!self.observed_state_provider || !self.clock) {
+    throw std::runtime_error("Observed robot-state authority is unavailable");
   }
-  return self.context->get_current_state();
+  auto state = self.observed_state_provider->current_state(self.clock->now());
+  if (!state.ok()) {
+    throw std::runtime_error(state.error().message);
+  }
+  return std::move(state.value());
+}
+
+std::vector<std::string> qualified_group_joint_names(
+    NativeKernelBundle& self, const std::string& group_id) {
+  if (!self.kinematics) {
+    throw std::runtime_error("Robot kinematics authority is unavailable");
+  }
+  auto names = self.kinematics->group_joint_names(group_id);
+  if (!names.ok()) {
+    throw std::runtime_error(names.error().message);
+  }
+  return std::move(names.value());
 }
 
 py::dict trajectory_to_python(const TrajectoryDTO& trajectory) {
@@ -675,7 +826,7 @@ py::dict object_state_to_python(const ObjectStateDTO& state) {
 }
 
 py::dict scene_trace_event_to_python(
-    const RoboPlanPlanningContext::SceneTraceEvent& event) {
+    const RoboPlanProjectionBackend::SceneTraceEvent& event) {
   py::dict d;
   d["timestamp_ns"] = event.timestamp_ns;
   d["source"] = "backend";
@@ -768,8 +919,65 @@ const char* kernel_event_type_to_string(KernelEventType type) {
     case KernelEventType::kMotionTripCompleted: return "motion_trip_completed";
     case KernelEventType::kMotionExecutionOutcomeRecorded:
       return "motion_execution_outcome_recorded";
+    case KernelEventType::kStopCertificatePublished:
+      return "stop_certificate_published";
+    case KernelEventType::kRecoveryAssessmentChanged:
+      return "recovery_assessment_changed";
+    case KernelEventType::kRecoveryActionAccepted:
+      return "recovery_action_accepted";
+    case KernelEventType::kRecoveryActionRejected:
+      return "recovery_action_rejected";
+    case KernelEventType::kRuntimeCollisionCoverage:
+      return "runtime_collision_coverage";
     default: return "unknown";
   }
+}
+
+py::dict recovery_assessment_to_python(
+    const KernelRecoveryAssessmentDTO& assessment) {
+  py::dict d;
+  d["schema_version"] = assessment.schema_version;
+  d["assessment_revision"] = assessment.assessment_revision;
+  d["assessed_at_ns"] = assessment.assessed_at_ns;
+  d["control_command_epoch"] = assessment.control_command_epoch;
+  d["execution_id"] = assessment.execution_id;
+  d["execution_state"] = to_string(assessment.execution_state);
+  d["recovery_class"] = recovery_class_name(assessment.recovery_class);
+  d["status"] = recovery_assessment_status_name(assessment.status);
+  d["latch_id"] = assessment.latch_id;
+  d["source_id"] = assessment.source_id;
+  d["policy_id"] = assessment.policy_id;
+  d["preemption_result"] =
+      interrupt_preemption_result_name(assessment.preemption_result);
+  d["stop_owner_active"] = assessment.stop_owner_active;
+  d["stop_owner_generation"] = assessment.stop_owner_generation;
+  d["backend_stop_confirmed"] = assessment.backend_stop_confirmed;
+  d["stop_certificate_id"] = assessment.stop_certificate_id;
+  d["observed_state_available"] = assessment.observed_state_available;
+  d["observed_state_sequence"] = assessment.observed_state_sequence;
+  d["observed_state_source_id"] = assessment.observed_state_source_id;
+  d["observed_state_authority_profile"] =
+      assessment.observed_state_authority_profile;
+  d["observed_state_measured"] = assessment.observed_state_measured;
+  d["observed_state_valid_until_ns"] =
+      assessment.observed_state_valid_until_ns;
+  d["observed_state_fresh"] = assessment.observed_state_fresh;
+  d["observed_state_at_rest"] = assessment.observed_state_at_rest;
+  d["stronger_authority_active"] = assessment.stronger_authority_active;
+  d["queued_latch_present"] = assessment.queued_latch_present;
+  d["retry_admissible"] = assessment.retry_admissible;
+  py::list actions;
+  for (const auto action : assessment.allowed_actions) {
+    actions.append(std::string(recovery_action_name(action)));
+  }
+  d["allowed_actions"] = actions;
+  d["reason_code"] = assessment.reason_code;
+  py::list refs;
+  for (const auto& ref : assessment.evidence_refs) {
+    refs.append(ref);
+  }
+  d["evidence_refs"] = refs;
+  return d;
 }
 
 // Helper: convert KernelEvent to Python dict
@@ -870,6 +1078,44 @@ py::dict metrics_to_python(const MetricsSnapshot& metrics) {
       metrics.runtime_collision_ticks_faulted;
   d["runtime_collision_tick_max_ns"] =
       metrics.runtime_collision_tick_max_ns;
+  d["runtime_collision_tick_start_jitter_max_ns"] =
+      metrics.runtime_collision_tick_start_jitter_max_ns;
+  d["runtime_collision_tick_late_periods"] =
+      metrics.runtime_collision_tick_late_periods;
+  d["runtime_collision_tick_missed_periods"] =
+      metrics.runtime_collision_tick_missed_periods;
+  d["runtime_collision_tick_max_consecutive_late_periods"] =
+      metrics.runtime_collision_tick_max_consecutive_late_periods;
+  d["runtime_collision_stop_windows_started"] =
+      metrics.runtime_collision_stop_windows_started;
+  d["runtime_collision_stop_windows_completed"] =
+      metrics.runtime_collision_stop_windows_completed;
+  d["runtime_collision_stop_ticks_attempted"] =
+      metrics.runtime_collision_stop_ticks_attempted;
+  d["runtime_collision_stop_queries_executed"] =
+      metrics.runtime_collision_stop_queries_executed;
+  d["runtime_collision_stop_unavailable_ticks"] =
+      metrics.runtime_collision_stop_unavailable_ticks;
+  d["runtime_collision_stop_longest_unavailable_ns"] =
+      metrics.runtime_collision_stop_longest_unavailable_ns;
+  d["runtime_collision_stop_zero_check_windows"] =
+      metrics.runtime_collision_stop_zero_check_windows;
+  d["runtime_collision_last_stop_ticks_attempted"] =
+      metrics.runtime_collision_last_stop_ticks_attempted;
+  d["runtime_collision_last_stop_queries_executed"] =
+      metrics.runtime_collision_last_stop_queries_executed;
+  d["runtime_collision_last_stop_unavailable_ticks"] =
+      metrics.runtime_collision_last_stop_unavailable_ticks;
+  d["runtime_collision_last_stop_longest_unavailable_ns"] =
+      metrics.runtime_collision_last_stop_longest_unavailable_ns;
+  d["runtime_collision_freshest_observed_source_age_ns"] =
+      metrics.runtime_collision_freshest_observed_source_age_ns;
+  d["runtime_collision_freshest_observed_source_id"] =
+      metrics.runtime_collision_freshest_observed_source_id;
+  d["runtime_collision_unavailable_events_suppressed"] =
+      metrics.runtime_collision_unavailable_events_suppressed;
+  d["observed_state_reader_retry_exhausted_total"] =
+      metrics.observed_state_reader_retry_exhausted_total;
   d["validation_deferred_runtime_monitor_active"] =
       metrics.validation_deferred_runtime_monitor_active;
   d["runtime_collision_snapshot_refresh_failures"] =
@@ -911,8 +1157,8 @@ py::dict shape_to_python(const CollisionShapeDTO& shape) {
   return d;
 }
 
-py::dict scene_object_snapshot_to_python(
-    const RoboPlanPlanningContext::SceneObjectSnapshot& object) {
+template <typename SceneObject>
+py::dict scene_object_snapshot_to_python(const SceneObject& object) {
   py::dict d;
   d["object_id"] = object.object_id;
   d["shape"] = shape_to_python(object.shape);
@@ -1284,6 +1530,47 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
     config.runtime_collision_query_timeout_ns =
         static_cast<int64_t>(timeout_ns);
   }
+  if (config_dict.contains("runtime_observed_state_max_age_ns")) {
+    const double max_age_ns = finite_scale_from_python(
+        config_dict["runtime_observed_state_max_age_ns"],
+        "runtime_observed_state_max_age_ns");
+    if (max_age_ns < 0.0) {
+      throw std::invalid_argument(
+          "runtime_observed_state_max_age_ns must be >= 0");
+    }
+    config.runtime_observed_state_max_age_ns =
+        static_cast<int64_t>(max_age_ns);
+  }
+  if (config_dict.contains("recovery_require_measured_observation")) {
+    config.recovery_require_measured_observation =
+        config_dict["recovery_require_measured_observation"].cast<bool>();
+  }
+  if (config_dict.contains("recovery_ready_dwell_ns")) {
+    config.recovery_ready_dwell_ns = static_cast<int64_t>(
+        finite_scale_from_python(config_dict["recovery_ready_dwell_ns"],
+                                 "recovery_ready_dwell_ns"));
+  }
+  if (config_dict.contains("recovery_ready_min_samples")) {
+    config.recovery_ready_min_samples = static_cast<std::uint32_t>(
+        size_t_from_python(config_dict["recovery_ready_min_samples"],
+                           "recovery_ready_min_samples"));
+  }
+  if (config_dict.contains("recovery_observed_joint_order_token")) {
+    config.recovery_observed_joint_order_token =
+        config_dict["recovery_observed_joint_order_token"].cast<std::string>();
+  }
+  if (config_dict.contains("recovery_at_rest_velocity_threshold_rad_s")) {
+    config.recovery_at_rest_velocity_threshold_rad_s =
+        finite_scale_from_python(
+            config_dict["recovery_at_rest_velocity_threshold_rad_s"],
+            "recovery_at_rest_velocity_threshold_rad_s");
+  }
+  if (config_dict.contains("recovery_observation_poll_period_ns")) {
+    config.recovery_observation_poll_period_ns = static_cast<int64_t>(
+        finite_scale_from_python(
+            config_dict["recovery_observation_poll_period_ns"],
+            "recovery_observation_poll_period_ns"));
+  }
   if (config_dict.contains("validation_collision_query_timeout_ns")) {
     const double timeout_ns = finite_scale_from_python(
         config_dict["validation_collision_query_timeout_ns"],
@@ -1410,6 +1697,15 @@ ros2_exec::Ros2ControlExecutionBackendConfig ros2_control_config_from_python(
   if (config_dict.contains("required_joints")) {
     config.required_joints =
         config_dict["required_joints"].cast<std::vector<std::string>>();
+  }
+  if (config_dict.contains("observed_state_source_precedence")) {
+    config.observed_state_source_precedence =
+        config_dict["observed_state_source_precedence"]
+            .cast<std::vector<std::string>>();
+  }
+  if (config_dict.contains("observed_state_authority_profile_id")) {
+    config.observed_state_authority_profile_id =
+        config_dict["observed_state_authority_profile_id"].cast<std::string>();
   }
   if (config_dict.contains("executor_thread_count")) {
     config.executor_thread_count = size_t_from_python(
@@ -1928,8 +2224,8 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                    sss = "execution_backend_feedback"; break;
                  case kKernelExecutionSnapshot:
                    sss = "kernel_execution_snapshot"; break;
-                 case kPlanningContextState:
-                   sss = "planning_context_state"; break;
+                 case kObservedStateProvider:
+                   sss = "observed_state_provider"; break;
                }
                td["stop_snapshot_source"] = std::string(sss);
                td["stop_snapshot_captured_at_ns"] =
@@ -2127,7 +2423,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         if (start_state_obj.is_none()) {
           start_state = [&]() {
             py::gil_scoped_release release;
-            return self.context->get_current_state();
+            return observer_robot_state(self);
           }();
         } else {
           py::dict start_dict = start_state_obj.cast<py::dict>();
@@ -2148,9 +2444,14 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         plan_request.base_frame = req.base_frame;
         plan_request.tcp_frame = req.tcp_frame;
         plan_request.start_state = start_state;
+        PlannerProjectionLeaseGuard projection_lease(self);
+        auto projection_binding = projection_lease.bind(plan_request);
+        if (!projection_binding.ok()) {
+          return error_result_to_python(projection_binding.error());
+        }
         MotionSpecDTO resolved_motion;
         if (auto error = resolve_motion_spec_for_direct_plan(
-                self, req, resolved_motion)) {
+                self, req, plan_request.scene_binding, resolved_motion)) {
           py::dict result;
           result["ok"] = false;
           result["error"] = error->message;
@@ -2180,17 +2481,11 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           return result;
         }
 
-        ValidationOptionsDTO validation_options;
-        if (req.speed_profile.max_tcp_linear_speed_mps.has_value()) {
-          validation_options.max_tcp_linear_speed_mps =
-              *req.speed_profile.max_tcp_linear_speed_mps;
-          validation_options.tcp_frame = req.tcp_frame;
-          validation_options.base_frame = req.base_frame;
-        }
         auto validation_result = [&]() {
           py::gil_scoped_release release;
-          return self.context->validate_trajectory(
-              *plan_result.trajectory, validation_options);
+          return validate_direct_planned_trajectory(
+              self, *plan_result.trajectory, req,
+              projection_lease.inventory());
         }();
         if (!validation_result.valid) {
           result["ok"] = false;
@@ -2221,15 +2516,22 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         fk_request.base_frame = req.base_frame;
         auto final_tcp_pose = [&]() {
           py::gil_scoped_release release;
-          return self.context->forward_kinematics(fk_request);
+          return self.kinematics->forward_kinematics(fk_request);
         }();
+        if (!final_tcp_pose.ok()) {
+          result["ok"] = false;
+          result["error"] = final_tcp_pose.error().message;
+          result["error_details"] =
+              error_details_to_python(final_tcp_pose.error().details);
+          return result;
+        }
 
         result["ok"] = true;
         result["trajectory_duration_s"] =
             trajectory.waypoints.empty() ? 0.0 : trajectory.waypoints.back().time_from_start_s;
         result["trajectory_waypoint_count"] = trajectory.waypoints.size();
         result["final_state"] = robot_state_to_python(final_state);
-        result["final_tcp_pose"] = pose_to_python(final_tcp_pose);
+        result["final_tcp_pose"] = pose_to_python(final_tcp_pose.value());
         return result;
       }, py::arg("request"), py::arg("start_state") = py::none())
       .def("plan_motion", [](NativeKernelBundle& self,
@@ -2349,7 +2651,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         if (start_state_obj.is_none()) {
           start_state = [&]() {
             py::gil_scoped_release release;
-            return self.context->get_current_state();
+            return observer_robot_state(self);
           }();
         } else {
           py::dict start_dict = start_state_obj.cast<py::dict>();
@@ -2370,9 +2672,14 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         plan_request.base_frame = req.base_frame;
         plan_request.tcp_frame = req.tcp_frame;
         plan_request.start_state = start_state;
+        PlannerProjectionLeaseGuard projection_lease(self);
+        auto projection_binding = projection_lease.bind(plan_request);
+        if (!projection_binding.ok()) {
+          return error_result_to_python(projection_binding.error());
+        }
         MotionSpecDTO resolved_motion;
         if (auto error = resolve_motion_spec_for_direct_plan(
-                self, req, resolved_motion)) {
+                self, req, plan_request.scene_binding, resolved_motion)) {
           py::dict result;
           result["ok"] = false;
           result["error"] = error->message;
@@ -2402,17 +2709,11 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           return result;
         }
 
-        ValidationOptionsDTO validation_options;
-        if (req.speed_profile.max_tcp_linear_speed_mps.has_value()) {
-          validation_options.max_tcp_linear_speed_mps =
-              *req.speed_profile.max_tcp_linear_speed_mps;
-          validation_options.tcp_frame = req.tcp_frame;
-          validation_options.base_frame = req.base_frame;
-        }
         auto validation_result = [&]() {
           py::gil_scoped_release release;
-          return self.context->validate_trajectory(
-              *plan_result.trajectory, validation_options);
+          return validate_direct_planned_trajectory(
+              self, *plan_result.trajectory, req,
+              projection_lease.inventory());
         }();
         if (!validation_result.valid) {
           result["ok"] = false;
@@ -2443,15 +2744,22 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         fk_request.base_frame = req.base_frame;
         auto final_tcp_pose = [&]() {
           py::gil_scoped_release release;
-          return self.context->forward_kinematics(fk_request);
+          return self.kinematics->forward_kinematics(fk_request);
         }();
+        if (!final_tcp_pose.ok()) {
+          result["ok"] = false;
+          result["error"] = final_tcp_pose.error().message;
+          result["error_details"] =
+              error_details_to_python(final_tcp_pose.error().details);
+          return result;
+        }
 
         result["ok"] = true;
         result["trajectory_duration_s"] =
             trajectory.waypoints.empty() ? 0.0 : trajectory.waypoints.back().time_from_start_s;
         result["trajectory_waypoint_count"] = trajectory.waypoints.size();
         result["final_state"] = robot_state_to_python(final_state);
-        result["final_tcp_pose"] = pose_to_python(final_tcp_pose);
+        result["final_tcp_pose"] = pose_to_python(final_tcp_pose.value());
         result["trajectory"] = trajectory_to_python(trajectory);
         return result;
       }, py::arg("request"), py::arg("start_state") = py::none(),
@@ -2601,6 +2909,103 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
            py::arg("principal_id"),
            py::arg("reason"),
            py::arg("expected_epoch") = py::none())
+      .def("get_recovery_assessment",
+           [](NativeKernelBundle& self) -> py::dict {
+             auto kernel = require_open_kernel(self);
+             auto assessment = [&]() {
+               py::gil_scoped_release release;
+               return kernel->get_recovery_assessment();
+             }();
+             return recovery_assessment_to_python(assessment);
+           })
+      .def("apply_recovery_action",
+           [](NativeKernelBundle& self, py::dict request_dict) -> py::dict {
+             auto kernel = require_open_kernel(self);
+             KernelRecoveryActionRequestDTO request;
+             request.request_id =
+                 request_dict.attr("get")("request_id", "").cast<std::string>();
+             const auto action_name =
+                 request_dict.attr("get")("action", "").cast<std::string>();
+             if (action_name == "retry_motion_from_current_state") {
+               request.action = RecoveryAction::kRetryMotionFromCurrentState;
+             } else if (action_name == "acknowledge_and_continue") {
+               request.action = RecoveryAction::kAcknowledgeAndContinue;
+             } else if (action_name == "retry_after_scene_repair") {
+               request.action = RecoveryAction::kRetryAfterSceneRepair;
+             } else if (action_name == "replan_from_stopped_state") {
+               request.action = RecoveryAction::kReplanFromStoppedState;
+             } else if (action_name == "reset_cycle") {
+               request.action = RecoveryAction::kResetCycle;
+             } else {
+               py::dict rejected;
+               rejected["request_id"] =
+                   request_dict.attr("get")("request_id", "");
+               rejected["action"] = action_name;
+               rejected["accepted"] = false;
+               py::dict error_details;
+               error_details["reason"] = "action_not_allowed";
+               py::dict error;
+               error["code"] = "recovery_action_rejected";
+               error["message"] =
+                   std::string("unknown recovery action: ") + action_name;
+               error["details"] = error_details;
+               rejected["error"] = error;
+               const auto assessment = [&]() {
+                 py::gil_scoped_release release;
+                 return kernel->get_recovery_assessment();
+               }();
+               rejected["resulting_assessment"] =
+                   recovery_assessment_to_python(assessment);
+               return rejected;
+             }
+             request.principal_id =
+                 request_dict.attr("get")("principal_id", "").cast<std::string>();
+             request.expected_assessment_revision =
+                 request_dict.attr("get")("expected_assessment_revision", 0)
+                     .cast<std::uint64_t>();
+             request.expected_control_command_epoch =
+                 request_dict.attr("get")("expected_control_command_epoch", 0)
+                     .cast<std::uint64_t>();
+             request.expected_execution_id =
+                 request_dict.attr("get")("expected_execution_id", 0)
+                     .cast<std::uint64_t>();
+             request.expected_latch_id =
+                 request_dict.attr("get")("expected_latch_id", "")
+                     .cast<std::string>();
+             request.expected_stop_certificate_id =
+                 request_dict.attr("get")("expected_stop_certificate_id", "")
+                     .cast<std::string>();
+             request.expected_stop_owner_generation =
+                 request_dict.attr("get")("expected_stop_owner_generation", 0)
+                     .cast<std::uint64_t>();
+             request.reason =
+                 request_dict.attr("get")("reason", "").cast<std::string>();
+             auto result = [&]() {
+               py::gil_scoped_release release;
+               return kernel->apply_recovery_action(request);
+             }();
+             py::dict d;
+             d["request_id"] = result.request_id;
+             d["action"] = recovery_action_name(result.action);
+             d["accepted"] = result.accepted;
+             d["resulting_assessment"] =
+                 recovery_assessment_to_python(result.resulting_assessment);
+             if (result.error.has_value()) {
+               py::dict details;
+               for (const auto& [key, value] : result.error->details) {
+                 details[py::str(key)] = value;
+               }
+               py::dict error;
+               error["code"] = result.error->code;
+               error["message"] = result.error->message;
+               error["details"] = details;
+               d["error"] = error;
+             } else {
+               d["error"] = py::none();
+             }
+             return d;
+           },
+           py::arg("request"))
       .def("acknowledge_intervention_for_retry",
            [](NativeKernelBundle& self, std::string principal_id,
               std::string reason, py::object expected_epoch) -> py::dict {
@@ -2796,6 +3201,25 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               progress_metrics.last_stop_confirmation_latency_ns;
           out["controller_max_stop_confirmation_latency_ns"] =
               progress_metrics.max_stop_confirmation_latency_ns;
+          out["controller_observed_state_reader_retry_exhausted_total"] =
+              progress_metrics.observed_state_reader_retry_exhausted_total;
+          py::list observed_sources;
+          for (const auto& source : progress_metrics.observed_state_sources) {
+            py::dict source_metrics;
+            source_metrics["source_kind"] =
+                observed_robot_state_source_kind_name(source.source_kind);
+            source_metrics["source_id"] = source.source_id;
+            source_metrics["published_total"] = source.published_total;
+            source_metrics["incomplete_total"] = source.incomplete_total;
+            source_metrics["writer_busy_total"] = source.writer_busy_total;
+            source_metrics["latest_received_timestamp_ns"] =
+                source.latest_received_timestamp_ns;
+            source_metrics["max_interarrival_ns"] =
+                source.max_interarrival_ns;
+            observed_sources.append(std::move(source_metrics));
+          }
+          out["controller_observed_state_sources"] =
+              std::move(observed_sources);
         }
 #endif
         return out;
@@ -2991,20 +3415,28 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           py::arg("gripper_id"))
 #endif
       .def("get_scene_object_ids", [](NativeKernelBundle& self) {
-        py::gil_scoped_release release;
-        return self.context->get_scene_object_ids();
+        const auto objects = [&]() {
+          py::gil_scoped_release release;
+          return self.scene_authority->scene_objects();
+        }();
+        std::vector<std::string> ids;
+        ids.reserve(objects.size());
+        for (const auto& object : objects) {
+          ids.push_back(object.object_id);
+        }
+        return ids;
       })
       .def("get_joint_names", [](NativeKernelBundle& self) {
         const auto names = [&]() {
           py::gil_scoped_release release;
-          return self.context->get_joint_names();
+          return qualified_group_joint_names(self, self.group_name);
         }();
         return canonical_joint_names(self, names);
       })
       .def("get_scene_objects", [](NativeKernelBundle& self) -> py::list {
         const auto objects = [&]() {
           py::gil_scoped_release release;
-          return self.context->get_scene_objects();
+          return self.scene_authority->scene_objects();
         }();
         py::list result;
         for (const auto& object : objects) {
@@ -3024,9 +3456,21 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         // Convert from Python BEFORE releasing the GIL (pose_from_python
         // touches the py::dict); only the native mutation runs unlocked.
         auto native_pose = pose_from_python(pose);
-        py::gil_scoped_release release;
-        self.context->set_robot_base_pose(std::move(native_pose));
-        self.cache->invalidate_all();
+        const auto result = [&]() {
+          py::gil_scoped_release release;
+          return self.scene_authority->set_robot_base_pose(
+              SetRobotBasePoseRequestDTO{self.robot_id,
+                                         std::move(native_pose)});
+        }();
+        if (!result.success) {
+          throw std::runtime_error(
+              result.error ? result.error->message
+                           : "Failed to commit robot base pose");
+        }
+        {
+          py::gil_scoped_release release;
+          self.cache->invalidate_all();
+        }
       }, py::arg("pose"))
       .def("scene_edit", [](NativeKernelBundle& self, py::dict request) -> py::dict {
         py::dict result;
@@ -3115,7 +3559,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           if (op == "upsert") {
             auto state = [&]() {
               py::gil_scoped_release release;
-              return self.context->get_object_state(req.object_id);
+              return self.scene_authority->object_state(req.object_id);
             }();
             if (state.exists && state.attached) {
               result["success"] = false;
@@ -3127,7 +3571,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               remove_req.object_id = req.object_id;
               auto remove_result = [&]() {
                 py::gil_scoped_release release;
-                return self.context->remove_object(remove_req);
+                return self.scene_authority->remove_object(remove_req);
               }();
               if (!remove_result.success) {
                 result["success"] = false;
@@ -3143,7 +3587,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
 
           auto r = [&]() {
             py::gil_scoped_release release;
-            return self.context->add_object(req);
+            return self.scene_authority->add_object(req);
           }();
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
@@ -3153,7 +3597,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           req.object_id = request["object_id"].cast<std::string>();
           auto r = [&]() {
             py::gil_scoped_release release;
-            return self.context->remove_object(req);
+            return self.scene_authority->remove_object(req);
           }();
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
@@ -3222,7 +3666,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           }
           auto r = [&]() {
             py::gil_scoped_release release;
-            return self.context->update_object_pose(req);
+            return self.scene_authority->update_object_pose(req);
           }();
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
@@ -3241,7 +3685,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           }
           auto r = [&]() {
             py::gil_scoped_release release;
-            return self.context->attach_object(req);
+            return self.scene_authority->attach_object(req);
           }();
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
@@ -3251,7 +3695,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           req.frame_id = request.attr("get")("frame_id", "universe").cast<std::string>();
           auto r = [&]() {
             py::gil_scoped_release release;
-            return self.context->detach_object(req);
+            return self.scene_authority->detach_object(req);
           }();
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
@@ -3280,7 +3724,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }
         {
           py::gil_scoped_release release;
-          kernel->sync_snapshot_from_context();
+          auto refreshed = kernel->refresh_observed_state_snapshot();
+          if (!refreshed.ok()) {
+            throw std::runtime_error(refreshed.error().message);
+          }
         }
       }, py::arg("positions"),
       "Set the robot's current joint positions in the planning scene.")
@@ -3332,7 +3779,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }
         {
           py::gil_scoped_release release;
-          kernel->sync_snapshot_from_context();
+          auto refreshed = kernel->refresh_observed_state_snapshot();
+          if (!refreshed.ok()) {
+            throw std::runtime_error(refreshed.error().message);
+          }
         }
       }, py::arg("group_name"), py::arg("positions"),
       "Set joint positions for a specific SRDF group in the planning scene.")
@@ -3341,14 +3791,28 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         RobotStateDTO state;
         state.joint_names = [&]() {
           py::gil_scoped_release release;
-          return self.context->get_joint_names();
+          return qualified_group_joint_names(self, self.group_name);
         }();
         state.positions_rad = positions;
-        CollisionCheckRequestDTO request;
-        request.robot_state = state;
+        CollisionQuery query;
+        query.query_id = "debug_authoritative_collision_check_positions";
+        query.surface = CollisionSurface::kDiagnosticCompare;
+        query.robot_state = std::move(state);
+        query.sampling_mode = CollisionSamplingMode::kWaypointOnly;
         const auto result = [&]() {
           py::gil_scoped_release release;
-          return self.context->collision_check(request);
+          auto snapshot = self.scene_authority->snapshot();
+          auto policy = self.scene_authority->collision_policy_snapshot();
+          if (!snapshot || !policy ||
+              self.collision_validation_engines.empty() ||
+              !self.collision_validation_engines.front()) {
+            throw std::runtime_error(
+                "Authoritative collision diagnostic resources are unavailable");
+          }
+          query.collision_world_revision = snapshot->revision;
+          CollisionCancellationToken cancel;
+          return self.collision_validation_engines.front()->check(
+              *snapshot, query, *policy, cancel);
         }();
         py::dict d;
         d["in_collision"] = result.in_collision;
@@ -3372,7 +3836,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         RobotStateDTO state;
         state.joint_names = [&]() {
           py::gil_scoped_release release;
-          return self.context->get_joint_names();
+          return qualified_group_joint_names(self, self.group_name);
         }();
         state.positions_rad = positions;
 
@@ -3385,7 +3849,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
 
         auto snapshot = [&]() {
           py::gil_scoped_release release;
-          return self.context->snapshot();
+          return self.scene_authority->snapshot();
         }();
         py::dict result;
         if (!snapshot) {
@@ -3397,20 +3861,21 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
 
         auto policy = [&]() {
           py::gil_scoped_release release;
-          return self.context->collision_policy_snapshot()
+          return self.scene_authority->collision_policy_snapshot()
               .value_or(CollisionPolicySnapshot{});
         }();
 
-        CollisionResult legacy_result = [&]() {
+        CollisionResult diagnostic_result = [&]() {
           py::gil_scoped_release release;
-          return self.context->collision_check_normalized(query);
+          return self.collision_diagnostic_comparator->compare(query);
         }();
 
         if (self.collision_validation_engines.empty() ||
             !self.collision_validation_engines.front()) {
           result["ok"] = false;
           result["error"] = "manyforge_collision_engine_unavailable";
-          result["legacy"] = collision_result_to_python(legacy_result);
+          result["diagnostic"] =
+              collision_result_to_python(diagnostic_result);
           return result;
         }
 
@@ -3422,14 +3887,15 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }();
 
         const bool in_collision_match =
-            legacy_result.in_collision == manyforge_result.in_collision;
+            diagnostic_result.in_collision == manyforge_result.in_collision;
         const bool decision_match =
-            legacy_result.decision == manyforge_result.decision;
+            diagnostic_result.decision == manyforge_result.decision;
         const bool pair_count_match =
-            legacy_result.normalized_pairs.size() ==
+            diagnostic_result.normalized_pairs.size() ==
             manyforge_result.normalized_pairs.size();
         const bool normalized_pairs_match =
-            legacy_result.normalized_pairs == manyforge_result.normalized_pairs;
+            diagnostic_result.normalized_pairs ==
+            manyforge_result.normalized_pairs;
 
         result["ok"] = true;
         result["in_collision_match"] = in_collision_match;
@@ -3440,7 +3906,8 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                           normalized_pairs_match;
         result["snapshot_revision_id"] = snapshot->revision.revision_id;
         result["snapshot_content_hash"] = snapshot->revision.content_hash;
-        result["legacy"] = collision_result_to_python(legacy_result);
+        result["diagnostic"] =
+            collision_result_to_python(diagnostic_result);
         result["manyforge_collision"] =
             collision_result_to_python(manyforge_result);
         return result;
@@ -3471,11 +3938,14 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           const auto poses = [&]() {
             py::gil_scoped_release release;
             const auto state = observer_robot_state(self);
-            return self.context->forward_kinematics_batch(
+            return self.kinematics->forward_kinematics_batch(
                 state, std::vector<std::string>{target_frame}, base_frame);
           }();
-          const auto it = poses.find(target_frame);
-          if (it == poses.end()) {
+          if (!poses.ok()) {
+            return py::none();
+          }
+          const auto it = poses.value().find(target_frame);
+          if (it == poses.value().end()) {
             return py::none();
           }
           return py::object(pose_to_python(it->second));
@@ -3489,11 +3959,14 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         const auto poses = [&]() {
           py::gil_scoped_release release;
           const auto state = observer_robot_state(self);
-          return self.context->forward_kinematics_batch(
+          return self.kinematics->forward_kinematics_batch(
               state, target_frames, base_frame);
         }();
+        if (!poses.ok()) {
+          throw std::runtime_error(poses.error().message);
+        }
         py::dict result;
-        for (const auto& [target_frame, pose] : poses) {
+        for (const auto& [target_frame, pose] : poses.value()) {
           result[py::str(target_frame)] = pose_to_python(pose);
         }
         return result;
@@ -3504,9 +3977,12 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         try {
           auto pose = [&]() {
             py::gil_scoped_release release;
-            return self.context->get_object_pose(object_id, base_frame);
+            return self.scene_authority->object_pose(object_id, base_frame);
           }();
-          return pose_to_python(pose);
+          if (!pose.ok()) {
+            return py::object(py::none());
+          }
+          return py::object(pose_to_python(pose.value()));
         } catch (...) {
           return py::none();
         }
@@ -3515,14 +3991,14 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                                    const std::string& object_id) -> py::dict {
         const auto state = [&]() {
           py::gil_scoped_release release;
-          return self.context->get_object_state(object_id);
+          return self.scene_authority->object_state(object_id);
         }();
         return object_state_to_python(state);
       })
       .def("get_scene_trace", [](NativeKernelBundle& self, int limit) -> py::list {
         const auto events = [&]() {
           py::gil_scoped_release release;
-          return self.context->get_scene_trace(
+          return self.scene_projection->scene_trace(
               limit < 0 ? 0 : static_cast<size_t>(limit));
         }();
         py::list result;
@@ -3532,12 +4008,12 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         return result;
       }, py::arg("limit") = -1)
       .def("clear_scene_trace", [](NativeKernelBundle& self) {
-        self.context->clear_scene_trace();
+        self.scene_projection->clear_scene_trace();
       })
       .def("scene_update_status_counters", [](NativeKernelBundle& self) -> py::dict {
         const auto counters = [&]() {
           py::gil_scoped_release release;
-          return self.context->scene_update_status_counters();
+          return self.scene_projection->scene_update_status_counters();
         }();
         py::dict result;
         for (const auto& [key, value] : counters) {
@@ -3618,7 +4094,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                    && state.positions_rad.size() == state.joint_names.size()) {
                  ik_req.seed_state = state;
                } else {
-                 ik_req.seed_state = self.context->get_current_state();
+                 ik_req.seed_state = observer_robot_state(self);
                }
                auto ik_result = [&]() {
                  py::gil_scoped_release release;
@@ -3654,14 +4130,21 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                try {
                  auto pose = [&]() {
                    py::gil_scoped_release release;
-                   return self.context->forward_kinematics(fk_req);
+                   return self.kinematics->forward_kinematics(fk_req);
                  }();
+                 if (!pose.ok()) {
+                   continue;
+                 }
                  py::dict d;
                  d["position_m"] = py::make_tuple(
-                     pose.position_m.x_m, pose.position_m.y_m, pose.position_m.z_m);
+                     pose.value().position_m.x_m,
+                     pose.value().position_m.y_m,
+                     pose.value().position_m.z_m);
                  d["orientation_xyzw"] = py::make_tuple(
-                     pose.orientation.x, pose.orientation.y,
-                     pose.orientation.z, pose.orientation.w);
+                     pose.value().orientation.x,
+                     pose.value().orientation.y,
+                     pose.value().orientation.z,
+                     pose.value().orientation.w);
                  link_poses[py::str(link_name)] = d;
                } catch (...) {
                  // Skip links FK can't resolve — frontend just won't

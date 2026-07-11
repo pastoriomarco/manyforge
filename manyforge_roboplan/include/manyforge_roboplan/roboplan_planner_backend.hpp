@@ -18,6 +18,8 @@
 
 namespace manyforge::roboplan_backend {
 
+class RoboPlanSceneProjection;
+
 /// Result of sampling per-joint peak velocity/acceleration against requested
 /// absolute caps (Phase 4-P5.1K). Consumed by the conservative retiming loop in
 /// RoboPlanPlannerBackend::plan and exercised directly by unit tests.
@@ -54,11 +56,10 @@ JointCapMeasurement measure_joint_cap_peaks(
 /// No Python trampolines — all calls stay in C++.
 class RoboPlanPlannerBackend final : public core::IPlannerBackend {
  public:
-  RoboPlanPlannerBackend(std::shared_ptr<roboplan::Scene> scene,
+  RoboPlanPlannerBackend(
+                         std::shared_ptr<RoboPlanSceneProjection> projection,
+                         std::shared_ptr<roboplan::Scene> live_scene,
                          const roboplan::RRTOptions& rrt_options,
-                         std::shared_ptr<roboplan::PathShortcutter> shortcutter,
-                         std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra,
-                         std::shared_ptr<roboplan::SimpleIk> ik,
                          std::shared_ptr<std::mutex> scene_mutex = nullptr,
                          std::shared_ptr<roboplan::SimpleIk> single_shot_ik = nullptr,
                          std::optional<roboplan::SimpleIkOptions> ik_options = std::nullopt,
@@ -74,11 +75,9 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
  private:
   core::TrajectoryDTO convert_trajectory(const roboplan::JointTrajectory& traj);
 
-  std::shared_ptr<roboplan::Scene> scene_;
+  std::shared_ptr<RoboPlanSceneProjection> projection_;
+  std::shared_ptr<roboplan::Scene> live_scene_;
   roboplan::RRTOptions rrt_options_;
-  std::shared_ptr<roboplan::PathShortcutter> shortcutter_;
-  std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra_;
-  std::shared_ptr<roboplan::SimpleIk> ik_;
   std::shared_ptr<roboplan::SimpleIk> single_shot_ik_;
   std::shared_ptr<std::mutex> scene_mutex_;
   roboplan::SimpleIkOptions ik_options_;

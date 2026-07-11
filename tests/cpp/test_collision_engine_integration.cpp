@@ -1,13 +1,12 @@
 // Chunk 4 unit tests for ManyForgeCollisionEngine: independent
 // per-instance scenes, concurrent queries on separate instances,
 // agreement with the RoboPlan path on a primitive fixture, and
-// no-scene-lock-contention against the planning context.
+// no-scene-lock-contention against the planner projection.
 
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <roboplan_example_models/resources.hpp>
 #include <manyforge_roboplan/native_kernel_factory.hpp>
-#include <manyforge_roboplan/roboplan_planning_context.hpp>
 
 #include <gtest/gtest.h>
 
@@ -47,7 +46,6 @@ using manyforge::core::TrajectoryWaypointDTO;
 using manyforge::core::Vector3DTO;
 using manyforge::collision::ManyForgeCollisionEngine;
 using manyforge::roboplan_backend::NativeKernelBundle;
-using manyforge::roboplan_backend::RoboPlanPlanningContext;
 using manyforge::roboplan_backend::create_native_kernel;
 
 std::shared_ptr<ManyForgeCollisionEngine> make_engine(
@@ -116,6 +114,17 @@ std::shared_ptr<ManyForgeCollisionEngine> make_ur10e_engine() {
       model_dir / "ur10e_robotiq_2f_140.srdf",
       std::vector<std::filesystem::path>{root},
       "arm");
+}
+
+manyforge::core::RobotStateDTO observed_state(
+    const NativeKernelBundle& bundle) {
+  auto state = bundle.observed_state_provider->current_state(
+      bundle.clock->now());
+  if (!state.ok()) {
+    throw std::runtime_error("observed state unavailable in test fixture: " +
+                             state.error().message);
+  }
+  return std::move(state.value());
 }
 
 CollisionQuery make_query(const std::vector<double>& positions) {
@@ -289,22 +298,81 @@ TEST(ManyForgeCollisionEngineTest, EngineExposesStableIdAndVersion) {
   EXPECT_FALSE(engine->engine_version().empty());
 }
 
+TEST(ManyForgeCollisionEngineTest,
+     DedicatedRuntimeSurfacePreparesAndTracksPublishedRevisions) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  auto snapshot = bundle->scene_authority->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  const auto state = observed_state(*bundle);
+  auto engine = make_engine();
+
+  const auto& capability = engine->capability();
+  EXPECT_EQ(capability.runtime_query_memory_model,
+            manyforge::core::RuntimeCollisionQueryMemoryModel::kMeasuredBounded);
+  EXPECT_GT(capability.runtime_query_clean_allocation_upper_bound, 0u);
+  EXPECT_GT(capability.runtime_query_qualified_wcet_ns, 0u);
+  EXPECT_TRUE(capability.runtime_query_snapshot_change_may_allocate);
+  EXPECT_GT(
+      capability.runtime_query_snapshot_change_allocation_upper_bound, 0u);
+  EXPECT_GT(capability.runtime_query_snapshot_change_qualified_wcet_ns, 0u);
+  ASSERT_EQ(engine->prepare_runtime_query(state.joint_names),
+            manyforge::core::RuntimeCollisionQueryPrepareStatus::kReady);
+  ASSERT_EQ(engine->prepare_runtime_snapshot(*snapshot),
+            manyforge::core::RuntimeCollisionQueryPrepareStatus::kReady);
+
+  manyforge::core::RuntimeCollisionQueryRequest request;
+  request.positions_rad = state.positions_rad;
+  request.state_time_ns = 1;
+  request.timeout_budget_ns = 100'000'000;
+  auto clear = engine->check_runtime(*snapshot, request);
+  EXPECT_NE(clear.status,
+            manyforge::core::RuntimeCollisionQueryStatus::kInconclusive);
+
+  ASSERT_TRUE(bundle->scene_authority->add_object(
+                         make_large_collision_box("runtime_collision_box"))
+                  .success);
+  auto collision_snapshot = bundle->scene_authority->snapshot();
+  ASSERT_NE(collision_snapshot, nullptr);
+  auto collision = engine->check_runtime(*collision_snapshot, request);
+  EXPECT_EQ(collision.status,
+            manyforge::core::RuntimeCollisionQueryStatus::kCollision);
+  EXPECT_FALSE(collision.collision_pairs.empty());
+  for (const auto& observation : collision.collision_pairs) {
+    ASSERT_NE(observation.pair, nullptr);
+    EXPECT_LE(observation.pair->body_a, observation.pair->body_b);
+  }
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     DedicatedRuntimeSurfaceRejectsDuplicateFullConfigurationNames) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  auto state = observed_state(*bundle);
+  ASSERT_GE(state.joint_names.size(), 2u);
+  ASSERT_EQ(state.joint_names.size(), state.positions_rad.size());
+  state.joint_names.back() = state.joint_names.front();
+  auto engine = make_engine();
+
+  EXPECT_EQ(engine->prepare_runtime_query(state.joint_names),
+            manyforge::core::RuntimeCollisionQueryPrepareStatus::
+                kInvalidJointOrder);
+}
+
 // --- Concurrent queries on separate instances -----------------------------
 
 TEST(ManyForgeCollisionEngineTest,
      ConcurrentQueriesOnDifferentInstancesComplete) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  auto snapshot = context->snapshot();
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
 
   auto engine_a = make_engine();
   auto engine_b = make_engine();
   CollisionQuery q;
   q.query_id = "concurrent-non-colliding-snapshot";
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
 
   std::atomic<int> done{0};
   std::atomic<bool> any_failed{false};
@@ -334,11 +402,9 @@ TEST(ManyForgeCollisionEngineTest,
      ConcurrentCollidingSnapshotQueriesDoNotRaceDiagnosticCapture) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  ASSERT_TRUE(context->add_object(make_large_collision_box("collision_box"))
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_large_collision_box("collision_box"))
                   .success);
-  auto snapshot = context->snapshot();
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
 
   auto engine_a = make_engine("ur5_gripper", "arm");
@@ -346,7 +412,7 @@ TEST(ManyForgeCollisionEngineTest,
 
   CollisionQuery q;
   q.query_id = "concurrent-colliding-snapshot";
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.collision_world_revision = snapshot->revision;
   q.required_capabilities = {"binary_collision", "body_pair_only"};
   CollisionPolicySnapshot policy;
@@ -389,41 +455,37 @@ TEST(ManyForgeCollisionEngineTest,
 // --- Compare-mode parity on a primitive fixture ---------------------------
 
 TEST(ManyForgeCollisionEngineTest,
-     AgreesWithLegacyOnFreeJointStateAgainstSameModel) {
+     AgreesWithDiagnosticComparatorOnFreeJointStateAgainstSameModel) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
 
   auto engine = make_engine("ur5_gripper", "arm");
 
   // Use the current robot state from the kernel bundle as the input.
-  auto current = context->get_current_state();
+  auto current = observed_state(*bundle);
   CollisionQuery q;
   q.query_id = "parity";
   q.robot_state = current;
 
-  auto snapshot = context->snapshot();
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
   auto direct = check_snapshot(*engine, *snapshot, q);
-  auto legacy = context->collision_check_normalized(q);
-  EXPECT_EQ(direct.in_collision, legacy.in_collision);
+  auto diagnostic = bundle->collision_diagnostic_comparator->compare(q);
+  EXPECT_EQ(direct.in_collision, diagnostic.in_collision);
 }
 
 TEST(ManyForgeCollisionEngineTest,
      SnapshotPortAcceptsPrimitiveSceneSnapshotWithBodyPairCapability) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  ASSERT_TRUE(context->add_object(make_box_object("box_a")).success);
-  auto snapshot = context->snapshot();
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_box_object("box_a")).success);
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
 
   auto engine = make_engine("ur5_gripper", "arm");
   CollisionQuery q;
   q.query_id = "snapshot-primitive";
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.collision_world_revision = snapshot->revision;
   q.required_capabilities = {"binary_collision", "body_pair_only"};
   CollisionPolicySnapshot policy;
@@ -444,16 +506,14 @@ TEST(ManyForgeCollisionEngineTest,
      SnapshotPortAppliesTimeoutBudgetToFullCall) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  ASSERT_TRUE(context->add_object(make_box_object("box_a")).success);
-  auto snapshot = context->snapshot();
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_box_object("box_a")).success);
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
 
   auto engine = make_engine("ur5_gripper", "arm");
   CollisionQuery q;
   q.query_id = "snapshot-timeout";
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.collision_world_revision = snapshot->revision;
   q.timeout_budget_ns = 1;
   CollisionPolicySnapshot policy;
@@ -477,10 +537,8 @@ TEST(ManyForgeCollisionEngineTest,
      ObservedRuntimeMonitorReportsSnapshotSyncSeparately) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  ASSERT_TRUE(context->add_object(make_mesh_object("mesh_a")).success);
-  auto snapshot = context->snapshot();
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_mesh_object("mesh_a")).success);
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
   ASSERT_TRUE(snapshot->contains_mesh_geometry);
 
@@ -488,7 +546,7 @@ TEST(ManyForgeCollisionEngineTest,
   CollisionQuery q;
   q.query_id = "observed-runtime-sync-separate";
   q.surface = CollisionSurface::kObservedRuntimeMonitor;
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.collision_world_revision = snapshot->revision;
   CollisionPolicySnapshot policy;
   CollisionCancellationToken cancel;
@@ -510,17 +568,15 @@ TEST(ManyForgeCollisionEngineTest,
      SnapshotPortLoadsTriangleMeshSceneObject) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  ASSERT_TRUE(context->add_object(make_mesh_object("mesh_a")).success);
-  auto snapshot = context->snapshot();
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_mesh_object("mesh_a")).success);
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
   ASSERT_TRUE(snapshot->contains_mesh_geometry);
 
   auto engine = make_engine("ur5_gripper", "arm");
   CollisionQuery q;
   q.query_id = "snapshot-mesh";
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.collision_world_revision = snapshot->revision;
   CollisionPolicySnapshot policy;
   CollisionCancellationToken cancel;
@@ -539,21 +595,19 @@ TEST(ManyForgeCollisionEngineTest,
      PassiveMeshSceneContactDoesNotEnterMotionEnginePairGraph) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  ASSERT_TRUE(context->add_object(make_mesh_object("mesh_a")).success);
-  ASSERT_TRUE(context->add_object(make_box_object("box_a", 0.7)).success);
-  auto snapshot = context->snapshot();
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_mesh_object("mesh_a")).success);
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_box_object("box_a", 0.7)).success);
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
   ASSERT_TRUE(snapshot->contains_mesh_geometry);
-  auto policy = context->collision_policy_snapshot();
+  auto policy = bundle->scene_authority->collision_policy_snapshot();
   ASSERT_TRUE(policy.has_value());
   ASSERT_FALSE(policy->allowed_static_static_pairs.empty());
 
   auto engine = make_engine("ur5_gripper", "arm");
   CollisionQuery q;
   q.query_id = "snapshot-mesh-static-contact";
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.collision_world_revision = snapshot->revision;
   CollisionCancellationToken cancel;
 
@@ -586,22 +640,23 @@ TEST(ManyForgeCollisionEngineTest,
      IsaacMeshTableCheeseStartContactDoesNotEnterMotionEnginePairGraph) {
   auto bundle = make_ur10e_bundle();
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  context->set_robot_base_pose(make_pose(
+  manyforge::core::SetRobotBasePoseRequestDTO placement;
+  placement.robot_id = bundle->robot_id;
+  placement.pose_in_world = make_pose(
       Vector3DTO{-0.21814000606536865, -0.571590006351471,
                  0.12999999523162842},
       manyforge::core::QuaternionDTO{0.0, 0.0, -0.7071067690849304,
-                                     0.7071067932881648}));
+                                     0.7071067932881648});
+  ASSERT_TRUE(bundle->scene_authority->set_robot_base_pose(placement).success);
 
-  ASSERT_TRUE(context->add_object(make_isaac_mesh_object(
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_isaac_mesh_object(
                   "isaac_table_low_327",
                   "examples/isaac_manipulator_scene_light/meshes/"
                   "background__table_low_327_collider_cooked.obj",
                   Vector3DTO{1.0, 1.5, 1.149999976},
                   Vector3DTO{0.0, 0.0, -0.7695999827980996}))
                   .success);
-  ASSERT_TRUE(context->add_object(make_isaac_mesh_object(
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_isaac_mesh_object(
                   "isaac_cheese_box",
                   "examples/isaac_manipulator_scene_light/meshes/"
                   "mac_n_cheese_centered_collider_cooked.obj",
@@ -612,7 +667,7 @@ TEST(ManyForgeCollisionEngineTest,
                       0.5020703673362732, -0.518012523651123,
                       -0.4821583032608032, 0.49710360169410706}))
                   .success);
-  ASSERT_TRUE(context->add_object(make_isaac_mesh_object(
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_isaac_mesh_object(
                   "isaac_soup_can",
                   "examples/isaac_manipulator_scene_light/meshes/"
                   "World__soup_can_collider_cooked.obj",
@@ -623,7 +678,7 @@ TEST(ManyForgeCollisionEngineTest,
                       0.03936762849031647, 0.705935907260489,
                       0.706009404317132, 0.04068667697327009}))
                   .success);
-  ASSERT_TRUE(context->add_object(make_isaac_mesh_object(
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_isaac_mesh_object(
                   "isaac_small_KLT",
                   "examples/isaac_manipulator_scene_light/meshes/"
                   "World__small_KLT_collider_primitives.obj",
@@ -633,7 +688,7 @@ TEST(ManyForgeCollisionEngineTest,
                       -7.463636797056011e-07, 0.0014223730063974037,
                       5.845196084198735e-05, 0.9999989867184076}))
                   .success);
-  ASSERT_TRUE(context->add_object(make_isaac_mesh_object(
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_isaac_mesh_object(
                   "isaac_small_KLT_01",
                   "examples/isaac_manipulator_scene_light/meshes/"
                   "World__small_KLT_01_collider_primitives.obj",
@@ -645,9 +700,9 @@ TEST(ManyForgeCollisionEngineTest,
                       -3.4923311013172767e-07, 0.9999995827699003}))
                   .success);
 
-  auto snapshot = context->snapshot();
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
-  auto policy = context->collision_policy_snapshot();
+  auto policy = bundle->scene_authority->collision_policy_snapshot();
   ASSERT_TRUE(policy.has_value());
   ASSERT_FALSE(policy->allowed_static_static_pairs.empty());
 
@@ -687,10 +742,8 @@ TEST(ManyForgeCollisionEngineTest,
      AttachedObjectTouchLinksHonorExplicitGripperCollisionEnvelope) {
   auto bundle = make_ur10e_bundle();
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
 
-  ASSERT_TRUE(context->add_object(make_box_object("grasped_box")).success);
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_box_object("grasped_box")).success);
   AttachObjectRequestDTO attach;
   attach.object_id = "grasped_box";
   attach.frame_id = "grasp_frame";
@@ -705,20 +758,20 @@ TEST(ManyForgeCollisionEngineTest,
                         "right_outer_finger",
                         "right_inner_knuckle",
                         "right_inner_finger_pad"};
-  const auto attach_result = context->attach_object(attach);
+  const auto attach_result = bundle->scene_authority->attach_object(attach);
   ASSERT_TRUE(attach_result.success)
       << (attach_result.error ? attach_result.error->message : "");
 
-  auto policy = context->collision_policy_snapshot();
+  auto policy = bundle->scene_authority->collision_policy_snapshot();
   ASSERT_TRUE(policy.has_value());
   const std::string object_body =
-      "robot/robot0/attached/grasped_box/shape/0";
+      "robot/ur10e_robotiq_2f_140/attached/grasped_box/shape/0";
   const std::string left_knuckle_body =
-      "robot/robot0/link/left_inner_knuckle/collision/0";
+      "robot/ur10e_robotiq_2f_140/link/left_inner_knuckle/collision/0";
   const std::string right_knuckle_body =
-      "robot/robot0/link/right_inner_knuckle/collision/0";
+      "robot/ur10e_robotiq_2f_140/link/right_inner_knuckle/collision/0";
   const std::string gripper_base_body =
-      "robot/robot0/link/robotiq_base_link/collision/0";
+      "robot/ur10e_robotiq_2f_140/link/robotiq_base_link/collision/0";
   const auto has_pair = [&](const std::string& a, const std::string& b) {
     manyforge::core::CollisionPairId expected{a, b};
     if (expected.body_b < expected.body_a) {
@@ -736,15 +789,13 @@ TEST(ManyForgeCollisionEngineTest,
 TEST(ManyForgeCollisionEngineTest, SnapshotPortRejectsStaleRevision) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  auto snapshot = context->snapshot();
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
 
   auto engine = make_engine("ur5_gripper", "arm");
   CollisionQuery q;
   q.query_id = "snapshot-stale";
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.collision_world_revision = snapshot->revision;
   q.collision_world_revision.revision_id += 1;
   CollisionPolicySnapshot policy;
@@ -764,9 +815,7 @@ TEST(ManyForgeCollisionEngineTest,
      SnapshotPortRejectsUnknownSnapshotFormatWithDiagnostic) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  auto snapshot = context->snapshot();
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
   auto unsupported_snapshot = *snapshot;
   unsupported_snapshot.snapshot_format_version = 99;
@@ -774,7 +823,7 @@ TEST(ManyForgeCollisionEngineTest,
   auto engine = make_engine("ur5_gripper", "arm");
   CollisionQuery q;
   q.query_id = "snapshot-format";
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.collision_world_revision = unsupported_snapshot.revision;
   CollisionPolicySnapshot policy;
   CollisionCancellationToken cancel;
@@ -789,15 +838,13 @@ TEST(ManyForgeCollisionEngineTest,
 TEST(ManyForgeCollisionEngineTest, SnapshotPortHonorsCancellation) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  auto snapshot = context->snapshot();
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
 
   auto engine = make_engine("ur5_gripper", "arm");
   CollisionQuery q;
   q.query_id = "snapshot-cancel";
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.collision_world_revision = snapshot->revision;
   CollisionPolicySnapshot policy;
   CollisionCancellationToken cancel;
@@ -813,14 +860,12 @@ TEST(ManyForgeCollisionEngineTest,
      RequiredUnsupportedDiagnosticCapabilityFailsClosed) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  auto snapshot = context->snapshot();
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
   auto engine = make_engine("ur5_gripper", "arm");
 
   CollisionQuery q;
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.required_capabilities = {"contact_points"};
   auto result = check_snapshot(*engine, *snapshot, q);
 
@@ -834,15 +879,13 @@ TEST(ManyForgeCollisionEngineTest,
      RequiredDistanceCapabilityPopulatesSignedClearance) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  ASSERT_TRUE(context->add_object(make_box_object("distance_box")).success);
-  auto snapshot = context->snapshot();
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_box_object("distance_box")).success);
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
   auto engine = make_engine("ur5_gripper", "arm");
 
   CollisionQuery q;
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.required_capabilities = {"distance", "penetration_depth"};
   auto result = check_snapshot(*engine, *snapshot, q);
 
@@ -857,14 +900,12 @@ TEST(ManyForgeCollisionEngineTest,
 TEST(ManyForgeCollisionEngineTest, ZeroTimeoutFailsClosedWithoutQueryPass) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  auto snapshot = context->snapshot();
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
   auto engine = make_engine("ur5_gripper", "arm");
 
   CollisionQuery q;
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.timeout_budget_ns = 0;
   auto result = check_snapshot(*engine, *snapshot, q);
 
@@ -878,9 +919,7 @@ TEST(ManyForgeCollisionEngineTest, ZeroTimeoutFailsClosedWithoutQueryPass) {
 TEST(ManyForgeCollisionEngineTest, MalformedQueryFailsClosedWithoutThrowing) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
-  auto snapshot = context->snapshot();
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
   auto engine = make_engine("ur5_gripper", "definitely_not_a_group");
 
@@ -899,28 +938,26 @@ TEST(ManyForgeCollisionEngineTest, MalformedQueryFailsClosedWithoutThrowing) {
 // --- No scene-lock contention --------------------------------------------
 
 TEST(ManyForgeCollisionEngineTest,
-     QueryProceedsEvenWhilePlanningContextSceneIsHeavilyBusy) {
+     QueryProceedsEvenWhilePlannerProjectionIsHeavilyBusy) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
 
   auto engine = make_engine("ur5_gripper", "arm");
 
-  auto snapshot = context->snapshot();
+  auto snapshot = bundle->scene_authority->snapshot();
   ASSERT_NE(snapshot, nullptr);
   CollisionQuery direct_query;
-  direct_query.robot_state = context->get_current_state();
+  direct_query.robot_state = observed_state(*bundle);
 
-  // Background thread hammers the planning context's scene_mutex_
-  // via repeated get_current_state() / collision_check_normalized().
+  // Background thread hammers the planner projection's scene mutex through
+  // observation copies and non-authoritative diagnostic comparisons.
   // The ManyForge-owned collision engine should not be blocked by that load.
   std::atomic<bool> stop{false};
   auto thrasher = std::thread([&] {
     while (!stop.load()) {
       CollisionQuery q;
-      q.robot_state = context->get_current_state();
-      auto r = context->collision_check_normalized(q);
+      q.robot_state = observed_state(*bundle);
+      auto r = bundle->collision_diagnostic_comparator->compare(q);
       (void)r;
     }
   });
@@ -945,18 +982,16 @@ TEST(ManyForgeCollisionEngineTest,
      CompareModeEmitsMismatchEventWhenEnginesDisagree) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
-  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
-  ASSERT_NE(context, nullptr);
 
   // Compare mode is generic: the RoboPlan adapter sees only an
   // ICollisionQueryEngine, not the concrete manyforge_collision type.
   auto secondary = std::make_shared<AlwaysIncompleteCompareEngine>();
-  context->set_collision_engine_for_compare(secondary);
+  bundle->collision_diagnostic_comparator->set_compare_engine(secondary);
 
   std::atomic<int> mismatch_count{0};
   std::atomic<bool> saw_secondary_incomplete{false};
   std::atomic<bool> saw_timestamp{false};
-  context->set_engine_mismatch_record_emitter(
+  bundle->collision_diagnostic_comparator->set_mismatch_record_emitter(
       [&mismatch_count, &saw_secondary_incomplete, &saw_timestamp](
           manyforge::core::CollisionEngineMismatchRecord record) {
         auto status_it = record.raw_diagnostics.find("secondary_engine_status");
@@ -971,17 +1006,17 @@ TEST(ManyForgeCollisionEngineTest,
       });
 
   CollisionQuery q;
-  q.robot_state = context->get_current_state();
+  q.robot_state = observed_state(*bundle);
   q.required_capabilities = {"body_pair_only"};
-  context->collision_check_normalized(q);
+  bundle->collision_diagnostic_comparator->compare(q);
 
   EXPECT_GT(mismatch_count.load(), 0);
   EXPECT_TRUE(saw_secondary_incomplete.load());
   EXPECT_TRUE(saw_timestamp.load());
 
   // Reset to disabled.
-  context->set_collision_engine_for_compare(nullptr);
-  context->set_engine_mismatch_record_emitter({});
+  bundle->collision_diagnostic_comparator->set_compare_engine(nullptr);
+  bundle->collision_diagnostic_comparator->set_mismatch_record_emitter({});
 }
 
 }  // namespace

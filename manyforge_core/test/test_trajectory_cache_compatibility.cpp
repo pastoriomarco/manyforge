@@ -1,83 +1,44 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
-#include <manyforge_core/ports/iplanning_context.hpp>
+#include <manyforge_core/ports/irobot_kinematics.hpp>
 
 #include <stdexcept>
 
 namespace manyforge::core {
 namespace {
 
-class FkOnlyPlanningContext final : public IPlanningContext {
+class FkOnlyKinematics final : public IRobotKinematics {
  public:
   Pose3DTO next_fk;
   bool throw_fk = false;
-  FkRequestDTO last_fk_request;
+  mutable FkRequestDTO last_fk_request;
 
-  RobotStateDTO get_current_state() override { return {}; }
-
-  ValidationResultDTO validate_trajectory(
-      const TrajectoryDTO& /*trajectory*/,
-      const ValidationOptionsDTO& /*options*/) override {
-    return ValidationResultDTO{true, std::nullopt};
-  }
-
-  CollisionCheckResultDTO collision_check(
-      const CollisionCheckRequestDTO& /*request*/) override {
-    return {};
-  }
-
-  Pose3DTO forward_kinematics(const FkRequestDTO& request) override {
+  Result<Pose3DTO> forward_kinematics(
+      const FkRequestDTO& request) const override {
     last_fk_request = request;
     if (throw_fk) {
-      throw std::runtime_error("fk failed");
+      return Result<Pose3DTO>::Err(ErrorDTO{
+          kErrorInvalidRequest, "fk failed", {{"reason", "fk_failed"}}});
     }
-    return next_fk;
+    return Result<Pose3DTO>::Ok(next_fk);
   }
 
-  Pose3DTO get_object_pose(const std::string& /*object_id*/,
-                           const std::string& /*base_frame*/) override {
-    return {};
+  Result<std::map<std::string, Pose3DTO>> forward_kinematics_batch(
+      const RobotStateDTO&,
+      const std::vector<std::string>&,
+      const std::string&) const override {
+    return Result<std::map<std::string, Pose3DTO>>::Ok({});
   }
 
-  ObjectStateDTO get_object_state(const std::string& /*object_id*/) override {
-    return {};
+  Result<JointLimitsDTO> joint_limits(
+      const std::string&, const std::string&) const override {
+    return Result<JointLimitsDTO>::Ok({});
   }
 
-  Result<Pose3DTO> resolve_reference_pose(
-      const ReferenceDTO& /*reference*/,
-      const std::string& /*base_frame*/) override {
-    return Result<Pose3DTO>::Ok(Pose3DTO{});
-  }
-
-  JointLimitsDTO get_joint_limits(const std::string& /*robot_id*/,
-                                  const std::string& /*group_id*/) override {
-    return {};
-  }
-
-  SceneEditResultDTO add_object(
-      const AddObjectRequestDTO& /*request*/) override {
-    return SceneEditResultDTO{true, std::nullopt};
-  }
-
-  SceneEditResultDTO remove_object(
-      const RemoveObjectRequestDTO& /*request*/) override {
-    return SceneEditResultDTO{true, std::nullopt};
-  }
-
-  SceneEditResultDTO update_object_pose(
-      const UpdateObjectPoseRequestDTO& /*request*/) override {
-    return SceneEditResultDTO{true, std::nullopt};
-  }
-
-  SceneEditResultDTO attach_object(
-      const AttachObjectRequestDTO& /*request*/) override {
-    return SceneEditResultDTO{true, std::nullopt};
-  }
-
-  SceneEditResultDTO detach_object(
-      const DetachObjectRequestDTO& /*request*/) override {
-    return SceneEditResultDTO{true, std::nullopt};
+  Result<std::vector<std::string>> group_joint_names(
+      const std::string&) const override {
+    return Result<std::vector<std::string>>::Ok({});
   }
 };
 
@@ -116,7 +77,7 @@ ExecuteRequestDTO make_pose_request(Pose3DTO goal) {
 
 TEST(TrajectoryCacheCompatibilityTest,
      JointGoalMatchesByNameIndependentOfOrder) {
-  FkOnlyPlanningContext context;
+  FkOnlyKinematics context;
   auto trajectory = make_two_joint_trajectory();
   auto request =
       make_joint_request({"joint_b", "joint_a"}, {-0.5, 1.0});
@@ -130,7 +91,7 @@ TEST(TrajectoryCacheCompatibilityTest,
 
 TEST(TrajectoryCacheCompatibilityTest,
      JointGoalRejectsDuplicateTrajectoryNamesAsUnverifiable) {
-  FkOnlyPlanningContext context;
+  FkOnlyKinematics context;
   auto trajectory = make_two_joint_trajectory();
   trajectory.joint_names = {"joint_a", "joint_a"};
   auto request =
@@ -145,7 +106,7 @@ TEST(TrajectoryCacheCompatibilityTest,
 
 TEST(TrajectoryCacheCompatibilityTest,
      JointGoalRejectsDifferentEndpointAsChanged) {
-  FkOnlyPlanningContext context;
+  FkOnlyKinematics context;
   auto trajectory = make_two_joint_trajectory();
   auto request =
       make_joint_request({"joint_a", "joint_b"}, {1.25, -0.5});
@@ -184,7 +145,7 @@ TEST(TrajectoryCacheCompatibilityTest, CurrentStartRejectsStalePosition) {
 }
 
 TEST(TrajectoryCacheCompatibilityTest, PoseGoalUsesFinalWaypointFk) {
-  FkOnlyPlanningContext context;
+  FkOnlyKinematics context;
   context.next_fk.position_m = {0.1, 0.2, 0.3};
   context.next_fk.orientation = {0.0, 0.0, 0.0, 1.0};
   auto trajectory = make_two_joint_trajectory();
@@ -203,7 +164,7 @@ TEST(TrajectoryCacheCompatibilityTest, PoseGoalUsesFinalWaypointFk) {
 }
 
 TEST(TrajectoryCacheCompatibilityTest, PoseGoalRejectsFkFailure) {
-  FkOnlyPlanningContext context;
+  FkOnlyKinematics context;
   context.throw_fk = true;
   auto trajectory = make_two_joint_trajectory();
   auto request = make_pose_request(Pose3DTO{});

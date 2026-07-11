@@ -108,7 +108,7 @@ bool fallback_row_allows_command_source(
 bool robot_state_size_ordering_ok(const RobotStateDTO& state);
 std::optional<ExecutionStopSnapshotDTO> capture_stop_snapshot(
     const ExecutionSnapshot& post_stop_backend_snapshot,
-    const std::optional<RobotStateDTO>& planning_context_state,
+    const std::optional<RobotStateDTO>& observed_state_provider_state,
     bool backend_stop_confirmed,
     MotionInterruptNodeCategory node_category,
     std::int64_t captured_at_ns,

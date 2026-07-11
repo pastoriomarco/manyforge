@@ -2,7 +2,7 @@
 //
 // Measures the per-call overhead of the body-id mapper's hot path:
 // rebuild + N lookups. This is the only new code Chunk 1 adds to the
-// collision_check call site; legacy collision_check itself is unchanged.
+// diagnostic-comparator call site; the planner-native query itself is unchanged.
 //
 // Output: prints a single JSON line on stdout when MANYFORGE_PERF_JSON_OUT
 // is set to a writable file path; otherwise prints the same JSON to stdout.
@@ -14,7 +14,7 @@
 // data calibrates a sensible threshold — see the implementation note).
 
 #include <manyforge_roboplan/collision_body_id_mapper.hpp>
-#include <manyforge_roboplan/roboplan_planning_context.hpp>
+#include <manyforge_roboplan/roboplan_projection_backend.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -31,9 +31,9 @@ namespace {
 using manyforge::core::CollisionShapeDTO;
 using manyforge::core::BoxShapeDTO;
 using manyforge::roboplan_backend::RoboPlanCollisionBodyIdMapper;
-using manyforge::roboplan_backend::RoboPlanPlanningContext;
+using manyforge::roboplan_backend::RoboPlanProjectionBackend;
 
-using Snapshot = RoboPlanPlanningContext::SceneObjectSnapshot;
+using Snapshot = RoboPlanProjectionBackend::SceneObjectSnapshot;
 
 Snapshot make_object(const std::string& id, bool attached) {
   Snapshot s;

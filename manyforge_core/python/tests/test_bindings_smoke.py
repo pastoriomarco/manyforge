@@ -326,6 +326,7 @@ def test_scene_edit_result_dto():
     assert r.update_status is None
     assert r.collision_world_revision_changed is False
     assert r.collision_world_freshness_changed is False
+    assert r.rollback_proven is False
     r.update_status = "freshness_only"
     r.collision_world_freshness_changed = True
     assert r.update_status == "freshness_only"

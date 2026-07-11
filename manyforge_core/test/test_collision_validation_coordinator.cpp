@@ -3,6 +3,7 @@
 // preservation, and pose-source borrow/retry behavior.
 
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
+#include <manyforge_core/execution_collision_support.hpp>
 
 #include <gtest/gtest.h>
 
@@ -466,6 +467,12 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_EQ(bundle.waypoint_records.front()
                 .result.raw_diagnostics.at("contact_release_violation"),
             "initial_penetration_exceeds_policy");
+  std::map<std::string, std::string> details;
+  append_collision_failure_diagnostics(details, bundle);
+  EXPECT_EQ(pre_dispatch_collision_validation_message(
+                details, bundle.decision.action),
+            "Support-contact initial penetration exceeds the permitted "
+            "envelope: object/box <-> robot/grasp");
 }
 
 TEST(CollisionValidationCoordinatorTest,
@@ -553,6 +560,17 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_EQ(bundle.waypoint_records.back()
                 .result.raw_diagnostics.at("contact_release_violation"),
             "final_sample_not_separated");
+
+  std::map<std::string, std::string> details;
+  append_collision_failure_diagnostics(details, bundle);
+  EXPECT_EQ(details.at("collision_result_contact_release_violation"),
+            "final_sample_not_separated");
+  EXPECT_EQ(details.at("collision_result_contact_release_pair"),
+            "object/box <-> robot/grasp");
+  EXPECT_EQ(pre_dispatch_collision_validation_message(
+                details, bundle.decision.action),
+            "Support-contact pair did not separate by final waypoint: "
+            "object/box <-> robot/grasp");
 }
 
 TEST(CollisionValidationCoordinatorTest,

@@ -140,6 +140,65 @@ std::string format_double(double value) {
   return out.str();
 }
 
+RuntimeCollisionUnavailableReason classify_runtime_collision_unavailable_reason(
+    std::string_view reason) noexcept {
+  if (reason == "missing_collision_world_snapshot_publisher" ||
+      reason == "missing_runtime_collision_query_engine" ||
+      reason.find("collision_resources") != std::string_view::npos) {
+    return RuntimeCollisionUnavailableReason::kCollisionResources;
+  }
+  if (reason.find("snapshot") != std::string_view::npos ||
+      reason.find("collision_policy") != std::string_view::npos) {
+    return RuntimeCollisionUnavailableReason::kCollisionSnapshot;
+  }
+  if (reason.find("dynamic_collision_body") != std::string_view::npos ||
+      reason.find("dynamic_body_freshness") != std::string_view::npos) {
+    return RuntimeCollisionUnavailableReason::kDynamicBodyFreshness;
+  }
+  if (reason == "observed_state_unavailable") {
+    return RuntimeCollisionUnavailableReason::kObservedStateUnavailable;
+  }
+  if (reason == "stale_observed_robot_state") {
+    return RuntimeCollisionUnavailableReason::kObservedStateStale;
+  }
+  if (reason == "observed_state_incomplete") {
+    return RuntimeCollisionUnavailableReason::kObservedStateIncomplete;
+  }
+  if (reason.find("runtime_collision_projection") != std::string_view::npos) {
+    return RuntimeCollisionUnavailableReason::kObservedStateProjection;
+  }
+  if (reason.find("engine") != std::string_view::npos ||
+      reason.find("inconclusive") != std::string_view::npos) {
+    return RuntimeCollisionUnavailableReason::kCollisionQuery;
+  }
+  return RuntimeCollisionUnavailableReason::kOther;
+}
+
+const char* runtime_collision_unavailable_reason_name(
+    RuntimeCollisionUnavailableReason reason) noexcept {
+  switch (reason) {
+    case RuntimeCollisionUnavailableReason::kCollisionResources:
+      return "collision_resources";
+    case RuntimeCollisionUnavailableReason::kCollisionSnapshot:
+      return "collision_snapshot";
+    case RuntimeCollisionUnavailableReason::kDynamicBodyFreshness:
+      return "dynamic_body_freshness";
+    case RuntimeCollisionUnavailableReason::kObservedStateUnavailable:
+      return "observed_state_unavailable";
+    case RuntimeCollisionUnavailableReason::kObservedStateStale:
+      return "observed_state_stale";
+    case RuntimeCollisionUnavailableReason::kObservedStateIncomplete:
+      return "observed_state_incomplete";
+    case RuntimeCollisionUnavailableReason::kObservedStateProjection:
+      return "observed_state_projection";
+    case RuntimeCollisionUnavailableReason::kCollisionQuery:
+      return "collision_query";
+    case RuntimeCollisionUnavailableReason::kOther:
+      return "other";
+  }
+  return "other";
+}
+
 bool snapshot_too_old(std::int64_t now_ns,
                       std::int64_t timestamp_ns,
                       std::int64_t max_age_ns,
@@ -172,75 +231,124 @@ std::optional<std::string> validate_dynamic_body_freshness(
     std::int64_t now_ns,
     std::int64_t runtime_cap_ns,
     std::map<std::string, std::string>& details) {
-  if (!std::is_sorted(body_freshness.begin(),
-                      body_freshness.end(),
-                      [](const auto& lhs, const auto& rhs) {
-                        return lhs.body_id < rhs.body_id;
-                      })) {
+  const auto check = check_runtime_dynamic_body_freshness(
+      snapshot, body_freshness, now_ns, runtime_cap_ns);
+  if (check.status == RuntimeDynamicBodyFreshnessStatus::kSidecarUnsorted) {
     details["dynamic_body_freshness_sidecar_status"] = "unsorted";
-    return "dynamic_body_freshness_sidecar_not_sorted";
+    return runtime_dynamic_body_freshness_reason(check.status);
+  }
+  if (check.body != nullptr) {
+    details["dynamic_body_id"] = check.body->body_id;
+    const auto& source_id =
+        check.freshness != nullptr ? check.freshness->source_id
+                                   : check.body->source_id;
+    const auto& timestamp =
+        check.freshness != nullptr ? check.freshness->source_timestamp_ns
+                                   : check.body->source_timestamp_ns;
+    const auto& budget =
+        check.freshness != nullptr
+            ? check.freshness->source_freshness_budget_ns
+            : check.body->source_freshness_budget_ns;
+    if (source_id) {
+      details["dynamic_body_source_id"] = *source_id;
+    }
+    if (budget) {
+      details["dynamic_body_declared_freshness_budget_ns"] =
+          std::to_string(*budget);
+    }
+    details["dynamic_body_effective_freshness_budget_ns"] =
+        std::to_string(check.effective_budget_ns);
+    if (timestamp) {
+      details["dynamic_body_source_timestamp_ns"] =
+          std::to_string(*timestamp);
+    }
+    details["dynamic_body_age_ns"] = std::to_string(check.age_ns);
+  }
+  if (check.status == RuntimeDynamicBodyFreshnessStatus::kFresh) {
+    return std::nullopt;
+  }
+  return runtime_dynamic_body_freshness_reason(check.status);
+}
+
+RuntimeDynamicBodyFreshnessCheck check_runtime_dynamic_body_freshness(
+    const CollisionWorldSnapshot& snapshot,
+    const std::vector<CollisionWorldBodyFreshness>& body_freshness,
+    std::int64_t now_ns,
+    std::int64_t runtime_cap_ns,
+    bool lookup_order_prevalidated) noexcept {
+  RuntimeDynamicBodyFreshnessCheck out;
+  if (!lookup_order_prevalidated &&
+      !runtime_collision_lookup_order_is_valid(snapshot, body_freshness)) {
+    out.status = RuntimeDynamicBodyFreshnessStatus::kSidecarUnsorted;
+    return out;
   }
 
-  const auto find_freshness =
-      [&](const std::string& body_id) -> const CollisionWorldBodyFreshness* {
-    auto it = std::lower_bound(
-        body_freshness.begin(), body_freshness.end(), body_id,
-        [](const CollisionWorldBodyFreshness& lhs, const std::string& rhs) {
-          return lhs.body_id < rhs;
-        });
-    if (it == body_freshness.end() || it->body_id != body_id) {
-      return nullptr;
-    }
-    return &*it;
-  };
-
+  std::size_t freshness_index = 0;
   for (const auto& body : snapshot.bodies) {
-    const auto* freshness = find_freshness(body.body_id);
+    while (freshness_index < body_freshness.size() &&
+           body_freshness[freshness_index].body_id < body.body_id) {
+      ++freshness_index;
+    }
+    const auto* freshness =
+        freshness_index < body_freshness.size() &&
+                body_freshness[freshness_index].body_id == body.body_id
+            ? &body_freshness[freshness_index]
+            : nullptr;
     const auto& freshness_budget =
         freshness != nullptr ? freshness->source_freshness_budget_ns
                              : body.source_freshness_budget_ns;
     const auto& source_timestamp =
         freshness != nullptr ? freshness->source_timestamp_ns
                              : body.source_timestamp_ns;
-    const auto& source_id =
-        freshness != nullptr ? freshness->source_id : body.source_id;
     if (!freshness_budget.has_value()) {
       continue;
     }
-    details["dynamic_body_id"] = body.body_id;
-    if (source_id.has_value()) {
-      details["dynamic_body_source_id"] = *source_id;
-    }
-    details["dynamic_body_declared_freshness_budget_ns"] =
-        std::to_string(*freshness_budget);
     const auto effective_budget_ns =
         runtime_cap_ns > 0
             ? std::min(*freshness_budget, runtime_cap_ns)
             : *freshness_budget;
-    details["dynamic_body_effective_freshness_budget_ns"] =
-        std::to_string(effective_budget_ns);
+    out.body = &body;
+    out.freshness = freshness;
+    out.effective_budget_ns = effective_budget_ns;
     if (!source_timestamp.has_value()) {
-      return "dynamic_body_missing_source_timestamp";
+      out.status = RuntimeDynamicBodyFreshnessStatus::kMissingTimestamp;
+      return out;
     }
-    details["dynamic_body_source_timestamp_ns"] =
-        std::to_string(*source_timestamp);
     if (*source_timestamp < 0) {
-      details["dynamic_body_age_ns"] = "invalid_negative_timestamp";
-      return "stale_dynamic_collision_body";
+      out.status = RuntimeDynamicBodyFreshnessStatus::kInvalidTimestamp;
+      out.age_ns = -1;
+      return out;
     }
     if (*source_timestamp > now_ns) {
-      details["dynamic_body_age_ns"] = "timestamp_in_future";
-      details["dynamic_body_clock_skew_ns"] =
-          std::to_string(*source_timestamp - now_ns);
-      return "stale_dynamic_collision_body";
+      out.status = RuntimeDynamicBodyFreshnessStatus::kInvalidTimestamp;
+      out.age_ns = now_ns - *source_timestamp;
+      return out;
     }
     const auto age_ns = now_ns - *source_timestamp;
-    details["dynamic_body_age_ns"] = std::to_string(age_ns);
+    out.age_ns = age_ns;
     if (effective_budget_ns <= 0 || age_ns > effective_budget_ns) {
-      return "stale_dynamic_collision_body";
+      out.status = RuntimeDynamicBodyFreshnessStatus::kStale;
+      return out;
     }
   }
-  return std::nullopt;
+  out.status = RuntimeDynamicBodyFreshnessStatus::kFresh;
+  return out;
+}
+
+const char* runtime_dynamic_body_freshness_reason(
+    RuntimeDynamicBodyFreshnessStatus status) noexcept {
+  switch (status) {
+    case RuntimeDynamicBodyFreshnessStatus::kFresh:
+      return "none";
+    case RuntimeDynamicBodyFreshnessStatus::kSidecarUnsorted:
+      return "dynamic_body_freshness_sidecar_not_sorted";
+    case RuntimeDynamicBodyFreshnessStatus::kMissingTimestamp:
+      return "dynamic_body_missing_source_timestamp";
+    case RuntimeDynamicBodyFreshnessStatus::kInvalidTimestamp:
+    case RuntimeDynamicBodyFreshnessStatus::kStale:
+      return "stale_dynamic_collision_body";
+  }
+  return "stale_dynamic_collision_body";
 }
 
 Result<RuntimeCollisionStateProjection> build_runtime_collision_state_projection(
@@ -322,54 +430,181 @@ Result<RuntimeCollisionStateProjection> build_runtime_collision_state_projection
   return Result<RuntimeCollisionStateProjection>::Ok(std::move(projection));
 }
 
-Result<RobotStateDTO> project_runtime_collision_observed_state(
-    const RuntimeCollisionStateProjection& projection,
-    const std::vector<double>& observed_positions_rad) {
-  RobotStateDTO state;
-  state.joint_names = projection.query_joint_names;
-  if (observed_positions_rad.size() == projection.query_joint_names.size() &&
-      projection.source_joint_names == projection.query_joint_names) {
-    state.positions_rad = observed_positions_rad;
-    return Result<RobotStateDTO>::Ok(std::move(state));
+void RuntimeCollisionStopCoverageTracker::update_max(
+    std::atomic<std::uint64_t>& target, std::uint64_t value) noexcept {
+  auto current = target.load(std::memory_order_relaxed);
+  while (current < value &&
+         !target.compare_exchange_weak(current, value,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
   }
-  if (observed_positions_rad.size() != projection.source_joint_names.size()) {
-    return Result<RobotStateDTO>::Err(ErrorDTO{
-        kErrorValidationCollision,
-        "Runtime collision monitor observed state shape does not match projection",
-        {{"reason", "runtime_collision_projection_observed_shape_mismatch"},
-         {"observed_position_count",
-          std::to_string(observed_positions_rad.size())},
-         {"source_joint_count",
-          std::to_string(projection.source_joint_names.size())},
-         {"query_joint_count",
-          std::to_string(projection.query_joint_names.size())}}});
-  }
-
-  state.positions_rad = projection.template_positions_rad;
-  for (std::size_t i = 0; i < observed_positions_rad.size(); ++i) {
-    state.positions_rad[projection.source_to_query_indices[i]] =
-        observed_positions_rad[i];
-  }
-  return Result<RobotStateDTO>::Ok(std::move(state));
 }
 
-void PublishedRuntimeCollisionSnapshotStore::publish(
-    CollisionWorldPolicySnapshotBundle bundle) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  bundle_ = std::move(bundle);
-  ++epoch_;
+void RuntimeCollisionStopCoverageTracker::start(
+    std::uint64_t generation) noexcept {
+  current_ticks_.store(0, std::memory_order_relaxed);
+  current_queries_.store(0, std::memory_order_relaxed);
+  current_unavailable_.store(0, std::memory_order_relaxed);
+  for (auto& count : current_unavailable_by_reason_) {
+    count.store(0, std::memory_order_relaxed);
+  }
+  current_max_unavailable_ns_.store(0, std::memory_order_relaxed);
+  unavailable_since_ns_.store(-1, std::memory_order_relaxed);
+  unavailable_reason_hash_.store(0, std::memory_order_relaxed);
+  unavailable_last_event_ns_.store(-1, std::memory_order_relaxed);
+  generation_.store(generation, std::memory_order_release);
+  windows_started_.fetch_add(1, std::memory_order_relaxed);
 }
 
-std::uint64_t PublishedRuntimeCollisionSnapshotStore::clear() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  bundle_ = {};
-  return ++epoch_;
+void RuntimeCollisionStopCoverageTracker::record_tick(
+    std::uint64_t generation) noexcept {
+  if (generation == 0 || active_generation() != generation) {
+    return;
+  }
+  current_ticks_.fetch_add(1, std::memory_order_relaxed);
+  total_ticks_.fetch_add(1, std::memory_order_relaxed);
 }
 
-PublishedRuntimeCollisionSnapshot PublishedRuntimeCollisionSnapshotStore::snapshot()
-    const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return PublishedRuntimeCollisionSnapshot{bundle_, epoch_};
+void RuntimeCollisionStopCoverageTracker::record_observed_source(
+    ObservedRobotStateSourceKind source_kind,
+    std::uint64_t source_age_ns) noexcept {
+  freshest_source_age_ns_.store(source_age_ns, std::memory_order_relaxed);
+  freshest_source_kind_.store(static_cast<int>(source_kind),
+                              std::memory_order_relaxed);
+}
+
+void RuntimeCollisionStopCoverageTracker::record_query(
+    std::uint64_t generation, std::int64_t now_ns) noexcept {
+  if (generation == 0 || active_generation() != generation) {
+    return;
+  }
+  current_queries_.fetch_add(1, std::memory_order_relaxed);
+  total_queries_.fetch_add(1, std::memory_order_relaxed);
+  const auto unavailable_since =
+      unavailable_since_ns_.exchange(-1, std::memory_order_acq_rel);
+  if (unavailable_since >= 0 && now_ns > unavailable_since) {
+    const auto duration =
+        static_cast<std::uint64_t>(now_ns - unavailable_since);
+    update_max(current_max_unavailable_ns_, duration);
+    update_max(longest_unavailable_ns_, duration);
+  }
+}
+
+void RuntimeCollisionStopCoverageTracker::record_unavailable(
+    std::uint64_t generation,
+    RuntimeCollisionUnavailableReason reason,
+    std::int64_t now_ns) noexcept {
+  if (generation == 0 || active_generation() != generation) {
+    return;
+  }
+  current_unavailable_.fetch_add(1, std::memory_order_relaxed);
+  const auto reason_index = static_cast<std::size_t>(reason);
+  if (reason_index < current_unavailable_by_reason_.size()) {
+    current_unavailable_by_reason_[reason_index].fetch_add(
+        1, std::memory_order_relaxed);
+  }
+  total_unavailable_.fetch_add(1, std::memory_order_relaxed);
+  std::int64_t no_interval = -1;
+  (void)unavailable_since_ns_.compare_exchange_strong(
+      no_interval, now_ns, std::memory_order_acq_rel,
+      std::memory_order_relaxed);
+}
+
+bool RuntimeCollisionStopCoverageTracker::should_emit_unavailable(
+    std::uint64_t reason_hash, std::int64_t now_ns) noexcept {
+  const auto previous_hash = unavailable_reason_hash_.exchange(
+      reason_hash, std::memory_order_acq_rel);
+  const auto previous_event_ns =
+      unavailable_last_event_ns_.load(std::memory_order_acquire);
+  constexpr std::int64_t kEventPeriodNs = 1'000'000'000;
+  if (previous_hash == reason_hash && previous_event_ns >= 0 &&
+      now_ns - previous_event_ns < kEventPeriodNs) {
+    unavailable_events_suppressed_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  unavailable_last_event_ns_.store(now_ns, std::memory_order_release);
+  return true;
+}
+
+std::optional<RuntimeCollisionStopCoverageSummary>
+RuntimeCollisionStopCoverageTracker::complete(std::uint64_t generation,
+                                              std::int64_t now_ns) noexcept {
+  if (generation == 0) {
+    return std::nullopt;
+  }
+  std::uint64_t expected = generation;
+  if (!generation_.compare_exchange_strong(expected, 0,
+                                           std::memory_order_acq_rel,
+                                           std::memory_order_acquire)) {
+    return std::nullopt;
+  }
+  const auto unavailable_since =
+      unavailable_since_ns_.exchange(-1, std::memory_order_acq_rel);
+  if (unavailable_since >= 0 && now_ns > unavailable_since) {
+    const auto duration =
+        static_cast<std::uint64_t>(now_ns - unavailable_since);
+    update_max(current_max_unavailable_ns_, duration);
+    update_max(longest_unavailable_ns_, duration);
+  }
+  RuntimeCollisionStopCoverageSummary summary;
+  summary.generation = generation;
+  summary.ticks_attempted = current_ticks_.load(std::memory_order_acquire);
+  summary.queries_executed = current_queries_.load(std::memory_order_acquire);
+  summary.unavailable_ticks =
+      current_unavailable_.load(std::memory_order_acquire);
+  summary.longest_unavailable_ns =
+      current_max_unavailable_ns_.load(std::memory_order_acquire);
+  for (std::size_t i = 0; i < summary.unavailable_by_reason.size(); ++i) {
+    summary.unavailable_by_reason[i] =
+        current_unavailable_by_reason_[i].load(std::memory_order_acquire);
+  }
+  last_generation_.store(generation, std::memory_order_relaxed);
+  last_ticks_.store(summary.ticks_attempted, std::memory_order_relaxed);
+  last_queries_.store(summary.queries_executed, std::memory_order_relaxed);
+  last_unavailable_.store(summary.unavailable_ticks,
+                          std::memory_order_relaxed);
+  last_max_unavailable_ns_.store(summary.longest_unavailable_ns,
+                                 std::memory_order_relaxed);
+  windows_completed_.fetch_add(1, std::memory_order_relaxed);
+  if (summary.ticks_attempted == 0 || summary.queries_executed == 0) {
+    zero_check_windows_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return summary;
+}
+
+std::uint64_t RuntimeCollisionStopCoverageTracker::active_generation() const
+    noexcept {
+  return generation_.load(std::memory_order_acquire);
+}
+
+RuntimeCollisionStopCoverageMetrics
+RuntimeCollisionStopCoverageTracker::metrics() const noexcept {
+  RuntimeCollisionStopCoverageMetrics result;
+  result.windows_started = windows_started_.load(std::memory_order_relaxed);
+  result.windows_completed =
+      windows_completed_.load(std::memory_order_relaxed);
+  result.ticks_attempted = total_ticks_.load(std::memory_order_relaxed);
+  result.queries_executed = total_queries_.load(std::memory_order_relaxed);
+  result.unavailable_ticks =
+      total_unavailable_.load(std::memory_order_relaxed);
+  result.longest_unavailable_ns =
+      longest_unavailable_ns_.load(std::memory_order_relaxed);
+  result.zero_check_windows =
+      zero_check_windows_.load(std::memory_order_relaxed);
+  result.last_window = {
+      last_generation_.load(std::memory_order_relaxed),
+      last_ticks_.load(std::memory_order_relaxed),
+      last_queries_.load(std::memory_order_relaxed),
+      last_unavailable_.load(std::memory_order_relaxed),
+      last_max_unavailable_ns_.load(std::memory_order_relaxed),
+  };
+  result.freshest_source_age_ns =
+      freshest_source_age_ns_.load(std::memory_order_relaxed);
+  result.freshest_source_kind =
+      freshest_source_kind_.load(std::memory_order_relaxed);
+  result.unavailable_events_suppressed =
+      unavailable_events_suppressed_.load(std::memory_order_relaxed);
+  return result;
 }
 
 Result<CollisionWorldPolicySnapshotBundle>
@@ -400,26 +635,77 @@ load_collision_world_policy_snapshot_bundle(
   return Result<CollisionWorldPolicySnapshotBundle>::Ok(std::move(bundle));
 }
 
-Result<CollisionWorldPolicySnapshotBundle>
-load_published_runtime_collision_snapshot_bundle(
+Result<RuntimeCollisionQueryBundlePtr>
+load_published_runtime_collision_query_bundle(
     const ICollisionWorldSnapshotPublisher& publisher) {
-  CollisionWorldPolicySnapshotBundle bundle;
+  RuntimeCollisionQueryBundlePtr bundle;
   try {
-    bundle = publisher.published_runtime_collision_snapshot_bundle();
+    bundle = publisher.published_runtime_collision_query_bundle();
   } catch (const std::exception& e) {
-    return Result<CollisionWorldPolicySnapshotBundle>::Err(ErrorDTO{
+    return Result<RuntimeCollisionQueryBundlePtr>::Err(ErrorDTO{
         kErrorValidationCollision,
         "Published runtime collision snapshot unavailable",
         {{"reason", "published_runtime_collision_snapshot_exception"},
          {"exception", e.what()}}});
   } catch (...) {
-    return Result<CollisionWorldPolicySnapshotBundle>::Err(ErrorDTO{
+    return Result<RuntimeCollisionQueryBundlePtr>::Err(ErrorDTO{
         kErrorValidationCollision,
         "Published runtime collision snapshot unavailable",
         {{"reason", "published_runtime_collision_snapshot_exception"},
          {"exception", reason_codes::kUnknownNonStdException}}});
   }
-  return Result<CollisionWorldPolicySnapshotBundle>::Ok(std::move(bundle));
+  return Result<RuntimeCollisionQueryBundlePtr>::Ok(std::move(bundle));
+}
+
+RuntimeCollisionQueryBundlePtr build_runtime_collision_query_bundle(
+    CollisionWorldPolicySnapshotBundle bundle, std::uint64_t epoch) {
+  auto runtime_bundle = std::make_shared<RuntimeCollisionQueryBundle>();
+  runtime_bundle->world = std::move(bundle.world);
+  runtime_bundle->body_freshness = std::move(bundle.body_freshness);
+  std::sort(runtime_bundle->body_freshness.begin(),
+            runtime_bundle->body_freshness.end(),
+            [](const auto& lhs, const auto& rhs) {
+              return lhs.body_id < rhs.body_id;
+            });
+  runtime_bundle->lookup_order_valid =
+      runtime_bundle->world &&
+      runtime_collision_lookup_order_is_valid(
+          *runtime_bundle->world, runtime_bundle->body_freshness);
+  runtime_bundle->epoch = epoch;
+  if (bundle.policy) {
+    auto policy =
+        std::make_shared<CollisionPolicySnapshot>(std::move(*bundle.policy));
+    for (auto& entry : policy->support_contacts) {
+      if (entry.mode == CollisionContactPolicyMode::kContactRelease) {
+        // Runtime ticks evaluate one observed state. End-of-trajectory progress
+        // is enforced by the generation-bound release tracker, not by a
+        // one-state trajectory evaluator.
+        entry.require_separation_by_end = false;
+        entry.require_strictly_decreasing_penetration = false;
+      }
+    }
+    runtime_bundle->policy_index = build_collision_policy_index(*policy);
+    runtime_bundle->policy = std::move(policy);
+  }
+  return runtime_bundle;
+}
+
+bool runtime_collision_lookup_order_is_valid(
+    const CollisionWorldSnapshot& world,
+    const std::vector<CollisionWorldBodyFreshness>& body_freshness) noexcept {
+  const auto bodies_ordered = std::adjacent_find(
+      world.bodies.begin(), world.bodies.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.body_id >= rhs.body_id;
+      });
+  if (bodies_ordered != world.bodies.end()) {
+    return false;
+  }
+  const auto freshness_ordered = std::adjacent_find(
+      body_freshness.begin(), body_freshness.end(),
+      [](const auto& lhs, const auto& rhs) {
+        return lhs.body_id >= rhs.body_id;
+      });
+  return freshness_ordered == body_freshness.end();
 }
 
 void append_collision_failure_diagnostics(
@@ -491,6 +777,15 @@ void append_collision_failure_diagnostics(
     details["collision_result_first_failure_classification"] =
         collision_pair_classification_name(first_failure_pair->classification);
   }
+  if (const auto violation =
+          result.raw_diagnostics.find("contact_release_violation");
+      violation != result.raw_diagnostics.end()) {
+    details["collision_result_contact_release_violation"] = violation->second;
+  }
+  if (const auto pair = result.raw_diagnostics.find("contact_release_pair");
+      pair != result.raw_diagnostics.end()) {
+    details["collision_result_contact_release_pair"] = pair->second;
+  }
   std::size_t emitted = 0;
   for (const auto& [key, value] : result.raw_diagnostics) {
     if (emitted >= 8) {
@@ -502,11 +797,94 @@ void append_collision_failure_diagnostics(
   }
 }
 
-void append_legacy_collision_compare_diagnostics(
+std::string pre_dispatch_collision_validation_message(
+    const std::map<std::string, std::string>& details,
+    CollisionDecisionAction action) {
+  const auto value = [&details](const char* key) -> std::string_view {
+    const auto it = details.find(key);
+    return it == details.end() ? std::string_view{} : it->second;
+  };
+
+  const auto reason = value("reason");
+  if (reason == "collision_validation_cancelled") {
+    return "Pre-dispatch collision validation cancelled";
+  }
+  if (reason == "validation_deferred_runtime_monitor_active") {
+    return "Pre-dispatch collision validation deferred";
+  }
+
+  const auto contact_release_violation =
+      value("collision_result_contact_release_violation");
+  const auto contact_release_pair =
+      value("collision_result_contact_release_pair");
+  const auto with_contact_pair = [&](std::string message) {
+    if (!contact_release_pair.empty()) {
+      message += ": " + std::string(contact_release_pair);
+    }
+    return message;
+  };
+  if (contact_release_violation == "final_sample_not_separated") {
+    return with_contact_pair(
+        "Support-contact pair did not separate by final waypoint");
+  }
+  if (contact_release_violation == "initial_penetration_exceeds_policy") {
+    return with_contact_pair(
+        "Support-contact initial penetration exceeds the permitted envelope");
+  }
+  if (contact_release_violation == "missing_contact_release_clearance") {
+    return with_contact_pair(
+        "Support-contact clearance diagnostics are unavailable");
+  }
+  if (contact_release_violation == "penetration_increased") {
+    return with_contact_pair(
+        "Support-contact penetration increased during release");
+  }
+  if (contact_release_violation == "insufficient_release_progress") {
+    return with_contact_pair(
+        "Support-contact release made insufficient progress");
+  }
+  if (contact_release_violation == "new_active_contact_after_clear_start") {
+    return with_contact_pair(
+        "Support-contact appeared after the trajectory started clear");
+  }
+  if (contact_release_violation == "recontact_after_release" ||
+      contact_release_violation ==
+          "recontact_penetration_exceeds_policy") {
+    return with_contact_pair(
+        "Support-contact pair re-contacted after release");
+  }
+  if (contact_release_violation == "contact_process_policy_not_implemented") {
+    return with_contact_pair(
+        "Contact-process collision policy is not implemented");
+  }
+
+  const auto status = value("collision_result_engine_status");
+  if (status == "timeout") {
+    return "Pre-dispatch collision validation timed out";
+  }
+  if (status == "unsupported_geometry") {
+    return "Pre-dispatch collision validation unsupported geometry";
+  }
+  if (status == "diagnostic_incomplete") {
+    return "Pre-dispatch collision validation diagnostics incomplete";
+  }
+  if (status == "engine_error") {
+    return "Pre-dispatch collision validation engine error";
+  }
+  if (status == "cancelled") {
+    return "Pre-dispatch collision validation cancelled";
+  }
+  if (action == CollisionDecisionAction::kInconclusive) {
+    return "Collision validation inconclusive";
+  }
+  return "Collision validation rejected trajectory";
+}
+
+void append_collision_compare_diagnostics(
     std::map<std::string, std::string>& details,
     const CollisionValidationDecisionBundle& bundle,
     const TrajectoryDTO& trajectory,
-    IPlanningContext& context) {
+    const ICollisionDiagnosticComparator& comparator) {
   const auto* selected = select_collision_failure_record(bundle);
   if (selected == nullptr || selected->waypoint_index < 0) {
     return;
@@ -518,7 +896,7 @@ void append_legacy_collision_compare_diagnostics(
 
   const auto& waypoint = trajectory.waypoints[waypoint_index];
   CollisionQuery query;
-  query.query_id = "legacy_compare_" +
+  query.query_id = "diagnostic_compare_" +
                    (selected->result.query_id
                         ? *selected->result.query_id
                         : std::to_string(selected->waypoint_index));
@@ -533,59 +911,60 @@ void append_legacy_collision_compare_diagnostics(
   query.sampling_mode = CollisionSamplingMode::kWaypointOnly;
 
   try {
-    const auto legacy = context.collision_check_normalized(query);
-    details["legacy_collision_compare_engine_id"] = legacy.engine_id;
-    details["legacy_collision_compare_engine_status"] =
-        collision_engine_status_name(legacy.engine_status);
-    details["legacy_collision_compare_decision"] =
-        collision_decision_result_name(legacy.decision);
-    details["legacy_collision_compare_in_collision"] =
-        legacy.in_collision ? "true" : "false";
-    details["legacy_collision_compare_normalized_pair_count"] =
-        std::to_string(legacy.normalized_pairs.size());
-    details["legacy_collision_compare_in_collision_match"] =
-        legacy.in_collision == selected->result.in_collision ? "true" : "false";
-    details["legacy_collision_compare_decision_match"] =
-        legacy.decision == selected->result.decision ? "true" : "false";
-    details["legacy_collision_compare_normalized_pairs_match"] =
-        legacy.normalized_pairs == selected->result.normalized_pairs ? "true"
-                                                                     : "false";
-    if (legacy.collision_world_revision.has_value()) {
-      details["legacy_collision_compare_world_revision_id"] =
-          std::to_string(legacy.collision_world_revision->revision_id);
-      details["legacy_collision_compare_world_content_hash"] =
-          legacy.collision_world_revision->content_hash;
+    const auto compared = comparator.compare(query);
+    details["collision_diagnostic_compare_engine_id"] = compared.engine_id;
+    details["collision_diagnostic_compare_engine_status"] =
+        collision_engine_status_name(compared.engine_status);
+    details["collision_diagnostic_compare_decision"] =
+        collision_decision_result_name(compared.decision);
+    details["collision_diagnostic_compare_in_collision"] =
+        compared.in_collision ? "true" : "false";
+    details["collision_diagnostic_compare_normalized_pair_count"] =
+        std::to_string(compared.normalized_pairs.size());
+    details["collision_diagnostic_compare_in_collision_match"] =
+        compared.in_collision == selected->result.in_collision ? "true"
+                                                               : "false";
+    details["collision_diagnostic_compare_decision_match"] =
+        compared.decision == selected->result.decision ? "true" : "false";
+    details["collision_diagnostic_compare_normalized_pairs_match"] =
+        compared.normalized_pairs == selected->result.normalized_pairs ? "true"
+                                                                       : "false";
+    if (compared.collision_world_revision.has_value()) {
+      details["collision_diagnostic_compare_world_revision_id"] =
+          std::to_string(compared.collision_world_revision->revision_id);
+      details["collision_diagnostic_compare_world_content_hash"] =
+          compared.collision_world_revision->content_hash;
     }
-    if (!legacy.normalized_pairs.empty()) {
-      details["legacy_collision_compare_first_pair"] =
-          collision_pair_name(legacy.normalized_pairs.front());
+    if (!compared.normalized_pairs.empty()) {
+      details["collision_diagnostic_compare_first_pair"] =
+          collision_pair_name(compared.normalized_pairs.front());
     }
-    const CollisionPairResult* legacy_failure = nullptr;
-    for (const auto& classified : legacy.normalized_pairs_classified) {
+    const CollisionPairResult* compared_failure = nullptr;
+    for (const auto& classified : compared.normalized_pairs_classified) {
       if (classified.is_first_failure) {
-        legacy_failure = &classified;
+        compared_failure = &classified;
         break;
       }
     }
-    if (legacy_failure == nullptr) {
-      for (const auto& classified : legacy.normalized_pairs_classified) {
+    if (compared_failure == nullptr) {
+      for (const auto& classified : compared.normalized_pairs_classified) {
         if (collision_pair_classification_blocks_dispatch(
                 classified.classification)) {
-          legacy_failure = &classified;
+          compared_failure = &classified;
           break;
         }
       }
     }
-    if (legacy_failure != nullptr) {
-      details["legacy_collision_compare_first_failure_pair"] =
-          collision_pair_name(legacy_failure->pair);
-      details["legacy_collision_compare_first_failure_classification"] =
-          collision_pair_classification_name(legacy_failure->classification);
+    if (compared_failure != nullptr) {
+      details["collision_diagnostic_compare_first_failure_pair"] =
+          collision_pair_name(compared_failure->pair);
+      details["collision_diagnostic_compare_first_failure_classification"] =
+          collision_pair_classification_name(compared_failure->classification);
     }
   } catch (const std::exception& e) {
-    details["legacy_collision_compare_error"] = e.what();
+    details["collision_diagnostic_compare_error"] = e.what();
   } catch (...) {
-    details["legacy_collision_compare_error"] =
+    details["collision_diagnostic_compare_error"] =
         reason_codes::kUnknownNonStdException;
   }
 }

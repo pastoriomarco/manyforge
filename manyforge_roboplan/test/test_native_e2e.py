@@ -115,6 +115,81 @@ def test_create_native_kernel_accepts_collision_monitor_config():
     assert status.state == ExecutionState.IDLE
 
 
+def test_native_recovery_binding_returns_complete_fail_closed_contract():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
+    assessment = bundle.get_recovery_assessment()
+    required_assessment_fields = {
+        "schema_version",
+        "assessment_revision",
+        "assessed_at_ns",
+        "control_command_epoch",
+        "execution_id",
+        "execution_state",
+        "recovery_class",
+        "status",
+        "latch_id",
+        "source_id",
+        "policy_id",
+        "preemption_result",
+        "stop_owner_active",
+        "stop_owner_generation",
+        "backend_stop_confirmed",
+        "stop_certificate_id",
+        "observed_state_available",
+        "observed_state_sequence",
+        "observed_state_source_id",
+        "observed_state_authority_profile",
+        "observed_state_measured",
+        "observed_state_valid_until_ns",
+        "observed_state_fresh",
+        "observed_state_at_rest",
+        "stronger_authority_active",
+        "queued_latch_present",
+        "retry_admissible",
+        "allowed_actions",
+        "reason_code",
+        "evidence_refs",
+    }
+    assert required_assessment_fields <= set(assessment)
+    assert assessment["status"] == "unavailable"
+
+    for action in ("unknown_action", "reset_cycle"):
+        request = {
+            "request_id": f"reject-{action}",
+            "action": action,
+            "principal_id": "test_operator",
+        }
+        if action == "reset_cycle":
+            request.update(
+                {
+                    "expected_assessment_revision": assessment[
+                        "assessment_revision"
+                    ],
+                    "expected_control_command_epoch": assessment[
+                        "control_command_epoch"
+                    ],
+                    "expected_execution_id": assessment["execution_id"],
+                    "expected_latch_id": assessment["latch_id"],
+                    "expected_stop_certificate_id": assessment[
+                        "stop_certificate_id"
+                    ],
+                    "expected_stop_owner_generation": assessment[
+                        "stop_owner_generation"
+                    ],
+                }
+            )
+        result = bundle.apply_recovery_action(request)
+        assert result["accepted"] is False
+        assert result["request_id"] == f"reject-{action}"
+        assert result["action"] == action
+        assert result["error"]["code"] == "recovery_action_rejected"
+        assert result["error"]["details"]["reason"] == "action_not_allowed"
+        assert required_assessment_fields <= set(result["resulting_assessment"])
+
+
 def test_motion_interrupt_scope_serializes_settle_velocity_threshold():
     if not HAS_NATIVE_CLIENT:
         pytest.skip("native_kernel_client not available")
@@ -1671,7 +1746,13 @@ class TestNativeUr10eRobotiqAttachedObjectCollision:
         assert preview.ok is False
         assert preview.error is not None
         assert "start state is already in collision" not in preview.error
-        assert "Support-contact pair did not separate" in preview.error
+        assert "Support-contact initial penetration exceeds" in preview.error
+        assert (
+            preview.error_details.get(
+                "collision_result_contact_release_violation"
+            )
+            == "initial_penetration_exceeds_policy"
+        )
         assert "dynamic_support_surface" in (
             preview.error + " " + str(preview.error_details)
         )

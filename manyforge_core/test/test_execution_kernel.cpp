@@ -45,9 +45,18 @@ class MockPlanner : public IPlannerBackend {
     if (!result_sequence.empty()) {
       auto result = result_sequence.front();
       result_sequence.erase(result_sequence.begin());
+      if (result.trajectory.has_value() &&
+          result.scene_revision.revision_id == 0) {
+        result.scene_revision = request.scene_binding.revision;
+      }
       return result;
     }
-    return next_result;
+    auto result = next_result;
+    if (result.trajectory.has_value() &&
+        result.scene_revision.revision_id == 0) {
+      result.scene_revision = request.scene_binding.revision;
+    }
+    return result;
   }
 
   void request_cancel() override {
@@ -100,7 +109,12 @@ class SlowMockPlanner : public IPlannerBackend {
       }
     }
 
-    return next_result;
+    auto result = next_result;
+    if (result.trajectory.has_value() &&
+        result.scene_revision.revision_id == 0) {
+      result.scene_revision = request.scene_binding.revision;
+    }
+    return result;
   }
 
   void request_cancel() override {
@@ -140,23 +154,26 @@ class SlowMockPlanner : public IPlannerBackend {
   bool cancel_requested_ = false;
 };
 
-class MockContext : public IPlanningContext {
+class MockFocusedPorts final : public IObservedRobotStateProvider,
+                               public IRobotKinematics,
+                               public IReferencePoseResolver,
+                               public ITrajectoryValidator,
+                               public ICollisionTrajectoryProjector,
+                               public ICollisionDiagnosticComparator {
  public:
-  MockContext() = default;
+  MockFocusedPorts() = default;
 
-  MockContext(const MockContext& other) { *this = other; }
+  MockFocusedPorts(const MockFocusedPorts& other) { *this = other; }
 
-  MockContext& operator=(const MockContext& other) {
+  MockFocusedPorts& operator=(const MockFocusedPorts& other) {
     if (this == &other) {
       return *this;
     }
-    current_state = other.current_state;
+    current_state_value = other.current_state_value;
     next_validation = other.next_validation;
     next_collision = other.next_collision;
     collision_sequence = other.collision_sequence;
     next_fk = other.next_fk;
-    next_object_pose = other.next_object_pose;
-    next_object_state = other.next_object_state;
     next_reference_pose = other.next_reference_pose;
     reference_pose_sequence = other.reference_pose_sequence;
     fk_sequence = other.fk_sequence;
@@ -178,46 +195,51 @@ class MockContext : public IPlanningContext {
     return *this;
   }
 
-  RobotStateDTO current_state;
+  RobotStateDTO current_state_value;
   ValidationResultDTO next_validation;
   CollisionCheckResultDTO next_collision;
-  std::vector<CollisionCheckResultDTO> collision_sequence;
+  mutable std::vector<CollisionCheckResultDTO> collision_sequence;
   Pose3DTO next_fk;
-  Pose3DTO next_object_pose;
-  ObjectStateDTO next_object_state;
   Result<Pose3DTO> next_reference_pose = Result<Pose3DTO>::Ok(Pose3DTO{});
-  std::vector<Result<Pose3DTO>> reference_pose_sequence;
-  std::vector<Pose3DTO> fk_sequence;
+  mutable std::vector<Result<Pose3DTO>> reference_pose_sequence;
+  mutable std::vector<Pose3DTO> fk_sequence;
   JointLimitsDTO next_limits;
   SceneEditResultDTO next_scene_edit;
   CollisionWorldRevision current_revision{1, "mock-collision-world"};
 
-  int get_state_count = 0;
-  int validate_count = 0;
+  mutable int get_state_count = 0;
+  mutable int validate_count = 0;
   // Written from kernel worker / fault-preempt threads while tests poll it;
   // atomic so unsynchronized reads stay defined.
-  std::atomic<int> collision_count{0};
-  int expand_count = 0;
-  int fk_count = 0;
-  FkRequestDTO last_fk_request;
-  TrajectoryDTO last_expand_trajectory;
+  mutable std::atomic<int> collision_count{0};
+  mutable int expand_count = 0;
+  mutable int fk_count = 0;
+  mutable FkRequestDTO last_fk_request;
+  mutable TrajectoryDTO last_expand_trajectory;
   std::optional<Result<TrajectoryDTO>> next_expand_result;
-  ValidationOptionsDTO last_validation_options;
+  mutable ValidationOptionsDTO last_validation_options;
   bool throw_get_state = false;
   bool throw_fk = false;
   std::function<void()> on_validate;
 
-  RobotStateDTO get_current_state() override {
+  Result<RobotStateDTO> current_state(std::int64_t) const override {
     ++get_state_count;
     if (throw_get_state) {
-      throw std::runtime_error("state unavailable");
+      return Result<RobotStateDTO>::Err(ErrorDTO{
+          kErrorExecutionRejected, "state unavailable",
+          {{"reason", "observed_state_unavailable"}}});
     }
-    return current_state;
+    return Result<RobotStateDTO>::Ok(current_state_value);
   }
 
-  ValidationResultDTO validate_trajectory(
+  const ObservedRobotStatePublication* publication() const noexcept override {
+    return nullptr;
+  }
+
+  ValidationResultDTO validate_non_collision(
       const TrajectoryDTO& /*trajectory*/,
-      const ValidationOptionsDTO& options) override {
+      const ValidationOptionsDTO& options,
+      const CollisionCancellationToken&) const override {
     ++validate_count;
     last_validation_options = options;
     if (on_validate) {
@@ -226,8 +248,9 @@ class MockContext : public IPlanningContext {
     return next_validation;
   }
 
-  Result<TrajectoryDTO> expand_trajectory_for_collision_validation(
-      const TrajectoryDTO& trajectory) override {
+  Result<TrajectoryDTO> expand_for_collision(
+      const TrajectoryDTO& trajectory,
+      const RobotStateDTO&) const override {
     ++expand_count;
     last_expand_trajectory = trajectory;
     if (next_expand_result.has_value()) {
@@ -237,7 +260,7 @@ class MockContext : public IPlanningContext {
   }
 
   CollisionCheckResultDTO collision_check(
-      const CollisionCheckRequestDTO& /*request*/) override {
+      const CollisionCheckRequestDTO& /*request*/) const {
     ++collision_count;
     if (!collision_sequence.empty()) {
       auto result = collision_sequence.front();
@@ -247,31 +270,41 @@ class MockContext : public IPlanningContext {
     return next_collision;
   }
 
-  Pose3DTO forward_kinematics(const FkRequestDTO& request) override {
+  Result<Pose3DTO> forward_kinematics(
+      const FkRequestDTO& request) const override {
     ++fk_count;
     last_fk_request = request;
     if (throw_fk) {
-      throw std::runtime_error("fk failed");
+      return Result<Pose3DTO>::Err(ErrorDTO{
+          kErrorInvalidRequest, "fk failed", {{"reason", "fk_failed"}}});
     }
     if (!fk_sequence.empty()) {
       auto result = fk_sequence.front();
       fk_sequence.erase(fk_sequence.begin());
-      return result;
+      return Result<Pose3DTO>::Ok(result);
     }
-    return next_fk;
+    return Result<Pose3DTO>::Ok(next_fk);
   }
 
-  Pose3DTO get_object_pose(const std::string& /*object_id*/,
-                           const std::string& /*base_frame*/) override {
-    return next_object_pose;
-  }
-
-  ObjectStateDTO get_object_state(const std::string& /*object_id*/) override {
-    return next_object_state;
+  Result<std::map<std::string, Pose3DTO>> forward_kinematics_batch(
+      const RobotStateDTO& robot_state,
+      const std::vector<std::string>& target_frames,
+      const std::string& base_frame) const override {
+    std::map<std::string, Pose3DTO> poses;
+    for (const auto& frame : target_frames) {
+      auto pose = forward_kinematics(
+          FkRequestDTO{robot_state, frame, base_frame});
+      if (!pose.ok()) {
+        return Result<std::map<std::string, Pose3DTO>>::Err(pose.error());
+      }
+      poses.emplace(frame, std::move(pose.value()));
+    }
+    return Result<std::map<std::string, Pose3DTO>>::Ok(std::move(poses));
   }
 
   Result<Pose3DTO> resolve_reference_pose(const ReferenceDTO& /*reference*/,
-                                          const std::string& /*base_frame*/) override {
+                                          const std::string& /*base_frame*/,
+                                          const SceneRevisionBindingDTO&) const override {
     if (!reference_pose_sequence.empty()) {
       auto result = reference_pose_sequence.front();
       reference_pose_sequence.erase(reference_pose_sequence.begin());
@@ -280,36 +313,65 @@ class MockContext : public IPlanningContext {
     return next_reference_pose;
   }
 
-  JointLimitsDTO get_joint_limits(const std::string& /*robot_id*/,
-                                   const std::string& /*group_id*/) override {
-    return next_limits;
+  Result<JointLimitsDTO> joint_limits(
+      const std::string& /*robot_id*/,
+      const std::string& /*group_id*/) const override {
+    return Result<JointLimitsDTO>::Ok(next_limits);
   }
 
-  SceneEditResultDTO add_object(const AddObjectRequestDTO& /*request*/) override {
+  Result<std::vector<std::string>> group_joint_names(
+      const std::string&) const override {
+    return Result<std::vector<std::string>>::Ok(
+        current_state_value.joint_names);
+  }
+
+  SceneEditResultDTO add_object(const AddObjectRequestDTO& /*request*/) {
     return next_scene_edit;
   }
 
-  SceneEditResultDTO remove_object(const RemoveObjectRequestDTO& /*request*/) override {
+  SceneEditResultDTO remove_object(const RemoveObjectRequestDTO& /*request*/) {
     return next_scene_edit;
   }
 
   SceneEditResultDTO update_object_pose(
-      const UpdateObjectPoseRequestDTO& /*request*/) override {
+      const UpdateObjectPoseRequestDTO& /*request*/) {
     return next_scene_edit;
   }
 
   SceneEditResultDTO attach_object(
-      const AttachObjectRequestDTO& /*request*/) override {
+      const AttachObjectRequestDTO& /*request*/) {
     return next_scene_edit;
   }
 
   SceneEditResultDTO detach_object(
-      const DetachObjectRequestDTO& /*request*/) override {
+      const DetachObjectRequestDTO& /*request*/) {
     return next_scene_edit;
   }
 
-  CollisionWorldRevision current_collision_world_revision() override {
+  CollisionWorldRevision current_collision_world_revision() {
     return current_revision;
+  }
+
+  CollisionResult compare(const CollisionQuery& query) const override {
+    CollisionCheckRequestDTO request;
+    request.robot_state = query.robot_state;
+    const auto legacy = collision_check(request);
+    CollisionResult result;
+    result.query_id = query.query_id;
+    result.surface = query.surface;
+    result.collision_world_revision = current_revision;
+    result.in_collision = legacy.in_collision;
+    result.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
+    result.decision = legacy.in_collision
+                          ? CollisionDecisionResult::kInconclusiveFail
+                          : CollisionDecisionResult::kPass;
+    result.engine_id = "mock_collision_diagnostic_comparator";
+    result.engine_version = "test";
+    return result;
+  }
+
+  operator ExecutionKernelPorts() {
+    return ExecutionKernelPorts{*this, *this, *this, *this, *this, this};
   }
 };
 
@@ -325,7 +387,7 @@ class MockCollisionWorldPublisher final : public ICollisionWorldSnapshotPublishe
   std::vector<int> throw_on_bundle_call_numbers;
   std::optional<int> throw_on_published_runtime_bundle_call_number;
   std::vector<int> throw_on_published_runtime_bundle_call_numbers;
-  bool lease_inventory_enabled = false;
+  bool lease_inventory_enabled = true;
   std::int64_t lease_inventory_captured_at_ns = 0;
   std::uint64_t lease_topology_epoch = 1;
   std::uint64_t lease_policy_epoch = 1;
@@ -394,8 +456,8 @@ class MockCollisionWorldPublisher final : public ICollisionWorldSnapshotPublishe
     lease_release_call_count.fetch_add(1);
   }
 
-  CollisionWorldPolicySnapshotBundle
-  published_runtime_collision_snapshot_bundle() const override {
+  RuntimeCollisionQueryBundlePtr
+  published_runtime_collision_query_bundle() const override {
     const int call = published_runtime_bundle_call_count.fetch_add(1) + 1;
     if ((throw_on_published_runtime_bundle_call_number.has_value() &&
          call == *throw_on_published_runtime_bundle_call_number) ||
@@ -405,7 +467,9 @@ class MockCollisionWorldPublisher final : public ICollisionWorldSnapshotPublishe
             throw_on_published_runtime_bundle_call_numbers.end()) {
       throw std::runtime_error("published runtime snapshot bundle unavailable");
     }
-    return {snapshot(), current_policy};
+    return build_runtime_collision_query_bundle(
+        CollisionWorldPolicySnapshotBundle{snapshot(), current_policy},
+        static_cast<std::uint64_t>(call));
   }
 
  private:
@@ -437,6 +501,10 @@ class MockCollisionEngine final : public ICollisionQueryEngine {
   bool release_blocked_checks = false;
   std::atomic<int> blocked_check_count{0};
   std::atomic<int> cancel_observed_count{0};
+  std::atomic<int> runtime_checks_in_flight{0};
+  std::atomic<int> runtime_query_prepare_count{0};
+  std::atomic<int> runtime_snapshot_prepare_count{0};
+  std::atomic<bool> runtime_prepare_overlapped_check{false};
   std::mutex cancel_reason_mutex;
   std::string last_cancel_reason;
 
@@ -454,6 +522,16 @@ class MockCollisionEngine final : public ICollisionQueryEngine {
         "mock_collision_engine:" +
         std::to_string(reinterpret_cast<std::uintptr_t>(this));
     capability_.deterministic_ordering = true;
+    capability_.runtime_query_memory_model =
+        RuntimeCollisionQueryMemoryModel::kMeasuredBounded;
+    capability_.runtime_query_max_joints = 256;
+    capability_.runtime_query_max_world_bodies = 4096;
+    capability_.runtime_query_max_collision_pairs = 4096;
+    capability_.runtime_query_clean_allocation_upper_bound = 16;
+    capability_.runtime_query_snapshot_change_may_allocate = true;
+    capability_.runtime_query_snapshot_change_allocation_upper_bound = 256;
+    capability_.runtime_query_qualified_wcet_ns = 10'000'000;
+    capability_.runtime_query_snapshot_change_qualified_wcet_ns = 10'000'000;
   }
 
   const CollisionEngineCapabilityDescriptor& capability() const override {
@@ -515,10 +593,119 @@ class MockCollisionEngine final : public ICollisionQueryEngine {
     return result;
   }
 
+  RuntimeCollisionQueryPrepareStatus prepare_runtime_query(
+      std::span<const std::string> canonical_joint_names) noexcept override {
+    runtime_query_prepare_count.fetch_add(1, std::memory_order_relaxed);
+    if (runtime_checks_in_flight.load(std::memory_order_acquire) > 0) {
+      runtime_prepare_overlapped_check.store(true, std::memory_order_release);
+    }
+    try {
+      runtime_joint_names.assign(canonical_joint_names.begin(),
+                                 canonical_joint_names.end());
+      return RuntimeCollisionQueryPrepareStatus::kReady;
+    } catch (...) {
+      return RuntimeCollisionQueryPrepareStatus::kEngineError;
+    }
+  }
+
+  RuntimeCollisionQueryPrepareStatus prepare_runtime_snapshot(
+      const CollisionWorldSnapshot& /*snapshot*/) noexcept override {
+    runtime_snapshot_prepare_count.fetch_add(1, std::memory_order_relaxed);
+    if (runtime_checks_in_flight.load(std::memory_order_acquire) > 0) {
+      runtime_prepare_overlapped_check.store(true, std::memory_order_release);
+    }
+    return RuntimeCollisionQueryPrepareStatus::kReady;
+  }
+
+  RuntimeCollisionQueryResultView check_runtime(
+      const CollisionWorldSnapshot& snapshot,
+      const RuntimeCollisionQueryRequest& request) noexcept override {
+    struct InFlightGuard {
+      std::atomic<int>& count;
+      explicit InFlightGuard(std::atomic<int>& in_flight) : count(in_flight) {
+        count.fetch_add(1, std::memory_order_acq_rel);
+      }
+      ~InFlightGuard() { count.fetch_sub(1, std::memory_order_acq_rel); }
+    } in_flight_guard{runtime_checks_in_flight};
+    runtime_observations.clear();
+    runtime_clearance_observations.clear();
+    try {
+      CollisionQuery query;
+      query.query_id = "runtime_test_query";
+      query.surface = CollisionSurface::kObservedRuntimeMonitor;
+      query.collision_world_revision = snapshot.revision;
+      query.robot_state.joint_names = runtime_joint_names;
+      query.robot_state.positions_rad.assign(request.positions_rad.begin(),
+                                             request.positions_rad.end());
+      query.waypoint_index = 0;
+      query.state_time_ns = request.state_time_ns;
+      query.timeout_budget_ns = request.timeout_budget_ns;
+      if (request.require_distance) {
+        query.required_capabilities = {"distance", "penetration_depth"};
+      }
+      CollisionCancellationToken cancel;
+      runtime_result = check(snapshot, query, CollisionPolicySnapshot{}, cancel);
+      for (auto& pair : runtime_result.normalized_pairs) {
+        if (pair.body_b < pair.body_a) {
+          std::swap(pair.body_a, pair.body_b);
+        }
+      }
+      for (auto& clearance : runtime_result.pair_clearances) {
+        if (clearance.pair.body_b < clearance.pair.body_a) {
+          std::swap(clearance.pair.body_a, clearance.pair.body_b);
+        }
+      }
+      for (const auto& clearance : runtime_result.pair_clearances) {
+        runtime_clearance_observations.push_back(
+            {&clearance.pair, clearance.signed_clearance_m});
+      }
+      for (const auto& pair : runtime_result.normalized_pairs) {
+        std::optional<double> clearance;
+        const auto it = std::find_if(
+            runtime_result.pair_clearances.begin(),
+            runtime_result.pair_clearances.end(), [&](const auto& candidate) {
+              return candidate.pair == pair;
+            });
+        if (it != runtime_result.pair_clearances.end()) {
+          clearance = it->signed_clearance_m;
+        }
+        runtime_observations.push_back({&pair, clearance});
+      }
+      RuntimeCollisionQueryResultView view;
+      view.engine_status = runtime_result.engine_status;
+      view.query_duration_ns = runtime_result.query_duration_ns.value_or(0);
+      view.collision_pairs = runtime_observations;
+      view.clearance_pairs = runtime_clearance_observations;
+      if (runtime_result.engine_status != CollisionEngineStatus::kOk ||
+          runtime_result.decision ==
+              CollisionDecisionResult::kInconclusiveFail) {
+        view.status = RuntimeCollisionQueryStatus::kInconclusive;
+        view.failure_reason = RuntimeCollisionQueryFailureReason::kEngineException;
+      } else if (runtime_result.in_collision) {
+        view.status = RuntimeCollisionQueryStatus::kCollision;
+        view.failure_reason = RuntimeCollisionQueryFailureReason::kNone;
+      } else {
+        view.status = RuntimeCollisionQueryStatus::kClear;
+        view.failure_reason = RuntimeCollisionQueryFailureReason::kNone;
+      }
+      return view;
+    } catch (...) {
+      RuntimeCollisionQueryResultView view;
+      view.failure_reason = RuntimeCollisionQueryFailureReason::kEngineException;
+      view.engine_status = CollisionEngineStatus::kEngineError;
+      return view;
+    }
+  }
+
   std::string engine_id() const override { return capability_.engine_id; }
   std::string engine_version() const override {
     return capability_.engine_version;
   }
+
+  std::vector<std::string> runtime_joint_names;
+  CollisionResult runtime_result;
+  std::vector<RuntimeCollisionPairObservation> runtime_observations;
+  std::vector<RuntimeCollisionPairObservation> runtime_clearance_observations;
 
   bool wait_until_check_blocked(
       std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
@@ -552,6 +739,17 @@ class MockCollisionEngine final : public ICollisionQueryEngine {
 
 class MockExecution : public IExecutionBackend {
  public:
+  MockExecution()
+      : observed_publication_(
+            {"j1", "j2"},
+            {ObservedRobotStateSourceConfig{
+                ObservedRobotStateSourceKind::kJointState,
+                "fixture_measured_state",
+                ObservedRobotStateAuthorityProfile::kMeasured,
+                1'000'000'000}}) {
+    publish_observed_state(0, {0.0, 0.0}, {});
+  }
+
   int execute_count = 0;
   int stop_count = 0;
   int pause_count = 0;
@@ -622,6 +820,20 @@ class MockExecution : public IExecutionBackend {
     return snapshot;
   }
 
+  const ObservedRobotStatePublication*
+  observed_robot_state_publication() const noexcept override {
+    return &observed_publication_;
+  }
+
+  void publish_observed_state(std::int64_t timestamp_ns,
+                              const std::vector<double>& positions,
+                              const std::vector<double>& velocities) {
+    static const std::vector<std::string> joints{"j1", "j2"};
+    (void)observed_publication_.publish(
+        ObservedRobotStateSourceKind::kJointState, joints, positions,
+        velocities, timestamp_ns, timestamp_ns);
+  }
+
   /// Test backend declares spring_back_hold + hard_deceleration as
   /// supported. Individual tests may further customize via the
   /// `motion_interrupt_stop_capability` field.
@@ -666,10 +878,59 @@ class MockExecution : public IExecutionBackend {
     r.confirmation_latency_ns = 1'000'000;  // 1 ms
     return r;
   }
+
+ private:
+  ObservedRobotStatePublication observed_publication_;
+};
+
+class BlockingStopExecution final : public MockExecution {
+ public:
+  StopResultDTO stop() override {
+    std::unique_lock<std::mutex> lock(stop_mutex_);
+    stop_entered_ = true;
+    stop_cv_.notify_all();
+    stop_cv_.wait_for(lock, std::chrono::seconds(5), [this]() {
+      return stop_released_;
+    });
+    ++stop_count;
+    return StopResultDTO{true, std::nullopt};
+  }
+
+  bool wait_until_stop_entered(
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
+    std::unique_lock<std::mutex> lock(stop_mutex_);
+    return stop_cv_.wait_for(lock, timeout,
+                             [this]() { return stop_entered_; });
+  }
+
+  void release_stop() {
+    {
+      std::lock_guard<std::mutex> lock(stop_mutex_);
+      stop_released_ = true;
+    }
+    stop_cv_.notify_all();
+  }
+
+ private:
+  std::mutex stop_mutex_;
+  std::condition_variable stop_cv_;
+  bool stop_entered_ = false;
+  bool stop_released_ = false;
 };
 
 class ControlledExecution : public IExecutionBackend {
  public:
+  ControlledExecution()
+      : observed_publication_(
+            {"j1", "j2"},
+            {ObservedRobotStateSourceConfig{
+                ObservedRobotStateSourceKind::kJointState,
+                "test_measured_state",
+                ObservedRobotStateAuthorityProfile::kMeasured,
+                1'000'000'000}}) {
+    publish_observed_state(0, {0.0, 0.0}, {});
+  }
+
   int execute_count = 0;
   int stop_count = 0;
   // Counts EVERY legacy stop() call, including no-ops issued while the backend
@@ -828,6 +1089,20 @@ class ControlledExecution : public IExecutionBackend {
     return snapshot;
   }
 
+  const ObservedRobotStatePublication*
+  observed_robot_state_publication() const noexcept override {
+    return &observed_publication_;
+  }
+
+  void publish_observed_state(std::int64_t timestamp_ns,
+                              const std::vector<double>& positions,
+                              const std::vector<double>& velocities) {
+    static const std::vector<std::string> joints{"j1", "j2"};
+    (void)observed_publication_.publish(
+        ObservedRobotStateSourceKind::kJointState, joints, positions,
+        velocities, timestamp_ns, timestamp_ns);
+  }
+
   /// Controlled-stop capability for trip tests using
   /// ControlledExecution. Mirrors MockExecution; individual tests
   /// may shrink the set to exercise capability-gate rejection.
@@ -883,6 +1158,10 @@ class ControlledExecution : public IExecutionBackend {
       const MotionInterruptStopProfileDTO& profile,
       std::stop_token stop_token) override {
     ControlledStopResultDTO r;
+    bool publish_stop_observation = false;
+    std::vector<double> stop_positions;
+    std::vector<double> stop_velocities;
+    std::int64_t stop_timestamp_ns = 0;
     if (next_controlled_stop_result) {
       r = *next_controlled_stop_result;
     } else {
@@ -948,7 +1227,15 @@ class ControlledExecution : public IExecutionBackend {
         if (next_post_stop_state_source) {
           snapshot.state_source = *next_post_stop_state_source;
         }
+        publish_stop_observation = true;
+        stop_positions = snapshot.joint_positions_rad;
+        stop_velocities = snapshot.joint_velocities_rad_s;
+        stop_timestamp_ns = snapshot.timestamp_ns;
       }
+    }
+    if (publish_stop_observation && stop_positions.size() == 2u) {
+      publish_observed_state(stop_timestamp_ns, stop_positions,
+                             stop_velocities);
     }
     cv_.notify_all();
     return r;
@@ -966,6 +1253,8 @@ class ControlledExecution : public IExecutionBackend {
   void set_progress(double progress,
                     std::vector<double> joint_positions,
                     std::optional<std::int64_t> timestamp_ns = std::nullopt) {
+    std::vector<double> observed_positions = joint_positions;
+    std::int64_t observed_timestamp_ns = timestamp_ns.value_or(0);
     {
       std::lock_guard<std::mutex> lock(mu_);
       snapshot.progress = progress;
@@ -973,15 +1262,26 @@ class ControlledExecution : public IExecutionBackend {
       snapshot.state = paused_ ? ExecutionState::kPaused : ExecutionState::kExecuting;
       if (timestamp_ns) {
         snapshot.timestamp_ns = *timestamp_ns;
+      } else {
+        observed_timestamp_ns = snapshot.timestamp_ns;
       }
     }
+    publish_observed_state(observed_timestamp_ns, observed_positions, {});
     cv_.notify_all();
   }
 
   void set_snapshot_velocities(std::vector<double> joint_velocities_rad_s) {
+    std::vector<double> positions;
+    std::vector<double> velocities = joint_velocities_rad_s;
+    std::int64_t timestamp_ns = 0;
     {
       std::lock_guard<std::mutex> lock(mu_);
       snapshot.joint_velocities_rad_s = std::move(joint_velocities_rad_s);
+      positions = snapshot.joint_positions_rad;
+      timestamp_ns = snapshot.timestamp_ns;
+    }
+    if (positions.size() == 2u) {
+      publish_observed_state(timestamp_ns, positions, velocities);
     }
     cv_.notify_all();
   }
@@ -1183,6 +1483,7 @@ class ControlledExecution : public IExecutionBackend {
   std::condition_variable_any cv_;
   bool running_ = false;
   bool paused_ = false;
+  ObservedRobotStatePublication observed_publication_;
 };
 
 class ThreadSafeManualScheduler final : public IScheduler {
@@ -1495,6 +1796,21 @@ SceneSnapshotLiveObject make_observed_box_live_object(
   return live;
 }
 
+void install_mock_retained_object(MockCollisionWorldPublisher& publisher,
+                                  const std::string& object_id) {
+  const auto pose = make_test_pose();
+  const auto revision = publisher.current_snapshot
+                            ? publisher.current_snapshot->revision
+                            : CollisionWorldRevision{1, "mock-collision-world"};
+  publisher.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(
+          make_test_collision_world_snapshot_with_object(
+              object_id, pose, revision, object_id + "-body-hash"));
+  publisher.lease_live_objects = {
+      make_observed_box_live_object(object_id, pose,
+                                    object_id + "-shape-token")};
+}
+
 CollisionWorldBody make_dynamic_test_body(std::int64_t source_timestamp_ns,
                                           std::int64_t freshness_budget_ns) {
   CollisionWorldBody body;
@@ -1635,6 +1951,21 @@ bool wait_for_pending_scheduler_work(ThreadSafeManualScheduler& scheduler,
   return false;
 }
 
+bool wait_for_recovery_status(ExecutionKernel& kernel,
+                              ThreadSafeManualScheduler& scheduler,
+                              ThreadSafeFakeClock& clock,
+                              RecoveryAssessmentStatus target_status,
+                              int max_attempts = 2000) {
+  for (int attempt = 0; attempt < max_attempts; ++attempt) {
+    scheduler.advance_to(clock.now());
+    if (kernel.get_recovery_assessment().status == target_status) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return false;
+}
+
 // --- Test fixture ---
 
 class ExecutionKernelTest : public ::testing::Test {
@@ -1642,7 +1973,7 @@ class ExecutionKernelTest : public ::testing::Test {
   FakeClock clock;
   ManualScheduler scheduler;
   MockPlanner planner;
-  MockContext context;
+  MockFocusedPorts context;
   MockExecution execution;
   TrajectoryCache cache{CacheConfig{10}};
   MockCollisionWorldPublisher collision_world_publisher;
@@ -1663,7 +1994,7 @@ class ExecutionKernelTest : public ::testing::Test {
     RobotStateDTO state;
     state.joint_names = {"j1", "j2"};
     state.positions_rad = {0.0, 0.0};
-    context.current_state = state;
+    context.current_state_value = state;
     collision_world_publisher.current_snapshot =
         std::make_shared<const CollisionWorldSnapshot>(
             make_test_collision_world_snapshot());
@@ -1676,6 +2007,15 @@ class ExecutionKernelTest : public ::testing::Test {
     kernel.set_collision_resources(collision_world_publisher,
                                    collision_runtime_engine,
                                    {collision_engine});
+  }
+
+  void install_at_rest_recovery_observation() {
+    execution.publish_observed_state(clock.now(), {1.0, 1.0}, {0.0, 0.0});
+    clock.advance(20'000'000);
+    scheduler.advance_to(clock.now());
+    clock.advance(200'000'000);
+    execution.publish_observed_state(clock.now(), {1.0, 1.0}, {0.0, 0.0});
+    scheduler.advance_to(clock.now());
   }
 
   /// Helper: execute and wait for async completion.
@@ -1709,7 +2049,6 @@ class ExecutionKernelTest : public ::testing::Test {
     relative.target_reference.id = object_id;
     relative.offset.orientation.w = 1.0;
     request.motion = relative;
-    context.next_object_pose = make_test_pose(0.0, 0.0, 0.0);
     return request;
   }
 
@@ -1996,6 +2335,7 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMove_ResolvesToPoseGoalBeforePlannin
   resolved_reference.position_m = {0.3, -0.2, 0.15};
   resolved_reference.orientation = {0.0, 0.0, 0.0, 1.0};
   context.next_reference_pose = Result<Pose3DTO>::Ok(resolved_reference);
+  install_mock_retained_object(collision_world_publisher, "graspable");
 
   auto result = execute_sync(req);
   ASSERT_TRUE(result.ok());
@@ -2058,6 +2398,7 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMove_OffsetReference_UsesIndependent
       Result<Pose3DTO>::Ok(target_pose),
       Result<Pose3DTO>::Ok(offset_basis_pose),
   };
+  install_mock_retained_object(collision_world_publisher, "graspable");
 
   auto result = execute_sync(req);
   ASSERT_TRUE(result.ok());
@@ -2146,7 +2487,7 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(snapshot.error.has_value());
   EXPECT_EQ(snapshot.error->code, kErrorSceneChangedDuringValidation);
   EXPECT_EQ(snapshot.error->details.at("reason"),
-            "collision_world_changed_after_validation");
+            "scene_snapshot_lease_missing_collision_coverage");
   EXPECT_EQ(snapshot.error->details.at("validation_collision_world_revision_id"),
             "1");
   EXPECT_EQ(snapshot.error->details.at("live_collision_world_revision_id"),
@@ -2587,6 +2928,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithUnchangedResolvedGoa
 
   context.next_reference_pose = Result<Pose3DTO>::Ok(make_pose(0.3, -0.2, 0.15));
   context.next_fk = make_pose(0.3, -0.2, 0.25);
+  install_mock_retained_object(collision_world_publisher, "box");
 
   auto result = execute_sync(req);
 
@@ -2608,6 +2950,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithMovedObject_Invalida
 
   context.next_reference_pose = Result<Pose3DTO>::Ok(make_pose(0.5, -0.2, 0.15));
   context.next_fk = make_pose(0.3, -0.2, 0.25);
+  install_mock_retained_object(collision_world_publisher, "box");
 
   auto result = execute_sync(req);
 
@@ -2701,7 +3044,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitJointGoalNameMismatch_InvalidatesAnd
   auto cached = make_test_trajectory();
   cached.joint_names = {"j3", "j1"};
   store_cache("move_joint_mismatch", cached);
-  context.current_state.joint_names = {"j3", "j1"};
+  context.current_state_value.joint_names = {"j3", "j1"};
 
   auto req = make_test_request("move_joint_mismatch");
   req.motion = JointGoalDTO{{"j1", "j2"}, {1.0, 1.0}};
@@ -2820,7 +3163,7 @@ TEST_F(ExecutionKernelTest, Execute_SyncObservedStateBeforePlanning_CalledBefore
     RobotStateDTO state;
     state.joint_names = {"j1", "j2"};
     state.positions_rad = {0.25, -0.5};
-    context.current_state = state;
+    context.current_state_value = state;
   };
 
   auto result = execute_sync(make_test_request("move_after_sync"));
@@ -2907,7 +3250,7 @@ TEST_F(ExecutionKernelTest, Execute_StartStateMismatch_Fails) {
   RobotStateDTO bad_state;
   bad_state.joint_names = {"j1", "j2"};
   bad_state.positions_rad = {5.0, 5.0};
-  context.current_state = bad_state;
+  context.current_state_value = bad_state;
 
   execute_sync(make_test_request());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
@@ -2917,7 +3260,7 @@ TEST_F(ExecutionKernelTest, Execute_StartStateValidationComparesByJointName) {
   RobotStateDTO reordered_state;
   reordered_state.joint_names = {"j2", "j1"};
   reordered_state.positions_rad = {0.0, 0.0};
-  context.current_state = reordered_state;
+  context.current_state_value = reordered_state;
 
   execute_sync(make_test_request("move_start_named"));
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
@@ -2928,33 +3271,33 @@ TEST_F(ExecutionKernelTest, Execute_StartStateMissingJointName_FailsClosed) {
   RobotStateDTO ambiguous_state;
   ambiguous_state.joint_names = {"j1"};
   ambiguous_state.positions_rad = {0.0};
-  context.current_state = ambiguous_state;
+  context.current_state_value = ambiguous_state;
 
   execute_sync(make_test_request("move_start_missing_joint"));
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
   EXPECT_EQ(execution.execute_count, 0);
 }
 
-// --- Legacy collision-compare diagnostics gate ---
+// --- Non-authoritative collision diagnostic comparator gate ---
 
 TEST_F(ExecutionKernelTest,
-       Execute_CollisionRejectionOmitsLegacyCompareDiagnosticsByDefault) {
+       Execute_CollisionRejectionOmitsDiagnosticCompareByDefault) {
   collision_engine->default_result = make_authoritative_collision_result();
 
-  execute_sync(make_test_request("legacy_compare_gated_off"));
+  execute_sync(make_test_request("diagnostic_compare_gated_off"));
 
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
   for (const auto& [key, value] : snapshot.error->details) {
-    EXPECT_EQ(key.rfind("legacy_collision_compare_", 0), std::string::npos)
-        << "unexpected legacy compare key on default config: " << key;
+    EXPECT_EQ(key.rfind("collision_diagnostic_compare_", 0), std::string::npos)
+        << "unexpected diagnostic compare key on default config: " << key;
   }
 }
 
 TEST_F(ExecutionKernelTest,
-       Execute_CollisionRejectionAppendsLegacyCompareDiagnosticsWhenEnabled) {
+       Execute_CollisionRejectionAppendsDiagnosticCompareWhenEnabled) {
   ExecutionKernelConfig config;
-  config.enable_legacy_collision_compare_diagnostics = true;
+  config.enable_collision_diagnostic_compare = true;
   ExecutionKernel gated_kernel{planner, context,   execution,
                                clock,   scheduler, cache,
                                config};
@@ -2962,21 +3305,21 @@ TEST_F(ExecutionKernelTest,
       gated_kernel, collision_world_publisher, collision_engine);
   collision_engine->default_result = make_authoritative_collision_result();
 
-  auto result = gated_kernel.execute(make_test_request("legacy_compare_on"));
+  auto result = gated_kernel.execute(make_test_request("diagnostic_compare_on"));
   ASSERT_TRUE(result.ok());
   gated_kernel.wait_for_completion();
 
   const auto snapshot = gated_kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
-  bool found_legacy_key = false;
+  bool found_compare_key = false;
   for (const auto& [key, value] : snapshot.error->details) {
-    if (key.rfind("legacy_collision_compare_", 0) == 0) {
-      found_legacy_key = true;
+    if (key.rfind("collision_diagnostic_compare_", 0) == 0) {
+      found_compare_key = true;
       break;
     }
   }
-  EXPECT_TRUE(found_legacy_key)
-      << "expected legacy compare keys when the gate is enabled";
+  EXPECT_TRUE(found_compare_key)
+      << "expected diagnostic compare keys when the gate is enabled";
 }
 
 // --- Pre-execution collision ---
@@ -3141,18 +3484,11 @@ TEST_F(ExecutionKernelTest,
       planner, context, execution, clock, scheduler, cache};
 
   auto result = unconfigured_kernel.execute(make_test_request("missing_pipeline"));
-  ASSERT_TRUE(result.ok());
-  unconfigured_kernel.wait_for_completion();
-  EXPECT_EQ(unconfigured_kernel.get_status().state, ExecutionState::kFailed);
-  const auto snapshot = unconfigured_kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorInvariantViolation);
-  EXPECT_EQ(snapshot.error->message,
-            "Authoritative collision validation snapshot publisher is not "
-            "configured");
-  EXPECT_EQ(snapshot.error->details.at("reason"),
-            "missing_collision_world_snapshot_publisher");
-  EXPECT_EQ(snapshot.error->details.at("phase"), "pre_execution_validation");
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, kErrorExecutionRejected);
+  EXPECT_EQ(result.error().details.at("reason"),
+            "scene_projection_authority_unavailable");
+  EXPECT_EQ(unconfigured_kernel.get_status().state, ExecutionState::kIdle);
   EXPECT_EQ(execution.execute_count, 0);
 }
 
@@ -3503,7 +3839,7 @@ TEST_F(ExecutionKernelTest,
   second_plan.trajectory =
       make_test_trajectory_from({0.0, 0.0}, {2.0, 2.0});
   local_planner.result_sequence = {first_plan, second_plan};
-  MockContext local_context = context;
+  MockFocusedPorts local_context = context;
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel local_kernel{local_planner,
@@ -3586,7 +3922,7 @@ TEST_F(ExecutionKernelTest,
   second_plan.trajectory =
       make_test_trajectory_from({0.0, 0.0}, {2.0, 2.0});
   local_planner.result_sequence = {first_plan, second_plan};
-  MockContext local_context = context;
+  MockFocusedPorts local_context = context;
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel local_kernel{local_planner,
@@ -3629,7 +3965,7 @@ TEST_F(ExecutionKernelTest,
   second_plan.trajectory =
       make_test_trajectory_from({0.0, 0.0}, {2.0, 2.0});
   local_planner.result_sequence = {first_plan, second_plan};
-  MockContext local_context = context;
+  MockFocusedPorts local_context = context;
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel local_kernel{local_planner,
@@ -3694,7 +4030,7 @@ TEST_F(ExecutionKernelTest,
   second_plan.trajectory =
       make_test_trajectory_from({0.0, 0.0}, {2.0, 2.0});
   local_planner.result_sequence = {first_plan, second_plan};
-  MockContext local_context = context;
+  MockFocusedPorts local_context = context;
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel local_kernel{local_planner,
@@ -3768,7 +4104,7 @@ TEST_F(ExecutionKernelTest,
   PlanResultDTO plan;
   plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
   local_planner.result_sequence = {plan, plan, plan};
-  MockContext local_context = context;
+  MockFocusedPorts local_context = context;
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel local_kernel{local_planner,
@@ -3921,6 +4257,7 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(first.ok());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
   EXPECT_EQ(execution.reset_count, 0);
+  install_at_rest_recovery_observation();
 
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
@@ -3968,12 +4305,14 @@ TEST_F(ExecutionKernelTest,
   auto first = execute_sync(make_test_request());
   ASSERT_TRUE(first.ok());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+  execution.publish_observed_state(clock.now(), {1.0, 1.0}, {0.2, 0.0});
 
   auto ack = kernel.acknowledge_intervention_for_retry(
       "operator_alice", "ui_acknowledge_and_continue");
   EXPECT_FALSE(ack.accepted);
   ASSERT_TRUE(ack.error.has_value());
-  EXPECT_EQ(ack.error->details.at("reason"), "robot_not_settled");
+  EXPECT_EQ(ack.error->details.at("reason"),
+            reason_codes::kRecoveryObservedStateNotAtRest);
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
   EXPECT_EQ(execution.reset_count, 0);
 }
@@ -4583,7 +4922,7 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ReplansFromFreshCurrentState) {
   ASSERT_TRUE(controlled_execution.wait_until_paused()) << "wait_until_paused timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
 
-  context.current_state.positions_rad = {0.25, 0.25};
+  context.current_state_value.positions_rad = {0.25, 0.25};
   PlanResultDTO resume_plan_ok;
   resume_plan_ok.trajectory =
       make_test_trajectory_from({0.25, 0.25}, {1.0, 1.0});
@@ -4672,7 +5011,7 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_WhenBackendPauseTerminatesHandle_K
   }
   EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kPaused);
 
-  context.current_state.positions_rad = {0.25, 0.25};
+  context.current_state_value.positions_rad = {0.25, 0.25};
   PlanResultDTO resume_plan_ok;
   resume_plan_ok.trajectory =
       make_test_trajectory_from({0.25, 0.25}, {1.0, 1.0});
@@ -4758,7 +5097,7 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ValidationFailureTransitionsToFail
   ASSERT_TRUE(controlled_execution.wait_until_paused()) << "wait_until_paused timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
 
-  context.current_state.positions_rad = {0.5, 0.5};
+  context.current_state_value.positions_rad = {0.5, 0.5};
   PlanResultDTO resume_plan_ok;
   resume_plan_ok.trajectory =
       make_test_trajectory_from({0.5, 0.5}, {1.0, 1.0});
@@ -4802,7 +5141,7 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_PlanningFailureStopsPausedBackend)
       << "wait_until_paused timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
 
-  context.current_state.positions_rad = {0.5, 0.5};
+  context.current_state_value.positions_rad = {0.5, 0.5};
   PlanResultDTO resume_plan_error;
   resume_plan_error.error =
       ErrorDTO{kErrorPlanningFailed, "No resume path", {}};
@@ -4844,7 +5183,7 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_StopDuringStateSyncDoesNotDispatch
       << "wait_until_paused timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
 
-  context.current_state.positions_rad = {0.5, 0.5};
+  context.current_state_value.positions_rad = {0.5, 0.5};
   PlanResultDTO resume_plan_ok;
   resume_plan_ok.trajectory =
       make_test_trajectory_from({0.5, 0.5}, {1.0, 1.0});
@@ -4893,7 +5232,7 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ResetDuringStateSyncDoesNotDispatc
       << "wait_until_paused timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
 
-  context.current_state.positions_rad = {0.5, 0.5};
+  context.current_state_value.positions_rad = {0.5, 0.5};
   PlanResultDTO resume_plan_ok;
   resume_plan_ok.trajectory =
       make_test_trajectory_from({0.5, 0.5}, {1.0, 1.0});
@@ -4980,6 +5319,11 @@ TEST_F(ExecutionKernelTest,
   MockCollisionWorldPublisher local_collision_world;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  // Subscriber storage must outlive the kernel: the fault-preempt completion
+  // worker can emit its final assessment after execute-worker completion.
+  std::mutex events_mu;
+  std::condition_variable events_cv;
+  std::vector<KernelEvent> events;
   ExecutionKernel controlled_kernel{planner,
                                     context,
                                     controlled_execution,
@@ -4990,16 +5334,17 @@ TEST_F(ExecutionKernelTest,
   configure_runtime_collision_monitoring(
       controlled_kernel, local_collision_world, local_collision_engine,
       local_runtime_engine);
-  std::mutex events_mu;
-  std::vector<KernelEvent> events;
   controlled_kernel.subscribe_events([&](const KernelEvent& e) {
-    std::lock_guard<std::mutex> lock(events_mu);
-    events.push_back(e);
+    {
+      std::lock_guard<std::mutex> lock(events_mu);
+      events.push_back(e);
+    }
+    events_cv.notify_all();
   });
 
-  // RT-1: runtime ticks consume the kernel-published snapshot captured at
-  // monitor start. Publish the live world before dispatch; the tick must not
-  // poll the scene publisher after execution is active.
+  // Runtime ticks consume the publisher's immutable query-bundle surface.
+  // Publish the live world before dispatch; the production port serves this
+  // as an atomic handle without borrowing the mutable scene.
   auto live_snapshot = make_test_collision_world_snapshot();
   live_snapshot.revision = CollisionWorldRevision{99, "live-scene-after-dispatch"};
   local_collision_world.current_snapshot =
@@ -5046,7 +5391,17 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(latch->preemption_result, InterruptPreemptionResult::kSucceeded);
   std::vector<KernelEvent> captured_events;
   {
-    std::lock_guard<std::mutex> lock(events_mu);
+    std::unique_lock<std::mutex> lock(events_mu);
+    ASSERT_TRUE(events_cv.wait_for(
+        lock, std::chrono::seconds(1), [&]() {
+          return std::any_of(events.begin(), events.end(),
+                             [](const KernelEvent& event) {
+                               return event.type == KernelEventType::
+                                                        kInterruptPreemptApplied &&
+                                      event.details.at("preemption_result") ==
+                                          "succeeded";
+                             });
+        })) << "fault worker did not publish its terminal preemption event";
     captured_events = events;
   }
   EXPECT_TRUE(
@@ -5085,6 +5440,8 @@ TEST_F(ExecutionKernelTest,
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.recovery_ready_dwell_ns = 0;
+  config.recovery_ready_min_samples = 1;
   MockCollisionWorldPublisher local_collision_world;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
@@ -5100,6 +5457,8 @@ TEST_F(ExecutionKernelTest,
     clear_result.decision = CollisionDecisionResult::kPass;
     return clear_result;
   };
+  controlled_execution.publish_observed_state(
+      local_clock.now(), {0.0, 0.0}, {0.0, 0.0});
   ExecutionKernel controlled_kernel{planner,
                                     context,
                                     controlled_execution,
@@ -5133,6 +5492,46 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(retry_latch.has_value());
   ASSERT_EQ(retry_latch->preemption_result,
             InterruptPreemptionResult::kSucceeded);
+
+  // The fault worker publishes after its completion guard clears activity. If
+  // lifecycle authority was busy, publication uses the coalesced Monitoring
+  // task; drive that deterministic lane while allowing the worker to finish.
+  KernelRecoveryAssessmentDTO ready_assessment;
+  for (int attempt = 0; attempt < 1000; ++attempt) {
+    local_scheduler.advance_to(local_clock.now());
+    ready_assessment = controlled_kernel.get_recovery_assessment();
+    if (ready_assessment.status == RecoveryAssessmentStatus::kRetryReady) {
+      break;
+    }
+    std::this_thread::yield();
+  }
+  ASSERT_EQ(ready_assessment.status, RecoveryAssessmentStatus::kRetryReady)
+      << ready_assessment.reason_code << " assessment_exec="
+      << ready_assessment.execution_id << " latch="
+      << ready_assessment.latch_id << " owner_gen="
+      << ready_assessment.stop_owner_generation << " cert="
+      << ready_assessment.stop_certificate_id << " evidence_count="
+      << controlled_kernel.stop_certificate_evidence().size();
+  ASSERT_GT(ready_assessment.observed_state_valid_until_ns, local_clock.now());
+
+  // Expiry is authority-driven, not observer-driven: at the exact exclusive
+  // valid-until boundary the Monitoring callback revokes readiness.
+  local_clock.advance(ready_assessment.observed_state_valid_until_ns -
+                      local_clock.now());
+  local_scheduler.advance_to(local_clock.now());
+  const auto expired_assessment = controlled_kernel.get_recovery_assessment();
+  EXPECT_EQ(expired_assessment.status, RecoveryAssessmentStatus::kWaiting);
+  EXPECT_EQ(expired_assessment.reason_code,
+            reason_codes::kRecoveryObservedStateStale);
+
+  // A genuinely newer safe publication restores readiness through the
+  // kernel-owned observation poll; no lifecycle callback seam is involved.
+  controlled_execution.publish_observed_state(
+      local_clock.now(), {0.0, 0.0}, {0.0, 0.0});
+  local_clock.advance(config.recovery_observation_poll_period_ns);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_EQ(controlled_kernel.get_recovery_assessment().status,
+            RecoveryAssessmentStatus::kRetryReady);
 
   auto ack = controlled_kernel.acknowledge_interrupted_for_retry(
       "operator", "runtime obstacle cleared");
@@ -5233,14 +5632,14 @@ TEST_F(ExecutionKernelTest,
 
   EXPECT_FALSE(ack.accepted);
   ASSERT_TRUE(ack.error.has_value());
-  EXPECT_EQ(ack.error->code, kErrorInvalidRequest);
+  EXPECT_EQ(ack.error->code, kErrorRecoveryActionRejected);
   EXPECT_EQ(ack.error->details.at("reason"),
-            kReasonRuntimeCollisionStopNotYetCertified);
+            reason_codes::kRecoveryStopNotCertified);
   EXPECT_EQ(ack.error->details.at("execution_id"),
             std::to_string(result.value()));
   EXPECT_EQ(ack.error->details.at("latch_id"), latch_before->latch_id);
   EXPECT_EQ(ack.error->details.at("preemption_result"), "pending");
-  EXPECT_EQ(ack.error->details.at("fault_preempt_stop_active"), "true");
+  EXPECT_EQ(ack.error->details.at("stop_owner_active"), "true");
   EXPECT_EQ(ack.error->details.at("retryable"), "true");
   EXPECT_EQ(controlled_kernel.control_command_epoch(), epoch);
   EXPECT_EQ(controlled_kernel.get_status().state,
@@ -5260,11 +5659,11 @@ TEST_F(ExecutionKernelTest,
     std::lock_guard<std::mutex> lock(events_mutex);
     EXPECT_TRUE(std::any_of(
         events.begin(), events.end(), [&](const KernelEvent& event) {
-          return event.type == KernelEventType::kErrorRaised &&
+          return event.type == KernelEventType::kRecoveryActionRejected &&
                  event.execution_id == result.value() &&
                  event.details.contains("reason") &&
                  event.details.at("reason") ==
-                     kReasonRuntimeCollisionStopNotYetCertified &&
+                     reason_codes::kRecoveryStopNotCertified &&
                  event.details.contains("latch_id") &&
                  event.details.at("latch_id") == latch_before->latch_id;
         }));
@@ -5391,10 +5790,10 @@ TEST_F(ExecutionKernelTest,
   EXPECT_FALSE(ack.accepted);
   ASSERT_TRUE(ack.error.has_value());
   EXPECT_EQ(ack.error->details.at("reason"),
-            kReasonRuntimeCollisionStopNotYetCertified);
+            reason_codes::kRecoveryStopFailedEscalating);
   EXPECT_EQ(ack.error->details.at("preemption_result"),
             "backend_preempt_failed");
-  EXPECT_EQ(ack.error->details.at("fault_preempt_stop_active"), "true");
+  EXPECT_EQ(ack.error->details.at("stop_owner_active"), "true");
   EXPECT_EQ(ack.error->details.at("retryable"), "false");
   ASSERT_TRUE(latch_after_rejection.has_value());
   EXPECT_EQ(latch_after_rejection->preemption_result,
@@ -5520,11 +5919,11 @@ TEST_F(ExecutionKernelTest,
   EXPECT_FALSE(ack.accepted);
   ASSERT_TRUE(ack.error.has_value());
   EXPECT_EQ(ack.error->details.at("reason"),
-            kReasonRuntimeCollisionStopNotYetCertified);
+            reason_codes::kRecoveryStopFailedEscalating);
   EXPECT_EQ(ack.error->details.at("preemption_result"),
             "backend_preempt_failed");
   EXPECT_EQ(ack.error->details.at("required_preemption_result"), "succeeded");
-  EXPECT_EQ(ack.error->details.at("fault_preempt_stop_active"), "false");
+  EXPECT_EQ(ack.error->details.at("stop_owner_active"), "true");
   EXPECT_EQ(ack.error->details.at("retryable"), "false");
   ASSERT_TRUE(latch_after_rejection.has_value());
   EXPECT_EQ(latch_after_rejection->latch_id, latch_before->latch_id);
@@ -5609,10 +6008,10 @@ TEST_F(ExecutionKernelTest,
   ASSERT_FALSE(ack.accepted);
   ASSERT_TRUE(ack.error.has_value());
   EXPECT_EQ(ack.error->details.at("reason"),
-            "interrupted_retry_replayed_latch");
+            reason_codes::kRecoveryQueuedLatchPresent);
   auto latch = controlled_kernel.get_active_interrupt_latch();
   ASSERT_TRUE(latch.has_value());
-  EXPECT_EQ(latch->source_id, "retry_replay_latch");
+  EXPECT_EQ(latch->source_id, kRuntimeCollisionFaultSourceId);
   ASSERT_TRUE(latch->borrowed_collision_world_revision.has_value());
   expect_collision_world_revision(*latch->borrowed_collision_world_revision,
                                   replay_revision);
@@ -5708,8 +6107,8 @@ TEST_F(ExecutionKernelTest,
       controlled_kernel, local_collision_world, local_collision_engine,
       local_runtime_engine);
 
-  context.current_state.joint_names = {"j1", "j2"};
-  context.current_state.positions_rad = {0.0, 0.0};
+  context.current_state_value.joint_names = {"j1", "j2"};
+  context.current_state_value.positions_rad = {0.0, 0.0};
   controlled_execution.snapshot.timestamp_ns = local_clock.now();
 
   TrajectoryDTO expanded;
@@ -5755,7 +6154,7 @@ TEST_F(ExecutionKernelTest,
 
   EXPECT_GE(context.expand_count, 1);
   EXPECT_EQ(context.expand_count, expand_count_after_dispatch)
-      << "runtime collision ticks must not call the planning context";
+      << "runtime collision ticks must not call the observed-state provider";
   ASSERT_EQ(context.last_expand_trajectory.joint_names,
             (std::vector<std::string>{"j1", "j2"}));
   ASSERT_GE(context.last_expand_trajectory.waypoints.size(), 1u);
@@ -6135,6 +6534,101 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest,
+       Stop_ActiveMonitorRearmReusesSessionWithoutPreparingEngine) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  MotionInterruptStopProfileDTO op_profile;
+  op_profile.profile_id = "operator_stop_soft_on_path";
+  op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  op_profile.deceleration_time_s = 0.3;
+  op_profile.per_joint_max_deceleration_rad_s2 = {{"j1", 8.0}, {"j2", 8.0}};
+  config.operator_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_query_timeout_ns = 10'000'000;
+
+  MockCollisionWorldPublisher local_publisher;
+  auto validation_engine = std::make_shared<MockCollisionEngine>();
+  auto runtime_engine = std::make_shared<MockCollisionEngine>();
+  runtime_engine->block_until_cancel_requested = true;
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  configure_runtime_collision_monitoring(local_kernel, local_publisher,
+                                         validation_engine, runtime_engine);
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath,
+       MotionInterruptStopMode::kSpringBackHold};
+
+  const auto execution_result =
+      local_kernel.execute(make_test_request("runtime_rearm_quiescence"));
+  ASSERT_TRUE(execution_result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
+
+  local_clock.advance(10'000'000);
+  auto tick_future = std::async(std::launch::async, [&]() {
+    local_scheduler.advance_to(local_clock.now());
+  });
+  const auto release_runtime_query = [&]() {
+    {
+      std::lock_guard<std::mutex> lock(runtime_engine->block_mutex);
+      runtime_engine->release_blocked_checks = true;
+    }
+    runtime_engine->block_cv.notify_all();
+  };
+  auto query_release_guard = std::shared_ptr<void>(
+      nullptr, [&](void*) { release_runtime_query(); });
+  for (int attempt = 0;
+       attempt < 1000 && runtime_engine->blocked_check_count.load() == 0;
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GT(runtime_engine->blocked_check_count.load(), 0);
+  const auto query_prepare_count =
+      runtime_engine->runtime_query_prepare_count.load();
+  const auto snapshot_prepare_count =
+      runtime_engine->runtime_snapshot_prepare_count.load();
+
+  auto stop_future = std::async(std::launch::async,
+                                [&]() { return local_kernel.stop(); });
+  const auto stop_wait_status =
+      stop_future.wait_for(std::chrono::milliseconds(500));
+  EXPECT_EQ(stop_wait_status, std::future_status::ready)
+      << "motion-to-stop rearm must reuse the active query session";
+  std::optional<StopResultDTO> stop_result;
+  if (stop_wait_status == std::future_status::ready) {
+    stop_result = stop_future.get();
+  }
+  EXPECT_FALSE(runtime_engine->runtime_prepare_overlapped_check.load());
+  EXPECT_EQ(runtime_engine->runtime_query_prepare_count.load(),
+            query_prepare_count);
+  EXPECT_EQ(runtime_engine->runtime_snapshot_prepare_count.load(),
+            snapshot_prepare_count);
+
+  release_runtime_query();
+  ASSERT_EQ(tick_future.wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+  tick_future.get();
+  if (!stop_result.has_value()) {
+    ASSERT_EQ(stop_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    stop_result = stop_future.get();
+  }
+  EXPECT_TRUE(stop_result->accepted);
+  EXPECT_FALSE(runtime_engine->runtime_prepare_overlapped_check.load());
+  query_release_guard.reset();
+}
+
+TEST_F(ExecutionKernelTest,
        Stop_OperatorStopProfileKeepsMonitorArmedDuringDecel) {
   ControlledExecution controlled_execution;
   controlled_execution.block_controlled_stop = true;
@@ -6226,6 +6720,14 @@ TEST_F(ExecutionKernelTest,
   EXPECT_GE(controlled_execution.stop_attempt_count_value(), 1);
   EXPECT_EQ(local_kernel.get_status().state,
             ExecutionState::kInterventionRequired);
+  const auto coverage = local_kernel.get_metrics();
+  EXPECT_EQ(coverage.runtime_collision_stop_windows_started, 1u);
+  EXPECT_EQ(coverage.runtime_collision_stop_windows_completed, 1u);
+  EXPECT_GT(coverage.runtime_collision_last_stop_ticks_attempted, 0u);
+  EXPECT_EQ(coverage.runtime_collision_last_stop_queries_executed,
+            coverage.runtime_collision_last_stop_ticks_attempted);
+  EXPECT_EQ(coverage.runtime_collision_last_stop_unavailable_ticks, 0u);
+  EXPECT_EQ(coverage.runtime_collision_last_stop_longest_unavailable_ns, 0u);
   auto snapshot = local_kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
   EXPECT_EQ(snapshot.error->details.at("reason"),
@@ -7960,6 +8462,10 @@ TEST_F(ExecutionKernelTest,
   config.runtime_collision_query_timeout_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 5'000'000'000;
   config.runtime_dynamic_body_max_age_cap_ns = 5'000'000'000;
+  // This test isolates stop/intervention mechanics for an explicitly
+  // non-measured test deployment. Production defaults stay fail-closed until
+  // RT-8C publishes qualified observed state.
+  config.recovery_require_measured_observation = false;
   MotionInterruptStopProfileDTO fault_profile;
   fault_profile.profile_id = "fault_spring_back_collision_window";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
@@ -8108,6 +8614,13 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(outcome->error->details.at("reason"),
             "fault_preempt_stop_path_collision");
 
+  ASSERT_TRUE(wait_for_recovery_status(
+      local_kernel, local_scheduler, local_clock,
+      RecoveryAssessmentStatus::kActionRequired))
+      << "fault preempt completion did not publish a recovery choice";
+  EXPECT_EQ(local_kernel.get_recovery_assessment().reason_code,
+            reason_codes::kRecoveryInterventionChoiceRequired);
+
   auto ack = local_kernel.acknowledge_intervention_for_retry(
       "operator_alice", "ui_acknowledge_and_continue");
   ASSERT_TRUE(ack.accepted)
@@ -8138,6 +8651,7 @@ TEST_F(ExecutionKernelTest,
   config.runtime_collision_query_timeout_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 5'000'000'000;
   config.runtime_dynamic_body_max_age_cap_ns = 5'000'000'000;
+  config.recovery_require_measured_observation = false;
   MotionInterruptStopProfileDTO fault_profile;
   fault_profile.profile_id = "fault_total_failure";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
@@ -8183,6 +8697,13 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(outcome.has_value());
   ASSERT_TRUE(outcome->error.has_value());
   EXPECT_EQ(outcome->error->details.at("reason"), "fault_stop_total_failure");
+
+  ASSERT_TRUE(wait_for_recovery_status(
+      local_kernel, local_scheduler, local_clock,
+      RecoveryAssessmentStatus::kActionRequired))
+      << "fault preempt completion did not publish a recovery choice";
+  EXPECT_EQ(local_kernel.get_recovery_assessment().reason_code,
+            reason_codes::kRecoveryInterventionChoiceRequired);
 
   auto ack = local_kernel.acknowledge_intervention_for_retry(
       "operator_alice", "ui_acknowledge_and_continue");
@@ -8310,7 +8831,7 @@ TEST_F(ExecutionKernelTest,
       << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
-  context.current_state.positions_rad = {99.0, 99.0};
+  context.current_state_value.positions_rad = {99.0, 99.0};
 
   auto tick = controlled_kernel.collision_check_tick();
   ASSERT_TRUE(tick.ok());
@@ -8407,11 +8928,7 @@ TEST_F(ExecutionKernelTest,
   auto latch = controlled_kernel.get_active_interrupt_latch();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->signal_snapshot.metadata.at("reason"),
-            "runtime_collision_projection_observed_shape_mismatch");
-  EXPECT_EQ(latch->signal_snapshot.metadata.at("observed_position_count"),
-            "1");
-  EXPECT_EQ(latch->signal_snapshot.metadata.at("source_joint_count"), "2");
-  EXPECT_EQ(latch->signal_snapshot.metadata.at("query_joint_count"), "2");
+            "observed_state_incomplete");
 }
 
 TEST_F(ExecutionKernelTest,
@@ -8460,7 +8977,7 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest,
-       CollisionMonitoring_FreshObservedStatePublishedDuringTickDoesNotLookStale) {
+       CollisionMonitoring_ReadsDedicatedPublicationWithoutLifecycleSnapshot) {
   ControlledExecution controlled_execution;
   ThreadSafeFakeClock local_clock;
   ThreadSafeManualScheduler local_scheduler;
@@ -8488,20 +9005,15 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
 
-  bool refreshed_during_monitor_tick = false;
+  bool lifecycle_snapshot_read = false;
   controlled_execution.on_get_snapshot = [&]() {
-    if (refreshed_during_monitor_tick) {
-      return;
-    }
-    refreshed_during_monitor_tick = true;
-    local_clock.advance(1);
-    controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
+    lifecycle_snapshot_read = true;
   };
   const int baseline_engine_checks = local_runtime_engine->check_count.load();
 
   auto tick = controlled_kernel.collision_check_tick();
   ASSERT_TRUE(tick.ok());
-  EXPECT_TRUE(refreshed_during_monitor_tick);
+  EXPECT_FALSE(lifecycle_snapshot_read);
   EXPECT_GT(local_runtime_engine->check_count.load(), baseline_engine_checks);
   EXPECT_EQ(controlled_execution.stop_count_value(), 0);
   EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kExecuting);
@@ -8764,6 +9276,7 @@ TEST_F(ExecutionKernelTest,
   auto policy = make_contact_grasp_policy_snapshot(
       kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
   local_collision_world.current_policy = policy;
+  install_mock_retained_object(local_collision_world, "graspable");
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
   auto request = make_test_request("runtime_contact_grasp_allowed");
@@ -8810,6 +9323,7 @@ TEST_F(ExecutionKernelTest,
   auto policy = make_contact_grasp_policy_snapshot(
       kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
   local_collision_world.current_policy = policy;
+  install_mock_retained_object(local_collision_world, "graspable");
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
   auto request = make_test_request("runtime_contact_grasp_over_limit");
@@ -8867,6 +9381,7 @@ TEST_F(ExecutionKernelTest,
   auto policy = make_contact_grasp_policy_snapshot(
       kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
   local_collision_world.current_policy = policy;
+  install_mock_retained_object(local_collision_world, "graspable");
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
   auto request = make_test_request("runtime_contact_grasp_mixed_pairs");
@@ -8927,6 +9442,7 @@ TEST_F(ExecutionKernelTest,
   auto policy = make_contact_grasp_policy_snapshot(
       kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
   local_collision_world.current_policy = policy;
+  install_mock_retained_object(local_collision_world, "graspable");
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
   auto request = make_test_request("runtime_contact_grasp_missing_clearance");
@@ -8979,6 +9495,7 @@ TEST_F(ExecutionKernelTest,
   auto policy = make_contact_grasp_policy_snapshot(
       kPolicyId, "graspable", {"right_finger", "left_finger"}, 0.002);
   local_collision_world.current_policy = policy;
+  install_mock_retained_object(local_collision_world, "graspable");
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
   auto request = make_test_request("runtime_contact_grasp_unexpected_pair");
@@ -9694,6 +10211,62 @@ TEST_F(ExecutionKernelTest, Cancel_StopDuringPlanning_TransitionsToStopped) {
 
   // Verify state is Stopped (not Failed)
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kStopped);
+}
+
+TEST_F(ExecutionKernelTest,
+       Cancel_StopDuringPlanning_CertificateWaitsForBackendAcknowledgement) {
+  SlowMockPlanner slow_planner;
+  BlockingStopExecution blocking_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{slow_planner, context, blocking_execution,
+                               local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+
+  auto execute_result = local_kernel.execute(make_test_request(
+      "planning_stop_certificate_backend_ack"));
+  ASSERT_TRUE(execute_result.ok());
+  ASSERT_TRUE(slow_planner.wait_until_in_plan());
+
+  auto stop_future = std::async(std::launch::async,
+                                [&local_kernel]() { return local_kernel.stop(); });
+  ASSERT_TRUE(blocking_execution.wait_until_stop_entered());
+
+  // The planner can finish while the backend stop is still blocked. The
+  // execute worker may classify its own outcome, but it must publish only
+  // partial evidence and recovery must remain fail-closed.
+  slow_planner.release();
+  ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+  ASSERT_EQ(local_kernel.get_status().state, ExecutionState::kStopped);
+  auto certificates = local_kernel.stop_certificate_evidence();
+  ASSERT_FALSE(certificates.empty());
+  const auto partial = certificates.back();
+  EXPECT_EQ(partial.stop_owner, StopOwnerKind::kOperatorStopWorker);
+  EXPECT_EQ(partial.completion_result, StopCertificateOutcome::kPartial);
+  EXPECT_FALSE(partial.backend_stop_confirmed);
+  EXPECT_NE(local_kernel.get_recovery_assessment().status,
+            RecoveryAssessmentStatus::kRetryReady);
+
+  blocking_execution.release_stop();
+  ASSERT_EQ(stop_future.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  EXPECT_TRUE(stop_future.get().accepted);
+
+  const auto assessment = local_kernel.get_recovery_assessment();
+  ASSERT_EQ(assessment.status, RecoveryAssessmentStatus::kRetryReady);
+  certificates = local_kernel.stop_certificate_evidence();
+  ASSERT_GE(certificates.size(), 2u);
+  const auto& confirmed = certificates.back();
+  EXPECT_EQ(confirmed.stop_owner_generation,
+            partial.stop_owner_generation);
+  EXPECT_EQ(confirmed.completion_result,
+            StopCertificateOutcome::kSucceeded);
+  EXPECT_TRUE(confirmed.backend_stop_confirmed);
+  EXPECT_EQ(assessment.stop_certificate_id, confirmed.certificate_id);
 }
 
 TEST_F(ExecutionKernelTest, Cancel_ResetDuringPlanning_TransitionsToIdle) {
@@ -10811,10 +11384,16 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
   ExecutionKernel local_kernel{planner, context, controlled_execution,
                                 local_clock, local_scheduler, local_cache};
   configure_authoritative_collision_validation(local_kernel, local_publisher,
                                                 local_engine);
+  local_kernel.subscribe_events([&](const KernelEvent& event) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(event);
+  });
   ASSERT_TRUE(local_kernel.register_interrupt_source(
                   make_fast_probe_source("probe")).ok());
   ASSERT_TRUE(local_kernel.register_interrupt_policy(
@@ -10853,6 +11432,37 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(controlled_execution.controlled_stop_count_value(), 1);
   EXPECT_EQ(controlled_execution.last_controlled_stop_profile.stop_mode,
             MotionInterruptStopMode::kSpringBackHold);
+  const auto certificates = local_kernel.stop_certificate_evidence();
+  const auto certificate = std::find_if(
+      certificates.begin(), certificates.end(),
+      [&](const KernelStopCertificateDTO& candidate) {
+        return candidate.stop_owner == StopOwnerKind::kMotionTripStop &&
+               candidate.execution_id == result.value();
+      });
+  ASSERT_NE(certificate, certificates.end());
+  EXPECT_EQ(certificate->completion_result,
+            StopCertificateOutcome::kSucceeded);
+  EXPECT_TRUE(certificate->backend_stop_confirmed);
+  EXPECT_EQ(certificate->latch_id, outcome->trip->latch_id);
+  EXPECT_EQ(certificate->requested_stop_mode, "spring_back_hold");
+  EXPECT_EQ(certificate->executed_stop_mode, "spring_back_hold");
+  EXPECT_EQ(certificate->command_source, "native_simulated_stop");
+  std::lock_guard<std::mutex> events_lock(events_mutex);
+  const auto certificate_event = std::find_if(
+      events.begin(), events.end(), [](const KernelEvent& event) {
+        return event.type == KernelEventType::kStopCertificatePublished &&
+               event.details.contains("stop_owner") &&
+               event.details.at("stop_owner") == "motion_trip_stop";
+      });
+  const auto terminal_event = std::find_if(
+      events.begin(), events.end(), [](const KernelEvent& event) {
+        return event.type == KernelEventType::kStateTransition &&
+               event.to_state == ExecutionState::kCompleted;
+      });
+  ASSERT_NE(certificate_event, events.end());
+  ASSERT_NE(terminal_event, events.end());
+  EXPECT_LT(std::distance(events.begin(), certificate_event),
+            std::distance(events.begin(), terminal_event));
 }
 
 TEST_F(ExecutionKernelTest,
@@ -11107,7 +11717,7 @@ TEST_F(ExecutionKernelTest,
             "not_attempted_controlled_stop_already_confirmed");
   EXPECT_EQ(controlled_execution.stop_attempt_count_value(), 0);
   EXPECT_FALSE(outcome->trip.has_value());
-  EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
+  ASSERT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
 }
 
 TEST_F(ExecutionKernelTest,
@@ -11234,9 +11844,40 @@ TEST_F(ExecutionKernelTest,
   EXPECT_TRUE(saw_monitor_unavailable);
   EXPECT_EQ(controlled_execution.controlled_stop_cancel_count_value(), 0);
 
+  // Repeated unavailable ticks are counted exactly but do not emit one ERROR
+  // per monitor period.
+  for (int tick = 0; tick < 3; ++tick) {
+    local_clock.advance(10'000'000);
+    local_scheduler.advance_to(local_clock.now());
+  }
+
   controlled_execution.release_controlled_stop();
   ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
   EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kCompleted);
+  const auto coverage = local_kernel.get_metrics();
+  EXPECT_EQ(coverage.runtime_collision_stop_windows_started, 1u);
+  EXPECT_EQ(coverage.runtime_collision_stop_windows_completed, 1u);
+  EXPECT_GT(coverage.runtime_collision_last_stop_ticks_attempted, 0u);
+  EXPECT_EQ(coverage.runtime_collision_last_stop_queries_executed, 0u);
+  EXPECT_EQ(coverage.runtime_collision_last_stop_unavailable_ticks,
+            coverage.runtime_collision_last_stop_ticks_attempted);
+  EXPECT_GT(coverage.runtime_collision_last_stop_longest_unavailable_ns, 0u);
+  EXPECT_EQ(coverage.runtime_collision_stop_zero_check_windows, 1u);
+  EXPECT_GT(coverage.runtime_collision_unavailable_events_suppressed, 0u);
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    const auto summary = std::find_if(
+        events.begin(), events.end(), [](const KernelEvent& event) {
+          return event.type == KernelEventType::kRuntimeCollisionCoverage;
+        });
+    ASSERT_NE(summary, events.end());
+    ASSERT_TRUE(summary->details.contains(
+        "unavailable_reason_collision_resources"));
+    EXPECT_EQ(
+        std::stoull(summary->details.at(
+            "unavailable_reason_collision_resources")),
+        coverage.runtime_collision_last_stop_unavailable_ticks);
+  }
 }
 
 TEST_F(ExecutionKernelTest,
@@ -11605,10 +12246,16 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
   ExecutionKernel local_kernel{planner, context, controlled_execution,
                                 local_clock, local_scheduler, local_cache};
   configure_authoritative_collision_validation(local_kernel, local_publisher,
                                                 local_engine);
+  local_kernel.subscribe_events([&](const KernelEvent& event) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(event);
+  });
   ASSERT_TRUE(local_kernel.register_interrupt_source(
                   make_fast_probe_source("probe")).ok());
   ASSERT_TRUE(local_kernel.register_interrupt_policy(
@@ -11656,7 +12303,39 @@ TEST_F(ExecutionKernelTest,
   // refused trip.
   EXPECT_EQ(controlled_execution.stop_count_value(), 1);
   // Latch persists for operator intervention-acknowledge.
-  EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
+  ASSERT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
+  const auto certificates = local_kernel.stop_certificate_evidence();
+  const auto certificate = std::find_if(
+      certificates.begin(), certificates.end(),
+      [&](const KernelStopCertificateDTO& candidate) {
+        return candidate.stop_owner == StopOwnerKind::kMotionTripStop &&
+               candidate.execution_id == result.value();
+      });
+  ASSERT_NE(certificate, certificates.end());
+  EXPECT_EQ(certificate->completion_result,
+            StopCertificateOutcome::kBackendPreemptFailed);
+  EXPECT_FALSE(certificate->backend_stop_confirmed);
+  EXPECT_EQ(certificate->latch_id,
+            local_kernel.get_active_interrupt_latch()->latch_id);
+  ASSERT_TRUE(certificate->terminal_error.has_value());
+  EXPECT_EQ(certificate->terminal_error->details.at("reason"),
+            "controller_rejected_goal");
+  std::lock_guard<std::mutex> events_lock(events_mutex);
+  const auto certificate_event = std::find_if(
+      events.begin(), events.end(), [](const KernelEvent& event) {
+        return event.type == KernelEventType::kStopCertificatePublished &&
+               event.details.contains("stop_owner") &&
+               event.details.at("stop_owner") == "motion_trip_stop";
+      });
+  const auto terminal_event = std::find_if(
+      events.begin(), events.end(), [](const KernelEvent& event) {
+        return event.type == KernelEventType::kStateTransition &&
+               event.to_state == ExecutionState::kInterventionRequired;
+      });
+  ASSERT_NE(certificate_event, events.end());
+  ASSERT_NE(terminal_event, events.end());
+  EXPECT_LT(std::distance(events.begin(), certificate_event),
+            std::distance(events.begin(), terminal_event));
 }
 
 TEST_F(ExecutionKernelTest,
@@ -12436,11 +13115,11 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest,
-       Execute_ScopedTrip_StopSnapshotCarriesJointNamesFromPlanningContext) {
+       Execute_ScopedTrip_StopSnapshotCarriesObservedJointNames) {
   // Finding 2b: the captured ExecutionStopSnapshotDTO MUST satisfy
   // spec/210 §3.7 size/ordering rules — joint_names non-empty and
   // matching positions_rad length. The capture path pulls
-  // joint_names from the planning context's current_state so the
+  // joint_names from the observed-state provider's current_state so the
   // RobotStateDTO is well-formed.
   using namespace motion_45c;
   ControlledExecution controlled_execution;
@@ -12489,7 +13168,7 @@ TEST_F(ExecutionKernelTest,
 TEST_F(ExecutionKernelTest,
        Execute_ScopedTrip_StopSnapshotInvalidDowngradesToInterventionRequired) {
   // Finding 2b: when the backend's post-stop joint vector does not
-  // match the planning context's joint_names (size mismatch), the
+  // match the observed-state provider's joint_names (size mismatch), the
   // RobotStateDTO size/ordering validation MUST fail and the outcome
   // MUST downgrade to failed with motion_interrupt_stop_state_invalid.
   using namespace motion_45c;
@@ -12514,9 +13193,9 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(local_kernel.register_interrupt_policy(
                   make_move_trip_policy("probe_trip", "probe")).ok());
 
-  // Precision-contact scope so the planning-context fallback is
+  // Precision-contact scope so the observed-state-provider fallback is
   // rejected too — failing both Priority 1 (size mismatch) and
-  // Priority 3 (precision-contact rejects planning_context_state).
+  // Priority 3 (precision-contact rejects observed_state_provider_state).
   auto req = make_test_request("trip_snap_invalid");
   auto scope = make_scope("scope_a", "probe_trip",
                             MotionInterruptActivationMode::kTripIfAlreadyActive,
@@ -13339,7 +14018,7 @@ TEST_F(ExecutionKernelTest,
   PlanResultDTO failed_replan;
   failed_replan.error = ErrorDTO{kErrorPlanningFailed, "No solution", {}};
   local_planner.result_sequence = {first_plan, failed_replan};
-  MockContext local_context = context;
+  MockFocusedPorts local_context = context;
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel local_kernel{local_planner,
@@ -13418,7 +14097,7 @@ TEST_F(ExecutionKernelTest,
   PlanResultDTO plan;
   plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
   local_planner.result_sequence = {plan};
-  MockContext local_context = context;
+  MockFocusedPorts local_context = context;
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel local_kernel{local_planner,
@@ -13523,6 +14202,218 @@ TEST_F(ExecutionKernelTest, KernelEventSequenceIsContiguousAcrossLifecycle) {
     EXPECT_EQ(sequences[i], static_cast<std::uint64_t>(i + 1))
         << "dispatch sequence must be contiguous from 1; index " << i;
   }
+}
+
+
+// RT-8B: the ordinary Stop button is motion-scoped and terminal; the stop
+// certificate and the certified replan assessment commit together with
+// terminal Stopped publication (fixture scenario
+// ordinary_stop_motion_scoped_replan).
+TEST_F(ExecutionKernelTest,
+       OrdinaryStop_CertificateAndReplanAssessmentCommitWithTerminalStopped) {
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  ExecutionKernel local_kernel{
+      planner, context, controlled_execution, local_clock,
+      local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      local_kernel, local_collision_world, local_collision_engine);
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  auto exec = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(exec.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  auto stop_dto = local_kernel.stop();
+  ASSERT_TRUE(stop_dto.accepted);
+  EXPECT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+  ASSERT_EQ(local_kernel.get_status().state, ExecutionState::kStopped);
+
+  // The assessment is already retry-ready with no further polling or
+  // round-trip: commit-coupled publication.
+  const auto assessment = local_kernel.get_recovery_assessment();
+  EXPECT_EQ(assessment.recovery_class,
+            RecoveryClass::kOrdinaryOperatorStop);
+  EXPECT_EQ(assessment.status, RecoveryAssessmentStatus::kRetryReady);
+  ASSERT_EQ(assessment.allowed_actions.size(), 2u);
+  EXPECT_EQ(assessment.allowed_actions[0],
+            RecoveryAction::kReplanFromStoppedState);
+  EXPECT_FALSE(assessment.stop_certificate_id.empty());
+
+  const auto certificates = local_kernel.stop_certificate_evidence();
+  ASSERT_FALSE(certificates.empty());
+  EXPECT_EQ(certificates.back().certificate_id,
+            assessment.stop_certificate_id);
+  EXPECT_EQ(certificates.back().completion_result,
+            StopCertificateOutcome::kSucceeded);
+
+  // Evidence ordering: certificate publication precedes the terminal
+  // Stopping->Stopped transition in the native stream.
+  std::lock_guard<std::mutex> lock(events_mutex);
+  std::optional<std::size_t> certificate_index;
+  std::optional<std::size_t> terminal_index;
+  std::optional<std::size_t> ready_index;
+  for (std::size_t i = 0; i < events.size(); ++i) {
+    const auto& e = events[i];
+    if (e.type == KernelEventType::kStopCertificatePublished &&
+        !certificate_index) {
+      certificate_index = i;
+    }
+    if (e.type == KernelEventType::kStateTransition &&
+        e.from_state == ExecutionState::kStopping &&
+        e.to_state == ExecutionState::kStopped && !terminal_index) {
+      terminal_index = i;
+    }
+    if (e.type == KernelEventType::kRecoveryAssessmentChanged &&
+        e.details.count("status") &&
+        e.details.at("status") == "retry_ready" && !ready_index) {
+      ready_index = i;
+    }
+  }
+  ASSERT_TRUE(certificate_index.has_value());
+  ASSERT_TRUE(terminal_index.has_value());
+  ASSERT_TRUE(ready_index.has_value());
+  EXPECT_LT(*certificate_index, *terminal_index);
+  EXPECT_LT(*ready_index, *terminal_index);
+}
+
+// RT-8B: lifecycle Pause is a distinct state with direct bounded Resume; it
+// never generates or consumes a recovery offer (fixture scenario
+// ordinary_stop_motion_scoped_replan invariants).
+TEST_F(ExecutionKernelTest, Pause_RemainsDirectResumeWithoutRecoveryOffer) {
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  ExecutionKernel local_kernel{
+      planner, context, controlled_execution, local_clock,
+      local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      local_kernel, local_collision_world, local_collision_engine);
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  auto exec = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(exec.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  auto pause_dto = local_kernel.pause();
+  ASSERT_TRUE(pause_dto.accepted);
+  local_scheduler.advance_to(local_clock.now() + 1'000'000'000);
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kPaused));
+
+  const auto assessment = local_kernel.get_recovery_assessment();
+  EXPECT_EQ(assessment.recovery_class, RecoveryClass::kNone);
+  EXPECT_EQ(assessment.status, RecoveryAssessmentStatus::kUnavailable);
+  EXPECT_TRUE(assessment.allowed_actions.empty());
+
+  // No recovery offer was ever published for the pause window.
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    EXPECT_FALSE(std::any_of(
+        events.begin(), events.end(), [](const KernelEvent& e) {
+          return e.type == KernelEventType::kRecoveryAssessmentChanged &&
+                 e.details.count("status") &&
+                 e.details.at("status") != "none";
+        }));
+  }
+
+  auto resume_dto = local_kernel.resume();
+  EXPECT_TRUE(resume_dto.accepted);
+}
+
+// RT-8B: apply_recovery_action generation-bound admission on the ordinary
+// certified stop: stale revision / wrong identity are side-effect-free
+// rejections, the bound accept is non-resetting, and a repeated action is
+// idempotently rejected without clearing newer state.
+TEST_F(ExecutionKernelTest,
+       ApplyRecoveryAction_ReplanFromStoppedMatrixAndIdempotency) {
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{
+      planner, context, controlled_execution, local_clock,
+      local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      local_kernel, local_collision_world, local_collision_engine);
+
+  auto exec = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(exec.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  ASSERT_TRUE(local_kernel.stop().accepted);
+  ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+  ASSERT_EQ(local_kernel.get_status().state, ExecutionState::kStopped);
+
+  const auto assessment = local_kernel.get_recovery_assessment();
+  ASSERT_EQ(assessment.status, RecoveryAssessmentStatus::kRetryReady);
+
+  KernelRecoveryActionRequestDTO request;
+  request.request_id = "replan-1";
+  request.action = RecoveryAction::kReplanFromStoppedState;
+  request.principal_id = "operator_test";
+  request.expected_assessment_revision = assessment.assessment_revision;
+  request.expected_control_command_epoch = assessment.control_command_epoch;
+  request.expected_execution_id = assessment.execution_id;
+  request.expected_latch_id = assessment.latch_id;
+  request.expected_stop_certificate_id = assessment.stop_certificate_id;
+  request.expected_stop_owner_generation = assessment.stop_owner_generation;
+
+  // Stale revision: rejected, state preserved.
+  auto stale = request;
+  stale.expected_assessment_revision += 40;
+  auto stale_result = local_kernel.apply_recovery_action(stale);
+  EXPECT_FALSE(stale_result.accepted);
+  ASSERT_TRUE(stale_result.error.has_value());
+  EXPECT_EQ(stale_result.error->details.at("reason"),
+            reason_codes::kRecoveryStaleAssessment);
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kStopped);
+
+  // Wrong certificate identity: rejected, state preserved.
+  auto wrong_certificate = request;
+  wrong_certificate.expected_stop_certificate_id = "stopcert-forged";
+  auto wrong_result = local_kernel.apply_recovery_action(wrong_certificate);
+  EXPECT_FALSE(wrong_result.accepted);
+  ASSERT_TRUE(wrong_result.error.has_value());
+  EXPECT_EQ(wrong_result.error->details.at("reason"),
+            reason_codes::kRecoveryStopCertificateChanged);
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kStopped);
+
+  const auto resets_before = controlled_execution.reset_count;
+
+  // Bound accept: non-resetting transition to Idle.
+  auto accepted = local_kernel.apply_recovery_action(request);
+  EXPECT_TRUE(accepted.accepted);
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kIdle);
+  EXPECT_EQ(controlled_execution.reset_count, resets_before);
+  EXPECT_EQ(accepted.resulting_assessment.status,
+            RecoveryAssessmentStatus::kUnavailable);
+
+  // Idempotency: replaying the consumed action is rejected and cannot
+  // clear the newer (Idle) state.
+  auto replay_result = local_kernel.apply_recovery_action(request);
+  EXPECT_FALSE(replay_result.accepted);
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kIdle);
 }
 
 }  // namespace

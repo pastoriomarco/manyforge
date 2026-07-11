@@ -15,10 +15,15 @@
 #include <manyforge_core/kernel_flight_recorder.hpp>
 #include <manyforge_core/motion_trip_stop_coordinator.hpp>
 #include <manyforge_core/operator_stop_worker.hpp>
+#include <manyforge_core/ports/icollision_trajectory_projector.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
+#include <manyforge_core/ports/iobserved_robot_state_provider.hpp>
 #include <manyforge_core/ports/iplanner_backend.hpp>
-#include <manyforge_core/ports/iplanning_context.hpp>
+#include <manyforge_core/ports/ireference_pose_resolver.hpp>
+#include <manyforge_core/ports/irobot_kinematics.hpp>
+#include <manyforge_core/ports/itrajectory_validator.hpp>
 #include <manyforge_core/runtime_collision_monitor.hpp>
+#include <manyforge_core/runtime_collision_query_session.hpp>
 #include <manyforge_core/state_machine.hpp>
 #include <manyforge_core/terminal_committer.hpp>
 #include <manyforge_core/stop_policy.hpp>
@@ -30,6 +35,8 @@
 #include <manyforge_core/types/kernel_event.hpp>
 #include <manyforge_core/types/metrics.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_core/types/recovery.hpp>
+#include <manyforge_core/execution_recovery_support.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -39,6 +46,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -48,6 +56,18 @@ namespace manyforge::core {
 
 struct ExecutionKernelConfig {
   Duration collision_monitor_period_ns = 50'000'000;  // 50 ms / 20 Hz
+
+  // RT-8B recovery readiness policy (spec/230 §3.7.1). Measured-observation
+  // enforcement is fail-closed before RT-8C wires the dedicated observed-state
+  // publication: observation-dependent recovery remains waiting rather than
+  // substituting lifecycle state. The dwell/sample values are conservative
+  // placeholders and are qualified in RT-8C evidence.
+  bool recovery_require_measured_observation = true;
+  std::int64_t recovery_ready_dwell_ns = 200'000'000;  // 200 ms
+  std::uint32_t recovery_ready_min_samples = 2;
+  std::string recovery_observed_joint_order_token;
+  double recovery_at_rest_velocity_threshold_rad_s = 0.01;
+  Duration recovery_observation_poll_period_ns = 20'000'000;  // 20 ms
 
   // Hard per-tick budget for the observed runtime collision query after the
   // live collision-world snapshot has been acquired. This is intentionally
@@ -87,12 +107,12 @@ struct ExecutionKernelConfig {
   double scene_snapshot_default_observed_angular_tolerance_rad = 0.17453292519943295;  // 10 deg
 
   // When true, a collision-validation rejection re-runs the failing waypoint
-  // through the planning context's normalized collision query and appends
-  // `legacy_collision_compare_*` engine-parity keys to the error details.
+  // through the dedicated non-authoritative diagnostic comparator and appends
+  // `collision_diagnostic_compare_*` engine-parity keys to the error details.
   // Default OFF: the duplicate check costs a full collision query on every
   // rejection and the parity evidence belongs to qualification runs, not
   // production rejections.
-  bool enable_legacy_collision_compare_diagnostics = false;
+  bool enable_collision_diagnostic_compare = false;
 
   // Native execution-backend lifecycle drain. ROS adapters expose their own
   // `stop_completion_timeout_s`; this field provides the equivalent reset
@@ -138,7 +158,7 @@ struct ExecutionKernelConfig {
   std::optional<CollisionPolicySnapshot> baseline_collision_policy_snapshot;
 
   // Runtime collision monitoring must run against live observed robot state,
-  // not authored/planning-context state. A backend snapshot older than this
+  // not authored/observed-state provider sample. A backend snapshot older than this
   // budget causes a runtime collision fault with a freshness reason before
   // the collision engine is queried. Zero disables the age check for
   // deterministic tests only; production deployments must keep this positive.
@@ -209,16 +229,29 @@ struct RuntimeCollisionProtectionSnapshot {
   std::string reason;
 };
 
+/// Focused, non-owning kernel dependencies for planning admission and
+/// validation. Each reference has one authority; no member is a combined
+/// scene/state/planner facade. Owners must outlive ExecutionKernel.
+struct ExecutionKernelPorts {
+  IObservedRobotStateProvider& observed_state;
+  IRobotKinematics& kinematics;
+  IReferencePoseResolver& reference_resolver;
+  ITrajectoryValidator& trajectory_validator;
+  ICollisionTrajectoryProjector& collision_projector;
+  const ICollisionDiagnosticComparator* collision_diagnostic_comparator =
+      nullptr;
+};
+
 /// Execution Kernel — single authority for motion execution governance.
 /// Ties together: state machine, stop/collision policies, trajectory cache,
-/// planner backend, planning context, and execution backend.
+/// planner backend, observed-state provider, and execution backend.
 ///
 /// Spec 230: all operations are ROS-free. This is an async v0.1
 /// implementation with event subscription.
 class ExecutionKernel {
  public:
   ExecutionKernel(IPlannerBackend& planner,
-                  IPlanningContext& context,
+                  ExecutionKernelPorts ports,
                   IExecutionBackend& execution_backend,
                   IClock& clock,
                   IScheduler& scheduler,
@@ -326,6 +359,21 @@ class ExecutionKernel {
       std::string reason,
       std::optional<std::uint64_t> expected_epoch = std::nullopt);
 
+  /// RT-8B (spec/200, spec/230 §3.7.1): the only kernel statement of
+  /// recovery admissibility. Pure bounded read of the latest published
+  /// assessment revision.
+  KernelRecoveryAssessmentDTO get_recovery_assessment() const;
+
+  /// RT-8B single generation-bound recovery command. Holds the lifecycle
+  /// admission boundary across the coherent re-check and interrupt
+  /// disposition; rejections are side-effect-free and return the newest
+  /// assessment. `reset_cycle` is deliberately not an action here.
+  KernelRecoveryActionResultDTO apply_recovery_action(
+      const KernelRecoveryActionRequestDTO& request);
+
+  /// Bounded copy of the stop-certificate evidence ring (tests/diagnostics).
+  std::vector<KernelStopCertificateDTO> stop_certificate_evidence() const;
+
   /// ADR-0018: update the runtime velocity scale for active execution.
   ///
   /// The UI velocity slider drives this through cycle_manager → kernel →
@@ -344,10 +392,10 @@ class ExecutionKernel {
   /// Get the latest observer-safe execution snapshot published by the kernel.
   ExecutionSnapshot get_execution_snapshot() const;
 
-  /// Refresh the observer-facing snapshot from the current planning-context
-  /// state. Intended for explicit simulator/bootstrap paths, not motion
-  /// execution semantics.
-  void sync_snapshot_from_context();
+  /// Explicitly ask the execution adapter to publish its current observed
+  /// state, then refresh the observer-facing kernel snapshot. Intended for
+  /// simulator/bootstrap commands only; status reads never call it.
+  Result<void> refresh_observed_state_snapshot();
 
   /// Run a single collision monitoring tick.
   /// Called externally (e.g., by a scheduler) during Executing.
@@ -451,10 +499,44 @@ class ExecutionKernel {
   std::string dump_flight_record(const char* reason) noexcept;
 
  private:
-  Result<MotionSpecDTO> resolve_motion_spec(const ExecuteRequestDTO& request);
-  Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request);
+  Result<MotionSpecDTO> resolve_motion_spec(
+      const ExecuteRequestDTO& request,
+      const SceneRevisionBindingDTO& scene_binding);
+  Result<TrajectoryDTO> plan_trajectory(
+      const ExecuteRequestDTO& request,
+      const SceneRevisionBindingDTO& scene_binding);
   Result<TrajectoryDTO> plan_resume_trajectory(
-      const ExecuteRequestDTO& request);
+      const ExecuteRequestDTO& request,
+      const SceneRevisionBindingDTO& scene_binding);
+
+  /// Move-only ownership of one retained scene/projection revision. Destruction
+  /// releases the publisher lookup entry on every success, rejection,
+  /// cancellation, exception, and worker-start race; immutable snapshot handles
+  /// already copied out of the inventory remain valid by contract.
+  class RetainedSceneSnapshotLease {
+   public:
+    RetainedSceneSnapshotLease() = default;
+    RetainedSceneSnapshotLease(
+        ICollisionWorldSnapshotPublisher& publisher,
+        CollisionWorldLeaseInventory inventory);
+    ~RetainedSceneSnapshotLease();
+    RetainedSceneSnapshotLease(const RetainedSceneSnapshotLease&) = delete;
+    RetainedSceneSnapshotLease& operator=(
+        const RetainedSceneSnapshotLease&) = delete;
+    RetainedSceneSnapshotLease(RetainedSceneSnapshotLease&& other) noexcept;
+    RetainedSceneSnapshotLease& operator=(
+        RetainedSceneSnapshotLease&& other) noexcept;
+
+    [[nodiscard]] const CollisionWorldLeaseInventory& inventory() const {
+      return inventory_;
+    }
+    [[nodiscard]] SceneRevisionBindingDTO binding() const;
+
+   private:
+    void release() noexcept;
+    ICollisionWorldSnapshotPublisher* publisher_ = nullptr;
+    CollisionWorldLeaseInventory inventory_;
+  };
 
   struct CollisionValidationSuccess {
     CollisionWorldRevision collision_world_revision;
@@ -474,8 +556,7 @@ class ExecutionKernel {
                             ExecuteRequestDTO request,
                             uint64_t exec_id,
                             std::optional<TrajectoryDTO> cached_trajectory,
-                            std::optional<CollisionWorldLeaseInventory>
-                                scene_snapshot_lease_inventory,
+                            RetainedSceneSnapshotLease retained_scene,
                             std::optional<SceneSnapshotLease>
                                 scene_snapshot_lease);
 
@@ -502,7 +583,14 @@ class ExecutionKernel {
 
   /// Publish an observer-safe execution snapshot.
   void publish_execution_snapshot(ExecutionSnapshot snapshot);
-  std::uint64_t start_collision_monitoring(std::string reason);
+  enum class RuntimeCollisionProtectionPurpose {
+    kMotion,
+    kControlledStop,
+  };
+  std::uint64_t start_collision_monitoring(
+      std::string reason,
+      RuntimeCollisionProtectionPurpose purpose =
+          RuntimeCollisionProtectionPurpose::kMotion);
   void stop_collision_monitoring(
       RuntimeCollisionMonitorRelease release,
       std::optional<std::uint64_t> expected_generation = std::nullopt,
@@ -510,15 +598,14 @@ class ExecutionKernel {
   RuntimeCollisionProtectionSnapshot runtime_collision_protection_snapshot()
       const;
   bool refresh_published_runtime_collision_snapshot(
-      std::map<std::string, std::string>* details = nullptr);
-  Result<RobotStateDTO> project_runtime_collision_observed_state(
-      const ExecutionSnapshot& observed_snapshot) const;
+      std::map<std::string, std::string>* details = nullptr,
+      RuntimeCollisionQueryBundlePtr* bundle = nullptr);
   void set_runtime_collision_state_projection(
       RuntimeCollisionStateProjection projection);
   void clear_runtime_collision_state_projection();
   void clear_runtime_collision_state_projection_unlocked();
   CollisionWorldRevision current_authoritative_collision_world_revision() const;
-  std::optional<CollisionWorldLeaseInventory>
+  Result<RetainedSceneSnapshotLease>
   retain_current_scene_snapshot_lease_inventory(std::uint64_t exec_id,
                                                 const std::string& move_id);
   std::optional<SceneSnapshotLease> build_scene_snapshot_lease(
@@ -563,6 +650,51 @@ class ExecutionKernel {
       std::stop_token worker_stop_token = {});
   bool request_fault_preempt_controlled_stop();
   bool fault_preempt_stop_active() const;
+  std::uint64_t fault_preempt_stop_generation() const;
+
+  // RT-8B internals.
+  RecoveryAuthorityCapture capture_recovery_authority_locked();
+  AcknowledgeInterventionResultDTO acknowledge_intervention_for_retry_locked(
+      std::string principal_id,
+      std::string reason,
+      std::optional<std::uint64_t> expected_epoch);
+  AcknowledgeFailedValidationResultDTO
+  acknowledge_failed_validation_for_retry_locked(
+      std::string principal_id,
+      std::string reason,
+      std::optional<std::uint64_t> expected_epoch);
+  RecoveryReadinessPolicy recovery_readiness_policy() const;
+  KernelRecoveryAssessmentDTO refresh_recovery_assessment_locked(
+      const char* trigger);
+  KernelRecoveryAssessmentDTO publish_recovery_assessment_locked(
+      RecoveryAuthorityCapture capture, const char* trigger);
+  KernelRecoveryAssessmentDTO
+  publish_terminal_recovery_assessment_locked(ExecutionState terminal_state,
+                                              const char* trigger);
+  void try_refresh_recovery_assessment(const char* trigger);
+  void schedule_recovery_assessment_refresh(const char* trigger) noexcept;
+  bool publish_stop_certificate(KernelStopCertificateDTO certificate,
+                                bool coalesce_owner_session = false);
+  std::uint64_t begin_operator_stop_owner_generation(
+      std::uint64_t execution_id);
+  std::uint64_t ensure_operator_stop_owner_generation(
+      std::uint64_t execution_id);
+  std::uint64_t operator_stop_owner_generation_for_execution(
+      std::uint64_t execution_id) const;
+  void publish_operator_stop_certificate(
+      std::uint64_t execution_id,
+      StopCertificateOutcome completion_result,
+      bool backend_stop_confirmed,
+      std::string command_source,
+      std::string requested_stop_mode = "hard_stop",
+      std::string executed_stop_mode = "hard_stop");
+  void schedule_recovery_freshness_deadline_locked(
+      const KernelRecoveryAssessmentDTO& assessment);
+  void schedule_recovery_observation_poll_locked(
+      const KernelRecoveryAssessmentDTO& assessment);
+  KernelRecoveryActionResultDTO apply_recovery_action_impl(
+      KernelRecoveryActionRequestDTO request,
+      bool bind_to_current_assessment);
   bool signal_fault_preempt_stop_path_collision(
       std::map<std::string, std::string> details);
   std::optional<std::map<std::string, std::string>>
@@ -594,8 +726,10 @@ class ExecutionKernel {
   bool start_operator_stop_worker(
       MotionInterruptStopProfileDTO profile,
       ExecutionState pre_completion_state,
-      std::optional<std::uint64_t> runtime_collision_generation);
+      std::optional<std::uint64_t> runtime_collision_generation,
+      std::uint64_t stop_owner_generation);
   void run_operator_stop_worker(std::uint64_t generation,
+                                std::uint64_t stop_owner_generation,
                                 MotionInterruptStopProfileDTO profile,
                                 ExecutionState pre_completion_state,
                                 std::optional<std::uint64_t>
@@ -671,6 +805,7 @@ class ExecutionKernel {
   ExecuteWorkerPlanPhaseResult execute_worker_plan_phase(
       std::stop_token st,
       const ExecuteRequestDTO& request,
+      const SceneRevisionBindingDTO& scene_binding,
       std::uint64_t exec_id,
       std::optional<TrajectoryDTO> cached_trajectory,
       ExecutionState worker_entry_state,
@@ -682,8 +817,8 @@ class ExecutionKernel {
       std::uint64_t exec_id,
       TrajectoryDTO& trajectory,
       bool& active_trajectory_from_cache,
-      const std::optional<CollisionWorldLeaseInventory>&
-          scene_snapshot_lease_inventory,
+      const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
+      const SceneRevisionBindingDTO& scene_binding,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
       ActiveMotionExecution& motion_state);
 
@@ -749,7 +884,12 @@ class ExecutionKernel {
       std::uint64_t execution_id);
 
   IPlannerBackend& planner_;
-  IPlanningContext& context_;
+  IObservedRobotStateProvider& observed_state_;
+  IRobotKinematics& kinematics_;
+  IReferencePoseResolver& reference_resolver_;
+  ITrajectoryValidator& trajectory_validator_;
+  ICollisionTrajectoryProjector& collision_projector_;
+  const ICollisionDiagnosticComparator* collision_diagnostic_comparator_;
   IExecutionBackend& execution_backend_;
   IClock& clock_;
   IScheduler& scheduler_;
@@ -779,10 +919,45 @@ class ExecutionKernel {
   mutable std::mutex runtime_collision_protection_mutex_;
   RuntimeCollisionProtectionSnapshot runtime_collision_protection_;
   std::uint64_t runtime_collision_protection_next_generation_ = 0;
+
+  // RT-8B recovery authority state. Lock order (documented at the admission
+  // site): lifecycle_mutex_ -> interrupt-manager leaf -> exactly one of
+  // {recovery_certificate_mutex_, recovery_assessment_mutex_,
+  //  recovery_refresh_mutex_,
+  //  operator_stop_identity_mutex_, fault_preempt_stop_mutex_}; the leaf
+  // locks are never nested and no
+  // publisher takes lifecycle_mutex_ while holding one. The refresh scheduler
+  // may take recovery_refresh_mutex_ alone before its callback later acquires
+  // lifecycle_mutex_; it never holds the leaf across callback execution.
+  mutable std::mutex recovery_certificate_mutex_;
+  RecoveryCertificateStore recovery_certificates_;
+  mutable std::mutex recovery_assessment_mutex_;
+  KernelRecoveryAssessmentDTO recovery_assessment_;
+  std::atomic<bool> recovery_assessment_dirty_{false};
+  mutable std::mutex recovery_refresh_mutex_;
+  ScheduleHandle recovery_refresh_handle_ = 0;
+  bool recovery_refresh_scheduled_ = false;
+  ObservedReadinessTracker recovery_readiness_tracker_;
+  ScheduleHandle recovery_freshness_deadline_handle_ = 0;  // lifecycle-guarded
+  std::int64_t recovery_freshness_deadline_ns_ = 0;  // lifecycle-guarded
+  ScheduleHandle recovery_observation_poll_handle_ = 0;  // lifecycle-guarded
+  std::uint64_t fault_preempt_stop_generation_ = 0;  // fault_preempt_stop_mutex_
+  // One coherent operator-stop identity. The generation counter is global,
+  // while the selected generation is bound to exactly one execution. Keeping
+  // the pair under a leaf mutex prevents a capture from combining a new
+  // generation with an older execution during deferred stop admission.
+  mutable std::mutex operator_stop_identity_mutex_;
+  StopOwnerIdentityTracker operator_stop_identity_;
+  std::atomic<std::uint64_t> motion_trip_stop_generation_{0};
+  std::atomic<bool> operator_stop_command_active_{false};
   mutable std::mutex runtime_collision_state_projection_mutex_;
   std::optional<RuntimeCollisionStateProjection>
       runtime_collision_state_projection_;
-  PublishedRuntimeCollisionSnapshotStore published_runtime_collision_snapshot_;
+  std::atomic<std::uint64_t> runtime_collision_snapshot_invalidation_epoch_{0};
+  std::atomic<std::shared_ptr<RuntimeCollisionQuerySession>>
+      runtime_collision_query_session_;
+  mutable std::mutex runtime_collision_query_prepare_error_mutex_;
+  std::optional<ErrorDTO> runtime_collision_query_prepare_error_;
   mutable std::mutex validation_cancel_mutex_;
   std::weak_ptr<CollisionCancellationToken> active_validation_cancel_token_;
 
@@ -863,6 +1038,7 @@ class ExecutionKernel {
   std::atomic<std::uint64_t> runtime_collision_ticks_completed_{0};
   std::atomic<std::uint64_t> runtime_collision_ticks_faulted_{0};
   std::atomic<std::uint64_t> runtime_collision_tick_max_ns_{0};
+  RuntimeCollisionStopCoverageTracker runtime_collision_stop_coverage_;
   std::atomic<std::uint64_t> validation_deferred_runtime_monitor_active_{0};
 
   // Bounded outcome store keyed by execution_id. FIFO

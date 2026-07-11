@@ -8,7 +8,7 @@
 
 namespace manyforge::core {
 
-class IPlanningContext;
+class IRobotKinematics;
 
 struct CacheCompatibilityResult {
   bool compatible = false;
@@ -18,7 +18,7 @@ struct CacheCompatibilityResult {
 CacheCompatibilityResult incompatible_cache(std::string reason);
 
 CacheCompatibilityResult cached_trajectory_matches_request_goal(
-    IPlanningContext& context,
+    const IRobotKinematics& kinematics,
     const TrajectoryDTO& trajectory,
     const ExecuteRequestDTO& request);
 

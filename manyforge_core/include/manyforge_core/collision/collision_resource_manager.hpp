@@ -24,6 +24,7 @@ enum class CollisionValidationAdmissionStatus {
   kMissingSnapshotPublisher,
   kMissingRuntimeResource,
   kMissingValidationResource,
+  kRuntimeQueryCapabilityUnsupported,
   kRuntimeMonitorLeaseActiveSharedResource,
 };
 
@@ -124,6 +125,18 @@ class CollisionResourceManager {
     if (resources.validation_engines.empty()) {
       return {CollisionValidationAdmissionStatus::kMissingValidationResource,
               "missing_collision_query_engines"};
+    }
+    if (resources.runtime_monitor_engine) {
+      const auto& runtime_cap = resources.runtime_monitor_engine->capability();
+      const auto capability_status =
+          runtime_collision_query_capability_status(runtime_cap);
+      if (capability_status !=
+          RuntimeCollisionQueryCapabilityStatus::kAdmitted) {
+        return {CollisionValidationAdmissionStatus::
+                    kRuntimeQueryCapabilityUnsupported,
+                runtime_collision_query_capability_status_name(
+                    capability_status)};
+      }
     }
     if (runtime_protection_active) {
       if (!resources.runtime_monitor_engine) {

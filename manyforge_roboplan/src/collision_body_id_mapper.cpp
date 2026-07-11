@@ -48,7 +48,7 @@ RoboPlanCollisionBodyIdMapper::RoboPlanCollisionBodyIdMapper() = default;
 
 void RoboPlanCollisionBodyIdMapper::rebuild(
     const std::string& robot_id,
-    const std::vector<RoboPlanPlanningContext::SceneObjectSnapshot>&
+    const std::vector<RoboPlanProjectionBackend::SceneObjectSnapshot>&
         scene_objects,
     const std::vector<std::pair<std::string, core::CollisionBodyId>>&
         robot_body_mappings) {

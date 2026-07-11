@@ -112,6 +112,25 @@ struct DetachObjectRequestDTO {
   std::string frame_id;
 };
 
+/// Set one robot model's world placement in the logical scene.
+///
+/// Robot placement is scene geometry, not observed joint state. It therefore
+/// advances the logical scene revision and every native/collision projection
+/// through the same transaction protocol as object geometry.
+struct SetRobotBasePoseRequestDTO {
+  std::string robot_id;
+  Pose3DTO pose_in_world;
+};
+
+/// Replace the collision policy owned by the logical scene authority.
+///
+/// Policy changes use the same compare-and-commit protocol as geometry so a
+/// projection rebuild can restore geometry and policy from one immutable
+/// committed snapshot.
+struct SetCollisionPolicyRequestDTO {
+  CollisionPolicySnapshot policy;
+};
+
 /// Object state query result (spec §3.9)
 struct ObjectStateDTO {
   std::string object_id;
@@ -134,6 +153,11 @@ struct SceneEditResultDTO {
   std::optional<std::string> update_status;
   bool collision_world_revision_changed = false;
   bool collision_world_freshness_changed = false;
+  /// True only when the projection can prove a failed edit did not mutate any
+  /// native scene, policy, or publication state. SceneAuthority consumes this
+  /// evidence to distinguish an ordinary rejected request from a projection
+  /// that must be rebuilt before further use.
+  bool rollback_proven = false;
 };
 
 }  // namespace manyforge::core

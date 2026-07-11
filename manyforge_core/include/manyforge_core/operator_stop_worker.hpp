@@ -23,13 +23,14 @@ class OperatorStopWorker {
  public:
   using WorkerBody =
       std::function<void(std::uint64_t generation, std::stop_token stop_token)>;
+  using CompletionCallback = std::function<void()>;
 
   OperatorStopWorker() = default;
   OperatorStopWorker(const OperatorStopWorker&) = delete;
   OperatorStopWorker& operator=(const OperatorStopWorker&) = delete;
   ~OperatorStopWorker();
 
-  bool start(WorkerBody body);
+  bool start(WorkerBody body, CompletionCallback on_finished = nullptr);
   bool cancel(bool invalidate_generation);
   void join_finished();
   void stop_and_join();

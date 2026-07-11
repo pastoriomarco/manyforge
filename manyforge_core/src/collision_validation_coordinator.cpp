@@ -297,7 +297,7 @@ CollisionValidationCoordinator::merge_engine_and_policy_decision(
     CollisionDecisionResult policy_decision) {
   // Fail-closed engine status cannot be downgraded by an allow / dispatch
   // policy result. Mirrors merge_policy_collision_decision in the RoboPlan
-  // planning context so the two surfaces stay coherent.
+  // observed-state provider so the two surfaces stay coherent.
   if (engine_decision == CollisionDecisionResult::kInconclusiveFail ||
       engine_decision == CollisionDecisionResult::kStopRequested) {
     return engine_decision;

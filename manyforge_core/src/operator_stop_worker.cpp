@@ -8,7 +8,8 @@ OperatorStopWorker::~OperatorStopWorker() {
   stop_and_join();
 }
 
-bool OperatorStopWorker::start(WorkerBody body) {
+bool OperatorStopWorker::start(WorkerBody body,
+                               CompletionCallback on_finished) {
   if (!body) {
     return false;
   }
@@ -27,12 +28,25 @@ bool OperatorStopWorker::start(WorkerBody body) {
         const auto generation = ++generation_;
         active_.store(true, std::memory_order_release);
         thread_ = std::jthread(
-            [this, generation, body = std::move(body)](
+            [this, generation, body = std::move(body),
+             on_finished = std::move(on_finished)](
                 std::stop_token stop_token) mutable {
               struct ActiveGuard {
                 OperatorStopWorker* self;
-                ~ActiveGuard() { self->mark_finished(); }
-              } guard{this};
+                CompletionCallback* on_finished;
+                ~ActiveGuard() noexcept {
+                  self->mark_finished();
+                  if (*on_finished) {
+                    try {
+                      (*on_finished)();
+                    } catch (...) {
+                      // Completion refresh is best-effort telemetry. A
+                      // callback defect must not escape the worker's teardown
+                      // guard and terminate the process after a safe stop.
+                    }
+                  }
+                }
+              } guard{this, &on_finished};
               body(generation, stop_token);
             });
         return true;

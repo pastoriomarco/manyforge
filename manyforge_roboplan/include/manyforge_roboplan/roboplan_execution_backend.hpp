@@ -9,6 +9,7 @@
 #include <optional>
 #include <stop_token>
 #include <thread>
+#include <vector>
 
 #include <roboplan/core/scene.hpp>
 
@@ -27,6 +28,9 @@ struct RoboPlanExecutionBackendConfig {
   std::optional<double> soft_on_path_max_initial_path_deviation_rad;
   std::optional<double> soft_on_path_max_initial_velocity_deviation_rad_s;
   std::map<std::string, double> soft_on_path_max_jerk_rad_s3;
+  /// Canonical command-group order for the dedicated observed-state channel.
+  /// Production factories always populate this from the observed-state provider.
+  std::vector<std::string> observed_joint_names;
 };
 
 struct RoboPlanSceneProjectionMetrics {
@@ -58,6 +62,10 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   core::ExecutionHandle resume(const core::TrajectoryDTO& trajectory) override;
   core::ResetResultDTO reset() override;
   core::ExecutionSnapshot get_execution_snapshot() const override;
+  const core::ObservedRobotStatePublication*
+  observed_robot_state_publication() const noexcept override {
+    return observed_state_publication_.get();
+  }
 
   // ADR-0018: atomic per-tick read of the runtime velocity scale so the UI
   // slider retimes in-flight discrete motion without stopping.
@@ -129,6 +137,9 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   core::IClock& clock_;
   std::shared_ptr<std::mutex> scene_mutex_;
   RoboPlanExecutionBackendConfig config_;
+  std::unique_ptr<core::ObservedRobotStatePublication>
+      observed_state_publication_;
+  std::vector<double> observed_at_rest_velocities_;
 
   mutable std::mutex execution_mutex_;
   mutable std::mutex state_mutex_;

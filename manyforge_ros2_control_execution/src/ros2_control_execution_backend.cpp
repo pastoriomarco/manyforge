@@ -1,6 +1,7 @@
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <future>
@@ -22,6 +23,11 @@ constexpr double kRuntimeScaleSlewPerSecond = 4.0;  // 0→1 in 250 ms.
 constexpr auto kIdleSceneProjectionMinPeriod = std::chrono::milliseconds(100);
 constexpr int kTerminalSceneProjectionRetryAttempts = 10;
 constexpr auto kTerminalSceneProjectionRetryDelay = std::chrono::milliseconds(20);
+
+std::int64_t ros_stamp_ns(const builtin_interfaces::msg::Time& stamp) noexcept {
+  return static_cast<std::int64_t>(stamp.sec) * 1'000'000'000LL +
+         static_cast<std::int64_t>(stamp.nanosec);
+}
 
 double controlled_stop_wait_timeout_s(
     const core::MotionInterruptStopProfileDTO& profile,
@@ -158,6 +164,7 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     throw std::invalid_argument("execution state sink must not be null");
   }
   validate_config();
+  initialize_observed_state_publication();
   snapshot_.timestamp_ns = clock_.now();
   start_ros();
 }
@@ -212,6 +219,27 @@ void Ros2ControlExecutionBackend::validate_config() const {
   }
   if (config_.required_joints.empty()) {
     throw std::invalid_argument("ros2_control required_joints must not be empty");
+  }
+  if (config_.observed_state_source_precedence.empty()) {
+    throw std::invalid_argument(
+        "observed_state_source_precedence must not be empty");
+  }
+  const std::array<std::string_view, 3> allowed_sources{
+      "action_feedback", "controller_state", "joint_state"};
+  for (std::size_t i = 0; i < config_.observed_state_source_precedence.size();
+       ++i) {
+    const auto& source = config_.observed_state_source_precedence[i];
+    if (std::find(allowed_sources.begin(), allowed_sources.end(), source) ==
+            allowed_sources.end() ||
+        std::find(config_.observed_state_source_precedence.begin(),
+                  config_.observed_state_source_precedence.begin() +
+                      static_cast<std::ptrdiff_t>(i),
+                  source) !=
+            config_.observed_state_source_precedence.begin() +
+                static_cast<std::ptrdiff_t>(i)) {
+      throw std::invalid_argument(
+          "observed_state_source_precedence contains an unknown or duplicate source");
+    }
   }
   if (config_.joint_state_max_age_s < 0.0 ||
       config_.wait_for_state_timeout_s < 0.0 ||
@@ -269,6 +297,54 @@ void Ros2ControlExecutionBackend::validate_config() const {
     throw std::invalid_argument(
         "disable_controller_path_tolerances is allowed only for commanded_sim deployments");
   }
+}
+
+void Ros2ControlExecutionBackend::initialize_observed_state_publication() {
+  const auto profile = uses_authored_backend_state()
+                           ? core::ObservedRobotStateAuthorityProfile::
+                                 kCommandedSimulation
+                           : core::ObservedRobotStateAuthorityProfile::kMeasured;
+  const auto budget_ns = static_cast<std::int64_t>(
+      config_.joint_state_max_age_s * 1'000'000'000.0);
+  std::vector<core::ObservedRobotStateSourceConfig> sources;
+  sources.reserve(config_.observed_state_source_precedence.size());
+  for (const auto& name : config_.observed_state_source_precedence) {
+    core::ObservedRobotStateSourceKind kind;
+    if (name == "action_feedback") {
+      kind = core::ObservedRobotStateSourceKind::kActionFeedback;
+    } else if (name == "controller_state") {
+      kind = core::ObservedRobotStateSourceKind::kControllerState;
+    } else {
+      kind = core::ObservedRobotStateSourceKind::kJointState;
+    }
+    auto source = core::ObservedRobotStateSourceConfig{
+        kind, name, profile, budget_ns};
+    source.authority_profile_id =
+        config_.observed_state_authority_profile_id.empty()
+            ? (uses_authored_backend_state()
+                   ? "ros2_control_commanded_sim_v1"
+                   : "ros2_control_measured_v1")
+            : config_.observed_state_authority_profile_id;
+    sources.push_back(std::move(source));
+  }
+  observed_state_publication_ =
+      std::make_unique<core::ObservedRobotStatePublication>(
+          config_.required_joints, std::move(sources));
+}
+
+void Ros2ControlExecutionBackend::publish_observed_robot_state(
+    core::ObservedRobotStateSourceKind source,
+    const std::vector<std::string>& joint_names,
+    const std::vector<double>& positions,
+    const std::vector<double>& velocities,
+    std::int64_t source_timestamp_ns,
+    std::int64_t received_timestamp_ns) noexcept {
+  if (observed_state_publication_ == nullptr) {
+    return;
+  }
+  (void)observed_state_publication_->publish(
+      source, joint_names, positions, velocities, source_timestamp_ns,
+      received_timestamp_ns);
 }
 
 void Ros2ControlExecutionBackend::start_ros() {
@@ -369,6 +445,11 @@ void Ros2ControlExecutionBackend::stop_ros() {
 void Ros2ControlExecutionBackend::on_joint_state(
     const sensor_msgs::msg::JointState::SharedPtr msg) {
   state_callbacks_total_.fetch_add(1, std::memory_order_relaxed);
+  const auto received_timestamp_ns = clock_.now();
+  publish_observed_robot_state(
+      core::ObservedRobotStateSourceKind::kJointState, msg->name,
+      msg->position, msg->velocity, ros_stamp_ns(msg->header.stamp),
+      received_timestamp_ns);
   JointSample sample;
   sample.joint_names = msg->name;
   sample.positions = msg->position;
@@ -387,6 +468,11 @@ void Ros2ControlExecutionBackend::on_joint_state(
 void Ros2ControlExecutionBackend::on_controller_state(
     const control_msgs::msg::JointTrajectoryControllerState::SharedPtr msg) {
   state_callbacks_total_.fetch_add(1, std::memory_order_relaxed);
+  const auto received_timestamp_ns = clock_.now();
+  publish_observed_robot_state(
+      core::ObservedRobotStateSourceKind::kControllerState,
+      msg->joint_names, msg->feedback.positions, msg->feedback.velocities,
+      ros_stamp_ns(msg->header.stamp), received_timestamp_ns);
   JointSample sample;
   sample.joint_names = msg->joint_names;
   sample.positions = msg->feedback.positions;
@@ -444,6 +530,11 @@ void Ros2ControlExecutionBackend::on_action_feedback(
     elapsed_s = seconds_since(execution_started_at_, now);
   }
   const auto& expected_positions = feedback->desired.positions;
+  publish_observed_robot_state(
+      core::ObservedRobotStateSourceKind::kActionFeedback,
+      feedback->joint_names, feedback->actual.positions,
+      feedback->actual.velocities, ros_stamp_ns(feedback->header.stamp),
+      clock_.now());
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (!latest_action_feedback_.has_value()) {
@@ -1097,6 +1188,12 @@ void Ros2ControlExecutionBackend::testing_store_latest_joint_sample_impl(
     std::vector<std::string> joint_names,
     std::vector<double> positions,
     std::chrono::steady_clock::time_point received_at) {
+  const auto received_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               received_at.time_since_epoch())
+                               .count();
+  publish_observed_robot_state(
+      core::ObservedRobotStateSourceKind::kJointState, joint_names, positions,
+      {}, 0, received_ns);
   JointSample sample;
   sample.joint_names = std::move(joint_names);
   sample.positions = std::move(positions);
@@ -1171,6 +1268,12 @@ Ros2ControlExecutionBackend::controller_progress_metrics() const {
       last_stop_confirmation_latency_ns_.load(std::memory_order_relaxed);
   metrics.max_stop_confirmation_latency_ns =
       max_stop_confirmation_latency_ns_.load(std::memory_order_relaxed);
+  if (observed_state_publication_ != nullptr) {
+    metrics.observed_state_reader_retry_exhausted_total =
+        observed_state_publication_->metrics().reader_retry_exhausted_total;
+    metrics.observed_state_sources =
+        observed_state_publication_->source_metrics();
+  }
 
   const auto now = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(state_mutex_);

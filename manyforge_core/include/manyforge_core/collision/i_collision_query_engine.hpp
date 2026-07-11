@@ -1,14 +1,163 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
+#include <string_view>
 
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 
 namespace manyforge::core {
+
+enum class RuntimeCollisionQueryPrepareStatus {
+  kReady,
+  kUnsupported,
+  kJointCountExceeded,
+  kInvalidJointOrder,
+  kEngineBusy,
+  kEngineError,
+};
+
+enum class RuntimeCollisionQueryCapabilityStatus {
+  kAdmitted,
+  kUnsupportedMemoryModel,
+  kMissingDimensionBound,
+  kMissingWarmWcet,
+  kPreallocatedDeclaresWarmAllocations,
+  kMeasuredBoundedMissingWarmAllocationBound,
+  kSnapshotChangeDeclaresAllocationsWhenDisabled,
+  kSnapshotChangeMissingAllocationBound,
+  kSnapshotChangeMissingWcet,
+};
+
+[[nodiscard]] constexpr RuntimeCollisionQueryCapabilityStatus
+runtime_collision_query_capability_status(
+    const CollisionEngineCapabilityDescriptor& capability) noexcept {
+  if (capability.runtime_query_memory_model ==
+      RuntimeCollisionQueryMemoryModel::kUnsupported) {
+    return RuntimeCollisionQueryCapabilityStatus::kUnsupportedMemoryModel;
+  }
+  if (capability.runtime_query_max_joints == 0 ||
+      capability.runtime_query_max_world_bodies == 0 ||
+      capability.runtime_query_max_collision_pairs == 0) {
+    return RuntimeCollisionQueryCapabilityStatus::kMissingDimensionBound;
+  }
+  if (capability.runtime_query_qualified_wcet_ns == 0) {
+    return RuntimeCollisionQueryCapabilityStatus::kMissingWarmWcet;
+  }
+  if (capability.runtime_query_memory_model ==
+          RuntimeCollisionQueryMemoryModel::kPreallocated &&
+      capability.runtime_query_clean_allocation_upper_bound != 0) {
+    return RuntimeCollisionQueryCapabilityStatus::
+        kPreallocatedDeclaresWarmAllocations;
+  }
+  if (capability.runtime_query_memory_model ==
+          RuntimeCollisionQueryMemoryModel::kMeasuredBounded &&
+      capability.runtime_query_clean_allocation_upper_bound == 0) {
+    return RuntimeCollisionQueryCapabilityStatus::
+        kMeasuredBoundedMissingWarmAllocationBound;
+  }
+  if (!capability.runtime_query_snapshot_change_may_allocate &&
+      capability.runtime_query_snapshot_change_allocation_upper_bound != 0) {
+    return RuntimeCollisionQueryCapabilityStatus::
+        kSnapshotChangeDeclaresAllocationsWhenDisabled;
+  }
+  if (capability.runtime_query_snapshot_change_may_allocate &&
+      capability.runtime_query_snapshot_change_allocation_upper_bound == 0) {
+    return RuntimeCollisionQueryCapabilityStatus::
+        kSnapshotChangeMissingAllocationBound;
+  }
+  if (capability.runtime_query_snapshot_change_qualified_wcet_ns == 0) {
+    return RuntimeCollisionQueryCapabilityStatus::kSnapshotChangeMissingWcet;
+  }
+  return RuntimeCollisionQueryCapabilityStatus::kAdmitted;
+}
+
+[[nodiscard]] constexpr const char*
+runtime_collision_query_capability_status_name(
+    RuntimeCollisionQueryCapabilityStatus status) noexcept {
+  switch (status) {
+    case RuntimeCollisionQueryCapabilityStatus::kAdmitted:
+      return "admitted";
+    case RuntimeCollisionQueryCapabilityStatus::kUnsupportedMemoryModel:
+      return "unsupported_memory_model";
+    case RuntimeCollisionQueryCapabilityStatus::kMissingDimensionBound:
+      return "missing_dimension_bound";
+    case RuntimeCollisionQueryCapabilityStatus::kMissingWarmWcet:
+      return "missing_warm_wcet";
+    case RuntimeCollisionQueryCapabilityStatus::
+        kPreallocatedDeclaresWarmAllocations:
+      return "preallocated_declares_warm_allocations";
+    case RuntimeCollisionQueryCapabilityStatus::
+        kMeasuredBoundedMissingWarmAllocationBound:
+      return "measured_bounded_missing_warm_allocation_bound";
+    case RuntimeCollisionQueryCapabilityStatus::
+        kSnapshotChangeDeclaresAllocationsWhenDisabled:
+      return "snapshot_change_declares_allocations_when_disabled";
+    case RuntimeCollisionQueryCapabilityStatus::
+        kSnapshotChangeMissingAllocationBound:
+      return "snapshot_change_missing_allocation_bound";
+    case RuntimeCollisionQueryCapabilityStatus::kSnapshotChangeMissingWcet:
+      return "snapshot_change_missing_wcet";
+  }
+  return "unknown";
+}
+
+enum class RuntimeCollisionQueryStatus {
+  kClear,
+  kCollision,
+  kInconclusive,
+};
+
+enum class RuntimeCollisionQueryFailureReason {
+  kNone,
+  kUnsupported,
+  kEngineBusy,
+  kSnapshotBodyLimitExceeded,
+  kSnapshotInvalid,
+  kSnapshotSyncFailed,
+  kObservedStateShapeMismatch,
+  kObservedStateNotFinite,
+  kPairDiagnosticsIncomplete,
+  kObservationCapacityExceeded,
+  kTimeout,
+  kEngineException,
+};
+
+/// Non-owning pair evidence valid until the next runtime query on the same
+/// engine instance. The pair points into revision-stable engine storage built
+/// during snapshot ingestion, so a warm clean query does not copy body ids.
+struct RuntimeCollisionPairObservation {
+  const CollisionPairId* pair = nullptr;
+  std::optional<double> signed_clearance_m;
+};
+
+struct RuntimeCollisionQueryRequest {
+  std::span<const double> positions_rad;
+  std::int64_t state_time_ns = 0;
+  std::int64_t timeout_budget_ns = 0;
+  bool require_distance = false;
+};
+
+/// Typed, non-owning runtime result. Maps, formatted strings, and owning result
+/// DTOs are deliberately absent; callers materialize diagnostics only after a
+/// collision or inconclusive result is known.
+struct RuntimeCollisionQueryResultView {
+  RuntimeCollisionQueryStatus status =
+      RuntimeCollisionQueryStatus::kInconclusive;
+  RuntimeCollisionQueryFailureReason failure_reason =
+      RuntimeCollisionQueryFailureReason::kUnsupported;
+  CollisionEngineStatus engine_status =
+      CollisionEngineStatus::kDiagnosticIncomplete;
+  std::int64_t query_duration_ns = 0;
+  std::span<const RuntimeCollisionPairObservation> collision_pairs;
+  std::span<const RuntimeCollisionPairObservation> clearance_pairs;
+};
 
 /// Cancellation token observed by collision engines and by the
 /// CollisionValidationCoordinator / ParallelCollisionValidationWorkerPool.
@@ -76,10 +225,9 @@ class CollisionCancellationToken {
 ///
 /// The `CollisionValidationCoordinator` and the
 /// `ParallelCollisionValidationWorkerPool` consume implementations of
-/// this interface as their production worker primitive. The previous
-/// `IPlanningContext::collision_check_normalized` worker boundary is
-/// retained only for the transitional shim during Phase 2; new
-/// validation paths MUST use this port.
+/// this interface as their production worker primitive. A planner-native
+/// collision path may exist only behind the dedicated diagnostic-comparator
+/// port; validation and runtime-monitor paths MUST use this interface.
 ///
 /// Implementations are expected to declare an immutable model + immutable
 /// `CollisionWorldSnapshot` shared across N worker instances, and to
@@ -95,8 +243,8 @@ class CollisionCancellationToken {
 ///     `kSingleContextExclusive` is declared. Distinct wrapper instances with
 ///     the same non-empty mutable context id are still one exclusive resource.
 ///
-/// Engine implementations MUST NOT depend on `IPlanningContext`; they
-/// receive a `CollisionWorldSnapshot` for scene state, a `CollisionQuery`
+/// Engine implementations MUST NOT depend on planner-native scene authority;
+/// they receive a `CollisionWorldSnapshot` for scene state, a `CollisionQuery`
 /// for the queried robot state + surface, and a
 /// `CollisionPolicySnapshot` for classification policy. This decouples
 /// the engine from planner internals (RoboPlan, MoveIt2, Isaac); each
@@ -158,6 +306,34 @@ class ICollisionQueryEngine {
       const CollisionQuery& query,
       const CollisionPolicySnapshot& policy,
       const CollisionCancellationToken& cancel) = 0;
+
+  /// Prepare fixed-capacity single-state runtime-query storage. This is an NRT
+  /// monitor-arm operation and may be called again when the canonical joint
+  /// order changes. Runtime-capable engines must not defer joint-map creation to
+  /// check_runtime().
+  [[nodiscard]] virtual RuntimeCollisionQueryPrepareStatus prepare_runtime_query(
+      std::span<const std::string> /*canonical_joint_names*/) noexcept {
+    return RuntimeCollisionQueryPrepareStatus::kUnsupported;
+  }
+
+  /// Ingest one immutable world revision before its first clean warm query. This
+  /// is where bounded geometry rebuilds and resource preparation belong. A
+  /// measured-bounded engine may also accept a changed revision on its qualified
+  /// cold path, but no runtime query may perform resource I/O.
+  [[nodiscard]] virtual RuntimeCollisionQueryPrepareStatus
+  prepare_runtime_snapshot(
+      const CollisionWorldSnapshot& /*snapshot*/) noexcept {
+    return RuntimeCollisionQueryPrepareStatus::kUnsupported;
+  }
+
+  /// Run one observed-state collision query through the dedicated runtime
+  /// surface. Implementations must obey capability().runtime_query_memory_model,
+  /// return promptly on internal resource contention, and never perform I/O.
+  [[nodiscard]] virtual RuntimeCollisionQueryResultView check_runtime(
+      const CollisionWorldSnapshot& /*snapshot*/,
+      const RuntimeCollisionQueryRequest& /*request*/) noexcept {
+    return {};
+  }
 
   /// Stable engine id for telemetry / mismatch ledger correlation.
   /// Engines MAY set this once and reuse it across all results; the

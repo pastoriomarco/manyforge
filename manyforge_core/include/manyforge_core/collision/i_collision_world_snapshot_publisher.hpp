@@ -14,6 +14,8 @@
 
 namespace manyforge::core {
 
+struct CollisionPolicyIndex;
+
 struct CollisionWorldBodyFreshness {
   std::string body_id;
   std::optional<std::string> source_id;
@@ -46,6 +48,24 @@ struct CollisionWorldPolicySnapshotBundle {
   std::vector<CollisionWorldBodyFreshness> body_freshness;
 };
 
+/// One immutable, coherent publication consumed by runtime-safety ticks.
+/// Writers build policy adaptation and indexes before publication, then swap a
+/// single shared handle. Freshness-only publications may retain world/policy/
+/// index handles while replacing the sorted sidecar and advancing epoch.
+struct RuntimeCollisionQueryBundle {
+  CollisionWorldSnapshotPtr world;
+  std::shared_ptr<const CollisionPolicySnapshot> policy;
+  std::shared_ptr<const CollisionPolicyIndex> policy_index;
+  std::vector<CollisionWorldBodyFreshness> body_freshness;
+  /// Publication-time proof that world bodies and freshness entries are sorted
+  /// and unique by body id, enabling a linear allocation-free merge per tick.
+  bool lookup_order_valid = false;
+  std::uint64_t epoch = 0;
+};
+
+using RuntimeCollisionQueryBundlePtr =
+    std::shared_ptr<const RuntimeCollisionQueryBundle>;
+
 struct CollisionWorldLeaseInventory {
   std::string retention_id;
   std::int64_t captured_at_ns = 0;
@@ -72,7 +92,7 @@ struct CollisionWorldLeaseRetentionStats {
 /// view of the collision world.
 ///
 /// **Expected publishers:**
-///   - RoboPlan-backed planning context (today, transitional).
+///   - RoboPlan-backed observed-state provider (today, transitional).
 ///   - Isaac scene observer (Phase 2+).
 ///   - Deterministic fixture publisher (tests + qualification).
 ///   - Composer's editable scene store (long-term, once scene-edit
@@ -119,12 +139,11 @@ class ICollisionWorldSnapshotPublisher {
   [[nodiscard]] virtual CollisionWorldSnapshotPtr snapshot() const = 0;
 
   /// Return the publisher's current world revision without requiring consumers
-  /// to borrow or rebuild the full snapshot. Runtime monitors use this as a
-  /// cheap coherency probe: if the revision differs from the currently
-  /// published runtime snapshot, they refresh the full world+policy bundle
-  /// before checking live robot state. Implementations should override this
-  /// with a leaf/atomic revision read; the default is correct but may be more
-  /// expensive because it borrows `snapshot()`.
+  /// to borrow or rebuild the full snapshot. Admission and diagnostics use this
+  /// as a cheap revision probe; runtime ticks consume the coherent immutable
+  /// query bundle below instead. Implementations should override this with a
+  /// leaf/atomic revision read; the default is correct but may be more expensive
+  /// because it borrows `snapshot()`.
   [[nodiscard]] virtual CollisionWorldRevision
   published_collision_world_revision() const {
     auto current = snapshot();
@@ -198,8 +217,8 @@ class ICollisionWorldSnapshotPublisher {
   /// geometry, or recompute policy. Writers that mutate the collision world or
   /// effective collision policy are responsible for publishing a coherent
   /// bundle before exposing the new revision to runtime monitors.
-  [[nodiscard]] virtual CollisionWorldPolicySnapshotBundle
-  published_runtime_collision_snapshot_bundle() const = 0;
+  [[nodiscard]] virtual RuntimeCollisionQueryBundlePtr
+  published_runtime_collision_query_bundle() const = 0;
 };
 
 }  // namespace manyforge::core

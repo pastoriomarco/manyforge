@@ -3,13 +3,12 @@
 // do not require a live roboplan::Scene: id format helpers, lookup semantics,
 // revision behavior, and deterministic content hashing.
 //
-// Integration with the planning context (collision_check_normalized,
-// scene-fingerprint-triggered rebuild) is covered separately by tests that
-// construct a real Scene; those tests live alongside test_native_backends and
-// are added in the same Chunk-1 commit batch.
+// Integration with the dedicated diagnostic comparator and its
+// scene-fingerprint-triggered rebuild is covered separately by tests that
+// construct a real Scene.
 
 #include <manyforge_roboplan/collision_body_id_mapper.hpp>
-#include <manyforge_roboplan/roboplan_planning_context.hpp>
+#include <manyforge_roboplan/roboplan_projection_backend.hpp>
 
 #include <gtest/gtest.h>
 
@@ -22,9 +21,9 @@ using manyforge::core::CollisionShapeDTO;
 using manyforge::core::BoxShapeDTO;
 using manyforge::core::Pose3DTO;
 using manyforge::roboplan_backend::RoboPlanCollisionBodyIdMapper;
-using manyforge::roboplan_backend::RoboPlanPlanningContext;
+using manyforge::roboplan_backend::RoboPlanProjectionBackend;
 
-using Snapshot = RoboPlanPlanningContext::SceneObjectSnapshot;
+using Snapshot = RoboPlanProjectionBackend::SceneObjectSnapshot;
 
 Snapshot make_object(const std::string& id, bool attached) {
   Snapshot s;

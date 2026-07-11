@@ -4,6 +4,7 @@
 
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
+#include <roboplan/core/scene_utils.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -97,6 +98,22 @@ RoboPlanExecutionBackend::RoboPlanExecutionBackend(
   if (!scene_mutex_) {
     scene_mutex_ = std::make_shared<std::mutex>();
   }
+  if (!config_.observed_joint_names.empty()) {
+    core::ObservedRobotStateSourceConfig source;
+    source.kind = core::ObservedRobotStateSourceKind::kPredictedState;
+    source.source_id = "native_predicted_state";
+    source.authority_profile =
+        core::ObservedRobotStateAuthorityProfile::kPredictedNative;
+    source.freshness_budget_ns = 0;
+    source.authority_profile_id = "native_predicted_v1";
+    observed_state_publication_ =
+        std::make_unique<core::ObservedRobotStatePublication>(
+            config_.observed_joint_names,
+            std::vector<core::ObservedRobotStateSourceConfig>{
+                std::move(source)});
+    observed_at_rest_velocities_.assign(config_.observed_joint_names.size(),
+                                        0.0);
+  }
   state_.snapshot.timestamp_ns = clock_.now();
 }
 
@@ -110,14 +127,37 @@ std::int64_t RoboPlanExecutionBackend::publish_snapshot(
     core::ExecutionState state, double progress,
     const std::vector<double>& joint_positions,
     std::optional<core::ErrorDTO> error) {
-  std::lock_guard<std::mutex> lock(state_mutex_);
   const auto timestamp_ns = clock_.now();
-  state_.snapshot.timestamp_ns = timestamp_ns;
-  state_.snapshot.sequence_number++;
-  state_.snapshot.state = state;
-  state_.snapshot.progress = clamp_progress(progress);
-  state_.snapshot.joint_positions_rad = joint_positions;
-  state_.snapshot.error = std::move(error);
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_.snapshot.timestamp_ns = timestamp_ns;
+    state_.snapshot.sequence_number++;
+    state_.snapshot.state = state;
+    state_.snapshot.progress = clamp_progress(progress);
+    state_.snapshot.joint_positions_rad = joint_positions;
+    state_.snapshot.error = std::move(error);
+  }
+  // RT-8C publication is deliberately outside state_mutex_: the RT0 writer
+  // has its own bounded preallocated lane and cannot queue behind lifecycle
+  // snapshot readers.
+  if (observed_state_publication_ != nullptr &&
+      joint_positions.size() == config_.observed_joint_names.size()) {
+    const bool at_rest_state =
+        state == core::ExecutionState::kIdle ||
+        state == core::ExecutionState::kPaused ||
+        state == core::ExecutionState::kStopped ||
+        state == core::ExecutionState::kCompleted ||
+        state == core::ExecutionState::kFailed ||
+        state == core::ExecutionState::kInterventionRequired;
+    const std::span<const double> velocities =
+        at_rest_state
+            ? std::span<const double>(observed_at_rest_velocities_)
+            : std::span<const double>{};
+    (void)observed_state_publication_->publish(
+        core::ObservedRobotStateSourceKind::kPredictedState,
+        config_.observed_joint_names, joint_positions, velocities,
+        timestamp_ns, timestamp_ns);
+  }
   return timestamp_ns;
 }
 
@@ -475,6 +515,84 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
 }
 
 core::Result<void> RoboPlanExecutionBackend::sync_observed_state_before_planning() {
+  if (observed_state_publication_ == nullptr) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorExecutionRejected,
+        "Native observed-state publication is unavailable",
+        {{"reason", "observed_state_publication_unavailable"}}});
+  }
+
+  std::vector<double> positions;
+  try {
+    std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+    const auto maybe_group = scene_->getJointGroupInfo(group_name_);
+    if (!maybe_group) {
+      return core::Result<void>::Err(core::ErrorDTO{
+          core::kErrorExecutionRejected,
+          "Native observed-state group is unavailable",
+          {{"reason", "observed_state_group_unavailable"},
+           {"group_id", group_name_},
+           {"error", maybe_group.error()}}});
+    }
+    const auto& group = maybe_group.value();
+    Eigen::VectorXd compact =
+        scene_->getCurrentJointPositions()(group.q_indices);
+    if (group.has_continuous_dofs) {
+      auto collapsed = roboplan::collapseContinuousJointPositions(
+          *scene_, group_name_, compact);
+      if (!collapsed) {
+        return core::Result<void>::Err(core::ErrorDTO{
+            core::kErrorExecutionRejected,
+            "Native continuous-joint state could not be normalized",
+            {{"reason", "observed_state_continuous_joint_collapse_failed"},
+             {"error", collapsed.error()}}});
+      }
+      compact = std::move(collapsed.value());
+    }
+    positions.resize(static_cast<std::size_t>(compact.size()));
+    for (Eigen::Index index = 0; index < compact.size(); ++index) {
+      positions[static_cast<std::size_t>(index)] = compact[index];
+    }
+  } catch (const std::exception& error) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorExecutionRejected,
+        "Native observed state could not be captured before planning",
+        {{"reason", "observed_state_capture_failed"},
+         {"exception", error.what()}}});
+  }
+
+  if (positions.size() != config_.observed_joint_names.size()) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorExecutionRejected,
+        "Native observed-state shape does not match the qualified joint order",
+        {{"reason", "observed_state_shape_mismatch"},
+         {"expected_joint_count",
+          std::to_string(config_.observed_joint_names.size())},
+         {"observed_joint_count", std::to_string(positions.size())}}});
+  }
+
+  const auto now_ns = clock_.now();
+  const auto state = get_execution_snapshot().state;
+  const bool at_rest = state == core::ExecutionState::kIdle ||
+                       state == core::ExecutionState::kPaused ||
+                       state == core::ExecutionState::kStopped ||
+                       state == core::ExecutionState::kCompleted ||
+                       state == core::ExecutionState::kFailed ||
+                       state == core::ExecutionState::kInterventionRequired;
+  const std::span<const double> velocities =
+      at_rest ? std::span<const double>(observed_at_rest_velocities_)
+              : std::span<const double>{};
+  auto published = observed_state_publication_->publish(
+      core::ObservedRobotStateSourceKind::kPredictedState,
+      config_.observed_joint_names, positions, velocities, now_ns, now_ns);
+  if (!published.published || !published.complete) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorExecutionRejected,
+        "Native observed state was rejected by the publication lane",
+        {{"reason", published.reason != nullptr && published.reason[0] != '\0'
+                        ? published.reason
+                        : "observed_state_publish_rejected"}}});
+  }
   return core::Result<void>::Ok();
 }
 

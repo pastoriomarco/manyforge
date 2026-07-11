@@ -310,7 +310,7 @@ def _normalize_pose_dict(pose: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
 class NativeKernelClient(KernelClient):
     """KernelClient backed by an all-C++ NativeKernelBundle.
 
-    The kernel, planner, planning context, and execution backend are all
+    The kernel, planner, observed-state provider, and execution backend are all
     native C++ — no pybind11 trampolines on the hot path.
     """
 
@@ -888,6 +888,18 @@ class NativeKernelClient(KernelClient):
             str(principal_id), str(reason), expected_epoch=expected_epoch
         )
         return self._command_result(r)
+
+    def get_recovery_assessment(self) -> dict:
+        """RT-8B: latest kernel recovery assessment (spec/200)."""
+        return dict(self._bundle.get_recovery_assessment())
+
+    def apply_recovery_action(self, request: dict) -> dict:
+        """RT-8B: single generation-bound kernel recovery command.
+
+        Python is plumbing only: the request dict is forwarded verbatim and
+        the C++ kernel is the sole admission authority (spec/230 §3.7.1).
+        """
+        return dict(self._bundle.apply_recovery_action(dict(request)))
 
     def set_runtime_velocity_scale(
         self, scale: float, principal_id: str | None = None

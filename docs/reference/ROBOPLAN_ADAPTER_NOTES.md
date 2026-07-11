@@ -206,18 +206,19 @@ Current gaps to keep visible:
 
 - support-contact release is validated against the planned waypoints, not
   continuously against swept volumes;
-- runtime monitoring uses the planner projection, so support-pair re-contact
-  after validation is not independently detected unless it also creates another
-  checked collision pair;
-- contact depth, penetration trend, and final separation tolerance are not
-  enforceable until RoboPlan exposes structured contact diagnostics;
-- performance still depends on RoboPlan/Pinocchio `hasCollisions(q)` over the
-  whole projected scene for each validation waypoint, although support-pair
-  projection is no longer toggled per waypoint.
+- runtime monitoring and pre-dispatch validation use the independent
+  `manyforge_collision` engine against immutable authority-published snapshots;
+  RoboPlan collision is diagnostic/planner-internal only;
+- contact depth, penetration trend, and final separation tolerance depend on
+  the selected ManyForge collision-engine capability tier. Missing required
+  evidence fails closed rather than falling back to RoboPlan diagnostics;
+- performance depends on snapshot projection/publication plus the selected
+  ManyForge collision engine. RoboPlan `hasCollisions(q)` may still guide
+  candidate generation or diagnostic comparison but cannot admit dispatch.
 
 ## Source Locations
 
-- `manyforge_roboplan/src/roboplan_planning_context.cpp`
+- `manyforge_roboplan/src/roboplan_projection_backend.cpp`
   - `scene_placement_from_tracked_locked`
   - `parent_joint_from_frame_matrix_locked`
   - `apply_static_collision_policy_for_object_locked`
@@ -227,7 +228,7 @@ Current gaps to keep visible:
   - mesh objects are added through RoboPlan's `Scene::addMeshGeometry` API,
     available in the RoboPlan 0.4.0 release pin used by
     `scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`)
-- `manyforge_roboplan/include/manyforge_roboplan/roboplan_planning_context.hpp`
+- `manyforge_roboplan/include/manyforge_roboplan/roboplan_projection_backend.hpp`
   - `disabled_static_collision_pairs_`
   - `disabled_support_contact_pairs_`
 - `manyforge_roboplan/test/test_native_backends.cpp`

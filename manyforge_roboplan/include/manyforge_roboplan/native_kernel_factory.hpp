@@ -22,8 +22,11 @@
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
+#include <manyforge_core/observed_robot_state_provider.hpp>
+#include <manyforge_core/scene_authority.hpp>
+#include <manyforge_roboplan/roboplan_focused_adapters.hpp>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
-#include <manyforge_roboplan/roboplan_planning_context.hpp>
+#include <manyforge_roboplan/roboplan_projection_backend.hpp>
 #include <manyforge_roboplan/roboplan_execution_backend.hpp>
 
 namespace manyforge::roboplan_backend {
@@ -133,6 +136,7 @@ class KernelEventCollector {
 /// Bundle that owns all components. Kernel is destroyed first (declared last).
 /// Python holds a shared_ptr to this bundle to keep everything alive.
 struct NativeKernelBundle {
+  std::string robot_id;
   std::string group_name;
 
   // Robot Model Authority metadata. Empty for legacy/example models that do
@@ -154,12 +158,23 @@ struct NativeKernelBundle {
   std::shared_ptr<roboplan::SimpleIk> ik;
   std::shared_ptr<roboplan::SimpleIk> single_shot_ik;
 
+  std::shared_ptr<RoboPlanProjectionBackend> projection_backend;
+  std::shared_ptr<RoboPlanSceneProjection> scene_projection;
+  std::unique_ptr<core::SceneAuthority> scene_authority;
+  std::unique_ptr<RoboPlanKinematicsAdapter> kinematics;
+  std::unique_ptr<RoboPlanReferencePoseResolver> reference_resolver;
+  std::unique_ptr<RoboPlanTrajectoryValidator> trajectory_validator;
+  std::unique_ptr<RoboPlanCollisionTrajectoryProjector>
+      collision_trajectory_projector;
+  std::unique_ptr<RoboPlanCollisionDiagnosticComparator>
+      collision_diagnostic_comparator;
   std::unique_ptr<RoboPlanPlannerBackend> planner;
-  std::unique_ptr<RoboPlanPlanningContext> context;
   std::unique_ptr<WallClock> clock;
   std::unique_ptr<SimpleScheduler> scheduler;
   std::unique_ptr<core::TrajectoryCache> cache;
   std::unique_ptr<core::IExecutionBackend> execution;
+  std::unique_ptr<core::PublishedObservedRobotStateProvider>
+      observed_state_provider;
   std::shared_ptr<core::IExecutionStateSink> execution_state_sink;
   std::shared_ptr<core::ICollisionQueryEngine> collision_runtime_monitor_engine;
   std::vector<std::shared_ptr<core::ICollisionQueryEngine>>

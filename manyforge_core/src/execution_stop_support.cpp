@@ -399,7 +399,7 @@ bool robot_state_size_ordering_ok(const RobotStateDTO& state) {
 
 std::optional<ExecutionStopSnapshotDTO> capture_stop_snapshot(
     const ExecutionSnapshot& post_stop_backend_snapshot,
-    const std::optional<RobotStateDTO>& planning_context_state,
+    const std::optional<RobotStateDTO>& observed_state_provider_state,
     bool backend_stop_confirmed,
     MotionInterruptNodeCategory node_category,
     std::int64_t captured_at_ns,
@@ -427,11 +427,11 @@ std::optional<ExecutionStopSnapshotDTO> capture_stop_snapshot(
   };
 
   if (!post_stop_backend_snapshot.joint_positions_rad.empty() &&
-      planning_context_state &&
-      planning_context_state->joint_names.size() ==
+      observed_state_provider_state &&
+      observed_state_provider_state->joint_names.size() ==
           post_stop_backend_snapshot.joint_positions_rad.size()) {
     snap.source = ExecutionStopSnapshotSource::kExecutionBackendFeedback;
-    snap.robot_state.joint_names = planning_context_state->joint_names;
+    snap.robot_state.joint_names = observed_state_provider_state->joint_names;
     snap.robot_state.positions_rad =
         post_stop_backend_snapshot.joint_positions_rad;
     if (post_stop_backend_snapshot.joint_velocities_rad_s.size() ==
@@ -453,12 +453,12 @@ std::optional<ExecutionStopSnapshotDTO> capture_stop_snapshot(
 
   if (node_category == MotionInterruptNodeCategory::kPrecisionContact) {
     failure_reason =
-        "stop_snapshot_planning_context_rejected_for_precision_contact";
+        "stop_snapshot_observed_state_rejected_for_precision_contact";
     return std::nullopt;
   }
-  if (planning_context_state) {
-    snap.source = ExecutionStopSnapshotSource::kPlanningContextState;
-    snap.robot_state = *planning_context_state;
+  if (observed_state_provider_state) {
+    snap.source = ExecutionStopSnapshotSource::kObservedStateProvider;
+    snap.robot_state = *observed_state_provider_state;
     if (!robot_state_size_ordering_ok(snap.robot_state)) {
       failure_reason = "stop_snapshot_robot_state_size_ordering_invalid";
       return std::nullopt;

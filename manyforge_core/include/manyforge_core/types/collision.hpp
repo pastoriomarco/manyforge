@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -59,6 +60,7 @@ enum class CollisionWorldMutationSource {
   kPoseSourceApply,
   kDeploymentLoad,
   kPolicyUpdate,
+  kProjectionRebuild,
 };
 
 /// Bounded-ledger entry recording a single collision-world revision
@@ -482,6 +484,19 @@ enum class CollisionEngineThreadSafetyClass {
   kProcessIsolated,
 };
 
+/// Memory/latency contract for the dedicated observed-runtime query surface.
+/// General trajectory validation support does not imply runtime suitability.
+enum class RuntimeCollisionQueryMemoryModel {
+  /// The engine must not be admitted as the runtime-monitor authority.
+  kUnsupported,
+  /// Warm, revision-stable queries use storage prepared before monitor arm.
+  /// Snapshot-revision preparation may allocate off the clean steady-state path.
+  kPreallocated,
+  /// Warm queries have a measured finite allocation/WCET envelope recorded by
+  /// qualification. This is firm-RT evidence, not a hard-RT claim.
+  kMeasuredBounded,
+};
+
 /// Engine capability descriptor (spec COLLISION_CHECKING_OWNERSHIP_PLAN
 /// §"Engine Capability And Mismatch Policy", added in Chunk 8 groundwork).
 ///
@@ -508,6 +523,30 @@ struct CollisionEngineCapabilityDescriptor {
   CollisionEngineThreadSafetyClass thread_safety =
       CollisionEngineThreadSafetyClass::kSingleContextExclusive;
   bool deterministic_ordering = false;
+  RuntimeCollisionQueryMemoryModel runtime_query_memory_model =
+      RuntimeCollisionQueryMemoryModel::kUnsupported;
+  /// Hard admission bounds enforced before a runtime query. Zero means the
+  /// corresponding dimension is unsupported, not unbounded.
+  std::size_t runtime_query_max_joints = 0;
+  std::size_t runtime_query_max_world_bodies = 0;
+  std::size_t runtime_query_max_collision_pairs = 0;
+  /// Upper bound for engine-owned heap allocations on a warm, unchanged-world
+  /// clean query. kPreallocated engines must publish zero here.
+  std::uint64_t runtime_query_clean_allocation_upper_bound = 0;
+  /// True when ingesting a new immutable world revision may allocate/rebuild
+  /// engine scratch. Qualification records this cold-path tail separately.
+  bool runtime_query_snapshot_change_may_allocate = false;
+  /// Qualified upper bound for allocations while ingesting one changed
+  /// immutable world revision. This is distinct from the warm query bound.
+  std::uint64_t runtime_query_snapshot_change_allocation_upper_bound = 0;
+  /// Qualified warm-query duration envelope. Zero means no runtime admission.
+  /// The per-call timeout may be tighter; this value documents the engine's
+  /// declared product/fixture envelope rather than replacing that timeout.
+  std::uint64_t runtime_query_qualified_wcet_ns = 0;
+  /// Qualified duration envelope for one changed-world ingestion/query. Every
+  /// admitted runtime engine must publish a nonzero bound, including engines
+  /// whose bounded response is to reject changed snapshots without allocation.
+  std::uint64_t runtime_query_snapshot_change_qualified_wcet_ns = 0;
   /// Free-form notes — e.g. "octree collision not yet supported",
   /// "support-contact requires policy snapshot attached".
   std::vector<std::string> known_unsupported_cases;

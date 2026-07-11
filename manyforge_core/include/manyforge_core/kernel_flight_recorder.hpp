@@ -32,8 +32,9 @@ struct FlightRecord {
 /// a leaf mutex that is never held across I/O or callbacks; recording
 /// failure can never affect control flow (all entry points are noexcept and
 /// best-effort). Dumping is crash-context aware: it spins briefly for the
-/// ring lock and, failing that, proceeds without it — torn tail entries are
-/// acceptable, the output stays line-valid (observability plan OW3;
+/// ring lock and, failing that, emits a minimal `torn=true` marker without
+/// reading concurrently-written storage. The output stays line-valid without
+/// relying on undefined data-race behavior (observability plan OW3;
 /// spec 520 §4.2).
 class KernelFlightRecorder {
  public:

@@ -74,7 +74,12 @@ def _runtime_safety_status(state: ComposerState) -> dict[str, Any]:
         metrics,
         "validation_deferred_runtime_monitor_active",
     )
-    status = "degraded" if faulted > 0 or refresh_failures > 0 else "healthy"
+    missed_periods = _int_metric(metrics, "runtime_collision_tick_missed_periods")
+    status = (
+        "degraded"
+        if faulted > 0 or refresh_failures > 0 or missed_periods > 0
+        else "healthy"
+    )
     return {
         "status": status,
         "runtime_collision_ticks_started": started,
@@ -83,6 +88,16 @@ def _runtime_safety_status(state: ComposerState) -> dict[str, Any]:
         "runtime_collision_tick_max_ns": _int_metric(
             metrics,
             "runtime_collision_tick_max_ns",
+        ),
+        "runtime_collision_tick_start_jitter_max_ns": _int_metric(
+            metrics, "runtime_collision_tick_start_jitter_max_ns"
+        ),
+        "runtime_collision_tick_late_periods": _int_metric(
+            metrics, "runtime_collision_tick_late_periods"
+        ),
+        "runtime_collision_tick_missed_periods": missed_periods,
+        "runtime_collision_tick_max_consecutive_late_periods": _int_metric(
+            metrics, "runtime_collision_tick_max_consecutive_late_periods"
         ),
         "collision_detections": _int_metric(metrics, "collision_detections"),
         "runtime_collision_snapshot_refresh_failures": refresh_failures,

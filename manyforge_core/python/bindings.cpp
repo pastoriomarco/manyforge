@@ -448,6 +448,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("speed_profile", &manyforge::core::PlanRequestDTO::speed_profile)
         .def_readwrite("planning_timeout_s", &manyforge::core::PlanRequestDTO::planning_timeout_s)
         .def_readwrite("per_joint_dynamics_limits", &manyforge::core::PlanRequestDTO::per_joint_dynamics_limits)
+        .def_readwrite("scene_binding", &manyforge::core::PlanRequestDTO::scene_binding)
         .def("__repr__", [](const manyforge::core::PlanRequestDTO& p) {
             return py::str("PlanRequestDTO(robot_id='{}', group_id='{}')")
                 .format(p.robot_id, p.group_id);
@@ -457,6 +458,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def(py::init<>())
         .def_readwrite("trajectory", &manyforge::core::PlanResultDTO::trajectory)
         .def_readwrite("error", &manyforge::core::PlanResultDTO::error)
+        .def_readwrite("scene_revision", &manyforge::core::PlanResultDTO::scene_revision)
         .def("__repr__", [](const manyforge::core::PlanResultDTO& p) {
             return py::str("PlanResultDTO(trajectory={})")
                 .format(p.trajectory.has_value() ? "present" : "absent");
@@ -664,6 +666,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite(
             "collision_world_freshness_changed",
             &manyforge::core::SceneEditResultDTO::collision_world_freshness_changed)
+        .def_readwrite("rollback_proven",
+                       &manyforge::core::SceneEditResultDTO::rollback_proven)
         .def("__repr__", [](const manyforge::core::SceneEditResultDTO& s) {
             return py::str("SceneEditResultDTO(success={})").format(s.success);
         });
@@ -753,6 +757,17 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                 .format(r.revision_id, r.content_hash);
         });
 
+    py::class_<manyforge::core::SceneRevisionBindingDTO>(m, "SceneRevisionBindingDTO")
+        .def(py::init<>())
+        .def(py::init<manyforge::core::SceneRevisionDTO, const std::string&>(),
+             py::arg("revision"), py::arg("projection_lease_id"))
+        .def_readwrite("revision",
+                       &manyforge::core::SceneRevisionBindingDTO::revision)
+        .def_readwrite(
+            "projection_lease_id",
+            &manyforge::core::SceneRevisionBindingDTO::projection_lease_id)
+        .def("valid", &manyforge::core::SceneRevisionBindingDTO::valid);
+
     py::enum_<manyforge::core::CollisionWorldMutationSource>(m, "CollisionWorldMutationSource")
         .value("kProgramLoad",
                manyforge::core::CollisionWorldMutationSource::kProgramLoad)
@@ -765,7 +780,9 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .value("kDeploymentLoad",
                manyforge::core::CollisionWorldMutationSource::kDeploymentLoad)
         .value("kPolicyUpdate",
-               manyforge::core::CollisionWorldMutationSource::kPolicyUpdate);
+               manyforge::core::CollisionWorldMutationSource::kPolicyUpdate)
+        .value("kProjectionRebuild",
+               manyforge::core::CollisionWorldMutationSource::kProjectionRebuild);
 
     py::class_<manyforge::core::CollisionWorldLedgerEntry>(m, "CollisionWorldLedgerEntry")
         .def(py::init<>())

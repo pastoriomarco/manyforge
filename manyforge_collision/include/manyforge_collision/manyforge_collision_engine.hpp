@@ -45,6 +45,14 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
       const core::CollisionPolicySnapshot& policy,
       const core::CollisionCancellationToken& cancel) override;
 
+  core::RuntimeCollisionQueryPrepareStatus prepare_runtime_query(
+      std::span<const std::string> canonical_joint_names) noexcept override;
+  core::RuntimeCollisionQueryPrepareStatus prepare_runtime_snapshot(
+      const core::CollisionWorldSnapshot& snapshot) noexcept override;
+  core::RuntimeCollisionQueryResultView check_runtime(
+      const core::CollisionWorldSnapshot& snapshot,
+      const core::RuntimeCollisionQueryRequest& request) noexcept override;
+
   const core::CollisionEngineCapabilityDescriptor& capability()
       const override {
     return capability_;
@@ -88,12 +96,31 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
   /// kSingleContextExclusive by contract.
   std::optional<pinocchio::Data> reusable_model_data_;
 
+  struct RuntimePairBinding {
+    bool mapped = false;
+    core::CollisionPairId pair;
+  };
+  std::vector<std::size_t> runtime_joint_q_indices_;
+  Eigen::VectorXd runtime_q_neutral_;
+  Eigen::VectorXd runtime_q_scratch_;
+  bool runtime_query_prepared_ = false;
+  bool runtime_query_is_full_configuration_ = false;
+  std::vector<RuntimePairBinding> runtime_pair_bindings_;
+  std::vector<core::RuntimeCollisionPairObservation>
+      runtime_collision_observations_;
+  std::vector<core::RuntimeCollisionPairObservation>
+      runtime_clearance_observations_;
+  std::map<std::string, std::shared_ptr<coal::CollisionGeometry>>
+      prepared_mesh_geometry_cache_;
+
   /// Internal mutex serializes concurrent check() calls on the same
   /// instance. Separate instances do not share this mutex.
   mutable std::mutex scene_mutex_;
 
   std::optional<std::string> sync_snapshot_locked(
-      const core::CollisionWorldSnapshot& snapshot);
+      const core::CollisionWorldSnapshot& snapshot,
+      bool allow_resource_io = true);
+  std::optional<std::string> rebuild_runtime_pair_bindings_locked();
   core::CollisionResult check_locked(
       const core::CollisionQuery& query,
       const core::CollisionWorldSnapshot* snapshot,

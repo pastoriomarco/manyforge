@@ -117,7 +117,7 @@ ctest --output-on-failure
 ```
 manyforge_core/          C++ library: execution kernel, state machine, DTOs, ports
   python/                pybind11 bindings exposing the kernel to Python
-manyforge_roboplan/      C++ RoboPlan adapters: planner, planning context, execution backend
+manyforge_roboplan/      C++ RoboPlan adapters: planner/projection, focused ports, native execution
   python/                pybind11 bindings + NativeKernelClient wrapper
 manyforge_behavior/      Python behavior tree runner (py_trees), node catalog, program loader
 manyforge_composer/      Composer: FastAPI backend, React frontend, MCP server

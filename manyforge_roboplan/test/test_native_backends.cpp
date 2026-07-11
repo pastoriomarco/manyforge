@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_roboplan/native_kernel_factory.hpp>
+#include <manyforge_roboplan/roboplan_focused_adapters.hpp>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 
 #include <Eigen/Dense>
@@ -32,7 +33,105 @@ class NativeKernelTest : public ::testing::Test {
     ASSERT_NE(bundle_->kernel, nullptr);
   }
 
+  void TearDown() override {
+    for (const auto& retention_id : retained_projection_ids_) {
+      bundle_->scene_authority->release_scene_snapshot_lease_inventory(
+          retention_id);
+    }
+  }
+
+  void bind_plan_request(PlanRequestDTO& request) {
+    const auto retention_id =
+        "planner_test_" + std::to_string(++next_retention_id_);
+    auto retained =
+        bundle_->scene_authority->retain_scene_snapshot_lease_inventory(
+            retention_id);
+    ASSERT_TRUE(retained.has_value());
+    ASSERT_NE(retained->bundle.world, nullptr);
+    request.scene_binding.revision = retained->bundle.world->revision;
+    request.scene_binding.projection_lease_id = retained->retention_id;
+    retained_projection_ids_.push_back(retained->retention_id);
+  }
+
+  RobotStateDTO current_state() const {
+    auto state = bundle_->observed_state_provider->current_state(
+        bundle_->clock->now());
+    if (!state.ok()) {
+      throw std::runtime_error(state.error().message);
+    }
+    return std::move(state.value());
+  }
+
+  Pose3DTO forward_kinematics(const FkRequestDTO& request) const {
+    auto pose = bundle_->kinematics->forward_kinematics(request);
+    if (!pose.ok()) {
+      throw std::runtime_error(pose.error().message);
+    }
+    return std::move(pose.value());
+  }
+
+  JointLimitsDTO joint_limits(const std::string& robot_id,
+                              const std::string& group_id) const {
+    auto limits = bundle_->kinematics->joint_limits(robot_id, group_id);
+    if (!limits.ok()) {
+      throw std::runtime_error(limits.error().message);
+    }
+    return std::move(limits.value());
+  }
+
+  Pose3DTO object_pose(const std::string& object_id,
+                       const std::string& base_frame) const {
+    auto pose = bundle_->scene_authority->object_pose(object_id, base_frame);
+    if (!pose.ok()) {
+      throw std::runtime_error(pose.error().message);
+    }
+    return std::move(pose.value());
+  }
+
+  CollisionResult diagnostic_collision(const CollisionQuery& query) const {
+    return bundle_->collision_diagnostic_comparator->compare(query);
+  }
+
+  CollisionResult authoritative_collision(const RobotStateDTO& state) const {
+    auto snapshot = bundle_->scene_authority->snapshot();
+    auto policy = bundle_->scene_authority->collision_policy_snapshot();
+    if (!snapshot || !policy || bundle_->collision_validation_engines.empty() ||
+        !bundle_->collision_validation_engines.front()) {
+      throw std::runtime_error(
+          "authoritative collision resources unavailable in test fixture");
+    }
+    CollisionQuery query;
+    query.query_id = "native_test_authoritative_collision";
+    query.surface = CollisionSurface::kDiagnosticCompare;
+    query.robot_state = state;
+    query.collision_world_revision = snapshot->revision;
+    CollisionCancellationToken cancel;
+    return bundle_->collision_validation_engines.front()->check(
+        *snapshot, query, *policy, cancel);
+  }
+
+  ValidationResultDTO validate_non_collision(
+      const TrajectoryDTO& trajectory,
+      const ValidationOptionsDTO& options = {}) const {
+    CollisionCancellationToken cancel;
+    return bundle_->trajectory_validator->validate_non_collision(
+        trajectory, options, cancel);
+  }
+
+  TrajectoryDTO stationary_trajectory() const {
+    const auto state = current_state();
+    TrajectoryDTO trajectory;
+    trajectory.joint_names = state.joint_names;
+    TrajectoryWaypointDTO waypoint;
+    waypoint.time_from_start_s = 0.0;
+    waypoint.positions_rad = state.positions_rad;
+    trajectory.waypoints.push_back(std::move(waypoint));
+    return trajectory;
+  }
+
   std::shared_ptr<NativeKernelBundle> bundle_;
+  std::uint64_t next_retention_id_ = 0;
+  std::vector<std::string> retained_projection_ids_;
 };
 
 // --- Factory ---
@@ -44,7 +143,7 @@ TEST_F(NativeKernelTest, FactoryCreatesAllComponents) {
   EXPECT_NE(bundle_->toppra, nullptr);
   EXPECT_NE(bundle_->ik, nullptr);
   EXPECT_NE(bundle_->planner, nullptr);
-  EXPECT_NE(bundle_->context, nullptr);
+  EXPECT_NE(bundle_->projection_backend, nullptr);
   EXPECT_NE(bundle_->execution, nullptr);
   EXPECT_NE(bundle_->clock, nullptr);
   EXPECT_NE(bundle_->scheduler, nullptr);
@@ -426,19 +525,19 @@ TEST(NativeSchedulerTest, DrainForTimesOutWhileRuntimeSafetyCallbackIsBlocked) {
 // --- Planning Context ---
 
 TEST_F(NativeKernelTest, GetCurrentStateReturnsJoints) {
-  auto state = bundle_->context->get_current_state();
+  auto state = current_state();
   EXPECT_FALSE(state.joint_names.empty());
   EXPECT_EQ(state.joint_names.size(), state.positions_rad.size());
 }
 
 TEST_F(NativeKernelTest, ForwardKinematicsReturnsPose) {
-  auto state = bundle_->context->get_current_state();
+  auto state = current_state();
   FkRequestDTO req;
   req.robot_state = state;
   req.target_frame = "tool0";
   req.base_frame = "base_link";
 
-  auto pose = bundle_->context->forward_kinematics(req);
+  auto pose = forward_kinematics(req);
   // Should return a valid position (not all zeros for a real URDF)
   double dist = std::sqrt(
       pose.position_m.x_m * pose.position_m.x_m +
@@ -448,20 +547,18 @@ TEST_F(NativeKernelTest, ForwardKinematicsReturnsPose) {
 }
 
 TEST_F(NativeKernelTest, CollisionCheckAtHomeNotInCollision) {
-  auto state = bundle_->context->get_current_state();
-  CollisionCheckRequestDTO req;
-  req.robot_state = state;
-  auto result = bundle_->context->collision_check(req);
+  auto state = current_state();
+  auto result = authoritative_collision(state);
   EXPECT_FALSE(result.in_collision);
 }
 
-TEST_F(NativeKernelTest, NormalizedCollisionCheckAtHomePreservesWorldRevision) {
+TEST_F(NativeKernelTest, DiagnosticComparatorAtHomePreservesWorldRevision) {
   CollisionQuery query;
   query.query_id = "normalized-home";
-  query.robot_state = bundle_->context->get_current_state();
+  query.robot_state = current_state();
   query.collision_world_revision = CollisionWorldRevision{42, "world-rev-42"};
 
-  auto result = bundle_->context->collision_check_normalized(query);
+  auto result = diagnostic_collision(query);
   EXPECT_FALSE(result.in_collision);
   EXPECT_EQ(result.engine_status, CollisionEngineStatus::kOk);
   EXPECT_EQ(result.decision, CollisionDecisionResult::kPass);
@@ -472,23 +569,21 @@ TEST_F(NativeKernelTest, NormalizedCollisionCheckAtHomePreservesWorldRevision) {
   EXPECT_EQ(result.collision_world_revision->content_hash, "world-rev-42");
 }
 
-TEST_F(NativeKernelTest, NormalizedCollisionCheckMapsRobotObjectPair) {
-  bundle_->context->set_collision_mapping_robot_id("ur5_gripper");
-
+TEST_F(NativeKernelTest, DiagnosticComparatorMapsRobotObjectPair) {
   AddObjectRequestDTO robot_blocker;
   robot_blocker.object_id = "robot_blocker";
   robot_blocker.frame_id = "universe";
   robot_blocker.shape = BoxShapeDTO{{0.3, 0.3, 0.3}};
   robot_blocker.pose.position_m = {0.0, 0.0, 0.05};
   robot_blocker.pose.orientation = {0, 0, 0, 1};
-  auto blocker_result = bundle_->context->add_object(robot_blocker);
+  auto blocker_result = bundle_->scene_authority->add_object(robot_blocker);
   ASSERT_TRUE(blocker_result.success)
       << (blocker_result.error.has_value() ? blocker_result.error->message : "");
 
   CollisionQuery query;
   query.query_id = "normalized-robot-blocker";
-  query.robot_state = bundle_->context->get_current_state();
-  auto result = bundle_->context->collision_check_normalized(query);
+  query.robot_state = current_state();
+  auto result = diagnostic_collision(query);
 
   ASSERT_TRUE(result.in_collision);
   ASSERT_TRUE(result.contact_body_a.has_value());
@@ -516,7 +611,7 @@ TEST_F(NativeKernelTest, NormalizedCollisionCheckMapsRobotObjectPair) {
 }
 
 TEST_F(NativeKernelTest, GetJointLimitsReturnsValidData) {
-  auto limits = bundle_->context->get_joint_limits("robot1", "arm");
+  auto limits = joint_limits("robot1", "arm");
   EXPECT_FALSE(limits.joint_names.empty());
   EXPECT_EQ(limits.joint_names.size(), limits.position_lower_rad.size());
   EXPECT_EQ(limits.joint_names.size(), limits.position_upper_rad.size());
@@ -533,24 +628,75 @@ TEST_F(NativeKernelTest, AddAndRemoveBoxObject) {
   add_req.pose.position_m = {0.5, 0.0, 0.5};
   add_req.pose.orientation = {0, 0, 0, 1};
 
-  auto add_result = bundle_->context->add_object(add_req);
+  auto add_result = bundle_->scene_authority->add_object(add_req);
   EXPECT_TRUE(add_result.success);
-  auto state = bundle_->context->get_object_state("test_box");
+  auto state = bundle_->scene_authority->object_state("test_box");
   EXPECT_TRUE(state.exists);
   ASSERT_TRUE(state.frame_id.has_value());
   EXPECT_EQ(*state.frame_id, "universe");
 
-  auto pose = bundle_->context->get_object_pose("test_box", "universe");
+  auto pose = object_pose("test_box", "universe");
   EXPECT_NEAR(pose.position_m.x_m, 0.5, 1e-9);
   EXPECT_NEAR(pose.position_m.y_m, 0.0, 1e-9);
   EXPECT_NEAR(pose.position_m.z_m, 0.5, 1e-9);
 
   RemoveObjectRequestDTO rem_req;
   rem_req.object_id = "test_box";
-  auto rem_result = bundle_->context->remove_object(rem_req);
+  auto rem_result = bundle_->scene_authority->remove_object(rem_req);
   EXPECT_TRUE(rem_result.success);
-  auto removed_state = bundle_->context->get_object_state("test_box");
+  auto removed_state = bundle_->scene_authority->object_state("test_box");
   EXPECT_FALSE(removed_state.exists);
+}
+
+TEST_F(NativeKernelTest,
+       RetainedReferenceResolutionSurvivesLiveSceneMutationAndRejectsRelease) {
+  AddObjectRequestDTO add;
+  add.object_id = "retained_reference_box";
+  add.frame_id = "universe";
+  add.shape = BoxShapeDTO{{0.1, 0.1, 0.1}};
+  add.pose.position_m = {0.4, -0.1, 0.5};
+  add.pose.orientation = {0.0, 0.0, 0.0, 1.0};
+  ASSERT_TRUE(bundle_->scene_authority->add_object(add).success);
+
+  const std::string retention_id = "retained_reference_resolution";
+  auto retained =
+      bundle_->scene_authority->retain_scene_snapshot_lease_inventory(
+          retention_id);
+  ASSERT_TRUE(retained.has_value());
+  ASSERT_NE(retained->bundle.world, nullptr);
+  retained_projection_ids_.push_back(retention_id);
+  const SceneRevisionBindingDTO binding{
+      retained->bundle.world->revision, retention_id};
+
+  ReferenceDTO reference;
+  reference.type = ReferenceDTO::Type::kObject;
+  reference.id = add.object_id;
+  auto before = bundle_->reference_resolver->resolve_reference_pose(
+      reference, "universe", binding);
+  ASSERT_TRUE(before.ok()) << before.error().message;
+  EXPECT_NEAR(before.value().position_m.x_m, 0.4, 1e-9);
+
+  UpdateObjectPoseRequestDTO update;
+  update.object_id = add.object_id;
+  update.frame_id = "universe";
+  update.pose = add.pose;
+  update.pose.position_m.x_m = 0.9;
+  ASSERT_TRUE(bundle_->scene_authority->update_object_pose(update).success);
+
+  auto retained_after_mutation =
+      bundle_->reference_resolver->resolve_reference_pose(
+          reference, "universe", binding);
+  ASSERT_TRUE(retained_after_mutation.ok())
+      << retained_after_mutation.error().message;
+  EXPECT_NEAR(retained_after_mutation.value().position_m.x_m, 0.4, 1e-9);
+
+  bundle_->scene_authority->release_scene_snapshot_lease_inventory(
+      retention_id);
+  auto after_release = bundle_->reference_resolver->resolve_reference_pose(
+      reference, "universe", binding);
+  ASSERT_FALSE(after_release.ok());
+  EXPECT_EQ(after_release.error().details.at("reason"),
+            "reference_projection_lease_unavailable");
 }
 
 TEST_F(NativeKernelTest, AddSphereObject) {
@@ -561,7 +707,7 @@ TEST_F(NativeKernelTest, AddSphereObject) {
   req.pose.position_m = {0.3, 0.1, 0.6};
   req.pose.orientation = {0, 0, 0, 1};
 
-  auto result = bundle_->context->add_object(req);
+  auto result = bundle_->scene_authority->add_object(req);
   EXPECT_TRUE(result.success);
 }
 
@@ -574,7 +720,7 @@ TEST_F(NativeKernelTest, DetachedStaticObjectOverlapDoesNotBlockRobotState) {
     req.pose.position_m = {0.7, 0.45, 0.35};
     req.pose.orientation = {0, 0, 0, 1};
 
-    auto result = bundle_->context->add_object(req);
+    auto result = bundle_->scene_authority->add_object(req);
     EXPECT_TRUE(result.success)
         << (result.error.has_value() ? result.error->message : "");
   };
@@ -583,8 +729,8 @@ TEST_F(NativeKernelTest, DetachedStaticObjectOverlapDoesNotBlockRobotState) {
   add_overlapping_box("static_overlap_b");
 
   CollisionCheckRequestDTO check;
-  check.robot_state = bundle_->context->get_current_state();
-  EXPECT_FALSE(bundle_->context->collision_check(check).in_collision);
+  check.robot_state = current_state();
+  EXPECT_FALSE(authoritative_collision(check.robot_state).in_collision);
 
   AddObjectRequestDTO robot_blocker;
   robot_blocker.object_id = "robot_blocker";
@@ -592,10 +738,10 @@ TEST_F(NativeKernelTest, DetachedStaticObjectOverlapDoesNotBlockRobotState) {
   robot_blocker.shape = BoxShapeDTO{{0.3, 0.3, 0.3}};
   robot_blocker.pose.position_m = {0.0, 0.0, 0.05};
   robot_blocker.pose.orientation = {0, 0, 0, 1};
-  auto blocker_result = bundle_->context->add_object(robot_blocker);
+  auto blocker_result = bundle_->scene_authority->add_object(robot_blocker);
   EXPECT_TRUE(blocker_result.success)
       << (blocker_result.error.has_value() ? blocker_result.error->message : "");
-  EXPECT_TRUE(bundle_->context->collision_check(check).in_collision);
+  EXPECT_TRUE(authoritative_collision(check.robot_state).in_collision);
 }
 
 TEST_F(NativeKernelTest, AddMeshObject) {
@@ -616,24 +762,24 @@ TEST_F(NativeKernelTest, AddMeshObject) {
   req.pose.position_m = {0.4, 0.1, 0.5};
   req.pose.orientation = {0, 0, 0, 1};
 
-  auto result = bundle_->context->add_object(req);
+  auto result = bundle_->scene_authority->add_object(req);
   EXPECT_TRUE(result.success) << (result.error.has_value() ? result.error->message : "");
 
-  auto state = bundle_->context->get_object_state("test_mesh");
+  auto state = bundle_->scene_authority->object_state("test_mesh");
   EXPECT_TRUE(state.exists);
-  auto pose = bundle_->context->get_object_pose("test_mesh", "universe");
+  auto pose = object_pose("test_mesh", "universe");
   EXPECT_NEAR(pose.position_m.x_m, 0.4, 1e-9);
   EXPECT_NEAR(pose.position_m.y_m, 0.1, 1e-9);
   EXPECT_NEAR(pose.position_m.z_m, 0.5, 1e-9);
 }
 
 TEST_F(NativeKernelTest, AttachedFrameObjectPoseResolvesFromBackendState) {
-  auto link_state = bundle_->context->get_current_state();
+  auto link_state = current_state();
   FkRequestDTO fk_req;
   fk_req.robot_state = link_state;
   fk_req.target_frame = "tool0";
   fk_req.base_frame = "universe";
-  auto tool_pose = bundle_->context->forward_kinematics(fk_req);
+  auto tool_pose = forward_kinematics(fk_req);
 
   AddObjectRequestDTO add_req;
   add_req.object_id = "carried_box";
@@ -642,16 +788,16 @@ TEST_F(NativeKernelTest, AttachedFrameObjectPoseResolvesFromBackendState) {
   add_req.pose.position_m = {0.0, 0.0, 0.0};
   add_req.pose.orientation = {0.0, 0.0, 0.0, 1.0};
 
-  auto add_result = bundle_->context->add_object(add_req);
+  auto add_result = bundle_->scene_authority->add_object(add_req);
   ASSERT_TRUE(add_result.success);
 
-  auto state = bundle_->context->get_object_state("carried_box");
+  auto state = bundle_->scene_authority->object_state("carried_box");
   EXPECT_TRUE(state.exists);
   EXPECT_TRUE(state.attached);
   ASSERT_TRUE(state.frame_id.has_value());
   EXPECT_EQ(*state.frame_id, "tool0");
 
-  auto pose = bundle_->context->get_object_pose("carried_box", "universe");
+  auto pose = object_pose("carried_box", "universe");
   EXPECT_NEAR(pose.position_m.x_m, tool_pose.position_m.x_m, 1e-6);
   EXPECT_NEAR(pose.position_m.y_m, tool_pose.position_m.y_m, 1e-6);
   EXPECT_NEAR(pose.position_m.z_m, tool_pose.position_m.z_m, 1e-6);
@@ -664,23 +810,23 @@ TEST_F(NativeKernelTest, AttachObjectReparentsWhilePreservingWorldPose) {
   add_req.shape = BoxShapeDTO{{0.05, 0.05, 0.05}};
   add_req.pose.position_m = {0.45, 0.0, 0.55};
   add_req.pose.orientation = {0.0, 0.0, 0.0, 1.0};
-  ASSERT_TRUE(bundle_->context->add_object(add_req).success);
+  ASSERT_TRUE(bundle_->scene_authority->add_object(add_req).success);
 
-  auto pose_before = bundle_->context->get_object_pose("carried_box", "universe");
+  auto pose_before = object_pose("carried_box", "universe");
 
   AttachObjectRequestDTO attach_req;
   attach_req.object_id = "carried_box";
   attach_req.frame_id = "tool0";
-  auto attach_result = bundle_->context->attach_object(attach_req);
+  auto attach_result = bundle_->scene_authority->attach_object(attach_req);
   ASSERT_TRUE(attach_result.success);
 
-  auto state = bundle_->context->get_object_state("carried_box");
+  auto state = bundle_->scene_authority->object_state("carried_box");
   EXPECT_TRUE(state.exists);
   EXPECT_TRUE(state.attached);
   ASSERT_TRUE(state.frame_id.has_value());
   EXPECT_EQ(*state.frame_id, "tool0");
 
-  auto pose_after = bundle_->context->get_object_pose("carried_box", "universe");
+  auto pose_after = object_pose("carried_box", "universe");
   EXPECT_NEAR(pose_after.position_m.x_m, pose_before.position_m.x_m, 1e-6);
   EXPECT_NEAR(pose_after.position_m.y_m, pose_before.position_m.y_m, 1e-6);
   EXPECT_NEAR(pose_after.position_m.z_m, pose_before.position_m.z_m, 1e-6);
@@ -693,23 +839,23 @@ TEST_F(NativeKernelTest, DetachObjectReparentsBackToUniverseWhilePreservingWorld
   add_req.shape = BoxShapeDTO{{0.05, 0.05, 0.05}};
   add_req.pose.position_m = {0.01, 0.0, 0.0};
   add_req.pose.orientation = {0.0, 0.0, 0.0, 1.0};
-  ASSERT_TRUE(bundle_->context->add_object(add_req).success);
+  ASSERT_TRUE(bundle_->scene_authority->add_object(add_req).success);
 
-  auto pose_before = bundle_->context->get_object_pose("carried_box", "universe");
+  auto pose_before = object_pose("carried_box", "universe");
 
   DetachObjectRequestDTO detach_req;
   detach_req.object_id = "carried_box";
   detach_req.frame_id = "universe";
-  auto detach_result = bundle_->context->detach_object(detach_req);
+  auto detach_result = bundle_->scene_authority->detach_object(detach_req);
   ASSERT_TRUE(detach_result.success);
 
-  auto state = bundle_->context->get_object_state("carried_box");
+  auto state = bundle_->scene_authority->object_state("carried_box");
   EXPECT_TRUE(state.exists);
   EXPECT_FALSE(state.attached);
   ASSERT_TRUE(state.frame_id.has_value());
   EXPECT_EQ(*state.frame_id, "universe");
 
-  auto pose_after = bundle_->context->get_object_pose("carried_box", "universe");
+  auto pose_after = object_pose("carried_box", "universe");
   EXPECT_NEAR(pose_after.position_m.x_m, pose_before.position_m.x_m, 1e-6);
   EXPECT_NEAR(pose_after.position_m.y_m, pose_before.position_m.y_m, 1e-6);
   EXPECT_NEAR(pose_after.position_m.z_m, pose_before.position_m.z_m, 1e-6);
@@ -733,12 +879,12 @@ TEST_F(NativeKernelTest, UpsertCascadeFollowedByAttachDoesNotCorruptScene) {
     r.shape = BoxShapeDTO{{dims[0], dims[1], dims[2]}};
     r.pose.position_m = {pos[0], pos[1], pos[2]};
     r.pose.orientation = {0.0, 0.0, 0.0, 1.0};
-    return bundle_->context->add_object(r);
+    return bundle_->scene_authority->add_object(r);
   };
   auto remove_box = [&](const std::string& id) {
     RemoveObjectRequestDTO r;
     r.object_id = id;
-    return bundle_->context->remove_object(r);
+    return bundle_->scene_authority->remove_object(r);
   };
 
   ASSERT_TRUE(add_box("ground", {1.0, 1.0, 0.2}, {0.0, 0.0, -0.11}).success);
@@ -759,20 +905,20 @@ TEST_F(NativeKernelTest, UpsertCascadeFollowedByAttachDoesNotCorruptScene) {
   AttachObjectRequestDTO ar;
   ar.object_id = "graspable";
   ar.frame_id = "tool0";
-  ASSERT_TRUE(bundle_->context->attach_object(ar).success);
+  ASSERT_TRUE(bundle_->scene_authority->attach_object(ar).success);
 
   // Box_1 must still report at universe (0, -0.2, 0.1) — not on the robot.
-  auto box_pose = bundle_->context->get_object_pose("box_1", "universe");
+  auto box_pose = object_pose("box_1", "universe");
   EXPECT_NEAR(box_pose.position_m.x_m,  0.0, 1e-6);
   EXPECT_NEAR(box_pose.position_m.y_m, -0.2, 1e-6);
   EXPECT_NEAR(box_pose.position_m.z_m,  0.1, 1e-6);
 
   // And the start-state collision check must come back clean for the
   // post-attach robot configuration.
-  auto state = bundle_->context->get_current_state();
+  auto state = current_state();
   CollisionCheckRequestDTO cc;
   cc.robot_state = state;
-  auto cc_result = bundle_->context->collision_check(cc);
+  auto cc_result = authoritative_collision(cc.robot_state);
   EXPECT_FALSE(cc_result.in_collision)
       << "Phantom collision after upsert+attach indicates the index-cache "
          "staleness regression has returned.";
@@ -896,7 +1042,7 @@ TEST_F(NativeKernelTest, NativeExecutionBackendResumeFreshDispatchesSuppliedTraj
   RoboPlanExecutionBackend backend(
       bundle_->scene, "arm", *bundle_->clock, nullptr);
 
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.joint_names.empty());
   ASSERT_EQ(start_state.joint_names.size(), start_state.positions_rad.size());
 
@@ -973,8 +1119,9 @@ TEST_F(NativeKernelTest, PlannerUsesPerRequestPlanningTimeout) {
   rrt_opts.max_nodes = 5000;
   rrt_opts.max_connection_distance = 0.1;  // force the planner into the RRT loop
 
-  RoboPlanPlannerBackend planner(bundle_->scene, rrt_opts, bundle_->shortcutter,
-                                 bundle_->toppra, bundle_->ik);
+  RoboPlanPlannerBackend planner(bundle_->scene_projection, bundle_->scene,
+                                 rrt_opts, bundle_->scene_mutex,
+                                 bundle_->single_shot_ik);
 
   PlanRequestDTO req;
   req.robot_id = "robot1";
@@ -982,7 +1129,7 @@ TEST_F(NativeKernelTest, PlannerUsesPerRequestPlanningTimeout) {
   req.move_id = "native_planning_timeout";
   req.base_frame = "base_link";
   req.tcp_frame = "tool0";
-  req.start_state = bundle_->context->get_current_state();
+  req.start_state = current_state();
   req.tolerances = {0.05, 0.005, 0.05};
   req.speed_profile = {1.0, 1.0, std::nullopt};
   req.planning_timeout_s = 1e-6;
@@ -991,6 +1138,7 @@ TEST_F(NativeKernelTest, PlannerUsesPerRequestPlanningTimeout) {
   goal.joint_names = req.start_state.joint_names;
   goal.positions_rad = {0.3, -0.8, 0.8, -0.3, -0.8, 0.1};
   req.motion = goal;
+  bind_plan_request(req);
 
   auto result = planner.plan(req);
   ASSERT_FALSE(result.trajectory.has_value());
@@ -1001,9 +1149,6 @@ TEST_F(NativeKernelTest, PlannerUsesPerRequestPlanningTimeout) {
 }
 
 TEST_F(NativeKernelTest, PlannerDoesNotHoldSceneMutexDuringLongRrt) {
-  auto scene_mutex = std::make_shared<std::mutex>();
-  RoboPlanPlanningContext context(bundle_->scene, "arm", scene_mutex);
-
   roboplan::RRTOptions rrt_opts;
   rrt_opts.group_name = "arm";
   rrt_opts.max_planning_time = 0.5;
@@ -1020,10 +1165,10 @@ TEST_F(NativeKernelTest, PlannerDoesNotHoldSceneMutexDuringLongRrt) {
   auto single_shot_ik_opts = ik_opts;
   single_shot_ik_opts.max_time = 0.05;
 
-  RoboPlanPlannerBackend planner(bundle_->scene, rrt_opts, bundle_->shortcutter,
-                                 bundle_->toppra, bundle_->ik, scene_mutex,
-                                 bundle_->single_shot_ik, ik_opts,
-                                 single_shot_ik_opts);
+  RoboPlanPlannerBackend planner(
+      bundle_->scene_projection, bundle_->scene, rrt_opts,
+      bundle_->scene_mutex, bundle_->single_shot_ik, ik_opts,
+      single_shot_ik_opts);
 
   PlanRequestDTO req;
   req.robot_id = "robot1";
@@ -1031,7 +1176,7 @@ TEST_F(NativeKernelTest, PlannerDoesNotHoldSceneMutexDuringLongRrt) {
   req.move_id = "native_long_rrt_lock_scope";
   req.base_frame = "base_link";
   req.tcp_frame = "tool0";
-  req.start_state = context.get_current_state();
+  req.start_state = current_state();
   req.tolerances = {0.05, 0.005, 0.05};
   req.speed_profile = {1.0, 1.0, std::nullopt};
   req.planning_timeout_s = 0.5;
@@ -1040,6 +1185,7 @@ TEST_F(NativeKernelTest, PlannerDoesNotHoldSceneMutexDuringLongRrt) {
   goal.joint_names = req.start_state.joint_names;
   goal.positions_rad = {2.6, -2.4, 2.2, -2.0, -1.8, 1.6};
   req.motion = goal;
+  bind_plan_request(req);
 
   auto plan_future = std::async(std::launch::async,
                                 [&]() { return planner.plan(req); });
@@ -1049,10 +1195,13 @@ TEST_F(NativeKernelTest, PlannerDoesNotHoldSceneMutexDuringLongRrt) {
       << "test setup expected RRT to still be active";
 
   const auto read_started = std::chrono::steady_clock::now();
-  auto state = context.get_current_state();
+  const auto read_state = [&]() {
+    std::lock_guard<std::mutex> lock(*bundle_->scene_mutex);
+    return bundle_->scene->getCurrentJointPositions();
+  }();
   const auto read_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - read_started);
-  EXPECT_FALSE(state.joint_names.empty());
+  EXPECT_GT(read_state.size(), 0);
   EXPECT_LT(read_elapsed.count(), 150)
       << "planner held scene_mutex across long RRT work";
 
@@ -1069,7 +1218,7 @@ TEST_F(NativeKernelTest, PlannerRejectsUnsatisfiedTcpSpeedLimit) {
   req.move_id = "native_tcp_limit_rejected_in_planning";
   req.base_frame = "base_link";
   req.tcp_frame = "tool0";
-  req.start_state = bundle_->context->get_current_state();
+  req.start_state = current_state();
   req.tolerances = {0.05, 0.005, 0.05};
   req.speed_profile = {1.0, 1.0, 1e-9};
   // This test exercises the TCP limit diagnostics, not the planner deadline.
@@ -1079,6 +1228,7 @@ TEST_F(NativeKernelTest, PlannerRejectsUnsatisfiedTcpSpeedLimit) {
   goal.joint_names = req.start_state.joint_names;
   goal.positions_rad = {0.1, -0.5, 0.5, -0.5, -0.5, 0.0};
   req.motion = goal;
+  bind_plan_request(req);
 
   auto result = bundle_->planner->plan(req);
   ASSERT_FALSE(result.trajectory.has_value());
@@ -1122,7 +1272,7 @@ TEST_F(NativeKernelTest, PerJointVelocityCapSlowsTrajectoryAndBoundsPeak) {
     req.move_id = move_id;
     req.base_frame = "base_link";
     req.tcp_frame = "tool0";
-    req.start_state = bundle_->context->get_current_state();
+    req.start_state = current_state();
     req.tolerances = {0.05, 0.005, 0.05};
     req.speed_profile = {1.0, 1.0, std::nullopt};
     req.planning_timeout_s = 10.0;
@@ -1130,6 +1280,7 @@ TEST_F(NativeKernelTest, PerJointVelocityCapSlowsTrajectoryAndBoundsPeak) {
     goal.joint_names = req.start_state.joint_names;
     goal.positions_rad = {0.3, -0.8, 0.8, -0.3, -0.8, 0.1};
     req.motion = goal;
+    bind_plan_request(req);
     return req;
   };
 
@@ -1169,7 +1320,7 @@ TEST_F(NativeKernelTest, PerJointAccelerationCapBoundsPeak) {
     req.move_id = move_id;
     req.base_frame = "base_link";
     req.tcp_frame = "tool0";
-    req.start_state = bundle_->context->get_current_state();
+    req.start_state = current_state();
     req.tolerances = {0.05, 0.005, 0.05};
     req.speed_profile = {1.0, 1.0, std::nullopt};
     req.planning_timeout_s = 10.0;
@@ -1177,6 +1328,7 @@ TEST_F(NativeKernelTest, PerJointAccelerationCapBoundsPeak) {
     goal.joint_names = req.start_state.joint_names;
     goal.positions_rad = {0.3, -0.8, 0.8, -0.3, -0.8, 0.1};
     req.motion = goal;
+    bind_plan_request(req);
     return req;
   };
 
@@ -1217,7 +1369,7 @@ TEST_F(NativeKernelTest, PerJointJerkCapRejectedAsUnsupported) {
   req.move_id = "dyn_jerk_rejected";
   req.base_frame = "base_link";
   req.tcp_frame = "tool0";
-  req.start_state = bundle_->context->get_current_state();
+  req.start_state = current_state();
   req.tolerances = {0.05, 0.005, 0.05};
   req.speed_profile = {1.0, 1.0, std::nullopt};
   req.planning_timeout_s = 10.0;
@@ -1228,6 +1380,7 @@ TEST_F(NativeKernelTest, PerJointJerkCapRejectedAsUnsupported) {
   JointDynamicsLimitDTO lim;
   lim.max_jerk_rad_s3 = 5.0;
   req.per_joint_dynamics_limits["elbow_joint"] = lim;
+  bind_plan_request(req);
 
   auto result = bundle_->planner->plan(req);
   ASSERT_FALSE(result.trajectory.has_value());
@@ -1248,7 +1401,7 @@ TEST_F(NativeKernelTest, PerJointMalformedJerkCapRejectedAsInvalid) {
     req.move_id = "dyn_jerk_invalid";
     req.base_frame = "base_link";
     req.tcp_frame = "tool0";
-    req.start_state = bundle_->context->get_current_state();
+    req.start_state = current_state();
     req.tolerances = {0.05, 0.005, 0.05};
     req.speed_profile = {1.0, 1.0, std::nullopt};
     req.planning_timeout_s = 10.0;
@@ -1259,6 +1412,7 @@ TEST_F(NativeKernelTest, PerJointMalformedJerkCapRejectedAsInvalid) {
     JointDynamicsLimitDTO lim;
     lim.max_jerk_rad_s3 = bad;
     req.per_joint_dynamics_limits["elbow_joint"] = lim;
+    bind_plan_request(req);
 
     auto result = bundle_->planner->plan(req);
     ASSERT_FALSE(result.trajectory.has_value());
@@ -1278,7 +1432,7 @@ TEST_F(NativeKernelTest, PerJointNonPositiveVelocityCapRejected) {
   req.move_id = "dyn_invalid_velocity";
   req.base_frame = "base_link";
   req.tcp_frame = "tool0";
-  req.start_state = bundle_->context->get_current_state();
+  req.start_state = current_state();
   req.tolerances = {0.05, 0.005, 0.05};
   req.speed_profile = {1.0, 1.0, std::nullopt};
   req.planning_timeout_s = 10.0;
@@ -1289,6 +1443,7 @@ TEST_F(NativeKernelTest, PerJointNonPositiveVelocityCapRejected) {
   JointDynamicsLimitDTO lim;
   lim.max_velocity_rad_s = -1.0;
   req.per_joint_dynamics_limits["elbow_joint"] = lim;
+  bind_plan_request(req);
 
   auto result = bundle_->planner->plan(req);
   ASSERT_FALSE(result.trajectory.has_value());
@@ -1306,7 +1461,7 @@ TEST_F(NativeKernelTest, PerJointCapUnknownJointRejected) {
   req.move_id = "dyn_unknown_joint";
   req.base_frame = "base_link";
   req.tcp_frame = "tool0";
-  req.start_state = bundle_->context->get_current_state();
+  req.start_state = current_state();
   req.tolerances = {0.05, 0.005, 0.05};
   req.speed_profile = {1.0, 1.0, std::nullopt};
   req.planning_timeout_s = 10.0;
@@ -1317,6 +1472,7 @@ TEST_F(NativeKernelTest, PerJointCapUnknownJointRejected) {
   JointDynamicsLimitDTO lim;
   lim.max_velocity_rad_s = 0.5;
   req.per_joint_dynamics_limits["elbow_joint_typo"] = lim;  // not a group joint
+  bind_plan_request(req);
 
   auto result = bundle_->planner->plan(req);
   ASSERT_FALSE(result.trajectory.has_value());
@@ -1424,7 +1580,7 @@ TEST(JointCapMeasurementTest, AccelCappedJointAbsentFromTrajectoryFailsClosed) {
 }
 
 TEST_F(NativeKernelTest, ExecutionBackendPublishesProgressAndInterpolatesSceneState) {
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -1466,7 +1622,7 @@ TEST_F(NativeKernelTest, ExecutionBackendPublishesProgressAndInterpolatesSceneSt
   EXPECT_DOUBLE_EQ(final.progress, 1.0);
   ASSERT_EQ(final.joint_positions_rad.size(), goal.size());
 
-  auto final_state = bundle_->context->get_current_state();
+  auto final_state = current_state();
   ASSERT_EQ(final_state.positions_rad.size(), goal.size());
   EXPECT_NEAR(final_state.positions_rad[0], goal[0], 1e-3);
   if (goal.size() > 1) {
@@ -1475,7 +1631,7 @@ TEST_F(NativeKernelTest, ExecutionBackendPublishesProgressAndInterpolatesSceneSt
 }
 
 TEST_F(NativeKernelTest, ExecutionBackendResetPublishesAuthoritativeIdleSnapshot) {
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -1512,7 +1668,7 @@ TEST_F(NativeKernelTest, RuntimeVelocityScaleZeroHoldsDiscreteTrajectoryTime) {
   // ADR-0018: runtime scale 0 is a hold/freeze of trajectory progress, not a
   // Stop. The native backend slews the applied scale smoothly, so this test
   // waits for the deceleration ramp before asserting the hold is stable.
-  const auto start_state = bundle_->context->get_current_state();
+  const auto start_state = current_state();
   ASSERT_FALSE(start_state.joint_names.empty());
   ASSERT_EQ(start_state.joint_names.size(), start_state.positions_rad.size());
 
@@ -1679,7 +1835,7 @@ TEST_F(NativeKernelTest, CacheHitSkipsPlanning) {
 
 TEST_F(NativeKernelTest, TrajectoryValidationWorks) {
   // Create a simple trajectory and validate
-  auto state = bundle_->context->get_current_state();
+  auto state = current_state();
 
   TrajectoryDTO traj;
   traj.joint_names = state.joint_names;
@@ -1689,12 +1845,174 @@ TEST_F(NativeKernelTest, TrajectoryValidationWorks) {
   traj.waypoints.push_back(wp);
 
   ValidationOptionsDTO opts;
-  auto result = bundle_->context->validate_trajectory(traj, opts);
+  auto result = validate_non_collision(traj, opts);
   EXPECT_TRUE(result.valid);
 }
 
-TEST_F(NativeKernelTest, TrajectoryValidationCanSkipLegacyCollisionSweep) {
-  auto state = bundle_->context->get_current_state();
+TEST_F(NativeKernelTest,
+       StandaloneValidatorRejectsEmptyAndDuplicateJointOrder) {
+  TrajectoryDTO empty;
+  auto result = validate_non_collision(empty);
+  ASSERT_FALSE(result.valid);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"), "trajectory_empty");
+
+  auto duplicate = stationary_trajectory();
+  ASSERT_GE(duplicate.joint_names.size(), 2U);
+  duplicate.joint_names[1] = duplicate.joint_names[0];
+  result = validate_non_collision(duplicate);
+  ASSERT_FALSE(result.valid);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "trajectory_joint_names_invalid");
+
+  auto reordered = stationary_trajectory();
+  ASSERT_GE(reordered.joint_names.size(), 2U);
+  std::swap(reordered.joint_names[0], reordered.joint_names[1]);
+  std::swap(reordered.waypoints[0].positions_rad[0],
+            reordered.waypoints[0].positions_rad[1]);
+  result = validate_non_collision(reordered);
+  EXPECT_TRUE(result.valid) << (result.error ? result.error->message : "");
+
+  auto unknown = stationary_trajectory();
+  unknown.joint_names[0] = "unknown_joint";
+  result = validate_non_collision(unknown);
+  ASSERT_FALSE(result.valid);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "trajectory_joint_not_in_group");
+}
+
+TEST_F(NativeKernelTest,
+       StandaloneValidatorRejectsNonfiniteAndNonmonotonicValues) {
+  auto nonfinite_position = stationary_trajectory();
+  nonfinite_position.waypoints[0].positions_rad[0] =
+      std::numeric_limits<double>::quiet_NaN();
+  auto result = validate_non_collision(nonfinite_position);
+  ASSERT_FALSE(result.valid);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "trajectory_value_not_finite");
+  EXPECT_EQ(result.error->details.at("dimension"), "position");
+
+  auto nonfinite_velocity = stationary_trajectory();
+  nonfinite_velocity.waypoints[0].velocities_rad_s.assign(
+      nonfinite_velocity.joint_names.size(), 0.0);
+  nonfinite_velocity.waypoints[0].velocities_rad_s[0] =
+      std::numeric_limits<double>::infinity();
+  result = validate_non_collision(nonfinite_velocity);
+  ASSERT_FALSE(result.valid);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "trajectory_value_not_finite");
+  EXPECT_EQ(result.error->details.at("dimension"), "velocity");
+
+  auto nonmonotonic = stationary_trajectory();
+  nonmonotonic.waypoints.push_back(nonmonotonic.waypoints.front());
+  result = validate_non_collision(nonmonotonic);
+  ASSERT_FALSE(result.valid);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"), "trajectory_time_invalid");
+}
+
+TEST_F(NativeKernelTest,
+       StandaloneValidatorRejectsJointPositionAndDerivedRateViolations) {
+  auto position = stationary_trajectory();
+  position.waypoints[0].positions_rad[0] = 100.0;
+  auto result = validate_non_collision(position);
+  ASSERT_FALSE(result.valid);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "trajectory_position_limit_exceeded");
+  EXPECT_EQ(result.error->details.at("limit_type"), "joint_position");
+
+  auto rate = stationary_trajectory();
+  auto next = rate.waypoints.front();
+  next.time_from_start_s = 0.001;
+  next.positions_rad[0] += 0.1;
+  rate.waypoints.push_back(std::move(next));
+  result = validate_non_collision(rate);
+  ASSERT_FALSE(result.valid);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "trajectory_segment_velocity_limit_exceeded");
+  EXPECT_EQ(result.error->details.at("limit_type"), "joint_velocity");
+}
+
+TEST_F(NativeKernelTest, StandaloneValidatorHonorsPreexistingCancellation) {
+  auto trajectory = stationary_trajectory();
+  CollisionCancellationToken cancel;
+  cancel.request_cancel("test_cancel");
+  const auto result = bundle_->trajectory_validator->validate_non_collision(
+      trajectory, ValidationOptionsDTO{}, cancel);
+  ASSERT_FALSE(result.valid);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "noncollision_validation_cancelled");
+  EXPECT_EQ(result.error->details.at("cancellation_reason"), "test_cancel");
+}
+
+TEST_F(NativeKernelTest, StandaloneValidatorFailsClosedOnInvalidTcpOptions) {
+  auto trajectory = stationary_trajectory();
+  ValidationOptionsDTO options;
+  options.max_tcp_linear_speed_mps =
+      std::numeric_limits<double>::quiet_NaN();
+  auto result = validate_non_collision(trajectory, options);
+  ASSERT_FALSE(result.valid);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "tcp_linear_speed_limit_invalid");
+
+  options.max_tcp_linear_speed_mps = 0.1;
+  result = validate_non_collision(trajectory, options);
+  ASSERT_FALSE(result.valid);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"), "tcp_speed_frames_missing");
+}
+
+TEST_F(NativeKernelTest,
+       CollisionProjectorPreservesObservedNoncommandedCoordinates) {
+  Eigen::VectorXd full_state;
+  roboplan::JointGroupInfo group;
+  {
+    std::lock_guard<std::mutex> lock(*bundle_->scene_mutex);
+    full_state = bundle_->scene->getCurrentJointPositions();
+    const auto maybe_group = bundle_->scene->getJointGroupInfo("arm");
+    ASSERT_TRUE(maybe_group.has_value());
+    group = maybe_group.value();
+  }
+  ASSERT_GE(group.q_indices.size(), 2);
+  ASSERT_EQ(group.q_indices.size(),
+            static_cast<Eigen::Index>(group.joint_names.size()));
+  const auto commanded = group.q_indices[0];
+  const auto noncommanded = group.q_indices[1];
+  full_state[noncommanded] = 0.123;
+
+  RobotStateDTO observed;
+  observed.positions_rad.assign(full_state.data(),
+                                full_state.data() + full_state.size());
+  TrajectoryDTO trajectory;
+  trajectory.joint_names = {group.joint_names.front()};
+  TrajectoryWaypointDTO waypoint;
+  waypoint.time_from_start_s = 0.0;
+  waypoint.positions_rad = {full_state[commanded]};
+  trajectory.waypoints.push_back(std::move(waypoint));
+
+  const auto expanded =
+      bundle_->collision_trajectory_projector->expand_for_collision(
+          trajectory, observed);
+  ASSERT_TRUE(expanded.ok()) << expanded.error().message;
+  ASSERT_EQ(expanded.value().waypoints.size(), 1U);
+  ASSERT_EQ(expanded.value().waypoints.front().positions_rad.size(),
+            static_cast<std::size_t>(full_state.size()));
+  EXPECT_DOUBLE_EQ(
+      expanded.value().waypoints.front().positions_rad[
+          static_cast<std::size_t>(noncommanded)],
+      0.123);
+}
+
+TEST_F(NativeKernelTest, NonCollisionValidationDoesNotRunCollisionSweep) {
+  auto state = current_state();
 
   AddObjectRequestDTO add;
   add.object_id = "validation_overlap_box";
@@ -1704,7 +2022,7 @@ TEST_F(NativeKernelTest, TrajectoryValidationCanSkipLegacyCollisionSweep) {
   add.frame_id = "base_link";
   add.pose.position_m = {0.0, 0.0, 0.0};
   add.pose.orientation = {0.0, 0.0, 0.0, 1.0};
-  auto edit = bundle_->context->add_object(add);
+  auto edit = bundle_->scene_authority->add_object(add);
   ASSERT_TRUE(edit.success) << (edit.error ? edit.error->message : "");
 
   TrajectoryDTO traj;
@@ -1716,25 +2034,25 @@ TEST_F(NativeKernelTest, TrajectoryValidationCanSkipLegacyCollisionSweep) {
 
   ValidationOptionsDTO opts;
   opts.run_collision_checks = false;
-  auto result = bundle_->context->validate_trajectory(traj, opts);
+  auto result = validate_non_collision(traj, opts);
   EXPECT_TRUE(result.valid);
 }
 
 TEST_F(NativeKernelTest,
-       NormalizedCollisionCheckUnsupportedRequiredCapabilityFailsClosed) {
-  auto state = bundle_->context->get_current_state();
+       DiagnosticComparatorUnsupportedRequiredCapabilityFailsClosed) {
+  auto state = current_state();
 
   CollisionQuery query;
   query.robot_state = state;
   query.required_capabilities = {"penetration_depth"};
 
-  auto result = bundle_->context->collision_check_normalized(query);
+  auto result = diagnostic_collision(query);
   EXPECT_EQ(result.engine_status, CollisionEngineStatus::kDiagnosticIncomplete);
   EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail);
 }
 
 TEST_F(NativeKernelTest, TrajectoryValidationReportsTcpSpeedBeforeCollisionSweep) {
-  auto state = bundle_->context->get_current_state();
+  auto state = current_state();
   ASSERT_GE(state.positions_rad.size(), 2u);
 
   TrajectoryDTO traj;
@@ -1746,9 +2064,9 @@ TEST_F(NativeKernelTest, TrajectoryValidationReportsTcpSpeedBeforeCollisionSweep
   traj.waypoints.push_back(start);
 
   TrajectoryWaypointDTO fast;
-  fast.time_from_start_s = 0.001;
+  fast.time_from_start_s = 1.0;
   fast.positions_rad = state.positions_rad;
-  fast.positions_rad[0] += 0.5;
+  fast.positions_rad[0] += 0.1;
   traj.waypoints.push_back(fast);
 
   ValidationOptionsDTO opts;
@@ -1756,7 +2074,7 @@ TEST_F(NativeKernelTest, TrajectoryValidationReportsTcpSpeedBeforeCollisionSweep
   opts.tcp_frame = "tool0";
   opts.base_frame = "base_link";
 
-  auto result = bundle_->context->validate_trajectory(traj, opts);
+  auto result = validate_non_collision(traj, opts);
   EXPECT_FALSE(result.valid);
   ASSERT_TRUE(result.error.has_value());
   EXPECT_EQ(result.error->code, kErrorValidationLimitsViolation);
@@ -1840,7 +2158,7 @@ TEST_F(NativeKernelTest,
   // then return along the accepted path to the trip cursor. It must not silently
   // complete the original trajectory, and it must not use the old native
   // stop-and-hold shortcut.
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -1905,7 +2223,7 @@ TEST_F(NativeKernelTest,
   // The native viewer consumes the backend/kernel execution snapshot stream.
   // spring_back_hold must therefore publish the authored two-phase replacement
   // while it runs, not only the terminal returned trip point.
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -1977,7 +2295,7 @@ TEST_F(NativeKernelTest,
   // spring-back replay in a stable stopped state. The native simulator is
   // kinematic, so the safety property we pin here is no residual motion after
   // the returned trip cursor is published.
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -2038,7 +2356,7 @@ TEST_F(NativeKernelTest,
 
 TEST_F(NativeKernelTest,
        NativeBackend_ControlledStop_SoftOnPathRunsWallTimePathRamp) {
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -2094,7 +2412,7 @@ TEST_F(NativeKernelTest,
       dynamic_cast<RoboPlanExecutionBackend*>(bundle_->execution.get());
   ASSERT_NE(backend, nullptr);
 
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -2149,7 +2467,7 @@ TEST_F(NativeKernelTest,
 
 TEST_F(NativeKernelTest,
        NativeBackend_ControlledStop_SoftOnPathReplayIsCancellable) {
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -2205,7 +2523,7 @@ TEST_F(NativeKernelTest,
 
 TEST_F(NativeKernelTest,
        NativeBackend_ControlledStop_SoftOnPathReplayStopsOnBackendStop) {
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -2271,7 +2589,7 @@ TEST_F(NativeKernelTest,
 
 TEST_F(NativeKernelTest,
        NativeBackend_ControlledStop_SpringBackReplayStopsOnBackendStop) {
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -2336,7 +2654,7 @@ TEST_F(NativeKernelTest,
 
 TEST_F(NativeKernelTest,
        NativeBackend_ControlledStop_SoftOnPathIgnoresSliderChangesDuringStop) {
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -2404,7 +2722,7 @@ TEST_F(NativeKernelTest,
 
 TEST_F(NativeKernelTest,
        NativeBackend_ControlledStop_DefersDirectScaleWriteUntilStopExits) {
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -2469,7 +2787,7 @@ TEST_F(NativeKernelTest,
 
 TEST_F(NativeKernelTest,
        NativeBackend_ControlledStop_SoftOnPathAllowsShortPathNaturalCompletion) {
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -2510,7 +2828,7 @@ TEST_F(NativeKernelTest,
 
 TEST_F(NativeKernelTest,
        NativeBackend_NaturalCompletionPublishesStoppingWhileOriginalTrajectoryFinishes) {
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -2569,7 +2887,7 @@ TEST_F(NativeKernelTest,
   // MotionTripOutcomeDTO. This exercises the controlled-stop port at the
   // kernel layer (handle_motion_trip_latch -> execute_controlled_stop ->
   // ExecutionStopSnapshotDTO capture), not via MockExecution.
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   // Register a fast-execution-relevant source and a move-scoped
@@ -2694,7 +3012,7 @@ TEST_F(NativeKernelTest,
   // spring_back_hold is now a timed two-phase path ramp. The backend should
   // spend approximately the requested stop time replaying it, and still remain
   // bounded by the profile stop deadline.
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
   std::vector<double> goal = start_state.positions_rad;
@@ -2745,7 +3063,7 @@ TEST_F(NativeKernelTest,
   profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   profile.deceleration_time_s = 0.5;
   profile.max_stop_time_s = 1.5;
-  auto start_state = bundle_->context->get_current_state();
+  auto start_state = current_state();
   ASSERT_FALSE(start_state.joint_names.empty());
   for (const auto& joint_name : start_state.joint_names) {
     profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
@@ -2755,7 +3073,11 @@ TEST_F(NativeKernelTest,
 
   auto local_bundle = create_native_kernel("ur5_gripper", "arm", kernel_config);
   ASSERT_NE(local_bundle, nullptr);
-  auto local_start = local_bundle->context->get_current_state();
+  auto local_start_result =
+      local_bundle->observed_state_provider->current_state(
+          local_bundle->clock->now());
+  ASSERT_TRUE(local_start_result.ok());
+  auto local_start = std::move(local_start_result.value());
   ASSERT_FALSE(local_start.positions_rad.empty());
 
   std::vector<double> goal = local_start.positions_rad;

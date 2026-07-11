@@ -778,3 +778,29 @@ class TestMockKernelGripperSemantics:
         assert result.accepted is False
         assert result.reason_code == "invalid_gripper_semantics"
         assert "open_state_ref" in (result.error or "")
+
+
+def test_mock_recovery_default_is_complete_and_fail_closed():
+    kernel = MockKernelClient()
+
+    assessment = kernel.get_recovery_assessment()
+    assert assessment["schema_version"] == (
+        "manyforge.kernel_recovery_assessment.v1"
+    )
+    assert assessment["status"] == "unavailable"
+    assert assessment["allowed_actions"] == []
+    assert assessment["retry_admissible"] is False
+    assert assessment["observed_state_available"] is False
+    assert assessment["observed_state_authority_profile"] == ""
+    assert assessment["observed_state_measured"] is False
+    assert assessment["stronger_authority_active"] is False
+    assert assessment["queued_latch_present"] is False
+
+    result = kernel.apply_recovery_action(
+        {
+            "request_id": "mock-recovery-probe",
+            "action": "retry_motion_from_current_state",
+        }
+    )
+    assert result["accepted"] is False
+    assert result["resulting_assessment"] == assessment

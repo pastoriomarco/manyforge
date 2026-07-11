@@ -115,7 +115,8 @@ Result<void> StopPolicy::request_soft_stop(Duration deceleration_ns) {
     return Result<void>::Err(ErrorCode::kInvalidStateTransition);
 }
 
-Result<void> StopPolicy::request_hard_stop() {
+Result<void> StopPolicy::request_hard_stop(
+    BeforeTerminalStopCallback before_terminal) {
     // Cancel any pending scheduled stop/pause before issuing the hard floor.
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -177,6 +178,9 @@ Result<void> StopPolicy::request_hard_stop() {
         }
     }
     if (terminal_stop_deferred_until_backend_ack) {
+        if (before_terminal) {
+            before_terminal();
+        }
         if (current == ExecutionState::kPaused &&
             sm_.status().state == ExecutionState::kPaused) {
             auto stopping = sm_.try_transition(ExecutionState::kStopping);

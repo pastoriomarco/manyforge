@@ -16,6 +16,42 @@ MAX_CONTROLLED_STOP_DECELERATION_TIME_S = 2.0
 _STOP_MODES = {"spring_back_hold", "soft_on_path", "hard_deceleration"}
 
 
+def _unavailable_recovery_assessment(reason_code: str) -> dict:
+    """Complete fail-closed RT-8B DTO for clients without recovery support."""
+    return {
+        "schema_version": "manyforge.kernel_recovery_assessment.v1",
+        "assessment_revision": 0,
+        "assessed_at_ns": 0,
+        "control_command_epoch": 0,
+        "execution_id": 0,
+        "execution_state": "idle",
+        "recovery_class": "none",
+        "status": "unavailable",
+        "latch_id": "",
+        "source_id": "",
+        "policy_id": "",
+        "preemption_result": "none_required",
+        "stop_owner_active": False,
+        "stop_owner_generation": 0,
+        "backend_stop_confirmed": False,
+        "stop_certificate_id": "",
+        "observed_state_available": False,
+        "observed_state_sequence": 0,
+        "observed_state_source_id": "",
+        "observed_state_authority_profile": "",
+        "observed_state_measured": False,
+        "observed_state_valid_until_ns": 0,
+        "observed_state_fresh": False,
+        "observed_state_at_rest": False,
+        "stronger_authority_active": False,
+        "queued_latch_present": False,
+        "retry_admissible": False,
+        "allowed_actions": [],
+        "reason_code": reason_code,
+        "evidence_refs": [],
+    }
+
+
 def _max_controlled_stop_deceleration_time_label() -> str:
     label = f"{MAX_CONTROLLED_STOP_DECELERATION_TIME_S:.15g}"
     return f"{label}.0" if "." not in label and "e" not in label.lower() else label
@@ -1054,6 +1090,27 @@ class KernelClient(ABC):
             error="acknowledge_interrupted_for_retry not supported by this kernel client",
         )
 
+    def get_recovery_assessment(self) -> dict:
+        """RT-8B kernel recovery assessment. Unsupported clients fail closed
+        with an empty none-assessment (no allowed actions)."""
+        return _unavailable_recovery_assessment(
+            "recovery_assessment_unsupported"
+        )
+
+    def apply_recovery_action(self, request: dict) -> dict:
+        """RT-8B recovery command. Unsupported clients fail closed."""
+        return {
+            "request_id": str(request.get("request_id", "")),
+            "action": str(request.get("action", "")),
+            "accepted": False,
+            "error": {
+                "code": "unsupported_capability",
+                "message": "apply_recovery_action unsupported by this client",
+                "details": {"reason": "recovery_action_unsupported"},
+            },
+            "resulting_assessment": self.get_recovery_assessment(),
+        }
+
     def set_runtime_velocity_scale(
         self, scale: float, principal_id: str | None = None
     ) -> None:
@@ -1332,6 +1389,10 @@ class MockKernelClient(KernelClient):
             "runtime_collision_ticks_completed": 0,
             "runtime_collision_ticks_faulted": 0,
             "runtime_collision_tick_max_ns": 0,
+            "runtime_collision_tick_start_jitter_max_ns": 0,
+            "runtime_collision_tick_late_periods": 0,
+            "runtime_collision_tick_missed_periods": 0,
+            "runtime_collision_tick_max_consecutive_late_periods": 0,
             "validation_deferred_runtime_monitor_active": 0,
             "runtime_collision_snapshot_refresh_failures": 0,
             "snapshots_published": 0,
@@ -1751,6 +1812,40 @@ class MockKernelClient(KernelClient):
             "state_transition", from_state=prev, to_state="idle"
         )
         return CommandResult(accepted=True)
+
+    def script_recovery_assessment(self, assessment: dict) -> None:
+        """Tests script the next assessment verbatim; the mock never
+        re-implements the C++ admission truth table (spec/230 §3.7.1)."""
+        self._scripted_recovery_assessment = dict(assessment)
+
+    def script_recovery_action_result(self, result: dict) -> None:
+        self._scripted_recovery_action_result = dict(result)
+
+    def get_recovery_assessment(self) -> dict:
+        scripted = getattr(self, "_scripted_recovery_assessment", None)
+        if scripted is not None:
+            return dict(scripted)
+        return _unavailable_recovery_assessment("no_recovery_active")
+
+    def apply_recovery_action(self, request: dict) -> dict:
+        self.apply_recovery_action_requests = getattr(
+            self, "apply_recovery_action_requests", []
+        )
+        self.apply_recovery_action_requests.append(dict(request))
+        scripted = getattr(self, "_scripted_recovery_action_result", None)
+        if scripted is not None:
+            return dict(scripted)
+        return {
+            "request_id": str(request.get("request_id", "")),
+            "action": str(request.get("action", "")),
+            "accepted": False,
+            "error": {
+                "code": "recovery_action_rejected",
+                "message": "no scripted recovery action result",
+                "details": {"reason": "recovery_action_not_scripted"},
+            },
+            "resulting_assessment": self.get_recovery_assessment(),
+        }
 
     def acknowledge_intervention_for_retry(
         self,

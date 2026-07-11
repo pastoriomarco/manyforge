@@ -17,6 +17,7 @@ class StopPolicy {
  public:
   using CacheInvalidationCallback = std::function<void()>;
   using StopCallback = std::function<Result<void>()>;
+  using BeforeTerminalStopCallback = std::function<void()>;
   using TerminalTransitionCallback =
       std::function<Result<void>(ExecutionState)>;
   using StopRequestedChangedCallback = std::function<void(bool)>;
@@ -42,7 +43,8 @@ class StopPolicy {
   /// From Executing/Paused: → Stopping → Stopped.
   /// From Stopping: upgrades soft → hard (immediate Stopped).
   /// From Planning/Validating: direct → Stopped.
-  Result<void> request_hard_stop();
+  Result<void> request_hard_stop(
+      BeforeTerminalStopCallback before_terminal = nullptr);
 
   /// Pause. Only from Executing.
   /// Executing → Stopping → Paused (controlled deceleration via scheduler).

@@ -110,6 +110,8 @@ struct Ros2ControlControllerProgressMetrics {
   std::uint64_t max_cancel_latency_ns = 0;
   std::uint64_t last_stop_confirmation_latency_ns = 0;
   std::uint64_t max_stop_confirmation_latency_ns = 0;
+  std::uint64_t observed_state_reader_retry_exhausted_total = 0;
+  std::vector<core::ObservedRobotStateSourceMetrics> observed_state_sources;
 };
 
 /// Controller-backed execution backend for ros2_control/JTC deployments.
@@ -142,6 +144,10 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   core::ExecutionHandle resume(const core::TrajectoryDTO& trajectory) override;
   core::ResetResultDTO reset() override;
   core::ExecutionSnapshot get_execution_snapshot() const override;
+  const core::ObservedRobotStatePublication*
+  observed_robot_state_publication() const noexcept override {
+    return observed_state_publication_.get();
+  }
 
   // Controlled-stop capability + result surface for motion-scoped
   // interrupt outcomes (spec/260 §5.6). The ros2_control adapter
@@ -235,6 +241,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       throw std::invalid_argument("execution state sink must not be null");
     }
     validate_config();
+    initialize_observed_state_publication();
     snapshot_.timestamp_ns = clock_.now();
   }
 
@@ -299,6 +306,12 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       const std::vector<double>& positions,
       const std::vector<double>& velocities,
       std::chrono::steady_clock::time_point received_at) {
+    const auto received_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 received_at.time_since_epoch())
+                                 .count();
+    publish_observed_robot_state(
+        core::ObservedRobotStateSourceKind::kActionFeedback, joint_names,
+        positions, velocities, 0, received_ns);
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (!latest_action_feedback_.has_value()) {
       latest_action_feedback_.emplace();
@@ -421,6 +434,14 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   };
 
   void validate_config() const;
+  void initialize_observed_state_publication();
+  void publish_observed_robot_state(
+      core::ObservedRobotStateSourceKind source,
+      const std::vector<std::string>& joint_names,
+      const std::vector<double>& positions,
+      const std::vector<double>& velocities,
+      std::int64_t source_timestamp_ns,
+      std::int64_t received_timestamp_ns) noexcept;
   void start_ros();
   void stop_ros();
 
@@ -575,6 +596,8 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   std::string group_name_;
   core::IClock& clock_;
   Ros2ControlExecutionBackendConfig config_;
+  std::unique_ptr<core::ObservedRobotStatePublication>
+      observed_state_publication_;
 
   std::shared_ptr<rclcpp::Context> context_;
   rclcpp::Node::SharedPtr node_;

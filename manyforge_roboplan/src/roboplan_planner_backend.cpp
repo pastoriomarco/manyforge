@@ -1,5 +1,7 @@
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 
+#include <manyforge_roboplan/roboplan_focused_adapters.hpp>
+
 #include <manyforge_roboplan/collision_diagnostics_capture.hpp>
 
 #include <Eigen/Dense>
@@ -370,22 +372,24 @@ JointCapMeasurement measure_joint_cap_peaks(
 }
 
 RoboPlanPlannerBackend::RoboPlanPlannerBackend(
-    std::shared_ptr<roboplan::Scene> scene,
+    std::shared_ptr<RoboPlanSceneProjection> projection,
+    std::shared_ptr<roboplan::Scene> live_scene,
     const roboplan::RRTOptions& rrt_options,
-    std::shared_ptr<roboplan::PathShortcutter> shortcutter,
-    std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra,
-    std::shared_ptr<roboplan::SimpleIk> ik,
     std::shared_ptr<std::mutex> scene_mutex,
     std::shared_ptr<roboplan::SimpleIk> single_shot_ik,
     std::optional<roboplan::SimpleIkOptions> ik_options,
     std::optional<roboplan::SimpleIkOptions> single_shot_ik_options)
-    : scene_(std::move(scene)),
+    : projection_(std::move(projection)),
+      live_scene_(std::move(live_scene)),
       rrt_options_(rrt_options),
-      shortcutter_(std::move(shortcutter)),
-      toppra_(std::move(toppra)),
-      ik_(std::move(ik)),
       single_shot_ik_(std::move(single_shot_ik)),
       scene_mutex_(std::move(scene_mutex)) {
+  if (!projection_) {
+    throw std::invalid_argument("RoboPlan planner projection must not be null");
+  }
+  if (!live_scene_) {
+    throw std::invalid_argument("RoboPlan live IK scene must not be null");
+  }
   if (!scene_mutex_) {
     scene_mutex_ = std::make_shared<std::mutex>();
   }
@@ -396,9 +400,6 @@ RoboPlanPlannerBackend::RoboPlanPlannerBackend(
   }());
   single_shot_ik_options_ =
       single_shot_ik_options.value_or(ik_options_);
-  if (!single_shot_ik_) {
-    single_shot_ik_ = ik_;
-  }
 }
 
 void RoboPlanPlannerBackend::request_cancel() {
@@ -413,10 +414,25 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       std::isfinite(request.planning_timeout_s) && request.planning_timeout_s > 0.0;
 
   try {
-    std::shared_ptr<roboplan::Scene> planning_scene;
-    {
-      std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
-      planning_scene = std::make_shared<roboplan::Scene>(*scene_);
+    if (!request.scene_binding.valid()) {
+      result.error = core::ErrorDTO{
+          core::kErrorInvalidRequest,
+          "Planning request does not carry a valid scene projection binding",
+          {{"reason", "planner_scene_binding_invalid"}}};
+      return result;
+    }
+    auto planning_scene =
+        projection_->acquire_native_projection(request.scene_binding);
+    if (!planning_scene) {
+      result.error = core::ErrorDTO{
+          core::kErrorSceneChangedDuringValidation,
+          "The retained planner scene projection is unavailable",
+          {{"reason", "planner_projection_lease_unavailable"},
+           {"projection_lease_id",
+            request.scene_binding.projection_lease_id},
+           {"requested_revision_id",
+            std::to_string(request.scene_binding.revision.revision_id)}}};
+      return result;
     }
     auto planning_ik =
         std::make_shared<roboplan::SimpleIk>(planning_scene, ik_options_);
@@ -801,8 +817,16 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     const double tcp_limit = request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
     const std::string& tcp_frame = request.tcp_frame;
     const bool has_tcp_limit = tcp_limit > 0.0 && !tcp_frame.empty();
-    double vel_scale = request.speed_profile.velocity_scale;
-    double acc_scale = request.speed_profile.acceleration_scale;
+    // TOPPRA's spline samples can overshoot a nominal model limit by a small
+    // interpolation/numerical amount at scale 1.0. Keep the producer inside
+    // the authoritative post-plan validator instead of adding a permissive
+    // validation tolerance. This margin applies to the model envelope before
+    // any stricter request-level cap retiming below.
+    constexpr double kModelLimitQualificationMargin = 0.995;
+    double vel_scale = request.speed_profile.velocity_scale *
+                       kModelLimitQualificationMargin;
+    double acc_scale = request.speed_profile.acceleration_scale *
+                       kModelLimitQualificationMargin;
     constexpr int kMaxRetimeIterations = 32;
     constexpr double kSpeedMargin = 0.99;  // aim slightly under each limit
 
@@ -989,6 +1013,7 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
 
     // Convert to TrajectoryDTO
     result.trajectory = convert_trajectory(final_traj);
+    result.scene_revision = request.scene_binding.revision;
 
   } catch (const std::exception& e) {
     result.error = core::ErrorDTO{core::kErrorPlanningFailed, e.what(), {}};
@@ -1080,7 +1105,7 @@ core::IkResultDTO RoboPlanPlannerBackend::solve_ik(
   cart_config.tform = tform;
 
   // Seed must come from the caller. The kernel populates request.seed_state
-  // from the live planning context before invoking solve_ik. Empty seeds
+  // from the live observed-state provider before invoking solve_ik. Empty seeds
   // fail fast — the IK solver needs a starting configuration for continuity.
   if (request.seed_state.joint_names.empty() ||
       request.seed_state.joint_names.size() !=
@@ -1089,7 +1114,7 @@ core::IkResultDTO RoboPlanPlannerBackend::solve_ik(
     result.error = core::ErrorDTO{
         std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
         "solve_ik requires a non-empty seed_state with matching joint names "
-        "and positions; kernel populates from planning-context current state",
+        "and positions; the kernel supplies the selected observed state",
         {}};
     return result;
   }
@@ -1108,7 +1133,7 @@ core::IkResultDTO RoboPlanPlannerBackend::solve_ik(
   std::shared_ptr<roboplan::Scene> ik_scene;
   {
     std::lock_guard<std::mutex> lock(*scene_mutex_);
-    ik_scene = std::make_shared<roboplan::Scene>(*scene_);
+    ik_scene = std::make_shared<roboplan::Scene>(*live_scene_);
   }
   auto single_shot_ik =
       std::make_shared<roboplan::SimpleIk>(ik_scene, single_shot_ik_options_);

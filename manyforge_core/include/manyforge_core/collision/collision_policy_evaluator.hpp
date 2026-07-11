@@ -26,10 +26,15 @@ struct EvaluatedPairs {
 /// share across per-pass evaluators; evaluators still own their mutable
 /// support-contact state machines.
 struct CollisionPolicyIndex {
+  /// Revision of the immutable policy used to build these indexes. Runtime
+  /// consumers compare this identity before trusting any allowance lookup.
+  CollisionPolicyRevision source_policy_revision;
   std::map<CollisionPairId, SupportContactPolicyEntry, std::less<>>
       support_contact_index;
   std::map<CollisionPairId, bool, std::less<>> static_static_index;
   std::map<CollisionPairId, bool, std::less<>> touch_link_index;
+  std::map<std::string, ContactGraspPolicyEntry, std::less<>>
+      contact_grasp_index;
 };
 
 std::shared_ptr<const CollisionPolicyIndex> build_collision_policy_index(

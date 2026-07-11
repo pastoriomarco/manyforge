@@ -16,6 +16,7 @@ add_library(manyforge_core
   src/execution_collision_support.cpp
   src/execution_correlation_tracker.cpp
   src/execution_interrupt_support.cpp
+  src/execution_recovery_support.cpp
   src/execution_snapshot_publisher.cpp
   src/execution_stop_support.cpp
   src/execution_worker_signals.cpp
@@ -24,8 +25,12 @@ add_library(manyforge_core
   src/kernel_event_factories.cpp
   src/motion_trip_stop_coordinator.cpp
   src/operator_stop_worker.cpp
+  src/observed_robot_state_publication.cpp
+  src/observed_robot_state_provider.cpp
   src/pose_math.cpp
   src/runtime_collision_monitor.cpp
+  src/runtime_collision_query_session.cpp
+  src/scene_authority.cpp
   src/scene_snapshot_lease.cpp
   src/stop_policy.cpp
   src/trajectory_cache.cpp
@@ -101,6 +106,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_runtime_collision_monitor
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_runtime_collision_query_session
+    test/test_runtime_collision_query_session.cpp)
+  target_link_libraries(test_runtime_collision_query_session PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_runtime_collision_query_session
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_motion_trip_stop_coordinator
     test/test_motion_trip_stop_coordinator.cpp)
   target_link_libraries(test_motion_trip_stop_coordinator PRIVATE
@@ -171,6 +183,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_operator_stop_worker
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_observed_robot_state_publication
+    test/test_observed_robot_state_publication.cpp)
+  target_link_libraries(test_observed_robot_state_publication PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_observed_robot_state_publication
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_cache test/test_cache.cpp)
   target_link_libraries(test_cache PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_cache
@@ -216,6 +235,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_collision_resource_manager
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_execution_recovery_support
+    test/test_execution_recovery_support.cpp)
+  target_link_libraries(test_execution_recovery_support PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_execution_recovery_support
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_parallel_collision_validation_worker_pool
     test/test_parallel_collision_validation_worker_pool.cpp)
   target_link_libraries(test_parallel_collision_validation_worker_pool PRIVATE
@@ -255,6 +281,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_scene_snapshot_lease PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_scene_snapshot_lease
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_scene_authority
+    test/test_scene_authority.cpp)
+  target_link_libraries(test_scene_authority PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_scene_authority
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_interrupt_manager

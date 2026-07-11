@@ -809,5 +809,96 @@ TEST(Ros2ControlExecutionBackendTest,
   EXPECT_LT(std::chrono::steady_clock::now() - started, 1s);
 }
 
+TEST(Ros2ControlExecutionBackendTest,
+     ObservedStatePublicationFallsBackWhenActionFeedbackStops) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  auto config = base_config();
+  config.joint_state_max_age_s = 0.1;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
+      clock, config);
+
+  const auto base = std::chrono::steady_clock::time_point{1s};
+  backend.testing_store_action_feedback_sample(
+      {"joint_1"}, {0.25}, {0.5}, base);
+  backend.testing_store_latest_joint_sample(
+      {"joint_1"}, {0.75}, base + 150ms);
+
+  const auto* publication = backend.observed_robot_state_publication();
+  ASSERT_NE(publication, nullptr);
+  const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          (base + 160ms).time_since_epoch())
+                          .count();
+  auto selected = publication->acquire(now_ns);
+  ASSERT_TRUE(selected);
+  EXPECT_EQ(selected.source_kind(),
+            core::ObservedRobotStateSourceKind::kJointState);
+  EXPECT_EQ(selected.source_id(), "joint_state");
+  ASSERT_EQ(selected.positions_rad().size(), 1u);
+  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.75);
+  EXPECT_EQ(selected.received_timestamp_ns(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                (base + 150ms).time_since_epoch())
+                .count());
+  const auto metrics = backend.controller_progress_metrics();
+  ASSERT_EQ(metrics.observed_state_sources.size(), 3u);
+  EXPECT_EQ(metrics.observed_state_sources[1].source_kind,
+            core::ObservedRobotStateSourceKind::kJointState);
+  EXPECT_EQ(metrics.observed_state_sources[1].published_total, 1u);
+  EXPECT_EQ(metrics.observed_state_sources[2].source_kind,
+            core::ObservedRobotStateSourceKind::kActionFeedback);
+  EXPECT_EQ(metrics.observed_state_sources[2].published_total, 1u);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ObservedStateSourcePrecedenceIsDeploymentDeclared) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  auto config = base_config();
+  config.observed_state_source_precedence = {"joint_state",
+                                             "action_feedback"};
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
+      clock, config);
+  const auto now = std::chrono::steady_clock::time_point{1s};
+  backend.testing_store_action_feedback_sample(
+      {"joint_1"}, {0.25}, {0.0}, now);
+  backend.testing_store_latest_joint_sample({"joint_1"}, {0.75}, now);
+
+  auto selected = backend.observed_robot_state_publication()->acquire(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          now.time_since_epoch())
+          .count());
+  ASSERT_TRUE(selected);
+  EXPECT_EQ(selected.source_kind(),
+            core::ObservedRobotStateSourceKind::kJointState);
+  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.75);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     AuthoredPreviewPublishesCommandedNotMeasuredAuthority) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  auto config = base_config();
+  config.execution_state_source_mode = "authored_preview";
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
+      clock, config);
+  const auto now = std::chrono::steady_clock::time_point{1s};
+  backend.testing_store_action_feedback_sample(
+      {"joint_1"}, {0.25}, {0.0}, now);
+
+  auto selected = backend.observed_robot_state_publication()->acquire(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          now.time_since_epoch())
+          .count());
+  ASSERT_TRUE(selected);
+  EXPECT_EQ(selected.authority_profile(),
+            core::ObservedRobotStateAuthorityProfile::kCommandedSimulation);
+  EXPECT_EQ(selected.authority_profile_id(),
+            "ros2_control_commanded_sim_v1");
+}
+
 }  // namespace
 }  // namespace manyforge::ros2_control_execution

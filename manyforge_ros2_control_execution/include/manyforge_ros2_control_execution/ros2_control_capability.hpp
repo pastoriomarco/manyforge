@@ -19,6 +19,12 @@ struct Ros2ControlExecutionBackendConfig {
   std::string joint_state_topic = "/joint_states";
   std::string controller_state_topic;
   std::vector<std::string> required_joints;
+  /// Highest-to-lowest authority order for the RT-8C observed-state channel.
+  /// Every configured source is retained independently; stale higher-priority
+  /// sources fall through to the next fresh complete source.
+  std::vector<std::string> observed_state_source_precedence{
+      "controller_state", "joint_state", "action_feedback"};
+  std::string observed_state_authority_profile_id;
 
   // RT-3: ROS2 controller command/progress callbacks use a dedicated action
   // callback group, state subscriptions use a dedicated state group, and

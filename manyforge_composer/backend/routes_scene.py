@@ -1522,7 +1522,7 @@ def create_scene_router(state: ComposerState) -> APIRouter:
 
         Backs the Composer Move-To "ghost robot" preview. Stateless
         w.r.t. the live scene — runs IK (for cartesian targets) and
-        per-link FK against the kernel's planning context without
+        per-link FK through the kernel's focused kinematics port without
         mutating scene joint state.
 
         Request:

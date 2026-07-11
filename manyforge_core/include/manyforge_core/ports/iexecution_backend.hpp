@@ -4,6 +4,7 @@
 #include <manyforge_core/types/execution_result.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
+#include <manyforge_core/observed_robot_state_publication.hpp>
 
 #include <stop_token>
 
@@ -76,6 +77,18 @@ class IExecutionBackend {
     /// observed/predicted execution state without forcing the kernel or UI to
     /// know which ROS topics/actions produced it.
     virtual ExecutionSnapshot get_execution_snapshot() const = 0;
+
+    /// Dedicated observed-robot-state publication (spec/210 section 3.13).
+    ///
+    /// This is deliberately separate from get_execution_snapshot(): lifecycle
+    /// state is not robot-state authority. The returned object is backend-owned,
+    /// immutable to the kernel, and must outlive every kernel call. A null
+    /// result means observed-state-dependent collision/recovery checks fail
+    /// closed; production backends are required to override it.
+    virtual const ObservedRobotStatePublication*
+    observed_robot_state_publication() const noexcept {
+      return nullptr;
+    }
 
     /// Update the runtime velocity scale used by active execution.
     ///

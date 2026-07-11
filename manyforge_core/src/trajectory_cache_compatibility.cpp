@@ -1,6 +1,6 @@
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
 
-#include <manyforge_core/ports/iplanning_context.hpp>
+#include <manyforge_core/ports/irobot_kinematics.hpp>
 #include <manyforge_core/types/reason_codes.hpp>
 
 #include <algorithm>
@@ -109,7 +109,7 @@ CacheCompatibilityResult cached_joint_goal_matches_request(
 }
 
 CacheCompatibilityResult cached_pose_goal_matches_request(
-    IPlanningContext& context,
+    const IRobotKinematics& kinematics,
     const TrajectoryDTO& trajectory,
     const TrajectoryWaypointDTO& end_wp,
     const Pose3DTO& requested_goal,
@@ -123,8 +123,12 @@ CacheCompatibilityResult cached_pose_goal_matches_request(
   final_state.velocities_rad_s = end_wp.velocities_rad_s;
 
   try {
-    const auto final_tcp_pose = context.forward_kinematics(
+    auto final_tcp_pose_result = kinematics.forward_kinematics(
         FkRequestDTO{final_state, request.tcp_frame, request.base_frame});
+    if (!final_tcp_pose_result.ok()) {
+      return incompatible_cache("fk_failed");
+    }
+    const auto& final_tcp_pose = final_tcp_pose_result.value();
     if (translation_distance_m(final_tcp_pose, requested_goal) >
         request.tolerances.translation_tol_m) {
       return incompatible_cache("goal_changed");
@@ -150,7 +154,7 @@ CacheCompatibilityResult incompatible_cache(std::string reason) {
 }
 
 CacheCompatibilityResult cached_trajectory_matches_request_goal(
-    IPlanningContext& context,
+    const IRobotKinematics& kinematics,
     const TrajectoryDTO& trajectory,
     const ExecuteRequestDTO& request) {
   if (trajectory.waypoints.empty()) {
@@ -165,7 +169,7 @@ CacheCompatibilityResult cached_trajectory_matches_request_goal(
   }
 
   if (const auto* pose_goal = std::get_if<PoseGoalDTO>(&request.motion)) {
-    return cached_pose_goal_matches_request(context, trajectory, end_wp,
+    return cached_pose_goal_matches_request(kinematics, trajectory, end_wp,
                                             pose_goal->goal, request);
   }
 
@@ -174,7 +178,7 @@ CacheCompatibilityResult cached_trajectory_matches_request_goal(
     if (cartesian_path->waypoints.empty()) {
       return incompatible_cache("goal_unverifiable");
     }
-    return cached_pose_goal_matches_request(context, trajectory, end_wp,
+    return cached_pose_goal_matches_request(kinematics, trajectory, end_wp,
                                             cartesian_path->waypoints.back(),
                                             request);
   }

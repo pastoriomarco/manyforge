@@ -23,6 +23,7 @@ CollisionPairId canonicalize(const CollisionPairId& pair) {
 std::shared_ptr<const CollisionPolicyIndex> build_collision_policy_index(
     const CollisionPolicySnapshot& snapshot) {
   auto index = std::make_shared<CollisionPolicyIndex>();
+  index->source_policy_revision = snapshot.revision;
   for (const auto& entry : snapshot.support_contacts) {
     index->support_contact_index[canonicalize(entry.pair)] = entry;
   }
@@ -31,6 +32,9 @@ std::shared_ptr<const CollisionPolicyIndex> build_collision_policy_index(
   }
   for (const auto& pair : snapshot.allowed_touch_link_pairs) {
     index->touch_link_index[canonicalize(pair)] = true;
+  }
+  for (const auto& entry : snapshot.contact_grasps) {
+    index->contact_grasp_index[entry.policy_id] = entry;
   }
   return index;
 }

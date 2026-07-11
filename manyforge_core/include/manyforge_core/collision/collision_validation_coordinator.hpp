@@ -10,7 +10,6 @@
 
 #include <manyforge_core/collision/collision_policy_evaluator.hpp>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
-#include <manyforge_core/ports/iplanning_context.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/error_code.hpp>
@@ -151,7 +150,7 @@ class CollisionValidationCoordinator {
   /// collision-query engine and immutable collision-world snapshot.
   ///
   /// This is the production worker primitive for the manyforge_collision path: it
-  /// does not depend on `IPlanningContext`, planner-scene mutexes, or
+  /// does not depend on planner scenes, planner-scene mutexes, or
   /// planner-owned mutable state. The snapshot revision is borrowed once and
   /// remains both the initial and final revision for the pass because the
   /// snapshot is immutable.

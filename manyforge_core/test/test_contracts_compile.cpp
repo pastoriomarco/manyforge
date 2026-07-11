@@ -24,7 +24,11 @@
 
 // Port headers
 #include <manyforge_core/ports/iplanner_backend.hpp>
-#include <manyforge_core/ports/iplanning_context.hpp>
+#include <manyforge_core/ports/iplanner_scene_projection.hpp>
+#include <manyforge_core/ports/ireference_pose_resolver.hpp>
+#include <manyforge_core/ports/irobot_kinematics.hpp>
+#include <manyforge_core/ports/iscene_authority.hpp>
+#include <manyforge_core/ports/itrajectory_validator.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
 
@@ -367,18 +371,30 @@ TEST(ContractsCompile, ExecuteRequestComposition) {
 TEST(ContractsCompile, PortInterfaces) {
   // Just verify the types exist and are accessible
   using PlannerBackendType = manyforge::core::IPlannerBackend;
-  using PlanningContextType = manyforge::core::IPlanningContext;
+  using PlannerSceneProjectionType = manyforge::core::IPlannerSceneProjection;
+  using ReferenceResolverType = manyforge::core::IReferencePoseResolver;
+  using RobotKinematicsType = manyforge::core::IRobotKinematics;
+  using SceneAuthorityType = manyforge::core::ISceneAuthority;
+  using TrajectoryValidatorType = manyforge::core::ITrajectoryValidator;
   using ExecutionBackendType = manyforge::core::IExecutionBackend;
   using ExecutionStateSinkType = manyforge::core::IExecutionStateSink;
   
   // Verify they're pointers (abstract classes)
   PlannerBackendType* planner = nullptr;
-  PlanningContextType* context = nullptr;
+  PlannerSceneProjectionType* projection = nullptr;
+  ReferenceResolverType* reference_resolver = nullptr;
+  RobotKinematicsType* kinematics = nullptr;
+  SceneAuthorityType* scene_authority = nullptr;
+  TrajectoryValidatorType* trajectory_validator = nullptr;
   ExecutionBackendType* execution = nullptr;
   ExecutionStateSinkType* execution_state_sink = nullptr;
   
   EXPECT_EQ(planner, nullptr);
-  EXPECT_EQ(context, nullptr);
+  EXPECT_EQ(projection, nullptr);
+  EXPECT_EQ(reference_resolver, nullptr);
+  EXPECT_EQ(kinematics, nullptr);
+  EXPECT_EQ(scene_authority, nullptr);
+  EXPECT_EQ(trajectory_validator, nullptr);
   EXPECT_EQ(execution, nullptr);
   EXPECT_EQ(execution_state_sink, nullptr);
 }

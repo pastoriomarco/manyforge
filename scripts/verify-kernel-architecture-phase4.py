@@ -84,6 +84,10 @@ REQUIRED_LIVE_ISAAC_PHASE4_P5_CHECKS: set[str] = set()
 # anchoring where an identifier could embed in a longer name (e.g. plain
 # `CollisionPolicy` vs. `CollisionPolicySnapshot`).
 FORBIDDEN_PRODUCTION_PATTERNS: list[tuple[str, str]] = [
+    (r"\bIPlanningContext\b", "deleted planning-context authority monolith"),
+    (r"\bRoboPlanPlanningContext\b", "deleted RoboPlan planning-context adapter"),
+    (r"\bcollision_check_normalized\b", "deleted planner collision authority/fallback"),
+    (r"\bplanning_context_state\b", "deleted stop-snapshot authority label"),
     (r"legacy_collision_validation", "legacy collision validation compatibility flag"),
     (r"collision_engine=direct_scene", "prototype collision engine selector"),
     (r"direct_scene_roboplan", "adapter-hosted prototype engine id"),

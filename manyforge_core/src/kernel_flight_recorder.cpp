@@ -80,6 +80,11 @@ const char* kernel_event_type_name(KernelEventType type) {
     case kMotionTripCompleted: return "motion_trip_completed";
     case kMotionExecutionOutcomeRecorded:
       return "motion_execution_outcome_recorded";
+    case kStopCertificatePublished: return "stop_certificate_published";
+    case kRecoveryAssessmentChanged: return "recovery_assessment_changed";
+    case kRecoveryActionAccepted: return "recovery_action_accepted";
+    case kRecoveryActionRejected: return "recovery_action_rejected";
+    case kRuntimeCollisionCoverage: return "runtime_collision_coverage";
   }
   return "unknown";
 }
@@ -134,9 +139,9 @@ std::uint64_t KernelFlightRecorder::recorded_total() const noexcept {
 }
 
 std::string KernelFlightRecorder::dump_now(const char* reason) noexcept {
-  // Crash-context lock acquisition: spin briefly, then proceed without the
-  // lock. A dying kernel must not deadlock behind a telemetry mutex; a torn
-  // tail entry in the copy is acceptable and is flagged in the header line.
+  // Crash-context lock acquisition: spin briefly, then emit only a minimal
+  // marker if the lock remains busy. A dying kernel must not deadlock behind a
+  // telemetry mutex, but unsynchronized ring reads would be undefined behavior.
   std::array<FlightRecord, kCapacity> copy;
   std::uint64_t next_sequence = 0;
   SnapshotNote snapshot_note;
@@ -147,13 +152,20 @@ std::string KernelFlightRecorder::dump_now(const char* reason) noexcept {
     for (int attempt = 0; attempt < 4096 && !locked; ++attempt) {
       locked = mutex_.try_lock();
     }
-    torn = !locked;
-    copy = ring_;
-    next_sequence = next_sequence_;
-    snapshot_note = snapshot_note_;
-    directory = dump_directory_;
     if (locked) {
+      copy = ring_;
+      next_sequence = next_sequence_;
+      snapshot_note = snapshot_note_;
+      directory = dump_directory_;
       mutex_.unlock();
+    } else {
+      // Reading the ring without synchronization is a C++ data race, not a
+      // valid "torn" snapshot. In a crash-context lock collision, emit a
+      // minimal torn marker to stderr and preserve process progress without
+      // touching concurrently-written storage.
+      torn = true;
+      next_sequence = 1;
+      directory.clear();
     }
   }
 

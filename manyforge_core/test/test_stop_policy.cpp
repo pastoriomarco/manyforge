@@ -94,6 +94,18 @@ TEST_F(StopPolicyTest, HardStopFromExecuting) {
   EXPECT_EQ(stop_callback_count, 1);
 }
 
+TEST_F(StopPolicyTest, HardStopPreterminalHookRunsAfterBackendBeforeStopped) {
+  go_to_executing();
+  bool hook_called = false;
+  EXPECT_TRUE(policy.request_hard_stop([&]() {
+    hook_called = true;
+    EXPECT_EQ(stop_callback_count, 1);
+    EXPECT_EQ(sm.status().state, ExecutionState::kStopping);
+  }).ok());
+  EXPECT_TRUE(hook_called);
+  EXPECT_EQ(sm.status().state, ExecutionState::kStopped);
+}
+
 TEST_F(StopPolicyTest, HardStopCancelsPendingSoftStop) {
   go_to_executing();
   clock.set(1000);

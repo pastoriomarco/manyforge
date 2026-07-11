@@ -6,7 +6,7 @@
 #include <vector>
 
 #include <manyforge_core/types/collision.hpp>
-#include <manyforge_roboplan/roboplan_planning_context.hpp>
+#include <manyforge_roboplan/roboplan_projection_backend.hpp>
 
 namespace manyforge::roboplan_backend {
 
@@ -43,7 +43,7 @@ class RoboPlanCollisionBodyIdMapper {
   /// implicitly; the explicit cell scope lands in Chunk 2).
   void rebuild(
       const std::string& robot_id,
-      const std::vector<RoboPlanPlanningContext::SceneObjectSnapshot>&
+      const std::vector<RoboPlanProjectionBackend::SceneObjectSnapshot>&
           scene_objects,
       const std::vector<std::pair<std::string, core::CollisionBodyId>>&
           robot_body_mappings);

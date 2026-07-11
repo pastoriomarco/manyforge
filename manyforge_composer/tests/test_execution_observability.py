@@ -657,6 +657,33 @@ def test_heartbeat_degrades_on_runtime_collision_tick_fault(tmp_path):
     assert runtime_safety["runtime_collision_tick_max_ns"] == 12_000_000
 
 
+def test_heartbeat_degrades_on_runtime_collision_missed_period(tmp_path):
+    class LateRuntimeSafetyKernel(MockKernelClient):
+        def get_metrics(self) -> dict[str, int]:
+            metrics = super().get_metrics()
+            metrics["runtime_collision_tick_start_jitter_max_ns"] = 25_000_000
+            metrics["runtime_collision_tick_late_periods"] = 1
+            metrics["runtime_collision_tick_missed_periods"] = 2
+            metrics["runtime_collision_tick_max_consecutive_late_periods"] = 1
+            return metrics
+
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=LateRuntimeSafetyKernel(),
+        trace_dir=str(tmp_path),
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        heartbeat = client.get("/api/infra/heartbeat").json()
+
+    assert heartbeat["status"] == "degraded"
+    runtime_safety = heartbeat["components"]["runtime_safety"]
+    assert runtime_safety["status"] == "degraded"
+    assert runtime_safety["runtime_collision_tick_missed_periods"] == 2
+    assert runtime_safety["runtime_collision_tick_start_jitter_max_ns"] == 25_000_000
+
+
 def test_heartbeat_degrades_when_runtime_safety_metrics_unavailable(tmp_path):
     class MetricsUnavailableKernel(MockKernelClient):
         def get_metrics(self) -> dict[str, int]:

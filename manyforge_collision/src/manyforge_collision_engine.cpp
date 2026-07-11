@@ -482,6 +482,12 @@ Eigen::Vector3d effective_mesh_scale(
   return Eigen::Vector3d(scale->x_m, scale->y_m, scale->z_m);
 }
 
+std::string mesh_cache_key(const std::string& source_uri,
+                           const Eigen::Vector3d& scale) {
+  return source_uri + "|" + std::to_string(scale.x()) + "|" +
+         std::to_string(scale.y()) + "|" + std::to_string(scale.z());
+}
+
 std::pair<std::string, std::string> canonical_pair(std::string a,
                                                    std::string b) {
   if (b < a) {
@@ -624,11 +630,269 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
   capability_.thread_safety =
       core::CollisionEngineThreadSafetyClass::kSingleContextExclusive;
   capability_.deterministic_ordering = true;
+  capability_.runtime_query_memory_model =
+      core::RuntimeCollisionQueryMemoryModel::kMeasuredBounded;
+  capability_.runtime_query_max_joints = 256;
+  capability_.runtime_query_max_world_bodies = 160;
+  capability_.runtime_query_max_collision_pairs = 2048;
+  capability_.runtime_query_clean_allocation_upper_bound = 4096;
+  capability_.runtime_query_snapshot_change_may_allocate = true;
+  capability_.runtime_query_snapshot_change_allocation_upper_bound = 65'536;
+  capability_.runtime_query_qualified_wcet_ns = 10'000'000;
+  capability_.runtime_query_snapshot_change_qualified_wcet_ns = 50'000'000;
   capability_.known_unsupported_cases = {
       "convex_mesh_without_qualified_decomposition",
       "scene_object_compound_geometry",
       "contact_points",
       "continuous_collision"};
+}
+
+core::RuntimeCollisionQueryPrepareStatus
+ManyForgeCollisionEngine::prepare_runtime_query(
+    std::span<const std::string> canonical_joint_names) noexcept {
+  try {
+    if (canonical_joint_names.empty() ||
+        canonical_joint_names.size() > capability_.runtime_query_max_joints) {
+      return canonical_joint_names.empty()
+                 ? core::RuntimeCollisionQueryPrepareStatus::kInvalidJointOrder
+                 : core::RuntimeCollisionQueryPrepareStatus::kJointCountExceeded;
+    }
+    std::lock_guard<std::mutex> scene_lock(scene_mutex_);
+    runtime_joint_q_indices_.clear();
+    runtime_joint_q_indices_.reserve(canonical_joint_names.size());
+    for (const auto& joint_name : canonical_joint_names) {
+      if (!model_.existJointName(joint_name)) {
+        runtime_query_prepared_ = false;
+        return core::RuntimeCollisionQueryPrepareStatus::kInvalidJointOrder;
+      }
+      const auto joint_id = model_.getJointId(joint_name);
+      if (joint_id >= model_.idx_qs.size() || joint_id >= model_.nqs.size() ||
+          model_.nqs[joint_id] != 1) {
+        runtime_query_prepared_ = false;
+        return core::RuntimeCollisionQueryPrepareStatus::kInvalidJointOrder;
+      }
+      const auto q_index = model_.idx_qs[joint_id];
+      if (std::find(runtime_joint_q_indices_.begin(),
+                    runtime_joint_q_indices_.end(), q_index) !=
+          runtime_joint_q_indices_.end()) {
+        runtime_query_prepared_ = false;
+        return core::RuntimeCollisionQueryPrepareStatus::kInvalidJointOrder;
+      }
+      runtime_joint_q_indices_.push_back(q_index);
+    }
+    runtime_query_is_full_configuration_ =
+        static_cast<Eigen::Index>(canonical_joint_names.size()) == model_.nq;
+    if (runtime_query_is_full_configuration_) {
+      for (std::size_t i = 0; i < runtime_joint_q_indices_.size(); ++i) {
+        if (runtime_joint_q_indices_[i] != i) {
+          runtime_query_is_full_configuration_ = false;
+          break;
+        }
+      }
+    }
+    runtime_q_neutral_ = pinocchio::neutral(model_);
+    runtime_q_scratch_ = runtime_q_neutral_;
+    runtime_query_prepared_ = true;
+    return core::RuntimeCollisionQueryPrepareStatus::kReady;
+  } catch (...) {
+    runtime_query_prepared_ = false;
+    return core::RuntimeCollisionQueryPrepareStatus::kEngineError;
+  }
+}
+
+core::RuntimeCollisionQueryPrepareStatus
+ManyForgeCollisionEngine::prepare_runtime_snapshot(
+    const core::CollisionWorldSnapshot& snapshot) noexcept {
+  try {
+    if (snapshot.bodies.size() > capability_.runtime_query_max_world_bodies) {
+      return core::RuntimeCollisionQueryPrepareStatus::kEngineError;
+    }
+    std::lock_guard<std::mutex> scene_lock(scene_mutex_);
+    if (auto error = sync_snapshot_locked(snapshot, /*allow_resource_io=*/true)) {
+      return core::RuntimeCollisionQueryPrepareStatus::kEngineError;
+    }
+    return core::RuntimeCollisionQueryPrepareStatus::kReady;
+  } catch (...) {
+    return core::RuntimeCollisionQueryPrepareStatus::kEngineError;
+  }
+}
+
+core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
+    const core::CollisionWorldSnapshot& snapshot,
+    const core::RuntimeCollisionQueryRequest& request) noexcept {
+  const auto started = std::chrono::steady_clock::now();
+  core::RuntimeCollisionQueryResultView out;
+  const auto finish_without_evidence =
+      [&](core::RuntimeCollisionQueryStatus status,
+          core::RuntimeCollisionQueryFailureReason reason,
+          core::CollisionEngineStatus engine_status) {
+    out.status = status;
+    out.failure_reason = reason;
+    out.engine_status = engine_status;
+    out.query_duration_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count();
+    return out;
+  };
+  if (snapshot.bodies.size() > capability_.runtime_query_max_world_bodies) {
+    return finish_without_evidence(
+        core::RuntimeCollisionQueryStatus::kInconclusive,
+        core::RuntimeCollisionQueryFailureReason::kSnapshotBodyLimitExceeded,
+        core::CollisionEngineStatus::kDiagnosticIncomplete);
+  }
+  if (request.timeout_budget_ns <= 0) {
+    return finish_without_evidence(
+        core::RuntimeCollisionQueryStatus::kInconclusive,
+        core::RuntimeCollisionQueryFailureReason::kTimeout,
+        core::CollisionEngineStatus::kTimeout);
+  }
+
+  try {
+    std::unique_lock<std::mutex> scene_lock(scene_mutex_, std::try_to_lock);
+    if (!scene_lock.owns_lock()) {
+      // Another owner may be changing the scratch vectors while holding the
+      // mutex. A busy result therefore exposes no view into those vectors.
+      return finish_without_evidence(
+          core::RuntimeCollisionQueryStatus::kInconclusive,
+          core::RuntimeCollisionQueryFailureReason::kEngineBusy,
+          core::CollisionEngineStatus::kTimeout);
+    }
+    runtime_collision_observations_.clear();
+    runtime_clearance_observations_.clear();
+    auto finish = [&](core::RuntimeCollisionQueryStatus status,
+                      core::RuntimeCollisionQueryFailureReason reason,
+                      core::CollisionEngineStatus engine_status) {
+      auto result = finish_without_evidence(status, reason, engine_status);
+      result.collision_pairs = runtime_collision_observations_;
+      result.clearance_pairs = runtime_clearance_observations_;
+      return result;
+    };
+    if (!runtime_query_prepared_) {
+      return finish(core::RuntimeCollisionQueryStatus::kInconclusive,
+                    core::RuntimeCollisionQueryFailureReason::kUnsupported,
+                    core::CollisionEngineStatus::kDiagnosticIncomplete);
+    }
+    const std::size_t expected_positions =
+        runtime_query_is_full_configuration_
+            ? static_cast<std::size_t>(model_.nq)
+            : runtime_joint_q_indices_.size();
+    if (request.positions_rad.size() != expected_positions) {
+      return finish(
+          core::RuntimeCollisionQueryStatus::kInconclusive,
+          core::RuntimeCollisionQueryFailureReason::kObservedStateShapeMismatch,
+          core::CollisionEngineStatus::kDiagnosticIncomplete);
+    }
+    if (!std::all_of(request.positions_rad.begin(), request.positions_rad.end(),
+                     [](double value) { return std::isfinite(value); })) {
+      return finish(
+          core::RuntimeCollisionQueryStatus::kInconclusive,
+          core::RuntimeCollisionQueryFailureReason::kObservedStateNotFinite,
+          core::CollisionEngineStatus::kDiagnosticIncomplete);
+    }
+    if (auto error =
+            sync_snapshot_locked(snapshot, /*allow_resource_io=*/false)) {
+      (void)error;
+      return finish(
+          core::RuntimeCollisionQueryStatus::kInconclusive,
+          core::RuntimeCollisionQueryFailureReason::kSnapshotSyncFailed,
+          core::CollisionEngineStatus::kDiagnosticIncomplete);
+    }
+    if (!active_collision_model_ || !active_collision_data_ ||
+        runtime_pair_bindings_.size() !=
+            active_collision_model_->collisionPairs.size() ||
+        active_collision_data_->collisionResults.size() !=
+            active_collision_model_->collisionPairs.size() ||
+        (request.require_distance &&
+         active_collision_data_->distanceResults.size() !=
+             active_collision_model_->collisionPairs.size())) {
+      return finish(
+          core::RuntimeCollisionQueryStatus::kInconclusive,
+          core::RuntimeCollisionQueryFailureReason::kSnapshotInvalid,
+          core::CollisionEngineStatus::kDiagnosticIncomplete);
+    }
+
+    if (runtime_query_is_full_configuration_) {
+      for (std::size_t i = 0; i < request.positions_rad.size(); ++i) {
+        runtime_q_scratch_(static_cast<Eigen::Index>(i)) =
+            request.positions_rad[i];
+      }
+    } else {
+      runtime_q_scratch_ = runtime_q_neutral_;
+      for (std::size_t i = 0; i < request.positions_rad.size(); ++i) {
+        runtime_q_scratch_(runtime_joint_q_indices_[i]) =
+            request.positions_rad[i];
+      }
+    }
+
+    const bool in_collision = pinocchio::computeCollisions(
+        model_, *reusable_model_data_, *active_collision_model_,
+        *active_collision_data_, runtime_q_scratch_,
+        /*stop_at_first_collision=*/false);
+    if (request.require_distance) {
+      for (auto& distance_request : active_collision_data_->distanceRequests) {
+        distance_request.enable_signed_distance = true;
+      }
+      pinocchio::computeDistances(model_, *reusable_model_data_,
+                                  *active_collision_model_,
+                                  *active_collision_data_, runtime_q_scratch_);
+    }
+
+    const auto pair_count = active_collision_model_->collisionPairs.size();
+    if (runtime_collision_observations_.capacity() < pair_count ||
+        (request.require_distance &&
+         runtime_clearance_observations_.capacity() < pair_count)) {
+      return finish(
+          core::RuntimeCollisionQueryStatus::kInconclusive,
+          core::RuntimeCollisionQueryFailureReason::kObservationCapacityExceeded,
+          core::CollisionEngineStatus::kDiagnosticIncomplete);
+    }
+    for (std::size_t i = 0; i < pair_count; ++i) {
+      if (i >= runtime_pair_bindings_.size() ||
+          !runtime_pair_bindings_[i].mapped) {
+        if (active_collision_data_->collisionResults[i].isCollision()) {
+          return finish(
+              core::RuntimeCollisionQueryStatus::kInconclusive,
+              core::RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete,
+              core::CollisionEngineStatus::kDiagnosticIncomplete);
+        }
+        continue;
+      }
+      const auto* pair = &runtime_pair_bindings_[i].pair;
+      std::optional<double> clearance;
+      if (request.require_distance &&
+          i < active_collision_data_->distanceResults.size()) {
+        const double distance =
+            active_collision_data_->distanceResults[i].min_distance;
+        if (std::isfinite(distance)) {
+          clearance = distance;
+          runtime_clearance_observations_.push_back({pair, distance});
+        }
+      }
+      if (active_collision_data_->collisionResults[i].isCollision()) {
+        runtime_collision_observations_.push_back({pair, clearance});
+      }
+    }
+
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count();
+    if (elapsed > request.timeout_budget_ns) {
+      return finish(core::RuntimeCollisionQueryStatus::kInconclusive,
+                    core::RuntimeCollisionQueryFailureReason::kTimeout,
+                    core::CollisionEngineStatus::kTimeout);
+    }
+    return finish(in_collision ? core::RuntimeCollisionQueryStatus::kCollision
+                               : core::RuntimeCollisionQueryStatus::kClear,
+                  core::RuntimeCollisionQueryFailureReason::kNone,
+                  core::CollisionEngineStatus::kOk);
+  } catch (...) {
+    return finish_without_evidence(
+        core::RuntimeCollisionQueryStatus::kInconclusive,
+        core::RuntimeCollisionQueryFailureReason::kEngineException,
+        core::CollisionEngineStatus::kEngineError);
+  }
 }
 
 core::CollisionResult ManyForgeCollisionEngine::check(
@@ -705,7 +969,7 @@ core::CollisionResult ManyForgeCollisionEngine::check(
   try {
     std::lock_guard<std::mutex> scene_lock(scene_mutex_);
     const auto sync_start = std::chrono::steady_clock::now();
-    if (auto sync_error = sync_snapshot_locked(snapshot);
+    if (auto sync_error = sync_snapshot_locked(snapshot, /*allow_resource_io=*/true);
         sync_error.has_value()) {
       finish_with_duration();
       result.engine_status = core::CollisionEngineStatus::kUnsupportedGeometry;
@@ -1098,7 +1362,7 @@ ManyForgeCollisionEngine::full_configuration_from_query(
 }
 
 std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
-    const core::CollisionWorldSnapshot& snapshot) {
+    const core::CollisionWorldSnapshot& snapshot, bool allow_resource_io) {
   if (synced_snapshot_revision_ &&
       synced_snapshot_revision_->revision_id == snapshot.revision.revision_id &&
       synced_snapshot_revision_->content_hash == snapshot.revision.content_hash) {
@@ -1251,10 +1515,23 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
           return "triangle mesh geometry has invalid mesh_scale: " +
                  body.body_id;
         }
+        const auto cache_key = mesh_cache_key(*geom.source_uri, scale);
+        auto cached = prepared_mesh_geometry_cache_.find(cache_key);
+        if (cached != prepared_mesh_geometry_cache_.end()) {
+          shape = cached->second;
+          break;
+        }
+        if (!allow_resource_io) {
+          return "runtime snapshot references an unprepared triangle mesh: " +
+                 body.body_id;
+        }
+        if (prepared_mesh_geometry_cache_.size() >=
+            capability_.runtime_query_max_world_bodies) {
+          return "prepared triangle-mesh cache exceeds qualified body bound";
+        }
         std::string mesh_error;
-        auto mesh_path =
-            resolve_mesh_resource_uri(*geom.source_uri, package_paths_,
-                                      mesh_error);
+        auto mesh_path = resolve_mesh_resource_uri(
+            *geom.source_uri, package_paths_, mesh_error);
         if (!mesh_path) {
           return "triangle mesh geometry could not resolve source_uri for " +
                  body.body_id + ": " + mesh_error;
@@ -1266,6 +1543,7 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
                  ": " + mesh_path->string();
         }
         shape = mesh;
+        prepared_mesh_geometry_cache_[cache_key] = mesh;
         break;
       }
       case core::CollisionGeometryKind::kCapsule:
@@ -1351,7 +1629,13 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
       }
       const auto first = std::min(it_a->second, it_b->second);
       const auto second = std::max(it_a->second, it_b->second);
-      if (active_pair_indices.insert({first, second}).second) {
+      if (active_pair_indices.find({first, second}) ==
+          active_pair_indices.end()) {
+        if (active_pair_indices.size() >=
+            capability_.runtime_query_max_collision_pairs) {
+          return "runtime collision-pair count exceeds qualified bound";
+        }
+        active_pair_indices.insert({first, second});
         active_collision_model_->addCollisionPair(
             pinocchio::CollisionPair(first, second));
       }
@@ -1367,7 +1651,50 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
                                                   synced_scene_geometry_names_,
                                                   synced_raw_name_to_body_id_);
 
+  if (auto runtime_binding_error = rebuild_runtime_pair_bindings_locked()) {
+    return runtime_binding_error;
+  }
+
   synced_snapshot_revision_ = snapshot.revision;
+  return std::nullopt;
+}
+
+std::optional<std::string>
+ManyForgeCollisionEngine::rebuild_runtime_pair_bindings_locked() {
+  runtime_pair_bindings_.clear();
+  runtime_collision_observations_.clear();
+  runtime_clearance_observations_.clear();
+  if (!active_collision_model_) {
+    return "runtime collision model is not initialized";
+  }
+  const auto pair_count = active_collision_model_->collisionPairs.size();
+  if (pair_count > capability_.runtime_query_max_collision_pairs) {
+    return "runtime collision-pair count exceeds qualified bound";
+  }
+  runtime_pair_bindings_.resize(pair_count);
+  runtime_collision_observations_.reserve(pair_count);
+  runtime_clearance_observations_.reserve(pair_count);
+  for (std::size_t i = 0; i < pair_count; ++i) {
+    const auto& pair = active_collision_model_->collisionPairs[i];
+    if (pair.first >= active_collision_model_->geometryObjects.size() ||
+        pair.second >= active_collision_model_->geometryObjects.size()) {
+      continue;
+    }
+    const auto& raw_a = active_collision_model_->geometryObjects[pair.first].name;
+    const auto& raw_b = active_collision_model_->geometryObjects[pair.second].name;
+    const auto body_a = synced_raw_to_body_map_.find(raw_a);
+    const auto body_b = synced_raw_to_body_map_.find(raw_b);
+    if (body_a == synced_raw_to_body_map_.end() ||
+        body_b == synced_raw_to_body_map_.end()) {
+      continue;
+    }
+    auto& binding = runtime_pair_bindings_[i];
+    binding.mapped = true;
+    binding.pair = {body_a->second, body_b->second};
+    if (binding.pair.body_b < binding.pair.body_a) {
+      std::swap(binding.pair.body_a, binding.pair.body_b);
+    }
+  }
   return std::nullopt;
 }
 

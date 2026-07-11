@@ -13,7 +13,6 @@
 
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
-#include <manyforge_core/ports/iplanning_context.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 
@@ -193,8 +192,8 @@ class ParallelCollisionValidationWorkerPool {
   /// kSingleContextExclusive. Null entries are ignored. The pool routes every
   /// waypoint through ICollisionQueryEngine::check(snapshot, query, policy,
   /// cancel) through the coordinator's engine-native path; this overload never
-  /// adapts engines into `IPlanningContext` and never touches planner-owned
-  /// scene state.
+  /// adapts engines into a combined planner facade and never touches
+  /// planner-owned scene state.
   ///
   /// The snapshot is immutable and shared across all workers. Telemetry
   /// collision geometry count is sourced directly from

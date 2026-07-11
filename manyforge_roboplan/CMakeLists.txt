@@ -89,7 +89,8 @@ endif()
 # Native backend library
 add_library(manyforge_roboplan
   src/roboplan_planner_backend.cpp
-  src/roboplan_planning_context.cpp
+  src/roboplan_projection_backend.cpp
+  src/roboplan_focused_adapters.cpp
   src/roboplan_execution_backend.cpp
   src/roboplan_execution_state_sink.cpp
   src/native_kernel_factory.cpp

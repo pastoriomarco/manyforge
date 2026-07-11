@@ -349,9 +349,9 @@ enum class ExecutionStopSnapshotSource {
   kExecutionBackendFeedback,
   /// Fallback: kernel's most-recent execution snapshot.
   kKernelExecutionSnapshot,
-  /// Last resort: planning-context state. Precision-contact node
+  /// Last resort: observed-state provider sample. Precision-contact node
   /// families MUST reject this source.
-  kPlanningContextState,
+  kObservedStateProvider,
 };
 
 /// Stop-state observation captured by the kernel after a

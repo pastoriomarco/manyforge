@@ -6,6 +6,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 
 namespace manyforge::core {
@@ -206,6 +207,37 @@ TEST(OperatorStopWorkerTest, InvalidatingGenerationMakesOldWorkerNotCurrent) {
   EXPECT_TRUE(current_before_cancel.load(std::memory_order_acquire));
   EXPECT_FALSE(current_after_cancel.load(std::memory_order_acquire));
   worker.join_finished();
+}
+
+TEST(OperatorStopWorkerTest, CompletionRunsAfterWorkerBecomesInactive) {
+  OperatorStopWorker worker;
+  std::atomic<bool> callback_ran{false};
+  std::atomic<bool> callback_observed_inactive{false};
+
+  ASSERT_TRUE(worker.start(
+      [](std::uint64_t, std::stop_token) {},
+      [&]() {
+        callback_observed_inactive.store(!worker.active(),
+                                         std::memory_order_release);
+        callback_ran.store(true, std::memory_order_release);
+      }));
+  ASSERT_TRUE(worker.wait_for(std::chrono::seconds(1)));
+  worker.join_finished();
+
+  EXPECT_TRUE(callback_ran.load(std::memory_order_acquire));
+  EXPECT_TRUE(
+      callback_observed_inactive.load(std::memory_order_acquire));
+}
+
+TEST(OperatorStopWorkerTest, CompletionExceptionDoesNotTerminateWorker) {
+  OperatorStopWorker worker;
+
+  ASSERT_TRUE(worker.start(
+      [](std::uint64_t, std::stop_token) {},
+      []() { throw std::runtime_error("completion callback failed"); }));
+  EXPECT_TRUE(worker.wait_for(std::chrono::seconds(1)));
+  worker.join_finished();
+  EXPECT_FALSE(worker.active());
 }
 
 TEST(OperatorStopWorkerTest, StoresAndClearsTerminalDiagnostics) {
