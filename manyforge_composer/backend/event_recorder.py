@@ -18,6 +18,13 @@ import threading
 import time
 from typing import Any, Optional
 
+from .stop_decision_assembler import (
+    StopDecisionAssembler,
+    StopDecisionBoundary,
+    StopDecisionRecord,
+    sequence_ordered,
+)
+
 logger = logging.getLogger(__name__)
 
 _ALLOWED_EVENT_TYPES = {
@@ -210,19 +217,6 @@ class _LatencyHistogram:
 # Incident-embed proximity window (recorder event indices): a chain older
 # than this many recorder events is never attached by the channel fallback.
 _STOP_DECISION_EMBED_WINDOW = 500
-_STOP_TERMINAL_STATES = frozenset({"Stopped", "Interrupted", "InterventionRequired"})
-_EPISODE_ABANDON_STATES = frozenset(
-    {"Executing", "Planning", "Validating", "Idle", "Completed"}
-)
-# Curated subset of stop/preempt detail keys carried into the decision chain.
-_STOP_CHAIN_DETAIL_KEYS = (
-    "requested_stop_mode",
-    "executed_stop_mode",
-    "controlled_stop_success",
-    "emergency_fallback",
-    "hard_stop_transitioned",
-    "stop_command_source",
-)
 _KERNEL_NATIVE_CHANNEL_LIMIT = 2000
 _KERNEL_NATIVE_ERROR_TYPES = {
     "error_raised",
@@ -783,6 +777,11 @@ class EventRecorder:
         # CycleManager snapshots. Do not call observe() while holding
         # CycleManager._lock; use recorder -> cycle-manager order only.
         self._lock = threading.RLock()
+        # Serializes native-sequence staging, assembly, run boundaries, and
+        # source rotation across the HTTP, WebSocket, shutdown, and background
+        # drain surfaces. It is always acquired before `_lock`; neither lock is
+        # part of a controller/runtime-safety path.
+        self._native_ingest_lock = threading.RLock()
         self._failure_archive_queue: queue.Queue[_FailureArchiveJob | None] | None = None
         self._failure_archive_worker: threading.Thread | None = None
         if self._failure_archive_dir is not None:
@@ -827,14 +826,25 @@ class EventRecorder:
         # OW1 loss-visibility state: last kernel dispatch sequence seen, the
         # last pipeline drop totals, and the full-fidelity dedup cursor.
         self._last_kernel_sequence = 0
+        self._kernel_event_source_generation = 1
+        self._active_kernel_event_source_identity: Optional[int] = None
+        # RT-8F NRT reorder stage. Kernel sequence is assigned before subscriber
+        # dispatch, so concurrent emitters may reach the collector in inverse
+        # arrival order. Production calls provide pipeline_status and are held
+        # here until the next contiguous sequence is available. The bound is
+        # equal to the upstream collector ring; overflow is explicit loss.
+        self._next_kernel_sequence_expected: Optional[int] = None
+        self._native_sequence_loss_skip_through = 0
+        self._pending_native_events_by_sequence: dict[int, dict[str, Any]] = {}
+        self._native_sequence_reorder_capacity = 4096
         self._last_pipeline_drop_totals = (0, 0)
         self._last_full_fidelity_kernel_event_index = 0
         self._kernel_gap_records_total = 0
         self._last_kernel_gap_wall: Optional[str] = None
-        # OW4 stop-decision assembler: one open "stop episode" at a time,
-        # built from the full-fidelity native event stream and closed into a
-        # durable stop_decision_chain record on a terminal transition.
-        self._stop_episode: Optional[dict[str, Any]] = None
+        # RT-8F: bounded, sequence-authoritative state machine isolated from
+        # recorder storage.  The recorder lock serializes it; the assembler has
+        # no lock and no I/O of its own.
+        self._stop_decision_assembler = StopDecisionAssembler(capacity=64)
         self._last_stop_decision: Optional[dict[str, Any]] = None
         # OW6 per-run latency histograms + bounded pending-start tracking.
         self._latency_histograms: dict[str, _LatencyHistogram] = {
@@ -852,7 +862,6 @@ class EventRecorder:
         }
         self._last_scene_snapshot_lease_reason: Optional[str] = None
         self._last_scene_snapshot_lease_wall: Optional[str] = None
-        self._stop_chain_execution_marker: Optional[tuple[int, str]] = None
         # Monotonic<->wall clock anchor for kernel-stamped timestamps
         # (observability plan OW2). None until the kernel client provides one;
         # without it, kernel-event wall times fall back to receipt time.
@@ -1074,6 +1083,11 @@ class EventRecorder:
             }
 
     def observe(self, state, *, force: bool = False) -> None:
+        """Serialize cycle/run boundaries with native stop-chain ingestion."""
+        with self._native_ingest_lock:
+            self._observe_serialized(state, force=force)
+
+    def _observe_serialized(self, state, *, force: bool = False) -> None:
         """Poll the current ComposerState and record semantic deltas.
 
         Polling callers (history/digest routes, websocket pump) are
@@ -1368,235 +1382,143 @@ class EventRecorder:
         with self._lock:
             return dict(self._last_stop_decision) if self._last_stop_decision else None
 
-    def _observe_stop_decision_event_locked(
+    def _record_stop_decision_records(
         self,
-        native_type: str,
-        native_event: dict[str, Any],
-        details: dict[str, Any],
-    ) -> Optional[dict[str, Any]]:
-        """Advance the stop-episode state machine by one native event.
-
-        Returns the finished chain payload when this event closed an episode
-        (caller records it outside this locked section). Pure assembly over
-        evidence the kernel already emits (plan OW4): opens on stop intent or
-        an interrupt latch, accumulates preemption/issue evidence, closes on
-        a terminal transition, abandons silently when execution resumes
-        without a terminal stop. Terminal transitions with no visible cause
-        still produce a chain (trigger="unobserved") — partial evidence is
-        reported loudly, never dropped.
-        """
-        timestamp_ns = int(native_event.get("timestamp_ns") or 0)
-        execution_id = int(native_event.get("execution_id") or 0)
-        sequence = int(native_event.get("sequence") or 0)
-
-        def _open_episode() -> dict[str, Any]:
-            if self._stop_episode is None:
-                self._stop_episode = {
-                    "started_ts_ns": timestamp_ns,
-                    "execution_id": execution_id,
-                    "first_sequence": sequence,
-                }
-            return self._stop_episode
-
-        if native_type == "stop_requested":
-            episode = _open_episode()
-            episode.setdefault("requested_ts_ns", timestamp_ns)
-            reason = str(details.get("reason") or "")
-            if reason:
-                episode.setdefault("stop_reason", reason)
-            return None
-        if native_type == "interrupt_latched":
-            episode = _open_episode()
-            for key in ("latch_id", "source_id", "policy_id"):
-                value = details.get(key)
-                if value:
-                    episode.setdefault(key, str(value))
-            episode.setdefault("latched_ts_ns", timestamp_ns)
-            return None
-        if native_type == "interrupt_preempt_applied":
-            if self._stop_episode is not None:
-                for key in ("preemption_action", "preemption_result"):
-                    value = details.get(key)
-                    if value:
-                        self._stop_episode[key] = str(value)
-                for key in _STOP_CHAIN_DETAIL_KEYS:
-                    value = details.get(key)
-                    if value:
-                        self._stop_episode.setdefault(key, str(value))
-            return None
-        if native_type == "stop_issued":
-            # stop_issued is direct stop-intent evidence and must be able to
-            # OPEN an episode: the pending-stop execute-admission path emits
-            # only kStopIssued (no second kStopRequested), and the racing
-            # ->Planning transition may have just abandoned the busy-path
-            # episode.
-            episode = _open_episode()
-            episode.setdefault("issued_ts_ns", timestamp_ns)
-            for key in _STOP_CHAIN_DETAIL_KEYS:
-                value = details.get(key)
-                if value:
-                    episode.setdefault(key, str(value))
-            return None
-        if native_type != "state_transition":
-            return None
-
-        to_state = str(details.get("to_state") or "")
-        if to_state in _EPISODE_ABANDON_STATES:
-            # Execution resumed / completed / reset to idle without a stop
-            # terminal: the episode (if any) never became a stop decision.
-            self._stop_episode = None
-            self._stop_chain_execution_marker = None
-            return None
-        if to_state == "Failed" and self._stop_episode is None:
-            # A plain planning/validation failure is not a stop decision.
-            return None
-        if to_state != "Failed" and to_state not in _STOP_TERMINAL_STATES:
-            return None
-
-        episode = self._stop_episode
-        abandoned_episode_execution: Optional[str] = None
-        if (
-            episode is not None
-            and execution_id
-            and int(episode.get("execution_id") or 0)
-            and int(episode["execution_id"]) != execution_id
-        ):
-            # Terminal from a DIFFERENT execution than the open episode:
-            # never merge cross-execution evidence into one chain. Abandon
-            # the stale episode loudly (its id rides the new chain) and
-            # treat this terminal on its own evidence.
-            abandoned_episode_execution = str(episode["execution_id"])
-            episode = None
-            self._stop_episode = None
-        if episode is None:
-            if self._stop_chain_execution_marker == (execution_id, to_state):
-                # A duplicate terminal for a stop already explained (the
-                # commit-override event followed by the regular transition
-                # emits the SAME to_state for the SAME execution). A LATER
-                # terminal with a different state (e.g. Stopped ->
-                # InterventionRequired after a failed reset) is a new
-                # decision and must produce its own chain.
-                return None
-            episode = {
-                "started_ts_ns": timestamp_ns,
-                "execution_id": execution_id,
-                "first_sequence": sequence,
-            }
-        self._stop_episode = None
-        chain_execution_id = execution_id or int(episode.get("execution_id") or 0)
-        self._stop_chain_execution_marker = (chain_execution_id, to_state)
-
-        source_id = str(episode.get("source_id") or "")
-        stop_reason = str(episode.get("stop_reason") or "")
-        if source_id == _RUNTIME_COLLISION_FAULT_SOURCE_ID:
-            trigger = "fault"
-        elif source_id or episode.get("latch_id"):
-            trigger = "interrupt"
-        elif "reset" in stop_reason:
-            trigger = "reset"
-        elif "requested_ts_ns" in episode or "issued_ts_ns" in episode:
-            trigger = "operator"
-        else:
-            trigger = "unobserved"
-
-        chain: dict[str, Any] = {
-            "trigger": trigger,
-            "terminal_state": to_state,
-            "kernel_execution_id": str(chain_execution_id),
-        }
-        if abandoned_episode_execution is not None:
-            chain["abandoned_episode_execution_id"] = abandoned_episode_execution
-        terminal_reason = str(details.get("reason") or "")
-        if terminal_reason:
-            chain["terminal_reason"] = terminal_reason
-        if str(details.get("terminal_authority_override") or "") == "true":
-            chain["override"] = "true"
-            proposed = str(details.get("proposed_terminal") or "")
-            if proposed:
-                chain["proposed_terminal"] = proposed
-        for key in (
-            "stop_reason",
-            "latch_id",
-            "source_id",
-            "policy_id",
-            "preemption_action",
-            "preemption_result",
-            *_STOP_CHAIN_DETAIL_KEYS,
-        ):
-            value = episode.get(key)
-            if value:
-                chain[key] = str(value)
-        requested = episode.get("requested_ts_ns")
-        issued = episode.get("issued_ts_ns")
-        latched = episode.get("latched_ts_ns")
-        if requested and issued and issued >= requested:
-            chain["request_to_issued_ns"] = str(issued - requested)
-        if issued and timestamp_ns >= issued:
-            chain["issued_to_terminal_ns"] = str(timestamp_ns - issued)
-        if requested and timestamp_ns >= requested:
-            chain["request_to_terminal_ns"] = str(timestamp_ns - requested)
-        if latched and timestamp_ns >= latched:
-            chain["latch_to_terminal_ns"] = str(timestamp_ns - latched)
-        if episode.get("first_sequence"):
-            chain["first_kernel_sequence"] = str(episode["first_sequence"])
-        if sequence:
-            chain["terminal_kernel_sequence"] = str(sequence)
-        return chain
-
-    def _record_kernel_event_gaps(
-        self,
-        events: list[dict[str, Any]],
-        pipeline_status: Optional[dict[str, int]],
+        records: list[StopDecisionRecord],
     ) -> None:
-        """Turn sequence gaps and pipeline drop-counter advances into durable
-        WARN evidence (observability plan P4: loud loss, never silent)."""
-        gap_details: dict[str, str] = {}
-        with self._lock:
-            for native_event in events:
-                sequence = int(native_event.get("sequence") or 0)
-                if sequence <= 0:
-                    continue
-                if (
-                    self._last_kernel_sequence
-                    and sequence > self._last_kernel_sequence + 1
-                ):
-                    gap_details.setdefault(
-                        "missed_min", str(self._last_kernel_sequence + 1)
-                    )
-                    gap_details["missed_max"] = str(sequence - 1)
-                if sequence > self._last_kernel_sequence:
-                    self._last_kernel_sequence = sequence
-            if pipeline_status:
-                collector = int(
-                    pipeline_status.get("collector_dropped_total") or 0
-                )
-                manager = int(pipeline_status.get("manager_dropped_total") or 0)
-                last_collector, last_manager = self._last_pipeline_drop_totals
-                if collector > last_collector or manager > last_manager:
-                    gap_details["collector_dropped_total"] = str(collector)
-                    gap_details["manager_dropped_total"] = str(manager)
-                    gap_details["collector_dropped_delta"] = str(
-                        collector - last_collector
-                    )
-                    gap_details["manager_dropped_delta"] = str(
-                        manager - last_manager
-                    )
-                self._last_pipeline_drop_totals = (collector, manager)
-        if gap_details:
+        """Persist derived records returned by the pure RT-8F assembler."""
+        for record in records:
+            details = dict(record.details)
             with self._lock:
-                self._kernel_gap_records_total += 1
-                self._last_kernel_gap_wall = _wall_timestamp_iso()
-                # Loss invalidates the open stop episode: evidence between
-                # its events may be missing, so a chain assembled across the
-                # gap could conflate decisions. The raw kernel_native lane
-                # still carries whatever survived.
-                self._stop_episode = None
-                self._stop_chain_execution_marker = None
-            self._record_event(
-                event_type="kernel_event_gap",
-                execution_id=0,
-                details=gap_details,
+                details.setdefault(
+                    "kernel_event_source_generation",
+                    str(self._kernel_event_source_generation),
+                )
+            stop_latency = (
+                details.get("request_to_terminal_ns")
+                or details.get("latch_to_terminal_ns")
+                or details.get("issued_to_terminal_ns")
             )
+            if stop_latency is not None:
+                with self._lock:
+                    self._latency_histograms["stop"].observe(int(stop_latency))
+            self._record_event(
+                event_type="stop_decision_chain",
+                execution_id=record.execution_id,
+                details=details,
+                run_id=record.run_id,
+                timestamp_ns=record.timestamp_ns or time.monotonic_ns(),
+                kernel_timestamp=record.timestamp_ns > 0,
+                system_event=True,
+            )
+
+    def _record_kernel_event_gap(
+        self,
+        details: dict[str, str],
+        incomplete_records: list[StopDecisionRecord],
+    ) -> None:
+        """Persist one loss fact and the episodes it made non-authoritative."""
+        with self._lock:
+            self._kernel_gap_records_total += 1
+            self._last_kernel_gap_wall = _wall_timestamp_iso()
+            details = dict(details)
+            details.setdefault(
+                "kernel_event_source_generation",
+                str(self._kernel_event_source_generation),
+            )
+        self._record_event(
+            event_type="kernel_event_gap",
+            execution_id=0,
+            details=details,
+        )
+        self._record_stop_decision_records(incomplete_records)
+
+    def _pipeline_drop_gap(
+        self,
+        pipeline_status: Optional[dict[str, int]],
+    ) -> tuple[dict[str, str], list[StopDecisionRecord]]:
+        if not pipeline_status:
+            return {}, []
+        with self._lock:
+            collector = int(pipeline_status.get("collector_dropped_total") or 0)
+            manager = int(pipeline_status.get("manager_dropped_total") or 0)
+            last_collector, last_manager = self._last_pipeline_drop_totals
+            self._last_pipeline_drop_totals = (collector, manager)
+            if collector <= last_collector and manager <= last_manager:
+                return {}, []
+            details = {
+                "reason": "pipeline_drop_counter_advanced",
+                "collector_dropped_total": str(collector),
+                "manager_dropped_total": str(manager),
+                "collector_dropped_delta": str(max(0, collector - last_collector)),
+                "manager_dropped_delta": str(max(0, manager - last_manager)),
+            }
+            incomplete = self._stop_decision_assembler.invalidate_all(
+                "pipeline_drop_counter_advanced",
+                boundary=StopDecisionBoundary.EVENT_GAP,
+                timestamp_ns=time.monotonic_ns(),
+            )
+        return details, incomplete
+
+    def _sequence_gap_before(
+        self,
+        native_event: dict[str, Any],
+    ) -> tuple[dict[str, str], list[StopDecisionRecord], bool]:
+        """Advance the native high-water mark and reject non-authoritative order.
+
+        Returns (gap details, invalidated episodes, may_assemble). Duplicate
+        delivery is filtered before this method; a regression here is therefore
+        a genuine ordering fault, not a second HTTP/WebSocket drain.
+        """
+        sequence = int(native_event.get("sequence") or 0)
+        timestamp_ns = int(native_event.get("timestamp_ns") or time.monotonic_ns())
+        with self._lock:
+            if sequence <= 0:
+                details = {
+                    "reason": "native_event_missing_sequence",
+                    "native_event_type": str(native_event.get("type") or ""),
+                }
+                incomplete = self._stop_decision_assembler.invalidate_all(
+                    "native_event_missing_sequence",
+                    boundary=StopDecisionBoundary.EVENT_GAP,
+                    timestamp_ns=timestamp_ns,
+                )
+                return details, incomplete, False
+            if self._last_kernel_sequence and sequence <= self._last_kernel_sequence:
+                details = {
+                    "reason": "kernel_sequence_regression",
+                    "last_kernel_sequence": str(self._last_kernel_sequence),
+                    "received_kernel_sequence": str(sequence),
+                }
+                incomplete = self._stop_decision_assembler.invalidate_all(
+                    "kernel_sequence_regression",
+                    boundary=StopDecisionBoundary.EVENT_GAP,
+                    timestamp_ns=timestamp_ns,
+                )
+                return details, incomplete, False
+
+            details: dict[str, str] = {}
+            incomplete: list[StopDecisionRecord] = []
+            if (
+                self._last_kernel_sequence
+                and sequence > self._last_kernel_sequence + 1
+            ):
+                missed_min = self._last_kernel_sequence + 1
+                missed_max = sequence - 1
+                details = {
+                    "reason": "kernel_sequence_gap",
+                    "missed_min": str(missed_min),
+                    "missed_max": str(missed_max),
+                }
+                incomplete = self._stop_decision_assembler.invalidate_all(
+                    "kernel_sequence_gap",
+                    boundary=StopDecisionBoundary.EVENT_GAP,
+                    missing_sequence_start=missed_min,
+                    missing_sequence_end=missed_max,
+                    timestamp_ns=timestamp_ns,
+                )
+            self._last_kernel_sequence = sequence
+        return details, incomplete, True
 
     def kernel_event_gap_status(self) -> dict[str, Any]:
         """Gap-record accounting for the heartbeat surface."""
@@ -1606,7 +1528,383 @@ class EventRecorder:
                 "last_gap_wall": self._last_kernel_gap_wall,
             }
 
+    def _stage_sequence_authoritative_events(
+        self,
+        fresh_events: list[dict[str, Any]],
+        *,
+        strict_pipeline_order: bool,
+        pipeline_drop_advanced: bool,
+        pipeline_last_sequence_seen: int,
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[tuple[dict[str, str], list[StopDecisionRecord]]],
+    ]:
+        """Return events safe to consume in native-sequence order.
+
+        Tests and offline importers without pipeline status provide a complete
+        batch and are sorted directly. Production drains provide status and use
+        the bounded cross-drain reorder buffer.
+        """
+        if not strict_pipeline_order:
+            return sequence_ordered(fresh_events), []
+
+        unsequenced: list[dict[str, Any]] = []
+        regressed: list[dict[str, Any]] = []
+        gaps: list[tuple[dict[str, str], list[StopDecisionRecord]]] = []
+        with self._lock:
+            for event in fresh_events:
+                sequence = int(event.get("sequence") or 0)
+                if sequence <= 0:
+                    unsequenced.append(event)
+                    continue
+                if (
+                    self._next_kernel_sequence_expected is not None
+                    and sequence < self._next_kernel_sequence_expected
+                ):
+                    # Do not strand a stale/replayed payload below the reorder
+                    # cursor. The high-water check records it as a regression
+                    # and excludes it from causal assembly.
+                    regressed.append(event)
+                    continue
+                existing = self._pending_native_events_by_sequence.get(sequence)
+                if existing is not None:
+                    if existing != event:
+                        incomplete = self._stop_decision_assembler.invalidate_all(
+                            "duplicate_kernel_sequence_payload_mismatch",
+                            boundary=StopDecisionBoundary.EVENT_GAP,
+                            timestamp_ns=int(
+                                event.get("timestamp_ns") or time.monotonic_ns()
+                            ),
+                        )
+                        gaps.append(
+                            (
+                                {
+                                    "reason": "duplicate_kernel_sequence_payload_mismatch",
+                                    "kernel_sequence": str(sequence),
+                                },
+                                incomplete,
+                            )
+                        )
+                    continue
+                self._pending_native_events_by_sequence[sequence] = event
+
+            if self._next_kernel_sequence_expected is None:
+                if self._pending_native_events_by_sequence:
+                    # A nonzero first drop count proves the retained stream no
+                    # longer starts at sequence 1. Otherwise the recorder and
+                    # kernel are process-lifetime peers and sequence 1 is the
+                    # only safe initial watermark.
+                    self._next_kernel_sequence_expected = (
+                        min(self._pending_native_events_by_sequence)
+                        if pipeline_drop_advanced
+                        else 1
+                    )
+
+            if pipeline_drop_advanced:
+                self._native_sequence_loss_skip_through = max(
+                    self._native_sequence_loss_skip_through,
+                    pipeline_last_sequence_seen,
+                )
+
+            # A drop counter can advance on an empty drain. Remember the
+            # manager's sequence high-water so a later event cannot leave the
+            # buffer waiting forever for a sequence already proven lost. Skip
+            # only through that observed high-water; do not skip a merely late
+            # event beyond it.
+            if (
+                self._next_kernel_sequence_expected is not None
+                and self._next_kernel_sequence_expected
+                <= self._native_sequence_loss_skip_through
+                and self._next_kernel_sequence_expected
+                not in self._pending_native_events_by_sequence
+            ):
+                available_before_high_water = [
+                    sequence
+                    for sequence in self._pending_native_events_by_sequence
+                    if self._next_kernel_sequence_expected < sequence
+                    <= self._native_sequence_loss_skip_through
+                ]
+                self._next_kernel_sequence_expected = (
+                    min(available_before_high_water)
+                    if available_before_high_water
+                    else self._native_sequence_loss_skip_through + 1
+                )
+
+            if (
+                len(self._pending_native_events_by_sequence)
+                > self._native_sequence_reorder_capacity
+            ):
+                expected = self._next_kernel_sequence_expected or 0
+                next_available = min(self._pending_native_events_by_sequence)
+                incomplete = self._stop_decision_assembler.invalidate_all(
+                    "native_sequence_reorder_capacity_exceeded",
+                    boundary=StopDecisionBoundary.EVENT_GAP,
+                    missing_sequence_start=expected,
+                    missing_sequence_end=max(expected, next_available - 1),
+                    timestamp_ns=time.monotonic_ns(),
+                )
+                gaps.append(
+                    (
+                        {
+                            "reason": "native_sequence_reorder_capacity_exceeded",
+                            "expected_kernel_sequence": str(expected),
+                            "next_available_kernel_sequence": str(next_available),
+                            "reorder_capacity": str(
+                                self._native_sequence_reorder_capacity
+                            ),
+                        },
+                        incomplete,
+                    )
+                )
+                self._next_kernel_sequence_expected = next_available
+
+            ready: list[dict[str, Any]] = []
+            while self._next_kernel_sequence_expected is not None:
+                expected = self._next_kernel_sequence_expected
+                event = self._pending_native_events_by_sequence.pop(
+                    expected, None
+                )
+                if event is not None:
+                    ready.append(event)
+                    self._next_kernel_sequence_expected += 1
+                    continue
+                if expected <= self._native_sequence_loss_skip_through:
+                    available_before_high_water = [
+                        sequence
+                        for sequence in self._pending_native_events_by_sequence
+                        if expected < sequence
+                        <= self._native_sequence_loss_skip_through
+                    ]
+                    self._next_kernel_sequence_expected = (
+                        min(available_before_high_water)
+                        if available_before_high_water
+                        else self._native_sequence_loss_skip_through + 1
+                    )
+                    continue
+                break
+            if (
+                self._next_kernel_sequence_expected is not None
+                and self._next_kernel_sequence_expected
+                > self._native_sequence_loss_skip_through
+            ):
+                self._native_sequence_loss_skip_through = 0
+
+        # Missing-sequence evidence invalidates before any sequenced event in
+        # this call can appear to close a complete chain.
+        return [*unsequenced, *sequence_ordered(regressed), *ready], gaps
+
+    def _force_release_sequence_buffer(
+        self,
+        reason: str,
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[tuple[dict[str, str], list[StopDecisionRecord]]],
+    ]:
+        """Drain retained events at run/process termination with loud loss."""
+        with self._lock:
+            if not self._pending_native_events_by_sequence:
+                return [], []
+            ready = sequence_ordered(
+                self._pending_native_events_by_sequence.values()
+            )
+            first = int(ready[0].get("sequence") or 0)
+            expected = self._next_kernel_sequence_expected or first
+            self._pending_native_events_by_sequence.clear()
+            self._next_kernel_sequence_expected = (
+                int(ready[-1].get("sequence") or first) + 1
+            )
+            if first == expected:
+                return ready, []
+            incomplete = self._stop_decision_assembler.invalidate_all(
+                reason,
+                boundary=StopDecisionBoundary.EVENT_GAP,
+                missing_sequence_start=expected,
+                missing_sequence_end=max(expected, first - 1),
+                timestamp_ns=time.monotonic_ns(),
+            )
+            if self._last_kernel_sequence < first - 1:
+                self._last_kernel_sequence = first - 1
+            return ready, [
+                (
+                    {
+                        "reason": reason,
+                        "expected_kernel_sequence": str(expected),
+                        "next_available_kernel_sequence": str(first),
+                        "missed_min": str(expected),
+                        "missed_max": str(max(expected, first - 1)),
+                    },
+                    incomplete,
+                )
+            ]
+
+    def rotate_kernel_event_source(
+        self,
+        *,
+        kernel_replaced: bool,
+        reason: str,
+        drain_error: Optional[str] = None,
+        next_source_identity: Optional[int] = None,
+    ) -> None:
+        with self._native_ingest_lock:
+            self._rotate_kernel_event_source_serialized(
+                kernel_replaced=kernel_replaced,
+                reason=reason,
+                drain_error=drain_error,
+                next_source_identity=next_source_identity,
+            )
+
+    def _rotate_kernel_event_source_serialized(
+        self,
+        *,
+        kernel_replaced: bool,
+        reason: str,
+        drain_error: Optional[str] = None,
+        next_source_identity: Optional[int] = None,
+    ) -> None:
+        """Fence recorder cursors when CycleManager/kernel ownership changes.
+
+        The caller drains the old manager first. A new manager always restarts
+        its arrival event_index; a new kernel also restarts native sequence.
+        Open old-source episodes are emitted as incomplete before generation is
+        advanced, so no chain can cross the authority boundary.
+        """
+        ready, gaps = self._force_release_sequence_buffer(
+            "kernel_event_source_rotation_with_unresolved_sequence"
+        )
+        for gap, incomplete in gaps:
+            self._record_kernel_event_gap(gap, incomplete)
+        self._record_sequence_ready_native_events(ready)
+        with self._lock:
+            incomplete = self._stop_decision_assembler.invalidate_all(
+                reason,
+                boundary=StopDecisionBoundary.KERNEL_SOURCE_REPLACED,
+                timestamp_ns=time.monotonic_ns(),
+            )
+        if drain_error:
+            self._record_kernel_event_gap(
+                {
+                    "reason": "kernel_event_source_drain_failed",
+                    "rotation_reason": reason,
+                    "error": drain_error[:500],
+                },
+                incomplete,
+            )
+        else:
+            self._record_stop_decision_records(incomplete)
+        with self._lock:
+            self._kernel_event_source_generation += 1
+            self._active_kernel_event_source_identity = next_source_identity
+            self._last_full_fidelity_kernel_event_index = 0
+            self._last_recorded_native_kernel_event_index = 0
+            self._last_pipeline_drop_totals = (0, 0)
+            self._native_sequence_loss_skip_through = 0
+            self._pending_native_events_by_sequence.clear()
+            if kernel_replaced:
+                self._last_kernel_sequence = 0
+                self._next_kernel_sequence_expected = None
+            else:
+                self._next_kernel_sequence_expected = self._last_kernel_sequence + 1
+
+    def _record_sequence_ready_native_events(
+        self,
+        ordered_events: list[dict[str, Any]],
+    ) -> None:
+        for native_event in ordered_events:
+            native_type = str(native_event.get("type") or "")
+            gap, incomplete, may_assemble = self._sequence_gap_before(native_event)
+            if gap:
+                self._record_kernel_event_gap(gap, incomplete)
+
+            details = self._native_event_details(native_event)
+            error_message = details.pop("_error_message", None)
+            if error_message:
+                details["error"] = error_message
+            sequence = int(native_event.get("sequence") or 0)
+            if sequence:
+                details["kernel_sequence"] = str(sequence)
+            with self._lock:
+                details["kernel_event_source_generation"] = str(
+                    self._kernel_event_source_generation
+                )
+            native_run_id = native_event.get("program_run_id")
+            if not native_run_id and isinstance(
+                native_event.get("details"), dict
+            ):
+                native_run_id = native_event["details"].get("program_run_id")
+            with self._lock:
+                current_run_id = (
+                    self._current_run.run_id
+                    if self._current_run is not None
+                    else None
+                )
+            assembly_run_id = (
+                str(native_run_id) if native_run_id else current_run_id
+            )
+            self._record_event(
+                event_type=f"kernel_native_{native_type}",
+                execution_id=int(native_event.get("execution_id") or 0),
+                details=details or None,
+                run_id=str(native_run_id) if native_run_id else None,
+                timestamp_ns=int(
+                    native_event.get("timestamp_ns") or time.monotonic_ns()
+                ),
+                kernel_timestamp=bool(native_event.get("timestamp_ns")),
+            )
+            # OW6 metrics and RT-8F assembly consume exactly the same deduped,
+            # sequence-authoritative stream.  Persistence occurs after the
+            # recorder lock is released.
+            with self._lock:
+                self._observe_scene_snapshot_lease_event_locked(
+                    native_type, details
+                )
+                self._observe_latency_event_locked(native_type, native_event)
+                finished_records = (
+                    self._stop_decision_assembler.observe(
+                        native_type,
+                        native_event,
+                        details,
+                        run_id=assembly_run_id,
+                    )
+                    if may_assemble
+                    else []
+                )
+            self._record_stop_decision_records(finished_records)
+
+
+
     def record_native_kernel_events(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        pipeline_status: Optional[dict[str, int]] = None,
+        source_identity: Optional[int] = None,
+    ) -> None:
+        with self._native_ingest_lock:
+            if source_identity is not None:
+                if self._active_kernel_event_source_identity is None:
+                    self._active_kernel_event_source_identity = source_identity
+                elif source_identity != self._active_kernel_event_source_identity:
+                    # A route/WS drain can capture the old manager immediately
+                    # before program load rotates the source. Never admit that
+                    # late batch into the restarted event-index/sequence domain.
+                    # An empty stale callback is only a benign observer race:
+                    # source rotation already sealed the old domain and no
+                    # evidence was rejected, so do not fabricate a loss record.
+                    if events:
+                        self._record_kernel_event_gap(
+                            {
+                                "reason": "stale_kernel_event_source_rejected",
+                                "rejected_event_count": str(len(events)),
+                            },
+                            [],
+                        )
+                    return
+            self._record_native_kernel_events_serialized(
+                events,
+                pipeline_status=pipeline_status,
+            )
+
+    def _record_native_kernel_events_serialized(
         self,
         events: list[dict[str, Any]],
         *,
@@ -1631,7 +1929,11 @@ class EventRecorder:
         `event_index` dedupes events drained through both `/api/kernel/events`
         and the websocket hub.
         """
-        self._record_kernel_event_gaps(events, pipeline_status)
+        # Deduplicate in collector-arrival order before sorting.  event_index is
+        # assigned on arrival and can be the inverse of kernel sequence when
+        # two producer threads dispatch concurrently; sorting first would let
+        # the higher arrival index advance the cursor and drop a distinct event.
+        fresh_events: list[dict[str, Any]] = []
         for native_event in events:
             native_type = str(native_event.get("type") or "")
             native_index = int(native_event.get("event_index") or 0)
@@ -1640,78 +1942,32 @@ class EventRecorder:
                     native_index > 0
                     and native_index <= self._last_full_fidelity_kernel_event_index
                 ):
-                    record_full = False
-                else:
-                    record_full = bool(native_type)
-                    if native_index > 0:
-                        self._last_full_fidelity_kernel_event_index = native_index
-            if record_full:
-                details = self._native_event_details(native_event)
-                error_message = details.pop("_error_message", None)
-                if error_message:
-                    details["error"] = error_message
-                sequence = int(native_event.get("sequence") or 0)
-                if sequence:
-                    details["kernel_sequence"] = str(sequence)
-                native_run_id = native_event.get("program_run_id")
-                if not native_run_id and isinstance(
-                    native_event.get("details"), dict
-                ):
-                    native_run_id = native_event["details"].get("program_run_id")
-                self._record_event(
-                    event_type=f"kernel_native_{native_type}",
-                    execution_id=int(native_event.get("execution_id") or 0),
-                    details=details or None,
-                    run_id=str(native_run_id) if native_run_id else None,
-                    timestamp_ns=int(
-                        native_event.get("timestamp_ns") or time.monotonic_ns()
-                    ),
-                    kernel_timestamp=bool(native_event.get("timestamp_ns")),
-                )
-                # OW4: advance the stop-decision assembler on the deduped
-                # native stream; a closed episode becomes one durable chain.
-                # OW6: the same deduped stream feeds the per-run latency
-                # histograms (recorder-thread work only).
-                with self._lock:
-                    self._observe_scene_snapshot_lease_event_locked(
-                        native_type, details
-                    )
-                    self._observe_latency_event_locked(
-                        native_type, native_event
-                    )
-                    finished_chain = self._observe_stop_decision_event_locked(
-                        native_type, native_event, details
-                    )
-                    if finished_chain is not None:
-                        # Prefer request->terminal, then latch->terminal, then
-                        # issued->terminal. The last covers the pending-stop
-                        # execute-admission path, which opens an episode on
-                        # stop_issued alone (no stop_requested, no
-                        # interrupt_latched) and would otherwise be silently
-                        # excluded from the stop-latency histogram. All three
-                        # are non-negative durations by assembler construction.
-                        stop_latency = (
-                            finished_chain.get("request_to_terminal_ns")
-                            or finished_chain.get("latch_to_terminal_ns")
-                            or finished_chain.get("issued_to_terminal_ns")
-                        )
-                        if stop_latency is not None:
-                            self._latency_histograms["stop"].observe(
-                                int(stop_latency)
-                            )
-                if finished_chain is not None:
-                    self._record_event(
-                        event_type="stop_decision_chain",
-                        execution_id=int(native_event.get("execution_id") or 0),
-                        details=finished_chain,
-                        run_id=str(native_run_id) if native_run_id else None,
-                        timestamp_ns=int(
-                            native_event.get("timestamp_ns")
-                            or time.monotonic_ns()
-                        ),
-                        kernel_timestamp=bool(native_event.get("timestamp_ns")),
-                        system_event=True,
-                    )
+                    continue
+                if native_index > 0:
+                    self._last_full_fidelity_kernel_event_index = native_index
+            if native_type:
+                fresh_events.append(native_event)
+
+        pipeline_gap, pipeline_incomplete = self._pipeline_drop_gap(
+            pipeline_status
+        )
+        ordered_events, reorder_gaps = self._stage_sequence_authoritative_events(
+            fresh_events,
+            strict_pipeline_order=pipeline_status is not None,
+            pipeline_drop_advanced=bool(pipeline_gap),
+            pipeline_last_sequence_seen=int(
+                (pipeline_status or {}).get("last_sequence_seen") or 0
+            ),
+        )
+        if pipeline_gap:
+            self._record_kernel_event_gap(pipeline_gap, pipeline_incomplete)
+        for gap, incomplete in reorder_gaps:
+            self._record_kernel_event_gap(gap, incomplete)
+
+        self._record_sequence_ready_native_events(ordered_events)
+        # Curated projections retain collector-arrival order.  They are UI
+        # evidence only and their independent cursor must likewise advance in
+        # arrival order rather than kernel-sequence order.
         for native_event in events:
             native_type = str(native_event.get("type") or "")
             native_index = int(native_event.get("event_index") or 0)
@@ -3092,19 +3348,28 @@ class EventRecorder:
                         "recovery_context_id",
                         recovery_context_id,
                     )
-                    details_payload.setdefault(
-                        "stop_decision_id",
-                        _stable_stop_decision_id(
-                            recovery_context_id=recovery_context_id,
-                            terminal_state=str(
-                                details_payload.get("terminal_state") or "unknown"
+                    if details_payload.get("chain_complete") == "true":
+                        details_payload.setdefault(
+                            "stop_decision_id",
+                            _stable_stop_decision_id(
+                                recovery_context_id=recovery_context_id,
+                                terminal_state=str(
+                                    details_payload.get("terminal_state")
+                                    or "unknown"
+                                ),
+                                terminal_kernel_sequence=str(
+                                    details_payload.get(
+                                        "terminal_kernel_sequence"
+                                    )
+                                    or self._event_index
+                                ),
                             ),
-                            terminal_kernel_sequence=str(
-                                details_payload.get("terminal_kernel_sequence")
-                                or self._event_index
-                            ),
-                        ),
-                    )
+                        )
+                    else:
+                        # Spec 520 section 6.4 reserves stop_decision_id for a
+                        # completed causal chain.  Incomplete fragments retain
+                        # recovery_context_id and their native sequence range.
+                        details_payload.pop("stop_decision_id", None)
                 # Correlation anchors for the incident-embed selector. Stamp
                 # them before serialization so durable trace records and the
                 # in-memory latest-chain view carry identical evidence.
@@ -3429,6 +3694,19 @@ class EventRecorder:
 
     def _finish_current_run(self) -> None:
         if self._current_run is not None:
+            ready, reorder_gaps = self._force_release_sequence_buffer(
+                "run_end_with_unresolved_native_sequence_gap"
+            )
+            for gap, incomplete in reorder_gaps:
+                self._record_kernel_event_gap(gap, incomplete)
+            self._record_sequence_ready_native_events(ready)
+            incomplete = self._stop_decision_assembler.invalidate_all(
+                "run_ended_before_stop_outcome",
+                boundary=StopDecisionBoundary.RUN_END,
+                timestamp_ns=time.monotonic_ns(),
+                run_id=self._current_run.run_id,
+            )
+            self._record_stop_decision_records(incomplete)
             self._last_run = self._current_run
             # Latency histograms are stashed at the NEXT run's start (not here)
             # so a trailing sample landing after finish is still attributed to
@@ -3856,6 +4134,21 @@ class EventRecorder:
         Returns True when both workers exited within the timeout. Safe to
         call more than once.
         """
+        with self._native_ingest_lock:
+            ready, reorder_gaps = self._force_release_sequence_buffer(
+                "process_exit_with_unresolved_native_sequence_gap"
+            )
+            for gap, incomplete in reorder_gaps:
+                self._record_kernel_event_gap(gap, incomplete)
+            self._record_sequence_ready_native_events(ready)
+            with self._lock:
+                incomplete = self._stop_decision_assembler.invalidate_all(
+                    "process_exit_before_stop_outcome",
+                    boundary=StopDecisionBoundary.PROCESS_EXIT,
+                    timestamp_ns=time.monotonic_ns(),
+                )
+            self._record_stop_decision_records(incomplete)
+
         ok = True
         # Order matters: the failure-archive/prune worker emits durable
         # evidence (trace_pruned, archives) through the JSONL writer. Joining

@@ -375,6 +375,41 @@ TEST(RecoveryAssessmentTest, CertifiedQuiescentIsRetryReady) {
 }
 
 TEST(RecoveryAssessmentTest,
+     PublicationHelperOwnsSemanticDecisionAndRecordMapping) {
+  KernelRecoveryAssessmentDTO previous;
+  auto capture = make_interrupted_capture(
+      InterruptPreemptionResult::kSucceeded, false, true);
+  const auto publication = prepare_recovery_assessment_publication(
+      previous, capture, RecoveryReadinessPolicy{}, "unit_test_trigger");
+
+  EXPECT_TRUE(publication.changed);
+  EXPECT_EQ(publication.candidate.status,
+            RecoveryAssessmentStatus::kRetryReady);
+  EXPECT_EQ(publication.event_details.at("assessment_revision"), "1");
+  EXPECT_EQ(publication.event_details.at("recovery_class"),
+            "runtime_collision");
+  EXPECT_EQ(publication.event_details.at("status"), "retry_ready");
+  EXPECT_EQ(publication.event_details.at("retry_admissible"), "true");
+  EXPECT_EQ(publication.event_details.at("trigger"), "unit_test_trigger");
+}
+
+TEST(RecoveryAssessmentTest,
+     PublicationHelperDoesNotChurnEquivalentAssessmentRecord) {
+  const auto capture = make_interrupted_capture(
+      InterruptPreemptionResult::kSucceeded, false, true);
+  const auto previous =
+      build_recovery_assessment(capture, RecoveryReadinessPolicy{}, 7);
+  const auto publication = prepare_recovery_assessment_publication(
+      previous, capture, RecoveryReadinessPolicy{}, "equivalent_refresh");
+
+  EXPECT_FALSE(publication.changed);
+  EXPECT_TRUE(publication.event_details.empty());
+  // Candidate carries the refreshed freshness facts/revision proposal; the
+  // kernel deliberately retains `previous` as the published assessment.
+  EXPECT_EQ(publication.candidate.assessment_revision, 9u);
+}
+
+TEST(RecoveryAssessmentTest,
      CertificateFromOtherExecutionIsNotCertification) {
   auto capture = make_interrupted_capture(
       InterruptPreemptionResult::kSucceeded, false, false);

@@ -4,8 +4,10 @@ from dataclasses import replace
 import json
 
 from manyforge_behavior.cycle_recovery import (
+    CycleRecoveryActionId,
     CycleRecoveryCoordinator,
     CycleRecoveryFacts,
+    RunRecoveryDisposition,
 )
 from manyforge_behavior.runtime_pause import RuntimePauseRegistry
 
@@ -43,7 +45,9 @@ def _ready_assessment(**overrides):
         latch_id="latch-42",
         stop_certificate_id="cert-42",
         stop_owner_generation=6,
-        observed_state_valid_until_ns=999_000_000,
+        # Absolute monotonic deadline. Keep the common fixture fresh without
+        # making otherwise-identical projections differ by construction.
+        observed_state_valid_until_ns=1 << 62,
         allowed_actions=["retry_motion_from_current_state", "reset_cycle"],
         reason_code="recovery_stop_certified",
         evidence_refs=["cert-42", "kernel-event:77"],
@@ -105,6 +109,41 @@ def test_plain_paused_cycle_has_no_recovery_offer():
         _facts(),
     )
     assert offer is None
+
+
+def test_run_directive_consumes_only_retry_ready_nonconfirming_primary():
+    coordinator = CycleRecoveryCoordinator()
+    coordinator.project(_ready_assessment(), _facts())
+
+    directive = coordinator.resolve_run_request()
+
+    assert directive.disposition == RunRecoveryDisposition.APPLY_PRIMARY
+    assert directive.action_id == CycleRecoveryActionId.RETRY_MOTION_FROM_CURRENT_STATE
+    assert directive.reason_code == "operator_run_primary_recovery"
+
+
+def test_run_directive_preserves_explicit_operator_choice():
+    coordinator = CycleRecoveryCoordinator()
+    coordinator.project(
+        _ready_assessment(
+            status="action_required",
+            allowed_actions=["acknowledge_and_continue", "reset_cycle"],
+            reason_code="operator_acknowledgement_required",
+        ),
+        _facts(),
+    )
+
+    directive = coordinator.resolve_run_request()
+
+    assert directive.disposition == RunRecoveryDisposition.EXPLICIT_ACTION_REQUIRED
+    assert directive.action_id is None
+    assert directive.reason_code == "operator_acknowledgement_required"
+
+
+def test_run_directive_bypasses_when_no_offer_exists():
+    directive = CycleRecoveryCoordinator().resolve_run_request()
+    assert directive.disposition == RunRecoveryDisposition.BYPASS
+    assert directive.offer is None
 
 
 def test_idle_kernel_runtime_fault_gets_cycle_only_exact_retry_action():

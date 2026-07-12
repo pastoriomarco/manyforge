@@ -711,6 +711,39 @@ bool recovery_assessment_semantically_differs(
          previous.reason_code != next.reason_code;
 }
 
+RecoveryAssessmentPublication prepare_recovery_assessment_publication(
+    const KernelRecoveryAssessmentDTO& previous,
+    const RecoveryAuthorityCapture& capture,
+    const RecoveryReadinessPolicy& policy,
+    std::string_view trigger) {
+  RecoveryAssessmentPublication publication;
+  publication.candidate = build_recovery_assessment(
+      capture, policy, previous.assessment_revision);
+  publication.changed = recovery_assessment_semantically_differs(
+      previous, publication.candidate);
+  if (!publication.changed) {
+    return publication;
+  }
+  const auto& next = publication.candidate;
+  publication.event_details = {
+      {"assessment_revision", std::to_string(next.assessment_revision)},
+      {"recovery_class", recovery_class_name(next.recovery_class)},
+      {"status", recovery_assessment_status_name(next.status)},
+      {"reason_code", next.reason_code},
+      {"retry_admissible", next.retry_admissible ? "true" : "false"},
+      {"stop_certificate_id", next.stop_certificate_id},
+      {"latch_id", next.latch_id},
+      {"source_id", next.source_id},
+      {"policy_id", next.policy_id},
+      {"queued_latch_present",
+       next.queued_latch_present ? "true" : "false"},
+      {"stronger_authority_active",
+       next.stronger_authority_active ? "true" : "false"},
+      {"trigger", std::string(trigger)},
+  };
+  return publication;
+}
+
 RecoveryAdmissionDecision evaluate_recovery_admission(
     const KernelRecoveryActionRequestDTO& request,
     const RecoveryAuthorityCapture& capture,

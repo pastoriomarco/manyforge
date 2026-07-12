@@ -374,7 +374,11 @@ class ComposerState:
         self._pose_source_drift_exceeded_since_ns: dict[tuple[str, str], int] = {}
         self._pose_source_drift_raised: set[tuple[str, str]] = set()
         self._pose_source_apply_lock = threading.Lock()
+        self._pose_source_invalidation_intent_lock = threading.Lock()
+        self._pose_source_invalidation_intent_count = 0
+        self._pose_source_invalidation_requested = threading.Event()
         self._pose_source_apply_pending: dict[str, dict[str, Any]] = {}
+        self._pose_source_apply_in_flight: dict[str, Any] | None = None
         self._pose_source_apply_running = False
         self._pose_source_apply_last_result: dict[str, Any] | None = None
         self._pose_source_apply_generation = 0
@@ -389,6 +393,7 @@ class ComposerState:
             "freshness_only_applied": 0,
             "no_op_skipped": 0,
             "stale_generation_dropped": 0,
+            "stale_result_ignored": 0,
             "errors": 0,
         }
         self._pose_source_apply_object_metrics: dict[str, dict[str, int]] = {}
@@ -965,6 +970,40 @@ class ComposerState:
             self._record_recovery_action_event,
         )
         self._recovery_offer_pump_wake.set()
+
+    def _rotate_kernel_event_source(
+        self,
+        previous_manager: Optional[CycleManager],
+        next_manager: CycleManager,
+        previous_kernel: KernelClient,
+        next_kernel: KernelClient,
+        *,
+        reason: str,
+    ) -> None:
+        """Drain the old manager and fence recorder sequence domains."""
+        drain_error: Optional[str] = None
+        if previous_manager is not None:
+            try:
+                previous_manager.drain_kernel_events_now()
+                self.event_recorder.record_native_kernel_events(
+                    previous_manager.get_kernel_events_since(0),
+                    pipeline_status=(
+                        previous_manager.kernel_event_pipeline_status()
+                    ),
+                    source_identity=id(previous_manager),
+                )
+            except Exception as exc:  # noqa: BLE001 - loss is recorded below.
+                drain_error = f"{type(exc).__name__}: {exc}"
+                logger.exception(
+                    "Failed to drain previous kernel event source during %s",
+                    reason,
+                )
+        self.event_recorder.rotate_kernel_event_source(
+            kernel_replaced=previous_kernel is not next_kernel,
+            reason=reason,
+            drain_error=drain_error,
+            next_source_identity=id(next_manager),
+        )
 
     def start_recovery_offer_pump(self) -> None:
         """Start the browser-independent NRT recovery event consumer."""
@@ -2360,11 +2399,31 @@ class ComposerState:
             self.request_visual_state_publish(reason=f"scene_edit_{request.operation}")
         return {"updated": updated, "needs_refresh": needs_refresh}
 
-    def refresh_visual_scene_objects_sync(self, *, reason: str = "") -> dict[str, Any]:
+    def refresh_visual_scene_objects_sync(
+        self,
+        *,
+        reason: str = "",
+        expected_pose_source_generation: int | None = None,
+    ) -> dict[str, Any]:
         """Refresh cached visual objects from the backend on a non-observer path."""
         if self.kernel is None:
             self.update_visual_scene_objects_snapshot([], error="kernel unavailable")
             return {"success": False, "error": "kernel unavailable", "reason": reason}
+        if expected_pose_source_generation is not None:
+            with self._pose_source_apply_lock:
+                current_generation = self._pose_source_apply_generation
+                if (
+                    self._pose_source_invalidation_requested.is_set()
+                    or expected_pose_source_generation != current_generation
+                ):
+                    return {
+                        "success": True,
+                        "skipped": True,
+                        "skip_reason": "pose_source_apply_generation_invalidated",
+                        "expected_generation": expected_pose_source_generation,
+                        "current_generation": current_generation,
+                        "reason": reason,
+                    }
         started = time.monotonic()
         with self._visual_scene_objects_lock:
             self._visual_scene_objects_refresh_attempt_ns = time.monotonic_ns()
@@ -2374,7 +2433,24 @@ class ComposerState:
             with self._visual_scene_objects_lock:
                 self._visual_scene_objects_refresh_error = str(exc)
             return {"success": False, "error": str(exc), "reason": reason}
-        self.update_visual_scene_objects_snapshot(objects)
+        if expected_pose_source_generation is not None:
+            with self._pose_source_apply_lock:
+                current_generation = self._pose_source_apply_generation
+                if (
+                    self._pose_source_invalidation_requested.is_set()
+                    or expected_pose_source_generation != current_generation
+                ):
+                    return {
+                        "success": True,
+                        "skipped": True,
+                        "skip_reason": "pose_source_apply_generation_invalidated",
+                        "expected_generation": expected_pose_source_generation,
+                        "current_generation": current_generation,
+                        "reason": reason,
+                    }
+                self.update_visual_scene_objects_snapshot(objects)
+        else:
+            self.update_visual_scene_objects_snapshot(objects)
         return {
             "success": True,
             "count": len(objects),
@@ -2382,7 +2458,12 @@ class ComposerState:
             "duration_ms": round((time.monotonic() - started) * 1000.0, 1),
         }
 
-    def request_visual_scene_objects_refresh(self, *, reason: str = "") -> dict[str, Any]:
+    def request_visual_scene_objects_refresh(
+        self,
+        *,
+        reason: str = "",
+        expected_pose_source_generation: int | None = None,
+    ) -> dict[str, Any]:
         """Start a latest-wins background refresh for observer-side objects."""
         with self._visual_scene_objects_lock:
             if self._visual_scene_objects_refresh_running:
@@ -2397,7 +2478,12 @@ class ComposerState:
 
         def worker() -> None:
             try:
-                result = self.refresh_visual_scene_objects_sync(reason=reason)
+                result = self.refresh_visual_scene_objects_sync(
+                    reason=reason,
+                    expected_pose_source_generation=(
+                        expected_pose_source_generation
+                    ),
+                )
                 if not result.get("success", False):
                     logger.debug(
                         "visual scene object refresh failed: %s",
@@ -2731,6 +2817,8 @@ class ComposerState:
     ) -> None:
         """Rebuild runner + cycle manager from already-validated in-memory models."""
         scene_snapshot_provider = self._resolve_scene_snapshot_provider()
+        previous_manager = self.cycle_manager
+        previous_kernel = self._kernel
         if self.cycle_manager is not None:
             self.cycle_manager.reset()
 
@@ -2768,7 +2856,15 @@ class ComposerState:
         self._clear_published_scene_snapshots()
         self.clear_pose_source_snapshots()
         self.clear_visual_state_snapshot()
-        self.cycle_manager = CycleManager(runner, self._kernel)
+        next_manager = CycleManager(runner, self._kernel)
+        self._rotate_kernel_event_source(
+            previous_manager,
+            next_manager,
+            previous_kernel,
+            self._kernel,
+            reason="runtime_rebuild",
+        )
+        self.cycle_manager = next_manager
         self._bind_cycle_manager_callbacks()
         self.reset_backend_authoritative_sim_if_needed(reason="program_load")
         # Explicit load-time scene seed: populate the live planning scene with
@@ -3083,6 +3179,8 @@ class ComposerState:
                 )
             self._clear_runtime_overrides()
 
+        previous_manager = self.cycle_manager
+        previous_kernel = self._kernel
         # Stop existing cycle manager if running
         if self.cycle_manager is not None:
             self.cycle_manager.reset()
@@ -3161,7 +3259,15 @@ class ComposerState:
         self.clear_pose_source_snapshots()
         self.clear_visual_scene_objects_snapshot()
         self.clear_visual_state_snapshot()
-        self.cycle_manager = CycleManager(runner, self._kernel)
+        next_manager = CycleManager(runner, self._kernel)
+        self._rotate_kernel_event_source(
+            previous_manager,
+            next_manager,
+            previous_kernel,
+            kernel,
+            reason="program_load",
+        )
+        self.cycle_manager = next_manager
         self._bind_cycle_manager_callbacks()
         if not defer_initial_runtime_reset:
             self.reset_backend_authoritative_sim_if_needed(reason="program_load")
@@ -4080,39 +4186,69 @@ class ComposerState:
         the rebuilt scene with stale source authority, so workers carry a
         generation and re-check it after they acquire ``scene_edit_lock``.
         """
-        with self._pose_source_apply_lock:
-            self._pose_source_apply_generation += 1
-            generation = self._pose_source_apply_generation
-            dropped = sum(
-                len(request.get("object_ids") or [request.get("policy")])
-                for request in self._pose_source_apply_pending.values()
-            )
-            self._pose_source_apply_pending.clear()
-            self._pose_source_apply_signatures.clear()
-            self._increment_pose_source_apply_metric_locked(
-                "stale_generation_dropped",
-                amount=dropped,
-            )
-            self._pose_source_apply_last_result = {
-                "success": True,
-                "policy": "continuous",
-                "applied_count": 0,
-                "skipped_count": dropped,
-                "rejected_count": 0,
-                "details": (
-                    [
-                        {
-                            "status": "skipped",
-                            "skip_reason": "pose_source_apply_generation_invalidated",
-                            "reason": reason,
-                        }
-                    ]
-                    if dropped
-                    else []
-                ),
-                "invalidated_generation": generation,
-                "reason": reason,
-            }
+        # Intent is visible before waiting for an in-flight per-object commit.
+        # This closes the check->scene_edit TOCTOU without asking reset to wait
+        # for the whole batch. Multiple concurrent invalidators keep the event
+        # asserted until the last intent has advanced the generation.
+        with self._pose_source_invalidation_intent_lock:
+            self._pose_source_invalidation_intent_count += 1
+            self._pose_source_invalidation_requested.set()
+        generation = 0
+        dropped = 0
+        try:
+            with self._pose_source_apply_lock:
+                previous_generation = self._pose_source_apply_generation
+                self._pose_source_apply_generation += 1
+                generation = self._pose_source_apply_generation
+                pending_dropped = sum(
+                    len(request.get("object_ids") or [request.get("policy")])
+                    for request in self._pose_source_apply_pending.values()
+                )
+                in_flight = self._pose_source_apply_in_flight
+                in_flight_dropped = 0
+                if (
+                    in_flight is not None
+                    and int(in_flight.get("expected_generation", -1))
+                    == previous_generation
+                ):
+                    in_flight_dropped = len(
+                        in_flight.get("object_ids")
+                        or [in_flight.get("policy")]
+                    )
+                dropped = pending_dropped + in_flight_dropped
+                self._pose_source_apply_pending.clear()
+                self._pose_source_apply_signatures.clear()
+                self._increment_pose_source_apply_metric_locked(
+                    "stale_generation_dropped",
+                    amount=pending_dropped,
+                )
+                self._pose_source_apply_last_result = {
+                    "success": True,
+                    "policy": "continuous",
+                    "generation": generation,
+                    "applied_count": 0,
+                    "skipped_count": dropped,
+                    "rejected_count": 0,
+                    "details": (
+                        [
+                            {
+                                "status": "skipped",
+                                "skip_reason": "pose_source_apply_generation_invalidated",
+                                "reason": reason,
+                            }
+                        ]
+                        if dropped
+                        else []
+                    ),
+                    "invalidated_generation": previous_generation,
+                    "current_generation": generation,
+                    "reason": reason,
+                }
+        finally:
+            with self._pose_source_invalidation_intent_lock:
+                self._pose_source_invalidation_intent_count -= 1
+                if self._pose_source_invalidation_intent_count == 0:
+                    self._pose_source_invalidation_requested.clear()
         return {"generation": generation, "dropped_count": dropped, "reason": reason}
 
     def _pose_source_apply_generation_value(self) -> int:
@@ -4202,19 +4338,30 @@ class ComposerState:
         runtime_freshness_required: bool,
     ) -> str:
         with self._pose_source_apply_lock:
-            previous = self._pose_source_apply_signatures.get(key)
-            if previous is not None and previous.get("full") == full_signature:
-                return "duplicate"
-            if (
-                previous is not None
-                and previous.get("geometry") == geometry_signature
-                and not runtime_freshness_required
-            ):
-                self._pose_source_apply_signatures[key] = {
-                    "geometry": geometry_signature,
-                    "full": full_signature,
-                }
-                return "unchanged_without_runtime_freshness"
+            return self._pose_source_apply_signature_decision_locked(
+                key=key,
+                geometry_signature=geometry_signature,
+                full_signature=full_signature,
+                runtime_freshness_required=runtime_freshness_required,
+            )
+
+    def _pose_source_apply_signature_decision_locked(
+        self,
+        *,
+        key: tuple[str, str, str],
+        geometry_signature: tuple[Any, ...],
+        full_signature: tuple[Any, ...],
+        runtime_freshness_required: bool,
+    ) -> str:
+        previous = self._pose_source_apply_signatures.get(key)
+        if previous is not None and previous.get("full") == full_signature:
+            return "duplicate"
+        if (
+            previous is not None
+            and previous.get("geometry") == geometry_signature
+            and not runtime_freshness_required
+        ):
+            return "unchanged_without_runtime_freshness"
         return "apply"
 
     def _pose_source_mark_signature_applied(
@@ -4225,10 +4372,23 @@ class ComposerState:
         full_signature: tuple[Any, ...],
     ) -> None:
         with self._pose_source_apply_lock:
-            self._pose_source_apply_signatures[key] = {
-                "geometry": geometry_signature,
-                "full": full_signature,
-            }
+            self._pose_source_mark_signature_applied_locked(
+                key=key,
+                geometry_signature=geometry_signature,
+                full_signature=full_signature,
+            )
+
+    def _pose_source_mark_signature_applied_locked(
+        self,
+        *,
+        key: tuple[str, str, str],
+        geometry_signature: tuple[Any, ...],
+        full_signature: tuple[Any, ...],
+    ) -> None:
+        self._pose_source_apply_signatures[key] = {
+            "geometry": geometry_signature,
+            "full": full_signature,
+        }
 
     def pose_source_apply_status(self) -> dict[str, Any]:
         with self._pose_source_apply_lock:
@@ -4236,6 +4396,11 @@ class ComposerState:
                 "generation": self._pose_source_apply_generation,
                 "running": self._pose_source_apply_running,
                 "pending_count": len(self._pose_source_apply_pending),
+                "in_flight_generation": (
+                    int(self._pose_source_apply_in_flight.get("expected_generation") or 0)
+                    if self._pose_source_apply_in_flight is not None
+                    else None
+                ),
                 "last_result": copy.deepcopy(self._pose_source_apply_last_result),
                 "counters": dict(self._pose_source_apply_metrics),
                 "objects": {
@@ -4309,6 +4474,21 @@ class ComposerState:
         sidecars can provide observations, but the deployment selects which
         object policies may mutate the planning scene.
         """
+        generation_at_entry = self._pose_source_apply_generation_value()
+        result_generation = (
+            expected_generation
+            if expected_generation is not None
+            else generation_at_entry
+        )
+
+        def tagged_result(payload: dict[str, Any]) -> dict[str, Any]:
+            payload.setdefault("generation", result_generation)
+            payload.setdefault(
+                "current_generation",
+                self._pose_source_apply_generation_value(),
+            )
+            return payload
+
         if policy not in {
             "when_idle",
             "continuous",
@@ -4318,7 +4498,7 @@ class ComposerState:
         }:
             raise ValueError(f"unsupported pose-source apply policy: {policy}")
         if self.kernel is None:
-            return {
+            return tagged_result({
                 "success": False,
                 "policy": policy,
                 "error": "kernel unavailable",
@@ -4326,10 +4506,10 @@ class ComposerState:
                 "skipped_count": 0,
                 "rejected_count": 1,
                 "details": [],
-            }
+            })
         cycle_state = self.cycle_manager.state if self.cycle_manager is not None else None
         if require_idle and cycle_state is not None and cycle_state.value != "idle":
-            return {
+            return tagged_result({
                 "success": False,
                 "policy": policy,
                 "error": f"pose-source apply requires idle cycle state, got {cycle_state.value}",
@@ -4338,10 +4518,10 @@ class ComposerState:
                 "skipped_count": 0,
                 "rejected_count": 1,
                 "details": [],
-            }
+            })
         block_reason = self.live_scene_mutation_block_reason()
         if block_reason == "resumable_stopped_context":
-            return {
+            return tagged_result({
                 "success": True,
                 "policy": policy,
                 "applied_count": 0,
@@ -4355,9 +4535,9 @@ class ComposerState:
                     }
                 ],
                 "blocked_reason": block_reason,
-            }
+            })
         if block_reason == "scene_mutation_guard_unavailable":
-            return {
+            return tagged_result({
                 "success": False,
                 "policy": policy,
                 "error": "live scene mutation guard unavailable",
@@ -4372,17 +4552,17 @@ class ComposerState:
                     }
                 ],
                 "blocked_reason": block_reason,
-            }
+            })
         deployment = self.deployment
         if deployment is None or not getattr(deployment, "pose_sources", {}):
-            return {
+            return tagged_result({
                 "success": True,
                 "policy": policy,
                 "applied_count": 0,
                 "skipped_count": 0,
                 "rejected_count": 0,
                 "details": [],
-            }
+            })
 
         requested_ids = {str(object_id) for object_id in object_ids or [] if str(object_id)}
         require_all_bound = policy == "before_planning" and not requested_ids
@@ -4393,17 +4573,22 @@ class ComposerState:
         rejected_count = 0
         required_ids: set[str] = set()
         visual_publish_needed = False
+        visual_refresh_needed = False
+        generation_invalidated = False
 
         with self.scene_edit_lock:
             if expected_generation is not None:
                 current_generation = self._pose_source_apply_generation_value()
-                if expected_generation != current_generation:
+                if (
+                    self._pose_source_invalidation_requested.is_set()
+                    or expected_generation != current_generation
+                ):
                     dropped_count = max(1, len(requested_ids))
                     self._record_pose_source_apply_metric(
                         "stale_generation_dropped",
                         amount=dropped_count,
                     )
-                    return {
+                    return tagged_result({
                         "success": True,
                         "policy": policy,
                         "applied_count": 0,
@@ -4418,8 +4603,8 @@ class ComposerState:
                                 "current_generation": current_generation,
                             }
                         ],
-                        "invalidated_generation": current_generation,
-                    }
+                        "invalidated_generation": expected_generation,
+                    })
             for source_id, source in sorted(deployment.pose_sources.items()):
                 if not source.enabled:
                     continue
@@ -4443,6 +4628,31 @@ class ComposerState:
                         "policy": policy,
                         "reason": reason,
                     }
+                    if expected_generation is not None:
+                        current_generation = self._pose_source_apply_generation_value()
+                        if (
+                            self._pose_source_invalidation_requested.is_set()
+                            or expected_generation != current_generation
+                        ):
+                            detail.update(
+                                {
+                                    "status": "skipped",
+                                    "skip_reason": (
+                                        "pose_source_apply_generation_invalidated"
+                                    ),
+                                    "expected_generation": expected_generation,
+                                    "current_generation": current_generation,
+                                }
+                            )
+                            generation_invalidated = True
+                            skipped_count += 1
+                            details.append(detail)
+                            self._record_pose_source_apply_metric(
+                                "stale_generation_dropped",
+                                source_id=source_id,
+                                object_id=object_id,
+                            )
+                            continue
                     scene_admission = getattr(binding, "scene_admission", None)
                     if scene_admission is None and policy != "observe_only":
                         scene_admission = PoseSourceSceneAdmissionConfig(
@@ -4671,12 +4881,110 @@ class ComposerState:
                     geometry_signature, full_signature = (
                         self._pose_source_scene_request_signatures(scene_request)
                     )
-                    signature_decision = self._pose_source_apply_signature_decision(
-                        key=signature_key,
-                        geometry_signature=geometry_signature,
-                        full_signature=full_signature,
-                        runtime_freshness_required=runtime_freshness_required,
-                    )
+                    stale_during_commit = False
+                    signature_decision = "apply"
+                    result = None
+                    object_visual_refresh_needed = False
+
+                    # Lock order is scene_edit_lock -> pose-source apply lock ->
+                    # visual leaf locks. Invalidation never holds the apply lock
+                    # while acquiring scene_edit_lock. Holding this lock across
+                    # one kernel edit makes generation admission and that one
+                    # object's backend/visual/signature commit atomic.
+                    with self._pose_source_apply_lock:
+                        current_generation = self._pose_source_apply_generation
+                        if expected_generation is not None and (
+                            self._pose_source_invalidation_requested.is_set()
+                            or expected_generation != current_generation
+                        ):
+                            stale_during_commit = True
+                            self._increment_pose_source_apply_metric_locked(
+                                "stale_generation_dropped",
+                                source_id=source_id,
+                                object_id=object_id,
+                            )
+                        else:
+                            signature_decision = (
+                                self._pose_source_apply_signature_decision_locked(
+                                    key=signature_key,
+                                    geometry_signature=geometry_signature,
+                                    full_signature=full_signature,
+                                    runtime_freshness_required=(
+                                        runtime_freshness_required
+                                    ),
+                                )
+                            )
+                            if signature_decision != "apply":
+                                if (
+                                    signature_decision
+                                    == "unchanged_without_runtime_freshness"
+                                ):
+                                    self._pose_source_mark_signature_applied_locked(
+                                        key=signature_key,
+                                        geometry_signature=geometry_signature,
+                                        full_signature=full_signature,
+                                    )
+                                self._increment_pose_source_apply_metric_locked(
+                                    "no_op_skipped",
+                                    source_id=source_id,
+                                    object_id=object_id,
+                                )
+                            else:
+                                result = self.kernel.scene_edit(scene_request)
+                                if result.success:
+                                    update_status = getattr(
+                                        result, "update_status", None
+                                    )
+                                    if update_status not in {
+                                        "freshness_only",
+                                        "no_op",
+                                    }:
+                                        visual_update = (
+                                            self.apply_visual_scene_edit_success(
+                                                scene_request,
+                                                publish=False,
+                                            )
+                                        )
+                                        visual_publish_needed = True
+                                        if visual_update.get("needs_refresh"):
+                                            visual_refresh_needed = True
+                                            object_visual_refresh_needed = True
+                                    self._pose_source_mark_signature_applied_locked(
+                                        key=signature_key,
+                                        geometry_signature=geometry_signature,
+                                        full_signature=full_signature,
+                                    )
+                                    metric = (
+                                        "freshness_only_applied"
+                                        if update_status == "freshness_only"
+                                        else (
+                                            "no_op_skipped"
+                                            if update_status == "no_op"
+                                            else "geometry_applied"
+                                        )
+                                    )
+                                    self._increment_pose_source_apply_metric_locked(
+                                        metric,
+                                        source_id=source_id,
+                                        object_id=object_id,
+                                    )
+
+                    if stale_during_commit:
+                        detail.update(
+                            {
+                                "status": "skipped",
+                                "skip_reason": (
+                                    "pose_source_apply_generation_invalidated"
+                                ),
+                                "expected_generation": expected_generation,
+                                "current_generation": current_generation,
+                            }
+                        )
+                        generation_invalidated = True
+                        skipped_count += 1
+                        details.append(detail)
+                        continue
+
                     if signature_decision != "apply":
                         detail["status"] = "skipped"
                         detail["skip_reason"] = (
@@ -4689,23 +4997,21 @@ class ComposerState:
                             detail["observed_frame_id"] = str(observed_frame_id)
                         skipped_count += 1
                         details.append(detail)
-                        self._record_pose_source_apply_metric(
-                            "no_op_skipped",
-                            source_id=source_id,
-                            object_id=object_id,
-                        )
                         continue
-                    result = self.kernel.scene_edit(scene_request)
-                    if not result.success:
+
+                    if result is None or not result.success:
                         detail["status"] = "rejected"
                         detail["reject_reason"] = "scene_edit_failed"
-                        detail["error"] = result.error
+                        detail["error"] = (
+                            result.error if result is not None else "missing result"
+                        )
                         detail["frame_id"] = edit_frame_id
                         if observed_frame_id:
                             detail["observed_frame_id"] = str(observed_frame_id)
                         rejected_count += 1
                         details.append(detail)
                         continue
+
                     detail["status"] = "applied"
                     detail["frame_id"] = edit_frame_id
                     update_status = getattr(result, "update_status", None)
@@ -4713,46 +5019,45 @@ class ComposerState:
                         detail["update_status"] = str(update_status)
                     if observed_frame_id:
                         detail["observed_frame_id"] = str(observed_frame_id)
-                    if update_status not in {"freshness_only", "no_op"}:
-                        visual_update = self.apply_visual_scene_edit_success(
-                            scene_request
-                        )
-                        visual_publish_needed = True
-                        if visual_update.get("needs_refresh"):
-                            detail["visual_refresh_requested"] = True
-                            self.request_visual_scene_objects_refresh(
-                                reason=f"pose_source_{policy}"
-                            )
-                    else:
+                    if update_status in {"freshness_only", "no_op"}:
                         detail["visual_update_skipped"] = str(update_status)
-                    self._pose_source_mark_signature_applied(
-                        key=signature_key,
-                        geometry_signature=geometry_signature,
-                        full_signature=full_signature,
-                    )
-                    if update_status == "freshness_only":
-                        self._record_pose_source_apply_metric(
-                            "freshness_only_applied",
-                            source_id=source_id,
-                            object_id=object_id,
-                        )
-                    elif update_status == "no_op":
-                        self._record_pose_source_apply_metric(
-                            "no_op_skipped",
-                            source_id=source_id,
-                            object_id=object_id,
-                        )
-                    else:
-                        self._record_pose_source_apply_metric(
-                            "geometry_applied",
-                            source_id=source_id,
-                            object_id=object_id,
-                        )
+                    elif object_visual_refresh_needed:
+                        detail["visual_refresh_requested"] = True
                     applied_count += 1
                     details.append(detail)
 
-        if visual_publish_needed:
-            self.request_visual_state_publish(reason=f"pose_source_{policy}")
+        if expected_generation is not None:
+            # Batch publication is admitted under the same generation lock as
+            # object commits. Reset invalidation can set intent concurrently,
+            # but cannot advance the generation until this bounded scheduling
+            # section exits; reset then clears/rebuilds the visual caches.
+            with self._pose_source_apply_lock:
+                current_generation = self._pose_source_apply_generation
+                batch_generation_valid = not (
+                    self._pose_source_invalidation_requested.is_set()
+                    or expected_generation != current_generation
+                )
+                if batch_generation_valid:
+                    if visual_refresh_needed:
+                        self.request_visual_scene_objects_refresh(
+                            reason=f"pose_source_{policy}",
+                            expected_pose_source_generation=expected_generation,
+                        )
+                    if visual_publish_needed:
+                        self.request_visual_state_publish(
+                            reason=f"pose_source_{policy}"
+                        )
+                else:
+                    generation_invalidated = True
+        else:
+            current_generation = self._pose_source_apply_generation_value()
+            batch_generation_valid = True
+            if visual_refresh_needed:
+                self.request_visual_scene_objects_refresh(
+                    reason=f"pose_source_{policy}"
+                )
+            if visual_publish_needed:
+                self.request_visual_state_publish(reason=f"pose_source_{policy}")
 
         if not require_all_bound:
             required_ids = set(requested_ids)
@@ -4775,6 +5080,7 @@ class ComposerState:
                             in {
                                 "pose_source_duplicate_no_op",
                                 "pose_source_unchanged_without_runtime_freshness",
+                                "pose_source_apply_generation_invalidated",
                             }
                         )
                     )
@@ -4796,6 +5102,10 @@ class ComposerState:
             self._record_pose_source_apply_metric("errors", amount=rejected_count)
 
         event_details = {
+            "generation": result_generation,
+            "current_generation": current_generation,
+            "generation_valid": batch_generation_valid,
+            "generation_invalidated": generation_invalidated,
             "policy": policy,
             "reason": reason,
             "object_ids": sorted(requested_ids),
@@ -4839,15 +5149,17 @@ class ComposerState:
             except Exception:
                 logger.debug("pose-source event recording failed", exc_info=True)
 
-        return {
+        return tagged_result({
             "success": success,
             "policy": policy,
             "error": error,
+            "generation_valid": batch_generation_valid,
+            "generation_invalidated": generation_invalidated,
             "applied_count": applied_count,
             "skipped_count": skipped_count,
             "rejected_count": rejected_count,
             "details": details,
-        }
+        })
 
     def enqueue_pose_source_apply(
         self,
@@ -4930,6 +5242,7 @@ class ComposerState:
                     return
                 policy = sorted(self._pose_source_apply_pending)[0]
                 request = self._pose_source_apply_pending.pop(policy)
+                self._pose_source_apply_in_flight = request
             started = time.monotonic()
             try:
                 result = self.apply_pose_source_updates(**request)
@@ -4944,10 +5257,26 @@ class ComposerState:
                     "details": [],
                 }
             duration_ms = (time.monotonic() - started) * 1000.0
+            request_generation = int(request.get("expected_generation") or 0)
+            result.setdefault("generation", request_generation)
             result["duration_ms"] = round(duration_ms, 1)
             result["queued_worker"] = True
             with self._pose_source_apply_lock:
-                self._pose_source_apply_last_result = copy.deepcopy(result)
+                current_generation = self._pose_source_apply_generation
+                result["current_generation"] = current_generation
+                stale_result = (
+                    self._pose_source_invalidation_requested.is_set()
+                    or request_generation != current_generation
+                )
+                if stale_result:
+                    result["stale_result_ignored"] = True
+                    self._increment_pose_source_apply_metric_locked(
+                        "stale_result_ignored"
+                    )
+                else:
+                    self._pose_source_apply_last_result = copy.deepcopy(result)
+                if self._pose_source_apply_in_flight is request:
+                    self._pose_source_apply_in_flight = None
             if duration_ms >= 100.0:
                 _log_throttle.warning(
                     logger,

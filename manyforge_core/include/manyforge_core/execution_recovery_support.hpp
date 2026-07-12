@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -180,6 +181,21 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(
 bool recovery_assessment_semantically_differs(
     const KernelRecoveryAssessmentDTO& previous,
     const KernelRecoveryAssessmentDTO& next);
+
+/// Pure assessment + durable-record projection. The kernel remains the owner
+/// of coherent capture, publication locks, scheduling, and event emission;
+/// this helper owns the duplicated semantic comparison and field mapping.
+struct RecoveryAssessmentPublication {
+  KernelRecoveryAssessmentDTO candidate;
+  bool changed = false;
+  std::map<std::string, std::string> event_details;
+};
+
+RecoveryAssessmentPublication prepare_recovery_assessment_publication(
+    const KernelRecoveryAssessmentDTO& previous,
+    const RecoveryAuthorityCapture& capture,
+    const RecoveryReadinessPolicy& policy,
+    std::string_view trigger);
 
 /// Structured admission decision for ApplyRecoveryAction. `admitted=false`
 /// carries the stable rejection reason; the caller guarantees no side

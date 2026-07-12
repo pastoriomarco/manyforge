@@ -55,6 +55,7 @@ from manyforge_behavior.cycle_recovery import (
     CycleRecoveryCoordinator,
     CycleRecoveryFacts,
     CycleRecoveryOffer,
+    RunRecoveryDisposition,
     is_kernel_recovery_action,
 )
 from manyforge_behavior.signals import RuntimeSignalRegistry, SignalProvider, SignalUpdate
@@ -2979,43 +2980,35 @@ class CycleManager:
                 self._runtime_pause_registry.active_faults()
             )
         if recovery_surface_active:
-            offer_wire = self.refresh_recovery_offer()
-            if offer_wire is not None:
-                primary_action = offer_wire.get("primaryAction")
-                automatic_actions = {
-                    "retry_motion_from_current_state",
-                    "retry_after_scene_repair",
-                    "replan_from_stopped_state",
-                    "retry_runtime_step",
-                }
-                if (
-                    offer_wire.get("status") == "retry_ready"
-                    and primary_action in automatic_actions
-                ):
-                    result = self.apply_recovery_action(
-                        {
-                            "request_id": f"run-{uuid.uuid4().hex}",
-                            "offer_id": offer_wire["offerId"],
-                            "offer_revision": offer_wire["offerRevision"],
-                            "action_id": primary_action,
-                            "reason": "operator_run_primary_recovery",
-                        },
-                        principal_id=principal_id,
+            self.refresh_recovery_offer()
+            directive = self._recovery_coordinator.resolve_run_request()
+            if directive.disposition == RunRecoveryDisposition.APPLY_PRIMARY:
+                if directive.offer is None or directive.action_id is None:
+                    raise RuntimeError(
+                        "Recovery coordinator returned an invalid Run directive"
                     )
-                    if not result.get("accepted"):
-                        error = result.get("error") or {}
-                        raise RuntimeError(
-                            str(
-                                error.get("message")
-                                or "Recovery action was rejected"
-                            )
-                        )
-                    return result
-                raise RuntimeError(
-                    "Run cannot choose the current recovery action. "
-                    f"status={offer_wire.get('status')}, "
-                    f"reason={offer_wire.get('reasonCode')}"
+                offer_wire = directive.offer.to_wire()
+                result = self.apply_recovery_action(
+                    {
+                        "request_id": f"run-{uuid.uuid4().hex}",
+                        "offer_id": offer_wire["offerId"],
+                        "offer_revision": offer_wire["offerRevision"],
+                        "action_id": directive.action_id.value,
+                        "reason": directive.reason_code,
+                    },
+                    principal_id=principal_id,
                 )
+                if not result.get("accepted"):
+                    error = result.get("error") or {}
+                    raise RuntimeError(
+                        str(error.get("message") or "Recovery action was rejected")
+                    )
+                return result
+            if (
+                directive.disposition
+                == RunRecoveryDisposition.EXPLICIT_ACTION_REQUIRED
+            ):
+                raise RuntimeError(directive.message)
 
         with self._run_transition_lock:
             prepare_fresh = False

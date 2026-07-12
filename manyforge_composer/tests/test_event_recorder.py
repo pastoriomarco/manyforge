@@ -2209,6 +2209,13 @@ class TestStopDecisionChains:
         rec = EventRecorder(observe_min_interval_s=0.0)
         rec.record_native_kernel_events(
             [
+                # Kernel act-before-emit ordering commits Interrupted before
+                # publishing the latch.  Interrupted is a phase boundary only.
+                self._ev(
+                    "state_transition", 500,
+                    from_state="Executing", to_state="Interrupted",
+                    details={"reason": "interrupt_latched"},
+                ),
                 self._ev(
                     "interrupt_latched", 1_000,
                     details={
@@ -2227,11 +2234,6 @@ class TestStopDecisionChains:
                         "preemption_result": "succeeded",
                     },
                 ),
-                self._ev(
-                    "state_transition", 4_000,
-                    from_state="Executing", to_state="Interrupted",
-                    details={"reason": "interrupt_latched"},
-                ),
             ]
         )
         chains = self._chains(rec)
@@ -2244,7 +2246,8 @@ class TestStopDecisionChains:
         assert d["preemption_result"] == "succeeded"
         assert d["terminal_state"] == "Interrupted"
         assert d["terminal_reason"] == "interrupt_latched"
-        assert d["latch_to_terminal_ns"] == "3000"
+        assert d["latch_to_terminal_ns"] == "1500"
+        assert d["chain_complete"] == "true"
 
     def test_fault_escalation_with_override_chain_golden(self):
         rec = EventRecorder(observe_min_interval_s=0.0)
@@ -2299,7 +2302,8 @@ class TestStopDecisionChains:
         )
         assert self._chains(rec)[-1]["details"]["trigger"] == "reset"
 
-        # A terminal with no visible cause still yields a chain — loudly.
+        # Interrupted alone is not a stop terminal.  It remains pending until a
+        # definitive outcome or an explicit incomplete boundary is observed.
         rec.record_native_kernel_events(
             [
                 self._ev(
@@ -2308,9 +2312,13 @@ class TestStopDecisionChains:
                 ),
             ]
         )
+        assert len(self._chains(rec)) == 1
+        assert rec.close(timeout_s=10.0)
         last = self._chains(rec)[-1]["details"]
         assert last["trigger"] == "unobserved"
         assert last["kernel_execution_id"] == "8"
+        assert last["chain_complete"] == "false"
+        assert last["incomplete_reason"] == "process_exit_before_stop_outcome"
 
     def test_resume_abandons_episode_and_duplicate_terminal_suppressed(self):
         rec = EventRecorder(observe_min_interval_s=0.0)
@@ -2418,7 +2426,8 @@ class TestStopDecisionChains:
         assert len(chains) == 2
         assert chains[0]["details"]["terminal_state"] == "Stopped"
         assert chains[1]["details"]["terminal_state"] == "InterventionRequired"
-        assert chains[1]["details"]["trigger"] == "unobserved"
+        assert chains[1]["details"]["trigger"] == "reset"
+        assert chains[1]["details"]["chain_complete"] == "false"
         # last_stop_decision reflects the escalation, not the stale stop
         assert rec.last_stop_decision()["terminal_state"] == "InterventionRequired"
 
@@ -2510,12 +2519,17 @@ class TestStopDecisionChains:
             ]
         )
         chains = self._chains(rec)
-        assert len(chains) == 1
-        d = chains[0]["details"]
-        assert d["kernel_execution_id"] == "8"
-        assert d["trigger"] == "unobserved"  # exec 8 has no own evidence
-        assert d["abandoned_episode_execution_id"] == "7"
-        assert "request_to_terminal_ns" not in d  # no cross-execution timing
+        assert len(chains) == 2
+        stale, terminal = (chain["details"] for chain in chains)
+        assert stale["kernel_execution_id"] == "7"
+        assert stale["chain_complete"] == "false"
+        assert stale["incomplete_reason"] == (
+            "superseded_by_other_execution_terminal"
+        )
+        assert terminal["kernel_execution_id"] == "8"
+        assert terminal["trigger"] == "unobserved"
+        assert terminal["chain_complete"] == "false"
+        assert "request_to_terminal_ns" not in terminal
 
     def test_kernel_event_gap_invalidates_open_episode(self):
         """Hardening: loss between episode events poisons the assembly."""
@@ -2532,8 +2546,527 @@ class TestStopDecisionChains:
         TestStopDecisionChains._seq += 50
         rec.record_native_kernel_events([gap_ev])
         chains = self._chains(rec)
+        assert len(chains) == 2
+        before_gap, terminal = (chain["details"] for chain in chains)
+        assert before_gap["trigger"] == "operator"
+        assert before_gap["chain_complete"] == "false"
+        assert before_gap["incomplete_reason"] == "kernel_sequence_gap"
+        assert before_gap["missing_sequence_start"]
+        assert before_gap["missing_sequence_end"]
+        assert terminal["trigger"] == "unobserved"
+        assert terminal["chain_complete"] == "false"
+
+    def test_runtime_collision_success_is_sequence_authoritative_across_drains(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        collision = self._ev(
+            "collision_detected",
+            1_000,
+            execution_id=81,
+            details={"reason": "runtime_collision_monitor", "contact_a": "arm"},
+        )
+        interrupted = self._ev(
+            "state_transition",
+            1_100,
+            execution_id=81,
+            from_state="Executing",
+            to_state="Interrupted",
+            details={"reason": "interrupt_latched"},
+        )
+        latched = self._ev(
+            "interrupt_latched",
+            1_200,
+            execution_id=81,
+            details={
+                "latch_id": "collision-latch-81",
+                "source_id": "manyforge.kernel.runtime_collision_fault",
+                "policy_id": "runtime-collision-policy",
+            },
+        )
+        coverage = self._ev(
+            "runtime_collision_coverage",
+            1_300,
+            execution_id=81,
+            details={
+                "coverage_complete": "true",
+                "ticks_attempted": "8",
+                "collision_queries_executed": "8",
+            },
+        )
+        certificate = self._ev(
+            "stop_certificate_published",
+            1_400,
+            execution_id=81,
+            details={
+                "latch_id": "collision-latch-81",
+                "certificate_id": "stopcert-81",
+                "completion_result": "succeeded",
+                "stop_owner": "fault_preempt_worker",
+                "backend_stop_confirmed": "true",
+            },
+        )
+        preempted = self._ev(
+            "interrupt_preempt_applied",
+            1_500,
+            execution_id=81,
+            details={
+                "latch_id": "collision-latch-81",
+                "preemption_action": "preempt_trajectory",
+                "preemption_result": "succeeded",
+            },
+        )
+
+        rec.record_native_kernel_events([collision, interrupted])
+        assert self._chains(rec) == []
+        # Arrival order within the second drain is deliberately reversed.  The
+        # assembler must use kernel sequence, not list/recorder order.
+        reversed_arrival = [preempted, certificate, coverage, latched]
+        next_arrival_index = interrupted["event_index"] + 1
+        for offset, event in enumerate(reversed_arrival):
+            event["event_index"] = next_arrival_index + offset
+        rec.record_native_kernel_events(reversed_arrival)
+
+        chains = self._chains(rec)
         assert len(chains) == 1
-        assert chains[0]["details"]["trigger"] == "unobserved"
+        details = chains[0]["details"]
+        assert details["chain_complete"] == "true"
+        assert details["trigger"] == "fault"
+        assert details["latch_id"] == "collision-latch-81"
+        assert details["stop_certificate_id"] == "stopcert-81"
+        assert details["physical_stop_result"] == "succeeded"
+        assert details["stop_monitor_coverage_complete"] == "true"
+        assert details["native_sequence_start"] == str(collision["sequence"])
+        assert details["native_sequence_end"] == str(preempted["sequence"])
+        assert "stop_decision_id" in details
+
+    def test_runtime_collision_failure_waits_for_intervention_terminal(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        first_batch = [
+            self._ev(
+                "collision_detected", 1_000, execution_id=82,
+                details={"reason": "runtime_collision_monitor"},
+            ),
+            self._ev(
+                "state_transition", 1_050, execution_id=82,
+                from_state="Executing", to_state="Interrupted",
+            ),
+            self._ev(
+                "interrupt_latched", 1_100, execution_id=82,
+                details={
+                    "latch_id": "collision-latch-82",
+                    "source_id": "manyforge.kernel.runtime_collision_fault",
+                },
+            ),
+            self._ev(
+                "stop_certificate_published", 1_200, execution_id=82,
+                details={
+                    "latch_id": "collision-latch-82",
+                    "certificate_id": "stopcert-82",
+                    "completion_result": "backend_preempt_failed",
+                    "stop_owner": "fault_preempt_worker",
+                    "backend_stop_confirmed": "false",
+                },
+            ),
+            self._ev(
+                "interrupt_preempt_applied", 1_300, execution_id=82,
+                details={
+                    "latch_id": "collision-latch-82",
+                    "preemption_action": "preempt_trajectory",
+                    "preemption_result": "backend_preempt_failed",
+                },
+            ),
+        ]
+        rec.record_native_kernel_events(first_batch)
+        assert self._chains(rec) == []
+
+        rec.record_native_kernel_events(
+            [
+                self._ev(
+                    "state_transition", 1_400, execution_id=82,
+                    from_state="Interrupted", to_state="InterventionRequired",
+                    details={"reason": "fault_stop_total_failure"},
+                )
+            ]
+        )
+        details = self._chains(rec)[0]["details"]
+        assert details["chain_complete"] == "true"
+        assert details["trigger"] == "fault"
+        assert details["terminal_state"] == "InterventionRequired"
+        assert details["terminal_reason"] == "fault_stop_total_failure"
+        assert details["physical_stop_result"] == "backend_preempt_failed"
+        assert details["stop_certificate_id"] == "stopcert-82"
+
+    def test_production_reorder_buffer_spans_drain_boundary(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        terminal = {
+            "type": "state_transition",
+            "sequence": 2,
+            "event_index": 1,
+            "execution_id": 91,
+            "timestamp_ns": 2_000,
+            "from_state": "Stopping",
+            "to_state": "Stopped",
+        }
+        requested = {
+            "type": "stop_requested",
+            "sequence": 1,
+            "event_index": 2,
+            "execution_id": 91,
+            "timestamp_ns": 1_000,
+        }
+        status = {
+            "collector_dropped_total": 0,
+            "manager_dropped_total": 0,
+            "last_sequence_seen": 2,
+        }
+
+        # Sequence 2 reaches the collector first. It must remain buffered and
+        # cannot create an unobserved terminal chain.
+        rec.record_native_kernel_events([terminal], pipeline_status=status)
+        assert self._chains(rec) == []
+        assert not [
+            event
+            for event in _memory_events(rec)
+            if event["type"].startswith("kernel_native_")
+        ]
+
+        rec.record_native_kernel_events([requested], pipeline_status=status)
+        chains = self._chains(rec)
+        assert len(chains) == 1
+        details = chains[0]["details"]
+        assert details["chain_complete"] == "true"
+        assert details["trigger"] == "operator"
+        assert details["native_sequence_start"] == "1"
+        assert details["native_sequence_end"] == "2"
+        raw_sequences = [
+            int(event["details"]["kernel_sequence"])
+            for event in _memory_events(rec)
+            if event["type"].startswith("kernel_native_")
+        ]
+        assert raw_sequences == [1, 2]
+
+    def test_concurrent_drains_cannot_overtake_staged_native_sequence(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        first_staged = threading.Event()
+        release_first = threading.Event()
+        original = rec._record_sequence_ready_native_events
+
+        def gated(events):
+            if events and int(events[0].get("sequence") or 0) == 1:
+                first_staged.set()
+                assert release_first.wait(timeout=2.0)
+            original(events)
+
+        rec._record_sequence_ready_native_events = gated
+        status = {
+            "collector_dropped_total": 0,
+            "manager_dropped_total": 0,
+            "last_sequence_seen": 2,
+        }
+        requested = {
+            "type": "stop_requested",
+            "sequence": 1,
+            "event_index": 1,
+            "execution_id": 92,
+            "timestamp_ns": 1_000,
+        }
+        terminal = {
+            "type": "state_transition",
+            "sequence": 2,
+            "event_index": 2,
+            "execution_id": 92,
+            "timestamp_ns": 2_000,
+            "from_state": "Stopping",
+            "to_state": "Stopped",
+        }
+        first = threading.Thread(
+            target=rec.record_native_kernel_events,
+            args=([requested],),
+            kwargs={"pipeline_status": status},
+        )
+        second = threading.Thread(
+            target=rec.record_native_kernel_events,
+            args=([terminal],),
+            kwargs={"pipeline_status": status},
+        )
+        first.start()
+        assert first_staged.wait(timeout=2.0)
+        second.start()
+        time.sleep(0.02)
+        assert second.is_alive()
+        release_first.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+        assert not first.is_alive()
+        assert not second.is_alive()
+
+        chains = self._chains(rec)
+        assert len(chains) == 1
+        assert chains[0]["details"]["chain_complete"] == "true"
+        assert not [
+            event
+            for event in _memory_events(rec)
+            if event["type"] == "kernel_event_gap"
+        ]
+
+    def test_empty_drop_observation_advances_later_reorder_cursor(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "stop_requested",
+                    "sequence": 1,
+                    "event_index": 1,
+                    "execution_id": 93,
+                    "timestamp_ns": 1_000,
+                }
+            ],
+            pipeline_status={
+                "collector_dropped_total": 0,
+                "manager_dropped_total": 0,
+                "last_sequence_seen": 1,
+            },
+        )
+        # Sequence 2 was observed and dropped before this empty drain.
+        rec.record_native_kernel_events(
+            [],
+            pipeline_status={
+                "collector_dropped_total": 1,
+                "manager_dropped_total": 0,
+                "last_sequence_seen": 2,
+            },
+        )
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "stop_requested",
+                    "sequence": 3,
+                    "event_index": 2,
+                    "execution_id": 94,
+                    "timestamp_ns": 3_000,
+                },
+                {
+                    "type": "state_transition",
+                    "sequence": 4,
+                    "event_index": 3,
+                    "execution_id": 94,
+                    "timestamp_ns": 4_000,
+                    "from_state": "Stopping",
+                    "to_state": "Stopped",
+                },
+            ],
+            pipeline_status={
+                "collector_dropped_total": 1,
+                "manager_dropped_total": 0,
+                "last_sequence_seen": 4,
+            },
+        )
+
+        chains = self._chains(rec)
+        assert len(chains) == 2
+        assert chains[0]["details"]["chain_complete"] == "false"
+        assert chains[0]["details"]["incomplete_reason"] == (
+            "pipeline_drop_counter_advanced"
+        )
+        assert chains[1]["details"]["kernel_execution_id"] == "94"
+        assert chains[1]["details"]["chain_complete"] == "true"
+        assert rec._pending_native_events_by_sequence == {}
+
+    def test_normal_completion_is_not_misreported_as_stop_decision(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "state_transition",
+                    "sequence": 1,
+                    "event_index": 1,
+                    "execution_id": 95,
+                    "timestamp_ns": 1_000,
+                    "from_state": "Executing",
+                    "to_state": "Completed",
+                }
+            ]
+        )
+        assert self._chains(rec) == []
+
+    def test_stop_intent_followed_by_completion_is_explicitly_incomplete(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "stop_requested",
+                    "sequence": 1,
+                    "event_index": 1,
+                    "execution_id": 96,
+                    "timestamp_ns": 1_000,
+                },
+                {
+                    "type": "state_transition",
+                    "sequence": 2,
+                    "event_index": 2,
+                    "execution_id": 96,
+                    "timestamp_ns": 2_000,
+                    "from_state": "Stopping",
+                    "to_state": "Completed",
+                },
+            ]
+        )
+        details = self._chains(rec)[0]["details"]
+        assert details["chain_complete"] == "false"
+        assert details["completion_boundary"] == (
+            "execution_progressed_without_stop_terminal"
+        )
+        assert details["incomplete_reason"] == (
+            "execution_completed_without_stop_terminal"
+        )
+
+    def test_kernel_source_rotation_fences_sequences_and_open_episode(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        status = {
+            "collector_dropped_total": 0,
+            "manager_dropped_total": 0,
+            "last_sequence_seen": 1,
+        }
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "stop_requested",
+                    "sequence": 1,
+                    "event_index": 1,
+                    "execution_id": 101,
+                    "timestamp_ns": 1_000,
+                }
+            ],
+            pipeline_status=status,
+        )
+        rec.rotate_kernel_event_source(
+            kernel_replaced=True,
+            reason="test_kernel_replacement",
+        )
+
+        first = self._chains(rec)[0]["details"]
+        assert first["chain_complete"] == "false"
+        assert first["incomplete_reason"] == "test_kernel_replacement"
+        assert first["kernel_event_source_generation"] == "1"
+
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "stop_requested",
+                    "sequence": 1,
+                    "event_index": 1,
+                    "execution_id": 102,
+                    "timestamp_ns": 2_000,
+                },
+                {
+                    "type": "state_transition",
+                    "sequence": 2,
+                    "event_index": 2,
+                    "execution_id": 102,
+                    "timestamp_ns": 3_000,
+                    "from_state": "Stopping",
+                    "to_state": "Stopped",
+                },
+            ],
+            pipeline_status={**status, "last_sequence_seen": 2},
+        )
+        second = self._chains(rec)[1]["details"]
+        assert second["chain_complete"] == "true"
+        assert second["kernel_execution_id"] == "102"
+        assert second["kernel_event_source_generation"] == "2"
+
+    def test_late_old_source_batch_is_rejected_after_rotation(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        status = {
+            "collector_dropped_total": 0,
+            "manager_dropped_total": 0,
+            "last_sequence_seen": 1,
+        }
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "stop_requested",
+                    "sequence": 1,
+                    "event_index": 1,
+                    "execution_id": 103,
+                    "timestamp_ns": 1_000,
+                }
+            ],
+            pipeline_status=status,
+            source_identity=1001,
+        )
+        rec.rotate_kernel_event_source(
+            kernel_replaced=True,
+            reason="test_source_identity_rotation",
+            next_source_identity=1002,
+        )
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "state_transition",
+                    "sequence": 2,
+                    "event_index": 2,
+                    "execution_id": 103,
+                    "timestamp_ns": 2_000,
+                    "from_state": "Stopping",
+                    "to_state": "Stopped",
+                }
+            ],
+            pipeline_status={**status, "last_sequence_seen": 2},
+            source_identity=1001,
+        )
+
+        gaps = [
+            event
+            for event in _memory_events(rec)
+            if event["type"] == "kernel_event_gap"
+        ]
+        assert gaps[-1]["details"]["reason"] == (
+            "stale_kernel_event_source_rejected"
+        )
+        assert not [
+            event
+            for event in _memory_events(rec)
+            if event["type"] == "kernel_native_state_transition"
+            and event["execution_id"] == 103
+        ]
+
+    def test_empty_old_source_callback_after_rotation_is_not_false_loss(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec.record_native_kernel_events(
+            [
+                {
+                    "type": "stop_requested",
+                    "sequence": 1,
+                    "event_index": 1,
+                    "execution_id": 104,
+                    "timestamp_ns": 1_000,
+                }
+            ],
+            pipeline_status={
+                "collector_dropped_total": 0,
+                "manager_dropped_total": 0,
+                "last_sequence_seen": 1,
+            },
+            source_identity=2001,
+        )
+        rec.rotate_kernel_event_source(
+            kernel_replaced=True,
+            reason="test_empty_source_identity_rotation",
+            next_source_identity=2002,
+        )
+        gaps_before = rec.kernel_event_gap_status()["gap_records_total"]
+
+        rec.record_native_kernel_events(
+            [],
+            pipeline_status={
+                "collector_dropped_total": 7,
+                "manager_dropped_total": 3,
+                "last_sequence_seen": 11,
+            },
+            source_identity=2001,
+        )
+
+        assert rec.kernel_event_gap_status()["gap_records_total"] == gaps_before
 
     def test_stale_chain_not_inherited_by_unrelated_stop_channel_incident(self):
         """Embed-selector hardening: a stop/fault-channel incident in a LATER
@@ -2778,6 +3311,7 @@ class TestRecoveryEvidenceCorrelation:
             event_type="stop_decision_chain",
             execution_id=42,
             details={
+                "chain_complete": "true",
                 "kernel_execution_id": "42",
                 "latch_id": "latch-42",
                 "terminal_state": "Stopped",

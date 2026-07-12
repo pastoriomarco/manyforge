@@ -28,6 +28,7 @@ class StateHub:
         self._state: ComposerState | None = None
         self._last_broadcast_event_index = 0
         self._last_kernel_event_index = 0
+        self._last_kernel_event_source_identity: int | None = None
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
@@ -81,24 +82,34 @@ class StateHub:
         if state is not None and hasattr(state, "event_recorder"):
             state.event_recorder.observe(state)
         native_kernel_events = []
-        if state is not None and state.cycle_manager is not None:
-            state.cycle_manager.drain_kernel_events_now()
-            native_kernel_events = state.cycle_manager.get_kernel_events_since(
+        manager = state.cycle_manager if state is not None else None
+        if manager is not None:
+            source_identity = id(manager)
+            since = (
                 self._last_kernel_event_index
+                if self._last_kernel_event_source_identity == source_identity
+                else 0
             )
+            manager.drain_kernel_events_now()
+            native_kernel_events = manager.get_kernel_events_since(since)
+            if hasattr(state, "event_recorder"):
+                # Report monotonic loss counters even for an empty batch. A
+                # collector/manager drop may be the only new fact after another
+                # consumer advanced this source's retained event cursor.
+                state.event_recorder.record_native_kernel_events(
+                    native_kernel_events,
+                    pipeline_status=(
+                        manager.kernel_event_pipeline_status()
+                    ),
+                    source_identity=source_identity,
+                )
             if native_kernel_events:
-                if hasattr(state, "event_recorder"):
-                    state.event_recorder.record_native_kernel_events(
-                        native_kernel_events,
-                        pipeline_status=(
-                            state.cycle_manager.kernel_event_pipeline_status()
-                            if state.cycle_manager is not None
-                            else None
-                        ),
-                    )
                 self._last_kernel_event_index = native_kernel_events[-1].get(
                     "event_index", self._last_kernel_event_index
                 )
+            else:
+                self._last_kernel_event_index = since
+            self._last_kernel_event_source_identity = source_identity
 
         if not include_payload:
             return None

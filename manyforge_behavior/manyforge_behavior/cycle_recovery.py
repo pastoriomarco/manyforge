@@ -141,6 +141,21 @@ class RecoveryRequestValidation:
     error: Optional[dict[str, Any]]
 
 
+class RunRecoveryDisposition(StrEnum):
+    BYPASS = "bypass"
+    APPLY_PRIMARY = "apply_primary"
+    EXPLICIT_ACTION_REQUIRED = "explicit_action_required"
+
+
+@dataclass(frozen=True)
+class RunRecoveryDirective:
+    disposition: RunRecoveryDisposition
+    offer: Optional[CycleRecoveryOffer]
+    action_id: Optional[CycleRecoveryActionId] = None
+    reason_code: str = ""
+    message: str = ""
+
+
 _ACTION_LABELS = {
     CycleRecoveryActionId.RETRY_MOTION_FROM_CURRENT_STATE.value: "cycle.recovery.retry_motion",
     CycleRecoveryActionId.ACKNOWLEDGE_AND_CONTINUE.value: "cycle.recovery.acknowledge_and_continue",
@@ -156,6 +171,17 @@ _KERNEL_ACTIONS = frozenset(
         CycleRecoveryActionId.RETRY_AFTER_SCENE_REPAIR.value,
         CycleRecoveryActionId.REPLAN_FROM_STOPPED_STATE.value,
     }
+)
+RUN_AUTOMATIC_RECOVERY_ACTIONS = frozenset(
+    {
+        CycleRecoveryActionId.RETRY_MOTION_FROM_CURRENT_STATE,
+        CycleRecoveryActionId.RETRY_AFTER_SCENE_REPAIR,
+        CycleRecoveryActionId.REPLAN_FROM_STOPPED_STATE,
+        CycleRecoveryActionId.RETRY_RUNTIME_STEP,
+    }
+)
+RUN_AUTOMATIC_RECOVERY_ACTION_IDS = frozenset(
+    action.value for action in RUN_AUTOMATIC_RECOVERY_ACTIONS
 )
 
 
@@ -213,6 +239,54 @@ class CycleRecoveryCoordinator:
     def current_offer_wire(self) -> Optional[dict[str, Any]]:
         offer = self.current_offer()
         return offer.to_wire() if offer is not None else None
+
+    def resolve_run_request(self) -> RunRecoveryDirective:
+        """Resolve Run against the currently published immutable offer.
+
+        Run is allowed to consume only retry-ready, non-confirming primary
+        actions. Every other offer remains an explicit operator choice. This is
+        NRT orchestration policy; kernel retry admission remains authoritative.
+        """
+        offer = self.current_offer()
+        if offer is None:
+            return RunRecoveryDirective(
+                disposition=RunRecoveryDisposition.BYPASS,
+                offer=None,
+            )
+        try:
+            action_id = CycleRecoveryActionId(str(offer.primary_action or ""))
+        except ValueError:
+            action_id = None
+        action = next(
+            (
+                candidate
+                for candidate in offer.actions
+                if candidate.action_id == str(offer.primary_action or "")
+            ),
+            None,
+        )
+        if (
+            offer.status == "retry_ready"
+            and action_id in RUN_AUTOMATIC_RECOVERY_ACTIONS
+            and action is not None
+            and action.enabled
+            and not action.requires_confirmation
+        ):
+            return RunRecoveryDirective(
+                disposition=RunRecoveryDisposition.APPLY_PRIMARY,
+                offer=offer,
+                action_id=action_id,
+                reason_code="operator_run_primary_recovery",
+            )
+        return RunRecoveryDirective(
+            disposition=RunRecoveryDisposition.EXPLICIT_ACTION_REQUIRED,
+            offer=offer,
+            reason_code=offer.reason_code,
+            message=(
+                "Run cannot choose the current recovery action. "
+                f"status={offer.status}, reason={offer.reason_code}"
+            ),
+        )
 
     def project(
         self,

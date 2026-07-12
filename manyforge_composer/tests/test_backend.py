@@ -5713,6 +5713,67 @@ def test_kernel_events_route_records_drop_gap_evidence():
     assert pipeline["collector_dropped_total"] == 4200 - 4096
 
 
+def test_kernel_events_route_records_drop_advance_with_empty_batch():
+    """RT-8F: loss accounting is independent of retained event delivery."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        state.stop_recovery_offer_pump()
+        manager = state.cycle_manager
+        assert manager is not None
+        manager.drain_kernel_events_now = lambda: []
+        manager.get_kernel_events_since = lambda _since: []
+        manager.kernel_event_pipeline_status = lambda: {
+            "collector_dropped_total": 1,
+            "manager_dropped_total": 0,
+            "last_sequence_seen": 1,
+        }
+
+        before = state.event_recorder.kernel_event_gap_status()[
+            "gap_records_total"
+        ]
+        response = client.get("/api/kernel/events?since=0")
+        assert response.status_code == 200
+        assert response.json()["events"] == []
+        after = state.event_recorder.kernel_event_gap_status()[
+            "gap_records_total"
+        ]
+        assert after == before + 1
+
+
+def test_state_hub_records_drop_advance_without_browser_or_events():
+    """RT-8F: the always-on NRT pump makes empty-batch loss durable."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        state.stop_recovery_offer_pump()
+        manager = state.cycle_manager
+        assert manager is not None
+        manager.drain_kernel_events_now = lambda: []
+        manager.get_kernel_events_since = lambda _since: []
+        manager.kernel_event_pipeline_status = lambda: {
+            "collector_dropped_total": 0,
+            "manager_dropped_total": 1,
+            "last_sequence_seen": 1,
+        }
+        hub = StateHub()
+        hub.start(state)
+
+        before = state.event_recorder.kernel_event_gap_status()[
+            "gap_records_total"
+        ]
+        assert hub._collect_frame(include_payload=False) is None
+        after = state.event_recorder.kernel_event_gap_status()[
+            "gap_records_total"
+        ]
+        hub.stop()
+        assert after == before + 1
+
+
 def test_heartbeat_degrades_on_kernel_event_pipeline_drops():
     """OW1 regression: nonzero pipeline drop totals degrade the heartbeat and
     the component carries the gap-record accounting fields."""

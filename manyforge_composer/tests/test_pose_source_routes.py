@@ -526,8 +526,9 @@ def test_continuous_snapshot_applies_planning_scene_without_operator_apply(tmp_p
     visual_objects, _meta = state.visual_scene_objects_snapshot()
     assert visual_objects[0].pose_in_universe["position_m"] == [1.0, 2.0, 3.0]
     assert refresh_reasons == []
+    # Per-object visual edits are committed with publish=False; one
+    # generation-checked batch wake replaces the old duplicate wake.
     assert publish_reasons == [
-        "scene_edit_update_pose",
         "pose_source_continuous",
         "scene_state_cache_empty",
     ]
@@ -683,6 +684,133 @@ def test_pose_source_clear_invalidates_worker_waiting_for_scene_lock(tmp_path: P
     assert [edit.operation for edit in state.kernel.scene_edits] == ["add"]
     metrics = state.pose_source_apply_status()["counters"]
     assert metrics["stale_generation_dropped"] >= 1
+
+
+def test_pose_source_invalidation_after_first_object_fences_rest_of_batch(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(
+            box_policy="continuous",
+            can_policy="continuous",
+        )
+    )
+    _add_object(client, "box")
+    _add_object(client, "can")
+    generation_before = state._pose_source_apply_generation_value()
+
+    first_edit_committed = threading.Event()
+    invalidation_done = threading.Event()
+    original_scene_edit = state.kernel.scene_edit
+
+    def scene_edit_with_mid_batch_invalidation(request):
+        result = original_scene_edit(request)
+        if request.operation == "update_pose" and request.object_id == "box":
+            first_edit_committed.set()
+            # Invalidation intent is wait-free with respect to the per-object
+            # commit lock. The invalidator itself remains blocked until this
+            # object transaction finishes.
+            assert state._pose_source_invalidation_requested.wait(timeout=1.0)
+        return result
+
+    state.kernel.scene_edit = scene_edit_with_mid_batch_invalidation
+    publish_reasons: list[str] = []
+    state.request_visual_state_publish = (
+        lambda *, reason="": publish_reasons.append(reason)
+    )
+
+    def invalidate() -> None:
+        assert first_edit_committed.wait(timeout=1.0)
+        state.invalidate_pose_source_applies(reason="deterministic_mid_batch_reset")
+        invalidation_done.set()
+
+    invalidator = threading.Thread(target=invalidate, daemon=False)
+    invalidator.start()
+    response = _post_fresh_snapshot(
+        client,
+        [
+            _pose_source_observation("box", position_xyz=[1.0, 0.0, 0.0]),
+            _pose_source_observation("can", position_xyz=[2.0, 0.0, 0.0]),
+        ],
+    )
+    assert response.json()["continuous_apply"]["queued"] is True
+    result = _wait_for_pose_source_apply(state)
+    invalidator.join(timeout=1.0)
+
+    assert invalidation_done.is_set()
+    update_ids = [
+        edit.object_id
+        for edit in state.kernel.scene_edits
+        if edit.operation == "update_pose"
+    ]
+    assert update_ids == ["box"]
+    assert not any(reason.startswith("pose_source_") for reason in publish_reasons)
+    assert state._pose_source_apply_signatures == {}
+    assert result["reason"] == "deterministic_mid_batch_reset"
+    assert result["invalidated_generation"] == generation_before
+    assert result["current_generation"] == generation_before + 1
+    metrics = state.pose_source_apply_status()["counters"]
+    assert metrics["stale_result_ignored"] >= 1
+
+
+def test_initial_generation_in_flight_apply_is_counted_by_invalidation(
+    tmp_path: Path,
+) -> None:
+    _, state = _client(tmp_path)
+    with state._pose_source_apply_lock:
+        assert state._pose_source_apply_generation == 0
+        state._pose_source_apply_in_flight = {
+            "policy": "continuous",
+            "object_ids": ["box"],
+            "expected_generation": 0,
+        }
+
+    result = state.invalidate_pose_source_applies(reason="generation_zero_probe")
+
+    assert result["generation"] == 1
+    assert result["dropped_count"] == 1
+    assert state.pose_source_apply_status()["last_result"]["skipped_count"] == 1
+
+
+def test_generation_aware_visual_refresh_cannot_publish_after_invalidation(
+    tmp_path: Path,
+) -> None:
+    _, state = _client(tmp_path)
+    read_started = threading.Event()
+    release_read = threading.Event()
+    original_get_scene_objects = state.kernel.get_scene_objects
+
+    def blocked_get_scene_objects():
+        read_started.set()
+        assert release_read.wait(timeout=1.0)
+        return original_get_scene_objects()
+
+    state.kernel.get_scene_objects = blocked_get_scene_objects
+    committed_snapshots: list[list[Any]] = []
+    state.update_visual_scene_objects_snapshot = (
+        lambda objects, *, error=None: committed_snapshots.append(list(objects))
+    )
+    generation = state._pose_source_apply_generation_value()
+
+    queued = state.request_visual_scene_objects_refresh(
+        reason="generation_fence_probe",
+        expected_pose_source_generation=generation,
+    )
+    assert queued["queued"] is True
+    assert read_started.wait(timeout=1.0)
+    state.invalidate_pose_source_applies(reason="visual_refresh_invalidation")
+    release_read.set()
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        with state._visual_scene_objects_lock:
+            if not state._visual_scene_objects_refresh_running:
+                break
+        time.sleep(0.005)
+
+    assert committed_snapshots == []
+    with state._visual_scene_objects_lock:
+        assert state._visual_scene_objects_refresh_running is False
 
 
 def test_continuous_snapshot_skips_live_mutation_during_resumable_stop(

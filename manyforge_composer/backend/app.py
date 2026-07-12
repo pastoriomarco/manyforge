@@ -105,13 +105,15 @@ def create_app(
         if recorder is not None:
 
             def _flush_final_events() -> None:
-                if state.cycle_manager is not None:
-                    state.cycle_manager.drain_kernel_events_now()
+                manager = state.cycle_manager
+                if manager is not None:
+                    manager.drain_kernel_events_now()
                     recorder.record_native_kernel_events(
-                        state.cycle_manager.get_kernel_events_since(0),
+                        manager.get_kernel_events_since(0),
                         pipeline_status=(
-                            state.cycle_manager.kernel_event_pipeline_status()
+                            manager.kernel_event_pipeline_status()
                         ),
+                        source_identity=id(manager),
                     )
                 recorder.observe(state, force=True)
 

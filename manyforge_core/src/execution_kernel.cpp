@@ -8184,16 +8184,16 @@ ExecutionKernel::publish_terminal_recovery_assessment_locked(
 KernelRecoveryAssessmentDTO
 ExecutionKernel::publish_recovery_assessment_locked(
     RecoveryAuthorityCapture capture, const char* trigger) {
-  std::uint64_t previous_revision = 0;
   KernelRecoveryAssessmentDTO previous;
   {
     std::lock_guard<std::mutex> lock(recovery_assessment_mutex_);
     previous = recovery_assessment_;
-    previous_revision = recovery_assessment_.assessment_revision;
   }
-  auto next = build_recovery_assessment(capture, recovery_readiness_policy(),
-                                        previous_revision);
-  if (!recovery_assessment_semantically_differs(previous, next)) {
+  auto publication = prepare_recovery_assessment_publication(
+      previous, capture, recovery_readiness_policy(),
+      trigger != nullptr ? std::string_view(trigger) : std::string_view{});
+  auto& next = publication.candidate;
+  if (!publication.changed) {
     // Equally admissible facts do not churn the published revision
     // (spec/210 §3.12 offer stability), but a newer equivalent observation
     // extends its own freshness deadline. Keep the expiry schedule current
@@ -8212,21 +8212,7 @@ ExecutionKernel::publish_recovery_assessment_locked(
   event.type = KernelEventType::kRecoveryAssessmentChanged;
   event.execution_id = next.execution_id;
   event.timestamp_ns = clock_.now();
-  event.details = {
-      {"assessment_revision", std::to_string(next.assessment_revision)},
-      {"recovery_class", recovery_class_name(next.recovery_class)},
-      {"status", recovery_assessment_status_name(next.status)},
-      {"reason_code", next.reason_code},
-      {"retry_admissible", next.retry_admissible ? "true" : "false"},
-      {"stop_certificate_id", next.stop_certificate_id},
-      {"latch_id", next.latch_id},
-      {"source_id", next.source_id},
-      {"policy_id", next.policy_id},
-      {"queued_latch_present", next.queued_latch_present ? "true" : "false"},
-      {"stronger_authority_active",
-       next.stronger_authority_active ? "true" : "false"},
-      {"trigger", trigger != nullptr ? trigger : ""},
-  };
+  event.details = std::move(publication.event_details);
   emit_event(std::move(event));
   return next;
 }

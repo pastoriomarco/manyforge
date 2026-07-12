@@ -149,20 +149,26 @@ def create_kernel_router(state: ComposerState) -> APIRouter:
         Pass the last received event_index as `since` to get only new events.
         """
         def command() -> dict[str, Any]:
-            if state.cycle_manager is None:
+            manager = state.cycle_manager
+            if manager is None:
                 return {
                     "events": [],
                     "last_event_index": 0,
                     "timestamp_ns": time.monotonic_ns(),
                 }
-            state.cycle_manager.drain_kernel_events_now()
-            events = state.cycle_manager.get_kernel_events_since(since)
-            if events and hasattr(state, "event_recorder"):
+            manager.drain_kernel_events_now()
+            events = manager.get_kernel_events_since(since)
+            if hasattr(state, "event_recorder"):
+                # Loss counters can advance even when this consumer's cursor
+                # yields no events (another drain may already have consumed the
+                # retained batch). The empty call is therefore load-bearing:
+                # it lets the recorder make otherwise invisible loss durable.
                 state.event_recorder.record_native_kernel_events(
                     events,
                     pipeline_status=(
-                        state.cycle_manager.kernel_event_pipeline_status()
+                        manager.kernel_event_pipeline_status()
                     ),
+                    source_identity=id(manager),
                 )
             last_index = events[-1]["event_index"] if events else since
             return {

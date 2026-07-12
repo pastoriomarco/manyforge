@@ -7,6 +7,10 @@ from typing import Any, Iterable
 from fastapi import APIRouter, HTTPException, Query
 
 from manyforge_behavior.cycle_manager import preferred_structured_error_code
+from manyforge_behavior.cycle_recovery import (
+    CycleRecoveryActionId,
+    RUN_AUTOMATIC_RECOVERY_ACTION_IDS,
+)
 from .cycle_diagnostics import manager_cycle_error_fields
 from .event_recorder import _wall_iso_to_ns
 
@@ -364,15 +368,13 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
         required_operator_action = "resume"
     resume_allowed = bool(
         enabled_actions
-        & {
-            "retry_motion_from_current_state",
-            "retry_after_scene_repair",
-            "replan_from_stopped_state",
-            "retry_runtime_step",
-        }
+        & RUN_AUTOMATIC_RECOVERY_ACTION_IDS
     ) or ordinary_resume_available
     reset_required = (recovery_offer or {}).get("status") == "reset_required"
-    ack_required = "acknowledge_and_continue" in enabled_actions
+    ack_required = (
+        CycleRecoveryActionId.ACKNOWLEDGE_AND_CONTINUE.value
+        in enabled_actions
+    )
     if required_operator_action != "none":
         warnings.append(f"Operator action required: {required_operator_action}")
     latest_incident_snapshots = (
