@@ -1423,20 +1423,17 @@ def test_scene_state_does_not_advance_gripper_commands_on_read_path(
     class OrderedKernel(MockKernelClient):
         def __init__(self) -> None:
             super().__init__(joint_names=["joint_a"])
-            self.gripper_update_count = 0
 
         def get_execution_snapshot(self):
             return SimpleNamespace(joint_positions_rad=[0.0])
 
         def get_link_pose(self, link_name: str, reference_frame: str):
-            assert self.gripper_update_count == 0
             return {
                 "position_m": [0.0, 0.0, 0.0],
                 "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
             }
 
         def get_link_poses(self, link_names: list[str], reference_frame: str):
-            assert self.gripper_update_count == 0
             return {
                 name: {
                     "position_m": [0.0, 0.0, 0.0],
@@ -1444,9 +1441,6 @@ def test_scene_state_does_not_advance_gripper_commands_on_read_path(
                 }
                 for name in link_names
             }
-
-        def update_gripper_commands(self) -> None:
-            self.gripper_update_count += 1
 
     monkeypatch.setattr(routes_urdf, "visual_link_names_for_fk", lambda _state: ("finger",))
     monkeypatch.setattr(routes_urdf, "active_urdf_model_key", lambda _state: "ordered")
@@ -1478,7 +1472,7 @@ def test_scene_state_does_not_advance_gripper_commands_on_read_path(
     payload = routes_scene.build_scene_state_payload(state)
 
     assert payload["link_poses"]["finger"]["position_m"] == [0.0, 0.0, 0.0]
-    assert kernel.gripper_update_count == 0
+    assert not hasattr(kernel, "update_gripper_commands")
 
 
 def test_scene_frames_expose_model_inventory_and_visibility_control(

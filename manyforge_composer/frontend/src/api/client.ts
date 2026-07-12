@@ -1,6 +1,9 @@
 import type {
   CycleStatus,
   CycleCommand,
+  CycleRecoveryActionRequest,
+  CycleRecoveryActionResult,
+  CycleRecoveryOffer,
   VelocityScaleResponse,
   ExecutionChannelsResponse,
   CatalogResponse,
@@ -97,23 +100,29 @@ function errorMessageFromPayload(payload: unknown, fallback: string): string {
 export function structuredErrorFromPayload(payload: unknown): {
   errorCode: string | null;
   errorDetails: Record<string, unknown> | null;
+  recoveryOffer: CycleRecoveryOffer | null;
 } {
   if (!payload || typeof payload !== 'object') {
-    return { errorCode: null, errorDetails: null };
+    return { errorCode: null, errorDetails: null, recoveryOffer: null };
   }
   const data = payload as Record<string, unknown>;
   const detail = data.detail;
   if (!detail || typeof detail !== 'object') {
-    return { errorCode: null, errorDetails: null };
+    return { errorCode: null, errorDetails: null, recoveryOffer: null };
   }
   const detailObj = detail as Record<string, unknown>;
   const code = detailObj.errorCode;
   const details = detailObj.errorDetails;
+  const recoveryOffer = detailObj.recoveryOffer;
   return {
     errorCode: typeof code === 'string' && code.trim() ? code : null,
     errorDetails:
       details && typeof details === 'object'
         ? (details as Record<string, unknown>)
+        : null,
+    recoveryOffer:
+      recoveryOffer && typeof recoveryOffer === 'object'
+        ? (recoveryOffer as CycleRecoveryOffer)
         : null,
   };
 }
@@ -123,6 +132,7 @@ export class ApiError extends Error {
   readonly payload: unknown;
   readonly errorCode: string | null;
   readonly errorDetails: Record<string, unknown> | null;
+  readonly recoveryOffer: CycleRecoveryOffer | null;
 
   constructor(message: string, status: number, payload: unknown) {
     super(message);
@@ -132,6 +142,7 @@ export class ApiError extends Error {
     const structured = structuredErrorFromPayload(payload);
     this.errorCode = structured.errorCode;
     this.errorDetails = structured.errorDetails;
+    this.recoveryOffer = structured.recoveryOffer;
   }
 }
 
@@ -159,10 +170,8 @@ export const api = {
     stop: () => request<CycleCommand>('POST', '/api/cycle/stop'),
     fullStop: () => request<CycleCommand>('POST', '/api/cycle/full-stop'),
     reset: () => request<CycleCommand>('POST', '/api/cycle/reset'),
-    acknowledgeInterventionForRetry: () =>
-      request<CycleCommand>('POST', '/api/cycle/acknowledge-intervention-for-retry'),
-    acknowledgeFailedValidationForRetry: () =>
-      request<CycleCommand>('POST', '/api/cycle/acknowledge-failed-validation-for-retry'),
+    applyRecoveryAction: (payload: CycleRecoveryActionRequest) =>
+      request<CycleRecoveryActionResult>('POST', '/api/cycle/recovery-actions', payload),
     setVelocityScale: (value: number) =>
       request<VelocityScaleResponse>('PUT', '/api/cycle/velocity-scale', { value }),
   },

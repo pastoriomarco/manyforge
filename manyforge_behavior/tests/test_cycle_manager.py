@@ -28,7 +28,6 @@ from manyforge_behavior.cycle_manager import (
     CycleState,
     InterventionSession,
     RecoveryTrigger,
-    _scene_resume_fingerprint_from_objects,
     canonical_recovery_trigger_values,
 )
 
@@ -36,6 +35,81 @@ CATALOG_PATH = str(Path(__file__).parent.parent / "resources" / "node_catalog.ya
 FIXTURE_PATH = str(
     Path(__file__).parent / "fixtures" / "pick_and_place.program.yaml"
 )
+
+
+def _script_ready_recovery(
+    kernel: MockKernelClient,
+    *,
+    action: str = "replan_from_stopped_state",
+    recovery_class: str = "ordinary_operator_stop",
+    status: str = "retry_ready",
+    execution_state: str = "stopped",
+) -> dict:
+    """Install one explicit kernel assessment/result pair for integration tests.
+
+    The mock deliberately does not reproduce the C++ admission matrix. Tests
+    script the authority verdict they need and then verify CycleManager binds
+    and forwards every exact token from that verdict.
+    """
+    kernel._state = ExecutionState(execution_state)
+    assessment = {
+        "schema_version": "manyforge.kernel_recovery_assessment.v1",
+        "assessment_revision": 11,
+        "assessed_at_ns": time.monotonic_ns(),
+        "control_command_epoch": kernel.control_command_epoch(),
+        "execution_id": kernel.get_status().execution_id,
+        "execution_state": execution_state,
+        "recovery_class": recovery_class,
+        "status": status,
+        "latch_id": "latch-test" if recovery_class != "ordinary_operator_stop" else "",
+        "source_id": "test",
+        "policy_id": "test",
+        "preemption_result": "succeeded",
+        "stop_owner_active": False,
+        "stop_owner_generation": 7,
+        "backend_stop_confirmed": True,
+        "stop_certificate_id": "stop-cert-test",
+        "observed_state_available": True,
+        "observed_state_sequence": 19,
+        "observed_state_source_id": "mock",
+        "observed_state_authority_profile": "mock_measured",
+        "observed_state_measured": True,
+        "observed_state_valid_until_ns": time.monotonic_ns() + 5_000_000_000,
+        "observed_state_fresh": True,
+        "observed_state_at_rest": True,
+        "stronger_authority_active": False,
+        "queued_latch_present": False,
+        "retry_admissible": status == "retry_ready",
+        "allowed_actions": [action, "reset_cycle"],
+        "reason_code": "recovery_stop_certified",
+        "evidence_refs": ["stop-cert-test", "kernel-event:19"],
+    }
+    resulting = dict(assessment)
+    resulting.update(
+        {
+            "assessment_revision": 12,
+            "execution_state": "idle",
+            "recovery_class": "none",
+            "status": "unavailable",
+            "latch_id": "",
+            "stop_certificate_id": "",
+            "retry_admissible": False,
+            "allowed_actions": [],
+            "reason_code": "no_recovery_active",
+            "evidence_refs": [],
+        }
+    )
+    kernel.script_recovery_assessment(assessment)
+    kernel.script_recovery_action_result(
+        {
+            "request_id": "scripted",
+            "action": action,
+            "accepted": True,
+            "error": None,
+            "resulting_assessment": resulting,
+        }
+    )
+    return assessment
 
 
 def _write_yaml_file(data: dict) -> str:
@@ -55,32 +129,6 @@ def reset_blackboard():
 @pytest.fixture
 def kernel():
     return MockKernelClient()
-
-
-class _ContainmentRejectingKernel(MockKernelClient):
-    """Mock the RT-8P0 authority retaining an interrupted retry."""
-
-    def __init__(self, *args, retryable: bool = True, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._interrupted_retryable = retryable
-
-    def acknowledge_interrupted_for_retry(
-        self,
-        principal_id: str,
-        reason: str,
-        *,
-        expected_epoch: int | None = None,
-    ) -> CommandResult:
-        del principal_id, reason, expected_epoch
-        self.acknowledge_interrupted_for_retry_count += 1
-        return CommandResult(
-            accepted=False,
-            error="runtime-collision stop is not yet certified",
-            reason_code="runtime_collision_stop_not_yet_certified",
-            details={
-                "retryable": "true" if self._interrupted_retryable else "false"
-            },
-        )
 
 
 class TestCycleManagerInitialState:
@@ -133,27 +181,22 @@ class TestCycleManagerRun:
         assert manager._tree is initial_tree
         assert len(slow_kernel.scene_edits) == initial_scene_edit_count
 
-    def test_reset_clears_motion_soft_fail_blackboard(self, kernel):
-        """Reset starts a fresh cycle, not a resume of a previous motion soft-fail."""
+    def test_reset_clears_generation_scoped_runtime_faults(self, kernel):
+        """Reset rebuilds the cycle and invalidates every old node fault handle."""
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
-
-        bb = py_trees.blackboard.Client(name="test_motion_soft_fail_reset")
-        bb.register_key(key="motion_paused_due_to_error", access=py_trees.common.Access.WRITE)
-        bb.register_key(key="motion_error_message", access=py_trees.common.Access.WRITE)
-        bb.register_key(key="motion_paused_node_name", access=py_trees.common.Access.WRITE)
-        bb.register_key(key="resume_after_error_requested", access=py_trees.common.Access.WRITE)
-        bb.set("motion_paused_due_to_error", True)
-        bb.set("motion_error_message", "stale collision")
-        bb.set("motion_paused_node_name", "stale_motion")
-        bb.set("resume_after_error_requested", True)
+        fault = runner.runtime_pause_registry.raise_fault(
+            node_name="stale_motion",
+            node_id="move_manipulator_action",
+            domain="motion",
+            reason_code="runtime_collision",
+            message="stale collision",
+        )
 
         manager.reset()
 
-        assert bb.get("motion_paused_due_to_error") is False
-        assert bb.get("motion_error_message") is None
-        assert bb.get("motion_paused_node_name") is None
-        assert bb.get("resume_after_error_requested") is False
+        assert runner.runtime_pause_registry.get(fault.fault_id) is None
+        assert runner.runtime_pause_registry.active_faults() == ()
     
     def test_run_from_running_is_noop(self, kernel):
         """run() from RUNNING state is a no-op."""
@@ -168,8 +211,8 @@ class TestCycleManagerRun:
         manager.run()
         assert manager.state == CycleState.RUNNING
     
-    def test_run_from_stopped_resumes(self, kernel):
-        """run() from STOPPED resumes execution."""
+    def test_run_from_stopped_consumes_exact_replan_offer(self, kernel):
+        """A terminal stop resumes only through the current certified offer."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
@@ -181,20 +224,33 @@ class TestCycleManagerRun:
             manager.full_stop()
             assert manager.state == CycleState.STOPPED
 
-            # Run again — should resume
-            manager.run()
+            assessment = _script_ready_recovery(slow_kernel)
+            reset_count = slow_kernel.reset_count
+            result = manager.run(principal_id="operator-test")
+
+            assert result is not None
+            assert result["accepted"] is True
             assert manager.state == CycleState.RUNNING
+            assert slow_kernel.reset_count == reset_count
+            request = slow_kernel.apply_recovery_action_requests[-1]
+            assert request["action"] == "replan_from_stopped_state"
+            assert request["principal_id"] == "operator-test"
+            assert (
+                request["expected_assessment_revision"]
+                == assessment["assessment_revision"]
+            )
+            assert request["expected_execution_id"] == assessment["execution_id"]
+            assert (
+                request["expected_stop_certificate_id"]
+                == assessment["stop_certificate_id"]
+            )
         finally:
             manager.reset()
 
-    def test_run_from_stopped_rejects_if_live_scene_changed(self, kernel):
-        """A resumable STOPPED cycle owns the live scene state.
-
-        If an external route detaches/moves/removes scene objects while stopped,
-        the memory behavior tree may otherwise resume past an already-successful
-        attach node with stale assumptions. Run must fail closed instead.
-        """
-
+    def test_structural_scene_change_rejects_rendered_offer_and_returns_new_one(
+        self, kernel
+    ):
+        """A request cannot cross a structural scene-admission generation."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
@@ -204,6 +260,9 @@ class TestCycleManagerRun:
             time.sleep(0.2)
             manager.full_stop()
             assert manager.state == CycleState.STOPPED
+            _script_ready_recovery(slow_kernel)
+            rendered_offer = manager.refresh_recovery_offer()
+            assert rendered_offer is not None
 
             result = slow_kernel.scene_edit(
                 SceneEditRequest(
@@ -216,293 +275,339 @@ class TestCycleManagerRun:
             )
             assert result.success is True
 
-            with pytest.raises(RuntimeError, match="live scene changed"):
-                manager.run()
+            response = manager.apply_recovery_action(
+                {
+                    "request_id": "stale-scene-request",
+                    "offer_id": rendered_offer["offerId"],
+                    "offer_revision": rendered_offer["offerRevision"],
+                    "action_id": rendered_offer["primaryAction"],
+                },
+                principal_id="operator-test",
+            )
+
+            assert response["accepted"] is False
+            assert response["error"]["details"]["reason"] == "recovery_offer_stale"
+            assert response["recoveryOffer"] is not None
+            assert (
+                response["recoveryOffer"]["sceneAdmissionEpoch"]
+                > rendered_offer["sceneAdmissionEpoch"]
+            )
             assert manager.state == CycleState.STOPPED
-            assert manager.error_code == "resumable_scene_changed"
+            assert not getattr(slow_kernel, "apply_recovery_action_requests", [])
         finally:
             manager.reset()
 
-    def test_run_from_stopped_rejects_if_attached_object_detached(self, kernel):
-        """Resume must not trust a memory tree after held attachment is lost."""
-
-        slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
-        manager = CycleManager(runner, slow_kernel)
-
-        try:
-            manager.run()
-            attach = slow_kernel.scene_edit(
-                SceneEditRequest(
-                    operation="attach",
-                    object_id="table",
-                    frame_id="tool0",
-                )
-            )
-            assert attach.success is True
-            time.sleep(0.2)
-            manager.full_stop()
-            assert manager.state == CycleState.STOPPED
-
-            detach = slow_kernel.scene_edit(
-                SceneEditRequest(operation="detach", object_id="table")
-            )
-            assert detach.success is True
-
-            with pytest.raises(RuntimeError, match="live scene changed"):
-                manager.run()
-            assert manager.state == CycleState.STOPPED
-            assert manager.error_code == "resumable_scene_changed"
-        finally:
-            manager.reset()
-
-    def test_attached_scene_fingerprint_uses_attachment_frame_not_world_pose(self):
-        """Real feedback/FK drift must not look like an attachment mutation."""
-
-        shape = SceneShape(type="box", box_dimensions_m=[0.1, 0.2, 0.3])
-        first = SceneObjectSnapshot(
-            object_id="part",
-            shape=shape,
-            pose_in_frame={
-                "position_m": [0.01, 0.0, 0.02],
-                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-            },
-            pose_in_universe={
-                "position_m": [1.0, 2.0, 3.0],
-                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-            },
-            attached=True,
-            frame_id="tool0",
+    def test_reset_recovery_request_is_idempotent_across_response_retry(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager._state = CycleState.STOPPED
+        manager._error = "cycle fault"
+        manager._error_code = "cycle_fault"
+        offer = manager.refresh_recovery_offer()
+        assert offer is not None
+        assert offer["primaryAction"] == "reset_cycle"
+        callbacks: list[str] = []
+        events: list[tuple[str, dict]] = []
+        manager.set_on_recovery_action_event(
+            lambda action, details: events.append((action, details))
         )
-        second = SceneObjectSnapshot(
-            object_id="part",
-            shape=shape,
-            pose_in_frame={
-                "position_m": [0.01, 0.0, 0.02],
-                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-            },
-            pose_in_universe={
-                "position_m": [1.1, 2.1, 3.1],
-                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-            },
-            attached=True,
-            frame_id="tool0",
+        request = {
+            "request_id": "reset-idempotency-1",
+            "offer_id": offer["offerId"],
+            "offer_revision": offer["offerRevision"],
+            "action_id": "reset_cycle",
+        }
+
+        first = manager.apply_recovery_action(
+            request,
+            principal_id="operator-test",
+            reset_callback=callbacks.append,
+        )
+        replay = manager.apply_recovery_action(
+            request,
+            principal_id="operator-test",
+            reset_callback=callbacks.append,
         )
 
-        assert _scene_resume_fingerprint_from_objects([first]) == (
-            _scene_resume_fingerprint_from_objects([second])
-        )
+        assert first == replay
+        assert first["accepted"] is True
+        assert callbacks == ["reset-idempotency-1"]
+        assert [action for action, _ in events] == ["requested", "accepted"]
 
-    def test_run_from_held_motion_soft_fail_clears_interrupted_kernel_retry(
+        conflict = manager.apply_recovery_action(
+            {**request, "reason": "different payload"},
+            principal_id="operator-test",
+            reset_callback=callbacks.append,
+        )
+        assert conflict["accepted"] is False
+        assert (
+            conflict["error"]["details"]["reason"]
+            == "recovery_request_id_reused"
+        )
+        assert callbacks == ["reset-idempotency-1"]
+        assert [action for action, _ in events] == [
+            "requested",
+            "accepted",
+            "requested",
+            "rejected",
+        ]
+
+    def test_recovery_offer_projects_within_server_deadline_after_kernel_event(
         self, kernel
     ):
-        """Run from held motion stop is an explicit retry after a motion soft-fail.
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager._state = CycleState.STOPPED
+        _script_ready_recovery(kernel)
+        publication_times: list[float] = []
+        manager.set_on_recovery_offer_published(
+            lambda _offer: publication_times.append(time.monotonic())
+        )
+        waiter = threading.Thread(
+            target=lambda: manager.wait_for_kernel_events_and_project(0.05),
+        )
+        waiter.start()
+        time.sleep(0.005)
+        emitted_at = time.monotonic()
+        kernel._emit_kernel_event("recovery_assessment_changed")
+        waiter.join(timeout=0.2)
 
-        Runtime collision faults leave the kernel in INTERRUPTED with an
-        active latch. Removing the obstacle fixes the scene but does not clear
-        that execution-local latch. The cycle keeps ticking with motion held;
-        the operator pressing Run means "retry this held motion". CycleManager
-        must acknowledge the interrupted kernel execution boundary first so the
-        motion node can submit a fresh execute request.
-        This must not call kernel.reset(), because ROS/Isaac reset can command
-        the robot back to its initial pose. If the obstacle is still present,
-        the fresh execute/monitor path will latch a new collision.
-        """
+        assert not waiter.is_alive()
+        assert publication_times
+        assert (publication_times[0] - emitted_at) < 0.050
+
+    def test_concurrent_duplicate_recovery_request_never_repeats_reset(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager._state = CycleState.STOPPED
+        manager._error = "cycle fault"
+        manager._error_code = "cycle_fault"
+        offer = manager.refresh_recovery_offer()
+        request = {
+            "request_id": "reset-singleflight-1",
+            "offer_id": offer["offerId"],
+            "offer_revision": offer["offerRevision"],
+            "action_id": "reset_cycle",
+        }
+        entered = threading.Event()
+        release = threading.Event()
+        callback_count = 0
+        first_result: list[dict] = []
+
+        def blocked_reset(_request_id: str) -> None:
+            nonlocal callback_count
+            callback_count += 1
+            entered.set()
+            assert release.wait(timeout=1.0)
+
+        first = threading.Thread(
+            target=lambda: first_result.append(
+                manager.apply_recovery_action(
+                    request,
+                    principal_id="operator-test",
+                    reset_callback=blocked_reset,
+                )
+            )
+        )
+        first.start()
+        assert entered.wait(timeout=1.0)
+        duplicate = manager.apply_recovery_action(
+            request,
+            principal_id="operator-test",
+            reset_callback=blocked_reset,
+        )
+        release.set()
+        first.join(timeout=1.0)
+
+        assert not first.is_alive()
+        assert callback_count == 1
+        assert duplicate["accepted"] is False
+        assert duplicate["resultCode"] == "recovery_request_in_progress"
+        assert first_result[0]["accepted"] is True
+
+    def test_unexpected_recovery_exception_consumes_request_id(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        calls = 0
+
+        def ambiguous_once(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("effect outcome unknown")
+
+        manager._apply_recovery_action_once = ambiguous_once  # type: ignore[method-assign]
+        request = {
+            "request_id": "ambiguous-recovery-1",
+            "offer_id": "offer-1",
+            "offer_revision": 1,
+            "action_id": "reset_cycle",
+        }
+        with pytest.raises(RuntimeError, match="effect outcome unknown"):
+            manager.apply_recovery_action(
+                request,
+                principal_id="operator-test",
+            )
+
+        replay = manager.apply_recovery_action(
+            request,
+            principal_id="operator-test",
+        )
+        assert calls == 1
+        assert replay["accepted"] is False
+        assert replay["resultCode"] == "recovery_action_outcome_unknown"
+
+    def test_run_from_held_runtime_fault_consumes_exact_cycle_offer(self, kernel):
+        """Run can consume a certified automatic runtime-step offer only."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
-
-        bb = py_trees.blackboard.Client(name="test_motion_retry_after_collision")
-        bb.register_key(key="motion_paused_due_to_error", access=py_trees.common.Access.READ)
-        bb.register_key(key="motion_error_message", access=py_trees.common.Access.READ)
-        bb.register_key(key="motion_paused_node_name", access=py_trees.common.Access.READ)
-        bb.register_key(key="resume_after_error_requested", access=py_trees.common.Access.READ)
-
         try:
-            manager.run()
-            deadline = time.time() + 1.0
-            while slow_kernel.execute_count == 0 and time.time() < deadline:
-                time.sleep(0.01)
-            assert slow_kernel.execute_count == 1
+            manager.reset()
+            fault = runner.runtime_pause_registry.raise_fault(
+                node_name="signal_bridge",
+                node_id="cycle_signal_condition",
+                domain="signal",
+                reason_code="runtime_signal_fault",
+                message="signal provider unavailable",
+                resume_owner="cycle_manager",
+            )
+            with manager._lock:
+                manager._state = CycleState.RUNNING
+                manager._motion_stop_state = "held"
+                manager._error = fault.message
+                manager._error_code = fault.reason_code
 
-            # Simulate a runtime collision fault while the authored motion node
-            # still owns the in-flight execution. This preserves the node's
-            # internal soft-fail state, matching the live path that Run must
-            # resume. Fabricating only blackboard keys after reset would build a
-            # fresh node that has no _soft_fail_error to consume.
-            initial_reset_count = slow_kernel.reset_count
-            slow_kernel._state = ExecutionState.INTERRUPTED
+            result = manager.run(principal_id="operator-test")
 
-            deadline = time.time() + 1.0
-            while manager.motion_stop_state != "held" and time.time() < deadline:
-                time.sleep(0.01)
+            assert result is not None
+            assert result["accepted"] is True
+            assert result["resultCode"] == "accepted"
             assert manager.state == CycleState.RUNNING
-            assert manager.motion_stop_state == "held"
-            assert manager._tick_pause_event.is_set()
-            assert bb.get("motion_paused_due_to_error") is False
-            assert bb.get("motion_error_message") is None
-            previous_execute_count = slow_kernel.execute_count
-
-            manager.run()
-            deadline = time.time() + 1.0
-            while slow_kernel.execute_count == previous_execute_count and time.time() < deadline:
-                time.sleep(0.01)
-
-            assert slow_kernel.reset_count == initial_reset_count
-            assert slow_kernel.acknowledge_interrupted_for_retry_count == 1
-            assert slow_kernel.execute_count > previous_execute_count
-            assert bb.get("motion_paused_due_to_error") is False
-            assert bb.get("motion_error_message") is None
-            assert bb.get("motion_paused_node_name") is None
-            assert bb.get("resume_after_error_requested") is False
-            assert manager.state == CycleState.RUNNING
+            assert manager.motion_stop_state == "idle"
+            assert runner.runtime_pause_registry.get(fault.fault_id) is None
+            assert not getattr(slow_kernel, "apply_recovery_action_requests", [])
         finally:
             manager.reset()
 
-    def test_run_keeps_held_motion_recovery_when_kernel_retains_retry_authority(
-        self,
-    ):
-        """A settling preemption stays held without becoming a cycle error."""
-
-        retry_kernel = _ContainmentRejectingKernel(execute_duration_s=1.0)
+    def test_run_keeps_held_recovery_unchanged_while_offer_is_waiting(self):
+        """Run cannot infer or execute an action from a waiting assessment."""
+        retry_kernel = MockKernelClient(execute_duration_s=1.0)
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, retry_kernel)
         manager = CycleManager(runner, retry_kernel)
-        retry_kernel._state = ExecutionState.INTERRUPTED
+        manager.reset()
+        _script_ready_recovery(
+            retry_kernel,
+            action="retry_motion_from_current_state",
+            recovery_class="runtime_collision",
+            status="waiting",
+            execution_state="interrupted",
+        )
         with manager._lock:
             manager._state = CycleState.RUNNING
             manager._motion_stop_state = "held"
             manager._error = "runtime collision"
             manager._error_code = "runtime_collision"
 
-        manager.run()
-
-        assert retry_kernel.acknowledge_interrupted_for_retry_count == 1
-        assert retry_kernel.get_status().state == ExecutionState.INTERRUPTED
-        assert manager.state == CycleState.RUNNING
-        assert manager.motion_stop_state == "held"
-        assert manager.error == "runtime collision"
-        assert manager.error_code == "runtime_collision"
-
-    def test_run_keeps_stopped_recovery_when_kernel_retains_retry_authority(
-        self,
-    ):
-        """STOPPED retry remains pending until the kernel changes its offer."""
-
-        retry_kernel = _ContainmentRejectingKernel(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, retry_kernel)
-        manager = CycleManager(runner, retry_kernel)
-        retry_kernel._state = ExecutionState.INTERRUPTED
-        bb = py_trees.blackboard.Client(name="test_stopped_retry_containment")
-        bb.register_key(
-            key="motion_paused_due_to_error",
-            access=py_trees.common.Access.WRITE,
-        )
-        bb.register_key(
-            key="motion_error_message",
-            access=py_trees.common.Access.WRITE,
-        )
-        bb.register_key(
-            key="stop_requested",
-            access=py_trees.common.Access.WRITE,
-        )
-        bb.register_key(
-            key="motion_stop_active",
-            access=py_trees.common.Access.WRITE,
-        )
-        bb.set("motion_paused_due_to_error", True)
-        bb.set("motion_error_message", "runtime collision")
-        bb.set("stop_requested", True)
-        bb.set("motion_stop_active", True)
-        pending_recovery = object()
-        with manager._lock:
-            manager._state = CycleState.STOPPED
-            manager._motion_stop_state = "held"
-            manager._error = "runtime collision"
-            manager._error_code = "runtime_collision"
-            manager._pending_delegated_recovery = pending_recovery
-
-        manager.run()
-
-        assert retry_kernel.acknowledge_interrupted_for_retry_count == 1
-        assert retry_kernel.get_status().state == ExecutionState.INTERRUPTED
-        assert manager.state == CycleState.STOPPED
-        assert manager.motion_stop_state == "held"
-        assert manager.error == "runtime collision"
-        assert manager.error_code == "runtime_collision"
-        assert manager._pending_delegated_recovery is pending_recovery
-        assert bb.get("motion_paused_due_to_error") is True
-        assert bb.get("motion_error_message") == "runtime collision"
-        assert bb.get("stop_requested") is True
-        assert bb.get("motion_stop_active") is True
-
-    def test_run_surfaces_non_retryable_containment_rejection(self):
-        """A definitive failed preemption is not mislabeled as settling."""
-
-        retry_kernel = _ContainmentRejectingKernel(retryable=False)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, retry_kernel)
-        manager = CycleManager(runner, retry_kernel)
-        retry_kernel._state = ExecutionState.INTERRUPTED
-        with manager._lock:
-            manager._state = CycleState.RUNNING
-            manager._motion_stop_state = "held"
-
-        with pytest.raises(
-            RuntimeError,
-            match="kernel.acknowledge_interrupted_for_retry rejected",
-        ):
+        with pytest.raises(RuntimeError, match="status=waiting"):
             manager.run()
 
-        assert retry_kernel.acknowledge_interrupted_for_retry_count == 1
+        assert retry_kernel.get_status().state == ExecutionState.INTERRUPTED
         assert manager.state == CycleState.RUNNING
         assert manager.motion_stop_state == "held"
+        assert manager.error == "runtime collision"
+        assert manager.error_code == "runtime_collision"
+        assert not getattr(retry_kernel, "apply_recovery_action_requests", [])
 
-    def test_run_promotes_pending_motion_soft_fail_before_noop(self, kernel):
-        """Run must not 200/no-op while a retryable motion fault is pending.
+    def test_run_requires_explicit_choice_for_intervention_offer(self):
+        """Run cannot choose acknowledge versus reset for an intervention."""
+        retry_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, retry_kernel)
+        manager = CycleManager(runner, retry_kernel)
+        manager.reset()
+        _script_ready_recovery(
+            retry_kernel,
+            action="acknowledge_and_continue",
+            recovery_class="stop_fault_intervention",
+            status="action_required",
+            execution_state="intervention_required",
+        )
+        with manager._lock:
+            manager._state = CycleState.STOPPED
+            manager._error = "controlled stop requires intervention"
+            manager._error_code = "backend_preempt_failed"
 
-        The motion node writes its soft-fail signal on the blackboard, then the
-        cycle-manager tick loop promotes that signal into `motion_stop_state =
-        held`. An operator can press Run in that small window. Treating RUNNING
-        + idle motion-stop as a no-op leaves the collision banner latched even
-        though the operator explicitly requested retry.
-        """
+        with pytest.raises(RuntimeError, match="status=action_required"):
+            manager.run()
+
+        assert retry_kernel.get_status().state == ExecutionState.INTERVENTION_REQUIRED
+        assert manager.state == CycleState.STOPPED
+        assert not getattr(retry_kernel, "apply_recovery_action_requests", [])
+
+    def test_unoffered_recovery_action_has_no_kernel_side_effect(self):
+        retry_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, retry_kernel)
+        manager = CycleManager(runner, retry_kernel)
+        manager.reset()
+        _script_ready_recovery(
+            retry_kernel,
+            action="acknowledge_and_continue",
+            recovery_class="stop_fault_intervention",
+            status="action_required",
+            execution_state="intervention_required",
+        )
+        with manager._lock:
+            manager._state = CycleState.STOPPED
+        offer = manager.refresh_recovery_offer()
+        assert offer is not None
+
+        result = manager.apply_recovery_action(
+            {
+                "request_id": "unoffered-action",
+                "offer_id": offer["offerId"],
+                "offer_revision": offer["offerRevision"],
+                "action_id": "retry_motion_from_current_state",
+            },
+            principal_id="operator-test",
+        )
+
+        assert result["accepted"] is False
+        assert result["error"]["details"]["reason"] == "action_not_offered"
+        assert manager.state == CycleState.STOPPED
+        assert not getattr(retry_kernel, "apply_recovery_action_requests", [])
+
+    def test_run_consumes_registry_fault_before_tick_loop_promotes_hold(self, kernel):
+        """An exact node fault closes the pre-promotion successful-no-op race."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
-        bb = py_trees.blackboard.Client(name="test_pending_motion_soft_fail_run")
-        bb.register_key(
-            key="motion_paused_due_to_error",
-            access=py_trees.common.Access.WRITE,
+        manager.reset()
+        fault = runner.runtime_pause_registry.raise_fault(
+            node_name="move_to_pick_approach",
+            node_id="move_manipulator_action",
+            domain="motion",
+            reason_code="motion_execution_failed",
+            message="runtime collision",
         )
-        bb.register_key(key="motion_error_message", access=py_trees.common.Access.WRITE)
-        bb.register_key(
-            key="motion_paused_node_name",
-            access=py_trees.common.Access.WRITE,
-        )
-        bb.register_key(
-            key="resume_after_error_requested",
-            access=py_trees.common.Access.WRITE,
-        )
-        bb.set("motion_paused_due_to_error", True)
-        bb.set("motion_error_message", "Motion execution ended in interrupted")
-        bb.set("motion_paused_node_name", "move_to_pick_approach")
-        bb.set("resume_after_error_requested", False)
-        slow_kernel._state = ExecutionState.INTERRUPTED
-
         with manager._lock:
             manager._state = CycleState.RUNNING
             manager._motion_stop_state = "idle"
 
-        manager.run()
+        result = manager.run(principal_id="operator-test")
 
-        assert slow_kernel.acknowledge_interrupted_for_retry_count == 1
+        assert result is not None
+        assert result["accepted"] is True
         assert manager.state == CycleState.RUNNING
         assert manager.motion_stop_state == "idle"
         assert manager.error is None
         assert manager.error_code is None
-        assert bb.get("motion_paused_due_to_error") is False
-        assert bb.get("motion_error_message") is None
-        assert bb.get("motion_paused_node_name") is None
-        assert bb.get("resume_after_error_requested") is True
+        resumed_fault = runner.runtime_pause_registry.get(fault.fault_id)
+        assert resumed_fault is not None
+        assert resumed_fault.state == "resume_requested"
+        assert resumed_fault.accepted_recovery_request_id == result["requestId"]
+        # The mock intentionally occupies execute() for one second. Give its
+        # cleanup a separate margin so host/container scheduling load cannot
+        # turn an exact duration==join-timeout boundary into a teardown flake.
+        assert manager.shutdown(timeout_s=2.0) is True
 
     def test_node_failure_feedback_is_exposed_as_cycle_error(self, kernel, tmp_path):
         """Clean node failures should surface node feedback in manager.error."""
@@ -821,7 +926,7 @@ class TestCycleManagerMotionStop:
             assert manager._tick_pause_event.is_set()
             assert slow_kernel.stop_count == 1
         finally:
-            manager.full_stop()
+            manager.reset()
 
     def test_motion_stop_resume_redispatches_held_motion(self):
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
@@ -838,6 +943,7 @@ class TestCycleManagerMotionStop:
             while manager.motion_stop_state != "held" and time.time() < deadline:
                 time.sleep(0.01)
             previous_execute_count = slow_kernel.execute_count
+            _script_ready_recovery(slow_kernel)
 
             manager.run()
 
@@ -848,7 +954,7 @@ class TestCycleManagerMotionStop:
             assert manager.motion_stop_state == "idle"
             assert slow_kernel.execute_count > previous_execute_count
         finally:
-            manager.full_stop()
+            manager.reset()
 
     def test_motion_stop_resume_acknowledges_natural_completion(self):
         class NaturalCompletionStopKernel(MockKernelClient):
@@ -893,6 +999,7 @@ class TestCycleManagerMotionStop:
             assert manager.motion_stop_state == "held"
             assert kernel.get_status().state == ExecutionState.COMPLETED
             previous_execute_count = kernel.execute_count
+            _script_ready_recovery(kernel)
 
             manager.run()
 
@@ -904,7 +1011,7 @@ class TestCycleManagerMotionStop:
             assert kernel.execute_count > previous_execute_count
             assert manager.error is None
         finally:
-            manager.full_stop()
+            manager.reset()
 
     def test_parallel_continue_branch_ticks_while_motion_is_held(self):
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
@@ -1796,9 +1903,20 @@ class TestErrorPropagation:
 
         with manager._lock:
             manager._error = "stale error from a previous incident"
+            manager._error_code = "stale_test_error"
 
-        # A new run() must clear the error
-        manager.run()
+        # A terminal cycle error is reset-only; explicitly consume that action.
+        offer = manager.refresh_recovery_offer()
+        result = manager.apply_recovery_action(
+            {
+                "request_id": "clear-stale-error",
+                "offer_id": offer["offerId"],
+                "offer_revision": offer["offerRevision"],
+                "action_id": "reset_cycle",
+            },
+            principal_id="operator:test",
+        )
+        assert result["accepted"] is True
         assert manager.error is None
 
 
@@ -2239,13 +2357,10 @@ class TestIntervention:
         assert session.status in ("completed", "failed")
         assert manager.state == CycleState.STOPPED
 
-    def test_completed_intervention_rebaselines_resumable_stopped_scene(self, kernel):
-        """A successful direct-control recovery may intentionally change the scene.
-
-        The STOPPED resume guard must keep blocking unapproved scene edits, but
-        once an explicit intervention completes and returns to STOPPED, the
-        post-intervention scene is the new operator-approved resume baseline.
-        """
+    def test_completed_intervention_offer_binds_post_intervention_scene_epoch(
+        self, kernel
+    ):
+        """Recovery after direct control binds the current structural scene."""
 
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         manager = self._make_manager(slow_kernel)
@@ -2255,6 +2370,9 @@ class TestIntervention:
             time.sleep(0.05)
             manager.full_stop()
             assert manager.state == CycleState.STOPPED
+            previous_scene_epoch = slow_kernel.get_scene_authority_status()[
+                "scene_admission_epoch"
+            ]
 
             session = manager.execute_intervention(
                 {
@@ -2285,11 +2403,14 @@ class TestIntervention:
 
             assert session.status == "completed"
             assert manager.state == CycleState.STOPPED
-            assert any(
-                event["type"] == "resume_scene_baselined"
-                for event in session.events
-            )
+            current_scene_epoch = slow_kernel.get_scene_authority_status()[
+                "scene_admission_epoch"
+            ]
+            assert current_scene_epoch > previous_scene_epoch
 
+            _script_ready_recovery(slow_kernel)
+            offer = manager.refresh_recovery_offer()
+            assert offer["sceneAdmissionEpoch"] == current_scene_epoch
             manager.run()
             assert manager.state == CycleState.RUNNING
         finally:
@@ -2780,8 +2901,8 @@ class TestCycleStateMachine:
         }
 
 
-class TestCycleManagerExplicitInterventionRecovery:
-    """Run on STOPPED + kernel INTERVENTION_REQUIRED (spec/400 §6.6.2)."""
+class TestCycleManagerRecoveryActions:
+    """One exact recovery-offer endpoint (spec/400 section 6.6.2)."""
 
     def _make_manager(self) -> tuple[CycleManager, MockKernelClient]:
         kernel = MockKernelClient(execute_duration_s=0.5)
@@ -2798,43 +2919,62 @@ class TestCycleManagerExplicitInterventionRecovery:
         manager.full_stop()
         assert manager.state == CycleState.STOPPED
 
-        # Drive the kernel into INTERVENTION_REQUIRED via direct mutation
-        # of the in-memory mock. Production kernels reach this via backend
-        # snapshots or reset failure; Run must not silently acknowledge it.
-        kernel._state = ExecutionState.INTERVENTION_REQUIRED
+        _script_ready_recovery(
+            kernel,
+            action="acknowledge_and_continue",
+            recovery_class="stop_fault_intervention",
+            status="action_required",
+            execution_state="intervention_required",
+        )
 
-        with pytest.raises(RuntimeError, match="Acknowledge and continue"):
+        with pytest.raises(RuntimeError, match="status=action_required"):
             manager.run()
         assert manager.state == CycleState.STOPPED
         assert kernel.get_status().state == ExecutionState.INTERVENTION_REQUIRED
-        assert kernel.acknowledge_intervention_count == 0
-        assert kernel.acknowledge_intervention_for_retry_count == 0
+        assert not getattr(kernel, "apply_recovery_action_requests", [])
 
-    def test_acknowledge_intervention_for_retry_preserves_backend_reset_count(
-        self,
-    ):
+    def test_acknowledge_and_continue_preserves_backend_reset_count(self):
         manager, kernel = self._make_manager()
         manager.run()
         time.sleep(0.1)
         manager.full_stop()
         assert manager.state == CycleState.STOPPED
 
-        kernel._state = ExecutionState.INTERVENTION_REQUIRED
-        manager.acknowledge_intervention_for_retry(
+        assessment = _script_ready_recovery(
+            kernel,
+            action="acknowledge_and_continue",
+            recovery_class="stop_fault_intervention",
+            status="action_required",
+            execution_state="intervention_required",
+        )
+        offer = manager.refresh_recovery_offer()
+        result = manager.apply_recovery_action(
+            {
+                "request_id": "ack-intervention",
+                "offer_id": offer["offerId"],
+                "offer_revision": offer["offerRevision"],
+                "action_id": "acknowledge_and_continue",
+                "reason": "controlled stop inspected",
+            },
             principal_id="operator:test",
-            reason="test_acknowledge_and_continue",
         )
 
-        assert manager.state == CycleState.STOPPED
+        assert result["accepted"] is True
+        assert manager.state == CycleState.RUNNING
         assert kernel.get_status().state == ExecutionState.IDLE
-        assert kernel.acknowledge_intervention_for_retry_count == 1
-        assert kernel.acknowledge_intervention_count == 0
         assert kernel.reset_count == 0
+        request = kernel.apply_recovery_action_requests[-1]
+        assert request["action"] == "acknowledge_and_continue"
+        assert request["principal_id"] == "operator:test"
+        assert request["expected_latch_id"] == assessment["latch_id"]
+        assert (
+            request["expected_stop_owner_generation"]
+            == assessment["stop_owner_generation"]
+        )
 
-    def test_acknowledge_intervention_for_retry_accepts_held_motion_intervention(
-        self,
-    ):
+    def test_acknowledge_and_continue_accepts_held_motion_intervention(self):
         manager, kernel = self._make_manager()
+        manager.reset()
         with manager._lock:  # noqa: SLF001 - targeted recovery-state fixture.
             manager._state = CycleState.RUNNING
             manager._motion_stop_state = "held"
@@ -2844,25 +2984,75 @@ class TestCycleManagerExplicitInterventionRecovery:
                 "motion_soft_stop_reason": "motion_soft_fail_requires_intervention",
                 "kernel_state": "intervention_required",
             }
-        kernel._state = ExecutionState.INTERVENTION_REQUIRED
+        _script_ready_recovery(
+            kernel,
+            action="acknowledge_and_continue",
+            recovery_class="stop_fault_intervention",
+            status="action_required",
+            execution_state="intervention_required",
+        )
+        offer = manager.refresh_recovery_offer()
         before_reset_count = kernel.reset_count
 
-        manager.acknowledge_intervention_for_retry(
+        result = manager.apply_recovery_action(
+            {
+                "request_id": "ack-held-intervention",
+                "offer_id": offer["offerId"],
+                "offer_revision": offer["offerRevision"],
+                "action_id": "acknowledge_and_continue",
+            },
             principal_id="operator:test",
-            reason="test_acknowledge_held_motion_intervention",
         )
 
-        assert manager.state == CycleState.STOPPED
+        assert result["accepted"] is True
+        assert manager.state == CycleState.RUNNING
         assert manager.motion_stop_state == "idle"
-        assert not manager._tick_pause_event.is_set()
+        assert manager._tick_pause_event.is_set()
         assert manager.error is None
         assert kernel.get_status().state == ExecutionState.IDLE
-        assert kernel.acknowledge_intervention_for_retry_count == 1
         assert kernel.reset_count == before_reset_count
 
-    def test_acknowledge_failed_validation_for_retry_preserves_backend_reset_count(
-        self,
-    ):
+    def test_retry_motion_from_current_state_consumes_exact_collision_offer(self):
+        manager, kernel = self._make_manager()
+        manager._prepare_fresh_cycle()  # noqa: SLF001 - resumable tree fixture.
+        with manager._lock:  # noqa: SLF001 - exact held-motion fixture.
+            manager._state = CycleState.RUNNING
+            manager._motion_stop_state = "held"
+            manager._error = "Runtime collision detected during execution"
+            manager._error_code = "runtime_collision"
+        assessment = _script_ready_recovery(
+            kernel,
+            action="retry_motion_from_current_state",
+            recovery_class="runtime_collision",
+            status="retry_ready",
+            execution_state="interrupted",
+        )
+        offer = manager.refresh_recovery_offer()
+        before_reset_count = kernel.reset_count
+        try:
+            result = manager.apply_recovery_action(
+                {
+                    "request_id": "retry-runtime-collision",
+                    "offer_id": offer["offerId"],
+                    "offer_revision": offer["offerRevision"],
+                    "action_id": "retry_motion_from_current_state",
+                },
+                principal_id="operator:test",
+            )
+
+            assert result["accepted"] is True
+            assert result["cycleResumed"] is True
+            assert manager.state == CycleState.RUNNING
+            assert manager.motion_stop_state == "idle"
+            assert kernel.reset_count == before_reset_count
+            request = kernel.apply_recovery_action_requests[-1]
+            assert request["action"] == "retry_motion_from_current_state"
+            assert request["expected_execution_id"] == assessment["execution_id"]
+            assert request["expected_latch_id"] == assessment["latch_id"]
+        finally:
+            manager.reset()
+
+    def test_retry_after_scene_repair_preserves_backend_reset_count(self):
         manager, kernel = self._make_manager()
         manager._prepare_fresh_cycle()  # noqa: SLF001 - build a resumable tree.
         with manager._lock:  # noqa: SLF001 - targeted recovery-state fixture.
@@ -2874,230 +3064,208 @@ class TestCycleManagerExplicitInterventionRecovery:
                 "object_id": "isaac_cheese_box",
                 "source_id": "isaac_scene_objects",
             }
-        kernel._state = ExecutionState.FAILED
-        kernel._last_error_message = "Observed scene source stale"  # noqa: SLF001
-        kernel._last_error_code = "scene_changed_during_validation"  # noqa: SLF001
-        kernel._last_error_details = {  # noqa: SLF001
-            "reason": "observed_scene_source_stale",
-            "object_id": "isaac_cheese_box",
-            "source_id": "isaac_scene_objects",
-        }
+        _script_ready_recovery(
+            kernel,
+            action="retry_after_scene_repair",
+            recovery_class="failed_validation",
+            execution_state="failed",
+        )
+        offer = manager.refresh_recovery_offer()
         before_reset_count = kernel.reset_count
 
-        manager.acknowledge_failed_validation_for_retry(
+        result = manager.apply_recovery_action(
+            {
+                "request_id": "retry-validation",
+                "offer_id": offer["offerId"],
+                "offer_revision": offer["offerRevision"],
+                "action_id": "retry_after_scene_repair",
+            },
             principal_id="operator:test",
-            reason="test_acknowledge_failed_validation",
         )
 
-        assert manager.state == CycleState.STOPPED
+        assert result["accepted"] is True
+        assert manager.state == CycleState.RUNNING
         assert manager.motion_stop_state == "idle"
         assert manager.error is None
         assert kernel.get_status().state == ExecutionState.IDLE
-        assert kernel.acknowledge_failed_validation_for_retry_count == 1
         assert kernel.reset_count == before_reset_count
 
-    def test_acknowledge_failed_validation_for_retry_rejects_non_validation_failed(
-        self,
-    ):
+    def test_retry_after_scene_repair_is_rejected_when_not_offered(self):
         manager, kernel = self._make_manager()
+        manager._prepare_fresh_cycle()  # noqa: SLF001 - resumable test context.
         with manager._lock:  # noqa: SLF001 - targeted recovery-state fixture.
             manager._state = CycleState.STOPPED
             manager._error = "Backend failed"
             manager._error_code = "execution_aborted"
             manager._error_details = {"reason": "controller_result_failed"}
-        kernel._state = ExecutionState.FAILED
-        kernel._last_error_message = "Backend failed"  # noqa: SLF001
-        kernel._last_error_code = "execution_aborted"  # noqa: SLF001
-        kernel._last_error_details = {  # noqa: SLF001
-            "reason": "controller_result_failed",
-        }
+        _script_ready_recovery(
+            kernel,
+            action="acknowledge_and_continue",
+            recovery_class="unknown_fault",
+            status="action_required",
+            execution_state="failed",
+        )
+        offer = manager.refresh_recovery_offer()
+        result = manager.apply_recovery_action(
+            {
+                "request_id": "invalid-scene-retry",
+                "offer_id": offer["offerId"],
+                "offer_revision": offer["offerRevision"],
+                "action_id": "retry_after_scene_repair",
+            },
+            principal_id="operator:test",
+        )
 
-        with pytest.raises(RuntimeError, match="not a retryable validation gate"):
-            manager.acknowledge_failed_validation_for_retry()
-
+        assert result["accepted"] is False
+        assert result["error"]["details"]["reason"] == "action_not_offered"
         assert kernel.get_status().state == ExecutionState.FAILED
-        assert kernel.acknowledge_failed_validation_for_retry_count == 0
         assert kernel.reset_count == 0
+        assert not getattr(kernel, "apply_recovery_action_requests", [])
 
-    def test_acknowledged_failed_validation_run_bypasses_scene_guard_for_replan(
-        self,
-        monkeypatch,
-    ):
+    def test_reset_action_uses_explicit_callback_without_kernel_recovery_call(self):
         manager, kernel = self._make_manager()
         manager._prepare_fresh_cycle()  # noqa: SLF001 - build a resumable tree.
         with manager._lock:  # noqa: SLF001 - targeted recovery-state fixture.
             manager._state = CycleState.STOPPED
-            manager._resumable_stop_scene_fingerprint = "stale-scene"
             manager._error = "Observed scene source stale"
             manager._error_code = "scene_changed_during_validation"
             manager._error_details = {"reason": "observed_scene_source_stale"}
-        kernel._state = ExecutionState.FAILED
-        kernel._last_error_message = "Observed scene source stale"  # noqa: SLF001
-        kernel._last_error_code = "scene_changed_during_validation"  # noqa: SLF001
-        kernel._last_error_details = {"reason": "observed_scene_source_stale"}  # noqa: SLF001
-
-        manager.acknowledge_failed_validation_for_retry(
+        _script_ready_recovery(
+            kernel,
+            action="retry_after_scene_repair",
+            recovery_class="failed_validation",
+            execution_state="failed",
+        )
+        offer = manager.refresh_recovery_offer()
+        callback_requests = []
+        result = manager.apply_recovery_action(
+            {
+                "request_id": "reset-recovery",
+                "offer_id": offer["offerId"],
+                "offer_revision": offer["offerRevision"],
+                "action_id": "reset_cycle",
+            },
             principal_id="operator:test",
-            reason="test_acknowledge_failed_validation",
+            reset_callback=callback_requests.append,
         )
 
-        with manager._lock:  # noqa: SLF001 - prove the ordinary guard would fail.
-            assert manager._state == CycleState.STOPPED
-            assert manager._allow_next_stopped_retry_replan is True
-        monkeypatch.setattr(
-            manager,
-            "_capture_scene_resume_fingerprint",
-            lambda: ("changed-live-scene", None),
-        )
-        monkeypatch.setattr(manager, "_start_tick_thread", lambda _target: None)
+        assert result["accepted"] is True
+        assert result["resultCode"] == "reset_completed"
+        assert callback_requests == ["reset-recovery"]
+        assert not getattr(kernel, "apply_recovery_action_requests", [])
 
-        manager.run()
-
-        bb = py_trees.blackboard.Client(name="test_failed_validation_retry_replan")
-        bb.register_key(
-            key="resume_after_error_requested",
-            access=py_trees.common.Access.READ,
-        )
-        assert manager.state == CycleState.RUNNING
-        assert manager.error is None
-        assert bb.get("resume_after_error_requested") is True
-        with manager._lock:  # noqa: SLF001 - bypass is one-shot.
-            assert manager._allow_next_stopped_retry_replan is False
-
-    def test_acknowledged_held_intervention_run_bypasses_scene_guard_for_replan(
-        self,
-        monkeypatch,
-    ):
+    def test_active_intervention_blocks_continue_but_keeps_reset_available(self):
         manager, kernel = self._make_manager()
         manager._prepare_fresh_cycle()  # noqa: SLF001 - build a resumable tree.
         with manager._lock:  # noqa: SLF001 - targeted recovery-state fixture.
-            manager._state = CycleState.RUNNING
-            manager._motion_stop_state = "held"
-            manager._error = "Runtime collision detected during execution"
-            manager._error_code = "runtime_collision"
-            manager._error_details = {
-                "motion_soft_stop_reason": "motion_soft_fail_requires_intervention",
-                "kernel_state": "intervention_required",
-            }
-        kernel._state = ExecutionState.INTERVENTION_REQUIRED
-
-        manager.acknowledge_intervention_for_retry(
-            principal_id="operator:test",
-            reason="test_acknowledge_held_motion_intervention",
+            manager._state = CycleState.STOPPED
+            manager._intervention = InterventionSession(
+                session_id="active-intervention",
+                parent_run_id=None,
+                entry_state="STOPPED",
+                lease_timeout_ms=60_000,
+                lease_expires_at_ns=10**18,
+                resume_target="resume",
+                principal_id="operator:test",
+            )
+            manager._intervention.status = "running"
+        _script_ready_recovery(
+            kernel,
+            action="acknowledge_and_continue",
+            recovery_class="stop_fault_intervention",
+            status="action_required",
+            execution_state="intervention_required",
         )
+        offer = manager.refresh_recovery_offer()
 
-        with manager._lock:  # noqa: SLF001 - prove the ordinary guard would fail.
-            assert manager._state == CycleState.STOPPED
-            assert manager._resumable_stop_scene_fingerprint is None
-            assert manager._allow_next_stopped_retry_replan is True
-        monkeypatch.setattr(
-            manager,
-            "_capture_scene_resume_fingerprint",
-            lambda: ("changed-live-scene", None),
+        actions = {action["actionId"]: action for action in offer["actions"]}
+        assert actions["acknowledge_and_continue"]["enabled"] is False
+        assert (
+            actions["acknowledge_and_continue"]["disabledReasonCode"]
+            == "stronger_cycle_authority_active"
         )
-        monkeypatch.setattr(manager, "_start_tick_thread", lambda _target: None)
+        assert actions["reset_cycle"]["enabled"] is True
 
-        manager.run()
-
-        bb = py_trees.blackboard.Client(name="test_retry_replan_resume_flag")
-        bb.register_key(
-            key="resume_after_error_requested",
-            access=py_trees.common.Access.READ,
+    def test_pending_lifecycle_command_temporarily_disables_all_actions(self):
+        manager, kernel = self._make_manager()
+        manager._prepare_fresh_cycle()  # noqa: SLF001 - resumable fixture.
+        _script_ready_recovery(
+            kernel,
+            action="acknowledge_and_continue",
+            recovery_class="stop_fault_intervention",
+            status="action_required",
+            execution_state="intervention_required",
         )
-        assert manager.state == CycleState.RUNNING
-        assert manager.error is None
-        assert bb.get("resume_after_error_requested") is True
-        with manager._lock:  # noqa: SLF001 - bypass is one-shot.
-            assert manager._allow_next_stopped_retry_replan is False
+        with manager._lock:
+            manager._state = CycleState.STOPPED
+            manager._run_transition_in_progress = True
 
-    def test_run_from_stopped_with_kernel_intervention_fails_closed_if_intervention_session_running(
-        self,
-    ):
-        # An intervention session that the cycle manager still considers
-        # running is a direct-control lease per spec/400 §6.6.2 — Run MUST
-        # refuse until the operator ends/promotes/aborts that session.
+        offer = manager.refresh_recovery_offer()
+
+        assert offer["status"] == "waiting"
+        assert offer["reasonCode"] == "cycle_lifecycle_command_pending"
+        assert all(action["enabled"] is False for action in offer["actions"])
+
+    def test_unsettled_stop_offer_exposes_reset_only_and_run_does_not_choose(self):
         manager, kernel = self._make_manager()
         manager.run()
         time.sleep(0.1)
         manager.full_stop()
         assert manager.state == CycleState.STOPPED
 
-        kernel._state = ExecutionState.INTERVENTION_REQUIRED
-        manager._intervention = InterventionSession(
-            session_id="sess-1",
-            parent_run_id=None,
-            entry_state="STOPPED",
-            lease_timeout_ms=60_000,
-            lease_expires_at_ns=10**18,
-            resume_target="resume",
-            principal_id="human:test",
+        assessment = _script_ready_recovery(
+            kernel,
+            action="acknowledge_and_continue",
+            recovery_class="stop_fault_intervention",
+            status="waiting",
+            execution_state="intervention_required",
         )
-        manager._intervention.status = "running"
+        assessment["allowed_actions"] = ["reset_cycle"]
+        assessment["reason_code"] = "stop_not_settled_measured_velocity"
+        kernel.script_recovery_assessment(assessment)
 
-        with pytest.raises(RuntimeError, match="intervention_session_running"):
+        with pytest.raises(RuntimeError, match="stop_not_settled_measured_velocity"):
             manager.run()
-        assert manager.state == CycleState.STOPPED
+        offer = manager.get_recovery_offer()
 
-    def test_run_from_stopped_refuses_auto_ack_when_stop_did_not_settle(self):
-        # A measured-settle intervention means the robot/controller did not
-        # prove rest after a confirmed stop. Run must not acknowledge that into a
-        # backend reset because commanded-sim and some real backends reset by
-        # commanding an initial/home state.
-        from types import SimpleNamespace
-
-        manager, kernel = self._make_manager()
-        manager.run()
-        time.sleep(0.1)
-        manager.full_stop()
-        assert manager.state == CycleState.STOPPED
-
-        kernel._state = ExecutionState.INTERVENTION_REQUIRED
-        kernel.get_execution_snapshot = lambda: SimpleNamespace(
-            error_code="motion_interrupt_backend_stop_failed",
-            error_details={"reason": "stop_not_settled_measured_velocity"},
-        )
-
-        with pytest.raises(
-            RuntimeError,
-            match="stop_not_settled_measured_velocity",
-        ):
-            manager.run()
+        assert offer["primaryAction"] is None
+        assert [action["actionId"] for action in offer["actions"]] == [
+            "reset_cycle"
+        ]
         assert manager.state == CycleState.STOPPED
         assert kernel.get_status().state == ExecutionState.INTERVENTION_REQUIRED
 
-    def test_run_from_stopped_normal_path_unchanged(self):
-        # The explicit recovery path only applies when the kernel is in
-        # INTERVENTION_REQUIRED. Normal STOPPED resume must not call
-        # acknowledge_intervention, so no new event is emitted.
+    def test_plain_paused_lifecycle_resume_bypasses_recovery_endpoint(self):
         manager, kernel = self._make_manager()
         manager.run()
         time.sleep(0.1)
         manager.full_stop()
         assert manager.state == CycleState.STOPPED
+        kernel._state = ExecutionState.PAUSED
 
-        events_before = list(manager.drain_kernel_events_now())
         manager.run()
-        assert manager.state == CycleState.RUNNING
-        events_after = list(manager.drain_kernel_events_now())
-        ack_events = [
-            e for e in events_before + events_after
-            if e.get("type") == "acknowledge_intervention"
-        ]
-        assert ack_events == []
 
-    def test_helper_refuses_when_kernel_status_unreadable(self):
-        # If the kernel's get_status() raises, the helper MUST fail
-        # closed with a structured reason — never silently swallow.
+        assert manager.state == CycleState.RUNNING
+        assert kernel.resume_count == 1
+        assert not getattr(kernel, "apply_recovery_action_requests", [])
+
+    def test_unreadable_kernel_assessment_fails_closed_to_reset_only(self):
         manager, kernel = self._make_manager()
+        manager._prepare_fresh_cycle()  # noqa: SLF001 - resumable fixture.
+        with manager._lock:
+            manager._state = CycleState.STOPPED
 
         def boom():
             raise RuntimeError("kernel went away")
 
-        kernel.get_status = boom  # type: ignore[assignment]
-        ok, reason = manager._can_auto_acknowledge_leftover_state()
-        assert ok is False
-        assert reason.startswith("kernel_status_unreadable:")
-        assert "RuntimeError" in reason
+        kernel.get_recovery_assessment = boom  # type: ignore[assignment]
+        offer = manager.refresh_recovery_offer()
+
+        assert offer["status"] == "waiting"
+        assert offer["reasonCode"] == "recovery_assessment_unreadable:RuntimeError"
+        assert [action["actionId"] for action in offer["actions"]] == [
+            "reset_cycle"
+        ]
 
 
 class TestGripperFaultDiagnostics:
@@ -3298,11 +3466,16 @@ class TestTickLoopContainment:
         self._inject_tick_exception(manager)
         self._await_state(manager, CycleState.STOPPED)
 
-        # The post-exception tree cannot be trusted for a resume: Run must
-        # be refused with an explicit reason, never silently restart.
-        with pytest.raises(RuntimeError, match="without a tree"):
+        # The post-exception tree cannot be trusted for a resume. The unified
+        # offer must expose reset-only recovery rather than an absent offer.
+        with pytest.raises(RuntimeError, match="cycle_error_requires_reset"):
             manager.run()
         assert manager.state == CycleState.STOPPED
+        offer = manager.get_recovery_offer()
+        assert offer["status"] == "reset_required"
+        assert [action["actionId"] for action in offer["actions"]] == [
+            "reset_cycle"
+        ]
         # The refusal must not wipe the diagnostic that explains why the
         # cycle is stopped — the operator still needs the original fault.
         assert manager.error_code == "tick_loop_exception"
@@ -3602,113 +3775,140 @@ class TestCycleManagerStopLivenessResiduals:
             "params": {"duration_s": 0.05},
         }
 
-    def test_ack_retry_blocked_status_does_not_hold_cycle_lock(self, monkeypatch):
-        release_status = threading.Event()
-        status_entered = threading.Event()
+    def test_blocked_recovery_assessment_does_not_block_full_stop(self):
+        release_assessment = threading.Event()
+        assessment_entered = threading.Event()
 
-        class BlockingStatusKernel(MockKernelClient):
-            def get_status(self):  # type: ignore[override]
-                status_entered.set()
-                release_status.wait(timeout=5.0)
-                return ExecutionStatus(
-                    state=ExecutionState.INTERVENTION_REQUIRED,
-                    execution_id=1,
-                    progress=0.0,
-                    active_move_id="blocked_ack_status",
+        class BlockingAssessmentKernel(MockKernelClient):
+            block_assessment = False
+
+            def get_recovery_assessment(self):  # type: ignore[override]
+                if self.block_assessment:
+                    assessment_entered.set()
+                    release_assessment.wait(timeout=5.0)
+                return super().get_recovery_assessment()
+
+        kernel = BlockingAssessmentKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager._prepare_fresh_cycle()  # noqa: SLF001 - resumable fixture.
+        with manager._lock:
+            manager._state = CycleState.STOPPED
+        _script_ready_recovery(kernel)
+        offer = manager.refresh_recovery_offer()
+        kernel.script_recovery_action_result(
+            {
+                "accepted": False,
+                "error": {
+                    "code": "recovery_action_rejected",
+                    "message": "superseded by full stop",
+                    "details": {"reason": "control_epoch_mismatch"},
+                },
+                "resulting_assessment": kernel.get_recovery_assessment(),
+            }
+        )
+        kernel.block_assessment = True
+        responses = []
+
+        def recover() -> None:
+            responses.append(
+                manager.apply_recovery_action(
+                    {
+                        "request_id": "blocked-assessment",
+                        "offer_id": offer["offerId"],
+                        "offer_revision": offer["offerRevision"],
+                        "action_id": offer["primaryAction"],
+                    },
+                    principal_id="operator:test",
                 )
+            )
+
+        thread = threading.Thread(target=recover, daemon=True)
+        thread.start()
+        try:
+            assert assessment_entered.wait(timeout=1.0)
+            started = time.monotonic()
+            assert manager.motion_stop_state == "idle"
+            manager.full_stop()
+            assert time.monotonic() - started < 0.2
+        finally:
+            release_assessment.set()
+            thread.join(timeout=1.0)
+        assert not thread.is_alive()
+        assert responses and responses[0]["accepted"] is False
+
+    def test_blocked_recovery_command_times_out_without_blocking_full_stop(
+        self, monkeypatch
+    ):
+        release_command = threading.Event()
+        command_entered = threading.Event()
+
+        class BlockingRecoveryKernel(MockKernelClient):
+            def apply_recovery_action(self, request):  # type: ignore[override]
+                command_entered.set()
+                release_command.wait(timeout=5.0)
+                if int(request.get("expected_control_command_epoch") or -1) != (
+                    self.control_command_epoch()
+                ):
+                    return {
+                        "accepted": False,
+                        "error": {
+                            "code": "recovery_action_rejected",
+                            "message": "stale recovery command",
+                            "details": {"reason": "control_epoch_mismatch"},
+                        },
+                        "resulting_assessment": self.get_recovery_assessment(),
+                    }
+                return super().apply_recovery_action(request)
 
         monkeypatch.setattr(
             cycle_manager_module,
             "_KERNEL_CONTROL_CALL_TIMEOUT_S",
             0.02,
         )
-        kernel = BlockingStatusKernel()
+        kernel = BlockingRecoveryKernel()
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
-        manager._state = CycleState.STOPPED
-
-        errors: list[BaseException] = []
-
-        def acknowledge() -> None:
-            try:
-                manager.acknowledge_intervention_for_retry()
-            except BaseException as exc:  # noqa: BLE001 - inspected below.
-                errors.append(exc)
-
-        thread = threading.Thread(target=acknowledge, daemon=True)
-        thread.start()
-        try:
-            assert status_entered.wait(timeout=1.0)
-            started = time.monotonic()
-            assert manager.motion_stop_state == "idle"
-            manager.full_stop()
-            assert time.monotonic() - started < 0.2
-            thread.join(timeout=1.0)
-            assert any(isinstance(exc, TimeoutError) for exc in errors)
-        finally:
-            release_status.set()
-            thread.join(timeout=1.0)
-
-    def test_ack_retry_blocked_ack_does_not_hold_cycle_lock(self, monkeypatch):
-        release_ack = threading.Event()
-        ack_entered = threading.Event()
-
-        class BlockingAckKernel(MockKernelClient):
-            def get_status(self):  # type: ignore[override]
-                return ExecutionStatus(
-                    state=ExecutionState.INTERVENTION_REQUIRED,
-                    execution_id=1,
-                    progress=0.0,
-                    active_move_id="blocked_ack",
-                )
-
-            def acknowledge_intervention_for_retry(  # type: ignore[override]
-                self,
-                principal_id,
-                reason,
-                *,
-                expected_epoch=None,
-            ):
-                ack_entered.set()
-                release_ack.wait(timeout=5.0)
-                return super().acknowledge_intervention_for_retry(
-                    principal_id,
-                    reason,
-                    expected_epoch=expected_epoch,
-                )
-
-        monkeypatch.setattr(
-            cycle_manager_module,
-            "_KERNEL_CONTROL_CALL_TIMEOUT_S",
-            0.02,
+        manager._prepare_fresh_cycle()  # noqa: SLF001 - resumable fixture.
+        with manager._lock:
+            manager._state = CycleState.STOPPED
+        _script_ready_recovery(
+            kernel,
+            action="acknowledge_and_continue",
+            recovery_class="stop_fault_intervention",
+            status="action_required",
+            execution_state="intervention_required",
         )
-        kernel = BlockingAckKernel()
-        kernel._state = ExecutionState.INTERVENTION_REQUIRED
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
-        manager = CycleManager(runner, kernel)
-        manager._state = CycleState.STOPPED
+        offer = manager.refresh_recovery_offer()
+        responses = []
 
-        errors: list[BaseException] = []
+        def recover() -> None:
+            responses.append(
+                manager.apply_recovery_action(
+                    {
+                        "request_id": "blocked-command",
+                        "offer_id": offer["offerId"],
+                        "offer_revision": offer["offerRevision"],
+                        "action_id": "acknowledge_and_continue",
+                    },
+                    principal_id="operator:test",
+                )
+            )
 
-        def acknowledge() -> None:
-            try:
-                manager.acknowledge_intervention_for_retry()
-            except BaseException as exc:  # noqa: BLE001 - inspected below.
-                errors.append(exc)
-
-        thread = threading.Thread(target=acknowledge, daemon=True)
+        thread = threading.Thread(target=recover, daemon=True)
         thread.start()
         try:
-            assert ack_entered.wait(timeout=1.0)
+            assert command_entered.wait(timeout=1.0)
             started = time.monotonic()
             assert manager.motion_stop_state == "idle"
             manager.full_stop()
             assert time.monotonic() - started < 0.2
             thread.join(timeout=1.0)
-            assert any(isinstance(exc, TimeoutError) for exc in errors)
+            assert responses and responses[0]["resultCode"] == "transport_failed"
         finally:
-            release_ack.set()
+            release_command.set()
             thread.join(timeout=1.0)
+        assert not thread.is_alive()
 
     def test_start_intervention_blocked_status_does_not_hold_cycle_lock(self, monkeypatch):
         release_status = threading.Event()
@@ -3762,51 +3962,40 @@ class TestCycleManagerStopLivenessResiduals:
             release_status.set()
             thread.join(timeout=1.0)
 
-    def test_full_stop_scene_fingerprint_timeout_is_bounded(self, monkeypatch):
-        release_scene = threading.Event()
-        scene_entered = threading.Event()
+    def test_full_stop_never_reads_scene_objects(self):
+        scene_reads = 0
 
         class BlockingSceneKernel(MockKernelClient):
             def __init__(self):
                 super().__init__(execute_duration_s=5.0)
-                self.block_scene = False
+                self.reject_scene_reads = False
 
             def get_scene_objects(self):  # type: ignore[override]
-                if self.block_scene:
-                    scene_entered.set()
-                    release_scene.wait(timeout=5.0)
+                nonlocal scene_reads
+                scene_reads += 1
+                if self.reject_scene_reads:
+                    raise AssertionError("full_stop must not snapshot scene objects")
                 return super().get_scene_objects()
 
-        monkeypatch.setattr(
-            cycle_manager_module,
-            "_KERNEL_CONTROL_CALL_TIMEOUT_S",
-            0.02,
-        )
         kernel = BlockingSceneKernel()
-        manager = self._stopped_manager(kernel)
-
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
         manager.run()
-        assert manager.state == CycleState.RUNNING
-        kernel.block_scene = True
-        try:
-            started = time.monotonic()
-            manager.full_stop()
-            assert time.monotonic() - started < 0.5
-            assert scene_entered.is_set()
-            assert manager.state == CycleState.STOPPED
-            assert manager._resumable_stop_scene_fingerprint is None
-            assert "TimeoutError" in (
-                manager._resumable_stop_scene_fingerprint_error or ""
-            )
-        finally:
-            release_scene.set()
+        deadline = time.monotonic() + 1.0
+        while kernel.execute_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        baseline_reads = scene_reads
+        kernel.reject_scene_reads = True
 
-    def test_stop_settle_watcher_does_not_wait_for_scene_fingerprint(
-        self,
-        monkeypatch,
-    ):
-        release_scene = threading.Event()
-        scene_entered = threading.Event()
+        started = time.monotonic()
+        manager.full_stop()
+
+        assert time.monotonic() - started < 0.5
+        assert manager.state == CycleState.STOPPED
+        assert scene_reads == baseline_reads
+
+    def test_stop_settle_watcher_does_not_read_scene_objects(self, monkeypatch):
+        scene_read = threading.Event()
 
         class TerminalThenBlockingSceneKernel(MockKernelClient):
             def __init__(self):
@@ -3840,8 +4029,7 @@ class TestCycleManagerStopLivenessResiduals:
                 )
 
             def get_scene_objects(self):  # type: ignore[override]
-                scene_entered.set()
-                release_scene.wait(timeout=5.0)
+                scene_read.set()
                 return super().get_scene_objects()
 
         monkeypatch.setattr(
@@ -3856,18 +4044,10 @@ class TestCycleManagerStopLivenessResiduals:
         manager._state = CycleState.RUNNING
         manager._tree = runner.build_tree()
 
-        try:
-            manager.full_stop()
-            assert manager.state == CycleState.STOPPING
-            assert scene_entered.wait(timeout=1.0)
-            self._await_state(manager, CycleState.STOPPED, timeout_s=0.5)
-            fingerprint_error = manager._resumable_stop_scene_fingerprint_error or ""
-            assert (
-                fingerprint_error == "scene fingerprint capture pending"
-                or "TimeoutError" in fingerprint_error
-            )
-        finally:
-            release_scene.set()
+        manager.full_stop()
+        assert manager.state == CycleState.STOPPING
+        self._await_state(manager, CycleState.STOPPED, timeout_s=0.5)
+        assert not scene_read.is_set()
 
     def test_full_stop_during_run_transition_is_honored(self):
         release_status = threading.Event()
@@ -3948,17 +4128,24 @@ class TestCycleManagerStopLivenessResiduals:
         manager.full_stop()
 
 
-class TestMotionErrorReadAllocation:
-    """The 100 Hz motion-error read must not grow py_trees global state."""
+class TestRuntimePauseReadAllocation:
+    """Runtime-fault observation must not grow py_trees global state."""
 
-    def test_read_motion_paused_error_does_not_register_new_clients(self, kernel):
+    def test_runtime_fault_reads_do_not_register_blackboard_clients(self, kernel):
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
+        runner.runtime_pause_registry.raise_fault(
+            node_name="allocation_probe",
+            node_id="test",
+            domain="test",
+            reason_code="test_fault",
+            message="test fault",
+        )
 
-        manager._read_motion_paused_error()
+        manager._active_runtime_fault_facts()
         clients_before = len(py_trees.blackboard.Blackboard.clients)
         for _ in range(200):
-            manager._read_motion_paused_error()
+            manager._active_runtime_fault_facts()
         assert len(py_trees.blackboard.Blackboard.clients) == clients_before
 
 
@@ -4068,6 +4255,7 @@ class TestProgramRunIdThreading:
         deadline = time.time() + 2.0
         while manager.state != CycleState.STOPPED and time.time() < deadline:
             time.sleep(0.01)
+        _script_ready_recovery(slow_kernel)
         manager.run()  # resume: same program run, same id
         assert manager._program_run_id == first
 
@@ -4112,11 +4300,6 @@ class TestControlCommandEpoch:
         manager = CycleManager(runner, kernel)
         manager._tree = runner.build_tree()  # noqa: SLF001
         manager._state = CycleState.STOPPED  # noqa: SLF001
-        with manager._lock:  # noqa: SLF001
-            manager._store_resumable_stop_scene_fingerprint_locked(  # noqa: SLF001
-                _scene_resume_fingerprint_from_objects(kernel.get_scene_objects()),
-                None,
-            )
 
         with pytest.raises(TimeoutError):
             manager.run()
@@ -4129,35 +4312,22 @@ class TestControlCommandEpoch:
         assert kernel.get_status().state == ExecutionState.PAUSED
         assert manager.state == CycleState.STOPPED
 
-    def test_ack_retry_during_wedged_run_transition_is_bounded(self, monkeypatch):
+    def test_recovery_action_during_wedged_run_transition_is_bounded(
+        self, monkeypatch
+    ):
         release_status = threading.Event()
         status_entered = threading.Event()
 
         class FirstRunStatusBlocksKernel(MockKernelClient):
             def __init__(self):
                 super().__init__(execute_duration_s=5.0)
-                self._status_calls = 0
-                self._status_lock = threading.Lock()
+                self.block_status = True
 
             def get_status(self):  # type: ignore[override]
-                with self._status_lock:
-                    self._status_calls += 1
-                    status_call = self._status_calls
-                if status_call == 1:
+                if self.block_status:
                     status_entered.set()
                     release_status.wait(timeout=5.0)
-                    return ExecutionStatus(
-                        state=ExecutionState.PAUSED,
-                        execution_id=1,
-                        progress=0.0,
-                        active_move_id="wedged_run",
-                    )
-                return ExecutionStatus(
-                    state=ExecutionState.INTERVENTION_REQUIRED,
-                    execution_id=1,
-                    progress=0.0,
-                    active_move_id="ack_after_wedged_run",
-                )
+                return super().get_status()
 
         monkeypatch.setattr(
             cycle_manager_module,
@@ -4165,17 +4335,12 @@ class TestControlCommandEpoch:
             0.02,
         )
         kernel = FirstRunStatusBlocksKernel()
-        kernel._state = ExecutionState.INTERVENTION_REQUIRED  # noqa: SLF001
+        kernel._state = ExecutionState.PAUSED  # noqa: SLF001
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         runner.load()
         manager = CycleManager(runner, kernel)
         manager._tree = runner.build_tree()  # noqa: SLF001
         manager._state = CycleState.STOPPED  # noqa: SLF001
-        with manager._lock:  # noqa: SLF001
-            manager._store_resumable_stop_scene_fingerprint_locked(  # noqa: SLF001
-                _scene_resume_fingerprint_from_objects(kernel.get_scene_objects()),
-                None,
-            )
 
         run_errors: list[BaseException] = []
 
@@ -4189,29 +4354,59 @@ class TestControlCommandEpoch:
         run_thread.start()
         try:
             assert status_entered.wait(timeout=1.0)
-            ack_errors: list[BaseException] = []
-            ack_elapsed: list[float] = []
+            kernel.block_status = False
+            _script_ready_recovery(
+                kernel,
+                action="acknowledge_and_continue",
+                recovery_class="stop_fault_intervention",
+                status="action_required",
+                execution_state="intervention_required",
+            )
+            offer = manager.refresh_recovery_offer()
+            recovery_responses: list[dict] = []
+            recovery_elapsed: list[float] = []
 
-            def acknowledge() -> None:
+            def recover() -> None:
                 started = time.monotonic()
-                try:
-                    manager.acknowledge_intervention_for_retry()
-                except BaseException as exc:  # noqa: BLE001 - inspected below.
-                    ack_errors.append(exc)
-                finally:
-                    ack_elapsed.append(time.monotonic() - started)
+                recovery_responses.append(
+                    manager.apply_recovery_action(
+                        {
+                            "request_id": "recovery-after-wedged-run",
+                            "offer_id": offer["offerId"],
+                            "offer_revision": offer["offerRevision"],
+                            "action_id": "acknowledge_and_continue",
+                        },
+                        principal_id="operator:test",
+                    )
+                )
+                recovery_elapsed.append(time.monotonic() - started)
 
-            ack_thread = threading.Thread(target=acknowledge, daemon=True)
-            ack_thread.start()
-            ack_thread.join(timeout=0.5)
-            assert not ack_thread.is_alive()
-            assert not ack_errors
-            assert ack_elapsed and ack_elapsed[0] < 0.3
+            recovery_thread = threading.Thread(target=recover, daemon=True)
+            recovery_thread.start()
+            recovery_thread.join(timeout=0.5)
+            assert not recovery_thread.is_alive()
+            assert recovery_responses[0]["accepted"] is False
+            assert (
+                recovery_responses[0]["error"]["details"]["reason"]
+                == "recovery_offer_stale"
+            )
+            assert recovery_elapsed and recovery_elapsed[0] < 0.3
             run_thread.join(timeout=1.0)
             assert not run_thread.is_alive()
             assert any(isinstance(exc, TimeoutError) for exc in run_errors)
-            assert kernel.acknowledge_intervention_for_retry_count == 1
-            assert manager.state == CycleState.STOPPED
+
+            current = recovery_responses[0]["recoveryOffer"]
+            accepted = manager.apply_recovery_action(
+                {
+                    "request_id": "recovery-after-stale-refresh",
+                    "offer_id": current["offerId"],
+                    "offer_revision": current["offerRevision"],
+                    "action_id": "acknowledge_and_continue",
+                },
+                principal_id="operator:test",
+            )
+            assert accepted["accepted"] is True
+            assert len(kernel.apply_recovery_action_requests) == 1
         finally:
             release_status.set()
             run_thread.join(timeout=1.0)

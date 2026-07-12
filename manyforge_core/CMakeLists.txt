@@ -15,6 +15,7 @@ add_library(manyforge_core
   src/execution_admission_support.cpp
   src/execution_collision_support.cpp
   src/execution_correlation_tracker.cpp
+  src/execution_gripper_support.cpp
   src/execution_interrupt_support.cpp
   src/execution_recovery_support.cpp
   src/execution_snapshot_publisher.cpp

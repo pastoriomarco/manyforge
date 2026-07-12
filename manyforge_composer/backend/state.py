@@ -53,6 +53,10 @@ def stop_all_visual_state_publishers(*, timeout_s: float = 0.5) -> None:
             state.stop_visual_state_publisher(timeout_s=timeout_s)
         except Exception:
             pass
+        try:
+            state.stop_recovery_offer_pump(timeout_s=timeout_s)
+        except Exception:
+            pass
 
 
 atexit.register(stop_all_visual_state_publishers)
@@ -331,8 +335,12 @@ class ComposerState:
         # handlers may hold this while calling apply_models(), so it must be
         # reentrant.
         self._program_edit_lock = threading.RLock()
+        # Leaf lock for generation tokens only. Recovery projection must not
+        # queue behind long program-model edits or assistant draft work.
+        self._runtime_generation_lock = threading.Lock()
         self._program_tree_hash: str = ""
         self._program_session_generation: int = 0
+        self._deployment_session_generation: int = 0
         self._scene_snapshot_lock = threading.Lock()
         self._published_scene_snapshots: dict[str, PublishedSceneSnapshot] = {}
         self.assistant_provider: Any = None
@@ -405,6 +413,13 @@ class ComposerState:
         self._visual_state_publisher_stop = threading.Event()
         self._visual_state_publisher_builder: Callable[[], Any] | None = None
         self._visual_state_publisher_period_s = 1.0 / 15.0
+        # Owned NRT kernel-event consumer for RT-8D. It is independent of
+        # browser/WebSocket demand and blocks on the native collector with the
+        # GIL released, so offer publication does not poll at viewer cadence.
+        self._recovery_offer_pump_lock = threading.Lock()
+        self._recovery_offer_pump_thread: threading.Thread | None = None
+        self._recovery_offer_pump_stop = threading.Event()
+        self._recovery_offer_pump_wake = threading.Event()
         self.skill_catalog: SkillCatalog = load_skill_catalog(
             default_skills_dir(),
             catalog=self.catalog,
@@ -940,6 +955,67 @@ class ComposerState:
         self.cycle_manager.set_on_reset_phase_event(
             self._record_cycle_reset_phase,
         )
+        self.cycle_manager.set_recovery_context_provider(
+            self._cycle_recovery_context,
+        )
+        self.cycle_manager.set_on_recovery_offer_published(
+            self._record_recovery_offer_published,
+        )
+        self.cycle_manager.set_on_recovery_action_event(
+            self._record_recovery_action_event,
+        )
+        self._recovery_offer_pump_wake.set()
+
+    def start_recovery_offer_pump(self) -> None:
+        """Start the browser-independent NRT recovery event consumer."""
+        with self._recovery_offer_pump_lock:
+            thread = self._recovery_offer_pump_thread
+            if thread is not None and thread.is_alive():
+                return
+            self._recovery_offer_pump_stop.clear()
+            self._recovery_offer_pump_wake.clear()
+
+            def worker() -> None:
+                while not self._recovery_offer_pump_stop.is_set():
+                    manager = self.cycle_manager
+                    if manager is None:
+                        self._recovery_offer_pump_wake.wait(timeout=0.02)
+                        self._recovery_offer_pump_wake.clear()
+                        continue
+                    try:
+                        manager.wait_for_kernel_events_and_project(0.02)
+                    except Exception:  # noqa: BLE001 - evidence remains fail-closed.
+                        _log_throttle.warning(
+                            logger,
+                            "recovery_offer_pump_failed",
+                            "Recovery offer event pump iteration failed",
+                            extra={"event": "manyforge.recovery.offer_pump_failed"},
+                        )
+                        self._recovery_offer_pump_stop.wait(timeout=0.05)
+
+            thread = threading.Thread(
+                target=worker,
+                name="manyforge_recovery_offer_pump",
+                daemon=False,
+            )
+            self._recovery_offer_pump_thread = thread
+            thread.start()
+
+    def stop_recovery_offer_pump(self, *, timeout_s: float = 1.0) -> None:
+        """Stop and join the owned recovery event consumer."""
+        with self._recovery_offer_pump_lock:
+            thread = self._recovery_offer_pump_thread
+            self._recovery_offer_pump_stop.set()
+            self._recovery_offer_pump_wake.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, timeout_s))
+            if thread.is_alive():
+                raise RuntimeError(
+                    "Recovery offer event pump did not stop within its deadline"
+                )
+        with self._recovery_offer_pump_lock:
+            if self._recovery_offer_pump_thread is thread:
+                self._recovery_offer_pump_thread = None
 
     def _initialize_kernel_observability(self, trace_dir: str) -> None:
         """Wire the kernel flight-ring dump directory, ingest dumps left by a
@@ -993,6 +1069,29 @@ class ComposerState:
 
     def _record_cycle_reset_phase(self, event: dict[str, Any]) -> None:
         self.event_recorder.record_cycle_reset_phase(event)
+
+    def _cycle_recovery_context(self) -> dict[str, int]:
+        """Return non-kernel generation tokens for immutable recovery offers."""
+        with self._runtime_generation_lock:
+            program_generation = self._program_session_generation
+            deployment_generation = self._deployment_session_generation
+        return {
+            "program_generation": program_generation,
+            "deployment_generation": deployment_generation,
+            "pose_source_apply_generation": (
+                self._pose_source_apply_generation_value()
+            ),
+        }
+
+    def _record_recovery_offer_published(self, offer: dict[str, Any]) -> None:
+        self.event_recorder.record_recovery_offer_published(offer)
+
+    def _record_recovery_action_event(
+        self,
+        action: str,
+        details: dict[str, Any],
+    ) -> None:
+        self.event_recorder.record_recovery_action_event(action, details)
 
     @property
     def kernel(self) -> Optional[KernelClient]:
@@ -2663,7 +2762,9 @@ class ComposerState:
         self.deployment = deployment
         self._evaluate_stop_capability()
         self._update_program_tree_hash()
-        self._program_session_generation += 1
+        with self._runtime_generation_lock:
+            self._program_session_generation += 1
+            self._deployment_session_generation += 1
         self._clear_published_scene_snapshots()
         self.clear_pose_source_snapshots()
         self.clear_visual_state_snapshot()
@@ -3049,7 +3150,9 @@ class ComposerState:
         with self._joint_state_lock:
             self._drivable_joint_names = list(joint_names_to_cache)
         self._update_program_tree_hash()
-        self._program_session_generation += 1
+        with self._runtime_generation_lock:
+            self._program_session_generation += 1
+            self._deployment_session_generation += 1
         self._clear_published_scene_snapshots()
         with self._scene_viewer_lock:
             self._hidden_frames.clear()
@@ -3388,8 +3491,22 @@ class ComposerState:
 
         gripper_id = matches[0]
         try:
+            status = self.kernel.get_gripper_status(gripper_id)
+            command_id = int(getattr(status, "command_id", 0) or 0)
+            generation = int(getattr(status, "generation", 0) or 0)
+            if command_id <= 0 or generation <= 0:
+                return {
+                    "gripper_grasp_loss": {
+                        "status": "not_recorded",
+                        "reason": "stale_gripper_state",
+                        "attached_frame_id": frame_id,
+                        "gripper_id": gripper_id,
+                    }
+                }
             result = self.kernel.mark_gripper_grasp_lost(
                 gripper_id=gripper_id,
+                expected_command_id=command_id,
+                expected_generation=generation,
                 evidence_label=evidence_label,
                 message=message,
                 reason_code="grasp_confirmation_lost",

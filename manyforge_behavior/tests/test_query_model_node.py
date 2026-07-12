@@ -33,6 +33,7 @@ from manyforge_behavior.nodes.model import (
     _parse_json_text,
     _render_prompt_template,
 )
+from manyforge_behavior.runtime_pause import RuntimePauseRegistry
 
 
 @pytest.fixture(autouse=True)
@@ -135,6 +136,17 @@ def _mock_call_result(text="hello", parsed=None, model_version="test-v1"):
 def _read_model_bundle(prefix: str = "model/test") -> dict[str, Any]:
     bb = py_trees.blackboard.Client(name=f"reader_{prefix.replace('/', '_')}")
     return read_namespace_bundle(bb, prefix)
+
+
+def _assert_only_runtime_fault(
+    registry: RuntimePauseRegistry,
+    *,
+    reason_code: str,
+) -> None:
+    faults = registry.active_faults()
+    assert len(faults) == 1
+    assert faults[0].domain == "model"
+    assert faults[0].reason_code == reason_code
 
 
 # ---------------------------------------------------------------------------
@@ -519,14 +531,30 @@ class TestQueryModelErrors:
 
     @patch("manyforge_behavior.nodes.model._call_model")
     def test_model_call_exception(self, mock_call):
-        """Exception from model call → FAILURE."""
+        """A transient model call fault pauses for an exact recovery action."""
         mock_call.side_effect = RuntimeError("connection refused")
-        node = _make_node()
+        registry = RuntimePauseRegistry()
+        node = _make_node(runtime_pause_registry=registry)
         tree = py_trees.trees.BehaviourTree(root=node)
         tree.setup()
 
         status = _tick_until_done(tree)
-        assert status == py_trees.common.Status.FAILURE
+        assert status == py_trees.common.Status.RUNNING
+        _assert_only_runtime_fault(registry, reason_code="model_call_failed")
+
+    @patch("manyforge_behavior.nodes.model._call_model")
+    def test_model_call_exception_can_be_authored_as_condition_failure(self, mock_call):
+        mock_call.side_effect = RuntimeError("connection refused")
+        registry = RuntimePauseRegistry()
+        node = _make_node(
+            model_runtime_failure_policy="condition_failure",
+            runtime_pause_registry=registry,
+        )
+        tree = py_trees.trees.BehaviourTree(root=node)
+        tree.setup()
+
+        assert _tick_until_done(tree) == py_trees.common.Status.FAILURE
+        assert registry.active_faults() == ()
 
     @patch("manyforge_behavior.nodes.model._call_model")
     def test_snapshot_requested_without_provider_fails(self, mock_call):
@@ -541,14 +569,19 @@ class TestQueryModelErrors:
 
     @patch("manyforge_behavior.nodes.model._call_model")
     def test_min_confidence_threshold(self, mock_call):
-        """Plain text response has confidence=0.5 which is below min_confidence=0.8 → FAILURE."""
+        """Low-confidence output pauses rather than selecting a fallback branch."""
         mock_call.return_value = _mock_call_result(text="maybe", parsed=None)
-        node = _make_node(min_confidence=0.8)
+        registry = RuntimePauseRegistry()
+        node = _make_node(min_confidence=0.8, runtime_pause_registry=registry)
         tree = py_trees.trees.BehaviourTree(root=node)
         tree.setup()
 
         status = _tick_until_done(tree)
-        assert status == py_trees.common.Status.FAILURE
+        assert status == py_trees.common.Status.RUNNING
+        _assert_only_runtime_fault(
+            registry,
+            reason_code="model_confidence_below_threshold",
+        )
 
     @patch("manyforge_behavior.nodes.model._call_model")
     def test_min_confidence_feedback_includes_structured_reason(self, mock_call):
@@ -565,15 +598,20 @@ class TestQueryModelErrors:
             text=json.dumps(result),
             parsed=result,
         )
-        node = _make_node(min_confidence=0.7)
+        registry = RuntimePauseRegistry()
+        node = _make_node(min_confidence=0.7, runtime_pause_registry=registry)
         tree = py_trees.trees.BehaviourTree(root=node)
         tree.setup()
 
         status = _tick_until_done(tree)
-        assert status == py_trees.common.Status.FAILURE
+        assert status == py_trees.common.Status.RUNNING
         assert "confidence 0.10 below threshold 0.70" in node.feedback_message
         assert "outcome=no_match" in node.feedback_message
         assert "reason=No selection request was provided." in node.feedback_message
+        _assert_only_runtime_fault(
+            registry,
+            reason_code="model_confidence_below_threshold",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -874,18 +912,23 @@ class TestQueryModelAudit:
         """Failed model call records a 'failed' event."""
         mock_call.side_effect = RuntimeError("timeout")
         recorder = MagicMock()
-        node = _make_node(event_recorder=recorder)
+        registry = RuntimePauseRegistry()
+        node = _make_node(
+            event_recorder=recorder,
+            runtime_pause_registry=registry,
+        )
         tree = py_trees.trees.BehaviourTree(root=node)
         tree.setup()
 
         status = _tick_until_done(tree)
-        assert status == py_trees.common.Status.FAILURE
+        assert status == py_trees.common.Status.RUNNING
 
         calls = recorder.record_model_event.call_args_list
         assert len(calls) == 2
         assert calls[0][1]["action"] == "started"
         assert calls[1][1]["action"] == "failed"
         assert "timeout" in calls[1][1]["error"]
+        _assert_only_runtime_fault(registry, reason_code="model_call_failed")
 
     @patch("manyforge_behavior.nodes.model._call_model")
     def test_intervention_context_propagated(self, mock_call):
@@ -971,7 +1014,8 @@ class TestQueryModelComplianceFixes:
             text=json.dumps(result),
             parsed=result,
         )
-        node = _make_node()
+        registry = RuntimePauseRegistry()
+        node = _make_node(runtime_pause_registry=registry)
         tree = py_trees.trees.BehaviourTree(root=node)
         tree.setup()
 
@@ -981,7 +1025,11 @@ class TestQueryModelComplianceFixes:
         ):
             status = _tick_until_done(tree)
 
-        assert status == py_trees.common.Status.FAILURE
+        assert status == py_trees.common.Status.RUNNING
+        _assert_only_runtime_fault(
+            registry,
+            reason_code="model_output_commit_failed",
+        )
 
         with pytest.raises(KeyError):
             _read_model_bundle()

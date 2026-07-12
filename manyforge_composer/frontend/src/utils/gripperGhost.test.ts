@@ -20,6 +20,9 @@ const ROBOT: SceneRobotState = {
 
 const GRIPPER: SceneGripperState = {
   gripper_id: 'primary',
+  command_id: 1,
+  generation: 1,
+  revision: 1,
   joint_name: 'finger_joint',
   state: 'idle',
   current_position: 0.0,

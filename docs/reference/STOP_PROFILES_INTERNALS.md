@@ -79,21 +79,19 @@ holds `INTERVENTION_REQUIRED` for operator/robot-safety recovery.
 
 Stop/fault intervention recovery has two distinct paths:
 
-- `ExecutionKernel::acknowledge_intervention_for_retry(...)` is the
-  no-backend-reset path. It is valid only for classified stop/fault
-  interventions after fresh admission checks: backend state readable, backend
-  not `Stopping`, finite current pose, reportable hard-stop floor, and measured
-  velocity settled when available. It republishes the current backend snapshot as
-  Idle and records `recovery_mode=acknowledge_and_continue` plus
-  `backend_reset_performed=false`.
-- `ExecutionKernel::acknowledge_intervention(...)` remains the reset/resync path.
-  It calls `execution_backend.reset()` and is therefore used only when the
-  operator explicitly selects a reset-style recovery. On commanded-sim lanes that
-  can command the deployment's initial pose.
+- `ExecutionKernel::apply_recovery_action(...)` with
+  `acknowledge_and_continue` is the no-backend-reset path. It is valid only for
+  the exact current assessment after fresh certificate, stop-owner, latch,
+  observed-state, and lifecycle admission checks. It records
+  `backend_reset_performed=false`; a later motion still replans and revalidates.
+- The normal `Reset` lifecycle command is the reset/resync path. It may call
+  `execution_backend.reset()` and, on commanded-sim lanes, may restore the
+  deployment's initial simulator state.
 
 `CycleManager.run()` must not choose either path implicitly from
-`STOPPED + INTERVENTION_REQUIRED`. Composer's Run control shows the explicit
-choice: **Acknowledge and continue**, **Reset cycle and run**, or **Cancel**.
+`STOPPED + INTERVENTION_REQUIRED`. Composer renders the exact current cycle
+recovery offer with **Acknowledge and continue**, **Reset cycle**, or no enabled
+action while evidence remains incomplete.
 
 ## 2.1 Lane Matrix
 

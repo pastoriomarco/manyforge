@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-07-03 06:45:42 UTC
+  Last regenerated: 2026-07-12 06:05:06 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -35,8 +35,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/capabilities` | skills | Get Capabilities |
 | `GET` | `/api/catalog` | catalog | Get Catalog |
 | `GET` | `/api/catalog/{entry_id}` | catalog | Get Catalog Entry |
-| `POST` | `/api/cycle/acknowledge-intervention-for-retry` | cycle | Acknowledge Intervention For Retry |
 | `POST` | `/api/cycle/full-stop` | cycle | Full Stop Cycle |
+| `POST` | `/api/cycle/recovery-actions` | cycle | Apply Recovery Action |
 | `POST` | `/api/cycle/reset` | cycle | Reset Cycle |
 | `POST` | `/api/cycle/run` | cycle | Run Cycle |
 | `GET` | `/api/cycle/status` | cycle | Get Status |
@@ -66,6 +66,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/execution/channels` | execution | Get Execution Channels |
 | `GET` | `/api/execution/digest` | execution | Get Execution Digest |
 | `GET` | `/api/execution/history` | execution | Get Execution History |
+| `GET` | `/api/execution/latency-histograms` | execution | Get Latency Histograms |
+| `GET` | `/api/execution/runs` | execution | List Execution Runs |
 | `GET` | `/api/files/browse` | files | Browse Filesystem |
 | `GET` | `/api/health` |  | Health |
 | `GET` | `/api/infra/heartbeat` | infra | Infra Heartbeat |

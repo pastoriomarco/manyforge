@@ -51,6 +51,7 @@ from manyforge_behavior.nodes.logic import (
     WaitForGripperState,
 )
 from manyforge_behavior.nodes.geometry import GetLinkPose, CheckPoseDistance
+from manyforge_behavior.runtime_pause import RuntimePauseRegistry
 
 
 @pytest.fixture(autouse=True)
@@ -73,6 +74,11 @@ def bb_with_kernel(kernel):
     client.register_key(key="kernel", access=py_trees.common.Access.WRITE)
     client.kernel = kernel
     return client
+
+
+@pytest.fixture
+def runtime_pause_registry():
+    return RuntimePauseRegistry()
 
 
 def _tick_node(node):
@@ -123,32 +129,24 @@ class TestMoveManipulatorAction:
         )
         assert "test_move" in kernel.last_execute_request.action_span.node_instance_id
 
-    def test_failure(self, kernel, bb_with_kernel):
-        # Motion soft-fail: instead of returning FAILURE and propagating
-        # up the tree, the node holds Status.RUNNING and writes the
-        # cause to the blackboard. The CycleManager observes the
-        # `motion_paused_due_to_error` signal and holds motion while
-        # continue-policy branches keep ticking; Run clears the soft-fail
-        # state and signals retry. See spec 410 §motion-soft-fail.
+    def test_failure(self, kernel, bb_with_kernel, runtime_pause_registry):
+        # Runtime motion faults hold the owning node without terminating a
+        # Parallel. Recovery is generation-bound through the shared registry;
+        # there is deliberately no global blackboard retry flag.
         kernel.fail_next_execute = True
         node = MoveManipulatorAction(
             name="test_move_fail",
             move_id="m1",
             motion_type="joint_goal",
+            runtime_pause_registry=runtime_pause_registry,
         )
         status = _tick_node(node)
         assert status == py_trees.common.Status.RUNNING
-        # The blackboard reader sees the cause + paused flag the
-        # CycleManager will pick up.
-        reader = py_trees.blackboard.Client(name="motion_state_reader")
-        reader.register_key(
-            key="motion_paused_due_to_error", access=py_trees.common.Access.READ
-        )
-        reader.register_key(
-            key="motion_error_message", access=py_trees.common.Access.READ
-        )
-        assert reader.get("motion_paused_due_to_error") is True
-        assert isinstance(reader.get("motion_error_message"), str)
+        faults = runtime_pause_registry.active_faults()
+        assert len(faults) == 1
+        assert faults[0].domain == "motion"
+        assert faults[0].reason_code == "motion_execute_rejected"
+        assert faults[0].node_name == "test_move_fail"
 
     def test_from_non_idle_non_terminal(self, kernel, bb_with_kernel):
         """Execute from non-terminal non-IDLE state holds RUNNING."""
@@ -635,9 +633,33 @@ class TestResetSimulation:
         assert _tick_node(node) == py_trees.common.Status.FAILURE
         assert "callback" in node.feedback_message
 
-    def test_fails_when_callback_rejects(self):
+    def test_runtime_rejection_pauses_by_default(self, runtime_pause_registry):
         self._install_callback(lambda **_kwargs: {"success": False, "error": "denied"})
-        node = ResetSimulation(name="reset_sim")
+        node = ResetSimulation(
+            name="reset_sim",
+            runtime_pause_registry=runtime_pause_registry,
+        )
+
+        node.setup()
+        node.initialise()
+        deadline = time.monotonic() + 1.0
+        status = node.update()
+        while not runtime_pause_registry.active_faults() and time.monotonic() < deadline:
+            time.sleep(0.001)
+            status = node.update()
+        assert status == py_trees.common.Status.RUNNING
+        assert node.feedback_message == "denied"
+        faults = runtime_pause_registry.active_faults()
+        assert len(faults) == 1
+        assert faults[0].domain == "simulation"
+        assert faults[0].reason_code == "simulation_control_rejected"
+
+    def test_runtime_rejection_can_be_authored_as_condition_failure(self):
+        self._install_callback(lambda **_kwargs: {"success": False, "error": "denied"})
+        node = ResetSimulation(
+            name="reset_sim",
+            runtime_failure_policy="condition_failure",
+        )
 
         assert _tick_node_until_terminal(node) == py_trees.common.Status.FAILURE
         assert node.feedback_message == "denied"
@@ -1108,7 +1130,7 @@ class TestAttachDetachObjectNodes:
         assert "none_open_loop" in node.feedback_message
 
     def test_attach_rejects_evidence_backed_policy_without_confirmation(
-        self, kernel, bb_with_kernel
+        self, kernel, bb_with_kernel, runtime_pause_registry
     ):
         bb_with_kernel.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
         bb_with_kernel.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
@@ -1135,11 +1157,16 @@ class TestAttachDetachObjectNodes:
             object_id="box1",
             link_frame="tool0",
             gripper_id="primary",
+            runtime_pause_registry=runtime_pause_registry,
         )
 
-        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        assert _tick_node(node) == py_trees.common.Status.RUNNING
         assert "lacks verified grasp evidence" in node.feedback_message
         assert kernel.get_object_state("box1").attached is False
+        faults = runtime_pause_registry.active_faults()
+        assert len(faults) == 1
+        assert faults[0].domain == "scene"
+        assert faults[0].reason_code == "command_estimate_attach_rejected"
 
         reader = py_trees.blackboard.Client(name="attach_fault_reader")
         reader.register_key(
@@ -1201,7 +1228,7 @@ class TestAttachDetachObjectNodes:
         assert kernel.get_object_state("box1").attached is True
 
     def test_attach_rejects_lost_grasp_confirmation_status(
-        self, kernel, bb_with_kernel
+        self, kernel, bb_with_kernel, runtime_pause_registry
     ):
         bb_with_kernel.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
         bb_with_kernel.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
@@ -1247,11 +1274,15 @@ class TestAttachDetachObjectNodes:
             object_id="box1",
             link_frame="tool0",
             gripper_id="primary",
+            runtime_pause_registry=runtime_pause_registry,
         )
 
-        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        assert _tick_node(node) == py_trees.common.Status.RUNNING
         assert "pressure_or_part_lost" in node.feedback_message
         assert kernel.get_object_state("box1").attached is False
+        faults = runtime_pause_registry.active_faults()
+        assert len(faults) == 1
+        assert faults[0].reason_code == "grasp_confirmation_lost"
 
         reader = py_trees.blackboard.Client(name="attach_lost_fault_reader")
         reader.register_key(
@@ -1569,7 +1600,9 @@ class TestCommandGripper:
         assert status == py_trees.common.Status.SUCCESS
 
 
-    def test_command_gripper_failure_records_structured_fault(self, kernel, bb_with_kernel):
+    def test_command_gripper_failure_records_structured_fault(
+        self, kernel, bb_with_kernel, runtime_pause_registry
+    ):
         writer = py_trees.blackboard.Client(name="gripper_setup")
         writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
         writer.gripper_configs = {
@@ -1587,11 +1620,16 @@ class TestCommandGripper:
             gripper_id="primary",
             position=0.7,
             timeout_s=1.0,
+            runtime_pause_registry=runtime_pause_registry,
         )
         node.setup()
         node.initialise()
 
-        assert node.update() == py_trees.common.Status.FAILURE
+        assert node.update() == py_trees.common.Status.RUNNING
+        faults = runtime_pause_registry.active_faults()
+        assert len(faults) == 1
+        assert faults[0].domain == "gripper"
+        assert faults[0].reason_code == "gripper_request_failed"
 
         reader = py_trees.blackboard.Client(name="gripper_fault_reader")
         reader.register_key(
@@ -1698,7 +1736,7 @@ class TestCommandGripper:
         assert runtime_status.evidence_state == "unverified"
 
     def test_pneumatic_dwell_timeout_uses_stable_fault_token(
-        self, kernel, bb_with_kernel
+        self, kernel, bb_with_kernel, runtime_pause_registry
     ):
         writer = py_trees.blackboard.Client(name="gripper_setup")
         writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
@@ -1724,13 +1762,17 @@ class TestCommandGripper:
             gripper_id="primary",
             position=0.0,
             timeout_s=0.001,
+            runtime_pause_registry=runtime_pause_registry,
         )
         node.setup()
         node.initialise()
 
         assert node.update() == py_trees.common.Status.RUNNING
         time.sleep(0.01)
-        assert node.update() == py_trees.common.Status.FAILURE
+        assert node.update() == py_trees.common.Status.RUNNING
+        faults = runtime_pause_registry.active_faults()
+        assert len(faults) == 1
+        assert faults[0].reason_code == "gripper_dwell_timeout"
 
         reader = py_trees.blackboard.Client(name="gripper_fault_reader_timeout")
         reader.register_key(
@@ -1888,7 +1930,7 @@ class TestCommandGripper:
         assert second.accepted is False
         assert "already executing" in (second.error or "")
 
-    def test_mock_kernel_status_reads_do_not_advance_inflight_command(self, kernel):
+    def test_mock_kernel_status_reads_are_side_effect_free(self, kernel):
         accepted = kernel.command_gripper(
             GripperCommandRequest(
                 gripper_id="primary",
@@ -1901,20 +1943,22 @@ class TestCommandGripper:
         assert accepted.accepted is True
 
         time.sleep(0.06)
-        stale_status = kernel.get_gripper_status("primary")
-
-        assert stale_status.state == GripperCommandState.EXECUTING
-        assert stale_status.current_position == pytest.approx(0.0)
-        assert kernel._gripper_positions.get("primary") is None
-
-        kernel.update_gripper_commands()
         completed = kernel.get_gripper_status("primary")
 
         assert completed.state == GripperCommandState.COMPLETED
         assert completed.current_position == pytest.approx(0.7)
-        assert kernel._gripper_positions["primary"] == pytest.approx(0.7)
+        assert completed.revision == 2
+        # The observer did not commit lifecycle state or projection.
+        assert kernel._gripper_commands["primary"]["state"] == (
+            GripperCommandState.EXECUTING
+        )
+        assert kernel._gripper_positions.get("primary") is None
 
-    def test_mock_kernel_accepts_next_gripper_command_after_update(self, kernel):
+        repeated = kernel.get_gripper_status("primary")
+        assert repeated == completed
+        assert kernel._gripper_positions.get("primary") is None
+
+    def test_mock_kernel_accepts_next_command_after_elapsed_predecessor(self, kernel):
         first = kernel.command_gripper(
             GripperCommandRequest(
                 gripper_id="primary",
@@ -2076,7 +2120,7 @@ class TestConfirmGripperGrasp:
         assert kernel.get_object_state("box1").attached is True
 
     def test_confirmation_rejects_false_source_signal(
-        self, kernel, bb_with_kernel
+        self, kernel, bb_with_kernel, runtime_pause_registry
     ):
         self._configure_gripper(kernel, policy="discrete_signal")
         writer = py_trees.blackboard.Client(name="signal_writer_false")
@@ -2089,9 +2133,14 @@ class TestConfirmGripperGrasp:
             name="confirm_part_present",
             gripper_id="primary",
             source_key="cell/part_present",
+            runtime_pause_registry=runtime_pause_registry,
         )
 
-        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        assert _tick_node(node) == py_trees.common.Status.RUNNING
+        faults = runtime_pause_registry.active_faults()
+        assert len(faults) == 1
+        assert faults[0].domain == "gripper"
+        assert faults[0].reason_code == "grasp_confirmation_lost"
         reader = py_trees.blackboard.Client(name="confirm_fault_reader")
         reader.register_key(
             key="gripper_fault_details", access=py_trees.common.Access.READ

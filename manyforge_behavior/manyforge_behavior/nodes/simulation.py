@@ -10,6 +10,7 @@ import py_trees
 
 from manyforge_behavior.action_span import ActionSpanMixin
 from manyforge_behavior.parameters import resolve_blackboard_value
+from manyforge_behavior.runtime_pause import RuntimePauseMixin, RuntimePauseRegistry
 
 
 _SIMULATION_CONTROL_EXECUTOR: ThreadPoolExecutor | None = None
@@ -27,16 +28,33 @@ def _get_simulation_control_executor() -> ThreadPoolExecutor:
         return _SIMULATION_CONTROL_EXECUTOR
 
 
-class _SimulationControlNode(ActionSpanMixin, py_trees.behaviour.Behaviour):
+class _SimulationControlNode(
+    RuntimePauseMixin,
+    ActionSpanMixin,
+    py_trees.behaviour.Behaviour,
+):
     """Base node that delegates simulator control to Composer."""
 
     operation: str = ""
 
     def __init__(self, name: str, **kwargs: Any):
         super().__init__(name=name)
+        runtime_pause_registry = kwargs.pop("runtime_pause_registry", None)
         self._params = kwargs
         self._reason = str(kwargs.get("reason", "") or name)
+        self._runtime_failure_policy = str(
+            kwargs.get("runtime_failure_policy", "pause_for_operator")
+        )
         self._future: Future | None = None
+        self._configure_runtime_pause(
+            registry=(
+                runtime_pause_registry
+                if isinstance(runtime_pause_registry, RuntimePauseRegistry)
+                else None
+            ),
+            node_id=str(kwargs.get("node_id", name)),
+            domain="simulation",
+        )
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
@@ -51,6 +69,29 @@ class _SimulationControlNode(ActionSpanMixin, py_trees.behaviour.Behaviour):
         self._reset_action_span()
         self._future = None
 
+    def _runtime_failure(
+        self,
+        *,
+        reason_code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> py_trees.common.Status:
+        self.feedback_message = message
+        if self._runtime_failure_policy == "condition_failure":
+            return py_trees.common.Status.FAILURE
+        if self._runtime_failure_policy != "pause_for_operator":
+            self.feedback_message = (
+                "invalid runtime_failure_policy: "
+                f"{self._runtime_failure_policy!r}"
+            )
+            return py_trees.common.Status.FAILURE
+        self._raise_runtime_pause(
+            reason_code=reason_code,
+            message=message,
+            details={"operation": self.operation, **(details or {})},
+        )
+        return py_trees.common.Status.RUNNING
+
     def _callback(self) -> Any:
         try:
             callback = self.blackboard.simulation_control_callback
@@ -62,6 +103,11 @@ class _SimulationControlNode(ActionSpanMixin, py_trees.behaviour.Behaviour):
         return {}
 
     def update(self) -> py_trees.common.Status:
+        if self._runtime_pause_fault is not None:
+            if self._consume_runtime_resume() is None:
+                self.feedback_message = self._runtime_pause_fault.message
+                return py_trees.common.Status.RUNNING
+
         if self._future is None:
             callback = self._callback()
             if callback is None:
@@ -91,21 +137,33 @@ class _SimulationControlNode(ActionSpanMixin, py_trees.behaviour.Behaviour):
 
         try:
             if self._future.cancelled():
-                self.feedback_message = "simulation control cancelled"
-                return py_trees.common.Status.FAILURE
+                return self._runtime_failure(
+                    reason_code="simulation_control_cancelled",
+                    message="simulation control cancelled",
+                )
             result = self._future.result()
         except CancelledError:
-            self.feedback_message = "simulation control cancelled"
-            return py_trees.common.Status.FAILURE
+            return self._runtime_failure(
+                reason_code="simulation_control_cancelled",
+                message="simulation control cancelled",
+            )
         except Exception as exc:
-            self.feedback_message = str(exc)
-            return py_trees.common.Status.FAILURE
+            return self._runtime_failure(
+                reason_code="simulation_control_callback_failed",
+                message=str(exc),
+                details={"exception_type": type(exc).__name__},
+            )
         finally:
             self._future = None
 
         if isinstance(result, dict) and result.get("success") is False:
-            self.feedback_message = str(result.get("error") or "simulation control failed")
-            return py_trees.common.Status.FAILURE
+            return self._runtime_failure(
+                reason_code="simulation_control_rejected",
+                message=str(result.get("error") or "simulation control failed"),
+                details={
+                    "result_code": str(result.get("code") or ""),
+                },
+            )
         return py_trees.common.Status.SUCCESS
 
     def terminate(self, new_status: py_trees.common.Status) -> None:
@@ -116,6 +174,8 @@ class _SimulationControlNode(ActionSpanMixin, py_trees.behaviour.Behaviour):
         ):
             self._future.cancel()
             self._future = None
+        if new_status != py_trees.common.Status.RUNNING:
+            self._clear_runtime_pause()
 
 
 class ResetSimulation(_SimulationControlNode):

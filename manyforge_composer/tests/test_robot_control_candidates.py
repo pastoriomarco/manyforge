@@ -1162,9 +1162,7 @@ def test_gripper_candidate_approve_fails_closed_when_gripper_busy(
 def test_gripper_candidate_not_stuck_busy_after_command_completes(
     tmp_path: Path,
 ) -> None:
-    """A positive-duration gripper command must progress to completion (via the
-    advance-on-read fix) so the gripper does not stay `executing` forever and
-    block all further candidates."""
+    """Backend-owned progress must complete without observer side effects."""
     client, _state, kernel = _gripper_client(tmp_path)
     cid = client.post(
         _BASE,
@@ -1190,12 +1188,7 @@ def test_gripper_candidate_not_stuck_busy_after_command_completes(
 def test_scene_state_path_clears_gripper_executing_after_completion(
     tmp_path: Path,
 ) -> None:
-    """The browser-visible regression: after an approved gripper command, the
-    scene-state collection path the visual publisher uses must advance the
-    simulated command from `executing` to `completed` (advance_commands=True),
-    so the UI re-enables. With advance_commands=False (the prior publisher
-    behavior) the state stays stuck `executing` — which had disabled the slider
-    and blocked further candidates."""
+    """The browser sees backend-owned completion without advancing it."""
     from manyforge_composer.backend.routes_scene import _collect_gripper_states
 
     client, state, _kernel = _gripper_client(tmp_path)
@@ -1217,26 +1210,17 @@ def test_scene_state_path_clears_gripper_executing_after_completion(
         return next(g for g in states if g.gripper_id == "primary")
 
     # Immediately after approve the simulated command is executing.
-    assert _primary(_collect_gripper_states(state, advance_commands=False)).state == (
-        "executing"
-    )
+    assert _primary(_collect_gripper_states(state)).state == "executing"
     time.sleep(0.12)
-    # Without advancing, the publisher snapshot would leave it stuck executing.
-    assert _primary(_collect_gripper_states(state, advance_commands=False)).state == (
-        "executing"
-    )
-    # The visual-publisher path now advances it to completion (the fix).
-    assert _primary(_collect_gripper_states(state, advance_commands=True)).state == (
-        "completed"
-    )
+    assert _primary(_collect_gripper_states(state)).state == "completed"
 
 
 def test_gripper_candidate_get_clears_executing_after_completion(
     tmp_path: Path,
 ) -> None:
     """A gripper candidate has no arm execution/session payload, but the
-    candidate endpoint still owns the UI lifecycle after Approve. Polling it
-    must advance and report the gripper bridge terminal state so the browser
+    candidate endpoint still reports the UI lifecycle after Approve. Polling it
+    must observe the gripper bridge terminal state so the browser
     cannot stay locally stuck at `executing` and block the next command."""
     client, _state, _kernel = _gripper_client(tmp_path)
     cid = client.post(

@@ -66,6 +66,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info("ManyForge Composer starting up")
+        state.start_recovery_offer_pump()
         hub.start(state)
         hub._task = asyncio.create_task(hub._broadcast_loop())
         yield
@@ -80,6 +81,10 @@ def create_app(
                 await asyncio.to_thread(state.cycle_manager.shutdown)
             except Exception:  # noqa: BLE001 — continue to the remaining steps
                 logger.exception("Shutdown: cycle quiesce failed")
+        try:
+            await asyncio.to_thread(state.stop_recovery_offer_pump)
+        except Exception:  # noqa: BLE001 - continue to final evidence flush.
+            logger.exception("Shutdown: recovery offer pump did not stop cleanly")
         try:
             routes_idle = await asyncio.to_thread(
                 shutdown_route_executors,

@@ -135,6 +135,7 @@ class StateHub:
                 error=error,
                 errorCode=error_code,
                 errorDetails=error_details,
+                recoveryOffer=state.cycle_manager.get_recovery_offer(),
                 programLoaded=bool(has_program),
                 programSessionGeneration=state.program_session_generation,
                 runtimeOverrideStatus=runtime_override_status,
@@ -153,6 +154,7 @@ class StateHub:
             nodeStatuses={},
             kernelEvents=kernel_events,
             nativeKernelEvents=[],
+            recoveryOffer=None,
             programLoaded=bool(has_program),
             programSessionGeneration=(
                 state.program_session_generation if state is not None else 0

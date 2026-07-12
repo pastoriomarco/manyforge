@@ -88,6 +88,7 @@ ROS2_CONTROL_BACKEND_FAULT_CLASSES: dict[str, BackendFaultClass] = {
         _fault_class("grasp_confirmation_lost", "ERROR"),
         _fault_class("gripper_result_failed", "ERROR"),
         _fault_class("gripper_result_timeout", "ERROR"),
+        _fault_class("gripper_state_not_finite", "ERROR"),
     )
 }
 

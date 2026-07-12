@@ -744,8 +744,11 @@ entries:
       capture. The node maps the kernel's terminal
       `MotionExecutionOutcome` to py_trees Status: signal_trip →
       SUCCESS; no_signal_trip → SUCCESS by default, or FAILURE when
-      `not_found_is_failure=true`; every other terminal cause →
-      FAILURE with the cause surfaced via `motion_error_message`.
+      `not_found_is_failure=true`; completed_normally and malformed or
+      mismatched outcomes fail closed as contract violations; recoverable
+      stopped, interrupted, or failed runtime outcomes keep the node RUNNING
+      with an exact generation-scoped runtime-pause fault until the cycle's
+      certified recovery action grants retry.
       Motion-field parity with `move_manipulator_action`: same
       tolerances / scales / timeouts / cache mode / blackboard pose
       resolution / pose-source callbacks / global TCP cap /
@@ -1307,6 +1310,15 @@ entries:
         required: false
         default: ""
         description: Optional trace reason for the simulator reset request.
+      - name: runtime_failure_policy
+        schema:
+          type: enum
+          values: [pause_for_operator, condition_failure]
+        required: false
+        default: pause_for_operator
+        description: >-
+          Runtime callback failures pause for an exact recovery action by
+          default. condition_failure is for an authored selector/fallback.
     required_capabilities:
       - simulator.control.reset
     execution:
@@ -1357,6 +1369,13 @@ entries:
         required: false
         default: ""
         description: Optional trace reason for the simulator state request.
+      - name: runtime_failure_policy
+        schema:
+          type: enum
+          values: [pause_for_operator, condition_failure]
+        required: false
+        default: pause_for_operator
+        description: Recovery policy for simulator runtime callback failures.
     required_capabilities: []
     execution:
       blocking: true
@@ -1402,6 +1421,13 @@ entries:
         required: false
         default: ""
         description: Optional trace reason for the simulator step request.
+      - name: runtime_failure_policy
+        schema:
+          type: enum
+          values: [pause_for_operator, condition_failure]
+        required: false
+        default: pause_for_operator
+        description: Recovery policy for simulator runtime callback failures.
     required_capabilities:
       - simulator.control.step
     execution:
@@ -1454,6 +1480,13 @@ entries:
         required: false
         default: ""
         description: Optional trace reason for the entity-state request.
+      - name: runtime_failure_policy
+        schema:
+          type: enum
+          values: [pause_for_operator, condition_failure]
+        required: false
+        default: pause_for_operator
+        description: Recovery policy for simulator runtime callback failures.
     required_capabilities:
       - simulator.entity_state.set
     execution:
@@ -2686,8 +2719,27 @@ entries:
         default: 0.0
         parameterizable: true
         description: >-
-          Minimum confidence threshold. If the response confidence is below
-          this threshold, the node returns FAILURE.
+          Minimum confidence threshold. Responses below this threshold follow
+          model_low_confidence_policy.
+      - name: model_runtime_failure_policy
+        schema:
+          type: enum
+          values: [pause_for_operator, condition_failure]
+        required: false
+        default: pause_for_operator
+        description: >-
+          Provider, timeout, cancellation, snapshot-runtime, and output-commit
+          failures pause for exact recovery by default. Contract/schema errors
+          remain terminal regardless of this policy.
+      - name: model_low_confidence_policy
+        schema:
+          type: enum
+          values: [pause_for_operator, condition_failure]
+        required: false
+        default: pause_for_operator
+        description: >-
+          Controls whether a valid but low-confidence response pauses for an
+          operator retry or behaves as an authored selector condition failure.
       - name: retry_on_parse_failure
         schema:
           type: bool
@@ -2857,6 +2909,16 @@ entries:
         required: false
         default: jpeg
         description: Image format for the optional viewer snapshot metadata.
+      - name: unavailable_policy
+        schema:
+          type: enum
+          values: [pause_for_operator, condition_failure]
+        required: false
+        default: pause_for_operator
+        description: >-
+          Temporarily missing candidates, poses, or viewer snapshots pause for
+          exact recovery by default. condition_failure enables intentional
+          selector/fallback semantics.
     required_capabilities: []
     execution:
       blocking: true
@@ -3011,6 +3073,15 @@ entries:
         description: >-
           Authoritative object snapshot source. Initial implementation supports
           backend_scene only.
+      - name: no_feasible_plan_policy
+        schema:
+          type: enum
+          values: [pause_for_operator, condition_failure]
+        required: false
+        default: pause_for_operator
+        description: >-
+          A valid request with no feasible candidate pauses for exact recovery
+          by default. condition_failure enables an authored fallback branch.
       - name: image_source
         schema:
           type: enum

@@ -183,6 +183,8 @@ inline constexpr const char* kGraspConfirmationLost =
 inline constexpr const char* kGripperResultFailed = "gripper_result_failed";
 inline constexpr const char* kGripperResultTimeout =
     "gripper_result_timeout";
+inline constexpr const char* kGripperStateNotFinite =
+    "gripper_state_not_finite";
 }  // namespace ros2_control_fault_reason
 
 /// Build a backend ErrorDTO with the stable reason token carried in

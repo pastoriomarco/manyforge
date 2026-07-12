@@ -24,6 +24,7 @@ from manyforge_behavior.kernel_client import (
 )
 from manyforge_behavior.nodes.pick_planning import PlanPickSequenceNode
 from manyforge_behavior.pick_stage_causes import PickStageFailureCause
+from manyforge_behavior.runtime_pause import RuntimePauseRegistry
 
 
 @pytest.fixture(autouse=True)
@@ -94,6 +95,17 @@ def _normalized_xy(vector: list[float]) -> list[float]:
     length = (vector[0] ** 2 + vector[1] ** 2) ** 0.5
     assert length > 1e-9
     return [vector[0] / length, vector[1] / length, 0.0]
+
+
+def _assert_only_planning_pause(
+    registry: RuntimePauseRegistry,
+    *,
+    reason_code: str,
+) -> None:
+    faults = registry.active_faults()
+    assert len(faults) == 1
+    assert faults[0].domain == "planning"
+    assert faults[0].reason_code == reason_code
 
 
 class TestPlanPickSequenceNode:
@@ -847,6 +859,7 @@ class TestPlanPickSequenceNode:
         assert status == py_trees.common.Status.SUCCESS
 
     def test_unknown_object_fails_closed(self, kernel, bb_with_kernel):
+        registry = RuntimePauseRegistry()
         node = PlanPickSequenceNode(
             name="plan_pick",
             selected_object_id="missing_part",
@@ -857,13 +870,18 @@ class TestPlanPickSequenceNode:
             group_id="arm",
             base_frame="base_link",
             tcp_frame="tool0",
+            runtime_pause_registry=registry,
         )
 
         status = _tick_node(node)
 
-        assert status == py_trees.common.Status.FAILURE
+        assert status == py_trees.common.Status.RUNNING
         reader = py_trees.blackboard.Client(name="reader")
         assert read_namespace_value(reader, "planning/pick_plan")["outcome"] == "object_not_found"
+        _assert_only_planning_pause(
+            registry,
+            reason_code="selected_object_unavailable",
+        )
 
     def test_invalid_pick_offset_envelope_fails_closed(self, kernel, bb_with_kernel):
         _seed_scene(kernel)
@@ -895,6 +913,7 @@ class TestPlanPickSequenceNode:
 
     def test_invalid_pick_offset_reference_fails_closed(self, kernel, bb_with_kernel):
         _seed_scene(kernel)
+        registry = RuntimePauseRegistry()
         node = PlanPickSequenceNode(
             name="plan_pick_bad_reference",
             selected_object_id="sphere_part",
@@ -906,16 +925,21 @@ class TestPlanPickSequenceNode:
             base_frame="base_link",
             tcp_frame="tool0",
             pick_offset_reference={"type": "object", "id": "missing_part"},
+            runtime_pause_registry=registry,
         )
 
         status = _tick_node(node)
 
-        assert status == py_trees.common.Status.FAILURE
+        assert status == py_trees.common.Status.RUNNING
         reader = py_trees.blackboard.Client(name="reader")
         plan_bundle = read_namespace_bundle(reader, "planning/pick_plan")
         assert plan_bundle["value"]["outcome"] == "invalid_pick_offset_reference"
         assert "missing_part" in plan_bundle["value"]["failure_detail"]
         assert plan_bundle["meta"]["status"] == "failed"
+        _assert_only_planning_pause(
+            registry,
+            reason_code="pick_reference_unavailable",
+        )
 
     def test_start_state_collision_surfaces_detailed_failure(self, kernel, bb_with_kernel):
         class StartCollisionKernel(MockKernelClient):
@@ -932,6 +956,7 @@ class TestPlanPickSequenceNode:
         collision_kernel = StartCollisionKernel()
         bb_with_kernel.kernel = collision_kernel
         _seed_scene(collision_kernel)
+        registry = RuntimePauseRegistry()
         node = PlanPickSequenceNode(
             name="plan_pick",
             selected_object_id="sphere_part",
@@ -942,11 +967,12 @@ class TestPlanPickSequenceNode:
             group_id="arm",
             base_frame="base_link",
             tcp_frame="tool0",
+            runtime_pause_registry=registry,
         )
 
         status = _tick_node(node)
 
-        assert status == py_trees.common.Status.FAILURE
+        assert status == py_trees.common.Status.RUNNING
         reader = py_trees.blackboard.Client(name="reader")
         plan_value = read_namespace_value(reader, "planning/pick_plan")
         assert plan_value["outcome"] == "start_state_in_collision"
@@ -954,6 +980,10 @@ class TestPlanPickSequenceNode:
         assert plan_value["pick_pose"] is not None
         assert plan_value["retreat_pose"] == plan_value["approach_pose"]
         assert "start_state_in_collision=true" in plan_value["failure_detail"]
+        _assert_only_planning_pause(
+            registry,
+            reason_code="pick_start_state_in_collision",
+        )
 
     def test_support_contact_preview_failure_surfaces_policy_numbers(
         self, kernel, bb_with_kernel
@@ -989,6 +1019,7 @@ class TestPlanPickSequenceNode:
         collision_kernel = SupportContactKernel()
         bb_with_kernel.kernel = collision_kernel
         _seed_scene(collision_kernel)
+        registry = RuntimePauseRegistry()
         node = PlanPickSequenceNode(
             name="plan_pick",
             selected_object_id="sphere_part",
@@ -999,11 +1030,12 @@ class TestPlanPickSequenceNode:
             group_id="arm",
             base_frame="base_link",
             tcp_frame="tool0",
+            runtime_pause_registry=registry,
         )
 
         status = _tick_node(node)
 
-        assert status == py_trees.common.Status.FAILURE
+        assert status == py_trees.common.Status.RUNNING
         reader = py_trees.blackboard.Client(name="reader")
         plan_value = read_namespace_value(reader, "planning/pick_plan")
         assert plan_value["approach_pose"] is not None
@@ -1014,6 +1046,10 @@ class TestPlanPickSequenceNode:
         assert "waypoint=0" in detail
         assert "current_penetration_m=0.021667" in detail
         assert "max_start_penetration_m=0.020000" in detail
+        _assert_only_planning_pause(
+            registry,
+            reason_code="no_feasible_pick_plan",
+        )
 
     def test_failure_records_stage_reports_for_all_attempted_candidates(
         self, kernel, bb_with_kernel
@@ -1058,6 +1094,7 @@ class TestPlanPickSequenceNode:
         failure_kernel = MultiFailureKernel()
         bb_with_kernel.kernel = failure_kernel
         _seed_scene(failure_kernel)
+        registry = RuntimePauseRegistry()
         node = PlanPickSequenceNode(
             name="plan_pick",
             selected_object_id="sphere_part",
@@ -1082,11 +1119,12 @@ class TestPlanPickSequenceNode:
             },
             translation_step_m=0.01,
             contact_policy_id="contact_grasp/sphere_part",
+            runtime_pause_registry=registry,
         )
 
         status = _tick_node(node)
 
-        assert status == py_trees.common.Status.FAILURE
+        assert status == py_trees.common.Status.RUNNING
         reader = py_trees.blackboard.Client(name="reader")
         plan_value = read_namespace_value(reader, "planning/pick_plan")
         assert plan_value["outcome"] == "no_feasible_plan"
@@ -1116,6 +1154,10 @@ class TestPlanPickSequenceNode:
         assert second_stages["pick"]["collision_check"] == "not_run"
         assert second_stages["pick"]["failures"][0]["cause"] == (
             PickStageFailureCause.RAW_IK_FAILURE.value
+        )
+        _assert_only_planning_pause(
+            registry,
+            reason_code="no_feasible_pick_plan",
         )
 
     def test_failure_populates_linked_move_pose_goals(self, kernel, bb_with_kernel):
@@ -1149,6 +1191,7 @@ class TestPlanPickSequenceNode:
             approach_move_node_name="move_to_approach",
             pick_move_node_name="move_to_pick",
             retreat_move_node_name="move_to_retreat",
+            no_feasible_plan_policy="condition_failure",
         )
         approach_move = MoveStub("move_to_approach")
         pick_move = MoveStub("move_to_pick")

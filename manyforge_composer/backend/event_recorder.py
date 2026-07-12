@@ -49,6 +49,10 @@ _ALLOWED_EVENT_TYPES = {
     "validation_failed",
     "validation_passed",
     "validation_started",
+    "recovery_offer_published",
+    "recovery_action_requested",
+    "recovery_action_accepted",
+    "recovery_action_rejected",
 }
 _ALLOWED_EVENT_PREFIXES = (
     "cycle_reset_",
@@ -65,7 +69,14 @@ _ALLOWED_EVENT_PREFIXES = (
 # WARN+ events despite their severity. Keep this set tiny — every entry is a
 # synchronous disk barrier on the writer thread.
 _DURABLE_INFO_EVENT_TYPES = frozenset(
-    {"clock_anchor", "stop_decision_chain", "trace_pruned"}
+    {
+        "clock_anchor",
+        "stop_decision_chain",
+        "trace_pruned",
+        "recovery_offer_published",
+        "recovery_action_requested",
+        "recovery_action_accepted",
+    }
 )
 _RUNS_INDEX_FILENAME = "runs.index.jsonl"
 # Durable events recorded before any run exists (startup clock anchor,
@@ -227,6 +238,59 @@ _KERNEL_NATIVE_WARN_TYPES = {
     "stop_issued",
     "motion_trip_secondary_signal",
 }
+
+
+def _stable_recovery_context_id(
+    *,
+    run_id: Optional[str],
+    execution_id: int,
+    latch_id: Optional[str] = None,
+    evidence_refs: Any = None,
+    offer_id: Optional[str] = None,
+) -> Optional[str]:
+    """Return one stable recorder-level join key for recovery evidence."""
+    identity = ""
+    if execution_id > 0:
+        identity = f"execution:{execution_id}"
+    elif latch_id:
+        identity = f"latch:{latch_id}"
+    elif isinstance(evidence_refs, (list, tuple)):
+        # RuntimePauseFault ids are opaque, generation-scoped identities shared
+        # by the immutable offer and every action event. They are the strongest
+        # cycle-only join key when no kernel execution or latch exists.
+        runtime_fault_refs = sorted(
+            {
+                ref[:256]
+                for ref in evidence_refs
+                if isinstance(ref, str) and ref.startswith("runtime_fault:")
+            }
+        )
+        if runtime_fault_refs:
+            identity = f"evidence:{runtime_fault_refs[0]}"
+    if not identity and offer_id:
+        # A non-runtime cycle offer may have neither kernel nor fault identity.
+        # Its immutable offer id still joins its own requested/result records
+        # without fabricating a relation to an incident or stop episode.
+        identity = f"offer:{offer_id[:256]}"
+    if not identity:
+        return None
+    material = f"manyforge.recovery-context.v1\0{run_id or '_norun'}\0{identity}"
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+    return f"recovery-context-{digest}"
+
+
+def _stable_stop_decision_id(
+    *,
+    recovery_context_id: str,
+    terminal_state: str,
+    terminal_kernel_sequence: str,
+) -> str:
+    material = (
+        "manyforge.stop-decision.v1\0"
+        f"{recovery_context_id}\0{terminal_state}\0{terminal_kernel_sequence}"
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+    return f"stop-decision-{digest}"
 
 _SEVERITY_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
 _FAILURE_ARCHIVE_EVENT_TYPES = {
@@ -439,6 +503,8 @@ def _severity_for_event(event_type: str, details: Optional[dict[str, Any]]) -> s
         return "ERROR"
     if event_type == "kernel_event_gap":
         return "WARN"
+    if event_type == "recovery_action_rejected":
+        return "WARN"
     if event_type.startswith("kernel_native_"):
         native_type = event_type[len("kernel_native_"):]
         if native_type in _KERNEL_NATIVE_ERROR_TYPES:
@@ -470,6 +536,8 @@ def _component_for_event(event_type: str) -> str:
         return "manyforge.execution"
     if event_type.startswith("cycle_"):
         return "manyforge.cycle"
+    if event_type.startswith("recovery_"):
+        return "manyforge.cycle_recovery"
     if event_type.startswith("kernel_") or event_type in {
         "plan_started",
         "plan_completed",
@@ -1054,13 +1122,24 @@ class EventRecorder:
                     cycle_state=cycle_state,
                     intervention_session=cycle_manager.intervention,
                 )
-                cycle_error = cycle_manager.error
+                error_reader = getattr(cycle_manager, "get_error_snapshot", None)
+                if callable(error_reader):
+                    cycle_error, cycle_error_code, cycle_error_details = error_reader()
+                else:
+                    cycle_error = cycle_manager.error
+                    cycle_error_code = getattr(cycle_manager, "error_code", None)
+                    cycle_error_details = getattr(cycle_manager, "error_details", None)
                 if cycle_error != self._last_cycle_error and cycle_error:
+                    event_details: dict[str, Any] = {"error": cycle_error}
+                    if cycle_error_code:
+                        event_details["error_code"] = str(cycle_error_code)
+                    if isinstance(cycle_error_details, dict) and cycle_error_details:
+                        event_details["error_details"] = deepcopy(cycle_error_details)
                     self._record_event(
                         event_type="cycle_error",
                         execution_id=status.execution_id if status is not None else 0,
                         move_id=status.active_move_id if status is not None else None,
-                        details={"error": cycle_error},
+                        details=event_details,
                         session_id=(
                             cycle_manager.intervention.session_id
                             if cycle_state == "direct_control"
@@ -1625,6 +1704,7 @@ class EventRecorder:
                         event_type="stop_decision_chain",
                         execution_id=int(native_event.get("execution_id") or 0),
                         details=finished_chain,
+                        run_id=str(native_run_id) if native_run_id else None,
                         timestamp_ns=int(
                             native_event.get("timestamp_ns")
                             or time.monotonic_ns()
@@ -2311,6 +2391,34 @@ class EventRecorder:
             execution_mode="program",
         )
 
+    def record_recovery_offer_published(self, offer: dict[str, Any]) -> None:
+        """Durably record one semantically new immutable cycle offer."""
+        self._record_event(
+            event_type="recovery_offer_published",
+            execution_id=int(offer.get("executionId") or 0),
+            details=dict(offer),
+            execution_mode="program",
+        )
+
+    def record_recovery_action_event(
+        self,
+        action: str,
+        details: dict[str, Any],
+    ) -> None:
+        if action not in {"requested", "accepted", "rejected"}:
+            raise ValueError(f"Unsupported recovery action event: {action}")
+        self._record_event(
+            event_type=f"recovery_action_{action}",
+            execution_id=int(details.get("execution_id") or 0),
+            details=dict(details),
+            principal_id=(
+                str(details.get("principal_id"))
+                if details.get("principal_id")
+                else None
+            ),
+            execution_mode="program",
+        )
+
     def record_delegated_recovery_requested(self, request) -> None:
         """Record a delegated-recovery request emitted by the running program."""
         self._record_event(
@@ -2973,12 +3081,99 @@ class EventRecorder:
             details_payload = dict(details) if details else None
             if event_type == "stop_decision_chain":
                 details_payload = details_payload or {}
+                latch_id = str(details_payload.get("latch_id") or "") or None
+                recovery_context_id = _stable_recovery_context_id(
+                    run_id=run_id,
+                    execution_id=execution_id,
+                    latch_id=latch_id,
+                )
+                if recovery_context_id is not None:
+                    details_payload.setdefault(
+                        "recovery_context_id",
+                        recovery_context_id,
+                    )
+                    details_payload.setdefault(
+                        "stop_decision_id",
+                        _stable_stop_decision_id(
+                            recovery_context_id=recovery_context_id,
+                            terminal_state=str(
+                                details_payload.get("terminal_state") or "unknown"
+                            ),
+                            terminal_kernel_sequence=str(
+                                details_payload.get("terminal_kernel_sequence")
+                                or self._event_index
+                            ),
+                        ),
+                    )
                 # Correlation anchors for the incident-embed selector. Stamp
                 # them before serialization so durable trace records and the
                 # in-memory latest-chain view carry identical evidence.
                 details_payload["recorded_event_index"] = str(self._event_index)
                 details_payload["recorded_run_id"] = str(run_id or "")
+                if recovery_context_id is not None:
+                    for snapshot in reversed(self._incident_snapshots):
+                        if snapshot.get("recoveryContextId") != recovery_context_id:
+                            continue
+                        details_payload["incident_id"] = snapshot["incidentId"]
+                        snapshot["stopDecision"] = dict(details_payload)
+                        snapshot["stopDecisionId"] = details_payload.get(
+                            "stop_decision_id"
+                        )
+                        snapshot["stopDecisionCorrelation"] = (
+                            "recovery_context_id_match"
+                        )
+                        break
                 self._last_stop_decision = dict(details_payload)
+            elif event_type.startswith("recovery_"):
+                details_payload = details_payload or {}
+                latch_id = str(
+                    details_payload.get("latch_id")
+                    or details_payload.get("latchId")
+                    or ""
+                ) or None
+                recovery_context_id = _stable_recovery_context_id(
+                    run_id=run_id,
+                    execution_id=execution_id,
+                    latch_id=latch_id,
+                    evidence_refs=(
+                        details_payload.get("evidence_refs")
+                        or details_payload.get("evidenceRefs")
+                    ),
+                    offer_id=str(
+                        details_payload.get("offer_id")
+                        or details_payload.get("offerId")
+                        or ""
+                    )
+                    or None,
+                )
+                if recovery_context_id is not None:
+                    details_payload.setdefault(
+                        "recovery_context_id",
+                        recovery_context_id,
+                    )
+                    chain = self._last_stop_decision
+                    if (
+                        chain is not None
+                        and chain.get("recovery_context_id") == recovery_context_id
+                    ):
+                        details_payload.setdefault(
+                            "stop_decision_id",
+                            chain.get("stop_decision_id"),
+                        )
+                        details_payload.setdefault(
+                            "incident_id",
+                            chain.get("incident_id"),
+                        )
+                    if not details_payload.get("incident_id"):
+                        for snapshot in reversed(self._incident_snapshots):
+                            if (
+                                snapshot.get("recoveryContextId")
+                                == recovery_context_id
+                            ):
+                                details_payload["incident_id"] = snapshot[
+                                    "incidentId"
+                                ]
+                                break
             action_span_id = None
             action_source = None
             node_instance_id = None
@@ -3310,6 +3505,37 @@ class EventRecorder:
                     stop_decision_correlation = "same_run_recent_stop_channel"
             if stop_decision_correlation is not None:
                 stop_decision = dict(chain)
+        trigger_details = trigger_event.get("details")
+        trigger_details = trigger_details if isinstance(trigger_details, dict) else {}
+        nested_error_details = trigger_details.get("error_details")
+        nested_error_details = (
+            nested_error_details if isinstance(nested_error_details, dict) else {}
+        )
+        runtime_fault_id = str(
+            nested_error_details.get("runtime_fault_id")
+            or trigger_details.get("runtime_fault_id")
+            or ""
+        )
+        recovery_context_id = _stable_recovery_context_id(
+            run_id=(
+                str(trigger_event.get("run_id"))
+                if trigger_event.get("run_id")
+                else None
+            ),
+            execution_id=int(trigger_event.get("execution_id") or 0),
+            latch_id=(
+                str(trigger_details.get("latch_id"))
+                if trigger_details.get("latch_id")
+                else None
+            ),
+            evidence_refs=(
+                [f"runtime_fault:{runtime_fault_id}"]
+                if runtime_fault_id
+                else None
+            ),
+        )
+        if stop_decision is not None and stop_decision.get("recovery_context_id"):
+            recovery_context_id = str(stop_decision["recovery_context_id"])
         span_events = self._span_events_for_trigger(trigger_event, all_events)
         action_span = self._action_span_summary(trigger_event)
         span_scope = self._span_scope_summary(trigger_event)
@@ -3323,6 +3549,12 @@ class EventRecorder:
         }
         return {
             "incidentId": f"incident-{trigger_event.get('event_index', 0)}",
+            "recoveryContextId": recovery_context_id,
+            "stopDecisionId": (
+                stop_decision.get("stop_decision_id")
+                if stop_decision is not None
+                else None
+            ),
             "timestampNs": trigger_event.get("timestamp_ns"),
             "timestamp": trigger_event.get("timestamp"),
             "triggerEventIndex": trigger_event.get("event_index"),

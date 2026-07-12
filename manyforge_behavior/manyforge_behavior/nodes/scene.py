@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Optional
 
 import py_trees
@@ -14,6 +15,10 @@ from manyforge_behavior.kernel_client import (
     SceneEditRequest,
 )
 from manyforge_behavior.parameters import resolve_blackboard_value
+from manyforge_behavior.runtime_pause import RuntimePauseMixin, RuntimePauseRegistry
+
+
+logger = logging.getLogger(__name__)
 
 
 _CONFIRMATION_POLICY_EVIDENCE_LABELS: dict[str, set[str]] = {
@@ -75,7 +80,64 @@ class _SceneCallbackMixin:
     def _emit_scene_callback(self, operation: str, request: SceneEditRequest) -> None:
         callback = self._get_scene_callback()
         if callback is not None:
-            callback(operation, request)
+            try:
+                callback(operation, request)
+            except Exception:  # noqa: BLE001 - observer must not change authority.
+                logger.exception("Scene observer callback failed after %s", operation)
+
+
+class _SceneMutationNode(
+    ActionSpanMixin,
+    RuntimePauseMixin,
+    _SceneCallbackMixin,
+    py_trees.behaviour.Behaviour,
+):
+    _catalog_node_id = "scene_mutation"
+
+    def __init__(self, name: str, **kwargs: Any):
+        runtime_pause_registry = kwargs.pop("runtime_pause_registry", None)
+        super().__init__(name=name)
+        self._params = kwargs
+        self._configure_runtime_pause(
+            registry=(
+                runtime_pause_registry
+                if isinstance(runtime_pause_registry, RuntimePauseRegistry)
+                else None
+            ),
+            node_id=self._catalog_node_id,
+            domain="scene",
+        )
+
+    def _runtime_pause_gate(self) -> Optional[py_trees.common.Status]:
+        if self._consume_runtime_resume() is not None:
+            self.feedback_message = ""
+            return None
+        if self._runtime_pause_active():
+            return py_trees.common.Status.RUNNING
+        return None
+
+    def _scene_backend_failure(
+        self,
+        *,
+        operation: str,
+        message: str,
+        object_id: str,
+        details: Optional[dict[str, Any]] = None,
+    ) -> py_trees.common.Status:
+        self.feedback_message = message
+        self._raise_runtime_pause(
+            reason_code="scene_backend_refused",
+            message=message,
+            details={
+                "operation": operation,
+                "object_id": object_id,
+                **(details or {}),
+            },
+        )
+        return py_trees.common.Status.RUNNING
+
+    def terminate(self, new_status: py_trees.common.Status) -> None:
+        self._clear_runtime_pause()
 
 
 def _resolve_collision_object_request(
@@ -137,12 +199,13 @@ def _shape_fields_from_registry(obj_info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-class AddCollisionObject(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviour.Behaviour):
+class AddCollisionObject(_SceneMutationNode):
     """Add a collision object to the backend scene via the kernel."""
 
+    _catalog_node_id = "add_collision_object"
+
     def __init__(self, name: str, **kwargs: Any):
-        super().__init__(name=name)
-        self._params = kwargs
+        super().__init__(name=name, **kwargs)
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
@@ -155,6 +218,9 @@ class AddCollisionObject(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
         self._reset_action_span()
 
     def update(self) -> py_trees.common.Status:
+        gated = self._runtime_pause_gate()
+        if gated is not None:
+            return gated
         kernel: KernelClient = self.blackboard.kernel
         try:
             request = _resolve_collision_object_request(
@@ -166,19 +232,32 @@ class AddCollisionObject(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
         except (AttributeError, KeyError) as exc:
             self.feedback_message = str(exc)
             return py_trees.common.Status.FAILURE
-        result = kernel.scene_edit(request)
+        try:
+            result = kernel.scene_edit(request)
+        except Exception as exc:  # noqa: BLE001 - backend runtime boundary.
+            return self._scene_backend_failure(
+                operation="add",
+                object_id=request.object_id,
+                message=f"Scene add failed: {exc}",
+                details={"exception_type": type(exc).__name__},
+            )
         if result.success:
             self._emit_scene_callback("add", request)
             return py_trees.common.Status.SUCCESS
-        return py_trees.common.Status.FAILURE
+        return self._scene_backend_failure(
+            operation="add",
+            object_id=request.object_id,
+            message=result.error or f"Failed to add '{request.object_id}'",
+        )
 
 
-class UpsertCollisionObject(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviour.Behaviour):
+class UpsertCollisionObject(_SceneMutationNode):
     """Insert or replace a collision object in the backend scene via the kernel."""
 
+    _catalog_node_id = "upsert_collision_object"
+
     def __init__(self, name: str, **kwargs: Any):
-        super().__init__(name=name)
-        self._params = kwargs
+        super().__init__(name=name, **kwargs)
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
@@ -191,6 +270,9 @@ class UpsertCollisionObject(ActionSpanMixin, _SceneCallbackMixin, py_trees.behav
         self._reset_action_span()
 
     def update(self) -> py_trees.common.Status:
+        gated = self._runtime_pause_gate()
+        if gated is not None:
+            return gated
         kernel: KernelClient = self.blackboard.kernel
         try:
             request = _resolve_collision_object_request(
@@ -202,19 +284,32 @@ class UpsertCollisionObject(ActionSpanMixin, _SceneCallbackMixin, py_trees.behav
         except (AttributeError, KeyError) as exc:
             self.feedback_message = str(exc)
             return py_trees.common.Status.FAILURE
-        result = kernel.scene_edit(request)
+        try:
+            result = kernel.scene_edit(request)
+        except Exception as exc:  # noqa: BLE001 - backend runtime boundary.
+            return self._scene_backend_failure(
+                operation="upsert",
+                object_id=request.object_id,
+                message=f"Scene upsert failed: {exc}",
+                details={"exception_type": type(exc).__name__},
+            )
         if result.success:
             self._emit_scene_callback("upsert", request)
             return py_trees.common.Status.SUCCESS
-        return py_trees.common.Status.FAILURE
+        return self._scene_backend_failure(
+            operation="upsert",
+            object_id=request.object_id,
+            message=result.error or f"Failed to upsert '{request.object_id}'",
+        )
 
 
-class RemoveCollisionObject(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviour.Behaviour):
+class RemoveCollisionObject(_SceneMutationNode):
     """Remove a collision object from the backend scene."""
 
+    _catalog_node_id = "remove_collision_object"
+
     def __init__(self, name: str, **kwargs: Any):
-        super().__init__(name=name)
-        self._params = kwargs
+        super().__init__(name=name, **kwargs)
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
@@ -227,6 +322,9 @@ class RemoveCollisionObject(ActionSpanMixin, _SceneCallbackMixin, py_trees.behav
         self._reset_action_span()
 
     def update(self) -> py_trees.common.Status:
+        gated = self._runtime_pause_gate()
+        if gated is not None:
+            return gated
         kernel: KernelClient = self.blackboard.kernel
         try:
             object_id = resolve_blackboard_value(
@@ -240,19 +338,32 @@ class RemoveCollisionObject(ActionSpanMixin, _SceneCallbackMixin, py_trees.behav
             object_id=object_id,
             action_span=self._current_action_span(self.blackboard),
         )
-        result = kernel.scene_edit(request)
+        try:
+            result = kernel.scene_edit(request)
+        except Exception as exc:  # noqa: BLE001 - backend runtime boundary.
+            return self._scene_backend_failure(
+                operation="remove",
+                object_id=request.object_id,
+                message=f"Scene remove failed: {exc}",
+                details={"exception_type": type(exc).__name__},
+            )
         if result.success:
             self._emit_scene_callback("remove", request)
             return py_trees.common.Status.SUCCESS
-        return py_trees.common.Status.FAILURE
+        return self._scene_backend_failure(
+            operation="remove",
+            object_id=request.object_id,
+            message=result.error or f"Failed to remove '{request.object_id}'",
+        )
 
 
-class UpdateCollisionObjectPose(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviour.Behaviour):
+class UpdateCollisionObjectPose(_SceneMutationNode):
     """Update the pose of an existing collision object."""
 
+    _catalog_node_id = "update_collision_object_pose"
+
     def __init__(self, name: str, **kwargs: Any):
-        super().__init__(name=name)
-        self._params = kwargs
+        super().__init__(name=name, **kwargs)
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
@@ -265,6 +376,9 @@ class UpdateCollisionObjectPose(ActionSpanMixin, _SceneCallbackMixin, py_trees.b
         self._reset_action_span()
 
     def update(self) -> py_trees.common.Status:
+        gated = self._runtime_pause_gate()
+        if gated is not None:
+            return gated
         kernel: KernelClient = self.blackboard.kernel
         try:
             object_id = resolve_blackboard_value(
@@ -291,14 +405,26 @@ class UpdateCollisionObjectPose(ActionSpanMixin, _SceneCallbackMixin, py_trees.b
             frame_id=frame_id,
             action_span=self._current_action_span(self.blackboard),
         )
-        result = kernel.scene_edit(request)
+        try:
+            result = kernel.scene_edit(request)
+        except Exception as exc:  # noqa: BLE001 - backend runtime boundary.
+            return self._scene_backend_failure(
+                operation="update_pose",
+                object_id=request.object_id,
+                message=f"Scene pose update failed: {exc}",
+                details={"exception_type": type(exc).__name__},
+            )
         if result.success:
             self._emit_scene_callback("update_pose", request)
             return py_trees.common.Status.SUCCESS
-        return py_trees.common.Status.FAILURE
+        return self._scene_backend_failure(
+            operation="update_pose",
+            object_id=request.object_id,
+            message=result.error or f"Failed to update '{request.object_id}'",
+        )
 
 
-class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviour.Behaviour):
+class AttachObjectToLink(_SceneMutationNode):
     """Attach a scene object to a robot link.
 
     Delegates the authoritative attach operation to the backend so the
@@ -309,9 +435,12 @@ class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
         link_frame: robot link to attach to (e.g. "tool0")
     """
 
+    _catalog_node_id = "attach_object_to_link"
+
     def __init__(self, name: str, **kwargs: Any):
-        super().__init__(name=name)
-        self._params = kwargs
+        super().__init__(name=name, **kwargs)
+        self._grasp_failure_recoverable = False
+        self._grasp_failure_reason = ""
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
@@ -325,6 +454,8 @@ class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
 
     def initialise(self) -> None:
         self._reset_action_span()
+        self._grasp_failure_recoverable = False
+        self._grasp_failure_reason = ""
         try:
             self.blackboard.set("gripper_fault_details", None)
         except (KeyError, AttributeError):
@@ -406,6 +537,8 @@ class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
         gripper_id: str,
         grasp_confirmation_policy: str,
     ) -> bool:
+        self._grasp_failure_recoverable = False
+        self._grasp_failure_reason = ""
         if not grasp_confirmation_policy:
             self.feedback_message = (
                 f"gripper '{gripper_id}' is missing grasp_confirmation_policy; "
@@ -454,6 +587,8 @@ class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
                 gripper_id=gripper_id,
                 grasp_confirmation_policy=grasp_confirmation_policy,
             )
+            self._grasp_failure_recoverable = True
+            self._grasp_failure_reason = "stale_gripper_state"
             return False
 
         status_policy = str(
@@ -488,6 +623,8 @@ class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
                 grasp_confirmation_policy=grasp_confirmation_policy,
                 status=status,
             )
+            self._grasp_failure_recoverable = True
+            self._grasp_failure_reason = "grasp_confirmation_lost"
             return False
 
         evidence_state = str(getattr(status, "evidence_state", "") or "").strip()
@@ -505,6 +642,8 @@ class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
                 grasp_confirmation_policy=grasp_confirmation_policy,
                 status=status,
             )
+            self._grasp_failure_recoverable = True
+            self._grasp_failure_reason = "grasp_confirmation_lost"
             return False
 
         if self._grasp_confirmation_satisfied(grasp_confirmation_policy, status):
@@ -526,9 +665,14 @@ class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
             grasp_confirmation_policy=grasp_confirmation_policy,
             status=status,
         )
+        self._grasp_failure_recoverable = True
+        self._grasp_failure_reason = "command_estimate_attach_rejected"
         return False
 
     def update(self) -> py_trees.common.Status:
+        gated = self._runtime_pause_gate()
+        if gated is not None:
+            return gated
         kernel: KernelClient = self.blackboard.kernel
         try:
             object_id = resolve_blackboard_value(
@@ -568,6 +712,16 @@ class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
                 gripper_id=gripper_id,
                 grasp_confirmation_policy=grasp_confirmation_policy,
             ):
+                if self._grasp_failure_recoverable:
+                    self._raise_runtime_pause(
+                        reason_code=self._grasp_failure_reason,
+                        message=self.feedback_message,
+                        details={
+                            "object_id": object_id,
+                            "gripper_id": gripper_id,
+                        },
+                    )
+                    return py_trees.common.Status.RUNNING
                 return py_trees.common.Status.FAILURE
         if explicit_touch_links is not None:
             if not isinstance(explicit_touch_links, list) or any(
@@ -599,10 +753,22 @@ class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
             touch_links=touch_links,
             action_span=self._current_action_span(self.blackboard),
         )
-        result = kernel.scene_edit(request)
+        try:
+            result = kernel.scene_edit(request)
+        except Exception as exc:  # noqa: BLE001 - backend runtime boundary.
+            return self._scene_backend_failure(
+                operation="attach",
+                object_id=request.object_id,
+                message=f"Scene attach failed: {exc}",
+                details={"exception_type": type(exc).__name__},
+            )
         if not result.success:
             self.logger.error(f"Failed to attach '{object_id}': {result.error}")
-            return py_trees.common.Status.FAILURE
+            return self._scene_backend_failure(
+                operation="attach",
+                object_id=request.object_id,
+                message=result.error or f"Failed to attach '{object_id}'",
+            )
 
         self._emit_scene_callback("attach", request)
         if grasp_confirmation_policy == "none_open_loop":
@@ -617,7 +783,13 @@ class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
             )
 
         if obj_info:
-            pose = kernel.get_object_pose(object_id, link_frame)
+            try:
+                pose = kernel.get_object_pose(object_id, link_frame)
+            except Exception:  # noqa: BLE001 - post-commit observer only.
+                logger.exception(
+                    "Post-attach visual pose refresh failed for %s", object_id
+                )
+                pose = None
             if pose is not None:
                 self._emit_scene_callback(
                     "remove", SceneEditRequest(operation="remove", object_id=object_id)
@@ -637,7 +809,7 @@ class AttachObjectToLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviou
         return py_trees.common.Status.SUCCESS
 
 
-class DetachObjectFromLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behaviour.Behaviour):
+class DetachObjectFromLink(_SceneMutationNode):
     """Detach an object from a robot link and place it in the world frame.
 
     Delegates the authoritative detach/reparent operation to the backend.
@@ -647,9 +819,10 @@ class DetachObjectFromLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behavi
         frame_id: target frame after detach (defaults to "universe")
     """
 
+    _catalog_node_id = "detach_object_from_link"
+
     def __init__(self, name: str, **kwargs: Any):
-        super().__init__(name=name)
-        self._params = kwargs
+        super().__init__(name=name, **kwargs)
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
@@ -661,6 +834,9 @@ class DetachObjectFromLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behavi
         self._reset_action_span()
 
     def update(self) -> py_trees.common.Status:
+        gated = self._runtime_pause_gate()
+        if gated is not None:
+            return gated
         kernel: KernelClient = self.blackboard.kernel
         try:
             object_id = resolve_blackboard_value(
@@ -682,15 +858,33 @@ class DetachObjectFromLink(ActionSpanMixin, _SceneCallbackMixin, py_trees.behavi
             frame_id=target_frame,
             action_span=self._current_action_span(self.blackboard),
         )
-        result = kernel.scene_edit(request)
+        try:
+            result = kernel.scene_edit(request)
+        except Exception as exc:  # noqa: BLE001 - backend runtime boundary.
+            return self._scene_backend_failure(
+                operation="detach",
+                object_id=request.object_id,
+                message=f"Scene detach failed: {exc}",
+                details={"exception_type": type(exc).__name__},
+            )
         if not result.success:
             self.logger.error(f"Failed to detach '{object_id}': {result.error}")
-            return py_trees.common.Status.FAILURE
+            return self._scene_backend_failure(
+                operation="detach",
+                object_id=request.object_id,
+                message=result.error or f"Failed to detach '{object_id}'",
+            )
 
         self._emit_scene_callback("detach", request)
 
         if obj_info:
-            pose = kernel.get_object_pose(object_id, target_frame)
+            try:
+                pose = kernel.get_object_pose(object_id, target_frame)
+            except Exception:  # noqa: BLE001 - post-commit observer only.
+                logger.exception(
+                    "Post-detach visual pose refresh failed for %s", object_id
+                )
+                pose = None
             if pose is not None:
                 self._emit_scene_callback(
                     "remove", SceneEditRequest(operation="remove", object_id=object_id)

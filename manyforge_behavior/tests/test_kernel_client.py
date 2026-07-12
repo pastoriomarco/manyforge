@@ -701,7 +701,6 @@ class TestMockKernelGripperConcurrency:
                         barrier.wait()
                         result = kernel.command_gripper(self._request(duration_s=30.0))
                         kernel.get_gripper_status("primary")
-                        kernel.update_gripper_commands()
                         if result.accepted:
                             accepted.append(True)
                     except Exception as exc:  # noqa: BLE001
@@ -720,6 +719,24 @@ class TestMockKernelGripperConcurrency:
                 assert kernel.gripper_command_count == thread_count
         finally:
             sys.setswitchinterval(switch_interval)
+
+    def test_stop_fences_command_and_new_execute_reauthorizes(self):
+        kernel = MockKernelClient(execute_duration_s=30.0)
+        assert kernel.execute(make_request("first_motion")).ok
+        first = kernel.command_gripper(self._request(duration_s=30.0))
+        assert first.accepted
+        first_status = kernel.get_gripper_status("primary")
+
+        assert kernel.stop().accepted
+        stopped_status = kernel.get_gripper_status("primary")
+        assert stopped_status.state == GripperCommandState.IDLE
+        assert stopped_status.generation != first_status.generation
+        blocked = kernel.command_gripper(self._request(duration_s=0.0))
+        assert not blocked.accepted
+        assert blocked.reason_code == "gripper_command_not_authorized"
+
+        assert kernel.execute(make_request("next_motion")).ok
+        assert kernel.command_gripper(self._request(duration_s=0.0)).accepted
 
 
 class TestMockKernelGripperSemantics:

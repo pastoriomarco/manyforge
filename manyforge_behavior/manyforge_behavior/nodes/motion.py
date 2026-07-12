@@ -17,6 +17,11 @@ from manyforge_behavior.kernel_client import (
 )
 from manyforge_behavior.motion_runtime import MotionExecutionCoordinator
 from manyforge_behavior.parameters import resolve_blackboard_value
+from manyforge_behavior.runtime_pause import (
+    RuntimePauseMixin,
+    RuntimePauseRegistry,
+    RuntimeRecoveryBinding,
+)
 
 
 # Canonical conversion is defined once in manyforge_behavior.geometry; re-exported
@@ -54,11 +59,25 @@ def _relative_move_object_ids(relative_move: dict[str, Any] | None) -> list[str]
     return object_ids
 
 
-class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
+class MoveManipulatorAction(
+    ActionSpanMixin,
+    RuntimePauseMixin,
+    py_trees.behaviour.Behaviour,
+):
     """Execute a motion request through the kernel (plan + validate + execute)."""
 
     def __init__(self, name: str, **kwargs: Any):
+        runtime_pause_registry = kwargs.pop("runtime_pause_registry", None)
         super().__init__(name=name)
+        self._configure_runtime_pause(
+            registry=(
+                runtime_pause_registry
+                if isinstance(runtime_pause_registry, RuntimePauseRegistry)
+                else None
+            ),
+            node_id="move_manipulator_action",
+            domain="motion",
+        )
         self._params = kwargs
         self._started = False
         self._execution_id: int | None = None
@@ -83,21 +102,6 @@ class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
             "program_run_id",
         ):
             self.blackboard.register_key(key=key, access=py_trees.common.Access.READ)
-        # Write keys: motion_error_message + motion_paused_due_to_error are
-        # how the motion node signals the cycle manager that it has entered
-        # a recoverable soft-fail state. Cycle manager converts that signal
-        # into a held motion stop so continue-policy branches keep ticking.
-        # resume_after_error_requested is bidirectional: cycle_manager.run()
-        # sets it when resuming a held soft-fail, and the motion node
-        # consumes-and-clears it on the next tick so it doesn't re-fire
-        # stale resumes after a successful retry.
-        for key in (
-            "motion_error_message",
-            "motion_paused_due_to_error",
-            "motion_paused_node_name",
-            "resume_after_error_requested",
-        ):
-            self.blackboard.register_key(key=key, access=py_trees.common.Access.WRITE)
 
     def _read_program_run_id(self):
         return read_program_run_id(self.blackboard)
@@ -108,16 +112,6 @@ class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
         self._execution_id = None
         self._motion_coordinator = None
         self._base_velocity_scale = float(self._params.get("velocity_scale", 1.0))
-        # Soft-fail state. When the kernel returns FAILED for our owned
-        # execution_id, we capture the cause here and hold Status.RUNNING
-        # on every subsequent tick until the operator either resumes
-        # (resume_after_error_requested clears it and we retry the same
-        # goal) or resets (the cycle manager destroys the tree externally,
-        # firing terminate() which cancels any in-flight kernel goal).
-        # This is the load-bearing change for motion recoverability:
-        # transient failures (collision, planning, execution timeout)
-        # become operator-resolvable instead of tree-terminating.
-        self._soft_fail_error = None
 
     def _read_optional_blackboard_value(self, key: str) -> Any | None:
         try:
@@ -125,14 +119,13 @@ class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
         except (KeyError, AttributeError):
             return None
 
-    def _set_blackboard_value(self, key: str, value: Any) -> None:
-        """Best-effort blackboard write that tolerates missing-key configurations."""
-        try:
-            self.blackboard.set(key, value)
-        except (KeyError, AttributeError):
-            pass
-
-    def _enter_soft_fail(self, error_message: str) -> py_trees.common.Status:
+    def _enter_soft_fail(
+        self,
+        error_message: str,
+        *,
+        reason_code: str,
+        details: dict[str, Any] | None = None,
+    ) -> py_trees.common.Status:
         """Capture the failure cause and hold Status.RUNNING until resume/reset.
 
         The motion node never returns Status.FAILURE on a runtime motion
@@ -142,53 +135,62 @@ class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
         tick loop, surfaces the error, and holds motion while
         continue-policy branches keep ticking.
 
-        Two recovery paths:
-          - Operator clicks Run again: cycle manager clears the soft-fail
-            blackboard keys and sets resume_after_error_requested; on the
-            next tick this node retries the same goal.
-          - Operator clicks Reset: cycle manager destroys the tree
-            externally and rebuilds; this node's terminate() cancels any
-            in-flight kernel goal so we don't orphan motions.
+        The exact fault generation is resumed only after the server accepts a
+        versioned recovery action. Reset destroys the tree externally;
+        terminate() cancels any in-flight kernel goal.
         """
-        self._soft_fail_error = error_message
         self.feedback_message = error_message
-        self._set_blackboard_value("motion_error_message", error_message)
-        self._set_blackboard_value("motion_paused_due_to_error", True)
-        self._set_blackboard_value("motion_paused_node_name", self.name)
+        self._raise_runtime_pause(
+            reason_code=reason_code,
+            message=error_message,
+            details=details,
+        )
         return py_trees.common.Status.RUNNING
 
     def _clear_soft_fail_state(self) -> None:
         """Reset internal + blackboard soft-fail state so the next tick re-issues the goal."""
-        self._soft_fail_error = None
         self._started = False
         self._execution_id = None
         self.feedback_message = ""
-        self._set_blackboard_value("motion_error_message", None)
-        self._set_blackboard_value("motion_paused_due_to_error", False)
-        self._set_blackboard_value("motion_paused_node_name", None)
-        # Consume the resume signal so a subsequent successful tick does
-        # not re-trigger another retry from a stale flag. The cycle
-        # manager re-sets it the next time it resumes a held soft-fail.
-        self._set_blackboard_value("resume_after_error_requested", False)
+
+    def runtime_recovery_binding(self) -> RuntimeRecoveryBinding | None:
+        if (
+            not self._started
+            or self._execution_id is None
+            or self._runtime_pause_fault is not None
+        ):
+            return None
+        return RuntimeRecoveryBinding(
+            node_name=self.name,
+            node_id="move_manipulator_action",
+            domain="motion",
+            execution_id=self._execution_id,
+        )
+
+    def accept_runtime_recovery(
+        self,
+        *,
+        recovery_request_id: str,
+        expected_execution_id: int,
+    ) -> bool:
+        _ = recovery_request_id
+        binding = self.runtime_recovery_binding()
+        if binding is None or binding.execution_id != expected_execution_id:
+            return False
+        self._clear_soft_fail_state()
+        return True
 
     def update(self) -> py_trees.common.Status:
         stop_requested = self._read_optional_blackboard_value("stop_requested")
         if stop_requested:
             return py_trees.common.Status.RUNNING  # block, don't start new motion
 
-        # Resume handling. The cycle manager sets resume_after_error_requested on
-        # Run from a held motion stop or STOPPED recovery. In either case we
-        # re-dispatch the goal from fresh state rather than
-        # re-reading the prior (failed/stopped) execution, which would re-surface
-        # its terminal cause ("Motion execution ended in stopped"). Without the
-        # signal a captured soft-fail keeps holding RUNNING until the operator acts.
-        resume_requested = self._read_optional_blackboard_value(
-            "resume_after_error_requested"
-        )
-        if resume_requested:
+        # Only an exact, accepted recovery request can wake this fault
+        # generation. Observer reads and generic Run cannot mutate it.
+        resume_request_id = self._consume_runtime_resume()
+        if resume_request_id is not None:
             self._clear_soft_fail_state()
-            # Fall through and re-execute with a fresh goal.
-        elif self._soft_fail_error is not None:
+        elif self._runtime_pause_active():
             return py_trees.common.Status.RUNNING
 
         # This is the authored per-move planning/execution scale. The viewer runtime
@@ -302,13 +304,19 @@ class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
                     )
                 except Exception as exc:  # noqa: BLE001 - callback boundary
                     return self._enter_soft_fail(
-                        f"{label} pose-source apply raised: {exc}"
+                        f"{label} pose-source apply raised: {exc}",
+                        reason_code="pose_source_apply_failed",
+                        details={"phase": label, "exception_type": type(exc).__name__},
                     )
                 if not apply_result.get("success", False):
                     error = apply_result.get("error") or (
                         f"{label} pose-source apply failed"
                     )
-                    return self._enter_soft_fail(str(error))
+                    return self._enter_soft_fail(
+                        str(error),
+                        reason_code="pose_source_apply_failed",
+                        details={"phase": label},
+                    )
 
             request = ExecuteRequest(
                 robot_id=self._params.get("robot_id", ""),
@@ -376,15 +384,14 @@ class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
                 # Planning rejected at submission. Soft-fail so the operator
                 # can adjust the scene/parameters and Run again to retry.
                 return self._enter_soft_fail(
-                    result.error or "Motion execution rejected"
+                    result.error or "Motion execution rejected",
+                    reason_code="motion_execute_rejected",
                 )
             self._execution_id = result.execution_id
 
         if self._execution_id is None:
-            # Defensive: this is an internal invariant violation, not a
-            # recoverable runtime failure. Surface it but still soft-fail
-            # so the operator isn't stuck with a terminated tree.
-            return self._enter_soft_fail("Motion execution id was not recorded")
+            self.feedback_message = "Motion execution id was not recorded"
+            return py_trees.common.Status.FAILURE
         update = self._motion_coordinator.update(self._execution_id)
         if update.state == "succeeded":
             return py_trees.common.Status.SUCCESS
@@ -396,7 +403,9 @@ class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
             # ExecutionSnapshot.error. The operator can Run again to retry
             # the same goal or Reset to clear the cycle.
             return self._enter_soft_fail(
-                update.error or "Motion execution failed"
+                update.error or "Motion execution failed",
+                reason_code="motion_execution_failed",
+                details={"execution_id": self._execution_id},
             )
         return py_trees.common.Status.RUNNING
 
@@ -412,6 +421,7 @@ class MoveManipulatorAction(ActionSpanMixin, py_trees.behaviour.Behaviour):
         state. Best-effort: kernel API may not be available in all
         configurations (e.g., during shutdown), so swallow exceptions.
         """
+        self._clear_runtime_pause()
         if not self._started or self._execution_id is None:
             return
         try:

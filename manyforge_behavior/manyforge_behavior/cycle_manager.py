@@ -22,7 +22,7 @@ import py_trees
 
 logger = logging.getLogger(__name__)
 
-from collections import deque
+from collections import OrderedDict, deque
 
 # The stop watchers trust the kernel's internal stop escalation (controlled
 # stop -> hard-stop floor) to reach a terminal state within seconds. This
@@ -47,13 +47,19 @@ _SIGNAL_PROVIDER_POLL_TICKS = max(
 )
 _PAUSED_TICK_WAIT_S = 0.050
 _INTERVENTION_SESSION_EVENT_LIMIT = 4096
+_RECOVERY_REQUEST_CACHE_LIMIT = 256
 
 from manyforge_behavior.blackboard_bindings import key_ref_id
 from manyforge_behavior.blackboard_namespace import write_namespace_bundle
+from manyforge_behavior.cycle_recovery import (
+    CycleRecoveryCoordinator,
+    CycleRecoveryFacts,
+    CycleRecoveryOffer,
+    is_kernel_recovery_action,
+)
 from manyforge_behavior.signals import RuntimeSignalRegistry, SignalProvider, SignalUpdate
 
 from manyforge_behavior.kernel_client import (
-    CommandResult,
     ExecutionSnapshot,
     ExecutionState,
     ExecutionStatus,
@@ -63,6 +69,7 @@ from manyforge_behavior.kernel_client import (
     SceneObjectSnapshot,
 )
 from manyforge_behavior.runner import OrchestratorRunner
+from manyforge_behavior.runtime_pause import RuntimePauseMixin, RuntimePauseRegistry
 
 
 class CycleState(Enum):
@@ -145,16 +152,6 @@ _GENERIC_BACKEND_ERROR_CODES = frozenset({
     "stop_failed",
 })
 
-_RETRYABLE_FAILED_VALIDATION_ERROR_CODES = frozenset({
-    "scene_changed_during_validation",
-    "validation_collision",
-})
-
-_RUNTIME_COLLISION_STOP_NOT_YET_CERTIFIED = (
-    "runtime_collision_stop_not_yet_certified"
-)
-
-
 def canonical_recovery_trigger_values() -> set[str]:
     """Return live-authoring recovery trigger values.
 
@@ -188,25 +185,6 @@ def preferred_structured_error_code(
         ):
             return reason_code
     return error_code
-
-
-def _kernel_retains_interrupted_retry_authority(result: CommandResult) -> bool:
-    """Return whether a denied retry remains owned by the kernel transition.
-
-    RT-8P0 uses one classified denial for settling and definitive failure. Only
-    the authority-owned `retryable` detail identifies the settling case; a
-    failed result falls through to the normal error path. Run is an explicit
-    operator retry, not a polling loop: leave the held/stopped cycle state
-    unchanged and let the next kernel status decide which recovery offer is
-    valid.
-    """
-
-    retryable = result.details.get("retryable")
-    return (
-        not result.accepted
-        and result.reason_code == _RUNTIME_COLLISION_STOP_NOT_YET_CERTIFIED
-        and (retryable is True or retryable == "true")
-    )
 
 
 @dataclass
@@ -320,72 +298,6 @@ def _find_failure_feedback(node) -> Optional[str]:
     return None
 
 
-def _scene_resume_fingerprint_from_objects(
-    objects: list[SceneObjectSnapshot],
-) -> str:
-    """Return a stable fingerprint for live scene state that affects resume.
-
-    This is stricter than UI candidate freshness: a resumable STOPPED cycle
-    must preserve the execution-world state, including attachment and geometry,
-    or Run must fail closed instead of resuming a stale behavior-tree context.
-    """
-
-    def finite_values(raw: Any) -> tuple[float | str, ...]:
-        if not isinstance(raw, (list, tuple)):
-            return ()
-        values: list[float | str] = []
-        for item in raw:
-            if isinstance(item, (int, float)):
-                value = float(item)
-                if math.isfinite(value):
-                    values.append(round(value, 9))
-                else:
-                    values.append(str(value))
-            else:
-                values.append(str(item))
-        return tuple(values)
-
-    def shape_key(shape: Any) -> tuple[Any, ...]:
-        if shape is None:
-            return ()
-        return (
-            str(getattr(shape, "type", "") or ""),
-            finite_values(getattr(shape, "box_dimensions_m", None)),
-            finite_values([getattr(shape, "sphere_radius_m", None)]),
-            finite_values([getattr(shape, "cylinder_radius_m", None)]),
-            finite_values([getattr(shape, "cylinder_height_m", None)]),
-            str(getattr(shape, "mesh_resource_uri", "") or ""),
-            finite_values(getattr(shape, "mesh_scale", None)),
-        )
-
-    def pose_key(pose: Any) -> tuple[float | str, ...]:
-        if not isinstance(pose, dict):
-            return ()
-        return finite_values(pose.get("position_m")) + finite_values(
-            pose.get("orientation_xyzw")
-        )
-
-    descriptors: list[tuple[Any, ...]] = []
-    for obj in objects:
-        attached = bool(getattr(obj, "attached", False))
-        pose = (
-            getattr(obj, "pose_in_frame", None)
-            if attached
-            else getattr(obj, "pose_in_universe", None)
-        )
-        descriptors.append(
-            (
-                str(getattr(obj, "object_id", "") or ""),
-                attached,
-                str(getattr(obj, "frame_id", "") or ""),
-                shape_key(getattr(obj, "shape", None)),
-                pose_key(pose),
-            )
-        )
-    descriptors.sort(key=lambda item: item[0])
-    return json.dumps(descriptors, sort_keys=True, separators=(",", ":"))
-
-
 class CycleManager:
     """Runtime lifecycle controller for continuous robot programs.
 
@@ -414,6 +326,10 @@ class CycleManager:
     def __init__(self, runner: OrchestratorRunner, kernel: KernelClient):
         self._runner = runner
         self._kernel = kernel
+        self._runtime_pause_registry: RuntimePauseRegistry = (
+            runner.runtime_pause_registry
+        )
+        self._cycle_runtime_fault_ids: dict[str, str] = {}
         self._state = CycleState.IDLE
         self._tree = None
         self._tick_thread = None
@@ -431,9 +347,41 @@ class CycleManager:
         # EventRecorder.observe() may hold its RLock while reading these
         # snapshots. Never call event_recorder.observe() while holding _lock.
         self._lock = threading.Lock()
-        self._run_transition_lock = threading.Lock()
+        # Serializes one complete behavior-tree tick against recovery action
+        # admission/resume. Lock order is lifecycle transition -> tree tick ->
+        # cycle state -> runtime-pause registry leaf. Stop/full-stop never wait
+        # on this lock and retain their reserved control path.
+        self._tree_tick_lock = threading.Lock()
+        # Reentrant only for the same lifecycle request: Run may consume the
+        # current offer through apply_recovery_action(), and a reset action may
+        # call reset() through the Composer callback. Other threads remain
+        # serialized behind this control-lane lock.
+        self._run_transition_lock = threading.RLock()
         self._run_transition_in_progress = False
         self._pending_run_stop: Optional[str] = None
+        self._cycle_recovery_generation = 0
+        self._cycle_recovery_fact_signature: Optional[tuple[Any, ...]] = None
+        self._recovery_context_provider: Optional[
+            Callable[[], dict[str, int]]
+        ] = None
+        self._on_recovery_action_event: Optional[
+            Callable[[str, dict[str, Any]], None]
+        ] = None
+        self._on_recovery_offer_published: Optional[
+            Callable[[dict[str, Any]], None]
+        ] = None
+        self._recovery_event_local = threading.local()
+        # Bounded NRT request-id replay ledger for every recovery action. Kernel
+        # actions additionally re-check assessment/generation authority in C++;
+        # this outer ledger prevents a lost response from repeating any kernel,
+        # cycle-only, or reset side effect.
+        self._recovery_request_lock = threading.Lock()
+        self._recovery_requests: OrderedDict[
+            str, tuple[tuple[Any, ...], Optional[dict[str, Any]]]
+        ] = OrderedDict()
+        self._recovery_coordinator = CycleRecoveryCoordinator(
+            on_offer_published=self._handle_recovery_offer_published,
+        )
         self._on_run_from_idle: Optional[Callable[[], None]] = None
         self._error: Optional[str] = None
         # Structured cause for the viewer: when the cycle's `_error` is set from
@@ -460,6 +408,11 @@ class CycleManager:
         ] = None
         self._parent_run_id_provider: Optional[Callable[[], Optional[str]]] = None
         self._kernel_events: deque[dict[str, Any]] = deque(maxlen=4096)
+        # Serializes collector drain + indexed append. The behavior tick,
+        # status routes, websocket recorder, and recovery pump may all request
+        # a drain; without this lock later kernel sequences could be indexed
+        # before an earlier concurrently drained batch.
+        self._kernel_event_drain_lock = threading.Lock()
         self._kernel_event_index: int = 0
         self._kernel_collector_dropped_total: int = 0
         self._kernel_manager_dropped_total: int = 0
@@ -471,30 +424,11 @@ class CycleManager:
         self._last_signal_registry_change_counter = (
             self._signal_registry.change_counter()
         )
-        self._resumable_stop_scene_fingerprint: Optional[str] = None
-        self._resumable_stop_scene_fingerprint_error: Optional[str] = None
-        self._allow_next_stopped_retry_replan: bool = False
         # Program-run correlation id (spec/500 §2.2): minted once per
         # program start (run from IDLE), written to the blackboard so
         # motion nodes attach it to every ExecuteRequest. Resume from
         # STOPPED keeps the same id — it is the same program run.
         self._program_run_id: Optional[str] = None
-        # Persistent read client for the motion soft-fail keys. Created once:
-        # py_trees registers every Client uuid in a global registry for the
-        # lifetime of the process, so a per-call Client in the 100 Hz tick
-        # loop is an unbounded allocation.
-        self._motion_error_bb = py_trees.blackboard.Client(
-            name="cycle_manager_motion_error_read"
-        )
-        self._motion_error_bb.register_key(
-            key="motion_paused_due_to_error",
-            access=py_trees.common.Access.READ,
-        )
-        self._motion_error_bb.register_key(
-            key="motion_error_message",
-            access=py_trees.common.Access.READ,
-        )
-
         # Set initial pause event to set (not paused)
         self._tick_pause_event.set()
         self._tick_exit_event.set()
@@ -602,9 +536,9 @@ class CycleManager:
     ) -> None:
         """Force the cycle out of STOPPING when the settle watcher gives up.
 
-        Fail-closed recovery surface: STOPPED with `_error` set (spec/410)
-        and no resume fingerprint stored, so Run is refused and Reset is the
-        operator path. Without this, a kernel that never reaches a terminal
+        Fail-closed recovery surface: STOPPED with `_error` set (spec/410),
+        so the recovery offer permits Reset only. Without this, a kernel that
+        never reaches a terminal
         stop state leaves the cycle in STOPPING forever with reset refused.
         """
         kernel_state_name = kernel_state.value if kernel_state is not None else "unreadable"
@@ -628,10 +562,6 @@ class CycleManager:
                 "kernel_state": kernel_state_name,
                 "deadline_s": f"{_STOP_SETTLE_DEADLINE_S:g}",
             }
-            self._store_resumable_stop_scene_fingerprint_locked(
-                None,
-                f"stop settle escalation: {error_code}",
-            )
         logger.error(
             "Stop settle watcher escalated (%s): kernel state %s after %.0fs",
             error_code,
@@ -673,26 +603,14 @@ class CycleManager:
                 )
                 return
             if self._kernel_stop_terminal(kernel_state):
-                should_capture = False
-                with self._lock:
-                    should_capture = (
-                        self._state == CycleState.STOPPING
-                        and self._stop_settle_generation == generation
-                    )
                 with self._lock:
                     if (
                         self._state == CycleState.STOPPING
                         and self._stop_settle_generation == generation
                     ):
                         self._state = CycleState.STOPPED
-                        self._store_resumable_stop_scene_fingerprint_locked(
-                            None,
-                            "scene fingerprint capture pending",
-                        )
                     if self._stop_settle_generation == generation:
                         self._stop_settle_thread = None
-                if should_capture:
-                    self._start_stop_terminal_fingerprint_capture(generation)
                 return
             time.sleep(0.02)
 
@@ -705,25 +623,6 @@ class CycleManager:
             daemon=True,
         )
         self._stop_settle_thread.start()
-
-    def _start_stop_terminal_fingerprint_capture(self, generation: int) -> None:
-        def worker() -> None:
-            fingerprint, fingerprint_error = self._capture_scene_resume_fingerprint()
-            with self._lock:
-                if (
-                    self._state == CycleState.STOPPED
-                    and self._stop_settle_generation == generation
-                ):
-                    self._store_resumable_stop_scene_fingerprint_locked(
-                        fingerprint,
-                        fingerprint_error,
-                    )
-
-        threading.Thread(
-            target=worker,
-            name="manyforge_cycle_stop_scene_fingerprint",
-            daemon=True,
-        ).start()
 
     def _escalate_motion_stop(
         self,
@@ -762,10 +661,6 @@ class CycleManager:
                 "deadline_s": f"{_STOP_SETTLE_DEADLINE_S:g}",
             }
             self._tick_pause_event.clear()
-            self._store_resumable_stop_scene_fingerprint_locked(
-                None,
-                f"motion stop escalation: {error_code}",
-            )
             clear_motion_stop_flag = True
             set_stop_requested = True
         if clear_motion_stop_flag:
@@ -922,75 +817,6 @@ class CycleManager:
                 return "resumable_stopped_context"
             return None
 
-    def _capture_scene_resume_fingerprint(self) -> tuple[Optional[str], Optional[str]]:
-        try:
-            objects = self._call_with_timeout(
-                "scene_resume_fingerprint_objects",
-                self._kernel.get_scene_objects,
-                _KERNEL_CONTROL_CALL_TIMEOUT_S,
-            )
-            return (
-                _scene_resume_fingerprint_from_objects(objects),
-                None,
-            )
-        except Exception as exc:  # noqa: BLE001 - unreadable scene must fail closed
-            return None, f"{type(exc).__name__}: {exc}"
-
-    def _store_resumable_stop_scene_fingerprint_locked(
-        self,
-        fingerprint: Optional[str],
-        error: Optional[str],
-    ) -> None:
-        self._allow_next_stopped_retry_replan = False
-        if not self._has_resumable_execution_context_locked():
-            self._resumable_stop_scene_fingerprint = None
-            self._resumable_stop_scene_fingerprint_error = None
-            return
-        self._resumable_stop_scene_fingerprint = fingerprint
-        self._resumable_stop_scene_fingerprint_error = error
-
-    def _assert_resumable_stop_scene_unchanged(self) -> None:
-        with self._lock:
-            if not self._has_resumable_execution_context_locked():
-                return
-            if (
-                self._state == CycleState.STOPPED
-                and self._allow_next_stopped_retry_replan
-                and self._error is None
-                and self._motion_stop_state == "idle"
-            ):
-                return
-        current, current_error = self._capture_scene_resume_fingerprint()
-        with self._lock:
-            if not self._has_resumable_execution_context_locked():
-                return
-            stored_error = self._resumable_stop_scene_fingerprint_error
-            stored = self._resumable_stop_scene_fingerprint
-            changed = (
-                stored_error is not None
-                or current_error is not None
-                or stored != current
-            )
-        if changed:
-            details = {
-                "reason_code": "resumable_scene_changed",
-                "stored_scene_fingerprint_available": str(stored is not None).lower(),
-                "current_scene_fingerprint_available": str(current is not None).lower(),
-            }
-            if stored_error is not None:
-                details["stored_scene_fingerprint_error"] = stored_error
-            if current_error is not None:
-                details["current_scene_fingerprint_error"] = current_error
-            message = (
-                "Cannot resume stopped cycle because the live scene changed while "
-                "execution was stopped. Reset or re-plan before running."
-            )
-            with self._lock:
-                self._error = message
-                self._error_code = "resumable_scene_changed"
-                self._error_details = details
-            raise RuntimeError(message)
-
     def _clear_runtime_scene(self) -> None:
         """Return the planning scene to its authored baseline.
 
@@ -1136,9 +962,6 @@ class CycleManager:
                 self._error_details["duration_s"] = f"{duration_s:.3f}"
             self._state = CycleState.STOPPED
             self._pending_delegated_recovery = None
-            self._resumable_stop_scene_fingerprint = None
-            self._resumable_stop_scene_fingerprint_error = None
-            self._allow_next_stopped_retry_replan = False
 
     def _run_reset_phase(
         self,
@@ -1230,9 +1053,10 @@ class CycleManager:
             self._runner.load()
 
         def clear_runtime_flags() -> None:
-            self._clear_motion_paused_blackboard()
+            self._runtime_pause_registry.clear_all()
+            with self._lock:
+                self._cycle_runtime_fault_ids.clear()
             self._clear_gripper_fault_blackboard()
-            self._set_resume_after_error_flag(False)
             self._set_motion_stop_active_flag(
                 False,
                 client_name="cycle_manager_prepare_fresh",
@@ -1272,9 +1096,6 @@ class CycleManager:
         with self._lock:
             self._node_statuses = {}
             self._pending_delegated_recovery = None
-            self._resumable_stop_scene_fingerprint = None
-            self._resumable_stop_scene_fingerprint_error = None
-            self._allow_next_stopped_retry_replan = False
 
     def seed_authored_scene(self) -> None:
         """Seed the live planning scene with the program's authored objects.
@@ -1318,14 +1139,16 @@ class CycleManager:
     @property
     def error(self) -> Optional[str]:
         """Last tick-loop exception or surfaced terminal node failure, or None."""
-        return self._error
+        with self._lock:
+            return self._error
 
     @property
     def error_code(self) -> Optional[str]:
         """Stable machine-readable code matching the kernel ErrorDTO, when
         the latest error came from a kernel/backend fault. Motion-soft-fail
         errors that only produced a human message leave this None."""
-        return self._error_code
+        with self._lock:
+            return self._error_code
 
     @property
     def error_details(self) -> Optional[dict[str, Any]]:
@@ -1333,7 +1156,19 @@ class CycleManager:
         collision-pair / classification / waypoint-index / reason-code style
         details when the cause is a kernel fault. None when the cause did
         not produce a structured payload."""
-        return self._error_details
+        with self._lock:
+            return deepcopy(self._error_details)
+
+    def get_error_snapshot(
+        self,
+    ) -> tuple[Optional[str], Optional[str], Optional[dict[str, Any]]]:
+        """Return one lock-coherent, observer-safe cycle error tuple."""
+        with self._lock:
+            return (
+                self._error,
+                self._error_code,
+                deepcopy(self._error_details),
+            )
 
     def get_execution_snapshot(self) -> ExecutionSnapshot:
         """Get the latest observer-safe execution snapshot from the kernel."""
@@ -1421,27 +1256,57 @@ class CycleManager:
         counted as manager-side drops. Both totals are monotonic and exposed
         via kernel_event_pipeline_status().
         """
-        stats = self._kernel.drain_kernel_events_with_stats()
-        events = stats.get("events") or []
-        collector_dropped = int(stats.get("dropped_total") or 0)
-        with self._lock:
-            self._kernel_collector_dropped_total = collector_dropped
-            if not events:
-                return []
-            maxlen = self._kernel_events.maxlen or 0
-            overflow = max(
-                0, len(self._kernel_events) + len(events) - maxlen
-            ) if maxlen else 0
-            if overflow:
-                self._kernel_manager_dropped_total += overflow
-            for event in events:
-                self._kernel_event_index += 1
-                event["event_index"] = self._kernel_event_index
-                self._kernel_events.append(event)
-            last_sequence = int(events[-1].get("sequence") or 0)
-            if last_sequence:
-                self._kernel_last_sequence_seen = last_sequence
+        with self._kernel_event_drain_lock:
+            stats = self._kernel.drain_kernel_events_with_stats()
+            events = stats.get("events") or []
+            collector_dropped = int(stats.get("dropped_total") or 0)
+            with self._lock:
+                self._kernel_collector_dropped_total = collector_dropped
+                if events:
+                    maxlen = self._kernel_events.maxlen or 0
+                    overflow = max(
+                        0, len(self._kernel_events) + len(events) - maxlen
+                    ) if maxlen else 0
+                    if overflow:
+                        self._kernel_manager_dropped_total += overflow
+                    for event in events:
+                        self._kernel_event_index += 1
+                        event["event_index"] = self._kernel_event_index
+                        self._kernel_events.append(event)
+                    last_sequence = int(events[-1].get("sequence") or 0)
+                    if last_sequence:
+                        self._kernel_last_sequence_seen = last_sequence
+        recovery_projection_needed = any(
+            str(event.get("type") or "")
+            in {
+                "recovery_assessment_changed",
+                "recovery_action_accepted",
+                "recovery_action_rejected",
+                "state_transition",
+                "stop_certificate_published",
+                "interrupt_latched",
+                "interrupt_preempt_applied",
+            }
+            for event in events
+        )
+        if recovery_projection_needed:
+            try:
+                self.refresh_recovery_offer()
+            except Exception:  # noqa: BLE001 - event drain remains available.
+                logger.exception("Recovery offer projection failed after kernel event")
         return events
+
+    def wait_for_kernel_events_and_project(self, timeout_s: float) -> bool:
+        """Wait on the NRT collector notification and project received facts.
+
+        Composer owns the caller thread. Native waits release the GIL and the
+        kernel event publisher only performs a notify; controller and safety
+        lanes never wait for this consumer.
+        """
+        if not self._kernel.wait_for_kernel_events(timeout_s):
+            return False
+        self._drain_kernel_events()
+        return True
 
     def kernel_event_pipeline_status(self) -> dict[str, int]:
         """Monotonic loss counters for the kernel->Python event pipeline."""
@@ -1704,32 +1569,14 @@ class CycleManager:
         bb.register_key(key="motion_stop_active", access=py_trees.common.Access.WRITE)
         bb.motion_stop_active = active
 
-    def _read_motion_paused_error(self) -> Optional[str]:
-        """Read the motion-soft-fail signal a motion node may have set on the blackboard.
-
-        Returns the human-readable cause string when a motion node has
-        captured a runtime failure and is awaiting operator decision;
-        returns None otherwise. The motion node sets two keys together:
-        ``motion_paused_due_to_error`` (bool) and ``motion_error_message``
-        (str). We require both for a positive signal so a stale message
-        from a previous run can't trigger an unwanted quiesce.
-        """
-        try:
-            paused = bool(self._motion_error_bb.get("motion_paused_due_to_error"))
-        except (KeyError, AttributeError):
-            return None
-        if not paused:
-            return None
-        try:
-            message = self._motion_error_bb.get("motion_error_message")
-        except (KeyError, AttributeError):
-            message = None
-        if isinstance(message, str) and message.strip():
-            return message.strip()
-        return "Motion failed without a cause string"
-
-    def _enter_motion_paused_state(self, error_message: str) -> None:
-        """Convert a motion soft-fail into a held motion-stop state.
+    def _enter_motion_paused_state(
+        self,
+        error_message: str,
+        *,
+        runtime_reason_code: Optional[str] = None,
+        runtime_details: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Convert a generation-scoped runtime fault into held motion-stop.
 
         A runtime motion fault is not, by itself, a behavior-tree failure:
         the motion branch should hold while continue-policy branches keep
@@ -1737,6 +1584,12 @@ class CycleManager:
         closed by pausing the whole tick loop.
         """
         structured_code, structured_details = self._capture_kernel_error_diagnostics()
+        structured_code = structured_code or runtime_reason_code
+        if runtime_details:
+            structured_details = {
+                **(structured_details or {}),
+                **runtime_details,
+            }
         clear_motion_signal = False
         with self._lock:
             if self._state != CycleState.RUNNING:
@@ -1753,15 +1606,12 @@ class CycleManager:
                 self._error_details = structured_details
 
         if clear_motion_signal:
-            self._clear_motion_paused_blackboard()
             return
 
         self._set_motion_stop_active_flag(
             True,
             client_name="cycle_manager_motion_soft_fail",
         )
-        self._clear_motion_paused_blackboard()
-
         try:
             kernel_status = self._call_with_timeout(
                 "motion_soft_fail_initial_status",
@@ -1865,10 +1715,6 @@ class CycleManager:
             self._error_code = structured_code or reason_code
             self._error_details = details or None
             self._tick_pause_event.clear()
-            self._store_resumable_stop_scene_fingerprint_locked(
-                None,
-                f"motion soft-stop escalation: {reason_code}",
-            )
         self._set_motion_stop_active_flag(
             False,
             client_name="cycle_manager_motion_soft_fail_failed",
@@ -1952,16 +1798,29 @@ class CycleManager:
                 client_name="cycle_manager_runtime_condition_fault",
                 kernel_action="stop_if_active",
             )
-        fingerprint, fingerprint_error = self._capture_scene_resume_fingerprint()
         with self._lock:
             self._error = message
             self._error_code = condition_id
             self._error_details = detail_payload
             self._state = CycleState.STOPPED
-            self._store_resumable_stop_scene_fingerprint_locked(
-                fingerprint,
-                fingerprint_error,
+            existing_fault_id = self._cycle_runtime_fault_ids.get(condition_id)
+            existing_fault = (
+                self._runtime_pause_registry.get(existing_fault_id)
+                if existing_fault_id is not None
+                else None
             )
+            if existing_fault is None:
+                fault = self._runtime_pause_registry.raise_fault(
+                    node_name="cycle_runtime_supervisor",
+                    node_id="cycle_runtime_supervisor",
+                    domain="supervisor",
+                    reason_code=condition_id,
+                    message=message,
+                    details=detail_payload,
+                    resume_owner="cycle_manager",
+                )
+                self._cycle_runtime_fault_ids[condition_id] = fault.fault_id
+        self.refresh_recovery_offer()
 
     def _capture_kernel_error_diagnostics(
         self,
@@ -2117,45 +1976,6 @@ class CycleManager:
             return "motion_interrupt_latched", latest_latch
         return None, None
 
-    def _set_resume_after_error_flag(self, value: bool) -> None:
-        """Toggle the blackboard signal that tells the motion node to retry.
-
-        Set to True before resuming a held motion stop or STOPPED recovery.
-        The motion node consumes the flag on its next tick, clears its
-        internal soft-fail state, and re-issues the same kernel goal.
-        """
-        try:
-            bb = py_trees.blackboard.Client(name="cycle_manager_resume_after_error")
-            bb.register_key(
-                key="resume_after_error_requested",
-                access=py_trees.common.Access.WRITE,
-            )
-            bb.set("resume_after_error_requested", value)
-        except (KeyError, AttributeError):
-            pass
-
-    def _clear_motion_paused_blackboard(self) -> None:
-        """Clear the soft-fail signal so the cycle resumes cleanly on next tick."""
-        try:
-            bb = py_trees.blackboard.Client(name="cycle_manager_motion_paused_clear")
-            bb.register_key(
-                key="motion_paused_due_to_error",
-                access=py_trees.common.Access.WRITE,
-            )
-            bb.register_key(
-                key="motion_error_message",
-                access=py_trees.common.Access.WRITE,
-            )
-            bb.register_key(
-                key="motion_paused_node_name",
-                access=py_trees.common.Access.WRITE,
-            )
-            bb.set("motion_paused_due_to_error", False)
-            bb.set("motion_error_message", None)
-            bb.set("motion_paused_node_name", None)
-        except (KeyError, AttributeError):
-            pass
-
     def _quiesce_runtime(
         self,
         *,
@@ -2283,235 +2103,854 @@ class CycleManager:
         """
         self._on_recovery_exhausted = callback
 
-    def _can_auto_acknowledge_leftover_state(self) -> tuple[bool, str]:
-        """Check whether kernel-side leftover state is safe to clear on Run.
+    def set_recovery_context_provider(
+        self,
+        provider: Optional[Callable[[], dict[str, int]]],
+    ) -> None:
+        """Install the Composer-owned generation/context provider.
 
-        M5.5 removes Run-side implicit acknowledgement of
-        `INTERVENTION_REQUIRED`: operator stop/fault interventions must be
-        cleared through an explicit recovery action. This helper remains as a
-        fail-closed diagnostic classifier for callers/tests that need a stable
-        reason before presenting the recovery choices.
+        The callback is invoked without the cycle lock. It must return quickly
+        and must not call back into CycleManager.
+        """
+        self._recovery_context_provider = provider
 
-        Returns (ok, reason). When ok is False, reason is a stable
-        identifier suitable for surfacing to the operator.
+    def set_on_recovery_offer_published(
+        self,
+        callback: Optional[Callable[[dict[str, Any]], None]],
+    ) -> None:
+        self._on_recovery_offer_published = callback
+
+    def set_on_recovery_action_event(
+        self,
+        callback: Optional[Callable[[str, dict[str, Any]], None]],
+    ) -> None:
+        self._on_recovery_action_event = callback
+
+    def _emit_recovery_action_event(
+        self,
+        event: str,
+        details: dict[str, Any],
+    ) -> None:
+        self._queue_or_dispatch_recovery_event("action", event, details)
+
+    def _handle_recovery_offer_published(self, offer: dict[str, Any]) -> None:
+        self._queue_or_dispatch_recovery_event("offer", "published", offer)
+
+    def _queue_or_dispatch_recovery_event(
+        self,
+        kind: str,
+        event: str,
+        details: dict[str, Any],
+    ) -> None:
+        deferred = getattr(self._recovery_event_local, "events", None)
+        item = (kind, event, deepcopy(details))
+        if deferred is not None:
+            deferred.append(item)
+            return
+        self._dispatch_recovery_event(item)
+
+    def _dispatch_recovery_event(
+        self,
+        item: tuple[str, str, dict[str, Any]],
+    ) -> None:
+        kind, event, details = item
+        try:
+            if kind == "offer":
+                callback = self._on_recovery_offer_published
+                if callback is not None:
+                    callback(details)
+                return
+            callback = self._on_recovery_action_event
+            if callback is not None:
+                callback(event, details)
+        except Exception:  # noqa: BLE001 - telemetry cannot change authority.
+            logger.exception("Recovery %s event callback failed", kind)
+
+    def _begin_recovery_event_deferral(self) -> list[tuple[str, str, dict[str, Any]]]:
+        if getattr(self._recovery_event_local, "events", None) is not None:
+            raise RuntimeError("nested recovery event deferral is not supported")
+        events: list[tuple[str, str, dict[str, Any]]] = []
+        self._recovery_event_local.events = events
+        return events
+
+    def _finish_recovery_event_deferral(
+        self,
+        events: list[tuple[str, str, dict[str, Any]]],
+    ) -> None:
+        del self._recovery_event_local.events
+        for item in events:
+            self._dispatch_recovery_event(item)
+
+    def _active_runtime_fault_facts(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        faults = sorted(
+            self._runtime_pause_registry.active_faults(),
+            key=lambda item: (item.generation, item.fault_id),
+        )
+        return (
+            tuple(fault.fault_id for fault in faults),
+            tuple(fault.domain for fault in faults),
+        )
+
+    def _capture_recovery_facts(self) -> CycleRecoveryFacts:
+        fault_ids, fault_domains = self._active_runtime_fault_facts()
+        context = {
+            "program_generation": 1,
+            "deployment_generation": 1,
+            "pose_source_apply_generation": 1,
+        }
+        provider = self._recovery_context_provider
+        if provider is not None:
+            try:
+                supplied = provider()
+                context = {
+                    "program_generation": int(supplied.get("program_generation") or 0),
+                    "deployment_generation": int(
+                        supplied.get("deployment_generation") or 0
+                    ),
+                    "pose_source_apply_generation": int(
+                        supplied.get("pose_source_apply_generation") or 0
+                    ),
+                }
+            except Exception:  # noqa: BLE001 - missing authority fails closed.
+                logger.exception("Recovery context provider failed")
+                context = {
+                    "program_generation": 0,
+                    "deployment_generation": 0,
+                    "pose_source_apply_generation": 0,
+                }
+        try:
+            scene = self._kernel.get_scene_authority_status()
+        except Exception:  # noqa: BLE001 - missing scene token fails closed.
+            logger.exception("Scene authority status read failed during recovery projection")
+            scene = {}
+
+        with self._lock:
+            intervention_active = bool(
+                self._intervention is not None
+                and self._intervention.status == "running"
+            )
+            signature = (
+                self._state.value,
+                self._motion_stop_state,
+                self._has_resumable_execution_context_locked(),
+                self._error_code,
+                fault_ids,
+                fault_domains,
+                intervention_active,
+                self._state == CycleState.DIRECT_CONTROL,
+                self._run_transition_in_progress,
+            )
+            if signature != self._cycle_recovery_fact_signature:
+                self._cycle_recovery_generation += 1
+                self._cycle_recovery_fact_signature = signature
+            cycle_generation = self._cycle_recovery_generation
+            state = self._state.value
+            motion_stop_state = self._motion_stop_state
+            tree_resumable = self._tree is not None and not self._tree_is_terminal()
+            has_resumable_context = (
+                self._has_resumable_execution_context_locked()
+                or (
+                    self._state == CycleState.RUNNING
+                    and tree_resumable
+                    and (self._motion_stop_state == "held" or bool(fault_ids))
+                )
+            )
+            cycle_error_code = self._error_code
+            direct_control_active = self._state == CycleState.DIRECT_CONTROL
+            lifecycle_pending = (
+                self._run_transition_in_progress
+                or self._state == CycleState.STOPPING
+            )
+        return CycleRecoveryFacts(
+            cycle_state=state,
+            motion_stop_state=motion_stop_state,
+            has_resumable_context=has_resumable_context,
+            cycle_error_code=cycle_error_code,
+            active_runtime_fault_ids=fault_ids,
+            active_runtime_fault_domains=fault_domains,
+            intervention_active=intervention_active,
+            direct_control_active=direct_control_active,
+            lifecycle_command_pending=lifecycle_pending,
+            cycle_generation=cycle_generation,
+            program_generation=context["program_generation"],
+            deployment_generation=context["deployment_generation"],
+            scene_admission_epoch=int(scene.get("scene_admission_epoch") or 0),
+            pose_source_apply_generation=context["pose_source_apply_generation"],
+            live_collision_world_revision=int(scene.get("revision_id") or 0),
+        )
+
+    def refresh_recovery_offer(self) -> Optional[dict[str, Any]]:
+        """Synchronously project the current immutable recovery offer.
+
+        This is a bounded NRT authority read used at kernel-event and command
+        boundaries. Browser polling only observes the result; it is not the
+        mechanism that makes a kernel assessment safe or unsafe.
         """
         try:
-            kernel_status = self._kernel.get_status()
-        except Exception as exc:  # noqa: BLE001 — propagate as structured reason
-            return False, f"kernel_status_unreadable:{type(exc).__name__}"
-
-        # Refuse if the kernel is in a transitional/stopping state that a
-        # supervisory Run cannot safely override; the operator must
-        # end/stop it first.
-        active_session_states = (
-            ExecutionState.INTERRUPTED,
-            ExecutionState.STOPPING,
+            assessment = self._kernel.get_recovery_assessment()
+        except Exception as exc:  # noqa: BLE001 - projection must fail closed.
+            logger.exception("Kernel recovery assessment read failed")
+            assessment = {
+                "assessment_revision": 0,
+                "control_command_epoch": 0,
+                "execution_id": 0,
+                "execution_state": "unknown",
+                "recovery_class": "unknown_fault",
+                "status": "waiting",
+                "allowed_actions": [],
+                "reason_code": f"recovery_assessment_unreadable:{type(exc).__name__}",
+                "evidence_refs": [],
+            }
+        offer = self._recovery_coordinator.project(
+            assessment,
+            self._capture_recovery_facts(),
         )
-        if kernel_status.state in active_session_states:
-            return False, "active_or_stopping"
+        return offer.to_wire() if offer is not None else None
 
-        if kernel_status.state == ExecutionState.INTERVENTION_REQUIRED:
-            try:
-                snapshot = self._kernel.get_execution_snapshot()
-            except Exception as exc:  # noqa: BLE001 — fail closed
-                return False, f"kernel_snapshot_unreadable:{type(exc).__name__}"
-            details = getattr(snapshot, "error_details", None) or {}
-            reason = details.get("reason") or details.get("reason_code")
-            if reason == "stop_not_settled_measured_velocity":
-                return False, "stop_not_settled_measured_velocity"
+    def get_recovery_offer(self) -> Optional[dict[str, Any]]:
+        offer = self._recovery_coordinator.current_offer()
+        return offer.to_wire() if offer is not None else None
 
-        # Refuse if the cycle-manager-tracked intervention session is still
-        # marked running: that means a direct-control lease still owns
-        # blackboard scope. The operator must end the intervention session
-        # via the explicit end/promote path before any recovery action.
-        if self._intervention is not None and self._intervention.status == "running":
-            return False, "intervention_session_running"
+    @staticmethod
+    def _recovery_offer_event_details(
+        offer: Optional[CycleRecoveryOffer],
+    ) -> dict[str, Any]:
+        if offer is None:
+            return {}
+        return {
+            "offer_id": offer.offer_id,
+            "offer_revision": offer.offer_revision,
+            "generated_at_ns": offer.generated_at_ns,
+            "valid_until_ns": offer.valid_until_ns,
+            "kernel_assessment_revision": offer.kernel_assessment_revision,
+            "control_command_epoch": offer.control_command_epoch,
+            "execution_id": offer.execution_id,
+            "latch_id": offer.latch_id,
+            "stop_certificate_id": offer.stop_certificate_id,
+            "stop_owner_generation": offer.stop_owner_generation,
+            "cycle_generation": offer.cycle_generation,
+            "program_generation": offer.program_generation,
+            "deployment_generation": offer.deployment_generation,
+            "scene_admission_epoch": offer.scene_admission_epoch,
+            "pose_source_apply_generation": offer.pose_source_apply_generation,
+            "live_collision_world_revision": offer.live_collision_world_revision,
+            "recovery_class": offer.recovery_class,
+            "status": offer.status,
+            "primary_action": offer.primary_action,
+            "reason_code": offer.reason_code,
+            "evidence_refs": list(offer.evidence_refs),
+        }
 
-        if kernel_status.state == ExecutionState.INTERVENTION_REQUIRED:
-            return False, "explicit_recovery_choice_required"
-
-        return True, "ok"
-
-    def acknowledge_intervention_for_retry(
+    def _select_runtime_recovery_participant(
         self,
         *,
-        principal_id: str = "operator",
-        reason: str = "operator_acknowledge_and_continue",
-    ) -> None:
-        """Explicitly clear a retryable intervention without backend reset.
+        offer: CycleRecoveryOffer,
+        action_id: str,
+    ) -> tuple[Optional[Any], Optional[dict[str, Any]]]:
+        """Resolve an exact active node for the pre-fault stop window.
 
-        This is the operator's "acknowledge error and continue" path. The
-        kernel performs the stop/fault classification and fresh stopped-state
-        checks. The cycle manager only enforces that no direct intervention
-        lease is still active and keeps the cycle STOPPED so the next Run
-        replans from the current backend pose.
+        RuntimePauseFault ids remain the normal path. This binding is needed
+        only when a certified kernel stop becomes visible before the owning
+        motion node gets another tick and can raise its fault. The caller owns
+        `_tree_tick_lock`, so the selected node cannot advance between this
+        preflight and post-kernel grant.
         """
-        with self._run_transition_lock:
-            normalize_held_motion_intervention = False
-            with self._lock:
-                normalize_held_motion_intervention = (
-                    self._state == CycleState.RUNNING
-                    and self._motion_stop_state == "held"
-                )
-                if (
-                    self._state != CycleState.STOPPED
-                    and not normalize_held_motion_intervention
-                ):
-                    raise RuntimeError(
-                        "Cannot acknowledge intervention for retry unless the "
-                        "cycle is STOPPED or holding a motion stop "
-                        f"(current state={self._state.value}, "
-                        f"motion_stop_state={self._motion_stop_state})"
-                    )
-                if (
-                    self._intervention is not None
-                    and self._intervention.status == "running"
-                ):
-                    raise RuntimeError(
-                        "Cannot acknowledge intervention for retry while a "
-                        "direct-control intervention session is running"
-                    )
+        if action_id not in {
+            "retry_motion_from_current_state",
+            "acknowledge_and_continue",
+            "replan_from_stopped_state",
+        }:
+            return None, None
+        if any(ref.startswith("runtime_fault:") for ref in offer.evidence_refs):
+            return None, None
+        if self._tree is None or offer.execution_id is None:
+            return None, None
 
-            kernel_status = self._call_with_timeout(
-                "ack_intervention_retry_status",
-                self._kernel.get_status,
-                _KERNEL_CONTROL_CALL_TIMEOUT_S,
-            )
+        active_bindings: list[tuple[Any, Any]] = []
+        for node in _iter_tree_nodes(self._tree.root):
+            if not isinstance(node, RuntimePauseMixin):
+                continue
+            if node.status != py_trees.common.Status.RUNNING:
+                continue
+            binding_reader = getattr(node, "runtime_recovery_binding", None)
+            if not callable(binding_reader):
+                continue
+            binding = binding_reader()
+            if binding is not None:
+                active_bindings.append((node, binding))
+        if not active_bindings:
+            return None, None
 
-            with self._lock:
-                normalize_held_motion_intervention = (
-                    self._state == CycleState.RUNNING
-                    and self._motion_stop_state == "held"
-                )
-                if (
-                    self._state != CycleState.STOPPED
-                    and not normalize_held_motion_intervention
-                ):
-                    raise RuntimeError(
-                        "Cannot acknowledge intervention for retry: cycle "
-                        f"changed to {self._state.value} / "
-                        f"{self._motion_stop_state}"
-                    )
-                if (
-                    self._intervention is not None
-                    and self._intervention.status == "running"
-                ):
-                    raise RuntimeError(
-                        "Cannot acknowledge intervention for retry while a "
-                        "direct-control intervention session is running"
-                    )
-            if kernel_status.state != ExecutionState.INTERVENTION_REQUIRED:
-                raise RuntimeError(
-                    "Cannot acknowledge intervention for retry: kernel is "
-                    f"{kernel_status.state.value}, not intervention_required"
-                )
-            ack = self._kernel_control_command(
-                "ack_intervention_retry",
-                lambda epoch: self._kernel.acknowledge_intervention_for_retry(
-                    principal_id=principal_id,
-                    reason=reason,
-                    expected_epoch=epoch,
+        exact = [
+            item
+            for item in active_bindings
+            if item[1].execution_id == offer.execution_id
+        ]
+        if len(exact) == 1:
+            return exact[0][0], None
+        return None, {
+            "code": "recovery_action_rejected",
+            "message": "The active behavior execution changed before recovery",
+            "details": {
+                "reason": "runtime_recovery_participant_mismatch",
+                "expected_execution_id": offer.execution_id,
+                "active_execution_ids": sorted(
+                    {binding.execution_id for _, binding in active_bindings}
                 ),
-            )
-            if not ack.accepted:
-                raise RuntimeError(
-                    "kernel.acknowledge_intervention_for_retry rejected: "
-                    f"{ack.error}"
-                )
-            clear_motion_stop_flag = False
-            with self._lock:
-                normalize_held_motion_intervention = (
-                    self._state == CycleState.RUNNING
-                    and self._motion_stop_state == "held"
-                )
-                if (
-                    self._state != CycleState.STOPPED
-                    and not normalize_held_motion_intervention
-                ):
-                    return
-                if normalize_held_motion_intervention:
-                    self._state = CycleState.STOPPED
-                    self._motion_stop_state = "idle"
-                    self._tick_pause_event.clear()
-                    clear_motion_stop_flag = True
-                self._error = None
-                self._error_code = None
-                self._error_details = None
-                self._allow_next_stopped_retry_replan = True
-                self._set_resume_after_error_flag(True)
-            if clear_motion_stop_flag:
-                self._set_motion_stop_active_flag(
-                    False,
-                    client_name="cycle_manager_ack_intervention_retry",
-                )
+                "matching_participant_count": len(exact),
+            },
+        }
 
-    def _has_retryable_failed_validation_error_locked(self) -> bool:
-        return self._error_code in _RETRYABLE_FAILED_VALIDATION_ERROR_CODES
-
-    def acknowledge_failed_validation_for_retry(
+    def _resume_after_accepted_recovery(
         self,
         *,
-        principal_id: str = "operator",
-        reason: str = "operator_acknowledge_failed_validation_and_retry",
-    ) -> None:
-        """Clear a retryable failed validation gate without backend reset."""
+        offer: CycleRecoveryOffer,
+        recovery_request_id: str,
+        runtime_participant: Optional[Any] = None,
+    ) -> bool:
+        fault_ids = tuple(
+            ref[len("runtime_fault:") :]
+            for ref in offer.evidence_refs
+            if ref.startswith("runtime_fault:")
+        )
+        cycle_owned_faults = tuple(
+            fault
+            for fault_id in fault_ids
+            if (fault := self._runtime_pause_registry.get(fault_id)) is not None
+            and fault.resume_owner == "cycle_manager"
+        )
+        with self._lock:
+            resumable = (
+                self._state == CycleState.STOPPED
+                and self._tree is not None
+                and not self._tree_is_terminal()
+            ) or (
+                self._state == CycleState.RUNNING
+                and (self._motion_stop_state == "held" or bool(fault_ids))
+            )
+            if not resumable:
+                return False
+            if runtime_participant is not None and not runtime_participant.accept_runtime_recovery(
+                recovery_request_id=recovery_request_id,
+                expected_execution_id=int(offer.execution_id or 0),
+            ):
+                return False
+            if fault_ids and not self._runtime_pause_registry.request_resume(
+                fault_ids,
+                recovery_request_id=recovery_request_id,
+            ):
+                return False
+            for fault in cycle_owned_faults:
+                if self._runtime_pause_registry.consume_resume(
+                    fault.fault_id,
+                    expected_generation=fault.generation,
+                ) is None:
+                    return False
+                self._cycle_runtime_fault_ids = {
+                    condition_id: fault_id
+                    for condition_id, fault_id in self._cycle_runtime_fault_ids.items()
+                    if fault_id != fault.fault_id
+                }
+            self._pending_delegated_recovery = None
+            self._motion_stop_state = "idle"
+            self._error = None
+            self._error_code = None
+            self._error_details = None
+            self._tick_pause_event.set()
+            if self._tick_thread is None or not self._tick_thread.is_alive():
+                if self._tree is None:
+                    return False
+                self._start_tick_thread(self._tick_loop)
+            self._state = CycleState.RUNNING
+        self._set_stop_requested_flag(
+            False,
+            client_name="cycle_manager_recovery_resume",
+        )
+        self._set_motion_stop_active_flag(
+            False,
+            client_name="cycle_manager_recovery_resume",
+        )
+        return True
 
-        with self._run_transition_lock:
-            with self._lock:
-                if self._state != CycleState.STOPPED:
-                    raise RuntimeError(
-                        "Cannot acknowledge failed validation for retry unless "
-                        f"the cycle is STOPPED (current state={self._state.value})"
-                    )
-                if (
-                    self._intervention is not None
-                    and self._intervention.status == "running"
+    @staticmethod
+    def _recovery_request_fingerprint(
+        request: dict[str, Any],
+        *,
+        principal_id: str,
+    ) -> tuple[Any, ...]:
+        raw_revision = request.get("offer_revision", request.get("offerRevision", 0))
+        try:
+            revision = int(raw_revision or 0)
+        except (TypeError, ValueError):
+            revision = 0
+        return (
+            str(request.get("offer_id") or request.get("offerId") or ""),
+            revision,
+            str(request.get("action_id") or request.get("actionId") or ""),
+            CycleRecoveryCoordinator.bounded_operator_reason(request.get("reason")),
+            principal_id,
+        )
+
+    def _begin_recovery_request(
+        self,
+        request_id: str,
+        fingerprint: tuple[Any, ...],
+    ) -> tuple[str, Optional[dict[str, Any]]]:
+        if not request_id:
+            return "new_uncached", None
+        with self._recovery_request_lock:
+            existing = self._recovery_requests.get(request_id)
+            if existing is not None:
+                existing_fingerprint, result = existing
+                self._recovery_requests.move_to_end(request_id)
+                if existing_fingerprint != fingerprint:
+                    return "conflict", None
+                if result is None:
+                    return "in_progress", None
+                return "replay", deepcopy(result)
+
+            while len(self._recovery_requests) >= _RECOVERY_REQUEST_CACHE_LIMIT:
+                evicted = False
+                for candidate_id, (_, candidate_result) in tuple(
+                    self._recovery_requests.items()
                 ):
-                    raise RuntimeError(
-                        "Cannot acknowledge failed validation for retry while "
-                        "a direct-control intervention session is running"
-                    )
-                if not self._has_retryable_failed_validation_error_locked():
-                    raise RuntimeError(
-                        "Cannot acknowledge failed validation for retry: active "
-                        "error is not a retryable validation gate"
-                    )
+                    if candidate_result is not None:
+                        del self._recovery_requests[candidate_id]
+                        evicted = True
+                        break
+                if not evicted:
+                    return "capacity_exhausted", None
+            self._recovery_requests[request_id] = (fingerprint, None)
+            return "new", None
 
-            kernel_status = self._call_with_timeout(
-                "ack_failed_validation_retry_status",
-                self._kernel.get_status,
-                _KERNEL_CONTROL_CALL_TIMEOUT_S,
-            )
-            if kernel_status.state != ExecutionState.FAILED:
-                raise RuntimeError(
-                    "Cannot acknowledge failed validation for retry: kernel is "
-                    f"{kernel_status.state.value}, not failed"
+    def _complete_recovery_request(
+        self,
+        request_id: str,
+        fingerprint: tuple[Any, ...],
+        result: dict[str, Any],
+    ) -> None:
+        if not request_id:
+            return
+        with self._recovery_request_lock:
+            existing = self._recovery_requests.get(request_id)
+            if existing is not None and existing[0] == fingerprint:
+                self._recovery_requests[request_id] = (
+                    fingerprint,
+                    deepcopy(result),
                 )
+                self._recovery_requests.move_to_end(request_id)
 
-            ack = self._kernel_control_command(
-                "ack_failed_validation_retry",
-                lambda epoch: self._kernel.acknowledge_failed_validation_for_retry(
-                    principal_id=principal_id,
-                    reason=reason,
-                    expected_epoch=epoch,
-                ),
-            )
-            if not ack.accepted:
-                raise RuntimeError(
-                    "kernel.acknowledge_failed_validation_for_retry rejected: "
-                    f"{ack.error}"
+    def apply_recovery_action(
+        self,
+        request: dict[str, Any],
+        *,
+        principal_id: str,
+        reset_callback: Optional[Callable[[str], None]] = None,
+    ) -> dict[str, Any]:
+        """Apply an idempotent exact offer-bound recovery action."""
+        if not principal_id:
+            raise RuntimeError("Authenticated recovery principal is required")
+        request_id = str(request.get("request_id") or request.get("requestId") or "")
+        fingerprint = self._recovery_request_fingerprint(
+            request,
+            principal_id=principal_id,
+        )
+        disposition, cached = self._begin_recovery_request(request_id, fingerprint)
+        if disposition == "replay":
+            assert cached is not None
+            return cached
+        if disposition != "new" and disposition != "new_uncached":
+            reason_by_disposition = {
+                "conflict": "recovery_request_id_reused",
+                "in_progress": "recovery_request_in_progress",
+                "capacity_exhausted": "recovery_request_capacity_exhausted",
+            }
+            reason_code = reason_by_disposition[disposition]
+            error = {
+                "code": "recovery_action_rejected",
+                "message": "Recovery request could not be admitted",
+                "details": {"reason": reason_code},
+            }
+            result = {
+                "requestId": request_id,
+                "accepted": False,
+                "cycleResumed": False,
+                "resultCode": reason_code,
+                "error": error,
+                "recoveryOffer": self.get_recovery_offer(),
+            }
+            # An identical in-flight duplicate is the same attempt and must not
+            # duplicate durable events. Conflicting reuse and capacity refusal
+            # are distinct rejected attempts and remain visible.
+            if disposition != "in_progress":
+                offer = self._recovery_coordinator.current_offer()
+                details = {
+                    **self._recovery_offer_event_details(offer),
+                    "request_id": request_id,
+                    "action_id": str(
+                        request.get("action_id") or request.get("actionId") or ""
+                    ),
+                    "principal_id": principal_id,
+                    "operator_reason": (
+                        CycleRecoveryCoordinator.bounded_operator_reason(
+                            request.get("reason")
+                        )
+                    ),
+                }
+                self._emit_recovery_action_event("requested", details)
+                self._emit_recovery_action_event(
+                    "rejected",
+                    {**details, "error": error},
                 )
+            return result
+        try:
+            result = self._apply_recovery_action_once(
+                request,
+                principal_id=principal_id,
+                reset_callback=reset_callback,
+            )
+        except BaseException as exc:
+            # The exact side-effect point may be unknowable for an unexpected
+            # exception. Keep the request id consumed so a transport retry can
+            # never repeat an action whose outcome is ambiguous.
+            self._complete_recovery_request(
+                request_id,
+                fingerprint,
+                {
+                    "requestId": request_id,
+                    "accepted": False,
+                    "cycleResumed": False,
+                    "resultCode": "recovery_action_outcome_unknown",
+                    "error": {
+                        "code": "recovery_action_outcome_unknown",
+                        "message": str(exc) or type(exc).__name__,
+                        "details": {
+                            "reason": "recovery_action_outcome_unknown",
+                            "exception_type": type(exc).__name__,
+                        },
+                    },
+                    "recoveryOffer": self.get_recovery_offer(),
+                },
+            )
+            raise
+        self._complete_recovery_request(request_id, fingerprint, result)
+        return result
 
+    def _apply_recovery_action_once(
+        self,
+        request: dict[str, Any],
+        *,
+        principal_id: str,
+        reset_callback: Optional[Callable[[str], None]] = None,
+    ) -> dict[str, Any]:
+        """Apply one exact offer-bound recovery action.
+
+        Non-resetting kernel actions retain C++ authority and are generation-
+        checked again by `ApplyRecoveryAction`. `retry_runtime_step` is a
+        cycle-only action and can only wake the exact fault ids embedded in the
+        current immutable offer while the kernel assessment has no active
+        recovery authority.
+        """
+        request_id = str(request.get("request_id") or request.get("requestId") or "")
+        action_id = str(request.get("action_id") or request.get("actionId") or "")
+        reason = self._recovery_coordinator.bounded_operator_reason(
+            request.get("reason")
+        )
+        deferred_events = self._begin_recovery_event_deferral()
+        reset_context: Optional[
+            tuple[CycleRecoveryOffer, dict[str, Any]]
+        ] = None
+        try:
+            with self._run_transition_lock, self._tree_tick_lock:
+                self.refresh_recovery_offer()
+                offer = self._recovery_coordinator.current_offer()
+                requested_details = {
+                    **self._recovery_offer_event_details(offer),
+                    "request_id": request_id,
+                    "action_id": action_id,
+                    "principal_id": principal_id,
+                    "operator_reason": reason,
+                }
+                offered_action = next(
+                    (
+                        item
+                        for item in offer.actions
+                        if item.action_id == action_id
+                    ),
+                    None,
+                ) if offer is not None else None
+                requested_details["performs_backend_reset"] = (
+                    offered_action.performs_backend_reset
+                    if offered_action is not None
+                    else None
+                )
+                self._emit_recovery_action_event("requested", requested_details)
+                validation = self._recovery_coordinator.validate_request(
+                    request, offer
+                )
+                if (
+                    not validation.accepted
+                    or validation.offer is None
+                    or validation.action is None
+                ):
+                    error = validation.error or {
+                        "code": "recovery_action_rejected",
+                        "message": "Recovery action was rejected",
+                        "details": {"reason": "recovery_action_rejected"},
+                    }
+                    self._emit_recovery_action_event(
+                        "rejected", {**requested_details, "error": error}
+                    )
+                    return {
+                        "requestId": request_id,
+                        "accepted": False,
+                        "cycleResumed": False,
+                        "resultCode": "rejected",
+                        "error": error,
+                        "recoveryOffer": (
+                            validation.offer.to_wire()
+                            if validation.offer is not None
+                            else None
+                        ),
+                    }
+
+                accepted_offer = validation.offer
+                action = validation.action
+                runtime_participant, participant_error = (
+                    self._select_runtime_recovery_participant(
+                        offer=accepted_offer,
+                        action_id=action.action_id,
+                    )
+                )
+                if participant_error is not None:
+                    self._emit_recovery_action_event(
+                        "rejected",
+                        {**requested_details, "error": participant_error},
+                    )
+                    return {
+                        "requestId": request_id,
+                        "accepted": False,
+                        "cycleResumed": False,
+                        "resultCode": "cycle_context_changed",
+                        "error": participant_error,
+                        "recoveryOffer": accepted_offer.to_wire(),
+                    }
+                if action.action_id == "reset_cycle":
+                    # Reset is an explicit fail-safe lifecycle command. Execute
+                    # it after releasing recovery/tree locks; reset owns its own
+                    # bounded lifecycle phases and may rebuild the tree.
+                    reset_context = (accepted_offer, requested_details)
+                else:
+                    kernel_result: Optional[dict[str, Any]] = None
+                    kernel_action_accepted = False
+                    if is_kernel_recovery_action(action.action_id):
+                        kernel_request = {
+                            "request_id": request_id,
+                            "action": action.action_id,
+                            "principal_id": principal_id,
+                            "expected_assessment_revision": (
+                                accepted_offer.kernel_assessment_revision
+                            ),
+                            "expected_control_command_epoch": (
+                                accepted_offer.control_command_epoch
+                            ),
+                            "expected_execution_id": accepted_offer.execution_id or 0,
+                            "expected_latch_id": accepted_offer.latch_id or "",
+                            "expected_stop_certificate_id": (
+                                accepted_offer.stop_certificate_id or ""
+                            ),
+                            "expected_stop_owner_generation": (
+                                accepted_offer.stop_owner_generation
+                            ),
+                            "reason": reason,
+                        }
+                        try:
+                            kernel_result = self._kernel_control_command(
+                                "apply_recovery_action",
+                                lambda _epoch: self._kernel.apply_recovery_action(
+                                    kernel_request
+                                ),
+                            )
+                        except Exception as exc:  # noqa: BLE001 - bounded RPC boundary.
+                            error = {
+                                "code": "recovery_action_transport_failed",
+                                "message": str(exc) or type(exc).__name__,
+                                "details": {
+                                    "reason": "kernel_recovery_action_transport_failed",
+                                    "exception_type": type(exc).__name__,
+                                },
+                            }
+                            self.refresh_recovery_offer()
+                            newest = self._recovery_coordinator.current_offer()
+                            self._emit_recovery_action_event(
+                                "rejected", {**requested_details, "error": error}
+                            )
+                            return {
+                                "requestId": request_id,
+                                "accepted": False,
+                                "cycleResumed": False,
+                                "resultCode": "transport_failed",
+                                "error": error,
+                                "recoveryOffer": (
+                                    newest.to_wire() if newest else None
+                                ),
+                            }
+                        kernel_action_accepted = bool(kernel_result.get("accepted"))
+                        if not kernel_action_accepted:
+                            error = kernel_result.get("error") or {
+                                "code": "recovery_action_rejected",
+                                "message": "Kernel rejected recovery action",
+                                "details": {
+                                    "reason": "kernel_recovery_action_rejected"
+                                },
+                            }
+                            self.refresh_recovery_offer()
+                            newest = self._recovery_coordinator.current_offer()
+                            self._emit_recovery_action_event(
+                                "rejected", {**requested_details, "error": error}
+                            )
+                            return {
+                                "requestId": request_id,
+                                "accepted": False,
+                                "cycleResumed": False,
+                                "resultCode": "kernel_rejected",
+                                "error": error,
+                                "recoveryOffer": (
+                                    newest.to_wire() if newest else None
+                                ),
+                            }
+                    elif action.action_id != "retry_runtime_step":
+                        error = {
+                            "code": "recovery_action_rejected",
+                            "message": "Recovery action is not implemented",
+                            "details": {"reason": "action_not_implemented"},
+                        }
+                        self._emit_recovery_action_event(
+                            "rejected", {**requested_details, "error": error}
+                        )
+                        return {
+                            "requestId": request_id,
+                            "accepted": False,
+                            "cycleResumed": False,
+                            "resultCode": "action_not_implemented",
+                            "error": error,
+                            "recoveryOffer": accepted_offer.to_wire(),
+                        }
+
+                    cycle_resumed = self._resume_after_accepted_recovery(
+                        offer=accepted_offer,
+                        recovery_request_id=request_id,
+                        runtime_participant=runtime_participant,
+                    )
+                    if not cycle_resumed and not kernel_action_accepted:
+                        error = {
+                            "code": "recovery_action_rejected",
+                            "message": (
+                                "Recovery context changed before the owning "
+                                "runtime node could resume"
+                            ),
+                            "details": {
+                                "reason": "cycle_context_changed_before_runtime_retry"
+                            },
+                        }
+                        self.refresh_recovery_offer()
+                        newest = self._recovery_coordinator.current_offer()
+                        self._emit_recovery_action_event(
+                            "rejected", {**requested_details, "error": error}
+                        )
+                        return {
+                            "requestId": request_id,
+                            "accepted": False,
+                            "cycleResumed": False,
+                            "resultCode": "cycle_context_changed",
+                            "error": error,
+                            "recoveryOffer": newest.to_wire() if newest else None,
+                        }
+
+                    self.refresh_recovery_offer()
+                    newest = self._recovery_coordinator.current_offer()
+                    result_code = (
+                        "accepted"
+                        if cycle_resumed
+                        else "kernel_accepted_cycle_context_superseded"
+                    )
+                    self._emit_recovery_action_event(
+                        "accepted",
+                        {
+                            **requested_details,
+                            "performs_backend_reset": False,
+                            "kernel_action_result": kernel_result,
+                            "cycle_resumed": cycle_resumed,
+                            "result_code": result_code,
+                        },
+                    )
+                    return {
+                        "requestId": request_id,
+                        "accepted": True,
+                        "cycleResumed": cycle_resumed,
+                        "resultCode": result_code,
+                        "error": None,
+                        "recoveryOffer": newest.to_wire() if newest else None,
+                    }
+
+            assert reset_context is not None
+            accepted_offer, requested_details = reset_context
+            callback = reset_callback
+            if callback is None:
+                callback = lambda callback_request_id: self.reset(
+                    request_id=callback_request_id
+                )
+            try:
+                callback(request_id)
+            except Exception as exc:  # noqa: BLE001 - reset remains fail-closed.
+                error = {
+                    "code": "recovery_reset_failed",
+                    "message": str(exc) or type(exc).__name__,
+                    "details": {
+                        "reason": "recovery_reset_failed",
+                        "exception_type": type(exc).__name__,
+                    },
+                }
+                self.refresh_recovery_offer()
+                newest = self._recovery_coordinator.current_offer()
+                self._emit_recovery_action_event(
+                    "rejected", {**requested_details, "error": error}
+                )
+                return {
+                    "requestId": request_id,
+                    "accepted": False,
+                    "cycleResumed": False,
+                    "resultCode": "reset_failed",
+                    "error": error,
+                    "recoveryOffer": newest.to_wire() if newest else None,
+                }
+            self._runtime_pause_registry.clear_all()
             with self._lock:
-                if self._state != CycleState.STOPPED:
-                    return
-                self._error = None
-                self._error_code = None
-                self._error_details = None
-                self._allow_next_stopped_retry_replan = True
-                self._set_resume_after_error_flag(True)
+                self._cycle_runtime_fault_ids.clear()
+            self.refresh_recovery_offer()
+            newest = self._recovery_coordinator.current_offer()
+            self._emit_recovery_action_event(
+                "accepted",
+                {
+                    **requested_details,
+                    "performs_backend_reset": True,
+                    "kernel_action_result": None,
+                    "cycle_resumed": False,
+                    "result_code": "reset_completed",
+                },
+            )
+            return {
+                "requestId": request_id,
+                "accepted": True,
+                "cycleResumed": False,
+                "resultCode": "reset_completed",
+                "error": None,
+                "recoveryOffer": newest.to_wire() if newest else None,
+            }
+        finally:
+            self._finish_recovery_event_deferral(deferred_events)
 
-    def run(self) -> None:
+    def run(self, *, principal_id: str = "operator") -> Optional[dict[str, Any]]:
         """
         Start or resume program execution.
         
@@ -2526,16 +2965,59 @@ class CycleManager:
                     If kernel is PAUSED, call kernel.resume().
         If RUNNING: no-op.
         """
-        with self._run_transition_lock:
-            # A motion node publishes its soft-fail on the blackboard from the
-            # tick thread, then the cycle manager promotes that signal into a
-            # held motion-stop state. If the operator presses Run in that small
-            # window, do the promotion here first; a successful Run must not be
-            # a silent no-op while a retryable motion fault is already visible.
-            pending_motion_error = self._read_motion_paused_error()
-            if pending_motion_error is not None:
-                self._enter_motion_paused_state(pending_motion_error)
+        with self._lock:
+            recovery_surface_active = (
+                self._state == CycleState.STOPPED
+                or self._motion_stop_state == "held"
+            )
+        if not recovery_surface_active:
+            # Close the node-fault -> tick-loop promotion window. An operator
+            # Run that arrives after the exact fault is registered must consume
+            # the current offer, not become a successful no-op merely because
+            # the next tree tick has not marked motion_stop_state=held yet.
+            recovery_surface_active = bool(
+                self._runtime_pause_registry.active_faults()
+            )
+        if recovery_surface_active:
+            offer_wire = self.refresh_recovery_offer()
+            if offer_wire is not None:
+                primary_action = offer_wire.get("primaryAction")
+                automatic_actions = {
+                    "retry_motion_from_current_state",
+                    "retry_after_scene_repair",
+                    "replan_from_stopped_state",
+                    "retry_runtime_step",
+                }
+                if (
+                    offer_wire.get("status") == "retry_ready"
+                    and primary_action in automatic_actions
+                ):
+                    result = self.apply_recovery_action(
+                        {
+                            "request_id": f"run-{uuid.uuid4().hex}",
+                            "offer_id": offer_wire["offerId"],
+                            "offer_revision": offer_wire["offerRevision"],
+                            "action_id": primary_action,
+                            "reason": "operator_run_primary_recovery",
+                        },
+                        principal_id=principal_id,
+                    )
+                    if not result.get("accepted"):
+                        error = result.get("error") or {}
+                        raise RuntimeError(
+                            str(
+                                error.get("message")
+                                or "Recovery action was rejected"
+                            )
+                        )
+                    return result
+                raise RuntimeError(
+                    "Run cannot choose the current recovery action. "
+                    f"status={offer_wire.get('status')}, "
+                    f"reason={offer_wire.get('reasonCode')}"
+                )
 
+        with self._run_transition_lock:
             prepare_fresh = False
             start_from_idle = False
             resume_from_stopped = False
@@ -2563,7 +3045,6 @@ class CycleManager:
                         self._pending_run_stop = None
                         run_transition_started = True
 
-                self._assert_resumable_stop_scene_unchanged()
                 with self._lock:
                     current_state = self._state
                     motion_stop_state = self._motion_stop_state
@@ -2598,49 +3079,14 @@ class CycleManager:
                     kernel_status = self._kernel_status_with_timeout(
                         "run_resume_motion_stop_status"
                     )
-                    if kernel_status.state == ExecutionState.INTERRUPTED:
-                        ack_interrupted = self._kernel_control_command(
-                            "run_ack_interrupted_after_motion_stop",
-                            lambda epoch: self._kernel.acknowledge_interrupted_for_retry(
-                                principal_id="cycle_manager_run",
-                                reason="run_retry_after_motion_fault",
-                                expected_epoch=epoch,
-                            ),
-                        )
-                        if not ack_interrupted.accepted:
-                            if _kernel_retains_interrupted_retry_authority(
-                                ack_interrupted
-                            ):
-                                return
-                            raise RuntimeError(
-                                "kernel.acknowledge_interrupted_for_retry rejected: "
-                                f"{ack_interrupted.error}"
-                            )
-                        kernel_status = self._kernel_status_with_timeout(
-                            "run_post_motion_stop_interrupted_ack_status"
-                        )
-                    if kernel_status.state == ExecutionState.COMPLETED:
-                        ack_completed = self._kernel_control_command(
-                            "run_ack_completed_after_motion_stop",
-                            lambda epoch: self._kernel.acknowledge_completed(
-                                kernel_status.execution_id,
-                                expected_epoch=epoch,
-                            ),
-                        )
-                        if not ack_completed.accepted:
-                            raise RuntimeError(
-                                "kernel.acknowledge_completed rejected: "
-                                f"{ack_completed.error}"
-                            )
-                        kernel_status = self._kernel_status_with_timeout(
-                            "run_post_motion_stop_completed_ack_status"
-                        )
-                    if kernel_status.state == ExecutionState.INTERVENTION_REQUIRED:
-                        _, recovery_reason = self._can_auto_acknowledge_leftover_state()
+                    if kernel_status.state not in {
+                        ExecutionState.PAUSED,
+                        ExecutionState.IDLE,
+                        ExecutionState.COMPLETED,
+                    }:
                         raise RuntimeError(
-                            "Kernel INTERVENTION_REQUIRED blocks Run. Choose "
-                            "Acknowledge and continue or Reset cycle before "
-                            f"running. reason={recovery_reason}"
+                            "Motion Stop cannot resume without a current recovery "
+                            f"offer (kernel state={kernel_status.state.value})"
                         )
                     if kernel_status.state == ExecutionState.PAUSED:
                         resume = self._kernel_control_command(
@@ -2652,7 +3098,6 @@ class CycleManager:
                                 "kernel.resume rejected: "
                                 f"{resume.error}"
                             )
-                    set_resume_after_error = False
                     clear_motion_stop_flag = False
                     with self._lock:
                         if (
@@ -2661,13 +3106,10 @@ class CycleManager:
                         ):
                             return
                         self._motion_stop_state = "idle"
-                        set_resume_after_error = True
                         clear_motion_stop_flag = True
                         self._error = None
                         self._error_code = None
                         self._error_details = None
-                    if set_resume_after_error:
-                        self._set_resume_after_error_flag(True)
                     if clear_motion_stop_flag:
                         self._set_motion_stop_active_flag(
                             False,
@@ -2680,58 +3122,17 @@ class CycleManager:
                         if self._state != CycleState.STOPPED:
                             return
 
-                    motion_paused_error = self._read_motion_paused_error()
                     kernel_status = self._kernel_status_with_timeout(
                         "run_resume_status"
                     )
-                    if (
-                        motion_paused_error is not None
-                        and kernel_status.state == ExecutionState.INTERRUPTED
-                    ):
-                        ack_interrupted = self._kernel_control_command(
-                            "run_ack_interrupted_for_retry",
-                            lambda epoch: self._kernel.acknowledge_interrupted_for_retry(
-                                principal_id="cycle_manager_run",
-                                reason="run_retry_after_motion_fault",
-                                expected_epoch=epoch,
-                            ),
-                        )
-                        if not ack_interrupted.accepted:
-                            if _kernel_retains_interrupted_retry_authority(
-                                ack_interrupted
-                            ):
-                                return
-                            raise RuntimeError(
-                                "kernel.acknowledge_interrupted_for_retry rejected: "
-                                f"{ack_interrupted.error}"
-                            )
-                        kernel_status = self._kernel_status_with_timeout(
-                            "run_post_interrupted_ack_status"
-                        )
-
-                    if kernel_status.state == ExecutionState.COMPLETED:
-                        ack_completed = self._kernel_control_command(
-                            "run_ack_completed",
-                            lambda epoch: self._kernel.acknowledge_completed(
-                                kernel_status.execution_id,
-                                expected_epoch=epoch,
-                            ),
-                        )
-                        if not ack_completed.accepted:
-                            raise RuntimeError(
-                                "kernel.acknowledge_completed rejected: "
-                                f"{ack_completed.error}"
-                            )
-                        kernel_status = self._kernel_status_with_timeout(
-                            "run_post_completed_ack_status"
-                        )
-
-                    if kernel_status.state == ExecutionState.INTERVENTION_REQUIRED:
-                        _, recovery_reason = self._can_auto_acknowledge_leftover_state()
+                    if kernel_status.state not in {
+                        ExecutionState.PAUSED,
+                        ExecutionState.IDLE,
+                        ExecutionState.COMPLETED,
+                    }:
                         raise RuntimeError(
-                            "Kernel INTERVENTION_REQUIRED blocks Run. Choose "
-                            "Acknowledge and continue or Reset cycle before "
-                            f"running. reason={recovery_reason}"
+                            "Stopped cycle cannot resume without a current recovery "
+                            f"offer (kernel state={kernel_status.state.value})"
                         )
 
                     if kernel_status.state == ExecutionState.PAUSED:
@@ -2744,10 +3145,6 @@ class CycleManager:
                                 "kernel.resume rejected: "
                                 f"{resume.error}"
                             )
-
-                    self._set_resume_after_error_flag(True)
-                    if motion_paused_error is not None:
-                        self._clear_motion_paused_blackboard()
 
                     bb = py_trees.blackboard.Client(name="cycle_manager_resume")
                     bb.register_key(
@@ -2774,9 +3171,6 @@ class CycleManager:
                         self._error_code = None
                         self._error_details = None
                         self._state = CycleState.RUNNING
-                        self._resumable_stop_scene_fingerprint = None
-                        self._resumable_stop_scene_fingerprint_error = None
-                        self._allow_next_stopped_retry_replan = False
                         run_committed = True
                     return
 
@@ -2927,26 +3321,11 @@ class CycleManager:
             logger.exception("Failed to read kernel state after operator stop")
             kernel_state = ExecutionState.STOPPING
 
-        should_capture = False
-        with self._lock:
-            should_capture = (
-                self._state == CycleState.STOPPING
-                and self._kernel_stop_terminal(kernel_state)
-            )
-        fingerprint, fingerprint_error = (
-            self._capture_scene_resume_fingerprint()
-            if should_capture
-            else (None, None)
-        )
         with self._lock:
             if self._state != CycleState.STOPPING:
                 return
             if self._kernel_stop_terminal(kernel_state):
                 self._state = CycleState.STOPPED
-                self._store_resumable_stop_scene_fingerprint_locked(
-                    fingerprint,
-                    fingerprint_error,
-                )
             else:
                 self._start_stop_settle_watcher_locked()
 
@@ -2998,6 +3377,11 @@ class CycleManager:
                 self._tick_thread = None
     
     def reset(self, *, request_id: Optional[str] = None) -> None:
+        """Serialize reset against Run, recovery, and intervention admission."""
+        with self._run_transition_lock:
+            self._reset_impl(request_id=request_id)
+
+    def _reset_impl(self, *, request_id: Optional[str] = None) -> None:
         """
         Reset program to initial state.
         
@@ -3058,9 +3442,6 @@ class CycleManager:
                     self._error_details = None
                     self._state = CycleState.IDLE
                     self._pending_delegated_recovery = None
-                    self._resumable_stop_scene_fingerprint = None
-                    self._resumable_stop_scene_fingerprint_error = None
-                    self._allow_next_stopped_retry_replan = False
                     cleanup_alive = (
                         self._tick_cleanup_thread is not None
                         and self._tick_cleanup_thread.is_alive()
@@ -3129,9 +3510,6 @@ class CycleManager:
                     }
                     self._state = CycleState.STOPPED
                     self._pending_delegated_recovery = None
-                    self._resumable_stop_scene_fingerprint = None
-                    self._resumable_stop_scene_fingerprint_error = None
-                    self._allow_next_stopped_retry_replan = False
                 self._emit_reset_phase_event(
                     phase="kernel_reset",
                     status="failed",
@@ -3161,9 +3539,7 @@ class CycleManager:
             self._error_details = None
             self._state = CycleState.IDLE
             self._pending_delegated_recovery = None
-            self._resumable_stop_scene_fingerprint = None
-            self._resumable_stop_scene_fingerprint_error = None
-            self._allow_next_stopped_retry_replan = False
+        self.refresh_recovery_offer()
 
     def set_velocity_scale(
         self, scale: float, principal_id: str | None = None
@@ -3270,7 +3646,8 @@ class CycleManager:
             # Tick the tree
             start_time = time.monotonic()
             try:
-                self._tree.tick()
+                with self._tree_tick_lock:
+                    self._tree.tick()
             except Exception:
                 error_msg = traceback.format_exc()
                 logger.error("Tick loop exception: %s", error_msg)
@@ -3307,9 +3684,6 @@ class CycleManager:
                     self._state = CycleState.STOPPED
                     self._tree = None
                     self._tick_thread = None
-                    self._resumable_stop_scene_fingerprint = None
-                    self._resumable_stop_scene_fingerprint_error = None
-                    self._allow_next_stopped_retry_replan = False
                 break
             
             # Drain native kernel events
@@ -3323,16 +3697,28 @@ class CycleManager:
             with self._lock:
                 self._node_statuses = statuses
 
-            # Motion soft-fail: a motion node has captured a runtime
-            # failure (collision, planning timeout, execution rejection,
-            # etc.) and is holding Status.RUNNING with the cause stored
-            # on the blackboard. Convert it into a held motion stop so
-            # continue-policy branches keep ticking and the operator can
-            # Run again to retry the same motion. Backend intervention
-            # states still fail closed.
-            motion_error = self._read_motion_paused_error()
-            if motion_error is not None:
-                self._enter_motion_paused_state(motion_error)
+            runtime_faults = sorted(
+                self._runtime_pause_registry.active_faults(),
+                key=lambda item: (item.generation, item.fault_id),
+            )
+            if runtime_faults:
+                fault = runtime_faults[0]
+                self._enter_motion_paused_state(
+                    fault.message,
+                    runtime_reason_code=fault.reason_code,
+                    runtime_details={
+                        **fault.details,
+                        "runtime_fault_id": fault.fault_id,
+                        "runtime_fault_generation": fault.generation,
+                        "runtime_fault_domain": fault.domain,
+                        "runtime_fault_node_name": fault.node_name,
+                        "runtime_fault_node_id": fault.node_id,
+                    },
+                )
+                try:
+                    self.refresh_recovery_offer()
+                except Exception:  # noqa: BLE001 - fault remains fail-closed.
+                    logger.exception("Recovery offer projection failed for runtime fault")
                 continue
 
             # Check if tree completed
@@ -3366,9 +3752,6 @@ class CycleManager:
                             tick_code, tick_details = (
                                 self._capture_kernel_error_diagnostics()
                             )
-                            fingerprint, fingerprint_error = (
-                                self._capture_scene_resume_fingerprint()
-                            )
                             clear_motion_stop_flag = False
                             with self._lock:
                                 self._error = failure_feedback
@@ -3378,10 +3761,6 @@ class CycleManager:
                                 self._error_details = tick_details
                                 self._state = CycleState.STOPPED
                                 self._tick_thread = None
-                                self._store_resumable_stop_scene_fingerprint_locked(
-                                    fingerprint,
-                                    fingerprint_error,
-                                )
                                 clear_motion_stop_flag = (
                                     self._clear_motion_stop_after_tree_terminal_locked()
                                 )
@@ -3407,9 +3786,6 @@ class CycleManager:
                         delegated_code, delegated_details = (
                             self._capture_kernel_error_diagnostics()
                         )
-                        fingerprint, fingerprint_error = (
-                            self._capture_scene_resume_fingerprint()
-                        )
                         clear_motion_stop_flag = False
                         with self._lock:
                             self._error = failure_feedback
@@ -3420,10 +3796,6 @@ class CycleManager:
                             self._pending_delegated_recovery = request
                             self._state = CycleState.STOPPED
                             self._tick_thread = None
-                            self._store_resumable_stop_scene_fingerprint_locked(
-                                fingerprint,
-                                fingerprint_error,
-                            )
                             clear_motion_stop_flag = (
                                 self._clear_motion_stop_after_tree_terminal_locked()
                             )
@@ -3453,9 +3825,6 @@ class CycleManager:
                         self._error_details = None
                     self._state = CycleState.IDLE
                     self._tick_thread = None
-                    self._resumable_stop_scene_fingerprint = None
-                    self._resumable_stop_scene_fingerprint_error = None
-                    self._allow_next_stopped_retry_replan = False
                     clear_motion_stop_flag = (
                         self._clear_motion_stop_after_tree_terminal_locked()
                     )
@@ -3808,18 +4177,6 @@ class CycleManager:
                 else CycleState.STOPPED
             )
         )
-        rebaseline_resumable_scene = (
-            base_state == CycleState.STOPPED
-            and session.entry_state == CycleState.STOPPED.value
-            and session.status == "completed"
-            and requested_outcome != "reset"
-        )
-        if rebaseline_resumable_scene:
-            resume_fingerprint, resume_fingerprint_error = (
-                self._capture_scene_resume_fingerprint()
-            )
-        else:
-            resume_fingerprint, resume_fingerprint_error = None, None
         with self._lock:
             if context is not None:
                 self._tree = context.tree
@@ -3833,22 +4190,7 @@ class CycleManager:
             self._tick_stop_event.clear()
             self._tick_pause_event.set()
             self._intervention_context = None
-            if rebaseline_resumable_scene:
-                self._store_resumable_stop_scene_fingerprint_locked(
-                    resume_fingerprint,
-                    resume_fingerprint_error,
-                )
-                session.record_event(
-                    "resume_scene_baselined",
-                    fingerprint_available=str(
-                        resume_fingerprint is not None
-                    ).lower(),
-                    fingerprint_error=resume_fingerprint_error,
-                )
-            elif base_state != CycleState.STOPPED:
-                self._resumable_stop_scene_fingerprint = None
-                self._resumable_stop_scene_fingerprint_error = None
-                self._allow_next_stopped_retry_replan = False
+        self.refresh_recovery_offer()
 
         if forced_state is not None:
             if session.actual_outcome is None:
@@ -4204,7 +4546,8 @@ class CycleManager:
 
             start_time = time.monotonic()
             try:
-                self._tree.tick()
+                with self._tree_tick_lock:
+                    self._tree.tick()
             except Exception:
                 error_msg = traceback.format_exc()
                 logger.error("Intervention tick exception: %s", error_msg)

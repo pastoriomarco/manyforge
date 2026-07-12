@@ -1,4 +1,6 @@
 import { useState } from 'react';
+import type { CycleRecoveryOffer } from '../types/api';
+import { RecoveryActionControls } from './RecoveryActionControls';
 
 /**
  * KernelErrorPanel — renders kernel/cycle-manager errors with their full
@@ -26,10 +28,15 @@ export interface KernelErrorPanelProps {
   errorDetails?: Record<string, unknown> | null;
   /** Captured event snapshot for the latest fault/stop incident, when known. */
   incidentSnapshot?: Record<string, unknown> | null;
-  /** Explicit non-reset recovery for retryable stop/fault interventions. */
-  onAcknowledgeAndContinue?: () => void | Promise<void>;
-  /** Explicit non-reset retry for failed pre-dispatch validation gates. */
-  onAcknowledgeFailedValidationForRetry?: () => void | Promise<void>;
+  /** Exact server-authored recovery offer shared by every operator surface. */
+  recoveryOffer?: CycleRecoveryOffer | null;
+  /** Submit an action bound to the exact rendered offer. */
+  onRecoveryAction?: (
+    offer: CycleRecoveryOffer,
+    actionId: string,
+  ) => void | Promise<void>;
+  recoveryActionBusy?: boolean;
+  onRecoveryActionError?: (error: unknown) => void;
   /** Optional close handler for a dismissible banner. */
   onDismiss?: () => void;
 }
@@ -764,61 +771,6 @@ function hasStopChain(details: Record<string, unknown> | null | undefined): bool
   return STOP_CHAIN_KEYS.some((key) => details[key] !== undefined && details[key] !== null);
 }
 
-function isRetryableStopIntervention(
-  errorCode: string | null | undefined,
-  details: Record<string, unknown> | null | undefined,
-): boolean {
-  if (!details) {
-    return false;
-  }
-  if (errorCode === 'scene_changed_during_validation' || errorCode === 'validation_collision') {
-    return false;
-  }
-  const reason = stringField(details, 'reason') || stringField(details, 'reason_code');
-  const kernelState = stringField(details, 'kernel_state');
-  const motionSoftStopReason = stringField(details, 'motion_soft_stop_reason');
-  if (
-    kernelState === 'intervention_required' ||
-    motionSoftStopReason === 'motion_soft_fail_requires_intervention' ||
-    reason === 'stop_not_settled_measured_velocity' ||
-    reason === 'operator_stop_total_failure' ||
-    reason === 'in_stop_completion_timeout' ||
-    reason === 'stop_path_collision' ||
-    reason === 'hard_deceleration_not_settled' ||
-    reason === 'controller_cancel_timeout'
-  ) {
-    return true;
-  }
-  const phase = stringField(details, 'phase');
-  return (
-    (phase === 'operator_stop' ||
-      phase === 'motion_trip_stop' ||
-      phase === 'motion_trip_stop_path_collision') &&
-    (stringField(details, 'requested_stop_mode') !== null ||
-      stringField(details, 'executed_stop_mode') !== null ||
-      stringField(details, 'hard_stop_transitioned') !== null)
-  );
-}
-
-function isRetryableFailedValidation(
-  errorCode: string | null | undefined,
-): boolean {
-  return errorCode === 'scene_changed_during_validation' || errorCode === 'validation_collision';
-}
-
-export function recoveryActionForError(
-  errorCode: string | null | undefined,
-  details: Record<string, unknown> | null | undefined,
-): 'stop_intervention' | 'failed_validation' | null {
-  if (isRetryableStopIntervention(errorCode, details)) {
-    return 'stop_intervention';
-  }
-  if (isRetryableFailedValidation(errorCode)) {
-    return 'failed_validation';
-  }
-  return null;
-}
-
 function stopChainRows(details: Record<string, unknown>): Array<[string, string]> {
   const requested =
     stringField(details, 'requested_stop_mode') ||
@@ -1099,8 +1051,10 @@ export function KernelErrorPanel({
   errorCode,
   errorDetails,
   incidentSnapshot,
-  onAcknowledgeAndContinue,
-  onAcknowledgeFailedValidationForRetry,
+  recoveryOffer,
+  onRecoveryAction,
+  recoveryActionBusy = false,
+  onRecoveryActionError,
   onDismiss,
 }: KernelErrorPanelProps) {
   const [showDetails, setShowDetails] = useState(false);
@@ -1117,12 +1071,6 @@ export function KernelErrorPanel({
     ? Object.entries(errorDetails).filter(([, v]) => v !== null && v !== undefined)
     : [];
   const showStopChain = hasStopChain(errorDetails);
-  const recoveryAction = recoveryActionForError(errorCode, errorDetails);
-  const canAcknowledgeAndContinue =
-    Boolean(onAcknowledgeAndContinue) && recoveryAction === 'stop_intervention';
-  const canAcknowledgeFailedValidation =
-    Boolean(onAcknowledgeFailedValidationForRetry) &&
-    recoveryAction === 'failed_validation';
   return (
     <div className={`mb-2 rounded border px-3 py-2 text-sm text-red-200 ${classes.border}`}>
       <div className="flex items-start justify-between gap-2">
@@ -1148,28 +1096,14 @@ export function KernelErrorPanel({
             <StopChainSummary details={errorDetails} />
           )}
           <IncidentSnapshotSummary snapshot={incidentSnapshot} />
-          {canAcknowledgeAndContinue && (
-            <div className="mt-2 flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={() => void onAcknowledgeAndContinue?.()}
-                className="rounded border border-red-300/50 bg-red-900/40 px-2.5 py-1 text-xs font-semibold text-red-100 hover:bg-red-800/60"
-                title="Clear this classified stop/fault intervention without resetting the backend. The kernel will refuse if fresh backend state is unreadable or still moving."
-              >
-                Acknowledge error
-              </button>
-            </div>
-          )}
-          {canAcknowledgeFailedValidation && (
-            <div className="mt-2 flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={() => void onAcknowledgeFailedValidationForRetry?.()}
-                className="rounded border border-amber-300/50 bg-amber-900/40 px-2.5 py-1 text-xs font-semibold text-amber-100 hover:bg-amber-800/60"
-                title="Clear this failed pre-dispatch validation gate without resetting the backend. Run will re-plan against the current live scene."
-              >
-                Acknowledge and retry
-              </button>
+          {recoveryOffer && onRecoveryAction && (
+            <div className="mt-2 border-t border-red-300/30 pt-2">
+              <RecoveryActionControls
+                offer={recoveryOffer}
+                busy={recoveryActionBusy}
+                onAction={onRecoveryAction}
+                onError={onRecoveryActionError}
+              />
             </div>
           )}
           {detailEntries.length > 0 && (

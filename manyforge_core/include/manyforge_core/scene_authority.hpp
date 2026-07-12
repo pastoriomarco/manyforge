@@ -26,6 +26,7 @@ class SceneAuthority final : public ISceneAuthority {
   SceneCommitResultDTO commit(SceneTransactionDTO transaction) override;
   Result<SceneRevisionDTO> rebuild_projection() override;
   SceneRevisionDTO current_revision() const override;
+  SceneAuthorityStatusDTO authority_status() const override;
   LogicalSceneSnapshotPtr logical_snapshot() const override;
 
   SceneEditResultDTO add_object(const AddObjectRequestDTO& request) override;
@@ -75,6 +76,7 @@ class SceneAuthority final : public ISceneAuthority {
       std::vector<SceneRobotPlacementDTO> robot_placements,
       std::vector<SceneObjectSnapshotDTO> objects,
       std::uint64_t transaction_sequence,
+      std::uint64_t admission_epoch,
       std::optional<std::uint64_t> expected_topology_epoch,
       std::optional<std::uint64_t> expected_policy_epoch,
       ErrorDTO& error);

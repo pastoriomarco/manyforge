@@ -793,13 +793,7 @@ def _build_visual_state_snapshot_for_publisher(state: ComposerState):
         **_execution_authority_metadata(state),
     )
 
-    # Advance simulated/fallback gripper commands here: this publisher loop is
-    # the only ticker outside the BT `command_gripper` node, so without it a
-    # positive-duration operator gripper command (Robot Control Approve) never
-    # progresses past `executing` — the slider stays disabled and further
-    # candidates are blocked as `gripper_busy`. update_gripper_commands is
-    # idempotent wall-clock progression, safe to call alongside the BT node.
-    grippers = _collect_gripper_states(state, advance_commands=True)
+    grippers = _collect_gripper_states(state)
     pose_sources = _pose_sources_payload(state)
 
     try:
@@ -1020,20 +1014,8 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
     )
 
 
-def _advance_gripper_commands(state: ComposerState) -> None:
-    kernel = state.kernel
-    if kernel is None:
-        return
-    try:
-        kernel.update_gripper_commands()
-    except Exception:
-        logger.debug("update_gripper_commands failed", exc_info=True)
-
-
 def _collect_gripper_states(
     state: ComposerState,
-    *,
-    advance_commands: bool = True,
 ) -> list[SceneGripperStateResponse]:
     """One entry per gripper declared in the active deployment. Surfaces
     enough metadata for the Robot panel's gripper widget to render a
@@ -1043,13 +1025,6 @@ def _collect_gripper_states(
     kernel = state.kernel
     if deployment is None or kernel is None:
         return []
-    # Advance any simulated_joint command in flight. The BT
-    # `command_gripper` node ticks this on every BT tick; the operator's
-    # widget is the only client outside the BT cycle, so without this
-    # call the simulated finger position never progresses from its
-    # "executing" snapshot toward the target.
-    if advance_commands:
-        _advance_gripper_commands(state)
     joint_limits: dict[str, tuple[Optional[float], Optional[float]]] = {}
     derived_joints_by_gripper: dict[str, list[str]] = {}
     try:
@@ -1155,6 +1130,9 @@ def _collect_gripper_states(
                 joint_name=config.joint_name,
                 derived_joints=list(derived_joints),
                 state=str(getattr(status.state, "value", status.state)),
+                command_id=int(getattr(status, "command_id", 0) or 0),
+                generation=int(getattr(status, "generation", 0) or 0),
+                revision=int(getattr(status, "revision", 0) or 0),
                 current_position=status.current_position,
                 target_position=status.target_position,
                 commanded_position=getattr(status, "commanded_position", None),
@@ -1171,12 +1149,20 @@ def _collect_gripper_states(
                 transport_kind=str(getattr(status, "transport_kind", "") or ""),
                 evidence=list(getattr(status, "evidence", []) or []),
                 evidence_state=str(getattr(status, "evidence_state", "") or ""),
+                projection_state=str(
+                    getattr(status, "projection_state", "not_required")
+                    or "not_required"
+                ),
+                projection_reason=str(
+                    getattr(status, "projection_reason", "") or ""
+                ),
                 limit_lower=limit_lower,
                 limit_upper=limit_upper,
                 motion_time_s=config.motion_time_s,
                 srdf_presets=dict(config.srdf_presets or {}),
                 visualization=visualization,
                 error=status.error,
+                reason_code=getattr(status, "reason_code", None),
             )
         )
     return out
@@ -1674,11 +1660,15 @@ def create_scene_router(state: ComposerState) -> APIRouter:
                 status_code=status_code, content={"detail": validation.detail}
             )
         result = state.kernel.command_gripper(validation.request)
+        details = dict(getattr(result, "details", {}) or {})
         return SceneGripperCommandApiResponse(
             accepted=bool(result.accepted),
             gripperId=validated.gripper_id,
             targetPosition=validation.request.target_position,
+            commandId=int(details.get("command_id", 0) or 0),
+            generation=int(details.get("generation", 0) or 0),
             error=(None if result.accepted else (result.error or "rejected")),
+            reasonCode=getattr(result, "reason_code", None),
             timestampNs=time.monotonic_ns(),
         ).model_dump(by_alias=True)
 

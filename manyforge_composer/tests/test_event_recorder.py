@@ -2672,6 +2672,151 @@ class TestStopDecisionChains:
             snapshot["stopDecisionCorrelation"] == "same_run_recent_stop_channel"
         )
 
+
+class TestRecoveryEvidenceCorrelation:
+    def test_runtime_fault_incident_offer_and_action_share_exact_context(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        manager = _StubCycleManager(
+            "running",
+            error="Model output could not be committed",
+        )
+        manager.get_error_snapshot = lambda: (
+            manager.error,
+            "model_output_commit_failed",
+            {
+                "reason_code": "model_output_commit_failed",
+                "runtime_fault_id": "fault-opaque-23",
+                "runtime_fault_generation": 23,
+                "runtime_fault_domain": "model",
+            },
+        )
+        rec.observe(_StubState(cycle_manager=manager))
+        rec.record_recovery_offer_published(
+            {
+                "offerId": "offer-runtime-fault-incident",
+                "offerRevision": 1,
+                "executionId": 0,
+                "evidenceRefs": ["runtime_fault:fault-opaque-23"],
+            }
+        )
+        rec.record_recovery_action_event(
+            "accepted",
+            {
+                "request_id": "request-runtime-fault-incident",
+                "offer_id": "offer-runtime-fault-incident",
+                "offer_revision": 1,
+                "execution_id": 0,
+                "evidence_refs": ["runtime_fault:fault-opaque-23"],
+                "action_id": "retry_runtime_step",
+                "principal_id": "operator:test",
+            },
+        )
+
+        events = _memory_events(rec)
+        cycle_error = next(e for e in events if e["type"] == "cycle_error")
+        offer = next(e for e in events if e["type"] == "recovery_offer_published")
+        action = next(e for e in events if e["type"] == "recovery_action_accepted")
+        incident = rec.incident_snapshots()[-1]
+        context_id = incident["recoveryContextId"]
+        assert cycle_error["details"]["error_details"]["runtime_fault_id"] == (
+            "fault-opaque-23"
+        )
+        assert offer["details"]["recovery_context_id"] == context_id
+        assert offer["details"]["incident_id"] == incident["incidentId"]
+        assert action["details"]["recovery_context_id"] == context_id
+        assert action["details"]["incident_id"] == incident["incidentId"]
+
+    def test_cycle_only_offer_and_action_share_runtime_fault_context(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec._start_run("run-cycle-only-recovery")
+        rec.record_recovery_offer_published(
+            {
+                "offerId": "offer-runtime-fault",
+                "offerRevision": 1,
+                "executionId": 0,
+                "evidenceRefs": ["runtime_fault:fault-opaque-17"],
+            }
+        )
+        rec.record_recovery_action_event(
+            "accepted",
+            {
+                "request_id": "request-runtime-fault",
+                "offer_id": "offer-runtime-fault",
+                "offer_revision": 1,
+                "execution_id": 0,
+                "evidence_refs": ["runtime_fault:fault-opaque-17"],
+                "action_id": "retry_runtime_step",
+                "principal_id": "operator:test",
+            },
+        )
+
+        events = _memory_events(rec)
+        offer = next(e for e in events if e["type"] == "recovery_offer_published")
+        action = next(e for e in events if e["type"] == "recovery_action_accepted")
+        context_id = offer["details"]["recovery_context_id"]
+        assert context_id.startswith("recovery-context-")
+        assert action["details"]["recovery_context_id"] == context_id
+
+    def test_offer_chain_action_and_incident_share_stable_ids(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec._start_run("run-recovery-correlation")
+        rec._record_event(
+            event_type="error_raised",
+            execution_id=42,
+            details={"latch_id": "latch-42", "reason_code": "runtime_collision"},
+        )
+        rec.record_recovery_offer_published(
+            {
+                "offerId": "offer-42",
+                "offerRevision": 1,
+                "executionId": 42,
+                "latchId": "latch-42",
+                "stopCertificateId": "stopcert-42",
+            }
+        )
+        rec._record_event(
+            event_type="stop_decision_chain",
+            execution_id=42,
+            details={
+                "kernel_execution_id": "42",
+                "latch_id": "latch-42",
+                "terminal_state": "Stopped",
+                "terminal_kernel_sequence": "91",
+            },
+            system_event=True,
+        )
+        rec.record_recovery_action_event(
+            "accepted",
+            {
+                "request_id": "request-42",
+                "offer_id": "offer-42",
+                "offer_revision": 1,
+                "execution_id": 42,
+                "latch_id": "latch-42",
+                "action_id": "retry_motion_from_current_state",
+                "principal_id": "operator:test",
+            },
+        )
+
+        events = _memory_events(rec)
+        offer = next(e for e in events if e["type"] == "recovery_offer_published")
+        chain = next(e for e in events if e["type"] == "stop_decision_chain")
+        action = next(e for e in events if e["type"] == "recovery_action_accepted")
+        snapshot = rec.incident_snapshots()[-1]
+
+        context_id = chain["details"]["recovery_context_id"]
+        decision_id = chain["details"]["stop_decision_id"]
+        incident_id = snapshot["incidentId"]
+        assert offer["details"]["recovery_context_id"] == context_id
+        assert offer["details"]["incident_id"] == incident_id
+        assert chain["details"]["incident_id"] == incident_id
+        assert action["details"]["recovery_context_id"] == context_id
+        assert action["details"]["stop_decision_id"] == decision_id
+        assert action["details"]["incident_id"] == incident_id
+        assert snapshot["recoveryContextId"] == context_id
+        assert snapshot["stopDecisionId"] == decision_id
+        assert snapshot["stopDecision"]["stop_decision_id"] == decision_id
+
 class TestLatencyHistograms:
     """OW6: per-run latency histograms derived on the recorder thread from
     event timestamps the pipeline already carries."""

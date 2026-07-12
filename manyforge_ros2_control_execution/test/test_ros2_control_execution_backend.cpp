@@ -1,5 +1,6 @@
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_core/time/manual_scheduler.hpp>
 #define MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 #undef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
@@ -14,10 +15,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -30,6 +33,17 @@ using namespace std::chrono_literals;
 using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
 using ServerGoalHandleFJT =
     rclcpp_action::ServerGoalHandle<FollowJointTrajectory>;
+
+class RejectingScheduler final : public core::IScheduler {
+ public:
+  core::ScheduleHandle schedule(
+      core::TimePoint, std::function<void()>,
+      core::SchedulerPriority) override {
+    throw std::runtime_error("injected schedule failure");
+  }
+
+  void cancel(core::ScheduleHandle) override {}
+};
 
 std::string unique_suffix() {
   static std::atomic<int> counter{0};
@@ -65,6 +79,41 @@ core::TrajectoryDTO make_single_joint_trajectory(double start, double finish) {
   last.velocities_rad_s = {0.0};
   trajectory.waypoints.push_back(std::move(last));
   return trajectory;
+}
+
+core::GripperCommandRequestDTO make_gripper_request(
+    double target_position,
+    double duration_s,
+    double max_effort,
+    std::string transport_kind,
+    std::string completion_policy) {
+  core::GripperCommandRequestDTO request;
+  request.gripper_id = "tool";
+  request.group_id = "gripper";
+  request.joint_name = "finger_joint";
+  request.target_position = target_position;
+  request.duration_s = duration_s;
+  request.max_effort = max_effort;
+  request.transport_kind = std::move(transport_kind);
+  request.completion_policy = std::move(completion_policy);
+  request.state_authority = "sim_observed";
+  return request;
+}
+
+Ros2GripperActionConfig isaac_gripper_config(std::string command_topic) {
+  Ros2GripperActionConfig config;
+  config.transport_kind = "isaac_joint_state_effort";
+  config.command_topic = std::move(command_topic);
+  config.command_joint_names = {"finger_joint"};
+  config.group_id = "gripper";
+  config.joint_name = "finger_joint";
+  config.completion_policy = "dwell_elapsed";
+  config.open_position = 0.7;
+  config.closed_position = 0.0;
+  config.open_effort = 5.0;
+  config.close_effort = -5.0;
+  config.publish_nominal_position = true;
+  return config;
 }
 
 struct SingleJointRead {
@@ -105,7 +154,12 @@ class RecordingExecutionStateSink final : public core::IExecutionStateSink {
   std::optional<double> group_joint_position(
       const std::string& group_id,
       const std::string& joint_name) const override {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (block_read_) {
+      read_entered_ = true;
+      read_cv_.notify_all();
+      read_cv_.wait_for(lock, 2s, [this]() { return release_read_; });
+    }
     reads_.push_back({group_id, joint_name});
     const auto key = std::make_pair(group_id, joint_name);
     const auto it = joint_positions_.find(key);
@@ -120,8 +174,19 @@ class RecordingExecutionStateSink final : public core::IExecutionStateSink {
       const std::string& joint_name,
       double position_rad,
       core::ExecutionStateUpdateMode mode) override {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     single_updates_.push_back({group_id, joint_name, position_rad, mode});
+    if (block_single_update_) {
+      single_update_entered_ = true;
+      single_update_cv_.notify_all();
+      single_update_cv_.wait_for(lock, 2s, [this]() {
+        return release_single_update_;
+      });
+    }
+    if (fail_single_updates_remaining_ > 0) {
+      --fail_single_updates_remaining_;
+      return {fail_single_update_status_};
+    }
     if (single_update_status_ != core::ExecutionStateSinkStatus::kApplied) {
       return {single_update_status_};
     }
@@ -161,6 +226,58 @@ class RecordingExecutionStateSink final : public core::IExecutionStateSink {
     fail_group_update_status_ = status;
   }
 
+  void fail_next_single_updates(
+      std::size_t count,
+      core::ExecutionStateSinkStatus status =
+          core::ExecutionStateSinkStatus::kBusy) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fail_single_updates_remaining_ = count;
+    fail_single_update_status_ = status;
+  }
+
+  void block_single_update() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    block_single_update_ = true;
+    single_update_entered_ = false;
+    release_single_update_ = false;
+  }
+
+  void block_read() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    block_read_ = true;
+    read_entered_ = false;
+    release_read_ = false;
+  }
+
+  bool wait_for_read() const {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return read_cv_.wait_for(lock, 2s, [this]() { return read_entered_; });
+  }
+
+  void release_read() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      release_read_ = true;
+      block_read_ = false;
+    }
+    read_cv_.notify_all();
+  }
+
+  bool wait_for_single_update() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return single_update_cv_.wait_for(
+        lock, 2s, [this]() { return single_update_entered_; });
+  }
+
+  void release_single_update() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      release_single_update_ = true;
+      block_single_update_ = false;
+    }
+    single_update_cv_.notify_all();
+  }
+
  private:
   mutable std::mutex mutex_;
   std::map<std::pair<std::string, std::string>, double> joint_positions_;
@@ -174,6 +291,17 @@ class RecordingExecutionStateSink final : public core::IExecutionStateSink {
       core::ExecutionStateSinkStatus::kApplied;
   core::ExecutionStateSinkStatus single_update_status_ =
       core::ExecutionStateSinkStatus::kApplied;
+  std::size_t fail_single_updates_remaining_ = 0;
+  core::ExecutionStateSinkStatus fail_single_update_status_ =
+      core::ExecutionStateSinkStatus::kBusy;
+  std::condition_variable single_update_cv_;
+  bool block_single_update_ = false;
+  bool single_update_entered_ = false;
+  bool release_single_update_ = false;
+  mutable std::condition_variable read_cv_;
+  mutable bool block_read_ = false;
+  mutable bool read_entered_ = false;
+  mutable bool release_read_ = false;
 };
 
 class JointStatePublisher {
@@ -249,12 +377,6 @@ class FakeFjtServer {
           return rclcpp_action::CancelResponse::ACCEPT;
         },
         [this](const std::shared_ptr<ServerGoalHandleFJT> goal_handle) {
-          auto feedback = std::make_shared<FollowJointTrajectory::Feedback>();
-          feedback->joint_names = {"joint_1"};
-          feedback->desired.positions = {0.0};
-          feedback->actual.positions = {0.0};
-          feedback->error.positions = {0.0};
-          goal_handle->publish_feedback(feedback);
           {
             std::lock_guard<std::mutex> lock(mutex_);
             goal_handle_ = goal_handle;
@@ -341,8 +463,10 @@ class FakeFjtServer {
 
 TEST(Ros2ControlExecutionBackendTest, RejectsNullExecutionStateSink) {
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   EXPECT_THROW(
-      Ros2ControlExecutionBackend(nullptr, "arm", clock, base_config()),
+      Ros2ControlExecutionBackend(
+          nullptr, "arm", clock, scheduler, base_config()),
       std::invalid_argument);
 }
 
@@ -350,6 +474,7 @@ TEST(Ros2ControlExecutionBackendTest,
      RejectsExecutorThreadCountBelowCallbackGroupMinimum) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   auto config = base_config();
   config.executor_thread_count = 2;
 
@@ -359,6 +484,7 @@ TEST(Ros2ControlExecutionBackendTest,
           sink,
           "arm",
           clock,
+          scheduler,
           config),
       std::invalid_argument);
 }
@@ -367,7 +493,9 @@ TEST(Ros2ControlExecutionBackendTest,
      GripperProjectionReadsStartPositionFromExecutionStateSink) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
-  Ros2ControlExecutionBackend backend(sink, "arm", clock, base_config());
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
 
   Ros2GripperActionConfig gripper;
   gripper.action_name = "/manyforge_missing_gripper_" + unique_suffix();
@@ -376,10 +504,13 @@ TEST(Ros2ControlExecutionBackendTest,
   gripper.wait_for_action_server_timeout_s = 0.0;
   backend.configure_gripper_action("tool", gripper);
 
-  const auto result = backend.command_gripper("tool", 0.7, 0.0, 1.0);
+  const auto result = backend.command_gripper(make_gripper_request(
+      0.7, 0.0, 1.0, "ros_gripper_command", "position_reached"));
 
   EXPECT_FALSE(result.accepted);
-  EXPECT_EQ(result.reason_code, ros2_control_fault_reason::kGripperNotConfigured);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code,
+            ros2_control_fault_reason::kGripperNotConfigured);
   const auto reads = sink->reads();
   ASSERT_EQ(reads.size(), 1u);
   EXPECT_EQ(reads.front().group_id, "gripper");
@@ -388,11 +519,39 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     GripperRejectsNonFiniteStartPositionBeforeDispatch) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint",
+                           std::numeric_limits<double>::quiet_NaN());
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
+
+  auto gripper = isaac_gripper_config(
+      "/manyforge_non_finite_start_gripper_" + unique_suffix());
+  backend.configure_gripper_action("tool", gripper);
+
+  const auto result = backend.command_gripper(make_gripper_request(
+      0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+
+  ASSERT_FALSE(result.accepted);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code,
+            ros2_control_fault_reason::kGripperStateNotFinite);
+  EXPECT_TRUE(sink->single_updates().empty());
+  EXPECT_EQ(backend.get_gripper_status("tool").state,
+            core::GripperCommandState::kIdle);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      GripperGraspLossInvalidatesBackendOwnedStatus) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   core::FakeClock clock;
-  Ros2ControlExecutionBackend backend(sink, "arm", clock, base_config());
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
 
   Ros2GripperActionConfig gripper;
   gripper.transport_kind = "isaac_joint_state_effort";
@@ -408,31 +567,381 @@ TEST(Ros2ControlExecutionBackendTest,
   gripper.publish_nominal_position = true;
   backend.configure_gripper_action("tool", gripper);
 
-  const auto command = backend.command_gripper("tool", 0.0, 0.2, 0.0);
-  ASSERT_TRUE(command.accepted) << command.error;
+  const auto command = backend.command_gripper(make_gripper_request(
+      0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  ASSERT_TRUE(command.accepted)
+      << (command.error ? command.error->message : "");
 
   const auto lost = backend.mark_gripper_grasp_lost(
-      "tool", "attached_drift_monitor",
+      "tool", command.command_id, command.generation,
+      "attached_drift_monitor",
       "Attached object drift exceeded measured TCP/object threshold",
       "grasp_confirmation_lost");
-  ASSERT_TRUE(lost.accepted) << lost.error;
+  ASSERT_TRUE(lost.accepted) << (lost.error ? lost.error->message : "");
 
   const auto failed = backend.get_gripper_status("tool");
-  EXPECT_EQ(failed.state, "failed");
-  EXPECT_EQ(failed.reason_code, "grasp_confirmation_lost");
+  EXPECT_EQ(failed.state, core::GripperCommandState::kFailed);
+  ASSERT_TRUE(failed.error.has_value());
+  EXPECT_EQ(failed.error->code, "grasp_confirmation_lost");
   EXPECT_EQ(failed.evidence_state, "pressure_or_part_lost");
   ASSERT_EQ(failed.evidence.size(), 1u);
   EXPECT_EQ(failed.evidence.front(), "attached_drift_monitor");
-  EXPECT_NE(failed.error.find("Attached object drift exceeded"),
+  EXPECT_NE(failed.error->message.find("Attached object drift exceeded"),
             std::string::npos);
 
-  const auto next = backend.command_gripper("tool", 0.7, 0.0, 0.0);
-  ASSERT_TRUE(next.accepted) << next.error;
+  const auto next = backend.command_gripper(make_gripper_request(
+      0.7, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  ASSERT_TRUE(next.accepted) << (next.error ? next.error->message : "");
+  scheduler.advance_to(clock.now());
   const auto reset = backend.get_gripper_status("tool");
-  EXPECT_EQ(reset.state, "executing");
+  EXPECT_EQ(reset.state, core::GripperCommandState::kCompleted);
   EXPECT_TRUE(reset.evidence.empty());
   EXPECT_TRUE(reset.evidence_state.empty());
-  EXPECT_TRUE(reset.reason_code.empty());
+  EXPECT_FALSE(reset.error.has_value());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     StaleGripperGraspLossCannotFailReplacementGeneration) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_stale_grasp_loss_" + unique_suffix()));
+
+  const auto old_command = backend.command_gripper(make_gripper_request(
+      0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  ASSERT_TRUE(old_command.accepted);
+  backend.invalidate_gripper_commands(core::GripperInvalidationReason::kReset);
+  backend.authorize_gripper_commands();
+  const auto replacement = backend.command_gripper(make_gripper_request(
+      0.7, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  ASSERT_TRUE(replacement.accepted);
+
+  const auto stale = backend.mark_gripper_grasp_lost(
+      "tool", old_command.command_id, old_command.generation,
+      "attached_drift_monitor", "Delayed object drift",
+      "grasp_confirmation_lost");
+  ASSERT_FALSE(stale.accepted);
+  ASSERT_TRUE(stale.error.has_value());
+  EXPECT_EQ(stale.error->code, "stale_gripper_state");
+
+  const auto status = backend.get_gripper_status("tool");
+  EXPECT_EQ(status.command_id, replacement.command_id);
+  EXPECT_EQ(status.generation, replacement.generation);
+  EXPECT_EQ(status.state, core::GripperCommandState::kExecuting);
+  EXPECT_FALSE(status.error.has_value());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     IsaacGripperSchedulerFailureRemainsAdmittedAndPublishesFailure) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  RejectingScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_schedule_failure_" + unique_suffix()));
+
+  const auto result = backend.command_gripper(make_gripper_request(
+      0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  ASSERT_TRUE(result.accepted)
+      << "the physical command crossed the transport boundary";
+
+  const auto status = backend.get_gripper_status("tool");
+  EXPECT_EQ(status.command_id, result.command_id);
+  EXPECT_EQ(status.generation, result.generation);
+  EXPECT_EQ(status.state, core::GripperCommandState::kFailed);
+  ASSERT_TRUE(status.error.has_value());
+  EXPECT_EQ(status.error->code,
+            ros2_control_fault_reason::kGripperRequestFailed);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     IsaacGripperLifecycleProgressesWithoutReadsAndHonorsDwell) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_autonomous_gripper_" + unique_suffix()));
+
+  const auto command = backend.command_gripper(make_gripper_request(
+      0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  ASSERT_TRUE(command.accepted)
+      << (command.error ? command.error->message : "");
+  EXPECT_EQ(scheduler.last_priority(),
+            core::SchedulerPriority::ControllerCommand);
+
+  const auto admitted = backend.get_gripper_status("tool");
+  const auto repeated = backend.get_gripper_status("tool");
+  EXPECT_EQ(admitted.revision, repeated.revision);
+  EXPECT_EQ(admitted.state, core::GripperCommandState::kExecuting);
+
+  clock.advance(199'000'000);
+  scheduler.advance_to(clock.now());
+  EXPECT_EQ(backend.get_gripper_status("tool").state,
+            core::GripperCommandState::kExecuting);
+
+  clock.advance(1'000'000);
+  scheduler.advance_to(clock.now());
+  const auto completed = backend.get_gripper_status("tool");
+  EXPECT_EQ(completed.state, core::GripperCommandState::kCompleted);
+  EXPECT_DOUBLE_EQ(completed.progress, 1.0);
+  ASSERT_FALSE(sink->single_updates().empty());
+  EXPECT_DOUBLE_EQ(sink->single_updates().back().position_rad, 0.0);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     GripperResetFencesQueuedLifecycleBeforeProjection) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_reset_fenced_gripper_" + unique_suffix()));
+
+  const auto command = backend.command_gripper(make_gripper_request(
+      0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  ASSERT_TRUE(command.accepted);
+  backend.invalidate_gripper_commands(
+      core::GripperInvalidationReason::kReset);
+
+  clock.advance(1'000'000'000);
+  scheduler.advance_to(clock.now());
+  const auto status = backend.get_gripper_status("tool");
+  EXPECT_EQ(status.state, core::GripperCommandState::kIdle);
+  EXPECT_NE(status.generation, command.generation);
+  EXPECT_TRUE(sink->single_updates().empty());
+
+  const auto blocked = backend.command_gripper(make_gripper_request(
+      0.7, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  ASSERT_FALSE(blocked.accepted);
+  ASSERT_TRUE(blocked.error.has_value());
+  EXPECT_EQ(blocked.error->code, "gripper_command_not_authorized");
+  backend.authorize_gripper_commands();
+  EXPECT_TRUE(backend.command_gripper(make_gripper_request(
+      0.7, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"))
+                  .accepted);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     GripperTerminalProjectionRetryIsBoundedAndGenerationOwned) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  sink->fail_next_single_updates(2);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_projection_retry_gripper_" + unique_suffix()));
+
+  const auto command = backend.command_gripper(make_gripper_request(
+      0.0, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  ASSERT_TRUE(command.accepted);
+  scheduler.advance_to(clock.now());
+  auto status = backend.get_gripper_status("tool");
+  EXPECT_EQ(status.state, core::GripperCommandState::kExecuting);
+  EXPECT_EQ(status.projection_state,
+            core::GripperProjectionState::kPending);
+  const auto while_pending = backend.command_gripper(make_gripper_request(
+      0.7, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  EXPECT_FALSE(while_pending.accepted);
+  ASSERT_TRUE(while_pending.error.has_value());
+  EXPECT_EQ(while_pending.error->code,
+            ros2_control_fault_reason::kGripperBusy);
+
+  clock.advance(20'000'000);
+  scheduler.advance_to(clock.now());
+  status = backend.get_gripper_status("tool");
+  EXPECT_EQ(status.state, core::GripperCommandState::kExecuting);
+  EXPECT_EQ(status.projection_state,
+            core::GripperProjectionState::kPending);
+
+  clock.advance(20'000'000);
+  scheduler.advance_to(clock.now());
+  status = backend.get_gripper_status("tool");
+  EXPECT_EQ(status.state, core::GripperCommandState::kCompleted);
+  EXPECT_EQ(status.projection_state,
+            core::GripperProjectionState::kApplied);
+  ASSERT_EQ(sink->single_updates().size(), 3u);
+  EXPECT_DOUBLE_EQ(sink->single_updates().back().position_rad, 0.0);
+  const auto after_projection = backend.command_gripper(make_gripper_request(
+      0.7, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  EXPECT_TRUE(after_projection.accepted);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     GripperInvalidationLinearizesAgainstDequeuedProjection) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  sink->block_single_update();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_projection_race_gripper_" + unique_suffix()));
+
+  const auto command = backend.command_gripper(make_gripper_request(
+      0.0, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  ASSERT_TRUE(command.accepted);
+  auto callback = std::async(std::launch::async, [&]() {
+    scheduler.advance_to(clock.now());
+  });
+  ASSERT_TRUE(sink->wait_for_single_update());
+
+  auto invalidate = std::async(std::launch::async, [&]() {
+    backend.invalidate_gripper_commands(
+        core::GripperInvalidationReason::kReset);
+  });
+  EXPECT_EQ(invalidate.wait_for(20ms), std::future_status::timeout)
+      << "invalidation must serialize with an already admitted sink effect";
+
+  sink->release_single_update();
+  callback.get();
+  invalidate.get();
+  const auto updates_after_invalidation = sink->single_updates().size();
+  clock.advance(1'000'000'000);
+  scheduler.advance_to(clock.now());
+  EXPECT_EQ(sink->single_updates().size(), updates_after_invalidation);
+  EXPECT_EQ(backend.get_gripper_status("tool").state,
+            core::GripperCommandState::kIdle);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     GripperConfigurationReplacementFencesOldScheduledGeneration) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_replaced_gripper_a_" + unique_suffix()));
+  const auto command = backend.command_gripper(make_gripper_request(
+      0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  ASSERT_TRUE(command.accepted);
+
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_replaced_gripper_b_" + unique_suffix()));
+  clock.advance(1'000'000'000);
+  scheduler.advance_to(clock.now());
+
+  const auto replacement = backend.get_gripper_status("tool");
+  EXPECT_EQ(replacement.state, core::GripperCommandState::kIdle);
+  EXPECT_NE(replacement.generation, command.generation);
+  EXPECT_TRUE(sink->single_updates().empty());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     GripperConfigurationReplacementRejectsInFlightPreflight) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  sink->block_read();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_preflight_gripper_a_" + unique_suffix()));
+
+  auto in_flight = std::async(std::launch::async, [&]() {
+    return backend.command_gripper(make_gripper_request(
+        0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  });
+  ASSERT_TRUE(sink->wait_for_read());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_preflight_gripper_b_" + unique_suffix()));
+  sink->release_read();
+
+  const auto stale = in_flight.get();
+  ASSERT_FALSE(stale.accepted);
+  ASSERT_TRUE(stale.error.has_value());
+  EXPECT_EQ(stale.error->code, "gripper_command_not_authorized");
+  const auto replacement = backend.get_gripper_status("tool");
+  EXPECT_EQ(replacement.state, core::GripperCommandState::kIdle);
+  EXPECT_EQ(replacement.command_id, 0u);
+
+  const auto fresh = backend.command_gripper(make_gripper_request(
+      0.0, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  EXPECT_TRUE(fresh.accepted)
+      << (fresh.error ? fresh.error->message : "");
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     LifecycleInvalidationDoesNotWaitForBlockedGripperPreflight) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  sink->block_read();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_preflight_invalidation_" + unique_suffix()));
+
+  auto in_flight = std::async(std::launch::async, [&]() {
+    return backend.command_gripper(make_gripper_request(
+        0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  });
+  ASSERT_TRUE(sink->wait_for_read());
+  const auto started = std::chrono::steady_clock::now();
+  backend.invalidate_gripper_commands(core::GripperInvalidationReason::kReset);
+  EXPECT_LT(std::chrono::steady_clock::now() - started, 50ms);
+  sink->release_read();
+
+  const auto stale = in_flight.get();
+  ASSERT_FALSE(stale.accepted);
+  ASSERT_TRUE(stale.error.has_value());
+  EXPECT_EQ(stale.error->code, "gripper_command_not_authorized");
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     UnrelatedGripperConfigurationDoesNotRejectInFlightPreflight) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  sink->block_read();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_independent_gripper_a_" + unique_suffix()));
+
+  auto in_flight = std::async(std::launch::async, [&]() {
+    return backend.command_gripper(make_gripper_request(
+        0.0, 0.2, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  });
+  ASSERT_TRUE(sink->wait_for_read());
+  backend.configure_gripper_action(
+      "auxiliary", isaac_gripper_config(
+                       "/manyforge_independent_gripper_b_" + unique_suffix()));
+  sink->release_read();
+
+  const auto admitted = in_flight.get();
+  EXPECT_TRUE(admitted.accepted)
+      << (admitted.error ? admitted.error->message : "");
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -441,12 +950,13 @@ TEST(Ros2ControlExecutionBackendTest,
 
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   auto config = base_config();
   config.required_joints = {"joint_1", "joint_2"};
   config.joint_state_topic = topic;
   config.wait_for_state_timeout_s = 1.0;
   config.joint_state_max_age_s = 5.0;
-  Ros2ControlExecutionBackend backend(sink, "arm", clock, config);
+  Ros2ControlExecutionBackend backend(sink, "arm", clock, scheduler, config);
   JointStatePublisher publisher(topic);
 
   ASSERT_TRUE(publisher.wait_for_subscription());
@@ -485,6 +995,7 @@ TEST(Ros2ControlExecutionBackendTest,
   JointStatePublisher publisher(joint_state_topic);
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   auto config = base_config();
   config.action_name = action_name;
   config.joint_state_topic = joint_state_topic;
@@ -494,7 +1005,7 @@ TEST(Ros2ControlExecutionBackendTest,
   config.tracking_error_tolerance_rad = 10.0;
   config.tracking_error_timeout_s = 10.0;
   config.executor_thread_count = 3;
-  Ros2ControlExecutionBackend backend(sink, "arm", clock, config);
+  Ros2ControlExecutionBackend backend(sink, "arm", clock, scheduler, config);
   EXPECT_TRUE(backend.testing_action_progress_has_dedicated_callback_group());
 
   ASSERT_TRUE(publisher.wait_for_subscription());
@@ -514,6 +1025,21 @@ TEST(Ros2ControlExecutionBackendTest,
   auto handle =
       backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
   ASSERT_TRUE(server.wait_for_goal());
+
+  ASSERT_TRUE(server.publish_feedback(0.0));
+  bool feedback_observed = false;
+  const auto feedback_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < feedback_deadline) {
+    const auto metrics = backend.controller_progress_metrics();
+    if (metrics.action_feedback_callbacks_total > 0 &&
+        metrics.command_progress_samples_total > 0) {
+      feedback_observed = true;
+      break;
+    }
+    std::this_thread::sleep_for(5ms);
+  }
+  ASSERT_TRUE(feedback_observed)
+      << "backend did not consume an explicitly published action feedback";
 
   ASSERT_TRUE(server.succeed_current_goal());
   bool observed_terminal_flag = false;
@@ -560,9 +1086,7 @@ TEST(Ros2ControlExecutionBackendTest,
   EXPECT_GT(metrics.state_callbacks_total, 0u);
   EXPECT_GT(metrics.action_feedback_callbacks_total, 0u);
   EXPECT_GT(metrics.action_result_callbacks_total, 0u);
-  // The fake server publishes its first feedback immediately when accepting the
-  // goal. This must count as command progress even if it races the caller
-  // thread returning from async_send_goal().
+  // Explicit feedback must count as command progress before terminal delivery.
   EXPECT_GT(metrics.command_progress_samples_total, 0u);
   EXPECT_GT(metrics.last_action_result_latency_ns, 0u);
 }
@@ -571,12 +1095,14 @@ TEST(Ros2ControlExecutionBackendTest,
      ControlledStopCommandReferenceValidatesOnceAndPublishesSamples) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   auto config = base_config();
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
       sink,
       "arm",
       clock,
+      scheduler,
       config);
 
   const auto started_at = std::chrono::steady_clock::now();
@@ -609,6 +1135,7 @@ TEST(Ros2ControlExecutionBackendTest,
      IdleSceneSyncRateLimitsAndSkipsWhileRunning) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   auto config = base_config();
   config.joint_state_max_age_s = 10.0;
   Ros2ControlExecutionBackend backend(
@@ -616,6 +1143,7 @@ TEST(Ros2ControlExecutionBackendTest,
       sink,
       "arm",
       clock,
+      scheduler,
       config);
 
   const auto t0 = std::chrono::steady_clock::now();
@@ -658,11 +1186,13 @@ TEST(Ros2ControlExecutionBackendTest,
      ActionFeedbackSampleStorageReusesVectorCapacity) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
       sink,
       "arm",
       clock,
+      scheduler,
       base_config());
 
   std::vector<std::string> names;
@@ -689,12 +1219,14 @@ TEST(Ros2ControlExecutionBackendTest,
      TerminalSceneProjectionMissIsMetricedAndRetriedAfterSnapshot) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   clock.set(1'000'000);
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
       sink,
       "arm",
       clock,
+      scheduler,
       base_config());
 
   const auto t0 = std::chrono::steady_clock::now();
@@ -738,11 +1270,13 @@ TEST(Ros2ControlExecutionBackendTest,
      ManagedFjtTerminalResultRequiresCurrentGenerationAndGoalId) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
       sink,
       "arm",
       clock,
+      scheduler,
       base_config());
 
   rclcpp_action::GoalUUID old_goal{};
@@ -787,11 +1321,13 @@ TEST(Ros2ControlExecutionBackendTest,
      ManagedTerminalWaitWakesOnStopTokenWithoutNotify) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
       sink,
       "arm",
       clock,
+      scheduler,
       base_config());
 
   std::stop_source stop_source;
@@ -813,11 +1349,12 @@ TEST(Ros2ControlExecutionBackendTest,
      ObservedStatePublicationFallsBackWhenActionFeedbackStops) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   auto config = base_config();
   config.joint_state_max_age_s = 0.1;
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
-      clock, config);
+      clock, scheduler, config);
 
   const auto base = std::chrono::steady_clock::time_point{1s};
   backend.testing_store_action_feedback_sample(
@@ -855,12 +1392,13 @@ TEST(Ros2ControlExecutionBackendTest,
      ObservedStateSourcePrecedenceIsDeploymentDeclared) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   auto config = base_config();
   config.observed_state_source_precedence = {"joint_state",
                                              "action_feedback"};
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
-      clock, config);
+      clock, scheduler, config);
   const auto now = std::chrono::steady_clock::time_point{1s};
   backend.testing_store_action_feedback_sample(
       {"joint_1"}, {0.25}, {0.0}, now);
@@ -880,11 +1418,12 @@ TEST(Ros2ControlExecutionBackendTest,
      AuthoredPreviewPublishesCommandedNotMeasuredAuthority) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
+  core::ManualScheduler scheduler;
   auto config = base_config();
   config.execution_state_source_mode = "authored_preview";
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
-      clock, config);
+      clock, scheduler, config);
   const auto now = std::chrono::steady_clock::time_point{1s};
   backend.testing_store_action_feedback_sample(
       {"joint_1"}, {0.25}, {0.0}, now);

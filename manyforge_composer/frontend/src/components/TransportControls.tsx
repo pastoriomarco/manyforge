@@ -12,51 +12,10 @@ import {
   shouldClearStopInProgress,
   shouldFreezeVelocitySlider,
 } from '../store/stopProfile';
-
-function stringDetail(details: Record<string, unknown> | null | undefined, key: string): string | null {
-  if (!details) {
-    return null;
-  }
-  const value = details[key];
-  return typeof value === 'string' && value.trim() ? value : null;
-}
-
-function requiresExplicitInterventionRecovery(
-  state: string,
-  details: Record<string, unknown> | null | undefined,
-): boolean {
-  if (!details) {
-    return false;
-  }
-  const kernelState = stringDetail(details, 'kernel_state');
-  const interventionLatched = kernelState === 'intervention_required';
-  if (state !== 'stopped' && !interventionLatched) {
-    return false;
-  }
-  const reason = stringDetail(details, 'reason') || stringDetail(details, 'reason_code');
-  const motionSoftStopReason = stringDetail(details, 'motion_soft_stop_reason');
-  if (
-    interventionLatched ||
-    motionSoftStopReason === 'motion_soft_fail_requires_intervention' ||
-    reason === 'stop_not_settled_measured_velocity' ||
-    reason === 'operator_stop_total_failure' ||
-    reason === 'in_stop_completion_timeout' ||
-    reason === 'stop_path_collision' ||
-    reason === 'hard_deceleration_not_settled' ||
-    reason === 'controller_cancel_timeout'
-  ) {
-    return true;
-  }
-  const phase = stringDetail(details, 'phase');
-  return (
-    (phase === 'operator_stop' ||
-      phase === 'motion_trip_stop' ||
-      phase === 'motion_trip_stop_path_collision') &&
-    (stringDetail(details, 'requested_stop_mode') !== null ||
-      stringDetail(details, 'executed_stop_mode') !== null ||
-      stringDetail(details, 'hard_stop_transitioned') !== null)
-  );
-}
+import {
+  RecoveryActionControls,
+  recoveryActionLabel,
+} from './RecoveryActionControls';
 
 /**
  * TransportControls — Run / Stop / Reset + velocity-scale slider.
@@ -77,8 +36,8 @@ export function TransportControls() {
     stop,
     fullStop,
     reset,
-    acknowledgeInterventionForRetry,
-    resetAndRun,
+    recoveryOffer,
+    applyRecoveryAction,
     setVelocityScale,
   } = useCycleStore();
   const runAuthority = useRobotCommandAuthority({
@@ -91,7 +50,6 @@ export function TransportControls() {
   const [cycleBusy, setCycleBusy] = useState(false);
   const [stopInProgress, setStopInProgress] = useState(false);
   const [showFullStopMenu, setShowFullStopMenu] = useState(false);
-  const [showRecoveryChoice, setShowRecoveryChoice] = useState(false);
   const [velocityDraft, setVelocityDraft] = useState(velocityScale);
   const pendingVelocityScaleRef = useRef<number | null>(null);
   const velocityScaleInFlightRef = useRef(false);
@@ -100,7 +58,12 @@ export function TransportControls() {
 
   const stopGate = evaluateStopRunGate(runtime);
   const stopExecutionWarning = buildStopExecutionWarning(errorDetails);
-  const needsRecoveryChoice = requiresExplicitInterventionRecovery(state, errorDetails);
+  const primaryRecoveryAction = recoveryOffer?.actions.find(
+    (action) => action.actionId === recoveryOffer.primaryAction,
+  );
+  const primaryRecoveryReady = Boolean(
+    recoveryOffer?.status === 'retry_ready' && primaryRecoveryAction?.enabled,
+  );
   // The velocity slider is frozen only while a stop is in flight; after the
   // robot reaches STOPPED the operator may choose the resume scale.
   const frozen = shouldFreezeVelocitySlider(state, stopInProgress, motionStopState);
@@ -119,11 +82,14 @@ export function TransportControls() {
       motionHeld &&
       runAuthority.reason === ROBOT_COMMAND_AUTHORITY_REASONS.cycleOwnsRobot
     );
-  const canRun =
+  const canRunWithoutRecovery =
     (state === 'idle' || state === 'stopped' || motionHeld) &&
     !stopping &&
     runAuthorityAllowsResume &&
     !stopGate.blocked;
+  const canRun = canRunWithoutRecovery && (
+    recoveryOffer === null || primaryRecoveryReady
+  );
   // Stop applies to in-flight motion the operator can see — BT
   // execution (state==='running') or an intervention / direct-jog
   // session (direct_control).
@@ -134,15 +100,15 @@ export function TransportControls() {
   const canFullStop = !cycleBusy && state === 'running';
 
   const runCycleCommand = useCallback(
-    (command: () => Promise<void>) => {
-      void (async () => {
-        setCycleBusy(true);
-        try {
-          await command();
-        } finally {
-          setCycleBusy(false);
-        }
-      })();
+    async (command: () => Promise<unknown>) => {
+      setCycleBusy(true);
+      try {
+        await command();
+      } catch {
+        // The cycle store preserves the authoritative error/offer payload.
+      } finally {
+        setCycleBusy(false);
+      }
     },
     [],
   );
@@ -267,70 +233,37 @@ export function TransportControls() {
           {stopExecutionWarning}
         </div>
       )}
-      {showRecoveryChoice && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-label="Intervention recovery choice"
-          className="pointer-events-auto w-[min(520px,calc(100vw-24px))] rounded-lg border border-amber-500/70 bg-gray-950/95 p-3 text-sm text-amber-100 shadow-2xl shadow-black/60"
-        >
-          <div className="font-semibold text-amber-100">Recovery choice required</div>
-          <div className="mt-1 text-xs leading-5 text-amber-100/85">
-            The last stop/fault entered operator intervention. Continue keeps
-            the current backend pose and lets the next Run replan from there;
-            reset clears the cycle and may command the backend to its reset
-            state.
-          </div>
-          <div className="mt-3 flex flex-wrap gap-2">
-            <button
-              type="button"
-              className="rounded border border-emerald-500/60 bg-emerald-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-600"
-              onClick={() => {
-                setShowRecoveryChoice(false);
-                runCycleCommand(async () => {
-                  await acknowledgeInterventionForRetry();
-                  await run();
-                });
-              }}
-            >
-              Acknowledge and continue
-            </button>
-            <button
-              type="button"
-              className="rounded border border-amber-500/70 bg-amber-800 px-3 py-1.5 text-xs font-semibold text-amber-50 hover:bg-amber-700"
-              onClick={() => {
-                setShowRecoveryChoice(false);
-                runCycleCommand(resetAndRun);
-              }}
-            >
-              Reset cycle and run
-            </button>
-            <button
-              type="button"
-              className="rounded border border-gray-600 bg-gray-800 px-3 py-1.5 text-xs font-semibold text-gray-200 hover:bg-gray-700"
-              onClick={() => setShowRecoveryChoice(false)}
-            >
-              Cancel
-            </button>
-          </div>
+      {recoveryOffer && (
+        <div className="pointer-events-auto w-[min(560px,calc(100vw-24px))] rounded border border-amber-500/70 bg-gray-950/95 px-3 py-2 shadow-xl shadow-black/50">
+          <RecoveryActionControls
+            offer={recoveryOffer}
+            busy={cycleBusy}
+            onAction={(offer, actionId) =>
+              runCycleCommand(() => applyRecoveryAction(offer, actionId))
+            }
+          />
         </div>
       )}
       <div className="pointer-events-auto flex items-center gap-2 rounded-lg border border-gray-600/80 bg-gray-900/90 px-3 py-2 shadow-xl shadow-black/50 backdrop-blur-sm">
         <button
           type="button"
           onClick={() => {
-            if (needsRecoveryChoice) {
-              setShowRecoveryChoice(true);
-              return;
+            if (recoveryOffer && primaryRecoveryAction) {
+              void runCycleCommand(() =>
+                applyRecoveryAction(recoveryOffer, primaryRecoveryAction.actionId),
+              );
+            } else {
+              void runCycleCommand(run);
             }
-            runCycleCommand(run);
           }}
           disabled={cycleBusy || !canRun}
           title={
             canRun
-              ? motionHeld
-                ? 'Resume the held motion branch'
-                : 'Start the loaded program'
+              ? primaryRecoveryAction
+                ? recoveryActionLabel(primaryRecoveryAction)
+                : motionHeld
+                  ? 'Resume the held motion branch'
+                  : 'Start the loaded program'
               : stopGate.blocked && stopGate.reason !== null
                 ? stopGate.reason
                 : runAuthority.reason !== null && !runAuthorityAllowsResume
@@ -358,9 +291,12 @@ export function TransportControls() {
               wide as the widest label — no layout shift on state change,
               and it adapts to whatever the labels are. */}
           <span className="grid text-center">
-            <span className={`col-start-1 row-start-1 ${running || motionHeld ? 'invisible' : ''}`}>Run</span>
+            <span className={`col-start-1 row-start-1 ${running || motionHeld || primaryRecoveryAction ? 'invisible' : ''}`}>Run</span>
             <span className={`col-start-1 row-start-1 ${running ? '' : 'invisible'}`}>Running</span>
-            <span className={`col-start-1 row-start-1 ${motionHeld ? '' : 'invisible'}`}>Resume Motion</span>
+            <span className={`col-start-1 row-start-1 ${motionHeld && !primaryRecoveryAction ? '' : 'invisible'}`}>Resume Motion</span>
+            <span className={`col-start-1 row-start-1 ${primaryRecoveryAction ? '' : 'invisible'}`}>
+              {primaryRecoveryAction ? recoveryActionLabel(primaryRecoveryAction) : ''}
+            </span>
           </span>
         </button>
         <div className="relative flex">

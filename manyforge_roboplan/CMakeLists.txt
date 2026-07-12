@@ -93,6 +93,7 @@ add_library(manyforge_roboplan
   src/roboplan_focused_adapters.cpp
   src/roboplan_execution_backend.cpp
   src/roboplan_execution_state_sink.cpp
+  src/roboplan_gripper_command_backend.cpp
   src/native_kernel_factory.cpp
   src/collision_body_id_mapper.cpp
   ${_MANYFORGE_ROS2_CONTROL_SOURCES}
@@ -170,6 +171,11 @@ if(BUILD_TESTING)
     target_link_libraries(test_roboplan_execution_state_sink PRIVATE
       manyforge_roboplan GTest::gtest_main)
 
+    add_executable(test_roboplan_gripper_command_backend
+      test/test_roboplan_gripper_command_backend.cpp)
+    target_link_libraries(test_roboplan_gripper_command_backend PRIVATE
+      manyforge_roboplan GTest::gtest_main)
+
     # Informational perf measurement for the collision-ownership Chunk 1
     # mapper. Not a ctest case: invoked by scripts/run-collision-mapper-perf.sh
     # and reports JSON to stdout / MANYFORGE_PERF_JSON_OUT. Phase 1 is
@@ -215,6 +221,12 @@ if(BUILD_TESTING)
       DISCOVERY_EXTRA_ARGS --gtest_filter=*)
 
     gtest_discover_tests(test_roboplan_execution_state_sink
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
+      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+
+    gtest_discover_tests(test_roboplan_gripper_command_backend
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}

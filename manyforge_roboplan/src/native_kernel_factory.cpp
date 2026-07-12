@@ -1,4 +1,6 @@
 #include <manyforge_roboplan/native_kernel_factory.hpp>
+#include <manyforge_roboplan/roboplan_execution_state_sink.hpp>
+#include <manyforge_roboplan/roboplan_gripper_command_backend.hpp>
 
 #include <manyforge_roboplan/roboplan_focused_adapters.hpp>
 
@@ -29,12 +31,15 @@ void KernelEventCollector::subscribe(core::ExecutionKernel& kernel) {
   if (subscribed_) return;
   subscription_ = kernel.subscribe_events(
       [this](const core::KernelEvent& event) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (buffer_.size() >= kMaxBufferedEvents) {
-          buffer_.pop_front();
-          ++dropped_total_;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (buffer_.size() >= kMaxBufferedEvents) {
+            buffer_.pop_front();
+            ++dropped_total_;
+          }
+          buffer_.push_back(event);
         }
-        buffer_.push_back(event);
+        cv_.notify_one();
       });
   subscribed_ = true;
 }
@@ -47,6 +52,7 @@ void KernelEventCollector::unsubscribe(core::ExecutionKernel& kernel) {
     subscription = subscription_;
     subscribed_ = false;
   }
+  cv_.notify_all();
   kernel.unsubscribe_events(subscription);
 }
 
@@ -64,6 +70,13 @@ KernelEventCollector::DrainStats KernelEventCollector::drain_with_stats() {
   buffer_.clear();
   stats.dropped_total = dropped_total_;
   return stats;
+}
+
+bool KernelEventCollector::wait_for_events(std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  cv_.wait_for(lock, timeout,
+               [this] { return !buffer_.empty() || !subscribed_; });
+  return !buffer_.empty();
 }
 
 // --- NativeKernelBundle ---
@@ -511,6 +524,14 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
           *observed_publication);
   bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->cache = std::make_unique<core::TrajectoryCache>();
+  bundle->execution_state_sink =
+      std::make_shared<RoboPlanExecutionStateSink>(
+          bundle->scene, bundle->scene_mutex);
+  bundle->owned_gripper_command_backend =
+      std::make_unique<RoboPlanGripperCommandBackend>(
+          bundle->execution_state_sink, *bundle->clock, *bundle->scheduler);
+  bundle->gripper_command_backend =
+      bundle->owned_gripper_command_backend.get();
 
   const int collision_worker_count =
       core::env_validation_collision_workers(
@@ -573,7 +594,8 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
           *bundle->reference_resolver,
           *bundle->trajectory_validator,
           *bundle->collision_trajectory_projector,
-          bundle->collision_diagnostic_comparator.get()},
+          bundle->collision_diagnostic_comparator.get(),
+          bundle->gripper_command_backend},
       *bundle->execution,
       *bundle->clock, *bundle->scheduler, *bundle->cache,
       resolved_kernel_config);

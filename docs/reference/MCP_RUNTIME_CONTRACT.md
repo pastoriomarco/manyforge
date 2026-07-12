@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-07-03 06:45:43 UTC
+  Last regenerated: 2026-07-12 06:05:07 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_contract
 -->
 

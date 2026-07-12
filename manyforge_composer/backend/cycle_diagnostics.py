@@ -49,6 +49,23 @@ def _message_from_details(
     return error_code
 
 
+def _manager_error_snapshot(
+    manager: Any,
+) -> tuple[Optional[str], Optional[str], Optional[dict[str, Any]]]:
+    reader = getattr(manager, "get_error_snapshot", None)
+    if callable(reader):
+        try:
+            error, code, details = reader()
+            return error, code, _dict_or_none(details)
+        except Exception:  # noqa: BLE001 - status projection stays available.
+            pass
+    return (
+        getattr(manager, "error", None),
+        getattr(manager, "error_code", None),
+        _dict_or_none(getattr(manager, "error_details", None)),
+    )
+
+
 def manager_cycle_error_fields(
     manager: Any,
 ) -> tuple[Optional[str], Optional[str], Optional[dict[str, Any]]]:
@@ -60,9 +77,7 @@ def manager_cycle_error_fields(
     active_cycle_error_fields() when the snapshot fallback is worth the extra
     visibility.
     """
-    error = getattr(manager, "error", None)
-    details = _dict_or_none(getattr(manager, "error_details", None))
-    raw_code = getattr(manager, "error_code", None)
+    error, raw_code, details = _manager_error_snapshot(manager)
     error_code = preferred_structured_error_code(raw_code, details)
     if error is None:
         error = _message_from_details(error_code, details)
@@ -80,9 +95,7 @@ def active_cycle_error_fields(
     export to explain that state, so this helper falls back to the snapshot when
     the kernel is in a fault/intervention state.
     """
-    error = getattr(manager, "error", None)
-    manager_details = _dict_or_none(getattr(manager, "error_details", None))
-    raw_code = getattr(manager, "error_code", None)
+    error, raw_code, manager_details = _manager_error_snapshot(manager)
     details = manager_details
 
     kernel_state_token: Optional[str]

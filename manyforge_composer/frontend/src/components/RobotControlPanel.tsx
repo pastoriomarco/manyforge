@@ -77,7 +77,7 @@ const _JOINT_DRAFTS_DONE_STATUSES = new Set([
   'error',
 ]);
 
-function useJointAuthoring(_sessionJointNames: string[]): {
+function useJointAuthoring(): {
   push: (jointName: string, valueRad: number) => void;
   pushFinal: (jointName: string, valueRad: number) => void;
   setJointArrivalTolerances: (tolerances: Map<string, number>) => void;
@@ -124,10 +124,7 @@ function useJointAuthoring(_sessionJointNames: string[]): {
   };
 }
 
-function useCartesianAuthoring(options: {
-  sessionJointNames: string[];
-  tcpFrame: string | null;
-}): {
+function useCartesianAuthoring(options: { tcpFrame: string | null }): {
   pushFinal: (
     positionM: [number, number, number],
     orientationXyzw: [number, number, number, number],
@@ -470,21 +467,11 @@ function JointModeBody({
     () => drivableJoints.some((joint) => joint.type === 'prismatic'),
     [drivableJoints],
   );
-  // Joint-name list for authored joint targets. RMA-5 makes this the active
-  // arm group's commandable joints from canonical Robot Model Authority
-  // metadata, so gripper mimic chains never leak into arm jogging.
-  const sessionJointNames = useMemo(
-    () =>
-      drivableJoints.length > 0
-        ? drivableJoints.map((j) => j.name)
-        : robot?.joint_names ?? [],
-    [robot, drivableJoints],
-  );
   const {
     push: jointDraftPush,
     pushFinal: jointDraftPushFinal,
     setJointArrivalTolerances,
-  } = useJointAuthoring(sessionJointNames);
+  } = useJointAuthoring();
   const jointArrivalTolerances = useMemo(() => {
     const out = new Map<string, number>();
     for (const joint of drivableJoints) {
@@ -1066,9 +1053,7 @@ function CartesianModeBody({
 }) {
   const robot = useSceneStateStore((s) => s.scene?.robot ?? null);
   const tcp = robot?.tcp_pose_in_base ?? null;
-  const sessionJointNames = robot?.joint_names ?? [];
   const cartesianAuthoring = useCartesianAuthoring({
-    sessionJointNames,
     tcpFrame: robot?.tcp_frame ?? null,
   });
   const gizmoMode = useViewerSelectionStore((s) => s.cartesianGizmoMode);
@@ -1673,12 +1658,18 @@ function GripperRow({
   }
 
   const stateLabel = gripper.state.replace(/^GripperCommandState\./, '');
+  const projectionState = gripper.projection_state ?? 'not_required';
   // The kernel reports an in-flight gripper command as `executing` (the
   // GripperCommandState enum value); also accept `in_progress` defensively.
   // While busy the widget disables authoring — the backend additionally
   // fails closed if a command is approved against a busy gripper.
   const busy = ['executing', 'in_progress'].includes(stateLabel.toLowerCase());
-  const disabled = busy || !commandGate.canCommand;
+  const projectionFailed = projectionState === 'failed';
+  const failedRequiresReset =
+    stateLabel.toLowerCase() === 'failed' &&
+    gripper.reason_code !== 'grasp_confirmation_lost';
+  const disabled =
+    busy || projectionFailed || failedRequiresReset || !commandGate.canCommand;
   return (
     <div className="space-y-1 rounded border border-gray-700 bg-gray-900/40 p-2">
       <div className="flex items-baseline justify-between gap-2">
@@ -1805,6 +1796,11 @@ function GripperRow({
       </div>
       {gripper.error && (
         <div className="text-[10px] text-red-400">{gripper.error}</div>
+      )}
+      {projectionFailed && !gripper.error && (
+        <div className="text-[10px] text-red-400">
+          {gripper.projection_reason || 'Gripper scene projection failed'}
+        </div>
       )}
       {!commandGate.canCommand && (
         <div className="text-[10px] text-amber-400">{commandGate.reason}</div>

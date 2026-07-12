@@ -31,6 +31,16 @@ using SceneOperationDTO =
                  DetachObjectRequestDTO, SetRobotBasePoseRequestDTO,
                  SetCollisionPolicyRequestDTO>;
 
+/// Whether a successful logical-scene transaction invalidates non-moving
+/// recovery admission. The default is deliberately fail-closed. Trusted
+/// perception/pose-source writers may mark a transaction as a live observation
+/// so high-rate object/octomap changes remain revision-visible without making
+/// an already-stopped recovery offer flicker.
+enum class SceneRecoveryAdmissionImpact {
+  kInvalidate,
+  kLiveObservation,
+};
+
 struct SceneTransactionDTO {
   std::string transaction_id;
   std::uint64_t transaction_sequence = 0;
@@ -38,6 +48,8 @@ struct SceneTransactionDTO {
   SceneOperationDTO operation;
   std::string authority_source;
   std::optional<std::string> session_id;
+  SceneRecoveryAdmissionImpact recovery_admission_impact =
+      SceneRecoveryAdmissionImpact::kInvalidate;
 };
 
 enum class SceneUpdateStatus {
@@ -102,6 +114,10 @@ struct SceneRobotPlacementDTO {
 struct LogicalSceneSnapshot {
   SceneRevisionDTO revision;
   std::uint64_t transaction_sequence = 0;
+  /// Monotonic token for non-moving recovery admission. Structural, policy,
+  /// robot-placement, and authored/manual pose changes advance it; continuous
+  /// observed-source pose/freshness updates do not.
+  std::uint64_t admission_epoch = 0;
   std::uint64_t topology_epoch = 0;
   std::uint64_t policy_epoch = 0;
   std::string world_frame = "universe";
@@ -114,6 +130,14 @@ struct LogicalSceneSnapshot {
 };
 
 using LogicalSceneSnapshotPtr = std::shared_ptr<const LogicalSceneSnapshot>;
+
+struct SceneAuthorityStatusDTO {
+  SceneRevisionDTO revision;
+  std::uint64_t transaction_sequence = 0;
+  std::uint64_t admission_epoch = 0;
+  std::uint64_t topology_epoch = 0;
+  std::uint64_t policy_epoch = 0;
+};
 
 struct SceneProjectionCommitResult {
   SceneEditResultDTO edit;

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any
 
@@ -18,6 +19,7 @@ from manyforge_behavior.kernel_client import (
     KernelClient,
     resolve_gripper_commanded_state,
 )
+from manyforge_behavior.runtime_pause import RuntimePauseMixin, RuntimePauseRegistry
 
 
 _DEFAULT_GRASP_EVIDENCE_LABELS: dict[str, str] = {
@@ -203,11 +205,25 @@ class SetGripperState(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
 
-class CommandGripper(ActionSpanMixin, py_trees.behaviour.Behaviour):
+class CommandGripper(
+    ActionSpanMixin,
+    RuntimePauseMixin,
+    py_trees.behaviour.Behaviour,
+):
     """Command an actuated gripper and block until the command completes."""
 
     def __init__(self, name: str, **kwargs: Any):
+        runtime_pause_registry = kwargs.pop("runtime_pause_registry", None)
         super().__init__(name=name)
+        self._configure_runtime_pause(
+            registry=(
+                runtime_pause_registry
+                if isinstance(runtime_pause_registry, RuntimePauseRegistry)
+                else None
+            ),
+            node_id="command_gripper",
+            domain="gripper",
+        )
         self._gripper_id = kwargs.get("gripper_id", "")
         self._position = kwargs.get("position")
         self._max_effort = kwargs.get("max_effort")
@@ -372,6 +388,13 @@ class CommandGripper(ActionSpanMixin, py_trees.behaviour.Behaviour):
         return "gripper_result_timeout"
 
     def update(self) -> py_trees.common.Status:
+        if self._consume_runtime_resume() is not None:
+            self._started = False
+            self._deadline = 0.0
+            self.feedback_message = ""
+        elif self._runtime_pause_active():
+            return py_trees.common.Status.RUNNING
+
         kernel: KernelClient = self.blackboard.kernel
         config = self._load_gripper_config()
         if config is None:
@@ -404,17 +427,32 @@ class CommandGripper(ActionSpanMixin, py_trees.behaviour.Behaviour):
         except (TypeError, ValueError):
             self.feedback_message = "command_gripper.position must be a number"
             return py_trees.common.Status.FAILURE
+        if not math.isfinite(target_position):
+            self.feedback_message = "command_gripper.position must be finite"
+            return py_trees.common.Status.FAILURE
         try:
             max_effort = None if self._max_effort is None else float(self._max_effort)
         except (TypeError, ValueError):
             self.feedback_message = "command_gripper.max_effort must be a number"
             return py_trees.common.Status.FAILURE
+        if max_effort is not None and not math.isfinite(max_effort):
+            self.feedback_message = "command_gripper.max_effort must be finite"
+            return py_trees.common.Status.FAILURE
 
-        duration_s = (
-            self._duration_s_override
-            if self._duration_s_override is not None
-            else float(config["motion_time_s"])
-        )
+        try:
+            duration_s = (
+                self._duration_s_override
+                if self._duration_s_override is not None
+                else float(config["motion_time_s"])
+            )
+        except (KeyError, TypeError, ValueError):
+            self.feedback_message = (
+                f"gripper '{self._gripper_id}' has invalid motion_time_s"
+            )
+            return py_trees.common.Status.FAILURE
+        if not math.isfinite(duration_s):
+            self.feedback_message = "command_gripper.duration_s must be finite"
+            return py_trees.common.Status.FAILURE
         if duration_s < 0.0:
             self.feedback_message = "command_gripper.duration_s must be >= 0"
             return py_trees.common.Status.FAILURE
@@ -427,6 +465,9 @@ class CommandGripper(ActionSpanMixin, py_trees.behaviour.Behaviour):
             self.feedback_message = (
                 "command_gripper.timeout_s must be >= 0; 0 disables the timeout"
             )
+            return py_trees.common.Status.FAILURE
+        if not math.isfinite(timeout_s):
+            self.feedback_message = "command_gripper.timeout_s must be finite"
             return py_trees.common.Status.FAILURE
 
         if not self._started:
@@ -441,36 +482,98 @@ class CommandGripper(ActionSpanMixin, py_trees.behaviour.Behaviour):
                 action_span=self._current_action_span(self.blackboard),
                 **semantic,
             )
-            result = kernel.command_gripper(
-                request
-            )
+            try:
+                result = kernel.command_gripper(request)
+            except Exception as exc:  # noqa: BLE001 - backend runtime boundary.
+                self.feedback_message = f"Gripper command failed: {exc}"
+                self._record_gripper_fault(
+                    "gripper_command_backend_unavailable",
+                    self.feedback_message,
+                    config=config,
+                    request=request,
+                )
+                self._raise_runtime_pause(
+                    reason_code="gripper_command_backend_unavailable",
+                    message=self.feedback_message,
+                    details={
+                        "gripper_id": self._gripper_id,
+                        "exception_type": type(exc).__name__,
+                    },
+                )
+                return py_trees.common.Status.RUNNING
             self._started = True
             self._deadline = (
                 float("inf") if timeout_s == 0.0 else time.monotonic() + timeout_s
             )
             if not result.accepted:
                 self.feedback_message = result.error or "Gripper command was rejected"
+                reason_code = (
+                    getattr(result, "reason_code", None)
+                    or "gripper_command_rejected"
+                )
                 self._record_gripper_fault(
-                    getattr(result, "reason_code", None),
+                    reason_code,
                     self.feedback_message,
                     config=config,
                     request=request,
                 )
-                return py_trees.common.Status.FAILURE
+                if reason_code in {
+                    "invalid_gripper_semantics",
+                    "unsupported_gripper_command_mode",
+                    "invalid_gripper_command",
+                }:
+                    return py_trees.common.Status.FAILURE
+                self._raise_runtime_pause(
+                    reason_code=reason_code,
+                    message=self.feedback_message,
+                    details={"gripper_id": self._gripper_id},
+                )
+                return py_trees.common.Status.RUNNING
 
-        kernel.update_gripper_commands()
-        status = kernel.get_gripper_status(self._gripper_id)
+        try:
+            status = kernel.get_gripper_status(self._gripper_id)
+        except Exception as exc:  # noqa: BLE001 - backend runtime boundary.
+            self.feedback_message = f"Gripper status unavailable: {exc}"
+            self._record_gripper_fault(
+                "gripper_status_unavailable",
+                self.feedback_message,
+                config=config,
+            )
+            self._raise_runtime_pause(
+                reason_code="gripper_status_unavailable",
+                message=self.feedback_message,
+                details={
+                    "gripper_id": self._gripper_id,
+                    "exception_type": type(exc).__name__,
+                },
+            )
+            return py_trees.common.Status.RUNNING
         if status.state == GripperCommandState.COMPLETED:
             return py_trees.common.Status.SUCCESS
         if status.state == GripperCommandState.FAILED:
             self.feedback_message = status.error or "Gripper command failed"
+            reason_code = (
+                getattr(status, "reason_code", None)
+                or "gripper_command_failed"
+            )
             self._record_gripper_fault(
-                getattr(status, "reason_code", None),
+                reason_code,
                 self.feedback_message,
                 config=config,
                 status=status,
             )
-            return py_trees.common.Status.FAILURE
+            if reason_code in {
+                "invalid_gripper_semantics",
+                "unsupported_gripper_command_mode",
+                "invalid_gripper_command",
+            }:
+                return py_trees.common.Status.FAILURE
+            self._raise_runtime_pause(
+                reason_code=reason_code,
+                message=self.feedback_message,
+                details={"gripper_id": self._gripper_id},
+            )
+            return py_trees.common.Status.RUNNING
 
         now = time.monotonic()
         if now >= self._deadline:
@@ -484,7 +587,12 @@ class CommandGripper(ActionSpanMixin, py_trees.behaviour.Behaviour):
                 config=config,
                 status=status,
             )
-            return py_trees.common.Status.FAILURE
+            self._raise_runtime_pause(
+                reason_code=self._timeout_reason_code(config),
+                message=self.feedback_message,
+                details={"gripper_id": self._gripper_id},
+            )
+            return py_trees.common.Status.RUNNING
 
         evidence = ",".join(getattr(status, "evidence", []) or [])
         authority = getattr(status, "state_authority", "") or "n/a"
@@ -498,18 +606,33 @@ class CommandGripper(ActionSpanMixin, py_trees.behaviour.Behaviour):
         )
         return py_trees.common.Status.RUNNING
 
+    def terminate(self, new_status: py_trees.common.Status) -> None:
+        self._clear_runtime_pause()
 
-class ConfirmGripperGrasp(py_trees.behaviour.Behaviour):
+
+class ConfirmGripperGrasp(RuntimePauseMixin, py_trees.behaviour.Behaviour):
     """Record verified grasp evidence for the latest gripper command."""
 
     def __init__(self, name: str, **kwargs: Any):
+        runtime_pause_registry = kwargs.pop("runtime_pause_registry", None)
         super().__init__(name=name)
+        self._configure_runtime_pause(
+            registry=(
+                runtime_pause_registry
+                if isinstance(runtime_pause_registry, RuntimePauseRegistry)
+                else None
+            ),
+            node_id="confirm_gripper_grasp",
+            domain="gripper",
+        )
         self._gripper_id = kwargs.get("gripper_id", "")
         self._policy = kwargs.get("grasp_confirmation_policy", "")
         self._source_key = kwargs.get("source_key", "")
         self._expected_value = kwargs.get("expected_value", True)
         self._evidence_label = kwargs.get("evidence_label", "")
         self._evidence_state = kwargs.get("evidence_state", "confirmed")
+        self._source_failure_runtime = False
+        self._source_failure_reason = ""
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
@@ -524,6 +647,8 @@ class ConfirmGripperGrasp(py_trees.behaviour.Behaviour):
             register_blackboard_binding_read(self.blackboard, self._source_key)
 
     def initialise(self) -> None:
+        self._source_failure_runtime = False
+        self._source_failure_reason = ""
         try:
             self.blackboard.set("gripper_fault_details", None)
         except (KeyError, AttributeError):
@@ -572,6 +697,8 @@ class ConfirmGripperGrasp(py_trees.behaviour.Behaviour):
         return str(config.get("grasp_confirmation_policy", "") or "").strip()
 
     def _source_is_confirmed(self, *, policy: str, evidence_label: str) -> bool:
+        self._source_failure_runtime = False
+        self._source_failure_reason = ""
         if not self._source_key:
             return True
         try:
@@ -586,6 +713,8 @@ class ConfirmGripperGrasp(py_trees.behaviour.Behaviour):
                 policy=policy,
                 evidence_label=evidence_label,
             )
+            self._source_failure_runtime = True
+            self._source_failure_reason = "stale_gripper_state"
             return False
         if not isinstance(value, bool):
             self.feedback_message = (
@@ -598,6 +727,7 @@ class ConfirmGripperGrasp(py_trees.behaviour.Behaviour):
                 policy=policy,
                 evidence_label=evidence_label,
             )
+            self._source_failure_reason = "invalid_gripper_semantics"
             return False
         if value != bool(self._expected_value):
             self.feedback_message = (
@@ -610,10 +740,17 @@ class ConfirmGripperGrasp(py_trees.behaviour.Behaviour):
                 policy=policy,
                 evidence_label=evidence_label,
             )
+            self._source_failure_runtime = True
+            self._source_failure_reason = "grasp_confirmation_lost"
             return False
         return True
 
     def update(self) -> py_trees.common.Status:
+        if self._consume_runtime_resume() is not None:
+            self.feedback_message = ""
+        elif self._runtime_pause_active():
+            return py_trees.common.Status.RUNNING
+
         kernel: KernelClient = self.blackboard.kernel
         policy = self._load_policy()
         if not policy:
@@ -646,6 +783,13 @@ class ConfirmGripperGrasp(py_trees.behaviour.Behaviour):
             policy=policy,
             evidence_label=evidence_label,
         ):
+            if self._source_failure_runtime:
+                self._raise_runtime_pause(
+                    reason_code=self._source_failure_reason,
+                    message=self.feedback_message,
+                    details={"gripper_id": self._gripper_id},
+                )
+                return py_trees.common.Status.RUNNING
             return py_trees.common.Status.FAILURE
         confirm = getattr(kernel, "confirm_gripper_grasp", None)
         if not callable(confirm):
@@ -659,12 +803,30 @@ class ConfirmGripperGrasp(py_trees.behaviour.Behaviour):
                 evidence_label=evidence_label,
             )
             return py_trees.common.Status.FAILURE
-        result = confirm(
-            gripper_id=self._gripper_id,
-            grasp_confirmation_policy=policy,
-            evidence_label=evidence_label,
-            evidence_state=str(self._evidence_state or "confirmed"),
-        )
+        try:
+            result = confirm(
+                gripper_id=self._gripper_id,
+                grasp_confirmation_policy=policy,
+                evidence_label=evidence_label,
+                evidence_state=str(self._evidence_state or "confirmed"),
+            )
+        except Exception as exc:  # noqa: BLE001 - backend runtime boundary.
+            self.feedback_message = f"Gripper grasp confirmation failed: {exc}"
+            self._record_grasp_confirmation_fault(
+                "grasp_confirmation_backend_unavailable",
+                self.feedback_message,
+                policy=policy,
+                evidence_label=evidence_label,
+            )
+            self._raise_runtime_pause(
+                reason_code="grasp_confirmation_backend_unavailable",
+                message=self.feedback_message,
+                details={
+                    "gripper_id": self._gripper_id,
+                    "exception_type": type(exc).__name__,
+                },
+            )
+            return py_trees.common.Status.RUNNING
         if not result.accepted:
             self.feedback_message = result.error or "Gripper grasp confirmation failed"
             self._record_grasp_confirmation_fault(
@@ -673,6 +835,17 @@ class ConfirmGripperGrasp(py_trees.behaviour.Behaviour):
                 policy=policy,
                 evidence_label=evidence_label,
             )
+            reason_code = (
+                getattr(result, "reason_code", None)
+                or "grasp_confirmation_rejected"
+            )
+            if reason_code != "invalid_gripper_semantics":
+                self._raise_runtime_pause(
+                    reason_code=reason_code,
+                    message=self.feedback_message,
+                    details={"gripper_id": self._gripper_id},
+                )
+                return py_trees.common.Status.RUNNING
             return py_trees.common.Status.FAILURE
 
         self.feedback_message = (
@@ -680,6 +853,9 @@ class ConfirmGripperGrasp(py_trees.behaviour.Behaviour):
             f"policy={policy} evidence={evidence_label}"
         )
         return py_trees.common.Status.SUCCESS
+
+    def terminate(self, new_status: py_trees.common.Status) -> None:
+        self._clear_runtime_pause()
 
 
 class WaitForGripperState(py_trees.behaviour.Behaviour):

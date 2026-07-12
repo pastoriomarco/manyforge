@@ -36,6 +36,12 @@ FORBIDDEN = (
     (re.compile(r"\bexpand_trajectory_for_collision_validation\b"), "deleted combined validation helper"),
     (re.compile(r"\bsync_snapshot_from_context\b"), "deleted observer-side-effect compatibility helper"),
     (re.compile(r"\bplanning_context_state\b"), "deleted stop-snapshot authority label"),
+    (re.compile(r"\bupdate_gripper_commands\b"), "deleted observer-driven gripper ticker"),
+    (re.compile(r"\bupdate_ros_grippers\b"), "deleted ROS gripper ticker alias"),
+    (re.compile(r"\bcommand_ros_gripper\b"), "deleted ROS-specific gripper command alias"),
+    (re.compile(r"\bget_ros_gripper_status\b"), "deleted ROS-specific gripper status alias"),
+    (re.compile(r"\bmark_ros_gripper_grasp_lost\b"), "deleted ROS-specific gripper evidence alias"),
+    (re.compile(r"\b_advance_gripper_commands\b"), "deleted Python gripper progression helper"),
 )
 
 REQUIRED = (
@@ -46,6 +52,7 @@ REQUIRED = (
     "manyforge_core/include/manyforge_core/ports/ireference_pose_resolver.hpp",
     "manyforge_core/include/manyforge_core/ports/itrajectory_validator.hpp",
     "manyforge_core/include/manyforge_core/ports/icollision_trajectory_projector.hpp",
+    "manyforge_core/include/manyforge_core/ports/igripper_command_backend.hpp",
     "manyforge_core/include/manyforge_core/ports/iscene_authority.hpp",
     "manyforge_core/include/manyforge_core/collision/i_collision_query_engine.hpp",
     "manyforge_core/include/manyforge_core/collision/i_collision_diagnostic_comparator.hpp",

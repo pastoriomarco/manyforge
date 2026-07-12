@@ -315,6 +315,10 @@ TEST(SceneAuthorityTest, PublishesOneCoherentInitialRevision) {
   EXPECT_EQ(authority.published_runtime_collision_query_bundle()
                 ->world->revision.revision_id,
             1U);
+  const auto status = authority.authority_status();
+  EXPECT_EQ(status.revision.revision_id, 1U);
+  EXPECT_EQ(status.transaction_sequence, 0U);
+  EXPECT_EQ(status.admission_epoch, 1U);
 }
 
 TEST(SceneAuthorityTest, CommitsMonotonicRevisionAndLogicalObject) {
@@ -332,6 +336,78 @@ TEST(SceneAuthorityTest, CommitsMonotonicRevisionAndLogicalObject) {
   const auto state = authority.object_state("box");
   EXPECT_TRUE(state.exists);
   EXPECT_EQ(state.frame_id, "universe");
+  EXPECT_EQ(authority.authority_status().admission_epoch, 2U);
+}
+
+TEST(SceneAuthorityTest,
+     LiveObservedPoseRevisionDoesNotInvalidateRecoveryAdmission) {
+  FakeProjection projection;
+  SceneAuthority authority(projection, projection);
+  ASSERT_TRUE(authority.add_object(add_box("tracked")).success);
+  const auto epoch_before = authority.authority_status().admission_epoch;
+
+  UpdateObjectPoseRequestDTO observed;
+  observed.object_id = "tracked";
+  observed.frame_id = "universe";
+  observed.pose.position_m.x_m = 0.25;
+  observed.pose.orientation.w = 1.0;
+  observed.source_id = "foundationpose:tracked";
+  observed.source_timestamp_ns = 42;
+  observed.source_freshness_budget_ns = 1000000000;
+
+  const auto result = authority.update_object_pose(observed);
+
+  ASSERT_TRUE(result.success);
+  EXPECT_TRUE(result.collision_world_revision_changed);
+  EXPECT_EQ(authority.authority_status().admission_epoch, epoch_before);
+}
+
+TEST(SceneAuthorityTest,
+     AuthoredPoseRevisionInvalidatesRecoveryAdmission) {
+  FakeProjection projection;
+  SceneAuthority authority(projection, projection);
+  ASSERT_TRUE(authority.add_object(add_box("authored")).success);
+  const auto epoch_before = authority.authority_status().admission_epoch;
+
+  UpdateObjectPoseRequestDTO authored;
+  authored.object_id = "authored";
+  authored.frame_id = "universe";
+  authored.pose.position_m.y_m = 0.5;
+  authored.pose.orientation.w = 1.0;
+
+  const auto result = authority.update_object_pose(authored);
+
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ(authority.authority_status().admission_epoch, epoch_before + 1);
+}
+
+TEST(SceneAuthorityTest,
+     ExplicitLiveTopologyTransactionRetainsRecoveryAdmissionEpoch) {
+  FakeProjection projection;
+  SceneAuthority authority(projection, projection);
+  const auto epoch_before = authority.authority_status().admission_epoch;
+  SceneTransactionDTO transaction;
+  transaction.expected_revision = authority.current_revision();
+  transaction.operation = add_box("perception_obstacle");
+  transaction.authority_source = "perception_world";
+  transaction.recovery_admission_impact =
+      SceneRecoveryAdmissionImpact::kLiveObservation;
+
+  const auto result = authority.commit(std::move(transaction));
+
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ(authority.authority_status().admission_epoch, epoch_before);
+}
+
+TEST(SceneAuthorityTest, NoOpDoesNotAdvanceRecoveryAdmissionEpoch) {
+  FakeProjection projection;
+  SceneAuthority authority(projection, projection);
+  projection.next_commit = FakeProjection::NextCommit::kSuccessNoOp;
+  const auto epoch_before = authority.authority_status().admission_epoch;
+
+  ASSERT_TRUE(authority.add_object(add_box("ignored")).success);
+
+  EXPECT_EQ(authority.authority_status().admission_epoch, epoch_before);
 }
 
 TEST(SceneAuthorityTest, CommitsRobotPlacementThroughLogicalTransaction) {

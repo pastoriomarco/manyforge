@@ -204,15 +204,6 @@ def gripper_busy_detail(state: ComposerState, gripper_id: str) -> Optional[str]:
     kernel = state.kernel
     if kernel is None:
         return None
-    # Advance any in-flight simulated gripper command before reading status:
-    # outside a BT cycle nothing else ticks it, so a stale `executing` would
-    # otherwise falsely block forever. Idempotent wall-clock progression.
-    advance = getattr(kernel, "update_gripper_commands", None)
-    if callable(advance):
-        try:
-            advance()
-        except Exception:  # noqa: BLE001 — progression must not raise here
-            pass
     get_status = getattr(kernel, "get_gripper_status", None)
     if not callable(get_status):
         return None

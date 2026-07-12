@@ -108,6 +108,8 @@ class IScheduler {
   /// in production schedulers — see `SchedulerPriority` for the
   /// threading invariants. Callers omitting the argument get `Lifecycle`;
   /// runtime-critical callbacks must select their narrower role explicitly.
+  /// A due callback may begin before `schedule()` returns; callers that publish
+  /// the returned handle into generation-owned state must support that handoff.
   virtual ScheduleHandle schedule(
       TimePoint deadline, std::function<void()> callback,
       SchedulerPriority priority = SchedulerPriority::Lifecycle) = 0;

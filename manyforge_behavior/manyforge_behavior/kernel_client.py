@@ -9,7 +9,7 @@ from enum import Enum
 import math
 import threading
 import time
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 
 
 MAX_CONTROLLED_STOP_DECELERATION_TIME_S = 2.0
@@ -459,6 +459,9 @@ class GripperCommandRequest:
 class GripperCommandStatus:
     state: GripperCommandState = GripperCommandState.IDLE
     gripper_id: str = ""
+    command_id: int = 0
+    generation: int = 0
+    revision: int = 0
     progress: float = 0.0
     current_position: Optional[float] = None
     target_position: Optional[float] = None
@@ -472,6 +475,8 @@ class GripperCommandStatus:
     transport_kind: str = ""
     evidence: List[str] = field(default_factory=list)
     evidence_state: str = ""
+    projection_state: str = "not_required"
+    projection_reason: str = ""
     error: Optional[str] = None
     # Stable fault token from the backend fault taxonomy; None unless FAILED.
     reason_code: Optional[str] = None
@@ -1012,83 +1017,23 @@ class KernelClient(ABC):
         """
         return {"events": self.drain_kernel_events(), "dropped_total": 0}
 
+    def wait_for_kernel_events(self, timeout_s: float) -> bool:
+        """Block an NRT consumer until an event is buffered or timeout expires.
+
+        Native clients override this with a condition-backed wait that releases
+        the GIL. The compatibility default sleeps, so clients without event
+        notification remain bounded without creating a busy loop.
+        """
+        timeout = float(timeout_s)
+        if not math.isfinite(timeout) or timeout < 0.0 or timeout > 1.0:
+            raise ValueError("timeout_s must be finite and in [0, 1]")
+        time.sleep(timeout)
+        return False
+
     @abstractmethod
     def acknowledge_completed(
         self, execution_id: int, *, expected_epoch: Optional[int] = None
     ) -> CommandResult: ...
-
-    @abstractmethod
-    def acknowledge_intervention(
-        self,
-        principal_id: str,
-        reason: str,
-        *,
-        expected_epoch: Optional[int] = None,
-    ) -> CommandResult:
-        """Explicitly clear `kInterventionRequired`.
-
-        Mirrors the C++ kernel API. This is the reset/resync recovery path;
-        callers must only use it after the operator explicitly selected a
-        reset-style recovery. `execute()` rejects while the kernel is in
-        `INTERVENTION_REQUIRED` until an explicit recovery action clears it.
-        """
-        ...
-
-    def acknowledge_intervention_for_retry(
-        self,
-        principal_id: str,
-        reason: str,
-        *,
-        expected_epoch: Optional[int] = None,
-    ) -> CommandResult:
-        """Clear a classified stop/fault intervention without backend reset.
-
-        This is the acknowledge-and-continue recovery path. The production
-        kernel performs the fresh stopped/readable checks and preserves the
-        current robot pose for the next execute. Unsupported clients fail
-        closed.
-        """
-        return CommandResult(
-            accepted=False,
-            error="acknowledge_intervention_for_retry not supported by this kernel client",
-        )
-
-    def acknowledge_failed_validation_for_retry(
-        self,
-        principal_id: str,
-        reason: str,
-        *,
-        expected_epoch: Optional[int] = None,
-    ) -> CommandResult:
-        """Clear a retryable failed pre-dispatch validation without reset.
-
-        The production kernel accepts only validation-gate failures that did
-        not dispatch motion. Unsupported clients fail closed.
-        """
-        return CommandResult(
-            accepted=False,
-            error=(
-                "acknowledge_failed_validation_for_retry not supported by "
-                "this kernel client"
-            ),
-        )
-
-    def acknowledge_interrupted_for_retry(
-        self,
-        principal_id: str,
-        reason: str,
-        *,
-        expected_epoch: Optional[int] = None,
-    ) -> CommandResult:
-        """Clear an interrupted runtime-collision latch for operator retry.
-
-        This differs from reset(): it must not command the backend or reset
-        scene/robot state. Unsupported clients fail closed.
-        """
-        return CommandResult(
-            accepted=False,
-            error="acknowledge_interrupted_for_retry not supported by this kernel client",
-        )
 
     def get_recovery_assessment(self) -> dict:
         """RT-8B kernel recovery assessment. Unsupported clients fail closed
@@ -1243,6 +1188,22 @@ class KernelClient(ABC):
         """Return IDs of all collision objects currently in the scene."""
         ...
 
+    def get_scene_authority_status(self) -> dict[str, Any]:
+        """Return immutable logical-scene authority tokens.
+
+        Unsupported clients fail closed with zero-valued tokens. Recovery
+        coordination must never substitute the high-rate world revision for
+        the structural admission epoch.
+        """
+        return {
+            "revision_id": 0,
+            "content_hash": "",
+            "transaction_sequence": 0,
+            "scene_admission_epoch": 0,
+            "topology_epoch": 0,
+            "policy_epoch": 0,
+        }
+
     @abstractmethod
     def get_joint_names(self) -> list[str]:
         """Return ordered joint names for the active robot group."""
@@ -1255,14 +1216,6 @@ class KernelClient(ABC):
 
     @abstractmethod
     def command_gripper(self, request: GripperCommandRequest) -> CommandResult: ...
-
-    def update_gripper_commands(self) -> None:
-        """Advance any client-owned simulated gripper commands.
-
-        Real adapters should normally publish state independently and may leave
-        this as a no-op. Mock/simulated clients use it to keep status reads
-        side-effect free while still supporting time-based command progress.
-        """
 
     @abstractmethod
     def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus: ...
@@ -1291,6 +1244,8 @@ class KernelClient(ABC):
         self,
         *,
         gripper_id: str,
+        expected_command_id: int,
+        expected_generation: int,
         evidence_label: str,
         message: str,
         reason_code: str = "grasp_confirmation_lost",
@@ -1318,7 +1273,13 @@ class MockKernelClient(KernelClient):
             the duration elapses. Set to 0 (default) for instant completion in tests.
     """
 
-    def __init__(self, execute_duration_s: float = 0.0, joint_names: Optional[List[str]] = None) -> None:
+    def __init__(
+        self,
+        execute_duration_s: float = 0.0,
+        joint_names: Optional[List[str]] = None,
+        *,
+        gripper_clock: Optional[Callable[[], float]] = None,
+    ) -> None:
         self._state = ExecutionState.IDLE
         self._execution_id = 0
         self._active_move_id = ""
@@ -1342,10 +1303,6 @@ class MockKernelClient(KernelClient):
         self.resume_count = 0
         self.reset_count = 0
         self._control_command_epoch = 0
-        self.acknowledge_intervention_count = 0
-        self.acknowledge_intervention_for_retry_count = 0
-        self.acknowledge_failed_validation_for_retry_count = 0
-        self.acknowledge_interrupted_for_retry_count = 0
         self.invalidate_count = 0
         self.last_invalidate_action_span: Optional[ActionSpan] = None
         self.runtime_velocity_scale = 1.0
@@ -1370,6 +1327,9 @@ class MockKernelClient(KernelClient):
         self.fail_next_execute = False
         self.fail_next_scene_edit = False
         self._objects: Dict[str, Dict[str, Any]] = {}
+        self._scene_revision_id = 1
+        self._scene_transaction_sequence = 0
+        self._scene_admission_epoch = 1
         self.robot_base_pose: Optional[Dict[str, Any]] = None
         self._scene_trace: Deque[Dict[str, Any]] = deque(maxlen=4096)
         # Metrics counters
@@ -1412,13 +1372,17 @@ class MockKernelClient(KernelClient):
         self.fail_next_gripper_command = False
         self._gripper_commands: Dict[str, Dict[str, Any]] = {}
         self._gripper_positions: Dict[str, float] = {}
-        # Gripper command/position state is mutated by the executing tree and
-        # read by status polls (and test threads injecting failures). RLock:
-        # command_gripper re-enters via update_gripper_commands/
-        # get_gripper_status.
+        self._gripper_clock = gripper_clock or time.monotonic
+        self._next_gripper_command_id = 1
+        self._next_gripper_generation = 1
+        self._gripper_admission_blocked = False
+        # The mock derives elapsed status from an injectable clock without
+        # mutating on reads. Mutating command admission commits an elapsed
+        # predecessor before deciding whether the gripper is busy.
         self._gripper_lock = threading.RLock()
         # Kernel event buffer (mirrors C++ KernelEventCollector)
         self._kernel_events_lock = threading.Lock()
+        self._kernel_events_cv = threading.Condition(self._kernel_events_lock)
         self._kernel_events: Deque[Dict[str, Any]] = deque(maxlen=4096)
         self._kernel_event_sequence = 0
         self._kernel_events_dropped_total = 0
@@ -1472,7 +1436,7 @@ class MockKernelClient(KernelClient):
             event["error"] = {"code": -1, "message": error}
         if details_payload:
             event["details"] = details_payload
-        with self._kernel_events_lock:
+        with self._kernel_events_cv:
             self._kernel_event_sequence += 1
             event["sequence"] = self._kernel_event_sequence
             if (
@@ -1480,6 +1444,7 @@ class MockKernelClient(KernelClient):
             ):
                 self._kernel_events_dropped_total += 1
             self._kernel_events.append(event)
+            self._kernel_events_cv.notify_all()
 
     def drain_kernel_events(self) -> List[Dict[str, Any]]:
         with self._kernel_events_lock:
@@ -1493,6 +1458,19 @@ class MockKernelClient(KernelClient):
             self._kernel_events.clear()
             dropped = self._kernel_events_dropped_total
         return {"events": events, "dropped_total": dropped}
+
+    def wait_for_kernel_events(self, timeout_s: float) -> bool:
+        timeout = float(timeout_s)
+        if not math.isfinite(timeout) or timeout < 0.0 or timeout > 1.0:
+            raise ValueError("timeout_s must be finite and in [0, 1]")
+        with self._kernel_events_cv:
+            if self._kernel_events:
+                return True
+            self._kernel_events_cv.wait_for(
+                lambda: bool(self._kernel_events),
+                timeout=timeout,
+            )
+            return bool(self._kernel_events)
 
     def control_command_epoch(self) -> int:
         return self._control_command_epoch
@@ -1558,9 +1536,11 @@ class MockKernelClient(KernelClient):
             self._last_error_details = {}
         if self._state != ExecutionState.IDLE:
             return ExecuteResult(ok=False, error="Not in IDLE state")
+        self._authorize_mock_gripper_commands()
         if self.fail_next_execute:
             self.fail_next_execute = False
             self._state = ExecutionState.FAILED
+            self._invalidate_mock_gripper_commands(block_admission=True)
             self._last_error_message = "Execution failed (injected)"
             self._last_error_code = "internal_error"
             self._last_error_details = {"reason_code": "injected_failure"}
@@ -1699,6 +1679,7 @@ class MockKernelClient(KernelClient):
         prev = self._state.value
         self._metrics["stops_issued"] += 1
         self._state = ExecutionState.STOPPED
+        self._invalidate_mock_gripper_commands(block_admission=True)
         self._emit_kernel_event("stop_requested")
         self._emit_kernel_event("state_transition", from_state=prev, to_state="stopped")
         return CommandResult(accepted=True)
@@ -1710,6 +1691,7 @@ class MockKernelClient(KernelClient):
                 accepted=False, error="Can only pause from EXECUTING"
             )
         self._state = ExecutionState.PAUSED
+        self._invalidate_mock_gripper_commands(block_admission=True)
         self._emit_kernel_event("pause_requested")
         self._emit_kernel_event("state_transition", from_state="executing", to_state="paused")
         return CommandResult(accepted=True)
@@ -1723,6 +1705,7 @@ class MockKernelClient(KernelClient):
                 accepted=False, error="Can only resume from PAUSED"
             )
         self._state = ExecutionState.EXECUTING
+        self._authorize_mock_gripper_commands()
         self._emit_kernel_event("resume_requested")
         self._emit_kernel_event("state_transition", from_state="paused", to_state="executing")
         return CommandResult(accepted=True)
@@ -1737,6 +1720,7 @@ class MockKernelClient(KernelClient):
             )
         prev = self._state.value
         self._state = ExecutionState.IDLE
+        self._invalidate_mock_gripper_commands(block_admission=False)
         self._active_move_id = ""
         self._last_error_message = None
         self._last_error_code = None
@@ -1765,6 +1749,7 @@ class MockKernelClient(KernelClient):
             )
         prev = self._state.value
         self._state = ExecutionState.IDLE
+        self._authorize_mock_gripper_commands()
         self._active_move_id = ""
         self._last_error_message = None
         self._last_error_code = None
@@ -1774,43 +1759,6 @@ class MockKernelClient(KernelClient):
             details={"acknowledged_execution_id": int(execution_id)},
         )
         self._emit_kernel_event("state_transition", from_state=prev, to_state="idle")
-        return CommandResult(accepted=True)
-
-    def acknowledge_intervention(
-        self,
-        principal_id: str,
-        reason: str,
-        *,
-        expected_epoch: Optional[int] = None,
-    ) -> CommandResult:
-        if stale := self._stale_control_command(expected_epoch):
-            return stale
-        self.acknowledge_intervention_count += 1
-        if self._state != ExecutionState.INTERVENTION_REQUIRED:
-            return CommandResult(
-                accepted=False,
-                error=(
-                    "acknowledge_intervention is valid only from "
-                    f"INTERVENTION_REQUIRED; current state={self._state.value}"
-                ),
-            )
-        prev = self._state.value
-        self._state = ExecutionState.IDLE
-        self._active_move_id = ""
-        self._last_error_message = None
-        self._last_error_code = None
-        self._last_error_details = {}
-        self._emit_kernel_event(
-            "acknowledge_intervention",
-            details={
-                "principal_id": principal_id,
-                "reason": reason,
-                "prev_state": prev,
-            },
-        )
-        self._emit_kernel_event(
-            "state_transition", from_state=prev, to_state="idle"
-        )
         return CommandResult(accepted=True)
 
     def script_recovery_assessment(self, assessment: dict) -> None:
@@ -1834,7 +1782,23 @@ class MockKernelClient(KernelClient):
         self.apply_recovery_action_requests.append(dict(request))
         scripted = getattr(self, "_scripted_recovery_action_result", None)
         if scripted is not None:
-            return dict(scripted)
+            result = dict(scripted)
+            resulting = result.get("resulting_assessment")
+            if result.get("accepted") is True and isinstance(resulting, dict):
+                # The mock does not reproduce the kernel admission matrix. It
+                # commits only the explicitly scripted authority result so the
+                # next read observes the same post-command assessment a native
+                # client would return.
+                self._scripted_recovery_assessment = dict(resulting)
+                execution_state = str(resulting.get("execution_state") or "")
+                state_by_value = {state.value: state for state in ExecutionState}
+                if execution_state in state_by_value:
+                    self._state = state_by_value[execution_state]
+                if self._state == ExecutionState.IDLE:
+                    self._last_error_message = None
+                    self._last_error_code = None
+                    self._last_error_details = {}
+            return result
         return {
             "request_id": str(request.get("request_id", "")),
             "action": str(request.get("action", "")),
@@ -1846,134 +1810,6 @@ class MockKernelClient(KernelClient):
             },
             "resulting_assessment": self.get_recovery_assessment(),
         }
-
-    def acknowledge_intervention_for_retry(
-        self,
-        principal_id: str,
-        reason: str,
-        *,
-        expected_epoch: Optional[int] = None,
-    ) -> CommandResult:
-        if stale := self._stale_control_command(expected_epoch):
-            return stale
-        self.acknowledge_intervention_for_retry_count += 1
-        if self._state != ExecutionState.INTERVENTION_REQUIRED:
-            return CommandResult(
-                accepted=False,
-                error=(
-                    "acknowledge_intervention_for_retry is valid only from "
-                    f"INTERVENTION_REQUIRED; current state={self._state.value}"
-                ),
-            )
-        prev = self._state.value
-        self._state = ExecutionState.IDLE
-        self._execution_id = 0
-        self._active_move_id = ""
-        self._last_error_message = None
-        self._last_error_code = None
-        self._last_error_details = {}
-        self._emit_kernel_event(
-            "acknowledge_intervention",
-            details={
-                "principal_id": principal_id,
-                "reason": reason,
-                "prev_state": prev,
-                "recovery_mode": "acknowledge_and_continue",
-                "backend_reset_performed": "false",
-            },
-        )
-        self._emit_kernel_event(
-            "state_transition", from_state=prev, to_state="idle"
-        )
-        return CommandResult(accepted=True)
-
-    def acknowledge_failed_validation_for_retry(
-        self,
-        principal_id: str,
-        reason: str,
-        *,
-        expected_epoch: Optional[int] = None,
-    ) -> CommandResult:
-        if stale := self._stale_control_command(expected_epoch):
-            return stale
-        self.acknowledge_failed_validation_for_retry_count += 1
-        if self._state != ExecutionState.FAILED:
-            return CommandResult(
-                accepted=False,
-                error=(
-                    "acknowledge_failed_validation_for_retry is valid only "
-                    f"from FAILED; current state={self._state.value}"
-                ),
-            )
-        if self._last_error_code not in {
-            "scene_changed_during_validation",
-            "validation_collision",
-        }:
-            return CommandResult(
-                accepted=False,
-                error=(
-                    "acknowledge_failed_validation_for_retry requires a "
-                    "retryable validation error"
-                ),
-                reason_code="failed_validation_not_retryable",
-            )
-        prev = self._state.value
-        self._state = ExecutionState.IDLE
-        self._execution_id = 0
-        self._active_move_id = ""
-        self._last_error_message = None
-        self._last_error_code = None
-        self._last_error_details = {}
-        self._emit_kernel_event(
-            "acknowledge_failed_validation",
-            details={
-                "principal_id": principal_id,
-                "reason": reason,
-                "prev_state": prev,
-            },
-        )
-        self._emit_kernel_event(
-            "state_transition", from_state=prev, to_state="idle"
-        )
-        return CommandResult(accepted=True)
-
-    def acknowledge_interrupted_for_retry(
-        self,
-        principal_id: str,
-        reason: str,
-        *,
-        expected_epoch: Optional[int] = None,
-    ) -> CommandResult:
-        if stale := self._stale_control_command(expected_epoch):
-            return stale
-        self.acknowledge_interrupted_for_retry_count += 1
-        if self._state != ExecutionState.INTERRUPTED:
-            return CommandResult(
-                accepted=False,
-                error=(
-                    "acknowledge_interrupted_for_retry is valid only from "
-                    f"INTERRUPTED; current state={self._state.value}"
-                ),
-            )
-        prev = self._state.value
-        self._state = ExecutionState.IDLE
-        self._execution_id = 0
-        self._active_move_id = ""
-        self._last_error_message = None
-        self._last_error_code = None
-        self._last_error_details = {}
-        self._emit_kernel_event(
-            "acknowledge_interrupted_for_retry",
-            details={
-                "principal_id": principal_id,
-                "reason": reason,
-                "prev_state": prev,
-            },
-        )
-        self._emit_kernel_event(
-            "state_transition", from_state=prev, to_state="idle"
-        )
-        return CommandResult(accepted=True)
 
     def get_status(self) -> ExecutionStatus:
         import time
@@ -2058,6 +1894,9 @@ class MockKernelClient(KernelClient):
 
     def set_robot_base_pose(self, pose: Optional[Dict[str, Any]]) -> None:
         self.robot_base_pose = None if not pose else dict(pose)
+        self._scene_revision_id += 1
+        self._scene_transaction_sequence += 1
+        self._scene_admission_epoch += 1
         self.invalidate_trajectories()
 
     def scene_edit(self, request: SceneEditRequest) -> SceneEditResult:
@@ -2378,12 +2217,26 @@ class MockKernelClient(KernelClient):
                 error=error,
             )
             return SceneEditResult(success=False, error=error)
+        if update_status is None:
+            update_status = "geometry_changed"
+            revision_changed = True
         result = SceneEditResult(
             success=True,
             update_status=update_status,
             collision_world_revision_changed=revision_changed,
             collision_world_freshness_changed=freshness_changed,
         )
+        if update_status != "no_op":
+            self._scene_transaction_sequence += 1
+            if revision_changed:
+                self._scene_revision_id += 1
+            # Source-backed updates are live observations. All authored scene
+            # mutations invalidate recovery admission by default.
+            if not (
+                request.operation == "update_pose"
+                and request.source_id is not None
+            ):
+                self._scene_admission_epoch += 1
         state_after = self.get_object_state(request.object_id)
         pose_in_frame = None
         pose_in_universe = None
@@ -2516,6 +2369,16 @@ class MockKernelClient(KernelClient):
         """Return IDs of all collision objects currently in the scene."""
         return [scene_object.object_id for scene_object in self.get_scene_objects()]
 
+    def get_scene_authority_status(self) -> dict[str, Any]:
+        return {
+            "revision_id": self._scene_revision_id,
+            "content_hash": f"mock-scene-{self._scene_revision_id}",
+            "transaction_sequence": self._scene_transaction_sequence,
+            "scene_admission_epoch": self._scene_admission_epoch,
+            "topology_epoch": self._scene_revision_id,
+            "policy_epoch": 1,
+        }
+
     def get_joint_names(self) -> list[str]:
         """Return ordered joint names for the active robot group."""
         return self._joint_names
@@ -2539,7 +2402,7 @@ class MockKernelClient(KernelClient):
         target_position = command.get("target_position")
 
         if state == GripperCommandState.EXECUTING:
-            elapsed = time.monotonic() - float(command["start_time"])
+            elapsed = self._gripper_clock() - float(command["start_time"])
             duration = float(command["duration_s"])
             progress = min(max(elapsed / duration, 0.0), 1.0)
             current_position = (
@@ -2553,6 +2416,13 @@ class MockKernelClient(KernelClient):
         return GripperCommandStatus(
             state=state,
             gripper_id=gripper_id,
+            command_id=int(command.get("command_id", 0)),
+            generation=int(command.get("generation", 0)),
+            revision=(
+                int(command.get("revision", 0)) + 1
+                if state != command["state"]
+                else int(command.get("revision", 0))
+            ),
             progress=progress,
             current_position=(
                 None if current_position is None else float(current_position)
@@ -2579,9 +2449,58 @@ class MockKernelClient(KernelClient):
             reason_code=command.get("reason_code"),
         )
 
+    def _invalidate_mock_gripper_commands(self, *, block_admission: bool) -> None:
+        with self._gripper_lock:
+            self._gripper_admission_blocked = block_admission
+            for command in self._gripper_commands.values():
+                command["state"] = GripperCommandState.IDLE
+                command["generation"] = self._next_gripper_generation
+                self._next_gripper_generation += 1
+                command["revision"] = int(command.get("revision", 0)) + 1
+                command["progress"] = 0.0
+                command["error"] = None
+                command["reason_code"] = None
+                command["projection_state"] = "not_required"
+                command["projection_reason"] = ""
+
+    def _authorize_mock_gripper_commands(self) -> None:
+        with self._gripper_lock:
+            self._gripper_admission_blocked = False
+
+    def _commit_elapsed_gripper_command(self, gripper_id: str) -> None:
+        """Commit clock-derived state only at a mutating authority boundary."""
+        status = self._compute_gripper_status(gripper_id)
+        command = self._gripper_commands.get(gripper_id)
+        if command is None or status.state == command["state"]:
+            return
+        command["state"] = status.state
+        command["current_position"] = status.current_position
+        command["progress"] = status.progress
+        command["observed_position"] = status.observed_position
+        command["revision"] = status.revision
+        if status.state == GripperCommandState.COMPLETED:
+            self._gripper_positions[gripper_id] = (
+                float(status.current_position)
+                if status.current_position is not None
+                else self._gripper_positions.get(gripper_id, 0.0)
+            )
+
     def command_gripper(self, request: GripperCommandRequest) -> CommandResult:
         with self._gripper_lock:
             self.gripper_command_count += 1
+            if self._gripper_admission_blocked or self._state in {
+                ExecutionState.PAUSED,
+                ExecutionState.STOPPING,
+                ExecutionState.STOPPED,
+                ExecutionState.INTERRUPTED,
+                ExecutionState.FAILED,
+                ExecutionState.INTERVENTION_REQUIRED,
+            }:
+                return CommandResult(
+                    accepted=False,
+                    error="Gripper command admission is closed by the execution lifecycle",
+                    reason_code="gripper_command_not_authorized",
+                )
             effective_request, semantic_error = gripper_effective_command_request(
                 request
             )
@@ -2602,7 +2521,7 @@ class MockKernelClient(KernelClient):
                     reason_code="gripper_request_failed",
                 )
 
-            self.update_gripper_commands()
+            self._commit_elapsed_gripper_command(request.gripper_id)
             current_status = self.get_gripper_status(request.gripper_id)
             if current_status.state == GripperCommandState.EXECUTING:
                 return CommandResult(
@@ -2615,6 +2534,10 @@ class MockKernelClient(KernelClient):
             if current_position is None:
                 current_position = self._gripper_positions.get(request.gripper_id, 0.0)
             if request.duration_s <= 0.0:
+                command_id = self._next_gripper_command_id
+                generation = self._next_gripper_generation
+                self._next_gripper_command_id += 1
+                self._next_gripper_generation += 1
                 self._gripper_positions[request.gripper_id] = request.target_position
                 metadata = gripper_request_status_metadata(
                     request,
@@ -2622,6 +2545,9 @@ class MockKernelClient(KernelClient):
                 )
                 self._gripper_commands[request.gripper_id] = {
                     "state": GripperCommandState.COMPLETED,
+                    "command_id": command_id,
+                    "generation": generation,
+                    "revision": 1,
                     "current_position": request.target_position,
                     "target_position": request.target_position,
                     "progress": 1.0,
@@ -2629,48 +2555,40 @@ class MockKernelClient(KernelClient):
                     "reason_code": None,
                     **metadata,
                 }
-                return CommandResult(accepted=True)
+                return CommandResult(
+                    accepted=True,
+                    details={"command_id": command_id, "generation": generation},
+                )
 
+            command_id = self._next_gripper_command_id
+            generation = self._next_gripper_generation
+            self._next_gripper_command_id += 1
+            self._next_gripper_generation += 1
             metadata = gripper_request_status_metadata(
                 request,
                 current_position=float(current_position),
             )
             self._gripper_commands[request.gripper_id] = {
                 "state": GripperCommandState.EXECUTING,
+                "command_id": command_id,
+                "generation": generation,
+                "revision": 1,
                 "group_id": request.group_id,
                 "joint_name": request.joint_name,
                 "start_position": current_position,
                 "current_position": current_position,
                 "target_position": request.target_position,
                 "duration_s": request.duration_s,
-                "start_time": time.monotonic(),
+                "start_time": self._gripper_clock(),
                 "progress": 0.0,
                 "error": None,
                 "reason_code": None,
                 **metadata,
             }
-            return CommandResult(accepted=True)
-
-    def update_gripper_commands(self) -> None:
-        with self._gripper_lock:
-            for gripper_id in list(self._gripper_commands):
-                status = self._compute_gripper_status(gripper_id)
-                command = self._gripper_commands.get(gripper_id)
-                if command is None:
-                    continue
-                command["state"] = status.state
-                command["current_position"] = status.current_position
-                command["progress"] = status.progress
-                command["observed_position"] = gripper_observed_position(
-                    str(command.get("state_authority", "")),
-                    status.current_position,
-                )
-                if status.state == GripperCommandState.COMPLETED:
-                    self._gripper_positions[gripper_id] = (
-                        float(status.current_position)
-                        if status.current_position is not None
-                        else self._gripper_positions.get(gripper_id, 0.0)
-                    )
+            return CommandResult(
+                accepted=True,
+                details={"command_id": command_id, "generation": generation},
+            )
 
     def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
         with self._gripper_lock:
@@ -2682,27 +2600,7 @@ class MockKernelClient(KernelClient):
                     current_position=self._gripper_positions.get(gripper_id),
                 )
 
-            return GripperCommandStatus(
-                state=command["state"],
-                gripper_id=gripper_id,
-                progress=float(command.get("progress", 0.0)),
-                current_position=command.get("current_position"),
-                target_position=command.get("target_position"),
-                commanded_position=command.get("commanded_position"),
-                observed_position=command.get("observed_position"),
-                commanded_state=str(command.get("commanded_state", "")),
-                actuation_kind=str(command.get("actuation_kind", "")),
-                state_authority=str(command.get("state_authority", "")),
-                completion_policy=str(command.get("completion_policy", "")),
-                grasp_confirmation_policy=str(
-                    command.get("grasp_confirmation_policy", "")
-                ),
-                transport_kind=str(command.get("transport_kind", "")),
-                evidence=normalize_gripper_evidence(command.get("evidence")),
-                evidence_state=str(command.get("evidence_state", "")),
-                error=command.get("error"),
-                reason_code=command.get("reason_code"),
-            )
+            return self._compute_gripper_status(gripper_id)
 
     def confirm_gripper_grasp(
         self,
@@ -2763,12 +2661,15 @@ class MockKernelClient(KernelClient):
             command["evidence"] = evidence
             command["evidence_state"] = state
             command["grasp_confirmation_policy"] = policy
+            command["revision"] = int(command.get("revision", 0)) + 1
             return CommandResult(accepted=True)
 
     def mark_gripper_grasp_lost(
         self,
         *,
         gripper_id: str,
+        expected_command_id: int,
+        expected_generation: int,
         evidence_label: str,
         message: str,
         reason_code: str = "grasp_confirmation_lost",
@@ -2788,12 +2689,27 @@ class MockKernelClient(KernelClient):
                     error=f"Gripper '{gripper_id}' has no command status to invalidate",
                     reason_code="stale_gripper_state",
                 )
+            if (
+                int(command.get("command_id", 0)) != int(expected_command_id)
+                or int(command.get("generation", 0)) != int(expected_generation)
+            ):
+                return CommandResult(
+                    accepted=False,
+                    error=(
+                        f"Gripper '{gripper_id}' command identity changed before "
+                        "grasp-loss evidence was applied"
+                    ),
+                    reason_code="stale_gripper_state",
+                )
             evidence = normalize_gripper_evidence(command.get("evidence"))
             if label not in evidence:
                 evidence.append(label)
             command["evidence"] = evidence
             command["evidence_state"] = "pressure_or_part_lost"
             command["state"] = GripperCommandState.FAILED
+            command["generation"] = self._next_gripper_generation
+            self._next_gripper_generation += 1
+            command["revision"] = int(command.get("revision", 0)) + 1
             command["progress"] = float(command.get("progress", 1.0))
             command["error"] = str(message or "gripper grasp confirmation was lost")
             command["reason_code"] = str(reason_code or "grasp_confirmation_lost")

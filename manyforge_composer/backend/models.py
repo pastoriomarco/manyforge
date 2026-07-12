@@ -9,6 +9,78 @@ _ALIAS_EXTRA_CFG = ConfigDict(populate_by_name=True, extra="allow")
 
 
 # --- Cycle ---
+class CycleRecoveryActionDTO(BaseModel):
+    model_config = _ALIAS_CFG
+    action_id: str = Field(alias="actionId")
+    label_key: str = Field(alias="labelKey")
+    requires_confirmation: bool = Field(alias="requiresConfirmation")
+    performs_backend_reset: bool = Field(alias="performsBackendReset")
+    enabled: bool
+    disabled_reason_code: Optional[str] = Field(
+        default=None, alias="disabledReasonCode"
+    )
+
+
+class CycleRecoveryOfferDTO(BaseModel):
+    model_config = _ALIAS_CFG
+    schema_version: Literal["manyforge.cycle_recovery_offer.v1"] = Field(
+        alias="schemaVersion"
+    )
+    offer_id: str = Field(alias="offerId")
+    offer_revision: int = Field(alias="offerRevision", ge=1)
+    generated_at_ns: int = Field(alias="generatedAtNs")
+    valid_until_ns: Optional[int] = Field(default=None, alias="validUntilNs")
+    kernel_assessment_revision: int = Field(alias="kernelAssessmentRevision")
+    control_command_epoch: int = Field(alias="controlCommandEpoch")
+    execution_id: Optional[int] = Field(default=None, alias="executionId")
+    latch_id: Optional[str] = Field(default=None, alias="latchId")
+    stop_certificate_id: Optional[str] = Field(
+        default=None, alias="stopCertificateId"
+    )
+    stop_owner_generation: int = Field(alias="stopOwnerGeneration")
+    cycle_generation: int = Field(alias="cycleGeneration")
+    program_generation: int = Field(alias="programGeneration")
+    deployment_generation: int = Field(alias="deploymentGeneration")
+    scene_admission_epoch: int = Field(alias="sceneAdmissionEpoch")
+    pose_source_apply_generation: int = Field(alias="poseSourceApplyGeneration")
+    live_collision_world_revision: Optional[int] = Field(
+        default=None, alias="liveCollisionWorldRevision"
+    )
+    recovery_class: str = Field(alias="recoveryClass")
+    status: Literal[
+        "waiting",
+        "action_required",
+        "retry_ready",
+        "reset_required",
+        "unavailable",
+    ]
+    actions: List[CycleRecoveryActionDTO] = Field(default_factory=list)
+    primary_action: Optional[str] = Field(default=None, alias="primaryAction")
+    reason_code: str = Field(alias="reasonCode")
+    evidence_refs: List[str] = Field(default_factory=list, alias="evidenceRefs")
+
+
+class CycleRecoveryActionRequestDTO(BaseModel):
+    model_config = _ALIAS_CFG
+    request_id: str = Field(alias="requestId", min_length=1, max_length=128)
+    offer_id: str = Field(alias="offerId", min_length=1, max_length=128)
+    offer_revision: int = Field(alias="offerRevision", ge=1)
+    action_id: str = Field(alias="actionId", min_length=1, max_length=128)
+    reason: Optional[str] = Field(default=None, max_length=512)
+
+
+class CycleRecoveryActionResultDTO(BaseModel):
+    model_config = _ALIAS_CFG
+    request_id: str = Field(alias="requestId")
+    accepted: bool
+    cycle_resumed: bool = Field(default=False, alias="cycleResumed")
+    result_code: str = Field(default="", alias="resultCode")
+    error: Optional[Dict[str, Any]] = None
+    recovery_offer: Optional[CycleRecoveryOfferDTO] = Field(
+        default=None, alias="recoveryOffer"
+    )
+
+
 class CycleStatusResponse(BaseModel):
     model_config = _ALIAS_CFG
     state: str
@@ -24,6 +96,9 @@ class CycleStatusResponse(BaseModel):
     error_code: Optional[str] = Field(default=None, alias="errorCode")
     error_details: Optional[Dict[str, Any]] = Field(
         default=None, alias="errorDetails"
+    )
+    recovery_offer: Optional[CycleRecoveryOfferDTO] = Field(
+        default=None, alias="recoveryOffer"
     )
 
 
@@ -41,6 +116,9 @@ class CycleCommandErrorResponse(BaseModel):
     error_code: Optional[str] = Field(default=None, alias="errorCode")
     error_details: Optional[Dict[str, Any]] = Field(
         default=None, alias="errorDetails"
+    )
+    recovery_offer: Optional[CycleRecoveryOfferDTO] = Field(
+        default=None, alias="recoveryOffer"
     )
 
 
@@ -62,6 +140,9 @@ class CycleCommandResponse(BaseModel):
     error_code: Optional[str] = Field(default=None, alias="errorCode")
     error_details: Optional[Dict[str, Any]] = Field(
         default=None, alias="errorDetails"
+    )
+    recovery_offer: Optional[CycleRecoveryOfferDTO] = Field(
+        default=None, alias="recoveryOffer"
     )
 
 
@@ -1124,6 +1205,9 @@ class SceneGripperStateResponse(BaseModel):
     joint_name: str
     derived_joints: List[str] = Field(default_factory=list)
     state: str
+    command_id: int = 0
+    generation: int = 0
+    revision: int = 0
     current_position: Optional[float] = None
     target_position: Optional[float] = None
     commanded_position: Optional[float] = None
@@ -1136,12 +1220,15 @@ class SceneGripperStateResponse(BaseModel):
     transport_kind: str = ""
     evidence: List[str] = Field(default_factory=list)
     evidence_state: str = ""
+    projection_state: str = "not_required"
+    projection_reason: str = ""
     limit_lower: Optional[float] = None
     limit_upper: Optional[float] = None
     motion_time_s: float = 0.0
     srdf_presets: Dict[str, float] = Field(default_factory=dict)
     visualization: Optional[SceneGripperVisualizationResponse] = None
     error: Optional[str] = None
+    reason_code: Optional[str] = None
 
 
 class PoseSourcePoseResponse(BaseModel):
@@ -1431,7 +1518,10 @@ class SceneGripperCommandApiResponse(BaseModel):
     accepted: bool
     gripper_id: str = Field(alias="gripperId")
     target_position: float = Field(alias="targetPosition")
+    command_id: int = Field(default=0, alias="commandId")
+    generation: int = 0
     error: Optional[str] = None
+    reason_code: Optional[str] = Field(default=None, alias="reasonCode")
     timestamp_ns: int = Field(alias="timestampNs")
 
 
@@ -1697,6 +1787,9 @@ class ExecutionDigestResponse(BaseModel):
     resume_allowed: bool = Field(alias="resumeAllowed")
     reset_required: bool = Field(alias="resetRequired")
     ack_required: bool = Field(alias="ackRequired")
+    recovery_offer: Optional[CycleRecoveryOfferDTO] = Field(
+        default=None, alias="recoveryOffer"
+    )
     # OW4: latest assembled stop-decision chain (trigger, latch/policy,
     # preemption, override, timings) — additive; external digest consumers
     # access by .get() and ignore unknown keys.
@@ -2189,5 +2282,8 @@ class StateUpdate(BaseModel):
     error_code: Optional[str] = Field(default=None, alias="errorCode")
     error_details: Optional[Dict[str, Any]] = Field(
         default=None, alias="errorDetails"
+    )
+    recovery_offer: Optional[CycleRecoveryOfferDTO] = Field(
+        default=None, alias="recoveryOffer"
     )
     timestamp: float

@@ -159,7 +159,8 @@ class MockFocusedPorts final : public IObservedRobotStateProvider,
                                public IReferencePoseResolver,
                                public ITrajectoryValidator,
                                public ICollisionTrajectoryProjector,
-                               public ICollisionDiagnosticComparator {
+                               public ICollisionDiagnosticComparator,
+                               public IGripperCommandBackend {
  public:
   MockFocusedPorts() = default;
 
@@ -221,6 +222,15 @@ class MockFocusedPorts final : public IObservedRobotStateProvider,
   bool throw_get_state = false;
   bool throw_fk = false;
   std::function<void()> on_validate;
+  mutable std::mutex gripper_mutex;
+  GripperCommandStatusDTO gripper_status;
+  GripperCommandRequestDTO last_gripper_request;
+  std::atomic<int> gripper_command_count{0};
+  std::atomic<int> gripper_mark_lost_count{0};
+  std::atomic<int> gripper_invalidation_count{0};
+  std::atomic<bool> gripper_admission_blocked{false};
+  std::atomic<GripperInvalidationReason> last_gripper_invalidation_reason{
+      GripperInvalidationReason::kReset};
 
   Result<RobotStateDTO> current_state(std::int64_t) const override {
     ++get_state_count;
@@ -370,8 +380,77 @@ class MockFocusedPorts final : public IObservedRobotStateProvider,
     return result;
   }
 
+  GripperCommandResultDTO command_gripper(
+      const GripperCommandRequestDTO& request) override {
+    std::lock_guard<std::mutex> lock(gripper_mutex);
+    if (gripper_admission_blocked.load(std::memory_order_acquire)) {
+      return {false,
+              0,
+              0,
+              ErrorDTO{"gripper_command_not_authorized",
+                       "gripper command admission blocked", {}}};
+    }
+    ++gripper_command_count;
+    last_gripper_request = request;
+    gripper_status.state = GripperCommandState::kExecuting;
+    gripper_status.gripper_id = request.gripper_id;
+    gripper_status.command_id = 41;
+    gripper_status.generation = 73;
+    ++gripper_status.revision;
+    gripper_status.target_position = request.target_position;
+    return {true, 41, 73, std::nullopt};
+  }
+
+  GripperCommandStatusDTO get_gripper_status(
+      const std::string& gripper_id) const override {
+    std::lock_guard<std::mutex> lock(gripper_mutex);
+    auto status = gripper_status;
+    status.gripper_id = gripper_id;
+    return status;
+  }
+
+  GripperCommandResultDTO mark_gripper_grasp_lost(
+      const std::string& gripper_id,
+      std::uint64_t expected_command_id,
+      std::uint64_t expected_generation,
+      const std::string& evidence_label,
+      const std::string& message,
+      const std::string& reason_code) override {
+    std::lock_guard<std::mutex> lock(gripper_mutex);
+    if (gripper_status.command_id != expected_command_id ||
+        gripper_status.generation != expected_generation) {
+      return {false, gripper_status.command_id, gripper_status.generation,
+              ErrorDTO{"stale_gripper_state",
+                       "gripper command identity changed", {}}};
+    }
+    ++gripper_mark_lost_count;
+    gripper_status.state = GripperCommandState::kFailed;
+    gripper_status.gripper_id = gripper_id;
+    gripper_status.evidence.push_back(evidence_label);
+    gripper_status.error = ErrorDTO{reason_code, message, {}};
+    ++gripper_status.revision;
+    return {true, gripper_status.command_id, gripper_status.generation,
+            std::nullopt};
+  }
+
+  void invalidate_gripper_commands(
+      GripperInvalidationReason reason) noexcept override {
+    std::lock_guard<std::mutex> lock(gripper_mutex);
+    gripper_admission_blocked.store(true, std::memory_order_release);
+    last_gripper_invalidation_reason.store(reason, std::memory_order_release);
+    ++gripper_invalidation_count;
+    gripper_status.state = GripperCommandState::kIdle;
+    ++gripper_status.generation;
+    ++gripper_status.revision;
+  }
+
+  void authorize_gripper_commands() noexcept override {
+    std::lock_guard<std::mutex> lock(gripper_mutex);
+    gripper_admission_blocked.store(false, std::memory_order_release);
+  }
+
   operator ExecutionKernelPorts() {
-    return ExecutionKernelPorts{*this, *this, *this, *this, *this, this};
+    return ExecutionKernelPorts{*this, *this, *this, *this, *this, this, this};
   }
 };
 
@@ -760,6 +839,7 @@ class MockExecution : public IExecutionBackend {
   ExecutionSnapshot snapshot;
   Result<void> next_sync_result = Result<void>::Ok();
   std::function<void()> on_sync;
+  std::function<void()> on_reset;
   /// Optional override for the terminal state reported back to the kernel
   /// at the end of `execute_trajectory`. When unset, behave as before
   /// (`kCompleted`). Used by tests that need to drive the kernel into a
@@ -813,6 +893,9 @@ class MockExecution : public IExecutionBackend {
 
   ResetResultDTO reset() override {
     ++reset_count;
+    if (on_reset) {
+      on_reset();
+    }
     return ResetResultDTO{true, std::nullopt};
   }
 
@@ -1675,6 +1758,16 @@ ExecuteRequestDTO make_test_request(const std::string& move_id = "move_1") {
   return req;
 }
 
+GripperCommandRequestDTO make_test_gripper_request() {
+  GripperCommandRequestDTO request;
+  request.gripper_id = "primary";
+  request.group_id = "gripper";
+  request.joint_name = "finger_joint";
+  request.target_position = 0.7;
+  request.duration_s = 0.1;
+  return request;
+}
+
 ActionSpanDTO make_test_action_span() {
   ActionSpanDTO span;
   span.action_source = ActionSource::kProgramNode;
@@ -1966,6 +2059,53 @@ bool wait_for_recovery_status(ExecutionKernel& kernel,
   return false;
 }
 
+KernelRecoveryActionRequestDTO bound_recovery_request(
+    const KernelRecoveryAssessmentDTO& assessment, RecoveryAction action,
+    std::string principal_id = "operator_test",
+    std::string reason = "test recovery action",
+    std::string request_id = "test-recovery-action") {
+  KernelRecoveryActionRequestDTO request;
+  request.request_id = std::move(request_id);
+  request.action = action;
+  request.principal_id = std::move(principal_id);
+  request.reason = std::move(reason);
+  request.expected_assessment_revision = assessment.assessment_revision;
+  request.expected_control_command_epoch = assessment.control_command_epoch;
+  request.expected_execution_id = assessment.execution_id;
+  request.expected_latch_id = assessment.latch_id;
+  request.expected_stop_certificate_id = assessment.stop_certificate_id;
+  request.expected_stop_owner_generation = assessment.stop_owner_generation;
+  return request;
+}
+
+KernelRecoveryActionRequestDTO bound_recovery_request(
+    ExecutionKernel& kernel, RecoveryAction action,
+    std::string principal_id = "operator_test",
+    std::string reason = "test recovery action",
+    std::string request_id = "test-recovery-action") {
+  return bound_recovery_request(
+      kernel.get_recovery_assessment(), action, std::move(principal_id),
+      std::move(reason), std::move(request_id));
+}
+
+KernelRecoveryActionResultDTO apply_recovery_action_after_projection(
+    ExecutionKernel& kernel, RecoveryAction action,
+    std::string principal_id = "operator_test",
+    std::string reason = "test recovery action") {
+  auto request = bound_recovery_request(kernel, action, principal_id, reason);
+  auto result = kernel.apply_recovery_action(request);
+  if (result.accepted || !result.error.has_value() ||
+      !result.error->details.contains("reason") ||
+      result.error->details.at("reason") !=
+          reason_codes::kRecoveryStaleAssessment) {
+    return result;
+  }
+  request = bound_recovery_request(
+      result.resulting_assessment, action, std::move(principal_id),
+      std::move(reason), "test-recovery-action-after-projection");
+  return kernel.apply_recovery_action(request);
+}
+
 // --- Test fixture ---
 
 class ExecutionKernelTest : public ::testing::Test {
@@ -2120,6 +2260,67 @@ class ExecutionKernelTest : public ::testing::Test {
 };
 
 // --- Happy path ---
+
+TEST_F(ExecutionKernelTest, GripperPortDelegatesImmutableCommandStatusAndLoss) {
+  GripperCommandRequestDTO request;
+  request.gripper_id = "primary";
+  request.group_id = "gripper";
+  request.joint_name = "finger_joint";
+  request.target_position = 0.7;
+
+  const auto admitted = kernel.command_gripper(request);
+  ASSERT_TRUE(admitted.accepted);
+  EXPECT_EQ(admitted.command_id, 41u);
+  EXPECT_EQ(admitted.generation, 73u);
+  EXPECT_EQ(context.gripper_command_count.load(), 1);
+  EXPECT_EQ(context.last_gripper_request.gripper_id, "primary");
+
+  const auto first = kernel.get_gripper_status("primary");
+  const auto repeated = kernel.get_gripper_status("primary");
+  EXPECT_EQ(first.command_id, 41u);
+  EXPECT_EQ(first.generation, 73u);
+  EXPECT_EQ(first.revision, repeated.revision);
+
+  const auto lost = kernel.mark_gripper_grasp_lost(
+      "primary", first.command_id, first.generation, "pressure_switch",
+      "Pressure was lost",
+      "grasp_confirmation_lost");
+  ASSERT_TRUE(lost.accepted);
+  EXPECT_EQ(context.gripper_mark_lost_count.load(), 1);
+  const auto failed = kernel.get_gripper_status("primary");
+  EXPECT_EQ(failed.state, GripperCommandState::kFailed);
+  ASSERT_TRUE(failed.error.has_value());
+  EXPECT_EQ(failed.error->code, "grasp_confirmation_lost");
+}
+
+TEST_F(ExecutionKernelTest, ResetInvalidatesGripperBeforeBackendReset) {
+  const auto execute = kernel.execute(make_test_request("gripper_reset"));
+  ASSERT_TRUE(execute.ok());
+  ASSERT_TRUE(kernel.wait_for_completion(1'000'000'000));
+  ASSERT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+
+  const int before = context.gripper_invalidation_count.load();
+  execution.on_reset = [&]() {
+    EXPECT_GT(context.gripper_invalidation_count.load(), before);
+    EXPECT_EQ(context.last_gripper_invalidation_reason.load(),
+              GripperInvalidationReason::kReset);
+  };
+  const auto reset = kernel.reset();
+  ASSERT_TRUE(reset.accepted);
+  EXPECT_EQ(context.gripper_invalidation_count.load(), before + 1);
+  EXPECT_TRUE(kernel.command_gripper(make_test_gripper_request()).accepted);
+}
+
+TEST_F(ExecutionKernelTest, DestructionInvalidatesGripperBeforePortRetirement) {
+  const int before = context.gripper_invalidation_count.load();
+  {
+    ExecutionKernel local_kernel{
+        planner, context, execution, clock, scheduler, cache};
+  }
+  EXPECT_EQ(context.gripper_invalidation_count.load(), before + 1);
+  EXPECT_EQ(context.last_gripper_invalidation_reason.load(),
+            GripperInvalidationReason::kShutdown);
+}
 
 TEST_F(ExecutionKernelTest, Execute_RejectsNonPositivePlanningTimeout) {
   auto req = make_test_request("invalid_planning_timeout");
@@ -3102,7 +3303,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitValidationFailure_BlocksExecution) {
 }
 
 TEST_F(ExecutionKernelTest,
-       AcknowledgeFailedValidationForRetry_ClearsFailedWithoutBackendReset) {
+       ApplyRecoveryAction_RetryAfterSceneRepairClearsFailedWithoutBackendReset) {
   std::vector<KernelEvent> events;
   auto sub = kernel.subscribe_events(
       [&](const KernelEvent& event) { events.push_back(event); });
@@ -3118,13 +3319,16 @@ TEST_F(ExecutionKernelTest,
   execute_sync(make_test_request("move_cached_invalid_ack"));
 
   ASSERT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_FALSE(kernel.command_gripper(make_test_gripper_request()).accepted);
   const auto reset_count_before_ack = execution.reset_count;
-  auto ack = kernel.acknowledge_failed_validation_for_retry(
-      "operator_alice", "ui_acknowledge_failed_validation_and_retry");
+  auto ack = apply_recovery_action_after_projection(
+      kernel, RecoveryAction::kRetryAfterSceneRepair, "operator_alice",
+      "ui_retry_after_scene_repair");
 
   ASSERT_TRUE(ack.accepted)
       << (ack.error.has_value() ? ack.error->message : std::string{});
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+  EXPECT_TRUE(kernel.command_gripper(make_test_gripper_request()).accepted);
   EXPECT_EQ(execution.reset_count, reset_count_before_ack);
   const auto snapshot = kernel.get_execution_snapshot();
   EXPECT_EQ(snapshot.state, ExecutionState::kIdle);
@@ -4180,19 +4384,14 @@ TEST_F(ExecutionKernelTest, AcknowledgeCompleted_FromFailed_Rejected) {
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
 }
 
-// --- Explicit acknowledge_intervention API ---
-//
-// `execute()` rejects with `kErrorInvalidRequest` while in
-// `kInterventionRequired`. The only legitimate exit is an explicit
-// `acknowledge_intervention(principal_id, reason)` call, which clears
-// the state and emits a `kInterventionAcknowledged` event whose details
-// carry the principal and reason for traceability.
+// --- Version-bound recovery action API ---
 
 TEST_F(ExecutionKernelTest, Execute_FromInterventionRequired_Rejected) {
   execution.next_terminal_state = ExecutionState::kInterventionRequired;
   auto first = execute_sync(make_test_request());
   ASSERT_TRUE(first.ok());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+  EXPECT_FALSE(kernel.command_gripper(make_test_gripper_request()).accepted);
 
   auto rejected = kernel.execute(make_test_request());
   EXPECT_FALSE(rejected.ok());
@@ -4201,50 +4400,8 @@ TEST_F(ExecutionKernelTest, Execute_FromInterventionRequired_Rejected) {
   EXPECT_EQ(rejected.error().details.at("reason_code"), "intervention_required");
 }
 
-TEST_F(ExecutionKernelTest, AcknowledgeIntervention_FromIntervention_TransitionsToIdle) {
-  execution.next_terminal_state = ExecutionState::kInterventionRequired;
-  auto first = execute_sync(make_test_request());
-  ASSERT_TRUE(first.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
-
-  std::mutex events_mutex;
-  std::vector<KernelEvent> events;
-  kernel.subscribe_events([&](const KernelEvent& e) {
-    std::lock_guard<std::mutex> lock(events_mutex);
-    events.push_back(e);
-  });
-
-  auto ack = kernel.acknowledge_intervention("operator_alice", "ui_run_resume");
-  ASSERT_TRUE(ack.accepted);
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
-
-  // Subsequent execute() must succeed: clear next_terminal_state so the
-  // backend reports a normal Completed result for the resume run.
-  execution.next_terminal_state.reset();
-  auto resumed = execute_sync(make_test_request());
-  EXPECT_TRUE(resumed.ok());
-
-  std::lock_guard<std::mutex> lock(events_mutex);
-  bool saw_ack_event = false;
-  for (const auto& e : events) {
-    if (e.type == KernelEventType::kInterventionAcknowledged) {
-      saw_ack_event = true;
-      ASSERT_TRUE(e.details.contains("principal_id"));
-      EXPECT_EQ(e.details.at("principal_id"), "operator_alice");
-      ASSERT_TRUE(e.details.contains("reason"));
-      EXPECT_EQ(e.details.at("reason"), "ui_run_resume");
-      ASSERT_TRUE(e.details.contains("prev_state"));
-      EXPECT_EQ(e.details.at("prev_state"),
-                to_string(ExecutionState::kInterventionRequired));
-      break;
-    }
-  }
-  EXPECT_TRUE(saw_ack_event)
-      << "kInterventionAcknowledged event was not emitted";
-}
-
 TEST_F(ExecutionKernelTest,
-       AcknowledgeInterventionForRetry_FromStopIntervention_DoesNotResetBackend) {
+       ApplyRecoveryAction_AcknowledgeAndContinueDoesNotResetBackend) {
   execution.next_terminal_state = ExecutionState::kInterventionRequired;
   execution.snapshot.error = ErrorDTO{
       std::string(kErrorMotionInterruptBackendStopFailed),
@@ -4266,8 +4423,9 @@ TEST_F(ExecutionKernelTest,
     events.push_back(e);
   });
 
-  auto ack = kernel.acknowledge_intervention_for_retry(
-      "operator_alice", "ui_acknowledge_and_continue");
+  auto ack = apply_recovery_action_after_projection(
+      kernel, RecoveryAction::kAcknowledgeAndContinue, "operator_alice",
+      "ui_acknowledge_and_continue");
   ASSERT_TRUE(ack.accepted);
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
   EXPECT_EQ(execution.reset_count, 0);
@@ -4291,7 +4449,7 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest,
-       AcknowledgeInterventionForRetry_RejectsWhenMeasuredVelocityStillMoving) {
+       ApplyRecoveryAction_AcknowledgeAndContinueRejectsWhileMoving) {
   execution.next_terminal_state = ExecutionState::kInterventionRequired;
   execution.snapshot.joint_velocities_rad_s = {0.2, 0.0};
   execution.snapshot.error = ErrorDTO{
@@ -4307,34 +4465,15 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
   execution.publish_observed_state(clock.now(), {1.0, 1.0}, {0.2, 0.0});
 
-  auto ack = kernel.acknowledge_intervention_for_retry(
-      "operator_alice", "ui_acknowledge_and_continue");
+  auto ack = apply_recovery_action_after_projection(
+      kernel, RecoveryAction::kAcknowledgeAndContinue, "operator_alice",
+      "ui_acknowledge_and_continue");
   EXPECT_FALSE(ack.accepted);
   ASSERT_TRUE(ack.error.has_value());
   EXPECT_EQ(ack.error->details.at("reason"),
             reason_codes::kRecoveryObservedStateNotAtRest);
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
   EXPECT_EQ(execution.reset_count, 0);
-}
-
-TEST_F(ExecutionKernelTest, AcknowledgeIntervention_FromIdle_Rejected) {
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
-
-  auto ack = kernel.acknowledge_intervention("operator_bob", "spurious");
-  EXPECT_FALSE(ack.accepted);
-  ASSERT_TRUE(ack.error.has_value());
-  EXPECT_EQ(ack.error->code, kErrorInvalidRequest);
-}
-
-TEST_F(ExecutionKernelTest, AcknowledgeIntervention_FromCompleted_Rejected) {
-  auto first = execute_sync(make_test_request());
-  ASSERT_TRUE(first.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
-
-  auto ack = kernel.acknowledge_intervention("operator_carol", "wrong_state");
-  EXPECT_FALSE(ack.accepted);
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted)
-      << "Wrong-state ack must not transition out of Completed";
 }
 
 TEST_F(ExecutionKernelTest, Execute_FromFailed_ResetsStateAndRetriesWithoutBackendReset) {
@@ -4879,14 +5018,15 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(intervention.ok());
   ASSERT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
   const auto reset_count_before = execution.reset_count;
-  auto stale_intervention_epoch = kernel.control_command_epoch();
+  auto intervention_request = bound_recovery_request(
+      kernel, RecoveryAction::kAcknowledgeAndContinue, "operator_alice",
+      "ui_acknowledge_and_continue");
   (void)kernel.bump_control_command_epoch();
-  auto intervention_ack = kernel.acknowledge_intervention(
-      "operator_alice", "ui_reset", stale_intervention_epoch);
+  auto intervention_ack = kernel.apply_recovery_action(intervention_request);
   EXPECT_FALSE(intervention_ack.accepted);
   ASSERT_TRUE(intervention_ack.error.has_value());
-  EXPECT_EQ(intervention_ack.error->details.at("reason_code"),
-            "stale_control_command");
+  EXPECT_EQ(intervention_ack.error->details.at("reason"),
+            reason_codes::kRecoveryStaleEpoch);
   EXPECT_EQ(execution.reset_count, reset_count_before);
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
 }
@@ -5533,7 +5673,8 @@ TEST_F(ExecutionKernelTest,
   ASSERT_EQ(controlled_kernel.get_recovery_assessment().status,
             RecoveryAssessmentStatus::kRetryReady);
 
-  auto ack = controlled_kernel.acknowledge_interrupted_for_retry(
+  auto ack = apply_recovery_action_after_projection(
+      controlled_kernel, RecoveryAction::kRetryMotionFromCurrentState,
       "operator", "runtime obstacle cleared");
   ASSERT_TRUE(ack.accepted) << (ack.error ? ack.error->message : "");
   ASSERT_EQ(controlled_kernel.get_status().state, ExecutionState::kIdle);
@@ -5570,7 +5711,7 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest,
-       AcknowledgeInterruptedForRetryRejectsPendingFaultPreemptWithoutSideEffects) {
+       ApplyRecoveryActionRejectsPendingFaultPreemptWithoutSideEffects) {
   ControlledExecution controlled_execution;
   controlled_execution.block_controlled_stop = true;
   ThreadSafeFakeClock local_clock;
@@ -5627,8 +5768,9 @@ TEST_F(ExecutionKernelTest,
             InterruptPreemptionResult::kPending);
   const auto epoch = controlled_kernel.control_command_epoch();
 
-  const auto ack = controlled_kernel.acknowledge_interrupted_for_retry(
-      "operator_alice", "runtime obstacle cleared", epoch);
+  const auto ack = apply_recovery_action_after_projection(
+      controlled_kernel, RecoveryAction::kRetryMotionFromCurrentState,
+      "operator_alice", "runtime obstacle cleared");
 
   EXPECT_FALSE(ack.accepted);
   ASSERT_TRUE(ack.error.has_value());
@@ -5679,7 +5821,7 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest,
-       AcknowledgeInterruptedForRetryRejectsDefinitivePreemptWhileStopSourceActive) {
+       ApplyRecoveryActionRejectsDefinitivePreemptWhileStopSourceActive) {
   ControlledExecution controlled_execution;
   controlled_execution.block_controlled_stop = true;
   controlled_execution.ignore_controlled_stop_token_while_blocked = true;
@@ -5775,7 +5917,8 @@ TEST_F(ExecutionKernelTest,
   }
   EXPECT_EQ(latch_before->preemption_result,
             InterruptPreemptionResult::kBackendPreemptFailed);
-  const auto ack = controlled_kernel.acknowledge_interrupted_for_retry(
+  const auto ack = apply_recovery_action_after_projection(
+      controlled_kernel, RecoveryAction::kRetryMotionFromCurrentState,
       "operator_alice", "runtime obstacle cleared");
   const auto latch_after_rejection =
       controlled_kernel.get_active_interrupt_latch();
@@ -5805,7 +5948,7 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest,
-       AcknowledgeInterruptedForRetryRejectsFailedPreemptAfterStopSourceClears) {
+       ApplyRecoveryActionRejectsFailedPreemptAfterStopSourceClears) {
   ControlledExecution controlled_execution;
   ControlledStopResultDTO controlled_stop_failure;
   controlled_stop_failure.accepted = false;
@@ -5905,7 +6048,8 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(controlled_kernel.get_status().state,
             ExecutionState::kInterrupted);
 
-  const auto ack = controlled_kernel.acknowledge_interrupted_for_retry(
+  const auto ack = apply_recovery_action_after_projection(
+      controlled_kernel, RecoveryAction::kRetryMotionFromCurrentState,
       "operator_alice", "runtime obstacle cleared");
   const auto latch_after_rejection =
       controlled_kernel.get_active_interrupt_latch();
@@ -5934,7 +6078,7 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest,
-       AcknowledgeInterruptedForRetryStampsReplayedQueuedLatchRevision) {
+       ApplyRecoveryActionStampsReplayedQueuedLatchRevision) {
   ControlledExecution controlled_execution;
   ThreadSafeFakeClock local_clock;
   ThreadSafeManualScheduler local_scheduler;
@@ -6002,7 +6146,8 @@ TEST_F(ExecutionKernelTest,
   auto queued = controlled_kernel.publish_fast_interrupt_signal(queued_signal);
   ASSERT_TRUE(queued.queued);
 
-  auto ack = controlled_kernel.acknowledge_interrupted_for_retry(
+  auto ack = apply_recovery_action_after_projection(
+      controlled_kernel, RecoveryAction::kRetryMotionFromCurrentState,
       "operator", "collision corrected");
 
   ASSERT_FALSE(ack.accepted);
@@ -7632,12 +7777,16 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(controlled_execution.wait_until_sync_observed_state_count(1));
   ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kPlanning));
 
+  const int invalidations_before = context.gripper_invalidation_count.load();
   const auto start = std::chrono::steady_clock::now();
   auto reset_result = local_kernel.reset();
   const auto elapsed = std::chrono::steady_clock::now() - start;
   EXPECT_TRUE(reset_result.accepted);
   EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
             100);
+  EXPECT_GT(context.gripper_invalidation_count.load(), invalidations_before);
+  EXPECT_TRUE(
+      context.gripper_admission_blocked.load(std::memory_order_acquire));
 
   controlled_execution.release_sync_observed_state();
   execute_thread.join();
@@ -7647,6 +7796,8 @@ TEST_F(ExecutionKernelTest,
   EXPECT_TRUE(wait_for_state(local_kernel, ExecutionState::kIdle));
   EXPECT_EQ(controlled_execution.execute_count, 0);
   EXPECT_EQ(controlled_execution.reset_count, 1);
+  EXPECT_FALSE(
+      context.gripper_admission_blocked.load(std::memory_order_acquire));
   auto outcome = local_kernel.get_execution_outcome(execute_result->value());
   ASSERT_TRUE(outcome.has_value());
   EXPECT_EQ(outcome->move_id, "slow_admission_reset");
@@ -8621,8 +8772,9 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(local_kernel.get_recovery_assessment().reason_code,
             reason_codes::kRecoveryInterventionChoiceRequired);
 
-  auto ack = local_kernel.acknowledge_intervention_for_retry(
-      "operator_alice", "ui_acknowledge_and_continue");
+  auto ack = apply_recovery_action_after_projection(
+      local_kernel, RecoveryAction::kAcknowledgeAndContinue, "operator_alice",
+      "ui_acknowledge_and_continue");
   ASSERT_TRUE(ack.accepted)
       << (ack.error.has_value() ? ack.error->message : std::string{});
   EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kIdle);
@@ -8705,8 +8857,9 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(local_kernel.get_recovery_assessment().reason_code,
             reason_codes::kRecoveryInterventionChoiceRequired);
 
-  auto ack = local_kernel.acknowledge_intervention_for_retry(
-      "operator_alice", "ui_acknowledge_and_continue");
+  auto ack = apply_recovery_action_after_projection(
+      local_kernel, RecoveryAction::kAcknowledgeAndContinue, "operator_alice",
+      "ui_acknowledge_and_continue");
   ASSERT_TRUE(ack.accepted)
       << (ack.error.has_value() ? ack.error->message : std::string{});
   EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kIdle);

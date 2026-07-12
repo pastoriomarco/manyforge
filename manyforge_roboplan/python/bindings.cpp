@@ -38,6 +38,8 @@ py::dict action_span_to_python(const ActionSpanDTO& span);
 std::optional<ActionSpanDTO> action_span_from_python(const py::dict& request);
 void populate_request_correlation(ExecuteRequestDTO& req,
                                   const py::dict& request);
+double finite_scale_from_python(const py::handle& value,
+                                const char* field_name);
 
 std::shared_ptr<ExecutionKernel> require_open_kernel(NativeKernelBundle& bundle) {
   return bundle.kernel_snapshot();
@@ -1038,6 +1040,99 @@ py::dict command_result(bool accepted, const std::optional<ErrorDTO>& error) {
     d["error_details"] = py::dict();
   }
   return d;
+}
+
+py::dict gripper_command_result_to_python(
+    const GripperCommandResultDTO& result) {
+  py::dict d;
+  d["accepted"] = result.accepted;
+  d["command_id"] = result.command_id;
+  d["generation"] = result.generation;
+  if (result.error.has_value()) {
+    d["error"] = result.error->message;
+    d["reason_code"] = result.error->code;
+    d["error_details"] = error_details_to_python(result.error->details);
+  } else {
+    d["error"] = py::none();
+    d["reason_code"] = py::none();
+    d["error_details"] = py::dict();
+  }
+  return d;
+}
+
+py::dict gripper_status_to_python(const GripperCommandStatusDTO& status) {
+  py::dict d;
+  d["state"] = gripper_command_state_name(status.state);
+  d["gripper_id"] = status.gripper_id;
+  d["command_id"] = status.command_id;
+  d["generation"] = status.generation;
+  d["revision"] = status.revision;
+  d["progress"] = status.progress;
+  d["current_position"] = status.current_position.has_value()
+                              ? py::cast(*status.current_position)
+                              : py::none();
+  d["target_position"] = status.target_position.has_value()
+                             ? py::cast(*status.target_position)
+                             : py::none();
+  d["commanded_position"] = status.commanded_position.has_value()
+                                ? py::cast(*status.commanded_position)
+                                : py::none();
+  d["observed_position"] = status.observed_position.has_value()
+                               ? py::cast(*status.observed_position)
+                               : py::none();
+  d["commanded_state"] = status.commanded_state;
+  d["actuation_kind"] = status.actuation_kind;
+  d["state_authority"] = status.state_authority;
+  d["completion_policy"] = status.completion_policy;
+  d["grasp_confirmation_policy"] = status.grasp_confirmation_policy;
+  d["transport_kind"] = status.transport_kind;
+  d["evidence"] = status.evidence;
+  d["evidence_state"] = status.evidence_state;
+  d["projection_state"] =
+      gripper_projection_state_name(status.projection_state);
+  d["projection_reason"] = status.projection_reason;
+  if (status.error.has_value()) {
+    d["error"] = status.error->message;
+    d["reason_code"] = status.error->code;
+    d["error_details"] = error_details_to_python(status.error->details);
+  } else {
+    d["error"] = py::none();
+    d["reason_code"] = py::none();
+    d["error_details"] = py::dict();
+  }
+  return d;
+}
+
+GripperCommandRequestDTO gripper_request_from_python(py::dict request) {
+  GripperCommandRequestDTO dto;
+  dto.gripper_id = request["gripper_id"].cast<std::string>();
+  dto.target_position =
+      finite_scale_from_python(request["target_position"], "target_position");
+  dto.duration_s =
+      finite_scale_from_python(request["duration_s"], "duration_s");
+  if (request.contains("max_effort") && !request["max_effort"].is_none()) {
+    dto.max_effort =
+        finite_scale_from_python(request["max_effort"], "max_effort");
+  }
+  const auto optional_string = [&request](const char* key) {
+    return request.contains(key) && !request[key].is_none()
+               ? request[key].cast<std::string>()
+               : std::string{};
+  };
+  dto.group_id = optional_string("group_id");
+  dto.joint_name = optional_string("joint_name");
+  dto.commanded_state = optional_string("commanded_state");
+  dto.actuation_kind = optional_string("actuation_kind");
+  dto.state_authority = optional_string("state_authority");
+  dto.completion_policy = optional_string("completion_policy");
+  dto.grasp_confirmation_policy =
+      optional_string("grasp_confirmation_policy");
+  dto.transport_kind = optional_string("transport_kind");
+  dto.evidence_state = optional_string("evidence_state");
+  if (request.contains("evidence") && !request["evidence"].is_none()) {
+    dto.evidence = request["evidence"].cast<std::vector<std::string>>();
+  }
+  return dto;
 }
 
 std::optional<std::uint64_t> optional_uint64_from_python(py::object value) {
@@ -2894,21 +2989,6 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }();
         return command_result(r.accepted, r.error);
       }, py::arg("execution_id"), py::arg("expected_epoch") = py::none())
-      .def("acknowledge_intervention",
-           [](NativeKernelBundle& self, std::string principal_id,
-              std::string reason, py::object expected_epoch) -> py::dict {
-             auto kernel = require_open_kernel(self);
-             auto epoch = optional_uint64_from_python(expected_epoch);
-             auto r = [&]() {
-               py::gil_scoped_release release;
-               return kernel->acknowledge_intervention(
-                   std::move(principal_id), std::move(reason), epoch);
-             }();
-             return command_result(r.accepted, r.error);
-           },
-           py::arg("principal_id"),
-           py::arg("reason"),
-           py::arg("expected_epoch") = py::none())
       .def("get_recovery_assessment",
            [](NativeKernelBundle& self) -> py::dict {
              auto kernel = require_open_kernel(self);
@@ -3006,51 +3086,6 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
              return d;
            },
            py::arg("request"))
-      .def("acknowledge_intervention_for_retry",
-           [](NativeKernelBundle& self, std::string principal_id,
-              std::string reason, py::object expected_epoch) -> py::dict {
-             auto kernel = require_open_kernel(self);
-             auto epoch = optional_uint64_from_python(expected_epoch);
-             auto r = [&]() {
-               py::gil_scoped_release release;
-               return kernel->acknowledge_intervention_for_retry(
-                   std::move(principal_id), std::move(reason), epoch);
-             }();
-             return command_result(r.accepted, r.error);
-           },
-           py::arg("principal_id"),
-           py::arg("reason"),
-           py::arg("expected_epoch") = py::none())
-      .def("acknowledge_failed_validation_for_retry",
-           [](NativeKernelBundle& self, std::string principal_id,
-              std::string reason, py::object expected_epoch) -> py::dict {
-             auto kernel = require_open_kernel(self);
-             auto epoch = optional_uint64_from_python(expected_epoch);
-             auto r = [&]() {
-               py::gil_scoped_release release;
-               return kernel->acknowledge_failed_validation_for_retry(
-                   std::move(principal_id), std::move(reason), epoch);
-             }();
-             return command_result(r.accepted, r.error);
-           },
-           py::arg("principal_id"),
-           py::arg("reason"),
-           py::arg("expected_epoch") = py::none())
-      .def("acknowledge_interrupted_for_retry",
-           [](NativeKernelBundle& self, std::string principal_id,
-              std::string reason, py::object expected_epoch) -> py::dict {
-             auto kernel = require_open_kernel(self);
-             auto epoch = optional_uint64_from_python(expected_epoch);
-             auto r = [&]() {
-               py::gil_scoped_release release;
-               return kernel->acknowledge_interrupted_for_retry(
-                   std::move(principal_id), std::move(reason), epoch);
-             }();
-             return command_result(r.accepted, r.error);
-           },
-           py::arg("principal_id"),
-           py::arg("reason"),
-           py::arg("expected_epoch") = py::none())
       .def("set_runtime_velocity_scale",
            [](NativeKernelBundle& self, double scale, py::object principal_id) {
              std::optional<std::string> principal;
@@ -3306,57 +3341,6 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                 gripper_id, std::move(config));
           },
           py::arg("gripper_id"), py::arg("config"))
-      .def("command_ros_gripper",
-          [](NativeKernelBundle& self, const std::string& gripper_id,
-             double target_position, double duration_s,
-             double max_effort) -> py::dict {
-            auto& backend = require_ros2_control_execution(self);
-            const auto result = [&]() {
-              py::gil_scoped_release release;
-              return backend.command_gripper(
-                  gripper_id, target_position, duration_s, max_effort);
-            }();
-            py::dict d;
-            d["accepted"] = result.accepted;
-            if (!result.error.empty()) {
-              d["error"] = result.error;
-            }
-            if (!result.reason_code.empty()) {
-              d["reason_code"] = result.reason_code;
-            }
-            return d;
-          },
-          py::arg("gripper_id"), py::arg("target_position"),
-          py::arg("duration_s"), py::arg("max_effort") = 0.0)
-      .def("update_ros_grippers", [](NativeKernelBundle& self) {
-        auto& backend = require_ros2_control_execution(self);
-        py::gil_scoped_release release;
-        backend.update_gripper_commands();
-      })
-      .def("mark_ros_gripper_grasp_lost",
-          [](NativeKernelBundle& self, const std::string& gripper_id,
-             const std::string& evidence_label, const std::string& message,
-             const std::string& reason_code) -> py::dict {
-            auto& backend = require_ros2_control_execution(self);
-            const auto result = [&]() {
-              py::gil_scoped_release release;
-              return backend.mark_gripper_grasp_lost(
-                  gripper_id, evidence_label, message, reason_code);
-            }();
-            py::dict d;
-            d["accepted"] = result.accepted;
-            if (!result.error.empty()) {
-              d["error"] = result.error;
-            }
-            if (!result.reason_code.empty()) {
-              d["reason_code"] = result.reason_code;
-            }
-            return d;
-          },
-          py::arg("gripper_id"),
-          py::arg("evidence_label"),
-          py::arg("message"),
-          py::arg("reason_code") = "grasp_confirmation_lost")
       // Command-enable gate: the ros2_control backend is the single
       // publishing authority (reliable + transient_local). Returns false
       // when the deployment configures no gate topic.
@@ -3375,45 +3359,48 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         py::gil_scoped_release release;
         return backend.command_gate_configured();
       })
-      .def("get_ros_gripper_status",
-          [](NativeKernelBundle& self, const std::string& gripper_id) -> py::dict {
-            auto& backend = require_ros2_control_execution(self);
+#endif
+      .def("command_gripper",
+          [](NativeKernelBundle& self, py::dict request) -> py::dict {
+            auto kernel = require_open_kernel(self);
+            const auto dto = gripper_request_from_python(std::move(request));
+            const auto result = [&]() {
+              py::gil_scoped_release release;
+              return kernel->command_gripper(dto);
+            }();
+            return gripper_command_result_to_python(result);
+          },
+          py::arg("request"))
+      .def("get_gripper_status",
+          [](NativeKernelBundle& self,
+             const std::string& gripper_id) -> py::dict {
+            auto kernel = require_open_kernel(self);
             const auto status = [&]() {
               py::gil_scoped_release release;
-              return backend.get_gripper_status(gripper_id);
+              return kernel->get_gripper_status(gripper_id);
             }();
-            py::dict d;
-            d["state"] = status.state;
-            d["progress"] = status.progress;
-            if (status.current_position.has_value()) {
-              d["current_position"] = *status.current_position;
-            } else {
-              d["current_position"] = py::none();
-            }
-            if (status.observed_position.has_value()) {
-              d["observed_position"] = *status.observed_position;
-            } else {
-              d["observed_position"] = py::none();
-            }
-            if (status.target_position.has_value()) {
-              d["target_position"] = *status.target_position;
-            } else {
-              d["target_position"] = py::none();
-            }
-            d["evidence"] = status.evidence;
-            if (!status.evidence_state.empty()) {
-              d["evidence_state"] = status.evidence_state;
-            }
-            if (!status.error.empty()) {
-              d["error"] = status.error;
-            }
-            if (!status.reason_code.empty()) {
-              d["reason_code"] = status.reason_code;
-            }
-            return d;
+            return gripper_status_to_python(status);
           },
           py::arg("gripper_id"))
-#endif
+      .def("mark_gripper_grasp_lost",
+          [](NativeKernelBundle& self, const std::string& gripper_id,
+             std::uint64_t expected_command_id,
+             std::uint64_t expected_generation,
+             const std::string& evidence_label, const std::string& message,
+             const std::string& reason_code) -> py::dict {
+            auto kernel = require_open_kernel(self);
+            const auto result = [&]() {
+              py::gil_scoped_release release;
+              return kernel->mark_gripper_grasp_lost(
+                  gripper_id, expected_command_id, expected_generation,
+                  evidence_label, message, reason_code);
+            }();
+            return gripper_command_result_to_python(result);
+          },
+          py::arg("gripper_id"), py::arg("expected_command_id"),
+          py::arg("expected_generation"), py::arg("evidence_label"),
+          py::arg("message"),
+          py::arg("reason_code") = "grasp_confirmation_lost")
       .def("get_scene_object_ids", [](NativeKernelBundle& self) {
         const auto objects = [&]() {
           py::gil_scoped_release release;
@@ -3425,6 +3412,20 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           ids.push_back(object.object_id);
         }
         return ids;
+      })
+      .def("get_scene_authority_status", [](NativeKernelBundle& self) {
+        const auto status = [&]() {
+          py::gil_scoped_release release;
+          return self.scene_authority->authority_status();
+        }();
+        py::dict result;
+        result["revision_id"] = status.revision.revision_id;
+        result["content_hash"] = status.revision.content_hash;
+        result["transaction_sequence"] = status.transaction_sequence;
+        result["scene_admission_epoch"] = status.admission_epoch;
+        result["topology_epoch"] = status.topology_epoch;
+        result["policy_epoch"] = status.policy_epoch;
+        return result;
       })
       .def("get_joint_names", [](NativeKernelBundle& self) {
         const auto names = [&]() {
@@ -3912,7 +3913,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
             collision_result_to_python(manyforge_result);
         return result;
       }, py::arg("positions"), py::arg("waypoint_index") = py::none(),
-      "Compare legacy RoboPlan and ManyForge collision engines for positions.")
+      "Compare diagnostic and authoritative collision engines for positions.")
       .def("get_cached_trajectory", [](NativeKernelBundle& self,
                                        const std::string& move_id) -> py::object {
         auto cached = self.cache->peek_unvalidated(move_id);
@@ -4040,6 +4041,20 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         out["dropped_total"] = stats.dropped_total;
         return out;
       })
+      .def("wait_for_kernel_events",
+           [](NativeKernelBundle& self, double timeout_s) {
+             if (!std::isfinite(timeout_s) || timeout_s < 0.0 ||
+                 timeout_s > 1.0) {
+               throw py::value_error(
+                   "timeout_s must be finite and in [0, 1]");
+             }
+             const auto timeout = std::chrono::duration_cast<
+                 std::chrono::milliseconds>(
+                 std::chrono::duration<double>(timeout_s));
+             py::gil_scoped_release release;
+             return self.event_collector.wait_for_events(timeout);
+           },
+           py::arg("timeout_s"))
       // Compute all link poses at a hypothetical robot configuration, for the
       // Composer Move-To / validated Robot Control candidate "ghost robot"
       // preview (no-motion authoring).

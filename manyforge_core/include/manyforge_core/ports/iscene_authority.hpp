@@ -15,6 +15,7 @@ class ISceneAuthority : public ICollisionWorldSnapshotPublisher {
   virtual SceneCommitResultDTO commit(SceneTransactionDTO transaction) = 0;
   virtual Result<SceneRevisionDTO> rebuild_projection() = 0;
   virtual SceneRevisionDTO current_revision() const = 0;
+  virtual SceneAuthorityStatusDTO authority_status() const = 0;
   virtual LogicalSceneSnapshotPtr logical_snapshot() const = 0;
 
   virtual SceneEditResultDTO add_object(const AddObjectRequestDTO& request) = 0;

@@ -101,10 +101,8 @@ export function HeaderBar() {
     error,
     errorCode: cycleErrorCode,
     errorDetails: cycleErrorDetails,
-    run,
-    acknowledgeInterventionForRetry,
-    acknowledgeFailedValidationForRetry,
-    refreshStatus,
+    recoveryOffer,
+    applyRecoveryAction,
   } = useCycleStore();
   const {
     flowToTree,
@@ -783,31 +781,20 @@ export function HeaderBar() {
             errorCode={activeError.errorCode}
             errorDetails={activeError.errorDetails}
             incidentSnapshot={incidentSnapshot}
-            onAcknowledgeAndContinue={async () => {
+            recoveryOffer={recoveryOffer}
+            recoveryActionBusy={busy}
+            onRecoveryAction={async (offer, actionId) => {
               setBusy(true);
               try {
-                await acknowledgeInterventionForRetry();
+                await applyRecoveryAction(offer, actionId);
                 setActionError(null);
-                await refreshStatus();
               } catch (e) {
                 setActionError(e);
               } finally {
                 setBusy(false);
               }
             }}
-            onAcknowledgeFailedValidationForRetry={async () => {
-              setBusy(true);
-              try {
-                await acknowledgeFailedValidationForRetry();
-                await run();
-                setActionError(null);
-                await refreshStatus();
-              } catch (e) {
-                setActionError(e);
-              } finally {
-                setBusy(false);
-              }
-            }}
+            onRecoveryActionError={setActionError}
           />
         </div>
       )}

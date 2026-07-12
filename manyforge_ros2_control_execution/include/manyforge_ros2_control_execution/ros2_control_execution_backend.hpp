@@ -30,9 +30,11 @@
 #include <trajectory_msgs/msg/joint_trajectory_point.hpp>
 
 #include <manyforge_core/execution_kernel.hpp>
+#include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
 #include <manyforge_core/time/iclock.hpp>
+#include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
 
@@ -59,27 +61,6 @@ struct Ros2GripperActionConfig {
   double state_freshness_timeout_s = 1.0;
   double wait_for_action_server_timeout_s = 2.0;
   double result_timeout_s = 5.0;
-};
-
-struct Ros2GripperCommandResult {
-  bool accepted = false;
-  std::string error;
-  // Stable fault token from ros2_control_fault_reason; empty when accepted.
-  std::string reason_code;
-};
-
-struct Ros2GripperStatus {
-  std::string state = "idle";
-  double progress = 0.0;
-  std::optional<double> current_position;
-  std::optional<double> observed_position;
-  std::optional<double> target_position;
-  std::vector<std::string> evidence;
-  std::string evidence_state;
-  std::string error;
-  // Stable fault token from ros2_control_fault_reason; empty unless
-  // state == "failed".
-  std::string reason_code;
 };
 
 struct Ros2ControlSceneProjectionMetrics {
@@ -128,12 +109,19 @@ struct Ros2ControlControllerProgressMetrics {
 ///   so long validation sweeps cannot block reset/stop completion.
 /// - Per-GripperRuntime::mutex is taken only after gripper_map_mutex_ has been
 ///   released, using a copied shared_ptr to the runtime.
-class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
+/// - A gripper runtime mutex may call only the sink's kBestEffort projection;
+///   that call uses try_lock and no scene/sink path may call back into a
+///   GripperRuntime. This linearizes generation invalidation with projection
+///   without introducing a blocking scene-lock dependency.
+class Ros2ControlExecutionBackend final
+    : public core::IExecutionBackend,
+      public core::IGripperCommandBackend {
  public:
   Ros2ControlExecutionBackend(std::shared_ptr<core::IExecutionStateSink>
                                   execution_state_sink,
                               std::string group_name,
                               core::IClock& clock,
+                              core::IScheduler& scheduler,
                               Ros2ControlExecutionBackendConfig config);
   ~Ros2ControlExecutionBackend() override;
 
@@ -189,17 +177,20 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
 
   void configure_gripper_action(std::string gripper_id,
                                 Ros2GripperActionConfig config);
-  Ros2GripperCommandResult command_gripper(const std::string& gripper_id,
-                                           double target_position,
-                                           double duration_s,
-                                           double max_effort);
-  Ros2GripperCommandResult mark_gripper_grasp_lost(
+  core::GripperCommandResultDTO command_gripper(
+      const core::GripperCommandRequestDTO& request) override;
+  core::GripperCommandResultDTO mark_gripper_grasp_lost(
       const std::string& gripper_id,
+      std::uint64_t expected_command_id,
+      std::uint64_t expected_generation,
       const std::string& evidence_label,
       const std::string& message,
-      const std::string& reason_code = "grasp_confirmation_lost");
-  Ros2GripperStatus get_gripper_status(const std::string& gripper_id) const;
-  void update_gripper_commands();
+      const std::string& reason_code = "grasp_confirmation_lost") override;
+  core::GripperCommandStatusDTO get_gripper_status(
+      const std::string& gripper_id) const override;
+  void invalidate_gripper_commands(
+      core::GripperInvalidationReason reason) noexcept override;
+  void authorize_gripper_commands() noexcept override;
 
   // Command-enable gate: this backend is the SINGLE publishing authority
   // for the gate topic (reliable + transient_local, so the latched value is
@@ -232,10 +223,12 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
       std::string group_name,
       core::IClock& clock,
+      core::IScheduler& scheduler,
       Ros2ControlExecutionBackendConfig config)
       : execution_state_sink_(std::move(execution_state_sink)),
         group_name_(std::move(group_name)),
         clock_(clock),
+        scheduler_(scheduler),
         config_(std::move(config)) {
     if (!execution_state_sink_) {
       throw std::invalid_argument("execution state sink must not be null");
@@ -417,6 +410,12 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
     bool executing = false;
     bool goal_accepted = false;
     bool cancel_pending = false;
+    std::uint64_t command_id = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t revision = 0;
+    double progress = 0.0;
+    std::optional<core::ScheduleHandle> lifecycle_handle;
+    std::uint64_t lifecycle_schedule_generation = 0;
     std::optional<double> start_position;
     std::optional<double> current_position;
     std::optional<double> observed_position;
@@ -424,8 +423,18 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
     std::optional<double> max_effort;
     double target_position = 0.0;
     double duration_s = 0.0;
-    std::chrono::steady_clock::time_point started_at;
-    std::optional<std::chrono::steady_clock::time_point> deadline_at;
+    core::TimePoint started_at_ns = 0;
+    std::optional<core::TimePoint> deadline_at_ns;
+    std::string commanded_state;
+    std::string actuation_kind;
+    std::string state_authority;
+    std::string completion_policy;
+    std::string grasp_confirmation_policy;
+    std::string transport_kind;
+    core::GripperProjectionState projection_state =
+        core::GripperProjectionState::kNotRequired;
+    std::string projection_reason;
+    int projection_retry_count = 0;
     std::vector<std::string> evidence;
     std::string evidence_state;
     bool externally_failed = false;
@@ -532,7 +541,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       const std::string& joint_name,
       double position,
       SceneUpdateMode mode = SceneUpdateMode::kBlocking);
-  void project_gripper_position_to_scene(
+  bool project_gripper_position_to_scene(
       const Ros2GripperActionConfig& config,
       double position,
       SceneUpdateMode mode = SceneUpdateMode::kBlocking);
@@ -585,16 +594,31 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
 
   void on_gripper_feedback(
       const std::shared_ptr<GripperRuntime>& runtime,
+      std::uint64_t command_id,
+      std::uint64_t generation,
       GoalHandleGripper::SharedPtr,
       const std::shared_ptr<const GripperCommand::Feedback> feedback);
   void on_gripper_result(
       const std::shared_ptr<GripperRuntime>& runtime,
+      std::uint64_t command_id,
+      std::uint64_t generation,
       const GoalHandleGripper::WrappedResult& result);
   void cancel_all_gripper_commands();
+  bool schedule_gripper_lifecycle(
+      const std::shared_ptr<GripperRuntime>& runtime,
+      std::uint64_t command_id,
+      std::uint64_t generation,
+      core::TimePoint deadline_ns);
+  void advance_gripper_command(
+      const std::shared_ptr<GripperRuntime>& runtime,
+      std::uint64_t command_id,
+      std::uint64_t generation,
+      std::uint64_t schedule_generation);
 
   std::shared_ptr<core::IExecutionStateSink> execution_state_sink_;
   std::string group_name_;
   core::IClock& clock_;
+  core::IScheduler& scheduler_;
   Ros2ControlExecutionBackendConfig config_;
   std::unique_ptr<core::ObservedRobotStatePublication>
       observed_state_publication_;
@@ -660,8 +684,17 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   std::optional<std::chrono::steady_clock::time_point> tracking_error_since_;
   std::optional<TrackingErrorPeak> peak_tracking_error_;
 
+  // Authority serializes admission/dispatch against reset, stop, and runtime
+  // replacement without holding lifecycle or scene locks across ROS waits.
+  // Lock order is authority -> map -> per-runtime; callbacks only take the
+  // per-runtime leaf lock.
+  mutable std::mutex gripper_authority_mutex_;
+  std::uint64_t gripper_authority_generation_ = 1;
+  bool gripper_admission_blocked_ = false;
   mutable std::mutex gripper_map_mutex_;
   std::unordered_map<std::string, std::shared_ptr<GripperRuntime>> grippers_;
+  std::atomic<std::uint64_t> next_gripper_command_id_{1};
+  std::atomic<std::uint64_t> next_gripper_generation_{1};
 
   // Managed FollowJointTrajectory preempt/controlled-stop substrate. Used by
   // the motion-interrupt controlled-stop paths (spring_back_hold /

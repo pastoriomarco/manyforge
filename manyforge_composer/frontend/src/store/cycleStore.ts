@@ -4,7 +4,12 @@ import { StateWebSocket } from '../api/websocket';
 import { useProgramStore } from './programStore';
 import { useViewerSelectionStore } from './viewerSelectionStore';
 import { coerceCycleStateFailClosed } from './cycleState';
-import type { CycleCommand, CycleStatus } from '../types/api';
+import type {
+  CycleCommand,
+  CycleRecoveryActionResult,
+  CycleRecoveryOffer,
+  CycleStatus,
+} from '../types/api';
 
 /**
  * Extract a structured error tuple from a thrown value. `ApiError` carries
@@ -19,28 +24,49 @@ function structuredErrorFromException(e: unknown): {
   message: string;
   errorCode: string | null;
   errorDetails: Record<string, unknown> | null;
+  recoveryOffer: CycleRecoveryOffer | null;
 } {
   if (e instanceof ApiError) {
     return {
       message: e.message,
       errorCode: e.errorCode,
       errorDetails: e.errorDetails,
+      recoveryOffer: e.recoveryOffer,
     };
   }
   if (e instanceof Error) {
-    return { message: e.message, errorCode: null, errorDetails: null };
+    return {
+      message: e.message,
+      errorCode: null,
+      errorDetails: null,
+      recoveryOffer: null,
+    };
   }
-  return { message: String(e), errorCode: null, errorDetails: null };
+  return {
+    message: String(e),
+    errorCode: null,
+    errorDetails: null,
+    recoveryOffer: null,
+  };
 }
 
 type CycleStatePatch = Pick<
   CycleStore,
-  'state' | 'motionStopState' | 'velocityScale' | 'error' | 'errorCode' | 'errorDetails'
+  | 'state'
+  | 'motionStopState'
+  | 'velocityScale'
+  | 'error'
+  | 'errorCode'
+  | 'errorDetails'
+  | 'recoveryOffer'
 >;
 
 function cycleStatePatchFromCommand(
   result: CycleCommand,
-): Pick<CycleStore, 'state' | 'motionStopState' | 'error' | 'errorCode' | 'errorDetails'> {
+): Pick<
+  CycleStore,
+  'state' | 'motionStopState' | 'error' | 'errorCode' | 'errorDetails' | 'recoveryOffer'
+> {
   const parsed = coerceCycleStateFailClosed(result.state);
   return {
     state: parsed.state,
@@ -48,6 +74,7 @@ function cycleStatePatchFromCommand(
     error: parsed.error ?? result.error ?? null,
     errorCode: result.errorCode ?? null,
     errorDetails: result.errorDetails ?? null,
+    recoveryOffer: result.recoveryOffer ?? null,
   };
 }
 
@@ -60,7 +87,23 @@ function cycleStatePatchFromStatus(status: CycleStatus): CycleStatePatch {
     error: parsed.error ?? status.error ?? null,
     errorCode: status.errorCode ?? null,
     errorDetails: status.errorDetails ?? null,
+    recoveryOffer: status.recoveryOffer ?? null,
   };
+}
+
+function newRecoveryRequestId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `recovery-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function recoveryResultMessage(result: CycleRecoveryActionResult): string {
+  const error = result.error;
+  if (error && typeof error.message === 'string' && error.message.trim()) {
+    return error.message;
+  }
+  return `Recovery action was rejected (${result.resultCode || 'rejected'})`;
 }
 
 let statusFallbackTimer: number | null = null;
@@ -118,15 +161,18 @@ interface CycleStore {
   // poll. Updated from the same WebSocket push as `error`.
   errorCode: string | null;
   errorDetails: Record<string, unknown> | null;
+  recoveryOffer: CycleRecoveryOffer | null;
 
   // Actions
   run: () => Promise<void>;
   stop: () => Promise<void>;
   fullStop: () => Promise<void>;
   reset: () => Promise<void>;
-  acknowledgeInterventionForRetry: () => Promise<void>;
-  acknowledgeFailedValidationForRetry: () => Promise<void>;
-  resetAndRun: () => Promise<void>;
+  applyRecoveryAction: (
+    offer: CycleRecoveryOffer,
+    actionId: string,
+    reason?: string,
+  ) => Promise<CycleRecoveryActionResult>;
   setVelocityScale: (value: number) => Promise<void>;
   refreshStatus: () => Promise<void>;
 
@@ -146,6 +192,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   error: null,
   errorCode: null,
   errorDetails: null,
+  recoveryOffer: null,
   _ws: null,
 
   run: async () => {
@@ -154,7 +201,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
       set(cycleStatePatchFromCommand(result));
     } catch (e) {
       const s = structuredErrorFromException(e);
-      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
+      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails, recoveryOffer: s.recoveryOffer });
     }
   },
 
@@ -164,7 +211,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
       set(cycleStatePatchFromCommand(result));
     } catch (e) {
       const s = structuredErrorFromException(e);
-      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
+      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails, recoveryOffer: s.recoveryOffer });
     }
   },
 
@@ -174,7 +221,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
       set(cycleStatePatchFromCommand(result));
     } catch (e) {
       const s = structuredErrorFromException(e);
-      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
+      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails, recoveryOffer: s.recoveryOffer });
     }
   },
 
@@ -191,50 +238,40 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
       }
     } catch (e) {
       const s = structuredErrorFromException(e);
-      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
+      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails, recoveryOffer: s.recoveryOffer });
     }
   },
 
-  acknowledgeInterventionForRetry: async () => {
-    try {
-      const result = await api.cycle.acknowledgeInterventionForRetry();
-      set(cycleStatePatchFromCommand(result));
-    } catch (e) {
-      const s = structuredErrorFromException(e);
-      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
-      throw e;
+  applyRecoveryAction: async (offer, actionId, reason) => {
+    const result = await api.cycle.applyRecoveryAction({
+      requestId: newRecoveryRequestId(),
+      offerId: offer.offerId,
+      offerRevision: offer.offerRevision,
+      actionId,
+      ...(reason ? { reason } : {}),
+    });
+    // The response always carries the newest immutable offer. Replace it
+    // atomically even on rejection, but preserve the active cycle error until
+    // the authority reports that recovery was accepted.
+    set({ recoveryOffer: result.recoveryOffer ?? null });
+    if (!result.accepted) {
+      throw new Error(recoveryResultMessage(result));
     }
-  },
-
-  acknowledgeFailedValidationForRetry: async () => {
-    try {
-      const result = await api.cycle.acknowledgeFailedValidationForRetry();
-      set(cycleStatePatchFromCommand(result));
-    } catch (e) {
-      const s = structuredErrorFromException(e);
-      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
-      throw e;
+    await get().refreshStatus();
+    const programStore = useProgramStore.getState();
+    const performedReset = offer.actions.some(
+      (action) => action.actionId === actionId && action.performsBackendReset,
+    );
+    if (
+      performedReset &&
+      (get().programLoaded || programStore.programInfo !== null)
+    ) {
+      await Promise.all([
+        programStore.fetchProgramInfo(),
+        programStore.fetchTree(),
+      ]);
     }
-  },
-
-  resetAndRun: async () => {
-    try {
-      const resetResult = await api.cycle.reset();
-      set(cycleStatePatchFromCommand(resetResult));
-      const programStore = useProgramStore.getState();
-      if (get().programLoaded || programStore.programInfo !== null) {
-        await Promise.all([
-          programStore.fetchProgramInfo(),
-          programStore.fetchTree(),
-        ]);
-      }
-      const runResult = await api.cycle.run();
-      set(cycleStatePatchFromCommand(runResult));
-    } catch (e) {
-      const s = structuredErrorFromException(e);
-      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
-      throw e;
-    }
+    return result;
   },
 
   setVelocityScale: async (value: number) => {
@@ -248,7 +285,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
       });
     } catch (e) {
       const s = structuredErrorFromException(e);
-      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
+      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails, recoveryOffer: s.recoveryOffer });
     }
   },
 
@@ -258,7 +295,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
       set(cycleStatePatchFromStatus(result));
     } catch (e) {
       const s = structuredErrorFromException(e);
-      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
+      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails, recoveryOffer: s.recoveryOffer });
     }
   },
 
@@ -279,6 +316,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
         error: parsed.error ?? update.error ?? null,
         errorCode: update.errorCode ?? null,
         errorDetails: update.errorDetails ?? null,
+        recoveryOffer: update.recoveryOffer ?? null,
       });
       // Keep the canvas hydrated even if startup ordering or reconnect timing
       // causes the initial load edge to be missed.

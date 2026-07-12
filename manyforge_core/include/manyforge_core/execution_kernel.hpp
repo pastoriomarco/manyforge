@@ -17,6 +17,7 @@
 #include <manyforge_core/operator_stop_worker.hpp>
 #include <manyforge_core/ports/icollision_trajectory_projector.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
+#include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/ports/iobserved_robot_state_provider.hpp>
 #include <manyforge_core/ports/iplanner_backend.hpp>
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
@@ -240,6 +241,7 @@ struct ExecutionKernelPorts {
   ICollisionTrajectoryProjector& collision_projector;
   const ICollisionDiagnosticComparator* collision_diagnostic_comparator =
       nullptr;
+  IGripperCommandBackend* gripper_command_backend = nullptr;
 };
 
 /// Execution Kernel — single authority for motion execution governance.
@@ -281,6 +283,20 @@ class ExecutionKernel {
   ResetResultDTO reset(
       std::optional<std::uint64_t> expected_epoch = std::nullopt);
 
+  /// Backend-neutral gripper command surface. The injected adapter owns all
+  /// progression and publishes immutable observer status.
+  GripperCommandResultDTO command_gripper(
+      const GripperCommandRequestDTO& request);
+  GripperCommandStatusDTO get_gripper_status(
+      const std::string& gripper_id) const;
+  GripperCommandResultDTO mark_gripper_grasp_lost(
+      const std::string& gripper_id,
+      std::uint64_t expected_command_id,
+      std::uint64_t expected_generation,
+      const std::string& evidence_label,
+      const std::string& message,
+      const std::string& reason_code);
+
   /// Monotonic lifecycle/recovery command epoch. Python control surfaces use
   /// this only to stamp bounded control calls; the C++ kernel owns the actual
   /// stale-command rejection at side-effect boundaries.
@@ -303,60 +319,6 @@ class ExecutionKernel {
   /// execution_id. Failed and Stopped executions require Reset/recovery instead.
   AcknowledgeCompletedResultDTO acknowledge_completed(
       uint64_t execution_id,
-      std::optional<std::uint64_t> expected_epoch = std::nullopt);
-
-  /// Acknowledge an `kInterventionRequired` state and return to Idle.
-  ///
-  /// Valid only from `kInterventionRequired`. Emits a traceable
-  /// `kInterventionAcknowledged` event with the supplied `principal_id` and
-  /// `reason`. This is the reset/resync recovery path. `execute()` rejects
-  /// with `kErrorInvalidRequest` while `kInterventionRequired`, requiring an
-  /// explicit recovery action first. See `spec/200` and ADR-0005.
-  AcknowledgeInterventionResultDTO acknowledge_intervention(
-      std::string principal_id,
-      std::string reason,
-      std::optional<std::uint64_t> expected_epoch = std::nullopt);
-
-  /// Acknowledge a stop/fault intervention for retry without backend reset.
-  ///
-  /// Valid only from `kInterventionRequired` when the latched error is a
-  /// classified stop/fault intervention and fresh backend state proves the
-  /// robot is readable and stopped when measured velocity evidence exists.
-  /// Unlike `acknowledge_intervention`, this path MUST NOT call
-  /// `execution_backend.reset()`: it preserves the current robot pose so the
-  /// next execute replans from where the robot actually stopped.
-  AcknowledgeInterventionResultDTO acknowledge_intervention_for_retry(
-      std::string principal_id,
-      std::string reason,
-      std::optional<std::uint64_t> expected_epoch = std::nullopt);
-
-  /// Acknowledge a retryable failed pre-dispatch validation for retry.
-  ///
-  /// Valid only from `kFailed` when the latched error is a validation gate that
-  /// did not dispatch motion (`validation_collision` or
-  /// `scene_changed_during_validation`). It clears kernel execution
-  /// bookkeeping to Idle and republishes the current backend snapshot without
-  /// calling `execution_backend.reset()`.
-  AcknowledgeFailedValidationResultDTO
-  acknowledge_failed_validation_for_retry(
-      std::string principal_id,
-      std::string reason,
-      std::optional<std::uint64_t> expected_epoch = std::nullopt);
-
-  /// Acknowledge a kernel-owned runtime collision interrupt for retry.
-  ///
-  /// Valid only from `kInterrupted` with the runtime-collision fault latch
-  /// active. Clears the latch, resets kernel execution bookkeeping to Idle,
-  /// and republishes the current backend snapshot without calling
-  /// `execution_backend.reset()`. This preserves the robot's actual stopped
-  /// pose so the next execute plans from that pose instead of commanding the
-  /// simulator/controller back to its reset/home state. Admission is rejected
-  /// unless fault preemption succeeded and its controlled-stop owner is no
-  /// longer active; callers may retry after that narrow containment boundary.
-  /// This does not certify backend stop completion or physical at-rest state.
-  AcknowledgeInterruptedResultDTO acknowledge_interrupted_for_retry(
-      std::string principal_id,
-      std::string reason,
       std::optional<std::uint64_t> expected_epoch = std::nullopt);
 
   /// RT-8B (spec/200, spec/230 §3.7.1): the only kernel statement of
@@ -654,15 +616,10 @@ class ExecutionKernel {
 
   // RT-8B internals.
   RecoveryAuthorityCapture capture_recovery_authority_locked();
-  AcknowledgeInterventionResultDTO acknowledge_intervention_for_retry_locked(
-      std::string principal_id,
-      std::string reason,
-      std::optional<std::uint64_t> expected_epoch);
-  AcknowledgeFailedValidationResultDTO
-  acknowledge_failed_validation_for_retry_locked(
-      std::string principal_id,
-      std::string reason,
-      std::optional<std::uint64_t> expected_epoch);
+  Result<void> apply_acknowledge_and_continue_locked(
+      const std::string& principal_id, const std::string& reason);
+  Result<void> apply_retry_after_scene_repair_locked(
+      const std::string& principal_id, const std::string& reason);
   RecoveryReadinessPolicy recovery_readiness_policy() const;
   KernelRecoveryAssessmentDTO refresh_recovery_assessment_locked(
       const char* trigger);
@@ -693,8 +650,7 @@ class ExecutionKernel {
   void schedule_recovery_observation_poll_locked(
       const KernelRecoveryAssessmentDTO& assessment);
   KernelRecoveryActionResultDTO apply_recovery_action_impl(
-      KernelRecoveryActionRequestDTO request,
-      bool bind_to_current_assessment);
+      KernelRecoveryActionRequestDTO request);
   bool signal_fault_preempt_stop_path_collision(
       std::map<std::string, std::string> details);
   std::optional<std::map<std::string, std::string>>
@@ -787,6 +743,10 @@ class ExecutionKernel {
   void finish_execute_worker();
   void notify_execution_waiters();
   bool retire_execute_worker(std::unique_lock<std::mutex>& lifecycle_lock);
+
+  void invalidate_gripper_authority(
+      GripperInvalidationReason reason) noexcept;
+  void authorize_gripper_authority() noexcept;
 
   bool finalize_overridden_terminal_authority(
       const ExecuteRequestDTO& request,
@@ -890,6 +850,7 @@ class ExecutionKernel {
   ITrajectoryValidator& trajectory_validator_;
   ICollisionTrajectoryProjector& collision_projector_;
   const ICollisionDiagnosticComparator* collision_diagnostic_comparator_;
+  IGripperCommandBackend* gripper_command_backend_;
   IExecutionBackend& execution_backend_;
   IClock& clock_;
   IScheduler& scheduler_;

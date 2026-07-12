@@ -29,6 +29,7 @@ from manyforge_behavior.kernel_client import (
 from manyforge_behavior.nodes.blackboard_output import BlackboardOutputMixin
 from manyforge_behavior.parameters import resolve_blackboard_value
 from manyforge_behavior.reason_codes import ReasonCode
+from manyforge_behavior.runtime_pause import RuntimePauseMixin, RuntimePauseRegistry
 
 
 _SCENE_SNAPSHOT_WAIT_TIMEOUT_S = 2.0
@@ -552,7 +553,12 @@ def _stage_checks_for_failure(causes: list[str]) -> tuple[str, str]:
     return "success", "failure"
 
 
-class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.behaviour.Behaviour):
+class PlanPickSequenceNode(
+    ActionSpanMixin,
+    BlackboardOutputMixin,
+    RuntimePauseMixin,
+    py_trees.behaviour.Behaviour,
+):
     """Deterministically generate and preview a three-leg pick sequence."""
 
     def __init__(
@@ -591,8 +597,15 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
         scene_snapshot_provider: Optional[
             Callable[[int, int, str], Optional[bytes]]
         ] = None,
+        no_feasible_plan_policy: str = "pause_for_operator",
+        runtime_pause_registry: Optional[RuntimePauseRegistry] = None,
     ):
         super().__init__(name=name)
+        self._configure_runtime_pause(
+            registry=runtime_pause_registry,
+            node_id="plan_pick_sequence",
+            domain="planning",
+        )
         self._selected_object_id = selected_object_id
         self._output_key_prefix = output_key_prefix
         self._object_source = object_source
@@ -627,6 +640,7 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
         self._group_id = group_id
         self._base_frame = base_frame
         self._scene_snapshot_provider = scene_snapshot_provider
+        self._no_feasible_plan_policy = str(no_feasible_plan_policy)
         self._bb = py_trees.blackboard.Client(name=f"plan_pick_sequence_{name}")
         self._output_keys_registered = False
         self._awaiting_scene_snapshot = False
@@ -681,7 +695,11 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                     outcome="pose_source_apply_failed",
                     failure_detail=f"{label}: {exc}",
                 )
-                return py_trees.common.Status.FAILURE
+                return self._pause_planning(
+                    reason_code="pose_source_apply_failed",
+                    message=self.feedback_message,
+                    details={"phase": label, "exception_type": type(exc).__name__},
+                )
             if not result.get("success", False):
                 error = str(result.get("error") or f"{label} pose-source apply failed")
                 self.feedback_message = error
@@ -691,7 +709,11 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                     outcome="pose_source_apply_failed",
                     failure_detail=f"{label}: {error}",
                 )
-                return py_trees.common.Status.FAILURE
+                return self._pause_planning(
+                    reason_code="pose_source_apply_failed",
+                    message=self.feedback_message,
+                    details={"phase": label},
+                )
         return None
 
     def initialise(self) -> None:
@@ -701,6 +723,13 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
         self._scene_snapshot_wait_started_ns = 0
 
     def update(self) -> py_trees.common.Status:
+        if self._consume_runtime_resume() is not None:
+            self._awaiting_scene_snapshot = False
+            self._scene_snapshot_wait_started_ns = 0
+            self.feedback_message = ""
+        elif self._runtime_pause_active():
+            return py_trees.common.Status.RUNNING
+
         kernel: KernelClient = self._bb.kernel
         try:
             selected_object_id = str(
@@ -713,7 +742,10 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                 attempted_candidates=0,
                 outcome="selected_object_unavailable",
             )
-            return py_trees.common.Status.FAILURE
+            return self._pause_planning(
+                reason_code="selected_object_unavailable",
+                message=self.feedback_message,
+            )
 
         if not selected_object_id:
             self.feedback_message = "selected_object_id must not be empty"
@@ -741,6 +773,16 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                 selected_object_id=selected_object_id,
                 attempted_candidates=0,
                 outcome="unsupported_search_strategy",
+            )
+            return py_trees.common.Status.FAILURE
+
+        if self._no_feasible_plan_policy not in {
+            "pause_for_operator",
+            "condition_failure",
+        }:
+            self.feedback_message = (
+                "no_feasible_plan_policy must be pause_for_operator or "
+                "condition_failure"
             )
             return py_trees.common.Status.FAILURE
 
@@ -814,7 +856,11 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                     attempted_candidates=0,
                     outcome="image_snapshot_unavailable",
                 )
-                return py_trees.common.Status.FAILURE
+                return self._pause_planning(
+                    reason_code="image_snapshot_unavailable",
+                    message=self.feedback_message,
+                    details={"exception_type": type(exc).__name__},
+                )
             if snapshot_bytes is None:
                 if self._scene_snapshot_wait_started_ns == 0:
                     self._scene_snapshot_wait_started_ns = time.monotonic_ns()
@@ -830,7 +876,10 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                         attempted_candidates=0,
                         outcome="image_snapshot_unavailable",
                     )
-                    return py_trees.common.Status.FAILURE
+                    return self._pause_planning(
+                        reason_code="image_snapshot_unavailable",
+                        message=self.feedback_message,
+                    )
                 self._awaiting_scene_snapshot = True
                 self.feedback_message = "waiting_for_scene_snapshot"
                 self._write_namespace_output(
@@ -851,11 +900,33 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
             )
             return py_trees.common.Status.FAILURE
 
-        scene_snapshot = next(
-            (obj for obj in kernel.get_scene_objects() if obj.object_id == selected_object_id),
-            None,
-        )
-        object_pose = kernel.get_object_pose(selected_object_id, self._base_frame)
+        try:
+            scene_snapshot = next(
+                (
+                    obj
+                    for obj in kernel.get_scene_objects()
+                    if obj.object_id == selected_object_id
+                ),
+                None,
+            )
+            object_pose = kernel.get_object_pose(
+                selected_object_id, self._base_frame
+            )
+        except Exception as exc:  # noqa: BLE001 - backend observation boundary.
+            self.feedback_message = (
+                f"Backend scene lookup failed for '{selected_object_id}': {exc}"
+            )
+            self._write_failure_response(
+                selected_object_id=selected_object_id,
+                attempted_candidates=0,
+                outcome="selected_object_unavailable",
+                failure_detail=str(exc),
+            )
+            return self._pause_planning(
+                reason_code="selected_object_unavailable",
+                message=self.feedback_message,
+                details={"exception_type": type(exc).__name__},
+            )
         if scene_snapshot is None or object_pose is None:
             self.feedback_message = f"Object '{selected_object_id}' not found in backend scene"
             self._write_failure_response(
@@ -863,7 +934,11 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                 attempted_candidates=0,
                 outcome="object_not_found",
             )
-            return py_trees.common.Status.FAILURE
+            return self._pause_planning(
+                reason_code="selected_object_unavailable",
+                message=self.feedback_message,
+                details={"selected_object_id": selected_object_id},
+            )
 
         object_top_z = _shape_top_height(scene_snapshot, object_pose)
         base_orientation = [180.0, 0.0, 0.0]
@@ -879,7 +954,11 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                     outcome="invalid_object_orientation",
                     failure_detail=str(exc),
                 )
-                return py_trees.common.Status.FAILURE
+                return self._pause_planning(
+                    reason_code="selected_object_pose_invalid",
+                    message=self.feedback_message,
+                    details={"selected_object_id": selected_object_id},
+                )
         try:
             pick_offsets = _iter_offset_vectors(
                 self._pick_offset_envelope,
@@ -921,6 +1000,11 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                 outcome="invalid_pick_offset_reference",
                 failure_detail=str(exc),
             )
+            if "unavailable" in str(exc).lower():
+                return self._pause_planning(
+                    reason_code="pick_reference_unavailable",
+                    message=self.feedback_message,
+                )
             return py_trees.common.Status.FAILURE
 
         try:
@@ -964,6 +1048,11 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                 outcome="invalid_approach_offset_reference",
                 failure_detail=str(exc),
             )
+            if "unavailable" in str(exc).lower():
+                return self._pause_planning(
+                    reason_code="approach_reference_unavailable",
+                    message=self.feedback_message,
+                )
             return py_trees.common.Status.FAILURE
 
         attempted_candidates = 0
@@ -1062,9 +1151,27 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                 last_candidate_response = candidate_response
                 self._write_candidate_response(candidate_response)
 
-                approach_preview = kernel.preview_motion(
-                    self._make_pose_goal_request("pick_approach_preview", approach_pose)
-                )
+                try:
+                    approach_preview = kernel.preview_motion(
+                        self._make_pose_goal_request(
+                            "pick_approach_preview", approach_pose
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - planner boundary.
+                    self.feedback_message = f"approach preview raised: {exc}"
+                    self._write_failure_response(
+                        selected_object_id=selected_object_id,
+                        attempted_candidates=attempted_candidates,
+                        outcome="preview_runtime_failed",
+                        failure_detail=self.feedback_message,
+                        candidate_response=last_candidate_response,
+                        candidate_stage_reports=candidate_stage_reports,
+                    )
+                    return self._pause_planning(
+                        reason_code="pick_preview_runtime_failed",
+                        message=self.feedback_message,
+                        details={"stage": "approach", "exception_type": type(exc).__name__},
+                    )
                 if not approach_preview.ok:
                     self._mark_stage_failure(
                         candidate_stage_report,
@@ -1089,7 +1196,11 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                             candidate_response=last_candidate_response,
                             candidate_stage_reports=candidate_stage_reports,
                         )
-                        return py_trees.common.Status.FAILURE
+                        return self._pause_planning(
+                            reason_code="pick_start_state_in_collision",
+                            message=self.feedback_message,
+                            details=(approach_preview.error_details or {}),
+                        )
                     continue
                 self._mark_stage_success(
                     candidate_stage_report,
@@ -1097,10 +1208,28 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                     preview=approach_preview,
                 )
 
-                pick_preview = kernel.preview_motion(
-                    self._make_pose_goal_request("pick_descend_preview", pick_pose),
-                    start_state=approach_preview.final_state,
-                )
+                try:
+                    pick_preview = kernel.preview_motion(
+                        self._make_pose_goal_request(
+                            "pick_descend_preview", pick_pose
+                        ),
+                        start_state=approach_preview.final_state,
+                    )
+                except Exception as exc:  # noqa: BLE001 - planner boundary.
+                    self.feedback_message = f"pick preview raised: {exc}"
+                    self._write_failure_response(
+                        selected_object_id=selected_object_id,
+                        attempted_candidates=attempted_candidates,
+                        outcome="preview_runtime_failed",
+                        failure_detail=self.feedback_message,
+                        candidate_response=last_candidate_response,
+                        candidate_stage_reports=candidate_stage_reports,
+                    )
+                    return self._pause_planning(
+                        reason_code="pick_preview_runtime_failed",
+                        message=self.feedback_message,
+                        details={"stage": "pick", "exception_type": type(exc).__name__},
+                    )
                 if not pick_preview.ok:
                     self._mark_stage_failure(
                         candidate_stage_report,
@@ -1120,10 +1249,28 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
                     preview=pick_preview,
                 )
 
-                exit_preview = kernel.preview_motion(
-                    self._make_pose_goal_request("pick_exit_preview", approach_pose),
-                    start_state=pick_preview.final_state,
-                )
+                try:
+                    exit_preview = kernel.preview_motion(
+                        self._make_pose_goal_request(
+                            "pick_exit_preview", approach_pose
+                        ),
+                        start_state=pick_preview.final_state,
+                    )
+                except Exception as exc:  # noqa: BLE001 - planner boundary.
+                    self.feedback_message = f"exit preview raised: {exc}"
+                    self._write_failure_response(
+                        selected_object_id=selected_object_id,
+                        attempted_candidates=attempted_candidates,
+                        outcome="preview_runtime_failed",
+                        failure_detail=self.feedback_message,
+                        candidate_response=last_candidate_response,
+                        candidate_stage_reports=candidate_stage_reports,
+                    )
+                    return self._pause_planning(
+                        reason_code="pick_preview_runtime_failed",
+                        message=self.feedback_message,
+                        details={"stage": "exit", "exception_type": type(exc).__name__},
+                    )
                 if not exit_preview.ok:
                     self._mark_stage_failure(
                         candidate_stage_report,
@@ -1185,7 +1332,34 @@ class PlanPickSequenceNode(ActionSpanMixin, BlackboardOutputMixin, py_trees.beha
             candidate_response=last_candidate_response,
             candidate_stage_reports=candidate_stage_reports,
         )
-        return py_trees.common.Status.FAILURE
+        if self._no_feasible_plan_policy == "condition_failure":
+            return py_trees.common.Status.FAILURE
+        return self._pause_planning(
+            reason_code="no_feasible_pick_plan",
+            message=self.feedback_message,
+            details={
+                "selected_object_id": selected_object_id,
+                "attempted_candidates": attempted_candidates,
+                "last_failure_detail": last_failure_detail,
+            },
+        )
+
+    def _pause_planning(
+        self,
+        *,
+        reason_code: str,
+        message: str,
+        details: Optional[dict[str, Any]] = None,
+    ) -> py_trees.common.Status:
+        self._raise_runtime_pause(
+            reason_code=reason_code,
+            message=message,
+            details=details,
+        )
+        return py_trees.common.Status.RUNNING
+
+    def terminate(self, new_status: py_trees.common.Status) -> None:
+        self._clear_runtime_pause()
 
     def _pose_output(self, pose: dict[str, Any]) -> dict[str, Any]:
         return {

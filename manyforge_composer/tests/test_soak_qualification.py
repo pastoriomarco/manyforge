@@ -50,7 +50,6 @@ class _SoakKernel:
         self.batch_fk_calls = 0
         self.batch_link_count = 0
         self.gripper_status_calls = 0
-        self.gripper_update_calls = 0
 
     def get_joint_names(self) -> list[str]:
         return ["j0", "j1", "j2"]
@@ -76,9 +75,6 @@ class _SoakKernel:
 
     def get_scene_objects(self) -> list[Any]:
         return []
-
-    def update_gripper_commands(self) -> None:
-        self.gripper_update_calls += 1
 
     def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
         self.gripper_status_calls += 1
@@ -293,7 +289,7 @@ def test_gripper_state_soak_resolves_urdf_limits_once_per_response(
 
     assert get_entry_calls == 75
     assert kernel.gripper_status_calls == 75 * 24
-    assert kernel.gripper_update_calls == 75
+    assert not hasattr(kernel, "update_gripper_commands")
 
 
 class _FakeUrdf:

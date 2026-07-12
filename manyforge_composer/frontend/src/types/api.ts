@@ -1,4 +1,63 @@
 // Cycle
+export type CycleRecoveryStatus =
+  | 'waiting'
+  | 'action_required'
+  | 'retry_ready'
+  | 'reset_required'
+  | 'unavailable';
+
+export interface CycleRecoveryAction {
+  actionId: string;
+  labelKey: string;
+  requiresConfirmation: boolean;
+  performsBackendReset: boolean;
+  enabled: boolean;
+  disabledReasonCode?: string | null;
+}
+
+export interface CycleRecoveryOffer {
+  schemaVersion: 'manyforge.cycle_recovery_offer.v1';
+  offerId: string;
+  offerRevision: number;
+  generatedAtNs: number;
+  validUntilNs?: number | null;
+  kernelAssessmentRevision: number;
+  controlCommandEpoch: number;
+  executionId?: number | null;
+  latchId?: string | null;
+  stopCertificateId?: string | null;
+  stopOwnerGeneration: number;
+  cycleGeneration: number;
+  programGeneration: number;
+  deploymentGeneration: number;
+  sceneAdmissionEpoch: number;
+  poseSourceApplyGeneration: number;
+  liveCollisionWorldRevision?: number | null;
+  recoveryClass: string;
+  status: CycleRecoveryStatus;
+  actions: CycleRecoveryAction[];
+  primaryAction?: string | null;
+  reasonCode: string;
+  evidenceRefs: string[];
+}
+
+export interface CycleRecoveryActionRequest {
+  requestId: string;
+  offerId: string;
+  offerRevision: number;
+  actionId: string;
+  reason?: string;
+}
+
+export interface CycleRecoveryActionResult {
+  requestId: string;
+  accepted: boolean;
+  cycleResumed: boolean;
+  resultCode: string;
+  error?: Record<string, unknown> | null;
+  recoveryOffer?: CycleRecoveryOffer | null;
+}
+
 export interface CycleStatus {
   state: 'idle' | 'running' | 'stopping' | 'stopped' | 'direct_control';
   motionStopState?: 'idle' | 'stopping' | 'held';
@@ -11,6 +70,7 @@ export interface CycleStatus {
   error?: string | null;
   errorCode?: string | null;
   errorDetails?: Record<string, unknown> | null;
+  recoveryOffer?: CycleRecoveryOffer | null;
 }
 
 export interface CycleCommand {
@@ -19,6 +79,7 @@ export interface CycleCommand {
   error?: string | null;
   errorCode?: string | null;
   errorDetails?: Record<string, unknown> | null;
+  recoveryOffer?: CycleRecoveryOffer | null;
 }
 
 export interface VelocityScaleResponse {
@@ -851,6 +912,9 @@ export interface SceneGripperState {
   joint_name: string;
   derived_joints?: string[];
   state: string;
+  command_id: number;
+  generation: number;
+  revision: number;
   current_position: number | null;
   target_position: number | null;
   commanded_position?: number | null;
@@ -863,12 +927,15 @@ export interface SceneGripperState {
   transport_kind?: string;
   evidence?: string[];
   evidence_state?: string;
+  projection_state?: string;
+  projection_reason?: string;
   limit_lower: number | null;
   limit_upper: number | null;
   motion_time_s: number;
   srdf_presets: Record<string, number>;
   visualization?: SceneGripperVisualization | null;
   error: string | null;
+  reason_code?: string | null;
 }
 
 export interface PoseSourcePoseState {
@@ -1202,7 +1269,10 @@ export interface SceneGripperCommandResponse {
   accepted: boolean;
   gripperId: string;
   targetPosition: number;
+  commandId: number;
+  generation: number;
   error?: string | null;
+  reasonCode?: string | null;
   timestampNs: number;
 }
 
@@ -1236,6 +1306,7 @@ export interface StateUpdate {
   // a separate poll.
   errorCode?: string | null;
   errorDetails?: Record<string, unknown> | null;
+  recoveryOffer?: CycleRecoveryOffer | null;
   programLoaded?: boolean;
   programSessionGeneration?: number;
   timestamp: number;

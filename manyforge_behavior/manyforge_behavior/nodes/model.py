@@ -29,6 +29,7 @@ from manyforge_behavior.blackboard_namespace import (
     read_blackboard_binding_value,
     write_namespace_bundle,
 )
+from manyforge_behavior.runtime_pause import RuntimePauseMixin, RuntimePauseRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -343,7 +344,7 @@ def _resolve_output_schema_template(
     return _walk(resolved)
 
 
-class QueryModelNode(py_trees.behaviour.Behaviour):
+class QueryModelNode(RuntimePauseMixin, py_trees.behaviour.Behaviour):
     """Non-blocking leaf node that queries a model endpoint.
 
     Constructor args are injected by the runner at build time.
@@ -376,6 +377,10 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         scene_snapshot_url_publisher: Optional[
             Callable[..., Optional[dict[str, Any]]]
         ] = None,
+        model_runtime_failure_policy: str = "pause_for_operator",
+        model_low_confidence_policy: str = "pause_for_operator",
+        runtime_pause_registry: Optional[RuntimePauseRegistry] = None,
+        node_id: Optional[str] = None,
         # Execution context — injected by runner for audit correlation
         run_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -401,6 +406,8 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         self._audit_policy = audit_policy
         self._scene_snapshot_provider = scene_snapshot_provider
         self._scene_snapshot_url_publisher = scene_snapshot_url_publisher
+        self._model_runtime_failure_policy = str(model_runtime_failure_policy)
+        self._model_low_confidence_policy = str(model_low_confidence_policy)
         self._run_id = run_id
         self._session_id = session_id
         self._principal_id = principal_id
@@ -423,6 +430,59 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         self._last_scene_snapshot_metadata: Optional[dict[str, Any]] = None
         self._bb = py_trees.blackboard.Client(name=f"query_model_{name}")
         self._output_keys_registered = False
+        self._configure_runtime_pause(
+            registry=runtime_pause_registry,
+            node_id=str(node_id or name),
+            domain="model",
+        )
+
+    def _pause_or_fail(
+        self,
+        *,
+        policy: str,
+        reason_code: str,
+        message: str,
+        details: Optional[dict[str, Any]] = None,
+    ) -> py_trees.common.Status:
+        self.feedback_message = message
+        self._write_failed_output_best_effort()
+        if policy == "condition_failure":
+            return py_trees.common.Status.FAILURE
+        if policy != "pause_for_operator":
+            self.feedback_message = f"invalid model failure policy: {policy!r}"
+            return py_trees.common.Status.FAILURE
+        self._future = None
+        self._active_call_generation = None
+        self._raise_runtime_pause(
+            reason_code=reason_code,
+            message=message,
+            details=details,
+        )
+        return py_trees.common.Status.RUNNING
+
+    def _runtime_failure(
+        self,
+        *,
+        reason_code: str,
+        message: str,
+        details: Optional[dict[str, Any]] = None,
+    ) -> py_trees.common.Status:
+        return self._pause_or_fail(
+            policy=self._model_runtime_failure_policy,
+            reason_code=reason_code,
+            message=message,
+            details=details,
+        )
+
+    @staticmethod
+    def _scene_snapshot_error_is_configuration(error: str) -> bool:
+        return error.startswith(
+            (
+                "scene snapshot requested but no native viewer render provider",
+                "scene_snapshot_url_publisher_unavailable",
+                "unsupported_scene_snapshot_transport",
+            )
+        )
 
     def _ensure_output_keys(self) -> None:
         if self._output_keys_registered:
@@ -605,6 +665,11 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         if error is not None:
             self.feedback_message = error
             self._write_namespace_output(value=None, status="failed")
+            if not self._scene_snapshot_error_is_configuration(error):
+                return self._runtime_failure(
+                    reason_code="model_scene_snapshot_failed",
+                    message=error,
+                )
             return py_trees.common.Status.FAILURE
         if not ready:
             if self._scene_snapshot_wait_started_ns == 0:
@@ -613,11 +678,14 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
                 time.monotonic_ns() - self._scene_snapshot_wait_started_ns
             ) / 1_000_000_000
             if elapsed_s >= _SCENE_SNAPSHOT_WAIT_TIMEOUT_S:
-                self.feedback_message = (
-                    f"scene_snapshot_unavailable_after_{_SCENE_SNAPSHOT_WAIT_TIMEOUT_S:.1f}s"
+                return self._runtime_failure(
+                    reason_code="model_scene_snapshot_timeout",
+                    message=(
+                        "scene_snapshot_unavailable_after_"
+                        f"{_SCENE_SNAPSHOT_WAIT_TIMEOUT_S:.1f}s"
+                    ),
+                    details={"timeout_s": _SCENE_SNAPSHOT_WAIT_TIMEOUT_S},
                 )
-                self._write_namespace_output(value=None, status="failed")
-                return py_trees.common.Status.FAILURE
             self._awaiting_scene_snapshot = True
             self.feedback_message = "waiting_for_scene_snapshot"
             self._write_namespace_output(
@@ -628,11 +696,19 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
 
         self._awaiting_scene_snapshot = False
         self.feedback_message = ""
-        self._submit_model_call(
-            scene_snapshot_bytes=scene_snapshot_bytes,
-            scene_snapshot_url=scene_snapshot_url,
-            scene_snapshot_metadata=scene_snapshot_metadata,
-        )
+        try:
+            self._submit_model_call(
+                scene_snapshot_bytes=scene_snapshot_bytes,
+                scene_snapshot_url=scene_snapshot_url,
+                scene_snapshot_metadata=scene_snapshot_metadata,
+            )
+        except Exception as exc:
+            logger.error("%s: failed to submit model call: %s", self.name, exc)
+            return self._runtime_failure(
+                reason_code="model_call_submission_failed",
+                message=str(exc),
+                details={"exception_type": type(exc).__name__},
+            )
         return None
 
     def initialise(self) -> None:
@@ -733,12 +809,20 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
             latency_ms=latency_ms,
         )
         self.feedback_message = f"{reason}; retrying_once"
-        self._submit_model_call(
-            scene_snapshot_bytes=self._last_scene_snapshot_bytes,
-            scene_snapshot_url=self._last_scene_snapshot_url,
-            scene_snapshot_metadata=self._last_scene_snapshot_metadata,
-            prompt_override=self._resolved_prompt + _PARSE_RETRY_SUFFIX,
-        )
+        try:
+            self._submit_model_call(
+                scene_snapshot_bytes=self._last_scene_snapshot_bytes,
+                scene_snapshot_url=self._last_scene_snapshot_url,
+                scene_snapshot_metadata=self._last_scene_snapshot_metadata,
+                prompt_override=self._resolved_prompt + _PARSE_RETRY_SUFFIX,
+            )
+        except Exception as exc:
+            logger.error("%s: failed to submit model repair call: %s", self.name, exc)
+            self._runtime_failure(
+                reason_code="model_call_submission_failed",
+                message=str(exc),
+                details={"exception_type": type(exc).__name__},
+            )
         return True
 
     def _write_namespace_output(self, *, value: Any, status: str, **meta: Any) -> None:
@@ -750,7 +834,28 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
             **meta,
         )
 
+    def _write_failed_output_best_effort(self) -> None:
+        """Do not let secondary diagnostics replace the originating fault."""
+        try:
+            self._write_namespace_output(value=None, status="failed")
+        except Exception as exc:  # noqa: BLE001 - diagnostic write boundary.
+            logger.error(
+                "%s: failed to publish model failure output: %s",
+                self.name,
+                exc,
+            )
+
     def update(self) -> py_trees.common.Status:
+        if self._runtime_pause_fault is not None:
+            if self._consume_runtime_resume() is None:
+                self.feedback_message = self._runtime_pause_fault.message
+                return py_trees.common.Status.RUNNING
+            # The accepted exact recovery action retries this node generation.
+            # Re-run the same configuration preflight; no observer or generic
+            # Run path can reach this branch.
+            self.initialise()
+            return py_trees.common.Status.RUNNING
+
         if self._stop_requested():
             self.feedback_message = "stop_requested"
             if self._future is not None and not self._future.done():
@@ -785,23 +890,28 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
 
         try:
             if self._future.cancelled():
-                self.feedback_message = "model_call_cancelled"
-                self._write_namespace_output(value=None, status="failed")
-                return py_trees.common.Status.FAILURE
+                return self._runtime_failure(
+                    reason_code="model_call_cancelled",
+                    message="model_call_cancelled",
+                )
             result = self._future.result()
         except CancelledError:
-            self.feedback_message = "model_call_cancelled"
-            self._write_namespace_output(value=None, status="failed")
-            return py_trees.common.Status.FAILURE
+            return self._runtime_failure(
+                reason_code="model_call_cancelled",
+                message="model_call_cancelled",
+            )
         except Exception as exc:
             logger.error("%s: model call failed: %s", self.name, exc)
-            self._write_namespace_output(value=None, status="failed")
             self._record_failed_model_event(
                 result=None,
                 error=str(exc),
                 latency_ms=latency_ms,
             )
-            return py_trees.common.Status.FAILURE
+            return self._runtime_failure(
+                reason_code="model_call_failed",
+                message=str(exc),
+                details={"exception_type": type(exc).__name__},
+            )
 
         if (
             active_generation is None
@@ -943,7 +1053,11 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
                 error=self.feedback_message,
                 latency_ms=latency_ms,
             )
-            return py_trees.common.Status.FAILURE
+            return self._runtime_failure(
+                reason_code="model_output_commit_failed",
+                message=self.feedback_message,
+                details={"exception_type": type(exc).__name__},
+            )
 
         # Record completed event
         if self._event_recorder is not None:
@@ -980,7 +1094,15 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
                     )
             self.feedback_message = " | ".join(message_parts)
             logger.warning("%s: %s", self.name, self.feedback_message)
-            return py_trees.common.Status.FAILURE
+            return self._pause_or_fail(
+                policy=self._model_low_confidence_policy,
+                reason_code="model_confidence_below_threshold",
+                message=self.feedback_message,
+                details={
+                    "confidence": confidence,
+                    "minimum_confidence": self._min_confidence,
+                },
+            )
 
         return py_trees.common.Status.SUCCESS
 
@@ -995,6 +1117,8 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
             self._future.cancel()
             self._future = None
             self._active_call_generation = None
+        if new_status != py_trees.common.Status.RUNNING:
+            self._clear_runtime_pause()
 
     def _derive_confidence(self, parsed: Any) -> float:
         if isinstance(parsed, dict):

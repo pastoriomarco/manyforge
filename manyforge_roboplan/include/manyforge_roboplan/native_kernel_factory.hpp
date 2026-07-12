@@ -22,6 +22,7 @@
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
+#include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/observed_robot_state_provider.hpp>
 #include <manyforge_core/scene_authority.hpp>
 #include <manyforge_roboplan/roboplan_focused_adapters.hpp>
@@ -125,8 +126,13 @@ class KernelEventCollector {
   /// (observability plan P4).
   DrainStats drain_with_stats();
 
+  /// Wait until at least one event is buffered or collection is stopped.
+  /// This is an NRT consumer wait; the kernel publisher never waits for it.
+  bool wait_for_events(std::chrono::milliseconds timeout);
+
  private:
   std::mutex mutex_;
+  std::condition_variable cv_;
   std::deque<core::KernelEvent> buffer_;
   std::uint64_t dropped_total_ = 0;
   core::SubscriptionHandle subscription_{0};
@@ -176,6 +182,9 @@ struct NativeKernelBundle {
   std::unique_ptr<core::PublishedObservedRobotStateProvider>
       observed_state_provider;
   std::shared_ptr<core::IExecutionStateSink> execution_state_sink;
+  std::unique_ptr<core::IGripperCommandBackend>
+      owned_gripper_command_backend;
+  core::IGripperCommandBackend* gripper_command_backend = nullptr;
   std::shared_ptr<core::ICollisionQueryEngine> collision_runtime_monitor_engine;
   std::vector<std::shared_ptr<core::ICollisionQueryEngine>>
       collision_validation_engines;

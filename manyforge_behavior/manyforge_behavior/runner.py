@@ -11,6 +11,7 @@ from manyforge_behavior.blackboard_bindings import resolve_runtime_blackboard_bi
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.kernel_client import KernelClient, SceneEditRequest
 from manyforge_behavior.motion_runtime import MotionExecutionCoordinator
+from manyforge_behavior.runtime_pause import RuntimePauseRegistry
 from manyforge_behavior.nodes.geometry import CheckPoseDistance, GetLinkPose
 from manyforge_behavior.nodes.logic import (
     CheckKeyBoolValue,
@@ -114,6 +115,28 @@ _CONTROL_FLOW_NODE_IDS = frozenset(
         "retry",
         "fallback_override_node",
         "recovery_skill_node",
+    }
+)
+_RUNTIME_PAUSE_NODE_IDS = frozenset(
+    {
+        "move_manipulator_action",
+        "move_until_signal",
+        "probe_search_move",
+        "command_gripper",
+        "confirm_gripper_grasp",
+        "plan_pick_sequence",
+        "build_scene_selection_context",
+        "add_collision_object",
+        "upsert_collision_object",
+        "remove_collision_object",
+        "update_collision_object_pose",
+        "attach_object_to_link",
+        "detach_object_from_link",
+        "reset_simulation",
+        "set_simulation_state",
+        "step_simulation",
+        "set_entity_state",
+        "query_model",
     }
 )
 _MOTION_STOP_HOLD_DEFAULT_NODE_IDS = frozenset(
@@ -237,10 +260,15 @@ class OrchestratorRunner:
         self._simulation_control_callback = simulation_control_callback
         self._simulation_reset_callback = simulation_reset_callback
         self._motion_coordinator = MotionExecutionCoordinator(kernel)
+        self._runtime_pause_registry = RuntimePauseRegistry()
         # Intervention context — set by cycle_manager before building
         # intervention subtrees so nodes like QueryModelNode can attribute
         # audit events to the active session.
         self._intervention_context: Optional[dict[str, str]] = None
+
+    @property
+    def runtime_pause_registry(self) -> RuntimePauseRegistry:
+        return self._runtime_pause_registry
 
     def load(self) -> None:
         """Load catalog, program, validate, set up parameter resolver."""
@@ -545,6 +573,8 @@ class OrchestratorRunner:
             blackboard_namespaces=self._program.blackboard_namespaces,
             blackboard_keys=self._program.blackboard_keys,
         )
+        if tree_node.id in _RUNTIME_PAUSE_NODE_IDS:
+            resolved_params["runtime_pause_registry"] = self._runtime_pause_registry
         children = [
             self._build_node(
                 c,
@@ -723,6 +753,18 @@ class OrchestratorRunner:
                     scene_snapshot_width=int(resolved_params.get("scene_snapshot_width", 640)),
                     scene_snapshot_height=int(resolved_params.get("scene_snapshot_height", 480)),
                     scene_snapshot_format=str(resolved_params.get("scene_snapshot_format", "jpeg")),
+                    model_runtime_failure_policy=str(
+                        resolved_params.get(
+                            "model_runtime_failure_policy",
+                            "pause_for_operator",
+                        )
+                    ),
+                    model_low_confidence_policy=str(
+                        resolved_params.get(
+                            "model_low_confidence_policy",
+                            "pause_for_operator",
+                        )
+                    ),
                     endpoint=endpoint,
                     template=template,
                     event_recorder=event_recorder,
@@ -733,6 +775,7 @@ class OrchestratorRunner:
                     session_id=ctx.get("session_id"),
                     principal_id=ctx.get("principal_id"),
                     parent_run_id=ctx.get("parent_run_id"),
+                    runtime_pause_registry=self._runtime_pause_registry,
                 )
             )
         if tree_node.id == "build_scene_selection_context":

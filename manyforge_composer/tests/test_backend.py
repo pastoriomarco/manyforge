@@ -55,6 +55,75 @@ _ISAAC_LITE6_DEPLOYMENT_PATH = str(
     _REPO_ROOT / "examples" / "isaac_lite6_lite_gripper_pick_and_place.deployment.yaml"
 )
 
+
+def _script_ready_recovery(
+    kernel: MockKernelClient,
+    *,
+    action: str,
+    recovery_class: str,
+    status: str = "retry_ready",
+    execution_state: str = "stopped",
+) -> dict:
+    kernel._state = ExecutionState(execution_state)
+    assessment = {
+        "schema_version": "manyforge.kernel_recovery_assessment.v1",
+        "assessment_revision": 31,
+        "assessed_at_ns": time.monotonic_ns(),
+        "control_command_epoch": kernel.control_command_epoch(),
+        "execution_id": kernel.get_status().execution_id,
+        "execution_state": execution_state,
+        "recovery_class": recovery_class,
+        "status": status,
+        "latch_id": "composer-latch" if recovery_class != "ordinary_operator_stop" else "",
+        "source_id": "composer-test",
+        "policy_id": "composer-test",
+        "preemption_result": "succeeded",
+        "stop_owner_active": False,
+        "stop_owner_generation": 9,
+        "backend_stop_confirmed": True,
+        "stop_certificate_id": "composer-stop-cert",
+        "observed_state_available": True,
+        "observed_state_sequence": 44,
+        "observed_state_source_id": "mock",
+        "observed_state_authority_profile": "mock_measured",
+        "observed_state_measured": True,
+        "observed_state_valid_until_ns": time.monotonic_ns() + 5_000_000_000,
+        "observed_state_fresh": True,
+        "observed_state_at_rest": True,
+        "stronger_authority_active": False,
+        "queued_latch_present": False,
+        "retry_admissible": status == "retry_ready",
+        "allowed_actions": [action, "reset_cycle"],
+        "reason_code": "recovery_stop_certified",
+        "evidence_refs": ["composer-stop-cert", "kernel-event:44"],
+    }
+    resulting = dict(assessment)
+    resulting.update(
+        {
+            "assessment_revision": 32,
+            "execution_state": "idle",
+            "recovery_class": "none",
+            "status": "unavailable",
+            "latch_id": "",
+            "stop_certificate_id": "",
+            "retry_admissible": False,
+            "allowed_actions": [],
+            "reason_code": "no_recovery_active",
+            "evidence_refs": [],
+        }
+    )
+    kernel.script_recovery_assessment(assessment)
+    kernel.script_recovery_action_result(
+        {
+            "request_id": "scripted",
+            "action": action,
+            "accepted": True,
+            "error": None,
+            "resulting_assessment": resulting,
+        }
+    )
+    return assessment
+
 # Test security config: no auth, permissive filesystem roots for tmp_path access
 _TEST_SECURITY = SecurityConfig(
     cors_origins=["http://localhost:3000"],
@@ -74,7 +143,31 @@ class _FakeKernelState:
         self.value = value
 
 
-class _FakeCycleManager:
+class _CycleManagerTestSurface:
+    """Minimal current CycleManager surface for route-focused test doubles."""
+
+    def get_recovery_offer(self):
+        return None
+
+    def wait_for_kernel_events_and_project(self, timeout_s):
+        time.sleep(float(timeout_s))
+        return False
+
+    def drain_kernel_events_now(self):
+        return []
+
+    def shutdown(self, *_, **__):
+        return True
+
+    def kernel_event_pipeline_status(self):
+        return {
+            "collector_dropped_total": 0,
+            "manager_dropped_total": 0,
+            "last_sequence_seen": 0,
+        }
+
+
+class _FakeCycleManager(_CycleManagerTestSurface):
     def __init__(self, state_value: str) -> None:
         self.state = _FakeCycleState(state_value)
         self.aborted = False
@@ -84,7 +177,7 @@ class _FakeCycleManager:
         self.state = _FakeCycleState("idle")
 
 
-class _ExecutorProbeCycleManager:
+class _ExecutorProbeCycleManager(_CycleManagerTestSurface):
     def __init__(self) -> None:
         self.state = _FakeCycleState("idle")
         self.motion_stop_state = "idle"
@@ -99,7 +192,8 @@ class _ExecutorProbeCycleManager:
         self._run_calls = 0
         self._lock = threading.Lock()
 
-    def run(self) -> None:
+    def run(self, *, principal_id="operator") -> None:
+        _ = principal_id
         self.thread_names["run"] = threading.current_thread().name
         with self._lock:
             index = self._run_calls
@@ -113,13 +207,26 @@ class _ExecutorProbeCycleManager:
         self.thread_names["reset"] = threading.current_thread().name
         self.state = _FakeCycleState("idle")
 
-    def acknowledge_intervention_for_retry(self, **_kwargs) -> None:
-        self.thread_names["ack"] = threading.current_thread().name
-        self.state = _FakeCycleState("stopped")
+    def get_recovery_offer(self):
+        return None
 
-    def acknowledge_failed_validation_for_retry(self, **_kwargs) -> None:
-        self.thread_names["ack_failed_validation"] = threading.current_thread().name
-        self.state = _FakeCycleState("stopped")
+    def apply_recovery_action(
+        self,
+        request,
+        *,
+        principal_id,
+        reset_callback=None,
+    ):
+        _ = (principal_id, reset_callback)
+        self.thread_names["recovery"] = threading.current_thread().name
+        return {
+            "requestId": request.get("request_id", ""),
+            "accepted": True,
+            "cycleResumed": False,
+            "resultCode": "accepted",
+            "error": None,
+            "recoveryOffer": None,
+        }
 
     def stop(self) -> None:
         self.thread_names["stop"] = threading.current_thread().name
@@ -140,7 +247,7 @@ class _ThreadProbeKernel(MockKernelClient):
         return super().stop()
 
 
-class _KernelSnapshotFaultCycleManager:
+class _KernelSnapshotFaultCycleManager(_CycleManagerTestSurface):
     """Cycle manager fake whose fault exists only in the kernel snapshot."""
 
     state = _FakeCycleState("stopped")
@@ -189,7 +296,7 @@ class _KernelSnapshotFaultCycleManager:
         return {}
 
 
-class _HeldCollisionInterventionCycleManager:
+class _HeldCollisionInterventionCycleManager(_CycleManagerTestSurface):
     """Fake for RUNNING+held soft-fail after the kernel escalated to intervention."""
 
     state = _FakeCycleState("running")
@@ -245,7 +352,7 @@ class _HeldCollisionInterventionCycleManager:
         return {}
 
 
-class _CommandPayloadProbeCycleManager:
+class _CommandPayloadProbeCycleManager(_CycleManagerTestSurface):
     """Fake that records kernel-visibility probes during command responses."""
 
     def __init__(self) -> None:
@@ -259,7 +366,8 @@ class _CommandPayloadProbeCycleManager:
         self.status_reads = 0
         self.snapshot_reads = 0
 
-    def run(self) -> None:
+    def run(self, *, principal_id="operator") -> None:
+        _ = principal_id
         self.state = _FakeCycleState("running")
 
     def get_status(self):
@@ -566,16 +674,32 @@ def test_reset_no_program_409(client):
     assert response.status_code == 409
 
 
-def test_acknowledge_intervention_for_retry_no_program_409(client):
-    """POST /api/cycle/acknowledge-intervention-for-retry returns 409 without program."""
-    response = client.post("/api/cycle/acknowledge-intervention-for-retry")
+def test_recovery_action_no_program_409(client):
+    response = client.post(
+        "/api/cycle/recovery-actions",
+        json={
+            "requestId": "no-program",
+            "offerId": "missing-offer",
+            "offerRevision": 1,
+            "actionId": "reset_cycle",
+        },
+    )
     assert response.status_code == 409
+    assert response.json()["detail"]["errorCode"] == "no_program_loaded"
 
 
-def test_acknowledge_failed_validation_for_retry_no_program_409(client):
-    """POST /api/cycle/acknowledge-failed-validation-for-retry returns 409 without program."""
-    response = client.post("/api/cycle/acknowledge-failed-validation-for-retry")
-    assert response.status_code == 409
+@pytest.mark.parametrize(
+    "legacy_path",
+    [
+        "/api/cycle/acknowledge-intervention-for-retry",
+        "/api/cycle/acknowledge-failed-validation-for-retry",
+    ],
+)
+def test_legacy_recovery_routes_are_absent(client, legacy_path):
+    assert legacy_path not in client.app.openapi()["paths"]
+    # The frontend SPA's GET catch-all can make a POST to an unknown path 405
+    # instead of 404; OpenAPI absence is the authoritative route assertion.
+    assert client.post(legacy_path).status_code in {404, 405}
 
 
 def test_cycle_status_includes_error_fields_for_hmi(client):
@@ -769,8 +893,10 @@ def test_full_stop_from_running():
         assert data["motionStopState"] == "idle"
 
 
-def test_acknowledge_intervention_for_retry_does_not_reset_backend(client, state):
-    """Explicit acknowledge-and-continue clears intervention without backend reset."""
+def test_recovery_action_acknowledge_and_continue_does_not_reset_backend(
+    client, state
+):
+    """The typed endpoint forwards an exact non-resetting intervention action."""
     assert isinstance(state.kernel, MockKernelClient)
     state.kernel._execute_duration_s = 1.0  # noqa: SLF001 - keep mock running for stop
     client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -780,24 +906,54 @@ def test_acknowledge_intervention_for_retry_does_not_reset_backend(client, state
     assert state.cycle_manager is not None
     kernel = state.cycle_manager._kernel  # noqa: SLF001 - test fixture introspection
     assert isinstance(kernel, MockKernelClient)
-    kernel._state = ExecutionState.INTERVENTION_REQUIRED  # noqa: SLF001
+    assessment = _script_ready_recovery(
+        kernel,
+        action="acknowledge_and_continue",
+        recovery_class="stop_fault_intervention",
+        status="action_required",
+        execution_state="intervention_required",
+    )
+    offer = state.cycle_manager.refresh_recovery_offer()
     before_reset_count = kernel.reset_count
 
-    response = client.post("/api/cycle/acknowledge-intervention-for-retry")
+    payload = {
+        "requestId": "composer-ack-intervention",
+        "offerId": offer["offerId"],
+        "offerRevision": offer["offerRevision"],
+        "actionId": "acknowledge_and_continue",
+        "reason": "operator inspected controlled stop",
+    }
+    response = client.post("/api/cycle/recovery-actions", json=payload)
     assert response.status_code == 200
-    assert response.json()["state"] == "stopped"
-    assert kernel.get_status().state == ExecutionState.IDLE
+    assert response.json()["accepted"] is True
+    assert response.json()["cycleResumed"] is True
+    assert kernel.get_status().state in {
+        ExecutionState.IDLE,
+        ExecutionState.EXECUTING,
+    }
     assert kernel.reset_count == before_reset_count
+    request = kernel.apply_recovery_action_requests[-1]
+    assert request["expected_assessment_revision"] == assessment["assessment_revision"]
+    assert request["expected_latch_id"] == assessment["latch_id"]
+    assert request["principal_id"] == "operator_ui"
+
+    replay = client.post("/api/cycle/recovery-actions", json=payload)
+    assert replay.status_code == 200
+    assert replay.json() == response.json()
+    assert len(kernel.apply_recovery_action_requests) == 1
 
 
-def test_acknowledge_failed_validation_for_retry_does_not_reset_backend(client, state):
-    """Failed validation retry clears the gate without backend/scene reset."""
+def test_recovery_action_retry_after_scene_repair_does_not_reset_backend(
+    client, state
+):
+    """Failed-validation recovery uses the same typed non-resetting endpoint."""
     assert isinstance(state.kernel, MockKernelClient)
     client.post("/api/program/load", json={"path": _PROGRAM_PATH})
     assert state.cycle_manager is not None
     manager = state.cycle_manager
     kernel = manager._kernel  # noqa: SLF001 - test fixture introspection
     assert isinstance(kernel, MockKernelClient)
+    manager.reset()
 
     manager._state = CycleState.STOPPED  # noqa: SLF001
     manager._error = "Observed scene source stale"  # noqa: SLF001
@@ -807,20 +963,32 @@ def test_acknowledge_failed_validation_for_retry_does_not_reset_backend(client, 
         "object_id": "isaac_cheese_box",
         "source_id": "isaac_scene_objects",
     }
-    kernel._state = ExecutionState.FAILED  # noqa: SLF001
-    kernel._last_error_message = "Observed scene source stale"  # noqa: SLF001
-    kernel._last_error_code = "scene_changed_during_validation"  # noqa: SLF001
-    kernel._last_error_details = dict(manager._error_details)  # noqa: SLF001
+    _script_ready_recovery(
+        kernel,
+        action="retry_after_scene_repair",
+        recovery_class="failed_validation",
+        execution_state="failed",
+    )
+    offer = manager.refresh_recovery_offer()
     before_reset_count = kernel.reset_count
 
-    response = client.post("/api/cycle/acknowledge-failed-validation-for-retry")
+    response = client.post(
+        "/api/cycle/recovery-actions",
+        json={
+            "requestId": "composer-retry-validation",
+            "offerId": offer["offerId"],
+            "offerRevision": offer["offerRevision"],
+            "actionId": "retry_after_scene_repair",
+        },
+    )
     assert response.status_code == 200
     data = response.json()
-    assert data["state"] == "stopped"
-    assert data["error"] is None
-    assert data["errorCode"] is None
-    assert kernel.get_status().state == ExecutionState.IDLE
-    assert kernel.acknowledge_failed_validation_for_retry_count == 1
+    assert data["accepted"] is True
+    assert data["cycleResumed"] is True
+    assert kernel.get_status().state in {
+        ExecutionState.IDLE,
+        ExecutionState.EXECUTING,
+    }
     assert kernel.reset_count == before_reset_count
 
 
@@ -857,20 +1025,21 @@ def test_cycle_lifecycle_routes_use_lifecycle_executor():
         assert local_client.post("/api/cycle/run").status_code == 200
         assert local_client.post("/api/cycle/reset").status_code == 200
         assert (
-            local_client.post("/api/cycle/acknowledge-intervention-for-retry").status_code
-            == 200
-        )
-        assert (
             local_client.post(
-                "/api/cycle/acknowledge-failed-validation-for-retry"
+                "/api/cycle/recovery-actions",
+                json={
+                    "requestId": "executor-probe",
+                    "offerId": "executor-offer",
+                    "offerRevision": 1,
+                    "actionId": "reset_cycle",
+                },
             ).status_code
             == 200
         )
 
     assert manager.thread_names["run"].startswith("manyforge_cycle_lifecycle")
     assert manager.thread_names["reset"].startswith("manyforge_cycle_lifecycle")
-    assert manager.thread_names["ack"].startswith("manyforge_cycle_lifecycle")
-    assert manager.thread_names["ack_failed_validation"].startswith(
+    assert manager.thread_names["recovery"].startswith(
         "manyforge_cycle_lifecycle"
     )
 
@@ -1784,30 +1953,36 @@ def test_simulation_control_route_rejects_active_program_cycle(state):
     assert "active program cycle" in response.json()["detail"]
 
 
-def test_run_from_stopped():
-    """Run, motion-stop, run again, verify motion resumes."""
-    with make_client(execute_duration_s=1.0) as client:
-        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
-        first_run = client.post("/api/cycle/run")
-        assert first_run.status_code == 200
-        assert first_run.json()["state"] == "running"
+def test_run_from_stopped(client, state):
+    """Run consumes the certified automatic offer after a motion stop."""
+    assert isinstance(state.kernel, MockKernelClient)
+    state.kernel._execute_duration_s = 1.0  # noqa: SLF001 - keep motion active.
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+    first_run = client.post("/api/cycle/run")
+    assert first_run.status_code == 200
+    assert first_run.json()["state"] == "running"
 
-        stop_response = client.post("/api/cycle/stop")
-        assert stop_response.status_code == 200
-        assert stop_response.json()["state"] == "running"
-        assert stop_response.json()["motionStopState"] == "held"
+    stop_response = client.post("/api/cycle/stop")
+    assert stop_response.status_code == 200
+    assert stop_response.json()["state"] == "running"
+    assert stop_response.json()["motionStopState"] == "held"
+    _script_ready_recovery(
+        state.kernel,
+        action="replan_from_stopped_state",
+        recovery_class="ordinary_operator_stop",
+    )
 
-        response = client.post("/api/cycle/run")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["state"] == "running"
-        assert data["motionStopState"] == "idle"
+    response = client.post("/api/cycle/run")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["state"] == "running"
+    assert data["motionStopState"] == "idle"
 
 
-def test_run_route_keeps_held_collision_offer_while_kernel_retains_authority(
+def test_run_route_returns_waiting_offer_while_kernel_retains_authority(
     client, state
 ):
-    """A classified RT-8P0 denial is a 200 held offer, not a route error."""
+    """A pending stop is a structured 409 with the current immutable offer."""
 
     load = client.post("/api/program/load", json={"path": _PROGRAM_PATH})
     assert load.status_code == 200
@@ -1815,20 +1990,13 @@ def test_run_route_keeps_held_collision_offer_while_kernel_retains_authority(
     kernel = state.kernel
     assert manager is not None
     assert isinstance(kernel, MockKernelClient)
-    kernel._state = ExecutionState.INTERRUPTED
-    calls = 0
-
-    def reject_interrupted_retry(**_kwargs) -> CommandResult:
-        nonlocal calls
-        calls += 1
-        return CommandResult(
-            accepted=False,
-            error="runtime-collision stop is not yet certified",
-            reason_code="runtime_collision_stop_not_yet_certified",
-            details={"retryable": "true"},
-        )
-
-    kernel.acknowledge_interrupted_for_retry = reject_interrupted_retry
+    _script_ready_recovery(
+        kernel,
+        action="retry_motion_from_current_state",
+        recovery_class="runtime_collision",
+        status="waiting",
+        execution_state="interrupted",
+    )
     with manager._lock:
         manager._state = CycleState.RUNNING
         manager._motion_stop_state = "held"
@@ -1837,10 +2005,11 @@ def test_run_route_keeps_held_collision_offer_while_kernel_retains_authority(
 
     response = client.post("/api/cycle/run")
 
-    assert response.status_code == 200
-    assert response.json()["state"] == "running"
-    assert response.json()["motionStopState"] == "held"
-    assert calls == 1
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["recoveryOffer"]["status"] == "waiting"
+    assert detail["recoveryOffer"]["recoveryClass"] == "runtime_collision"
+    assert not getattr(kernel, "apply_recovery_action_requests", [])
     assert manager.error == "runtime collision"
     assert manager.error_code == "runtime_collision"
 
@@ -5519,6 +5688,11 @@ def test_kernel_events_route_records_drop_gap_evidence():
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        # This test owns collector overflow deterministically. The recovery
+        # pump is a legitimate concurrent consumer in production, so stop
+        # it here before filling the ring; otherwise the test measures a
+        # scheduler race rather than the collector's drop accounting.
+        state.stop_recovery_offer_pump()
         # Overflow the mock collector ring (maxlen 4096) before any drain:
         # the first drained batch starts past the dropped prefix, so the
         # drop counter is the only loss signal.
@@ -5559,6 +5733,10 @@ def test_heartbeat_degrades_on_kernel_event_pipeline_drops():
         assert "gap_records_total" in component
         assert "last_gap_wall" in component
 
+        # This test deliberately owns collector overflow. The production
+        # recovery pump is a valid concurrent drain consumer, so leaving it
+        # active makes the asserted drop count a scheduler race.
+        state.stop_recovery_offer_pump()
         for _ in range(4200):
             kernel._emit_kernel_event("state_transition")
         state.cycle_manager.drain_kernel_events_now()

@@ -266,6 +266,7 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
       collision_projector_(ports.collision_projector),
       collision_diagnostic_comparator_(
           ports.collision_diagnostic_comparator),
+      gripper_command_backend_(ports.gripper_command_backend),
       execution_backend_(execution_backend),
       clock_(clock),
       scheduler_(scheduler),
@@ -478,6 +479,7 @@ ExecutionKernel::~ExecutionKernel() {
     }
   };
 
+  invalidate_gripper_authority(GripperInvalidationReason::kShutdown);
   stop_policy_.cancel_pending_callbacks();
   drain_scheduler_or_terminate("stop_policy_cancel");
   request_fault_preempt_controlled_stop();
@@ -1293,6 +1295,21 @@ TerminalCommitter::CommitOutcome ExecutionKernel::commit_terminal(
     TerminalCommitter::Origin origin) {
   auto outcome = terminal_committer_.commit({proposed, reason, origin});
   if (outcome.ok()) {
+    switch (outcome.committed) {
+      using enum ExecutionState;
+      case kPaused:
+        invalidate_gripper_authority(GripperInvalidationReason::kPause);
+        break;
+      case kStopping:
+      case kStopped:
+      case kInterrupted:
+      case kFailed:
+      case kInterventionRequired:
+        invalidate_gripper_authority(GripperInvalidationReason::kStop);
+        break;
+      default:
+        break;
+    }
     // RT-8B: terminal transitions change recovery authority facts. This
     // function is reached both with and without lifecycle_mutex_ held, and
     // std::mutex try_lock by the owning thread is UB. Mark dirty and enqueue
@@ -6583,6 +6600,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     sm_.set_execution_id(0);
     return Result<uint64_t>::Err(ErrorCode::kInternalError);
   }
+  authorize_gripper_authority();
 
   worker_signals_.mark_started();
   stop_collision_monitoring(RuntimeCollisionMonitorRelease::kResetOrTeardown);
@@ -6775,6 +6793,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     // Execute admission has not launched a motion worker or operator-stop
     // worker yet; reset can clear the admission without touching any selected
     // stop profile. Active operator stops are handled by reset() in Stopping.
+    invalidate_gripper_authority(GripperInvalidationReason::kReset);
     auto backend_reset = execution_backend_.reset();
     if (!backend_reset.accepted) {
       return fail_admission(backend_reset.error.value_or(
@@ -6796,6 +6815,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     snapshot.progress = 0.0;
     snapshot.error.reset();
     publish_execution_snapshot(std::move(snapshot));
+    authorize_gripper_authority();
     emit_event({KernelEventType::kStateTransition,
                 exec_id,
                 clock_.now(),
@@ -6977,6 +6997,7 @@ StopResultDTO ExecutionKernel::stop() {
       bump_control_command_epoch();
       stop_epoch_bumped = true;
     }
+    invalidate_gripper_authority(GripperInvalidationReason::kStop);
     if (lifecycle_held) {
       // Rebind the published recovery assessment to the post-stop epoch
       // while still inside stop()'s lifecycle hold: commit-coupled, and a
@@ -7236,6 +7257,7 @@ PauseResultDTO ExecutionKernel::pause() {
       }
       return PauseResultDTO{false, error};
     }
+    invalidate_gripper_authority(GripperInvalidationReason::kPause);
     auto snapshot = get_execution_snapshot();
     snapshot.timestamp_ns = clock_.now();
     snapshot.state = sm_.status().state;
@@ -7269,6 +7291,7 @@ ResumeResultDTO ExecutionKernel::resume(
   auto prev_state = sm_.status().state;
   auto result = stop_policy_.request_resume();
   if (result.ok()) {
+    authorize_gripper_authority();
     // Audit 6D: wake the paused worker immediately (it waits on
     // worker_signals_ keyed on resume intent instead of sleep-polling).
     worker_signals_.request_resume();
@@ -7316,6 +7339,11 @@ ResetResultDTO ExecutionKernel::reset(
       lifecycle_reset_requested_while_busy_.store(true,
                                                   std::memory_order_release);
       if (execute_admission_interruptible_.load(std::memory_order_seq_cst)) {
+        // The admission thread cannot consume the pending-reset flag until it
+        // first publishes execute_admission_interruptible_=false. Seeing true
+        // here therefore establishes the reset boundary before that thread can
+        // process it, and makes immediate gripper invalidation race-free.
+        invalidate_gripper_authority(GripperInvalidationReason::kReset);
         return ResetResultDTO{true, std::nullopt};
       }
     }
@@ -7340,6 +7368,11 @@ ResetResultDTO ExecutionKernel::reset(
                  "Execution worker retirement is already in progress",
                  {{"reason_code", "worker_retirement_in_progress"}}}};
   }
+  // This reset intent is now admitted. Fence gripper callbacks and dispatch
+  // before any cancellation, worker retirement, controlled-stop wait, or
+  // backend reset can block. Later reset failure deliberately leaves admission
+  // closed; only a successful reset/resume/new execute reauthorizes commands.
+  invalidate_gripper_authority(GripperInvalidationReason::kReset);
   auto prev_state = sm_.status().state;
   if (prev_state == ExecutionState::kPlanning) {
     request_active_planning_cancel();
@@ -7441,6 +7474,7 @@ ResetResultDTO ExecutionKernel::reset(
     }
     recovery_readiness_tracker_.reset();
     (void)refresh_recovery_assessment_locked("reset_accepted");
+    authorize_gripper_authority();
     return ResetResultDTO{true, std::nullopt};
   };
 
@@ -7734,164 +7768,21 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
   return AcknowledgeCompletedResultDTO{true, std::nullopt};
 }
 
-AcknowledgeInterventionResultDTO ExecutionKernel::acknowledge_intervention(
-    std::string principal_id,
-    std::string reason,
-    std::optional<std::uint64_t> expected_epoch) {
-  EventDeferralScope event_scope(*this);
-  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-  const auto reject_if_stale =
-      [&]() -> std::optional<AcknowledgeInterventionResultDTO> {
-    if (!control_command_epoch_matches(expected_epoch)) {
-      return AcknowledgeInterventionResultDTO{false,
-                                             stale_control_command_error()};
-    }
-    return std::nullopt;
-  };
-
-  if (auto stale = reject_if_stale()) {
-    return *stale;
-  }
-  const auto status = sm_.status();
-  if (status.state != ExecutionState::kInterventionRequired) {
-    return AcknowledgeInterventionResultDTO{
-        false,
-        ErrorDTO{kErrorInvalidRequest,
-                 "acknowledge_intervention is valid only from InterventionRequired",
-                 {{"state", to_string(status.state)}}}};
-  }
-
-  // Resync the backend before clearing the intervention flag. Without this,
-  // a downstream `execute()` call would race against backend state that
-  // still reflects the pre-intervention error. Mirrors the previous implicit
-  // path in execute() but with explicit operator authority.
-  if (auto stale = reject_if_stale()) {
-    return *stale;
-  }
-  auto backend_reset = execution_backend_.reset();
-  if (!backend_reset.accepted) {
-    return AcknowledgeInterventionResultDTO{
-        false,
-        backend_reset.error.value_or(
-            ErrorDTO{kErrorResetFailed,
-                     "Execution backend could not resync from intervention_required",
-                     {{"requires_operator_intervention", "true"},
-                      {"resync_required", "true"},
-                      {"phase", "acknowledge_intervention_resync"}}})};
-  }
-
-  if (auto stale = reject_if_stale()) {
-    return *stale;
-  }
-  // Use `stop_policy_.request_reset()` rather than `sm_.reset()` directly
-  // (which is what `acknowledge_completed` does) because intervention can
-  // be entered with a pending scheduled soft-stop or a sticky `stop_requested_`
-  // flag in StopPolicy. `request_reset()` cancels the scheduled callback
-  // and clears the flag in addition to driving `sm_.reset()`; from
-  // `kCompleted` there is no such pending work to cancel, hence the
-  // sibling acknowledge_completed uses the narrower `sm_.reset()` directly.
-  auto reset_result = stop_policy_.request_reset();
-  if (!reset_result.ok()) {
-    return AcknowledgeInterventionResultDTO{false, reset_result.error()};
-  }
-
-  const auto prev_state = status.state;
-  const auto prev_execution_id = status.execution_id;
-  sm_.set_execution_id(0);
-  active_correlation_.clear_move_id();
-
-  ExecutionSnapshot snapshot = execution_backend_.get_execution_snapshot();
-  snapshot.timestamp_ns = clock_.now();
-  snapshot.execution_id = 0;
-  snapshot.move_id.clear();
-  snapshot.state = ExecutionState::kIdle;
-  snapshot.progress = 0.0;
-  snapshot.error.reset();
-  publish_execution_snapshot(std::move(snapshot));
-  {
-    operator_stop_worker_.clear_errors();
-  }
-
-  emit_event({KernelEventType::kInterventionAcknowledged,
-              prev_execution_id,
-              clock_.now(),
-              {},
-              {},
-              std::nullopt,
-              {{"principal_id", principal_id},
-               {"reason", reason},
-               {"prev_state", to_string(prev_state)}}});
-  emit_event({KernelEventType::kStateTransition,
-              prev_execution_id,
-              clock_.now(),
-              prev_state,
-              ExecutionState::kIdle,
-              std::nullopt,
-              {}});
-
-  {
-    // Cleared AFTER the acknowledgement/recovery boundary events: they are
-    // part of this run's incident story and must carry request correlation.
-    active_correlation_.clear_program_run_and_action_span();
-  }
-  {
-    runtime_collision_monitor_.clear_active_contact_policy_id();
-  }
-  return AcknowledgeInterventionResultDTO{true, std::nullopt};
-}
-
-AcknowledgeInterventionResultDTO
-ExecutionKernel::acknowledge_intervention_for_retry(
-    std::string principal_id,
-    std::string reason,
-    std::optional<std::uint64_t> expected_epoch) {
-  if (expected_epoch.has_value() &&
-      !control_command_epoch_matches(expected_epoch)) {
-    return AcknowledgeInterventionResultDTO{false,
-                                            stale_control_command_error()};
-  }
-  KernelRecoveryActionRequestDTO request;
-  request.request_id = "transitional_intervention_retry";
-  request.action = RecoveryAction::kAcknowledgeAndContinue;
-  request.principal_id = std::move(principal_id);
-  request.reason = std::move(reason);
-  auto result = apply_recovery_action_impl(std::move(request),
-                                           /*bind_to_current_assessment=*/true);
-  return AcknowledgeInterventionResultDTO{result.accepted, result.error};
-}
-
-AcknowledgeInterventionResultDTO
-ExecutionKernel::acknowledge_intervention_for_retry_locked(
-    std::string principal_id,
-    std::string reason,
-    std::optional<std::uint64_t> expected_epoch) {
-  const auto reject_if_stale =
-      [&]() -> std::optional<AcknowledgeInterventionResultDTO> {
-    if (!control_command_epoch_matches(expected_epoch)) {
-      return AcknowledgeInterventionResultDTO{false,
-                                             stale_control_command_error()};
-    }
-    return std::nullopt;
-  };
-
-  if (auto stale = reject_if_stale()) {
-    return *stale;
-  }
+Result<void> ExecutionKernel::apply_acknowledge_and_continue_locked(
+    const std::string& principal_id, const std::string& reason) {
   const auto status = sm_.status();
   if (principal_id.empty()) {
-    return AcknowledgeInterventionResultDTO{
-        false,
+    return Result<void>::Err(
         ErrorDTO{kErrorInvalidRequest,
-                 "acknowledge_intervention_for_retry requires principal_id",
-                 {{"state", to_string(status.state)}}}};
+                 "acknowledge_and_continue requires principal_id",
+                 {{"state", to_string(status.state)}}});
   }
   if (status.state != ExecutionState::kInterventionRequired) {
-    return AcknowledgeInterventionResultDTO{
-        false,
+    return Result<void>::Err(
         ErrorDTO{kErrorInvalidRequest,
-                 "acknowledge_intervention_for_retry is valid only from "
+                 "acknowledge_and_continue is valid only from "
                  "InterventionRequired",
-                 {{"state", to_string(status.state)}}}};
+                 {{"state", to_string(status.state)}}});
   }
 
   // apply_recovery_action_impl is the sole caller. Its coherent assessment
@@ -7901,9 +7792,6 @@ ExecutionKernel::acknowledge_intervention_for_retry_locked(
   // held. This helper owns mutation only.
   auto snapshot = snapshot_publisher_.latest();
 
-  if (auto stale = reject_if_stale()) {
-    return *stale;
-  }
   if (interrupt_manager_.active_latch()) {
     auto clear = interrupt_manager_.clear_active_latch(
         "intervention_retry_acknowledged", clock_.now());
@@ -7911,15 +7799,14 @@ ExecutionKernel::acknowledge_intervention_for_retry_locked(
       record_terminal_fault_authority(clear.value());
       emit_interrupt_events(clear.value());
     } else {
-      return AcknowledgeInterventionResultDTO{false, clear.error()};
+      return Result<void>::Err(clear.error());
     }
     if (interrupt_manager_.active_latch()) {
-      return AcknowledgeInterventionResultDTO{
-          false,
+      return Result<void>::Err(
           ErrorDTO{kErrorInvalidRequest,
                    "Interrupt acknowledgement replayed another active latch; "
                    "retry is not yet admissible",
-                   {{"reason", "intervention_retry_replayed_latch"}}}};
+                   {{"reason", "intervention_retry_replayed_latch"}}});
     }
   }
 
@@ -7928,7 +7815,7 @@ ExecutionKernel::acknowledge_intervention_for_retry_locked(
   // expose false Idle if the disposition revealed a queued latch.
   auto reset_result = stop_policy_.request_reset();
   if (!reset_result.ok()) {
-    return AcknowledgeInterventionResultDTO{false, reset_result.error()};
+    return Result<void>::Err(reset_result.error());
   }
 
   const auto prev_state = status.state;
@@ -7976,7 +7863,8 @@ ExecutionKernel::acknowledge_intervention_for_retry_locked(
   {
     runtime_collision_monitor_.clear_active_contact_policy_id();
   }
-  return AcknowledgeInterventionResultDTO{true, std::nullopt};
+  authorize_gripper_authority();
+  return Result<void>::Ok();
 }
 
 namespace {
@@ -7998,57 +7886,20 @@ bool is_retryable_failed_validation_error(const ErrorDTO& error) {
 
 }  // namespace
 
-AcknowledgeFailedValidationResultDTO
-ExecutionKernel::acknowledge_failed_validation_for_retry(
-    std::string principal_id,
-    std::string reason,
-    std::optional<std::uint64_t> expected_epoch) {
-  if (expected_epoch.has_value() &&
-      !control_command_epoch_matches(expected_epoch)) {
-    return AcknowledgeFailedValidationResultDTO{
-        false, stale_control_command_error()};
-  }
-  KernelRecoveryActionRequestDTO request;
-  request.request_id = "transitional_failed_validation_retry";
-  request.action = RecoveryAction::kRetryAfterSceneRepair;
-  request.principal_id = std::move(principal_id);
-  request.reason = std::move(reason);
-  auto result = apply_recovery_action_impl(std::move(request),
-                                           /*bind_to_current_assessment=*/true);
-  return AcknowledgeFailedValidationResultDTO{result.accepted, result.error};
-}
-
-AcknowledgeFailedValidationResultDTO
-ExecutionKernel::acknowledge_failed_validation_for_retry_locked(
-    std::string principal_id,
-    std::string reason,
-    std::optional<std::uint64_t> expected_epoch) {
-  const auto reject_if_stale =
-      [&]() -> std::optional<AcknowledgeFailedValidationResultDTO> {
-    if (!control_command_epoch_matches(expected_epoch)) {
-      return AcknowledgeFailedValidationResultDTO{
-          false, stale_control_command_error()};
-    }
-    return std::nullopt;
-  };
-
-  if (auto stale = reject_if_stale()) {
-    return *stale;
-  }
+Result<void> ExecutionKernel::apply_retry_after_scene_repair_locked(
+    const std::string& principal_id, const std::string& reason) {
   const auto status = sm_.status();
   if (principal_id.empty()) {
-    return AcknowledgeFailedValidationResultDTO{
-        false,
+    return Result<void>::Err(
         ErrorDTO{kErrorInvalidRequest,
-                 "acknowledge_failed_validation_for_retry requires principal_id",
-                 {{"state", to_string(status.state)}}}};
+                 "retry_after_scene_repair requires principal_id",
+                 {{"state", to_string(status.state)}}});
   }
   if (status.state != ExecutionState::kFailed) {
-    return AcknowledgeFailedValidationResultDTO{
-        false,
+    return Result<void>::Err(
         ErrorDTO{kErrorInvalidRequest,
-                 "acknowledge_failed_validation_for_retry is valid only from Failed",
-                 {{"state", to_string(status.state)}}}};
+                 "retry_after_scene_repair is valid only from Failed",
+                 {{"state", to_string(status.state)}}});
   }
 
   // The assessment transaction already classified the published failure as a
@@ -8056,31 +7907,26 @@ ExecutionKernel::acknowledge_failed_validation_for_retry_locked(
   // than issuing a backend RPC under lifecycle_mutex_.
   const auto failed_snapshot = snapshot_publisher_.latest();
   if (!failed_snapshot.error.has_value()) {
-    return AcknowledgeFailedValidationResultDTO{
-        false,
+    return Result<void>::Err(
         ErrorDTO{kErrorInvalidRequest,
-                 "Cannot acknowledge failed validation for retry: missing "
-                 "classified validation error",
-                 {{"reason", "failed_validation_error_missing"}}}};
+                 "Cannot retry after scene repair: missing classified "
+                 "validation error",
+                 {{"reason", "failed_validation_error_missing"}}});
   }
   if (!is_retryable_failed_validation_error(*failed_snapshot.error)) {
-    return AcknowledgeFailedValidationResultDTO{
-        false,
+    return Result<void>::Err(
         ErrorDTO{kErrorInvalidRequest,
-                 "Cannot acknowledge failed validation for retry: failure is "
-                 "not a retryable pre-dispatch validation boundary",
+                 "Cannot retry after scene repair: failure is not a retryable "
+                 "pre-dispatch validation boundary",
                  {{"reason", "failed_validation_not_retryable"},
-                  {"error_code", failed_snapshot.error->code}}}};
+                  {"error_code", failed_snapshot.error->code}}});
   }
 
   auto backend_snapshot = failed_snapshot;
 
-  if (auto stale = reject_if_stale()) {
-    return *stale;
-  }
   auto reset_result = stop_policy_.request_reset();
   if (!reset_result.ok()) {
-    return AcknowledgeFailedValidationResultDTO{false, reset_result.error()};
+    return Result<void>::Err(reset_result.error());
   }
 
   const auto prev_execution_id = status.execution_id;
@@ -8119,34 +7965,8 @@ ExecutionKernel::acknowledge_failed_validation_for_retry_locked(
   {
     runtime_collision_monitor_.clear_active_contact_policy_id();
   }
-  return AcknowledgeFailedValidationResultDTO{true, std::nullopt};
-}
-
-AcknowledgeInterruptedResultDTO
-ExecutionKernel::acknowledge_interrupted_for_retry(
-    std::string principal_id,
-    std::string reason,
-    std::optional<std::uint64_t> expected_epoch) {
-  // RT-8B: transitional adapter. The single admission truth table lives in
-  // apply_recovery_action_impl; this API binds to the current assessment
-  // (live-state semantics identical to the RT-8P0 guard it subsumes) and is
-  // deleted in RT-8D once callers consume offers.
-  if (expected_epoch.has_value() &&
-      !control_command_epoch_matches(expected_epoch)) {
-    return AcknowledgeInterruptedResultDTO{false,
-                                           stale_control_command_error()};
-  }
-  KernelRecoveryActionRequestDTO request;
-  request.request_id = "transitional_interrupted_retry";
-  request.action = RecoveryAction::kRetryMotionFromCurrentState;
-  request.principal_id = std::move(principal_id);
-  request.reason = std::move(reason);
-  auto result = apply_recovery_action_impl(std::move(request),
-                                           /*bind_to_current_assessment=*/true);
-  if (result.accepted) {
-    return AcknowledgeInterruptedResultDTO{true, std::nullopt};
-  }
-  return AcknowledgeInterruptedResultDTO{false, result.error};
+  authorize_gripper_authority();
+  return Result<void>::Ok();
 }
 
 KernelRecoveryAssessmentDTO ExecutionKernel::get_recovery_assessment() const {
@@ -8538,28 +8358,16 @@ void ExecutionKernel::schedule_recovery_observation_poll_locked(
 
 KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action(
     const KernelRecoveryActionRequestDTO& request) {
-  return apply_recovery_action_impl(request,
-                                    /*bind_to_current_assessment=*/false);
+  return apply_recovery_action_impl(request);
 }
 
 KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action_impl(
-    KernelRecoveryActionRequestDTO request,
-    bool bind_to_current_assessment) {
+    KernelRecoveryActionRequestDTO request) {
   EventDeferralScope event_scope(*this);
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
   RecoveryAuthorityCapture capture = capture_recovery_authority_locked();
   auto assessment = publish_recovery_assessment_locked(
       capture, "recovery_action_admission");
-  if (bind_to_current_assessment) {
-    request.expected_assessment_revision = assessment.assessment_revision;
-    request.expected_control_command_epoch =
-        assessment.control_command_epoch;
-    request.expected_execution_id = assessment.execution_id;
-    request.expected_latch_id = assessment.latch_id;
-    request.expected_stop_certificate_id = assessment.stop_certificate_id;
-    request.expected_stop_owner_generation =
-        assessment.stop_owner_generation;
-  }
   const auto reject_with_assessment =
       [&](const KernelRecoveryAssessmentDTO& rejected_assessment,
           std::string_view reason)
@@ -8657,6 +8465,7 @@ KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action_impl(
       accepted_from_state = ExecutionState::kInterrupted;
       active_correlation_.clear_program_run_and_action_span();
       runtime_collision_monitor_.clear_active_contact_policy_id();
+      authorize_gripper_authority();
       break;
     }
     case RecoveryAction::kReplanFromStoppedState: {
@@ -8688,27 +8497,26 @@ KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action_impl(
                   {{"reason", "stopped_replan_acknowledged"}}});
       accepted_from_state = ExecutionState::kStopped;
       active_correlation_.clear_program_run_and_action_span();
+      authorize_gripper_authority();
       break;
     }
     case RecoveryAction::kAcknowledgeAndContinue: {
-      auto result = acknowledge_intervention_for_retry_locked(
-          request.principal_id, request.reason, std::nullopt);
-      if (!result.accepted) {
-        return reject(result.error.has_value() &&
-                              result.error->details.count("reason")
-                          ? result.error->details.at("reason")
+      auto result = apply_acknowledge_and_continue_locked(
+          request.principal_id, request.reason);
+      if (!result.ok()) {
+        return reject(result.error().details.count("reason")
+                          ? result.error().details.at("reason")
                           : std::string("intervention_ack_rejected"));
       }
       accepted_from_state = ExecutionState::kInterventionRequired;
       break;
     }
     case RecoveryAction::kRetryAfterSceneRepair: {
-      auto result = acknowledge_failed_validation_for_retry_locked(
-          request.principal_id, request.reason, std::nullopt);
-      if (!result.accepted) {
-        return reject(result.error.has_value() &&
-                              result.error->details.count("reason")
-                          ? result.error->details.at("reason")
+      auto result = apply_retry_after_scene_repair_locked(
+          request.principal_id, request.reason);
+      if (!result.ok()) {
+        return reject(result.error().details.count("reason")
+                          ? result.error().details.at("reason")
                           : std::string("failed_validation_ack_rejected"));
       }
       accepted_from_state = ExecutionState::kFailed;

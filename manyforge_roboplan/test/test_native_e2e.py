@@ -11,7 +11,7 @@ import pytest
 
 from manyforge_behavior.kernel_client import (
     ExecuteRequest, ExecutionState, GripperCommandRequest,
-    GripperCommandState, GripperCommandStatus, MotionInterruptScope, MotionInterruptStopProfile,
+    GripperCommandState, MotionInterruptScope, MotionInterruptStopProfile,
     SceneEditRequest,
 )
 
@@ -212,27 +212,131 @@ def test_motion_interrupt_scope_serializes_settle_velocity_threshold():
     assert serialized["stop_profile"]["settle_velocity_threshold_rad_s"] == 0.02
 
 
-def test_native_gripper_grasp_loss_marks_cached_status_without_extension():
+class _FakeGripperPortBundle:
+    """Backend-owned gripper-port double; no transport-name feature probing."""
+
+    def __init__(self, *, initial_position: float = 0.0081):
+        self.mark_calls = []
+        self.command_requests = []
+        self.next_command_id = 1
+        self.next_generation = 1
+        self.status = {
+            "state": "idle",
+            "gripper_id": "primary",
+            "command_id": 0,
+            "generation": 0,
+            "revision": 0,
+            "progress": 0.0,
+            "current_position": initial_position,
+            "target_position": None,
+            "commanded_position": None,
+            "observed_position": initial_position,
+            "evidence": [],
+            "evidence_state": "",
+            "projection_state": "not_required",
+            "projection_reason": "",
+            "error": None,
+            "reason_code": None,
+        }
+
+    def command_gripper(self, request):
+        self.command_requests.append(dict(request))
+        if (
+            self.status["state"] == "failed"
+            and self.status.get("reason_code") != "grasp_confirmation_lost"
+        ):
+            return {
+                "accepted": False,
+                "command_id": self.status["command_id"],
+                "generation": self.status["generation"],
+                "error": self.status["error"],
+                "reason_code": self.status["reason_code"],
+                "error_details": {},
+            }
+        command_id = self.next_command_id
+        generation = self.next_generation
+        self.next_command_id += 1
+        self.next_generation += 1
+        target = float(request["target_position"])
+        self.status = {
+            **self.status,
+            **request,
+            "state": "completed",
+            "command_id": command_id,
+            "generation": generation,
+            "revision": int(self.status["revision"]) + 1,
+            "progress": 1.0,
+            "current_position": target,
+            "target_position": target,
+            "commanded_position": target,
+            "observed_position": target,
+            "projection_state": "applied",
+            "projection_reason": "",
+            "error": None,
+            "reason_code": None,
+        }
+        return {
+            "accepted": True,
+            "command_id": command_id,
+            "generation": generation,
+            "error": None,
+            "reason_code": None,
+            "error_details": {},
+        }
+
+    def get_gripper_status(self, gripper_id):
+        assert gripper_id == "primary"
+        return dict(self.status)
+
+    def mark_gripper_grasp_lost(
+        self,
+        gripper_id,
+        expected_command_id,
+        expected_generation,
+        evidence_label,
+        message,
+        reason_code,
+    ):
+        assert int(expected_command_id) == int(self.status["command_id"])
+        assert int(expected_generation) == int(self.status["generation"])
+        self.mark_calls.append(
+            (
+                gripper_id,
+                expected_command_id,
+                expected_generation,
+                evidence_label,
+                message,
+                reason_code,
+            )
+        )
+        self.status = {
+            **self.status,
+            "state": "failed",
+            "generation": self.next_generation,
+            "revision": int(self.status["revision"]) + 1,
+            "evidence": [*self.status.get("evidence", []), evidence_label],
+            "evidence_state": "pressure_or_part_lost",
+            "projection_state": "not_required",
+            "error": message,
+            "reason_code": reason_code,
+        }
+        self.next_generation += 1
+        return {
+            "accepted": True,
+            "command_id": self.status["command_id"],
+            "generation": self.status["generation"],
+            "error": None,
+            "reason_code": None,
+            "error_details": {},
+        }
+
+
+def test_native_gripper_grasp_loss_is_owned_by_generic_backend_port():
     if not HAS_NATIVE_CLIENT:
         pytest.skip("native_kernel_client not available")
 
-    class FakeBundle:
-        def __init__(self):
-            self.positions = [0.0081]
-
-        def get_group_joint_names(self, group_id):
-            assert group_id == "lite_gripper"
-            return ["right_finger_joint"]
-
-        def get_group_joint_positions(self, group_id):
-            assert group_id == "lite_gripper"
-            return list(self.positions)
-
-        def set_group_joint_positions(self, group_id, positions):
-            assert group_id == "lite_gripper"
-            self.positions = list(positions)
-
-    kernel = NativeKernelClient(FakeBundle())
+    bundle = _FakeGripperPortBundle()
+    kernel = NativeKernelClient(bundle)
     close = kernel.command_gripper(
         GripperCommandRequest(
             gripper_id="primary",
@@ -251,9 +355,13 @@ def test_native_gripper_grasp_loss_marks_cached_status_without_extension():
         )
     )
     assert close.accepted is True, close.error
+    assert bundle.command_requests[-1]["transport_kind"] == "native_kinematic"
+    assert not hasattr(bundle, "command_ros_gripper")
 
     lost = kernel.mark_gripper_grasp_lost(
         gripper_id="primary",
+        expected_command_id=close.details["command_id"],
+        expected_generation=close.details["generation"],
         evidence_label="attached_drift_monitor",
         message="measured object drift exceeded threshold",
     )
@@ -292,14 +400,14 @@ def test_native_gripper_unrelated_failure_blocks_replacement_command():
     if not HAS_NATIVE_CLIENT:
         pytest.skip("native_kernel_client not available")
 
-    kernel = NativeKernelClient(object())
-    kernel._gripper_status_cache["primary"] = GripperCommandStatus(
-        state=GripperCommandState.FAILED,
-        gripper_id="primary",
+    bundle = _FakeGripperPortBundle()
+    bundle.status.update(
+        state="failed",
         evidence_state="faulted_unverified",
         error="gripper feedback unavailable",
         reason_code="gripper_state_unavailable",
     )
+    kernel = NativeKernelClient(bundle)
 
     result = kernel.command_gripper(
         GripperCommandRequest(
@@ -320,61 +428,7 @@ def test_ros_gripper_grasp_loss_delegates_to_backend_status_sink():
     if not HAS_NATIVE_CLIENT:
         pytest.skip("native_kernel_client not available")
 
-    class FakeRosBundle:
-        def __init__(self):
-            self.mark_calls = []
-            self.status = {
-                "state": "completed",
-                "progress": 1.0,
-                "current_position": 0.0,
-                "target_position": 0.0,
-                "evidence": ["driver_result"],
-                "evidence_state": "confirmed",
-            }
-
-        def command_ros_gripper(
-            self,
-            gripper_id,
-            target_position,
-            duration_s,
-            max_effort,
-        ):
-            assert gripper_id == "primary"
-            self.status = {
-                "state": "completed",
-                "progress": 1.0,
-                "current_position": target_position,
-                "target_position": target_position,
-                "evidence": ["driver_result"],
-                "evidence_state": "confirmed",
-            }
-            return {"accepted": True}
-
-        def get_ros_gripper_status(self, gripper_id):
-            assert gripper_id == "primary"
-            return dict(self.status)
-
-        def mark_ros_gripper_grasp_lost(
-            self,
-            gripper_id,
-            evidence_label,
-            message,
-            reason_code,
-        ):
-            self.mark_calls.append(
-                (gripper_id, evidence_label, message, reason_code)
-            )
-            self.status = {
-                **self.status,
-                "state": "failed",
-                "evidence": ["driver_result", evidence_label],
-                "evidence_state": "pressure_or_part_lost",
-                "error": message,
-                "reason_code": reason_code,
-            }
-            return {"accepted": True}
-
-    bundle = FakeRosBundle()
+    bundle = _FakeGripperPortBundle(initial_position=0.0)
     kernel = NativeKernelClient(bundle)
     close = kernel.command_gripper(
         GripperCommandRequest(
@@ -394,9 +448,15 @@ def test_ros_gripper_grasp_loss_delegates_to_backend_status_sink():
         )
     )
     assert close.accepted is True, close.error
+    assert bundle.command_requests[-1]["transport_kind"] == (
+        "isaac_joint_state_effort"
+    )
+    assert not hasattr(bundle, "command_ros_gripper")
 
     lost = kernel.mark_gripper_grasp_lost(
         gripper_id="primary",
+        expected_command_id=close.details["command_id"],
+        expected_generation=close.details["generation"],
         evidence_label="attached_drift_monitor",
         message="measured object drift exceeded threshold",
     )
@@ -404,6 +464,8 @@ def test_ros_gripper_grasp_loss_delegates_to_backend_status_sink():
     assert bundle.mark_calls == [
         (
             "primary",
+            close.details["command_id"],
+            close.details["generation"],
             "attached_drift_monitor",
             "measured object drift exceeded threshold",
             "grasp_confirmation_lost",
@@ -910,11 +972,9 @@ class TestNativeKernelBasics:
         assert result.accepted is True, result.error
 
         deadline = time.monotonic() + 1.0
-        native_kernel_ur10e_robotiq.update_gripper_commands()
         status = native_kernel_ur10e_robotiq.get_gripper_status("primary")
         while status.state == GripperCommandState.EXECUTING and time.monotonic() < deadline:
             time.sleep(0.01)
-            native_kernel_ur10e_robotiq.update_gripper_commands()
             status = native_kernel_ur10e_robotiq.get_gripper_status("primary")
 
         assert status.state == GripperCommandState.COMPLETED
@@ -935,17 +995,101 @@ class TestNativeKernelBasics:
         )
         assert result.accepted is True, result.error
 
-        time.sleep(0.03)
-        status = native_kernel_ur10e_robotiq.get_gripper_status("primary")
-
-        assert status.state == GripperCommandState.EXECUTING
-        assert native_kernel_ur10e_robotiq._bundle.get_group_joint_positions("gripper") == pytest.approx([0.0])
-
-        native_kernel_ur10e_robotiq.update_gripper_commands()
+        deadline = time.monotonic() + 1.0
         completed = native_kernel_ur10e_robotiq.get_gripper_status("primary")
+        while completed.state == GripperCommandState.EXECUTING and time.monotonic() < deadline:
+            time.sleep(0.01)
+            completed = native_kernel_ur10e_robotiq.get_gripper_status("primary")
 
         assert completed.state == GripperCommandState.COMPLETED
         assert native_kernel_ur10e_robotiq._bundle.get_group_joint_positions("gripper") == pytest.approx([0.7], abs=1e-3)
+        repeated = native_kernel_ur10e_robotiq.get_gripper_status("primary")
+        assert repeated == completed
+
+    def test_custom_ur10e_gripper_completes_without_observer_under_python_load(
+        self, native_kernel_ur10e_robotiq
+    ):
+        started = time.monotonic()
+        result = native_kernel_ur10e_robotiq.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="gripper",
+                joint_name="finger_joint",
+                target_position=0.7,
+                duration_s=0.02,
+            )
+        )
+        assert result.accepted is True, result.error
+
+        # No behavior tick, viewer collection, candidate refresh, or status
+        # read occurs while the backend-owned ControllerCommand callback runs.
+        busy_until = time.monotonic() + 0.08
+        accumulator = 0
+        while time.monotonic() < busy_until:
+            accumulator += 1
+        assert accumulator > 0
+
+        completed = native_kernel_ur10e_robotiq.get_gripper_status("primary")
+        elapsed = time.monotonic() - started
+        assert completed.state == GripperCommandState.COMPLETED
+        assert elapsed >= 0.02
+        assert elapsed < 0.25
+        assert completed.projection_state == "applied"
+
+    def test_custom_ur10e_gripper_lifecycle_is_viewer_presence_invariant(
+        self, native_kernel_ur10e_robotiq
+    ):
+        observer_modes = (
+            "never_opened",
+            "opened",
+            "hidden",
+            "disconnected",
+            "reopened",
+        )
+        command_ids = []
+        for index, observer_mode in enumerate(observer_modes):
+            target = 0.7 if index % 2 == 0 else 0.0
+            result = native_kernel_ur10e_robotiq.command_gripper(
+                GripperCommandRequest(
+                    gripper_id="primary",
+                    group_id="gripper",
+                    joint_name="finger_joint",
+                    target_position=target,
+                    duration_s=0.02,
+                )
+            )
+            assert result.accepted is True, (observer_mode, result.error)
+
+            if observer_mode == "opened":
+                observe_until = time.monotonic() + 0.06
+                while time.monotonic() < observe_until:
+                    native_kernel_ur10e_robotiq.get_gripper_status("primary")
+                    native_kernel_ur10e_robotiq._bundle.get_group_joint_positions(
+                        "gripper"
+                    )
+                    time.sleep(0.002)
+            elif observer_mode == "reopened":
+                native_kernel_ur10e_robotiq.get_gripper_status("primary")
+                time.sleep(0.05)
+                native_kernel_ur10e_robotiq._bundle.get_group_joint_positions(
+                    "gripper"
+                )
+            else:
+                # Hidden/disconnected and never-opened viewers issue no scene
+                # or gripper reads while the owner progresses the command.
+                time.sleep(0.06)
+
+            completed = native_kernel_ur10e_robotiq.get_gripper_status("primary")
+            assert completed.state == GripperCommandState.COMPLETED, observer_mode
+            assert completed.current_position == pytest.approx(target, abs=1e-3)
+            assert completed.projection_state == "applied"
+            assert native_kernel_ur10e_robotiq._bundle.get_group_joint_positions(
+                "gripper"
+            ) == pytest.approx([target], abs=1e-3)
+            command_ids.append(completed.command_id)
+
+        assert command_ids == sorted(command_ids)
+        assert len(set(command_ids)) == len(observer_modes)
 
     def test_custom_ur10e_bundle_executes_speed_limited_joint_goal(
         self, native_kernel_ur10e_robotiq

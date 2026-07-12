@@ -97,11 +97,16 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
       bundle->scene_mutex, bundle->single_shot_ik, ik_opts,
       single_shot_ik_opts);
   bundle->clock = std::make_unique<WallClock>();
+  bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->execution_state_sink =
       std::make_shared<RoboPlanExecutionStateSink>(
           bundle->scene, bundle->scene_mutex);
-  bundle->execution = std::make_unique<ros2_exec::Ros2ControlExecutionBackend>(
-      bundle->execution_state_sink, group_name, *bundle->clock, ros_config);
+  auto ros_execution =
+      std::make_unique<ros2_exec::Ros2ControlExecutionBackend>(
+      bundle->execution_state_sink, group_name, *bundle->clock,
+      *bundle->scheduler, ros_config);
+  bundle->gripper_command_backend = ros_execution.get();
+  bundle->execution = std::move(ros_execution);
   const auto* observed_publication =
       bundle->execution->observed_robot_state_publication();
   if (observed_publication == nullptr) {
@@ -111,7 +116,6 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
   bundle->observed_state_provider =
       std::make_unique<core::PublishedObservedRobotStateProvider>(
           *observed_publication);
-  bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->cache = std::make_unique<core::TrajectoryCache>();
 
   const int collision_worker_count =
@@ -177,7 +181,8 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
           *bundle->reference_resolver,
           *bundle->trajectory_validator,
           *bundle->collision_trajectory_projector,
-          bundle->collision_diagnostic_comparator.get()},
+          bundle->collision_diagnostic_comparator.get(),
+          bundle->gripper_command_backend},
       *bundle->execution,
       *bundle->clock, *bundle->scheduler, *bundle->cache,
       resolved_kernel_config);

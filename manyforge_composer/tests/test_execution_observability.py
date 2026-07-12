@@ -124,6 +124,43 @@ def test_execution_digest_reports_held_intervention_as_explicit_recovery_require
         state.cycle_manager._state = CycleState.RUNNING  # noqa: SLF001
         state.cycle_manager._motion_stop_state = "held"  # noqa: SLF001
         kernel._state = ExecutionState.INTERVENTION_REQUIRED  # noqa: SLF001
+        now_ns = time.monotonic_ns()
+        kernel.script_recovery_assessment(
+            {
+                "schema_version": "manyforge.kernel_recovery_assessment.v1",
+                "assessment_revision": 7,
+                "assessed_at_ns": now_ns,
+                "control_command_epoch": kernel.control_command_epoch(),
+                "execution_id": kernel.get_status().execution_id,
+                "execution_state": "intervention_required",
+                "recovery_class": "stop_fault_intervention",
+                "status": "action_required",
+                "latch_id": "digest-intervention-latch",
+                "source_id": "digest-test",
+                "policy_id": "digest-test",
+                "preemption_result": "succeeded",
+                "stop_owner_active": False,
+                "stop_owner_generation": 3,
+                "backend_stop_confirmed": True,
+                "stop_certificate_id": "digest-stop-certificate",
+                "observed_state_available": True,
+                "observed_state_sequence": 11,
+                "observed_state_source_id": "mock",
+                "observed_state_authority_profile": "mock_measured",
+                "observed_state_measured": True,
+                "observed_state_valid_until_ns": now_ns + 5_000_000_000,
+                "observed_state_fresh": True,
+                "observed_state_at_rest": True,
+                "stronger_authority_active": False,
+                "queued_latch_present": False,
+                "retry_admissible": False,
+                "allowed_actions": ["acknowledge_and_continue", "reset_cycle"],
+                "reason_code": "intervention_requires_operator_choice",
+                "evidence_refs": ["digest-stop-certificate"],
+            }
+        )
+        expected_offer = state.cycle_manager.refresh_recovery_offer()
+        assert expected_offer is not None
 
         response = client.get("/api/execution/digest")
         assert response.status_code == 200
@@ -131,10 +168,11 @@ def test_execution_digest_reports_held_intervention_as_explicit_recovery_require
 
         assert data["state"] == "running"
         assert data["motionStopState"] == "held"
-        assert data["requiredOperatorAction"] == "acknowledge_or_reset"
+        assert data["recoveryOffer"] == expected_offer
+        assert data["requiredOperatorAction"] == "choose_recovery_action"
         assert data["resumeAllowed"] is False
         assert data["ackRequired"] is True
-        assert data["resetRequired"] is True
+        assert data["resetRequired"] is False
 
 
 def test_execution_digest_reports_structured_backend_fault_details():

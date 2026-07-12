@@ -22,6 +22,7 @@ from manyforge_behavior.nodes.motion_scoped import (
     MoveUntilSignal,
     ProbeSearchMove,
 )
+from manyforge_behavior.runtime_pause import RuntimePauseRegistry
 
 
 @pytest.fixture(autouse=True)
@@ -42,7 +43,6 @@ def _wire_blackboard(node, kernel):
     bb = node.attach_blackboard_client()
     bb.register_key(key="kernel", access=py_trees.common.Access.WRITE)
     bb.register_key(key="motion_coordinator", access=py_trees.common.Access.WRITE)
-    bb.register_key(key="motion_error_message", access=py_trees.common.Access.WRITE)
     bb.kernel = kernel
     bb.motion_coordinator = coord
 
@@ -148,8 +148,9 @@ def test_move_until_signal_no_signal_trip_with_strict_flag_returns_failure():
     assert status == py_trees.common.Status.FAILURE
 
 
-def test_move_until_signal_failed_outcome_returns_failure_with_message():
+def test_move_until_signal_failed_outcome_pauses_with_exact_fault():
     kernel = MockKernelClient()
+    registry = RuntimePauseRegistry()
     def factory(eid, req):
         return MotionExecutionOutcome(
             execution_id=eid,
@@ -164,16 +165,21 @@ def test_move_until_signal_failed_outcome_returns_failure_with_message():
     # motion_coordinator.update path to read FAILED state. The
     # MockKernelClient transitions to COMPLETED on synchronous
     # execute; for FAILED we'd need a different mock. Instead test
-    # that the node maps outcome.terminal_cause=failed to FAILURE
-    # even on the COMPLETED kernel path.
-    node = _move_until_signal()
+    # that the node maps outcome.terminal_cause=failed to a recoverable,
+    # generation-scoped pause even on the COMPLETED kernel path.
+    node = _move_until_signal(runtime_pause_registry=registry)
     _wire_blackboard(node, kernel)
     status = _tick(node)
-    assert status == py_trees.common.Status.FAILURE
+    assert status == py_trees.common.Status.RUNNING
+    faults = registry.active_faults()
+    assert len(faults) == 1
+    assert faults[0].reason_code == "motion_interrupt_backend_stop_failed"
+    assert "controller refused" in faults[0].message
 
 
-def test_move_until_signal_interrupted_fault_returns_failure():
+def test_move_until_signal_interrupted_fault_pauses_with_exact_fault():
     kernel = MockKernelClient()
+    registry = RuntimePauseRegistry()
     def factory(eid, req):
         return MotionExecutionOutcome(
             execution_id=eid,
@@ -181,10 +187,13 @@ def test_move_until_signal_interrupted_fault_returns_failure():
             terminal_cause="interrupted_fault",
         )
     kernel.next_outcome_factory = factory  # type: ignore[assignment]
-    node = _move_until_signal()
+    node = _move_until_signal(runtime_pause_registry=registry)
     _wire_blackboard(node, kernel)
     status = _tick(node)
-    assert status == py_trees.common.Status.FAILURE
+    assert status == py_trees.common.Status.RUNNING
+    faults = registry.active_faults()
+    assert len(faults) == 1
+    assert faults[0].reason_code == "motion_scoped_interrupted_fault"
 
 
 def test_move_until_signal_writes_outcome_to_blackboard():
@@ -612,17 +621,19 @@ def test_pose_source_apply_callback_invoked_for_object_relative_move():
     )
 
 
-def test_pose_source_apply_callback_failure_surfaces_as_failure():
-    # When the pose-source apply callback fails, the node must FAIL
-    # (with motion_error_message set) rather than dispatching with a
-    # stale scene pose.
+def test_pose_source_apply_callback_failure_pauses_without_dispatch():
+    # A transient source failure must never dispatch against stale scene data.
+    # It pauses the exact node generation so an accepted recovery offer can
+    # retry after the source recovers without terminating Parallel siblings.
     kernel = MockKernelClient()
+    registry = RuntimePauseRegistry()
 
     def failing_callback(*, object_ids, reason, action_span):
         _ = (object_ids, reason, action_span)
         return {"success": False, "error": "pose source disconnected"}
 
     node = _move_until_signal(
+        runtime_pause_registry=registry,
         motion_type="relative_move",
         joint_goal_names=[],
         joint_goal_positions_rad=[],
@@ -637,14 +648,16 @@ def test_pose_source_apply_callback_failure_surfaces_as_failure():
         extra_keys=(
             "pose_source_apply_callback",
             "pose_source_between_nodes_callback",
-            "motion_error_message",
         ),
     )
     bb.set("pose_source_apply_callback", failing_callback)
     status = _tick(node)
-    assert status == py_trees.common.Status.FAILURE
+    assert status == py_trees.common.Status.RUNNING
     assert kernel.last_execute_request is None
-    assert "pose source disconnected" in str(bb.get("motion_error_message"))
+    faults = registry.active_faults()
+    assert len(faults) == 1
+    assert faults[0].reason_code == "pose_source_apply_failed"
+    assert "pose source disconnected" in faults[0].message
 
 
 def test_pose_goal_rpy_normalized_to_xyzw_quaternion():
@@ -664,12 +677,11 @@ def test_pose_goal_rpy_normalized_to_xyzw_quaternion():
     assert "orientation_rpy_deg" not in sent_pose
 
 
-# ----- Failure observability -----
+# ----- Failure and pause observability -----
 #
-# Every FAILURE terminal cause must set motion_error_message so the
-# cycle manager / operator surface gets a concrete reason. Without
-# this, the operator sees a FAILURE with no explanation — opaque is
-# the worst kind of fault for industrial contact/search.
+# Intentional BT failures expose feedback on the node. Recoverable runtime
+# causes additionally carry a structured, exact RuntimePauseFault; neither path
+# depends on process-global blackboard error aliases.
 
 
 def _outcome_factory(cause: str):
@@ -682,15 +694,7 @@ def _outcome_factory(cause: str):
     return factory
 
 
-def _read_motion_error(node):
-    bb = node.attach_blackboard_client()
-    bb.register_key(
-        key="motion_error_message", access=py_trees.common.Access.READ
-    )
-    return bb.get("motion_error_message")
-
-
-def test_probe_search_move_no_signal_trip_failure_writes_message():
+def test_probe_search_move_no_signal_trip_failure_has_feedback():
     # ProbeSearchMove defaults not_found_is_failure=True; reaching the
     # endpoint without contact must surface "probe did not contact".
     kernel = MockKernelClient()  # default outcome is no_signal_trip
@@ -698,56 +702,53 @@ def test_probe_search_move_no_signal_trip_failure_writes_message():
     _wire_blackboard(node, kernel)
     status = _tick(node)
     assert status == py_trees.common.Status.FAILURE
-    msg = _read_motion_error(node)
-    assert msg is not None
-    assert "probe did not contact" in msg
+    assert "probe did not contact" in node.feedback_message
 
 
-def test_move_until_signal_strict_no_signal_trip_writes_message():
+def test_move_until_signal_strict_no_signal_trip_has_feedback():
     kernel = MockKernelClient()
     node = _move_until_signal(not_found_is_failure=True)
     _wire_blackboard(node, kernel)
     status = _tick(node)
     assert status == py_trees.common.Status.FAILURE
-    msg = _read_motion_error(node)
-    assert msg is not None
-    assert "probe did not contact" in msg
+    assert "probe did not contact" in node.feedback_message
 
 
-def test_scoped_node_completed_normally_writes_message():
+def test_scoped_node_completed_normally_has_feedback():
     kernel = MockKernelClient()
     kernel.next_outcome_factory = _outcome_factory("completed_normally")
     node = _move_until_signal()
     _wire_blackboard(node, kernel)
     status = _tick(node)
     assert status == py_trees.common.Status.FAILURE
-    msg = _read_motion_error(node)
-    assert msg is not None
-    assert "completed_normally" in msg
+    assert "completed_normally" in node.feedback_message
 
 
-def test_scoped_node_stopped_writes_message():
+def test_scoped_node_stopped_pauses_with_feedback():
     kernel = MockKernelClient()
+    registry = RuntimePauseRegistry()
     kernel.next_outcome_factory = _outcome_factory("stopped")
-    node = _move_until_signal()
+    node = _move_until_signal(runtime_pause_registry=registry)
     _wire_blackboard(node, kernel)
     status = _tick(node)
-    assert status == py_trees.common.Status.FAILURE
-    msg = _read_motion_error(node)
-    assert msg is not None
-    assert "operator stop" in msg
+    assert status == py_trees.common.Status.RUNNING
+    assert "operator stop" in node.feedback_message
+    assert registry.active_faults()[0].reason_code == "motion_scoped_stopped"
 
 
-def test_scoped_node_interrupted_fault_writes_message():
+def test_scoped_node_interrupted_fault_pauses_with_feedback():
     kernel = MockKernelClient()
+    registry = RuntimePauseRegistry()
     kernel.next_outcome_factory = _outcome_factory("interrupted_fault")
-    node = _move_until_signal()
+    node = _move_until_signal(runtime_pause_registry=registry)
     _wire_blackboard(node, kernel)
     status = _tick(node)
-    assert status == py_trees.common.Status.FAILURE
-    msg = _read_motion_error(node)
-    assert msg is not None
-    assert "fault session" in msg
+    assert status == py_trees.common.Status.RUNNING
+    assert "fault session" in node.feedback_message
+    assert (
+        registry.active_faults()[0].reason_code
+        == "motion_scoped_interrupted_fault"
+    )
 
 
 def test_probe_search_move_writes_outcome_with_trip_details():

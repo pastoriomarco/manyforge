@@ -75,36 +75,4 @@ struct AcknowledgeCompletedResultDTO {
   std::optional<ErrorDTO> error;
 };
 
-/// Explicit intervention acknowledgement result.
-///
-/// Valid only from `kInterventionRequired`. Clears the intervention flag
-/// and transitions to `kIdle`, emitting a `kInterventionAcknowledged`
-/// event with `principal_id` and `reason` for traceability. The reset/resync
-/// and retry-without-reset intervention APIs share this result shape.
-struct AcknowledgeInterventionResultDTO {
-  bool accepted = false;
-  std::optional<ErrorDTO> error;
-};
-
-/// Explicit acknowledgement of a retryable failed pre-dispatch validation.
-///
-/// Unlike Reset, this must not command or reset the execution backend. It is
-/// used when planning/validation failed before dispatch, the operator corrected
-/// the scene/source condition, and Run means "try this motion again from the
-/// current observed robot state".
-struct AcknowledgeFailedValidationResultDTO {
-  bool accepted = false;
-  std::optional<ErrorDTO> error;
-};
-
-/// Explicit acknowledgement of an interrupted execution for operator retry.
-///
-/// Unlike Reset, this must not command or reset the execution backend. It is
-/// used when a fault interrupt stopped a motion, the operator fixed the
-/// condition, and Run means "retry from the current observed robot state".
-struct AcknowledgeInterruptedResultDTO {
-  bool accepted = false;
-  std::optional<ErrorDTO> error;
-};
-
 }  // namespace manyforge::core

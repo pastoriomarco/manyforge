@@ -7,6 +7,7 @@ from typing import Any, Iterable
 from fastapi import APIRouter, HTTPException, Query
 
 from manyforge_behavior.cycle_manager import preferred_structured_error_code
+from .cycle_diagnostics import manager_cycle_error_fields
 from .event_recorder import _wall_iso_to_ns
 
 from .models import (
@@ -119,27 +120,6 @@ def _parse_wall_query(name: str, value: str | None) -> int | None:
     return parsed
 
 
-def _state_token(value: Any) -> str:
-    raw = getattr(value, "state", value)
-    token = getattr(raw, "name", None) or getattr(raw, "value", None) or str(raw)
-    return str(token).split(".")[-1].lower()
-
-
-def _operator_action_state(
-    *,
-    cycle_state: str,
-    motion_stop_state: str = "idle",
-    kernel_state: Any = None,
-) -> tuple[str, bool, bool, bool]:
-    if _state_token(kernel_state) == "intervention_required":
-        return ("acknowledge_or_reset", False, True, True)
-    if cycle_state == "running" and motion_stop_state == "held":
-        return ("resume", True, False, False)
-    if cycle_state == "stopped":
-        return ("resume", True, False, False)
-    return ("none", False, False, False)
-
-
 def build_blackboard_snapshot_payload(state: ComposerState) -> dict[str, Any]:
     """Build a JSON-safe blackboard snapshot."""
     keys = {}
@@ -192,23 +172,27 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
     )
     if not snapshot_error_details:
         snapshot_error_details = None
-    cycle_error_details = (
-        state.cycle_manager.error_details
-        if state.cycle_manager is not None
-        else None
-    )
+    cycle_error = None
+    cycle_error_code = None
+    cycle_error_details = None
+    if state.cycle_manager is not None:
+        (
+            cycle_error,
+            cycle_error_code,
+            cycle_error_details,
+        ) = manager_cycle_error_fields(state.cycle_manager)
     error_details = cycle_error_details or snapshot_error_details
     raw_error_code = (
-        state.cycle_manager.error_code
-        if state.cycle_manager is not None and state.cycle_manager.error_code
+        cycle_error_code
+        if cycle_error_code
         else getattr(kernel_snapshot, "error_code", None)
         if kernel_snapshot is not None
         else None
     )
     error_code = preferred_structured_error_code(raw_error_code, error_details)
     error_message = (
-        state.cycle_manager.error
-        if state.cycle_manager is not None and state.cycle_manager.error is not None
+        cycle_error
+        if cycle_error is not None
         else getattr(kernel_snapshot, "error", None)
         if kernel_snapshot is not None
         else None
@@ -351,13 +335,44 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
     if started_at_ns is not None:
         elapsed_s = max(0.0, (time.monotonic_ns() - started_at_ns) / 1_000_000_000.0)
 
-    required_operator_action, resume_allowed, reset_required, ack_required = (
-        _operator_action_state(
-            cycle_state=cycle_state,
-            motion_stop_state=motion_stop_state,
-            kernel_state=getattr(kernel_status, "state", None),
-        )
+    recovery_offer = (
+        state.cycle_manager.get_recovery_offer()
+        if state.cycle_manager is not None
+        else None
     )
+    enabled_actions = {
+        str(action.get("actionId"))
+        for action in (recovery_offer or {}).get("actions", [])
+        if action.get("enabled")
+    }
+    primary_action = (recovery_offer or {}).get("primaryAction")
+    required_operator_action = str(primary_action or "none")
+    if (recovery_offer or {}).get("status") == "action_required":
+        required_operator_action = "choose_recovery_action"
+    kernel_state = getattr(getattr(kernel_status, "state", None), "value", "")
+    ordinary_resume_available = bool(
+        recovery_offer is None
+        and cycle_state == "running"
+        and motion_stop_state == "held"
+        and kernel_state in {"paused", "stopped"}
+        and error_code is None
+        and error_message is None
+    )
+    if ordinary_resume_available:
+        # The ordinary Stop/Pause lifecycle is deliberately outside the
+        # versioned recovery-offer surface (spec/450 section 5.1).
+        required_operator_action = "resume"
+    resume_allowed = bool(
+        enabled_actions
+        & {
+            "retry_motion_from_current_state",
+            "retry_after_scene_repair",
+            "replan_from_stopped_state",
+            "retry_runtime_step",
+        }
+    ) or ordinary_resume_available
+    reset_required = (recovery_offer or {}).get("status") == "reset_required"
+    ack_required = "acknowledge_and_continue" in enabled_actions
     if required_operator_action != "none":
         warnings.append(f"Operator action required: {required_operator_action}")
     latest_incident_snapshots = (
@@ -422,6 +437,7 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
         resumeAllowed=resume_allowed,
         resetRequired=reset_required,
         ackRequired=ack_required,
+        recoveryOffer=recovery_offer,
         lastStopDecision=state.event_recorder.last_stop_decision(),
         timestampNs=time.monotonic_ns(),
     ).model_dump(by_alias=True)

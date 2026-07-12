@@ -100,6 +100,159 @@ def _execute_joint_goal(bundle, move_id: str):
     )
 
 
+def _command_gripper(
+    bundle,
+    *,
+    target_position: float,
+    duration_s: float,
+    max_effort: float,
+    transport_kind: str = "ros_gripper_command",
+    completion_policy: str = "position_reached",
+    group_id: str = "",
+    joint_name: str = "",
+):
+    return bundle.command_gripper(
+        {
+            "gripper_id": "primary",
+            "group_id": group_id,
+            "joint_name": joint_name,
+            "target_position": target_position,
+            "duration_s": duration_s,
+            "max_effort": max_effort,
+            "actuation_kind": "position_commanded",
+            "state_authority": "sim_observed",
+            "completion_policy": completion_policy,
+            "grasp_confirmation_policy": "none_open_loop",
+            "transport_kind": transport_kind,
+            "evidence": [],
+            "evidence_state": "",
+        }
+    )
+
+
+def _assert_nonfinite_gripper_action_sample_fails_closed(sample_kind: str) -> None:
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("control_msgs")
+
+    from control_msgs.action import GripperCommand
+    from rclpy.action import ActionServer, CancelResponse
+    from rclpy.callback_groups import ReentrantCallbackGroup
+    from rclpy.executors import MultiThreadedExecutor
+
+    suffix = uuid.uuid4().hex
+    gripper_action = (
+        f"/manyforge_contract_gripper_nonfinite_{sample_kind}_{suffix}/gripper_cmd"
+    )
+    rclpy.init(args=None)
+    executor = MultiThreadedExecutor(num_threads=2)
+    node = rclpy.create_node(
+        f"manyforge_contract_gripper_nonfinite_{sample_kind}_{suffix}"
+    )
+    stop_event = threading.Event()
+    callback_finished = threading.Event()
+
+    def execute_gripper_goal(goal_handle):
+        result = GripperCommand.Result()
+        try:
+            if sample_kind == "feedback":
+                feedback = GripperCommand.Feedback()
+                feedback.position = float("nan")
+                feedback.effort = 0.0
+                feedback.stalled = False
+                feedback.reached_goal = False
+                goal_handle.publish_feedback(feedback)
+                deadline = time.monotonic() + 2.0
+                while (
+                    not goal_handle.is_cancel_requested
+                    and not stop_event.is_set()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                else:
+                    goal_handle.abort()
+                result.position = 0.0
+                result.reached_goal = False
+            else:
+                goal_handle.succeed()
+                result.position = float("nan")
+                result.reached_goal = True
+            result.effort = 0.0
+            result.stalled = False
+            return result
+        finally:
+            callback_finished.set()
+
+    action_server = ActionServer(
+        node,
+        GripperCommand,
+        gripper_action,
+        execute_callback=execute_gripper_goal,
+        cancel_callback=lambda _request: CancelResponse.ACCEPT,
+        callback_group=ReentrantCallbackGroup(),
+    )
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+    bundle = _create_bundle(
+        action_name=(
+            f"/manyforge_contract_gripper_nonfinite_{sample_kind}_{suffix}"
+            "/follow_joint_trajectory"
+        ),
+        joint_state_topic=(
+            f"/manyforge_contract_gripper_nonfinite_{sample_kind}_{suffix}"
+            "/joint_states"
+        ),
+        controller_state_topic=(
+            f"/manyforge_contract_gripper_nonfinite_{sample_kind}_{suffix}"
+            "/controller_state"
+        ),
+        wait_s=0.05,
+    )
+    try:
+        bundle.configure_ros_gripper_action(
+            "primary",
+            {
+                "action_name": gripper_action,
+                "wait_for_action_server_timeout_s": 2.0,
+                "result_timeout_s": 2.0,
+            },
+        )
+        result = _command_gripper(
+            bundle, target_position=0.7, duration_s=0.1, max_effort=5.0
+        )
+        assert result["accepted"] is True, result
+
+        deadline = time.monotonic() + 2.0
+        status = bundle.get_gripper_status("primary")
+        while time.monotonic() < deadline and status["state"] == "executing":
+            time.sleep(0.01)
+            status = bundle.get_gripper_status("primary")
+
+        assert status["state"] == "failed", status
+        assert status["reason_code"] == "gripper_state_not_finite", status
+        assert callback_finished.wait(timeout=2.0)
+    finally:
+        stop_event.set()
+        try:
+            bundle.reset()
+        except RuntimeError:
+            pass
+        bundle.close()
+        assert executor.shutdown(timeout_sec=5.0)
+        spin_thread.join(timeout=5.0)
+        assert not spin_thread.is_alive()
+        action_server.destroy()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+@pytest.mark.parametrize("sample_kind", ["feedback", "result"])
+def test_ros2_control_gripper_nonfinite_action_sample_fails_closed(sample_kind):
+    _assert_nonfinite_gripper_action_sample_fails_closed(sample_kind)
+
+
 def test_ros2_control_backend_requires_fresh_state_before_planning():
     suffix = uuid.uuid4().hex
     bundle = _create_bundle(
@@ -614,30 +767,40 @@ def test_ros2_control_backend_reset_clears_inflight_gripper_command():
     executor = MultiThreadedExecutor(num_threads=2)
     node = rclpy.create_node(f"manyforge_contract_gripper_reset_{suffix}")
     stop_event = threading.Event()
+    callback_cv = threading.Condition()
+    callback_counts = {"started": 0, "finished": 0}
 
     def execute_gripper_goal(goal_handle):
-        result = GripperCommand.Result()
-        while not stop_event.is_set():
-            if goal_handle.is_cancel_requested:
-                goal_handle.canceled()
-                result.position = 0.0
-                result.effort = 0.0
-                result.stalled = False
-                result.reached_goal = False
-                return result
-            feedback = GripperCommand.Feedback()
-            feedback.position = 0.0
-            feedback.effort = 0.0
-            feedback.stalled = False
-            feedback.reached_goal = False
-            goal_handle.publish_feedback(feedback)
-            time.sleep(0.05)
-        goal_handle.abort()
-        result.position = 0.0
-        result.effort = 0.0
-        result.stalled = True
-        result.reached_goal = False
-        return result
+        with callback_cv:
+            callback_counts["started"] += 1
+            callback_cv.notify_all()
+        try:
+            result = GripperCommand.Result()
+            while not stop_event.is_set():
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                    result.position = 0.0
+                    result.effort = 0.0
+                    result.stalled = False
+                    result.reached_goal = False
+                    return result
+                feedback = GripperCommand.Feedback()
+                feedback.position = 0.0
+                feedback.effort = 0.0
+                feedback.stalled = False
+                feedback.reached_goal = False
+                goal_handle.publish_feedback(feedback)
+                time.sleep(0.05)
+            goal_handle.abort()
+            result.position = 0.0
+            result.effort = 0.0
+            result.stalled = True
+            result.reached_goal = False
+            return result
+        finally:
+            with callback_cv:
+                callback_counts["finished"] += 1
+                callback_cv.notify_all()
 
     action_server = ActionServer(
         node,
@@ -668,22 +831,41 @@ def test_ros2_control_backend_reset_clears_inflight_gripper_command():
         )
         time.sleep(1.0)
 
-        first = bundle.command_ros_gripper("primary", 0.0, 10.0, 5.0)
+        first = _command_gripper(
+            bundle, target_position=0.0, duration_s=10.0, max_effort=5.0
+        )
         assert first["accepted"] is True, first
-        assert bundle.get_ros_gripper_status("primary")["state"] == "executing"
+        with callback_cv:
+            assert callback_cv.wait_for(
+                lambda: callback_counts["started"] >= 1, timeout=2.0
+            )
+        assert bundle.get_gripper_status("primary")["state"] == "executing"
 
         bundle.reset()
 
-        second = bundle.command_ros_gripper("primary", 0.0, 10.0, 5.0)
+        second = _command_gripper(
+            bundle, target_position=0.0, duration_s=10.0, max_effort=5.0
+        )
         assert second["accepted"] is True
+        with callback_cv:
+            assert callback_cv.wait_for(
+                lambda: callback_counts["started"] >= 2, timeout=2.0
+            )
     finally:
         stop_event.set()
         try:
             bundle.reset()
         except RuntimeError:
             pass
+        with callback_cv:
+            assert callback_cv.wait_for(
+                lambda: callback_counts["finished"] >= 2, timeout=5.0
+            )
+        bundle.close()
+        assert executor.shutdown(timeout_sec=5.0)
+        spin_thread.join(timeout=5.0)
+        assert not spin_thread.is_alive()
         action_server.destroy()
-        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
@@ -772,14 +954,20 @@ def test_ros2_control_gripper_updates_roboplan_scene_group_state():
         )
         time.sleep(0.2)
 
-        result = bundle.command_ros_gripper("primary", 0.7, 0.2, 5.0)
+        result = _command_gripper(
+            bundle,
+            target_position=0.7,
+            duration_s=0.2,
+            max_effort=5.0,
+            group_id="gripper",
+            joint_name="finger_joint",
+        )
         assert result["accepted"] is True, result
 
         deadline = time.monotonic() + 1.5
         observed_motion = False
         final_position = 0.0
         while time.monotonic() < deadline:
-            bundle.update_ros_grippers()
             final_position = bundle.get_group_joint_positions("gripper")[0]
             if 0.05 < final_position < 0.69:
                 observed_motion = True
@@ -795,8 +983,11 @@ def test_ros2_control_gripper_updates_roboplan_scene_group_state():
             bundle.reset()
         except RuntimeError:
             pass
+        bundle.close()
+        assert executor.shutdown(timeout_sec=5.0)
+        spin_thread.join(timeout=5.0)
+        assert not spin_thread.is_alive()
         action_server.destroy()
-        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
@@ -855,14 +1046,19 @@ def test_ros2_control_gripper_driver_result_accepts_success_without_reached_goal
         )
         time.sleep(0.2)
 
-        result = bundle.command_ros_gripper("primary", 0.7, 0.2, 5.0)
+        result = _command_gripper(
+            bundle,
+            target_position=0.7,
+            duration_s=0.2,
+            max_effort=5.0,
+            completion_policy="driver_result",
+        )
         assert result["accepted"] is True, result
 
         deadline = time.monotonic() + 1.0
-        status = bundle.get_ros_gripper_status("primary")
+        status = bundle.get_gripper_status("primary")
         while time.monotonic() < deadline:
-            bundle.update_ros_grippers()
-            status = bundle.get_ros_gripper_status("primary")
+            status = bundle.get_gripper_status("primary")
             if status["state"] != "executing":
                 break
             time.sleep(0.02)
@@ -874,8 +1070,11 @@ def test_ros2_control_gripper_driver_result_accepts_success_without_reached_goal
             bundle.reset()
         except RuntimeError:
             pass
+        bundle.close()
+        assert executor.shutdown(timeout_sec=5.0)
+        spin_thread.join(timeout=5.0)
+        assert not spin_thread.is_alive()
         action_server.destroy()
-        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
@@ -939,7 +1138,7 @@ def test_ros2_control_isaac_effort_gripper_publishes_joint_state_and_dwell_compl
                 "open_effort": 5.0,
                 "close_effort": -5.0,
                 "publish_nominal_position": True,
-                "state_freshness_timeout_s": 2.0,
+                "state_freshness_timeout_s": 0.05,
             },
         )
         observed = JointState()
@@ -950,7 +1149,16 @@ def test_ros2_control_isaac_effort_gripper_publishes_joint_state_and_dwell_compl
             state_pub.publish(observed)
             time.sleep(0.02)
 
-        result = bundle.command_ros_gripper("primary", 0.0, 0.05, 0.0)
+        result = _command_gripper(
+            bundle,
+            target_position=0.0,
+            duration_s=0.05,
+            max_effort=0.0,
+            transport_kind="isaac_joint_state_effort",
+            completion_policy="dwell_elapsed",
+            group_id="gripper",
+            joint_name="finger_joint",
+        )
         assert result["accepted"] is True, result
 
         deadline = time.monotonic() + 1.0
@@ -963,9 +1171,9 @@ def test_ros2_control_isaac_effort_gripper_publishes_joint_state_and_dwell_compl
         assert list(received[-1].effort) == pytest.approx([-5.0])
 
         deadline = time.monotonic() + 1.0
-        status = bundle.get_ros_gripper_status("primary")
+        status = bundle.get_gripper_status("primary")
         while time.monotonic() < deadline:
-            status = bundle.get_ros_gripper_status("primary")
+            status = bundle.get_gripper_status("primary")
             if status.get("observed_position") is not None:
                 break
             observed.header.stamp = node.get_clock().now().to_msg()
@@ -973,11 +1181,10 @@ def test_ros2_control_isaac_effort_gripper_publishes_joint_state_and_dwell_compl
             time.sleep(0.02)
         assert status["observed_position"] == pytest.approx(0.004)
 
-        status = bundle.get_ros_gripper_status("primary")
+        status = bundle.get_gripper_status("primary")
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline:
-            bundle.update_ros_grippers()
-            status = bundle.get_ros_gripper_status("primary")
+            status = bundle.get_gripper_status("primary")
             if status["state"] != "executing":
                 break
             time.sleep(0.02)
@@ -987,15 +1194,25 @@ def test_ros2_control_isaac_effort_gripper_publishes_joint_state_and_dwell_compl
             0.0,
             abs=1e-6,
         )
+        terminal_revision = int(status["revision"])
+        terminal_observed_position = status["observed_position"]
+        time.sleep(0.08)
+        aged_status = bundle.get_gripper_status("primary")
+        assert aged_status["observed_position"] == pytest.approx(
+            terminal_observed_position
+        )
+        assert int(aged_status["revision"]) == terminal_revision
 
-        lost = bundle.mark_ros_gripper_grasp_lost(
+        lost = bundle.mark_gripper_grasp_lost(
             "primary",
+            int(status["command_id"]),
+            int(status["generation"]),
             "attached_drift_monitor",
             "measured object drift exceeded threshold",
             "grasp_confirmation_lost",
         )
         assert lost["accepted"] is True, lost
-        status = bundle.get_ros_gripper_status("primary")
+        status = bundle.get_gripper_status("primary")
         assert status["state"] == "failed"
         assert status["reason_code"] == "grasp_confirmation_lost"
         assert status["evidence_state"] == "pressure_or_part_lost"
@@ -1005,7 +1222,10 @@ def test_ros2_control_isaac_effort_gripper_publishes_joint_state_and_dwell_compl
             bundle.reset()
         except RuntimeError:
             pass
-        executor.shutdown()
+        bundle.close()
+        assert executor.shutdown(timeout_sec=5.0)
+        spin_thread.join(timeout=5.0)
+        assert not spin_thread.is_alive()
         node.destroy_node()
         rclpy.shutdown()
 

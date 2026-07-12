@@ -9,6 +9,8 @@ from .models import (
     CycleCommandErrorResponse,
     CycleStatusResponse,
     CycleCommandResponse,
+    CycleRecoveryActionRequestDTO,
+    CycleRecoveryActionResultDTO,
     VelocityScaleRequest,
     VelocityScaleResponse,
 )
@@ -48,6 +50,7 @@ def _structured_command_error(
         message=message,
         error_code=code,
         error_details=details,
+        recovery_offer=(manager.get_recovery_offer() if manager is not None else None),
     ).model_dump(by_alias=True)
 
 
@@ -73,7 +76,29 @@ def _cycle_command_payload(manager: Any) -> dict[str, Any]:
         "error": error,
         "errorCode": error_code,
         "errorDetails": error_details,
+        "recoveryOffer": manager.get_recovery_offer(),
     }
+
+
+def _perform_cycle_reset(
+    state: ComposerState,
+    *,
+    request_id: Optional[str],
+) -> dict[str, Any]:
+    if state.cycle_manager is None:
+        raise RuntimeError("No program loaded")
+    override_status = state.runtime_override_status()
+    prev = state.cycle_manager.state.value
+    if override_status["has_staged"]:
+        state.activate_staged_runtime_overrides()
+    else:
+        state.clear_pose_source_snapshots()
+        with state.scene_edit_lock:
+            state.cycle_manager.reset(request_id=request_id)
+    state.reset_backend_authoritative_sim_if_needed(reason="cycle_reset")
+    _refresh_visual_scene_after_reset(state)
+    logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
+    return _cycle_command_payload(state.cycle_manager)
 
 
 def create_cycle_router(state: ComposerState) -> APIRouter:
@@ -96,8 +121,10 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                 "error": None,
                 "errorCode": None,
                 "errorDetails": None,
+                "recoveryOffer": None,
             }
         manager = state.cycle_manager
+        manager.drain_kernel_events_now()
         error, error_code, error_details = active_cycle_error_fields(manager)
         return {
             "state": manager.state.value,
@@ -106,10 +133,11 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
             "error": error,
             "errorCode": error_code,
             "errorDetails": error_details,
+            "recoveryOffer": manager.get_recovery_offer(),
         }
 
     @router.post("/run", response_model=CycleCommandResponse, response_model_by_alias=True)
-    async def run_cycle() -> dict:
+    async def run_cycle(request: Request) -> dict:
         """Start the cycle (IDLE→RUNNING or STOPPED→RUNNING)."""
 
         def command() -> dict:
@@ -169,7 +197,12 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                     )
             prev = state.cycle_manager.state.value
             try:
-                state.cycle_manager.run()
+                state.cycle_manager.run(
+                    principal_id=(
+                        getattr(request.state, "principal_id", None)
+                        or "operator_ui"
+                    )
+                )
             except RuntimeError as exc:
                 # Cycle-manager recovery refusals (e.g. a latched
                 # INTERVENTION_REQUIRED that needs an explicit operator choice)
@@ -243,54 +276,29 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                         state, "No program loaded", error_code="no_program_loaded"
                     ),
                 )
-            override_status = state.runtime_override_status()
-            prev = state.cycle_manager.state.value
-            if override_status["has_staged"]:
-                try:
-                    state.activate_staged_runtime_overrides()
-                except RuntimeError as exc:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=_structured_command_error(
-                            state,
-                            str(exc),
-                            error_code="staged_overrides_activate_failed",
-                        ),
-                    )
-            else:
-                try:
-                    state.clear_pose_source_snapshots()
-                    with state.scene_edit_lock:
-                        state.cycle_manager.reset(
-                            request_id=request_id if isinstance(request_id, str) else None
-                        )
-                except RuntimeError as exc:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=_structured_command_error(state, str(exc)),
-                    )
             try:
-                state.reset_backend_authoritative_sim_if_needed(reason="cycle_reset")
+                return _perform_cycle_reset(
+                    state,
+                    request_id=request_id if isinstance(request_id, str) else None,
+                )
             except RuntimeError as exc:
                 raise HTTPException(
                     status_code=409,
-                    detail=_structured_command_error(
-                        state, str(exc), error_code="backend_sim_reset_failed"
-                    ),
+                    detail=_structured_command_error(state, str(exc)),
                 )
-            _refresh_visual_scene_after_reset(state)
-            logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
-            return _cycle_command_payload(state.cycle_manager)
 
         return await _run_cycle_lifecycle(command)
 
     @router.post(
-        "/acknowledge-intervention-for-retry",
-        response_model=CycleCommandResponse,
+        "/recovery-actions",
+        response_model=CycleRecoveryActionResultDTO,
         response_model_by_alias=True,
     )
-    async def acknowledge_intervention_for_retry() -> dict:
-        """Acknowledge a retryable stop/fault intervention without reset."""
+    async def apply_recovery_action(
+        payload: CycleRecoveryActionRequestDTO,
+        request: Request,
+    ) -> dict:
+        """Apply one exact immutable recovery offer action."""
 
         def command() -> dict:
             if state.cycle_manager is None:
@@ -300,59 +308,23 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                         state, "No program loaded", error_code="no_program_loaded"
                     ),
                 )
-            prev = state.cycle_manager.state.value
-            try:
-                state.cycle_manager.acknowledge_intervention_for_retry(
-                    principal_id="operator_ui",
-                    reason="ui_acknowledge_and_continue",
-                )
-            except RuntimeError as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail=_structured_command_error(state, str(exc)),
-                )
-            logger.info(
-                "Cycle intervention acknowledged for retry: %s → %s",
-                prev,
-                state.cycle_manager.state.value,
+            principal_id = (
+                getattr(request.state, "principal_id", None) or "operator_ui"
             )
-            return _cycle_command_payload(state.cycle_manager)
-
-        return await _run_cycle_lifecycle(command)
-
-    @router.post(
-        "/acknowledge-failed-validation-for-retry",
-        response_model=CycleCommandResponse,
-        response_model_by_alias=True,
-    )
-    async def acknowledge_failed_validation_for_retry() -> dict:
-        """Acknowledge a retryable failed validation gate without reset."""
-
-        def command() -> dict:
-            if state.cycle_manager is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=_structured_command_error(
-                        state, "No program loaded", error_code="no_program_loaded"
+            try:
+                return state.cycle_manager.apply_recovery_action(
+                    payload.model_dump(),
+                    principal_id=principal_id,
+                    reset_callback=lambda recovery_request_id: _perform_cycle_reset(
+                        state,
+                        request_id=recovery_request_id,
                     ),
                 )
-            prev = state.cycle_manager.state.value
-            try:
-                state.cycle_manager.acknowledge_failed_validation_for_retry(
-                    principal_id="operator_ui",
-                    reason="ui_acknowledge_failed_validation_and_retry",
-                )
             except RuntimeError as exc:
                 raise HTTPException(
                     status_code=409,
                     detail=_structured_command_error(state, str(exc)),
                 )
-            logger.info(
-                "Cycle failed validation acknowledged for retry: %s → %s",
-                prev,
-                state.cycle_manager.state.value,
-            )
-            return _cycle_command_payload(state.cycle_manager)
 
         return await _run_cycle_lifecycle(command)
 

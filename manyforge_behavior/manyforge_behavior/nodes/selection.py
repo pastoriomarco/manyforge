@@ -14,6 +14,7 @@ from manyforge_behavior.kernel_client import KernelClient, SceneObjectSnapshot
 from manyforge_behavior.blackboard_namespace import read_namespace_value
 from manyforge_behavior.nodes.blackboard_output import BlackboardOutputMixin
 from manyforge_behavior.parameters import resolve_blackboard_value
+from manyforge_behavior.runtime_pause import RuntimePauseMixin, RuntimePauseRegistry
 
 
 _SCENE_SNAPSHOT_WAIT_TIMEOUT_S = 2.0
@@ -63,7 +64,11 @@ def _shape_top_height(snapshot: SceneObjectSnapshot, object_pose: dict[str, Any]
         return base_z + float(shape.cylinder_height_m) / 2.0
     return base_z
 
-class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
+class BuildSceneSelectionContextNode(
+    RuntimePauseMixin,
+    BlackboardOutputMixin,
+    py_trees.behaviour.Behaviour,
+):
     """Build an authoritative object-selection context from backend scene state."""
 
     def __init__(
@@ -82,6 +87,9 @@ class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.B
         scene_snapshot_provider: Optional[
             Callable[[int, int, str], Optional[bytes]]
         ] = None,
+        unavailable_policy: str = "pause_for_operator",
+        runtime_pause_registry: Optional[RuntimePauseRegistry] = None,
+        node_id: Optional[str] = None,
     ):
         super().__init__(name=name)
         self._selection_request_text = selection_request_text
@@ -94,10 +102,45 @@ class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.B
         self._image_snapshot_format = image_snapshot_format
         self._base_frame = base_frame
         self._scene_snapshot_provider = scene_snapshot_provider
+        self._unavailable_policy = str(unavailable_policy)
         self._bb = py_trees.blackboard.Client(name=f"build_scene_selection_context_{name}")
         self._output_keys_registered = False
         self._awaiting_scene_snapshot = False
         self._scene_snapshot_wait_started_ns = 0
+        self._configure_runtime_pause(
+            registry=runtime_pause_registry,
+            node_id=str(node_id or name),
+            domain="selection",
+        )
+
+    def _temporary_unavailable(
+        self,
+        *,
+        reason_code: str,
+        message: str,
+        selection_request_text: Optional[str],
+        outcome: str,
+        details: Optional[dict[str, Any]] = None,
+    ) -> py_trees.common.Status:
+        self.feedback_message = message
+        self._write_failure_response(
+            selection_request_text=selection_request_text,
+            candidate_count=0,
+            outcome=outcome,
+        )
+        if self._unavailable_policy == "condition_failure":
+            return py_trees.common.Status.FAILURE
+        if self._unavailable_policy != "pause_for_operator":
+            self.feedback_message = (
+                f"invalid unavailable_policy: {self._unavailable_policy!r}"
+            )
+            return py_trees.common.Status.FAILURE
+        self._raise_runtime_pause(
+            reason_code=reason_code,
+            message=message,
+            details=details,
+        )
+        return py_trees.common.Status.RUNNING
 
     def _ensure_output_keys(self) -> None:
         if self._output_keys_registered:
@@ -115,7 +158,21 @@ class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.B
         self._scene_snapshot_wait_started_ns = 0
 
     def update(self) -> py_trees.common.Status:
-        kernel: KernelClient = self._bb.kernel
+        if self._runtime_pause_fault is not None:
+            if self._consume_runtime_resume() is None:
+                self.feedback_message = self._runtime_pause_fault.message
+                return py_trees.common.Status.RUNNING
+
+        try:
+            kernel: KernelClient = self._bb.kernel
+        except (KeyError, AttributeError):
+            self.feedback_message = "kernel is not configured"
+            self._write_failure_response(
+                selection_request_text=None,
+                candidate_count=0,
+                outcome="kernel_not_configured",
+            )
+            return py_trees.common.Status.FAILURE
         try:
             selection_request_text = str(
                 resolve_blackboard_value(self._bb, self._selection_request_text)
@@ -162,7 +219,16 @@ class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.B
         allowed_object_ids = {
             str(object_id) for object_id in (candidate_object_ids or []) if str(object_id)
         }
-        scene_objects = kernel.get_scene_objects()
+        try:
+            scene_objects = kernel.get_scene_objects()
+        except Exception as exc:
+            return self._temporary_unavailable(
+                reason_code="selection_scene_query_failed",
+                message=f"scene object query failed: {exc}",
+                selection_request_text=selection_request_text,
+                outcome="scene_query_failed",
+                details={"exception_type": type(exc).__name__},
+            )
         candidates_raw = [
             snapshot
             for snapshot in scene_objects
@@ -170,13 +236,13 @@ class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.B
         ]
 
         if not candidates_raw:
-            self.feedback_message = "No candidate scene objects available"
-            self._write_failure_response(
+            return self._temporary_unavailable(
+                reason_code="selection_candidates_unavailable",
+                message="No candidate scene objects available",
                 selection_request_text=selection_request_text,
-                candidate_count=0,
                 outcome="no_candidates",
+                details={"requested_object_ids": sorted(allowed_object_ids)},
             )
-            return py_trees.common.Status.FAILURE
 
         image_context: dict[str, Any] = {
             "source": self._image_source,
@@ -207,13 +273,13 @@ class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.B
                     self._image_snapshot_format,
                 )
             except Exception as exc:
-                self.feedback_message = f"image_snapshot_unavailable: {exc}"
-                self._write_failure_response(
+                return self._temporary_unavailable(
+                    reason_code="selection_image_snapshot_failed",
+                    message=f"image_snapshot_unavailable: {exc}",
                     selection_request_text=selection_request_text,
-                    candidate_count=0,
                     outcome="image_snapshot_unavailable",
+                    details={"exception_type": type(exc).__name__},
                 )
-                return py_trees.common.Status.FAILURE
             if snapshot_bytes is None:
                 if self._scene_snapshot_wait_started_ns == 0:
                     self._scene_snapshot_wait_started_ns = time.monotonic_ns()
@@ -221,15 +287,18 @@ class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.B
                     time.monotonic_ns() - self._scene_snapshot_wait_started_ns
                 ) / 1_000_000_000
                 if elapsed_s >= _SCENE_SNAPSHOT_WAIT_TIMEOUT_S:
-                    self.feedback_message = (
-                        f"image_snapshot_unavailable_after_{_SCENE_SNAPSHOT_WAIT_TIMEOUT_S:.1f}s"
-                    )
-                    self._write_failure_response(
+                    return self._temporary_unavailable(
+                        reason_code="selection_image_snapshot_timeout",
+                        message=(
+                            "image_snapshot_unavailable_after_"
+                            f"{_SCENE_SNAPSHOT_WAIT_TIMEOUT_S:.1f}s"
+                        ),
                         selection_request_text=selection_request_text,
-                        candidate_count=0,
                         outcome="image_snapshot_unavailable",
+                        details={
+                            "timeout_s": _SCENE_SNAPSHOT_WAIT_TIMEOUT_S,
+                        },
                     )
-                    return py_trees.common.Status.FAILURE
                 self._awaiting_scene_snapshot = True
                 self.feedback_message = "waiting_for_scene_snapshot"
                 self._write_namespace_output(
@@ -259,23 +328,49 @@ class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.B
 
         candidates: list[dict[str, Any]] = []
         for snapshot in sorted(candidates_raw, key=lambda item: item.object_id):
-            pose = kernel.get_object_pose(snapshot.object_id, self._base_frame)
+            try:
+                pose = kernel.get_object_pose(snapshot.object_id, self._base_frame)
+            except Exception as exc:
+                return self._temporary_unavailable(
+                    reason_code="selection_object_pose_query_failed",
+                    message=f"object pose query failed for {snapshot.object_id}: {exc}",
+                    selection_request_text=selection_request_text,
+                    outcome="object_pose_query_failed",
+                    details={
+                        "object_id": snapshot.object_id,
+                        "exception_type": type(exc).__name__,
+                    },
+                )
             if pose is None:
                 continue
-            orientation_xyzw = list(pose.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0]))
-            candidate = {
-                "object_id": snapshot.object_id,
-                "shape": _shape_summary(snapshot),
-                "pose": {
-                    "frame_id": self._base_frame,
-                    "position_m": [float(v) for v in pose.get("position_m", [0.0, 0.0, 0.0])],
-                    "orientation_xyzw": orientation_xyzw,
-                    "orientation_rpy_deg": _xyzw_to_rpy_deg(orientation_xyzw),
-                },
-                "attached": bool(snapshot.attached),
-                "frame_id": snapshot.frame_id or "universe",
-                "top_z_m": _shape_top_height(snapshot, pose),
-            }
+            try:
+                orientation_xyzw = list(
+                    pose.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0])
+                )
+                candidate = {
+                    "object_id": snapshot.object_id,
+                    "shape": _shape_summary(snapshot),
+                    "pose": {
+                        "frame_id": self._base_frame,
+                        "position_m": [
+                            float(v)
+                            for v in pose.get("position_m", [0.0, 0.0, 0.0])
+                        ],
+                        "orientation_xyzw": orientation_xyzw,
+                        "orientation_rpy_deg": _xyzw_to_rpy_deg(orientation_xyzw),
+                    },
+                    "attached": bool(snapshot.attached),
+                    "frame_id": snapshot.frame_id or "universe",
+                    "top_z_m": _shape_top_height(snapshot, pose),
+                }
+            except (TypeError, ValueError, IndexError) as exc:
+                return self._temporary_unavailable(
+                    reason_code="selection_object_pose_invalid",
+                    message=f"object pose is invalid for {snapshot.object_id}: {exc}",
+                    selection_request_text=selection_request_text,
+                    outcome="object_pose_invalid",
+                    details={"object_id": snapshot.object_id},
+                )
             candidate["spatial"] = {
                 "distance_from_base_xy_m": math.hypot(
                     candidate["pose"]["position_m"][0],
@@ -290,13 +385,12 @@ class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.B
             candidates.append(candidate)
 
         if not candidates:
-            self.feedback_message = "No candidate scene objects resolved in base frame"
-            self._write_failure_response(
+            return self._temporary_unavailable(
+                reason_code="selection_object_poses_unavailable",
+                message="No candidate scene objects resolved in base frame",
                 selection_request_text=selection_request_text,
-                candidate_count=0,
                 outcome="no_resolved_candidates",
             )
-            return py_trees.common.Status.FAILURE
 
         by_y_desc = [candidate["object_id"] for candidate in sorted(
             candidates, key=lambda item: item["pose"]["position_m"][1], reverse=True
@@ -343,6 +437,10 @@ class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.B
         )
         self._write_namespace_output(response, status="built")
         return py_trees.common.Status.SUCCESS
+
+    def terminate(self, new_status: py_trees.common.Status) -> None:
+        if new_status != py_trees.common.Status.RUNNING:
+            self._clear_runtime_pause()
 
     def _write_failure_response(
         self,

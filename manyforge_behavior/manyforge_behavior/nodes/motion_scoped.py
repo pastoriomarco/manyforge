@@ -7,7 +7,7 @@ to the kernel (spec/260 §2.6 + spec/210 §3.10), wait for the terminal
 never call backend stop, and never arbitrate competing sources — the
 kernel owns all of that.
 
-Outcome → tree-status mapping (spec/260 §B.6):
+Outcome -> tree-status mapping (spec/260 §B.6):
   - `signal_trip`       → SUCCESS (the desired event happened)
   - `no_signal_trip`    → FAILURE when `not_found_is_failure=True`
                           (default) and SUCCESS otherwise. The default
@@ -19,10 +19,9 @@ Outcome → tree-status mapping (spec/260 §B.6):
                           kernel could arm it (mostly a misconfiguration;
                           surfaces the issue rather than silently
                           succeeding).
-  - `stopped`           → FAILURE (operator/BT stop reached first)
-  - `failed`            → FAILURE with `motion_error_message` set so
-                          the cycle manager can surface the cause.
-  - `interrupted_fault` → FAILURE (fault session policy preempted)
+  - `stopped`           -> generation-scoped runtime pause
+  - `failed`            -> generation-scoped runtime pause with structured cause
+  - `interrupted_fault` -> generation-scoped runtime pause
 
 Both nodes write the terminal outcome to a blackboard key
 (`scope_outcome_key`, default `motion_scope_outcome`) so downstream
@@ -62,15 +61,25 @@ from manyforge_behavior.nodes.motion import (
     _relative_move_object_ids,
 )
 from manyforge_behavior.parameters import resolve_blackboard_value
+from manyforge_behavior.runtime_pause import (
+    RuntimePauseMixin,
+    RuntimePauseRegistry,
+    RuntimeRecoveryBinding,
+)
 
 
-class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
+class _MotionScopedBase(
+    ActionSpanMixin,
+    RuntimePauseMixin,
+    py_trees.behaviour.Behaviour,
+):
     """Shared lifecycle for motion-scoped trip nodes. Subclasses
     populate `_node_category` and `_not_found_default`; the rest of
     the execute/await/outcome loop is identical."""
 
     # Subclasses override.
     _node_category: str = "generic"
+    _catalog_node_id: str = "move_until_signal"
     _not_found_default: bool = False
     _allow_natural_completion_default: bool = False
     # Subclasses may override to bias the default motion_type to
@@ -78,7 +87,17 @@ class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
     _default_motion_type: str = "joint_goal"
 
     def __init__(self, name: str, **kwargs: Any) -> None:
+        runtime_pause_registry = kwargs.pop("runtime_pause_registry", None)
         super().__init__(name=name)
+        self._configure_runtime_pause(
+            registry=(
+                runtime_pause_registry
+                if isinstance(runtime_pause_registry, RuntimePauseRegistry)
+                else None
+            ),
+            node_id=self._catalog_node_id,
+            domain="motion",
+        )
         self._params = kwargs
         self._execution_id: int | None = None
         self._motion_coordinator: MotionExecutionCoordinator | None = None
@@ -148,6 +167,7 @@ class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
             kwargs.get("execution_timeout_s", 10.0)
         )
         self._cache_mode = str(kwargs.get("cache_mode", "default"))
+        self._request_error_recoverable = False
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
@@ -175,28 +195,19 @@ class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
             key=self._scope_outcome_key,
             access=py_trees.common.Access.WRITE,
         )
-        self.blackboard.register_key(
-            key="motion_error_message",
-            access=py_trees.common.Access.WRITE,
-        )
 
     def initialise(self) -> None:
         self._reset_action_span()
         self._execution_id = None
         self._terminal_outcome = None
         self._error_message = None
+        self._request_error_recoverable = False
 
     def _read_optional_blackboard_value(self, key: str) -> Any | None:
         try:
             return self.blackboard.get(key)
         except (KeyError, AttributeError):
             return None
-
-    def _set_blackboard_value(self, key: str, value: Any) -> None:
-        try:
-            self.blackboard.set(key, value)
-        except (KeyError, AttributeError):
-            pass
 
     def _build_scope(self) -> MotionInterruptScope:
         profile = MotionInterruptStopProfile(
@@ -350,12 +361,14 @@ class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
         when pose/relative-move resolution or pose-source apply fails.
         Subclasses override `_default_motion_type` to bias the default
         but do NOT override this method (the assembly is identical)."""
+        self._request_error_recoverable = False
         resolved = self._resolve_motion_inputs()
         if isinstance(resolved, str):
             return resolved
         pose_goal, relative_move = resolved
         cb_error = self._apply_pose_source_callbacks(relative_move)
         if cb_error is not None:
+            self._request_error_recoverable = True
             return cb_error
 
         request = ExecuteRequest(
@@ -424,9 +437,11 @@ class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
             self._error_message = request_or_error
             self.feedback_message = request_or_error
             self._set_outcome(None)
-            self._set_blackboard_value(
-                "motion_error_message", self._error_message
-            )
+            if self._request_error_recoverable:
+                return self._pause_runtime(
+                    reason_code="pose_source_apply_failed",
+                    message=self._error_message,
+                )
             return py_trees.common.Status.FAILURE
         request = request_or_error
         # Force the scope onto every motion-scoped trip.
@@ -435,10 +450,10 @@ class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
         if not result.ok:
             self._error_message = result.error or "kernel rejected execute"
             self._set_outcome(None)
-            self._set_blackboard_value(
-                "motion_error_message", self._error_message
+            return self._pause_runtime(
+                reason_code="motion_execute_rejected",
+                message=self._error_message,
             )
-            return py_trees.common.Status.FAILURE
         self._execution_id = result.execution_id
         return py_trees.common.Status.RUNNING
 
@@ -452,6 +467,14 @@ class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
             "stop_requested"
         )
         if stop_requested:
+            return py_trees.common.Status.RUNNING
+
+        if self._consume_runtime_resume() is not None:
+            self._execution_id = None
+            self._terminal_outcome = None
+            self._error_message = None
+            self.feedback_message = ""
+        elif self._runtime_pause_active():
             return py_trees.common.Status.RUNNING
 
         if self._execution_id is None:
@@ -471,10 +494,11 @@ class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
         self._set_outcome(outcome)
         if update.state == "failed":
             self._error_message = update.error or "motion failed"
-            self._set_blackboard_value(
-                "motion_error_message", self._error_message
+            return self._pause_runtime(
+                reason_code="motion_scoped_execution_failed",
+                message=self._error_message,
+                details={"execution_id": self._execution_id},
             )
-            return py_trees.common.Status.FAILURE
         # update.state == "succeeded": map outcome.terminal_cause.
         # Fail closed when the outcome surface is absent or the record
         # is missing the execution id (spec/210 §3.11: every terminal
@@ -485,18 +509,40 @@ class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
         # SUCCESS would silently certify a precision contact never
         # occurred. Honor the spec contract by failing closed.
         if outcome is None or outcome.execution_id != self._execution_id:
-            self._error_message = (
+            return self._fail_terminal(
                 "scoped move reached kernel-COMPLETED but the terminal "
                 "outcome surface is unavailable or returned the wrong "
                 "execution id; cannot certify the trip happened "
                 f"(expected execution_id={self._execution_id}, "
                 f"got={outcome.execution_id if outcome else 'None'})"
             )
-            self._set_blackboard_value(
-                "motion_error_message", self._error_message
-            )
-            return py_trees.common.Status.FAILURE
         return self._status_from_terminal_cause(outcome)
+
+    def runtime_recovery_binding(self) -> RuntimeRecoveryBinding | None:
+        if self._execution_id is None or self._runtime_pause_fault is not None:
+            return None
+        return RuntimeRecoveryBinding(
+            node_name=self.name,
+            node_id=self._catalog_node_id,
+            domain="motion",
+            execution_id=self._execution_id,
+        )
+
+    def accept_runtime_recovery(
+        self,
+        *,
+        recovery_request_id: str,
+        expected_execution_id: int,
+    ) -> bool:
+        _ = recovery_request_id
+        binding = self.runtime_recovery_binding()
+        if binding is None or binding.execution_id != expected_execution_id:
+            return False
+        self._execution_id = None
+        self._terminal_outcome = None
+        self._error_message = None
+        self.feedback_message = ""
+        return True
 
     def _set_outcome(self, outcome: Optional[MotionExecutionOutcome]) -> None:
         self._terminal_outcome = outcome
@@ -513,6 +559,7 @@ class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
         BT owner — orphaned motion is the worst kind of safety hazard
         for search/contact moves. Best-effort: swallows exceptions
         because the kernel may already be torn down."""
+        self._clear_runtime_pause()
         if self._execution_id is None:
             return
         try:
@@ -544,48 +591,37 @@ class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
     def _status_from_terminal_cause(
         self, outcome: MotionExecutionOutcome
     ) -> py_trees.common.Status:
-        # Every FAILURE terminal cause must set motion_error_message so
-        # the cycle manager / operator surface gets a concrete reason —
-        # especially "probe did not contact" on a precision-contact
-        # node. A FAILURE without a message reads to the operator as an
-        # unexplained tree halt; that is the worst kind of opaque fault
-        # for industrial contact/search moves.
+        # Strict no-signal and malformed-outcome cases remain intentional BT
+        # failures. Runtime stop/fault causes use the generation-scoped pause
+        # registry so a Parallel does not terminate accidentally.
         cause = outcome.terminal_cause
         if cause == "signal_trip":
             return py_trees.common.Status.SUCCESS
         if cause == "no_signal_trip":
             if not self._not_found_is_failure:
                 return py_trees.common.Status.SUCCESS
-            self._error_message = (
+            return self._fail_terminal(
                 "no_signal_trip: probe did not contact within the planned "
                 "search envelope (move reached its endpoint without "
                 "triggering the configured signal)"
             )
-            self._set_blackboard_value(
-                "motion_error_message", self._error_message
-            )
-            return py_trees.common.Status.FAILURE
         if cause == "completed_normally":
-            self._error_message = (
+            return self._fail_terminal(
                 "scope dropped before arming (completed_normally on a "
                 "scoped move is a configuration error)"
             )
-            self._set_blackboard_value(
-                "motion_error_message", self._error_message
-            )
-            return py_trees.common.Status.FAILURE
         if cause == "stopped":
             self._error_message = "operator stop reached kernel before trip"
-            self._set_blackboard_value(
-                "motion_error_message", self._error_message
+            return self._pause_runtime(
+                reason_code="motion_scoped_stopped",
+                message=self._error_message,
             )
-            return py_trees.common.Status.FAILURE
         if cause == "interrupted_fault":
             self._error_message = "fault session policy preempted the move"
-            self._set_blackboard_value(
-                "motion_error_message", self._error_message
+            return self._pause_runtime(
+                reason_code="motion_scoped_interrupted_fault",
+                message=self._error_message,
             )
-            return py_trees.common.Status.FAILURE
         # `failed` and anything unexpected.
         self._error_message = (
             outcome.error_message
@@ -593,10 +629,35 @@ class _MotionScopedBase(ActionSpanMixin, py_trees.behaviour.Behaviour):
             or outcome.error_code
             or f"motion failed: terminal_cause={cause}"
         )
-        self._set_blackboard_value(
-            "motion_error_message", self._error_message
+        return self._pause_runtime(
+            reason_code=(outcome.error_code or "motion_scoped_failed"),
+            message=self._error_message,
+            details={
+                "terminal_cause": cause,
+                "error_reason": outcome.error_reason,
+            },
         )
+
+    def _fail_terminal(self, message: str) -> py_trees.common.Status:
+        """Return an intentional BT failure with operator-visible feedback."""
+        self._error_message = message
+        self.feedback_message = message
         return py_trees.common.Status.FAILURE
+
+    def _pause_runtime(
+        self,
+        *,
+        reason_code: str,
+        message: str,
+        details: Optional[dict[str, Any]] = None,
+    ) -> py_trees.common.Status:
+        self.feedback_message = message
+        self._raise_runtime_pause(
+            reason_code=reason_code,
+            message=message,
+            details=details,
+        )
+        return py_trees.common.Status.RUNNING
 
 
 class MoveUntilSignal(_MotionScopedBase):
@@ -606,6 +667,7 @@ class MoveUntilSignal(_MotionScopedBase):
     Pass `not_found_is_failure=True` to enforce contact semantics."""
 
     _node_category = "generic"
+    _catalog_node_id = "move_until_signal"
     _not_found_default = False
     _allow_natural_completion_default = True
     _default_motion_type = "joint_goal"
@@ -619,6 +681,7 @@ class ProbeSearchMove(_MotionScopedBase):
     pre-existing contact."""
 
     _node_category = "precision_contact"
+    _catalog_node_id = "probe_search_move"
     _not_found_default = True
     _allow_natural_completion_default = False
     _default_motion_type = "pose_goal"

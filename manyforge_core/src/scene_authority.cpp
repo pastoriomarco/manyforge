@@ -87,7 +87,8 @@ SceneAuthority::SceneAuthority(
       !refresh_committed_publication(
           revision, projection_.configured_collision_policy(),
           projection_.robot_placements(),
-          projection_.scene_objects(), 0, std::nullopt, std::nullopt, error)) {
+          projection_.scene_objects(), 0, 1, std::nullopt, std::nullopt,
+          error)) {
     throw std::runtime_error(
         error.message.empty()
             ? "scene projection did not publish a valid initial revision"
@@ -171,6 +172,13 @@ SceneCommitResultDTO SceneAuthority::commit(SceneTransactionDTO transaction) {
   }
 
   result.update_status = classify_update(projection_result.edit);
+  const std::uint64_t admission_epoch =
+      current->logical->admission_epoch +
+      (result.update_status != SceneUpdateStatus::kNoOp &&
+               transaction.recovery_admission_impact ==
+                   SceneRecoveryAdmissionImpact::kInvalidate
+           ? 1
+           : 0);
   const std::uint64_t expected_revision_id =
       result.update_status == SceneUpdateStatus::kGeometryChanged
           ? proposed.revision_id
@@ -202,6 +210,7 @@ SceneCommitResultDTO SceneAuthority::commit(SceneTransactionDTO transaction) {
           std::move(configured_collision_policy),
           projection_.robot_placements(),
           projection_.scene_objects(), result.transaction_sequence,
+          admission_epoch,
           std::nullopt, std::nullopt, publication_error)) {
     desynchronized_.store(true, std::memory_order_release);
     result.error = std::move(publication_error);
@@ -219,6 +228,7 @@ bool SceneAuthority::refresh_committed_publication(
     std::vector<SceneRobotPlacementDTO> robot_placements,
     std::vector<SceneObjectSnapshotDTO> objects,
     std::uint64_t transaction_sequence,
+    std::uint64_t admission_epoch,
     std::optional<std::uint64_t> expected_topology_epoch,
     std::optional<std::uint64_t> expected_policy_epoch,
     ErrorDTO& error) {
@@ -344,6 +354,7 @@ bool SceneAuthority::refresh_committed_publication(
   auto logical = std::make_shared<LogicalSceneSnapshot>();
   logical->revision = expected_revision;
   logical->transaction_sequence = transaction_sequence;
+  logical->admission_epoch = admission_epoch;
   logical->topology_epoch = inventory->topology_epoch;
   logical->policy_epoch = inventory->policy_epoch;
   logical->world_frame = config_.world_frame;
@@ -398,6 +409,7 @@ Result<SceneRevisionDTO> SceneAuthority::rebuild_projection() {
           projection_.robot_placements(),
           projection_.scene_objects(),
           current->logical->transaction_sequence,
+          current->logical->admission_epoch,
           current->logical->topology_epoch,
           current->logical->policy_epoch, publication_error)) {
     return Result<SceneRevisionDTO>::Err(std::move(publication_error));
@@ -410,6 +422,20 @@ SceneRevisionDTO SceneAuthority::current_revision() const {
   const auto current = publication_.load(std::memory_order_acquire);
   return current && current->logical ? current->logical->revision
                                      : SceneRevisionDTO{};
+}
+
+SceneAuthorityStatusDTO SceneAuthority::authority_status() const {
+  const auto current = publication_.load(std::memory_order_acquire);
+  SceneAuthorityStatusDTO status;
+  if (!current || !current->logical) {
+    return status;
+  }
+  status.revision = current->logical->revision;
+  status.transaction_sequence = current->logical->transaction_sequence;
+  status.admission_epoch = current->logical->admission_epoch;
+  status.topology_epoch = current->logical->topology_epoch;
+  status.policy_epoch = current->logical->policy_epoch;
+  return status;
 }
 
 LogicalSceneSnapshotPtr SceneAuthority::logical_snapshot() const {
@@ -452,7 +478,15 @@ SceneEditResultDTO SceneAuthority::remove_object(
 
 SceneEditResultDTO SceneAuthority::update_object_pose(
     const UpdateObjectPoseRequestDTO& request) {
-  return commit_typed(request, "scene_authority.update_object_pose");
+  SceneTransactionDTO transaction;
+  transaction.expected_revision = current_revision();
+  transaction.operation = request;
+  transaction.authority_source = "scene_authority.update_object_pose";
+  if (request.source_id.has_value()) {
+    transaction.recovery_admission_impact =
+        SceneRecoveryAdmissionImpact::kLiveObservation;
+  }
+  return edit_result(commit(std::move(transaction)));
 }
 
 SceneEditResultDTO SceneAuthority::attach_object(

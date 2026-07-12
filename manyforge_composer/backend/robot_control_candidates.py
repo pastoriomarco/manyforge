@@ -1887,12 +1887,6 @@ def _refresh_gripper_candidate_execution_from_runtime(
         return candidate
 
     gripper_id = candidate.gripper_target.gripper_id
-    advance = getattr(state.kernel, "update_gripper_commands", None)
-    if callable(advance):
-        try:
-            advance()
-        except Exception:  # noqa: BLE001 - observer path must stay best-effort
-            pass
     get_status = getattr(state.kernel, "get_gripper_status", None)
     if not callable(get_status):
         return candidate
@@ -1933,6 +1927,9 @@ def _refresh_gripper_candidate_execution_from_runtime(
         ),
         details={
             "gripperId": gripper_id,
+            "commandId": int(getattr(gripper_status, "command_id", 0) or 0),
+            "generation": int(getattr(gripper_status, "generation", 0) or 0),
+            "revision": int(getattr(gripper_status, "revision", 0) or 0),
             "gripperState": (
                 raw_state.value if isinstance(raw_state, GripperCommandState) else str(raw_state)
             ),
@@ -1953,6 +1950,12 @@ def _refresh_gripper_candidate_execution_from_runtime(
             "transportKind": getattr(gripper_status, "transport_kind", ""),
             "evidence": list(getattr(gripper_status, "evidence", []) or []),
             "evidenceState": getattr(gripper_status, "evidence_state", ""),
+            "projectionState": getattr(
+                gripper_status, "projection_state", "not_required"
+            ),
+            "projectionReason": getattr(
+                gripper_status, "projection_reason", ""
+            ),
             "error": detail_error,
         },
     )

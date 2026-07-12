@@ -1,5 +1,6 @@
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_core/time/manual_scheduler.hpp>
 #define MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 #undef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
@@ -290,12 +291,14 @@ int main() {
   auto warm_positions = make_positions(warm_names.size(), 1.0);
 
   manyforge::core::FakeClock feedback_clock;
+  manyforge::core::ManualScheduler feedback_scheduler;
   auto feedback_sink = std::make_shared<CountingExecutionStateSink>();
   Ros2ControlExecutionBackend feedback_backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
       feedback_sink,
       "arm",
       feedback_clock,
+      feedback_scheduler,
       make_config(hot_names));
   const auto feedback_allocations = measure_feedback_storage_allocations(
       feedback_backend,
@@ -306,12 +309,14 @@ int main() {
       iterations);
 
   manyforge::core::FakeClock idle_clock;
+  manyforge::core::ManualScheduler idle_scheduler;
   auto idle_sink = std::make_shared<CountingExecutionStateSink>();
   Ros2ControlExecutionBackend idle_backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
       idle_sink,
       "arm",
       idle_clock,
+      idle_scheduler,
       make_config(hot_names));
   const auto idle_skip_allocations =
       measure_idle_repeated_sample_skip_allocations(

@@ -10,6 +10,7 @@ from manyforge_behavior.kernel_client import (
     ExecuteRequest,
     ExecutionState,
     GripperCommandRequest,
+    GripperCommandState,
     SceneEditRequest,
 )
 from manyforge_behavior.model_paths import ResolvedRobotModel
@@ -27,6 +28,16 @@ from manyforge_behavior.robot_model_runtime import prepare_roboplan_runtime_mode
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODEL_ROOT = REPO_ROOT / "manyforge_example_models" / "models"
+
+
+def _wait_for_gripper_completed(kernel, gripper_id: str, timeout_s: float = 1.0):
+    deadline = time.monotonic() + timeout_s
+    status = kernel.get_gripper_status(gripper_id)
+    while status.state == GripperCommandState.EXECUTING and time.monotonic() < deadline:
+        time.sleep(0.001)
+        status = kernel.get_gripper_status(gripper_id)
+    assert status.state == GripperCommandState.COMPLETED, status.error
+    return status
 
 
 def _write_model(
@@ -290,6 +301,7 @@ def test_lite6_canonical_gripper_command_uses_roboplan_view_mapping_when_binding
     )
 
     assert result.accepted is True, result.error
+    _wait_for_gripper_completed(kernel, "lite_gripper")
     assert bundle.get_group_joint_positions("lite_gripper") == pytest.approx(
         [0.0081, 0.0081],
         abs=1e-4,
@@ -421,6 +433,7 @@ def test_lite6_arm_pick_validation_preserves_open_gripper_state_when_binding_ava
         )
     )
     assert gripper.accepted, gripper.error
+    _wait_for_gripper_completed(kernel, "primary")
     assert bundle.get_group_joint_positions("lite_gripper") == pytest.approx(
         [0.0081, 0.0081],
         abs=1e-4,
@@ -430,7 +443,7 @@ def test_lite6_arm_pick_validation_preserves_open_gripper_state_when_binding_ava
     execute_relative("lite6_pick_down", 0.035)
 
 
-def test_lite6_manyforge_collision_matches_legacy_for_open_gripper_pick_waypoint():
+def test_lite6_manyforge_collision_matches_diagnostic_for_open_gripper_pick_waypoint():
     try:
         import manyforge_roboplan_py
         from native_kernel_client import NativeKernelClient
@@ -508,15 +521,16 @@ def test_lite6_manyforge_collision_matches_legacy_for_open_gripper_pick_waypoint
         )
     )
     assert result.accepted, result.error
+    _wait_for_gripper_completed(kernel, "primary")
     assert bundle.get_group_joint_positions("lite_gripper") == pytest.approx(
         [0.0081, 0.0081],
         abs=1e-4,
     )
 
     # Regression for the live Lite6 false positive seen on lite6_pick_down:
-    # the legacy RoboPlan scene accepted this open-gripper waypoint while the
-    # snapshot-backed ManyForge collision engine used a conservative robot-mesh
-    # AABB proxy and reported graspable <-> finger collision.
+    # the diagnostic comparator accepted this open-gripper waypoint while an
+    # earlier snapshot-backed engine used a conservative robot-mesh AABB proxy
+    # and reported graspable <-> finger collision.
     failing_waypoint = [
         -0.94676919298494788,
         0.70804426974298251,
@@ -528,9 +542,9 @@ def test_lite6_manyforge_collision_matches_legacy_for_open_gripper_pick_waypoint
     ]
     comparison = bundle.collision_compare_positions(failing_waypoint, 66)
     assert comparison["ok"] is True, comparison
-    assert comparison["legacy"]["decision"] == "pass"
+    assert comparison["diagnostic"]["decision"] == "pass"
     assert comparison["manyforge_collision"]["decision"] == "pass", comparison
-    assert comparison["match"] is True, comparison
+    assert comparison["decision_match"] is True, comparison
 
 
 def test_lite6_asset_descriptor_and_instance_view_preserve_mimic_gripper_maps():
