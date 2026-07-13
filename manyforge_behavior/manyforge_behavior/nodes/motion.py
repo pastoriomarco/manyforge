@@ -84,6 +84,9 @@ class MoveManipulatorAction(
         self._motion_coordinator: MotionExecutionCoordinator | None = None
         self._move_id = kwargs.get("move_id", "")
         self._base_velocity_scale = float(kwargs.get("velocity_scale", 1.0))
+        self._planning_qualification_action_span = None
+        self._planning_qualification_started = False
+        self._planning_qualification_terminal = False
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
@@ -112,6 +115,41 @@ class MoveManipulatorAction(
         self._execution_id = None
         self._motion_coordinator = None
         self._base_velocity_scale = float(self._params.get("velocity_scale", 1.0))
+        self._planning_qualification_action_span = None
+        self._planning_qualification_started = False
+        self._planning_qualification_terminal = False
+
+    def _planning_qualification_span(self):
+        if self._planning_qualification_action_span is None:
+            self._planning_qualification_action_span = self._current_action_span(
+                self.blackboard,
+                parent_node_attempt_id=self._params.get("parent_node_attempt_id")
+                or None,
+            )
+        return self._planning_qualification_action_span
+
+    def _record_planning_qualification_boundary(
+        self, kernel: KernelClient, phase: str
+    ) -> None:
+        if phase == "started":
+            if self._planning_qualification_started:
+                return
+            self._planning_qualification_started = True
+        else:
+            if (
+                not self._planning_qualification_started
+                or self._planning_qualification_terminal
+            ):
+                return
+            self._planning_qualification_terminal = True
+        try:
+            kernel.record_planning_qualification_behavior_boundary(
+                action_span=self._planning_qualification_span(),
+                move_id=str(self._params.get("move_id", "")),
+                phase=phase,
+            )
+        except Exception:  # noqa: BLE001 - evidence must not own motion behavior
+            return
 
     def _read_optional_blackboard_value(self, key: str) -> Any | None:
         try:
@@ -210,6 +248,7 @@ class MoveManipulatorAction(
             )
 
         if not self._started:
+            self._record_planning_qualification_boundary(kernel, "started")
             try:
                 pose_goal = resolve_blackboard_value(
                     self.blackboard, self._params.get("pose_goal")
@@ -357,13 +396,7 @@ class MoveManipulatorAction(
                 ),
                 cache_mode=self._params.get("cache_mode", "default"),
                 program_run_id=self._read_program_run_id(),
-                action_span=self._current_action_span(
-                    self.blackboard,
-                    parent_node_attempt_id=self._params.get(
-                        "parent_node_attempt_id"
-                    )
-                    or None,
-                ),
+                action_span=self._planning_qualification_span(),
                 contact_policy_id=self._params.get("contact_policy_id") or None,
             )
 
@@ -394,6 +427,7 @@ class MoveManipulatorAction(
             return py_trees.common.Status.FAILURE
         update = self._motion_coordinator.update(self._execution_id)
         if update.state == "succeeded":
+            self._record_planning_qualification_boundary(kernel, "succeeded")
             return py_trees.common.Status.SUCCESS
         if update.state == "failed":
             # Kernel reached FAILED or STOPPED for our owned execution_id
@@ -421,12 +455,23 @@ class MoveManipulatorAction(
         state. Best-effort: kernel API may not be available in all
         configurations (e.g., during shutdown), so swallow exceptions.
         """
-        self._clear_runtime_pause()
-        if not self._started or self._execution_id is None:
-            return
         try:
             kernel = self.blackboard.kernel
         except (KeyError, AttributeError):
+            kernel = None
+        if kernel is not None:
+            phase = (
+                "succeeded"
+                if new_status == py_trees.common.Status.SUCCESS
+                else "failed"
+                if new_status == py_trees.common.Status.FAILURE
+                else "abandoned"
+            )
+            self._record_planning_qualification_boundary(kernel, phase)
+        self._clear_runtime_pause()
+        if not self._started or self._execution_id is None:
+            return
+        if kernel is None:
             return
         try:
             status = kernel.get_status()

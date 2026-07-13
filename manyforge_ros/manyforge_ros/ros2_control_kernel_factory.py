@@ -72,7 +72,12 @@ def create_ros2_control_kernel(
         srdf_path=robot_config.srdf_path,
         package_paths=robot_config.package_paths,
         deployment_path=deployment.source_path,
-        extra_package_paths=default_package_paths(),
+        # Explicit deployment roots are authoritative. Appending environment
+        # defaults changes the RMA fingerprint and can resolve the same URI to
+        # a different asset across native and ROS lanes.
+        extra_package_paths=(
+            [] if robot_config.package_paths else default_package_paths()
+        ),
     )
     runtime_model = prepare_roboplan_runtime_model_view(
         resolved_model=resolved_model,
@@ -105,7 +110,11 @@ def create_ros2_control_kernel(
     ):
         if key in config:
             kernel_config[key] = config[key]
-    for key in ("planner_max_planning_time_s", "planner_max_planning_time_ms"):
+    for key in (
+        "planner_max_planning_time_s",
+        "planner_max_planning_time_ms",
+        "rng_seed",
+    ):
         if key in planning_config:
             kernel_config[key] = planning_config[key]
         elif key in config:
@@ -136,6 +145,7 @@ def create_ros2_control_kernel(
         runtime_model.package_paths,
         ros_config,
         kernel_config_arg,
+        robot_config.robot_id,
     )
 
     attach_robot_model_metadata(native_bundle, runtime_model)

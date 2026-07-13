@@ -94,7 +94,11 @@ def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, A
     for key in ("single_shot_ik_timeout_s", "single_shot_ik_timeout_ms"):
         if key in execution_config:
             config[key] = execution_config[key]
-    for key in ("planner_max_planning_time_s", "planner_max_planning_time_ms"):
+    for key in (
+        "planner_max_planning_time_s",
+        "planner_max_planning_time_ms",
+        "rng_seed",
+    ):
         if key in planning_config:
             config[key] = planning_config[key]
         elif key in execution_config:
@@ -156,11 +160,15 @@ def create_kernel(deployment: Deployment) -> KernelClient:
                     runtime_model.srdf_path,
                     runtime_model.package_paths,
                     _native_kernel_config_from_deployment(deployment),
+                    robot_config.robot_id,
                 )
             else:
                 model_name = robot_config.urdf_path.rsplit("/", 1)[-1].replace(".urdf", "")
                 bundle = manyforge_roboplan_py.create_native_kernel(
-                    model_name, group, _native_kernel_config_from_deployment(deployment)
+                    model_name,
+                    group,
+                    _native_kernel_config_from_deployment(deployment),
+                    robot_config.robot_id,
                 )
                 runtime_model = None
             if runtime_model is not None:

@@ -2466,6 +2466,7 @@ class TestDeploymentLoading:
             simulation_control={
                 "kind": "ros2_simulation_interfaces",
                 "service_prefix": "auto",
+                "service_timeout_s": 8.5,
                 "capabilities": {
                     "reset": True,
                     "pause": False,
@@ -2487,6 +2488,7 @@ class TestDeploymentLoading:
         assert control is not None
         assert control.kind == "ros2_simulation_interfaces"
         assert control.service_prefix == "auto"
+        assert control.service_timeout_s == 8.5
         assert control.capabilities.reset is True
         assert control.capabilities.set_entity_state is True
         assert control.reset.default_scope == "state"
@@ -2499,6 +2501,7 @@ class TestDeploymentLoading:
 
         reloaded = Deployment.from_dict(deploy.to_dict())
         assert reloaded.simulation_control is not None
+        assert reloaded.simulation_control.service_timeout_s == 8.5
         assert reloaded.simulation_control.capabilities.reset is True
         assert reloaded.simulation_control.reset.wait_ready_s == 4.5
         assert reloaded.simulation_control.reset.resume_play_after_reset is False
@@ -2520,6 +2523,14 @@ class TestDeploymentLoading:
                     "capabilities": {"reset": True},
                 },
                 "simulation_control contains unknown fields",
+            ),
+            (
+                {
+                    "kind": "ros2_simulation_interfaces",
+                    "service_timeout_s": 0,
+                    "capabilities": {"reset": True},
+                },
+                "simulation_control.service_timeout_s must be a number > 0",
             ),
             (
                 {
@@ -3436,6 +3447,10 @@ class TestCrossArtifactValidation:
         assert deploy.grippers["primary"].transport["kind"] == "ros_gripper_command"
         assert deploy.adapters["execution"].config["gripper"]["action_name"] == (
             "/robotiq_gripper_controller/gripper_cmd"
+        )
+        assert (
+            deploy.orchestrator.config["runtime_dynamic_body_max_age_cap_ms"]
+            == 750.0
         )
         deploy.validate_against_program(prog)
         deploy.validate_capabilities()

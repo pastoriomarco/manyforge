@@ -278,6 +278,7 @@ class SimulationControlConfig:
 
     kind: str
     service_prefix: str = "auto"
+    service_timeout_s: float = 10.0
     capabilities: SimulationControlCapabilities = field(
         default_factory=SimulationControlCapabilities
     )
@@ -1643,6 +1644,8 @@ class Deployment:
                 "kind",
                 "service_prefix",
                 "servicePrefix",
+                "service_timeout_s",
+                "serviceTimeoutS",
                 "capabilities",
                 "reset",
             }
@@ -1676,6 +1679,15 @@ class Deployment:
             raise DeploymentValidationError(
                 "simulation_control.service_prefix must be non-empty"
             )
+        service_timeout_s = self._parse_positive_float(
+            get_alias(
+                simulation_control_data,
+                "service_timeout_s",
+                "serviceTimeoutS",
+                10.0,
+            ),
+            "simulation_control.service_timeout_s",
+        )
 
         capabilities_input = simulation_control_data.get("capabilities", {})
         if capabilities_input is None:
@@ -1815,6 +1827,7 @@ class Deployment:
         return SimulationControlConfig(
             kind=kind,
             service_prefix=service_prefix,
+            service_timeout_s=service_timeout_s,
             capabilities=capabilities,
             reset=reset_config,
         )
@@ -4276,6 +4289,7 @@ class Deployment:
             simulation_control_d: dict[str, Any] = {
                 "kind": self.simulation_control.kind,
                 "service_prefix": self.simulation_control.service_prefix,
+                "service_timeout_s": self.simulation_control.service_timeout_s,
                 "capabilities": {
                     "reset": self.simulation_control.capabilities.reset,
                     "pause": self.simulation_control.capabilities.pause,

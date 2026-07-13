@@ -66,7 +66,7 @@ class RoboPlanSceneProjection final
   /// portable callers retain and pass opaque SceneRevisionBindingDTO values.
   /// Missing, released, or mismatched bindings return nullptr and must fail
   /// planning closed rather than falling forward to the live scene.
-  std::shared_ptr<roboplan::Scene> acquire_native_projection(
+  std::shared_ptr<const roboplan::Scene> acquire_native_projection(
       const core::SceneRevisionBindingDTO& binding) const;
   core::Result<core::Pose3DTO> resolve_reference_pose(
       const core::ReferenceDTO& reference,

@@ -24,6 +24,9 @@ ErrorCode error_code_from_dto(const ErrorDTO& error) {
   if (error.code == kErrorSceneChangedDuringValidation) {
     return ErrorCode::kSceneChangedDuringValidation;
   }
+  if (error.code == kErrorSceneObjectStateConflict) {
+    return ErrorCode::kSceneObjectStateConflict;
+  }
   if (error.code == kErrorExecutionTimeout) {
     return ErrorCode::kExecutionTimeout;
   }

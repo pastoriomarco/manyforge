@@ -971,6 +971,7 @@ class SimulationControlConfigResponse(BaseModel):
     model_config = _ALIAS_CFG
     kind: str
     service_prefix: str = Field(default="auto", alias="servicePrefix")
+    service_timeout_s: float = Field(default=10.0, alias="serviceTimeoutS")
     capabilities: SimulationControlCapabilitiesResponse = Field(
         default_factory=SimulationControlCapabilitiesResponse
     )

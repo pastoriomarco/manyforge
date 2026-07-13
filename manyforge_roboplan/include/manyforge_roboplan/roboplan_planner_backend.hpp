@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -41,6 +42,62 @@ struct JointCapMeasurement {
   double worst_acc_peak = 0.0;  // rad/s^2
 };
 
+/// Optional qualification-only collision counter sampled at planner stage
+/// boundaries. Production adapters leave the probe unavailable; benchmark
+/// builds can provide an interposed RoboPlan Scene counter without changing
+/// planner behavior or linking two RoboPlan versions into one process.
+struct RoboPlanCollisionProbeSnapshot {
+  bool available = false;
+  std::uint64_t query_count = 0;
+  std::uint64_t query_duration_ns = 0;
+};
+
+struct RoboPlanPlanningStageMetrics {
+  std::uint64_t duration_ns = 0;
+  std::uint64_t collision_query_count = 0;
+  std::uint64_t collision_query_duration_ns = 0;
+};
+
+/// One immutable planner invocation measurement. It intentionally contains
+/// backend-stage facts only; dispatch, authoritative validation, and runtime
+/// collision evidence remain owned by their respective ManyForge surfaces.
+struct RoboPlanPlanningPipelineMetrics {
+  std::map<std::string, RoboPlanPlanningStageMetrics> stages;
+  std::uint64_t total_duration_ns = 0;
+  std::uint64_t total_collision_query_count = 0;
+  std::uint64_t total_collision_query_duration_ns = 0;
+  bool collision_probe_available = false;
+  bool measurement_complete = true;
+  bool succeeded = false;
+  std::string error_code;
+  std::size_t waypoint_count = 0;
+  double trajectory_duration_s = 0.0;
+  std::optional<std::uint32_t> rng_base_seed;
+  std::optional<std::uint32_t> rng_seed;
+  std::optional<int> shortcut_rng_seed_argument;
+  std::uint32_t planning_attempt_index = 0;
+};
+
+/// NRT qualification observer. Implementations must be thread-safe and must
+/// not throw. The planner calls this surface only when enabled; production
+/// factories do not install an observer.
+class IRoboPlanPlanningPerformanceObserver {
+ public:
+  virtual ~IRoboPlanPlanningPerformanceObserver() = default;
+  virtual RoboPlanCollisionProbeSnapshot collision_probe_snapshot()
+      const noexcept = 0;
+  /// Atomically admit one invocation into the observer's lifetime. Returning
+  /// false excludes the invocation from measurement after capture admission
+  /// has closed, even if the planner retained an older observer snapshot.
+  virtual bool try_begin_invocation(const core::PlanRequestDTO&) noexcept {
+    return true;
+  }
+  virtual void record(
+      const core::PlanRequestDTO& request,
+      const core::PlanResultDTO& result,
+      const RoboPlanPlanningPipelineMetrics& metrics) noexcept = 0;
+};
+
 /// Sample peak |velocity| / |acceleration| per capped joint from `traj` and
 /// compare against the requested absolute caps. Caps are keyed by joint name;
 /// only joints present in `traj.joint_names` are measured. If a capped
@@ -64,11 +121,17 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
                          std::shared_ptr<roboplan::SimpleIk> single_shot_ik = nullptr,
                          std::optional<roboplan::SimpleIkOptions> ik_options = std::nullopt,
                          std::optional<roboplan::SimpleIkOptions> single_shot_ik_options =
-                             std::nullopt);
+                             std::nullopt,
+                         std::optional<std::uint32_t> rng_seed = std::nullopt,
+                         std::shared_ptr<IRoboPlanPlanningPerformanceObserver>
+                             performance_observer = nullptr);
 
   core::PlanResultDTO plan(const core::PlanRequestDTO& request) override;
 
   void request_cancel() override;
+
+  void set_performance_observer(
+      std::shared_ptr<IRoboPlanPlanningPerformanceObserver> observer) noexcept;
 
   core::IkResultDTO solve_ik(const core::IkRequestDTO& request) override;
 
@@ -82,6 +145,9 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
   std::shared_ptr<std::mutex> scene_mutex_;
   roboplan::SimpleIkOptions ik_options_;
   roboplan::SimpleIkOptions single_shot_ik_options_;
+  std::optional<std::uint32_t> rng_seed_;
+  std::atomic<std::shared_ptr<IRoboPlanPlanningPerformanceObserver>>
+      performance_observer_;
   std::atomic_bool cancel_requested_{false};
 };
 

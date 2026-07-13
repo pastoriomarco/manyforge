@@ -1274,9 +1274,14 @@ class CycleManager:
                         self._kernel_event_index += 1
                         event["event_index"] = self._kernel_event_index
                         self._kernel_events.append(event)
-                    last_sequence = int(events[-1].get("sequence") or 0)
+                    last_sequence = max(
+                        int(event.get("sequence") or 0) for event in events
+                    )
                     if last_sequence:
-                        self._kernel_last_sequence_seen = last_sequence
+                        self._kernel_last_sequence_seen = max(
+                            self._kernel_last_sequence_seen,
+                            last_sequence,
+                        )
         recovery_projection_needed = any(
             str(event.get("type") or "")
             in {

@@ -1427,16 +1427,145 @@ TEST(Ros2ControlExecutionBackendTest,
   const auto now = std::chrono::steady_clock::time_point{1s};
   backend.testing_store_action_feedback_sample(
       {"joint_1"}, {0.25}, {0.0}, now);
+  ASSERT_TRUE(backend.testing_publish_snapshot(
+      core::ExecutionState::kIdle, {0.75}));
 
   auto selected = backend.observed_robot_state_publication()->acquire(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           now.time_since_epoch())
           .count());
   ASSERT_TRUE(selected);
+  EXPECT_EQ(selected.source_kind(),
+            core::ObservedRobotStateSourceKind::kPredictedState);
+  EXPECT_EQ(selected.source_id(), "authored_preview_state");
+  EXPECT_EQ(selected.authority_profile(),
+            core::ObservedRobotStateAuthorityProfile::kCommandedSimulation);
+  EXPECT_EQ(selected.authority_profile_id(),
+            "ros2_control_authored_preview_v1");
+  ASSERT_EQ(selected.positions_rad().size(), 1u);
+  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.75);
+  ASSERT_EQ(selected.velocities_rad_s().size(), 1u);
+  EXPECT_DOUBLE_EQ(selected.velocities_rad_s()[0], 0.0);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     CommandedSimKeepsCommandReferenceAuthoritativeOverMeasuredUpdates) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
+      clock, scheduler, config);
+
+  auto initial = backend.observed_robot_state_publication()->acquire(clock.now());
+  ASSERT_TRUE(initial);
+  EXPECT_EQ(initial.source_kind(),
+            core::ObservedRobotStateSourceKind::kCommandedState);
+  ASSERT_EQ(initial.positions_rad().size(), 1u);
+  EXPECT_DOUBLE_EQ(initial.positions_rad()[0], 0.0);
+
+  ASSERT_TRUE(backend.testing_publish_snapshot(
+      core::ExecutionState::kIdle, {0.75}));
+  const auto now = std::chrono::steady_clock::time_point{1s};
+  backend.testing_store_action_feedback_sample(
+      {"joint_1"}, {0.25}, {0.5}, now);
+  backend.testing_store_latest_joint_sample({"joint_1"}, {0.5}, now);
+
+  auto selected = backend.observed_robot_state_publication()->acquire(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          now.time_since_epoch())
+          .count());
+  ASSERT_TRUE(selected);
+  EXPECT_EQ(selected.source_kind(),
+            core::ObservedRobotStateSourceKind::kCommandedState);
+  EXPECT_EQ(selected.source_id(), "commanded_state");
   EXPECT_EQ(selected.authority_profile(),
             core::ObservedRobotStateAuthorityProfile::kCommandedSimulation);
   EXPECT_EQ(selected.authority_profile_id(),
             "ros2_control_commanded_sim_v1");
+  ASSERT_EQ(selected.positions_rad().size(), 1u);
+  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.75);
+  ASSERT_EQ(selected.velocities_rad_s().size(), 1u);
+  EXPECT_DOUBLE_EQ(selected.velocities_rad_s()[0], 0.0);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     TerminalGenerationRejectsLateMonitorSnapshotAndCommandAuthority) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
+      clock, scheduler, config);
+
+  backend.testing_set_running_state(true);
+  const auto execution_generation = backend.testing_running_generation();
+  ASSERT_TRUE(backend.testing_publish_snapshot_for_generation(
+      core::ExecutionState::kExecuting, {0.5}, execution_generation));
+
+  backend.testing_set_running_state(false);
+  ASSERT_TRUE(backend.testing_publish_snapshot(
+      core::ExecutionState::kCompleted, {1.0}));
+  EXPECT_FALSE(backend.testing_publish_snapshot_for_generation(
+      core::ExecutionState::kExecuting, {0.75}, execution_generation));
+
+  const auto snapshot = backend.get_execution_snapshot();
+  EXPECT_EQ(snapshot.state, core::ExecutionState::kCompleted);
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad[0], 1.0);
+  auto observed = backend.observed_robot_state_publication()->acquire(clock.now());
+  ASSERT_TRUE(observed);
+  ASSERT_EQ(observed.positions_rad().size(), 1u);
+  EXPECT_DOUBLE_EQ(observed.positions_rad()[0], 1.0);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     TerminalCommandPublicationFailureInvalidatesPlanningAuthority) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
+      clock, scheduler, config);
+
+  const auto* publication = backend.observed_robot_state_publication();
+  ASSERT_NE(publication, nullptr);
+  auto first = publication->acquire(clock.now());
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(backend.testing_publish_snapshot(
+      core::ExecutionState::kExecuting, {0.25}));
+  auto second = publication->acquire(clock.now());
+  ASSERT_TRUE(second);
+  ASSERT_TRUE(backend.testing_publish_snapshot(
+      core::ExecutionState::kExecuting, {0.5}));
+
+  // The current slot is never overwritten and both older slots are pinned.
+  // A terminal authority replacement must fail closed instead of leaving the
+  // non-expiring 0.5 command reference admissible for the next plan.
+  EXPECT_FALSE(backend.testing_publish_snapshot(
+      core::ExecutionState::kCompleted, {1.0}));
+  ASSERT_NE(backend.authored_state_authority_epoch(), nullptr);
+  const auto invalid_epoch = backend.authored_state_authority_epoch()->load(
+      std::memory_order_acquire);
+  EXPECT_NE(invalid_epoch & 1u, 0u);
+
+  first = {};
+  second = {};
+  EXPECT_TRUE(backend.testing_publish_snapshot(
+      core::ExecutionState::kIdle, {1.0}));
+  const auto restored_epoch = backend.authored_state_authority_epoch()->load(
+      std::memory_order_acquire);
+  EXPECT_EQ(restored_epoch & 1u, 0u);
+  EXPECT_GT(restored_epoch, invalid_epoch);
 }
 
 }  // namespace

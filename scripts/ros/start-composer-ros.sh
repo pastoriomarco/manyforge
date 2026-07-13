@@ -22,6 +22,23 @@ manyforge_build_frontend_dist \
 
 BUILD_DIR="${MANYFORGE_ROBOPLAN_BUILD_DIR:-${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}/roboplan}"
 export PYTHONPATH="${BUILD_DIR}:/workspace/manyforge_roboplan/python:${PYTHONPATH:-}"
+qualification_probe="${BUILD_DIR}/libroboplan_collision_counter_probe.so"
+if [[ "${MANYFORGE_ENABLE_QUALIFICATION_PROBES:-OFF}" == "ON" ]]; then
+    requested_probe="${MANYFORGE_QUALIFICATION_LD_PRELOAD:-${qualification_probe}}"
+    if [[ ! -f "${requested_probe}" ]]; then
+        echo "Qualification preload library is missing: ${requested_probe}" >&2
+        exit 1
+    fi
+    if [[ "$(readlink -f "${requested_probe}")" != "$(readlink -f "${qualification_probe}")" ]]; then
+        echo "Qualification preload must be the probe built with this runtime: ${qualification_probe}" >&2
+        echo "Refusing stale or cross-build probe: ${requested_probe}" >&2
+        exit 1
+    fi
+    export LD_PRELOAD="${qualification_probe}${LD_PRELOAD:+:${LD_PRELOAD}}"
+elif [[ -n "${MANYFORGE_QUALIFICATION_LD_PRELOAD:-}" ]]; then
+    echo "Qualification preload requires MANYFORGE_ENABLE_QUALIFICATION_PROBES=ON." >&2
+    exit 1
+fi
 COMPOSER_PORT="${MANYFORGE_COMPOSER_PORT:-${COMPOSER_PORT:-9000}}"
 
 exec python -m manyforge_composer \

@@ -525,6 +525,48 @@ class TestMockKernelSceneEdit:
         assert tracked["position_m"] == [0.5, 0.1, 0.0]
         assert tracked["orientation_xyzw"] == rotated  # NOT identity
 
+    def test_scene_edit_attachment_precondition_rejects_stale_pose_source(
+        self, kernel
+    ):
+        assert kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="tracked_attachment",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="universe",
+            )
+        ).success
+        assert kernel.scene_edit(
+            SceneEditRequest(
+                operation="attach",
+                object_id="tracked_attachment",
+                frame_id="tool0",
+            )
+        ).success
+
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="update_pose",
+                object_id="tracked_attachment",
+                pose_position_m=[1.0, 2.0, 3.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="universe",
+                expected_attached=False,
+            )
+        )
+
+        assert result.success is False
+        assert result.error_code == "scene_object_state_conflict"
+        assert result.error_details["reason"] == (
+            "scene_object_attachment_precondition_failed"
+        )
+        state = kernel.get_object_state("tracked_attachment")
+        assert state.attached is True
+        assert state.frame_id == "tool0"
+
 
 class TestMockKernelMisc:
     def test_invalidate_trajectories(self, kernel):

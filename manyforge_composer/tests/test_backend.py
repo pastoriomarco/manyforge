@@ -397,6 +397,7 @@ def _simulation_control_deployment(
     source_mode: str = "commanded_sim",
     capabilities: dict[str, bool] | None = None,
     resume_play_after_reset: bool = True,
+    service_timeout_s: float = 0.2,
 ) -> Deployment:
     control_capabilities = {"reset": True}
     if capabilities:
@@ -416,6 +417,7 @@ def _simulation_control_deployment(
             "simulation_control": {
                 "kind": "ros2_simulation_interfaces",
                 "service_prefix": "auto",
+                "service_timeout_s": service_timeout_s,
                 "capabilities": control_capabilities,
                 "reset": {
                     "default_scope": "state",
@@ -1570,6 +1572,8 @@ def test_behavior_node_reset_allows_running_cycle(state):
 
     assert result["success"] is True
     assert calls
+    assert calls[0]["service_timeout_s"] == 0.2
+    assert calls[0]["wait_ready_s"] == 0.1
 
 
 def test_simulation_reset_requires_command_gate_topic(state):
@@ -1847,6 +1851,7 @@ def test_set_simulation_state_route_uses_deployment_capability_and_records_event
     assert body["state"] == "paused"
     assert body["serviceName"] == "/set_simulation_state"
     assert calls[0]["payload"] == {"state": "paused"}
+    assert calls[0]["service_timeout_s"] == 0.2
 
     events = state.event_recorder.get_events_since(0, include_node_transitions=True)
     event_types = [event["type"] for event in events]
@@ -4811,6 +4816,103 @@ def test_debug_collision_compare_trajectory_endpoint_uses_cached_waypoint():
     assert data["comparison"]["manyforge_collision"]["in_collision"] is True
     assert kernel.compared_positions == [0.3, 0.4]
     assert kernel.compared_waypoint_index == 1
+
+
+def test_debug_planning_qualification_routes_preserve_generation_and_snapshot():
+    class QualificationKernel(MockKernelClient):
+        def __init__(self):
+            super().__init__()
+            self.active_generation = 0
+
+        def get_scene_authority_snapshot(self):
+            return {
+                "revision": {"revision_id": 7, "content_hash": "scene-seven"},
+                "objects": [],
+            }
+
+        def start_planning_qualification_capture(self, capacity=128):
+            assert capacity == 4
+            self.active_generation = 9
+            return self.active_generation
+
+        def drain_planning_qualification_capture(self, generation):
+            assert generation == self.active_generation
+            return {
+                "records": [{"sequence": 1, "request": {"move_id": "move"}}],
+                "dropped_total": 1,
+                "in_flight": 1,
+                "status": {
+                    "behavior_dropped_total": 3,
+                    "behavior_in_flight": 2,
+                },
+            }
+
+        def stop_planning_qualification_capture(
+            self, generation, idle_timeout_ms=10_000
+        ):
+            assert generation == self.active_generation
+            assert idle_timeout_ms == 123
+            self.active_generation = 0
+            return {
+                "records": [{"sequence": 2, "request": {"move_id": "move"}}],
+                "dropped_total": 2,
+                "in_flight": 0,
+                "status": {
+                    "behavior_dropped_total": 4,
+                    "behavior_in_flight": 0,
+                },
+            }
+
+        def planning_qualification_capture_status(self):
+            return {
+                "generation": self.active_generation,
+                "dropped_total": 0,
+                "in_flight": 0,
+            }
+
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=QualificationKernel())
+    app = create_app(state)
+    with TestClient(app) as client:
+        snapshot = client.get(
+            "/api/debug/qualification/scene-authority-snapshot"
+        )
+        started = client.post(
+            "/api/debug/qualification/planning-capture/start",
+            json={"capacity": 4},
+        )
+        drained = client.post(
+            "/api/debug/qualification/planning-capture/drain",
+            json={"generation": 9},
+        )
+        stopped = client.post(
+            "/api/debug/qualification/planning-capture/stop",
+            json={"generation": 9, "idle_timeout_ms": 123},
+        )
+
+    assert snapshot.json()["revision"]["revision_id"] == 7
+    assert started.json() == {"generation": 9, "capacity": 4}
+    assert drained.json()["records"][0]["sequence"] == 1
+    assert drained.json()["status"]["dropped_total"] == 1
+    assert drained.json()["status"]["in_flight"] == 1
+    assert drained.json()["status"]["behavior_dropped_total"] == 3
+    assert drained.json()["status"]["behavior_in_flight"] == 2
+    assert stopped.json()["status"]["generation"] == 9
+    assert stopped.json()["status"]["dropped_total"] == 2
+    assert stopped.json()["status"]["behavior_dropped_total"] == 4
+    assert stopped.json()["status"]["behavior_in_flight"] == 0
+    assert stopped.json()["records"][0]["sequence"] == 2
+
+
+def test_debug_qualification_environment_reports_state_websocket_clients():
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    app = create_app(state)
+    with TestClient(app) as client:
+        disconnected = client.get("/api/debug/qualification/environment")
+        with client.websocket_connect("/ws/state"):
+            connected = client.get("/api/debug/qualification/environment")
+
+    assert disconnected.json() == {"state_websocket_clients": 0}
+    assert connected.json() == {"state_websocket_clients": 1}
 
 
 def test_debug_collision_compare_positions_endpoint_uses_explicit_positions():

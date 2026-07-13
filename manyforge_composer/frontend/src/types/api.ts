@@ -617,6 +617,7 @@ export interface SimulationResetConfig {
 export interface SimulationControlConfig {
   kind: 'ros2_simulation_interfaces';
   servicePrefix: string;
+  serviceTimeoutS: number;
   capabilities: SimulationControlCapabilitiesConfig;
   reset?: SimulationResetConfig | null;
 }

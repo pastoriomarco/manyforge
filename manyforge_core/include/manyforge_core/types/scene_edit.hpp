@@ -97,6 +97,12 @@ struct UpdateObjectPoseRequestDTO {
   std::optional<double> scene_admission_obstacle_drift_tolerance_m;
   std::optional<double> scene_admission_obstacle_angular_tolerance_rad;
   bool scene_admission_allow_runtime_dynamic_obstacle = false;
+
+  /// Optional compare-and-commit precondition on the object's attachment state.
+  /// SceneAuthority evaluates it while holding the scene writer lock, before the
+  /// planner projection is called. Pose sources use `false` when their policy
+  /// permits updates only while an object is detached.
+  std::optional<bool> expected_attached;
 };
 
 /// Attach an existing object to a frame while preserving its current world pose.

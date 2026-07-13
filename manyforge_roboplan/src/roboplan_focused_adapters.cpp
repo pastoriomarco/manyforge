@@ -355,7 +355,7 @@ RoboPlanSceneProjection::published_runtime_collision_query_bundle() const {
   return services_->published_runtime_collision_query_bundle();
 }
 
-std::shared_ptr<roboplan::Scene>
+std::shared_ptr<const roboplan::Scene>
 RoboPlanSceneProjection::acquire_native_projection(
     const core::SceneRevisionBindingDTO& binding) const {
   if (!binding.valid() || !projection_health().ready()) {

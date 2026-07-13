@@ -227,10 +227,11 @@ def test_native_kernel_factory_passes_validation_collision_timeouts(monkeypatch)
 
     fake_roboplan = ModuleType("manyforge_roboplan_py")
 
-    def create_native_kernel(model_name, group_name, config):
+    def create_native_kernel(model_name, group_name, config, logical_robot_id):
         recorded["model_name"] = model_name
         recorded["group_name"] = group_name
         recorded["config"] = config
+        recorded["logical_robot_id"] = logical_robot_id
         return fake_bundle
 
     fake_roboplan.create_native_kernel = create_native_kernel
@@ -250,6 +251,7 @@ def test_native_kernel_factory_passes_validation_collision_timeouts(monkeypatch)
 
     assert isinstance(kernel, FakeNativeKernelClient)
     assert bundle is fake_bundle
+    assert recorded["logical_robot_id"] == "ur5_gripper"
     assert (
         recorded["config"]["validation_collision_query_timeout_ns"]
         == 275_000_000
@@ -384,6 +386,28 @@ def test_kernel_config_forwards_planner_budget_from_planning_adapter():
     assert config["planner_max_planning_time_s"] == 12.0
 
 
+def test_kernel_config_forwards_planner_rng_seed_from_planning_adapter():
+    deployment = SimpleNamespace(
+        adapters={
+            "planning": SimpleNamespace(
+                adapter_id="planning.roboplan",
+                config={"rng_seed": 12345},
+            ),
+            "execution": SimpleNamespace(adapter_id="execution.native", config={}),
+        },
+        orchestrator=SimpleNamespace(config={}),
+    )
+    config = composer_main._kernel_config_from_deployment(
+        deployment,
+        collision_monitor_period_ns=None,
+        runtime_collision_query_timeout_ns=None,
+        validation_collision_query_timeout_ns=None,
+        validation_collision_wall_timeout_ns=None,
+        runtime_dynamic_body_max_age_cap_ns=None,
+    )
+    assert config["rng_seed"] == 12345
+
+
 def test_kernel_config_forwards_baseline_collision_policy_snapshot():
     snapshot = {
         "policy_id": "deployment_baseline",
@@ -444,6 +468,7 @@ def test_native_kernel_factory_attaches_robot_model_authority_metadata(
         },
         orchestrator=SimpleNamespace(config={}),
         robot_config=SimpleNamespace(
+            robot_id="logical_robot",
             group_id="arm",
             urdf_path=str(urdf),
             srdf_path=str(srdf),
@@ -465,6 +490,7 @@ def test_native_kernel_factory_attaches_robot_model_authority_metadata(
         srdf_path,
         package_paths,
         config,
+        logical_robot_id,
     ):
         recorded["model_name"] = model_name
         recorded["group_name"] = group_name
@@ -472,6 +498,7 @@ def test_native_kernel_factory_attaches_robot_model_authority_metadata(
         recorded["srdf_path"] = srdf_path
         recorded["package_paths"] = package_paths
         recorded["config"] = config
+        recorded["logical_robot_id"] = logical_robot_id
         return fake_bundle
 
     fake_roboplan.create_native_kernel_from_paths = create_native_kernel_from_paths
@@ -493,6 +520,7 @@ def test_native_kernel_factory_attaches_robot_model_authority_metadata(
     assert bundle is fake_bundle
     assert recorded["model_name"] == "robot"
     assert recorded["group_name"] == "arm"
+    assert recorded["logical_robot_id"] == "logical_robot"
     assert recorded["urdf_path"] == str(urdf)
     assert recorded["srdf_path"] == str(srdf)
     assert recorded["package_paths"] == [str(tmp_path)]

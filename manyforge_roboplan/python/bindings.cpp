@@ -3,6 +3,7 @@
 #include <pybind11/functional.h>
 
 #include <chrono>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cmath>
@@ -26,6 +27,7 @@
 #endif
 
 namespace py = pybind11;
+using namespace pybind11::literals;
 using namespace manyforge::roboplan_backend;
 using namespace manyforge::core;
 #ifdef MANYFORGE_ROS2_CONTROL_ENABLED
@@ -813,6 +815,177 @@ py::dict trajectory_to_python(const TrajectoryDTO& trajectory) {
   return d;
 }
 
+template <typename T>
+py::object optional_to_python(const std::optional<T>& value) {
+  return value.has_value() ? py::cast(*value) : py::none();
+}
+
+py::dict reference_to_python(const ReferenceDTO& reference) {
+  py::dict d;
+  switch (reference.type) {
+    case ReferenceDTO::Type::kFrame:
+      d["type"] = "frame";
+      break;
+    case ReferenceDTO::Type::kObject:
+      d["type"] = "object";
+      break;
+    case ReferenceDTO::Type::kRobotLink:
+      d["type"] = "robot_link";
+      break;
+    case ReferenceDTO::Type::kPose:
+      d["type"] = "pose";
+      break;
+  }
+  d["id"] = reference.id;
+  if (reference.pose.has_value()) {
+    d["pose"] = pose_to_python(*reference.pose);
+  }
+  return d;
+}
+
+py::dict motion_spec_to_python(const MotionSpecDTO& motion) {
+  py::dict d;
+  if (const auto* joint = std::get_if<JointGoalDTO>(&motion)) {
+    d["type"] = "joint_goal";
+    d["joint_names"] = joint->joint_names;
+    d["positions_rad"] = joint->positions_rad;
+    return d;
+  }
+  if (const auto* pose = std::get_if<PoseGoalDTO>(&motion)) {
+    d["type"] = "pose_goal";
+    d["pose"] = pose_to_python(pose->goal);
+    return d;
+  }
+  if (const auto* named = std::get_if<NamedTargetDTO>(&motion)) {
+    d["type"] = "named_target";
+    d["name"] = named->name;
+    return d;
+  }
+  if (const auto* relative = std::get_if<RelativeMoveDTO>(&motion)) {
+    d["type"] = "relative_move";
+    d["target_reference"] = reference_to_python(relative->target_reference);
+    d["offset"] = pose_to_python(relative->offset);
+    if (relative->offset_reference.has_value()) {
+      d["offset_reference"] =
+          reference_to_python(*relative->offset_reference);
+    } else {
+      d["offset_reference"] = py::none();
+    }
+    return d;
+  }
+  const auto& cartesian = std::get<CartesianPathDTO>(motion);
+  d["type"] = "cartesian_path";
+  py::list waypoints;
+  for (const auto& waypoint : cartesian.waypoints) {
+    waypoints.append(pose_to_python(waypoint));
+  }
+  d["waypoints"] = std::move(waypoints);
+  d["max_translation_step_m"] = cartesian.max_translation_step_m;
+  d["max_rotation_step_rad"] = cartesian.max_rotation_step_rad;
+  return d;
+}
+
+py::dict plan_request_to_python(const PlanRequestDTO& request) {
+  py::dict d;
+  d["robot_id"] = request.robot_id;
+  d["group_id"] = request.group_id;
+  d["move_id"] = request.move_id;
+  d["base_frame"] = request.base_frame;
+  d["tcp_frame"] = request.tcp_frame;
+  d["start_state"] = robot_state_to_python(request.start_state);
+  d["motion"] = motion_spec_to_python(request.motion);
+  d["tolerances"] = py::dict(
+      "joint_position_tol_rad"_a =
+          request.tolerances.joint_position_tol_rad,
+      "translation_tol_m"_a = request.tolerances.translation_tol_m,
+      "rotation_tol_rad"_a = request.tolerances.rotation_tol_rad);
+  py::dict speed_profile;
+  speed_profile["velocity_scale"] = request.speed_profile.velocity_scale;
+  speed_profile["acceleration_scale"] =
+      request.speed_profile.acceleration_scale;
+  speed_profile["max_tcp_linear_speed_mps"] =
+      optional_to_python(request.speed_profile.max_tcp_linear_speed_mps);
+  d["speed_profile"] = std::move(speed_profile);
+  d["planning_timeout_s"] = request.planning_timeout_s;
+  d["planning_attempt_index"] = request.planning_attempt_index;
+  py::dict limits;
+  for (const auto& [joint_name, limit] : request.per_joint_dynamics_limits) {
+    py::dict value;
+    value["max_velocity_rad_s"] =
+        optional_to_python(limit.max_velocity_rad_s);
+    value["max_acceleration_rad_s2"] =
+        optional_to_python(limit.max_acceleration_rad_s2);
+    value["max_jerk_rad_s3"] = optional_to_python(limit.max_jerk_rad_s3);
+    limits[py::str(joint_name)] = std::move(value);
+  }
+  d["per_joint_dynamics_limits"] = std::move(limits);
+  d["contact_policy_id"] = request.contact_policy_id;
+  d["action_span"] = request.action_span.has_value()
+                         ? py::object(action_span_to_python(*request.action_span))
+                         : py::object(py::none());
+  d["scene_binding"] = py::dict(
+      "revision_id"_a = request.scene_binding.revision.revision_id,
+      "content_hash"_a = request.scene_binding.revision.content_hash,
+      "projection_lease_id"_a = request.scene_binding.projection_lease_id);
+  return d;
+}
+
+py::dict planning_metrics_to_python(
+    const RoboPlanPlanningPipelineMetrics& metrics) {
+  py::dict d;
+  d["total_duration_ns"] = metrics.total_duration_ns;
+  d["total_collision_query_count"] = metrics.total_collision_query_count;
+  d["total_collision_query_duration_ns"] =
+      metrics.total_collision_query_duration_ns;
+  d["collision_probe_available"] = metrics.collision_probe_available;
+  d["measurement_complete"] = metrics.measurement_complete;
+  d["succeeded"] = metrics.succeeded;
+  d["error_code"] = metrics.error_code;
+  d["waypoint_count"] = metrics.waypoint_count;
+  d["trajectory_duration_s"] = metrics.trajectory_duration_s;
+  d["rng_base_seed"] = optional_to_python(metrics.rng_base_seed);
+  d["rng_seed"] = optional_to_python(metrics.rng_seed);
+  d["shortcut_rng_seed_argument"] =
+      optional_to_python(metrics.shortcut_rng_seed_argument);
+  d["planning_attempt_index"] = metrics.planning_attempt_index;
+  py::dict stages;
+  for (const auto& [name, stage] : metrics.stages) {
+    stages[py::str(name)] = py::dict(
+        "duration_ns"_a = stage.duration_ns,
+        "collision_query_count"_a = stage.collision_query_count,
+        "collision_query_duration_ns"_a =
+            stage.collision_query_duration_ns);
+  }
+  d["stages"] = std::move(stages);
+  return d;
+}
+
+py::dict planning_qualification_record_to_python(
+    const RoboPlanPlanningQualificationRecord& record) {
+  py::dict d;
+  d["sequence"] = record.sequence;
+  d["request"] = plan_request_to_python(record.request);
+  py::dict result;
+  result["scene_revision"] = py::dict(
+      "revision_id"_a = record.result.scene_revision.revision_id,
+      "content_hash"_a = record.result.scene_revision.content_hash);
+  result["trajectory"] = record.result.trajectory.has_value()
+                             ? py::object(trajectory_to_python(
+                                   *record.result.trajectory))
+                             : py::object(py::none());
+  if (record.result.error.has_value()) {
+    result["error"] = py::dict(
+        "code"_a = record.result.error->code,
+        "message"_a = record.result.error->message,
+        "details"_a = error_details_to_python(record.result.error->details));
+  } else {
+    result["error"] = py::none();
+  }
+  d["result"] = std::move(result);
+  d["metrics"] = planning_metrics_to_python(record.metrics);
+  return d;
+}
+
 // Helper: convert ObjectStateDTO to Python dict
 py::dict object_state_to_python(const ObjectStateDTO& state) {
   py::dict d;
@@ -1261,7 +1434,108 @@ py::dict scene_object_snapshot_to_python(const SceneObject& object) {
   d["pose_in_universe"] = pose_to_python(object.pose_in_universe);
   d["frame_id"] = object.frame_id;
   d["attached"] = object.attached;
+  d["touch_links"] = object.touch_links;
   d["support_contacts"] = support_contacts_to_python(object.support_contacts);
+  d["source_id"] = optional_to_python(object.source_id);
+  d["source_timestamp_ns"] = optional_to_python(object.source_timestamp_ns);
+  d["source_freshness_budget_ns"] =
+      optional_to_python(object.source_freshness_budget_ns);
+  d["scene_admission_role"] = object.scene_admission_role.has_value()
+                                  ? py::object(py::str(to_string(
+                                        *object.scene_admission_role)))
+                                  : py::object(py::none());
+  d["scene_admission_lease_max_age_ns"] =
+      optional_to_python(object.scene_admission_lease_max_age_ns);
+  d["scene_admission_target_drift_tolerance_m"] = optional_to_python(
+      object.scene_admission_target_drift_tolerance_m);
+  d["scene_admission_target_angular_tolerance_rad"] = optional_to_python(
+      object.scene_admission_target_angular_tolerance_rad);
+  d["scene_admission_obstacle_drift_tolerance_m"] = optional_to_python(
+      object.scene_admission_obstacle_drift_tolerance_m);
+  d["scene_admission_obstacle_angular_tolerance_rad"] = optional_to_python(
+      object.scene_admission_obstacle_angular_tolerance_rad);
+  d["scene_admission_allow_runtime_dynamic_obstacle"] =
+      object.scene_admission_allow_runtime_dynamic_obstacle;
+  return d;
+}
+
+py::dict collision_policy_to_python(const CollisionPolicySnapshot& policy) {
+  py::dict d;
+  d["policy_id"] = policy.policy_id;
+  d["revision"] = py::dict(
+      "revision_id"_a = policy.revision.revision_id,
+      "content_hash"_a = policy.revision.content_hash);
+  d["require_full_diagnostics"] = policy.require_full_diagnostics;
+  py::list static_pairs;
+  for (const auto& pair : policy.allowed_static_static_pairs) {
+    static_pairs.append(collision_pair_to_python(pair));
+  }
+  d["allowed_static_static_pairs"] = std::move(static_pairs);
+  py::list touch_pairs;
+  for (const auto& pair : policy.allowed_touch_link_pairs) {
+    touch_pairs.append(collision_pair_to_python(pair));
+  }
+  d["allowed_touch_link_pairs"] = std::move(touch_pairs);
+  py::list support_contacts;
+  for (const auto& contact : policy.support_contacts) {
+    py::dict value;
+    value["pair"] = collision_pair_to_python(contact.pair);
+    value["mode"] = contact.mode == CollisionContactPolicyMode::kContactProcess
+                        ? "contact_process"
+                        : "contact_release";
+    value["enforce_max_start_penetration"] =
+        contact.enforce_max_start_penetration;
+    value["max_start_penetration_m"] = contact.max_start_penetration_m;
+    value["release_tolerance_m"] = contact.release_tolerance_m;
+    value["min_release_progress_m"] = contact.min_release_progress_m;
+    value["min_separation_clearance_m"] =
+        contact.min_separation_clearance_m;
+    value["require_separation_by_end"] = contact.require_separation_by_end;
+    value["require_strictly_decreasing_penetration"] =
+        contact.require_strictly_decreasing_penetration;
+    value["allow_recontact"] = contact.allow_recontact;
+    support_contacts.append(std::move(value));
+  }
+  d["support_contacts"] = std::move(support_contacts);
+  py::list contact_grasps;
+  for (const auto& grasp : policy.contact_grasps) {
+    contact_grasps.append(py::dict(
+        "policy_id"_a = grasp.policy_id,
+        "selected_object_id"_a = grasp.selected_object_id,
+        "allowed_robot_links"_a = grasp.allowed_robot_links,
+        "max_penetration_m"_a = grasp.max_penetration_m,
+        "terminal_window_start_fraction"_a =
+            grasp.terminal_window_start_fraction));
+  }
+  d["contact_grasps"] = std::move(contact_grasps);
+  return d;
+}
+
+py::dict logical_scene_snapshot_to_python(
+    const LogicalSceneSnapshot& snapshot) {
+  py::dict d;
+  d["revision"] = py::dict(
+      "revision_id"_a = snapshot.revision.revision_id,
+      "content_hash"_a = snapshot.revision.content_hash);
+  d["transaction_sequence"] = snapshot.transaction_sequence;
+  d["scene_admission_epoch"] = snapshot.admission_epoch;
+  d["topology_epoch"] = snapshot.topology_epoch;
+  d["policy_epoch"] = snapshot.policy_epoch;
+  d["world_frame"] = snapshot.world_frame;
+  d["configured_collision_policy"] =
+      collision_policy_to_python(snapshot.configured_collision_policy);
+  py::list robots;
+  for (const auto& robot : snapshot.robot_placements) {
+    robots.append(py::dict(
+        "robot_id"_a = robot.robot_id,
+        "pose_in_world"_a = pose_to_python(robot.pose_in_world)));
+  }
+  d["robot_placements"] = std::move(robots);
+  py::list objects;
+  for (const auto& object : snapshot.objects) {
+    objects.append(scene_object_snapshot_to_python(object));
+  }
+  d["objects"] = std::move(objects);
   return d;
 }
 
@@ -1722,6 +1996,14 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
   if (config.planner_max_planning_time_s <= 0.0) {
     throw std::invalid_argument("planner_max_planning_time_s must be > 0");
   }
+  if (config_dict.contains("rng_seed") &&
+      !config_dict["rng_seed"].is_none()) {
+    const auto seed = config_dict["rng_seed"].cast<std::uint64_t>();
+    if (seed > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::invalid_argument("rng_seed must fit in uint32");
+    }
+    config.planner_rng_seed = static_cast<std::uint32_t>(seed);
+  }
   if (config_dict.contains(
           "authoritative_validation_collision_replan_attempts")) {
     const double attempts = finite_scale_from_python(
@@ -2028,6 +2310,57 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
            },
            "Close the native kernel and join owned workers with the GIL released.")
       .def("closed", [](NativeKernelBundle& self) { return self.closed(); })
+      .def("start_planning_qualification_capture",
+           [](NativeKernelBundle& self, std::size_t capacity) {
+             py::gil_scoped_release release;
+             return self.start_planning_qualification_capture(capacity);
+           },
+           py::arg("capacity") = 128)
+      .def("drain_planning_qualification_capture",
+           [](NativeKernelBundle& self, std::uint64_t generation) {
+             const auto batch = [&]() {
+               py::gil_scoped_release release;
+               return self.drain_planning_qualification_capture(generation);
+             }();
+             py::list out;
+             for (const auto& record : batch.records) {
+               out.append(planning_qualification_record_to_python(record));
+             }
+             return py::dict("records"_a = std::move(out),
+                             "dropped_total"_a = batch.dropped_total,
+                             "in_flight"_a = batch.in_flight);
+           },
+           py::arg("generation"))
+      .def("stop_planning_qualification_capture",
+           [](NativeKernelBundle& self, std::uint64_t generation,
+              std::uint64_t idle_timeout_ms) {
+             const auto batch = [&]() {
+               py::gil_scoped_release release;
+               return self.stop_planning_qualification_capture(
+                   generation, std::chrono::milliseconds(idle_timeout_ms));
+             }();
+             py::list out;
+             for (const auto& record : batch.records) {
+               out.append(planning_qualification_record_to_python(record));
+             }
+             return py::dict("records"_a = std::move(out),
+                             "dropped_total"_a = batch.dropped_total,
+                             "in_flight"_a = batch.in_flight);
+           },
+           py::arg("generation"), py::arg("idle_timeout_ms") = 10'000)
+      .def("planning_qualification_capture_status",
+           [](NativeKernelBundle& self) {
+             const auto values = [&]() {
+               py::gil_scoped_release release;
+               return std::array<std::uint64_t, 3>{
+                   self.planning_qualification_generation(),
+                   self.planning_qualification_dropped_total(),
+                   self.planning_qualification_in_flight()};
+             }();
+             return py::dict("generation"_a = values[0],
+                             "dropped_total"_a = values[1],
+                             "in_flight"_a = values[2]);
+           })
       .def("execute", [](NativeKernelBundle& self, py::dict request) -> py::dict {
         // Build ExecuteRequestDTO from Python dict
         ExecuteRequestDTO req;
@@ -3427,6 +3760,17 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         result["policy_epoch"] = status.policy_epoch;
         return result;
       })
+      .def("get_scene_authority_snapshot", [](NativeKernelBundle& self) {
+        const auto snapshot = [&]() {
+          py::gil_scoped_release release;
+          return self.scene_authority->logical_snapshot();
+        }();
+        if (!snapshot) {
+          throw std::runtime_error(
+              "Logical scene authority snapshot is unavailable");
+        }
+        return logical_scene_snapshot_to_python(*snapshot);
+      })
       .def("get_joint_names", [](NativeKernelBundle& self) {
         const auto names = [&]() {
           py::gil_scoped_release release;
@@ -3665,12 +4009,20 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
             req.scene_admission_allow_runtime_dynamic_obstacle =
                 request["scene_admission_allow_runtime_dynamic_obstacle"].cast<bool>();
           }
+          if (request.contains("expected_attached") &&
+              !request["expected_attached"].is_none()) {
+            req.expected_attached = request["expected_attached"].cast<bool>();
+          }
           auto r = [&]() {
             py::gil_scoped_release release;
             return self.scene_authority->update_object_pose(req);
           }();
           result["success"] = r.success;
-          if (r.error.has_value()) result["error"] = r.error->message;
+          if (r.error.has_value()) {
+            result["error"] = r.error->message;
+            result["error_code"] = r.error->code;
+            result["error_details"] = r.error->details;
+          }
           if (r.update_status.has_value()) result["update_status"] = *r.update_status;
           result["collision_world_revision_changed"] =
               r.collision_world_revision_changed;
@@ -4176,22 +4528,25 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
   // Factory function
   m.def("create_native_kernel",
         [](const std::string& model_name, const std::string& group_name,
-           py::object config) {
+           py::object config, const std::string& logical_robot_id) {
           return create_native_kernel(
-              model_name, group_name, kernel_config_from_python(config));
+              model_name, group_name, kernel_config_from_python(config),
+              logical_robot_id);
         },
         py::arg("model_name") = "ur5_gripper",
         py::arg("group_name") = "arm",
         py::arg("config") = py::none(),
+        py::arg("logical_robot_id") = "",
         "Create a native C++ kernel with real RoboPlan backends.");
 
   m.def("create_native_kernel_from_paths",
         [](const std::string& model_name, const std::string& group_name,
            const std::string& urdf_path, const std::string& srdf_path,
-           const std::vector<std::string>& package_paths, py::object config) {
+           const std::vector<std::string>& package_paths, py::object config,
+           const std::string& logical_robot_id) {
           return create_native_kernel(
               model_name, group_name, urdf_path, srdf_path, package_paths,
-              kernel_config_from_python(config));
+              kernel_config_from_python(config), logical_robot_id);
         },
         py::arg("model_name"),
         py::arg("group_name"),
@@ -4199,6 +4554,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         py::arg("srdf_path"),
         py::arg("package_paths") = std::vector<std::string>{},
         py::arg("config") = py::none(),
+        py::arg("logical_robot_id") = "",
         "Create a native C++ kernel from explicit URDF/SRDF/package bundle paths.");
 
 #ifdef MANYFORGE_ROS2_CONTROL_ENABLED
@@ -4206,11 +4562,11 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         [](const std::string& model_name, const std::string& group_name,
            const std::string& urdf_path, const std::string& srdf_path,
            const std::vector<std::string>& package_paths, py::object ros_config,
-           py::object kernel_config) {
+           py::object kernel_config, const std::string& logical_robot_id) {
           return create_ros2_control_kernel(
               model_name, group_name, urdf_path, srdf_path, package_paths,
               ros2_control_config_from_python(ros_config),
-              kernel_config_from_python(kernel_config));
+              kernel_config_from_python(kernel_config), logical_robot_id);
         },
         py::arg("model_name"),
         py::arg("group_name"),
@@ -4219,6 +4575,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         py::arg("package_paths") = std::vector<std::string>{},
         py::arg("ros_config") = py::none(),
         py::arg("kernel_config") = py::none(),
+        py::arg("logical_robot_id") = "",
         "Create a native C++ kernel with RoboPlan planning and ros2_control execution.");
 #endif
 }

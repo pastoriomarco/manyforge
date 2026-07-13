@@ -107,6 +107,7 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
     urdf, srdf = _write_one_joint_model(tmp_path)
     deployment = SimpleNamespace(
         robot_config=SimpleNamespace(
+            robot_id="logical_robot",
             group_id="arm",
             urdf_path=str(urdf),
             srdf_path=str(srdf),
@@ -123,7 +124,7 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
             ),
             "planning": SimpleNamespace(
                 adapter_id="planning.roboplan",
-                config={},
+                config={"rng_seed": 12345},
             ),
         },
         grippers={},
@@ -143,6 +144,7 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
         package_paths,
         ros_config,
         kernel_config,
+        logical_robot_id,
     ):
         recorded["model_name"] = model_name
         recorded["group_name"] = group_name
@@ -151,6 +153,7 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
         recorded["package_paths"] = package_paths
         recorded["ros_config"] = ros_config
         recorded["kernel_config"] = kernel_config
+        recorded["logical_robot_id"] = logical_robot_id
         return fake_native_bundle
 
     fake_roboplan.create_ros2_control_kernel_from_paths = (
@@ -175,13 +178,15 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
     assert bundle.native_bundle is fake_native_bundle
     assert recorded["model_name"] == "robot"
     assert recorded["group_name"] == "arm"
+    assert recorded["logical_robot_id"] == "logical_robot"
     assert recorded["urdf_path"] == str(urdf)
     assert recorded["srdf_path"] == str(srdf)
-    assert recorded["package_paths"][0] == str(tmp_path)
+    assert recorded["package_paths"] == [str(tmp_path)]
     assert recorded["ros_config"]["action_name"] == (
         "/arm_controller/follow_joint_trajectory"
     )
     assert recorded["ros_config"]["executor_thread_count"] == 4
+    assert recorded["kernel_config"]["rng_seed"] == 12345
     assert kernel.robot_model_authority_metadata["view_changed"] is False
     assert bundle.robot_model_authority_metadata["canonical_urdf_path"] == str(urdf)
     assert kernel.kwargs["robot_model_authority_metadata"] == (
@@ -196,6 +201,7 @@ def test_ros2_control_factory_forwards_validation_collision_timeout(
     urdf, srdf = _write_one_joint_model(tmp_path)
     deployment = SimpleNamespace(
         robot_config=SimpleNamespace(
+            robot_id="logical_robot",
             group_id="arm",
             urdf_path=str(urdf),
             srdf_path=str(srdf),
@@ -269,6 +275,7 @@ def test_ros2_control_factory_keeps_ros_gripper_config_canonical_and_seeds_scene
     )
     deployment = SimpleNamespace(
         robot_config=SimpleNamespace(
+            robot_id="logical_robot",
             group_id="arm",
             urdf_path=str(urdf),
             srdf_path=str(srdf),
@@ -395,6 +402,7 @@ def test_ros2_control_factory_configures_isaac_effort_gripper_transport(
     )
     deployment = SimpleNamespace(
         robot_config=SimpleNamespace(
+            robot_id="logical_robot",
             group_id="arm",
             urdf_path=str(urdf),
             srdf_path=str(srdf),

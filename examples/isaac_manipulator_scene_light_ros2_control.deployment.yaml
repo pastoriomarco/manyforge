@@ -251,6 +251,10 @@ orchestrator:
   engine: py_trees
   config:
     collision_monitor_period_ms: 50.0
+    # The simulation_interfaces source runs at 4 Hz and timestamps at poll
+    # admission. Three source periods cover bounded acquisition/delivery jitter
+    # while remaining stricter than the source's 1 s stale contract.
+    runtime_dynamic_body_max_age_cap_ms: 750.0
 launch:
   runner:
     module: manyforge_behavior.runner

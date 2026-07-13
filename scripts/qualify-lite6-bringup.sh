@@ -51,6 +51,18 @@ run_in_container() {
   local workspace="${WORKSPACE:-/workspace}"
   cd "${workspace}"
 
+  # The ROS-enabled pybind module links against rosidl/rclcpp libraries. An
+  # interactive `docker exec ... bash -lc` does not inherit the service's
+  # sourced shell environment, so make the qualification gate self-contained
+  # rather than silently converting import failures into skipped RMA tests.
+  local ros_setup="/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
+  if [[ -f "${ros_setup}" ]]; then
+    # shellcheck disable=SC1090 -- deployment-selected ROS distribution
+    set +u
+    source "${ros_setup}"
+    set -u
+  fi
+
   run_step python3 -m py_compile \
     scripts/models/export_lite6_lite_gripper_model.py \
     scripts/models/capture_manymove_lite6_descriptions.py \

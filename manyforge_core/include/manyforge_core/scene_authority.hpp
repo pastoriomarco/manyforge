@@ -68,6 +68,7 @@ class SceneAuthority final : public ISceneAuthority {
       const override;
 
  private:
+  SceneCommitResultDTO commit_locked(SceneTransactionDTO transaction);
   template <typename Request>
   SceneEditResultDTO commit_typed(Request request, const char* source);
   bool refresh_committed_publication(

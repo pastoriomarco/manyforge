@@ -235,7 +235,8 @@ class TestLauncherKernelCreation:
             "validation_collision_wall_timeout_ms": 3250.0,
         }
         data["adapters"]["planning"]["config"] = {
-            "planner_max_planning_time_s": 9.0
+            "planner_max_planning_time_s": 9.0,
+            "rng_seed": 12345,
         }
         data["adapters"]["execution"]["config"] = {
             "single_shot_ik_timeout_s": 0.04
@@ -245,6 +246,7 @@ class TestLauncherKernelCreation:
         config = _native_kernel_config_from_deployment(deployment)
 
         assert config["planner_max_planning_time_s"] == 9.0
+        assert config["rng_seed"] == 12345
         assert config["single_shot_ik_timeout_s"] == 0.04
         assert config["validation_collision_query_timeout_ns"] == 275_000_000
         assert config["validation_collision_wall_timeout_ns"] == 3_250_000_000
@@ -344,6 +346,7 @@ class TestLauncherKernelCreation:
             srdf_path,
             package_paths,
             config,
+            logical_robot_id,
         ):
             recorded["model_name"] = model_name
             recorded["group_name"] = group_name
@@ -351,6 +354,7 @@ class TestLauncherKernelCreation:
             recorded["srdf_path"] = srdf_path
             recorded["package_paths"] = package_paths
             recorded["config"] = config
+            recorded["logical_robot_id"] = logical_robot_id
             return fake_bundle
 
         fake_roboplan.create_native_kernel_from_paths = fake_create_native_kernel_from_paths
@@ -378,6 +382,7 @@ class TestLauncherKernelCreation:
         assert kernel.bundle is fake_bundle
         assert recorded["model_name"] == "custom"
         assert recorded["group_name"] == "arm"
+        assert recorded["logical_robot_id"] == "ur5"
         assert recorded["urdf_path"] == str(tmp_path / "robots" / "custom.urdf")
         assert recorded["srdf_path"] == str(tmp_path / "robots" / "custom.srdf")
         assert recorded["package_paths"] == [
@@ -403,6 +408,7 @@ class TestLauncherKernelCreation:
             srdf_path,
             package_paths,
             config,
+            logical_robot_id,
         ):
             recorded["model_name"] = model_name
             recorded["group_name"] = group_name
@@ -410,6 +416,7 @@ class TestLauncherKernelCreation:
             recorded["srdf_path"] = srdf_path
             recorded["package_paths"] = package_paths
             recorded["config"] = config
+            recorded["logical_robot_id"] = logical_robot_id
             return fake_bundle
 
         fake_roboplan.create_native_kernel_from_paths = fake_create_native_kernel_from_paths
@@ -436,6 +443,7 @@ class TestLauncherKernelCreation:
         assert isinstance(kernel, FakeNativeKernelClient)
         assert recorded["model_name"] == "lite6_lite_gripper"
         assert recorded["group_name"] == "lite6"
+        assert recorded["logical_robot_id"] == "lite6"
         assert recorded["urdf_path"] != str(
             LITE6_DEPLOYMENT_PATH.parent
             / "../manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf"

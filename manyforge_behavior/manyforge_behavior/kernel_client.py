@@ -383,6 +383,7 @@ class SceneEditRequest:
     scene_admission_obstacle_drift_tolerance_m: Optional[float] = None
     scene_admission_obstacle_angular_tolerance_rad: Optional[float] = None
     scene_admission_allow_runtime_dynamic_obstacle: bool = False
+    expected_attached: Optional[bool] = None
     action_span: Optional[ActionSpan] = None
 
 
@@ -390,6 +391,8 @@ class SceneEditRequest:
 class SceneEditResult:
     success: bool = False
     error: Optional[str] = None
+    error_code: Optional[str] = None
+    error_details: Dict[str, str] = field(default_factory=dict)
     update_status: Optional[str] = None
     collision_world_revision_changed: bool = False
     collision_world_freshness_changed: bool = False
@@ -761,6 +764,11 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
 
     if request.operation not in {"add", "upsert", "remove", "update_pose", "attach", "detach"}:
         return f"Unsupported scene edit operation: {request.operation}"
+    if request.expected_attached is not None:
+        if request.operation != "update_pose":
+            return "expected_attached is only valid for update_pose"
+        if not isinstance(request.expected_attached, bool):
+            return "expected_attached must be boolean when provided"
 
     if request.operation in {"add", "upsert"}:
         if request.shape_type not in {"box", "sphere", "cylinder", "mesh"}:
@@ -1203,6 +1211,42 @@ class KernelClient(ABC):
             "topology_epoch": 0,
             "policy_epoch": 0,
         }
+
+    def get_scene_authority_snapshot(self) -> dict[str, Any]:
+        """Return one coherent immutable logical-scene publication."""
+        raise NotImplementedError("logical scene snapshot capture is unavailable")
+
+    def start_planning_qualification_capture(self, capacity: int = 128) -> int:
+        """Enable bounded NRT planner evidence capture for qualification."""
+        raise NotImplementedError("planning qualification capture is unavailable")
+
+    def drain_planning_qualification_capture(
+        self, generation: int
+    ) -> dict[str, Any]:
+        raise NotImplementedError("planning qualification capture is unavailable")
+
+    def stop_planning_qualification_capture(
+        self, generation: int, idle_timeout_ms: int = 10_000
+    ) -> dict[str, Any]:
+        raise NotImplementedError("planning qualification capture is unavailable")
+
+    def planning_qualification_capture_status(self) -> dict[str, int]:
+        return {"generation": 0, "dropped_total": 0, "in_flight": 0}
+
+    def record_planning_qualification_behavior_boundary(
+        self,
+        *,
+        action_span: ActionSpan,
+        move_id: str,
+        phase: str,
+    ) -> None:
+        """Record an opt-in NRT behavior-node qualification boundary.
+
+        Backends without the qualification recorder intentionally do nothing.
+        This surface is evidence-only and must never become execution authority.
+        """
+
+        _ = action_span, move_id, phase
 
     @abstractmethod
     def get_joint_names(self) -> list[str]:
@@ -2007,6 +2051,36 @@ class MockKernelClient(KernelClient):
                     error=error,
                 )
                 return SceneEditResult(success=False, error=error)
+            current_attached = str(tracked.get("frame_id", "universe")) not in {
+                "",
+                "universe",
+                "world",
+                "World",
+                "/World",
+                "base_link",
+            }
+            if (
+                request.expected_attached is not None
+                and current_attached != request.expected_attached
+            ):
+                error = (
+                    "Scene object attachment state changed before pose update "
+                    "admission"
+                )
+                return SceneEditResult(
+                    success=False,
+                    error=error,
+                    error_code="scene_object_state_conflict",
+                    error_details={
+                        "reason": "scene_object_attachment_precondition_failed",
+                        "object_id": request.object_id,
+                        "expected_attached": str(request.expected_attached).lower(),
+                        "current_attached": str(current_attached).lower(),
+                        "current_frame_id": str(
+                            tracked.get("frame_id", "universe")
+                        ),
+                    },
+                )
             next_orientation = (
                 list(request.pose_orientation_xyzw)
                 if request.pose_orientation_xyzw is not None

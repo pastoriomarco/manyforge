@@ -1002,6 +1002,51 @@ def test_continuous_unattached_snapshot_applies_only_while_detached(tmp_path: Pa
     assert state.kernel.scene_edits[-1].operation == "attach"
 
 
+def test_continuous_unattached_update_cannot_race_attachment_commit(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(box_policy="continuous_unattached")
+    )
+    _add_box(client)
+    original_scene_edit = state.kernel.scene_edit
+    attachment_inserted = False
+
+    def attach_before_stale_update(request: SceneEditRequest):
+        nonlocal attachment_inserted
+        if request.operation == "update_pose" and not attachment_inserted:
+            assert request.expected_attached is False
+            attachment_inserted = True
+            attached = original_scene_edit(
+                SceneEditRequest(
+                    operation="attach", object_id="box", frame_id="tool0"
+                )
+            )
+            assert attached.success is True
+        return original_scene_edit(request)
+
+    state.kernel.scene_edit = attach_before_stale_update  # type: ignore[method-assign]
+
+    response = _post_fresh_box_snapshot(client)
+
+    assert response.json()["continuous_apply"]["queued"] is True
+    result = _wait_for_pose_source_apply(state)
+    assert result["success"] is True
+    assert result["applied_count"] == 0
+    assert result["skipped_count"] == 1
+    detail = result["details"][0]
+    assert detail["status"] == "skipped"
+    assert detail["skip_reason"] == "attached_object"
+    assert detail["attachment_precondition_race"] is True
+    assert detail["attached_frame_id"] == "tool0"
+    object_state = state.kernel.get_object_state("box")
+    assert object_state.attached is True
+    assert object_state.frame_id == "tool0"
+    metrics = state.pose_source_apply_status()["counters"]
+    assert metrics["attachment_conflict_skipped"] == 1
+
+
 def test_continuous_unattached_snapshot_updates_canonical_scene_while_cycle_running(
     tmp_path: Path,
 ) -> None:

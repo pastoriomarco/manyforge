@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <thread>
 #include <vector>
@@ -66,6 +67,12 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   observed_robot_state_publication() const noexcept override {
     return observed_state_publication_.get();
   }
+  const std::atomic<std::uint64_t>* observed_state_authority_epoch()
+      const noexcept {
+    return observed_state_publication_ != nullptr
+               ? &observed_state_authority_epoch_
+               : nullptr;
+  }
 
   // ADR-0018: atomic per-tick read of the runtime velocity scale so the UI
   // slider retimes in-flight discrete motion without stopping.
@@ -105,6 +112,11 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
       core::ExecutionState state, double progress,
       const std::vector<double>& joint_positions,
       std::optional<core::ErrorDTO> error = std::nullopt);
+  core::ObservedRobotStatePublishResult publish_observed_state_authority(
+      std::span<const double> positions,
+      std::span<const double> velocities,
+      std::int64_t timestamp_ns,
+      bool authority_boundary) noexcept;
 
   // Active execution must never block observed-state publication on
   // `scene_mutex_`. During execution, call publish_snapshot() first and
@@ -140,6 +152,8 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   std::unique_ptr<core::ObservedRobotStatePublication>
       observed_state_publication_;
   std::vector<double> observed_at_rest_velocities_;
+  mutable std::mutex observed_state_publication_mutex_;
+  std::atomic<std::uint64_t> observed_state_authority_epoch_{1};
 
   mutable std::mutex execution_mutex_;
   mutable std::mutex state_mutex_;

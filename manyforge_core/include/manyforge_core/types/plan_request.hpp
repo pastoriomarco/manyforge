@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -27,6 +28,10 @@ struct PlanRequestDTO {
   TolerancesDTO tolerances;
   SpeedProfileDTO speed_profile;
   double planning_timeout_s = 5.0;  // > 0
+  /// Kernel-owned zero-based attempt ordinal for this logical motion plan.
+  /// Candidate producers may combine it with a deployment seed to make retry
+  /// diversity reproducible. It is execution metadata, not program intent.
+  std::uint32_t planning_attempt_index = 0;
   /// Per-joint absolute dynamics caps (Phase 4-P5.1K). Empty preserves prior
   /// behavior. Consumed by the planner backend's time-parameterization.
   PerJointDynamicsLimitsDTO per_joint_dynamics_limits;

@@ -17,11 +17,10 @@ from typing import Any
 
 import pytest
 
-if os.getenv("MANYFORGE_RUN_SOAK_TESTS") != "1":
-    pytest.skip(
-        "set MANYFORGE_RUN_SOAK_TESTS=1 to run soak/load qualification",
-        allow_module_level=True,
-    )
+pytestmark = pytest.mark.skipif(
+    os.getenv("MANYFORGE_RUN_SOAK_TESTS") != "1",
+    reason="set MANYFORGE_RUN_SOAK_TESTS=1 to run soak/load qualification",
+)
 
 pytest.importorskip("fastapi")
 

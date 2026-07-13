@@ -1,0 +1,48 @@
+{
+  "schema_version": "manyforge.roboplan_transition_baseline_manifest.v1",
+  "baseline_id": "rp5-0-roboplan-0.4.0-pinocchio-4",
+  "status": "measurement_pending",
+  "source": {
+    "roboplan_version": "0.4.0",
+    "roboplan_commit": "7bddd403cf679dd976135aff6d9412fae9c4c04d",
+    "pinocchio_version": "4.0.0",
+    "coal_version": "3.0.3",
+    "eigenpy_version": "3.13.0",
+    "dependency_source": "vendored shallow source plus cmeel wheels"
+  },
+  "corpus": "../corpus/corpus-v1.json",
+  "capture_schema": "../schema/capture-v1.schema.json",
+  "evidence_schema": "../schema/evidence-v1.schema.json",
+  "predeclared_adoption_thresholds": {
+    "noise_rule": "A claimed gain must exceed both the measured independent-process noise interval and the practical threshold for that surface.",
+    "planner_internal": {
+      "p95_relative_improvement_min": 0.10,
+      "p99_or_max_regression_max": 0.05,
+      "allocation_regression_allowed": false,
+      "invariant_regression_allowed": false
+    },
+    "authoritative_collision": {
+      "p95_relative_improvement_min": 0.15,
+      "p99_or_max_regression_max": 0.0,
+      "allocation_regression_allowed": false,
+      "normalized_pair_or_distance_regression_allowed": false
+    },
+    "runtime_collision": {
+      "p99_relative_improvement_min": 0.10,
+      "max_regression_allowed": false,
+      "qualified_budget_margin_must_increase": true,
+      "allocation_regression_allowed": false
+    },
+    "live_isaac_drop_approach": {
+      "p95_relative_improvement_min": 0.10,
+      "required_successful_observations_per_stratum": 30,
+      "failed_or_timeout_runs_must_be_reported": true,
+      "viewer_strata_must_not_be_pooled": true
+    }
+  },
+  "evidence": {
+    "summary_file": null,
+    "captured_authority_fixture": null,
+    "raw_artifact_location": null
+  }
+}

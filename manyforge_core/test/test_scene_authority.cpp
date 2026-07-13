@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <set>
 #include <string>
@@ -46,6 +48,17 @@ class FakeProjection final : public IPlannerSceneProjection,
       const SceneTransactionDTO& transaction,
       const SceneRevisionDTO& proposed_revision) override {
     std::lock_guard<std::mutex> lock(mutex_);
+    {
+      std::unique_lock<std::mutex> gate_lock(apply_gate_mutex_);
+      if (block_next_apply_) {
+        apply_blocked_ = true;
+        apply_gate_cv_.notify_all();
+        apply_gate_cv_.wait(gate_lock, [&] { return release_blocked_apply_; });
+        block_next_apply_ = false;
+        apply_blocked_ = false;
+        release_blocked_apply_ = false;
+      }
+    }
     ++apply_calls;
     SceneProjectionCommitResult result;
     result.acknowledged_revision = revision_;
@@ -209,6 +222,22 @@ class FakeProjection final : public IPlannerSceneProjection,
     return runtime_;
   }
 
+  void block_next_apply() {
+    std::lock_guard<std::mutex> lock(apply_gate_mutex_);
+    block_next_apply_ = true;
+  }
+
+  void wait_until_apply_blocked() {
+    std::unique_lock<std::mutex> lock(apply_gate_mutex_);
+    apply_gate_cv_.wait(lock, [&] { return apply_blocked_; });
+  }
+
+  void release_blocked_apply() {
+    std::lock_guard<std::mutex> lock(apply_gate_mutex_);
+    release_blocked_apply_ = true;
+    apply_gate_cv_.notify_all();
+  }
+
   void mutate_projection_object_without_publication(std::string object_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     SceneObjectSnapshotDTO object;
@@ -226,6 +255,11 @@ class FakeProjection final : public IPlannerSceneProjection,
   std::set<std::string> retained_ids;
 
  private:
+  std::mutex apply_gate_mutex_;
+  std::condition_variable apply_gate_cv_;
+  bool block_next_apply_ = false;
+  bool apply_blocked_ = false;
+  bool release_blocked_apply_ = false;
   void apply_operation_locked(const SceneOperationDTO& operation) {
     std::visit(
         [&](const auto& request) {
@@ -244,6 +278,40 @@ class FakeProjection final : public IPlannerSceneProjection,
             std::erase_if(objects_, [&](const auto& object) {
               return object.object_id == request.object_id;
             });
+          } else if constexpr (std::is_same_v<
+                                   Request, UpdateObjectPoseRequestDTO>) {
+            const auto object = std::find_if(
+                objects_.begin(), objects_.end(), [&](const auto& candidate) {
+                  return candidate.object_id == request.object_id;
+                });
+            if (object != objects_.end()) {
+              object->pose_in_frame = request.pose;
+              object->pose_in_universe = request.pose;
+              object->frame_id = request.frame_id;
+              object->attached = request.frame_id != "universe";
+            }
+          } else if constexpr (std::is_same_v<Request,
+                                              AttachObjectRequestDTO>) {
+            const auto object = std::find_if(
+                objects_.begin(), objects_.end(), [&](const auto& candidate) {
+                  return candidate.object_id == request.object_id;
+                });
+            if (object != objects_.end()) {
+              object->frame_id = request.frame_id;
+              object->attached = true;
+              object->touch_links = request.touch_links;
+            }
+          } else if constexpr (std::is_same_v<Request,
+                                              DetachObjectRequestDTO>) {
+            const auto object = std::find_if(
+                objects_.begin(), objects_.end(), [&](const auto& candidate) {
+                  return candidate.object_id == request.object_id;
+                });
+            if (object != objects_.end()) {
+              object->frame_id = request.frame_id;
+              object->attached = false;
+              object->touch_links.clear();
+            }
           } else if constexpr (std::is_same_v<
                                    Request,
                                    SetRobotBasePoseRequestDTO>) {
@@ -382,6 +450,47 @@ TEST(SceneAuthorityTest,
 }
 
 TEST(SceneAuthorityTest,
+     AttachmentPreconditionRejectsBeforeProjectionWithoutMutation) {
+  FakeProjection projection;
+  SceneAuthority authority(projection, projection);
+  ASSERT_TRUE(authority.add_object(add_box("tracked")).success);
+
+  AttachObjectRequestDTO attach;
+  attach.object_id = "tracked";
+  attach.frame_id = "tool0";
+  attach.touch_links = {"finger"};
+  ASSERT_TRUE(authority.attach_object(attach).success);
+  ASSERT_TRUE(authority.object_state("tracked").attached);
+
+  const auto revision_before = authority.current_revision();
+  const auto projection_calls_before = projection.apply_calls.load();
+  UpdateObjectPoseRequestDTO stale_observation;
+  stale_observation.object_id = "tracked";
+  stale_observation.frame_id = "universe";
+  stale_observation.pose.position_m.x_m = 0.5;
+  stale_observation.pose.orientation.w = 1.0;
+  stale_observation.expected_attached = false;
+
+  const auto result = authority.update_object_pose(stale_observation);
+
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorSceneObjectStateConflict);
+  EXPECT_EQ(result.error->details.at("reason"),
+            "scene_object_attachment_precondition_failed");
+  EXPECT_EQ(result.error->details.at("current_attached"), "true");
+  EXPECT_EQ(result.error->details.at("current_frame_id"), "tool0");
+  EXPECT_EQ(projection.apply_calls.load(), projection_calls_before);
+  EXPECT_EQ(authority.current_revision().revision_id,
+            revision_before.revision_id);
+  EXPECT_EQ(authority.current_revision().content_hash,
+            revision_before.content_hash);
+  const auto state = authority.object_state("tracked");
+  EXPECT_TRUE(state.attached);
+  EXPECT_EQ(state.frame_id, "tool0");
+}
+
+TEST(SceneAuthorityTest,
      ExplicitLiveTopologyTransactionRetainsRecoveryAdmissionEpoch) {
   FakeProjection projection;
   SceneAuthority authority(projection, projection);
@@ -492,6 +601,42 @@ TEST(SceneAuthorityTest, RejectsStaleExpectedRevisionWithoutProjectionCall) {
   ASSERT_TRUE(result.error.has_value());
   EXPECT_EQ(result.error->details.at("reason"),
             "scene_transaction_revision_mismatch");
+}
+
+TEST(SceneAuthorityTest,
+     ConcurrentConvenienceEditsBindRevisionUnderWriterLock) {
+  FakeProjection projection;
+  SceneAuthority authority(projection, projection);
+  projection.block_next_apply();
+
+  SceneEditResultDTO first;
+  SceneEditResultDTO second;
+  std::atomic<bool> second_started{false};
+  std::thread first_writer([&] {
+    first = authority.add_object(add_box("first"));
+  });
+  projection.wait_until_apply_blocked();
+  std::thread second_writer([&] {
+    second_started.store(true, std::memory_order_release);
+    second = authority.add_object(add_box("second"));
+  });
+  while (!second_started.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  // Give the second writer an opportunity to reach revision binding while the
+  // first projection commit is deliberately held open. Correct code blocks it
+  // before that read; the old read-then-lock implementation bound revision 1.
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  projection.release_blocked_apply();
+
+  first_writer.join();
+  second_writer.join();
+
+  ASSERT_TRUE(first.success);
+  ASSERT_TRUE(second.success)
+      << (second.error ? second.error->message : "missing error");
+  EXPECT_EQ(authority.current_revision().revision_id, 3U);
+  EXPECT_EQ(projection.apply_calls.load(), 2U);
 }
 
 TEST(SceneAuthorityTest, RolledBackFailureDoesNotPoisonAuthority) {

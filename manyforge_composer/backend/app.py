@@ -286,7 +286,13 @@ def create_app(
     app.include_router(create_pointcloud_router(state, security), tags=["scene-pointcloud"])
     app.include_router(create_execution_router(state), prefix="/api/execution", tags=["execution"])
     app.include_router(create_skills_router(state), prefix="/api", tags=["skills"])
-    app.include_router(create_debug_router(state), prefix="/api/debug", tags=["debug"])
+    app.include_router(
+        create_debug_router(
+            state, viewer_connection_count=hub.connection_count
+        ),
+        prefix="/api/debug",
+        tags=["debug"],
+    )
     app.include_router(create_direct_router(state), prefix="/api/direct", tags=["direct"])
     app.include_router(
         create_robot_control_candidates_router(state),

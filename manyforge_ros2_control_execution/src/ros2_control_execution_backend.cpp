@@ -209,6 +209,7 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
   validate_config();
   initialize_observed_state_publication();
   snapshot_.timestamp_ns = clock_.now();
+  initialize_authored_state();
   start_ros();
 }
 
@@ -350,14 +351,26 @@ void Ros2ControlExecutionBackend::validate_config() const {
 }
 
 void Ros2ControlExecutionBackend::initialize_observed_state_publication() {
-  const auto profile = uses_authored_backend_state()
-                           ? core::ObservedRobotStateAuthorityProfile::
-                                 kCommandedSimulation
-                           : core::ObservedRobotStateAuthorityProfile::kMeasured;
+  const bool authored = uses_authored_backend_state();
   const auto budget_ns = static_cast<std::int64_t>(
       config_.joint_state_max_age_s * 1'000'000'000.0);
   std::vector<core::ObservedRobotStateSourceConfig> sources;
-  sources.reserve(config_.observed_state_source_precedence.size());
+  sources.reserve(config_.observed_state_source_precedence.size() +
+                  (authored ? 1u : 0u));
+  if (authored) {
+    const bool commanded_sim = is_commanded_sim_mode();
+    sources.emplace_back(
+        commanded_sim ? core::ObservedRobotStateSourceKind::kCommandedState
+                      : core::ObservedRobotStateSourceKind::kPredictedState,
+        commanded_sim ? "commanded_state" : "authored_preview_state",
+        core::ObservedRobotStateAuthorityProfile::kCommandedSimulation,
+        /*budget_ns=*/0,
+        config_.observed_state_authority_profile_id.empty()
+            ? (commanded_sim ? "ros2_control_commanded_sim_v1"
+                             : "ros2_control_authored_preview_v1")
+            : config_.observed_state_authority_profile_id);
+    authored_at_rest_velocities_.assign(config_.required_joints.size(), 0.0);
+  }
   for (const auto& name : config_.observed_state_source_precedence) {
     core::ObservedRobotStateSourceKind kind;
     if (name == "action_feedback") {
@@ -368,18 +381,49 @@ void Ros2ControlExecutionBackend::initialize_observed_state_publication() {
       kind = core::ObservedRobotStateSourceKind::kJointState;
     }
     auto source = core::ObservedRobotStateSourceConfig{
-        kind, name, profile, budget_ns};
+        kind, name, core::ObservedRobotStateAuthorityProfile::kMeasured,
+        budget_ns};
     source.authority_profile_id =
-        config_.observed_state_authority_profile_id.empty()
-            ? (uses_authored_backend_state()
-                   ? "ros2_control_commanded_sim_v1"
-                   : "ros2_control_measured_v1")
-            : config_.observed_state_authority_profile_id;
+        authored
+            ? "ros2_control_measured_diagnostic_v1"
+            : (config_.observed_state_authority_profile_id.empty()
+                   ? "ros2_control_measured_v1"
+                   : config_.observed_state_authority_profile_id);
     sources.push_back(std::move(source));
   }
   observed_state_publication_ =
       std::make_unique<core::ObservedRobotStatePublication>(
-          config_.required_joints, std::move(sources));
+      config_.required_joints, std::move(sources));
+}
+
+void Ros2ControlExecutionBackend::initialize_authored_state() {
+  if (!uses_authored_backend_state()) {
+    return;
+  }
+
+  std::vector<double> positions;
+  if (is_commanded_sim_mode()) {
+    positions = config_.initial_joint_positions_rad;
+  } else {
+    positions.reserve(config_.required_joints.size());
+    for (const auto& joint_name : config_.required_joints) {
+      const auto position =
+          execution_state_sink_->group_joint_position(group_name_, joint_name);
+      if (!position.has_value() || !std::isfinite(*position)) {
+        positions.clear();
+        break;
+      }
+      positions.push_back(*position);
+    }
+  }
+  if (positions.size() != config_.required_joints.size()) {
+    return;
+  }
+
+  // The authored initial vector is deployment authority, not inferred feedback.
+  // Seed it before ROS callbacks start so factory composition cannot race a
+  // measured diagnostic sample into the planning authority slot.
+  (void)publish_snapshot(core::ExecutionState::kIdle, 0.0, positions);
 }
 
 void Ros2ControlExecutionBackend::publish_observed_robot_state(
@@ -395,6 +439,66 @@ void Ros2ControlExecutionBackend::publish_observed_robot_state(
   (void)observed_state_publication_->publish(
       source, joint_names, positions, velocities, source_timestamp_ns,
       received_timestamp_ns);
+}
+
+bool Ros2ControlExecutionBackend::publish_authored_robot_state(
+    std::span<const double> positions,
+    std::span<const double> velocities,
+    std::int64_t timestamp_ns,
+    std::optional<std::uint64_t> expected_running_generation,
+    bool invalidate_before_publish) noexcept {
+  if (!uses_authored_backend_state() || observed_state_publication_ == nullptr ||
+      positions.size() != config_.required_joints.size()) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> writer_lock(authored_state_publication_mutex_);
+  if (expected_running_generation.has_value() &&
+      running_generation_.load(std::memory_order_acquire) !=
+          *expected_running_generation) {
+    return false;
+  }
+  auto authority_epoch =
+      authored_state_authority_epoch_.load(std::memory_order_relaxed);
+  if (invalidate_before_publish) {
+    // Non-expiring authored state must never remain admissible when a
+    // lifecycle/terminal replacement cannot acquire a publication slot.
+    if ((authority_epoch & 1u) == 0u) {
+      ++authority_epoch;
+      authored_state_authority_epoch_.store(authority_epoch,
+                                            std::memory_order_release);
+    }
+  } else if ((authority_epoch & 1u) != 0u) {
+    // A progress writer may update an already-valid active generation but may
+    // never resurrect authority invalidated by a lifecycle/terminal boundary.
+    return false;
+  }
+
+  const auto source = is_commanded_sim_mode()
+                          ? core::ObservedRobotStateSourceKind::kCommandedState
+                          : core::ObservedRobotStateSourceKind::kPredictedState;
+  // Readers pin slots only while copying one bounded joint vector. A terminal
+  // authority update gets a few bounded retries so transient slot pinning does
+  // not leave the next plan on the previous command reference. The runtime
+  // monitor performs exactly one try and never yields or waits on readers.
+  const int attempt_count = invalidate_before_publish ? 8 : 1;
+  for (int attempt = 0; attempt < attempt_count; ++attempt) {
+    const auto result = observed_state_publication_->publish(
+        source, config_.required_joints, positions, velocities, timestamp_ns,
+        timestamp_ns);
+    if (result.published) {
+      if (invalidate_before_publish) {
+        authored_state_authority_epoch_.store(authority_epoch + 1,
+                                              std::memory_order_release);
+      }
+      return true;
+    }
+    if (std::string_view(result.reason) != "publication_slots_exhausted") {
+      return false;
+    }
+    std::this_thread::yield();
+  }
+  return false;
 }
 
 void Ros2ControlExecutionBackend::start_ros() {
@@ -1224,9 +1328,14 @@ void Ros2ControlExecutionBackend::assign_joint_sample(
 }
 
 void Ros2ControlExecutionBackend::set_running_locked(bool running) noexcept {
+  if (running_ != running) {
+    // This generation fences goal callbacks, monitor snapshots, and authored
+    // observed-state publication in both directions. In particular, terminal
+    // completion must invalidate a monitor tick that began before completion.
+    running_generation_.fetch_add(1, std::memory_order_acq_rel);
+  }
   if (running) {
     running_flag_.store(true, std::memory_order_release);
-    running_generation_.fetch_add(1, std::memory_order_acq_rel);
   }
   running_ = running;
   if (!running) {
@@ -1547,24 +1656,16 @@ bool Ros2ControlExecutionBackend::project_gripper_position_to_scene(
                                            position, mode);
 }
 
-void Ros2ControlExecutionBackend::publish_snapshot(
+bool Ros2ControlExecutionBackend::publish_snapshot(
     core::ExecutionState state,
     double progress,
     const std::vector<double>& joint_positions,
     std::optional<core::ErrorDTO> error,
-    std::string state_source) {
-  std::lock_guard<std::mutex> lock(state_mutex_);
+    std::string state_source,
+    std::optional<std::uint64_t> expected_running_generation,
+    SnapshotPublicationAuthority authority,
+    const std::vector<double>* authored_velocities) {
   const auto now_ns = clock_.now();
-  snapshot_.timestamp_ns = now_ns;
-  snapshot_.sequence_number++;
-  snapshot_.state = state;
-  snapshot_.progress = clamp_progress(progress);
-  snapshot_.joint_positions_rad = joint_positions;
-  // Velocities are settle evidence and are only valid for the exact state
-  // just published. Reset here so a position-only publish never leaves stale
-  // velocities; the controlled-stop path sets measured velocities explicitly
-  // after publishing the post-stop snapshot.
-  snapshot_.joint_velocities_rad_s.clear();
   if (state_source.empty()) {
     if (is_commanded_sim_mode()) {
       state_source = "commanded_sim_predicted";
@@ -1574,10 +1675,75 @@ void Ros2ControlExecutionBackend::publish_snapshot(
       state_source = "observed_ros2";
     }
   }
-  snapshot_.state_source = std::move(state_source);
-  snapshot_.source_timestamp_ns = now_ns;
-  snapshot_.source_age_ns = 0;
-  snapshot_.error = std::move(error);
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (expected_running_generation.has_value() &&
+        running_generation_.load(std::memory_order_acquire) !=
+            *expected_running_generation) {
+      return false;
+    }
+    snapshot_.timestamp_ns = now_ns;
+    snapshot_.sequence_number++;
+    snapshot_.state = state;
+    snapshot_.progress = clamp_progress(progress);
+    snapshot_.joint_positions_rad = joint_positions;
+    // Velocities are settle evidence and are only valid for the exact state
+    // just published. Reset here so a position-only publish never leaves stale
+    // velocities; the controlled-stop path sets measured velocities explicitly
+    // after publishing the post-stop snapshot.
+    snapshot_.joint_velocities_rad_s.clear();
+    snapshot_.state_source = std::move(state_source);
+    snapshot_.source_timestamp_ns = now_ns;
+    snapshot_.source_age_ns = 0;
+    snapshot_.error = std::move(error);
+  }
+
+  if (uses_authored_backend_state() &&
+      authority == SnapshotPublicationAuthority::kBackendAuthored &&
+      !joint_positions.empty()) {
+    const bool at_rest_state =
+        state == core::ExecutionState::kIdle ||
+        state == core::ExecutionState::kPaused ||
+        state == core::ExecutionState::kStopped ||
+        state == core::ExecutionState::kCompleted ||
+        state == core::ExecutionState::kFailed ||
+        state == core::ExecutionState::kInterventionRequired;
+    const std::span<const double> velocities =
+        authored_velocities != nullptr
+            ? std::span<const double>(*authored_velocities)
+            : (at_rest_state
+                   ? std::span<const double>(authored_at_rest_velocities_)
+                   : std::span<const double>{});
+    const bool authority_boundary = !expected_running_generation.has_value();
+    const bool authored_published = publish_authored_robot_state(
+        joint_positions, velocities, now_ns, expected_running_generation,
+        authority_boundary);
+    if (!authored_published &&
+        (!expected_running_generation.has_value() ||
+         running_generation_.load(std::memory_order_acquire) ==
+             *expected_running_generation) &&
+        node_) {
+      RCLCPP_ERROR_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 5000,
+          "Failed to publish backend-authored robot state; planning authority "
+          "remains invalid until an authoritative replacement is published");
+    }
+    return authored_published;
+  }
+  if (uses_authored_backend_state() &&
+      authority == SnapshotPublicationAuthority::kBackendAuthored &&
+      joint_positions.empty() && !expected_running_generation.has_value()) {
+    std::lock_guard<std::mutex> writer_lock(
+        authored_state_publication_mutex_);
+    const auto authority_epoch =
+        authored_state_authority_epoch_.load(std::memory_order_relaxed);
+    if ((authority_epoch & 1u) == 0u) {
+      authored_state_authority_epoch_.store(authority_epoch + 1,
+                                            std::memory_order_release);
+    }
+    return false;
+  }
+  return true;
 }
 
 bool Ros2ControlExecutionBackend::publish_passive_idle_snapshot(
@@ -1634,7 +1800,8 @@ void Ros2ControlExecutionBackend::clear_managed_controlled_stop_state() {
 }
 
 bool Ros2ControlExecutionBackend::publish_controlled_stop_command_reference_snapshot(
-    std::chrono::steady_clock::time_point now) {
+    std::chrono::steady_clock::time_point now,
+    std::optional<std::uint64_t> expected_running_generation) {
   std::shared_ptr<ControlledStopCommandReference> reference;
   {
     std::lock_guard<std::mutex> lock(execution_mutex_);
@@ -1665,20 +1832,21 @@ bool Ros2ControlExecutionBackend::publish_controlled_stop_command_reference_snap
 
   const double progress = end_s <= 1e-9 ? 1.0 : clamp_progress(sample_time_s / end_s);
   update_scene_positions(reference->sample.positions_rad, SceneUpdateMode::kBestEffort);
-  publish_snapshot(core::ExecutionState::kStopping,
-                   progress,
-                   reference->sample.positions_rad,
-                   std::nullopt,
-                   is_commanded_sim_mode()
-                       ? "commanded_sim_controlled_stop_reference"
-                       : "controlled_stop_command_reference");
-  return true;
+  return publish_snapshot(
+      core::ExecutionState::kStopping, progress,
+      reference->sample.positions_rad, std::nullopt,
+      is_commanded_sim_mode() ? "commanded_sim_controlled_stop_reference"
+                              : "controlled_stop_command_reference",
+      expected_running_generation,
+      SnapshotPublicationAuthority::kBackendAuthored,
+      &reference->sample.velocities_rad_s);
 }
 
 bool Ros2ControlExecutionBackend::publish_observed_cancel_stop_snapshot(
     const std::vector<std::string>& joint_names,
     double progress,
-    std::chrono::steady_clock::time_point now) {
+    std::chrono::steady_clock::time_point now,
+    std::optional<std::uint64_t> expected_running_generation) {
   std::vector<double> positions;
   std::vector<double> velocities;
   std::string sample_source;
@@ -1701,9 +1869,12 @@ bool Ros2ControlExecutionBackend::publish_observed_cancel_stop_snapshot(
   }
 
   update_scene_positions(positions, SceneUpdateMode::kBestEffort);
-  publish_snapshot(
-      core::ExecutionState::kStopping, progress, positions, std::nullopt,
-      "measured_cancel_stop_feedback");
+  if (!publish_snapshot(
+          core::ExecutionState::kStopping, progress, positions, std::nullopt,
+          "measured_cancel_stop_feedback", expected_running_generation,
+          SnapshotPublicationAuthority::kMeasuredDiagnostic)) {
+    return false;
+  }
   if (!velocities.empty()) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     snapshot_.joint_velocities_rad_s = std::move(velocities);
@@ -2571,6 +2742,8 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
 
 void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory) {
   monitor_active_.store(true);
+  const auto monitor_generation =
+      running_generation_.load(std::memory_order_acquire);
   const auto monitor_guard =
       std::shared_ptr<void>(nullptr, [this](void*) {
         {
@@ -2633,13 +2806,16 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
       return;
     }
     if (cancel_pending) {
-      if (!publish_controlled_stop_command_reference_snapshot(now)) {
+      if (!publish_controlled_stop_command_reference_snapshot(
+              now, monitor_generation)) {
         const auto snapshot = get_execution_snapshot();
         if (!publish_observed_cancel_stop_snapshot(
-                trajectory.joint_names, snapshot.progress, now)) {
-          publish_snapshot(core::ExecutionState::kStopping,
-                           snapshot.progress,
-                           snapshot.joint_positions_rad);
+                trajectory.joint_names, snapshot.progress, now,
+                monitor_generation)) {
+          (void)publish_snapshot(core::ExecutionState::kStopping,
+                                 snapshot.progress,
+                                 snapshot.joint_positions_rad,
+                                 std::nullopt, "", monitor_generation);
         }
       }
       // Plain JTC cancel/pause waits for the old goal to terminate and is
@@ -2682,11 +2858,10 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
       if (snapshot_positions.empty() && !trajectory.waypoints.empty()) {
         snapshot_positions = trajectory.waypoints.front().positions_rad;
       }
-      publish_snapshot(natural_completion_stop_requested
-                           ? core::ExecutionState::kStopping
-                           : core::ExecutionState::kExecuting,
-                       0.0,
-                       snapshot_positions);
+      (void)publish_snapshot(
+          natural_completion_stop_requested ? core::ExecutionState::kStopping
+                                            : core::ExecutionState::kExecuting,
+          0.0, snapshot_positions, std::nullopt, "", monitor_generation);
       // Audit 6C (finding 2.5): wake on first feedback / terminal /
       // stop-pause intent instead of sleeping out the period
       // (on_action_feedback notifies execution_cv_ on the first-feedback
@@ -2882,11 +3057,12 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
                      std::move(tracking_failure_details));
       return;
     }
-    publish_snapshot(natural_completion_stop_requested
-                         ? core::ExecutionState::kStopping
-                         : core::ExecutionState::kExecuting,
-                     progress,
-                     snapshot_positions);
+    (void)publish_snapshot(
+        natural_completion_stop_requested ? core::ExecutionState::kStopping
+                                          : core::ExecutionState::kExecuting,
+        progress, snapshot_positions, std::nullopt, "", monitor_generation,
+        SnapshotPublicationAuthority::kBackendAuthored,
+        predicted_positions.empty() ? nullptr : &predicted_sample.velocities_rad_s);
     // Audit 6C (finding 2.5): the period still PACES the tick (waking on
     // every 100 Hz sample would burn CPU for nothing), but terminal and
     // stop/pause intent wake the worker immediately instead of waiting out

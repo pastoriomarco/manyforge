@@ -32,6 +32,7 @@ enum class ErrorCode {
     kValidationLimitsViolation,
     kObjectAlreadyExists,
     kObjectNotFound,
+    kSceneObjectStateConflict,
     kExecutionRejected,
     kExecutionAborted,
     kExecutionTimeout,
@@ -71,6 +72,7 @@ inline const char* to_string(ErrorCode code) {
         case kValidationLimitsViolation: return "validation_limits_violation";
         case kObjectAlreadyExists: return "object_already_exists";
         case kObjectNotFound: return "object_not_found";
+        case kSceneObjectStateConflict: return "scene_object_state_conflict";
         case kExecutionRejected: return "execution_rejected";
         case kExecutionAborted: return "execution_aborted";
         case kExecutionTimeout: return "execution_timeout";
@@ -266,6 +268,8 @@ inline const char* kErrorSceneChangedDuringValidation =
 // Scene editing
 inline const char* kErrorObjectAlreadyExists = "object_already_exists";
 inline const char* kErrorObjectNotFound = "object_not_found";
+inline const char* kErrorSceneObjectStateConflict =
+    "scene_object_state_conflict";
 
 // Execution
 inline const char* kErrorExecutionRejected = "execution_rejected";

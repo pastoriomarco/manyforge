@@ -19,6 +19,9 @@ TEST(ErrorCodeMappingTest, MapsPublicErrorDtoCodes) {
   EXPECT_EQ(error_code_from_dto(
                 ErrorDTO{kErrorSceneChangedDuringValidation, "", {}}),
             ErrorCode::kSceneChangedDuringValidation);
+  EXPECT_EQ(error_code_from_dto(
+                ErrorDTO{kErrorSceneObjectStateConflict, "", {}}),
+            ErrorCode::kSceneObjectStateConflict);
   EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorExecutionTimeout, "", {}}),
             ErrorCode::kExecutionTimeout);
   EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorStopFailed, "", {}}),

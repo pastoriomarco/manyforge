@@ -35,10 +35,12 @@ class MockPlanner : public IPlannerBackend {
   int plan_count = 0;
   int cancel_count = 0;
   PlanRequestDTO last_request;
+  std::vector<std::uint32_t> planning_attempt_indices;
 
   PlanResultDTO plan(const PlanRequestDTO& request) override {
     ++plan_count;
     last_request = request;
+    planning_attempt_indices.push_back(request.planning_attempt_index);
     if (on_plan) {
       on_plan(plan_count);
     }
@@ -4078,6 +4080,8 @@ TEST_F(ExecutionKernelTest,
 
   EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kCompleted);
   EXPECT_EQ(local_planner.plan_count, 2);
+  EXPECT_EQ(local_planner.planning_attempt_indices,
+            (std::vector<std::uint32_t>{0, 1}));
   EXPECT_EQ(controlled_execution.execute_count, 1);
   ASSERT_FALSE(controlled_execution.last_execute_trajectory.waypoints.empty());
   EXPECT_EQ(controlled_execution.last_execute_trajectory.waypoints.back().positions_rad,
@@ -11119,14 +11123,22 @@ TEST_F(ExecutionKernelTest, ResetDuringPlanning_PrevStateIsPlanning) {
   local_kernel.wait_for_completion();
 
   std::lock_guard<std::mutex> lock(events_mutex);
-  // Find the transition to Idle
+  bool found_planning_to_idle = false;
   for (const auto& e : events) {
-    if (e.type == KernelEventType::kStateTransition && e.to_state == ExecutionState::kIdle) {
+    if (e.type != KernelEventType::kStateTransition) {
+      continue;
+    }
+    EXPECT_NE(e.to_state, ExecutionState::kFailed)
+        << "Reset-owned planner cancellation must not publish a transient "
+           "planning failure";
+    if (e.to_state == ExecutionState::kIdle) {
       EXPECT_EQ(e.from_state, ExecutionState::kPlanning)
           << "prev_state should be Planning, not " << static_cast<int>(e.from_state);
-      break;
+      found_planning_to_idle = true;
     }
   }
+  EXPECT_TRUE(found_planning_to_idle);
+  EXPECT_EQ(local_kernel.get_metrics().plans_failed, 0u);
 }
 
 // =============================================================================

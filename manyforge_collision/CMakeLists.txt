@@ -35,9 +35,17 @@ if(Git_FOUND)
     set(_MANYFORGE_COLLISION_GIT_DIRTY "-dirty")
   endif()
 endif()
-set(MANYFORGE_COLLISION_ENGINE_VERSION
-    "${PROJECT_VERSION}+${_MANYFORGE_COLLISION_GIT_SHA}${_MANYFORGE_COLLISION_GIT_DIRTY}"
-    CACHE STRING "Traceable manyforge_collision engine version")
+set(MANYFORGE_COLLISION_ENGINE_VERSION_OVERRIDE "" CACHE STRING
+    "Explicit manyforge_collision engine version override")
+if(MANYFORGE_COLLISION_ENGINE_VERSION_OVERRIDE)
+  set(MANYFORGE_COLLISION_ENGINE_VERSION
+      "${MANYFORGE_COLLISION_ENGINE_VERSION_OVERRIDE}")
+else()
+  # This must not be a cached derived value: reused container build volumes
+  # are reconfigured across commits and must never retain a stale engine id.
+  set(MANYFORGE_COLLISION_ENGINE_VERSION
+      "${PROJECT_VERSION}+${_MANYFORGE_COLLISION_GIT_SHA}${_MANYFORGE_COLLISION_GIT_DIRTY}")
+endif()
 
 execute_process(
   COMMAND python3 -c

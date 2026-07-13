@@ -129,6 +129,32 @@ class TestMoveManipulatorAction:
         )
         assert "test_move" in kernel.last_execute_request.action_span.node_instance_id
 
+    def test_success_records_one_opt_in_behavior_qualification_interval(
+        self, kernel, bb_with_kernel
+    ):
+        boundaries = []
+        kernel.record_planning_qualification_behavior_boundary = (
+            lambda **value: boundaries.append(value)
+        )
+        node = MoveManipulatorAction(
+            name="test_move_qualification",
+            move_id="drop_approach",
+            motion_type="joint_goal",
+            joint_goal_names=["j1"],
+            joint_goal_positions_rad=[1.0],
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        assert [value["phase"] for value in boundaries] == [
+            "started",
+            "succeeded",
+        ]
+        assert all(value["move_id"] == "drop_approach" for value in boundaries)
+        assert (
+            boundaries[0]["action_span"].node_attempt_id
+            == boundaries[1]["action_span"].node_attempt_id
+        )
+
     def test_failure(self, kernel, bb_with_kernel, runtime_pause_registry):
         # Runtime motion faults hold the owning node without terminating a
         # Parallel. Recovery is generation-bound through the shared registry;

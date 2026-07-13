@@ -633,6 +633,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite(
             "scene_admission_allow_runtime_dynamic_obstacle",
             &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_allow_runtime_dynamic_obstacle)
+        .def_readwrite("expected_attached",
+                       &manyforge::core::UpdateObjectPoseRequestDTO::expected_attached)
         .def("__repr__", [](const manyforge::core::UpdateObjectPoseRequestDTO& u) {
             return py::str("UpdateObjectPoseRequestDTO(object_id='{}')").format(u.object_id);
         });

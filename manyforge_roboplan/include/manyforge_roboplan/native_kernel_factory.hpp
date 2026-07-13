@@ -27,6 +27,7 @@
 #include <manyforge_core/scene_authority.hpp>
 #include <manyforge_roboplan/roboplan_focused_adapters.hpp>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
+#include <manyforge_roboplan/roboplan_planning_qualification.hpp>
 #include <manyforge_roboplan/roboplan_projection_backend.hpp>
 #include <manyforge_roboplan/roboplan_execution_backend.hpp>
 
@@ -192,6 +193,10 @@ struct NativeKernelBundle {
  private:
   mutable std::mutex close_mutex_;
   bool closed_{false};
+  mutable std::mutex planning_qualification_mutex_;
+  std::uint64_t planning_qualification_generation_ = 0;
+  std::shared_ptr<RoboPlanPlanningQualificationRecorder>
+      planning_qualification_recorder_;
 
  public:
   // Event collector — subscribes to kernel, must be destroyed before kernel
@@ -200,6 +205,17 @@ struct NativeKernelBundle {
   // Kernel holds references to everything above. close() resets the bundle's
   // owner before component teardown; in-flight bindings hold short snapshots.
   std::shared_ptr<core::ExecutionKernel> kernel;
+
+  std::uint64_t start_planning_qualification_capture(std::size_t capacity);
+  RoboPlanPlanningQualificationBatch
+  drain_planning_qualification_capture(std::uint64_t generation);
+  RoboPlanPlanningQualificationBatch
+  stop_planning_qualification_capture(
+      std::uint64_t generation,
+      std::chrono::milliseconds idle_timeout = std::chrono::seconds(10));
+  std::uint64_t planning_qualification_generation() const;
+  std::uint64_t planning_qualification_dropped_total() const;
+  std::size_t planning_qualification_in_flight() const;
 
   void close();
   bool closed() const;
@@ -221,12 +237,14 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
     const std::string& urdf_path,
     const std::string& srdf_path,
     const std::vector<std::string>& package_paths,
-    const core::ExecutionKernelConfig& kernel_config = {});
+    const core::ExecutionKernelConfig& kernel_config = {},
+    const std::string& logical_robot_id = {});
 
 /// Convenience overload using roboplan example_models to resolve paths.
 std::shared_ptr<NativeKernelBundle> create_native_kernel(
     const std::string& model_name = "ur5_gripper",
     const std::string& group_name = "arm",
-    const core::ExecutionKernelConfig& kernel_config = {});
+    const core::ExecutionKernelConfig& kernel_config = {},
+    const std::string& logical_robot_id = {});
 
 }  // namespace manyforge::roboplan_backend

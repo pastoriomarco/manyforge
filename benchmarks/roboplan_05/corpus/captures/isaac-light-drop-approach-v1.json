@@ -1,0 +1,506 @@
+{
+  "capture_id": "isaac-light-drop-approach-v1",
+  "plan_request": {
+    "action_span": {
+      "action_source": "program_node",
+      "action_span_id": "run-20260713T071414Z-6c3b896c:run_sequence[0]/repeat[1]/sequence[0]/pick_and_place[1]/move_to_drop_approach[5]/move_to_drop_approach[0]:2",
+      "node_attempt_id": "run-20260713T071414Z-6c3b896c:run_sequence[0]/repeat[1]/sequence[0]/pick_and_place[1]/move_to_drop_approach[5]/move_to_drop_approach[0]:2",
+      "node_instance_id": "run_sequence[0]/repeat[1]/sequence[0]/pick_and_place[1]/move_to_drop_approach[5]/move_to_drop_approach[0]",
+      "program_run_id": "run-20260713T071414Z-6c3b896c"
+    },
+    "base_frame": "base_link",
+    "contact_policy_id": "",
+    "group_id": "arm",
+    "motion": {
+      "pose": {
+        "orientation_xyzw": [
+          6.123234020311551e-17,
+          1.0,
+          6.123233995736766e-17,
+          3.74939947170236e-33
+        ],
+        "position_m": [
+          -0.2043380181160544,
+          -0.34369898694027967,
+          0.3434590047683716
+        ]
+      },
+      "type": "pose_goal"
+    },
+    "move_id": "drop_approach",
+    "per_joint_dynamics_limits": {},
+    "planning_attempt_index": 0,
+    "planning_timeout_s": 10.0,
+    "robot_id": "ur10e",
+    "scene_binding": {
+      "content_hash": "127280df03362a62",
+      "projection_lease_id": "execution_11_drop_approach",
+      "revision_id": 96
+    },
+    "speed_profile": {
+      "acceleration_scale": 1.0,
+      "max_tcp_linear_speed_mps": 0.25,
+      "velocity_scale": 0.2
+    },
+    "start_state": {
+      "joint_names": [
+        "shoulder_pan_joint",
+        "shoulder_lift_joint",
+        "elbow_joint",
+        "wrist_1_joint",
+        "wrist_2_joint",
+        "wrist_3_joint"
+      ],
+      "positions_rad": [
+        3.2339965205124526,
+        -1.509942146258945,
+        1.9460107856810451,
+        -2.0070904759999633,
+        -1.5707453638141515,
+        -3.040623293319109
+      ],
+      "velocities_rad_s": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "tcp_frame": "grasp_frame",
+    "tolerances": {
+      "joint_position_tol_rad": 0.05,
+      "rotation_tol_rad": 0.05,
+      "translation_tol_m": 0.005
+    }
+  },
+  "planner_contract": {
+    "planning_attempt_index": 0,
+    "rng_base_seed": 12345,
+    "rng_seed": 12345,
+    "shortcut_rng_seed_argument": -12346
+  },
+  "resolved_motion": {
+    "pose_goal": {
+      "orientation_xyzw": [
+        6.123234020311551e-17,
+        1.0,
+        6.123233995736766e-17,
+        3.74939947170236e-33
+      ],
+      "position_m": [
+        -0.2043380181160544,
+        -0.34369898694027967,
+        0.3434590047683716
+      ]
+    },
+    "source": {
+      "authored_offset": {
+        "orientation_rpy_deg": [
+          180,
+          0,
+          180
+        ],
+        "position_m": [
+          0,
+          0,
+          0.4
+        ]
+      },
+      "offset_pose": {
+        "orientation_xyzw": [
+          6.123233995736766e-17,
+          1.0,
+          6.123233995736766e-17,
+          3.749399456654644e-33
+        ],
+        "position_m": [
+          0.0,
+          0.0,
+          0.4
+        ]
+      },
+      "offset_reference": {
+        "id": "base_link",
+        "type": "frame"
+      },
+      "target_reference": {
+        "id": "isaac_small_KLT",
+        "type": "object"
+      }
+    },
+    "type": "pose_goal"
+  },
+  "robot_model_authority": {
+    "canonical_fingerprint": "4f234dbd40a1058411ee0988414a675176968457a445b16c9e5536f8f986c556",
+    "commandable_joint_names": [
+      "shoulder_pan_joint",
+      "shoulder_lift_joint",
+      "elbow_joint",
+      "wrist_1_joint",
+      "wrist_2_joint",
+      "wrist_3_joint",
+      "finger_joint"
+    ],
+    "grippers": {
+      "primary": {
+        "command_joint": "finger_joint",
+        "derived_joints": [],
+        "group_id": "gripper",
+        "presets": {
+          "closed": 0.66,
+          "open": 0.0
+        }
+      }
+    },
+    "group_commandable_joint_names": {
+      "arm": [],
+      "gripper": [
+        "finger_joint"
+      ]
+    },
+    "view_changed": false,
+    "view_fingerprint": "dc38020f93594b55a5d369c0456910e9e6d0865e27d028707c54854482586dae"
+  },
+  "scene": {
+    "authority": {
+      "configured_collision_policy": {
+        "allowed_static_static_pairs": [],
+        "allowed_touch_link_pairs": [],
+        "contact_grasps": [],
+        "policy_id": "default_free_space",
+        "require_full_diagnostics": false,
+        "revision": {
+          "content_hash": "default_free_space_v1",
+          "revision_id": 1
+        },
+        "support_contacts": []
+      },
+      "policy_epoch": 5,
+      "revision": {
+        "content_hash": "127280df03362a62",
+        "revision_id": 96
+      },
+      "scene_admission_epoch": 30,
+      "topology_epoch": 30,
+      "transaction_sequence": 322
+    },
+    "objects": [
+      {
+        "attached": true,
+        "attached_to": "grasp_frame",
+        "object_id": "isaac_cheese_box",
+        "observation": {
+          "scene_admission_allow_runtime_dynamic_obstacle": false,
+          "scene_admission_lease_max_age_ns": null,
+          "scene_admission_obstacle_angular_tolerance_rad": null,
+          "scene_admission_obstacle_drift_tolerance_m": null,
+          "scene_admission_role": null,
+          "scene_admission_target_angular_tolerance_rad": null,
+          "scene_admission_target_drift_tolerance_m": null,
+          "source_freshness_budget_ns": null,
+          "source_id": null,
+          "source_timestamp_ns": null
+        },
+        "pose_in_world": {
+          "orientation_xyzw": [
+            -0.502070722743241,
+            0.5180124045797828,
+            0.48215841407448623,
+            -0.49710371594273933
+          ],
+          "position_m": [
+            -0.4550379514694214,
+            0.07659500092267989,
+            0.087826669216156
+          ]
+        },
+        "shape": {
+          "mesh_scale": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "resource_uri": "examples/isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj",
+          "type": "mesh"
+        },
+        "support_contacts": [
+          {
+            "allow_recontact": false,
+            "enforce_max_start_penetration": true,
+            "max_start_penetration_m": 0.03,
+            "min_release_progress_m": 0.0,
+            "min_separation_clearance_m": 0.0,
+            "mode": "contact_release",
+            "release_tolerance_m": 0.001,
+            "require_separation_by_end": true,
+            "require_strictly_decreasing_penetration": true,
+            "support_object_id": "isaac_table_low_327"
+          }
+        ],
+        "touch_links": [
+          "left_inner_finger",
+          "left_inner_finger_pad",
+          "left_inner_knuckle",
+          "left_outer_finger",
+          "left_outer_knuckle",
+          "right_inner_finger",
+          "right_inner_finger_pad",
+          "right_inner_knuckle",
+          "right_outer_finger",
+          "right_outer_knuckle",
+          "robotiq_base_link"
+        ]
+      },
+      {
+        "attached": false,
+        "attached_to": "",
+        "object_id": "isaac_small_KLT",
+        "observation": {
+          "scene_admission_allow_runtime_dynamic_obstacle": false,
+          "scene_admission_lease_max_age_ns": null,
+          "scene_admission_obstacle_angular_tolerance_rad": null,
+          "scene_admission_obstacle_drift_tolerance_m": null,
+          "scene_admission_role": null,
+          "scene_admission_target_angular_tolerance_rad": null,
+          "scene_admission_target_drift_tolerance_m": null,
+          "source_freshness_budget_ns": null,
+          "source_id": null,
+          "source_timestamp_ns": null
+        },
+        "pose_in_world": {
+          "orientation_xyzw": [
+            -7.463636797056011e-07,
+            0.0014223730063974037,
+            5.845196084198735e-05,
+            0.9999989867184076
+          ],
+          "position_m": [
+            -0.561839,
+            -0.367252,
+            0.073459
+          ]
+        },
+        "shape": {
+          "mesh_scale": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "resource_uri": "examples/isaac_manipulator_scene_light/meshes/World__small_KLT_collider_primitives.obj",
+          "type": "mesh"
+        },
+        "support_contacts": [],
+        "touch_links": []
+      },
+      {
+        "attached": false,
+        "attached_to": "",
+        "object_id": "isaac_small_KLT_01",
+        "observation": {
+          "scene_admission_allow_runtime_dynamic_obstacle": false,
+          "scene_admission_lease_max_age_ns": null,
+          "scene_admission_obstacle_angular_tolerance_rad": null,
+          "scene_admission_obstacle_drift_tolerance_m": null,
+          "scene_admission_role": null,
+          "scene_admission_target_angular_tolerance_rad": null,
+          "scene_admission_target_drift_tolerance_m": null,
+          "source_freshness_budget_ns": null,
+          "source_id": null,
+          "source_timestamp_ns": null
+        },
+        "pose_in_world": {
+          "orientation_xyzw": [
+            -1.8357836237633475e-07,
+            -0.0009134877500924124,
+            -3.492331101317278e-07,
+            0.9999995827699003
+          ],
+          "position_m": [
+            0.27161648869514465,
+            -0.35853588581085205,
+            0.07468909025192261
+          ]
+        },
+        "shape": {
+          "mesh_scale": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "resource_uri": "examples/isaac_manipulator_scene_light/meshes/World__small_KLT_01_collider_primitives.obj",
+          "type": "mesh"
+        },
+        "support_contacts": [],
+        "touch_links": []
+      },
+      {
+        "attached": false,
+        "attached_to": "",
+        "object_id": "isaac_soup_can",
+        "observation": {
+          "scene_admission_allow_runtime_dynamic_obstacle": false,
+          "scene_admission_lease_max_age_ns": null,
+          "scene_admission_obstacle_angular_tolerance_rad": null,
+          "scene_admission_obstacle_drift_tolerance_m": null,
+          "scene_admission_role": null,
+          "scene_admission_target_angular_tolerance_rad": null,
+          "scene_admission_target_drift_tolerance_m": null,
+          "source_freshness_budget_ns": null,
+          "source_id": null,
+          "source_timestamp_ns": null
+        },
+        "pose_in_world": {
+          "orientation_xyzw": [
+            0.03936762849031647,
+            0.705935907260489,
+            0.706009404317132,
+            0.04068667697327009
+          ],
+          "position_m": [
+            0.085370734333992,
+            -0.004780956543982029,
+            0.05248536914587021
+          ]
+        },
+        "shape": {
+          "mesh_scale": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "resource_uri": "examples/isaac_manipulator_scene_light/meshes/World__soup_can_collider_cooked.obj",
+          "type": "mesh"
+        },
+        "support_contacts": [],
+        "touch_links": []
+      },
+      {
+        "attached": false,
+        "attached_to": "",
+        "object_id": "isaac_table_low_327",
+        "observation": {
+          "scene_admission_allow_runtime_dynamic_obstacle": false,
+          "scene_admission_lease_max_age_ns": null,
+          "scene_admission_obstacle_angular_tolerance_rad": null,
+          "scene_admission_obstacle_drift_tolerance_m": null,
+          "scene_admission_role": null,
+          "scene_admission_target_angular_tolerance_rad": null,
+          "scene_admission_target_drift_tolerance_m": null,
+          "source_freshness_budget_ns": null,
+          "source_id": null,
+          "source_timestamp_ns": null
+        },
+        "pose_in_world": {
+          "orientation_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "position_m": [
+            0.0,
+            0.0,
+            -0.7695999827980996
+          ]
+        },
+        "shape": {
+          "mesh_scale": [
+            1.0,
+            1.5,
+            1.149999976
+          ],
+          "resource_uri": "examples/isaac_manipulator_scene_light/meshes/background__table_low_327_collider_cooked.obj",
+          "type": "mesh"
+        },
+        "support_contacts": [],
+        "touch_links": []
+      }
+    ],
+    "robot": {
+      "base_frame": "base_link",
+      "pose_in_world": {
+        "orientation_xyzw": [
+          0.0,
+          0.0,
+          -0.7071067690846545,
+          0.7071067932884404
+        ],
+        "position_m": [
+          -0.21814000606536865,
+          -0.571590006351471,
+          0.12999999523162842
+        ]
+      },
+      "robot_id": "ur10e"
+    },
+    "world_frame": "universe"
+  },
+  "schema_version": "manyforge.roboplan_transition_capture.v1",
+  "semantic_sha256": "553e54e3d489f5c8ea9028bf3760c0c6438ed4e797f89094267577ecb805f9f0",
+  "source": {
+    "captured_at_wall_ns": 1783926896163459866,
+    "deployment": "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
+    "deployment_sha256": "443702218f517b698e0dcce3ef5bbe60e89c98d7c79833e8277874bc8c112d6f",
+    "move_id": "drop_approach",
+    "planning_execution_id": 11,
+    "predecessor_node": "pick_retreat",
+    "program": "examples/isaac_manipulator_scene_light.program.yaml",
+    "program_run_id": "run-20260713T071414Z-6c3b896c",
+    "program_sha256": "72033e9bb895805b7d70f54afe24c837bf3aa6014c01e3682b0da833e159f85e",
+    "visual_state_diagnostics": {
+      "fallback_reason": null,
+      "mode": "visual_snapshot",
+      "objects_age_ms": 91.9,
+      "objects_refresh_error": null,
+      "objects_refresh_running": false,
+      "objects_source": "visual_snapshot",
+      "served_from_visual_snapshot": true,
+      "slow_steps": {},
+      "snapshot_age_ms": 91.9,
+      "snapshot_build_ms": 31.6,
+      "snapshot_publisher_error": null,
+      "snapshot_publisher_error_detail": null,
+      "snapshot_publisher_running": true,
+      "snapshot_sequence_number": 339,
+      "snapshot_stale": false,
+      "timings_ms": {
+        "snapshot_read": 0.1
+      },
+      "total_ms": 0.1
+    }
+  },
+  "start_state": {
+    "joint_names": [
+      "shoulder_pan_joint",
+      "shoulder_lift_joint",
+      "elbow_joint",
+      "wrist_1_joint",
+      "wrist_2_joint",
+      "wrist_3_joint"
+    ],
+    "positions_rad": [
+      3.2339965205124526,
+      -1.509942146258945,
+      1.9460107856810451,
+      -2.0070904759999633,
+      -1.5707453638141515,
+      -3.040623293319109
+    ],
+    "provenance": {
+      "capture_method": "planner_qualification_observer",
+      "execution_state_source_mode": "commanded_sim",
+      "predecessor_move_id": "pick_retreat"
+    },
+    "state_source": "exact_plan_request",
+    "velocities_rad_s": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  }
+}

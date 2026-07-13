@@ -4473,3 +4473,22 @@ class TestKernelEventPipelineStatus:
         manager.drain_kernel_events_now()
         status = manager.kernel_event_pipeline_status()
         assert status["manager_dropped_total"] > 0
+
+    def test_sequence_high_water_does_not_regress_on_reordered_delivery(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        with kernel._kernel_events_lock:
+            kernel._kernel_events.extend(
+                [
+                    {"type": "state_transition", "sequence": 1260},
+                    {
+                        "type": "motion_execution_outcome_recorded",
+                        "sequence": 1261,
+                    },
+                    {"type": "recovery_assessment_changed", "sequence": 1259},
+                ]
+            )
+        manager.drain_kernel_events_now()
+
+        assert manager.kernel_event_pipeline_status()["last_sequence_seen"] == 1261

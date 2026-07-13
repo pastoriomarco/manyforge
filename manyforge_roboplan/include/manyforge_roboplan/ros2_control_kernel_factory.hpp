@@ -25,6 +25,7 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
     const std::vector<std::string>& package_paths,
     const ::manyforge::ros2_control_execution::
         Ros2ControlExecutionBackendConfig& ros_config,
-    const core::ExecutionKernelConfig& kernel_config = {});
+    const core::ExecutionKernelConfig& kernel_config = {},
+    const std::string& logical_robot_id = {});
 
 }  // namespace manyforge::roboplan_backend

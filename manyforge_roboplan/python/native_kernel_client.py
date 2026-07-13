@@ -5,7 +5,10 @@ Only 1 Python↔C++ boundary crossing per call (no trampolines).
 
 from __future__ import annotations
 
+from collections import deque
 import math
+import threading
+import time
 from typing import Any, Dict, Optional
 
 from manyforge_behavior.kernel_client import (
@@ -329,6 +332,16 @@ class NativeKernelClient(KernelClient):
             robot_model_authority_metadata or {}
         )
         self._robot_model_authority_temp_dir = robot_model_authority_temp_dir
+        self._planning_qualification_lock = threading.Lock()
+        self._planning_qualification_generation = 0
+        self._planning_qualification_capacity = 0
+        self._planning_qualification_behavior_pending: dict[
+            str, dict[str, Any]
+        ] = {}
+        self._planning_qualification_behavior_completed: deque[
+            dict[str, Any]
+        ] = deque()
+        self._planning_qualification_behavior_dropped_total = 0
         attach_metadata = getattr(
             self._bundle,
             "set_robot_model_authority_metadata",
@@ -845,6 +858,165 @@ class NativeKernelClient(KernelClient):
     def get_scene_authority_status(self) -> dict[str, Any]:
         return dict(self._bundle.get_scene_authority_status())
 
+    def get_scene_authority_snapshot(self) -> dict[str, Any]:
+        return dict(self._bundle.get_scene_authority_snapshot())
+
+    def start_planning_qualification_capture(self, capacity: int = 128) -> int:
+        generation = int(
+            self._bundle.start_planning_qualification_capture(capacity)
+        )
+        with self._planning_qualification_lock:
+            self._planning_qualification_generation = generation
+            self._planning_qualification_capacity = int(capacity)
+            self._planning_qualification_behavior_pending.clear()
+            self._planning_qualification_behavior_completed.clear()
+            self._planning_qualification_behavior_dropped_total = 0
+        return generation
+
+    @staticmethod
+    def _planning_qualification_span_key(action_span: ActionSpan) -> str:
+        return str(action_span.node_attempt_id or action_span.action_span_id or "")
+
+    def record_planning_qualification_behavior_boundary(
+        self,
+        *,
+        action_span: ActionSpan,
+        move_id: str,
+        phase: str,
+    ) -> None:
+        if phase not in {"started", "succeeded", "failed", "abandoned"}:
+            raise ValueError(f"unknown behavior qualification phase: {phase!r}")
+        key = self._planning_qualification_span_key(action_span)
+        if not key:
+            return
+        wall_ns = time.monotonic_ns()
+        thread_cpu_ns = time.thread_time_ns()
+        with self._planning_qualification_lock:
+            if self._planning_qualification_generation == 0:
+                return
+            if phase == "started":
+                if key in self._planning_qualification_behavior_pending:
+                    return
+                if (
+                    len(self._planning_qualification_behavior_pending)
+                    + len(self._planning_qualification_behavior_completed)
+                    >= self._planning_qualification_capacity
+                ):
+                    self._planning_qualification_behavior_dropped_total += 1
+                    return
+                self._planning_qualification_behavior_pending[key] = {
+                    "action_span_id": action_span.action_span_id,
+                    "node_attempt_id": action_span.node_attempt_id,
+                    "program_run_id": action_span.program_run_id,
+                    "move_id": str(move_id),
+                    "started_monotonic_ns": wall_ns,
+                    "started_thread_cpu_ns": thread_cpu_ns,
+                }
+                return
+
+            started = self._planning_qualification_behavior_pending.pop(key, None)
+            if started is None:
+                self._planning_qualification_behavior_dropped_total += 1
+                return
+            started["terminal_phase"] = phase
+            started["completed_monotonic_ns"] = wall_ns
+            started["completed_thread_cpu_ns"] = thread_cpu_ns
+            started["wall_duration_ns"] = max(
+                0, wall_ns - int(started["started_monotonic_ns"])
+            )
+            started["thread_cpu_duration_ns"] = max(
+                0, thread_cpu_ns - int(started["started_thread_cpu_ns"])
+            )
+            self._planning_qualification_behavior_completed.append(started)
+
+    def _merge_planning_qualification_behavior(
+        self, batch: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self._planning_qualification_lock:
+            completed = {
+                str(value.get("node_attempt_id") or value.get("action_span_id") or ""):
+                dict(value)
+                for value in self._planning_qualification_behavior_completed
+            }
+            behavior_dropped = self._planning_qualification_behavior_dropped_total
+            behavior_in_flight = len(self._planning_qualification_behavior_pending)
+        records: list[dict[str, Any]] = []
+        for raw_record in batch.get("records", []):
+            record = dict(raw_record)
+            request = dict(record.get("request") or {})
+            action_span = dict(request.get("action_span") or {})
+            key = str(
+                action_span.get("node_attempt_id")
+                or action_span.get("action_span_id")
+                or ""
+            )
+            behavior = completed.get(key)
+            if behavior is not None and behavior.get("move_id") == request.get(
+                "move_id"
+            ):
+                record["behavior_node"] = behavior
+            records.append(record)
+        batch["records"] = records
+        status = dict(batch.get("status") or {})
+        status["behavior_dropped_total"] = behavior_dropped
+        status["behavior_in_flight"] = behavior_in_flight
+        batch["status"] = status
+        return batch
+
+    def drain_planning_qualification_capture(
+        self, generation: int
+    ) -> dict[str, Any]:
+        batch = dict(
+            self._bundle.drain_planning_qualification_capture(generation)
+        )
+        return self._merge_planning_qualification_behavior(batch)
+
+    def stop_planning_qualification_capture(
+        self, generation: int, idle_timeout_ms: int = 10_000
+    ) -> dict[str, Any]:
+        batch = dict(
+            self._bundle.stop_planning_qualification_capture(
+                generation, idle_timeout_ms
+            )
+        )
+        with self._planning_qualification_lock:
+            if self._planning_qualification_generation == generation:
+                completed_wall_ns = time.monotonic_ns()
+                # The native recorder has quiesced, but full-stop can park a BT
+                # motion node in RUNNING by design. Close those observer-only
+                # spans as abandoned before disabling the generation so a late
+                # terminal callback cannot resurrect or double-count them.
+                for started in self._planning_qualification_behavior_pending.values():
+                    started["terminal_phase"] = "abandoned"
+                    started["terminal_reason"] = "capture_stopped"
+                    started["completed_monotonic_ns"] = completed_wall_ns
+                    started["completed_thread_cpu_ns"] = started[
+                        "started_thread_cpu_ns"
+                    ]
+                    started["wall_duration_ns"] = max(
+                        0,
+                        completed_wall_ns
+                        - int(started["started_monotonic_ns"]),
+                    )
+                    # Stop runs on a route worker, not necessarily the BT tick
+                    # thread. Do not attribute another thread's CPU time.
+                    started["thread_cpu_duration_ns"] = 0
+                    self._planning_qualification_behavior_completed.append(started)
+                self._planning_qualification_behavior_pending.clear()
+                self._planning_qualification_generation = 0
+        return self._merge_planning_qualification_behavior(batch)
+
+    def planning_qualification_capture_status(self) -> dict[str, int]:
+        status = dict(self._bundle.planning_qualification_capture_status())
+        with self._planning_qualification_lock:
+            status["behavior_dropped_total"] = (
+                self._planning_qualification_behavior_dropped_total
+            )
+            status["behavior_in_flight"] = len(
+                self._planning_qualification_behavior_pending
+            )
+        return status
+
     def get_joint_names(self) -> list[str]:
         return list(self._bundle.get_joint_names())
 
@@ -1146,6 +1318,8 @@ class NativeKernelClient(KernelClient):
             )
         if request.scene_admission_allow_runtime_dynamic_obstacle:
             req_dict["scene_admission_allow_runtime_dynamic_obstacle"] = True
+        if request.expected_attached is not None:
+            req_dict["expected_attached"] = bool(request.expected_attached)
 
         try:
             result = self._bundle.scene_edit(req_dict)
@@ -1154,6 +1328,8 @@ class NativeKernelClient(KernelClient):
         return SceneEditResult(
             success=result.get("success", False),
             error=result.get("error"),
+            error_code=result.get("error_code"),
+            error_details=dict(result.get("error_details") or {}),
             update_status=result.get("update_status"),
             collision_world_revision_changed=bool(
                 result.get("collision_world_revision_changed", False)

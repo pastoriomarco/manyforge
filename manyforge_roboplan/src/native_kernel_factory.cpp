@@ -1,6 +1,7 @@
 #include <manyforge_roboplan/native_kernel_factory.hpp>
 #include <manyforge_roboplan/roboplan_execution_state_sink.hpp>
 #include <manyforge_roboplan/roboplan_gripper_command_backend.hpp>
+#include <manyforge_roboplan/roboplan_planner_options.hpp>
 
 #include <manyforge_roboplan/roboplan_focused_adapters.hpp>
 
@@ -81,6 +82,93 @@ bool KernelEventCollector::wait_for_events(std::chrono::milliseconds timeout) {
 
 // --- NativeKernelBundle ---
 
+std::uint64_t NativeKernelBundle::start_planning_qualification_capture(
+    std::size_t capacity) {
+  std::lock_guard<std::mutex> close_lock(close_mutex_);
+  if (closed_ || !planner) {
+    throw std::runtime_error("NativeKernelBundle is closed");
+  }
+  std::lock_guard<std::mutex> capture_lock(planning_qualification_mutex_);
+  if (planning_qualification_recorder_) {
+    throw std::runtime_error(
+        "planning qualification capture is already active");
+  }
+  auto recorder =
+      std::make_shared<RoboPlanPlanningQualificationRecorder>(capacity);
+  ++planning_qualification_generation_;
+  if (planning_qualification_generation_ == 0) {
+    ++planning_qualification_generation_;
+  }
+  planning_qualification_recorder_ = recorder;
+  planner->set_performance_observer(std::move(recorder));
+  return planning_qualification_generation_;
+}
+
+RoboPlanPlanningQualificationBatch
+NativeKernelBundle::drain_planning_qualification_capture(
+    std::uint64_t generation) {
+  std::lock_guard<std::mutex> lock(planning_qualification_mutex_);
+  if (!planning_qualification_recorder_ ||
+      generation != planning_qualification_generation_) {
+    throw std::runtime_error(
+        "planning qualification capture generation is not active");
+  }
+  return planning_qualification_recorder_->drain_with_status();
+}
+
+RoboPlanPlanningQualificationBatch
+NativeKernelBundle::stop_planning_qualification_capture(
+    std::uint64_t generation, std::chrono::milliseconds idle_timeout) {
+  std::shared_ptr<RoboPlanPlanningQualificationRecorder> recorder;
+  {
+    std::lock_guard<std::mutex> lock(planning_qualification_mutex_);
+    if (!planning_qualification_recorder_ ||
+        generation != planning_qualification_generation_) {
+      throw std::runtime_error(
+          "planning qualification capture generation is not active");
+    }
+    planner->set_performance_observer(nullptr);
+    recorder = planning_qualification_recorder_;
+    recorder->close_admission();
+  }
+  if (!recorder->wait_until_idle(idle_timeout)) {
+    throw std::runtime_error(
+        "planning qualification capture still has an in-flight planner call");
+  }
+  {
+    std::lock_guard<std::mutex> lock(planning_qualification_mutex_);
+    if (planning_qualification_recorder_ != recorder ||
+        generation != planning_qualification_generation_) {
+      throw std::runtime_error(
+          "planning qualification capture changed while stopping");
+    }
+    planning_qualification_recorder_.reset();
+  }
+  return recorder->drain_with_status();
+}
+
+std::uint64_t NativeKernelBundle::planning_qualification_generation() const {
+  std::lock_guard<std::mutex> lock(planning_qualification_mutex_);
+  return planning_qualification_recorder_
+             ? planning_qualification_generation_
+             : 0;
+}
+
+std::uint64_t NativeKernelBundle::planning_qualification_dropped_total()
+    const {
+  std::lock_guard<std::mutex> lock(planning_qualification_mutex_);
+  return planning_qualification_recorder_
+             ? planning_qualification_recorder_->dropped_total()
+             : 0;
+}
+
+std::size_t NativeKernelBundle::planning_qualification_in_flight() const {
+  std::lock_guard<std::mutex> lock(planning_qualification_mutex_);
+  return planning_qualification_recorder_
+             ? planning_qualification_recorder_->in_flight()
+             : 0;
+}
+
 void NativeKernelBundle::close() {
   std::shared_ptr<core::ExecutionKernel> kernel_to_close;
   {
@@ -93,6 +181,16 @@ void NativeKernelBundle::close() {
       event_collector.unsubscribe(*kernel);
     }
     kernel_to_close = std::move(kernel);
+  }
+  {
+    std::lock_guard<std::mutex> lock(planning_qualification_mutex_);
+    if (planner) {
+      planner->set_performance_observer(nullptr);
+    }
+    if (planning_qualification_recorder_) {
+      planning_qualification_recorder_->close_admission();
+    }
+    planning_qualification_recorder_.reset();
   }
   kernel_to_close.reset();
 }
@@ -417,10 +515,13 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
     const std::string& urdf_path,
     const std::string& srdf_path,
     const std::vector<std::string>& package_paths,
-    const core::ExecutionKernelConfig& kernel_config) {
+    const core::ExecutionKernelConfig& kernel_config,
+    const std::string& logical_robot_id) {
 
   auto bundle = std::make_shared<NativeKernelBundle>();
-  bundle->robot_id = model_name;
+  const std::string robot_id =
+      logical_robot_id.empty() ? model_name : logical_robot_id;
+  bundle->robot_id = robot_id;
   bundle->group_name = group_name;
 
   // Convert string paths to filesystem paths
@@ -435,10 +536,8 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
       std::filesystem::path(srdf_path), pkg_paths);
 
   // Create RRT
-  roboplan::RRTOptions rrt_opts;
-  rrt_opts.group_name = group_name;
-  rrt_opts.max_planning_time = kernel_config.planner_max_planning_time_s;
-  rrt_opts.max_nodes = 5000;
+  const auto rrt_opts = production_rrt_options(
+      group_name, kernel_config.planner_max_planning_time_s);
   bundle->rrt = std::make_shared<roboplan::RRT>(bundle->scene, rrt_opts);
 
   // Create PathShortcutter
@@ -450,14 +549,10 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
       bundle->scene, group_name);
 
   // Create IK (match roboplan example_ik.cpp settings)
-  roboplan::SimpleIkOptions ik_opts;
-  ik_opts.group_name = group_name;
-  ik_opts.step_size = 0.25;
-  ik_opts.max_restarts = 50;
-  ik_opts.max_time = 1.0;
+  const auto ik_opts = production_planning_ik_options(group_name);
   bundle->ik = std::make_shared<roboplan::SimpleIk>(bundle->scene, ik_opts);
-  auto single_shot_ik_opts = ik_opts;
-  single_shot_ik_opts.max_time = kernel_config.single_shot_ik_timeout_s;
+  const auto single_shot_ik_opts = production_single_shot_ik_options(
+      group_name, kernel_config.single_shot_ik_timeout_s);
   bundle->single_shot_ik =
       std::make_shared<roboplan::SimpleIk>(bundle->scene, single_shot_ik_opts);
 
@@ -466,7 +561,7 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   const auto policy = kernel_config.baseline_collision_policy_snapshot.value_or(
       default_collision_policy_snapshot());
   bundle->projection_backend = std::make_shared<RoboPlanProjectionBackend>(
-      bundle->scene, group_name, bundle->scene_mutex, policy, model_name);
+      bundle->scene, group_name, bundle->scene_mutex, policy, robot_id);
   bundle->scene_projection =
       std::make_shared<RoboPlanSceneProjection>(bundle->projection_backend);
   bundle->scene_authority = std::make_unique<core::SceneAuthority>(
@@ -474,7 +569,7 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   bundle->kinematics =
       std::make_unique<RoboPlanKinematicsAdapter>(
           bundle->scene, group_name, bundle->scene_mutex,
-          *bundle->scene_authority, model_name);
+          *bundle->scene_authority, robot_id);
   bundle->reference_resolver =
       std::make_unique<RoboPlanReferencePoseResolver>(
           bundle->scene_projection);
@@ -489,7 +584,7 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
       bundle->scene_projection, bundle->scene, rrt_opts,
       bundle->scene_mutex, bundle->single_shot_ik, ik_opts,
-      single_shot_ik_opts);
+      single_shot_ik_opts, kernel_config.planner_rng_seed);
   bundle->clock = std::make_unique<WallClock>();
   RoboPlanExecutionBackendConfig execution_config;
   execution_config.reset_completion_timeout_s =
@@ -502,9 +597,11 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   }
   execution_config.observed_joint_names =
       std::move(observed_joint_names.value());
-  bundle->execution = std::make_unique<RoboPlanExecutionBackend>(
+  auto native_execution = std::make_unique<RoboPlanExecutionBackend>(
       bundle->scene, group_name, *bundle->clock, bundle->scene_mutex,
       execution_config);
+  auto* native_execution_ptr = native_execution.get();
+  bundle->execution = std::move(native_execution);
   auto initial_observed_state =
       bundle->execution->sync_observed_state_before_planning();
   if (!initial_observed_state.ok()) {
@@ -521,7 +618,9 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   }
   bundle->observed_state_provider =
       std::make_unique<core::PublishedObservedRobotStateProvider>(
-          *observed_publication);
+          *observed_publication,
+          core::ObservedRobotStateAuthorityProfile::kPredictedNative,
+          native_execution_ptr->observed_state_authority_epoch());
   bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->cache = std::make_unique<core::TrajectoryCache>();
   bundle->execution_state_sink =
@@ -616,7 +715,8 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
 std::shared_ptr<NativeKernelBundle> create_native_kernel(
     const std::string& model_name,
     const std::string& group_name,
-    const core::ExecutionKernelConfig& kernel_config) {
+    const core::ExecutionKernelConfig& kernel_config,
+    const std::string& logical_robot_id) {
 
   auto it = model_configs().find(model_name);
   if (it == model_configs().end()) {
@@ -633,7 +733,8 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   std::string srdf = (models_dir / config.srdf_rel).string();
 
   return create_native_kernel(model_name, actual_group, urdf, srdf,
-                              {pkg_share.string()}, kernel_config);
+                              {pkg_share.string()}, kernel_config,
+                              logical_robot_id);
 }
 
 }  // namespace manyforge::roboplan_backend

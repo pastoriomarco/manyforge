@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <stdexcept>
 #include <string>
@@ -136,6 +137,11 @@ class Ros2ControlExecutionBackend final
   observed_robot_state_publication() const noexcept override {
     return observed_state_publication_.get();
   }
+  const std::atomic<std::uint64_t>* authored_state_authority_epoch()
+      const noexcept {
+    return uses_authored_backend_state() ? &authored_state_authority_epoch_
+                                         : nullptr;
+  }
 
   // Controlled-stop capability + result surface for motion-scoped
   // interrupt outcomes (spec/260 §5.6). The ros2_control adapter
@@ -236,6 +242,7 @@ class Ros2ControlExecutionBackend final
     validate_config();
     initialize_observed_state_publication();
     snapshot_.timestamp_ns = clock_.now();
+    initialize_authored_state();
   }
 
   void testing_begin_managed_fjt_terminal_session(
@@ -329,6 +336,23 @@ class Ros2ControlExecutionBackend final
     complete_execution();
   }
 
+  bool testing_publish_snapshot(core::ExecutionState state,
+                                const std::vector<double>& positions) {
+    return publish_snapshot(state, 0.0, positions);
+  }
+
+  std::uint64_t testing_running_generation() const {
+    return running_generation_.load(std::memory_order_acquire);
+  }
+
+  bool testing_publish_snapshot_for_generation(
+      core::ExecutionState state,
+      const std::vector<double>& positions,
+      std::uint64_t expected_running_generation) {
+    return publish_snapshot(state, 0.0, positions, std::nullopt, "",
+                            expected_running_generation);
+  }
+
   bool testing_action_progress_has_dedicated_callback_group() const {
     return action_callback_group_ && state_callback_group_ &&
            action_callback_group_.get() != state_callback_group_.get();
@@ -346,6 +370,11 @@ class Ros2ControlExecutionBackend final
 #endif
 
  private:
+  enum class SnapshotPublicationAuthority {
+    kBackendAuthored,
+    kMeasuredDiagnostic,
+  };
+
   using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
   using GoalHandleFJT = rclcpp_action::ClientGoalHandle<FollowJointTrajectory>;
   using GripperCommand = control_msgs::action::GripperCommand;
@@ -444,6 +473,7 @@ class Ros2ControlExecutionBackend final
 
   void validate_config() const;
   void initialize_observed_state_publication();
+  void initialize_authored_state();
   void publish_observed_robot_state(
       core::ObservedRobotStateSourceKind source,
       const std::vector<std::string>& joint_names,
@@ -451,6 +481,12 @@ class Ros2ControlExecutionBackend final
       const std::vector<double>& velocities,
       std::int64_t source_timestamp_ns,
       std::int64_t received_timestamp_ns) noexcept;
+  bool publish_authored_robot_state(
+      std::span<const double> positions,
+      std::span<const double> velocities,
+      std::int64_t timestamp_ns,
+      std::optional<std::uint64_t> expected_running_generation,
+      bool invalidate_before_publish) noexcept;
   void start_ros();
   void stop_ros();
 
@@ -503,11 +539,13 @@ class Ros2ControlExecutionBackend final
       std::chrono::steady_clock::time_point started_at);
   void clear_managed_controlled_stop_state();
   bool publish_controlled_stop_command_reference_snapshot(
-      std::chrono::steady_clock::time_point now);
+      std::chrono::steady_clock::time_point now,
+      std::optional<std::uint64_t> expected_running_generation = std::nullopt);
   bool publish_observed_cancel_stop_snapshot(
       const std::vector<std::string>& joint_names,
       double progress,
-      std::chrono::steady_clock::time_point now);
+      std::chrono::steady_clock::time_point now,
+      std::optional<std::uint64_t> expected_running_generation = std::nullopt);
   std::optional<PostStopObservation> wait_for_post_stop_observation(
       const std::vector<std::string>& joint_names,
       double settle_velocity_threshold_rad_s,
@@ -545,11 +583,16 @@ class Ros2ControlExecutionBackend final
       const Ros2GripperActionConfig& config,
       double position,
       SceneUpdateMode mode = SceneUpdateMode::kBlocking);
-  void publish_snapshot(core::ExecutionState state,
-                        double progress,
-                        const std::vector<double>& joint_positions,
-                        std::optional<core::ErrorDTO> error = std::nullopt,
-                        std::string state_source = "");
+  bool publish_snapshot(
+      core::ExecutionState state,
+      double progress,
+      const std::vector<double>& joint_positions,
+      std::optional<core::ErrorDTO> error = std::nullopt,
+      std::string state_source = "",
+      std::optional<std::uint64_t> expected_running_generation = std::nullopt,
+      SnapshotPublicationAuthority authority =
+          SnapshotPublicationAuthority::kBackendAuthored,
+      const std::vector<double>* authored_velocities = nullptr);
   bool publish_passive_idle_snapshot(const std::vector<double>& joint_positions);
   core::ErrorDTO operator_intervention_error(
       core::ErrorCode code,
@@ -622,6 +665,15 @@ class Ros2ControlExecutionBackend final
   Ros2ControlExecutionBackendConfig config_;
   std::unique_ptr<core::ObservedRobotStatePublication>
       observed_state_publication_;
+  // Command/predicted authority has one backend-owned writer domain. This leaf
+  // lock is never used by ROS measured-state ingress or by publication readers;
+  // it only orders the monitor and lifecycle terminal writers so an old monitor
+  // tick cannot overwrite a newer terminal command reference.
+  mutable std::mutex authored_state_publication_mutex_;
+  std::vector<double> authored_at_rest_velocities_;
+  // Odd epochs are invalid. Lifecycle/terminal replacement moves through an
+  // odd epoch and only successful publication commits the next even epoch.
+  std::atomic<std::uint64_t> authored_state_authority_epoch_{1};
 
   std::shared_ptr<rclcpp::Context> context_;
   rclcpp::Node::SharedPtr node_;

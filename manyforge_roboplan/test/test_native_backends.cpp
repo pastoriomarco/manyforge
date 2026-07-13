@@ -25,6 +25,92 @@
 using namespace manyforge::roboplan_backend;
 using namespace manyforge::core;
 
+class RecordingPlanningObserver final
+    : public IRoboPlanPlanningPerformanceObserver {
+ public:
+  RoboPlanCollisionProbeSnapshot collision_probe_snapshot()
+      const noexcept override {
+    return {};
+  }
+
+  void record(const PlanRequestDTO& request, const PlanResultDTO&,
+              const RoboPlanPlanningPipelineMetrics& metrics) noexcept override {
+    move_ids.push_back(request.move_id);
+    samples.push_back(metrics);
+  }
+
+  std::vector<std::string> move_ids;
+  std::vector<RoboPlanPlanningPipelineMetrics> samples;
+};
+
+TEST(RoboPlanPlanningQualificationRecorderTest,
+     PreservesExactRequestAndTracksInvocationLifetime) {
+  RoboPlanPlanningQualificationRecorder recorder(2);
+  PlanRequestDTO request;
+  request.move_id = "drop_approach";
+  request.start_state.joint_names = {"joint_1"};
+  request.start_state.positions_rad = {0.25};
+  request.scene_binding.revision = {7, "scene-seven"};
+  request.scene_binding.projection_lease_id = "lease-seven";
+  PoseGoalDTO goal;
+  goal.goal.position_m = {0.1, 0.2, 0.3};
+  request.motion = goal;
+  PlanResultDTO result;
+  result.scene_revision = request.scene_binding.revision;
+  RoboPlanPlanningPipelineMetrics metrics;
+  metrics.total_duration_ns = 42;
+
+  EXPECT_TRUE(recorder.try_begin_invocation(request));
+  EXPECT_EQ(recorder.in_flight(), 1U);
+  EXPECT_FALSE(recorder.wait_until_idle(std::chrono::milliseconds(1)));
+  recorder.record(request, result, metrics);
+  EXPECT_TRUE(recorder.wait_until_idle(std::chrono::milliseconds(1)));
+
+  auto records = recorder.drain();
+  ASSERT_EQ(records.size(), 1U);
+  EXPECT_EQ(records[0].sequence, 1U);
+  EXPECT_EQ(records[0].request.move_id, "drop_approach");
+  EXPECT_EQ(records[0].request.scene_binding.projection_lease_id,
+            "lease-seven");
+  EXPECT_EQ(records[0].metrics.total_duration_ns, 42U);
+  EXPECT_EQ(recorder.dropped_total(), 0U);
+}
+
+TEST(RoboPlanPlanningQualificationRecorderTest,
+     BoundedQueueReportsEveryEviction) {
+  RoboPlanPlanningQualificationRecorder recorder(1);
+  PlanRequestDTO request;
+  PlanResultDTO result;
+  RoboPlanPlanningPipelineMetrics metrics;
+  for (int index = 0; index < 2; ++index) {
+    request.move_id = "move_" + std::to_string(index);
+    EXPECT_TRUE(recorder.try_begin_invocation(request));
+    recorder.record(request, result, metrics);
+  }
+
+  auto batch = recorder.drain_with_status();
+  ASSERT_EQ(batch.records.size(), 1U);
+  EXPECT_EQ(batch.records[0].sequence, 2U);
+  EXPECT_EQ(batch.records[0].request.move_id, "move_1");
+  EXPECT_EQ(batch.dropped_total, 1U);
+  EXPECT_EQ(batch.in_flight, 0U);
+}
+
+TEST(RoboPlanPlanningQualificationRecorderTest,
+     ClosedAdmissionRejectsRetainedObserverSnapshots) {
+  RoboPlanPlanningQualificationRecorder recorder(2);
+  PlanRequestDTO request;
+  request.move_id = "late_move";
+
+  recorder.close_admission();
+
+  EXPECT_FALSE(recorder.try_begin_invocation(request));
+  const auto batch = recorder.drain_with_status();
+  EXPECT_TRUE(batch.records.empty());
+  EXPECT_EQ(batch.dropped_total, 0U);
+  EXPECT_EQ(batch.in_flight, 0U);
+}
+
 class NativeKernelTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -154,6 +240,104 @@ TEST_F(NativeKernelTest, FactoryCreatesAllComponents) {
 TEST_F(NativeKernelTest, InitialStateIsIdle) {
   auto status = bundle_->kernel->get_status();
   EXPECT_EQ(status.state, ExecutionState::kIdle);
+}
+
+TEST_F(NativeKernelTest,
+       PredictedAuthoritySlotExhaustionInvalidatesUntilSuccessfulResync) {
+  const auto* publication = bundle_->execution->observed_robot_state_publication();
+  ASSERT_NE(publication, nullptr);
+  auto first = publication->acquire(bundle_->clock->now());
+  ASSERT_TRUE(first);
+
+  ASSERT_TRUE(bundle_->execution->sync_observed_state_before_planning().ok());
+  auto second = publication->acquire(bundle_->clock->now());
+  ASSERT_TRUE(second);
+  ASSERT_TRUE(bundle_->execution->sync_observed_state_before_planning().ok());
+
+  // The current slot is immutable and both reusable slots are pinned. A new
+  // authority boundary must fail closed instead of leaving the old predicted
+  // command indefinitely admissible.
+  EXPECT_FALSE(bundle_->execution->sync_observed_state_before_planning().ok());
+  const auto invalid = bundle_->observed_state_provider->current_state(
+      bundle_->clock->now());
+  ASSERT_FALSE(invalid.ok());
+  EXPECT_EQ(invalid.error().details.at("reason"),
+            "observed_state_authority_invalidated");
+
+  first = {};
+  second = {};
+  ASSERT_TRUE(bundle_->execution->sync_observed_state_before_planning().ok());
+  EXPECT_TRUE(bundle_->observed_state_provider
+                  ->current_state(bundle_->clock->now())
+                  .ok());
+}
+
+TEST_F(NativeKernelTest,
+       PlannerQualificationObserverCapturesDeterministicStageEvidence) {
+  auto observer = std::make_shared<RecordingPlanningObserver>();
+  roboplan::RRTOptions rrt_options;
+  rrt_options.group_name = "arm";
+  rrt_options.max_planning_time = 5.0;
+  rrt_options.max_nodes = 5000;
+  RoboPlanPlannerBackend planner(
+      bundle_->scene_projection, bundle_->scene, rrt_options,
+      bundle_->scene_mutex, bundle_->single_shot_ik, std::nullopt,
+      std::nullopt, 12345U, observer);
+
+  PlanRequestDTO request;
+  request.robot_id = "robot1";
+  request.group_id = "arm";
+  request.move_id = "qualification_seeded_joint_goal";
+  request.base_frame = "base_link";
+  request.tcp_frame = "tool0";
+  request.start_state = current_state();
+  request.tolerances = {0.05, 0.005, 0.05};
+  request.speed_profile = {1.0, 1.0, std::nullopt};
+  request.planning_timeout_s = 5.0;
+  JointGoalDTO goal;
+  goal.joint_names = request.start_state.joint_names;
+  goal.positions_rad = {0.1, -0.5, 0.5, -0.5, -0.5, 0.0};
+  request.motion = goal;
+  bind_plan_request(request);
+
+  const auto result = planner.plan(request);
+  ASSERT_TRUE(result.trajectory.has_value())
+      << (result.error ? result.error->message : "missing trajectory");
+  request.planning_attempt_index = 1;
+  const auto retry_result = planner.plan(request);
+  ASSERT_TRUE(retry_result.trajectory.has_value())
+      << (retry_result.error ? retry_result.error->message
+                             : "missing retry trajectory");
+  ASSERT_EQ(observer->samples.size(), 2U);
+  ASSERT_EQ(observer->move_ids,
+            (std::vector<std::string>{request.move_id, request.move_id}));
+  const auto& metrics = observer->samples.front();
+  EXPECT_TRUE(metrics.measurement_complete);
+  EXPECT_TRUE(metrics.succeeded);
+  EXPECT_EQ(metrics.rng_base_seed, 12345U);
+  EXPECT_EQ(metrics.rng_seed, 12345U);
+  ASSERT_TRUE(metrics.shortcut_rng_seed_argument.has_value());
+  EXPECT_LT(*metrics.shortcut_rng_seed_argument, 0);
+  EXPECT_EQ(metrics.planning_attempt_index, 0U);
+  const auto& retry_metrics = observer->samples.back();
+  EXPECT_EQ(retry_metrics.rng_base_seed, 12345U);
+  ASSERT_TRUE(retry_metrics.rng_seed.has_value());
+  EXPECT_NE(*retry_metrics.rng_seed, 12345U);
+  ASSERT_TRUE(retry_metrics.shortcut_rng_seed_argument.has_value());
+  EXPECT_NE(*retry_metrics.shortcut_rng_seed_argument,
+            *metrics.shortcut_rng_seed_argument);
+  EXPECT_EQ(retry_metrics.planning_attempt_index, 1U);
+  EXPECT_FALSE(metrics.collision_probe_available);
+  EXPECT_GT(metrics.total_duration_ns, 0U);
+  EXPECT_EQ(metrics.waypoint_count, result.trajectory->waypoints.size());
+  EXPECT_GT(metrics.trajectory_duration_s, 0.0);
+  for (const auto* stage_name : {"projection_acquire", "context_construction",
+                                 "start_collision_query", "rrt", "shortcut",
+                                 "retime", "trajectory_conversion"}) {
+    const auto stage = metrics.stages.find(stage_name);
+    ASSERT_NE(stage, metrics.stages.end()) << stage_name;
+    EXPECT_GT(stage->second.duration_ns, 0U) << stage_name;
+  }
 }
 
 TEST_F(NativeKernelTest, CloseRejectsNewKernelSnapshotsButPreservesInFlightSnapshot) {

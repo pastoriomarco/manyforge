@@ -106,7 +106,7 @@ class RoboPlanProjectionBackend final
   core::Result<core::CollisionWorldLeaseInventory> retain_planner_projection(
       const core::CollisionWorldRevision& revision,
       const std::string& retention_id);
-  std::shared_ptr<roboplan::Scene> acquire_planner_projection(
+  std::shared_ptr<const roboplan::Scene> acquire_planner_projection(
       const core::CollisionWorldRevision& revision,
       const std::string& retention_id) const;
   core::Result<core::Pose3DTO> resolve_reference_pose_on_retained_projection(
@@ -392,7 +392,7 @@ class RoboPlanProjectionBackend final
 
   struct RetainedPlannerProjection {
     core::CollisionWorldRevision revision;
-    std::shared_ptr<roboplan::Scene> scene;
+    std::shared_ptr<const roboplan::Scene> scene;
     core::Pose3DTO robot_base_pose_in_world;
     std::map<std::string, core::Pose3DTO> object_world_poses;
   };

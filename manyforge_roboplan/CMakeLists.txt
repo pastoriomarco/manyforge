@@ -39,6 +39,10 @@ find_package(roboplan_simple_ik REQUIRED)
 find_package(roboplan_example_models REQUIRED)
 find_package(fmt CONFIG QUIET)
 
+option(MANYFORGE_ENABLE_QUALIFICATION_PROBES
+  "Build opt-in process-local qualification instrumentation" OFF)
+option(BUILD_TESTING "Build unit tests" ON)
+
 option(MANYFORGE_ENABLE_ROS2_CONTROL "Build ros2_control execution backend" OFF)
 set(_MANYFORGE_ROS2_CONTROL_SOURCES "")
 if(MANYFORGE_ENABLE_ROS2_CONTROL)
@@ -94,6 +98,7 @@ add_library(manyforge_roboplan
   src/roboplan_execution_backend.cpp
   src/roboplan_execution_state_sink.cpp
   src/roboplan_gripper_command_backend.cpp
+  src/roboplan_planning_qualification.cpp
   src/native_kernel_factory.cpp
   src/collision_body_id_mapper.cpp
   ${_MANYFORGE_ROS2_CONTROL_SOURCES}
@@ -139,8 +144,19 @@ if(pybind11_FOUND AND Python3_FOUND AND Python3_Development.Module_FOUND)
   target_link_libraries(manyforge_roboplan_py PRIVATE manyforge_roboplan)
 endif()
 
+# The collision counter is never linked into a production target. A live RP5
+# qualification process may preload it explicitly; normal runtime builds leave
+# this option disabled and therefore carry no query interception overhead.
+if(BUILD_TESTING OR MANYFORGE_ENABLE_QUALIFICATION_PROBES)
+  add_library(roboplan_collision_counter_probe SHARED
+    test/perf/roboplan_collision_counter_probe.cpp)
+  target_link_libraries(roboplan_collision_counter_probe PRIVATE
+    Eigen3::Eigen pinocchio::pinocchio ${CMAKE_DL_LIBS})
+  set_target_properties(roboplan_collision_counter_probe PROPERTIES
+    PREFIX "lib")
+endif()
+
 # Tests
-option(BUILD_TESTING "Build unit tests" ON)
 if(BUILD_TESTING)
   enable_testing()
   find_package(GTest QUIET)
@@ -182,6 +198,23 @@ if(BUILD_TESTING)
     # informational only; a future RoboPlan-aware CI lane can promote it.
     add_executable(perf_collision_mapper test/perf/perf_collision_mapper.cpp)
     target_link_libraries(perf_collision_mapper PRIVATE manyforge_roboplan)
+
+    add_executable(perf_roboplan_planning_pipeline
+      test/perf/perf_roboplan_planning_pipeline.cpp)
+    target_link_libraries(perf_roboplan_planning_pipeline PRIVATE
+      manyforge_roboplan ${CMAKE_DL_LIBS})
+    # The benchmark deliberately pairs global operator new with malloc/free to
+    # count allocations. GCC's whole-program warning cannot infer that pair.
+    target_compile_options(perf_roboplan_planning_pipeline PRIVATE
+      -Wno-mismatched-new-delete)
+
+    add_executable(perf_collision_strategy
+      ../manyforge_collision/test/perf/perf_collision_strategy.cpp)
+    target_link_libraries(perf_collision_strategy PRIVATE
+      manyforge_roboplan manyforge_collision
+      roboplan_example_models::roboplan_example_models)
+    target_compile_options(perf_collision_strategy PRIVATE
+      -Wno-mismatched-new-delete)
 
     # Pinocchio/coal/roboplan .so files live in cmeel.prefix/lib.
     # Discover the active Python site-packages roots rather than hardcoding a

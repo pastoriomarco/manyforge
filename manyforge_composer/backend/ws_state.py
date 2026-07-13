@@ -39,6 +39,10 @@ class StateHub:
         if ws in self._connections:
             self._connections.remove(ws)
             logger.info("WebSocket client disconnected (total: %d)", len(self._connections))
+
+    def connection_count(self) -> int:
+        """Return the event-loop-owned state-channel client count."""
+        return len(self._connections)
     
     async def broadcast(self, data: dict):
         dead = []

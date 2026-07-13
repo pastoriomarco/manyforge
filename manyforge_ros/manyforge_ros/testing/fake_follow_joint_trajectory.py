@@ -45,6 +45,7 @@ class FakeFollowJointTrajectoryServer:
     actual_position_offsets: list[float] | None = None
     hold_after_first_feedback_s: float = 0.0
     hold_cancel_poll_period_s: float = 0.01
+    hold_feedback_period_s: float = 0.0
     abort_error_code: int = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
     abort_error_string: str = "fake path tolerance violation"
     reentrant_callbacks: bool = False
@@ -125,12 +126,22 @@ class FakeFollowJointTrajectoryServer:
             if index == 0 and self.hold_after_first_feedback_s > 0:
                 deadline = time.monotonic() + self.hold_after_first_feedback_s
                 poll_period = max(0.001, self.hold_cancel_poll_period_s)
+                feedback_period = max(0.001, self.hold_feedback_period_s)
+                next_feedback_at = time.monotonic() + feedback_period
                 while time.monotonic() < deadline:
                     if goal_handle.is_cancel_requested:
                         record.canceled = True
                         goal_handle.canceled()
                         return self._result(0, "canceled")
-                    time.sleep(min(poll_period, deadline - time.monotonic()))
+                    now = time.monotonic()
+                    if self.hold_feedback_period_s > 0 and now >= next_feedback_at:
+                        # Real trajectory controllers continue publishing while
+                        # a goal is active. The opt-in repeat also prevents a
+                        # contract test from depending on transport ordering
+                        # between the goal response and the first feedback.
+                        goal_handle.publish_feedback(feedback)
+                        next_feedback_at = now + feedback_period
+                    time.sleep(min(poll_period, deadline - now))
 
             if self.feedback_delay_s > 0:
                 time.sleep(self.feedback_delay_s)

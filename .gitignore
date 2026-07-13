@@ -24,6 +24,10 @@ dist.*-old/
 .manyforge-var/
 # Qualification evidence is archived by CI/artifact storage, not committed.
 qualification/
+# Qualification source tooling is code; only generated evidence directories
+# are ignored by the rule above.
+!scripts/qualification/
+!scripts/qualification/*.py
 
 # Bridge per-tool audit log (state-dir by default; never commit)
 manyforge_assistant_bridge/audit.log*

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException
 
@@ -226,6 +226,114 @@ def build_collision_compare_trajectory_waypoint_payload(
     }
 
 
+def build_scene_authority_snapshot_payload(state: ComposerState) -> dict[str, Any]:
+    if state.kernel is None:
+        raise HTTPException(status_code=503, detail="Kernel is not available")
+    try:
+        return dict(state.kernel.get_scene_authority_snapshot())
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+
+
+def start_planning_qualification_capture_payload(
+    state: ComposerState, *, capacity: int
+) -> dict[str, Any]:
+    if state.kernel is None:
+        raise HTTPException(status_code=503, detail="Kernel is not available")
+    if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+        raise HTTPException(status_code=400, detail="capacity must be a positive integer")
+    if capacity > 4096:
+        raise HTTPException(status_code=400, detail="capacity exceeds the 4096 record bound")
+    status = state.kernel.get_status()
+    state_name = getattr(status.state, "value", str(status.state))
+    if state_name != "idle":
+        raise HTTPException(
+            status_code=409,
+            detail="planning qualification capture may start only while idle",
+        )
+    try:
+        generation = state.kernel.start_planning_qualification_capture(capacity)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"generation": int(generation), "capacity": capacity}
+
+
+def drain_planning_qualification_capture_payload(
+    state: ComposerState, *, generation: int
+) -> dict[str, Any]:
+    if state.kernel is None:
+        raise HTTPException(status_code=503, detail="Kernel is not available")
+    try:
+        batch = state.kernel.drain_planning_qualification_capture(generation)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    status = dict(batch.get("status") or {})
+    status.update(
+        {
+            "generation": generation,
+            "dropped_total": int(batch.get("dropped_total", 0)),
+            "in_flight": int(batch.get("in_flight", 0)),
+        }
+    )
+    return {
+        "generation": generation,
+        "records": batch.get("records", []),
+        "status": status,
+    }
+
+
+def stop_planning_qualification_capture_payload(
+    state: ComposerState, *, generation: int, idle_timeout_ms: int
+) -> dict[str, Any]:
+    if state.kernel is None:
+        raise HTTPException(status_code=503, detail="Kernel is not available")
+    if (
+        isinstance(idle_timeout_ms, bool)
+        or not isinstance(idle_timeout_ms, int)
+        or idle_timeout_ms <= 0
+        or idle_timeout_ms > 60_000
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="idle_timeout_ms must be an integer in [1, 60000]",
+        )
+    try:
+        batch = state.kernel.stop_planning_qualification_capture(
+            generation, idle_timeout_ms
+        )
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    status = dict(batch.get("status") or {})
+    status.update(
+        {
+            "generation": generation,
+            "dropped_total": int(batch.get("dropped_total", 0)),
+            "in_flight": int(batch.get("in_flight", 0)),
+        }
+    )
+    return {
+        "generation": generation,
+        "records": batch.get("records", []),
+        "status": status,
+        "stopped": True,
+    }
+
+
+def _qualification_generation(request: dict[str, Any]) -> int:
+    generation = request.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+        raise HTTPException(
+            status_code=400, detail="generation must be a positive integer"
+        )
+    return generation
+
+
 def build_collision_compare_positions_payload(
     state: ComposerState,
     *,
@@ -253,7 +361,11 @@ def build_collision_compare_positions_payload(
     }
 
 
-def create_debug_router(state: ComposerState) -> APIRouter:
+def create_debug_router(
+    state: ComposerState,
+    *,
+    viewer_connection_count: Callable[[], int] | None = None,
+) -> APIRouter:
     """Create debug/export routes."""
     router = APIRouter()
 
@@ -289,6 +401,50 @@ def create_debug_router(state: ComposerState) -> APIRouter:
                 state,
                 move_id=move_id,
                 waypoint_index=waypoint_index,
+            )
+        )
+
+    @router.get("/qualification/scene-authority-snapshot")
+    async def debug_scene_authority_snapshot() -> dict[str, Any]:
+        return await run_route_background(
+            lambda: build_scene_authority_snapshot_payload(state)
+        )
+
+    @router.get("/qualification/environment")
+    async def debug_qualification_environment() -> dict[str, Any]:
+        # This callback is event-loop-owned, like StateHub._connections. Keep
+        # the read on this coroutine rather than sending it to a route worker.
+        return {
+            "state_websocket_clients": (
+                int(viewer_connection_count())
+                if viewer_connection_count is not None
+                else None
+            )
+        }
+
+    @router.post("/qualification/planning-capture/start")
+    async def debug_start_planning_capture(request: dict[str, Any]) -> dict[str, Any]:
+        return await run_route_background(
+            lambda: start_planning_qualification_capture_payload(
+                state, capacity=request.get("capacity", 128)
+            )
+        )
+
+    @router.post("/qualification/planning-capture/drain")
+    async def debug_drain_planning_capture(request: dict[str, Any]) -> dict[str, Any]:
+        return await run_route_background(
+            lambda: drain_planning_qualification_capture_payload(
+                state, generation=_qualification_generation(request)
+            )
+        )
+
+    @router.post("/qualification/planning-capture/stop")
+    async def debug_stop_planning_capture(request: dict[str, Any]) -> dict[str, Any]:
+        return await run_route_background(
+            lambda: stop_planning_qualification_capture_payload(
+                state,
+                generation=_qualification_generation(request),
+                idle_timeout_ms=request.get("idle_timeout_ms", 10_000),
             )
         )
 

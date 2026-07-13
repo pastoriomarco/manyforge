@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manyforge.dev/schemas/roboplan-transition-evidence-v1.json",
+  "title": "ManyForge RoboPlan transition qualification evidence",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "phase",
+    "source",
+    "environment",
+    "records"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "manyforge.roboplan_transition_evidence.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "phase": {
+      "enum": ["rp5_0", "rp5_3", "rp5_7"]
+    },
+    "source": {
+      "type": "object",
+      "required": ["manyforge_commit", "roboplan_version", "roboplan_commit"],
+      "properties": {
+        "manyforge_commit": {"type": "string", "minLength": 7},
+        "roboplan_version": {"type": "string", "minLength": 1},
+        "roboplan_commit": {"type": "string", "minLength": 7},
+        "pinocchio_version": {"type": "string"},
+        "coal_version": {"type": "string"},
+        "eigenpy_version": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "environment": {
+      "type": "object",
+      "required": ["lane", "container", "architecture", "cpu_count"],
+      "properties": {
+        "lane": {"type": "string", "minLength": 1},
+        "container": {"type": "string", "minLength": 1},
+        "architecture": {"type": "string", "minLength": 1},
+        "cpu_count": {"type": "integer", "minimum": 1},
+        "cpu_set": {"type": ["string", "null"]},
+        "cpu_governor": {"type": ["string", "null"]},
+        "viewer_stratum": {
+          "enum": ["not_applicable", "disconnected", "focused"]
+        }
+      },
+      "additionalProperties": true
+    },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["record_type", "fixture_id", "passed"],
+        "properties": {
+          "record_type": {
+            "enum": [
+              "inventory",
+              "collision_query",
+              "collision_revision",
+              "trajectory_validation",
+              "planning_pipeline",
+              "live_planning_stage",
+              "rma_contract"
+            ]
+          },
+          "fixture_id": {"type": "string", "minLength": 1},
+          "passed": {"type": "boolean"},
+          "sample_count": {"type": "integer", "minimum": 0},
+          "warmup_count": {"type": "integer", "minimum": 0},
+          "latency_ns": {"$ref": "#/$defs/latency"},
+          "cpu_time_ns": {"$ref": "#/$defs/latency"},
+          "allocations": {"type": ["integer", "null"], "minimum": 0},
+          "details": {"type": "object"}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "$defs": {
+    "latency": {
+      "type": "object",
+      "required": ["p50", "p95", "max"],
+      "properties": {
+        "p50": {"type": "number", "minimum": 0},
+        "p95": {"type": "number", "minimum": 0},
+        "p99": {"type": ["number", "null"], "minimum": 0},
+        "max": {"type": "number", "minimum": 0},
+        "mad": {"type": ["number", "null"], "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

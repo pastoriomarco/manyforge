@@ -7,3 +7,15 @@ race:eprosima::fastrtps::rtps::ReaderProxy::stop
 race:eprosima::fastdds::rtps::ReaderProxy::stop
 race:eprosima::fastrtps::rtps::RTPSReader
 race:eprosima::fastdds::rtps::RTPSReader
+
+# ROS Jazzy rclcpp 28.1.18 registers context shutdown callbacks through the
+# graph listener while repeated test-node teardown acquires the same two
+# middleware locks in reverse order. The report contains only librclcpp frames;
+# scope this to the exact registration function, not rclcpp as a package.
+deadlock:rclcpp::Context::add_on_shutdown_callback
+
+# Fast-DDS 2.14 shared-memory payload-pool teardown can race a subscriber
+# deserialize when the same ROS graph fixture is repeatedly constructed in one
+# process. The report is wholly inside libfastrtps/libfastcdr.
+race:eprosima::fastrtps::rtps::TopicPayloadPool::do_get_payload
+race:eprosima::fastrtps::rtps::TopicPayloadPool::get_payload

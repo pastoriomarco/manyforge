@@ -11,6 +11,8 @@
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
+#include <thread>
 #include <utility>
 
 namespace manyforge::roboplan_backend {
@@ -153,12 +155,73 @@ std::int64_t RoboPlanExecutionBackend::publish_snapshot(
         at_rest_state
             ? std::span<const double>(observed_at_rest_velocities_)
             : std::span<const double>{};
-    (void)observed_state_publication_->publish(
-        core::ObservedRobotStateSourceKind::kPredictedState,
-        config_.observed_joint_names, joint_positions, velocities,
-        timestamp_ns, timestamp_ns);
+    (void)publish_observed_state_authority(
+        joint_positions, velocities, timestamp_ns, at_rest_state);
+  } else if (observed_state_publication_ != nullptr &&
+             joint_positions.empty() &&
+             (state == core::ExecutionState::kIdle ||
+              state == core::ExecutionState::kStopped ||
+              state == core::ExecutionState::kCompleted ||
+              state == core::ExecutionState::kFailed ||
+              state == core::ExecutionState::kInterventionRequired)) {
+    std::lock_guard<std::mutex> writer_lock(
+        observed_state_publication_mutex_);
+    const auto authority_epoch =
+        observed_state_authority_epoch_.load(std::memory_order_relaxed);
+    if ((authority_epoch & 1u) == 0u) {
+      observed_state_authority_epoch_.store(authority_epoch + 1,
+                                            std::memory_order_release);
+    }
   }
   return timestamp_ns;
+}
+
+core::ObservedRobotStatePublishResult
+RoboPlanExecutionBackend::publish_observed_state_authority(
+    std::span<const double> positions,
+    std::span<const double> velocities,
+    std::int64_t timestamp_ns,
+    bool authority_boundary) noexcept {
+  if (observed_state_publication_ == nullptr ||
+      positions.size() != config_.observed_joint_names.size()) {
+    return core::ObservedRobotStatePublishResult{
+        false, false, false, 0, "observed_state_shape_mismatch"};
+  }
+
+  std::lock_guard<std::mutex> writer_lock(observed_state_publication_mutex_);
+  auto authority_epoch =
+      observed_state_authority_epoch_.load(std::memory_order_relaxed);
+  if (authority_boundary) {
+    if ((authority_epoch & 1u) == 0u) {
+      ++authority_epoch;
+      observed_state_authority_epoch_.store(authority_epoch,
+                                            std::memory_order_release);
+    }
+  } else if ((authority_epoch & 1u) != 0u) {
+    return core::ObservedRobotStatePublishResult{
+        false, false, false, 0, "observed_state_authority_invalidated"};
+  }
+
+  core::ObservedRobotStatePublishResult published;
+  const int attempt_count = authority_boundary ? 8 : 1;
+  for (int attempt = 0; attempt < attempt_count; ++attempt) {
+    published = observed_state_publication_->publish(
+        core::ObservedRobotStateSourceKind::kPredictedState,
+        config_.observed_joint_names, positions, velocities, timestamp_ns,
+        timestamp_ns);
+    if (published.published) {
+      if (authority_boundary) {
+        observed_state_authority_epoch_.store(authority_epoch + 1,
+                                              std::memory_order_release);
+      }
+      return published;
+    }
+    if (std::string_view(published.reason) != "publication_slots_exhausted") {
+      return published;
+    }
+    std::this_thread::yield();
+  }
+  return published;
 }
 
 bool RoboPlanExecutionBackend::update_scene_positions(
@@ -582,9 +645,8 @@ core::Result<void> RoboPlanExecutionBackend::sync_observed_state_before_planning
   const std::span<const double> velocities =
       at_rest ? std::span<const double>(observed_at_rest_velocities_)
               : std::span<const double>{};
-  auto published = observed_state_publication_->publish(
-      core::ObservedRobotStateSourceKind::kPredictedState,
-      config_.observed_joint_names, positions, velocities, now_ns, now_ns);
+  auto published = publish_observed_state_authority(
+      positions, velocities, now_ns, /*authority_boundary=*/true);
   if (!published.published || !published.complete) {
     return core::Result<void>::Err(core::ErrorDTO{
         core::kErrorExecutionRejected,

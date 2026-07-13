@@ -332,7 +332,11 @@ def _kernel_config_from_deployment(
     ):
         if key in execution_config:
             config[key] = execution_config[key]
-    for key in ("planner_max_planning_time_s", "planner_max_planning_time_ms"):
+    for key in (
+        "planner_max_planning_time_s",
+        "planner_max_planning_time_ms",
+        "rng_seed",
+    ):
         if key in planning_config:
             config[key] = planning_config[key]
         elif key in execution_config:
@@ -534,6 +538,10 @@ def _make_kernel(
             "and execution.ros2_control_follow_joint_trajectory."
         )
     model_name, group_name = _native_model_and_group_from_deployment(deployment)
+    robot_config = getattr(deployment, "robot_config", None)
+    logical_robot_id = str(
+        getattr(robot_config, "robot_id", None) or model_name
+    )
     try:
         import manyforge_roboplan_py
         from native_kernel_client import NativeKernelClient
@@ -563,11 +571,15 @@ def _make_kernel(
                 runtime_model.srdf_path,
                 runtime_model.package_paths,
                 kernel_config,
+                logical_robot_id,
             )
         else:
             runtime_model = None
             bundle = manyforge_roboplan_py.create_native_kernel(
-                model_name, group_name, kernel_config
+                model_name,
+                group_name,
+                kernel_config,
+                logical_robot_id,
             )
         if runtime_model is not None:
             kernel = NativeKernelClient(

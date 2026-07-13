@@ -181,9 +181,12 @@ def test_scene_state_reports_visual_snapshot_pending_without_live_fallback():
     assert diagnostics["mode"] == "visual_snapshot_pending"
     assert diagnostics["served_from_visual_snapshot"] is False
     assert diagnostics["fallback_reason"] in {
+        "visual_model_unavailable",
         "visual_snapshot_publisher_unavailable",
         "visual_snapshot_pending",
     }
+    if diagnostics["fallback_reason"] == "visual_model_unavailable":
+        assert diagnostics["snapshot_publisher_error"] == "visual_model_unavailable"
     assert "snapshot_read" in diagnostics["timings_ms"]
 
 

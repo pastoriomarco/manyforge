@@ -3969,7 +3969,6 @@ bool ExecutionKernel::finalize_overridden_terminal_authority(
     default:
       return false;
   }
-  finish_execute_worker();
   return true;
 }
 
@@ -3977,9 +3976,8 @@ bool ExecutionKernel::finalize_competing_terminal_authority(
     const ExecuteRequestDTO& request,
     std::uint64_t exec_id,
     ActiveMotionExecution& motion_state,
-    const char* reason) {
+  const char* reason) {
   if (motion_state.outcome_emitted) {
-    finish_execute_worker();
     return true;
   }
 
@@ -3999,7 +3997,6 @@ bool ExecutionKernel::finalize_competing_terminal_authority(
 
   const auto current = sm_.status().state;
   if (motion_state.outcome_emitted) {
-    finish_execute_worker();
     return true;
   }
   if (current == ExecutionState::kStopped ||
@@ -4007,7 +4004,6 @@ bool ExecutionKernel::finalize_competing_terminal_authority(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kStopped,
         std::nullopt, std::nullopt, reason);
-    finish_execute_worker();
     return true;
   }
   if (current == ExecutionState::kInterventionRequired) {
@@ -4037,7 +4033,6 @@ bool ExecutionKernel::finalize_competing_terminal_authority(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kFailed,
         intervention_error, std::nullopt, reason);
-    finish_execute_worker();
     return true;
   }
   if (current == ExecutionState::kInterrupted ||
@@ -4068,7 +4063,6 @@ bool ExecutionKernel::finalize_competing_terminal_authority(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kInterruptedFault,
         std::nullopt, std::nullopt, reason);
-    finish_execute_worker();
     return true;
   }
   if (current == ExecutionState::kStopping &&
@@ -4098,7 +4092,6 @@ bool ExecutionKernel::finalize_competing_terminal_authority(
           motion_state, MotionExecutionTerminalCause::kStopped,
           std::nullopt, std::nullopt,
           "terminal_completion_stop_requested");
-      finish_execute_worker();
       return true;
     }
   }
@@ -4143,7 +4136,6 @@ bool ExecutionKernel::finalize_competing_terminal_authority(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kFailed,
         err, std::nullopt, reason);
-    finish_execute_worker();
     return true;
   }
   return false;
@@ -4164,7 +4156,6 @@ ExecutionKernel::execute_worker_plan_phase(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kStopped,
         std::nullopt, std::nullopt, "early_stop_requested");
-    finish_execute_worker();
     result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return result;
   }
@@ -4202,6 +4193,28 @@ ExecutionKernel::execute_worker_plan_phase(
     scheduler_.cancel(planning_timeout_handle);
   }
 
+  // Reset and the planner result need one linearization order, but the worker
+  // must never acquire lifecycle_mutex_: stop() can hold that mutex while it
+  // waits for backend acknowledgement and the planner worker must remain able
+  // to finish. This leaf is held only through the plan-result state decision;
+  // external callbacks remain deferred until after it is released.
+  EventDeferralScope event_scope(*this);
+  std::unique_lock<std::mutex> planning_result_lock(planning_result_mutex_);
+
+  if (planning_reset_requested_.load(std::memory_order_acquire)) {
+    // Reset owns the state transition and backend reset. The planner cancel can
+    // complete before Reset commits Idle, so this worker must not reinterpret
+    // the cancellation result as a planning failure and race Reset for terminal
+    // authority.
+    planning_result_lock.unlock();
+    event_scope.flush();
+    finalize_motion_execution_outcome(
+        motion_state, MotionExecutionTerminalCause::kStopped,
+        std::nullopt, std::nullopt, "planning_reset_requested");
+    result.status = ExecuteWorkerPhaseStatus::kTerminal;
+    return result;
+  }
+
   if (planning_timed_out || stop_policy_.stop_requested()) {
     auto prev = worker_entry_state;  // B-2: use captured state
     const auto message = planning_timed_out
@@ -4216,6 +4229,8 @@ ExecutionKernel::execute_worker_plan_phase(
         "planning_worker_observed_stop_pending");
     auto terminal_commit =
         commit_terminal(ExecutionState::kStopped, "terminal_commit");
+    planning_result_lock.unlock();
+    event_scope.flush();
     if (terminal_commit.committed != ExecutionState::kStopped) {
       if (finalize_overridden_terminal_authority(
               request, exec_id, motion_state, terminal_commit.committed,
@@ -4237,12 +4252,13 @@ ExecutionKernel::execute_worker_plan_phase(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kStopped,
         std::nullopt, std::nullopt, "planning_stop");
-    finish_execute_worker();
     result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return result;
   }
 
   if (sm_.status().state == ExecutionState::kIdle) {
+    planning_result_lock.unlock();
+    event_scope.flush();
     auto prev = worker_entry_state;  // B-2: use captured state
     sm_.set_last_error(ErrorCode::kPlanningTimeout);
     emit_event(make_error_raised_event(
@@ -4262,7 +4278,6 @@ ExecutionKernel::execute_worker_plan_phase(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kStopped,
         std::nullopt, std::nullopt, "planning_reset");
-    finish_execute_worker();
     result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return result;
   }
@@ -4270,6 +4285,8 @@ ExecutionKernel::execute_worker_plan_phase(
   if (!plan_result.ok()) {
     if (planning_cancelled_by_interrupt(plan_result.error()) &&
         sm_.status().state == ExecutionState::kInterrupted) {
+      planning_result_lock.unlock();
+      event_scope.flush();
       emit_event(make_error_raised_event(
           exec_id, clock_.now(), plan_result.error()));
       mark_active_interrupt_preemption_result(
@@ -4285,7 +4302,6 @@ ExecutionKernel::execute_worker_plan_phase(
       finalize_motion_execution_outcome(
           motion_state, MotionExecutionTerminalCause::kInterruptedFault,
           std::nullopt, std::nullopt, "planning_cancelled_by_interrupt");
-      finish_execute_worker();
       result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return result;
     }
@@ -4298,6 +4314,8 @@ ExecutionKernel::execute_worker_plan_phase(
     sm_.set_last_error(error_code_from_dto(plan_result.error()));
     auto terminal_commit =
         commit_terminal(ExecutionState::kFailed, "terminal_commit");
+    planning_result_lock.unlock();
+    event_scope.flush();
     if (terminal_commit.committed != ExecutionState::kFailed) {
       if (terminal_commit.committed == ExecutionState::kStopped) {
         finalize_motion_execution_outcome(
@@ -4313,7 +4331,6 @@ ExecutionKernel::execute_worker_plan_phase(
             plan_result.error(), std::nullopt,
             "planning_failed_overridden_by_terminal_authority");
       }
-      finish_execute_worker();
       result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return result;
     }
@@ -4330,7 +4347,6 @@ ExecutionKernel::execute_worker_plan_phase(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kFailed,
         plan_result.error(), std::nullopt, "planning_failed");
-    finish_execute_worker();
     result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return result;
   }
@@ -4350,6 +4366,8 @@ ExecutionKernel::execute_worker_plan_phase(
     sm_.set_last_error(ErrorCode::kInternalError);
     auto terminal_commit =
         commit_terminal(ExecutionState::kFailed, "terminal_commit");
+    planning_result_lock.unlock();
+    event_scope.flush();
     if (terminal_commit.committed != ExecutionState::kFailed) {
       finalize_motion_execution_outcome(
           motion_state,
@@ -4360,7 +4378,6 @@ ExecutionKernel::execute_worker_plan_phase(
                      : MotionExecutionTerminalCause::kFailed),
           std::nullopt, std::nullopt,
           "validating_transition_overridden_by_terminal_authority");
-      finish_execute_worker();
       result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return result;
     }
@@ -4371,10 +4388,11 @@ ExecutionKernel::execute_worker_plan_phase(
         ErrorDTO{kErrorInternalError,
                  "Failed to transition to Validating", {}},
         std::nullopt, "validating_transition_failed");
-    finish_execute_worker();
     result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return result;
   }
+  planning_result_lock.unlock();
+  event_scope.flush();
   emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                prev_state2, ExecutionState::kValidating, std::nullopt, {}});
   auto validating_snapshot = get_execution_snapshot();
@@ -4504,7 +4522,9 @@ ExecutionKernel::execute_worker_validate_replan_phase(
           [this]() { stop_policy_.request_hard_stop(); },
           SchedulerPriority::Monitoring);
     }
-    auto replan_result = plan_trajectory(request, scene_binding);
+    auto replan_result = plan_trajectory(
+        request, scene_binding,
+        static_cast<std::uint32_t>(authoritative_validation_attempt));
     const bool replan_timed_out =
         replan_timeout_ns > 0 &&
         (clock_.now() - replan_start_ns) >= replan_timeout_ns;
@@ -4533,7 +4553,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
         finalize_motion_execution_outcome(
             motion_state, MotionExecutionTerminalCause::kStopped,
             std::nullopt, std::nullopt, reason);
-        finish_execute_worker();
         return true;
       }
       if (current == ExecutionState::kInterrupted ||
@@ -4561,7 +4580,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
         finalize_motion_execution_outcome(
             motion_state, MotionExecutionTerminalCause::kInterruptedFault,
             std::nullopt, std::nullopt, reason);
-        finish_execute_worker();
         return true;
       }
       if (current == ExecutionState::kInterventionRequired) {
@@ -4581,7 +4599,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
         finalize_motion_execution_outcome(
             motion_state, MotionExecutionTerminalCause::kFailed,
             intervention_error, std::nullopt, reason);
-        finish_execute_worker();
         return true;
       }
       return false;
@@ -4638,7 +4655,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       finalize_motion_execution_outcome(
           motion_state, MotionExecutionTerminalCause::kStopped,
           std::nullopt, std::nullopt, "validation_replan_stop");
-      finish_execute_worker();
       phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return phase_result;
     }
@@ -4653,7 +4669,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       finalize_motion_execution_outcome(
           motion_state, MotionExecutionTerminalCause::kStopped,
           std::nullopt, std::nullopt, "validation_replan_reset");
-      finish_execute_worker();
       phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return phase_result;
     }
@@ -4681,7 +4696,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
             motion_state, MotionExecutionTerminalCause::kInterruptedFault,
             std::nullopt, std::nullopt,
             "validation_replan_cancelled_by_interrupt");
-        finish_execute_worker();
         phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
         return phase_result;
       }
@@ -4720,7 +4734,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       finalize_motion_execution_outcome(
           motion_state, MotionExecutionTerminalCause::kFailed,
           replan_result.error(), std::nullopt, "validation_replan_failed");
-      finish_execute_worker();
       phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return phase_result;
     }
@@ -4771,7 +4784,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
           ErrorDTO{kErrorInternalError,
                    "Failed to transition retry to Validating", {}},
           std::nullopt, "validation_replan_transition_failed");
-      finish_execute_worker();
       phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return phase_result;
     }
@@ -4824,7 +4836,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       finalize_motion_execution_outcome(
           motion_state, MotionExecutionTerminalCause::kInterruptedFault,
           std::nullopt, std::nullopt, "validation_cancelled_by_interrupt");
-      finish_execute_worker();
       phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return phase_result;
     }
@@ -4873,7 +4884,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kFailed,
         val_result.error(), std::nullopt, "validation_failed");
-    finish_execute_worker();
     phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return phase_result;
   }
@@ -4923,7 +4933,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kStopped,
         std::nullopt, std::nullopt, "validation_stop");
-    finish_execute_worker();
     phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return phase_result;
   }
@@ -4950,7 +4959,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kStopped,
         std::nullopt, std::nullopt, "validation_reset");
-    finish_execute_worker();
     phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return phase_result;
   }
@@ -5003,7 +5011,6 @@ ExecutionKernel::execute_worker_dispatch_phase(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kFailed,
         stale_error, std::nullopt, terminal_reason);
-    finish_execute_worker();
     phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return true;
   };
@@ -5235,7 +5242,6 @@ ExecutionKernel::execute_worker_dispatch_phase(
       finalize_motion_execution_outcome(
           motion_state, MotionExecutionTerminalCause::kFailed,
           arm_result.error(), std::nullopt, "arm_failed");
-      finish_execute_worker();
       phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return phase_result;
     }
@@ -5258,7 +5264,6 @@ ExecutionKernel::execute_worker_dispatch_phase(
         finalize_motion_execution_outcome(
             motion_state, MotionExecutionTerminalCause::kInterruptedFault,
             std::nullopt, std::nullopt, "arm_time_interrupt_latched");
-        finish_execute_worker();
         phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
         return phase_result;
       }
@@ -5286,7 +5291,6 @@ ExecutionKernel::execute_worker_dispatch_phase(
         ErrorDTO{kErrorInternalError,
                  "Failed to transition to Executing", {}},
         std::nullopt, "state_transition_failed");
-    finish_execute_worker();
     phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return phase_result;
   }
@@ -5356,7 +5360,6 @@ void ExecutionKernel::execute_worker_finalize_phase(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kFailed,
         intervention_error, std::nullopt, "execution_intervention_required");
-    finish_execute_worker();
     return;
   }
 
@@ -5391,7 +5394,6 @@ void ExecutionKernel::execute_worker_finalize_phase(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kStopped,
         std::nullopt, std::nullopt, "execution_stop_terminal");
-    finish_execute_worker();
     return;
   }
 
@@ -5432,7 +5434,6 @@ void ExecutionKernel::execute_worker_finalize_phase(
                      "Execution failed without captured error",
                      {{"reason", "missing_error_on_failed"}}}),
         std::nullopt, "execution_failed");
-    finish_execute_worker();
     return;
   }
 
@@ -5476,7 +5477,6 @@ void ExecutionKernel::execute_worker_finalize_phase(
                      "error",
                      {{"reason", "missing_error_on_intervention"}}}),
         std::nullopt, "execution_intervention_required");
-    finish_execute_worker();
     return;
   }
 
@@ -5536,7 +5536,6 @@ void ExecutionKernel::execute_worker_finalize_phase(
     finalize_motion_execution_outcome(
         motion_state, MotionExecutionTerminalCause::kFailed,
         err, std::nullopt, "normal_completion_transition_rejected");
-    finish_execute_worker();
     return;
   }
 
@@ -5563,7 +5562,6 @@ void ExecutionKernel::execute_worker_finalize_phase(
   finalize_motion_execution_outcome(
       motion_state, MotionExecutionTerminalCause::kCompletedNormally,
       std::nullopt, std::nullopt, "execution_completed");
-  finish_execute_worker();
 }
 
 void ExecutionKernel::async_execute_worker(
@@ -5580,6 +5578,19 @@ void ExecutionKernel::async_execute_worker(
   ActiveMotionExecution motion_state;
   motion_state.execution_id = exec_id;
   motion_state.move_id = request.move_id;
+  struct WorkerCompletionGuard {
+    ExecutionKernel* self;
+    RetainedSceneSnapshotLease& retained_scene;
+    std::optional<SceneSnapshotLease>& scene_snapshot_lease;
+    ~WorkerCompletionGuard() {
+      // Completion is the quiescence boundary observed by reset, tests, and
+      // callers. Release every worker-owned scene authority handle before
+      // publishing it; otherwise a waiter can race retained-lease cleanup.
+      scene_snapshot_lease.reset();
+      retained_scene = RetainedSceneSnapshotLease{};
+      self->finish_execute_worker();
+    }
+  };
   struct MotionOutcomeGuard {
     ExecutionKernel* self;
     ActiveMotionExecution& state;
@@ -5598,8 +5609,11 @@ void ExecutionKernel::async_execute_worker(
           std::nullopt, "worker_exit_without_outcome");
     }
   };
+  // Reverse destruction order is intentional: the outcome is made durable
+  // first, then scene authority is released, then completion is signalled.
+  WorkerCompletionGuard completion_guard{this, retained_scene,
+                                          scene_snapshot_lease};
   MotionOutcomeGuard outcome_guard{this, motion_state};
-  const auto finish_worker = [this]() { finish_execute_worker(); };
   const auto finalize_overridden_terminal_authority =
       [&](ExecutionState committed, const char* reason,
           std::optional<ErrorDTO> error = std::nullopt) -> bool {
@@ -5652,7 +5666,7 @@ void ExecutionKernel::async_execute_worker(
     bool pause_in_progress = false;
     int64_t last_runtime_scale_sample_ns = exec_start_ns;
     double runtime_scaled_execution_ns = 0.0;
-    const auto finish_worker_stop_token_requested = [&]() {
+    const auto finalize_worker_stop_token_requested = [&]() {
       stop_collision_monitoring(
           RuntimeCollisionMonitorRelease::kWorkerRetirement,
           motion_state.runtime_collision_protection_generation);
@@ -5703,7 +5717,6 @@ void ExecutionKernel::async_execute_worker(
           std::nullopt,
           stop_confirmed ? "worker_stop_token_requested"
                          : "worker_stop_token_backend_stop_failed");
-      finish_worker();
     };
     const auto fault_preempt_pending_budget_ns = [&]() -> int64_t {
       std::optional<MotionInterruptStopProfileDTO> profile;
@@ -5726,7 +5739,7 @@ void ExecutionKernel::async_execute_worker(
 
     while (true) {
       if (st.stop_requested()) {
-        finish_worker_stop_token_requested();
+        finalize_worker_stop_token_requested();
         return;
       }
       bool completed = true;
@@ -5794,7 +5807,6 @@ void ExecutionKernel::async_execute_worker(
                 motion_state, MotionExecutionTerminalCause::kStopped,
                 std::nullopt, std::nullopt,
                 "execution_timeout_deferred_to_operator_stop");
-            finish_worker();
             return;
           }
           if (state_after_stop == ExecutionState::kInterventionRequired) {
@@ -5818,7 +5830,6 @@ void ExecutionKernel::async_execute_worker(
                 motion_state, MotionExecutionTerminalCause::kFailed,
                 intervention_error, std::nullopt,
                 "execution_timeout_operator_stop_intervention");
-            finish_worker();
             return;
           }
         }
@@ -5837,7 +5848,6 @@ void ExecutionKernel::async_execute_worker(
               motion_state, MotionExecutionTerminalCause::kInterruptedFault,
               std::nullopt, std::nullopt,
               "execution_timeout_deferred_to_interrupt");
-          finish_worker();
           return;
         }
         stop_collision_monitoring(
@@ -5882,7 +5892,6 @@ void ExecutionKernel::async_execute_worker(
                 motion_state, MotionExecutionTerminalCause::kStopped,
                 std::nullopt, std::nullopt,
                 "execution_timeout_lost_to_stop");
-            finish_worker();
             return;
           }
           if (current == ExecutionState::kInterrupted ||
@@ -5892,7 +5901,6 @@ void ExecutionKernel::async_execute_worker(
                 MotionExecutionTerminalCause::kInterruptedFault,
                 std::nullopt, std::nullopt,
               "execution_timeout_lost_to_interrupt");
-            finish_worker();
             return;
           }
           terminal_state = ExecutionState::kInterventionRequired;
@@ -5933,7 +5941,6 @@ void ExecutionKernel::async_execute_worker(
         finalize_motion_execution_outcome(
             motion_state, MotionExecutionTerminalCause::kFailed,
             terminal_error, std::nullopt, "execution_timeout");
-        finish_worker();
         return;
       }
 
@@ -6020,7 +6027,6 @@ void ExecutionKernel::async_execute_worker(
               stop_collision_monitoring(
                   RuntimeCollisionMonitorRelease::kFailClosedTerminal,
                   motion_state.runtime_collision_protection_generation);
-              finish_worker();
               return;
             }
             continue;
@@ -6077,7 +6083,6 @@ void ExecutionKernel::async_execute_worker(
             stop_collision_monitoring(
                 RuntimeCollisionMonitorRelease::kFailClosedTerminal,
                 motion_state.runtime_collision_protection_generation);
-            finish_worker();
             return;
           }
           // Fault session policy preempted the move. The scope (if
@@ -6091,7 +6096,6 @@ void ExecutionKernel::async_execute_worker(
           finalize_motion_execution_outcome(
               motion_state, MotionExecutionTerminalCause::kInterruptedFault,
               std::nullopt, std::nullopt, "interrupted_fault");
-          finish_worker();
           return;
         }
         if (latch &&
@@ -6106,7 +6110,6 @@ void ExecutionKernel::async_execute_worker(
           handle_motion_trip_latch(request, *latch, exec_id,
                                      latest_backend_snapshot, motion_state,
                                      st);
-          finish_worker();
           return;
         }
       }
@@ -6136,7 +6139,6 @@ void ExecutionKernel::async_execute_worker(
             finalize_motion_execution_outcome(
                 motion_state, MotionExecutionTerminalCause::kStopped,
                 std::nullopt, std::nullopt, reap_reason);
-            finish_worker();
           };
 
           auto fail_resume_closed = [&](ErrorDTO error,
@@ -6209,7 +6211,6 @@ void ExecutionKernel::async_execute_worker(
                                "Resume failed and stop drain did not complete",
                                {{"reason", "resume_failure_stop_drain"}}},
                 std::nullopt, outcome_reap_reason);
-            finish_worker();
           };
 
           emit_event({KernelEventType::kPlanStarted, exec_id, clock_.now(),
@@ -6307,7 +6308,6 @@ void ExecutionKernel::async_execute_worker(
                   MotionExecutionTerminalCause::kInterruptedFault,
                   std::nullopt, std::nullopt,
                   "resume_validation_cancelled_by_interrupt");
-              finish_worker();
               return;
             }
             fail_resume_closed(resume_validation.error(),
@@ -6395,7 +6395,6 @@ void ExecutionKernel::async_execute_worker(
                 motion_state, MotionExecutionTerminalCause::kFailed,
                 resume_error,
                 std::nullopt, "resume_transition_failed");
-            finish_worker();
             return;
           }
 
@@ -6488,7 +6487,6 @@ void ExecutionKernel::async_execute_worker(
         std::nullopt, "worker_exception");
   }
 
-  finish_worker();
 }
 
 Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
@@ -6527,6 +6525,19 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
             "Execution cannot be started from the active execution worker",
             {{"reason_code", "worker_retirement_self_thread"}}});
       }
+      break;
+    default:
+      break;
+  }
+
+  switch (sm_.status().state) {
+    using enum ExecutionState;
+    case kIdle:
+    case kCompleted:
+    case kStopped:
+    case kFailed:
+    case kInterventionRequired:
+      planning_reset_requested_.store(false, std::memory_order_release);
       break;
     default:
       break;
@@ -7373,7 +7384,18 @@ ResetResultDTO ExecutionKernel::reset(
   // backend reset can block. Later reset failure deliberately leaves admission
   // closed; only a successful reset/resume/new execute reauthorizes commands.
   invalidate_gripper_authority(GripperInvalidationReason::kReset);
-  auto prev_state = sm_.status().state;
+  ExecutionState prev_state;
+  {
+    // Linearize the reset claim with the worker's post-plan classification.
+    // If Reset wins, the worker observes the claim and performs no competing
+    // state transition. If the worker wins, Reset observes its resulting state
+    // and follows that state's normal reset path.
+    std::lock_guard<std::mutex> planning_result_lock(planning_result_mutex_);
+    prev_state = sm_.status().state;
+    if (prev_state == ExecutionState::kPlanning) {
+      planning_reset_requested_.store(true, std::memory_order_release);
+    }
+  }
   if (prev_state == ExecutionState::kPlanning) {
     request_active_planning_cancel();
   } else if (prev_state == ExecutionState::kValidating) {
@@ -9126,7 +9148,8 @@ Result<void> ExecutionKernel::collision_check_tick() {
 
 Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
     const ExecuteRequestDTO& request,
-    const SceneRevisionBindingDTO& scene_binding) {
+    const SceneRevisionBindingDTO& scene_binding,
+    std::uint32_t planning_attempt_index) {
   if (!scene_binding.valid()) {
     return Result<TrajectoryDTO>::Err(ErrorDTO{
         kErrorInvalidRequest,
@@ -9157,6 +9180,7 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
   plan_req.action_span = request.action_span;
   plan_req.contact_policy_id = request.contact_policy_id;
   plan_req.planning_timeout_s = request.timeouts.planning_timeout_s;
+  plan_req.planning_attempt_index = planning_attempt_index;
   plan_req.scene_binding = scene_binding;
 
   auto result = planner_.plan(plan_req);

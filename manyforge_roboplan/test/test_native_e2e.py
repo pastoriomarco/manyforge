@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from manyforge_behavior.kernel_client import (
-    ExecuteRequest, ExecutionState, GripperCommandRequest,
+    ActionSpan, ExecuteRequest, ExecutionState, GripperCommandRequest,
     GripperCommandState, MotionInterruptScope, MotionInterruptStopProfile,
     SceneEditRequest,
 )
@@ -74,6 +74,95 @@ _UR10E_URDF = _REPO_ROOT / "manyforge_example_models" / "models" / "ur10e_roboti
 _UR10E_SRDF = _REPO_ROOT / "manyforge_example_models" / "models" / "ur10e_robotiq_2f_140" / "ur10e_robotiq_2f_140.srdf"
 
 
+class _QualificationBundle:
+    def start_planning_qualification_capture(self, capacity):
+        assert capacity == 4
+        return 7
+
+    def drain_planning_qualification_capture(self, generation):
+        return self._batch(generation)
+
+    def stop_planning_qualification_capture(self, generation, idle_timeout_ms):
+        assert idle_timeout_ms == 10_000
+        return self._batch(generation)
+
+    def planning_qualification_capture_status(self):
+        return {"generation": 7, "dropped_total": 0, "in_flight": 0}
+
+    @staticmethod
+    def _batch(generation):
+        assert generation == 7
+        return {
+            "records": [
+                {
+                    "sequence": 1,
+                    "request": {
+                        "move_id": "drop_approach",
+                        "action_span": {
+                            "action_span_id": "attempt-1",
+                            "node_attempt_id": "attempt-1",
+                        },
+                    },
+                }
+            ],
+            "status": {"generation": 7, "dropped_total": 0, "in_flight": 0},
+        }
+
+
+def test_planning_qualification_capture_merges_exact_behavior_boundaries():
+    if not HAS_NATIVE_CLIENT:
+        pytest.skip("native client adapter unavailable")
+    client = NativeKernelClient(_QualificationBundle())
+    span = ActionSpan(
+        action_source="program_node",
+        action_span_id="attempt-1",
+        program_run_id="run-1",
+        node_attempt_id="attempt-1",
+    )
+
+    assert client.start_planning_qualification_capture(4) == 7
+    client.record_planning_qualification_behavior_boundary(
+        action_span=span, move_id="drop_approach", phase="started"
+    )
+    client.record_planning_qualification_behavior_boundary(
+        action_span=span, move_id="drop_approach", phase="succeeded"
+    )
+    batch = client.stop_planning_qualification_capture(7)
+
+    assert batch["status"]["behavior_dropped_total"] == 0
+    assert batch["status"]["behavior_in_flight"] == 0
+    behavior = batch["records"][0]["behavior_node"]
+    assert behavior["terminal_phase"] == "succeeded"
+    assert behavior["wall_duration_ns"] >= 0
+    assert behavior["thread_cpu_duration_ns"] >= 0
+
+
+def test_planning_qualification_stop_abandons_pending_behavior_boundary():
+    if not HAS_NATIVE_CLIENT:
+        pytest.skip("native client adapter unavailable")
+    client = NativeKernelClient(_QualificationBundle())
+    span = ActionSpan(
+        action_source="program_node",
+        action_span_id="attempt-1",
+        program_run_id="run-1",
+        node_attempt_id="attempt-1",
+    )
+
+    assert client.start_planning_qualification_capture(4) == 7
+    client.record_planning_qualification_behavior_boundary(
+        action_span=span, move_id="drop_approach", phase="started"
+    )
+    batch = client.stop_planning_qualification_capture(7)
+
+    assert batch["status"]["behavior_dropped_total"] == 0
+    assert batch["status"]["behavior_in_flight"] == 0
+    behavior = batch["records"][0]["behavior_node"]
+    assert behavior["terminal_phase"] == "abandoned"
+    assert behavior["terminal_reason"] == "capture_stopped"
+    assert behavior["wall_duration_ns"] >= 0
+    assert behavior["thread_cpu_duration_ns"] == 0
+
+
 # ============================================================================
 # Fixtures
 # ============================================================================
@@ -113,6 +202,31 @@ def test_create_native_kernel_accepts_collision_monitor_config():
     status = kernel.get_status()
 
     assert status.state == ExecutionState.IDLE
+
+
+def test_factory_keeps_planner_model_name_private_from_logical_robot_id():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    bundle = manyforge_roboplan_py.create_native_kernel(
+        "ur5_gripper",
+        "arm",
+        None,
+        "cell_robot",
+    )
+    try:
+        snapshot = bundle.get_scene_authority_snapshot()
+        assert snapshot["robot_placements"] == [
+            {
+                "robot_id": "cell_robot",
+                "pose_in_world": {
+                    "position_m": (0.0, 0.0, 0.0),
+                    "orientation_xyzw": (0.0, 0.0, 0.0, 1.0),
+                },
+            }
+        ]
+    finally:
+        bundle.close()
 
 
 def test_native_recovery_binding_returns_complete_fail_closed_contract():
@@ -497,6 +611,26 @@ def test_create_native_kernel_rejects_stop_profile_deceleration_time_over_cap():
                     },
                 }
             },
+        )
+
+
+def test_create_native_kernel_accepts_uint32_planner_rng_seed():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    bundle = manyforge_roboplan_py.create_native_kernel(
+        "ur5_gripper", "arm", {"rng_seed": 2**32 - 1}
+    )
+    assert bundle is not None
+
+
+def test_create_native_kernel_rejects_planner_rng_seed_over_uint32():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    with pytest.raises(ValueError, match="rng_seed must fit in uint32"):
+        manyforge_roboplan_py.create_native_kernel(
+            "ur5_gripper", "arm", {"rng_seed": 2**32}
         )
 
 
@@ -1413,6 +1547,44 @@ class TestNativeSceneEdits:
         assert pose_after is not None
         for actual, expected in zip(pose_after["position_m"], pose_before["position_m"]):
             assert actual == pytest.approx(expected, abs=1e-6)
+
+    def test_stale_detached_pose_update_cannot_reverse_attachment(
+        self, native_kernel
+    ):
+        add_result = native_kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="conditional_attach_box",
+            shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
+            pose_position_m=[0.42, -0.08, 0.52],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        assert add_result.success is True
+        attach_result = native_kernel.scene_edit(SceneEditRequest(
+            operation="attach",
+            object_id="conditional_attach_box",
+            frame_id="tool0",
+        ))
+        assert attach_result.success is True
+
+        stale_update = native_kernel.scene_edit(SceneEditRequest(
+            operation="update_pose",
+            object_id="conditional_attach_box",
+            pose_position_m=[1.0, 2.0, 3.0],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+            expected_attached=False,
+        ))
+
+        assert stale_update.success is False
+        assert stale_update.error_code == "scene_object_state_conflict"
+        assert stale_update.error_details["reason"] == (
+            "scene_object_attachment_precondition_failed"
+        )
+        state = native_kernel.get_object_state("conditional_attach_box")
+        assert state.attached is True
+        assert state.frame_id == "tool0"
 
     def test_scene_edit_detach_preserves_world_pose_with_stable_object_id(self, native_kernel):
         add_result = native_kernel.scene_edit(SceneEditRequest(

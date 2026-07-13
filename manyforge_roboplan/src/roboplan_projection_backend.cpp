@@ -4080,7 +4080,7 @@ RoboPlanProjectionBackend::retain_planner_projection(
       std::move(inventory));
 }
 
-std::shared_ptr<roboplan::Scene>
+std::shared_ptr<const roboplan::Scene>
 RoboPlanProjectionBackend::acquire_planner_projection(
     const core::CollisionWorldRevision& revision,
     const std::string& retention_id) const {

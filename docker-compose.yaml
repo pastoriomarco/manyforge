@@ -182,6 +182,11 @@ services:
       - MANYFORGE_VALIDATION_COLLISION_WORKERS=${MANYFORGE_VALIDATION_COLLISION_WORKERS:-}
       - MANYFORGE_FRONTEND_SOURCE_MODE=${MANYFORGE_FRONTEND_SOURCE_MODE:-committed}
       - MANYFORGE_FRONTEND_FORCE_REBUILD=${MANYFORGE_FRONTEND_FORCE_REBUILD:-}
+      # Opt-in RP5 qualification instrumentation. The start script exports the
+      # preload only after the requested probe has built successfully, so
+      # normal runtime commands never inherit a missing or test-only library.
+      - MANYFORGE_ENABLE_QUALIFICATION_PROBES=${MANYFORGE_ENABLE_QUALIFICATION_PROBES:-OFF}
+      - MANYFORGE_QUALIFICATION_LD_PRELOAD=${MANYFORGE_QUALIFICATION_LD_PRELOAD:-}
       # See the `composer` service note on trace persistence/ownership.
       - MANYFORGE_TRACE_DIR=/workspace/.manyforge-var/traces
     working_dir: /workspace

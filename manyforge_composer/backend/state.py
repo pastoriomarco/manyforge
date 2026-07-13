@@ -392,6 +392,7 @@ class ComposerState:
             "geometry_applied": 0,
             "freshness_only_applied": 0,
             "no_op_skipped": 0,
+            "attachment_conflict_skipped": 0,
             "stale_generation_dropped": 0,
             "stale_result_ignored": 0,
             "errors": 0,
@@ -4875,6 +4876,12 @@ class ComposerState:
                             if scene_admission is not None
                             else False
                         ),
+                        expected_attached=(
+                            False
+                            if policy
+                            in {"before_planning", "continuous_unattached"}
+                            else None
+                        ),
                         action_span=action_span,
                     )
                     signature_key = (policy, source_id, object_id)
@@ -4997,6 +5004,36 @@ class ComposerState:
                             detail["observed_frame_id"] = str(observed_frame_id)
                         skipped_count += 1
                         details.append(detail)
+                        continue
+
+                    attachment_conflict = (
+                        result is not None
+                        and not result.success
+                        and result.error_code == "scene_object_state_conflict"
+                        and result.error_details.get("reason")
+                        == "scene_object_attachment_precondition_failed"
+                        and result.error_details.get("expected_attached") == "false"
+                        and result.error_details.get("current_attached") == "true"
+                    )
+                    if attachment_conflict:
+                        detail.update(
+                            {
+                                "status": "skipped",
+                                "skip_reason": "attached_object",
+                                "attached": True,
+                                "attached_frame_id": result.error_details.get(
+                                    "current_frame_id", ""
+                                ),
+                                "attachment_precondition_race": True,
+                            }
+                        )
+                        skipped_count += 1
+                        details.append(detail)
+                        self._record_pose_source_apply_metric(
+                            "attachment_conflict_skipped",
+                            source_id=source_id,
+                            object_id=object_id,
+                        )
                         continue
 
                     if result is None or not result.success:
@@ -5488,6 +5525,7 @@ class ComposerState:
         resume_play_after_reset = control.reset.resume_play_after_reset
         command_gate_topic = self._simulation_command_gate_topic(execution_config)
         wait_ready_s = control.reset.wait_ready_s
+        service_timeout_s = control.service_timeout_s
         cycle_state = (
             self.cycle_manager.state.value if self.cycle_manager is not None else "none"
         )
@@ -5531,7 +5569,7 @@ class ComposerState:
                     close_command_gate=close_command_gate,
                     resume_play_after_reset=resume_play_after_reset,
                     play_capability_declared=control.capabilities.play,
-                    service_timeout_s=wait_ready_s,
+                    service_timeout_s=service_timeout_s,
                     wait_ready_s=wait_ready_s,
                     execution_config=execution_config,
                     source=source,
@@ -5607,7 +5645,7 @@ class ComposerState:
         control, _execution_config = self._simulation_control_contract(
             required_capability=required_capability,
         )
-        service_timeout_s = control.reset.wait_ready_s
+        service_timeout_s = control.service_timeout_s
         cycle_state = (
             self.cycle_manager.state.value if self.cycle_manager is not None else "none"
         )

@@ -1,0 +1,84 @@
+{
+  "schema_version": "manyforge.roboplan_capability_inventory.v1",
+  "roboplan_version": "0.4.0",
+  "capabilities": [
+    {
+      "capability": "planning.motion.joint_goal",
+      "status": "supported",
+      "owner": "RoboPlanPlannerBackend",
+      "implementation": "RRT candidate generation followed by PathShortcutter and TOPPRA"
+    },
+    {
+      "capability": "planning.motion.pose_goal",
+      "status": "supported",
+      "owner": "RoboPlanPlannerBackend",
+      "implementation": "revision-bound SimpleIk followed by joint-space RRT and TOPPRA"
+    },
+    {
+      "capability": "planning.motion.cartesian_path",
+      "status": "unsupported",
+      "owner": "RP5-4/RP5-5",
+      "implementation": "No public ManyForge adapter contract on RoboPlan 0.4"
+    },
+    {
+      "capability": "planning.motion.named_target",
+      "status": "compiled_by_manyforge",
+      "owner": "ManyForge behavior/kernel request compiler",
+      "implementation": "Portable named targets are resolved before the planner adapter"
+    },
+    {
+      "capability": "planning.motion.relative_move",
+      "status": "compiled_by_manyforge",
+      "owner": "IReferencePoseResolver and ExecutionKernel",
+      "implementation": "Revision-bound target and offset references compile to PoseGoalDTO"
+    },
+    {
+      "capability": "planning.ik.single_shot",
+      "status": "supported",
+      "owner": "RoboPlanPlannerBackend",
+      "implementation": "Dedicated bounded SimpleIk solver"
+    },
+    {
+      "capability": "planning.cancellation.cooperative",
+      "status": "supported",
+      "owner": "RoboPlanPlannerBackend",
+      "implementation": "Lock-free cancel request with checkpoints around IK, RRT, shortcut, retime, verification, and conversion"
+    },
+    {
+      "capability": "planning.randomness.seeded_attempts",
+      "status": "supported",
+      "owner": "ExecutionKernel and RoboPlanPlannerBackend",
+      "implementation": "Deployment base seed plus kernel-owned planning-attempt ordinal yields reproducible initial plans and reproducibly distinct collision-replan seeds"
+    },
+    {
+      "capability": "planning.trajectory.time_parameterized",
+      "status": "supported",
+      "owner": "RoboPlanPlannerBackend",
+      "implementation": "TOPPRA plus conservative TCP and per-joint limit verification/retiming"
+    },
+    {
+      "capability": "scene.projection.revision_bound",
+      "status": "supported",
+      "owner": "RoboPlanSceneProjection",
+      "implementation": "Exact revision retention and projection lease binding"
+    },
+    {
+      "capability": "planning.failure.structured",
+      "status": "supported",
+      "owner": "RoboPlanPlannerBackend",
+      "implementation": "ManyForge ErrorDTO codes, failure stages, and collision diagnostics"
+    },
+    {
+      "capability": "collision.query.pre_execution",
+      "status": "manyforge_authority",
+      "owner": "ManyForgeCollisionEngine",
+      "implementation": "RoboPlan only proposes candidates; authoritative validation consumes immutable ManyForge world and policy snapshots"
+    },
+    {
+      "capability": "collision.query.runtime",
+      "status": "manyforge_authority",
+      "owner": "ManyForgeCollisionEngine",
+      "implementation": "Dedicated prepared runtime query engine; no planner scene or Python dependency"
+    }
+  ]
+}

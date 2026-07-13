@@ -145,6 +145,13 @@ struct ExecutionKernelConfig {
   // is visible in the deployment artifact.
   double planner_max_planning_time_s = 5.0;
 
+  // Optional deployment-side planner RNG seed. This is a reproducibility
+  // input for stochastic candidate producers, not part of portable program
+  // intent and not a safety authority. Backends that can honor it must reset
+  // their per-request RNG from this value; unsupported backends must reject a
+  // declared seed rather than silently ignoring it.
+  std::optional<std::uint32_t> planner_rng_seed;
+
   // Additional planning attempts allowed when the authoritative
   // manyforge_collision validator rejects a freshly planned candidate for a
   // blocking collision. RRT planning is probabilistic and its internal
@@ -466,7 +473,8 @@ class ExecutionKernel {
       const SceneRevisionBindingDTO& scene_binding);
   Result<TrajectoryDTO> plan_trajectory(
       const ExecuteRequestDTO& request,
-      const SceneRevisionBindingDTO& scene_binding);
+      const SceneRevisionBindingDTO& scene_binding,
+      std::uint32_t planning_attempt_index = 0);
   Result<TrajectoryDTO> plan_resume_trajectory(
       const ExecuteRequestDTO& request,
       const SceneRevisionBindingDTO& scene_binding);
@@ -955,6 +963,15 @@ class ExecutionKernel {
   std::atomic<bool> lifecycle_stop_requested_while_busy_{false};
   std::atomic<bool> lifecycle_stop_requested_event_emitted_{false};
   std::atomic<bool> lifecycle_reset_requested_while_busy_{false};
+  // Linearizes Reset's ownership claim against the execute worker's first
+  // post-plan state decision. Lifecycle commands take lifecycle_mutex_ first
+  // and then this leaf; the worker takes only this leaf. Never wait for a
+  // planner, backend stop, or worker while holding it.
+  std::mutex planning_result_mutex_;
+  // Reset cancellation of an admitted planner is owned by Reset, not by the
+  // worker's generic planning-failure path. It remains asserted until the old
+  // worker is retired before a later execute admission.
+  std::atomic<bool> planning_reset_requested_{false};
   std::atomic<bool> lifecycle_reset_waiting_for_stop_{false};
   std::atomic<bool> lifecycle_worker_retirement_in_progress_{false};
   // Monotonic per-execution terminal authority. Active interrupt latches can

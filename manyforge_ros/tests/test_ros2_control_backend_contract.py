@@ -1432,6 +1432,7 @@ def test_ros2_control_stop_observes_cancel_for_held_active_goal():
             node,
             action_name=action_name,
             hold_after_first_feedback_s=10.0,
+            hold_feedback_period_s=0.01,
             reentrant_callbacks=True,
         )
         joint_pub = node.create_publisher(JointState, joint_state_topic, 10)
@@ -1478,19 +1479,31 @@ def test_ros2_control_stop_observes_cancel_for_held_active_goal():
         )
         time.sleep(1.5)
 
+        metrics_before = bundle.get_metrics()
+        progress_samples_before = metrics_before[
+            "controller_command_progress_samples_total"
+        ]
+        cancel_confirmations_before = metrics_before[
+            "controller_cancel_confirmations_total"
+        ]
+
         result = _execute_joint_goal(bundle, "held_goal_cancel_probe")
         assert result["ok"] is True
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            if bundle.get_execution_snapshot().get("state_name") == "Executing":
+            metrics = bundle.get_metrics()
+            if (
+                bundle.get_execution_snapshot().get("state_name") == "Executing"
+                and metrics["controller_command_progress_samples_total"]
+                > progress_samples_before
+            ):
                 break
             time.sleep(0.01)
         assert bundle.get_execution_snapshot().get("state_name") == "Executing"
-
-        metrics_before = bundle.get_metrics()
-        cancel_confirmations_before = metrics_before[
-            "controller_cancel_confirmations_total"
-        ]
+        assert (
+            bundle.get_metrics()["controller_command_progress_samples_total"]
+            > progress_samples_before
+        ), "backend never observed first feedback for the accepted active goal"
 
         stop_result = bundle.stop()
         assert stop_result["accepted"] is True, stop_result

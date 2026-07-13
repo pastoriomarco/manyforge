@@ -11,11 +11,13 @@
 #include <cstdlib>
 #include <fmt/format.h>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -274,6 +276,179 @@ void anchor_trajectory_endpoints(
     zero_if_present(trajectory.accelerations, last);
   }
 }
+
+using PlanningMetrics =
+    manyforge::roboplan_backend::RoboPlanPlanningPipelineMetrics;
+using PlanningObserver =
+    manyforge::roboplan_backend::IRoboPlanPlanningPerformanceObserver;
+using CollisionProbeSnapshot =
+    manyforge::roboplan_backend::RoboPlanCollisionProbeSnapshot;
+
+CollisionProbeSnapshot read_collision_probe(
+    const std::shared_ptr<PlanningObserver>& observer) noexcept {
+  return observer ? observer->collision_probe_snapshot()
+                  : CollisionProbeSnapshot{};
+}
+
+std::uint32_t effective_planner_seed(
+    std::uint32_t base_seed, std::uint32_t attempt_index) noexcept {
+  if (attempt_index == 0) {
+    return base_seed;
+  }
+  // SplitMix64 finalization gives adjacent retry ordinals well-dispersed,
+  // reproducible MT19937 seeds without keeping mutable planner RNG state.
+  std::uint64_t value =
+      (static_cast<std::uint64_t>(base_seed) << 32U) | attempt_index;
+  value += 0x9e3779b97f4a7c15ULL;
+  value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+  value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+  value ^= value >> 31U;
+  return static_cast<std::uint32_t>(value ^ (value >> 32U));
+}
+
+int roboplan_04_deterministic_shortcut_seed(std::uint32_t seed) noexcept {
+  // RoboPlan 0.4 PathShortcutter has its documented seed branch reversed:
+  // nonnegative values use random_device, while negative values seed mt19937
+  // directly after unsigned conversion. Keep this adapter-local encoding until
+  // RP5-1 verifies the 0.5 behavior and deletes the 0.4-only workaround.
+  constexpr std::uint32_t kMaxMagnitude =
+      static_cast<std::uint32_t>(std::numeric_limits<int>::max());
+  const auto magnitude = 1U + (seed % kMaxMagnitude);
+  return -static_cast<int>(magnitude);
+}
+
+void accumulate_probe_delta(
+    manyforge::roboplan_backend::RoboPlanPlanningStageMetrics& metrics,
+    const CollisionProbeSnapshot& before,
+    const CollisionProbeSnapshot& after) noexcept {
+  if (!before.available || !after.available ||
+      after.query_count < before.query_count ||
+      after.query_duration_ns < before.query_duration_ns) {
+    return;
+  }
+  metrics.collision_query_count += after.query_count - before.query_count;
+  metrics.collision_query_duration_ns +=
+      after.query_duration_ns - before.query_duration_ns;
+}
+
+class PlanningStageMeasurement final {
+ public:
+  PlanningStageMeasurement(
+      PlanningMetrics& metrics,
+      std::shared_ptr<PlanningObserver> observer,
+      std::string_view stage_name) noexcept
+      : metrics_(metrics),
+        observer_(std::move(observer)),
+        stage_name_(stage_name),
+        enabled_(observer_ != nullptr) {
+    if (enabled_) {
+      started_at_ = std::chrono::steady_clock::now();
+      collision_before_ = read_collision_probe(observer_);
+    }
+  }
+
+  PlanningStageMeasurement(const PlanningStageMeasurement&) = delete;
+  PlanningStageMeasurement& operator=(const PlanningStageMeasurement&) = delete;
+
+  ~PlanningStageMeasurement() {
+    if (!enabled_) {
+      return;
+    }
+    try {
+      auto& stage = metrics_.stages[std::string(stage_name_)];
+      stage.duration_ns += static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - started_at_)
+              .count());
+      accumulate_probe_delta(
+          stage, collision_before_, read_collision_probe(observer_));
+    } catch (...) {
+      metrics_.measurement_complete = false;
+    }
+  }
+
+ private:
+  PlanningMetrics& metrics_;
+  std::shared_ptr<PlanningObserver> observer_;
+  std::string_view stage_name_;
+  bool enabled_ = false;
+  std::chrono::steady_clock::time_point started_at_{};
+  CollisionProbeSnapshot collision_before_;
+};
+
+class PlanningInvocationMeasurement final {
+ public:
+  PlanningInvocationMeasurement(
+      std::shared_ptr<PlanningObserver> observer,
+      const manyforge::core::PlanRequestDTO& request,
+      const manyforge::core::PlanResultDTO& result,
+      PlanningMetrics& metrics) noexcept
+      : observer_(std::move(observer)),
+        request_(request),
+        result_(result),
+        metrics_(metrics),
+        enabled_(observer_ != nullptr &&
+                 observer_->try_begin_invocation(request_)) {
+    if (enabled_) {
+      started_at_ = std::chrono::steady_clock::now();
+      collision_before_ = read_collision_probe(observer_);
+    }
+  }
+
+  PlanningInvocationMeasurement(const PlanningInvocationMeasurement&) = delete;
+  PlanningInvocationMeasurement& operator=(
+      const PlanningInvocationMeasurement&) = delete;
+
+  ~PlanningInvocationMeasurement() noexcept {
+    if (!enabled_) {
+      return;
+    }
+    try {
+      metrics_.total_duration_ns = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - started_at_)
+              .count());
+      const auto collision_after = read_collision_probe(observer_);
+      metrics_.collision_probe_available =
+          collision_before_.available && collision_after.available;
+      if (metrics_.collision_probe_available &&
+          collision_after.query_count >= collision_before_.query_count &&
+          collision_after.query_duration_ns >=
+              collision_before_.query_duration_ns) {
+        metrics_.total_collision_query_count =
+            collision_after.query_count - collision_before_.query_count;
+        metrics_.total_collision_query_duration_ns =
+            collision_after.query_duration_ns -
+            collision_before_.query_duration_ns;
+      }
+      metrics_.succeeded = result_.trajectory.has_value() && !result_.error;
+      if (result_.error) {
+        metrics_.error_code = result_.error->code;
+      }
+      if (result_.trajectory) {
+        metrics_.waypoint_count = result_.trajectory->waypoints.size();
+        if (!result_.trajectory->waypoints.empty()) {
+          metrics_.trajectory_duration_s =
+              result_.trajectory->waypoints.back().time_from_start_s;
+        }
+      }
+    } catch (...) {
+      // Qualification is evidence-only. Decoration failure invalidates the
+      // record but must never terminate or alter planning behavior.
+      metrics_.measurement_complete = false;
+    }
+    observer_->record(request_, result_, metrics_);
+  }
+
+ private:
+  std::shared_ptr<PlanningObserver> observer_;
+  const manyforge::core::PlanRequestDTO& request_;
+  const manyforge::core::PlanResultDTO& result_;
+  PlanningMetrics& metrics_;
+  bool enabled_ = false;
+  std::chrono::steady_clock::time_point started_at_{};
+  CollisionProbeSnapshot collision_before_;
+};
 }  // namespace
 
 namespace manyforge::roboplan_backend {
@@ -378,12 +553,17 @@ RoboPlanPlannerBackend::RoboPlanPlannerBackend(
     std::shared_ptr<std::mutex> scene_mutex,
     std::shared_ptr<roboplan::SimpleIk> single_shot_ik,
     std::optional<roboplan::SimpleIkOptions> ik_options,
-    std::optional<roboplan::SimpleIkOptions> single_shot_ik_options)
+    std::optional<roboplan::SimpleIkOptions> single_shot_ik_options,
+    std::optional<std::uint32_t> rng_seed,
+    std::shared_ptr<IRoboPlanPlanningPerformanceObserver>
+        performance_observer)
     : projection_(std::move(projection)),
       live_scene_(std::move(live_scene)),
       rrt_options_(rrt_options),
       single_shot_ik_(std::move(single_shot_ik)),
-      scene_mutex_(std::move(scene_mutex)) {
+      scene_mutex_(std::move(scene_mutex)),
+      rng_seed_(rng_seed),
+      performance_observer_(std::move(performance_observer)) {
   if (!projection_) {
     throw std::invalid_argument("RoboPlan planner projection must not be null");
   }
@@ -406,8 +586,24 @@ void RoboPlanPlannerBackend::request_cancel() {
   cancel_requested_.store(true, std::memory_order_release);
 }
 
+void RoboPlanPlannerBackend::set_performance_observer(
+    std::shared_ptr<IRoboPlanPlanningPerformanceObserver> observer) noexcept {
+  performance_observer_.store(std::move(observer), std::memory_order_release);
+}
+
 core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& request) {
   core::PlanResultDTO result;
+  RoboPlanPlanningPipelineMetrics performance_metrics;
+  performance_metrics.rng_base_seed = rng_seed_;
+  performance_metrics.planning_attempt_index = request.planning_attempt_index;
+  if (rng_seed_) {
+    performance_metrics.rng_seed = effective_planner_seed(
+        *rng_seed_, request.planning_attempt_index);
+  }
+  const auto performance_observer =
+      performance_observer_.load(std::memory_order_acquire);
+  PlanningInvocationMeasurement invocation(
+      performance_observer, request, result, performance_metrics);
   cancel_requested_.store(false, std::memory_order_release);
   const auto plan_started_at = std::chrono::steady_clock::now();
   const bool has_planning_deadline =
@@ -421,9 +617,14 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
           {{"reason", "planner_scene_binding_invalid"}}};
       return result;
     }
-    auto planning_scene =
-        projection_->acquire_native_projection(request.scene_binding);
-    if (!planning_scene) {
+    std::shared_ptr<const roboplan::Scene> retained_scene;
+    {
+      PlanningStageMeasurement stage(
+          performance_metrics, performance_observer, "projection_acquire");
+      retained_scene =
+          projection_->acquire_native_projection(request.scene_binding);
+    }
+    if (!retained_scene) {
       result.error = core::ErrorDTO{
           core::kErrorSceneChangedDuringValidation,
           "The retained planner scene projection is unavailable",
@@ -434,14 +635,29 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
             std::to_string(request.scene_binding.revision.revision_id)}}};
       return result;
     }
-    auto planning_ik =
-        std::make_shared<roboplan::SimpleIk>(planning_scene, ik_options_);
-    auto planning_shortcutter =
-        std::make_shared<roboplan::PathShortcutter>(
-            planning_scene, rrt_options_.group_name);
-    auto planning_toppra =
-        std::make_shared<roboplan::PathParameterizerTOPPRA>(
-            planning_scene, rrt_options_.group_name);
+    std::shared_ptr<roboplan::Scene> planning_scene;
+    std::shared_ptr<roboplan::SimpleIk> planning_ik;
+    std::shared_ptr<roboplan::PathShortcutter> planning_shortcutter;
+    std::shared_ptr<roboplan::PathParameterizerTOPPRA> planning_toppra;
+    {
+      PlanningStageMeasurement stage(
+          performance_metrics, performance_observer, "context_construction");
+      // Retained projections are immutable evidence. Planner algorithms own a
+      // request-local working copy because IK and sampling advance Scene RNG
+      // state even when geometry is unchanged.
+      planning_scene = std::make_shared<roboplan::Scene>(*retained_scene);
+      if (performance_metrics.rng_seed.has_value()) {
+        planning_scene->setRngSeed(*performance_metrics.rng_seed);
+      }
+      planning_ik =
+          std::make_shared<roboplan::SimpleIk>(planning_scene, ik_options_);
+      planning_shortcutter =
+          std::make_shared<roboplan::PathShortcutter>(
+              planning_scene, rrt_options_.group_name);
+      planning_toppra =
+          std::make_shared<roboplan::PathParameterizerTOPPRA>(
+              planning_scene, rrt_options_.group_name);
+    }
 
     const auto fail_if_cancelled = [&](const std::string& stage) {
       if (!cancel_requested_.load(std::memory_order_acquire)) {
@@ -501,7 +717,13 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
                                              start_positions);
 
     // Check start for self-collision
-    bool start_collision = planning_scene->hasCollisions(start_positions_full);
+    bool start_collision = false;
+    {
+      PlanningStageMeasurement stage(
+          performance_metrics, performance_observer,
+          "start_collision_query");
+      start_collision = planning_scene->hasCollisions(start_positions_full);
+    }
     bool goal_collision = false;
     if (fail_if_cancelled_or_timed_out("start_collision_check")) {
       return result;
@@ -509,6 +731,8 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
 
     // FK of start pose
     {
+      PlanningStageMeasurement stage(
+          performance_metrics, performance_observer, "start_fk");
       Eigen::Matrix4d start_fk = planning_scene->forwardKinematics(
           start_positions_full, request.tcp_frame);
       double r, p, ya;
@@ -582,7 +806,14 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       goal_config.joint_names = start.joint_names;
       goal_config.positions = start_positions;  // seed with current
 
-      if (!planning_ik->solveIk(cart_config, start_config, goal_config)) {
+      bool ik_succeeded = false;
+      {
+        PlanningStageMeasurement stage(
+            performance_metrics, performance_observer, "ik");
+        ik_succeeded =
+            planning_ik->solveIk(cart_config, start_config, goal_config);
+      }
+      if (!ik_succeeded) {
         double r, p, ya;
         matrix_to_rpy_deg(tform, r, p, ya);
         auto str = fmt::format(
@@ -610,7 +841,12 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       const Eigen::VectorXd goal_positions_full =
           planning_scene->toFullJointPositions(
               rrt_options_.group_name, goal_config.positions);
-      goal_collision = planning_scene->hasCollisions(goal_positions_full);
+      {
+        PlanningStageMeasurement stage(
+            performance_metrics, performance_observer,
+            "goal_collision_query");
+        goal_collision = planning_scene->hasCollisions(goal_positions_full);
+      }
       planner_debug("[PLANNER] goal in collision: {}\n",
                     goal_collision ? "YES" : "no");
       if (fail_if_cancelled_or_timed_out("goal_collision_check")) {
@@ -749,13 +985,20 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       }
     }
     roboplan::RRT request_rrt(planning_scene, request_rrt_options);
+    if (performance_metrics.rng_seed.has_value()) {
+      request_rrt.setRngSeed(*performance_metrics.rng_seed);
+    }
 
     // Plan path with RRT
     if (fail_if_cancelled_or_timed_out("before_rrt")) {
       return result;
     }
     planner_debug("[PLANNER] calling RRT...\n");
-    auto path_result = request_rrt.plan(start_config, goal_config);
+    auto path_result = [&]() {
+      PlanningStageMeasurement stage(
+          performance_metrics, performance_observer, "rrt");
+      return request_rrt.plan(start_config, goal_config);
+    }();
     if (fail_if_cancelled_or_timed_out("rrt")) {
       return result;
     }
@@ -793,7 +1036,19 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     if (fail_if_cancelled_or_timed_out("before_shortcut")) {
       return result;
     }
-    auto smoothed_path = planning_shortcutter->shortcut(path_result.value(), 0.05);
+    auto smoothed_path = [&]() {
+      PlanningStageMeasurement stage(
+          performance_metrics, performance_observer, "shortcut");
+      if (performance_metrics.rng_seed.has_value()) {
+        performance_metrics.shortcut_rng_seed_argument =
+            roboplan_04_deterministic_shortcut_seed(
+                *performance_metrics.rng_seed);
+        return planning_shortcutter->shortcut(
+            path_result.value(), 0.05, 100,
+            *performance_metrics.shortcut_rng_seed_argument);
+      }
+      return planning_shortcutter->shortcut(path_result.value(), 0.05);
+    }();
     if (fail_if_cancelled_or_timed_out("shortcut")) {
       return result;
     }
@@ -841,117 +1096,121 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     double final_vel_cap_peak = 0.0;
     double final_acc_cap_peak = 0.0;
 
-    for (int iter = 0; iter < kMaxRetimeIterations; ++iter) {
-      if (fail_if_cancelled_or_timed_out("retime")) {
-        return result;
-      }
-      retime_iterations_used = iter + 1;
-      auto traj_result = planning_toppra->generate(
-          smoothed_path, 0.01,
-          roboplan::SplineFittingMode::Hermite,
-          vel_scale,
-          acc_scale);
-
-      if (!traj_result.has_value()) {
-        result.error = core::ErrorDTO{core::kErrorPlanningFailed,
-                                       "TOPPRA failed: " + traj_result.error(), {}};
-        return result;
-      }
-      if (fail_if_cancelled_or_timed_out("retime_generate")) {
-        return result;
-      }
-
-      final_traj = traj_result.value();
-      anchor_trajectory_endpoints(
-          final_traj, start_config.positions, goal_config.positions);
-      if (fail_if_cancelled_or_timed_out("retime_verify")) {
-        return result;
-      }
-
-      // --- Global TCP linear speed ---
-      bool tcp_ok = true;
-      if (has_tcp_limit) {
-        final_tcp_check = compute_tcp_speed_check(
-            planning_scene, rrt_options_.group_name, final_traj, tcp_frame);
-        if (fail_if_cancelled_or_timed_out("tcp_speed_verify")) {
+    {
+      PlanningStageMeasurement stage(
+          performance_metrics, performance_observer, "retime");
+      for (int iter = 0; iter < kMaxRetimeIterations; ++iter) {
+        if (fail_if_cancelled_or_timed_out("retime")) {
           return result;
         }
-        tcp_ok = final_tcp_check.max_speed_mps <= tcp_limit;
-      }
+        retime_iterations_used = iter + 1;
+        auto traj_result = planning_toppra->generate(
+            smoothed_path, 0.01,
+            roboplan::SplineFittingMode::Hermite,
+            vel_scale,
+            acc_scale);
 
-      // --- Per-joint velocity / acceleration caps ---
-      // Sample the generated trajectory and compare peaks against the caps. If a
-      // capped dimension lacks samples for a capped joint, the cap cannot be
-      // verified -> fail closed (do NOT treat the missing peak as zero, which
-      // would falsely pass the cap).
-      double vel_cap_ratio = 1.0;
-      double acc_cap_ratio = 1.0;
-      final_vel_cap_joint.clear();
-      final_acc_cap_joint.clear();
-      final_vel_cap_peak = 0.0;
-      final_acc_cap_peak = 0.0;
-      if (has_joint_dynamics_caps) {
-        const JointCapMeasurement meas =
-            measure_joint_cap_peaks(final_traj, vel_cap_by_name, acc_cap_by_name);
-        if (fail_if_cancelled_or_timed_out("joint_dynamics_verify")) {
+        if (!traj_result.has_value()) {
+          result.error = core::ErrorDTO{core::kErrorPlanningFailed,
+                                         "TOPPRA failed: " + traj_result.error(), {}};
           return result;
         }
-        if (!meas.samples_complete) {
-          result.error = core::ErrorDTO{
-              core::kErrorUnsupportedCapability,
-              "trajectory lacks the samples required to verify a per-joint "
-              "dynamics cap; cannot prove enforcement",
-              {{"reason", "unsupported_joint_dynamics_limit"},
-               {"failure_stage", "time_parameterization"},
-               {"dimension", meas.incomplete_dimension},
-               {"joint", meas.incomplete_joint}}};
+        if (fail_if_cancelled_or_timed_out("retime_generate")) {
           return result;
         }
-        vel_cap_ratio = meas.worst_vel_ratio;
-        acc_cap_ratio = meas.worst_acc_ratio;
-        final_vel_cap_joint = meas.worst_vel_joint;
-        final_acc_cap_joint = meas.worst_acc_joint;
-        final_vel_cap_peak = meas.worst_vel_peak;
-        final_acc_cap_peak = meas.worst_acc_peak;
-      }
-      final_vel_cap_ratio = vel_cap_ratio;
-      final_acc_cap_ratio = acc_cap_ratio;
-      const bool joints_ok = vel_cap_ratio <= 1.0 && acc_cap_ratio <= 1.0;
 
-      if (tcp_ok && joints_ok) {
-        break;
-      }
+        final_traj = traj_result.value();
+        anchor_trajectory_endpoints(
+            final_traj, start_config.positions, goal_config.positions);
+        if (fail_if_cancelled_or_timed_out("retime_verify")) {
+          return result;
+        }
 
-      // Reduce scales conservatively so every constraint moves toward
-      // satisfaction together; take the most aggressive factor on each lever.
-      // TCP speed and per-joint velocity act ~linearly on vel_scale. Per-joint
-      // acceleration has a tangential component (∝ acc_scale) and a centripetal
-      // component (∝ traversal speed²), so an acceleration violation pulls down
-      // acc_scale (tangential) AND vel_scale by sqrt(ratio) (centripetal) — the
-      // square root because the velocity-squared term scales the peak by
-      // vel_scale².
-      double vel_factor = 1.0;
-      double acc_factor = 1.0;
-      if (has_tcp_limit && !tcp_ok) {
-        vel_factor = std::min(
-            vel_factor, (tcp_limit * kSpeedMargin) / final_tcp_check.max_speed_mps);
+        // --- Global TCP linear speed ---
+        bool tcp_ok = true;
+        if (has_tcp_limit) {
+          final_tcp_check = compute_tcp_speed_check(
+              planning_scene, rrt_options_.group_name, final_traj, tcp_frame);
+          if (fail_if_cancelled_or_timed_out("tcp_speed_verify")) {
+            return result;
+          }
+          tcp_ok = final_tcp_check.max_speed_mps <= tcp_limit;
+        }
+
+        // --- Per-joint velocity / acceleration caps ---
+        // Sample the generated trajectory and compare peaks against the caps. If a
+        // capped dimension lacks samples for a capped joint, the cap cannot be
+        // verified -> fail closed (do NOT treat the missing peak as zero, which
+        // would falsely pass the cap).
+        double vel_cap_ratio = 1.0;
+        double acc_cap_ratio = 1.0;
+        final_vel_cap_joint.clear();
+        final_acc_cap_joint.clear();
+        final_vel_cap_peak = 0.0;
+        final_acc_cap_peak = 0.0;
+        if (has_joint_dynamics_caps) {
+          const JointCapMeasurement meas =
+              measure_joint_cap_peaks(final_traj, vel_cap_by_name, acc_cap_by_name);
+          if (fail_if_cancelled_or_timed_out("joint_dynamics_verify")) {
+            return result;
+          }
+          if (!meas.samples_complete) {
+            result.error = core::ErrorDTO{
+                core::kErrorUnsupportedCapability,
+                "trajectory lacks the samples required to verify a per-joint "
+                "dynamics cap; cannot prove enforcement",
+                {{"reason", "unsupported_joint_dynamics_limit"},
+                 {"failure_stage", "time_parameterization"},
+                 {"dimension", meas.incomplete_dimension},
+                 {"joint", meas.incomplete_joint}}};
+            return result;
+          }
+          vel_cap_ratio = meas.worst_vel_ratio;
+          acc_cap_ratio = meas.worst_acc_ratio;
+          final_vel_cap_joint = meas.worst_vel_joint;
+          final_acc_cap_joint = meas.worst_acc_joint;
+          final_vel_cap_peak = meas.worst_vel_peak;
+          final_acc_cap_peak = meas.worst_acc_peak;
+        }
+        final_vel_cap_ratio = vel_cap_ratio;
+        final_acc_cap_ratio = acc_cap_ratio;
+        const bool joints_ok = vel_cap_ratio <= 1.0 && acc_cap_ratio <= 1.0;
+
+        if (tcp_ok && joints_ok) {
+          break;
+        }
+
+        // Reduce scales conservatively so every constraint moves toward
+        // satisfaction together; take the most aggressive factor on each lever.
+        // TCP speed and per-joint velocity act ~linearly on vel_scale. Per-joint
+        // acceleration has a tangential component (∝ acc_scale) and a centripetal
+        // component (∝ traversal speed²), so an acceleration violation pulls down
+        // acc_scale (tangential) AND vel_scale by sqrt(ratio) (centripetal) — the
+        // square root because the velocity-squared term scales the peak by
+        // vel_scale².
+        double vel_factor = 1.0;
+        double acc_factor = 1.0;
+        if (has_tcp_limit && !tcp_ok) {
+          vel_factor = std::min(
+              vel_factor, (tcp_limit * kSpeedMargin) / final_tcp_check.max_speed_mps);
+        }
+        if (vel_cap_ratio > 1.0) {
+          vel_factor = std::min(vel_factor, kSpeedMargin / vel_cap_ratio);
+        }
+        if (acc_cap_ratio > 1.0) {
+          acc_factor = std::min(acc_factor, kSpeedMargin / acc_cap_ratio);
+          vel_factor =
+              std::min(vel_factor, kSpeedMargin / std::sqrt(acc_cap_ratio));
+        }
+        if (vel_factor < 1.0) {
+          vel_scale *= vel_factor;
+        }
+        if (acc_factor < 1.0) {
+          acc_scale *= acc_factor;
+        }
+        if (vel_scale < 0.001) vel_scale = 0.001;
+        if (acc_scale < 0.001) acc_scale = 0.001;
       }
-      if (vel_cap_ratio > 1.0) {
-        vel_factor = std::min(vel_factor, kSpeedMargin / vel_cap_ratio);
-      }
-      if (acc_cap_ratio > 1.0) {
-        acc_factor = std::min(acc_factor, kSpeedMargin / acc_cap_ratio);
-        vel_factor =
-            std::min(vel_factor, kSpeedMargin / std::sqrt(acc_cap_ratio));
-      }
-      if (vel_factor < 1.0) {
-        vel_scale *= vel_factor;
-      }
-      if (acc_factor < 1.0) {
-        acc_scale *= acc_factor;
-      }
-      if (vel_scale < 0.001) vel_scale = 0.001;
-      if (acc_scale < 0.001) acc_scale = 0.001;
     }
 
     if (has_tcp_limit && final_tcp_check.max_speed_mps > tcp_limit) {
@@ -1012,7 +1271,12 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     }
 
     // Convert to TrajectoryDTO
-    result.trajectory = convert_trajectory(final_traj);
+    {
+      PlanningStageMeasurement stage(
+          performance_metrics, performance_observer,
+          "trajectory_conversion");
+      result.trajectory = convert_trajectory(final_traj);
+    }
     result.scene_revision = request.scene_binding.revision;
 
   } catch (const std::exception& e) {

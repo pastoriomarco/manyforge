@@ -113,6 +113,11 @@ SceneUpdateStatus SceneAuthority::classify_update(
 
 SceneCommitResultDTO SceneAuthority::commit(SceneTransactionDTO transaction) {
   std::lock_guard<std::mutex> lock(transaction_mutex_);
+  return commit_locked(std::move(transaction));
+}
+
+SceneCommitResultDTO SceneAuthority::commit_locked(
+    SceneTransactionDTO transaction) {
   SceneCommitResultDTO result;
   result.transaction_sequence = ++next_transaction_sequence_;
   transaction.transaction_sequence = result.transaction_sequence;
@@ -152,6 +157,29 @@ SceneCommitResultDTO SceneAuthority::commit(SceneTransactionDTO transaction) {
          {"current_revision_id",
           std::to_string(current->logical->revision.revision_id)}});
     return result;
+  }
+
+  if (const auto* update =
+          std::get_if<UpdateObjectPoseRequestDTO>(&transaction.operation);
+      update != nullptr && update->expected_attached.has_value()) {
+    const auto object = std::find_if(
+        current->logical->objects.begin(), current->logical->objects.end(),
+        [&](const SceneObjectSnapshotDTO& candidate) {
+          return candidate.object_id == update->object_id;
+        });
+    if (object != current->logical->objects.end() &&
+        object->attached != *update->expected_attached) {
+      result.error = scene_error(
+          ErrorCode::kSceneObjectStateConflict,
+          "Scene object attachment state changed before pose update admission",
+          {{"reason", "scene_object_attachment_precondition_failed"},
+           {"object_id", update->object_id},
+           {"expected_attached",
+            *update->expected_attached ? "true" : "false"},
+           {"current_attached", object->attached ? "true" : "false"},
+           {"current_frame_id", object->frame_id}});
+      return result;
+    }
   }
 
   SceneRevisionDTO proposed;
@@ -446,11 +474,15 @@ LogicalSceneSnapshotPtr SceneAuthority::logical_snapshot() const {
 template <typename Request>
 SceneEditResultDTO SceneAuthority::commit_typed(Request request,
                                                 const char* source) {
+  // One-shot convenience edits bind to "current" by contract. Acquire the
+  // writer mutex before reading that revision so concurrent convenience edits
+  // serialize instead of manufacturing a stale optimistic transaction.
+  std::lock_guard<std::mutex> lock(transaction_mutex_);
   SceneTransactionDTO transaction;
   transaction.expected_revision = current_revision();
   transaction.operation = std::move(request);
   transaction.authority_source = source;
-  return edit_result(commit(std::move(transaction)));
+  return edit_result(commit_locked(std::move(transaction)));
 }
 
 SceneEditResultDTO SceneAuthority::edit_result(
@@ -478,6 +510,7 @@ SceneEditResultDTO SceneAuthority::remove_object(
 
 SceneEditResultDTO SceneAuthority::update_object_pose(
     const UpdateObjectPoseRequestDTO& request) {
+  std::lock_guard<std::mutex> lock(transaction_mutex_);
   SceneTransactionDTO transaction;
   transaction.expected_revision = current_revision();
   transaction.operation = request;
@@ -486,7 +519,7 @@ SceneEditResultDTO SceneAuthority::update_object_pose(
     transaction.recovery_admission_impact =
         SceneRecoveryAdmissionImpact::kLiveObservation;
   }
-  return edit_result(commit(std::move(transaction)));
+  return edit_result(commit_locked(std::move(transaction)));
 }
 
 SceneEditResultDTO SceneAuthority::attach_object(

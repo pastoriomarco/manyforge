@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_core/observed_robot_state_publication.hpp>
+#include <manyforge_core/observed_robot_state_provider.hpp>
 
-#include <string>
 #include <atomic>
+#include <cstdint>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -88,6 +90,90 @@ TEST(ObservedRobotStatePublicationTest,
   ASSERT_TRUE(selected);
   EXPECT_EQ(selected.source_id(), "joint");
   EXPECT_TRUE(selected.complete());
+}
+
+TEST(ObservedRobotStatePublicationTest,
+     ProviderRejectsFallbackFromRequiredCommandAuthorityToMeasuredData) {
+  auto command_source = ObservedRobotStateSourceConfig{
+      ObservedRobotStateSourceKind::kCommandedState, "commanded_state",
+      ObservedRobotStateAuthorityProfile::kCommandedSimulation,
+      /*budget_ns=*/0, "commanded_sim_v1"};
+  ObservedRobotStatePublication publication(
+      {"j1"},
+      {std::move(command_source),
+       source(ObservedRobotStateSourceKind::kJointState, "joint", 1000)});
+  const std::vector<std::string> joints{"j1"};
+  const std::vector<double> measured{0.25};
+  ASSERT_TRUE(publication
+                  .publish(ObservedRobotStateSourceKind::kJointState, joints,
+                           measured, {}, 10, 10)
+                  .published);
+  PublishedObservedRobotStateProvider provider(
+      publication,
+      ObservedRobotStateAuthorityProfile::kCommandedSimulation);
+
+  const auto result = provider.current_state(10);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"),
+            "observed_state_authority_mismatch");
+  EXPECT_EQ(result.error().details.at("expected_authority_profile"),
+            "commanded_simulation");
+  EXPECT_EQ(result.error().details.at("actual_authority_profile"), "measured");
+}
+
+TEST(ObservedRobotStatePublicationTest,
+     ProviderAcceptsTheDeploymentRequiredAuthorityProfile) {
+  auto command_source = ObservedRobotStateSourceConfig{
+      ObservedRobotStateSourceKind::kCommandedState, "commanded_state",
+      ObservedRobotStateAuthorityProfile::kCommandedSimulation,
+      /*budget_ns=*/0, "commanded_sim_v1"};
+  ObservedRobotStatePublication publication(
+      {"j1"}, {std::move(command_source)});
+  const std::vector<std::string> joints{"j1"};
+  const std::vector<double> commanded{0.75};
+  const std::vector<double> velocities{0.0};
+  ASSERT_TRUE(publication
+                  .publish(ObservedRobotStateSourceKind::kCommandedState,
+                           joints, commanded, velocities, 10, 10)
+                  .published);
+  PublishedObservedRobotStateProvider provider(
+      publication,
+      ObservedRobotStateAuthorityProfile::kCommandedSimulation);
+
+  const auto result = provider.current_state(10);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(result.value().positions_rad, commanded);
+  EXPECT_EQ(result.value().velocities_rad_s, velocities);
+}
+
+TEST(ObservedRobotStatePublicationTest,
+     ProviderRejectsAnInvalidatedNonExpiringAuthority) {
+  auto command_source = ObservedRobotStateSourceConfig{
+      ObservedRobotStateSourceKind::kCommandedState, "commanded_state",
+      ObservedRobotStateAuthorityProfile::kCommandedSimulation,
+      /*budget_ns=*/0, "commanded_sim_v1"};
+  ObservedRobotStatePublication publication(
+      {"j1"}, {std::move(command_source)});
+  const std::vector<std::string> joints{"j1"};
+  const std::vector<double> commanded{0.75};
+  ASSERT_TRUE(publication
+                  .publish(ObservedRobotStateSourceKind::kCommandedState,
+                           joints, commanded, {}, 10, 10)
+                  .published);
+  std::atomic<std::uint64_t> authority_epoch{2};
+  PublishedObservedRobotStateProvider provider(
+      publication,
+      ObservedRobotStateAuthorityProfile::kCommandedSimulation,
+      &authority_epoch);
+
+  ASSERT_TRUE(provider.current_state(10).ok());
+  authority_epoch.store(3, std::memory_order_release);
+  const auto rejected = provider.current_state(10);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"),
+            "observed_state_authority_invalidated");
+  authority_epoch.store(4, std::memory_order_release);
+  EXPECT_TRUE(provider.current_state(10).ok());
 }
 
 TEST(ObservedRobotStatePublicationTest,

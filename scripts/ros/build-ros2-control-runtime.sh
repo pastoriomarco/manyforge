@@ -42,12 +42,19 @@ fi
 cmake -S "${WORKSPACE}/manyforge_roboplan" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DMANYFORGE_ENABLE_ROS2_CONTROL=ON \
+    -DMANYFORGE_ENABLE_QUALIFICATION_PROBES="${MANYFORGE_ENABLE_QUALIFICATION_PROBES:-OFF}" \
     -DBUILD_TESTING=OFF \
     -Dpybind11_DIR="${PYBIND11_DIR}"
 cmake --build "${BUILD_DIR}" -j"$(nproc)"
 
 if ! ls "${BUILD_DIR}"/manyforge_roboplan_py*.so >/dev/null 2>&1; then
     echo "manyforge_roboplan_py was not produced in ${BUILD_DIR}." >&2
+    exit 1
+fi
+
+if [[ "${MANYFORGE_ENABLE_QUALIFICATION_PROBES:-OFF}" == "ON" ]] &&
+   [[ ! -f "${BUILD_DIR}/libroboplan_collision_counter_probe.so" ]]; then
+    echo "RP5 qualification collision probe was not produced in ${BUILD_DIR}." >&2
     exit 1
 fi
 
