@@ -432,7 +432,9 @@ TEST_F(StateMachineTest, ConcurrentTransitionsDontCorrupt) {
       (void)shared_sm.try_transition(ExecutionState::kCompleted);
     });
   }
-  // jthreads auto-join when destroyed
+  for (auto& thread : threads) {
+    thread.join();
+  }
 
   auto state = shared_sm.status().state;
   EXPECT_EQ(state, ExecutionState::kCompleted);

@@ -6801,6 +6801,10 @@ TEST_F(ExecutionKernelTest,
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  // The stop worker can publish a final assessment after terminal completion.
+  // Keep the subscriber state alive until the kernel has joined that worker.
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
   ExecutionKernel local_kernel{planner,
                                context,
                                controlled_execution,
@@ -6814,9 +6818,6 @@ TEST_F(ExecutionKernelTest,
   controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
       {MotionInterruptStopMode::kSoftOnPath,
        MotionInterruptStopMode::kSpringBackHold};
-
-  std::mutex events_mutex;
-  std::vector<KernelEvent> events;
   local_kernel.subscribe_events([&](const KernelEvent& e) {
     std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
