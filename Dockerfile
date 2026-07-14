@@ -51,7 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Python packages: testing, behavior trees, bindings, visualization
 # Pin the cmeel/pinocchio dependency set to a self-consistent Pinocchio 4 stack.
-# `pin==4.0.0` and `coal==3.0.3` link urdfdom 6 (liburdfdom_*.so.6), so
+# `pin==4.1.0` and `coal==3.0.3` link urdfdom 6 (liburdfdom_*.so.6), so
 # `cmeel-urdfdom` is pinned to 6.0.0 to keep the whole stack on one urdfdom
 # soname; an older/unpinned urdfdom would reintroduce a `liburdfdom_*.so.X`
 # ImportError at the RoboPlan bindings build. urdfdom 6 in turn links tinyxml2
@@ -64,8 +64,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # resolution order.
 RUN pip install --no-cache-dir --upgrade pip setuptools && \
     printf '%s\n' \
-        'pin==4.0.0' \
-        'libpinocchio==4.0.0' \
+        'pin==4.1.0' \
+        'libpinocchio==4.1.0' \
         'coal==3.0.3' \
         'libcoal==3.0.3' \
         'cmeel-urdfdom==6.0.0' \
@@ -90,29 +90,38 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
         yourdfpy==0.0.60 \
         nanobind==2.12.0 \
         scikit-build-core==0.12.2 \
-        pin==4.0.0 \
+        pin==4.1.0 \
         fastapi==0.135.3 \
         "uvicorn[standard]==0.44.0" \
         httpx==0.28.1 \
         websockets==16.0 \
         mcp==1.27.0 \
+    && pip check \
     && CMEEL_LIB=$(python3 -c "import site; print(site.getsitepackages()[0])")/cmeel.prefix/lib \
     && if [ -d "$CMEEL_LIB" ]; then echo "$CMEEL_LIB" > /etc/ld.so.conf.d/cmeel.conf && ldconfig; fi
 
 # RoboPlan: C++ planning library with Python bindings (nanobind)
 # Pre-cloned on host — see scripts/setup-docker.sh
 COPY .docker/roboplan/ /tmp/roboplan/
+COPY third_party/roboplan/ /tmp/roboplan-manifest/
+COPY scripts/ci/check-roboplan-dependency-stack.py /tmp/check-roboplan-dependency-stack.py
 RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1) \
     && PINOCCHIO_PREFIX=$(dirname $(dirname $(dirname $PINOCCHIO_CMAKE_DIR))) \
     && echo "Pinocchio prefix: ${PINOCCHIO_PREFIX}" \
+    && cd /tmp/roboplan-manifest \
+    && sha256sum -c patches.sha256 \
+    && while read -r digest patch; do \
+         case "$patch" in patches/*.patch) ;; *) echo "Invalid RoboPlan patch path: $patch" >&2; exit 1;; esac; \
+         git -C /tmp/roboplan apply --check "/tmp/roboplan-manifest/$patch"; \
+         git -C /tmp/roboplan apply "/tmp/roboplan-manifest/$patch"; \
+       done < patches.sha256 \
     && cd /tmp/roboplan \
     && export CMAKE_PREFIX_PATH="${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH}" \
     && export LD_LIBRARY_PATH="${PINOCCHIO_PREFIX}/lib:${LD_LIBRARY_PATH}" \
-    && sed -i 's#-DCMAKE_INSTALL_PREFIX#-DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX#' scripts/build_cmake.bash \
-    && ./scripts/build_cmake.bash \
+    && ROBOPLAN_CMAKE_ARGS=-DBUILD_TESTING=OFF ./scripts/build_cmake.bash \
     && ROBOPLAN_INSTALL=/tmp/roboplan/install \
     && mkdir -p /usr/local/lib/cmake /usr/local/include /usr/local/share \
-    && for pkg in roboplan roboplan_rrt roboplan_simple_ik roboplan_toppra roboplan_oink roboplan_example_models toppra; do \
+    && for pkg in roboplan roboplan_rrt roboplan_simple_ik roboplan_toppra roboplan_oink roboplan_cartesian_planning roboplan_example_models toppra; do \
          if [ -d "${ROBOPLAN_INSTALL}/${pkg}/lib" ]; then \
            cp -a ${ROBOPLAN_INSTALL}/${pkg}/lib/*.so* /usr/local/lib/ 2>/dev/null || true; \
            cp -a ${ROBOPLAN_INSTALL}/${pkg}/lib/*.a /usr/local/lib/ 2>/dev/null || true; \
@@ -129,11 +138,13 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
        done \
     && ldconfig \
     && export CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH}" \
-    && for py_pkg in roboplan roboplan_example_models roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt; do \
+    && for py_pkg in roboplan roboplan_example_models roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt roboplan_cartesian_planning; do \
          cd "/tmp/roboplan/${py_pkg}"; \
          pip install --no-build-isolation --no-deps --no-cache-dir -v .; \
        done \
-    && rm -rf /tmp/roboplan
+    && pip check \
+    && python3 /tmp/check-roboplan-dependency-stack.py \
+    && rm -rf /tmp/roboplan /tmp/check-roboplan-dependency-stack.py
 
 WORKDIR /workspace
 

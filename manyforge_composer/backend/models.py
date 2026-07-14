@@ -1869,7 +1869,7 @@ class DebugExportResponse(BaseModel):
     program: DebugExportProgramResponse
     deployment: DebugExportDeploymentResponse
     kernel_snapshot: Dict[str, Any] = Field(alias="kernelSnapshot")
-    kernel_metrics: Dict[str, int] = Field(alias="kernelMetrics")
+    kernel_metrics: Dict[str, int | str] = Field(alias="kernelMetrics")
     execution_digest: Dict[str, Any] = Field(alias="executionDigest")
     execution_history: Dict[str, Any] = Field(alias="executionHistory")
     event_channels: Dict[str, List[Dict[str, Any]]] = Field(

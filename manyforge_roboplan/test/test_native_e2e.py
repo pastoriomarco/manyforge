@@ -858,6 +858,247 @@ def make_ur10e_joint_preview_request(move_id, goal):
     )
 
 
+def make_cartesian_request(move_id):
+    return ExecuteRequest(
+        robot_id="robot1",
+        group_id="arm",
+        move_id=move_id,
+        base_frame="base_link",
+        tcp_frame="tool0",
+        motion_type="cartesian_path",
+        cartesian_path={
+            "waypoints": [
+                {
+                    "position_m": [0.4, 0.0, 0.3],
+                    "orientation_rpy_deg": [180.0, 0.0, 0.0],
+                },
+                {
+                    "position_m": [0.4, 0.0, 0.32],
+                    "orientation_rpy_deg": [180.0, 0.0, 0.0],
+                },
+            ],
+            "max_translation_step_m": 0.005,
+            "max_rotation_step_rad": 0.05,
+            "speed_mode": "bounded",
+            "max_linear_speed_mps": 0.05,
+            "max_angular_speed_rad_s": 0.5,
+            "max_linear_acceleration_mps2": 0.2,
+            "max_angular_acceleration_rad_s2": 1.0,
+            "fallback_policy": "fail_closed",
+        },
+        velocity_scale=1.0,
+        acceleration_scale=1.0,
+        planning_timeout_s=5.0,
+        execution_timeout_s=10.0,
+        cache_mode="disable",
+    )
+
+
+def test_cartesian_request_serialization_is_portable_and_non_mutating():
+    if not HAS_NATIVE_CLIENT:
+        pytest.skip("native client adapter unavailable")
+    request = make_cartesian_request("cartesian_serialization")
+    original_waypoints = [dict(value) for value in request.cartesian_path["waypoints"]]
+    client = NativeKernelClient(object())
+
+    serialized = client._request_to_native_dict(request)
+
+    assert serialized["motion_type"] == "cartesian_path"
+    assert serialized["cartesian_path"]["waypoints"][0][
+        "orientation_xyzw"
+    ] == pytest.approx([1.0, 0.0, 0.0, 0.0])
+    assert "orientation_rpy_deg" not in serialized["cartesian_path"]["waypoints"][0]
+    assert request.cartesian_path["waypoints"] == original_waypoints
+
+
+def test_native_cartesian_candidate_preview_runs_full_portable_path(native_kernel):
+    start = native_kernel.get_link_pose("tool0", "base_link")
+    assert start is not None
+    target = {
+        "position_m": list(start["position_m"]),
+        "orientation_xyzw": list(start["orientation_xyzw"]),
+    }
+    target["position_m"][2] += 0.005
+    request = make_cartesian_request("cartesian_candidate_preview")
+    request.cartesian_path["waypoints"] = [
+        {
+            "position_m": list(start["position_m"]),
+            "orientation_xyzw": list(start["orientation_xyzw"]),
+        },
+        target,
+    ]
+
+    preview = native_kernel.preview_motion(request)
+
+    assert preview.ok is True, preview.error
+    assert preview.trajectory_duration_s > 0.0
+    assert preview.final_tcp_pose is not None
+    assert preview.final_tcp_pose["position_m"] == pytest.approx(
+        target["position_m"], abs=request.translation_tol_m
+    )
+
+
+@pytest.mark.parametrize(
+    ("path_change", "message"),
+    [
+        (
+            {"tip_frames": ["tool0"]},
+            "unsupported field 'tip_frames'",
+        ),
+        (
+            {
+                "waypoints": [
+                    {
+                        "position_m": [0.4, 0.0, 0.3],
+                    }
+                ]
+            },
+            "waypoints require position_m and orientation_xyzw",
+        ),
+        (
+            {
+                "waypoints": [
+                    {
+                        "position_m": [0.4, 0.0, 0.3],
+                        "orientation_xyzw": [1.0, 0.0, 0.0, 0.0],
+                        "frame_id": "tool0",
+                    },
+                    {
+                        "position_m": [0.4, 0.0, 0.32],
+                        "orientation_xyzw": [1.0, 0.0, 0.0, 0.0],
+                    },
+                ]
+            },
+            "waypoint contains unsupported field 'frame_id'",
+        ),
+        (
+            {
+                "waypoints": [
+                    {
+                        "position_m": [0.4, 0.0],
+                        "orientation_xyzw": [1.0, 0.0, 0.0, 0.0],
+                    },
+                    {
+                        "position_m": [0.4, 0.0, 0.32],
+                        "orientation_xyzw": [1.0, 0.0, 0.0, 0.0],
+                    },
+                ]
+            },
+            "position_m must have exactly 3 elements",
+        ),
+        (
+            {
+                "waypoints": [
+                    {
+                        "position_m": [True, 0.0, 0.3],
+                        "orientation_xyzw": [1.0, 0.0, 0.0, 0.0],
+                    },
+                    {
+                        "position_m": [0.4, 0.0, 0.32],
+                        "orientation_xyzw": [1.0, 0.0, 0.0, 0.0],
+                    },
+                ]
+            },
+            "position_m must contain numbers, not booleans",
+        ),
+        (
+            {"max_translation_step_m": True},
+            "max_translation_step_m must be a number, not a boolean",
+        ),
+        (
+            {"speed_mode": "backend_magic"},
+            "speed_mode must be bounded",
+        ),
+        (
+            {"fallback_policy": "implicit"},
+            "fallback_policy must be fail_closed or allow_joint_space_fallback",
+        ),
+    ],
+)
+def test_native_cartesian_parser_rejects_nonportable_or_incomplete_shapes(
+    path_change, message
+):
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+    bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
+    request = NativeKernelClient(bundle)._request_to_native_dict(
+        make_cartesian_request("cartesian_parser_rejection")
+    )
+    request["cartesian_path"].update(path_change)
+    try:
+        with pytest.raises(ValueError, match=message):
+            bundle.preview_motion(request, None)
+    finally:
+        bundle.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_limit",
+    [
+        0.0,
+        -0.1,
+        float("inf"),
+        float("nan"),
+        float.fromhex("0x0.0000000000001p-1022"),
+        True,
+    ],
+)
+def test_native_parser_rejects_invalid_optional_tcp_speed_limit(invalid_limit):
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+    bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
+    request = NativeKernelClient(bundle)._request_to_native_dict(
+        make_cartesian_request("cartesian_invalid_tcp_limit")
+    )
+    request["max_tcp_linear_speed_mps"] = invalid_limit
+    try:
+        with pytest.raises(
+            ValueError,
+            match="max_tcp_linear_speed_mps must",
+        ):
+            bundle.preview_motion(request, None)
+    finally:
+        bundle.close()
+
+
+@pytest.mark.parametrize(
+    ("motion_type", "request_field", "message"),
+    [
+        (
+            "pose_goal",
+            {"pose_goal": {"position_m": [0.4, 0.0, 0.3]}},
+            "pose_goal requires position_m and orientation_xyzw",
+        ),
+        (
+            "relative_move",
+            {
+                "relative_move": {
+                    "target_reference": {"type": "frame", "id": "base_link"},
+                    "offset": {"position_m": [0.0, 0.0, 0.1]},
+                }
+            },
+            "relative_move.offset requires position_m and orientation_xyzw",
+        ),
+    ],
+)
+def test_shared_native_motion_parser_never_defaults_incomplete_poses(
+    motion_type, request_field, message
+):
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+    bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
+    request = NativeKernelClient(bundle)._request_to_native_dict(
+        make_request("incomplete_pose", GOAL_A)
+    )
+    request["motion_type"] = motion_type
+    request.update(request_field)
+    try:
+        with pytest.raises(ValueError, match=message):
+            bundle.preview_motion(request, None)
+    finally:
+        bundle.close()
+
+
 def make_relative_request(
     move_id,
     object_id,
@@ -2287,23 +2528,15 @@ class TestTcpSpeedEnforcement:
         assert t_limited > t_unlimited, \
             f"Limited trajectory ({t_limited:.3f}s) should be slower than unlimited ({t_unlimited:.3f}s)"
 
-    def test_no_limit_when_zero(self, native_kernel):
-        """TCP speed = 0 means no limit (same as no field)."""
+    def test_zero_limit_is_rejected_before_execution(self, native_kernel):
+        """An optional TCP cap is absent or strictly positive, never a sentinel."""
         req = self._make_speed_limited_request("tcp_zero_a", GOAL_A, 0.0)
-        r1 = native_kernel.execute(req)
-        assert r1.ok is True
-        wait_for_terminal(native_kernel)
-        t_zero = get_cached_duration_s(native_kernel, "tcp_zero_a")
-        reset_to_home(native_kernel)
-
-        r2 = native_kernel.execute(make_request("tcp_none_a", GOAL_A))
-        assert r2.ok is True
-        wait_for_terminal(native_kernel)
-        t_none = get_cached_duration_s(native_kernel, "tcp_none_a")
-
-        # Should be approximately the same (both unlimited)
-        assert abs(t_zero - t_none) < 0.01, \
-            f"Zero limit ({t_zero:.3f}s) should match no limit ({t_none:.3f}s)"
+        with pytest.raises(
+            ValueError,
+            match="max_tcp_linear_speed_mps must be finite, normal, and > 0",
+        ):
+            native_kernel.execute(req)
+        assert native_kernel.get_status().state == ExecutionState.IDLE
 
 
 if __name__ == "__main__":

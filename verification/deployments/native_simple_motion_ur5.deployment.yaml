@@ -21,6 +21,7 @@ adapters:
     capability_keys:
       - planning.motion.joint_goal
       - planning.motion.pose_goal
+      - planning.motion.cartesian_path
       - planning.trajectory.time_parameterized
     config:
       rng_seed: 12345

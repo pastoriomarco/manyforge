@@ -26,6 +26,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <time.h>
 #include <utility>
 #include <vector>
@@ -34,6 +35,15 @@ namespace {
 
 std::atomic<bool> g_count_allocations{false};
 std::atomic<std::uint64_t> g_allocation_count{0};
+std::atomic<std::uint64_t> g_allocation_bytes{0};
+
+void record_allocation(std::size_t size) noexcept {
+  if (g_count_allocations.load(std::memory_order_relaxed)) {
+    g_allocation_count.fetch_add(1, std::memory_order_relaxed);
+    g_allocation_bytes.fetch_add(
+        static_cast<std::uint64_t>(size), std::memory_order_relaxed);
+  }
+}
 
 void* allocate_bytes(std::size_t size) {
   return std::malloc(size == 0 ? 1 : size);
@@ -52,9 +62,7 @@ void free_bytes(void* pointer) { std::free(pointer); }
 }  // namespace
 
 void* operator new(std::size_t size) {
-  if (g_count_allocations.load(std::memory_order_relaxed)) {
-    g_allocation_count.fetch_add(1, std::memory_order_relaxed);
-  }
+  record_allocation(size);
   if (void* pointer = allocate_bytes(size)) {
     return pointer;
   }
@@ -63,9 +71,7 @@ void* operator new(std::size_t size) {
 
 void* operator new[](std::size_t size) { return operator new(size); }
 void* operator new(std::size_t size, std::align_val_t alignment) {
-  if (g_count_allocations.load(std::memory_order_relaxed)) {
-    g_allocation_count.fetch_add(1, std::memory_order_relaxed);
-  }
+  record_allocation(size);
   if (void* pointer =
           allocate_aligned_bytes(size, static_cast<std::size_t>(alignment))) {
     return pointer;
@@ -122,6 +128,7 @@ using manyforge::core::SupportContactPolicyEntry;
 using manyforge::core::Vector3DTO;
 using manyforge::roboplan_backend::IRoboPlanPlanningPerformanceObserver;
 using manyforge::roboplan_backend::NativeKernelBundle;
+using manyforge::roboplan_backend::RoboPlanAllocationProbeSnapshot;
 using manyforge::roboplan_backend::RoboPlanCollisionProbeSnapshot;
 using manyforge::roboplan_backend::RoboPlanPlannerBackend;
 using manyforge::roboplan_backend::RoboPlanPlanningPipelineMetrics;
@@ -140,7 +147,38 @@ struct Options {
   std::optional<std::string> urdf_override;
   std::optional<std::string> srdf_override;
   std::vector<std::string> package_path_overrides;
+  enum class PlannerPolicy {
+    kCompatibility,
+    kRrtStar,
+    kBudgetSpending,
+  } planner_policy = PlannerPolicy::kCompatibility;
 };
+
+std::string_view planner_policy_name(Options::PlannerPolicy policy) {
+  switch (policy) {
+    case Options::PlannerPolicy::kCompatibility:
+      return "compatibility";
+    case Options::PlannerPolicy::kRrtStar:
+      return "rrt_star";
+    case Options::PlannerPolicy::kBudgetSpending:
+      return "budget_spending";
+  }
+  throw std::invalid_argument("unknown planner policy");
+}
+
+Options::PlannerPolicy parse_planner_policy(const std::string& value) {
+  if (value == "compatibility") {
+    return Options::PlannerPolicy::kCompatibility;
+  }
+  if (value == "rrt_star") {
+    return Options::PlannerPolicy::kRrtStar;
+  }
+  if (value == "budget_spending") {
+    return Options::PlannerPolicy::kBudgetSpending;
+  }
+  throw std::invalid_argument(
+      "--planner-policy must be compatibility, rrt_star, or budget_spending");
+}
 
 struct Fixture {
   std::string id;
@@ -168,7 +206,7 @@ std::vector<T> array_values(const ptree& tree) {
   std::vector<T> values;
   for (const auto& [key, value] : tree) {
     (void)key;
-    values.push_back(value.get_value<T>());
+    values.push_back(value.template get_value<T>());
   }
   return values;
 }
@@ -225,6 +263,8 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("rng seed exceeds uint32");
       }
       options.rng_seed = static_cast<std::uint32_t>(value);
+    } else if (arg == "--planner-policy") {
+      options.planner_policy = parse_planner_policy(next());
     } else if (arg == "--urdf") {
       options.urdf_override = next();
     } else if (arg == "--srdf") {
@@ -715,6 +755,15 @@ class RecordingObserver final : public IRoboPlanPlanningPerformanceObserver {
     return result;
   }
 
+  RoboPlanAllocationProbeSnapshot allocation_probe_snapshot()
+      const noexcept override {
+    return {
+        true,
+        g_allocation_count.load(std::memory_order_relaxed),
+        g_allocation_bytes.load(std::memory_order_relaxed),
+    };
+  }
+
   void record(const PlanRequestDTO&, const PlanResultDTO&,
               const RoboPlanPlanningPipelineMetrics& metrics) noexcept override {
     try {
@@ -933,9 +982,21 @@ int main(int argc, char** argv) {
         options.warmup_repetitions + options.measured_repetitions);
     auto observer = std::make_shared<RecordingObserver>(total_repetitions);
     const manyforge::core::ExecutionKernelConfig production_kernel_config;
-    const auto rrt_options = production_rrt_options(
+    auto rrt_options = production_rrt_options(
         model.group_name,
         production_kernel_config.planner_max_planning_time_s);
+    switch (options.planner_policy) {
+      case Options::PlannerPolicy::kCompatibility:
+        break;
+      case Options::PlannerPolicy::kRrtStar:
+        rrt_options.rrt_star = true;
+        rrt_options.fast_return = false;
+        break;
+      case Options::PlannerPolicy::kBudgetSpending:
+        rrt_options.rrt_star = false;
+        rrt_options.fast_return = false;
+        break;
+    }
     const auto planning_ik_options =
         production_planning_ik_options(model.group_name);
     const auto single_shot_ik_options = production_single_shot_ik_options(
@@ -943,12 +1004,13 @@ int main(int argc, char** argv) {
         production_kernel_config.single_shot_ik_timeout_s);
     RoboPlanPlannerBackend planner(
         bundle->scene_projection, bundle->scene, rrt_options,
-        bundle->scene_mutex, bundle->single_shot_ik, planning_ik_options,
-        single_shot_ik_options, options.rng_seed, observer);
+        bundle->scene_mutex, planning_ik_options, single_shot_ik_options,
+        options.rng_seed, observer);
 
     std::vector<std::uint64_t> wall_ns;
     std::vector<std::uint64_t> cpu_ns;
     std::vector<std::uint64_t> allocations;
+    std::vector<std::uint64_t> allocation_bytes;
     std::vector<std::uint64_t> hashes;
     std::vector<std::uint64_t> target_resolution_ns;
     bool invariants_passed = true;
@@ -956,6 +1018,7 @@ int main(int argc, char** argv) {
     wall_ns.reserve(options.measured_repetitions);
     cpu_ns.reserve(options.measured_repetitions);
     allocations.reserve(options.measured_repetitions);
+    allocation_bytes.reserve(options.measured_repetitions);
     hashes.reserve(options.measured_repetitions);
     target_resolution_ns.reserve(options.measured_repetitions);
 
@@ -1001,6 +1064,7 @@ int main(int argc, char** argv) {
       }
 
       g_allocation_count.store(0, std::memory_order_relaxed);
+      g_allocation_bytes.store(0, std::memory_order_relaxed);
       const auto wall_started = std::chrono::steady_clock::now();
       const auto cpu_started = thread_cpu_time_ns();
       g_count_allocations.store(repetition >=
@@ -1049,6 +1113,8 @@ int main(int argc, char** argv) {
       cpu_ns.push_back(cpu_finished - cpu_started);
       allocations.push_back(
           g_allocation_count.load(std::memory_order_relaxed));
+      allocation_bytes.push_back(
+          g_allocation_bytes.load(std::memory_order_relaxed));
       if (capture) {
         target_resolution_ns.push_back(target_resolution_duration_ns);
       }
@@ -1067,6 +1133,8 @@ int main(int argc, char** argv) {
     std::map<std::string, std::vector<std::uint64_t>> stage_collision_counts;
     std::map<std::string, std::vector<std::uint64_t>>
         stage_collision_duration;
+    std::map<std::string, std::vector<std::uint64_t>> stage_allocation_counts;
+    std::map<std::string, std::vector<std::uint64_t>> stage_allocation_bytes;
     bool metrics_complete = true;
     bool collision_probe_available = true;
     std::uint64_t total_collision_query_count = 0;
@@ -1091,6 +1159,8 @@ int main(int argc, char** argv) {
             stage.collision_query_count);
         stage_collision_duration[stage_name].push_back(
             stage.collision_query_duration_ns);
+        stage_allocation_counts[stage_name].push_back(stage.allocation_count);
+        stage_allocation_bytes[stage_name].push_back(stage.allocation_bytes);
       }
     }
     if (capture) {
@@ -1099,6 +1169,21 @@ int main(int argc, char** argv) {
           target_resolution_ns.size(), 0);
       stage_collision_duration["target_resolution"].assign(
           target_resolution_ns.size(), 0);
+      stage_allocation_counts["target_resolution"].assign(
+          target_resolution_ns.size(), 0);
+      stage_allocation_bytes["target_resolution"].assign(
+          target_resolution_ns.size(), 0);
+    }
+    if (collision_probe_available) {
+      const auto rrt = stage_collision_counts.find("rrt");
+      if (rrt == stage_collision_counts.end() ||
+          std::none_of(
+              rrt->second.begin(), rrt->second.end(),
+              [](const std::uint64_t count) { return count > 0; })) {
+        throw std::runtime_error(
+            "collision probe observed no RRT collision queries; verify that "
+            "the active RoboPlan collision owner is interposed");
+      }
     }
     std::sort(hashes.begin(), hashes.end());
     const auto distinct_hashes =
@@ -1118,12 +1203,18 @@ int main(int argc, char** argv) {
         << ",\"sample_count\":" << options.measured_repetitions
         << ",\"warmup_count\":" << options.warmup_repetitions
         << ",\"rng_seed\":" << options.rng_seed
+        << ",\"planner_policy\":\""
+        << planner_policy_name(options.planner_policy) << "\""
         << ",\"shortcut_rng_seed_argument\":"
         << shortcut_rng_seed_argument.value_or(0)
         << ",\"planner_options\":{"
         << "\"rrt_max_planning_time_s\":"
         << rrt_options.max_planning_time
         << ",\"rrt_max_nodes\":" << rrt_options.max_nodes
+        << ",\"rrt_star\":"
+        << (rrt_options.rrt_star ? "true" : "false")
+        << ",\"fast_return\":"
+        << (rrt_options.fast_return ? "true" : "false")
         << ",\"ik_step_size\":" << planning_ik_options.step_size
         << ",\"ik_max_restarts\":" << planning_ik_options.max_restarts
         << ",\"ik_max_time_s\":" << planning_ik_options.max_time
@@ -1144,6 +1235,8 @@ int main(int argc, char** argv) {
     append_latency_json(out, cpu_ns);
     out << ",\"allocation_count\":";
     append_latency_json(out, allocations);
+    out << ",\"allocation_bytes\":";
+    append_latency_json(out, allocation_bytes);
     out << ",\"invariants_passed\":"
         << (invariants_passed ? "true" : "false")
         << ",\"outcomes_passed\":"
@@ -1177,6 +1270,10 @@ int main(int argc, char** argv) {
       append_latency_json(out, stage_collision_counts[stage_name]);
       out << ",\"collision_query_duration_ns\":";
       append_latency_json(out, stage_collision_duration[stage_name]);
+      out << ",\"allocation_count\":";
+      append_latency_json(out, stage_allocation_counts[stage_name]);
+      out << ",\"allocation_bytes\":";
+      append_latency_json(out, stage_allocation_bytes[stage_name]);
       out << '}';
     }
     out << "}}";

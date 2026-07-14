@@ -1,0 +1,114 @@
+{
+  "schema_version": "manyforge.roboplan_workaround_inventory.v1",
+  "roboplan_version": "0.5.1",
+  "workarounds": [
+    {
+      "id": "detached_static_object_collision_filter",
+      "status": "retained",
+      "reason": "Planner-internal state validity still lacks ManyForge request-scoped pair-policy semantics for detached object/object overlap",
+      "removal_gate": "A planner-neutral filtered state-validity contract preserves robot/object and attached-object/world checks with exact policy parity"
+    },
+    {
+      "id": "support_contact_release_projection",
+      "status": "retained",
+      "reason": "RoboPlan 0.5 does not own ManyForge support-contact release policy or structured contact authority",
+      "removal_gate": "A planner-neutral request policy proves start contact, release, and no re-contact without global pair mutation"
+    },
+    {
+      "id": "explicit_isolated_scene_clone_patch",
+      "status": "retained",
+      "reason": "Upstream 0.5 has no explicit deep-clone and transactional replacement contract for pointer-bearing collision scratch",
+      "removal_gate": "An upstream release provides equivalent clone/replacement ownership and the source-destruction, mutation-isolation, replacement, ASan, and TSan suites pass without patch 0001"
+    },
+    {
+      "id": "cartesian_cooperative_cancellation_patch",
+      "status": "retained",
+      "reason": "Upstream Cartesian planning lacks the nonblocking cancellation and progress hooks required by the portable deadline contract",
+      "removal_gate": "Upstream exposes equivalent hooks and pre-start, in-flight, deadline, and structured-failure regressions pass without patch 0002"
+    },
+    {
+      "id": "cartesian_time_optimal_not_advertised",
+      "status": "blocked_by_upstream_api",
+      "reason": "RoboPlan 0.5 delegates time-optimal Cartesian timing to a monolithic TOPP-RA solve that cannot observe the ManyForge planning cancellation/deadline token while it is running",
+      "removal_gate": "The parameterizer provides bounded cooperative cancellation through every material stage, and cancellation, deadline, path-fidelity, dynamics, and tail-latency qualification pass before the portable spec adds a time-optimal mode"
+    },
+    {
+      "id": "collision_context_scene_generation_owner_patch",
+      "status": "retained",
+      "reason": "Upstream CollisionContext borrows Scene model storage without retaining its generation",
+      "removal_gate": "Upstream contexts structurally own their scene generation and source-destruction/context-lifetime sanitizer tests pass without patch 0003"
+    },
+    {
+      "id": "configurable_source_build_arguments_patch",
+      "status": "retained",
+      "reason": "The upstream aggregate build helper cannot receive checked CMake arguments without source mutation",
+      "removal_gate": "Upstream supports explicit build arguments or ManyForge adopts a checked package build that needs no source edit, allowing patch 0004 deletion"
+    },
+    {
+      "id": "scene_scratch_construction_patch",
+      "status": "retained",
+      "reason": "Upstream Scene copy-assigns Pinocchio scratch after model construction, which strict UBSan proves reads uninitialized Eigen solver state",
+      "removal_gate": "Upstream constructs scratch directly and strict ASan/UBSan scene construction plus clone/context tests pass without patch 0005"
+    },
+    {
+      "id": "cartesian_duration_budget_patch",
+      "status": "retained",
+      "reason": "Upstream bounded Cartesian planning converts duration-derived allocation and loop budgets without first proving finite representability or bounded size",
+      "removal_gate": "Upstream checks cumulative duration, feedrate-envelope size, and servo-loop budget before allocation or integer conversion, and the extreme speed/acceleration regression passes without patch 0006"
+    },
+    {
+      "id": "caller_owned_collision_context_reuse_patch",
+      "status": "retained",
+      "reason": "Upstream joint/pose pipelines rebuild equivalent broadphase scratch independently in IK, RRT, shortcutting, and retiming even when one request owns a private scene generation",
+      "removal_gate": "Upstream accepts a generation-owning caller context across serial planner stages, or an equivalent workspace API preserves isolation with equal-or-lower allocation and tail evidence, allowing patch 0007 deletion"
+    },
+    {
+      "id": "stdout_collision_diagnostic_capture",
+      "status": "blocked_by_upstream_api",
+      "reason": "RoboPlan 0.5 still exposes colliding names for this diagnostic comparator through debug output rather than a complete structured contact result",
+      "removal_gate": "A structured result preserves exact body-name mapping without process-global stdout redirection"
+    },
+    {
+      "id": "private_mimic_import_view",
+      "status": "retained",
+      "reason": "The pinned RoboPlan/Pinocchio import path still requires the RMA private renamed view for canonical Lite6 mimic ordering",
+      "removal_gate": "Canonical Lite6 URDF imports directly with identical kinematics, limits, gripper mapping, and public names across every consumer"
+    },
+    {
+      "id": "toppra_endpoint_anchor",
+      "status": "retained",
+      "reason": "RoboPlan 0.5 output is normalized and independently checked because execution requires exact held endpoints and finite derivatives",
+      "removal_gate": "Upstream output satisfies endpoint identity and derivative invariants across the version-neutral corpus without adapter normalization"
+    },
+    {
+      "id": "iterative_post_toppra_limit_retime",
+      "status": "retained",
+      "reason": "Scalar upstream scales do not prove every ManyForge per-joint, TCP, and Cartesian dynamics cap after interpolation",
+      "removal_gate": "A backend-neutral parameterization result proves every requested limit with unchanged fail-closed diagnostics and no tail-latency regression"
+    },
+    {
+      "id": "per_request_planning_context_construction",
+      "status": "retained",
+      "reason": "Planner algorithms retain mutable request state and must bind to the exact immutable scene generation without cross-request leakage",
+      "removal_gate": "Reusable contexts have explicit generation ownership, reset semantics, source-destruction tests, and lower measured cost"
+    },
+    {
+      "id": "roboplan_04_negative_shortcut_seed_encoding",
+      "status": "retired",
+      "reason": "RoboPlan 0.5 corrected nonnegative deterministic seed behavior; the 0.4 encoding helper is deleted and parity tests use the upstream 0.5 contract",
+      "removal_gate": "Closed by the deterministic seeded-attempt corpus"
+    },
+    {
+      "id": "implicit_scene_copy_for_revision_retention",
+      "status": "retired",
+      "reason": "All production retention and request-local copies now call the explicit isolated clone contract",
+      "removal_gate": "Closed by the clone architecture scan and strict lifetime suites"
+    },
+    {
+      "id": "scene_geometry_bookkeeping_lifo_replay",
+      "status": "retired",
+      "reason": "The pinned source retains the scene mutation and mesh/cylinder corrections already qualified on 0.4",
+      "removal_gate": "Closed while non-LIFO remove, reparent, detach, and mesh/cylinder regressions remain green"
+    }
+  ]
+}

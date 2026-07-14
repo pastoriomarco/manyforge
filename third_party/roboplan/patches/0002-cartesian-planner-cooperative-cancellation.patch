@@ -1,0 +1,160 @@
+diff --git a/roboplan_cartesian_planning/include/roboplan_cartesian_planning/cartesian_path_planner.hpp b/roboplan_cartesian_planning/include/roboplan_cartesian_planning/cartesian_path_planner.hpp
+index 5f40e43..d75de9c 100644
+--- a/roboplan_cartesian_planning/include/roboplan_cartesian_planning/cartesian_path_planner.hpp
++++ b/roboplan_cartesian_planning/include/roboplan_cartesian_planning/cartesian_path_planner.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <functional>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -128,6 +129,17 @@ struct CartesianPlannerOptions {
+   /// stationary.
+   int max_attempts_per_step = 16;
+ 
++  /// @brief Optional cooperative cancellation probe checked at bounded points
++  /// throughout Cartesian resolution and time parameterization.
++  /// @details The callback must be thread-safe, non-blocking, and must not
++  /// throw. Returning true aborts planning with a cancellation error.
++  std::function<bool()> cancellation_requested;
++
++  /// @brief Optional monotonic-path progress observer for diagnostics.
++  /// @details Called with a value in [0, 1] at bounded servo-loop checkpoints. A bounded-mode
++  /// retry starts a new attempt at 0. The callback must be non-blocking and must not throw.
++  std::function<void(double)> progress_observer;
++
+   /// @brief Validates the mode-independent option values (dt, tolerances, scales).
+   /// @details Mode-specific options (e.g. the Bounded mode's commanded speeds/accelerations) are
+   /// validated where they are used.
+diff --git a/roboplan_cartesian_planning/src/cartesian_path_planner.cpp b/roboplan_cartesian_planning/src/cartesian_path_planner.cpp
+index ebc01ab..6042b22 100644
+--- a/roboplan_cartesian_planning/src/cartesian_path_planner.cpp
++++ b/roboplan_cartesian_planning/src/cartesian_path_planner.cpp
+@@ -53,6 +53,8 @@ constexpr size_t kMaxToppraWaypoints = 10000;
+ /// whose estimate is tiny, against tripping the safety cap on benign sub-dt fragments and retries.
+ constexpr int kHardCapStepMargin = 1000;
+ 
++constexpr const char* kCancellationError = "Cartesian planning cancelled.";
++
+ /// @brief Maximum feedrate (fraction of full speed) the reference may carry through the corner at
+ /// `cur` between `prev` and `next`, keeping the Cartesian acceleration within the commanded maxima.
+ /// @details The reference is piecewise-linear (linear position interpolation, SLERP orientation),
+@@ -264,6 +266,12 @@ tl::expected<void, std::string> CartesianPlannerOptions::validate() const {
+ 
+ tl::expected<JointTrajectory, std::string>
+ CartesianPathPlanner::plan(const CartesianPath& path, const JointConfiguration& q_start) {
++  if (options_.progress_observer) {
++    options_.progress_observer(0.0);
++  }
++  if (options_.cancellation_requested && options_.cancellation_requested()) {
++    return tl::make_unexpected(kCancellationError);
++  }
+   if (const auto valid = options_.validate(); !valid) {
+     return tl::make_unexpected(valid.error());
+   }
+@@ -280,6 +288,9 @@ CartesianPathPlanner::plan(const CartesianPath& path, const JointConfiguration&
+         "transform lists (one per end-effector).");
+   }
+   for (size_t f = 0; f < num_frames; ++f) {
++    if (options_.cancellation_requested && options_.cancellation_requested()) {
++      return tl::make_unexpected(kCancellationError);
++    }
+     if (path.tforms.at(f).size() < 1) {
+       return tl::make_unexpected("Each Cartesian path frame must contain at least one waypoint (" +
+                                  path.tip_frames.at(f) + " has none).");
+@@ -331,6 +342,9 @@ CartesianPathPlanner::buildFrameTracks(const CartesianPath& path,
+     track.waypoints = path.tforms.at(f);
+     track.cumulative_times.assign(track.waypoints.size(), 0.0);
+     for (size_t i = 1; i < track.waypoints.size(); ++i) {
++      if (options_.cancellation_requested && options_.cancellation_requested()) {
++        return tl::make_unexpected(kCancellationError);
++      }
+       const auto [linear_distance, angular_distance] =
+           poseError(track.waypoints.at(i - 1), track.waypoints.at(i));
+       const double linear_time = linear_speed > 0.0 ? linear_distance / linear_speed : 0.0;
+@@ -519,6 +533,9 @@ CartesianPathPlanner::convergeToStart(const std::vector<FrameTrack>& tracks, Eig
+   double position_error = 0.0;
+   double orientation_error = 0.0;
+   for (int i = 0; i < kMaxIkConvergenceIters; ++i) {
++    if (options_.cancellation_requested && options_.cancellation_requested()) {
++      return tl::make_unexpected(kCancellationError);
++    }
+     const auto step =
+         solveStep(tracks, q, 0.0, q_candidate, delta_q, position_error, orientation_error);
+     if (!step) {
+@@ -573,7 +590,13 @@ CartesianPathPlanner::runServoLoop(const std::vector<FrameTrack>& tracks,
+   double s = 0.0;
+   double feedrate = 0.0;  // Current feedrate ds/dt in [0, 1]; ramped under the trapezoidal profile.
+   int total_steps = 0;
++  if (options_.progress_observer) {
++    options_.progress_observer(0.0);
++  }
+   while (s < total_time - kEps) {
++    if (options_.cancellation_requested && options_.cancellation_requested()) {
++      return tl::make_unexpected(kCancellationError);
++    }
+     // Commanded feedrate for this step. Without the profile this is full speed; with it, ramp
+     // toward full speed at s_ddot_max but never above the precomputed deceleration envelope (which
+     // forces the feedrate down before each corner cap and to a stop at the path end), then floor it
+@@ -589,6 +612,9 @@ CartesianPathPlanner::runServoLoop(const std::vector<FrameTrack>& tracks,
+     double feedrate_eff = feedrate_cmd;
+     double committed_s = s;
+     for (int attempt = 0; attempt < options_.max_attempts_per_step; ++attempt) {
++      if (options_.cancellation_requested && options_.cancellation_requested()) {
++        return tl::make_unexpected(kCancellationError);
++      }
+       const double s_try = std::min(s + feedrate_eff * options_.dt, total_time);
+       const auto step =
+           solveStep(tracks, q, s_try, q_candidate, delta_q, position_error, orientation_error);
+@@ -618,6 +644,9 @@ CartesianPathPlanner::runServoLoop(const std::vector<FrameTrack>& tracks,
+     s = committed_s;
+     feedrate = feedrate_eff;
+     q = q_candidate;
++    if (options_.progress_observer) {
++      options_.progress_observer(total_time > kEps ? std::clamp(s / total_time, 0.0, 1.0) : 1.0);
++    }
+ 
+     // The velocity constraint keeps each step within the joint velocity limits inside the QP;
+     // verify the committed step actually does, to guard against solver constraint relaxation or
+@@ -650,6 +679,10 @@ CartesianPathPlanner::runServoLoop(const std::vector<FrameTrack>& tracks,
+     }
+   }
+ 
++  if (options_.progress_observer) {
++    options_.progress_observer(1.0);
++  }
++
+   return trajectory;
+ }
+ 
+@@ -783,6 +816,9 @@ CartesianPathPlanner::planBounded(const CartesianPath& path, const Eigen::Vector
+   double speed_scale = 1.0;
+   JointTrajectory trajectory;
+   for (int iter = 0; iter < kMaxSlowdownIters; ++iter) {
++    if (options_.cancellation_requested && options_.cancellation_requested()) {
++      return tl::make_unexpected(kCancellationError);
++    }
+     auto tracked = trackReference(path, q_start_full, options_.max_linear_speed * speed_scale,
+                                   options_.max_angular_speed * speed_scale,
+                                   options_.max_linear_acceleration * speed_scale * speed_scale,
+@@ -835,6 +871,9 @@ CartesianPathPlanner::planTimeOptimal(const CartesianPath& path,
+   if (!tracked) {
+     return tl::make_unexpected(tracked.error());
+   }
++  if (options_.cancellation_requested && options_.cancellation_requested()) {
++    return tl::make_unexpected(kCancellationError);
++  }
+ 
+   // Hand the dense diff-IK trace straight to TOPP-RA: the LinearBlend geometry is density-robust
+   // (straight segments have zero curvature), so decimating only throws away path detail.
+@@ -864,6 +903,9 @@ CartesianPathPlanner::planTimeOptimal(const CartesianPath& path,
+   toppra_options.acceleration_scale = options_.acceleration_scale;
+   toppra_options.max_blend_deviation = options_.toppra_blend_deviation;
+   auto maybe_trajectory = toppra_.generate(joint_path, toppra_options);
++  if (options_.cancellation_requested && options_.cancellation_requested()) {
++    return tl::make_unexpected(kCancellationError);
++  }
+   if (!maybe_trajectory) {
+     return tl::make_unexpected("TOPP-RA time parameterization failed: " + maybe_trajectory.error());
+   }

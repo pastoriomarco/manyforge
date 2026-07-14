@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import deque
+import copy
 from dataclasses import dataclass, field, replace
 from enum import Enum
 import math
@@ -250,11 +251,12 @@ class ExecuteRequest:
     move_id: str
     base_frame: str
     tcp_frame: str
-    motion_type: str  # "joint_goal", "pose_goal", or "relative_move"
+    motion_type: str  # joint_goal | pose_goal | relative_move | cartesian_path
     joint_goal_names: List[str] = field(default_factory=list)
     joint_goal_positions_rad: List[float] = field(default_factory=list)
     pose_goal: Optional[Dict[str, Any]] = None
     relative_move: Optional[Dict[str, Any]] = None
+    cartesian_path: Optional[Dict[str, Any]] = None
     velocity_scale: float = 1.0
     acceleration_scale: float = 1.0
     max_tcp_linear_speed_mps: Optional[float] = None
@@ -1079,6 +1081,15 @@ class KernelClient(ABC):
         # runtime scaling override.
         return None
 
+    def get_motion_interrupt_stop_capability(self) -> Dict[str, Any]:
+        """Report the execution backend's controlled-stop capability.
+
+        Clients without a qualified stop implementation fail closed. Composer
+        uses this report to admit deployment stop profiles; returning an empty
+        or invented capability would be less safe than making absence loud.
+        """
+        raise RuntimeError("controlled-stop capability is unavailable")
+
     def set_command_gate(self, enabled: bool) -> bool:
         """Request the backend command-enable gate (single gate authority).
 
@@ -1141,6 +1152,19 @@ class KernelClient(ABC):
     def get_link_pose(
         self, target_frame: str, base_frame: str
     ) -> Optional[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def compute_target_link_poses(
+        self, request: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Compute link poses for the exact joint state carried by ``request``.
+
+        Candidate planning uses this authority boundary to bind waypoint zero
+        to the same immutable start vector passed to preview. Implementations
+        must fail closed when that vector or any requested frame cannot be
+        resolved; substituting a separately sampled current pose is invalid.
+        """
+        ...
 
     def get_link_poses(
         self, target_frames: List[str], base_frame: str
@@ -1323,6 +1347,7 @@ class MockKernelClient(KernelClient):
         joint_names: Optional[List[str]] = None,
         *,
         gripper_clock: Optional[Callable[[], float]] = None,
+        motion_interrupt_stop_capability: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._state = ExecutionState.IDLE
         self._execution_id = 0
@@ -1354,6 +1379,7 @@ class MockKernelClient(KernelClient):
         self.runtime_velocity_scale_principal_ids: List[Optional[str]] = []
         self.scene_edits: List[SceneEditRequest] = []
         self.link_pose_calls: List[tuple[str, str]] = []
+        self.target_link_pose_requests: List[Dict[str, Any]] = []
         # Outcome store keyed by execution_id, populated
         # automatically when execute() returns. Tests can override the
         # default outcome shape via `next_outcome_factory`; if unset,
@@ -1417,6 +1443,12 @@ class MockKernelClient(KernelClient):
         self._gripper_commands: Dict[str, Dict[str, Any]] = {}
         self._gripper_positions: Dict[str, float] = {}
         self._gripper_clock = gripper_clock or time.monotonic
+        # Tests must opt in to a synthetic controlled-stop capability. A plain
+        # mock has no physical stop implementation and therefore fails closed
+        # when a deployment asks Composer to verify stop-profile support.
+        self._motion_interrupt_stop_capability = copy.deepcopy(
+            motion_interrupt_stop_capability
+        )
         self._next_gripper_command_id = 1
         self._next_gripper_generation = 1
         self._gripper_admission_blocked = False
@@ -1699,6 +1731,18 @@ class MockKernelClient(KernelClient):
                 "position_m": list(request.pose_goal.get("position_m", [])),
                 "orientation_xyzw": list(request.pose_goal.get("orientation_xyzw", [])),
             }
+        elif (
+            request.motion_type == "cartesian_path"
+            and request.cartesian_path is not None
+        ):
+            waypoints = request.cartesian_path.get("waypoints", [])
+            if waypoints:
+                final_tcp_pose = {
+                    "position_m": list(waypoints[-1].get("position_m", [])),
+                    "orientation_xyzw": list(
+                        waypoints[-1].get("orientation_xyzw", [])
+                    ),
+                }
         return MotionPreviewResult(
             ok=True,
             trajectory_duration_s=1.0,
@@ -1925,6 +1969,11 @@ class MockKernelClient(KernelClient):
         self.runtime_velocity_scale = clamped
         self.runtime_velocity_scale_updates.append(clamped)
         self.runtime_velocity_scale_principal_ids.append(principal_id)
+
+    def get_motion_interrupt_stop_capability(self) -> Dict[str, Any]:
+        if self._motion_interrupt_stop_capability is None:
+            return super().get_motion_interrupt_stop_capability()
+        return copy.deepcopy(self._motion_interrupt_stop_capability)
 
     def set_command_gate(self, enabled: bool) -> bool:
         # Mock gate authority: records requests so composer simulation-reset
@@ -2350,6 +2399,35 @@ class MockKernelClient(KernelClient):
             "position_m": [0.5, 0.0, 0.6],
             "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
         }
+
+    def compute_target_link_poses(
+        self, request: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Deterministic FK stand-in that records the exact requested vector."""
+        self.target_link_pose_requests.append(copy.deepcopy(request))
+        if request.get("kind") != "joint":
+            return {"reachable": False, "reason": "unsupported_target_kind"}
+        joint_names = request.get("joint_names")
+        positions = request.get("joint_positions_rad")
+        link_names = request.get("link_names")
+        base_frame = request.get("base_frame")
+        if (
+            not isinstance(joint_names, list)
+            or not isinstance(positions, list)
+            or len(joint_names) != len(positions)
+            or not isinstance(link_names, list)
+            or not isinstance(base_frame, str)
+        ):
+            return {"reachable": False, "reason": "invalid_joint_target"}
+        link_poses: Dict[str, Dict[str, Any]] = {}
+        for link_name in link_names:
+            if not isinstance(link_name, str):
+                return {"reachable": False, "reason": "invalid_link_name"}
+            pose = self.get_link_pose(link_name, base_frame)
+            if pose is None:
+                return {"reachable": False, "reason": "frame_unresolved"}
+            link_poses[link_name] = pose
+        return {"reachable": True, "link_poses": link_poses}
 
     def get_object_pose(
         self, object_id: str, base_frame: str

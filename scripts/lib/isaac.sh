@@ -96,20 +96,16 @@ wait_for_arm_controller_state() {
         arm_controller_state_ready
 }
 
-# Does the ros-jazzy-full image exist locally? Derives the canonical name
-# from `docker compose config --images` so this honors COMPOSE_PROJECT_NAME
-# overrides instead of hard-coding `manyforge-ros-jazzy-full`.
+# Does the canonical ros-jazzy-full image exist locally? All ROS-full services
+# consume one explicit image tag, so the image checked here is also the image
+# started for Composer and topic control. MANYFORGE_ROS_FULL_IMAGE can override
+# the default tag for an isolated development/CI lane.
 #
-# Used as an early gate in maybe_build_isaac_image. WITHOUT this gate, the
-# `isaac_image_runtime_ready` probe below silently triggers an implicit
-# `docker compose run` build on a missing image — and the probe redirects
-# stdout/stderr to /dev/null, so the operator stares at a black hole for
-# 10+ minutes instead of seeing compose's actual build progress.
+# Used before a REBUILD=false runtime probe. Without this gate, `docker compose
+# run` may implicitly build a missing image while the probe's output is hidden.
 isaac_image_present() {
-    local image_name
-    image_name=$("${COMPOSE_CMD[@]}" config --images 2>/dev/null \
-        | awk '/ros-jazzy-full(:|$)/ {print; exit}')
-    [[ -n "${image_name}" ]] && docker image inspect "${image_name}" >/dev/null 2>&1
+    local image_name="${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}"
+    docker image inspect "${image_name}" >/dev/null 2>&1
 }
 
 # image_has_isaac_runtime adapter — preflight.sh uses ros_shell via a callable;
@@ -126,26 +122,36 @@ maybe_build_isaac_image() {
     case "${rebuild}" in
         true)
             step "Building ROS-capable image (REBUILD=true)"
-            "${COMPOSE_CMD[@]}" build ros-jazzy-full composer-ros isaac-topic-control
+            "${COMPOSE_CMD[@]}" build ros-jazzy-full
+            if ! isaac_image_runtime_ready; then
+                fail "Rebuilt canonical ROS image failed its runtime probe"
+                return 2
+            fi
+            pass "Canonical ROS image is runtime-ready"
             ;;
         false)
-            info "Skipping image build (REBUILD=false)"
+            if ! isaac_image_present; then
+                fail "REBUILD=false but the canonical ROS image is unavailable"
+                return 2
+            fi
+            if ! isaac_image_runtime_ready; then
+                fail "REBUILD=false but the canonical ROS image failed its runtime probe"
+                return 2
+            fi
+            info "Using the existing canonical ROS image (REBUILD=false)"
             ;;
         auto)
-            if ! isaac_image_present; then
-                # Cold path: image is not on disk. Go straight to the
-                # visible-output build path. Running the runtime-readiness
-                # probe here would trigger an implicit build under the
-                # probe's /dev/null redirect — exactly the silent black-
-                # hole behavior this gate exists to prevent.
-                step "ROS image not present; building"
-                "${COMPOSE_CMD[@]}" build ros-jazzy-full composer-ros isaac-topic-control
-            elif isaac_image_runtime_ready; then
-                pass "ROS image already contains ${TOPIC_BASED_PKG} and gripper-action Python deps"
-            else
-                step "ROS image missing Isaac ros2_control runtime deps; rebuilding"
-                "${COMPOSE_CMD[@]}" build ros-jazzy-full composer-ros isaac-topic-control
+            # Let BuildKit compare the complete checked Docker context on every
+            # start. A package-presence probe cannot detect an ABI-changing
+            # Dockerfile or vendored-patch update, while a cached build is fast
+            # when every input is unchanged.
+            step "Reconciling the canonical ROS image with current Docker inputs"
+            "${COMPOSE_CMD[@]}" build ros-jazzy-full
+            if ! isaac_image_runtime_ready; then
+                fail "Rebuilt canonical ROS image failed its runtime probe"
+                return 2
             fi
+            pass "Canonical ROS image is current and runtime-ready"
             ;;
         *)
             fail "Invalid REBUILD=${rebuild}; use true|false|auto"

@@ -1,0 +1,111 @@
+diff --git a/roboplan/include/roboplan/core/scene.hpp b/roboplan/include/roboplan/core/scene.hpp
+index 13fba7e..1e8aa88 100644
+--- a/roboplan/include/roboplan/core/scene.hpp
++++ b/roboplan/include/roboplan/core/scene.hpp
+@@ -3,6 +3,7 @@
+ #include <filesystem>
+ #include <iostream>
+ #include <map>
++#include <memory>
+ #include <optional>
+ #include <stdexcept>
+ #include <string>
+@@ -61,6 +62,30 @@ public:
+             std::vector<std::filesystem::path>(),
+         const std::filesystem::path& yaml_config_path = std::filesystem::path());
+ 
++  /// @brief Deep-copy constructor.
++  /// @details Copies immutable model/geometry state and logical scene state, then reconstructs
++  /// all mutable Pinocchio scratch and the broadphase manager against this Scene's own members.
++  /// No pointer-bearing collision scratch is shared with `other`.
++  Scene(const Scene& other);
++
++  // The broadphase manager caches pointers into this object, so an implicit move would leave it
++  // bound to the moved-from Scene. Assignment has no synchronization contract and is intentionally
++  // disabled; callers that own exclusive access use replaceWithIsolatedCopy() explicitly.
++  Scene& operator=(const Scene&) = delete;
++  Scene(Scene&&) = delete;
++  Scene& operator=(Scene&&) = delete;
++
++  /// @brief Creates an isolated scene generation.
++  /// @return A deep copy whose collision scratch and broadphase pointers are self-owned.
++  std::shared_ptr<Scene> clone() const;
++
++  /// @brief Transactionally replaces this mutable scene from an isolated copy of `other`.
++  /// @details The replacement is fully constructed before this object changes. Pointer-bearing
++  /// collision scratch is discarded and rebuilt against this object's new model members. The
++  /// caller must hold exclusive access to this Scene for the full call; retained generations must
++  /// use clone() and must never be updated through this method.
++  void replaceWithIsolatedCopy(const Scene& other);
++
+   /// @brief Gets the scene's name.
+   /// @return The scene name.
+   const std::string& getName() const { return name_; };
+diff --git a/roboplan/src/core/scene.cpp b/roboplan/src/core/scene.cpp
+index 15bc9e8..29ddef7 100644
+--- a/roboplan/src/core/scene.cpp
++++ b/roboplan/src/core/scene.cpp
+@@ -192,6 +192,63 @@ Scene::Scene(const std::string& name, const std::string& urdf, const std::string
+                                   .accelerations = Eigen::VectorXd::Zero(model_.nv)};
+ }
+ 
++Scene::Scene(const Scene& other)
++    : name_(other.name_), model_(other.model_), model_data_(model_),
++      collision_model_(other.collision_model_), collision_model_data_(collision_model_),
++      joint_names_(other.joint_names_), actuated_joint_names_(other.actuated_joint_names_),
++      joint_info_map_(other.joint_info_map_), joint_group_info_map_(other.joint_group_info_map_),
++      rng_gen_(other.rng_gen_), cur_state_(other.cur_state_), frame_map_(other.frame_map_),
++      collision_geometry_map_(other.collision_geometry_map_) {
++  rebuildBroadphaseManager();
++}
++
++std::shared_ptr<Scene> Scene::clone() const { return std::make_shared<Scene>(*this); }
++
++void Scene::replaceWithIsolatedCopy(const Scene& other) {
++  if (this == &other) {
++    return;
++  }
++
++  // Construct every potentially-throwing copy before changing the live scene. The old
++  // broadphase manager is released before model/data swaps because it caches pointers into both.
++  Scene replacement(other);
++  broadphase_manager_.reset();
++  replacement.broadphase_manager_.reset();
++
++  const auto swap_state = [&]() {
++    using std::swap;
++    swap(name_, replacement.name_);
++    swap(model_, replacement.model_);
++    swap(model_data_, replacement.model_data_);
++    swap(collision_model_, replacement.collision_model_);
++    swap(collision_model_data_, replacement.collision_model_data_);
++    swap(joint_names_, replacement.joint_names_);
++    swap(actuated_joint_names_, replacement.actuated_joint_names_);
++    swap(joint_info_map_, replacement.joint_info_map_);
++    swap(joint_group_info_map_, replacement.joint_group_info_map_);
++    swap(rng_gen_, replacement.rng_gen_);
++    swap(cur_state_, replacement.cur_state_);
++    swap(frame_map_, replacement.frame_map_);
++    swap(collision_geometry_map_, replacement.collision_geometry_map_);
++  };
++
++  swap_state();
++  try {
++    rebuildBroadphaseManager();
++  } catch (...) {
++    // Restore the previously valid state before reporting commit failure. Failure to rebuild that
++    // state means collision queries can no longer be made safely, so continuing is not permitted.
++    broadphase_manager_.reset();
++    swap_state();
++    try {
++      rebuildBroadphaseManager();
++    } catch (...) {
++      std::terminate();
++    }
++    throw;
++  }
++}
++
+ Eigen::VectorXd Scene::getCurrentJointPositionsWithMimics() const {
+   return jointPositionsWithMimicsFromPinocchio(*this, cur_state_.positions);
+ }

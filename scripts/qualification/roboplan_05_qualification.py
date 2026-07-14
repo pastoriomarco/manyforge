@@ -17,6 +17,7 @@ import math
 import os
 import platform
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -29,6 +30,47 @@ CAPTURE_SCHEMA = "manyforge.roboplan_transition_capture.v1"
 EVIDENCE_SCHEMA = "manyforge.roboplan_transition_evidence.v1"
 CAPABILITY_SCHEMA = "manyforge.roboplan_capability_inventory.v1"
 WORKAROUND_SCHEMA = "manyforge.roboplan_workaround_inventory.v1"
+ROBOPLAN_05_VERSION = "0.5.1"
+ROBOPLAN_05_SCHEMA_VERSIONS = frozenset({"0.5.0", ROBOPLAN_05_VERSION})
+ROBOPLAN_05_PINNED_COMMIT = "e06d1a2f1b749c38742aee9e401bbe97fa967f7b"
+ROBOPLAN_05_PINOCCHIO_VERSION = "4.1.0"
+ROBOPLAN_05_COAL_VERSION = "3.0.3"
+ROBOPLAN_05_PACKAGE_VERSIONS = {
+    "roboplan": ROBOPLAN_05_VERSION,
+    "roboplan_cartesian_planning": ROBOPLAN_05_VERSION,
+    "roboplan_example_models": ROBOPLAN_05_VERSION,
+    "roboplan_examples": ROBOPLAN_05_VERSION,
+    "roboplan_oink": ROBOPLAN_05_VERSION,
+    "roboplan_rrt": ROBOPLAN_05_VERSION,
+    "roboplan_simple_ik": ROBOPLAN_05_VERSION,
+    "roboplan_toppra": ROBOPLAN_05_VERSION,
+}
+ROBOPLAN_05_PATCH_MANIFEST_SHA256 = (
+    "06d0c235d7cba107468d89f642f76b3459ff9d0c4884fbfbbcdc8f40e60504ed"
+)
+ROBOPLAN_05_PATCH_DIGESTS = {
+    "patches/0001-explicit-isolated-scene-clone.patch": (
+        "cfa676dca94d8a8e9d4f61fb76b4988dc0810a5484b4d3a42416b5d294363344"
+    ),
+    "patches/0002-cartesian-planner-cooperative-cancellation.patch": (
+        "344123b71a6eb2bcf8217ca7aea77413f68e70c5e96a397f6deb856c0cf8c9bf"
+    ),
+    "patches/0003-own-collision-context-scene-generation.patch": (
+        "0e83a7b644bf033e9d00d3ec1f638f8126593602c04416ab9fc70e98d186c81c"
+    ),
+    "patches/0004-configurable-source-build-cmake-arguments.patch": (
+        "8867a87ea695b4196e9d05b424c1a4be0219fe9017ab21fa8e89aeb7b89ac086"
+    ),
+    "patches/0005-construct-scene-scratch-without-copy-assignment.patch": (
+        "e13cdc712cd98c411f8f1a0dbc2ee9944fed536745fc92ddf64e60c41ed2b537"
+    ),
+    "patches/0006-bound-cartesian-duration-arithmetic.patch": (
+        "c0b699d5f2eb28edda43290710b328aca6837cee2290ec5b3a339b1d1051a581"
+    ),
+    "patches/0007-explicit-serialized-collision-query-view.patch": (
+        "d14a8eb7b2f99dfc37a59475e0add3514fe1d96d78a818ca4c7ce658cbc2e14d"
+    ),
+}
 ROBOPLAN_PACKAGES = (
     "roboplan",
     "roboplan_rrt",
@@ -37,6 +79,16 @@ ROBOPLAN_PACKAGES = (
     "roboplan_oink",
     "roboplan_cartesian_planning",
 )
+ROBOPLAN_INVENTORY_FILES = {
+    "0.4.0": (
+        "roboplan-0.4.0-capabilities.json",
+        "roboplan-0.4.0-workarounds.json",
+    ),
+    ROBOPLAN_05_VERSION: (
+        "roboplan-0.5.1-capabilities.json",
+        "roboplan-0.5.1-workarounds.json",
+    ),
+}
 SCAN_SUFFIXES = {
     ".cmake",
     ".cpp",
@@ -727,7 +779,23 @@ def validate_corpus(
     for row in corpus["planning_fixtures"]:
         capture = row.get("capture_file")
         if capture is None:
+            if "capture_source_policy" in row:
+                raise ValidationError(
+                    f"planning fixture {row['id']!r} has a capture source policy "
+                    "without a capture"
+                )
             continue
+        capture_source_policy = row.get(
+            "capture_source_policy", "current_artifacts"
+        )
+        if capture_source_policy not in {
+            "current_artifacts",
+            "frozen_rp5_0_manifest",
+        }:
+            raise ValidationError(
+                f"planning fixture {row['id']!r} has unsupported "
+                f"capture_source_policy {capture_source_policy!r}"
+            )
         capture_root = corpus_path.parent.resolve()
         capture_path = (capture_root / str(capture)).resolve()
         if not capture_path.is_relative_to(capture_root):
@@ -816,6 +884,185 @@ def _validate_revision_identity(value: Any, field: str) -> dict[str, Any]:
     }
 
 
+def _nonnegative_integer(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValidationError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _positive_integer(value: Any, field: str) -> int:
+    result = _nonnegative_integer(value, field)
+    if result == 0:
+        raise ValidationError(f"{field} must be positive")
+    return result
+
+
+def _nonnegative_scalar(value: Any, field: str) -> float:
+    result = _finite_scalar(value, field)
+    if result < 0.0:
+        raise ValidationError(f"{field} must be non-negative")
+    return result
+
+
+def _validate_collision_revision_record(
+    record: dict[str, Any], field: str, *, formal: bool
+) -> None:
+    _validate_latency_summary(
+        record.get("latency_ns"), f"{field}.latency_ns", require_p99=formal
+    )
+    details = record.get("details")
+    if not isinstance(details, dict):
+        raise ValidationError(f"{field}.details must be an object")
+    allocations = _nonnegative_integer(
+        details.get("allocations"), f"{field}.details.allocations"
+    )
+    allocations_per_query = _nonnegative_scalar(
+        details.get("allocations_per_query"),
+        f"{field}.details.allocations_per_query",
+    )
+    allocation_bound = _positive_integer(
+        details.get("allocation_bound_per_query"),
+        f"{field}.details.allocation_bound_per_query",
+    )
+    wcet_budget_ns = _positive_integer(
+        details.get("wcet_budget_ns"), f"{field}.details.wcet_budget_ns"
+    )
+    if allocations > 0 and allocations_per_query <= 0.0:
+        raise ValidationError(
+            f"{field}.details.allocations_per_query contradicts allocations"
+        )
+    if record.get("passed") is True:
+        if allocations_per_query > allocation_bound:
+            raise ValidationError(
+                f"{field}.details.allocations_per_query exceeds its bound"
+            )
+        if float(record["latency_ns"]["max"]) > wcet_budget_ns:
+            raise ValidationError(f"{field}.latency_ns.max exceeds the WCET budget")
+
+
+def _validate_trajectory_validation_record(
+    record: dict[str, Any], field: str, *, formal: bool
+) -> None:
+    samples = _positive_sample_count(record, field)
+    details = record.get("details")
+    if not isinstance(details, dict):
+        raise ValidationError(f"{field}.details must be an object")
+    collision = details.get("collision_validation")
+    noncollision = details.get("noncollision_validation")
+    if not isinstance(collision, dict) or not isinstance(noncollision, dict):
+        raise ValidationError(
+            f"{field}.details must retain collision and non-collision validation"
+        )
+    collision_enabled = collision.get("enabled") is True
+    noncollision_enabled = noncollision.get("enabled") is True
+    if not isinstance(collision.get("enabled"), bool):
+        raise ValidationError(f"{field}.details.collision_validation.enabled must be boolean")
+    if not isinstance(noncollision.get("enabled"), bool):
+        raise ValidationError(
+            f"{field}.details.noncollision_validation.enabled must be boolean"
+        )
+    if not collision_enabled and not noncollision_enabled:
+        raise ValidationError(f"{field} does not contain an enabled validation surface")
+
+    run_counts: list[int] = []
+    if collision_enabled:
+        collision_field = f"{field}.details.collision_validation"
+        run_counts.append(_positive_integer(collision.get("runs"), f"{collision_field}.runs"))
+        _positive_integer(collision.get("waypoints"), f"{collision_field}.waypoints")
+        workers = _positive_integer(collision.get("workers"), f"{collision_field}.workers")
+        if not isinstance(collision.get("decision_match"), bool):
+            raise ValidationError(f"{collision_field}.decision_match must be boolean")
+        if record.get("passed") is True and collision.get("decision_match") is not True:
+            raise ValidationError(f"{collision_field}.decision_match must be true")
+        _nonnegative_scalar(
+            collision.get("serial_p95_us"), f"{collision_field}.serial_p95_us"
+        )
+        _nonnegative_scalar(
+            collision.get("parallel_p95_us"), f"{collision_field}.parallel_p95_us"
+        )
+        support_active = collision.get("support_contact_active")
+        if not isinstance(support_active, bool):
+            raise ValidationError(f"{collision_field}.support_contact_active must be boolean")
+        fallback_reason = collision.get("fallback_reason")
+        if not isinstance(fallback_reason, str):
+            raise ValidationError(f"{collision_field}.fallback_reason must be a string")
+        fallback_verified = details.get("support_contact_fallback_verified")
+        if not isinstance(fallback_verified, bool):
+            raise ValidationError(
+                f"{field}.details.support_contact_fallback_verified must be boolean"
+            )
+        if support_active is True and (
+            workers != 1
+            or not fallback_reason
+            or fallback_verified is not True
+        ):
+            raise ValidationError(
+                f"{collision_field} must prove the serial support-contact fallback"
+            )
+
+    if noncollision_enabled:
+        noncollision_field = f"{field}.details.noncollision_validation"
+        run_counts.append(
+            _positive_integer(noncollision.get("runs"), f"{noncollision_field}.runs")
+        )
+        _nonnegative_integer(
+            noncollision.get("allocations"), f"{noncollision_field}.allocations"
+        )
+        detail_latency = {
+            name: _nonnegative_scalar(
+                noncollision.get(f"{name}_us"), f"{noncollision_field}.{name}_us"
+            )
+            * 1000.0
+            for name in ("p50", "p95", "p99", "max")
+        }
+        _validate_latency_summary(
+            detail_latency, f"{noncollision_field}.latency_ns", require_p99=True
+        )
+        _validate_latency_summary(
+            record.get("latency_ns"), f"{field}.latency_ns", require_p99=formal
+        )
+        for name, expected in detail_latency.items():
+            observed = float(record["latency_ns"][name])
+            if not math.isclose(observed, expected, rel_tol=1e-12, abs_tol=1e-6):
+                raise ValidationError(
+                    f"{field}.latency_ns.{name} contradicts non-collision details"
+                )
+    elif record.get("latency_ns") is not None:
+        raise ValidationError(
+            f"{field}.latency_ns is present without non-collision validation"
+        )
+
+    if samples != max(run_counts):
+        raise ValidationError(f"{field}.sample_count contradicts validation run counts")
+
+
+def _validate_rma_contract_record(record: dict[str, Any], field: str) -> None:
+    details = record.get("details")
+    if not isinstance(details, dict):
+        raise ValidationError(f"{field}.details must be an object")
+    for name in ("canonical_fingerprint", "view_fingerprint"):
+        value = _require_nonempty_string(details.get(name), f"{field}.details.{name}")
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValidationError(f"{field}.details.{name} must be a lowercase SHA-256")
+    for name in (
+        "view_changed",
+        "mapping_bijective",
+        "public_planning_joint_names_preserved",
+    ):
+        if not isinstance(details.get(name), bool):
+            raise ValidationError(f"{field}.details.{name} must be boolean")
+    renamed = _nonnegative_integer(
+        details.get("renamed_joint_count"), f"{field}.details.renamed_joint_count"
+    )
+    if renamed > 0 and details["view_changed"] is not True:
+        raise ValidationError(f"{field}.details.view_changed contradicts renamed joints")
+    if record.get("passed") is True and (
+        details["mapping_bijective"] is not True
+        or details["public_planning_joint_names_preserved"] is not True
+    ):
+        raise ValidationError(f"{field} passed without preserving the RMA contract")
+
+
 def _validate_live_scene_authority(value: Any, field: str) -> None:
     if not isinstance(value, dict):
         raise ValidationError(f"{field} must be an object")
@@ -847,7 +1094,11 @@ def _validate_source_artifact(value: Any, field: str, *, named: bool) -> None:
 
 
 def _validate_rp5_record(
-    record: dict[str, Any], field: str, *, formal: bool
+    record: dict[str, Any],
+    field: str,
+    *,
+    formal: bool,
+    roboplan_version: str | None = None,
 ) -> None:
     record_type = str(record["record_type"])
     if record_type == "collision_query":
@@ -869,6 +1120,12 @@ def _validate_rp5_record(
         )
         _require_nonempty_string(record.get("query_class"), f"{field}.query_class")
         return
+    if record_type == "collision_revision":
+        _validate_collision_revision_record(record, field, formal=formal)
+        return
+    if record_type == "trajectory_validation":
+        _validate_trajectory_validation_record(record, field, formal=formal)
+        return
     if record_type == "planning_pipeline":
         samples = _positive_sample_count(record, field)
         if formal and record.get("passed") is True and samples < 50:
@@ -876,8 +1133,46 @@ def _validate_rp5_record(
                 f"{field}.sample_count must be at least 50 for formal planning evidence"
             )
         mode = record.get("measurement_mode")
-        if mode not in {"primary", "collision_probe_attribution"}:
+        if mode not in {
+            "primary",
+            "collision_probe_attribution",
+            "capability_opt_in",
+        }:
             raise ValidationError(f"{field}.measurement_mode is invalid")
+        policy = record.get("planner_policy")
+        if policy is None and roboplan_version not in ROBOPLAN_05_SCHEMA_VERSIONS:
+            policy = "compatibility"
+            planner_options = None
+        else:
+            planner_options = record.get("planner_options")
+        if policy not in {"compatibility", "rrt_star", "budget_spending"}:
+            raise ValidationError(f"{field}.planner_policy is invalid")
+        if (
+            roboplan_version in ROBOPLAN_05_SCHEMA_VERSIONS
+            and not isinstance(planner_options, dict)
+        ):
+            raise ValidationError(f"{field}.planner_options must be an object")
+        expected_policy_options = {
+            "compatibility": (False, True),
+            "rrt_star": (True, False),
+            "budget_spending": (False, False),
+        }
+        expected_rrt_star, expected_fast_return = expected_policy_options[policy]
+        if isinstance(planner_options, dict) and (
+            planner_options.get("rrt_star") is not expected_rrt_star
+            or planner_options.get("fast_return") is not expected_fast_return
+        ):
+            raise ValidationError(
+                f"{field}.planner_options do not match planner_policy"
+            )
+        if mode == "capability_opt_in" and policy == "compatibility":
+            raise ValidationError(
+                f"{field} capability measurement uses the compatibility policy"
+            )
+        if mode != "capability_opt_in" and policy != "compatibility":
+            raise ValidationError(
+                f"{field} primary/attribution measurement changed production policy"
+            )
         probe = record.get("collision_probe_available") is True
         if mode == "primary" and probe:
             raise ValidationError(f"{field} primary measurement loaded the collision probe")
@@ -885,6 +1180,25 @@ def _validate_rp5_record(
             not probe or int(record.get("total_collision_query_count") or 0) <= 0
         ):
             raise ValidationError(f"{field} attribution measurement has no collision evidence")
+        if (
+            mode == "collision_probe_attribution"
+            and roboplan_version in ROBOPLAN_05_SCHEMA_VERSIONS
+        ):
+            stages = record.get("stages")
+            rrt = stages.get("rrt") if isinstance(stages, dict) else None
+            rrt_queries = (
+                rrt.get("collision_query_count") if isinstance(rrt, dict) else None
+            )
+            if (
+                not isinstance(rrt_queries, dict)
+                or int(rrt_queries.get("p50") or 0) <= 0
+            ):
+                raise ValidationError(
+                    f"{field} attribution did not observe RoboPlan 0.5 "
+                    "CollisionContext queries inside the RRT stage"
+                )
+        if mode == "capability_opt_in" and probe:
+            raise ValidationError(f"{field} capability measurement loaded the collision probe")
         for name in ("invariants_passed", "outcomes_passed", "deterministic_trajectory"):
             if record.get(name) is not True:
                 raise ValidationError(f"{field}.{name} must be true")
@@ -993,6 +1307,11 @@ def _validate_rp5_record(
             failures = details.get("failed_or_timeout_observations")
             if not isinstance(failures, list) or not failures:
                 raise ValidationError(f"{field} failed live evidence must retain its failure")
+        return
+    if record_type == "rma_contract":
+        _validate_rma_contract_record(record, field)
+        return
+    raise ValidationError(f"{field}.record_type is not supported: {record_type!r}")
 
 
 def validate_evidence(path: Path) -> dict[str, Any]:
@@ -1008,7 +1327,10 @@ def validate_evidence(path: Path) -> dict[str, Any]:
             raise ValidationError(f"{field} must be an object")
     source = evidence["source"]
     environment = evidence["environment"]
-    formal = evidence["phase"] == "rp5_0" and source.get("manyforge_dirty") is False
+    # A clean-source RP5-3 or RP5-7 artifact is release evidence just as the
+    # RP5-0 baseline is. Apply the same provenance and sample-size contract to
+    # every formal phase; dirty-source preflights remain explicitly non-formal.
+    formal = source.get("manyforge_dirty") is False
     if formal:
         commit = _require_nonempty_string(
             source.get("manyforge_commit"), "source.manyforge_commit"
@@ -1017,6 +1339,88 @@ def validate_evidence(path: Path) -> dict[str, Any]:
             raise ValidationError("source.manyforge_commit must be a full Git SHA")
         for name in ("roboplan_version", "roboplan_commit", "pinocchio_version"):
             _require_nonempty_string(source.get(name), f"source.{name}")
+        expected_version = {
+            "rp5_0": "0.4.0",
+            "rp5_3": ROBOPLAN_05_VERSION,
+            "rp5_7": ROBOPLAN_05_VERSION,
+        }[str(evidence["phase"])]
+        if source.get("roboplan_version") != expected_version:
+            raise ValidationError(
+                f"formal {evidence['phase']} evidence requires RoboPlan "
+                f"{expected_version}"
+            )
+        if source.get("roboplan_version") == ROBOPLAN_05_VERSION:
+            if source.get("roboplan_source_clean") is not True:
+                raise ValidationError(
+                    "formal RoboPlan 0.5 evidence requires a verified clean source checkout"
+                )
+            if source.get("pinocchio_version") != ROBOPLAN_05_PINOCCHIO_VERSION:
+                raise ValidationError(
+                    "formal RoboPlan 0.5 evidence must use Pinocchio "
+                    f"{ROBOPLAN_05_PINOCCHIO_VERSION}"
+                )
+            if source.get("coal_version") != ROBOPLAN_05_COAL_VERSION:
+                raise ValidationError(
+                    "formal RoboPlan 0.5 evidence must use Coal "
+                    f"{ROBOPLAN_05_COAL_VERSION}"
+                )
+            package_versions = source.get("roboplan_package_versions")
+            if package_versions != ROBOPLAN_05_PACKAGE_VERSIONS:
+                raise ValidationError(
+                    "formal RoboPlan 0.5 evidence package-version inventory "
+                    "differs from the reviewed source generation"
+                )
+            if source.get("roboplan_commit") != ROBOPLAN_05_PINNED_COMMIT:
+                raise ValidationError(
+                    "formal RoboPlan 0.5 evidence must use the reviewed pinned commit"
+                )
+            if source.get("roboplan_ref") != ROBOPLAN_05_PINNED_COMMIT:
+                raise ValidationError(
+                    "formal RoboPlan 0.5 evidence cannot use ROBOPLAN_REF override"
+                )
+            patch_manifest = _require_nonempty_string(
+                source.get("roboplan_patch_manifest_sha256"),
+                "source.roboplan_patch_manifest_sha256",
+            )
+            if patch_manifest != ROBOPLAN_05_PATCH_MANIFEST_SHA256:
+                raise ValidationError(
+                    "formal RoboPlan 0.5 evidence must use the reviewed patch manifest"
+                )
+            patches = source.get("roboplan_patches")
+            if not isinstance(patches, list) or not patches:
+                raise ValidationError(
+                    "formal RoboPlan 0.5 evidence must retain checked patches"
+                )
+            seen_paths: set[str] = set()
+            for index, patch in enumerate(patches):
+                if not isinstance(patch, dict):
+                    raise ValidationError(
+                        f"source.roboplan_patches[{index}] must be an object"
+                    )
+                patch_path = _require_nonempty_string(
+                    patch.get("path"),
+                    f"source.roboplan_patches[{index}].path",
+                )
+                digest = _require_nonempty_string(
+                    patch.get("sha256"),
+                    f"source.roboplan_patches[{index}].sha256",
+                )
+                if patch_path in seen_paths:
+                    raise ValidationError(
+                        f"source.roboplan_patches repeats {patch_path!r}"
+                    )
+                if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    raise ValidationError(
+                        f"source.roboplan_patches[{index}].sha256 must be a SHA-256"
+                    )
+                seen_paths.add(patch_path)
+            observed_patches = {
+                str(patch["path"]): str(patch["sha256"]) for patch in patches
+            }
+            if observed_patches != ROBOPLAN_05_PATCH_DIGESTS:
+                raise ValidationError(
+                    "formal RoboPlan 0.5 evidence patch set differs from the reviewed manifest"
+                )
         _require_nonempty_string(environment.get("command"), "environment.command")
     records = evidence.get("records")
     if not isinstance(records, list) or not records:
@@ -1028,7 +1432,12 @@ def validate_evidence(path: Path) -> dict[str, Any]:
         _require_nonempty_string(record.get("fixture_id"), f"records[{index}].fixture_id")
         if not isinstance(record.get("passed"), bool):
             raise ValidationError(f"records[{index}].passed must be boolean")
-        _validate_rp5_record(record, f"records[{index}]", formal=formal)
+        _validate_rp5_record(
+            record,
+            f"records[{index}]",
+            formal=formal,
+            roboplan_version=str(source.get("roboplan_version") or ""),
+        )
     if formal and all(record.get("passed") is True for record in records):
         if environment.get("source_verified_after_run") is not True:
             raise ValidationError(
@@ -1050,7 +1459,7 @@ def validate_evidence(path: Path) -> dict[str, Any]:
         or not isinstance(inventory.get("capabilities"), list)
         or not isinstance(inventory.get("workarounds"), list)
     ):
-        raise ValidationError("formal RP5-0 evidence must retain the complete inventory")
+        raise ValidationError("formal RP5 evidence must retain the complete inventory")
     return {"schema_version": EVIDENCE_SCHEMA, "records": len(records)}
 
 
@@ -1063,6 +1472,62 @@ def require_source_inventory_stable(
         raise RuntimeError(
             "ManyForge or RoboPlan source identity changed during qualification"
         )
+
+
+def _manyforge_worktree_sha256(repo_root: Path) -> str:
+    """Fingerprint every non-ignored source change relative to HEAD."""
+
+    digest = hashlib.sha256()
+    tracked = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "HEAD",
+            "--",
+        ]
+    )
+    digest.update(b"tracked-diff\0")
+    digest.update(len(tracked).to_bytes(8, "big"))
+    digest.update(tracked)
+
+    untracked_output = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ]
+    )
+    untracked = sorted(name for name in untracked_output.split(b"\0") if name)
+    digest.update(b"untracked-files\0")
+    digest.update(len(untracked).to_bytes(8, "big"))
+    for encoded_name in untracked:
+        relative = os.fsdecode(encoded_name)
+        path = repo_root / relative
+        metadata = path.lstat()
+        mode = stat.S_IMODE(metadata.st_mode)
+        digest.update(len(encoded_name).to_bytes(8, "big"))
+        digest.update(encoded_name)
+        digest.update(mode.to_bytes(4, "big"))
+        if stat.S_ISLNK(metadata.st_mode):
+            payload = os.fsencode(os.readlink(path))
+        elif stat.S_ISREG(metadata.st_mode):
+            payload = path.read_bytes()
+        else:
+            raise ValidationError(
+                f"{path}: unsupported untracked source file type"
+            )
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
 
 
 def _git(repo_root: Path, *args: str) -> str:
@@ -1088,6 +1553,91 @@ def _package_xml_versions(roboplan_root: Path) -> dict[str, str]:
     return versions
 
 
+def _checked_patch_manifest(repo_root: Path) -> dict[str, Any]:
+    root = repo_root / "third_party/roboplan"
+    manifest = root / "patches.sha256"
+    if not manifest.is_file():
+        raise ValidationError(f"{manifest}: RoboPlan patch manifest is missing")
+    patches: list[dict[str, str]] = []
+    listed_paths: set[str] = set()
+    for line_number, raw_line in enumerate(
+        manifest.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 2 or re.fullmatch(r"[0-9a-f]{64}", parts[0]) is None:
+            raise ValidationError(
+                f"{manifest}:{line_number}: expected '<sha256> <relative path>'"
+            )
+        digest, relative_name = parts
+        if re.fullmatch(r"patches/[A-Za-z0-9][A-Za-z0-9._-]*\.patch", relative_name) is None:
+            raise ValidationError(
+                f"{manifest}:{line_number}: patch must be a direct patches/*.patch entry"
+            )
+        if relative_name in listed_paths:
+            raise ValidationError(
+                f"{manifest}:{line_number}: duplicate patch path {relative_name!r}"
+            )
+        listed_paths.add(relative_name)
+        patch = (root / relative_name).resolve()
+        if not patch.is_relative_to(root.resolve()) or not patch.is_file():
+            raise ValidationError(
+                f"{manifest}:{line_number}: patch path is unavailable or escapes the manifest root"
+            )
+        actual = hashlib.sha256(patch.read_bytes()).hexdigest()
+        if actual != digest:
+            raise ValidationError(
+                f"{patch}: digest {actual} does not match manifest {digest}"
+            )
+        patches.append({"path": relative_name, "sha256": digest})
+    if not patches:
+        raise ValidationError(f"{manifest}: at least one checked patch is required")
+    available_paths = {
+        path.relative_to(root).as_posix() for path in (root / "patches").glob("*.patch")
+    }
+    if listed_paths != available_paths:
+        unlisted = sorted(available_paths - listed_paths)
+        missing = sorted(listed_paths - available_paths)
+        raise ValidationError(
+            f"{manifest}: manifest/patch-directory mismatch; "
+            f"unlisted={unlisted}, missing={missing}"
+        )
+    return {
+        "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        "patches": patches,
+    }
+
+
+def _version_inventory(
+    repo_root: Path, roboplan_version: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    names = ROBOPLAN_INVENTORY_FILES.get(roboplan_version)
+    if names is None:
+        raise ValidationError(
+            f"RoboPlan {roboplan_version!r} has no reviewed capability/workaround inventory"
+        )
+    inventory_root = repo_root / "benchmarks/roboplan_05/inventory"
+    capability_path = inventory_root / names[0]
+    workaround_path = inventory_root / names[1]
+    capabilities = _read_json(capability_path)
+    workarounds = _read_json(workaround_path)
+    if capabilities.get("schema_version") != CAPABILITY_SCHEMA:
+        raise ValidationError(f"{capability_path}: invalid schema_version")
+    if workarounds.get("schema_version") != WORKAROUND_SCHEMA:
+        raise ValidationError(f"{workaround_path}: invalid schema_version")
+    if capabilities.get("roboplan_version") != roboplan_version:
+        raise ValidationError(
+            f"{capability_path}: inventory version does not match the source"
+        )
+    if workarounds.get("roboplan_version") != roboplan_version:
+        raise ValidationError(
+            f"{workaround_path}: inventory version does not match the source"
+        )
+    return capabilities, workarounds
+
+
 def _build_reference_inventory(repo_root: Path) -> dict[str, list[str]]:
     patterns = {
         package: re.compile(rf"\b{re.escape(package)}\b")
@@ -1111,28 +1661,73 @@ def _build_reference_inventory(repo_root: Path) -> dict[str, list[str]]:
     return references
 
 
-def collect_inventory(repo_root: Path) -> dict[str, Any]:
+def _verified_roboplan_checkout(repo_root: Path) -> tuple[Path, str, str]:
     roboplan_root = repo_root / ".docker" / "roboplan"
-    ref_path = roboplan_root / ".manyforge-roboplan-ref"
-    sha_path = roboplan_root / ".manyforge-roboplan-sha"
+    ref_path = repo_root / ".docker" / ".manyforge-roboplan-ref"
+    sha_path = repo_root / ".docker" / ".manyforge-roboplan-sha"
     if not ref_path.is_file() or not sha_path.is_file():
         raise ValidationError(
             f"{roboplan_root}: resolved RoboPlan ref/SHA markers are missing"
         )
-    capability_path = (
-        repo_root
-        / "benchmarks/roboplan_05/inventory/roboplan-0.4.0-capabilities.json"
+    if not (roboplan_root / ".git").exists():
+        raise ValidationError(
+            f"{roboplan_root}: verifiable Git metadata is missing; rerun scripts/setup-docker.sh"
+        )
+    try:
+        actual_sha = _git(roboplan_root, "rev-parse", "HEAD")
+        status = _git(
+            roboplan_root,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        )
+        submodules = _git(roboplan_root, "submodule", "status", "--recursive")
+    except subprocess.CalledProcessError as exc:
+        raise ValidationError(
+            f"{roboplan_root}: RoboPlan source checkout cannot be verified"
+        ) from exc
+    expected_sha = sha_path.read_text(encoding="utf-8").strip()
+    if actual_sha != expected_sha:
+        raise ValidationError(
+            f"{roboplan_root}: checkout SHA {actual_sha} does not match recorded {expected_sha}"
+        )
+    if status:
+        raise ValidationError(
+            f"{roboplan_root}: RoboPlan source checkout is dirty"
+        )
+    invalid_submodules = [
+        line for line in submodules.splitlines() if line[:1] in {"-", "+", "U"}
+    ]
+    if invalid_submodules:
+        raise ValidationError(
+            f"{roboplan_root}: RoboPlan submodule checkout is not exact"
+        )
+    return (
+        roboplan_root,
+        ref_path.read_text(encoding="utf-8").strip(),
+        actual_sha,
     )
-    workaround_path = (
+
+
+def collect_inventory(repo_root: Path) -> dict[str, Any]:
+    roboplan_root, roboplan_ref, roboplan_sha = _verified_roboplan_checkout(
         repo_root
-        / "benchmarks/roboplan_05/inventory/roboplan-0.4.0-workarounds.json"
     )
-    capabilities = _read_json(capability_path)
-    workarounds = _read_json(workaround_path)
-    if capabilities.get("schema_version") != CAPABILITY_SCHEMA:
-        raise ValidationError(f"{capability_path}: invalid schema_version")
-    if workarounds.get("schema_version") != WORKAROUND_SCHEMA:
-        raise ValidationError(f"{workaround_path}: invalid schema_version")
+    package_versions = _package_xml_versions(roboplan_root)
+    roboplan_version = package_versions.get("roboplan")
+    if not roboplan_version:
+        raise ValidationError(
+            f"{roboplan_root}: RoboPlan package version is unavailable"
+        )
+    capabilities, workarounds = _version_inventory(
+        repo_root, roboplan_version
+    )
+    patch_manifest = (
+        _checked_patch_manifest(repo_root)
+        if roboplan_version == ROBOPLAN_05_VERSION
+        else {"manifest_sha256": None, "patches": []}
+    )
 
     governors: set[str] = set()
     for governor in Path("/sys/devices/system/cpu").glob(
@@ -1148,9 +1743,15 @@ def collect_inventory(repo_root: Path) -> dict[str, Any]:
         "source": {
             "manyforge_commit": _git(repo_root, "rev-parse", "HEAD"),
             "manyforge_dirty": dirty,
-            "roboplan_ref": ref_path.read_text(encoding="utf-8").strip(),
-            "roboplan_commit": sha_path.read_text(encoding="utf-8").strip(),
-            "roboplan_packages": _package_xml_versions(roboplan_root),
+            "manyforge_worktree_sha256": _manyforge_worktree_sha256(repo_root),
+            "roboplan_ref": roboplan_ref,
+            "roboplan_commit": roboplan_sha,
+            "roboplan_source_clean": True,
+            "roboplan_packages": package_versions,
+            "roboplan_patch_manifest_sha256": patch_manifest[
+                "manifest_sha256"
+            ],
+            "roboplan_patches": patch_manifest["patches"],
             "python_packages": {
                 name: _distribution_version(name)
                 for name in (

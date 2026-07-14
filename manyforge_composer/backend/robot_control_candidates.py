@@ -102,6 +102,18 @@ _POSITION_FINGERPRINT_DECIMALS = 5
 # stale a candidate while a genuine relocation / (de)attach still flips it.
 _SCENE_POSE_FINGERPRINT_DECIMALS = 4
 
+_CARTESIAN_PATH_CAPABILITY = "planning.motion.cartesian_path"
+_CARTESIAN_PATH_DEFAULTS: dict[str, Any] = {
+    "max_translation_step_m": 0.005,
+    "max_rotation_step_rad": 0.05,
+    "speed_mode": "bounded",
+    "max_linear_speed_mps": 0.1,
+    "max_angular_speed_rad_s": 0.5,
+    "max_linear_acceleration_mps2": 0.5,
+    "max_angular_acceleration_rad_s2": 2.5,
+    "fallback_policy": "fail_closed",
+}
+
 
 # --- Per-joint robot_control_joint_limits enforcement (Phase 4-P5.1K) ---
 # `deployment.robot_config.robot_control_joint_limits` carries per-joint Robot
@@ -149,6 +161,7 @@ REASON_BACKEND_UNAVAILABLE = "backend_unavailable"
 REASON_NO_PROGRAM = "no_program_loaded"
 REASON_NO_ROBOT_STATE = "no_robot_state"
 REASON_PLANNING_FAILED = "planning_failed"
+REASON_CAPABILITY_UNSUPPORTED = "unsupported_capability"
 REASON_STALE = "stale_planning_snapshot"
 REASON_EXPIRED = "candidate_expired"
 REASON_SUPERSEDED = "candidate_superseded"
@@ -177,6 +190,7 @@ _KNOWN_REASON_CODES = frozenset(
         REASON_MALFORMED_TARGET,
         REASON_BACKEND_UNAVAILABLE,
         REASON_PLANNING_FAILED,
+        REASON_CAPABILITY_UNSUPPORTED,
         REASON_JOINT_DYNAMICS_UNSUPPORTED,
         REASON_JOINT_DYNAMICS_INVALID,
     }
@@ -902,6 +916,7 @@ class _CandidatePlanner:
         joint_names: Optional[list[str]] = None,
         joint_positions: Optional[list[float]] = None,
         pose_goal: Optional[dict] = None,
+        cartesian_path: Optional[dict] = None,
         base_frame: Optional[str] = None,
         tcp_frame: Optional[str] = None,
     ) -> ExecuteRequest:
@@ -928,6 +943,7 @@ class _CandidatePlanner:
             joint_goal_names=list(joint_names or []),
             joint_goal_positions_rad=list(joint_positions or []),
             pose_goal=pose_goal,
+            cartesian_path=cartesian_path,
             max_tcp_linear_speed_mps=self._global_tcp_speed_cap(),
             per_joint_dynamics_limits=self._per_joint_dynamics_limits(),
         )
@@ -988,6 +1004,50 @@ class _CandidatePlanner:
             if pose is not None:
                 poses[str(link_name)] = pose
         return poses or None
+
+    def _start_tcp_pose(
+        self,
+        start: RobotStateSnapshot,
+        *,
+        base_frame: str,
+        tcp_frame: str,
+    ) -> Optional[dict[str, list[float]]]:
+        """Resolve TCP FK for exactly the start state used by preview planning.
+
+        Every production client exposes exact-state batch FK. Failure is
+        definitive: falling back to a separately sampled live pose would
+        create a path whose first waypoint does not correspond to ``start``.
+        """
+        kernel = self._state.kernel
+        compute = getattr(kernel, "compute_target_link_poses", None)
+        if not callable(compute):
+            return None
+        try:
+            result = compute(
+                {
+                    "kind": "joint",
+                    "base_frame": base_frame,
+                    "link_names": [tcp_frame],
+                    "joint_names": list(start.joint_names),
+                    "joint_positions_rad": list(start.positions_rad),
+                }
+            )
+        except Exception:  # noqa: BLE001 - candidate must fail closed
+            return None
+        if not isinstance(result, dict) or not result.get("reachable", False):
+            return None
+        link_poses = result.get("link_poses")
+        raw_pose = (
+            link_poses.get(tcp_frame) if isinstance(link_poses, dict) else None
+        )
+
+        pose = _to_pose(raw_pose)
+        if pose is None:
+            return None
+        return {
+            "position_m": list(pose.position_m),
+            "orientation_xyzw": list(pose.orientation_xyzw),
+        }
 
     def _maybe_preview_trajectory(
         self,
@@ -1192,6 +1252,27 @@ class _CandidatePlanner:
 
     def _plan_cartesian(self, req, start, start_state_model, snapshot, _make):
         assert req.cartesian_target is not None
+        planning_adapter = self._state.deployment.adapters.get("planning")
+        capability_keys = (
+            set(planning_adapter.capability_keys)
+            if planning_adapter is not None
+            else set()
+        )
+        if _CARTESIAN_PATH_CAPABILITY not in capability_keys:
+            response = _make(
+                CandidateStatus.BLOCKED,
+                start_state=start_state_model,
+                diagnostics=CandidateDiagnostics(
+                    reason_code=REASON_CAPABILITY_UNSUPPORTED,
+                    summary=(
+                        "The active planning adapter does not declare the "
+                        "portable Cartesian-path capability."
+                    ),
+                    details={"requiredCapability": _CARTESIAN_PATH_CAPABILITY},
+                ),
+            )
+            return response, _StoredCandidate(response, snapshot, None)
+
         # Honor the candidate's frameId / tcpFrame. `frame_id`
         # defaults to the sentinel "base" at the model layer and `tcp_frame` is
         # optional; both sentinels mean "use the program robot's frame". A
@@ -1215,17 +1296,48 @@ class _CandidatePlanner:
                 float(v) for v in req.cartesian_target.orientation_xyzw
             ],
         }
-        move_id = f"rc_candidate_pose_{uuid.uuid4().hex}"
+        start_tcp_pose = self._start_tcp_pose(
+            start,
+            base_frame=candidate_base_frame,
+            tcp_frame=candidate_tcp_frame,
+        )
+        if start_tcp_pose is None:
+            response = _make(
+                CandidateStatus.ERROR,
+                start_state=start_state_model,
+                diagnostics=CandidateDiagnostics(
+                    reason_code=REASON_NO_ROBOT_STATE,
+                    summary=(
+                        "Cannot resolve the TCP pose for the candidate's exact "
+                        "start state; no Cartesian path was planned."
+                    ),
+                    details={
+                        "baseFrame": candidate_base_frame,
+                        "tcpFrame": candidate_tcp_frame,
+                    },
+                ),
+            )
+            return response, _StoredCandidate(response, snapshot, None)
+
+        target_waypoint = {
+            "position_m": list(pose_goal["position_m"]),
+            "orientation_xyzw": list(pose_goal["orientation_xyzw"]),
+        }
+        cartesian_path = {
+            "waypoints": [start_tcp_pose, target_waypoint],
+            **_CARTESIAN_PATH_DEFAULTS,
+        }
+        move_id = f"rc_candidate_cartesian_{uuid.uuid4().hex}"
         exec_request = self._build_execute_request(
             move_id=move_id,
-            motion_type="pose_goal",
-            pose_goal=pose_goal,
+            motion_type="cartesian_path",
+            cartesian_path=cartesian_path,
             base_frame=candidate_base_frame,
             tcp_frame=candidate_tcp_frame,
         )
         dispatch_params = {
-            "motion_type": "pose_goal",
-            "pose_goal": pose_goal,
+            "motion_type": "cartesian_path",
+            "cartesian_path": cartesian_path,
             "base_frame": candidate_base_frame,
             "tcp_frame": candidate_tcp_frame,
         }
@@ -2536,6 +2648,7 @@ def create_robot_control_candidates_router(state: ComposerState) -> APIRouter:
             joint_names=dispatch_params.get("joint_goal_names"),
             joint_positions=dispatch_params.get("joint_goal_positions_rad"),
             pose_goal=dispatch_params.get("pose_goal"),
+            cartesian_path=dispatch_params.get("cartesian_path"),
             # Revalidate against the same frames the candidate was
             # planned with (cartesian frameId / tcpFrame), not the program
             # defaults, so the pre-dispatch gate matches the planned motion.

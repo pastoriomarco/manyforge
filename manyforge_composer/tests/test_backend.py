@@ -4592,14 +4592,38 @@ def test_json_log_format():
     import logging
     from manyforge_composer.backend.logging_config import setup_logging
 
-    setup_logging("INFO")
-    test_logger = logging.getLogger("test.json_format")
-    buf = io.StringIO()
-    handler = logging.StreamHandler(buf)
-    handler.setFormatter(logging.getLogger().handlers[0].formatter)
-    test_logger.addHandler(handler)
-    test_logger.info("hello world")
-    test_logger.removeHandler(handler)
+    root_logger = logging.getLogger()
+    uvicorn_access_logger = logging.getLogger("uvicorn.access")
+    original_handlers = tuple(root_logger.handlers)
+    original_root_level = root_logger.level
+    original_uvicorn_access_level = uvicorn_access_logger.level
+
+    try:
+        setup_logging("INFO")
+        configured_handlers = tuple(root_logger.handlers)
+        test_logger = logging.getLogger("test.json_format")
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setFormatter(root_logger.handlers[0].formatter)
+        test_logger.addHandler(handler)
+        try:
+            test_logger.info("hello world")
+        finally:
+            test_logger.removeHandler(handler)
+            handler.close()
+    finally:
+        # setup_logging() intentionally replaces the process-wide root handlers.
+        # This test must put pytest's capture handler back or later caplog tests
+        # become order-dependent while production logging remains correct.
+        for configured_handler in tuple(root_logger.handlers):
+            root_logger.removeHandler(configured_handler)
+        for original_handler in original_handlers:
+            root_logger.addHandler(original_handler)
+        root_logger.setLevel(original_root_level)
+        uvicorn_access_logger.setLevel(original_uvicorn_access_level)
+        for configured_handler in configured_handlers:
+            if configured_handler not in original_handlers:
+                configured_handler.close()
 
     line = buf.getvalue().strip()
     record = json.loads(line)

@@ -164,7 +164,7 @@ std::vector<T> array_values(const ptree& tree) {
   std::vector<T> values;
   for (const auto& [key, value] : tree) {
     (void)key;
-    values.push_back(value.get_value<T>());
+    values.push_back(value.template get_value<T>());
   }
   return values;
 }

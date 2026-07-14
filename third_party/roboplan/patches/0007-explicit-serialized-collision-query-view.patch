@@ -1,0 +1,1141 @@
+diff --git a/roboplan/bindings/src/core.cpp b/roboplan/bindings/src/core.cpp
+index 200088b30c8611d86a3706ca824e0e700142a2a3..fcdcfdd62b5475c0b93ebaa0b312e92236cd3d61 100644
+--- a/roboplan/bindings/src/core.cpp
++++ b/roboplan/bindings/src/core.cpp
+@@ -208,7 +208,8 @@ void init_core_scene(nanobind::module_& m) {
+            "seed"_a)
+       .def("randomPositions", &Scene::randomPositions,
+            "Generates random positions for the robot model.")
+-      .def("randomCollisionFreePositions", &Scene::randomCollisionFreePositions,
++      .def("randomCollisionFreePositions",
++           nanobind::overload_cast<size_t>(&Scene::randomCollisionFreePositions),
+            "Generates random collision-free positions for the robot model.", "max_samples"_a = 1000)
+       .def("hasCollisions", &Scene::hasCollisions,
+            "Checks collisions at specified joint positions.", "q"_a, "debug"_a = false)
+@@ -367,8 +368,9 @@ void init_core_path_utils(nanobind::module_& m) {
+       m, "PathShortcutter", "Shortcuts joint paths with random sampling and checking connections.")
+       .def(nanobind::init<const std::shared_ptr<Scene>, const PathShortcuttingOptions&>(),
+            "scene"_a, "options"_a)
+-      .def("shortcut", &PathShortcutter::shortcut, "Attempts to shortcut a specified path.",
+-           "path"_a)
++      .def("shortcut",
++           nanobind::overload_cast<const JointPath&>(&PathShortcutter::shortcut),
++           "Attempts to shortcut a specified path.", "path"_a)
+       .def("getPathLengths", unwrap_expected(&PathShortcutter::getPathLengths),
+            "Computes configuration distances from the start to each pose in a path.", "path"_a)
+       .def("getNormalizedPathScaling", unwrap_expected(&PathShortcutter::getNormalizedPathScaling),
+diff --git a/roboplan/include/roboplan/core/collision_context.hpp b/roboplan/include/roboplan/core/collision_context.hpp
+index 4b764aa71bb89a7dc4775b128f38d27be076916e..222def5d1281821c0cf0c3e5f7a7c7ff69103f36 100644
+--- a/roboplan/include/roboplan/core/collision_context.hpp
++++ b/roboplan/include/roboplan/core/collision_context.hpp
+@@ -42,6 +42,12 @@ public:
+   /// Planner-owned code should use the shared-owner overload above.
+   explicit CollisionContext(const Scene& scene);
+ 
++  // A borrowed context may only bind an lvalue Scene. Without these overloads,
++  // a temporary can bind to the const-reference constructor and leave every
++  // model reference dangling as soon as the full expression ends.
++  CollisionContext(Scene&&) = delete;
++  CollisionContext(const Scene&&) = delete;
++
+   // Non-copyable and non-movable: the broadphase manager caches a raw pointer to `geom_data_`, so
+   // the object's address must remain stable for its whole lifetime. Hold one behind a pointer
+   // (e.g. std::unique_ptr) if it needs to be relocated or rebuilt.
+@@ -87,10 +93,14 @@ public:
+   /// @brief This context's private GeometryData scratch (geometry placements, distance results).
+   pinocchio::GeometryData& getCollisionData() const { return geom_data_; }
+ 
++  /// @brief Scene generation whose immutable model data this context snapshots.
++  const Scene* sourceScene() const noexcept { return source_scene_; }
++
+ private:
+   using BroadPhaseManager = pinocchio::BroadPhaseManagerTpl<coal::DynamicAABBTreeCollisionManager>;
+ 
+   std::shared_ptr<const Scene> scene_owner_;         ///< Optional exact-generation lifetime owner.
++  const Scene* source_scene_;                        ///< Exact snapshotted scene generation.
+   const pinocchio::Model& model_;                    ///< Borrowed; immutable; owned by the Scene.
+   const pinocchio::GeometryModel& collision_model_;  ///< Borrowed; immutable; owned by the Scene.
+   mutable pinocchio::Data data_;                     ///< Owned scratch for forward kinematics.
+@@ -105,4 +115,43 @@ private:
+   void initializeScratch();
+ };
+ 
++/// @brief Call-scoped collision-query access with explicit scratch ownership.
++/// @details General callers should wrap an isolated CollisionContext. A caller
++/// that owns an entire Scene generation and serializes every operation on it
++/// may instead select the Scene's existing collision scratch, avoiding a
++/// redundant broadphase workspace. The retained Scene owner makes that second
++/// mode lifetime-safe; neither mode makes concurrent use of one scratch safe.
++class CollisionQueryView {
++public:
++  [[nodiscard]]
++  static CollisionQueryView forIsolatedContext(
++      const CollisionContext& context) noexcept;
++
++  // The isolated form borrows its context and therefore must not be created
++  // from a temporary whose lifetime ends before the returned view is used.
++  static CollisionQueryView forIsolatedContext(CollisionContext&&) = delete;
++  static CollisionQueryView forIsolatedContext(
++      const CollisionContext&&) = delete;
++
++  [[nodiscard]]
++  static CollisionQueryView forSerializedScene(
++      std::shared_ptr<const Scene> scene);
++
++  bool hasCollisions(const Eigen::VectorXd& q) const;
++
++  const Scene* sourceScene() const noexcept { return source_scene_; }
++  bool usesSerializedSceneScratch() const noexcept {
++    return isolated_context_ == nullptr;
++  }
++
++private:
++  CollisionQueryView(const CollisionContext* isolated_context,
++                     std::shared_ptr<const Scene> scene_owner,
++                     const Scene* source_scene) noexcept;
++
++  const CollisionContext* isolated_context_;
++  std::shared_ptr<const Scene> scene_owner_;
++  const Scene* source_scene_;
++};
++
+ }  // namespace roboplan
+diff --git a/roboplan/include/roboplan/core/path_utils.hpp b/roboplan/include/roboplan/core/path_utils.hpp
+index 02c5ea45b2f07d442ce48b8a6ce733fb5d8ec2d5..526bda8b5cfb94d8e96bf773c565aa79affe9d4c 100644
+--- a/roboplan/include/roboplan/core/path_utils.hpp
++++ b/roboplan/include/roboplan/core/path_utils.hpp
+@@ -9,6 +9,7 @@
+ namespace roboplan {
+ 
+ class CollisionContext;
++class CollisionQueryView;
+ 
+ /// @brief Computes the Cartesian path of a specified frame by interpolating sparse positions.
+ /// @param scene The scene to use.
+@@ -73,6 +74,15 @@ bool hasCollisionsAlongPath(const Scene& scene, const CollisionContext& collisio
+                             const double max_step_size, const bool bisection = false,
+                             const bool check_endpoints = true);
+ 
++/// @brief Checks collisions through an explicitly selected collision-query workspace.
++/// @details `collision_query` must belong to the exact `scene` generation. This overload lets a
++///   request-private, serial pipeline reuse the Scene's own scratch without weakening the isolated
++///   CollisionContext behavior used by general callers.
++bool hasCollisionsAlongPath(const Scene& scene, const CollisionQueryView& collision_query,
++                            const Eigen::VectorXd& q_start, const Eigen::VectorXd& q_end,
++                            const double max_step_size, const bool bisection = false,
++                            const bool check_endpoints = true);
++
+ /// @brief Checks collisions along a specified configuration space path using the Scene's own
+ /// scratch.
+ /// @details This convenience overload answers every collision check via `scene.hasCollisions`,
+@@ -152,6 +162,14 @@ public:
+   /// @return A shortcutted JointPath, if available.
+   JointPath shortcut(const JointPath& path);
+ 
++  /// @brief Shortcut with caller-owned, serially used collision scratch.
++  JointPath shortcut(const JointPath& path,
++                     const CollisionContext& collision_context);
++
++  /// @brief Shortcut through an explicitly selected, serial collision-query workspace.
++  JointPath shortcut(const JointPath& path,
++                     const CollisionQueryView& collision_query);
++
+   /// @brief Computes configuration distances from the start to each pose in a path.
+   /// @param path The JointPath to evaluate.
+   /// @return A vector of incremental path distances, if there is sufficient data. Otherwise an
+@@ -182,10 +200,10 @@ private:
+   ///   nearly-collinear vertices left behind by corner-cutting shortcuts. Endpoint collision
+   ///   checks are skipped because every vertex is already an existing (collision-free) path node.
+   /// @param path_configs The path configurations to prune in place.
+-  /// @param collision_context The collision context whose scratch backs the connection checks.
++  /// @param collision_query The collision query whose scratch backs the connection checks.
+   /// @return The number of vertices removed.
+   size_t removeRedundantVertices(std::vector<Eigen::VectorXd>& path_configs,
+-                                 const CollisionContext& collision_context);
++                                 const CollisionQueryView& collision_query);
+ 
+   /// @brief A pointer to the scene.
+   std::shared_ptr<Scene> scene_;
+diff --git a/roboplan/include/roboplan/core/scene.hpp b/roboplan/include/roboplan/core/scene.hpp
+index b8221a01efaa6b8e65e73dfa58d36db75205235f..4ee4df2baa78faa1063223ace7dbf171d6a6efb6 100644
+--- a/roboplan/include/roboplan/core/scene.hpp
++++ b/roboplan/include/roboplan/core/scene.hpp
+@@ -32,6 +32,8 @@ namespace coal = hpp::fcl;
+ 
+ namespace roboplan {
+ 
++class CollisionQueryView;
++
+ /// @brief Returns the contents of a file as a string.
+ /// @param name path The path to the file.
+ std::string readFile(const std::filesystem::path& path);
+@@ -155,6 +157,15 @@ public:
+   /// @return The random positions, if successful, else std::nullopt.
+   std::optional<Eigen::VectorXd> randomCollisionFreePositions(size_t max_samples = 1000);
+ 
++  /// @brief Generates random collision-free positions through an explicitly
++  /// selected collision-query workspace.
++  /// @details `collision_query` must belong to this exact Scene generation.
++  /// This keeps callers that selected isolated scratch from falling back to
++  /// the Scene's mutable collision scratch during random restarts.
++  std::optional<Eigen::VectorXd> randomCollisionFreePositions(
++      const CollisionQueryView& collision_query,
++      size_t max_samples = 1000);
++
+   /// @brief Checks collisions at specified joint positions.
+   /// @param q The joint positions.
+   /// @param debug If true, prints debug information and does not stop at first collision.
+diff --git a/roboplan/src/core/collision_context.cpp b/roboplan/src/core/collision_context.cpp
+index 7b9eb80114a61ff3d42463a4723de8c4f89b57ce..8024aacb87b9a11c7aabc834a809e1b6c43c4037 100644
+--- a/roboplan/src/core/collision_context.cpp
++++ b/roboplan/src/core/collision_context.cpp
+@@ -1,6 +1,7 @@
+ #include <roboplan/core/collision_context.hpp>
+ 
+ #include <limits>
++#include <stdexcept>
+ 
+ #include <pinocchio/algorithm/geometry.hpp>
+ #include <pinocchio/algorithm/jacobian.hpp>
+@@ -24,6 +25,7 @@ const Scene& requireScene(const std::shared_ptr<const Scene>& scene) {
+ 
+ CollisionContext::CollisionContext(std::shared_ptr<const Scene> scene)
+     : scene_owner_(std::move(scene)),
++      source_scene_(&requireScene(scene_owner_)),
+       model_(requireScene(scene_owner_).getModel()),
+       collision_model_(scene_owner_->getCollisionModel()), data_(model_),
+       geom_data_(collision_model_) {
+@@ -31,8 +33,9 @@ CollisionContext::CollisionContext(std::shared_ptr<const Scene> scene)
+ }
+ 
+ CollisionContext::CollisionContext(const Scene& scene)
+-    : model_(scene.getModel()), collision_model_(scene.getCollisionModel()),
+-      data_(scene.getModel()), geom_data_(scene.getCollisionModel()) {
++    : source_scene_(&scene), model_(scene.getModel()),
++      collision_model_(scene.getCollisionModel()), data_(scene.getModel()),
++      geom_data_(scene.getCollisionModel()) {
+   initializeScratch();
+ }
+ 
+@@ -104,4 +107,33 @@ void CollisionContext::computeJointJacobians(const Eigen::VectorXd& q) const {
+   pinocchio::computeJointJacobians(model_, data_, q);
+ }
+ 
++CollisionQueryView::CollisionQueryView(
++    const CollisionContext* isolated_context,
++    std::shared_ptr<const Scene> scene_owner,
++    const Scene* source_scene) noexcept
++    : isolated_context_(isolated_context),
++      scene_owner_(std::move(scene_owner)), source_scene_(source_scene) {}
++
++CollisionQueryView CollisionQueryView::forIsolatedContext(
++    const CollisionContext& context) noexcept {
++  return CollisionQueryView(&context, nullptr, context.sourceScene());
++}
++
++CollisionQueryView CollisionQueryView::forSerializedScene(
++    std::shared_ptr<const Scene> scene) {
++  if (!scene) {
++    throw std::invalid_argument(
++        "CollisionQueryView requires a non-null serialized scene owner");
++  }
++  const Scene* source_scene = scene.get();
++  return CollisionQueryView(nullptr, std::move(scene), source_scene);
++}
++
++bool CollisionQueryView::hasCollisions(const Eigen::VectorXd& q) const {
++  if (isolated_context_ != nullptr) {
++    return isolated_context_->hasCollisions(q);
++  }
++  return scene_owner_->hasCollisions(q);
++}
++
+ }  // namespace roboplan
+diff --git a/roboplan/src/core/path_utils.cpp b/roboplan/src/core/path_utils.cpp
+index 537d39c48da6810f30ffe960a507e0dfde6675ca..fff641c321fcbd8296e5d115dc056940a20fa0fa 100644
+--- a/roboplan/src/core/path_utils.cpp
++++ b/roboplan/src/core/path_utils.cpp
+@@ -1,5 +1,6 @@
+ #include <algorithm>
+ #include <queue>
++#include <stdexcept>
+ #include <utility>
+ 
+ #include <roboplan/core/collision_context.hpp>
+@@ -165,8 +166,21 @@ bool hasCollisionsAlongPath(const Scene& scene, const CollisionContext& collisio
+                             const Eigen::VectorXd& q_start, const Eigen::VectorXd& q_end,
+                             const double max_step_size, const bool bisection,
+                             const bool check_endpoints) {
++  return hasCollisionsAlongPath(
++      scene, CollisionQueryView::forIsolatedContext(collision_context), q_start,
++      q_end, max_step_size, bisection, check_endpoints);
++}
++
++bool hasCollisionsAlongPath(const Scene& scene, const CollisionQueryView& collision_query,
++                            const Eigen::VectorXd& q_start, const Eigen::VectorXd& q_end,
++                            const double max_step_size, const bool bisection,
++                            const bool check_endpoints) {
++  if (collision_query.sourceScene() != &scene) {
++    throw std::invalid_argument(
++        "Collision query and path interpolation must use the same Scene generation");
++  }
+   return hasCollisionsAlongPathImpl(
+-      scene, [&](const Eigen::VectorXd& q) { return collision_context.hasCollisions(q); }, q_start,
++      scene, [&](const Eigen::VectorXd& q) { return collision_query.hasCollisions(q); }, q_start,
+       q_end, max_step_size, bisection, check_endpoints);
+ }
+ 
+@@ -209,6 +223,21 @@ PathShortcutter::PathShortcutter(const std::shared_ptr<Scene> scene,
+ }
+ 
+ JointPath PathShortcutter::shortcut(const JointPath& path) {
++  const CollisionContext collision_context(scene_);
++  return shortcut(path, collision_context);
++}
++
++JointPath PathShortcutter::shortcut(
++    const JointPath& path, const CollisionContext& collision_context) {
++  return shortcut(path, CollisionQueryView::forIsolatedContext(collision_context));
++}
++
++JointPath PathShortcutter::shortcut(
++    const JointPath& path, const CollisionQueryView& collision_query) {
++  if (collision_query.sourceScene() != scene_.get()) {
++    throw std::invalid_argument(
++        "Collision query and path shortcutter must use the same Scene generation");
++  }
+ 
+   const double max_step_size = options_.max_step_size;
+   const unsigned int max_convergence_iters = options_.max_convergence_iters;
+@@ -222,10 +251,6 @@ JointPath PathShortcutter::shortcut(const JointPath& path) {
+   std::mt19937 gen(options_.seed < 0 ? rd() : static_cast<unsigned int>(options_.seed));
+   std::uniform_real_distribution<double> dis(std::numeric_limits<double>::epsilon(), 1.0);
+ 
+-  // Snapshot the scene geometry into a private collision context for this shortcutting pass, so all
+-  // connection checks below use their own scratch instead of the Scene's shared collision data.
+-  const CollisionContext collision_context(scene_);
+-
+   q_full_ = scene_->getCurrentJointPositions();
+   auto q_start = q_full_;
+   auto q_end = q_full_;
+@@ -244,7 +269,7 @@ JointPath PathShortcutter::shortcut(const JointPath& path) {
+     // Periodically collapse redundant vertices left behind by corner-cutting shortcuts, so the
+     // working path stays compact rather than accumulating unhelpful micro-segments.
+     if (i > 0 && i % options_.redundant_removal_iters == 0) {
+-      removeRedundantVertices(path_configs, collision_context);
++      removeRedundantVertices(path_configs, collision_query);
+       if (path_configs.size() < 3) {
+         break;
+       }
+@@ -301,7 +326,7 @@ JointPath PathShortcutter::shortcut(const JointPath& path) {
+     }
+ 
+     // Ensure the new connection is valid. If not, try again.
+-    if (hasCollisionsAlongPath(*scene_, collision_context, q_low, q_high, max_step_size)) {
++    if (hasCollisionsAlongPath(*scene_, collision_query, q_low, q_high, max_step_size)) {
+       if (max_convergence_iters > 0 && ++empty_iters >= max_convergence_iters) {
+         break;
+       }
+@@ -318,13 +343,13 @@ JointPath PathShortcutter::shortcut(const JointPath& path) {
+   }
+ 
+   // Final cleanup pass to collapse any redundant vertices remaining at convergence.
+-  removeRedundantVertices(path_configs, collision_context);
++  removeRedundantVertices(path_configs, collision_query);
+ 
+   return shortened_path;
+ }
+ 
+ size_t PathShortcutter::removeRedundantVertices(std::vector<Eigen::VectorXd>& path_configs,
+-                                                const CollisionContext& collision_context) {
++                                                const CollisionQueryView& collision_query) {
+   const auto& q_indices = joint_group_info_.q_indices;
+   auto q_prev = q_full_;
+   auto q_next = q_full_;
+@@ -340,7 +365,7 @@ size_t PathShortcutter::removeRedundantVertices(std::vector<Eigen::VectorXd>& pa
+       q_prev(q_indices) = path_configs[i - 1];
+       q_next(q_indices) = path_configs[i + 1];
+       // The neighbors are existing collision-free path nodes, so skip the endpoint checks.
+-      if (!hasCollisionsAlongPath(*scene_, collision_context, q_prev, q_next,
++      if (!hasCollisionsAlongPath(*scene_, collision_query, q_prev, q_next,
+                                   options_.max_step_size,
+                                   /* bisection */ false, /* check_endpoints */ false)) {
+         path_configs.erase(path_configs.begin() + i);
+diff --git a/roboplan/src/core/scene.cpp b/roboplan/src/core/scene.cpp
+index 94aa53b18fbf6fd34a1404ac044218193c00a801..582b78a5815f4f506fc7cb53451d6b203ff690b1 100644
+--- a/roboplan/src/core/scene.cpp
++++ b/roboplan/src/core/scene.cpp
+@@ -14,6 +14,7 @@
+ #include <pinocchio/parsers/urdf.hpp>
+ #include <yaml-cpp/yaml.h>
+ 
++#include <roboplan/core/collision_context.hpp>
+ #include <roboplan/core/scene.hpp>
+ #include <roboplan/core/scene_utils.hpp>
+ 
+@@ -333,6 +334,21 @@ std::optional<Eigen::VectorXd> Scene::randomCollisionFreePositions(size_t max_sa
+   return std::nullopt;
+ }
+ 
++std::optional<Eigen::VectorXd> Scene::randomCollisionFreePositions(
++    const CollisionQueryView& collision_query, size_t max_samples) {
++  if (collision_query.sourceScene() != this) {
++    throw std::invalid_argument(
++        "Collision query and random sampler must use the same Scene generation");
++  }
++  for (size_t idx = 0; idx < max_samples; ++idx) {
++    const auto positions = randomPositions();
++    if (!collision_query.hasCollisions(positions)) {
++      return positions;
++    }
++  }
++  return std::nullopt;
++}
++
+ void Scene::rebuildBroadphaseManager() {
+   // The manager caches AABB-tree state and pointers into collision_model_/collision_model_data_,
+   // so it is rebuilt from scratch whenever the collision data is (re)assigned.
+diff --git a/roboplan/test/test_path_utils.cpp b/roboplan/test/test_path_utils.cpp
+index 5aedcadabd3e04a55796435510554bfebd03832c..4dfe556b4cf9a05811a18f540c276b5fdd4993e6 100644
+--- a/roboplan/test/test_path_utils.cpp
++++ b/roboplan/test/test_path_utils.cpp
+@@ -1,5 +1,7 @@
+ #include <gtest/gtest.h>
+ 
++#include <type_traits>
++
+ #include <roboplan/core/collision_context.hpp>
+ #include <roboplan/core/path_utils.hpp>
+ #include <roboplan/core/scene.hpp>
+@@ -7,6 +9,9 @@
+ 
+ namespace roboplan {
+ 
++static_assert(!std::is_constructible_v<CollisionContext, Scene&&>);
++static_assert(!std::is_constructible_v<CollisionContext, const Scene&&>);
++
+ class RoboPlanPathUtilsTest : public ::testing::Test {
+ protected:
+   void SetUp() override {
+@@ -70,6 +75,13 @@ TEST_F(RoboPlanPathUtilsTest, testHasCollisionsAlongPath) {
+                                                          max_step_size, /* bisection*/ true);
+     ASSERT_EQ(result_linear, result_bisection);
+ 
++    const auto serialized_query =
++        CollisionQueryView::forSerializedScene(scene);
++    const auto result_serialized = hasCollisionsAlongPath(
++        *scene, serialized_query, q_start, q_end, max_step_size,
++        /* bisection */ false);
++    ASSERT_EQ(result_linear, result_serialized);
++
+     // The Scene-only overload (which uses the Scene's own collision scratch) must agree with the
+     // CollisionContext overload.
+     const auto result_scene =
+@@ -78,6 +90,39 @@ TEST_F(RoboPlanPathUtilsTest, testHasCollisionsAlongPath) {
+   }
+ }
+ 
++TEST_F(RoboPlanPathUtilsTest, CollisionQueryRejectsMismatchedSceneGeneration) {
++  const auto other_scene = scene->clone();
++  const auto collision_query =
++      CollisionQueryView::forSerializedScene(other_scene);
++  const Eigen::VectorXd q_start = Eigen::VectorXd::Zero(6);
++  const Eigen::VectorXd q_end = Eigen::VectorXd::Ones(6) * 0.1;
++
++  EXPECT_THROW(
++      hasCollisionsAlongPath(*scene, collision_query, q_start, q_end, 0.05),
++      std::invalid_argument);
++  EXPECT_THROW(scene->randomCollisionFreePositions(collision_query),
++               std::invalid_argument);
++
++  PathShortcuttingOptions options;
++  options.group_name = "arm";
++  PathShortcutter shortcutter(scene, options);
++  EXPECT_THROW(shortcutter.shortcut(getTestPath(2), collision_query),
++               std::invalid_argument);
++}
++
++TEST_F(RoboPlanPathUtilsTest, SerializedCollisionQueryRetainsSceneGeneration) {
++  auto owned_scene = scene->clone();
++  const Scene* expected_scene = owned_scene.get();
++  const Eigen::VectorXd q = owned_scene->getCurrentJointPositions();
++  auto collision_query =
++      CollisionQueryView::forSerializedScene(owned_scene);
++
++  owned_scene.reset();
++
++  EXPECT_EQ(collision_query.sourceScene(), expected_scene);
++  EXPECT_NO_THROW(static_cast<void>(collision_query.hasCollisions(q)));
++}
++
+ TEST_F(RoboPlanPathUtilsTest, testGetPathLengths) {
+   PathShortcuttingOptions options;
+   options.group_name = "arm";
+diff --git a/roboplan_rrt/bindings/src/rrt.cpp b/roboplan_rrt/bindings/src/rrt.cpp
+index aba6c21e7e441a3a95fbbbb0a7a68548e8e69599..c6d4309e952588aa138ab8dc34adcc4ac1454285 100644
+--- a/roboplan_rrt/bindings/src/rrt.cpp
++++ b/roboplan_rrt/bindings/src/rrt.cpp
+@@ -57,8 +57,11 @@ void initRrt(nanobind::module_& m) {
+       m, "RRT", "Motion planner based on the Rapidly-exploring Random Tree (RRT) algorithm.")
+       .def(nanobind::init<const std::shared_ptr<Scene>, const RRTOptions&>(), "scene"_a,
+            "options"_a)
+-      .def("plan", unwrap_expected(&RRT::plan), "Plan a path from start to goal.", "start"_a,
+-           "goal"_a)
++      .def("plan",
++           unwrap_expected(nanobind::overload_cast<const JointConfiguration&,
++                                                    const JointConfiguration&>(
++               &RRT::plan)),
++           "Plan a path from start to goal.", "start"_a, "goal"_a)
+       .def("setRngSeed", &RRT::setRngSeed, "Sets the seed for the random number generator (RNG).",
+            "seed"_a)
+       .def("getNodes", &RRT::getNodes,
+diff --git a/roboplan_rrt/include/roboplan_rrt/rrt.hpp b/roboplan_rrt/include/roboplan_rrt/rrt.hpp
+index ed20eba12cdf37d7f8e17cf4349c7560e4fb5bb9..574c88c39a5221da9eace94baa9450b75800b8c3 100644
+--- a/roboplan_rrt/include/roboplan_rrt/rrt.hpp
++++ b/roboplan_rrt/include/roboplan_rrt/rrt.hpp
+@@ -86,6 +86,20 @@ public:
+   tl::expected<JointPath, std::string> plan(const JointConfiguration& start,
+                                             const JointConfiguration& goal);
+ 
++  /// @brief Plan with caller-owned collision scratch.
++  /// @details The caller must serialize every use of `collision_context` and
++  /// keep its scene generation alive. This overload lets a request-scoped
++  /// pipeline reuse one context across IK, RRT, shortcutting, and retiming.
++  tl::expected<JointPath, std::string> plan(
++      const JointConfiguration& start, const JointConfiguration& goal,
++      const CollisionContext& collision_context);
++
++  /// @brief Plan through an explicitly selected, serial collision-query workspace.
++  /// @details The query must belong to the exact Scene generation held by this planner.
++  tl::expected<JointPath, std::string> plan(
++      const JointConfiguration& start, const JointConfiguration& goal,
++      const CollisionQueryView& collision_query);
++
+   /// @brief Sets the seed for the random number generator (RNG).
+   /// @details For reproducibility, this also seeds the underlying scene.
+   /// For now, this means it would break multi-threaded applications.
+@@ -104,7 +118,7 @@ public:
+   /// @param tree The tree to grow.
+   /// @param nodes The set of sampled nodes so far.
+   /// @param q_sample The configuration to extend towards (or connect to).
+-  /// @param collision_context This plan's private collision context, used for all collision checks.
++  /// @param collision_query This plan's collision query, used for all collision checks.
+   /// @param greedy If true (the RRT-Connect CONNECT step), repeatedly extend toward `q_sample`
+   /// until it is reached or an obstacle is hit. If false (a single EXTEND step), add at most one
+   /// node, one `max_connection_distance` step toward `q_sample`.
+@@ -112,6 +126,10 @@ public:
+   bool growTree(KdTree& tree, std::vector<Node>& nodes, const Eigen::VectorXd& q_sample,
+                 const CollisionContext& collision_context, bool greedy);
+ 
++  /// @brief Grow a tree through an explicitly selected collision-query workspace.
++  bool growTree(KdTree& tree, std::vector<Node>& nodes, const Eigen::VectorXd& q_sample,
++                const CollisionQueryView& collision_query, bool greedy);
++
+   /// @brief Attempts to connect the `target_tree` to the latest added node in `nodes`.
+   /// @details The "latest added node" refers to `nodes.back()`. The function will identify the
+   /// nearest node in the target_tree, and attempt to make a connection. If successful, will
+@@ -120,7 +138,7 @@ public:
+   /// @param target_tree The tree to connect to the nodes list.
+   /// @param target_nodes The nodes in the target tree.
+   /// @param grow_start_tree If true, the target_tree is the goal tree.
+-  /// @param collision_context This plan's private collision context, used for all collision checks.
++  /// @param collision_query This plan's collision query, used for all collision checks.
+   /// @return If a path is found, a pair of the completed start-to-goal path and its total
+   /// cost-to-come (the two connected nodes' costs plus the connecting edge length); otherwise none.
+   /// The cost is only meaningful when the planner tracks node costs (RRT*, or any mode with
+@@ -131,6 +149,13 @@ public:
+                                                         bool grow_start_tree,
+                                                         const CollisionContext& collision_context);
+ 
++  /// @brief Join trees through an explicitly selected collision-query workspace.
++  std::optional<std::pair<JointPath, double>> joinTrees(const std::vector<Node>& nodes,
++                                                        const KdTree& target_tree,
++                                                        const std::vector<Node>& target_nodes,
++                                                        bool grow_start_tree,
++                                                        const CollisionQueryView& collision_query);
++
+   /// @brief Returns a path from the specified index to the first added node.
+   /// @param nodes The list of nodes in the tree.
+   /// @param end_node The index of the goal destination in the nodes list.
+@@ -170,10 +195,10 @@ private:
+   /// @param nodes The nodes backing `kd_tree`.
+   /// @param q_new The configuration to insert. Must already be validated as collision-free.
+   /// @param default_parent_id The node `q_new` was extended from, used as the fallback parent.
+-  /// @param collision_context This plan's private collision context, used for all collision checks.
++  /// @param collision_query This plan's collision query, used for all collision checks.
+   /// @return The ID of the newly inserted node.
+   int rewire(KdTree& kd_tree, std::vector<Node>& nodes, const Eigen::VectorXd& q_new,
+-             int default_parent_id, const CollisionContext& collision_context);
++             int default_parent_id, const CollisionQueryView& collision_query);
+ 
+   /// @brief Propagates an RRT* cost change down a node's subtree.
+   /// @details Call after a node's parent and cost have been updated by a rewire. Each descendant's
+diff --git a/roboplan_rrt/src/rrt.cpp b/roboplan_rrt/src/rrt.cpp
+index 89b47b2ad8d9206e45721a67039885ab5d0c968f..c2e67ce269f00d175f8e7a06e22003c984e1f5aa 100644
+--- a/roboplan_rrt/src/rrt.cpp
++++ b/roboplan_rrt/src/rrt.cpp
+@@ -77,6 +77,24 @@ RRT::RRT(const std::shared_ptr<Scene> scene, const RRTOptions& options)
+ 
+ tl::expected<JointPath, std::string> RRT::plan(const JointConfiguration& start,
+                                                const JointConfiguration& goal) {
++  const CollisionContext collision_context(scene_);
++  return plan(start, goal, collision_context);
++}
++
++tl::expected<JointPath, std::string> RRT::plan(
++    const JointConfiguration& start, const JointConfiguration& goal,
++    const CollisionContext& collision_context) {
++  return plan(start, goal,
++              CollisionQueryView::forIsolatedContext(collision_context));
++}
++
++tl::expected<JointPath, std::string> RRT::plan(
++    const JointConfiguration& start, const JointConfiguration& goal,
++    const CollisionQueryView& collision_query) {
++  if (collision_query.sourceScene() != scene_.get()) {
++    throw std::invalid_argument(
++        "Collision query and RRT planner must use the same Scene generation");
++  }
+   // Record the start for measuring timeouts.
+   const auto start_time = std::chrono::steady_clock::now();
+ 
+@@ -85,11 +103,6 @@ tl::expected<JointPath, std::string> RRT::plan(const JointConfiguration& start,
+   auto q_goal = scene_->toFullJointPositions(options_.group_name, goal.positions);
+   auto q_sample = q_start;
+ 
+-  // Snapshot the scene's collision geometry into this plan's private context. All collision checks
+-  // below route through it, so this plan() call never contends on the Scene's shared collision
+-  // scratch (it is safe to run concurrently with collision queries elsewhere).
+-  const CollisionContext collision_context(scene_);
+-
+   // Ensure the start and goal configurations are valid and collision-free.
+   if (!scene_->isValidConfiguration(q_start)) {
+     return tl::make_unexpected("Invalid start configuration requested, cannot plan!");
+@@ -97,17 +110,17 @@ tl::expected<JointPath, std::string> RRT::plan(const JointConfiguration& start,
+   if (!scene_->isValidConfiguration(q_goal)) {
+     return tl::make_unexpected("Invalid goal configuration requested, cannot plan!");
+   }
+-  if (collision_context.hasCollisions(q_start)) {
++  if (collision_query.hasCollisions(q_start)) {
+     return tl::make_unexpected("Start configuration is in collision, cannot plan!");
+   }
+-  if (collision_context.hasCollisions(q_goal)) {
++  if (collision_query.hasCollisions(q_goal)) {
+     return tl::make_unexpected("Goal configuration is in collision, cannot plan!");
+   }
+ 
+   // Check whether direct connection between the start and goal is possible.
+   // Both endpoints were validated as collision-free above, so we only check the interior.
+   if ((scene_->configurationDistance(q_start, q_goal) <= options_.max_connection_distance) &&
+-      (!hasCollisionsAlongPath(*scene_, collision_context, q_start, q_goal,
++      (!hasCollisionsAlongPath(*scene_, collision_query, q_start, q_goal,
+                                options_.collision_check_step_size,
+                                options_.collision_check_use_bisection,
+                                /*check_endpoints*/ false))) {
+@@ -176,7 +189,7 @@ tl::expected<JointPath, std::string> RRT::plan(const JointConfiguration& start,
+ 
+     // Extend the growing tree a single step toward the sample (EXTEND).
+     // If nothing was added, resample and try again.
+-    if (!growTree(tree, nodes, q_sample, collision_context, /*greedy*/ false)) {
++    if (!growTree(tree, nodes, q_sample, collision_query, /*greedy*/ false)) {
+       continue;
+     }
+ 
+@@ -184,12 +197,12 @@ tl::expected<JointPath, std::string> RRT::plan(const JointConfiguration& start,
+     // (the CONNECT step), so the two trees actively reach for each other. The connection itself is
+     // verified and turned into a path by joinTrees below.
+     if (options_.rrt_connect) {
+-      growTree(target_tree, target_nodes, nodes.back().config, collision_context, /*greedy*/ true);
++      growTree(target_tree, target_nodes, nodes.back().config, collision_query, /*greedy*/ true);
+     }
+ 
+     // Check if the trees can be connected from the latest added node.
+     auto maybe_path =
+-        joinTrees(nodes, target_tree, target_nodes, grow_start_tree, collision_context);
++        joinTrees(nodes, target_tree, target_nodes, grow_start_tree, collision_query);
+     if (maybe_path.has_value()) {
+       auto& [path, path_cost] = maybe_path.value();
+       // With fast_return, return the first path found. Otherwise keep the cheapest path seen and
+@@ -224,8 +237,21 @@ void RRT::initializeTree(KdTree& tree, std::vector<Node>& nodes, const Eigen::Ve
+   nodes.emplace_back(q_init, -1);
+ }
+ 
+-bool RRT::growTree(KdTree& kd_tree, std::vector<Node>& nodes, const Eigen::VectorXd& q_sample,
++bool RRT::growTree(KdTree& kd_tree, std::vector<Node>& nodes,
++                   const Eigen::VectorXd& q_sample,
+                    const CollisionContext& collision_context, bool greedy) {
++  return growTree(kd_tree, nodes, q_sample,
++                  CollisionQueryView::forIsolatedContext(collision_context),
++                  greedy);
++}
++
++bool RRT::growTree(KdTree& kd_tree, std::vector<Node>& nodes,
++                   const Eigen::VectorXd& q_sample,
++                   const CollisionQueryView& collision_query, bool greedy) {
++  if (collision_query.sourceScene() != scene_.get()) {
++    throw std::invalid_argument(
++        "Collision query and RRT planner must use the same Scene generation");
++  }
+   bool grew_tree = false;
+   const auto& q_indices = joint_group_info_.q_indices;
+ 
+@@ -243,7 +269,7 @@ bool RRT::growTree(KdTree& kd_tree, std::vector<Node>& nodes, const Eigen::Vecto
+     // If the extended node cannot be connected to the tree then throw it away and return. The new
+     // endpoint `q_extend` must be validated; `q_current` is always an existing (known collision-
+     // free) tree node, so checking the endpoints only re-checks that known-free configuration.
+-    if (hasCollisionsAlongPath(*scene_, collision_context, q_current, q_extend,
++    if (hasCollisionsAlongPath(*scene_, collision_query, q_current, q_extend,
+                                options_.collision_check_step_size,
+                                options_.collision_check_use_bisection,
+                                /*check_endpoints*/ true)) {
+@@ -253,7 +279,7 @@ bool RRT::growTree(KdTree& kd_tree, std::vector<Node>& nodes, const Eigen::Vecto
+     grew_tree = true;
+     int new_id;
+     if (options_.rrt_star) {
+-      new_id = rewire(kd_tree, nodes, q_extend, parent_id, collision_context);
++      new_id = rewire(kd_tree, nodes, q_extend, parent_id, collision_query);
+     } else {
+       new_id = static_cast<int>(nodes.size());
+       kd_tree.addPoint(collapse(q_extend(q_indices)), new_id);
+@@ -288,6 +314,18 @@ std::optional<std::pair<JointPath, double>>
+ RRT::joinTrees(const std::vector<Node>& nodes, const KdTree& target_tree,
+                const std::vector<Node>& target_nodes, bool grow_start_tree,
+                const CollisionContext& collision_context) {
++  return joinTrees(nodes, target_tree, target_nodes, grow_start_tree,
++                   CollisionQueryView::forIsolatedContext(collision_context));
++}
++
++std::optional<std::pair<JointPath, double>>
++RRT::joinTrees(const std::vector<Node>& nodes, const KdTree& target_tree,
++               const std::vector<Node>& target_nodes, bool grow_start_tree,
++               const CollisionQueryView& collision_query) {
++  if (collision_query.sourceScene() != scene_.get()) {
++    throw std::invalid_argument(
++        "Collision query and RRT planner must use the same Scene generation");
++  }
+   // The most recently added node is the last appended node in the nodes list.
+   const auto& last_added_node = nodes.back();
+   const auto& q_last_added = last_added_node.config;
+@@ -330,7 +368,7 @@ RRT::joinTrees(const std::vector<Node>& nodes, const KdTree& target_tree,
+   // Otherwise attempt a normal connection edge between the two nearest nodes.
+   const auto connection_distance = scene_->configurationDistance(q_last_added, q_nearest);
+   if ((connection_distance <= options_.max_connection_distance) &&
+-      (!hasCollisionsAlongPath(*scene_, collision_context, q_last_added, q_nearest,
++      (!hasCollisionsAlongPath(*scene_, collision_query, q_last_added, q_nearest,
+                                options_.collision_check_step_size,
+                                options_.collision_check_use_bisection,
+                                /*check_endpoints*/ false))) {
+@@ -362,7 +400,7 @@ JointPath RRT::getPath(const std::vector<Node>& nodes, const Node& end_node) {
+ }
+ 
+ int RRT::rewire(KdTree& kd_tree, std::vector<Node>& nodes, const Eigen::VectorXd& q_new,
+-                int default_parent_id, const CollisionContext& collision_context) {
++                int default_parent_id, const CollisionQueryView& collision_query) {
+   const auto& q_indices = joint_group_info_.q_indices;
+   const int new_id = static_cast<int>(nodes.size());
+ 
+@@ -380,7 +418,7 @@ int RRT::rewire(KdTree& kd_tree, std::vector<Node>& nodes, const Eigen::VectorXd
+     const double candidate_cost =
+         nodes.at(near_id).cost + scene_->configurationDistance(q_near, q_new);
+     if (candidate_cost < best_cost &&
+-        !hasCollisionsAlongPath(*scene_, collision_context, q_near, q_new,
++        !hasCollisionsAlongPath(*scene_, collision_query, q_near, q_new,
+                                 options_.collision_check_step_size,
+                                 options_.collision_check_use_bisection,
+                                 /*check_endpoints*/ false)) {
+@@ -401,7 +439,7 @@ int RRT::rewire(KdTree& kd_tree, std::vector<Node>& nodes, const Eigen::VectorXd
+     Node& near_node = nodes.at(near_id);
+     const double rewired_cost = best_cost + scene_->configurationDistance(q_new, near_node.config);
+     if (rewired_cost < near_node.cost &&
+-        !hasCollisionsAlongPath(*scene_, collision_context, q_new, near_node.config,
++        !hasCollisionsAlongPath(*scene_, collision_query, q_new, near_node.config,
+                                 options_.collision_check_step_size,
+                                 options_.collision_check_use_bisection,
+                                 /*check_endpoints*/ false)) {
+diff --git a/roboplan_rrt/test/test_rrt.cpp b/roboplan_rrt/test/test_rrt.cpp
+index 94dc2f63ecc15f95a41ea0312424c563a26b35f8..e3c29e2d2073d98ba7e1d0f4af13a0dffde17137 100644
+--- a/roboplan_rrt/test/test_rrt.cpp
++++ b/roboplan_rrt/test/test_rrt.cpp
+@@ -269,6 +269,40 @@ TEST_F(RoboPlanRRTTest, TestGrowTree) {
+   ASSERT_EQ(nodes.back().config, q_end);
+ }
+ 
++TEST_F(RoboPlanRRTTest, CollisionQueryRejectsMismatchedSceneGeneration) {
++  RRTOptions options;
++  options.group_name = "arm";
++  RRT rrt(scene, options);
++  const auto other_scene = scene->clone();
++  const auto collision_query =
++      CollisionQueryView::forSerializedScene(other_scene);
++  JointConfiguration start;
++  JointConfiguration goal;
++  start.positions = Eigen::VectorXd::Zero(6);
++  goal.positions = Eigen::VectorXd::Zero(6);
++
++  EXPECT_THROW(rrt.plan(start, goal, collision_query), std::invalid_argument);
++
++  KdTree start_tree;
++  KdTree goal_tree;
++  std::vector<Node> start_nodes;
++  std::vector<Node> goal_nodes;
++  const Eigen::VectorXd q = Eigen::VectorXd::Zero(6);
++  rrt.initializeTree(start_tree, start_nodes, q);
++  rrt.initializeTree(goal_tree, goal_nodes, q);
++
++  EXPECT_THROW(
++      rrt.growTree(start_tree, start_nodes, q, collision_query,
++                   /*greedy*/ false),
++      std::invalid_argument);
++  // Equal endpoints take joinTrees' no-collision-check fast path. The public
++  // contract must still reject a workspace from another Scene generation.
++  EXPECT_THROW(
++      rrt.joinTrees(start_nodes, goal_tree, goal_nodes,
++                    /*grow_start_tree*/ true, collision_query),
++      std::invalid_argument);
++}
++
+ TEST_F(RoboPlanRRTTest, TestJoinTrees) {
+   RRTOptions options;
+   options.group_name = "arm";
+diff --git a/roboplan_simple_ik/include/roboplan_simple_ik/simple_ik.hpp b/roboplan_simple_ik/include/roboplan_simple_ik/simple_ik.hpp
+index 5d5cc2db6164f13cf7f139531f0bacef22618355..3baf6d66f3f1a2979aae68e1d7f3042eaeae770b 100644
+--- a/roboplan_simple_ik/include/roboplan_simple_ik/simple_ik.hpp
++++ b/roboplan_simple_ik/include/roboplan_simple_ik/simple_ik.hpp
+@@ -8,6 +8,9 @@
+ 
+ namespace roboplan {
+ 
++class CollisionContext;
++class CollisionQueryView;
++
+ /// @brief Options struct for simple IK solver.
+ struct SimpleIkOptions {
+   /// @brief The joint group name to be used by the solver.
+@@ -62,6 +65,24 @@ public:
+     return solveIk(std::vector<CartesianConfiguration>{goal}, start, solution);
+   }
+ 
++  bool solveIk(const CartesianConfiguration& goal,
++               const JointConfiguration& start,
++               JointConfiguration& solution,
++               const CollisionContext& collision_context) {
++    return solveIk(
++        std::vector<CartesianConfiguration>{goal}, start, solution,
++        collision_context);
++  }
++
++  bool solveIk(const CartesianConfiguration& goal,
++               const JointConfiguration& start,
++               JointConfiguration& solution,
++               const CollisionQueryView& collision_query) {
++    return solveIk(
++        std::vector<CartesianConfiguration>{goal}, start, solution,
++        collision_query);
++  }
++
+   /// @brief Solves inverse kinematics (multiple goal).
+   /// @param goals The goal Cartesian configurations.
+   /// @param start The starting joint configuration. (should be optional)
+@@ -70,6 +91,18 @@ public:
+   bool solveIk(const std::vector<CartesianConfiguration>& goals, const JointConfiguration& start,
+                JointConfiguration& solution);
+ 
++  /// @brief Solve with caller-owned, serially used collision scratch.
++  bool solveIk(const std::vector<CartesianConfiguration>& goals,
++               const JointConfiguration& start,
++               JointConfiguration& solution,
++               const CollisionContext& collision_context);
++
++  /// @brief Solve through an explicitly selected, serial collision-query workspace.
++  bool solveIk(const std::vector<CartesianConfiguration>& goals,
++               const JointConfiguration& start,
++               JointConfiguration& solution,
++               const CollisionQueryView& collision_query);
++
+ private:
+   /// @brief A pointer to the scene.
+   std::shared_ptr<Scene> scene_;
+diff --git a/roboplan_simple_ik/src/simple_ik.cpp b/roboplan_simple_ik/src/simple_ik.cpp
+index fa86349e79e638537c76e36098cc09fca8c4c716..ba89d09ab61a1a43cb03ae3fec5e234d3602539a 100644
+--- a/roboplan_simple_ik/src/simple_ik.cpp
++++ b/roboplan_simple_ik/src/simple_ik.cpp
+@@ -1,4 +1,5 @@
+ #include <chrono>
++#include <stdexcept>
+ 
+ #include <roboplan/core/collision_context.hpp>
+ #include <roboplan_simple_ik/simple_ik.hpp>
+@@ -32,13 +33,29 @@ SimpleIk::SimpleIk(const std::shared_ptr<Scene> scene, const SimpleIkOptions& op
+ 
+ bool SimpleIk::solveIk(const std::vector<CartesianConfiguration>& goals,
+                        const JointConfiguration& start, JointConfiguration& solution) {
++  const CollisionContext collision_context(scene_);
++  return solveIk(goals, start, solution, collision_context);
++}
++
++bool SimpleIk::solveIk(const std::vector<CartesianConfiguration>& goals,
++                       const JointConfiguration& start,
++                       JointConfiguration& solution,
++                       const CollisionContext& collision_context) {
++  return solveIk(goals, start, solution,
++                 CollisionQueryView::forIsolatedContext(collision_context));
++}
++
++bool SimpleIk::solveIk(const std::vector<CartesianConfiguration>& goals,
++                       const JointConfiguration& start,
++                       JointConfiguration& solution,
++                       const CollisionQueryView& collision_query) {
++  if (collision_query.sourceScene() != scene_.get()) {
++    throw std::invalid_argument(
++        "Collision query and IK solver must use the same Scene generation");
++  }
+   const auto start_time = std::chrono::steady_clock::now();
+   const std::chrono::duration<double> timeout(options_.max_time);
+ 
+-  // Snapshot the scene geometry into a private collision context for this solve, so the IK
+-  // iterations check collisions against their own scratch rather than the Scene's shared data.
+-  const CollisionContext collision_context(scene_);
+-
+   const auto& model = scene_->getModel();
+ 
+   const auto& q_indices = joint_group_info_.q_indices;
+@@ -87,7 +104,8 @@ bool SimpleIk::solveIk(const std::vector<CartesianConfiguration>& goals,
+   bool timed_out = false;
+   while (attempt <= options_.max_restarts && !timed_out) {
+     if (attempt > 0) {
+-      const auto maybe_q_random = scene_->randomCollisionFreePositions();
++      const auto maybe_q_random =
++          scene_->randomCollisionFreePositions(collision_query);
+       if (!maybe_q_random) {
+         throw std::runtime_error("Failed to generate random collision free positions for IK.");
+       }
+@@ -144,7 +162,7 @@ bool SimpleIk::solveIk(const std::vector<CartesianConfiguration>& goals,
+       }
+ 
+       if (converged) {
+-        if (!options_.check_collisions || !collision_context.hasCollisions(q)) {
++        if (!options_.check_collisions || !collision_query.hasCollisions(q)) {
+           // Return immedaiately if requested
+           if (options_.fast_return) {
+             solution.positions = q(q_indices);
+diff --git a/roboplan_simple_ik/test/test_simple_ik.cpp b/roboplan_simple_ik/test/test_simple_ik.cpp
+index d2e2c7e7d5a41866f4109f93429088c8d0421001..e5b12e5fa1fbac713e9ba59e33c7f7bb32abbd8a 100644
+--- a/roboplan_simple_ik/test/test_simple_ik.cpp
++++ b/roboplan_simple_ik/test/test_simple_ik.cpp
+@@ -2,6 +2,7 @@
+ #include <memory>
+ #include <vector>
+ 
++#include <roboplan/core/collision_context.hpp>
+ #include <roboplan/core/scene.hpp>
+ #include <roboplan/core/types.hpp>
+ #include <roboplan_example_models/resources.hpp>
+@@ -73,6 +74,62 @@ TEST_F(RoboPlanSimpleIkTest, InvalidGroupName) {
+   EXPECT_THROW(SimpleIk(scene, options), std::runtime_error);
+ }
+ 
++TEST_F(RoboPlanSimpleIkTest, CollisionQueryRejectsMismatchedSceneGeneration) {
++  SimpleIkOptions options;
++  options.group_name = kGroupName;
++  SimpleIk ik(scene, options);
++  const auto other_scene = scene->clone();
++  const auto collision_query =
++      CollisionQueryView::forSerializedScene(other_scene);
++  JointConfiguration start;
++  start.positions = Eigen::VectorXd::Zero(6);
++  JointConfiguration solution;
++
++  EXPECT_THROW(ik.solveIk(reachableGoal(), start, solution, collision_query),
++               std::invalid_argument);
++}
++
++TEST_F(RoboPlanSimpleIkTest, TimeoutReturnsBestCandidateFoundBeforeDeadline) {
++  scene->setRngSeed(286);
++
++  SimpleIkOptions options;
++  options.group_name = kGroupName;
++  options.check_collisions = false;
++  options.fast_return = false;
++  options.max_time = 0.0;
++  options.max_restarts = 1;
++  SimpleIk ik(scene, options);
++
++  JointConfiguration start;
++  start.positions = Eigen::VectorXd::Zero(6);
++  const auto q_start =
++      scene->toFullJointPositions(kGroupName, start.positions);
++  CartesianConfiguration goal;
++  goal.base_frame = kBaseFrame;
++  goal.tip_frame = kTipFrame;
++  goal.tform = scene->forwardKinematics(q_start, kTipFrame, kBaseFrame);
++
++  JointConfiguration solution;
++  ASSERT_TRUE(ik.solveIk(goal, start, solution));
++  EXPECT_TRUE(solution.positions.isApprox(start.positions));
++}
++
++TEST_F(RoboPlanSimpleIkTest, TimeoutWithoutCandidateFails) {
++  SimpleIkOptions options;
++  options.group_name = kGroupName;
++  options.check_collisions = false;
++  options.fast_return = false;
++  options.max_time = 0.0;
++  options.max_restarts = 0;
++  SimpleIk ik(scene, options);
++
++  JointConfiguration start;
++  start.positions = Eigen::VectorXd::Zero(6);
++  JointConfiguration solution;
++
++  EXPECT_FALSE(ik.solveIk(reachableGoal(), start, solution));
++}
++
+ TEST_F(RoboPlanSimpleIkTest, InvalidTipFrame) {
+   // An unknown tip frame must fail when solving.
+   SimpleIkOptions options;
+diff --git a/roboplan_toppra/bindings/src/toppra.cpp b/roboplan_toppra/bindings/src/toppra.cpp
+index 9fe3986e68446575024e4739e54f4ca903e030ab..8d355c5eb300eab68c89e7428a78fd4bea8a9567 100644
+--- a/roboplan_toppra/bindings/src/toppra.cpp
++++ b/roboplan_toppra/bindings/src/toppra.cpp
+@@ -51,7 +51,10 @@ void init_toppra(nanobind::module_& m) {
+       m, "PathParameterizerTOPPRA", "Trajectory time parameterizer using the TOPP-RA algorithm.")
+       .def(nanobind::init<const std::shared_ptr<Scene>, std::string>(), "scene"_a,
+            "group_name"_a = "")
+-      .def("generate", unwrap_expected(&PathParameterizerTOPPRA::generate),
++      .def("generate",
++           unwrap_expected(nanobind::overload_cast<const JointPath&,
++                                                    const TOPPRAOptions&>(
++               &PathParameterizerTOPPRA::generate)),
+            "Time-parameterizes a joint-space path using TOPP-RA.", "path"_a,
+            "options"_a = TOPPRAOptions{});
+ }
+diff --git a/roboplan_toppra/include/roboplan_toppra/toppra.hpp b/roboplan_toppra/include/roboplan_toppra/toppra.hpp
+index 84ff566a4c6046ccf62db371730f8275c00db814..6d189f9991993be5ee94700fb912caeeb13a7f99 100644
+--- a/roboplan_toppra/include/roboplan_toppra/toppra.hpp
++++ b/roboplan_toppra/include/roboplan_toppra/toppra.hpp
+@@ -11,6 +11,9 @@
+ 
+ namespace roboplan {
+ 
++class CollisionContext;
++class CollisionQueryView;
++
+ /// @brief Enumeration for TOPP-RA spline fitting mode.
+ /// @details Refer to the TOPPRAOptions::mode documentation for more information.
+ enum class SplineFittingMode {
+@@ -82,6 +85,17 @@ public:
+   tl::expected<JointTrajectory, std::string> generate(const JointPath& path,
+                                                       const TOPPRAOptions& options = {});
+ 
++  /// @brief Time-parameterize with caller-owned, serially used collision
++  /// scratch so a request pipeline can avoid rebuilding equivalent contexts.
++  tl::expected<JointTrajectory, std::string> generate(
++      const JointPath& path, const TOPPRAOptions& options,
++      const CollisionContext& collision_context);
++
++  /// @brief Time-parameterize through an explicitly selected, serial collision-query workspace.
++  tl::expected<JointTrajectory, std::string> generate(
++      const JointPath& path, const TOPPRAOptions& options,
++      const CollisionQueryView& collision_query);
++
+ private:
+   /// @brief Helper function to convert the raw joint path to TOPP-RA compatible position vectors.
+   /// @param path The joint path to convert.
+diff --git a/roboplan_toppra/src/toppra.cpp b/roboplan_toppra/src/toppra.cpp
+index ba5e3bb5fb70fb0117123ee3bfcc87d07fc0eb41..2e76bec72cb9d3476abdb3d3d944cb576843e0ef 100644
+--- a/roboplan_toppra/src/toppra.cpp
++++ b/roboplan_toppra/src/toppra.cpp
+@@ -166,6 +166,24 @@ PathParameterizerTOPPRA::generateCubicHermiteSpline(const toppra::Vectors& path_
+ 
+ tl::expected<JointTrajectory, std::string>
+ PathParameterizerTOPPRA::generate(const JointPath& path, const TOPPRAOptions& options) {
++  const CollisionContext collision_context(scene_);
++  return generate(path, options, collision_context);
++}
++
++tl::expected<JointTrajectory, std::string> PathParameterizerTOPPRA::generate(
++    const JointPath& path, const TOPPRAOptions& options,
++    const CollisionContext& collision_context) {
++  return generate(path, options,
++                  CollisionQueryView::forIsolatedContext(collision_context));
++}
++
++tl::expected<JointTrajectory, std::string> PathParameterizerTOPPRA::generate(
++    const JointPath& path, const TOPPRAOptions& options,
++    const CollisionQueryView& collision_query) {
++  if (collision_query.sourceScene() != scene_.get()) {
++    throw std::invalid_argument(
++        "Collision query and TOPPRA parameterizer must use the same Scene generation");
++  }
+   if (path.positions.size() < 2) {
+     return tl::make_unexpected("Path must have at least 2 points.");
+   }
+@@ -225,10 +243,6 @@ PathParameterizerTOPPRA::generate(const JointPath& path, const TOPPRAOptions& op
+     break;
+   }
+ 
+-  // Snapshot the scene geometry into a private collision context for the collision-check loop
+-  // below, so it uses its own scratch rather than the Scene's shared collision data.
+-  const CollisionContext collision_context(scene_);
+-
+   toppra::GeometricPathPtr geom_path;
+   bool found_collision_free_path = false;
+   for (int idx = 0; idx < max_collision_iterations; ++idx) {
+@@ -264,7 +278,7 @@ PathParameterizerTOPPRA::generate(const JointPath& path, const TOPPRAOptions& op
+ 
+       // If a collision is found, add a waypoint in the middle of the current and next point.
+       // Don't add points in the final iteration, as it is not needed.
+-      if (collision_context.hasCollisions(q_full)) {
++      if (collision_query.hasCollisions(q_full)) {
+         last_collision_index = t_idx;
+         if (idx < max_collision_iterations - 1) {
+           const auto& q_prev = path_pos_vecs.at(t_idx + points_added);
+diff --git a/roboplan_toppra/test/test_toppra.cpp b/roboplan_toppra/test/test_toppra.cpp
+index 41a7a564a272f16709e8e0bbea756a79e4178683..4c400616d92e47418e1a7313d207e86334c7e189 100644
+--- a/roboplan_toppra/test/test_toppra.cpp
++++ b/roboplan_toppra/test/test_toppra.cpp
+@@ -5,6 +5,7 @@
+ #include <stdexcept>
+ #include <vector>
+ 
++#include <roboplan/core/collision_context.hpp>
+ #include <roboplan/core/scene.hpp>
+ #include <roboplan_example_models/resources.hpp>
+ #include <roboplan_toppra/linear_blend_path.hpp>
+@@ -179,6 +180,17 @@ TEST_F(RoboPlanToppraTest, BadJointNames) {
+   ASSERT_EQ(result.error(), "Path joint names do not match the scene joint names.");
+ }
+ 
++TEST_F(RoboPlanToppraTest, CollisionQueryRejectsMismatchedSceneGeneration) {
++  PathParameterizerTOPPRA toppra(scene, "arm");
++  const auto other_scene = scene->clone();
++  const auto collision_query =
++      CollisionQueryView::forSerializedScene(other_scene);
++
++  EXPECT_THROW(
++      toppra.generate(createTestPathShort(), TOPPRAOptions{}, collision_query),
++      std::invalid_argument);
++}
++
+ TEST_F(RoboPlanToppraTest, NegativeDt) {
+   auto path = createTestPathShort();
+   double dt = -0.1;
+diff --git a/scripts/build_cmake.bash b/scripts/build_cmake.bash
+index cf780a8b156009cf2b7b6527d38a5db11974a87d..8cdcfc3f607431d1ef72af00c9b9ff88faa8b1ce 100755
+--- a/scripts/build_cmake.bash
++++ b/scripts/build_cmake.bash
+@@ -27,13 +27,13 @@ build_project() {
+   # Make this package's installed libraries discoverable to later packages.
+   # Build steps such as nanobind stub generation import the just-built
+   # extensions, which transitively load shared libraries.
++  export CMAKE_PREFIX_PATH="${PWD}/install/${PROJECT_NAME}:${CMAKE_PREFIX_PATH}"
+   export LD_LIBRARY_PATH="${PWD}/install/${PROJECT_NAME}/lib:${LD_LIBRARY_PATH}"
+ }
+ 
+ # Build all the packages with CMake
+ # rm -rf build install  # If you want a clean build
+ mkdir -p build install
+-export CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:${PWD}/install/
+ 
+ build_project roboplan_example_models
+ build_project roboplan

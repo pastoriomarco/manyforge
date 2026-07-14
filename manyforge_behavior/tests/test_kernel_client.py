@@ -37,6 +37,23 @@ def make_request(move_id: str = "move_1") -> ExecuteRequest:
     )
 
 
+def test_mock_stop_capability_is_explicit_and_returned_by_value():
+    capability = {
+        "supported_stop_modes": ["spring_back_hold"],
+        "capability_profile_id": "test_profile",
+    }
+    configured = MockKernelClient(
+        motion_interrupt_stop_capability=capability
+    )
+
+    reported = configured.get_motion_interrupt_stop_capability()
+    reported["supported_stop_modes"].append("soft_on_path")
+
+    assert configured.get_motion_interrupt_stop_capability() == capability
+    with pytest.raises(RuntimeError, match="capability is unavailable"):
+        MockKernelClient().get_motion_interrupt_stop_capability()
+
+
 class TestMockKernelExecute:
     def test_execute_from_idle(self, kernel):
         result = kernel.execute(make_request())

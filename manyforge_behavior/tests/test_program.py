@@ -1589,6 +1589,73 @@ class TestProgramValidation:
             Program(path, catalog)
         os.unlink(path)
 
+    def test_accepts_portable_cartesian_path(self, catalog):
+        data = _minimal_program()
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "move_manipulator_action",
+                    "name": "trace_tcp",
+                    "params": {
+                        "move_id": "trace_tcp",
+                        "motion_type": "cartesian_path",
+                        "base_frame": "base_link",
+                        "tcp_frame": "tool0",
+                        "cartesian_path": {
+                            "waypoints": [
+                                {
+                                    "position_m": [0.4, 0.0, 0.5],
+                                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                                },
+                                {
+                                    "position_m": [0.4, 0.0, 0.6],
+                                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                                },
+                            ],
+                            "speed_mode": "bounded",
+                            "fallback_policy": "fail_closed",
+                        },
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        try:
+            program = Program(path, catalog)
+            params = program.tree.children[0].params
+            assert params["motion_type"] == "cartesian_path"
+            assert len(params["cartesian_path"]["waypoints"]) == 2
+        finally:
+            os.unlink(path)
+
+    def test_rejects_cartesian_path_without_waypoints(self, catalog):
+        data = _minimal_program()
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "move_manipulator_action",
+                    "name": "bad_cartesian",
+                    "params": {
+                        "move_id": "bad_cartesian",
+                        "motion_type": "cartesian_path",
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match="cartesian_path is required when motion_type=cartesian_path",
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
     def test_allows_pose_goal_blackboard_reference_for_motion_nodes(self, catalog):
         data = _minimal_program()
         data["tree"] = {

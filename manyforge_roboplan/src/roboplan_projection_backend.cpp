@@ -187,7 +187,7 @@ RoboPlanProjectionBackend::RoboPlanProjectionBackend(
     std::optional<core::CollisionPolicySnapshot> initial_policy_snapshot,
     std::string robot_id)
     : scene_(std::move(scene)),
-      base_scene_(scene_ ? std::make_shared<roboplan::Scene>(*scene_) : nullptr),
+      base_scene_(scene_ ? scene_->clone() : nullptr),
       group_name_(std::move(group_name)),
       scene_mutex_(std::move(scene_mutex)),
       mapper_(std::make_unique<RoboPlanCollisionBodyIdMapper>()) {
@@ -1310,7 +1310,7 @@ core::SceneEditResultDTO RoboPlanProjectionBackend::apply_robot_base_pose(
 
   bool mutation_started = false;
   try {
-    auto candidate = std::make_shared<roboplan::Scene>(*scene_);
+    auto candidate = scene_->clone();
     for (const auto& [object_id, tracked] : object_states_) {
       const Eigen::Matrix4d frame_from_object = pose_to_matrix(tracked.pose);
       Eigen::Matrix4d scene_from_object;
@@ -1341,7 +1341,7 @@ core::SceneEditResultDTO RoboPlanProjectionBackend::apply_robot_base_pose(
     }
 
     mutation_started = true;
-    *scene_ = *candidate;
+    scene_->replaceWithIsolatedCopy(*candidate);
     world_from_robot_base_ = proposed_world_from_robot_base;
     publish_collision_world_revision_locked(
         core::CollisionWorldMutationSource::kDeploymentLoad, {},
@@ -3825,7 +3825,7 @@ RoboPlanProjectionBackend::rebuild_from_logical_snapshot(
   try {
     {
       std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
-      candidate_scene = std::make_shared<roboplan::Scene>(*base_scene_);
+      candidate_scene = base_scene_->clone();
       current_positions = scene_->getCurrentJointPositions();
     }
     {
@@ -3939,7 +3939,7 @@ RoboPlanProjectionBackend::rebuild_from_logical_snapshot(
   try {
     std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
     candidate_scene->setJointPositions(scene_->getCurrentJointPositions());
-    *scene_ = *candidate_scene;
+    scene_->replaceWithIsolatedCopy(*candidate_scene);
     object_states_ = std::move(candidate->object_states_);
     object_body_hash_cache_.clear();
     disabled_static_collision_pairs_ =
@@ -4047,7 +4047,7 @@ RoboPlanProjectionBackend::retain_planner_projection(
         retention_id,
         RetainedPlannerProjection{
             revision,
-            std::make_shared<roboplan::Scene>(*scene_),
+            scene_->clone(),
             matrix_to_pose(world_from_robot_base_),
             std::move(object_world_poses)});
     inserted = true;

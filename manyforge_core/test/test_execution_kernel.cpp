@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <manyforge_core/execution_interrupt_support.hpp>
 #include <manyforge_core/execution_kernel.hpp>
+#include <manyforge_core/cache/trajectory_cache_intent.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_core/types/reason_codes.hpp>
@@ -2179,7 +2180,14 @@ class ExecutionKernelTest : public ::testing::Test {
   }
 
   void store_cache(const std::string& move_id, TrajectoryDTO trajectory) {
-    cache.store(move_id, std::move(trajectory), context.current_revision);
+    store_cache(make_test_request(move_id), std::move(trajectory));
+  }
+
+  void store_cache(const ExecuteRequestDTO& resolved_request,
+                   TrajectoryDTO trajectory) {
+    cache.store(resolved_request.move_id, std::move(trajectory),
+                context.current_revision,
+                trajectory_cache_intent_identity(resolved_request));
   }
 
   ExecuteRequestDTO make_relative_object_request(
@@ -2947,7 +2955,8 @@ TEST_F(ExecutionKernelTest,
        Execute_CachedTrajectoryMissesAfterLeaseWorldRevisionChanges) {
   enable_observed_box_lease("box");
   cache.store("move_lease_cache", make_test_trajectory(),
-              CollisionWorldRevision{1, "box-world-1"});
+              CollisionWorldRevision{1, "box-world-1"},
+              "stale-revision-entry");
   ASSERT_TRUE(cache.peek_unvalidated("move_lease_cache").has_value());
 
   publish_observed_box_for_lease(
@@ -3010,10 +3019,8 @@ TEST_F(ExecutionKernelTest, Execute_CacheHit_SkipsPlanning) {
   EXPECT_EQ(execution.execute_count, 1);
 }
 
-// Phase 4-P5.1K direction A: an existing (uncapped) cache entry must NOT be
-// served to a request carrying per-joint dynamics caps. Cache lookup is
-// disabled for capped requests — the move is re-planned and the stale entry is
-// invalidated with a recorded reason.
+// Planner-intent cache admission: an existing uncapped entry must not be
+// served to a request carrying per-joint dynamics caps.
 TEST_F(ExecutionKernelTest, Execute_PerJointDynamicsLimitsBypassCacheAndReplan) {
   store_cache("move_dyn_capped", make_test_trajectory());
   auto req = make_test_request("move_dyn_capped");
@@ -3028,12 +3035,8 @@ TEST_F(ExecutionKernelTest, Execute_PerJointDynamicsLimitsBypassCacheAndReplan) 
   EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
 }
 
-// Phase 4-P5.1K direction B: a capped request must NOT leave a reusable cache
-// entry. The TrajectoryCache key has no dynamics-limit fingerprint, so a capped
-// trajectory stored under move_id could otherwise be picked up by a later
-// uncapped request. Cache store is disabled for capped requests. (The uncapped
-// happy path DOES store — see Execute_HappyPath_CachesTrajectory.)
-TEST_F(ExecutionKernelTest, Execute_CappedRequest_DoesNotStoreReusableCacheEntry) {
+TEST_F(ExecutionKernelTest,
+       Execute_CappedRequestStoresIntentScopedEntryNotReusableByUncappedRequest) {
   auto req = make_test_request("move_capped_no_store");
   JointDynamicsLimitDTO lim;
   lim.max_velocity_rad_s = 0.5;
@@ -3042,16 +3045,22 @@ TEST_F(ExecutionKernelTest, Execute_CappedRequest_DoesNotStoreReusableCacheEntry
   auto result = execute_sync(req);
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(planner.plan_count, 1);  // planned (cache miss), then dispatched
-  EXPECT_FALSE(cache.peek_unvalidated("move_capped_no_store").has_value());
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_TRUE(cache.peek_unvalidated("move_capped_no_store").has_value());
+
+  ASSERT_TRUE(kernel.reset().accepted);
+  auto uncapped = execute_sync(make_test_request("move_capped_no_store"));
+  ASSERT_TRUE(uncapped.ok());
+  EXPECT_EQ(planner.plan_count, 2);
+  EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitPoseGoalWithMatchingEndPose_SkipsPlanning) {
-  store_cache("move_pose_cached", make_test_trajectory());
   auto req = make_test_request("move_pose_cached");
   PoseGoalDTO pose_goal;
   pose_goal.goal = make_pose(0.4, -0.1, 0.2);
   req.motion = pose_goal;
+  store_cache(req, make_test_trajectory());
   context.next_fk = pose_goal.goal;
 
   auto result = execute_sync(req);
@@ -3066,11 +3075,11 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitPoseGoalWithMatchingEndPose_SkipsPla
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitPoseGoalWithChangedEndPose_InvalidatesAndReplans) {
-  store_cache("move_pose_changed", make_test_trajectory());
   auto req = make_test_request("move_pose_changed");
   PoseGoalDTO pose_goal;
   pose_goal.goal = make_pose(0.45, -0.1, 0.2);
   req.motion = pose_goal;
+  store_cache(req, make_test_trajectory());
   context.next_fk = make_pose(0.1, -0.1, 0.2);
 
   auto result = execute_sync(req);
@@ -3084,13 +3093,13 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitPoseGoalWithChangedEndPose_Invalidat
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitCartesianPathWithMatchingFinalWaypoint_SkipsPlanning) {
-  store_cache("move_cartesian_cached", make_test_trajectory());
   auto req = make_test_request("move_cartesian_cached");
   CartesianPathDTO path;
   path.waypoints = {make_pose(0.2, -0.1, 0.1), make_pose(0.4, -0.1, 0.2)};
   path.max_translation_step_m = 0.01;
   path.max_rotation_step_rad = 0.01;
   req.motion = path;
+  store_cache(req, make_test_trajectory());
   context.next_fk = path.waypoints.back();
 
   auto result = execute_sync(req);
@@ -3102,13 +3111,13 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitCartesianPathWithMatchingFinalWaypoi
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitCartesianPathWithChangedFinalWaypoint_InvalidatesAndReplans) {
-  store_cache("move_cartesian_changed", make_test_trajectory());
   auto req = make_test_request("move_cartesian_changed");
   CartesianPathDTO path;
   path.waypoints = {make_pose(0.2, -0.1, 0.1), make_pose(0.45, -0.1, 0.2)};
   path.max_translation_step_m = 0.01;
   path.max_rotation_step_rad = 0.01;
   req.motion = path;
+  store_cache(req, make_test_trajectory());
   context.next_fk = make_pose(0.1, -0.1, 0.2);
 
   auto result = execute_sync(req);
@@ -3119,8 +3128,30 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitCartesianPathWithChangedFinalWaypoin
   EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
 }
 
+TEST_F(ExecutionKernelTest,
+       Execute_CartesianIntermediateWaypointChangeInvalidatesSameEndpointCache) {
+  auto cached_request = make_test_request("move_cartesian_shape_changed");
+  CartesianPathDTO cached_path;
+  cached_path.waypoints = {make_pose(0.2, -0.1, 0.1),
+                           make_pose(0.3, -0.1, 0.15),
+                           make_pose(0.4, -0.1, 0.2)};
+  cached_request.motion = cached_path;
+  store_cache(cached_request, make_test_trajectory());
+
+  auto changed_request = cached_request;
+  auto& changed_path = std::get<CartesianPathDTO>(changed_request.motion);
+  changed_path.waypoints[1] = make_pose(0.3, 0.2, 0.15);
+  context.next_fk = changed_path.waypoints.back();
+
+  auto result = execute_sync(changed_request);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(context.fk_count, 0);
+  EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
+}
+
 TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithUnchangedResolvedGoal_SkipsPlanning) {
-  store_cache("move_relative_same", make_test_trajectory());
   auto req = make_test_request("move_relative_same");
   RelativeMoveDTO relative_move;
   relative_move.target_reference.type = ReferenceDTO::Type::kObject;
@@ -3132,6 +3163,9 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithUnchangedResolvedGoa
   context.next_reference_pose = Result<Pose3DTO>::Ok(make_pose(0.3, -0.2, 0.15));
   context.next_fk = make_pose(0.3, -0.2, 0.25);
   install_mock_retained_object(collision_world_publisher, "box");
+  auto resolved_request = req;
+  resolved_request.motion = PoseGoalDTO{make_pose(0.3, -0.2, 0.25)};
+  store_cache(resolved_request, make_test_trajectory());
 
   auto result = execute_sync(req);
 
@@ -3142,7 +3176,6 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithUnchangedResolvedGoa
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithMovedObject_InvalidatesAndReplans) {
-  store_cache("move_relative_changed", make_test_trajectory());
   auto req = make_test_request("move_relative_changed");
   RelativeMoveDTO relative_move;
   relative_move.target_reference.type = ReferenceDTO::Type::kObject;
@@ -3154,6 +3187,10 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithMovedObject_Invalida
   context.next_reference_pose = Result<Pose3DTO>::Ok(make_pose(0.5, -0.2, 0.15));
   context.next_fk = make_pose(0.3, -0.2, 0.25);
   install_mock_retained_object(collision_world_publisher, "box");
+  auto previously_resolved_request = req;
+  previously_resolved_request.motion =
+      PoseGoalDTO{make_pose(0.3, -0.2, 0.25)};
+  store_cache(previously_resolved_request, make_test_trajectory());
 
   auto result = execute_sync(req);
 
@@ -3211,11 +3248,11 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMoveMissingReference_DoesNotUseStale
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitFkFailure_InvalidatesAndReplans) {
-  store_cache("move_fk_failure", make_test_trajectory());
   auto req = make_test_request("move_fk_failure");
   PoseGoalDTO pose_goal;
   pose_goal.goal = make_pose(0.4, -0.1, 0.2);
   req.motion = pose_goal;
+  store_cache(req, make_test_trajectory());
   context.throw_fk = true;
 
   auto result = execute_sync(req);
@@ -3231,10 +3268,11 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitJointGoalComparesByJointName) {
   cached.joint_names = {"j2", "j1"};
   cached.waypoints.front().positions_rad = {0.0, 0.0};
   cached.waypoints.back().positions_rad = {2.0, 1.0};
-  store_cache("move_joint_named", cached);
-
   auto req = make_test_request("move_joint_named");
   req.motion = JointGoalDTO{{"j1", "j2"}, {1.0, 2.0}};
+  auto cached_request = req;
+  cached_request.motion = JointGoalDTO{{"j2", "j1"}, {2.0, 1.0}};
+  store_cache(cached_request, cached);
 
   auto result = execute_sync(req);
 
@@ -3260,9 +3298,9 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitJointGoalNameMismatch_InvalidatesAnd
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitNamedTarget_InvalidatesAndReplans) {
-  store_cache("move_named_target", make_test_trajectory());
   auto req = make_test_request("move_named_target");
   req.motion = NamedTargetDTO{"ready"};
+  store_cache(req, make_test_trajectory());
 
   auto result = execute_sync(req);
 
@@ -5640,15 +5678,10 @@ TEST_F(ExecutionKernelTest,
   // The fault worker publishes after its completion guard clears activity. If
   // lifecycle authority was busy, publication uses the coalesced Monitoring
   // task; drive that deterministic lane while allowing the worker to finish.
-  KernelRecoveryAssessmentDTO ready_assessment;
-  for (int attempt = 0; attempt < 1000; ++attempt) {
-    local_scheduler.advance_to(local_clock.now());
-    ready_assessment = controlled_kernel.get_recovery_assessment();
-    if (ready_assessment.status == RecoveryAssessmentStatus::kRetryReady) {
-      break;
-    }
-    std::this_thread::yield();
-  }
+  ASSERT_TRUE(wait_for_recovery_status(
+      controlled_kernel, local_scheduler, local_clock,
+      RecoveryAssessmentStatus::kRetryReady));
+  const auto ready_assessment = controlled_kernel.get_recovery_assessment();
   ASSERT_EQ(ready_assessment.status, RecoveryAssessmentStatus::kRetryReady)
       << ready_assessment.reason_code << " assessment_exec="
       << ready_assessment.execution_id << " latch="
@@ -10697,11 +10730,11 @@ TEST_F(ExecutionKernelTest, Events_CacheInvalidatedEvent) {
 }
 
 TEST_F(ExecutionKernelTest, Events_CacheInvalidatedEventIncludesCompatibilityReason) {
-  store_cache("goal_changed_event", make_test_trajectory());
   auto req = make_test_request("goal_changed_event");
   PoseGoalDTO pose_goal;
   pose_goal.goal = make_pose(0.45, -0.1, 0.2);
   req.motion = pose_goal;
+  store_cache(req, make_test_trajectory());
   context.next_fk = make_pose(0.1, -0.1, 0.2);
 
   std::mutex events_mutex;

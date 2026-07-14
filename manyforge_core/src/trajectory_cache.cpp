@@ -8,7 +8,8 @@ TrajectoryCache::TrajectoryCache(CacheConfig config)
     : config_(config) {}
 
 void TrajectoryCache::store(const std::string& move_id, TrajectoryDTO trajectory,
-                            CollisionWorldRevision revision) {
+                            CollisionWorldRevision revision,
+                            std::string intent_identity) {
   // Build the shared payload outside the lock; the critical section only
   // swaps pointers and maintains the FIFO index.
   auto shared_trajectory =
@@ -20,6 +21,7 @@ void TrajectoryCache::store(const std::string& move_id, TrajectoryDTO trajectory
   if (it != entries_.end()) {
     it->second.trajectory = std::move(shared_trajectory);
     it->second.revision = std::move(revision);
+    it->second.intent_identity = std::move(intent_identity);
     return;
   }
 
@@ -30,7 +32,8 @@ void TrajectoryCache::store(const std::string& move_id, TrajectoryDTO trajectory
   }
 
   entries_.emplace(move_id,
-                   Entry{std::move(shared_trajectory), std::move(revision)});
+                   Entry{std::move(shared_trajectory), std::move(revision),
+                         std::move(intent_identity)});
   insertion_order_.push_back(move_id);
 }
 
@@ -54,16 +57,17 @@ std::optional<TrajectoryDTO> TrajectoryCache::peek_unvalidated(
   return *found;
 }
 
-std::optional<TrajectoryDTO> TrajectoryCache::lookup_with_revision(
+TrajectoryCacheLookupResult TrajectoryCache::lookup_with_revision(
     const std::string& move_id,
-    const CollisionWorldRevision& expected_revision) {
+    const CollisionWorldRevision& expected_revision,
+    const std::string& expected_intent_identity) {
   const bool expected_is_unset = expected_revision.revision_id == 0 &&
                                  expected_revision.content_hash.empty();
 
   std::unique_lock<std::mutex> lock(mutex_);
   auto it = entries_.find(move_id);
   if (it == entries_.end()) {
-    return std::nullopt;
+    return {TrajectoryCacheLookupDisposition::kMiss, std::nullopt};
   }
 
   const auto& stored = it->second.revision;
@@ -72,8 +76,7 @@ std::optional<TrajectoryDTO> TrajectoryCache::lookup_with_revision(
 
   // Trust-the-trust-boundary policy:
   // - Expected unset: caller has no authoritative collision-world revision.
-  //   Do not serve a revision-aware hit. The legacy lookup() overload remains
-  //   available for explicitly legacy call sites.
+  //   Do not serve a revision-aware hit.
   // - Expected unset, stored tagged: caller did not provide an
   //   authoritative revision; do not serve a tagged entry. Treat as miss
   //   without evicting (the entry may be valid for a future caller that
@@ -83,22 +86,29 @@ std::optional<TrajectoryDTO> TrajectoryCache::lookup_with_revision(
   //   evict and miss so the kernel revalidates.
   // - Both tagged: must match exactly. Mismatch evicts the stale entry.
   if (expected_is_unset) {
-    return std::nullopt;
+    return {TrajectoryCacheLookupDisposition::kAuthoritativeRevisionUnavailable,
+            std::nullopt};
   }
   if (!expected_is_unset && stored_is_unset) {
     erase_locked(move_id);
-    return std::nullopt;
+    return {TrajectoryCacheLookupDisposition::kRevisionMismatch,
+            std::nullopt};
   }
   if (stored.revision_id != expected_revision.revision_id ||
       stored.content_hash != expected_revision.content_hash) {
     erase_locked(move_id);
-    return std::nullopt;
+    return {TrajectoryCacheLookupDisposition::kRevisionMismatch,
+            std::nullopt};
+  }
+  if (it->second.intent_identity != expected_intent_identity) {
+    erase_locked(move_id);
+    return {TrajectoryCacheLookupDisposition::kIntentMismatch, std::nullopt};
   }
   // Hold the shared payload, then deep-copy outside the lock so the hit
   // path's lock hold time stays O(1).
   std::shared_ptr<const TrajectoryDTO> found = it->second.trajectory;
   lock.unlock();
-  return *found;
+  return {TrajectoryCacheLookupDisposition::kHit, *found};
 }
 
 std::optional<CollisionWorldRevision> TrajectoryCache::revision_of(

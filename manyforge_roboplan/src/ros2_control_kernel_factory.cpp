@@ -53,18 +53,9 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
 
   const auto rrt_opts = production_rrt_options(
       group_name, kernel_config.planner_max_planning_time_s);
-  bundle->rrt = std::make_shared<roboplan::RRT>(bundle->scene, rrt_opts);
-  bundle->shortcutter = std::make_shared<roboplan::PathShortcutter>(
-      bundle->scene, group_name);
-  bundle->toppra = std::make_shared<roboplan::PathParameterizerTOPPRA>(
-      bundle->scene, group_name);
-
   const auto ik_opts = production_planning_ik_options(group_name);
-  bundle->ik = std::make_shared<roboplan::SimpleIk>(bundle->scene, ik_opts);
   const auto single_shot_ik_opts = production_single_shot_ik_options(
       group_name, kernel_config.single_shot_ik_timeout_s);
-  bundle->single_shot_ik =
-      std::make_shared<roboplan::SimpleIk>(bundle->scene, single_shot_ik_opts);
 
   bundle->scene_mutex = std::make_shared<std::mutex>();
   const auto policy = kernel_config.baseline_collision_policy_snapshot.value_or(
@@ -92,8 +83,8 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
       std::make_unique<RoboPlanCollisionDiagnosticComparator>(bundle->projection_backend);
   bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
       bundle->scene_projection, bundle->scene, rrt_opts,
-      bundle->scene_mutex, bundle->single_shot_ik, ik_opts,
-      single_shot_ik_opts, kernel_config.planner_rng_seed);
+      bundle->scene_mutex, ik_opts, single_shot_ik_opts,
+      kernel_config.planner_rng_seed);
   bundle->clock = std::make_unique<WallClock>();
   bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->execution_state_sink =

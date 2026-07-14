@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -47,6 +48,131 @@ _LIVE = importlib.util.module_from_spec(_LIVE_SPEC)
 _LIVE_SPEC.loader.exec_module(_LIVE)
 
 
+def test_roboplan_05_inventory_binds_capabilities_workarounds_and_patches() -> None:
+    capabilities, workarounds = _MODULE._version_inventory(  # noqa: SLF001
+        _REPO_ROOT, _MODULE.ROBOPLAN_05_VERSION
+    )
+    capability_by_name = {
+        item["capability"]: item for item in capabilities["capabilities"]
+    }
+    workaround_by_id = {
+        item["id"]: item for item in workarounds["workarounds"]
+    }
+    assert capability_by_name["planning.motion.cartesian_path"]["status"] == (
+        "supported"
+    )
+    assert capability_by_name["planning.motion.named_target"]["status"] == (
+        "unsupported"
+    )
+    assert workaround_by_id["roboplan_04_negative_shortcut_seed_encoding"][
+        "status"
+    ] == "retired"
+    assert workaround_by_id["implicit_scene_copy_for_revision_retention"][
+        "status"
+    ] == "retired"
+
+    patch_manifest = _MODULE._checked_patch_manifest(_REPO_ROOT)  # noqa: SLF001
+    assert len(patch_manifest["patches"]) == 7
+    assert all(len(item["sha256"]) == 64 for item in patch_manifest["patches"])
+
+
+def test_patch_manifest_rejects_unlisted_patch(tmp_path: Path) -> None:
+    root = tmp_path / "third_party/roboplan"
+    patches = root / "patches"
+    patches.mkdir(parents=True)
+    listed = patches / "0001-listed.patch"
+    listed.write_text("listed\n", encoding="utf-8")
+    (patches / "0002-unlisted.patch").write_text("unlisted\n", encoding="utf-8")
+    digest = hashlib.sha256(listed.read_bytes()).hexdigest()
+    (root / "patches.sha256").write_text(
+        f"{digest}  patches/{listed.name}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(_MODULE.ValidationError, match="unlisted"):
+        _MODULE._checked_patch_manifest(tmp_path)  # noqa: SLF001
+
+
+def test_verified_checkout_rejects_dirty_source(tmp_path: Path) -> None:
+    docker_root = tmp_path / ".docker"
+    checkout = docker_root / "roboplan"
+    checkout.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    source = checkout / "source.txt"
+    source.write_text("reviewed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(checkout), "add", "source.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "-c",
+            "user.name=ManyForge Test",
+            "-c",
+            "user.email=manyforge-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+    )
+    commit = subprocess.check_output(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
+    ).strip()
+    (docker_root / ".manyforge-roboplan-ref").write_text(
+        f"{commit}\n", encoding="utf-8"
+    )
+    (docker_root / ".manyforge-roboplan-sha").write_text(
+        f"{commit}\n", encoding="utf-8"
+    )
+
+    assert _MODULE._verified_roboplan_checkout(tmp_path) == (  # noqa: SLF001
+        checkout,
+        commit,
+        commit,
+    )
+    source.write_text("modified\n", encoding="utf-8")
+    with pytest.raises(_MODULE.ValidationError, match="dirty"):
+        _MODULE._verified_roboplan_checkout(tmp_path)  # noqa: SLF001
+
+
+def test_dirty_worktree_fingerprint_changes_with_source_content(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    source = tmp_path / "source.txt"
+    source.write_text("committed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "source.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=ManyForge Test",
+            "-c",
+            "user.email=manyforge-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+    )
+
+    source.write_text("dirty-one\n", encoding="utf-8")
+    first = _MODULE._manyforge_worktree_sha256(tmp_path)  # noqa: SLF001
+    source.write_text("dirty-two\n", encoding="utf-8")
+    second = _MODULE._manyforge_worktree_sha256(tmp_path)  # noqa: SLF001
+    assert first != second
+
+    with pytest.raises(RuntimeError, match="source identity changed"):
+        _MODULE.require_source_inventory_stable(
+            {"source": {"manyforge_dirty": True, "fingerprint": first}},
+            {"source": {"manyforge_dirty": True, "fingerprint": second}},
+        )
+
+
 def test_checked_in_corpus_has_required_sample_sizes_and_unique_links() -> None:
     corpus = _REPO_ROOT / "benchmarks/roboplan_05/corpus/corpus-v1.json"
     summary = _MODULE.validate_corpus(corpus, allow_pending_capture=True)
@@ -61,6 +187,12 @@ def test_checked_in_corpus_has_required_sample_sizes_and_unique_links() -> None:
     }
     value = json.loads(corpus.read_text(encoding="utf-8"))
     assert value["models"]["lite6_gripper"]["group_name"] == "lite6"
+    captured = next(
+        fixture
+        for fixture in value["planning_fixtures"]
+        if fixture["id"] == "ur10e_drop_approach_capture"
+    )
+    assert captured["capture_source_policy"] == "frozen_rp5_0_manifest"
 
 
 def test_isaac_live_baseline_plays_once_and_reset_owns_loop_replay() -> None:
@@ -100,6 +232,36 @@ def test_isaac_live_baseline_plays_once_and_reset_owns_loop_replay() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "program_name",
+    [
+        "isaac_manipulator_scene_light.program.yaml",
+        "isaac_manipulator_scene_light_collision.program.yaml",
+    ],
+)
+def test_isaac_light_drop_release_keeps_attached_object_clear_of_klt(
+    program_name: str,
+) -> None:
+    program = yaml.safe_load(
+        (_REPO_ROOT / "examples" / program_name).read_text(encoding="utf-8")
+    )
+
+    def descendants(node: dict[str, object]) -> list[dict[str, object]]:
+        children = list(node.get("children") or [])
+        return [node, *[nested for child in children for nested in descendants(child)]]
+
+    nodes = {str(node.get("name")): node for node in descendants(program["tree"])}
+    approach_offset = nodes["move_to_drop_approach"]["params"]["relative_move"][
+        "offset"
+    ]["position_m"]
+    release_offset = nodes["move_to_drop"]["params"]["relative_move"]["offset"][
+        "position_m"
+    ]
+
+    assert approach_offset == [0, 0, 0.4]
+    assert release_offset == [0, 0, 0.35]
+
+
 def test_corpus_rejects_pooled_or_under_sampled_live_strata(tmp_path: Path) -> None:
     source = _REPO_ROOT / "benchmarks/roboplan_05/corpus/corpus-v1.json"
     corpus = json.loads(source.read_text(encoding="utf-8"))
@@ -118,6 +280,21 @@ def test_corpus_requires_captured_replay_before_final_validation(
     path = tmp_path / "corpus.json"
     path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
     with pytest.raises(_MODULE.ValidationError, match="capture is missing"):
+        _MODULE.validate_corpus(path)
+
+
+def test_corpus_rejects_unknown_capture_source_policy(tmp_path: Path) -> None:
+    source = _REPO_ROOT / "benchmarks/roboplan_05/corpus/corpus-v1.json"
+    corpus = json.loads(source.read_text(encoding="utf-8"))
+    captured = next(
+        fixture
+        for fixture in corpus["planning_fixtures"]
+        if fixture.get("capture_file")
+    )
+    captured["capture_source_policy"] = "trust_stale_source"
+    path = tmp_path / "corpus.json"
+    path.write_text(json.dumps(corpus), encoding="utf-8")
+    with pytest.raises(_MODULE.ValidationError, match="unsupported"):
         _MODULE.validate_corpus(path)
 
 
@@ -142,16 +319,352 @@ def test_evidence_validator_rejects_non_boolean_passed(tmp_path: Path) -> None:
         _MODULE.validate_evidence(path)
 
 
-def test_evidence_validator_rejects_undersampled_clean_source_baseline(
+def test_evidence_validator_rejects_unknown_record_type() -> None:
+    with pytest.raises(_MODULE.ValidationError, match="record_type is not supported"):
+        _MODULE._validate_rp5_record(  # noqa: SLF001
+            {
+                "record_type": "future_unvalidated_measurement",
+                "fixture_id": "unknown",
+                "passed": True,
+            },
+            "record",
+            formal=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("record", "message"),
+    [
+        (
+            {
+                "record_type": "collision_revision",
+                "fixture_id": "revision",
+                "passed": True,
+                "latency_ns": {"p50": 1, "p95": 2, "p99": 3, "max": 4},
+                "details": {
+                    "allocations": 4,
+                    "allocations_per_query": 2.0,
+                    "allocation_bound_per_query": 1,
+                    "wcet_budget_ns": 10,
+                },
+            },
+            "exceeds its bound",
+        ),
+        (
+            {
+                "record_type": "trajectory_validation",
+                "fixture_id": "validation",
+                "passed": True,
+                "sample_count": 9,
+                "latency_ns": {"p50": 1, "p95": 2, "p99": 3, "max": 4},
+                "details": {
+                    "collision_validation": {"enabled": False},
+                    "noncollision_validation": {"enabled": False},
+                },
+            },
+            "enabled validation surface",
+        ),
+        (
+            {
+                "record_type": "rma_contract",
+                "fixture_id": "model",
+                "passed": True,
+                "details": {
+                    "canonical_fingerprint": "a" * 64,
+                    "view_fingerprint": "b" * 64,
+                    "view_changed": False,
+                    "mapping_bijective": False,
+                    "public_planning_joint_names_preserved": True,
+                    "renamed_joint_count": 0,
+                },
+            },
+            "passed without preserving",
+        ),
+    ],
+)
+def test_evidence_validator_rejects_malformed_auxiliary_records(
+    record: dict, message: str
+) -> None:
+    with pytest.raises(_MODULE.ValidationError, match=message):
+        _MODULE._validate_rp5_record(  # noqa: SLF001
+            record,
+            "record",
+            formal=True,
+            roboplan_version=_MODULE.ROBOPLAN_05_VERSION,
+        )
+
+
+def test_frozen_roboplan_04_offline_evidence_remains_valid() -> None:
+    evidence = _REPO_ROOT / "build/qualification/rp5-0-offline-2952090.json"
+    if not evidence.is_file():
+        pytest.skip("local frozen RP5-0 raw evidence is not installed")
+    assert _MODULE.validate_evidence(evidence)["records"] == 70
+
+
+def _promote_to_formal_roboplan_05(evidence: dict) -> dict:
+    evidence["phase"] = "rp5_3"
+    evidence["source"].update(
+        {
+            "roboplan_version": _MODULE.ROBOPLAN_05_VERSION,
+            "roboplan_commit": _MODULE.ROBOPLAN_05_PINNED_COMMIT,
+            "roboplan_ref": _MODULE.ROBOPLAN_05_PINNED_COMMIT,
+            "pinocchio_version": _MODULE.ROBOPLAN_05_PINOCCHIO_VERSION,
+            "coal_version": _MODULE.ROBOPLAN_05_COAL_VERSION,
+            "roboplan_package_versions": dict(
+                _MODULE.ROBOPLAN_05_PACKAGE_VERSIONS
+            ),
+            "roboplan_patch_manifest_sha256": (
+                _MODULE.ROBOPLAN_05_PATCH_MANIFEST_SHA256
+            ),
+            "roboplan_patches": [
+                {"path": path, "sha256": digest}
+                for path, digest in _MODULE.ROBOPLAN_05_PATCH_DIGESTS.items()
+            ],
+        }
+    )
+    return evidence
+
+
+def test_formal_roboplan_05_evidence_requires_patch_provenance(
     tmp_path: Path,
+) -> None:
+    evidence = _promote_to_formal_roboplan_05(_formal_live_evidence())
+    del evidence["source"]["roboplan_patch_manifest_sha256"]
+    del evidence["source"]["roboplan_patches"]
+    path = tmp_path / "missing-patch-provenance.json"
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    with pytest.raises(_MODULE.ValidationError, match="patch_manifest"):
+        _MODULE.validate_evidence(path)
+
+
+def test_formal_rp5_3_evidence_rejects_superseded_roboplan_050(
+    tmp_path: Path,
+) -> None:
+    evidence = _formal_live_evidence()
+    evidence["phase"] = "rp5_3"
+    evidence["source"]["roboplan_version"] = "0.5.0"
+    path = tmp_path / "superseded-roboplan-050.json"
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    with pytest.raises(_MODULE.ValidationError, match="requires RoboPlan 0.5.1"):
+        _MODULE.validate_evidence(path)
+
+
+def test_formal_roboplan_05_evidence_is_bound_to_reviewed_patch_set(
+    tmp_path: Path,
+) -> None:
+    evidence = _promote_to_formal_roboplan_05(_formal_live_evidence())
+    source = evidence["source"]
+    path = tmp_path / "reviewed-patches.json"
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    assert _MODULE.validate_evidence(path)["records"] == 1
+    source["roboplan_patches"][0]["sha256"] = "f" * 64
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+    with pytest.raises(_MODULE.ValidationError, match="reviewed manifest"):
+        _MODULE.validate_evidence(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("pinocchio_version", "4.0.0", "Pinocchio 4.1.0"),
+        ("coal_version", "3.0.2", "Coal 3.0.3"),
+    ],
+)
+def test_formal_roboplan_05_evidence_requires_exact_native_dependencies(
+    tmp_path: Path, field: str, value: str, message: str
+) -> None:
+    evidence = _promote_to_formal_roboplan_05(_formal_live_evidence())
+    evidence["source"][field] = value
+    path = tmp_path / f"wrong-{field}.json"
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    with pytest.raises(_MODULE.ValidationError, match=message):
+        _MODULE.validate_evidence(path)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "wrong"])
+def test_formal_roboplan_05_evidence_requires_exact_package_generation(
+    tmp_path: Path, mutation: str
+) -> None:
+    evidence = _promote_to_formal_roboplan_05(_formal_live_evidence())
+    versions = evidence["source"]["roboplan_package_versions"]
+    if mutation == "missing":
+        del versions["roboplan_rrt"]
+    else:
+        versions["roboplan_rrt"] = "0.5.0"
+    path = tmp_path / f"{mutation}-package-version.json"
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    with pytest.raises(_MODULE.ValidationError, match="package-version inventory"):
+        _MODULE.validate_evidence(path)
+
+
+@pytest.mark.parametrize(
+    ("policy", "mode", "rrt_star", "fast_return"),
+    [
+        ("compatibility", "primary", False, True),
+        ("compatibility", "collision_probe_attribution", False, True),
+        ("rrt_star", "capability_opt_in", True, False),
+        ("budget_spending", "capability_opt_in", False, False),
+    ],
+)
+def test_planning_evidence_keeps_opt_in_policies_separate(
+    policy: str,
+    mode: str,
+    rrt_star: bool,
+    fast_return: bool,
+) -> None:
+    probe = mode == "collision_probe_attribution"
+    record = {
+        "record_type": "planning_pipeline",
+        "fixture_id": "planner-policy",
+        "passed": True,
+        "sample_count": 50,
+        "measurement_mode": mode,
+        "planner_policy": policy,
+        "planner_options": {
+            "rrt_star": rrt_star,
+            "fast_return": fast_return,
+        },
+        "collision_probe_available": probe,
+        "total_collision_query_count": 1 if probe else 0,
+        "stages": (
+            {
+                "rrt": {
+                    "collision_query_count": {
+                        "p50": 1,
+                        "p95": 1,
+                        "p99": 1,
+                        "max": 1,
+                    }
+                }
+            }
+            if probe
+            else {}
+        ),
+        "invariants_passed": True,
+        "outcomes_passed": True,
+        "deterministic_trajectory": True,
+        "distinct_trajectory_hashes": 1,
+        "latency_ns": {"p50": 1, "p95": 2, "p99": 3, "max": 4},
+        "cpu_time_ns": {"p50": 1, "p95": 2, "p99": 3, "max": 4},
+        "allocation_count": {"p50": 0, "p95": 0, "p99": 0, "max": 0},
+    }
+    _MODULE._validate_rp5_record(  # noqa: SLF001
+        record,
+        "record",
+        formal=True,
+        roboplan_version=_MODULE.ROBOPLAN_05_VERSION,
+    )
+
+
+def test_roboplan_05_attribution_rejects_scene_only_collision_probe() -> None:
+    record = {
+        "record_type": "planning_pipeline",
+        "fixture_id": "scene-only-probe",
+        "passed": True,
+        "sample_count": 50,
+        "measurement_mode": "collision_probe_attribution",
+        "planner_policy": "compatibility",
+        "planner_options": {"rrt_star": False, "fast_return": True},
+        "collision_probe_available": True,
+        "total_collision_query_count": 50,
+        "stages": {
+            "start_collision_query": {
+                "collision_query_count": {
+                    "p50": 1,
+                    "p95": 1,
+                    "p99": 1,
+                    "max": 1,
+                }
+            },
+            "rrt": {
+                "collision_query_count": {
+                    "p50": 0,
+                    "p95": 0,
+                    "p99": 0,
+                    "max": 0,
+                }
+            },
+        },
+        "invariants_passed": True,
+        "outcomes_passed": True,
+        "deterministic_trajectory": True,
+        "distinct_trajectory_hashes": 1,
+        "latency_ns": {"p50": 1, "p95": 2, "p99": 3, "max": 4},
+        "cpu_time_ns": {"p50": 1, "p95": 2, "p99": 3, "max": 4},
+        "allocation_count": {"p50": 0, "p95": 0, "p99": 0, "max": 0},
+    }
+
+    with pytest.raises(_MODULE.ValidationError, match="CollisionContext"):
+        _MODULE._validate_rp5_record(  # noqa: SLF001
+            record,
+            "record",
+            formal=True,
+            roboplan_version=_MODULE.ROBOPLAN_05_VERSION,
+        )
+
+
+@pytest.mark.parametrize(
+    ("policy", "mode", "rrt_star", "fast_return"),
+    [
+        ("compatibility", "capability_opt_in", False, True),
+        ("rrt_star", "primary", True, False),
+        ("rrt_star", "capability_opt_in", False, False),
+        ("budget_spending", "capability_opt_in", True, False),
+    ],
+)
+def test_planning_evidence_rejects_mislabeled_policy_rows(
+    policy: str,
+    mode: str,
+    rrt_star: bool,
+    fast_return: bool,
+) -> None:
+    record = {
+        "record_type": "planning_pipeline",
+        "fixture_id": "planner-policy",
+        "passed": True,
+        "sample_count": 50,
+        "measurement_mode": mode,
+        "planner_policy": policy,
+        "planner_options": {
+            "rrt_star": rrt_star,
+            "fast_return": fast_return,
+        },
+        "collision_probe_available": False,
+        "total_collision_query_count": 0,
+        "invariants_passed": True,
+        "outcomes_passed": True,
+        "deterministic_trajectory": True,
+        "distinct_trajectory_hashes": 1,
+        "latency_ns": {"p50": 1, "p95": 2, "p99": 3, "max": 4},
+        "cpu_time_ns": {"p50": 1, "p95": 2, "p99": 3, "max": 4},
+        "allocation_count": {"p50": 0, "p95": 0, "p99": 0, "max": 0},
+    }
+    with pytest.raises(_MODULE.ValidationError):
+        _MODULE._validate_rp5_record(  # noqa: SLF001
+            record,
+            "record",
+            formal=True,
+            roboplan_version=_MODULE.ROBOPLAN_05_VERSION,
+        )
+
+
+@pytest.mark.parametrize("phase", ["rp5_0", "rp5_3", "rp5_7"])
+def test_evidence_validator_rejects_undersampled_clean_source_evidence(
+    tmp_path: Path, phase: str,
 ) -> None:
     evidence = {
         "schema_version": "manyforge.roboplan_transition_evidence.v1",
         "run_id": "formal-run",
-        "phase": "rp5_0",
+        "phase": phase,
         "source": {
             "manyforge_dirty": False,
             "manyforge_commit": "a" * 40,
+            "roboplan_source_clean": True,
             "roboplan_version": "0.4.0",
             "roboplan_commit": "b" * 40,
             "pinocchio_version": "4.0.0",
@@ -180,6 +693,8 @@ def test_evidence_validator_rejects_undersampled_clean_source_baseline(
             "workarounds": [],
         },
     }
+    if phase != "rp5_0":
+        _promote_to_formal_roboplan_05(evidence)
     path = tmp_path / "undersampled.json"
     path.write_text(json.dumps(evidence), encoding="utf-8")
     with pytest.raises(_MODULE.ValidationError, match="at least 10000"):
@@ -226,6 +741,7 @@ def _formal_live_evidence() -> dict:
         "source": {
             "manyforge_dirty": False,
             "manyforge_commit": "a" * 40,
+            "roboplan_source_clean": True,
             "roboplan_version": "0.4.0",
             "roboplan_commit": "b" * 40,
             "pinocchio_version": "4.0.0",
@@ -1290,4 +1806,75 @@ def test_captured_replay_rejects_changed_source_or_model_view(tmp_path: Path) ->
             capture_path=capture_path,
             repo_root=tmp_path,
             view=view,
+        )
+
+
+def test_frozen_rp5_0_capture_requires_exact_manifest_identity(
+    tmp_path: Path,
+) -> None:
+    capture_path = (
+        tmp_path
+        / "benchmarks/roboplan_05/corpus/captures/isaac-light-drop-approach-v1.json"
+    )
+    manifest_path = (
+        tmp_path
+        / "benchmarks/roboplan_05/baselines/roboplan-0.4.0-manifest.json"
+    )
+    capture_path.parent.mkdir(parents=True)
+    manifest_path.parent.mkdir(parents=True)
+    capture = {
+        "semantic_sha256": "c" * 64,
+        "source": {
+            "program": "examples/program.yaml",
+            "program_sha256": "a" * 64,
+            "deployment": "examples/deployment.yaml",
+            "deployment_sha256": "b" * 64,
+        },
+        "robot_model_authority": {
+            "canonical_fingerprint": "d" * 64,
+            "view_fingerprint": "e" * 64,
+        },
+    }
+    manifest = {
+        "baseline_id": "rp5-0-roboplan-0.4.0-pinocchio-4",
+        "status": "complete",
+        "source": {
+            "program": {
+                "path": "examples/program.yaml",
+                "sha256": "a" * 64,
+            },
+            "deployment": {
+                "path": "examples/deployment.yaml",
+                "sha256": "b" * 64,
+            },
+        },
+        "evidence": {
+            "captured_authority_fixture": (
+                "../corpus/captures/isaac-light-drop-approach-v1.json"
+            ),
+            "captured_authority_fixture_semantic_sha256": "c" * 64,
+        },
+    }
+    capture_path.write_text(json.dumps(capture), encoding="utf-8")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    view = SimpleNamespace(
+        authority=SimpleNamespace(canonical_fingerprint="d" * 64),
+        import_view=SimpleNamespace(view_fingerprint="e" * 64),
+    )
+
+    assert _RUNNER._verify_capture_provenance(
+        capture_path=capture_path,
+        repo_root=tmp_path,
+        view=view,
+        source_policy="frozen_rp5_0_manifest",
+    ) == capture
+
+    capture["semantic_sha256"] = "f" * 64
+    capture_path.write_text(json.dumps(capture), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="semantic hash changed"):
+        _RUNNER._verify_capture_provenance(
+            capture_path=capture_path,
+            repo_root=tmp_path,
+            view=view,
+            source_policy="frozen_rp5_0_manifest",
         )

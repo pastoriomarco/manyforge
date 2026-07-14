@@ -271,18 +271,60 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                 .format(py::cast(r.target_reference), py::cast(r.offset_reference), py::cast(r.offset));
         });
 
+    py::enum_<manyforge::core::CartesianSpeedModeDTO>(m, "CartesianSpeedMode")
+        .value("kBounded", manyforge::core::CartesianSpeedModeDTO::kBounded);
+
+    py::enum_<manyforge::core::CartesianFallbackPolicyDTO>(m, "CartesianFallbackPolicy")
+        .value("kFailClosed", manyforge::core::CartesianFallbackPolicyDTO::kFailClosed)
+        .value("kAllowJointSpaceFallback",
+               manyforge::core::CartesianFallbackPolicyDTO::kAllowJointSpaceFallback);
+
     py::class_<manyforge::core::CartesianPathDTO>(m, "CartesianPathDTO")
         .def(py::init<>())
-        .def(py::init<std::vector<manyforge::core::Pose3DTO>, double, double>(),
+        .def(py::init([](std::vector<manyforge::core::Pose3DTO> waypoints,
+                         double max_translation_step_m,
+                         double max_rotation_step_rad,
+                         manyforge::core::CartesianSpeedModeDTO speed_mode,
+                         double max_linear_speed_mps,
+                         double max_angular_speed_rad_s,
+                         double max_linear_acceleration_mps2,
+                         double max_angular_acceleration_rad_s2,
+                         manyforge::core::CartesianFallbackPolicyDTO fallback_policy) {
+            manyforge::core::CartesianPathDTO path;
+            path.waypoints = std::move(waypoints);
+            path.max_translation_step_m = max_translation_step_m;
+            path.max_rotation_step_rad = max_rotation_step_rad;
+            path.speed_mode = speed_mode;
+            path.max_linear_speed_mps = max_linear_speed_mps;
+            path.max_angular_speed_rad_s = max_angular_speed_rad_s;
+            path.max_linear_acceleration_mps2 = max_linear_acceleration_mps2;
+            path.max_angular_acceleration_rad_s2 = max_angular_acceleration_rad_s2;
+            path.fallback_policy = fallback_policy;
+            return path;
+        }),
              py::arg("waypoints"),
-             py::arg("max_translation_step_m"),
-             py::arg("max_rotation_step_rad"))
+             py::arg("max_translation_step_m") = 0.005,
+             py::arg("max_rotation_step_rad") = 0.05,
+             py::arg("speed_mode") = manyforge::core::CartesianSpeedModeDTO::kBounded,
+             py::arg("max_linear_speed_mps") = 0.1,
+             py::arg("max_angular_speed_rad_s") = 0.5,
+             py::arg("max_linear_acceleration_mps2") = 0.5,
+             py::arg("max_angular_acceleration_rad_s2") = 2.5,
+             py::arg("fallback_policy") =
+                 manyforge::core::CartesianFallbackPolicyDTO::kFailClosed)
         .def_readwrite("waypoints", &manyforge::core::CartesianPathDTO::waypoints)
         .def_readwrite("max_translation_step_m", &manyforge::core::CartesianPathDTO::max_translation_step_m)
         .def_readwrite("max_rotation_step_rad", &manyforge::core::CartesianPathDTO::max_rotation_step_rad)
+        .def_readwrite("speed_mode", &manyforge::core::CartesianPathDTO::speed_mode)
+        .def_readwrite("max_linear_speed_mps", &manyforge::core::CartesianPathDTO::max_linear_speed_mps)
+        .def_readwrite("max_angular_speed_rad_s", &manyforge::core::CartesianPathDTO::max_angular_speed_rad_s)
+        .def_readwrite("max_linear_acceleration_mps2", &manyforge::core::CartesianPathDTO::max_linear_acceleration_mps2)
+        .def_readwrite("max_angular_acceleration_rad_s2", &manyforge::core::CartesianPathDTO::max_angular_acceleration_rad_s2)
+        .def_readwrite("fallback_policy", &manyforge::core::CartesianPathDTO::fallback_policy)
         .def("__repr__", [](const manyforge::core::CartesianPathDTO& c) {
-            return py::str("CartesianPathDTO(waypoints={}, max_translation_step_m={}, max_rotation_step_rad={})")
-                .format(py::cast(c.waypoints), c.max_translation_step_m, c.max_rotation_step_rad);
+            return py::str("CartesianPathDTO(waypoints={}, max_translation_step_m={}, max_rotation_step_rad={}, speed_mode={})")
+                .format(py::cast(c.waypoints), c.max_translation_step_m,
+                        c.max_rotation_step_rad, py::cast(c.speed_mode));
         });
 
     // ========================================================================

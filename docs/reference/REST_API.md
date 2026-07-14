@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-07-12 06:05:06 UTC
+  Last regenerated: 2026-07-13 18:21:55 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -46,6 +46,11 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/debug/collision/compare-trajectory/{move_id}` | debug | Debug Collision Compare Trajectory Waypoint |
 | `GET` | `/api/debug/export` | debug | Debug Export |
 | `GET` | `/api/debug/export/ros2-medkit` | debug | Debug Export Ros2 Medkit |
+| `GET` | `/api/debug/qualification/environment` | debug | Debug Qualification Environment |
+| `POST` | `/api/debug/qualification/planning-capture/drain` | debug | Debug Drain Planning Capture |
+| `POST` | `/api/debug/qualification/planning-capture/start` | debug | Debug Start Planning Capture |
+| `POST` | `/api/debug/qualification/planning-capture/stop` | debug | Debug Stop Planning Capture |
+| `GET` | `/api/debug/qualification/scene-authority-snapshot` | debug | Debug Scene Authority Snapshot |
 | `GET` | `/api/debug/scene-trace` | debug | Debug Scene Trace |
 | `POST` | `/api/debug/signals/publish` | debug | Debug Publish Signal |
 | `GET` | `/api/deployment` | program | Get Deployment |

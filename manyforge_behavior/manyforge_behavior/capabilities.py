@@ -97,6 +97,7 @@ class AdapterCapabilityManifest:
 _PLANNING_ROBOPLAN_CAPABILITY_KEYS = frozenset({
     "planning.motion.joint_goal",
     "planning.motion.pose_goal",
+    "planning.motion.cartesian_path",
     "planning.trajectory.time_parameterized",
 })
 

@@ -290,6 +290,42 @@ class TestMoveManipulatorAction:
             abs=1e-6,
         )
 
+    def test_cartesian_path_request_preserves_full_intent_and_normalizes_waypoints(
+        self, kernel, bb_with_kernel
+    ):
+        node = MoveManipulatorAction(
+            name="test_cartesian_path",
+            move_id="m_cartesian",
+            motion_type="cartesian_path",
+            cartesian_path={
+                "waypoints": [
+                    {
+                        "position_m": [0.4, 0.0, 0.5],
+                        "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                    },
+                    {
+                        "position_m": [0.4, 0.0, 0.6],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                ],
+                "speed_mode": "bounded",
+                "fallback_policy": "fail_closed",
+            },
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        request = kernel.last_execute_request
+        assert request is not None
+        assert request.motion_type == "cartesian_path"
+        assert request.pose_goal is None
+        assert request.cartesian_path is not None
+        assert request.cartesian_path["fallback_policy"] == "fail_closed"
+        assert len(request.cartesian_path["waypoints"]) == 2
+        assert "orientation_rpy_deg" not in request.cartesian_path["waypoints"][0]
+        assert request.cartesian_path["waypoints"][0][
+            "orientation_xyzw"
+        ] == pytest.approx([0.0, 0.0, 0.0, 1.0])
+
     def test_relative_move_applies_pose_source_before_planning(self, kernel, bb_with_kernel):
         calls = []
 

@@ -42,6 +42,29 @@ def _normalize_pose_dict(pose: dict[str, Any] | None) -> dict[str, Any] | None:
     return pose
 
 
+def _normalize_cartesian_path_dict(
+    path: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Normalize every Cartesian waypoint without changing path semantics."""
+    if path is None:
+        return None
+    normalized = dict(path)
+    waypoints = normalized.get("waypoints")
+    if not isinstance(waypoints, list):
+        raise ValueError("cartesian_path.waypoints must resolve to a list")
+    normalized_waypoints: list[dict[str, Any]] = []
+    for index, waypoint in enumerate(waypoints):
+        if not isinstance(waypoint, dict):
+            raise ValueError(
+                f"cartesian_path.waypoints[{index}] must resolve to a mapping"
+            )
+        normalized_waypoint = _normalize_pose_dict(waypoint)
+        assert normalized_waypoint is not None
+        normalized_waypoints.append(normalized_waypoint)
+    normalized["waypoints"] = normalized_waypoints
+    return normalized
+
+
 def _relative_move_object_ids(relative_move: dict[str, Any] | None) -> list[str]:
     """Return scene object IDs referenced by a relative move request."""
     if not isinstance(relative_move, dict):
@@ -256,6 +279,9 @@ class MoveManipulatorAction(
                 relative_move = resolve_blackboard_value(
                     self.blackboard, self._params.get("relative_move")
                 )
+                cartesian_path = resolve_blackboard_value(
+                    self.blackboard, self._params.get("cartesian_path")
+                )
             except (AttributeError, KeyError) as exc:
                 self.feedback_message = str(exc)
                 return py_trees.common.Status.FAILURE
@@ -264,6 +290,17 @@ class MoveManipulatorAction(
                 self.feedback_message = "pose_goal blackboard reference must resolve to a mapping"
                 return py_trees.common.Status.FAILURE
             pose_goal = _normalize_pose_dict(pose_goal)
+
+            if cartesian_path is not None and not isinstance(cartesian_path, dict):
+                self.feedback_message = (
+                    "cartesian_path blackboard reference must resolve to a mapping"
+                )
+                return py_trees.common.Status.FAILURE
+            try:
+                cartesian_path = _normalize_cartesian_path_dict(cartesian_path)
+            except ValueError as exc:
+                self.feedback_message = str(exc)
+                return py_trees.common.Status.FAILURE
 
             if relative_move:
                 if not isinstance(relative_move, dict):
@@ -370,6 +407,7 @@ class MoveManipulatorAction(
                 ),
                 pose_goal=pose_goal,
                 relative_move=relative_move,
+                cartesian_path=cartesian_path,
                 velocity_scale=effective_velocity_scale,
                 acceleration_scale=float(
                     self._params.get("acceleration_scale", 1.0)

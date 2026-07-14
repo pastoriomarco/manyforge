@@ -497,7 +497,29 @@ def _make_kernel(
             "Using MockKernelClient (forced), execute_duration_s=%.3f",
             mock_execute_duration_s,
         )
-        return MockKernelClient(execute_duration_s=mock_execute_duration_s), None
+        # This profile exists solely for deterministic control-flow
+        # qualification. It does not claim physical stop-dynamics evidence and
+        # is never selected by auto/production kernel discovery.
+        mock_stop_capability = {
+            "supported_stop_modes": [
+                "spring_back_hold",
+                "soft_on_path",
+                "hard_deceleration",
+            ],
+            "capability_profile_id": "manyforge_mock_control_flow_v1",
+            "hard_stop_level": "mock_immediate_terminal",
+            "derivative_proof_level": "test_double_no_physical_dynamics",
+            "scaling_source_visibility": "not_applicable",
+            "scaling_source_probe_status": "not_applicable",
+            "unsupported_reasons": {},
+        }
+        return (
+            MockKernelClient(
+                execute_duration_s=mock_execute_duration_s,
+                motion_interrupt_stop_capability=mock_stop_capability,
+            ),
+            None,
+        )
     execution_adapter_id = _execution_adapter_id_from_deployment(deployment)
     collision_monitor_period_ns = _collision_monitor_period_ns_from_deployment(
         deployment

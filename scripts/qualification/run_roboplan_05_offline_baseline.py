@@ -231,21 +231,65 @@ def _verify_capture_provenance(
     capture_path: Path,
     repo_root: Path,
     view: RoboPlanRuntimeModelView | None,
+    source_policy: str = "current_artifacts",
 ) -> dict[str, Any]:
     capture = _read_json(capture_path)
     source = capture["source"]
-    for field, digest_field in (
-        ("program", "program_sha256"),
-        ("deployment", "deployment_sha256"),
-    ):
-        artifact = (repo_root / source[field]).resolve()
-        if not artifact.is_relative_to(repo_root) or not artifact.is_file():
-            raise RuntimeError(f"captured source is unavailable: {source[field]}")
-        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-        if digest != source[digest_field]:
-            raise RuntimeError(
-                f"captured {field} changed after capture; acquire a new fixture"
-            )
+    if source_policy == "current_artifacts":
+        for field, digest_field in (
+            ("program", "program_sha256"),
+            ("deployment", "deployment_sha256"),
+        ):
+            artifact = (repo_root / source[field]).resolve()
+            if not artifact.is_relative_to(repo_root) or not artifact.is_file():
+                raise RuntimeError(
+                    f"captured source is unavailable: {source[field]}"
+                )
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            if digest != source[digest_field]:
+                raise RuntimeError(
+                    f"captured {field} changed after capture; acquire a new fixture"
+                )
+    elif source_policy == "frozen_rp5_0_manifest":
+        manifest_path = (
+            repo_root
+            / "benchmarks/roboplan_05/baselines/roboplan-0.4.0-manifest.json"
+        ).resolve()
+        manifest = _read_json(manifest_path)
+        if (
+            manifest.get("status") != "complete"
+            or manifest.get("baseline_id")
+            != "rp5-0-roboplan-0.4.0-pinocchio-4"
+        ):
+            raise RuntimeError("frozen RP5-0 capture manifest is not complete")
+        evidence = manifest.get("evidence")
+        manifest_source = manifest.get("source")
+        if not isinstance(evidence, dict) or not isinstance(manifest_source, dict):
+            raise RuntimeError("frozen RP5-0 capture manifest is malformed")
+        expected_relative = evidence.get("captured_authority_fixture")
+        if not isinstance(expected_relative, str):
+            raise RuntimeError("frozen RP5-0 capture path is unavailable")
+        expected_path = (manifest_path.parent / expected_relative).resolve()
+        if capture_path.resolve() != expected_path:
+            raise RuntimeError("capture is not the manifest-pinned RP5-0 fixture")
+        if capture.get("semantic_sha256") != evidence.get(
+            "captured_authority_fixture_semantic_sha256"
+        ):
+            raise RuntimeError("frozen RP5-0 capture semantic hash changed")
+        for field, digest_field in (
+            ("program", "program_sha256"),
+            ("deployment", "deployment_sha256"),
+        ):
+            expected_source = manifest_source.get(field)
+            if not isinstance(expected_source, dict) or (
+                source.get(field) != expected_source.get("path")
+                or source.get(digest_field) != expected_source.get("sha256")
+            ):
+                raise RuntimeError(
+                    f"frozen RP5-0 capture {field} provenance changed"
+                )
+    else:
+        raise RuntimeError(f"unsupported capture source policy: {source_policy}")
     if view is None:
         raise RuntimeError("captured fixture requires a Robot Model Authority view")
     authority = capture["robot_model_authority"]
@@ -266,10 +310,20 @@ def _source_and_environment(
     source = {
         "manyforge_commit": source_inventory["manyforge_commit"],
         "manyforge_dirty": source_inventory["manyforge_dirty"],
+        "manyforge_worktree_sha256": source_inventory[
+            "manyforge_worktree_sha256"
+        ],
         "roboplan_version": roboplan_version,
         "roboplan_ref": source_inventory["roboplan_ref"],
         "roboplan_commit": source_inventory["roboplan_commit"],
+        "roboplan_source_clean": source_inventory.get(
+            "roboplan_source_clean", False
+        ),
         "roboplan_package_versions": versions,
+        "roboplan_patch_manifest_sha256": source_inventory.get(
+            "roboplan_patch_manifest_sha256"
+        ),
+        "roboplan_patches": source_inventory.get("roboplan_patches", []),
         "pinocchio_version": python_versions.get("libpinocchio")
         or python_versions.get("pin"),
         "coal_version": python_versions.get("libcoal")
@@ -331,7 +385,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     inventory = collect_inventory(repo_root)
     if inventory["source"]["manyforge_dirty"] and not args.allow_dirty_source:
         raise RuntimeError(
-            "formal RP5-0 evidence requires a clean ManyForge source tree; "
+            f"formal {args.phase} evidence requires a clean ManyForge source tree; "
             "use --allow-dirty-source only for an explicitly labeled preflight"
         )
     source, environment = _source_and_environment(
@@ -409,6 +463,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 capture_path=(corpus_path.parent / capture_file).resolve(),
                 repo_root=repo_root,
                 view=views.get(fixture["model"]),
+                source_policy=fixture.get(
+                    "capture_source_policy", "current_artifacts"
+                ),
             )
         base_command = [
             str(planning_binary),
@@ -439,6 +496,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "view_fingerprint": capture["robot_model_authority"][
                     "view_fingerprint"
                 ],
+                "source_policy": fixture.get(
+                    "capture_source_policy", "current_artifacts"
+                ),
             }
         records.append(primary)
         probe_env = dict(env)
@@ -457,11 +517,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             attributed["capture_source"] = primary["capture_source"]
         records.append(attributed)
 
+        if args.phase in {"rp5_3", "rp5_7"} and str(
+            source["roboplan_version"]
+        ).startswith("0.5"):
+            for planner_policy in ("rrt_star", "budget_spending"):
+                capability = _run_json(
+                    [
+                        *base_command,
+                        "--planner-policy",
+                        planner_policy,
+                    ],
+                    env=env,
+                )
+                if capability.get("collision_probe_available"):
+                    raise RuntimeError(
+                        "planner capability run unexpectedly loaded collision probe"
+                    )
+                capability["measurement_mode"] = "capability_opt_in"
+                if capture is not None:
+                    capability["capture_source"] = primary["capture_source"]
+                records.append(capability)
+
     evidence = {
         "schema_version": EVIDENCE_SCHEMA,
         "run_id": args.run_id
-        or f"rp5-0-offline-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}",
-        "phase": "rp5_0",
+        or f"{args.phase.replace('_', '-')}-offline-"
+        f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}",
+        "phase": args.phase,
         "source": source,
         "environment": environment,
         "records": records,
@@ -491,6 +573,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--run-id")
+    parser.add_argument(
+        "--phase",
+        choices=("rp5_0", "rp5_3", "rp5_7"),
+        default="rp5_0",
+        help="Qualification phase recorded in the evidence artifact.",
+    )
     parser.add_argument("--lane", default="ros_isaac_container")
     parser.add_argument("--fixture")
     parser.add_argument("--collision-warmup", type=int)

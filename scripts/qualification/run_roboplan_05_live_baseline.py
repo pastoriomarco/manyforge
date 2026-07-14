@@ -917,10 +917,20 @@ def _source_and_environment(
     source = {
         "manyforge_commit": source_inventory["manyforge_commit"],
         "manyforge_dirty": source_inventory["manyforge_dirty"],
+        "manyforge_worktree_sha256": source_inventory[
+            "manyforge_worktree_sha256"
+        ],
         "roboplan_version": versions.get("roboplan", "unknown"),
         "roboplan_ref": source_inventory["roboplan_ref"],
         "roboplan_commit": source_inventory["roboplan_commit"],
+        "roboplan_source_clean": source_inventory.get(
+            "roboplan_source_clean", False
+        ),
         "roboplan_package_versions": versions,
+        "roboplan_patch_manifest_sha256": source_inventory.get(
+            "roboplan_patch_manifest_sha256"
+        ),
+        "roboplan_patches": source_inventory.get("roboplan_patches", []),
         "pinocchio_version": python_versions.get("libpinocchio")
         or python_versions.get("pin"),
         "coal_version": python_versions.get("libcoal")
@@ -949,7 +959,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     inventory = collect_inventory(args.repo_root.resolve())
     if inventory["source"]["manyforge_dirty"] and not args.allow_dirty_source:
         raise RuntimeError(
-            "formal RP5-0 evidence requires a clean ManyForge source tree; "
+            f"formal {args.phase} evidence requires a clean ManyForge source tree; "
             "use --allow-dirty-source only for an explicitly labeled preflight"
         )
     artifact_provenance = require_loaded_artifacts_match(
@@ -1123,10 +1133,10 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema_version": EVIDENCE_SCHEMA,
         "run_id": args.run_id
-        or f"rp5-0-live-{args.viewer_stratum}-"
+        or f"{args.phase.replace('_', '-')}-live-{args.viewer_stratum}-"
         f"{args.measurement_mode}-"
         f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}",
-        "phase": "rp5_0",
+        "phase": args.phase,
         "source": source,
         "environment": environment,
         "records": [record],
@@ -1154,9 +1164,10 @@ def _failed_evidence(
     return {
         "schema_version": EVIDENCE_SCHEMA,
         "run_id": args.run_id
-        or f"rp5-0-live-{args.viewer_stratum}-{args.measurement_mode}-failed-"
+        or f"{args.phase.replace('_', '-')}-live-{args.viewer_stratum}-"
+        f"{args.measurement_mode}-failed-"
         f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}",
-        "phase": "rp5_0",
+        "phase": args.phase,
         "source": source,
         "environment": environment,
         "records": [
@@ -1218,6 +1229,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--simulation-settle-s", type=float, default=3.0)
     parser.add_argument("--timeout-s", type=float, default=3600.0)
     parser.add_argument("--run-id")
+    parser.add_argument(
+        "--phase",
+        choices=("rp5_0", "rp5_3", "rp5_7"),
+        default="rp5_0",
+        help="Qualification phase recorded in success and failure evidence.",
+    )
     parser.add_argument(
         "--allow-dirty-source",
         action="store_true",

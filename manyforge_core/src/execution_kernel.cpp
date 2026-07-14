@@ -1,6 +1,7 @@
 #include <manyforge_core/execution_kernel.hpp>
 
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
+#include <manyforge_core/cache/trajectory_cache_intent.hpp>
 #include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
 #include <manyforge_core/execution_admission_support.hpp>
 #include <manyforge_core/execution_collision_support.hpp>
@@ -5188,23 +5189,17 @@ ExecutionKernel::execute_worker_dispatch_phase(
     }
   }
 
-  // Store in cache.
-  //
-  // Per-joint dynamics caps (Phase 4-P5.1K) disable BOTH cache lookup (the
-  // lookup path above declines and invalidates any pre-existing entry) and
-  // cache store: a trajectory planned under specific caps must never become a
-  // reusable entry that a later uncapped request — or a request with
-  // different caps — could pick up by move_id. The TrajectoryCache key does
-  // not carry a dynamics-limit fingerprint, so the cache-safe behavior is to
-  // not populate it from capped requests at all.
+  // Store against both the exact validation revision and the resolved planner
+  // intent. This prevents same-endpoint Cartesian paths, speed profiles, or
+  // per-joint cap variants from sharing a move_id cache entry.
   if (request.cache_mode != CacheMode::kDisable &&
       !active_trajectory_from_cache &&
-      request.per_joint_dynamics_limits.empty() &&
       collision_world_revision_is_set(validation_world_revision)) {
     // Tag every cache entry with the immutable snapshot revision that
     // validation actually used. If live pose-source updates publish newer
     // revisions before the next lookup, lookup_with_revision declines the hit.
-    cache_.store(request.move_id, trajectory, validation_world_revision);
+    cache_.store(request.move_id, trajectory, validation_world_revision,
+                 trajectory_cache_intent_identity(request));
   }
 
   {
@@ -6757,36 +6752,39 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     // A default revision means the authoritative publisher is unavailable; the
     // cache then declines to serve a hit and validation fails closed later.
     const auto active_revision = scene_binding.revision;
-    auto cached =
-        cache_.lookup_with_revision(request.move_id, active_revision);
-    if (cached.has_value()) {
-      // Per-joint dynamics caps (Phase 4-P5.1K) disable cache lookup: a request
-      // carrying non-empty caps never serves from cache. It also invalidates any
-      // pre-existing entry for this move_id (which may have been planned under
-      // no caps, or different caps) so a stale trajectory cannot linger. The
-      // companion store guard (see "Store in cache" below) ensures a capped
-      // request also never populates the cache. Together these give cache safety
-      // without a dynamics-limit fingerprint on the cache key.
-      const bool has_dynamics_limits = !request.per_joint_dynamics_limits.empty();
+    const auto intent_identity =
+        trajectory_cache_intent_identity(resolved_request);
+    auto cache_lookup = cache_.lookup_with_revision(
+        request.move_id, active_revision, intent_identity);
+    if (cache_lookup.disposition == TrajectoryCacheLookupDisposition::kHit &&
+        cache_lookup.trajectory.has_value()) {
+      auto& cached = *cache_lookup.trajectory;
       const auto goal_match =
-          cached_trajectory_matches_request_goal(kinematics_, *cached,
+          cached_trajectory_matches_request_goal(kinematics_, cached,
                                                  resolved_request);
       const auto start_match =
           synced_state.has_value()
               ? cached_trajectory_matches_current_start(
-                    *cached, *synced_state, request.tolerances.joint_position_tol_rad)
+                    cached, *synced_state,
+                    request.tolerances.joint_position_tol_rad)
               : incompatible_cache("start_state_changed");
-      if (!has_dynamics_limits && goal_match.compatible && start_match.compatible) {
+      if (goal_match.compatible && start_match.compatible) {
         prepared.cache_hit = true;
-        prepared.trajectory = std::move(*cached);
+        prepared.trajectory = std::move(cached);
       } else {
         cache_.invalidate(request.move_id);
         prepared.cache_invalidated = true;
         prepared.cache_invalidation_reason =
-            has_dynamics_limits
-                ? "per_joint_dynamics_limits_present"
-                : (!start_match.compatible ? start_match.reason : goal_match.reason);
+            !start_match.compatible ? start_match.reason : goal_match.reason;
       }
+    } else if (cache_lookup.disposition ==
+               TrajectoryCacheLookupDisposition::kIntentMismatch) {
+      prepared.cache_invalidated = true;
+      prepared.cache_invalidation_reason = "planner_intent_changed";
+    } else if (cache_lookup.disposition ==
+               TrajectoryCacheLookupDisposition::kRevisionMismatch) {
+      prepared.cache_invalidated = true;
+      prepared.cache_invalidation_reason = "collision_world_revision_changed";
     } else {
       prepared.cache_miss = true;
     }

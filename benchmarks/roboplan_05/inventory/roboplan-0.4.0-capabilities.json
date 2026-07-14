@@ -22,9 +22,9 @@
     },
     {
       "capability": "planning.motion.named_target",
-      "status": "compiled_by_manyforge",
-      "owner": "ManyForge behavior/kernel request compiler",
-      "implementation": "Portable named targets are resolved before the planner adapter"
+      "status": "unsupported",
+      "owner": "No production compiler",
+      "implementation": "The neutral DTO exists, but no production compiler resolves named targets before planner dispatch and the RoboPlan manifest does not advertise this capability"
     },
     {
       "capability": "planning.motion.relative_move",
@@ -54,7 +54,7 @@
       "capability": "planning.trajectory.time_parameterized",
       "status": "supported",
       "owner": "RoboPlanPlannerBackend",
-      "implementation": "TOPPRA plus conservative TCP and per-joint limit verification/retiming"
+      "implementation": "TOPPRA plus ManyForge-owned TCP checks and full interpolated joint-dynamics extrema verification/retiming"
     },
     {
       "capability": "scene.projection.revision_bound",

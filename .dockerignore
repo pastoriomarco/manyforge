@@ -11,6 +11,8 @@ __pycache__/
 
 # Git
 .git/
+**/.git
+**/.git/**
 
 # IDE
 .vscode/

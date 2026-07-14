@@ -91,8 +91,8 @@ RUN set -eux; \
 RUN python3 -m venv --system-site-packages "${MANYFORGE_VENV}" \
     && python -m pip install --no-cache-dir --upgrade pip "setuptools<80" \
     && printf '%s\n' \
-        'pin==4.0.0' \
-        'libpinocchio==4.0.0' \
+        'pin==4.1.0' \
+        'libpinocchio==4.1.0' \
         'coal==3.0.3' \
         'libcoal==3.0.3' \
         'cmeel-urdfdom==6.0.0' \
@@ -117,28 +117,38 @@ RUN python3 -m venv --system-site-packages "${MANYFORGE_VENV}" \
         yourdfpy==0.0.60 \
         nanobind==2.12.0 \
         scikit-build-core==0.12.2 \
-        pin==4.0.0 \
+        pin==4.1.0 \
         fastapi==0.135.3 \
         "uvicorn[standard]==0.44.0" \
         httpx==0.28.1 \
         websockets==16.0 \
         mcp==1.27.0 \
+    && python -m pip check \
     && CMEEL_LIB=$(python -c "import site; print(site.getsitepackages()[0])")/cmeel.prefix/lib \
     && if [ -d "$CMEEL_LIB" ]; then echo "$CMEEL_LIB" > /etc/ld.so.conf.d/manyforge-cmeel.conf && ldconfig; fi
 
 # RoboPlan: C++ planning library with Python bindings (nanobind).
 # Pre-cloned on host; see scripts/setup-docker.sh.
 COPY .docker/roboplan/ /tmp/roboplan/
+COPY third_party/roboplan/ /tmp/roboplan-manifest/
+COPY scripts/ci/check-roboplan-dependency-stack.py /tmp/check-roboplan-dependency-stack.py
 RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1) \
     && PINOCCHIO_PREFIX=$(dirname "$(dirname "$(dirname "$PINOCCHIO_CMAKE_DIR")")") \
     && echo "Pinocchio prefix: ${PINOCCHIO_PREFIX}" \
+    && cd /tmp/roboplan-manifest \
+    && sha256sum -c patches.sha256 \
+    && while read -r digest patch; do \
+         case "$patch" in patches/*.patch) ;; *) echo "Invalid RoboPlan patch path: $patch" >&2; exit 1;; esac; \
+         git -C /tmp/roboplan apply --check "/tmp/roboplan-manifest/$patch"; \
+         git -C /tmp/roboplan apply "/tmp/roboplan-manifest/$patch"; \
+       done < patches.sha256 \
     && cd /tmp/roboplan \
     && export CMAKE_PREFIX_PATH="${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}" \
     && export LD_LIBRARY_PATH="${PINOCCHIO_PREFIX}/lib:${LD_LIBRARY_PATH}" \
-    && ./scripts/build_cmake.bash \
+    && ROBOPLAN_CMAKE_ARGS=-DBUILD_TESTING=OFF ./scripts/build_cmake.bash \
     && ROBOPLAN_INSTALL=/tmp/roboplan/install \
     && mkdir -p /usr/local/lib/cmake /usr/local/include /usr/local/share \
-    && for pkg in roboplan roboplan_rrt roboplan_simple_ik roboplan_toppra roboplan_oink roboplan_example_models toppra; do \
+    && for pkg in roboplan roboplan_rrt roboplan_simple_ik roboplan_toppra roboplan_oink roboplan_cartesian_planning roboplan_example_models toppra; do \
          if [ -d "${ROBOPLAN_INSTALL}/${pkg}/lib" ]; then \
            cp -a ${ROBOPLAN_INSTALL}/${pkg}/lib/*.so* /usr/local/lib/ 2>/dev/null || true; \
            cp -a ${ROBOPLAN_INSTALL}/${pkg}/lib/*.a /usr/local/lib/ 2>/dev/null || true; \
@@ -155,11 +165,13 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
        done \
     && ldconfig \
     && export CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}" \
-    && for py_pkg in roboplan roboplan_example_models roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt; do \
+    && for py_pkg in roboplan roboplan_example_models roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt roboplan_cartesian_planning; do \
          cd "/tmp/roboplan/${py_pkg}"; \
          python -m pip install --no-build-isolation --no-deps --no-cache-dir -v .; \
        done \
-    && rm -rf /tmp/roboplan
+    && python -m pip check \
+    && python /tmp/check-roboplan-dependency-stack.py \
+    && rm -rf /tmp/roboplan /tmp/check-roboplan-dependency-stack.py
 
 WORKDIR /workspace
 

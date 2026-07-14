@@ -42,6 +42,10 @@ void populate_request_correlation(ExecuteRequestDTO& req,
                                   const py::dict& request);
 double finite_scale_from_python(const py::handle& value,
                                 const char* field_name);
+double positive_normal_from_python(const py::handle& value,
+                                   const std::string& field_name);
+std::optional<double> optional_positive_normal_from_python(
+    const py::dict& request, const char* field_name);
 
 std::shared_ptr<ExecutionKernel> require_open_kernel(NativeKernelBundle& bundle) {
   return bundle.kernel_snapshot();
@@ -637,24 +641,238 @@ ValidationResultDTO validate_direct_planned_trajectory(
 }
 
 Pose3DTO pose_from_python(const py::dict& pose_dict) {
+  const auto finite_vector = [](const py::handle& value,
+                                std::size_t expected_size,
+                                const char* field_name) {
+    const auto values = value.cast<std::vector<double>>();
+    if (values.size() != expected_size) {
+      throw std::invalid_argument(std::string(field_name) +
+                                  " must have exactly " +
+                                  std::to_string(expected_size) +
+                                  " elements");
+    }
+    for (const auto item : py::reinterpret_borrow<py::iterable>(value)) {
+      if (py::isinstance<py::bool_>(item)) {
+        throw std::invalid_argument(std::string(field_name) +
+                                    " must contain numbers, not booleans");
+      }
+    }
+    if (!std::all_of(values.begin(), values.end(),
+                     [](double item) { return std::isfinite(item); })) {
+      throw std::invalid_argument(std::string(field_name) +
+                                  " must contain only finite numbers");
+    }
+    return values;
+  };
   Pose3DTO pose{};
   pose.position_m = {0.0, 0.0, 0.0};
   pose.orientation = {0.0, 0.0, 0.0, 1.0};
   if (pose_dict.contains("position_m")) {
-    auto pos = pose_dict["position_m"].cast<std::vector<double>>();
-    if (pos.size() != 3) {
-      throw std::invalid_argument("position_m must have exactly 3 elements");
-    }
+    const auto pos =
+        finite_vector(pose_dict["position_m"], 3, "position_m");
     pose.position_m = {pos[0], pos[1], pos[2]};
   }
   if (pose_dict.contains("orientation_xyzw")) {
-    auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
-    if (orient.size() != 4) {
-      throw std::invalid_argument("orientation_xyzw must have exactly 4 elements");
-    }
+    const auto orient = finite_vector(
+        pose_dict["orientation_xyzw"], 4, "orientation_xyzw");
     pose.orientation = {orient[0], orient[1], orient[2], orient[3]};
   }
   return pose;
+}
+
+Pose3DTO complete_pose_from_python(const py::dict& pose_dict,
+                                   const std::string& field_name) {
+  if (!pose_dict.contains("position_m") ||
+      !pose_dict.contains("orientation_xyzw")) {
+    throw std::invalid_argument(
+        field_name + " requires position_m and orientation_xyzw");
+  }
+  return pose_from_python(pose_dict);
+}
+
+ReferenceDTO reference_from_python(const py::dict& reference_dict,
+                                   const std::string& field_name) {
+  if (!reference_dict.contains("type")) {
+    throw std::invalid_argument(field_name + ".type is required");
+  }
+
+  ReferenceDTO reference;
+  const auto type = reference_dict["type"].cast<std::string>();
+  if (type == "frame") {
+    reference.type = ReferenceDTO::Type::kFrame;
+  } else if (type == "object") {
+    reference.type = ReferenceDTO::Type::kObject;
+  } else if (type == "robot_link") {
+    reference.type = ReferenceDTO::Type::kRobotLink;
+  } else if (type == "pose") {
+    reference.type = ReferenceDTO::Type::kPose;
+  } else {
+    throw std::invalid_argument(field_name + ".type has unsupported value '" +
+                                type + "'");
+  }
+
+  if (reference_dict.contains("id") && !reference_dict["id"].is_none()) {
+    reference.id = reference_dict["id"].cast<std::string>();
+  }
+  if (reference.type == ReferenceDTO::Type::kPose) {
+    if (!reference_dict.contains("pose") || reference_dict["pose"].is_none()) {
+      throw std::invalid_argument(field_name + ".pose is required for pose references");
+    }
+    reference.pose = complete_pose_from_python(
+        reference_dict["pose"].cast<py::dict>(), field_name + ".pose");
+  }
+  return reference;
+}
+
+MotionSpecDTO motion_spec_from_python(const py::dict& request) {
+  if (!request.contains("motion_type")) {
+    throw std::invalid_argument("motion_type is required");
+  }
+  const auto motion_type = request["motion_type"].cast<std::string>();
+
+  if (motion_type == "joint_goal") {
+    JointGoalDTO goal;
+    goal.joint_names =
+        request["joint_goal_names"].cast<std::vector<std::string>>();
+    goal.positions_rad =
+        request["joint_goal_positions_rad"].cast<std::vector<double>>();
+    return goal;
+  }
+  if (motion_type == "pose_goal") {
+    PoseGoalDTO goal;
+    goal.goal = complete_pose_from_python(
+        request["pose_goal"].cast<py::dict>(), "pose_goal");
+    return goal;
+  }
+  if (motion_type == "relative_move") {
+    const auto relative = request["relative_move"].cast<py::dict>();
+    RelativeMoveDTO goal;
+    goal.target_reference = reference_from_python(
+        relative["target_reference"].cast<py::dict>(),
+        "relative_move.target_reference");
+    if (relative.contains("offset_reference") &&
+        !relative["offset_reference"].is_none()) {
+      goal.offset_reference = reference_from_python(
+          relative["offset_reference"].cast<py::dict>(),
+          "relative_move.offset_reference");
+    }
+    goal.offset = complete_pose_from_python(
+        relative["offset"].cast<py::dict>(), "relative_move.offset");
+    return goal;
+  }
+  if (motion_type == "cartesian_path") {
+    if (!request.contains("cartesian_path") ||
+        request["cartesian_path"].is_none()) {
+      throw std::invalid_argument(
+          "cartesian_path is required for motion_type cartesian_path");
+    }
+    const auto path = request["cartesian_path"].cast<py::dict>();
+    static const std::set<std::string> kAllowedCartesianFields{
+        "waypoints",
+        "max_translation_step_m",
+        "max_rotation_step_rad",
+        "speed_mode",
+        "max_linear_speed_mps",
+        "max_angular_speed_rad_s",
+        "max_linear_acceleration_mps2",
+        "max_angular_acceleration_rad_s2",
+        "fallback_policy",
+    };
+    for (const auto item : path) {
+      const auto field = py::cast<std::string>(item.first);
+      if (!kAllowedCartesianFields.contains(field)) {
+        throw std::invalid_argument(
+            "cartesian_path contains unsupported field '" + field +
+            "'; multi-tip and backend-specific request shapes are not portable");
+      }
+    }
+    if (!path.contains("waypoints") || !py::isinstance<py::list>(path["waypoints"])) {
+      throw std::invalid_argument("cartesian_path.waypoints must be a list");
+    }
+
+    CartesianPathDTO goal;
+    for (const auto item : path["waypoints"].cast<py::list>()) {
+      if (!py::isinstance<py::dict>(item)) {
+        throw std::invalid_argument(
+            "cartesian_path.waypoints entries must be dictionaries");
+      }
+      const auto waypoint = py::reinterpret_borrow<py::dict>(item);
+      static const std::set<std::string> kAllowedWaypointFields{
+          "position_m", "orientation_xyzw"};
+      for (const auto field_item : waypoint) {
+        const auto field = py::cast<std::string>(field_item.first);
+        if (!kAllowedWaypointFields.contains(field)) {
+          throw std::invalid_argument(
+              "cartesian_path waypoint contains unsupported field '" + field +
+              "'; waypoint frames and backend-specific fields are not portable");
+        }
+      }
+      if (!waypoint.contains("position_m") ||
+          !waypoint.contains("orientation_xyzw")) {
+        throw std::invalid_argument(
+            "cartesian_path waypoints require position_m and orientation_xyzw");
+      }
+      goal.waypoints.push_back(
+          complete_pose_from_python(waypoint, "cartesian_path waypoint"));
+    }
+    goal.max_translation_step_m =
+        positive_normal_from_python(
+            path.attr("get")("max_translation_step_m",
+                             goal.max_translation_step_m),
+            "cartesian_path.max_translation_step_m");
+    goal.max_rotation_step_rad =
+        positive_normal_from_python(
+            path.attr("get")("max_rotation_step_rad",
+                             goal.max_rotation_step_rad),
+            "cartesian_path.max_rotation_step_rad");
+    goal.max_linear_speed_mps =
+        positive_normal_from_python(
+            path.attr("get")("max_linear_speed_mps",
+                             goal.max_linear_speed_mps),
+            "cartesian_path.max_linear_speed_mps");
+    goal.max_angular_speed_rad_s =
+        positive_normal_from_python(
+            path.attr("get")("max_angular_speed_rad_s",
+                             goal.max_angular_speed_rad_s),
+            "cartesian_path.max_angular_speed_rad_s");
+    goal.max_linear_acceleration_mps2 =
+        positive_normal_from_python(
+            path.attr("get")("max_linear_acceleration_mps2",
+                             goal.max_linear_acceleration_mps2),
+            "cartesian_path.max_linear_acceleration_mps2");
+    goal.max_angular_acceleration_rad_s2 =
+        positive_normal_from_python(
+            path.attr("get")("max_angular_acceleration_rad_s2",
+                             goal.max_angular_acceleration_rad_s2),
+            "cartesian_path.max_angular_acceleration_rad_s2");
+
+    const auto speed_mode =
+        path.attr("get")("speed_mode", std::string("bounded"))
+            .cast<std::string>();
+    if (speed_mode == "bounded") {
+      goal.speed_mode = CartesianSpeedModeDTO::kBounded;
+    } else {
+      throw std::invalid_argument(
+          "cartesian_path.speed_mode must be bounded");
+    }
+
+    const auto fallback =
+        path.attr("get")("fallback_policy", std::string("fail_closed"))
+            .cast<std::string>();
+    if (fallback == "fail_closed") {
+      goal.fallback_policy = CartesianFallbackPolicyDTO::kFailClosed;
+    } else if (fallback == "allow_joint_space_fallback") {
+      goal.fallback_policy =
+          CartesianFallbackPolicyDTO::kAllowJointSpaceFallback;
+    } else {
+      throw std::invalid_argument(
+          "cartesian_path.fallback_policy must be fail_closed or "
+          "allow_joint_space_fallback");
+    }
+    return goal;
+  }
+
+  throw std::invalid_argument("Unsupported motion_type '" + motion_type + "'");
 }
 
 std::vector<SupportContactDTO> support_contacts_from_python(const py::dict& request) {
@@ -882,6 +1100,17 @@ py::dict motion_spec_to_python(const MotionSpecDTO& motion) {
   d["waypoints"] = std::move(waypoints);
   d["max_translation_step_m"] = cartesian.max_translation_step_m;
   d["max_rotation_step_rad"] = cartesian.max_rotation_step_rad;
+  d["speed_mode"] = "bounded";
+  d["max_linear_speed_mps"] = cartesian.max_linear_speed_mps;
+  d["max_angular_speed_rad_s"] = cartesian.max_angular_speed_rad_s;
+  d["max_linear_acceleration_mps2"] =
+      cartesian.max_linear_acceleration_mps2;
+  d["max_angular_acceleration_rad_s2"] =
+      cartesian.max_angular_acceleration_rad_s2;
+  d["fallback_policy"] =
+      cartesian.fallback_policy == CartesianFallbackPolicyDTO::kFailClosed
+          ? "fail_closed"
+          : "allow_joint_space_fallback";
   return d;
 }
 
@@ -1540,11 +1769,37 @@ py::dict logical_scene_snapshot_to_python(
 }
 
 double finite_scale_from_python(const py::handle& value, const char* field_name) {
+  if (py::isinstance<py::bool_>(value)) {
+    throw std::invalid_argument(std::string(field_name) +
+                                " must be a number, not a boolean");
+  }
   const double result = value.cast<double>();
   if (!std::isfinite(result)) {
     throw std::invalid_argument(std::string(field_name) + " must be finite");
   }
   return result;
+}
+
+double positive_normal_from_python(const py::handle& value,
+                                   const std::string& field_name) {
+  if (py::isinstance<py::bool_>(value)) {
+    throw std::invalid_argument(field_name +
+                                " must be a number, not a boolean");
+  }
+  const double result = value.cast<double>();
+  if (!std::isnormal(result) || result <= 0.0) {
+    throw std::invalid_argument(field_name +
+                                " must be finite, normal, and > 0");
+  }
+  return result;
+}
+
+std::optional<double> optional_positive_normal_from_python(
+    const py::dict& request, const char* field_name) {
+  if (!request.contains(field_name) || request[field_name].is_none()) {
+    return std::nullopt;
+  }
+  return positive_normal_from_python(request[field_name], field_name);
 }
 
 [[maybe_unused]] std::size_t size_t_from_python(const py::handle& value,
@@ -2383,15 +2638,9 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         req.speed_profile.acceleration_scale = finite_scale_from_python(
             request.attr("get")("acceleration_scale", 1.0),
             "acceleration_scale");
-        if (request.contains("max_tcp_linear_speed_mps")) {
-          auto val = request["max_tcp_linear_speed_mps"];
-          if (!val.is_none()) {
-            double tcp_speed = val.cast<double>();
-            if (tcp_speed > 0.0) {
-              req.speed_profile.max_tcp_linear_speed_mps = tcp_speed;
-            }
-          }
-        }
+        req.speed_profile.max_tcp_linear_speed_mps =
+            optional_positive_normal_from_python(
+                request, "max_tcp_linear_speed_mps");
 
         // Per-joint dynamics caps (Phase 4-P5.1K). Fail closed on malformed
         // values before planning; the backend enforces vel/accel and rejects
@@ -2406,71 +2655,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         std::string cache_mode_str = request.attr("get")("cache_mode", "default").cast<std::string>();
         req.cache_mode = (cache_mode_str == "disable") ? CacheMode::kDisable : CacheMode::kDefault;
 
-        // Motion type
-        std::string motion_type = request["motion_type"].cast<std::string>();
-        if (motion_type == "joint_goal") {
-          JointGoalDTO goal;
-          goal.joint_names = request["joint_goal_names"].cast<std::vector<std::string>>();
-          goal.positions_rad = request["joint_goal_positions_rad"].cast<std::vector<double>>();
-          req.motion = goal;
-        } else if (motion_type == "pose_goal") {
-          PoseGoalDTO goal;
-          auto pose_dict = request["pose_goal"];
-          auto pos = pose_dict["position_m"].cast<std::vector<double>>();
-          auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
-          goal.goal.position_m = {pos[0], pos[1], pos[2]};
-          goal.goal.orientation = {orient[0], orient[1], orient[2], orient[3]};
-          req.motion = goal;
-        } else if (motion_type == "relative_move") {
-          RelativeMoveDTO goal;
-          auto rel_dict = request["relative_move"];
-          auto parse_reference_dict = [](const py::dict& ref_dict,
-                                         const std::string& field_name) {
-            ReferenceDTO reference;
-            const std::string ref_type = ref_dict["type"].cast<std::string>();
-            if (ref_type == "frame") {
-              reference.type = ReferenceDTO::Type::kFrame;
-            } else if (ref_type == "object") {
-              reference.type = ReferenceDTO::Type::kObject;
-            } else if (ref_type == "robot_link") {
-              reference.type = ReferenceDTO::Type::kRobotLink;
-            } else if (ref_type == "pose") {
-              reference.type = ReferenceDTO::Type::kPose;
-            } else {
-              throw std::runtime_error("Unsupported reference type: " + ref_type);
-            }
-            if (ref_dict.contains("id")) {
-              reference.id = ref_dict["id"].cast<std::string>();
-            }
-            if (reference.type == ReferenceDTO::Type::kPose) {
-              if (!ref_dict.contains("pose")) {
-                throw std::runtime_error(
-                    "Pose reference requires " + field_name + ".pose");
-              }
-              auto pose_dict = ref_dict["pose"];
-              auto pos = pose_dict["position_m"].cast<std::vector<double>>();
-              auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
-              reference.pose = Pose3DTO{};
-              reference.pose->position_m = {pos[0], pos[1], pos[2]};
-              reference.pose->orientation = {orient[0], orient[1], orient[2], orient[3]};
-            }
-            return reference;
-          };
-
-          goal.target_reference = parse_reference_dict(
-              rel_dict["target_reference"].cast<py::dict>(), "target_reference");
-          if (rel_dict.contains("offset_reference")) {
-            goal.offset_reference = parse_reference_dict(
-                rel_dict["offset_reference"].cast<py::dict>(), "offset_reference");
-          }
-
-          auto offset_dict = rel_dict["offset"];
-          auto pos = offset_dict["position_m"].cast<std::vector<double>>();
-          auto orient = offset_dict["orientation_xyzw"].cast<std::vector<double>>();
-          goal.offset.position_m = {pos[0], pos[1], pos[2]};
-          goal.offset.orientation = {orient[0], orient[1], orient[2], orient[3]};
-          req.motion = goal;
-        }
+        req.motion = motion_spec_from_python(request);
 
         // Motion-scoped interrupt scopes
         // (spec/210 §3.10 + spec/260 §2.6). Parse each scope's
@@ -2755,15 +2940,9 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         req.speed_profile.acceleration_scale = finite_scale_from_python(
             request.attr("get")("acceleration_scale", 1.0),
             "acceleration_scale");
-        if (request.contains("max_tcp_linear_speed_mps")) {
-          auto val = request["max_tcp_linear_speed_mps"];
-          if (!val.is_none()) {
-            double tcp_speed = val.cast<double>();
-            if (tcp_speed > 0.0) {
-              req.speed_profile.max_tcp_linear_speed_mps = tcp_speed;
-            }
-          }
-        }
+        req.speed_profile.max_tcp_linear_speed_mps =
+            optional_positive_normal_from_python(
+                request, "max_tcp_linear_speed_mps");
 
         // Per-joint dynamics caps (Phase 4-P5.1K). Fail closed on malformed
         // values before planning; the backend enforces vel/accel and rejects
@@ -2776,70 +2955,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         std::string cache_mode_str = request.attr("get")("cache_mode", "default").cast<std::string>();
         req.cache_mode = (cache_mode_str == "disable") ? CacheMode::kDisable : CacheMode::kDefault;
 
-        std::string motion_type = request["motion_type"].cast<std::string>();
-        if (motion_type == "joint_goal") {
-          JointGoalDTO goal;
-          goal.joint_names = request["joint_goal_names"].cast<std::vector<std::string>>();
-          goal.positions_rad = request["joint_goal_positions_rad"].cast<std::vector<double>>();
-          req.motion = goal;
-        } else if (motion_type == "pose_goal") {
-          PoseGoalDTO goal;
-          auto pose_dict = request["pose_goal"];
-          auto pos = pose_dict["position_m"].cast<std::vector<double>>();
-          auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
-          goal.goal.position_m = {pos[0], pos[1], pos[2]};
-          goal.goal.orientation = {orient[0], orient[1], orient[2], orient[3]};
-          req.motion = goal;
-        } else if (motion_type == "relative_move") {
-          RelativeMoveDTO goal;
-          auto rel_dict = request["relative_move"];
-          auto parse_reference_dict = [](const py::dict& ref_dict,
-                                         const std::string& field_name) {
-            ReferenceDTO reference;
-            const std::string ref_type = ref_dict["type"].cast<std::string>();
-            if (ref_type == "frame") {
-              reference.type = ReferenceDTO::Type::kFrame;
-            } else if (ref_type == "object") {
-              reference.type = ReferenceDTO::Type::kObject;
-            } else if (ref_type == "robot_link") {
-              reference.type = ReferenceDTO::Type::kRobotLink;
-            } else if (ref_type == "pose") {
-              reference.type = ReferenceDTO::Type::kPose;
-            } else {
-              throw std::runtime_error("Unsupported reference type: " + ref_type);
-            }
-            if (ref_dict.contains("id")) {
-              reference.id = ref_dict["id"].cast<std::string>();
-            }
-            if (reference.type == ReferenceDTO::Type::kPose) {
-              if (!ref_dict.contains("pose")) {
-                throw std::runtime_error(
-                    "Pose reference requires " + field_name + ".pose");
-              }
-              auto pose_dict = ref_dict["pose"];
-              auto pos = pose_dict["position_m"].cast<std::vector<double>>();
-              auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
-              reference.pose = Pose3DTO{};
-              reference.pose->position_m = {pos[0], pos[1], pos[2]};
-              reference.pose->orientation = {orient[0], orient[1], orient[2], orient[3]};
-            }
-            return reference;
-          };
-
-          goal.target_reference = parse_reference_dict(
-              rel_dict["target_reference"].cast<py::dict>(), "target_reference");
-          if (rel_dict.contains("offset_reference")) {
-            goal.offset_reference = parse_reference_dict(
-                rel_dict["offset_reference"].cast<py::dict>(), "offset_reference");
-          }
-
-          auto offset_dict = rel_dict["offset"];
-          auto pos = offset_dict["position_m"].cast<std::vector<double>>();
-          auto orient = offset_dict["orientation_xyzw"].cast<std::vector<double>>();
-          goal.offset.position_m = {pos[0], pos[1], pos[2]};
-          goal.offset.orientation = {orient[0], orient[1], orient[2], orient[3]};
-          req.motion = goal;
-        }
+        req.motion = motion_spec_from_python(request);
 
         auto kernel = require_open_kernel(self);
         if (auto admission_error =
@@ -2983,15 +3099,9 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         req.speed_profile.acceleration_scale = finite_scale_from_python(
             request.attr("get")("acceleration_scale", 1.0),
             "acceleration_scale");
-        if (request.contains("max_tcp_linear_speed_mps")) {
-          auto val = request["max_tcp_linear_speed_mps"];
-          if (!val.is_none()) {
-            double tcp_speed = val.cast<double>();
-            if (tcp_speed > 0.0) {
-              req.speed_profile.max_tcp_linear_speed_mps = tcp_speed;
-            }
-          }
-        }
+        req.speed_profile.max_tcp_linear_speed_mps =
+            optional_positive_normal_from_python(
+                request, "max_tcp_linear_speed_mps");
 
         // Per-joint dynamics caps (Phase 4-P5.1K). Fail closed on malformed
         // values before planning; the backend enforces vel/accel and rejects
@@ -3004,70 +3114,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         std::string cache_mode_str = request.attr("get")("cache_mode", "default").cast<std::string>();
         req.cache_mode = (cache_mode_str == "disable") ? CacheMode::kDisable : CacheMode::kDefault;
 
-        std::string motion_type = request["motion_type"].cast<std::string>();
-        if (motion_type == "joint_goal") {
-          JointGoalDTO goal;
-          goal.joint_names = request["joint_goal_names"].cast<std::vector<std::string>>();
-          goal.positions_rad = request["joint_goal_positions_rad"].cast<std::vector<double>>();
-          req.motion = goal;
-        } else if (motion_type == "pose_goal") {
-          PoseGoalDTO goal;
-          auto pose_dict = request["pose_goal"];
-          auto pos = pose_dict["position_m"].cast<std::vector<double>>();
-          auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
-          goal.goal.position_m = {pos[0], pos[1], pos[2]};
-          goal.goal.orientation = {orient[0], orient[1], orient[2], orient[3]};
-          req.motion = goal;
-        } else if (motion_type == "relative_move") {
-          RelativeMoveDTO goal;
-          auto rel_dict = request["relative_move"];
-          auto parse_reference_dict = [](const py::dict& ref_dict,
-                                         const std::string& field_name) {
-            ReferenceDTO reference;
-            const std::string ref_type = ref_dict["type"].cast<std::string>();
-            if (ref_type == "frame") {
-              reference.type = ReferenceDTO::Type::kFrame;
-            } else if (ref_type == "object") {
-              reference.type = ReferenceDTO::Type::kObject;
-            } else if (ref_type == "robot_link") {
-              reference.type = ReferenceDTO::Type::kRobotLink;
-            } else if (ref_type == "pose") {
-              reference.type = ReferenceDTO::Type::kPose;
-            } else {
-              throw std::runtime_error("Unsupported reference type: " + ref_type);
-            }
-            if (ref_dict.contains("id")) {
-              reference.id = ref_dict["id"].cast<std::string>();
-            }
-            if (reference.type == ReferenceDTO::Type::kPose) {
-              if (!ref_dict.contains("pose")) {
-                throw std::runtime_error(
-                    "Pose reference requires " + field_name + ".pose");
-              }
-              auto pose_dict = ref_dict["pose"];
-              auto pos = pose_dict["position_m"].cast<std::vector<double>>();
-              auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
-              reference.pose = Pose3DTO{};
-              reference.pose->position_m = {pos[0], pos[1], pos[2]};
-              reference.pose->orientation = {orient[0], orient[1], orient[2], orient[3]};
-            }
-            return reference;
-          };
-
-          goal.target_reference = parse_reference_dict(
-              rel_dict["target_reference"].cast<py::dict>(), "target_reference");
-          if (rel_dict.contains("offset_reference")) {
-            goal.offset_reference = parse_reference_dict(
-                rel_dict["offset_reference"].cast<py::dict>(), "offset_reference");
-          }
-
-          auto offset_dict = rel_dict["offset"];
-          auto pos = offset_dict["position_m"].cast<std::vector<double>>();
-          auto orient = offset_dict["orientation_xyzw"].cast<std::vector<double>>();
-          goal.offset.position_m = {pos[0], pos[1], pos[2]};
-          goal.offset.orientation = {orient[0], orient[1], orient[2], orient[3]};
-          req.motion = goal;
-        }
+        req.motion = motion_spec_from_python(request);
 
         auto kernel = require_open_kernel(self);
         if (auto admission_error =

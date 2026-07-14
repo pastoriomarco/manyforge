@@ -535,26 +535,11 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
       model_name, std::filesystem::path(urdf_path),
       std::filesystem::path(srdf_path), pkg_paths);
 
-  // Create RRT
   const auto rrt_opts = production_rrt_options(
       group_name, kernel_config.planner_max_planning_time_s);
-  bundle->rrt = std::make_shared<roboplan::RRT>(bundle->scene, rrt_opts);
-
-  // Create PathShortcutter
-  bundle->shortcutter = std::make_shared<roboplan::PathShortcutter>(
-      bundle->scene, group_name);
-
-  // Create TOPPRA
-  bundle->toppra = std::make_shared<roboplan::PathParameterizerTOPPRA>(
-      bundle->scene, group_name);
-
-  // Create IK (match roboplan example_ik.cpp settings)
   const auto ik_opts = production_planning_ik_options(group_name);
-  bundle->ik = std::make_shared<roboplan::SimpleIk>(bundle->scene, ik_opts);
   const auto single_shot_ik_opts = production_single_shot_ik_options(
       group_name, kernel_config.single_shot_ik_timeout_s);
-  bundle->single_shot_ik =
-      std::make_shared<roboplan::SimpleIk>(bundle->scene, single_shot_ik_opts);
 
   // Create native backends
   bundle->scene_mutex = std::make_shared<std::mutex>();
@@ -583,8 +568,8 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
       std::make_unique<RoboPlanCollisionDiagnosticComparator>(bundle->projection_backend);
   bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
       bundle->scene_projection, bundle->scene, rrt_opts,
-      bundle->scene_mutex, bundle->single_shot_ik, ik_opts,
-      single_shot_ik_opts, kernel_config.planner_rng_seed);
+      bundle->scene_mutex, ik_opts, single_shot_ik_opts,
+      kernel_config.planner_rng_seed);
   bundle->clock = std::make_unique<WallClock>();
   RoboPlanExecutionBackendConfig execution_config;
   execution_config.reset_completion_timeout_s =

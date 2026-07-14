@@ -1,8 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_roboplan/native_kernel_factory.hpp>
+#include <manyforge_roboplan/detail/cartesian_trajectory_contract.hpp>
+#include <manyforge_roboplan/roboplan_cartesian_path_adapter.hpp>
 #include <manyforge_roboplan/roboplan_focused_adapters.hpp>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
+#include <manyforge_roboplan/roboplan_planner_options.hpp>
+
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
 
 #include <Eigen/Dense>
 #include <algorithm>
@@ -111,6 +116,333 @@ TEST(RoboPlanPlanningQualificationRecorderTest,
   EXPECT_EQ(batch.in_flight, 0U);
 }
 
+TEST(CartesianPathFidelityTest,
+     AcceptsEquivalentPathWithDifferentSamplingDensity) {
+  const auto pose = [](double x, double y = 0.0) {
+    Eigen::Matrix4d result = Eigen::Matrix4d::Identity();
+    result(0, 3) = x;
+    result(1, 3) = y;
+    return result;
+  };
+  const std::vector<Eigen::Matrix4d> requested{
+      pose(0.0), pose(1.0), pose(2.0)};
+  const std::vector<Eigen::Matrix4d> actual{
+      pose(0.0), pose(0.25), pose(0.5), pose(1.0), pose(1.5), pose(2.0)};
+
+  const auto report =
+      verify_cartesian_path_fidelity(requested, actual, 1e-6, 1e-6);
+
+  EXPECT_TRUE(report.complete);
+  EXPECT_DOUBLE_EQ(report.fraction_completed, 1.0);
+  EXPECT_FALSE(report.first_failing_path_sample_index.has_value());
+  EXPECT_GT(report.interval_checks, 0U);
+  EXPECT_LE(report.max_translation_error_m, 1e-12);
+  EXPECT_LE(report.max_rotation_error_rad, 1e-12);
+}
+
+TEST(CartesianPathFidelityTest,
+     ExtremeNormalTolerancesRemainBoundedAndScaleInvariant) {
+  const auto pose = [](double x) {
+    Eigen::Matrix4d result = Eigen::Matrix4d::Identity();
+    result(0, 3) = x;
+    return result;
+  };
+  const std::vector<Eigen::Matrix4d> requested{
+      pose(0.0), pose(0.5), pose(1.0)};
+  const std::vector<Eigen::Matrix4d> actual{
+      pose(0.0), pose(0.25), pose(0.5), pose(0.75), pose(1.0)};
+
+  const auto report = verify_cartesian_path_fidelity(
+      requested, actual, std::numeric_limits<double>::min(),
+      std::numeric_limits<double>::min());
+
+  EXPECT_TRUE(report.complete);
+  EXPECT_DOUBLE_EQ(report.fraction_completed, 1.0);
+  EXPECT_FALSE(report.first_failing_path_sample_index.has_value());
+  EXPECT_GT(report.interval_checks, 0U);
+}
+
+TEST(CartesianPathFidelityTest,
+     RejectsMiddleDetourEvenWhenBothEndpointsMatch) {
+  const auto pose = [](double x, double y = 0.0) {
+    Eigen::Matrix4d result = Eigen::Matrix4d::Identity();
+    result(0, 3) = x;
+    result(1, 3) = y;
+    return result;
+  };
+  const std::vector<Eigen::Matrix4d> requested{
+      pose(0.0), pose(1.0), pose(2.0)};
+  const std::vector<Eigen::Matrix4d> actual{
+      pose(0.0), pose(1.0, 0.2), pose(2.0)};
+
+  const auto report =
+      verify_cartesian_path_fidelity(requested, actual, 0.01, 0.01);
+
+  EXPECT_FALSE(report.complete);
+  EXPECT_LT(report.fraction_completed, 1.0);
+  ASSERT_TRUE(report.first_failing_path_sample_index.has_value());
+  EXPECT_LE(*report.first_failing_path_sample_index, 1U);
+  EXPECT_GT(report.max_translation_error_m, 0.1);
+}
+
+TEST(CartesianPathFidelityTest,
+     RejectsRotationalExcursionHiddenBetweenEndpointAndMidpointSamples) {
+  const auto pose = [](double x, double y, double z, double w) {
+    Eigen::Quaterniond orientation(w, x, y, z);
+    orientation.normalize();
+    Eigen::Matrix4d result = Eigen::Matrix4d::Identity();
+    result.block<3, 3>(0, 0) = orientation.toRotationMatrix();
+    return result;
+  };
+  // These two pairs of shortest-arc slerp endpoints stay below 2.8 rad at
+  // t={0, 0.5, 1}, but their relative rotation reaches pi near t=0.75. A
+  // three-point checker accepts this path incorrectly.
+  const std::vector<Eigen::Matrix4d> requested{
+      pose(-0.7976291493229339, 0.4587640303975524,
+           -0.13736419282209256, -0.3666802191202862),
+      pose(-0.6438591859348575, -0.6592910366987037,
+           0.3729907515185029, -0.1079748901265729)};
+  const std::vector<Eigen::Matrix4d> actual{
+      pose(0.5887466021432151, -0.7265574691650781,
+           -0.0012234876298491953, -0.3542459393462047),
+      pose(0.33860359723742856, -0.924357227032254,
+           -0.14999402758991756, 0.09172302033007032)};
+
+  const auto report =
+      verify_cartesian_path_fidelity(requested, actual, 1e-6, 2.8);
+
+  EXPECT_FALSE(report.complete);
+  EXPECT_LT(report.fraction_completed, 1.0);
+  EXPECT_TRUE(report.first_failing_path_sample_index.has_value());
+  EXPECT_GT(report.max_rotation_error_rad, 2.8);
+}
+
+TEST(CartesianTrajectoryContractTest,
+     RejectsNonFiniteEndpointDerivativesBeforeNormalization) {
+  const auto make_trajectory = [] {
+    roboplan::JointTrajectory trajectory;
+    trajectory.joint_names = {"joint_1"};
+    trajectory.times = {0.0, 1.0};
+    trajectory.positions = {Eigen::VectorXd::Zero(1),
+                            Eigen::VectorXd::Ones(1)};
+    trajectory.velocities = {Eigen::VectorXd::Ones(1),
+                             Eigen::VectorXd::Ones(1)};
+    trajectory.accelerations = {Eigen::VectorXd::Ones(1),
+                                Eigen::VectorXd::Ones(1)};
+    return trajectory;
+  };
+  const CartesianPlanningControl control{[] { return false; },
+                                         [] { return false; }};
+
+  auto invalid_start = make_trajectory();
+  invalid_start.velocities.front()[0] =
+      std::numeric_limits<double>::quiet_NaN();
+  const auto start_error =
+      detail::validate_and_normalize_cartesian_trajectory_output(
+          invalid_start, invalid_start.joint_names, control);
+  ASSERT_TRUE(start_error.has_value());
+  EXPECT_EQ(start_error->details.at("reason"),
+            "cartesian_trajectory_sample_invalid");
+  EXPECT_TRUE(std::isnan(invalid_start.velocities.front()[0]));
+
+  auto invalid_end = make_trajectory();
+  invalid_end.accelerations.back()[0] =
+      std::numeric_limits<double>::infinity();
+  const auto end_error =
+      detail::validate_and_normalize_cartesian_trajectory_output(
+          invalid_end, invalid_end.joint_names, control);
+  ASSERT_TRUE(end_error.has_value());
+  EXPECT_EQ(end_error->details.at("reason"),
+            "cartesian_trajectory_sample_invalid");
+  EXPECT_TRUE(std::isinf(invalid_end.accelerations.back()[0]));
+}
+
+TEST(CartesianTrajectoryContractTest,
+     NormalizesOnlyStructurallyValidFiniteRestBoundaries) {
+  roboplan::JointTrajectory trajectory;
+  trajectory.joint_names = {"joint_1"};
+  trajectory.times = {0.0, 1.0};
+  trajectory.positions = {Eigen::VectorXd::Zero(1),
+                          Eigen::VectorXd::Ones(1)};
+  trajectory.velocities = {Eigen::VectorXd::Ones(1),
+                           Eigen::VectorXd::Ones(1)};
+  trajectory.accelerations = {Eigen::VectorXd::Ones(1),
+                              Eigen::VectorXd::Ones(1)};
+  const CartesianPlanningControl control{[] { return false; },
+                                         [] { return false; }};
+
+  const auto error = detail::validate_and_normalize_cartesian_trajectory_output(
+      trajectory, trajectory.joint_names, control);
+
+  EXPECT_FALSE(error.has_value());
+  EXPECT_TRUE(trajectory.velocities.front().isZero());
+  EXPECT_TRUE(trajectory.velocities.back().isZero());
+  EXPECT_TRUE(trajectory.accelerations.front().isZero());
+  EXPECT_TRUE(trajectory.accelerations.back().isZero());
+}
+
+TEST(CartesianTrajectoryContractTest,
+     DynamicsEnvelopeMeasuresInteriorQuinticExtremaInsteadOfTrustingProducer) {
+  roboplan::JointTrajectory trajectory;
+  trajectory.joint_names = {"joint_1"};
+  trajectory.times = {0.0, 1.0};
+  trajectory.positions = {Eigen::VectorXd::Zero(1),
+                          Eigen::VectorXd::Ones(1)};
+  trajectory.velocities = {Eigen::VectorXd::Zero(1),
+                           Eigen::VectorXd::Zero(1)};
+  trajectory.accelerations = {Eigen::VectorXd::Zero(1),
+                              Eigen::VectorXd::Zero(1)};
+
+  PlanRequestDTO request;
+  request.speed_profile.velocity_scale = 1.0;
+  request.speed_profile.acceleration_scale = 1.0;
+  JointDynamicsLimitDTO limits;
+  limits.max_velocity_rad_s = 1.0;
+  limits.max_acceleration_rad_s2 = 1.0;
+  request.per_joint_dynamics_limits["joint_1"] = limits;
+  const std::vector<double> model_velocity_limits{100.0};
+  const std::vector<double> model_acceleration_limits{100.0};
+  const CartesianPlanningControl control{[] { return false; },
+                                         [] { return false; }};
+
+  const auto envelope = detail::measure_cartesian_joint_dynamics_envelope(
+      request, trajectory, model_velocity_limits, model_acceleration_limits,
+      control);
+
+  ASSERT_TRUE(envelope.ok()) << envelope.error().message;
+  ASSERT_TRUE(envelope.value().complete);
+  EXPECT_NEAR(envelope.value().velocity_ratio, 1.875, 1e-10);
+  EXPECT_NEAR(envelope.value().acceleration_ratio,
+              10.0 / std::sqrt(3.0), 1e-9);
+}
+
+TEST(CartesianTrajectoryContractTest,
+     FrameDynamicsIncludesMultipleMimicDerivativesExactly) {
+  const std::string urdf = R"(
+<robot name="cartesian_mimic_chain">
+  <link name="base"/>
+  <joint name="source" type="prismatic">
+    <parent link="base"/><child link="link_1"/>
+    <axis xyz="1 0 0"/><limit lower="-1" upper="1" effort="1" velocity="2"/>
+  </joint>
+  <link name="link_1"/>
+  <joint name="follower_1" type="prismatic">
+    <parent link="link_1"/><child link="link_2"/>
+    <axis xyz="1 0 0"/><limit lower="-2" upper="2" effort="1" velocity="4"/>
+    <mimic joint="source" multiplier="2" offset="0"/>
+  </joint>
+  <link name="link_2"/>
+  <joint name="follower_2" type="prismatic">
+    <parent link="link_2"/><child link="tip"/>
+    <axis xyz="1 0 0"/><limit lower="-6" upper="6" effort="1" velocity="12"/>
+    <mimic joint="source" multiplier="6" offset="0"/>
+  </joint>
+  <link name="tip"/>
+</robot>)";
+  const std::string srdf = R"(
+<robot name="cartesian_mimic_chain">
+  <group name="arm">
+    <joint name="source"/>
+  </group>
+</robot>)";
+  auto scene = std::make_shared<roboplan::Scene>(
+      "cartesian_mimic_chain", urdf, srdf);
+  const auto group = scene->getJointGroupInfo("arm");
+  ASSERT_TRUE(group.has_value()) << group.error();
+  ASSERT_EQ(group->joint_names, std::vector<std::string>{"source"});
+
+  const auto bounds = detail::resolve_cartesian_kinematic_motion_bounds(
+      scene, "arm", group->joint_names);
+  ASSERT_TRUE(bounds.ok()) << bounds.error().message;
+  EXPECT_DOUBLE_EQ(
+      static_cast<double>(bounds.value().prismatic_amplification[0]), 9.0);
+
+  PlanRequestDTO request;
+  request.group_id = "arm";
+  request.base_frame = "base";
+  request.tcp_frame = "tip";
+  request.speed_profile.velocity_scale = 1.0;
+  request.speed_profile.acceleration_scale = 1.0;
+  CartesianPathDTO path;
+  path.max_linear_speed_mps = 10.0;
+  path.max_angular_speed_rad_s = 10.0;
+  path.max_linear_acceleration_mps2 = 100.0;
+  path.max_angular_acceleration_rad_s2 = 100.0;
+
+  roboplan::JointTrajectory trajectory;
+  trajectory.joint_names = group->joint_names;
+  trajectory.times = {0.0, 1.0};
+  trajectory.positions = {Eigen::VectorXd::Zero(1),
+                          Eigen::VectorXd::Constant(1, 0.1)};
+  trajectory.velocities = {Eigen::VectorXd::Zero(1),
+                           Eigen::VectorXd::Zero(1)};
+  trajectory.accelerations = trajectory.velocities;
+  const CartesianPlanningControl control{[] { return false; },
+                                         [] { return false; }};
+
+  const auto envelope = detail::measure_cartesian_frame_dynamics_envelope(
+      request, path, scene, trajectory, control);
+
+  ASSERT_TRUE(envelope.ok()) << envelope.error().message;
+  ASSERT_TRUE(envelope.value().complete);
+  // A rest-to-rest unit quintic peaks at 1.875 * delta / duration.
+  // This serial chain moves (1 + 2 + 6) times the source coordinate.
+  constexpr double kExactPeakLinearSpeedMps = 1.875 * 0.1 * 9.0;
+  EXPECT_GE(envelope.value().linear_speed_ratio *
+                path.max_linear_speed_mps,
+            kExactPeakLinearSpeedMps * 0.999);
+}
+
+TEST(CartesianBackendErrorMappingTest,
+     PartialPathFailuresCarryStableProgressAndWaypointDetails) {
+  const auto stalled = map_cartesian_backend_failure(
+      "Cartesian differential IK stalled near a singularity", 0.375, 2U);
+  EXPECT_EQ(stalled.code, kErrorCartesianIncomplete);
+  EXPECT_EQ(stalled.details.at("reason"), "cartesian_tracking_stalled");
+  EXPECT_DOUBLE_EQ(std::stod(stalled.details.at("fraction_completed")),
+                   0.375);
+  EXPECT_EQ(stalled.details.at("first_failing_waypoint_index"), "2");
+  EXPECT_EQ(stalled.details.at("failure_stage"), "cartesian_tracking");
+
+  const auto tolerance = map_cartesian_backend_failure(
+      "Reached maximum number of control steps", 0.75, 3U);
+  EXPECT_EQ(tolerance.code, kErrorCartesianIncomplete);
+  EXPECT_EQ(tolerance.details.at("reason"),
+            "cartesian_path_tolerance_exceeded");
+
+  const auto retime = map_cartesian_backend_failure(
+      "TOPP-RA time parameterization failed", 1.0, std::nullopt);
+  EXPECT_EQ(retime.code, kErrorPlanningFailed);
+  EXPECT_EQ(retime.details.at("reason"),
+            "cartesian_time_parameterization_failed");
+  EXPECT_EQ(retime.details.at("failure_stage"),
+            "cartesian_time_parameterization");
+}
+
+TEST(RoboPlanCompatibilityOptionsTest,
+     ProductionDefaultsPreserveQualifiedRoboPlan04Policy) {
+  const auto rrt = production_rrt_options("arm", 2.5);
+  EXPECT_EQ(rrt.group_name, "arm");
+  EXPECT_DOUBLE_EQ(rrt.max_planning_time, 2.5);
+  EXPECT_EQ(rrt.max_nodes, 5000);
+  EXPECT_FALSE(rrt.rrt_star);
+  EXPECT_TRUE(rrt.fast_return);
+
+  const auto shortcut = production_shortcutting_options("arm", 42U);
+  EXPECT_EQ(shortcut.group_name, "arm");
+  EXPECT_DOUBLE_EQ(shortcut.max_step_size, 0.05);
+  EXPECT_EQ(shortcut.max_iters, 100);
+  EXPECT_EQ(shortcut.max_convergence_iters, 0);
+  EXPECT_EQ(shortcut.seed, 42);
+
+  const auto ik = production_planning_ik_options("arm");
+  EXPECT_EQ(ik.group_name, "arm");
+  EXPECT_DOUBLE_EQ(ik.step_size, 0.25);
+  EXPECT_EQ(ik.max_restarts, 50);
+  EXPECT_DOUBLE_EQ(ik.max_time, 1.0);
+  EXPECT_TRUE(ik.fast_return);
+}
+
 class NativeKernelTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -204,6 +536,129 @@ class NativeKernelTest : public ::testing::Test {
         trajectory, options, cancel);
   }
 
+  PlanRequestDTO make_cartesian_request(const std::string& move_id) {
+    PlanRequestDTO request;
+    request.robot_id = bundle_->robot_id;
+    request.group_id = bundle_->group_name;
+    request.move_id = move_id;
+    request.base_frame = "base_link";
+    request.tcp_frame = "tool0";
+    request.start_state = current_state();
+    request.tolerances = {0.05, 0.01, 0.1};
+    request.speed_profile = {0.5, 0.5, 0.05};
+    request.planning_timeout_s = 5.0;
+
+    FkRequestDTO start_fk;
+    start_fk.robot_state = request.start_state;
+    start_fk.target_frame = request.tcp_frame;
+    start_fk.base_frame = request.base_frame;
+    const auto start_pose = forward_kinematics(start_fk);
+
+    auto target_state = request.start_state;
+    const auto limits = joint_limits(request.robot_id, request.group_id);
+    const std::size_t joint_index = target_state.positions_rad.size() - 1;
+    const double lower = limits.position_lower_rad[joint_index];
+    const double upper = limits.position_upper_rad[joint_index];
+    target_state.positions_rad[joint_index] = std::clamp(
+        target_state.positions_rad[joint_index] + 0.03, lower + 0.01,
+        upper - 0.01);
+    FkRequestDTO target_fk;
+    target_fk.robot_state = target_state;
+    target_fk.target_frame = request.tcp_frame;
+    target_fk.base_frame = request.base_frame;
+
+    CartesianPathDTO path;
+    path.waypoints = {start_pose, forward_kinematics(target_fk)};
+    path.max_translation_step_m = 0.002;
+    path.max_rotation_step_rad = 0.02;
+    path.speed_mode = CartesianSpeedModeDTO::kBounded;
+    path.max_linear_speed_mps = 0.03;
+    path.max_angular_speed_rad_s = 0.2;
+    path.max_linear_acceleration_mps2 = 0.2;
+    path.max_angular_acceleration_rad_s2 = 1.0;
+    request.motion = std::move(path);
+    bind_plan_request(request);
+    return request;
+  }
+
+  struct DenseCartesianDynamics {
+    double linear_speed_mps = 0.0;
+    double angular_speed_rad_s = 0.0;
+    double linear_acceleration_mps2 = 0.0;
+    double angular_acceleration_rad_s2 = 0.0;
+  };
+
+  DenseCartesianDynamics measure_dense_cartesian_dynamics(
+      const PlanRequestDTO& request, const TrajectoryDTO& trajectory,
+      double sample_period_s = 0.0002) const {
+    if (!validate_trajectory_for_sampling(trajectory).ok() ||
+        trajectory.waypoints.empty() || sample_period_s <= 0.0) {
+      throw std::runtime_error("dense Cartesian test trajectory is invalid");
+    }
+    const double end_time = trajectory.waypoints.back().time_from_start_s;
+    const std::size_t sample_count =
+        static_cast<std::size_t>(std::ceil(end_time / sample_period_s));
+    TrajectorySampleResult sampled;
+    std::optional<Eigen::Matrix4d> previous_pose;
+    std::optional<Eigen::Vector3d> previous_linear_velocity;
+    std::optional<Eigen::Vector3d> previous_angular_velocity;
+    std::optional<double> previous_interval_s;
+    double previous_time_s = 0.0;
+    DenseCartesianDynamics peak;
+    for (std::size_t index = 0; index <= sample_count; ++index) {
+      const double time_s =
+          std::min(end_time, static_cast<double>(index) * sample_period_s);
+      if (!sample_trajectory_prevalidated(trajectory, time_s, sampled).ok()) {
+        throw std::runtime_error("dense Cartesian trajectory sampling failed");
+      }
+      Eigen::Map<const Eigen::VectorXd> group_positions(
+          sampled.positions_rad.data(),
+          static_cast<Eigen::Index>(sampled.positions_rad.size()));
+      const auto full_positions = bundle_->scene->toFullJointPositions(
+          request.group_id, group_positions);
+      const auto pose = bundle_->scene->forwardKinematics(
+          full_positions, request.tcp_frame, request.base_frame);
+      if (previous_pose.has_value()) {
+        const double interval_s = time_s - previous_time_s;
+        if (interval_s <= 0.0) {
+          throw std::runtime_error("dense Cartesian sample time regressed");
+        }
+        const Eigen::Vector3d linear_velocity =
+            (pose.block<3, 1>(0, 3) -
+             previous_pose->block<3, 1>(0, 3)) /
+            interval_s;
+        const Eigen::AngleAxisd angular_delta(
+            pose.block<3, 3>(0, 0) *
+            previous_pose->block<3, 3>(0, 0).transpose());
+        const Eigen::Vector3d angular_velocity =
+            angular_delta.axis() * angular_delta.angle() / interval_s;
+        peak.linear_speed_mps =
+            std::max(peak.linear_speed_mps, linear_velocity.norm());
+        peak.angular_speed_rad_s =
+            std::max(peak.angular_speed_rad_s, angular_velocity.norm());
+        if (previous_linear_velocity.has_value() &&
+            previous_interval_s.has_value()) {
+          const double midpoint_interval_s =
+              0.5 * (*previous_interval_s + interval_s);
+          peak.linear_acceleration_mps2 = std::max(
+              peak.linear_acceleration_mps2,
+              (linear_velocity - *previous_linear_velocity).norm() /
+                  midpoint_interval_s);
+          peak.angular_acceleration_rad_s2 = std::max(
+              peak.angular_acceleration_rad_s2,
+              (angular_velocity - *previous_angular_velocity).norm() /
+                  midpoint_interval_s);
+        }
+        previous_linear_velocity = linear_velocity;
+        previous_angular_velocity = angular_velocity;
+        previous_interval_s = interval_s;
+      }
+      previous_pose = pose;
+      previous_time_s = time_s;
+    }
+    return peak;
+  }
+
   TrajectoryDTO stationary_trajectory() const {
     const auto state = current_state();
     TrajectoryDTO trajectory;
@@ -222,12 +677,8 @@ class NativeKernelTest : public ::testing::Test {
 
 // --- Factory ---
 
-TEST_F(NativeKernelTest, FactoryCreatesAllComponents) {
+TEST_F(NativeKernelTest, FactoryCreatesOperationalComponents) {
   EXPECT_NE(bundle_->scene, nullptr);
-  EXPECT_NE(bundle_->rrt, nullptr);
-  EXPECT_NE(bundle_->shortcutter, nullptr);
-  EXPECT_NE(bundle_->toppra, nullptr);
-  EXPECT_NE(bundle_->ik, nullptr);
   EXPECT_NE(bundle_->planner, nullptr);
   EXPECT_NE(bundle_->projection_backend, nullptr);
   EXPECT_NE(bundle_->execution, nullptr);
@@ -281,8 +732,7 @@ TEST_F(NativeKernelTest,
   rrt_options.max_nodes = 5000;
   RoboPlanPlannerBackend planner(
       bundle_->scene_projection, bundle_->scene, rrt_options,
-      bundle_->scene_mutex, bundle_->single_shot_ik, std::nullopt,
-      std::nullopt, 12345U, observer);
+      bundle_->scene_mutex, std::nullopt, std::nullopt, 12345U, observer);
 
   PlanRequestDTO request;
   request.robot_id = "robot1";
@@ -317,13 +767,15 @@ TEST_F(NativeKernelTest,
   EXPECT_EQ(metrics.rng_base_seed, 12345U);
   EXPECT_EQ(metrics.rng_seed, 12345U);
   ASSERT_TRUE(metrics.shortcut_rng_seed_argument.has_value());
-  EXPECT_LT(*metrics.shortcut_rng_seed_argument, 0);
+  EXPECT_EQ(*metrics.shortcut_rng_seed_argument,
+            static_cast<int>(*metrics.rng_seed));
   EXPECT_EQ(metrics.planning_attempt_index, 0U);
   const auto& retry_metrics = observer->samples.back();
   EXPECT_EQ(retry_metrics.rng_base_seed, 12345U);
   ASSERT_TRUE(retry_metrics.rng_seed.has_value());
   EXPECT_NE(*retry_metrics.rng_seed, 12345U);
   ASSERT_TRUE(retry_metrics.shortcut_rng_seed_argument.has_value());
+  EXPECT_GE(*retry_metrics.shortcut_rng_seed_argument, 0);
   EXPECT_NE(*retry_metrics.shortcut_rng_seed_argument,
             *metrics.shortcut_rng_seed_argument);
   EXPECT_EQ(retry_metrics.planning_attempt_index, 1U);
@@ -338,6 +790,648 @@ TEST_F(NativeKernelTest,
     ASSERT_NE(stage, metrics.stages.end()) << stage_name;
     EXPECT_GT(stage->second.duration_ns, 0U) << stage_name;
   }
+}
+
+TEST_F(NativeKernelTest,
+       CartesianPlannerMapsPortableRequestAndPreservesOutputInvariants) {
+  auto request = make_cartesian_request("cartesian_portable_success");
+  const auto requested_path = std::get<CartesianPathDTO>(request.motion);
+
+  const auto result = bundle_->planner->plan(request);
+  ASSERT_TRUE(result.trajectory.has_value())
+      << (result.error ? result.error->message : "missing trajectory");
+  EXPECT_EQ(result.scene_revision.revision_id,
+            request.scene_binding.revision.revision_id);
+  EXPECT_EQ(result.scene_revision.content_hash,
+            request.scene_binding.revision.content_hash);
+  ASSERT_GE(result.trajectory->waypoints.size(), 2U);
+  EXPECT_EQ(result.trajectory->joint_names, request.start_state.joint_names);
+  EXPECT_DOUBLE_EQ(result.trajectory->waypoints.front().time_from_start_s,
+                   0.0);
+  for (const auto* boundary : {&result.trajectory->waypoints.front(),
+                               &result.trajectory->waypoints.back()}) {
+    ASSERT_EQ(boundary->velocities_rad_s.size(),
+              result.trajectory->joint_names.size());
+    ASSERT_EQ(boundary->accelerations_rad_s2.size(),
+              result.trajectory->joint_names.size());
+    EXPECT_TRUE(std::all_of(boundary->velocities_rad_s.begin(),
+                            boundary->velocities_rad_s.end(),
+                            [](double value) { return value == 0.0; }));
+    EXPECT_TRUE(std::all_of(boundary->accelerations_rad_s2.begin(),
+                            boundary->accelerations_rad_s2.end(),
+                            [](double value) { return value == 0.0; }));
+  }
+
+  double previous_time = -1.0;
+  for (const auto& waypoint : result.trajectory->waypoints) {
+    EXPECT_TRUE(std::isfinite(waypoint.time_from_start_s));
+    EXPECT_GT(waypoint.time_from_start_s, previous_time);
+    EXPECT_EQ(waypoint.positions_rad.size(),
+              result.trajectory->joint_names.size());
+    EXPECT_TRUE(std::all_of(
+        waypoint.positions_rad.begin(), waypoint.positions_rad.end(),
+        [](double value) { return std::isfinite(value); }));
+    previous_time = waypoint.time_from_start_s;
+  }
+  const auto validation = validate_non_collision(*result.trajectory);
+  ASSERT_TRUE(validation.valid)
+      << (validation.error ? validation.error->message
+                           : "missing validation error");
+
+  const auto model_velocity_limits =
+      bundle_->scene->getVelocityLimitVectors(request.group_id);
+  const auto model_acceleration_limits =
+      bundle_->scene->getAccelerationLimitVectors(request.group_id);
+  ASSERT_TRUE(model_velocity_limits.has_value());
+  ASSERT_TRUE(model_acceleration_limits.has_value());
+  ASSERT_EQ(model_velocity_limits->second.size(),
+            static_cast<Eigen::Index>(result.trajectory->joint_names.size()));
+  ASSERT_EQ(model_acceleration_limits->second.size(),
+            static_cast<Eigen::Index>(result.trajectory->joint_names.size()));
+  for (const auto& waypoint : result.trajectory->waypoints) {
+    for (std::size_t joint = 0; joint < result.trajectory->joint_names.size();
+         ++joint) {
+      EXPECT_LE(
+          std::abs(waypoint.velocities_rad_s[joint]),
+          std::abs(model_velocity_limits->second[
+              static_cast<Eigen::Index>(joint)]) *
+              request.speed_profile.velocity_scale * 1.01);
+      EXPECT_LE(
+          std::abs(waypoint.accelerations_rad_s2[joint]),
+          std::abs(model_acceleration_limits->second[
+              static_cast<Eigen::Index>(joint)]) *
+              request.speed_profile.acceleration_scale * 1.01);
+    }
+  }
+
+  RobotStateDTO final_state;
+  final_state.joint_names = result.trajectory->joint_names;
+  final_state.positions_rad =
+      result.trajectory->waypoints.back().positions_rad;
+  FkRequestDTO final_fk{final_state, request.tcp_frame, request.base_frame};
+  const auto actual_end = forward_kinematics(final_fk);
+  const auto& expected_end = requested_path.waypoints.back();
+  const double translation_error = std::sqrt(
+      std::pow(actual_end.position_m.x_m - expected_end.position_m.x_m, 2) +
+      std::pow(actual_end.position_m.y_m - expected_end.position_m.y_m, 2) +
+      std::pow(actual_end.position_m.z_m - expected_end.position_m.z_m, 2));
+  Eigen::Quaterniond actual_orientation(
+      actual_end.orientation.w, actual_end.orientation.x,
+      actual_end.orientation.y, actual_end.orientation.z);
+  Eigen::Quaterniond expected_orientation(
+      expected_end.orientation.w, expected_end.orientation.x,
+      expected_end.orientation.y, expected_end.orientation.z);
+  actual_orientation.normalize();
+  expected_orientation.normalize();
+  const double rotation_error = 2.0 * std::acos(std::clamp(
+      std::abs(actual_orientation.dot(expected_orientation)), 0.0, 1.0));
+  EXPECT_LE(translation_error, request.tolerances.translation_tol_m);
+  EXPECT_LE(rotation_error, request.tolerances.rotation_tol_rad);
+}
+
+TEST_F(NativeKernelTest,
+       CartesianPlannerNormalizesLargeFiniteScaleEquivalentQuaternions) {
+  auto request = make_cartesian_request("cartesian_large_finite_quaternion");
+  auto& path = std::get<CartesianPathDTO>(request.motion);
+  constexpr double kFiniteScale = 1e300;
+  for (auto& waypoint : path.waypoints) {
+    waypoint.orientation.x *= kFiniteScale;
+    waypoint.orientation.y *= kFiniteScale;
+    waypoint.orientation.z *= kFiniteScale;
+    waypoint.orientation.w *= kFiniteScale;
+  }
+
+  const auto result = bundle_->planner->plan(request);
+
+  ASSERT_TRUE(result.trajectory.has_value())
+      << (result.error ? result.error->message : "missing trajectory");
+}
+
+TEST_F(NativeKernelTest,
+       CartesianInterpolantCertificateDetectsMotionHiddenBetweenWaypoints) {
+  auto request = make_cartesian_request("cartesian_hidden_interpolant_motion");
+  const auto joint_count = request.start_state.joint_names.size();
+  ASSERT_GT(joint_count, 0U);
+
+  roboplan::JointTrajectory trajectory;
+  trajectory.joint_names = request.start_state.joint_names;
+  trajectory.times = {0.0, 1.0, 2.0};
+  const Eigen::Map<const Eigen::VectorXd> start(
+      request.start_state.positions_rad.data(),
+      static_cast<Eigen::Index>(joint_count));
+  trajectory.positions = {start, start, start};
+  trajectory.velocities = {
+      Eigen::VectorXd::Zero(static_cast<Eigen::Index>(joint_count)),
+      Eigen::VectorXd::Zero(static_cast<Eigen::Index>(joint_count)),
+      Eigen::VectorXd::Zero(static_cast<Eigen::Index>(joint_count))};
+  trajectory.accelerations = trajectory.velocities;
+  trajectory.velocities[1][0] = 0.2;
+  const CartesianPlanningControl control{[] { return false; },
+                                         [] { return false; }};
+  constexpr double kTranslationTolerance = 1e-3;
+  constexpr double kRotationTolerance = 1e-3;
+
+  const auto sampled = detail::sample_cartesian_interpolant_path(
+      request, bundle_->scene->clone(), trajectory, kTranslationTolerance,
+      kRotationTolerance, control);
+
+  ASSERT_TRUE(sampled.ok()) << sampled.error().message;
+  EXPECT_GT(sampled.value().poses.size(), trajectory.positions.size());
+  EXPECT_LE(sampled.value().unsampled_translation_bound_m,
+            kTranslationTolerance * 0.25 * (1.0 + 1e-12));
+  EXPECT_LE(sampled.value().unsampled_rotation_bound_rad,
+            kRotationTolerance * 0.25 * (1.0 + 1e-12));
+
+  const auto start_pose = sampled.value().poses.front();
+  const std::vector<Eigen::Matrix4d> producer_waypoint_path{
+      start_pose, start_pose, start_pose};
+  EXPECT_TRUE(verify_cartesian_path_fidelity(
+                  producer_waypoint_path, producer_waypoint_path,
+                  kTranslationTolerance, kRotationTolerance)
+                  .complete);
+  const auto continuous_report = verify_cartesian_path_fidelity(
+      producer_waypoint_path, sampled.value().poses,
+      kTranslationTolerance -
+          sampled.value().unsampled_translation_bound_m,
+      kRotationTolerance - sampled.value().unsampled_rotation_bound_rad);
+  EXPECT_FALSE(continuous_report.complete);
+  EXPECT_TRUE(
+      continuous_report.first_failing_path_sample_index.has_value());
+}
+
+TEST_F(NativeKernelTest,
+       CartesianInterpolantCertificateRejectsUnrepresentableResolution) {
+  auto request = make_cartesian_request("cartesian_interpolant_budget");
+  const auto joint_count = request.start_state.joint_names.size();
+  ASSERT_GT(joint_count, 0U);
+
+  roboplan::JointTrajectory trajectory;
+  trajectory.joint_names = request.start_state.joint_names;
+  trajectory.times = {0.0, 1.0};
+  const Eigen::Map<const Eigen::VectorXd> start(
+      request.start_state.positions_rad.data(),
+      static_cast<Eigen::Index>(joint_count));
+  auto end = Eigen::VectorXd(start);
+  end[0] += 0.01;
+  trajectory.positions = {start, end};
+  trajectory.velocities = {
+      Eigen::VectorXd::Zero(static_cast<Eigen::Index>(joint_count)),
+      Eigen::VectorXd::Zero(static_cast<Eigen::Index>(joint_count))};
+  trajectory.accelerations = trajectory.velocities;
+  const CartesianPlanningControl control{[] { return false; },
+                                         [] { return false; }};
+
+  const auto sampled = detail::sample_cartesian_interpolant_path(
+      request, bundle_->scene->clone(), trajectory,
+      1e-12, 1e-12, control);
+
+  ASSERT_FALSE(sampled.ok());
+  EXPECT_EQ(sampled.error().details.at("reason"),
+            "cartesian_resource_budget_exceeded");
+  EXPECT_EQ(sampled.error().details.at("resource"),
+            "interpolant_fidelity_samples");
+}
+
+TEST_F(NativeKernelTest,
+       PoseGoalPlannerConformancePreservesPortableTrajectoryInvariants) {
+  PlanRequestDTO request;
+  request.robot_id = bundle_->robot_id;
+  request.group_id = bundle_->group_name;
+  request.move_id = "pose_goal_05_conformance";
+  request.base_frame = "base_link";
+  request.tcp_frame = "tool0";
+  request.start_state = current_state();
+  request.tolerances = {0.05, 0.01, 0.1};
+  request.speed_profile = {0.5, 0.5, 0.05};
+  request.planning_timeout_s = 5.0;
+
+  auto target_state = request.start_state;
+  target_state.positions_rad.back() += 0.03;
+  PoseGoalDTO goal;
+  goal.goal = forward_kinematics(
+      FkRequestDTO{target_state, request.tcp_frame, request.base_frame});
+  request.motion = goal;
+  bind_plan_request(request);
+
+  const auto result = bundle_->planner->plan(request);
+  ASSERT_TRUE(result.trajectory.has_value())
+      << (result.error ? result.error->message : "missing trajectory");
+  EXPECT_EQ(result.scene_revision.revision_id,
+            request.scene_binding.revision.revision_id);
+  EXPECT_EQ(result.scene_revision.content_hash,
+            request.scene_binding.revision.content_hash);
+  ASSERT_GE(result.trajectory->waypoints.size(), 2U);
+  EXPECT_EQ(result.trajectory->joint_names, request.start_state.joint_names);
+
+  double previous_time = -1.0;
+  for (const auto& waypoint : result.trajectory->waypoints) {
+    EXPECT_GT(waypoint.time_from_start_s, previous_time);
+    EXPECT_EQ(waypoint.positions_rad.size(),
+              result.trajectory->joint_names.size());
+    EXPECT_EQ(waypoint.velocities_rad_s.size(),
+              result.trajectory->joint_names.size());
+    EXPECT_EQ(waypoint.accelerations_rad_s2.size(),
+              result.trajectory->joint_names.size());
+    RobotStateDTO state;
+    state.joint_names = result.trajectory->joint_names;
+    state.positions_rad = waypoint.positions_rad;
+    EXPECT_FALSE(authoritative_collision(state).in_collision);
+    previous_time = waypoint.time_from_start_s;
+  }
+  EXPECT_TRUE(validate_non_collision(*result.trajectory).valid);
+
+  RobotStateDTO final_state;
+  final_state.joint_names = result.trajectory->joint_names;
+  final_state.positions_rad =
+      result.trajectory->waypoints.back().positions_rad;
+  const auto actual = forward_kinematics(
+      FkRequestDTO{final_state, request.tcp_frame, request.base_frame});
+  const double translation_error = std::sqrt(
+      std::pow(actual.position_m.x_m - goal.goal.position_m.x_m, 2) +
+      std::pow(actual.position_m.y_m - goal.goal.position_m.y_m, 2) +
+      std::pow(actual.position_m.z_m - goal.goal.position_m.z_m, 2));
+  EXPECT_LE(translation_error, request.tolerances.translation_tol_m);
+}
+
+TEST_F(NativeKernelTest,
+       CartesianPlannerRejectsMismatchedStartAndUnknownFrameStructurally) {
+  auto mismatched = make_cartesian_request("cartesian_start_mismatch");
+  auto& mismatched_path = std::get<CartesianPathDTO>(mismatched.motion);
+  mismatched_path.waypoints.front().position_m.x_m += 0.2;
+  auto result = bundle_->planner->plan(mismatched);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidRequest);
+  EXPECT_EQ(result.error->details.at("reason"),
+            "cartesian_start_waypoint_mismatch");
+
+  auto unknown_frame = make_cartesian_request("cartesian_unknown_frame");
+  unknown_frame.tcp_frame = "missing_tcp_frame";
+  result = bundle_->planner->plan(unknown_frame);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidRequest);
+  EXPECT_EQ(result.error->details.at("reason"), "cartesian_frame_unknown");
+  EXPECT_EQ(result.error->details.at("frame_role"), "tcp");
+}
+
+TEST_F(NativeKernelTest,
+       CartesianPlannerRejectsUnrepresentableDensificationBeforeAllocation) {
+  auto request = make_cartesian_request("cartesian_density_overflow");
+  auto& path = std::get<CartesianPathDTO>(request.motion);
+  path.max_translation_step_m = std::numeric_limits<double>::min();
+  path.max_rotation_step_rad = std::numeric_limits<double>::min();
+
+  const auto result = bundle_->planner->plan(request);
+
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidRequest);
+  EXPECT_EQ(result.error->details.at("reason"), "cartesian_path_too_dense");
+}
+
+TEST_F(NativeKernelTest,
+       CartesianPlannerRejectsSubnormalLimitsAtNeutralBoundary) {
+  auto request = make_cartesian_request("cartesian_subnormal_limit");
+  auto& path = std::get<CartesianPathDTO>(request.motion);
+  path.max_linear_speed_mps = std::numeric_limits<double>::denorm_min();
+
+  const auto result = bundle_->planner->plan(request);
+
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidRequest);
+  EXPECT_EQ(result.error->details.at("reason"),
+            "cartesian_bounded_limit_invalid");
+}
+
+TEST_F(NativeKernelTest,
+       CartesianPlannerRejectsUnrepresentableReferenceAndServoBudgets) {
+  const auto expect_budget_rejection = [this](PlanRequestDTO request) {
+    const auto result = bundle_->planner->plan(request);
+    ASSERT_TRUE(result.error.has_value());
+    EXPECT_EQ(result.error->code, kErrorCartesianIncomplete);
+    EXPECT_EQ(result.error->details.at("reason"),
+              "cartesian_resource_budget_exceeded");
+    EXPECT_EQ(result.error->details.at("failure_stage"),
+              "cartesian_tracking");
+  };
+
+  auto speed_overflow = make_cartesian_request("cartesian_speed_overflow");
+  auto& speed_path = std::get<CartesianPathDTO>(speed_overflow.motion);
+  // The fixture's joint-derived target can clamp back to its start pose. Make
+  // the reference length explicit so this test reaches duration accounting.
+  speed_path.waypoints.back().position_m.x_m += 0.01;
+  speed_path.max_linear_speed_mps = std::numeric_limits<double>::min();
+  speed_path.max_angular_speed_rad_s =
+      std::numeric_limits<double>::min();
+  expect_budget_rejection(std::move(speed_overflow));
+
+  auto acceleration_overflow =
+      make_cartesian_request("cartesian_acceleration_overflow");
+  auto& acceleration_path =
+      std::get<CartesianPathDTO>(acceleration_overflow.motion);
+  acceleration_path.waypoints.back().position_m.x_m += 0.01;
+  acceleration_path.max_linear_acceleration_mps2 =
+      std::numeric_limits<double>::min();
+  acceleration_path.max_angular_acceleration_rad_s2 =
+      std::numeric_limits<double>::min();
+  expect_budget_rejection(std::move(acceleration_overflow));
+}
+
+TEST_F(NativeKernelTest,
+       CartesianPlannerCancellationAndDeadlineAreBoundedAndDistinct) {
+  auto request = make_cartesian_request("cartesian_control_checks");
+  const auto path = std::get<CartesianPathDTO>(request.motion);
+
+  auto cancelled = plan_cartesian_path(
+      request, path, bundle_->scene->clone(),
+      CartesianPlanningControl{[] { return true; }, [] { return false; }});
+  ASSERT_FALSE(cancelled.ok());
+  EXPECT_EQ(cancelled.error().code, kErrorPlanningFailed);
+  EXPECT_EQ(cancelled.error().details.at("reason"),
+            "planning_cancelled_by_interrupt");
+
+  auto timed_out = plan_cartesian_path(
+      request, path, bundle_->scene->clone(),
+      CartesianPlanningControl{[] { return false; }, [] { return true; }});
+  ASSERT_FALSE(timed_out.ok());
+  EXPECT_EQ(timed_out.error().code, kErrorPlanningTimeout);
+  EXPECT_EQ(timed_out.error().details.at("reason"), "planning_timeout");
+}
+
+TEST_F(NativeKernelTest,
+       CartesianBoundedModeIncludesLaunchAndTerminalAcceleration) {
+  auto request = make_cartesian_request("cartesian_rest_boundary_acceleration");
+  const auto path = std::get<CartesianPathDTO>(request.motion);
+
+  const auto result = bundle_->planner->plan(request);
+  ASSERT_TRUE(result.trajectory.has_value())
+      << (result.error ? result.error->message : "missing trajectory");
+  ASSERT_GE(result.trajectory->waypoints.size(), 2U);
+
+  std::vector<Eigen::Vector3d> linear_velocities;
+  std::vector<Eigen::Vector3d> angular_velocities;
+  std::vector<double> durations;
+  linear_velocities.reserve(result.trajectory->waypoints.size() - 1);
+  angular_velocities.reserve(result.trajectory->waypoints.size() - 1);
+  durations.reserve(result.trajectory->waypoints.size() - 1);
+
+  auto pose_matrix = [](const Pose3DTO& pose) {
+    Eigen::Matrix4d matrix = Eigen::Matrix4d::Identity();
+    Eigen::Quaterniond orientation(pose.orientation.w, pose.orientation.x,
+                                   pose.orientation.y, pose.orientation.z);
+    orientation.normalize();
+    matrix.block<3, 3>(0, 0) = orientation.toRotationMatrix();
+    matrix.block<3, 1>(0, 3) =
+        Eigen::Vector3d{pose.position_m.x_m, pose.position_m.y_m,
+                        pose.position_m.z_m};
+    return matrix;
+  };
+
+  std::optional<Eigen::Matrix4d> previous_pose;
+  double previous_time = 0.0;
+  for (const auto& waypoint : result.trajectory->waypoints) {
+    RobotStateDTO state;
+    state.joint_names = result.trajectory->joint_names;
+    state.positions_rad = waypoint.positions_rad;
+    const auto current_pose = pose_matrix(forward_kinematics(
+        FkRequestDTO{state, request.tcp_frame, request.base_frame}));
+    if (previous_pose.has_value()) {
+      const double duration = waypoint.time_from_start_s - previous_time;
+      ASSERT_GT(duration, 0.0);
+      durations.push_back(duration);
+      linear_velocities.push_back(
+          (current_pose.block<3, 1>(0, 3) -
+           previous_pose->block<3, 1>(0, 3)) /
+          duration);
+      const Eigen::AngleAxisd rotation_delta(
+          current_pose.block<3, 3>(0, 0) *
+          previous_pose->block<3, 3>(0, 0).transpose());
+      angular_velocities.push_back(
+          rotation_delta.axis() * rotation_delta.angle() / duration);
+    }
+    previous_pose = current_pose;
+    previous_time = waypoint.time_from_start_s;
+  }
+
+  auto peak_rest_bounded_acceleration = [&](const auto& velocities) {
+    double peak = velocities.front().norm() / (0.5 * durations.front());
+    for (std::size_t segment = 1; segment < velocities.size(); ++segment) {
+      peak = std::max(
+          peak,
+          (velocities[segment] - velocities[segment - 1]).norm() /
+              (0.5 * (durations[segment - 1] + durations[segment])));
+    }
+    return std::max(
+        peak, velocities.back().norm() / (0.5 * durations.back()));
+  };
+
+  for (const auto& velocity : linear_velocities) {
+    EXPECT_LE(velocity.norm(),
+              path.max_linear_speed_mps *
+                  request.speed_profile.velocity_scale * 1.01);
+  }
+  for (const auto& velocity : angular_velocities) {
+    EXPECT_LE(velocity.norm(),
+              path.max_angular_speed_rad_s *
+                  request.speed_profile.velocity_scale * 1.01);
+  }
+
+  EXPECT_LE(peak_rest_bounded_acceleration(linear_velocities),
+            path.max_linear_acceleration_mps2 *
+                request.speed_profile.acceleration_scale * 1.01);
+  EXPECT_LE(peak_rest_bounded_acceleration(angular_velocities),
+            path.max_angular_acceleration_rad_s2 *
+                request.speed_profile.acceleration_scale * 1.01);
+
+  // The controller executes the quintic interpolation implied by the stamped
+  // position/velocity/acceleration waypoints. Prove the bounded-mode contract
+  // against that interpolant as well as waypoint-to-waypoint averages; a
+  // rest-to-rest quintic can otherwise hide a peak between both endpoints.
+  const auto dense = measure_dense_cartesian_dynamics(request,
+                                                       *result.trajectory);
+  EXPECT_LE(dense.linear_speed_mps,
+            path.max_linear_speed_mps *
+                request.speed_profile.velocity_scale * 1.01);
+  EXPECT_LE(dense.angular_speed_rad_s,
+            path.max_angular_speed_rad_s *
+                request.speed_profile.velocity_scale * 1.01);
+  EXPECT_LE(dense.linear_acceleration_mps2,
+            path.max_linear_acceleration_mps2 *
+                request.speed_profile.acceleration_scale * 1.01);
+  EXPECT_LE(dense.angular_acceleration_rad_s2,
+            path.max_angular_acceleration_rad_s2 *
+                request.speed_profile.acceleration_scale * 1.01);
+}
+
+TEST_F(NativeKernelTest,
+       CartesianDynamicsCertificateHandlesMovingBaseFrames) {
+  auto request = make_cartesian_request("cartesian_moving_base_certificate");
+  request.base_frame = "wrist_1_link";
+  request.speed_profile = {1.0, 1.0, std::nullopt};
+  auto path = std::get<CartesianPathDTO>(request.motion);
+  path.max_linear_speed_mps = 10.0;
+  path.max_angular_speed_rad_s = 10.0;
+  path.max_linear_acceleration_mps2 = 10.0;
+  path.max_angular_acceleration_rad_s2 = 10.0;
+
+  roboplan::JointTrajectory native;
+  native.joint_names = request.start_state.joint_names;
+  Eigen::VectorXd start(static_cast<Eigen::Index>(native.joint_names.size()));
+  for (std::size_t joint = 0; joint < native.joint_names.size(); ++joint) {
+    start[static_cast<Eigen::Index>(joint)] =
+        request.start_state.positions_rad[joint];
+  }
+  Eigen::VectorXd finish = start;
+  finish[0] += 0.04;
+  finish[1] -= 0.03;
+  finish[finish.size() - 1] += 0.05;
+  native.positions = {start, finish};
+  native.times = {0.0, 2.0};
+  native.velocities = {
+      Eigen::VectorXd::Zero(start.size()),
+      Eigen::VectorXd::Zero(start.size())};
+  native.accelerations = {
+      Eigen::VectorXd::Zero(start.size()),
+      Eigen::VectorXd::Zero(start.size())};
+
+  const auto certified =
+      detail::measure_cartesian_frame_dynamics_envelope(
+          request, path, bundle_->scene->clone(), native,
+          CartesianPlanningControl{[] { return false; },
+                                   [] { return false; }});
+  ASSERT_TRUE(certified.ok()) << certified.error().message;
+  ASSERT_TRUE(certified.value().complete);
+  EXPECT_LT(certified.value().interval_checks, 128U);
+
+  TrajectoryDTO executable;
+  executable.joint_names = native.joint_names;
+  for (std::size_t sample = 0; sample < native.positions.size(); ++sample) {
+    TrajectoryWaypointDTO waypoint;
+    waypoint.time_from_start_s = native.times[sample];
+    waypoint.positions_rad.assign(native.positions[sample].data(),
+                                  native.positions[sample].data() +
+                                      native.positions[sample].size());
+    waypoint.velocities_rad_s.assign(native.velocities[sample].data(),
+                                     native.velocities[sample].data() +
+                                         native.velocities[sample].size());
+    waypoint.accelerations_rad_s2.assign(
+        native.accelerations[sample].data(),
+        native.accelerations[sample].data() +
+            native.accelerations[sample].size());
+    executable.waypoints.push_back(std::move(waypoint));
+  }
+  const auto dense =
+      measure_dense_cartesian_dynamics(request, executable, 0.0001);
+  EXPECT_GE(certified.value().linear_speed_ratio *
+                path.max_linear_speed_mps,
+            dense.linear_speed_mps * 0.999);
+  EXPECT_GE(certified.value().angular_speed_ratio *
+                path.max_angular_speed_rad_s,
+            dense.angular_speed_rad_s * 0.999);
+  EXPECT_GE(certified.value().linear_acceleration_ratio *
+                path.max_linear_acceleration_mps2,
+            dense.linear_acceleration_mps2 * 0.999);
+  EXPECT_GE(certified.value().angular_acceleration_ratio *
+                path.max_angular_acceleration_rad_s2,
+            dense.angular_acceleration_rad_s2 * 0.999);
+}
+
+TEST_F(NativeKernelTest,
+       CartesianPlannerCooperativelyCancelsAfterBackendWorkBegins) {
+  auto request = make_cartesian_request("cartesian_in_flight_cancel");
+  const auto path = std::get<CartesianPathDTO>(request.motion);
+  std::atomic<int> cancellation_checks{0};
+  const auto started = std::chrono::steady_clock::now();
+
+  auto cancelled = plan_cartesian_path(
+      request, path, bundle_->scene->clone(),
+      CartesianPlanningControl{
+          [&] {
+            return cancellation_checks.fetch_add(1,
+                                                 std::memory_order_relaxed) >=
+                   8;
+          },
+          [] { return false; }});
+
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  ASSERT_FALSE(cancelled.ok());
+  EXPECT_EQ(cancelled.error().code, kErrorPlanningFailed);
+  EXPECT_EQ(cancelled.error().details.at("reason"),
+            "planning_cancelled_by_interrupt");
+  EXPECT_GT(cancellation_checks.load(std::memory_order_relaxed), 8);
+  EXPECT_LT(elapsed, std::chrono::seconds(1));
+}
+
+TEST_F(NativeKernelTest,
+       CartesianPerJointDynamicsCapRetimesWithoutChangingPath) {
+  auto baseline_request = make_cartesian_request("cartesian_cap_baseline");
+  const auto baseline = bundle_->planner->plan(baseline_request);
+  ASSERT_TRUE(baseline.trajectory.has_value())
+      << (baseline.error ? baseline.error->message : "missing trajectory");
+
+  double peak_velocity = 0.0;
+  std::size_t peak_joint_index = 0;
+  for (const auto& waypoint : baseline.trajectory->waypoints) {
+    for (std::size_t joint = 0; joint < waypoint.velocities_rad_s.size();
+         ++joint) {
+      if (std::abs(waypoint.velocities_rad_s[joint]) > peak_velocity) {
+        peak_velocity = std::abs(waypoint.velocities_rad_s[joint]);
+        peak_joint_index = joint;
+      }
+    }
+  }
+  ASSERT_GT(peak_velocity, 0.0);
+  ASSERT_LT(peak_joint_index, baseline.trajectory->joint_names.size());
+
+  auto capped_request = make_cartesian_request("cartesian_cap_enforced");
+  JointDynamicsLimitDTO limit;
+  limit.max_velocity_rad_s = peak_velocity * 0.5;
+  capped_request.per_joint_dynamics_limits
+      [baseline.trajectory->joint_names[peak_joint_index]] = limit;
+  const auto capped = bundle_->planner->plan(capped_request);
+  ASSERT_TRUE(capped.trajectory.has_value())
+      << (capped.error ? capped.error->message : "missing trajectory");
+
+  double capped_peak = 0.0;
+  for (const auto& waypoint : capped.trajectory->waypoints) {
+    ASSERT_LT(peak_joint_index, waypoint.velocities_rad_s.size());
+    capped_peak = std::max(
+        capped_peak, std::abs(waypoint.velocities_rad_s[peak_joint_index]));
+  }
+  EXPECT_LE(capped_peak,
+            *limit.max_velocity_rad_s *
+                capped_request.speed_profile.velocity_scale * 1.01);
+  EXPECT_GT(capped.trajectory->waypoints.back().time_from_start_s,
+            baseline.trajectory->waypoints.back().time_from_start_s);
+}
+
+TEST_F(NativeKernelTest,
+       CartesianDeadlineNeverSilentlyUsesPermittedJointFallback) {
+  auto request = make_cartesian_request("cartesian_no_adapter_fallback");
+  auto& path = std::get<CartesianPathDTO>(request.motion);
+  path.fallback_policy =
+      CartesianFallbackPolicyDTO::kAllowJointSpaceFallback;
+  path.waypoints.back().position_m.z_m += 2.0;
+  request.planning_timeout_s = 0.05;
+
+  const auto result = bundle_->planner->plan(request);
+  ASSERT_FALSE(result.trajectory.has_value());
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorPlanningTimeout);
+  EXPECT_EQ(result.error->details.at("reason"), "planning_timeout");
+}
+
+TEST_F(NativeKernelTest,
+       CartesianPlannerRejectsUnknownCappedJointBeforeBackendWork) {
+  auto request = make_cartesian_request("cartesian_unknown_capped_joint");
+  JointDynamicsLimitDTO limit;
+  limit.max_velocity_rad_s = 0.1;
+  request.per_joint_dynamics_limits["not_a_group_joint"] = limit;
+
+  const auto result = bundle_->planner->plan(request);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorUnsupportedCapability);
+  EXPECT_EQ(result.error->details.at("reason"),
+            "unsupported_joint_dynamics_limit");
+  EXPECT_EQ(result.error->details.at("joint"), "not_a_group_joint");
 }
 
 TEST_F(NativeKernelTest, CloseRejectsNewKernelSnapshotsButPreservesInFlightSnapshot) {
@@ -1304,8 +2398,7 @@ TEST_F(NativeKernelTest, PlannerUsesPerRequestPlanningTimeout) {
   rrt_opts.max_connection_distance = 0.1;  // force the planner into the RRT loop
 
   RoboPlanPlannerBackend planner(bundle_->scene_projection, bundle_->scene,
-                                 rrt_opts, bundle_->scene_mutex,
-                                 bundle_->single_shot_ik);
+                                 rrt_opts, bundle_->scene_mutex);
 
   PlanRequestDTO req;
   req.robot_id = "robot1";
@@ -1351,8 +2444,7 @@ TEST_F(NativeKernelTest, PlannerDoesNotHoldSceneMutexDuringLongRrt) {
 
   RoboPlanPlannerBackend planner(
       bundle_->scene_projection, bundle_->scene, rrt_opts,
-      bundle_->scene_mutex, bundle_->single_shot_ik, ik_opts,
-      single_shot_ik_opts);
+      bundle_->scene_mutex, ik_opts, single_shot_ik_opts);
 
   PlanRequestDTO req;
   req.robot_id = "robot1";

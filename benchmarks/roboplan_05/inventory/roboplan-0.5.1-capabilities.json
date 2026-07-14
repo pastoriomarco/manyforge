@@ -1,0 +1,84 @@
+{
+  "schema_version": "manyforge.roboplan_capability_inventory.v1",
+  "roboplan_version": "0.5.1",
+  "capabilities": [
+    {
+      "capability": "planning.motion.joint_goal",
+      "status": "supported",
+      "owner": "RoboPlanPlannerBackend",
+      "implementation": "RoboPlan 0.5 RRT with the qualified 0.4-equivalent non-star, fast-return policy, followed by deterministic shortcutting and TOPPRA"
+    },
+    {
+      "capability": "planning.motion.pose_goal",
+      "status": "supported",
+      "owner": "RoboPlanPlannerBackend",
+      "implementation": "Revision-bound SimpleIk followed by the same portable joint-space planning pipeline"
+    },
+    {
+      "capability": "planning.motion.cartesian_path",
+      "status": "supported",
+      "owner": "RoboPlanCartesianPathAdapter",
+      "implementation": "Portable single-tip bounded full-path request mapped to RoboPlan Cartesian planning, then independently checked against the continuously dispatched quintic path with conservative unsampled residual margins, finite monotonic output, TCP and full interpolated joint-dynamics limits, cancellation, deadline, and unchanged ManyForge validation; time-optimal mode is not advertised because its monolithic TOPP-RA solve is not cooperatively cancellable"
+    },
+    {
+      "capability": "planning.motion.named_target",
+      "status": "unsupported",
+      "owner": "No production compiler",
+      "implementation": "The neutral DTO exists, but no production compiler resolves named targets before planner dispatch and the RoboPlan manifest does not advertise this capability"
+    },
+    {
+      "capability": "planning.motion.relative_move",
+      "status": "compiled_by_manyforge",
+      "owner": "ManyForge reference-pose resolver and ExecutionKernel",
+      "implementation": "Revision-bound target and offset references compile to PoseGoalDTO"
+    },
+    {
+      "capability": "planning.ik.single_shot",
+      "status": "supported",
+      "owner": "RoboPlanPlannerBackend",
+      "implementation": "Dedicated bounded SimpleIk solver against an isolated scene generation"
+    },
+    {
+      "capability": "planning.cancellation.cooperative",
+      "status": "supported",
+      "owner": "RoboPlanPlannerBackend and RoboPlanCartesianPathAdapter",
+      "implementation": "Lock-free cancellation and deadline probes at bounded adapter and upstream Cartesian checkpoints; unsupported non-cancellable time-optimal Cartesian parameterization is excluded from the portable capability"
+    },
+    {
+      "capability": "planning.randomness.seeded_attempts",
+      "status": "supported",
+      "owner": "ExecutionKernel and RoboPlanPlannerBackend",
+      "implementation": "Deployment seed plus kernel attempt ordinal drives RoboPlan 0.5 scene, RRT, and corrected nonnegative shortcut seeds"
+    },
+    {
+      "capability": "planning.trajectory.time_parameterized",
+      "status": "supported",
+      "owner": "RoboPlanPlannerBackend and ManyForge trajectory validator",
+      "implementation": "RoboPlan 0.5 TOPPRA plus endpoint normalization, ManyForge-owned TCP/Cartesian checks, and full interpolated joint-dynamics extrema verification and retiming"
+    },
+    {
+      "capability": "scene.projection.revision_bound",
+      "status": "supported",
+      "owner": "RoboPlanProjectionBackend",
+      "implementation": "Explicit deep-clone generations, exact revision retention, and projection lease binding"
+    },
+    {
+      "capability": "planning.failure.structured",
+      "status": "supported",
+      "owner": "ManyForge planner adapters",
+      "implementation": "Portable ErrorDTO codes, stable reasons, failure stages, progress, and diagnostic-only collision evidence"
+    },
+    {
+      "capability": "collision.query.pre_execution",
+      "status": "manyforge_authority",
+      "owner": "ManyForgeCollisionEngine",
+      "implementation": "RoboPlan proposes candidates only; authoritative validation consumes immutable ManyForge world and policy snapshots"
+    },
+    {
+      "capability": "collision.query.runtime",
+      "status": "manyforge_authority",
+      "owner": "ManyForgeCollisionEngine",
+      "implementation": "Dedicated prepared runtime query engine with no planner-scene, Python, or browser dependency"
+    }
+  ]
+}

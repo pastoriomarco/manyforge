@@ -41,8 +41,8 @@ grippers:
     transport:
       kind: ros_gripper_command
       action_name: /robotiq_gripper_controller/gripper_cmd
-      result_timeout_s: 5.0
-      position_tolerance: 0.004
+      result_timeout_s: 15.0
+      position_tolerance: 0.04
     touch_links:
     - robotiq_base_link
     - left_outer_knuckle
@@ -83,6 +83,7 @@ adapters:
     capability_keys:
     - planning.motion.joint_goal
     - planning.motion.pose_goal
+    - planning.motion.cartesian_path
     - planning.trajectory.time_parameterized
     config:
       rng_seed: 12345
@@ -246,7 +247,7 @@ adapters:
       gripper:
         action_name: /robotiq_gripper_controller/gripper_cmd
         wait_for_action_server_timeout_s: 2
-        result_timeout_s: 5
+        result_timeout_s: 15
 orchestrator:
   engine: py_trees
   config:

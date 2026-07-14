@@ -40,6 +40,26 @@ LITE6_DEPLOYMENT_PATH = (
 )
 
 
+def test_ros_full_runtime_services_share_one_canonical_image() -> None:
+    """Runtime services cannot drift from the image qualified by the launcher."""
+    repo_root = Path(__file__).resolve().parents[2]
+    compose = yaml.safe_load(
+        (repo_root / "docker-compose.yaml").read_text(encoding="utf-8")
+    )
+    services = compose["services"]
+    build_owner = services["ros-jazzy-full"]
+    canonical_image = build_owner["image"]
+
+    assert build_owner["build"]["dockerfile"] == "Dockerfile.ros-jazzy-full"
+    assert canonical_image == (
+        "${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}"
+    )
+    for service_name in ("composer-ros", "isaac-topic-control"):
+        service = services[service_name]
+        assert service["image"] == canonical_image
+        assert "build" not in service
+
+
 def _write_yaml(data: dict, suffix: str = ".yaml") -> str:
     """Write a dict to a temp YAML file and return the path."""
     f = tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False)
@@ -275,6 +295,7 @@ class TestLauncherKernelCreation:
         data["adapters"]["planning"]["capability_keys"] = [
             "planning.motion.joint_goal",
             "planning.motion.pose_goal",
+            "planning.motion.cartesian_path",
             "planning.trajectory.time_parameterized",
         ]
         deploy_path = _write_yaml(data)
@@ -316,6 +337,7 @@ class TestLauncherKernelCreation:
                     "capability_keys": [
                         "planning.motion.joint_goal",
                         "planning.motion.pose_goal",
+                        "planning.motion.cartesian_path",
                         "planning.trajectory.time_parameterized",
                     ],
                     "config": {},

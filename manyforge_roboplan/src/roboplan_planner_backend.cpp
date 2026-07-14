@@ -1,8 +1,12 @@
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 
 #include <manyforge_roboplan/roboplan_focused_adapters.hpp>
+#include <manyforge_roboplan/roboplan_cartesian_path_adapter.hpp>
+#include <manyforge_roboplan/roboplan_planner_options.hpp>
 
 #include <manyforge_roboplan/collision_diagnostics_capture.hpp>
+
+#include <roboplan/core/collision_context.hpp>
 
 #include <Eigen/Dense>
 #include <algorithm>
@@ -14,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -283,11 +288,19 @@ using PlanningObserver =
     manyforge::roboplan_backend::IRoboPlanPlanningPerformanceObserver;
 using CollisionProbeSnapshot =
     manyforge::roboplan_backend::RoboPlanCollisionProbeSnapshot;
+using AllocationProbeSnapshot =
+    manyforge::roboplan_backend::RoboPlanAllocationProbeSnapshot;
 
 CollisionProbeSnapshot read_collision_probe(
     const std::shared_ptr<PlanningObserver>& observer) noexcept {
   return observer ? observer->collision_probe_snapshot()
                   : CollisionProbeSnapshot{};
+}
+
+AllocationProbeSnapshot read_allocation_probe(
+    const std::shared_ptr<PlanningObserver>& observer) noexcept {
+  return observer ? observer->allocation_probe_snapshot()
+                  : AllocationProbeSnapshot{};
 }
 
 std::uint32_t effective_planner_seed(
@@ -306,17 +319,6 @@ std::uint32_t effective_planner_seed(
   return static_cast<std::uint32_t>(value ^ (value >> 32U));
 }
 
-int roboplan_04_deterministic_shortcut_seed(std::uint32_t seed) noexcept {
-  // RoboPlan 0.4 PathShortcutter has its documented seed branch reversed:
-  // nonnegative values use random_device, while negative values seed mt19937
-  // directly after unsigned conversion. Keep this adapter-local encoding until
-  // RP5-1 verifies the 0.5 behavior and deletes the 0.4-only workaround.
-  constexpr std::uint32_t kMaxMagnitude =
-      static_cast<std::uint32_t>(std::numeric_limits<int>::max());
-  const auto magnitude = 1U + (seed % kMaxMagnitude);
-  return -static_cast<int>(magnitude);
-}
-
 void accumulate_probe_delta(
     manyforge::roboplan_backend::RoboPlanPlanningStageMetrics& metrics,
     const CollisionProbeSnapshot& before,
@@ -329,6 +331,27 @@ void accumulate_probe_delta(
   metrics.collision_query_count += after.query_count - before.query_count;
   metrics.collision_query_duration_ns +=
       after.query_duration_ns - before.query_duration_ns;
+}
+
+bool accumulate_allocation_delta(
+    manyforge::roboplan_backend::RoboPlanPlanningStageMetrics& metrics,
+    const AllocationProbeSnapshot& before,
+    const AllocationProbeSnapshot& after) noexcept {
+  if (before.available != after.available) {
+    return false;
+  }
+  if (!before.available) {
+    return true;
+  }
+  if (after.allocation_count < before.allocation_count ||
+      after.allocation_bytes < before.allocation_bytes) {
+    return false;
+  }
+  metrics.allocation_count +=
+      after.allocation_count - before.allocation_count;
+  metrics.allocation_bytes +=
+      after.allocation_bytes - before.allocation_bytes;
+  return true;
 }
 
 class PlanningStageMeasurement final {
@@ -344,6 +367,7 @@ class PlanningStageMeasurement final {
     if (enabled_) {
       started_at_ = std::chrono::steady_clock::now();
       collision_before_ = read_collision_probe(observer_);
+      allocation_before_ = read_allocation_probe(observer_);
     }
   }
 
@@ -362,6 +386,10 @@ class PlanningStageMeasurement final {
               .count());
       accumulate_probe_delta(
           stage, collision_before_, read_collision_probe(observer_));
+      if (!accumulate_allocation_delta(
+              stage, allocation_before_, read_allocation_probe(observer_))) {
+        metrics_.measurement_complete = false;
+      }
     } catch (...) {
       metrics_.measurement_complete = false;
     }
@@ -374,6 +402,7 @@ class PlanningStageMeasurement final {
   bool enabled_ = false;
   std::chrono::steady_clock::time_point started_at_{};
   CollisionProbeSnapshot collision_before_;
+  AllocationProbeSnapshot allocation_before_;
 };
 
 class PlanningInvocationMeasurement final {
@@ -551,7 +580,6 @@ RoboPlanPlannerBackend::RoboPlanPlannerBackend(
     std::shared_ptr<roboplan::Scene> live_scene,
     const roboplan::RRTOptions& rrt_options,
     std::shared_ptr<std::mutex> scene_mutex,
-    std::shared_ptr<roboplan::SimpleIk> single_shot_ik,
     std::optional<roboplan::SimpleIkOptions> ik_options,
     std::optional<roboplan::SimpleIkOptions> single_shot_ik_options,
     std::optional<std::uint32_t> rng_seed,
@@ -560,7 +588,6 @@ RoboPlanPlannerBackend::RoboPlanPlannerBackend(
     : projection_(std::move(projection)),
       live_scene_(std::move(live_scene)),
       rrt_options_(rrt_options),
-      single_shot_ik_(std::move(single_shot_ik)),
       scene_mutex_(std::move(scene_mutex)),
       rng_seed_(rng_seed),
       performance_observer_(std::move(performance_observer)) {
@@ -639,24 +666,40 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     std::shared_ptr<roboplan::SimpleIk> planning_ik;
     std::shared_ptr<roboplan::PathShortcutter> planning_shortcutter;
     std::shared_ptr<roboplan::PathParameterizerTOPPRA> planning_toppra;
+    std::optional<roboplan::CollisionQueryView> planning_collision_query;
+    const bool is_cartesian_path =
+        std::holds_alternative<core::CartesianPathDTO>(request.motion);
     {
       PlanningStageMeasurement stage(
           performance_metrics, performance_observer, "context_construction");
       // Retained projections are immutable evidence. Planner algorithms own a
       // request-local working copy because IK and sampling advance Scene RNG
       // state even when geometry is unchanged.
-      planning_scene = std::make_shared<roboplan::Scene>(*retained_scene);
+      planning_scene = retained_scene->clone();
       if (performance_metrics.rng_seed.has_value()) {
         planning_scene->setRngSeed(*performance_metrics.rng_seed);
       }
-      planning_ik =
-          std::make_shared<roboplan::SimpleIk>(planning_scene, ik_options_);
-      planning_shortcutter =
-          std::make_shared<roboplan::PathShortcutter>(
-              planning_scene, rrt_options_.group_name);
-      planning_toppra =
-          std::make_shared<roboplan::PathParameterizerTOPPRA>(
-              planning_scene, rrt_options_.group_name);
+      if (!is_cartesian_path) {
+        // Joint/pose planning exclusively owns this request-local scene and
+        // executes its stages serially. Select that Scene generation's existing
+        // collision workspace explicitly, avoiding a redundant broadphase copy
+        // while preserving isolated CollisionContext defaults for callers that
+        // may query one Scene concurrently.
+        planning_collision_query.emplace(
+            roboplan::CollisionQueryView::forSerializedScene(planning_scene));
+        planning_ik =
+            std::make_shared<roboplan::SimpleIk>(planning_scene, ik_options_);
+        const auto shortcutting_options = production_shortcutting_options(
+            rrt_options_.group_name, performance_metrics.rng_seed);
+        performance_metrics.shortcut_rng_seed_argument =
+            shortcutting_options.seed;
+        planning_shortcutter =
+            std::make_shared<roboplan::PathShortcutter>(
+                planning_scene, shortcutting_options);
+        planning_toppra =
+            std::make_shared<roboplan::PathParameterizerTOPPRA>(
+                planning_scene, rrt_options_.group_name);
+      }
     }
 
     const auto fail_if_cancelled = [&](const std::string& stage) {
@@ -692,9 +735,14 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       return fail_if_cancelled(stage) || fail_if_timed_out(stage);
     };
 
+    const char* motion_type =
+        std::holds_alternative<core::JointGoalDTO>(request.motion)
+            ? "joint"
+            : (std::holds_alternative<core::PoseGoalDTO>(request.motion)
+                   ? "pose"
+                   : (is_cartesian_path ? "cartesian_path" : "unsupported"));
     planner_debug("[PLANNER] plan() called, move_id={}, motion_type={}\n",
-            request.move_id,
-            std::holds_alternative<core::JointGoalDTO>(request.motion) ? "joint" : "pose");
+                  request.move_id, motion_type);
 
     // Extract start state
     const auto& start = request.start_state;
@@ -722,15 +770,20 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       PlanningStageMeasurement stage(
           performance_metrics, performance_observer,
           "start_collision_query");
-      start_collision = planning_scene->hasCollisions(start_positions_full);
+      start_collision = is_cartesian_path
+                            ? planning_scene->hasCollisions(start_positions_full)
+                            : planning_collision_query->hasCollisions(
+                                  start_positions_full);
     }
     bool goal_collision = false;
     if (fail_if_cancelled_or_timed_out("start_collision_check")) {
       return result;
     }
 
-    // FK of start pose
-    {
+    // Cartesian requests validate both frames and the start pose inside the
+    // adapter before using either. Keep this diagnostic off that path so an
+    // unknown frame cannot bypass the structured request error.
+    if (!is_cartesian_path) {
       PlanningStageMeasurement stage(
           performance_metrics, performance_observer, "start_fk");
       Eigen::Matrix4d start_fk = planning_scene->forwardKinematics(
@@ -754,6 +807,38 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
           message,
           collision_details("start_state", true, false, diagnostics),
       };
+      return result;
+    }
+
+    if (const auto* cartesian =
+            std::get_if<core::CartesianPathDTO>(&request.motion)) {
+      auto cartesian_result = [&]() {
+        PlanningStageMeasurement stage(
+            performance_metrics, performance_observer, "cartesian_path");
+        return plan_cartesian_path(
+            request, *cartesian, planning_scene,
+            CartesianPlanningControl{
+                .cancellation_requested = [this] {
+                  return cancel_requested_.load(std::memory_order_acquire);
+                },
+                .deadline_expired = [&] {
+                  if (!has_planning_deadline) {
+                    return false;
+                  }
+                  return std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - plan_started_at)
+                             .count() >= request.planning_timeout_s;
+                }});
+      }();
+      if (!cartesian_result.ok()) {
+        result.error = cartesian_result.error();
+        return result;
+      }
+      if (fail_if_cancelled_or_timed_out("cartesian_output_conversion")) {
+        return result;
+      }
+      result.trajectory = convert_trajectory(cartesian_result.value());
+      result.scene_revision = request.scene_binding.revision;
       return result;
     }
 
@@ -811,7 +896,9 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
         PlanningStageMeasurement stage(
             performance_metrics, performance_observer, "ik");
         ik_succeeded =
-            planning_ik->solveIk(cart_config, start_config, goal_config);
+            planning_ik->solveIk(
+                cart_config, start_config, goal_config,
+                *planning_collision_query);
       }
       if (!ik_succeeded) {
         double r, p, ya;
@@ -845,7 +932,8 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
         PlanningStageMeasurement stage(
             performance_metrics, performance_observer,
             "goal_collision_query");
-        goal_collision = planning_scene->hasCollisions(goal_positions_full);
+        goal_collision = planning_collision_query->hasCollisions(
+            goal_positions_full);
       }
       planner_debug("[PLANNER] goal in collision: {}\n",
                     goal_collision ? "YES" : "no");
@@ -997,7 +1085,8 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     auto path_result = [&]() {
       PlanningStageMeasurement stage(
           performance_metrics, performance_observer, "rrt");
-      return request_rrt.plan(start_config, goal_config);
+      return request_rrt.plan(
+          start_config, goal_config, *planning_collision_query);
     }();
     if (fail_if_cancelled_or_timed_out("rrt")) {
       return result;
@@ -1039,15 +1128,8 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     auto smoothed_path = [&]() {
       PlanningStageMeasurement stage(
           performance_metrics, performance_observer, "shortcut");
-      if (performance_metrics.rng_seed.has_value()) {
-        performance_metrics.shortcut_rng_seed_argument =
-            roboplan_04_deterministic_shortcut_seed(
-                *performance_metrics.rng_seed);
-        return planning_shortcutter->shortcut(
-            path_result.value(), 0.05, 100,
-            *performance_metrics.shortcut_rng_seed_argument);
-      }
-      return planning_shortcutter->shortcut(path_result.value(), 0.05);
+      return planning_shortcutter->shortcut(
+          path_result.value(), *planning_collision_query);
     }();
     if (fail_if_cancelled_or_timed_out("shortcut")) {
       return result;
@@ -1104,11 +1186,15 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
           return result;
         }
         retime_iterations_used = iter + 1;
-        auto traj_result = planning_toppra->generate(
-            smoothed_path, 0.01,
-            roboplan::SplineFittingMode::Hermite,
-            vel_scale,
-            acc_scale);
+        roboplan::TOPPRAOptions toppra_options;
+        toppra_options.dt = 0.01;
+        toppra_options.mode = roboplan::SplineFittingMode::Hermite;
+        toppra_options.velocity_scale = vel_scale;
+        toppra_options.acceleration_scale = acc_scale;
+        auto traj_result =
+            planning_toppra->generate(
+                smoothed_path, toppra_options,
+                *planning_collision_query);
 
         if (!traj_result.has_value()) {
           result.error = core::ErrorDTO{core::kErrorPlanningFailed,
@@ -1334,15 +1420,6 @@ core::IkResultDTO RoboPlanPlannerBackend::solve_ik(
     const core::IkRequestDTO& request) {
   core::IkResultDTO result;
 
-  if (!single_shot_ik_) {
-    result.ok = false;
-    result.error = core::ErrorDTO{
-        std::string(core::to_string(core::ErrorCode::kUnsupportedCapability)),
-        "no IK solver configured on this planner backend",
-        {}};
-    return result;
-  }
-
   // Build the 4x4 target transform from the requested pose. Same conversion
   // used in plan() above; factored inline to avoid lifting a helper.
   Eigen::Matrix4d tform = Eigen::Matrix4d::Identity();
@@ -1397,7 +1474,7 @@ core::IkResultDTO RoboPlanPlannerBackend::solve_ik(
   std::shared_ptr<roboplan::Scene> ik_scene;
   {
     std::lock_guard<std::mutex> lock(*scene_mutex_);
-    ik_scene = std::make_shared<roboplan::Scene>(*live_scene_);
+    ik_scene = live_scene_->clone();
   }
   auto single_shot_ik =
       std::make_shared<roboplan::SimpleIk>(ik_scene, single_shot_ik_options_);

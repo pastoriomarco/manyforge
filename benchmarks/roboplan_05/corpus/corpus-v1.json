@@ -133,6 +133,7 @@
       "model": "ur10e_robotiq",
       "capture_file": "captures/isaac-light-drop-approach-v1.json",
       "capture_id": "isaac-light-drop-approach-v1",
+      "capture_source_policy": "frozen_rp5_0_manifest",
       "required_attachment": "isaac_cheese_box",
       "world_profile": "captured_authority_snapshot",
       "expected": {"success": true}

@@ -28,17 +28,11 @@ from manyforge_ros_bringup.isaac_gripper_command import (
 )
 
 
-DEFAULT_JOINT_NAMES = [
-    "finger_joint",
-    "right_outer_knuckle_joint",
-    "left_outer_finger_joint",
-    "right_outer_finger_joint",
-    "left_inner_finger_joint",
-    "right_inner_finger_joint",
-    "left_inner_finger_pad_joint",
-    "right_inner_finger_pad_joint",
-]
-DEFAULT_MULTIPLIERS = [1.0, 1.0, 0.0, 0.0, -1.0, -1.0, 1.0, 1.0]
+# Command only the canonical Robotiq drive joint. The remaining USD articulation
+# joints are mechanically coupled/passive state and must not receive competing
+# position targets.
+DEFAULT_JOINT_NAMES = ["finger_joint"]
+DEFAULT_MULTIPLIERS = [1.0]
 DEFAULT_OFFSETS = [0.0] * len(DEFAULT_JOINT_NAMES)
 
 

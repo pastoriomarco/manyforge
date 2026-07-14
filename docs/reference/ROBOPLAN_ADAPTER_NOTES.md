@@ -136,22 +136,24 @@ maps. RoboPlan currently exposes collision pair enablement through scene-level
 4. The same validation runs for freshly planned and cached trajectories; cache
    hits skip planning, not validation.
 
-Because RoboPlan only exposes scene-level pair enablement, the execution-time
-collision monitor observes the same projection as the planner. That means the
-current adapter verifies the planned trajectory's support-contact release, but
-it cannot independently detect a runtime deviation that re-enters only that
-support pair after validation. This is one of the reasons the workaround must be
-removed once RoboPlan exposes request-scoped collision policy/contact queries.
+RoboPlan's scene-level pair enablement is confined to its planner projection.
+Authoritative pre-dispatch validation and runtime monitoring use the independent
+`manyforge_collision` engine with an immutable world-and-policy publication.
+That policy contains the support-contact entries, so the runtime query session
+tracks initial penetration, separation, penetration progress, and forbidden
+recontact independently of the planner's disabled pair. A future RoboPlan
+request-scoped contact API can remove the planner-projection workaround, but it
+must not replace or weaken these backend-neutral ManyForge safety checks.
 
 The execution monitor is not a 50 ms "grace period" for support contacts. The
 kernel starts monitoring after a trajectory has passed validation and execution
-has begun; the default monitor tick period is 50 ms / 20 Hz. Support-contact pairs are
-already disabled in the RoboPlan planner projection at that point, so the live
-monitor does not require the initial attached-object/support contact to separate
-before the first tick. The planned trajectory must have proven release during
-validation. The live monitor can still stop on other non-support collisions that
-appear during execution, but it does not currently maintain phase state such as
-"support pair has separated, now reject re-contact" at runtime.
+has begun; the default monitor tick period is 50 ms / 20 Hz. The first runtime
+observation initializes the support-contact state and enforces the configured
+start-penetration envelope. Subsequent observations must make non-increasing
+penetration progress, and once separation is observed a forbidden recontact is a
+runtime collision. Missing or non-finite clearance diagnostics fail closed as an
+inconclusive runtime query. The planned trajectory must separately have proven
+release during authoritative pre-dispatch validation.
 
 This is intentionally narrower than `touch_links`. Touch links describe robot
 links that an attached object may touch while grasped. Support contacts describe
@@ -226,8 +228,9 @@ Current gaps to keep visible:
   - `recompute_support_contact_policy_locked`
   - `set_support_contact_pairs_for_validation_locked`
   - mesh objects are added through RoboPlan's `Scene::addMeshGeometry` API,
-    available in the RoboPlan 0.4.0 release pin used by
-    `scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`)
+    available in the reviewed RoboPlan 0.5.1 commit used by
+    `scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`); the exact source and
+    checked patch manifest is `third_party/roboplan/README.md`
 - `manyforge_roboplan/include/manyforge_roboplan/roboplan_projection_backend.hpp`
   - `disabled_static_collision_pairs_`
   - `disabled_support_contact_pairs_`

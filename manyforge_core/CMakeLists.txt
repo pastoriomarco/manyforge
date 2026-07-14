@@ -35,6 +35,7 @@ add_library(manyforge_core
   src/scene_snapshot_lease.cpp
   src/stop_policy.cpp
   src/trajectory_cache.cpp
+  src/trajectory_cache_intent.cpp
   src/trajectory_cache_compatibility.cpp
   src/trajectory_sampler.cpp
   src/collision_policy_evaluator.cpp

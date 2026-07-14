@@ -60,7 +60,6 @@
         "properties": {
           "record_type": {
             "enum": [
-              "inventory",
               "collision_query",
               "collision_revision",
               "trajectory_validation",

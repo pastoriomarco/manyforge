@@ -52,6 +52,11 @@ if ! ls "${BUILD_DIR}"/manyforge_roboplan_py*.so >/dev/null 2>&1; then
     exit 1
 fi
 
+# Loading the extension is the runtime ABI gate. Merely producing the file can
+# hide a stale dependency image until the first deployment factory imports it.
+PYTHONPATH="${BUILD_DIR}:${WORKSPACE}/manyforge_roboplan/python:${PYTHONPATH:-}" \
+    python -c "import manyforge_roboplan_py"
+
 if [[ "${MANYFORGE_ENABLE_QUALIFICATION_PROBES:-OFF}" == "ON" ]] &&
    [[ ! -f "${BUILD_DIR}/libroboplan_collision_counter_probe.so" ]]; then
     echo "RP5 qualification collision probe was not produced in ${BUILD_DIR}." >&2

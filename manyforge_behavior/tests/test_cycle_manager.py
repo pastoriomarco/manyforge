@@ -604,10 +604,11 @@ class TestCycleManagerRun:
         assert resumed_fault is not None
         assert resumed_fault.state == "resume_requested"
         assert resumed_fault.accepted_recovery_request_id == result["requestId"]
-        # The mock intentionally occupies execute() for one second. Give its
-        # cleanup a separate margin so host/container scheduling load cannot
-        # turn an exact duration==join-timeout boundary into a teardown flake.
-        assert manager.shutdown(timeout_s=2.0) is True
+        # This test owns registry-fault admission, not shutdown latency. Use
+        # shutdown's production budget because cleanup may traverse multiple
+        # independently bounded control RPCs before joining the tick thread;
+        # dedicated shutdown tests retain the tighter timing assertions.
+        assert manager.shutdown() is True
 
     def test_node_failure_feedback_is_exposed_as_cycle_error(self, kernel, tmp_path):
         """Clean node failures should surface node feedback in manager.error."""
@@ -1079,7 +1080,7 @@ class TestCycleManagerMotionStop:
     def test_motion_soft_fail_terminal_tree_clears_motion_hold(self):
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         program_path = self._parallel_motion_timer_program(
-            timer_duration_s=0.25,
+            timer_duration_s=60.0,
             success_policy="success_on_one",
         )
         runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
@@ -1100,6 +1101,15 @@ class TestCycleManagerMotionStop:
                 time.sleep(0.01)
             assert manager.state == CycleState.RUNNING
             assert manager.motion_stop_state == "held"
+
+            assert manager._tree is not None
+            background_wait = next(
+                child
+                for child in manager._tree.root.children
+                if child.name == "background_wait"
+            )
+            assert isinstance(background_wait, py_trees.timers.Timer)
+            background_wait.finish_time = time.time() - 1.0
 
             deadline = time.time() + 1.0
             while manager.state != CycleState.IDLE and time.time() < deadline:

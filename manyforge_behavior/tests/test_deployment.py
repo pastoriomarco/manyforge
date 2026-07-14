@@ -53,6 +53,22 @@ ISAAC_LIGHT_ROS2_CONTROL_DEPLOYMENT_PATH = (
     / "examples"
     / "isaac_manipulator_scene_light_ros2_control.deployment.yaml"
 )
+ISAAC_LIGHT_ROS2_CONTROL_COLLISION_DEPLOYMENT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml"
+)
+ISAAC_LIGHT_ASSISTANT_DEPLOYMENT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "isaac_manipulator_scene_light_assistant.deployment.yaml"
+)
+ISAAC_ROBOTIQ_GRIPPER_BRIDGE_CONFIG_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "manyforge_ros_bringup"
+    / "config"
+    / "isaac_robotiq_2f_140_gripper_bridge.yaml"
+)
 ISAAC_LIGHT_PROGRAM_PATH = (
     Path(__file__).resolve().parents[2]
     / "examples"
@@ -3445,8 +3461,13 @@ class TestCrossArtifactValidation:
         assert deploy.grippers["primary"].state_authority == "sim_observed"
         assert deploy.grippers["primary"].completion_policy == "position_reached"
         assert deploy.grippers["primary"].transport["kind"] == "ros_gripper_command"
+        assert deploy.grippers["primary"].transport["result_timeout_s"] == 15.0
         assert deploy.adapters["execution"].config["gripper"]["action_name"] == (
             "/robotiq_gripper_controller/gripper_cmd"
+        )
+        assert (
+            deploy.adapters["execution"].config["gripper"]["result_timeout_s"]
+            == deploy.grippers["primary"].transport["result_timeout_s"]
         )
         assert (
             deploy.orchestrator.config["runtime_dynamic_body_max_age_cap_ms"]
@@ -3454,6 +3475,51 @@ class TestCrossArtifactValidation:
         )
         deploy.validate_against_program(prog)
         deploy.validate_capabilities()
+
+    @pytest.mark.parametrize(
+        "deployment_path",
+        [
+            ISAAC_LIGHT_ROS2_CONTROL_DEPLOYMENT_PATH,
+            ISAAC_LIGHT_ROS2_CONTROL_COLLISION_DEPLOYMENT_PATH,
+            ISAAC_LIGHT_ASSISTANT_DEPLOYMENT_PATH,
+        ],
+    )
+    def test_isaac_light_gripper_deadline_ownership_is_ordered(
+        self, deployment_path
+    ):
+        """The C++ owner must cancel before the simulator bridge emergency floor."""
+        deploy = Deployment(deployment_path)
+        gripper = deploy.grippers["primary"]
+        bridge_config = yaml.safe_load(
+            ISAAC_ROBOTIQ_GRIPPER_BRIDGE_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+        bridge_timeout_s = float(
+            bridge_config["manyforge_isaac_gripper_action_bridge"]["ros__parameters"][
+                "goal_timeout_s"
+            ]
+        )
+        bridge_parameters = bridge_config["manyforge_isaac_gripper_action_bridge"][
+            "ros__parameters"
+        ]
+        backend_deadline_s = (
+            gripper.motion_time_s + gripper.transport["result_timeout_s"]
+        )
+        adapter_timeout_s = deploy.adapters["execution"].config["gripper"][
+            "result_timeout_s"
+        ]
+
+        assert adapter_timeout_s == gripper.transport["result_timeout_s"]
+        assert backend_deadline_s == pytest.approx(15.8)
+        assert bridge_timeout_s == pytest.approx(20.0)
+        assert bridge_timeout_s > backend_deadline_s
+        assert bridge_parameters["commanded_joint"] == gripper.joint_name
+        assert bridge_parameters["joint_names"] == [gripper.joint_name]
+        assert bridge_parameters["multipliers"] == [1.0]
+        assert bridge_parameters["offsets"] == [0.0]
+        assert bridge_parameters["require_all_state_joints"] is True
+        assert gripper.transport["position_tolerance"] == pytest.approx(
+            bridge_parameters["completion_tolerance_rad"]
+        )
 
     def test_validate_against_isaac_lite6_ros2_control_program_success(self, catalog):
         """The Isaac Lite6 ROS execution deployment matches its pick-and-place program."""
@@ -4167,6 +4233,7 @@ class TestAdapterCapabilityKeys:
         assert deploy.adapters["planning"].capability_keys == [
             "planning.motion.joint_goal",
             "planning.motion.pose_goal",
+            "planning.motion.cartesian_path",
             "planning.trajectory.time_parameterized",
         ]
         

@@ -1,7 +1,11 @@
 #pragma once
 
 #include <string>
+#include <optional>
+#include <cstdint>
+#include <limits>
 
+#include <roboplan/core/path_utils.hpp>
 #include <roboplan_rrt/rrt.hpp>
 #include <roboplan_simple_ik/simple_ik.hpp>
 
@@ -13,6 +17,30 @@ inline roboplan::RRTOptions production_rrt_options(
   options.group_name = group_name;
   options.max_planning_time = max_planning_time_s;
   options.max_nodes = 5000;
+  // Preserve the qualified RoboPlan 0.4 search policy. RoboPlan 0.5 adds
+  // budget-spending and optimal variants, but they remain opt-in capabilities.
+  options.rrt_star = false;
+  options.fast_return = true;
+  return options;
+}
+
+inline roboplan::PathShortcuttingOptions production_shortcutting_options(
+    const std::string& group_name,
+    std::optional<std::uint32_t> deterministic_seed = std::nullopt) {
+  roboplan::PathShortcuttingOptions options;
+  options.group_name = group_name;
+  options.max_step_size = 0.05;
+  options.max_iters = 100;
+  // RoboPlan 0.4 always spent the configured 100-iteration budget. Keep that
+  // compatibility behavior; 0.5 convergence-shortcutting is benchmarked as a
+  // separate opt-in row before it can become a production policy change.
+  options.max_convergence_iters = 0;
+  options.seed = deterministic_seed.has_value()
+                     ? static_cast<int>(
+                           *deterministic_seed &
+                           static_cast<std::uint32_t>(
+                               std::numeric_limits<int>::max()))
+                     : -1;
   return options;
 }
 
@@ -23,6 +51,7 @@ inline roboplan::SimpleIkOptions production_planning_ik_options(
   options.step_size = 0.25;
   options.max_restarts = 50;
   options.max_time = 1.0;
+  options.fast_return = true;
   return options;
 }
 

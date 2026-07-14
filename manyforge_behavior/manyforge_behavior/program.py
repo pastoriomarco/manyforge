@@ -935,6 +935,18 @@ def _validate_tree_node_semantics(
                         message=relative_move_error,
                     )
                 )
+        elif motion_type == "cartesian_path" and not resolved_params.get(
+            "cartesian_path"
+        ):
+            issues.append(
+                TreeValidationIssue(
+                    path=f"{path}.params.cartesian_path",
+                    message=(
+                        "cartesian_path is required when "
+                        "motion_type=cartesian_path"
+                    ),
+                )
+            )
 
     has_schema_backed_shape = any(
         param.name == "shape" and getattr(param, "schema", None) is not None

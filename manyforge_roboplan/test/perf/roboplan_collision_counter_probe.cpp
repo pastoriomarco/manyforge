@@ -1,3 +1,4 @@
+#include <roboplan/core/collision_context.hpp>
 #include <roboplan/core/scene.hpp>
 
 #include <atomic>
@@ -13,6 +14,8 @@ std::atomic<std::uint64_t> g_query_duration_ns{0};
 
 using RealHasCollisions = bool (*)(
     const roboplan::Scene*, const Eigen::VectorXd&, bool);
+using RealContextHasCollisions = bool (*)(
+    const roboplan::CollisionContext*, const Eigen::VectorXd&);
 
 RealHasCollisions resolve_real_has_collisions() noexcept {
   constexpr const char* kSymbol =
@@ -32,6 +35,22 @@ RealHasCollisions resolve_real_has_collisions() noexcept {
     return nullptr;
   }
   return reinterpret_cast<RealHasCollisions>(dlsym(roboplan, kSymbol));
+}
+
+RealContextHasCollisions resolve_real_context_has_collisions() noexcept {
+  constexpr const char* kSymbol =
+      "_ZNK8roboplan16CollisionContext13hasCollisionsERKN5Eigen6MatrixIdLin1ELi1ELi0ELin1ELi1EEE";
+  if (void* symbol = dlsym(RTLD_NEXT, kSymbol); symbol != nullptr) {
+    return reinterpret_cast<RealContextHasCollisions>(symbol);
+  }
+
+  void* const roboplan =
+      dlopen("libroboplan.so", RTLD_NOW | RTLD_NOLOAD);
+  if (roboplan == nullptr) {
+    return nullptr;
+  }
+  return reinterpret_cast<RealContextHasCollisions>(
+      dlsym(roboplan, kSymbol));
 }
 
 void record_duration(
@@ -73,6 +92,23 @@ bool Scene::hasCollisions(const Eigen::VectorXd& q, const bool debug) const {
   const auto started_at = std::chrono::steady_clock::now();
   try {
     const bool result = real(this, q, debug);
+    record_duration(started_at);
+    return result;
+  } catch (...) {
+    record_duration(started_at);
+    throw;
+  }
+}
+
+bool CollisionContext::hasCollisions(const Eigen::VectorXd& q) const {
+  static const RealContextHasCollisions real =
+      resolve_real_context_has_collisions();
+  if (real == nullptr) {
+    std::abort();
+  }
+  const auto started_at = std::chrono::steady_clock::now();
+  try {
+    const bool result = real(this, q);
     record_duration(started_at);
     return result;
   } catch (...) {

@@ -13,17 +13,27 @@
 
 namespace manyforge::core {
 
-/// Trajectory cache keyed by move_id (spec 230 §3.1).
+enum class TrajectoryCacheLookupDisposition {
+  kHit,
+  kMiss,
+  kAuthoritativeRevisionUnavailable,
+  kRevisionMismatch,
+  kIntentMismatch,
+};
+
+struct TrajectoryCacheLookupResult {
+  TrajectoryCacheLookupDisposition disposition =
+      TrajectoryCacheLookupDisposition::kMiss;
+  std::optional<TrajectoryDTO> trajectory;
+};
+
+/// Trajectory cache indexed by move_id and admitted only when both the scene
+/// revision and full canonical planner-intent identity match (spec 230 §3.1).
 /// One trajectory per move_id. No LRU, no TTL.
 /// Thread-safe.
 ///
-/// Chunk 2 of the collision-ownership plan adds revision-aware entries:
-/// every stored trajectory MAY carry the CollisionWorldRevision it was
-/// validated against. Revision-aware lookups (lookup_with_revision) treat
-/// a revision mismatch as a miss and remove the stale entry so the next
-/// caller sees no ambiguity. The legacy revision-less overloads remain for
-/// non-revision-aware code paths (kernel call sites that have not yet
-/// migrated, and unit tests).
+/// Revision or planner-intent mismatches remove the stale entry atomically and
+/// return a structured disposition so the kernel can make cache loss visible.
 class TrajectoryCache {
  public:
   explicit TrajectoryCache(CacheConfig config = {});
@@ -33,7 +43,8 @@ class TrajectoryCache {
   /// revision-less overload: every stored trajectory must declare what
   /// collision world it was validated against.
   void store(const std::string& move_id, TrajectoryDTO trajectory,
-             CollisionWorldRevision revision);
+             CollisionWorldRevision revision,
+             std::string intent_identity);
 
   /// Whether an entry exists for move_id, regardless of revision. Existence
   /// probe only (e.g. invalidate-if-present); never use to serve a hit.
@@ -45,17 +56,17 @@ class TrajectoryCache {
   std::optional<TrajectoryDTO> peek_unvalidated(const std::string& move_id) const;
 
   /// Look up trajectory by move_id, returning the trajectory only when its
-  /// stored revision matches `expected_revision`. On a revision mismatch,
-  /// the stale entry is removed and std::nullopt is returned so subsequent
-  /// lookups see no ambiguity.
+  /// stored revision and canonical planner-intent identity match. Any mismatch is
+  /// removed while holding the cache mutex and identified in the result.
   ///
   /// An expected revision with both `revision_id == 0` and an empty
   /// `content_hash` is treated as "no authoritative revision available";
   /// callers in that state MUST NOT serve a cache hit — this method
-  /// returns std::nullopt regardless of the stored entry.
-  std::optional<TrajectoryDTO> lookup_with_revision(
+  /// returns kAuthoritativeRevisionUnavailable regardless of the stored entry.
+  TrajectoryCacheLookupResult lookup_with_revision(
       const std::string& move_id,
-      const CollisionWorldRevision& expected_revision);
+      const CollisionWorldRevision& expected_revision,
+      const std::string& expected_intent_identity);
 
   /// Stored revision for an entry, when present. Returns std::nullopt if
   /// the entry is missing or was stored without a revision tag.
@@ -82,6 +93,9 @@ class TrajectoryCache {
     std::shared_ptr<const TrajectoryDTO> trajectory;
     /// Revision the trajectory was validated against.
     CollisionWorldRevision revision;
+    /// Canonical identity of the resolved motion, frames, tolerances, speed
+    /// profile, and request-level dynamics limits that produced this trajectory.
+    std::string intent_identity;
   };
 
   CacheConfig config_;

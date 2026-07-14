@@ -257,8 +257,8 @@ manually; they are documented here for traceability.
 | Base dev image | `python:3.12-slim-bookworm` | Docker Hub | Dockerfile L31; ROS-free dev environment |
 | Frontend builder | `node:22-slim` | Docker Hub | Dockerfile L23; React/Vite build stage |
 | ROS image | `ros:jazzy-ros-base-noble` | Docker Hub | Dockerfile.ros-jazzy L11; Ubuntu Noble + ROS Jazzy |
-| RoboPlan | `0.4.0` tag SHA `7bddd403cf679dd976135aff6d9412fae9c4c04d` | `https://github.com/open-planning/roboplan.git` | Pinned in `scripts/setup-docker.sh` as `ROBOPLAN_PINNED_REF`. This release includes the mesh/cylinder geometry APIs required by `manyforge_roboplan/`; the Dockerfiles install RoboPlan's modular Python packages from their package roots. |
-| Pinocchio (kinematics / dynamics) | `pin==3.9.0` | PyPI | Dockerfile L65; brings `hpp-fcl` / `coal` and Eigen helpers transitively |
+| RoboPlan | reviewed `0.5.1` commit `e06d1a2f1b749c38742aee9e401bbe97fa967f7b` | `https://github.com/open-planning/roboplan.git` | Pinned in `scripts/setup-docker.sh` as `ROBOPLAN_PINNED_REF`. The upstream tag is lightweight and unsigned; the exact commit and every checked patch/removal criterion are recorded in `third_party/roboplan/README.md`. The Dockerfiles install RoboPlan's modular C++ and Python packages, including Cartesian planning. |
+| Pinocchio (kinematics / dynamics) | `pin==4.1.0`, `libpinocchio==4.1.0` | PyPI | Both wrapper and C++ library wheels are pinned; the compatible aarch64 graph uses `coal==3.0.3` and `libcoal==3.0.3`. |
 | `pybind11` | `3.0.3` | PyPI | Dockerfile L58 |
 | `nanobind` | `2.12.0` | PyPI | Dockerfile L63 |
 | `topic_based_ros2_control` | commit `7ee291ab13adba52ab5889deb9e520009fe2283d` | `https://github.com/karanchahal-nv/topic_based_ros2_control.git` | Dockerfile.ros-jazzy L17; built into the ROS image; the bridge used by the Isaac lane |
@@ -284,9 +284,14 @@ carry the same string as the tag they forked from), so
 on the host:
 
 ```bash
-cat .docker/roboplan/.manyforge-roboplan-ref   # the ref passed to git fetch
-cat .docker/roboplan/.manyforge-roboplan-sha   # the resolved commit SHA
+cat .docker/.manyforge-roboplan-ref   # the ref passed to git fetch
+cat .docker/.manyforge-roboplan-sha   # the resolved commit SHA
 ```
+
+The disposable checkout retains shallow Git metadata. Every setup run verifies
+the recorded commit, tracked and untracked files, and recursive submodule
+commits before reusing it; any drift causes a fresh clone. Docker excludes the
+Git metadata and applies exactly the hash-manifested patches in manifest order.
 
 **Force a refresh** (e.g. to test a newer release tag or local branch):
 
@@ -295,9 +300,12 @@ rm -rf .docker/roboplan/
 ROBOPLAN_REF=<branch|tag|sha> ./scripts/setup-docker.sh
 ```
 
-With no `ROBOPLAN_REF`, the script uses the RoboPlan 0.4.0 SHA pinned at
+With no `ROBOPLAN_REF`, the script uses the reviewed RoboPlan 0.5.1 commit pinned at
 `scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`). Maintainers move that pin
-forward only after Docker build and RoboPlan adapter tests pass.
+forward only after the dependency, adapter, sanitizer, ROS/Isaac, and
+performance gates in `third_party/roboplan/README.md` pass. An explicit
+`ROBOPLAN_REF` is a development override and cannot produce release evidence
+for the pinned build.
 
 ## Primary Scripts
 

@@ -178,6 +178,24 @@ def _write_deployment_with_stop_profile(tmp_path: Path, *, stop_mode: str) -> st
     return str(target)
 
 
+def _write_deployment_without_cartesian_capability(tmp_path: Path) -> str:
+    data = yaml.safe_load(Path(_DEPLOYMENT_PATH).read_text(encoding="utf-8"))
+    planning = data["adapters"]["planning"]
+    # An unregistered deterministic test adapter may advertise the mandatory
+    # v0.0 surface without the optional Cartesian capability. Production
+    # planning.roboplan manifests are exact and always advertise what they
+    # implement.
+    planning["adapter_id"] = "planning.test"
+    planning["capability_keys"] = [
+        key
+        for key in planning["capability_keys"]
+        if key != "planning.motion.cartesian_path"
+    ]
+    target = tmp_path / "deployment_without_cartesian.deployment.yaml"
+    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return str(target)
+
+
 def _set_mock_robot_positions(
     state: ComposerState, kernel: MockKernelClient, positions: list[float]
 ) -> None:
@@ -288,8 +306,12 @@ def test_cartesian_candidate_honors_frame_id_and_tcp_frame(tmp_path: Path) -> No
     assert kernel.last_preview_request is not None
     assert kernel.last_preview_request.base_frame == "custom_world"
     assert kernel.last_preview_request.tcp_frame == "gripper_tip"
-    assert kernel.last_preview_request.pose_goal is not None
-    assert kernel.last_preview_request.pose_goal["frame_id"] == "custom_world"
+    assert kernel.last_preview_request.motion_type == "cartesian_path"
+    assert kernel.last_preview_request.pose_goal is None
+    path = kernel.last_preview_request.cartesian_path
+    assert path is not None
+    assert path["fallback_policy"] == "fail_closed"
+    assert path["waypoints"][-1]["position_m"] == [0.4, 0.1, 0.5]
     # The dispatch params (used at approve) carry the same frames so execute
     # validates and moves against exactly the planned frames.
     assert body["cartesianTarget"]["frameId"] == "custom_world"
@@ -316,8 +338,94 @@ def test_cartesian_candidate_defaults_use_program_frames(tmp_path: Path) -> None
     # The fixture program robot uses base_frame=base_link, tcp_frame=tool0.
     assert kernel.last_preview_request.base_frame == "base_link"
     assert kernel.last_preview_request.tcp_frame == "tool0"
-    assert kernel.last_preview_request.pose_goal is not None
-    assert kernel.last_preview_request.pose_goal["frame_id"] == "base_link"
+    assert kernel.last_preview_request.motion_type == "cartesian_path"
+    assert kernel.last_preview_request.cartesian_path is not None
+
+
+def test_cartesian_candidate_pins_exact_start_tcp_waypoint(tmp_path: Path) -> None:
+    client, state, kernel = _recording_loaded_client(tmp_path)
+    expected_positions = state.get_current_joint_positions()
+    assert expected_positions is not None
+    body = client.post(_BASE, json=_cartesian_body()).json()
+
+    assert body["status"] == "ready"
+    assert kernel.last_preview_request is not None
+    path = kernel.last_preview_request.cartesian_path
+    assert path is not None
+    start_fk_requests = [
+        request
+        for request in kernel.target_link_pose_requests
+        if request.get("link_names") == ["tool0"]
+    ]
+    assert start_fk_requests == [{
+        "kind": "joint",
+        "base_frame": "base_link",
+        "link_names": ["tool0"],
+        "joint_names": kernel.get_joint_names(),
+        "joint_positions_rad": expected_positions,
+    }]
+    # The deterministic FK stand-in's returned tool pose must be retained as
+    # waypoint zero rather than inferred by the adapter or replaced by target.
+    assert path["waypoints"][0] == {
+        "position_m": [0.5, 0.0, 0.6],
+        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+    }
+    assert path["waypoints"][1] == {
+        "position_m": [0.4, 0.1, 0.5],
+        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+    }
+
+
+def test_cartesian_candidate_fails_closed_without_capability(tmp_path: Path) -> None:
+    deployment_path = _write_deployment_without_cartesian_capability(tmp_path)
+    client, _state, kernel = _loaded_client(
+        tmp_path, deployment_path=deployment_path
+    )
+
+    body = client.post(_BASE, json=_cartesian_body()).json()
+
+    assert body["status"] == "blocked"
+    assert body["commitEligible"] is False
+    assert body["diagnostics"]["reasonCode"] == "unsupported_capability"
+    assert body["diagnostics"]["details"]["requiredCapability"] == (
+        "planning.motion.cartesian_path"
+    )
+    assert kernel.preview_requests == []
+    assert kernel.execute_count == 0
+
+
+def test_cartesian_capability_must_belong_to_planning_adapter(
+    tmp_path: Path,
+) -> None:
+    client, state, kernel = _recording_loaded_client(tmp_path)
+    state.deployment.adapters["planning"].capability_keys.remove(
+        "planning.motion.cartesian_path"
+    )
+    state.deployment.adapters["execution"].capability_keys.append(
+        "planning.motion.cartesian_path"
+    )
+
+    body = client.post(_BASE, json=_cartesian_body()).json()
+
+    assert body["status"] == "blocked"
+    assert body["diagnostics"]["reasonCode"] == "unsupported_capability"
+    assert kernel.preview_requests == []
+
+
+def test_cartesian_candidate_fails_closed_when_start_fk_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    client, _state, kernel = _recording_loaded_client(tmp_path)
+    kernel.compute_target_link_poses = lambda _request: {  # type: ignore[method-assign]
+        "reachable": False,
+        "reason": "frame_unresolved",
+    }
+
+    body = client.post(_BASE, json=_cartesian_body()).json()
+
+    assert body["status"] == "error"
+    assert body["diagnostics"]["reasonCode"] == "no_robot_state"
+    assert kernel.preview_requests == []
 
 
 def test_candidate_forwards_per_joint_dynamics_limits_to_execute_request(
@@ -339,7 +447,6 @@ def test_candidate_forwards_per_joint_dynamics_limits_to_execute_request(
         target_joint: RobotControlJointLimit(
             max_velocity_rad_s=0.4,
             max_acceleration_rad_s2=1.5,
-            max_jerk_rad_s3=8.0,
         )
     }
     body = client.post(_BASE, json=_cartesian_body()).json()
@@ -351,7 +458,7 @@ def test_candidate_forwards_per_joint_dynamics_limits_to_execute_request(
     assert isinstance(fwd, JointDynamicsLimit)
     assert fwd.max_velocity_rad_s == 0.4
     assert fwd.max_acceleration_rad_s2 == 1.5
-    assert fwd.max_jerk_rad_s3 == 8.0
+    assert fwd.max_jerk_rad_s3 is None
 
 
 def test_candidate_without_per_joint_limits_forwards_empty_map(
@@ -367,6 +474,34 @@ def test_candidate_without_per_joint_limits_forwards_empty_map(
     assert kernel.last_preview_request.per_joint_dynamics_limits == {}
 
 
+def test_cartesian_candidate_rejects_unprovable_jerk_limit(tmp_path: Path) -> None:
+    from manyforge_behavior.deployment import RobotControlJointLimit
+
+    client, state, kernel = _recording_loaded_client(tmp_path)
+    target_joint = kernel.get_joint_names()[0]
+    state.deployment.robot_config.robot_control_joint_limits = {
+        target_joint: RobotControlJointLimit(max_jerk_rad_s3=8.0)
+    }
+    kernel.next_preview_result = MotionPreviewResult(
+        ok=False,
+        error="Cartesian planning cannot prove a requested per-joint jerk cap",
+        error_details={
+            "reason": "unsupported_joint_dynamics_limit",
+            "joint": target_joint,
+            "dimension": "jerk",
+        },
+    )
+
+    body = client.post(_BASE, json=_cartesian_body()).json()
+
+    assert body["status"] == "blocked"
+    assert body["diagnostics"]["reasonCode"] == "joint_dynamics_limit_unsupported"
+    assert kernel.last_preview_request is not None
+    assert kernel.last_preview_request.per_joint_dynamics_limits[
+        target_joint
+    ].max_jerk_rad_s3 == 8.0
+
+
 class _FkRecordingKernel(MockKernelClient):
     """MockKernelClient that also implements compute_target_link_poses and
     records the FK request, so a test can assert which base frame the ghost FK
@@ -379,6 +514,7 @@ class _FkRecordingKernel(MockKernelClient):
     def compute_target_link_poses(self, request):
         self.last_fk_request = dict(request)
         return {
+            "reachable": True,
             "link_poses": {
                 "tool0": {
                     "position_m": [0.4, 0.1, 0.5],
@@ -822,6 +958,7 @@ def test_execute_fresh_cartesian_candidate_dispatches_with_pose_frame(
 ) -> None:
     client, _state, kernel = _loaded_client(tmp_path)
     cid = client.post(_BASE, json=_cartesian_body()).json()["candidateId"]
+    preview_path = dict(kernel.preview_requests[-1].cartesian_path or {})
     resp = client.post(f"{_BASE}/{cid}/execute")
     assert resp.status_code == 200, resp.text
     deadline = time.time() + 5.0
@@ -829,8 +966,13 @@ def test_execute_fresh_cartesian_candidate_dispatches_with_pose_frame(
         time.sleep(0.02)
     assert kernel.execute_count >= 1
     assert kernel.last_execute_request is not None
-    assert kernel.last_execute_request.pose_goal is not None
-    assert kernel.last_execute_request.pose_goal["frame_id"] == "base_link"
+    assert kernel.last_execute_request.motion_type == "cartesian_path"
+    assert kernel.last_execute_request.pose_goal is None
+    assert kernel.last_execute_request.cartesian_path is not None
+    assert kernel.last_execute_request.cartesian_path == preview_path
+    assert kernel.last_execute_request.cartesian_path["waypoints"][-1][
+        "position_m"
+    ] == [0.4, 0.1, 0.5]
     assert kernel.last_execute_request.base_frame == "base_link"
     assert kernel.last_execute_request.tcp_frame == "tool0"
 
@@ -850,8 +992,10 @@ def test_execute_fresh_cartesian_candidate_preserves_custom_frames(
         time.sleep(0.02)
     assert kernel.execute_count >= 1
     assert kernel.last_execute_request is not None
-    assert kernel.last_execute_request.pose_goal is not None
-    assert kernel.last_execute_request.pose_goal["frame_id"] == "custom_world"
+    assert kernel.last_execute_request.motion_type == "cartesian_path"
+    assert kernel.last_execute_request.pose_goal is None
+    assert kernel.last_execute_request.cartesian_path is not None
+    assert kernel.last_execute_request.cartesian_path["fallback_policy"] == "fail_closed"
     assert kernel.last_execute_request.base_frame == "custom_world"
     assert kernel.last_execute_request.tcp_frame == "gripper_tip"
 

@@ -116,6 +116,10 @@ services:
   # Full ROS-capable ManyForge runtime/test image.
   # Host networking is intentional for ROS 2 DDS discovery during development.
   ros-jazzy-full:
+    # This is the sole build owner for the ROS-full image. Runtime services
+    # below consume this exact tag instead of maintaining independently cached
+    # images from the same Dockerfile.
+    image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}
     build:
       context: .
       dockerfile: Dockerfile.ros-jazzy-full
@@ -142,9 +146,7 @@ services:
   # selecting execution.ros2_control_follow_joint_trajectory so Composer can
   # load ROS adapter code and discover Isaac/robot ROS endpoints over DDS.
   composer-ros:
-    build:
-      context: .
-      dockerfile: Dockerfile.ros-jazzy-full
+    image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}
     logging: *default-logging
     restart: unless-stopped
     network_mode: host
@@ -198,9 +200,7 @@ services:
   # executing against Isaac's /isaac_joint_states and /isaac_joint_commands
   # topics through the standard FollowJointTrajectory surface.
   isaac-topic-control:
-    build:
-      context: .
-      dockerfile: Dockerfile.ros-jazzy-full
+    image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}
     logging: *default-logging
     restart: unless-stopped
     network_mode: host

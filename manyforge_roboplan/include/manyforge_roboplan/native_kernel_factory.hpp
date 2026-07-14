@@ -14,10 +14,6 @@
 #include <stop_token>
 
 #include <roboplan/core/scene.hpp>
-#include <roboplan_rrt/rrt.hpp>
-#include <roboplan_toppra/toppra.hpp>
-#include <roboplan_simple_ik/simple_ik.hpp>
-
 #include <manyforge_core/execution_kernel.hpp>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
@@ -159,12 +155,9 @@ struct NativeKernelBundle {
   // Owned components — order matters for destruction
   std::shared_ptr<roboplan::Scene> scene;
   std::shared_ptr<std::mutex> scene_mutex;
-  std::shared_ptr<roboplan::RRT> rrt;
-  std::shared_ptr<roboplan::PathShortcutter> shortcutter;
-  std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra;
-  std::shared_ptr<roboplan::SimpleIk> ik;
-  std::shared_ptr<roboplan::SimpleIk> single_shot_ik;
-
+  // Search, shortcutting, retiming, and IK algorithms are intentionally not
+  // retained here. The planner constructs them per request against the pinned,
+  // isolated scene generation so no algorithm can alias the mutable live scene.
   std::shared_ptr<RoboPlanProjectionBackend> projection_backend;
   std::shared_ptr<RoboPlanSceneProjection> scene_projection;
   std::unique_ptr<core::SceneAuthority> scene_authority;

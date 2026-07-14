@@ -36,6 +36,7 @@ find_package(roboplan REQUIRED)
 find_package(roboplan_rrt REQUIRED)
 find_package(roboplan_toppra REQUIRED)
 find_package(roboplan_simple_ik REQUIRED)
+find_package(roboplan_cartesian_planning REQUIRED)
 find_package(roboplan_example_models REQUIRED)
 find_package(fmt CONFIG QUIET)
 
@@ -93,6 +94,8 @@ endif()
 # Native backend library
 add_library(manyforge_roboplan
   src/roboplan_planner_backend.cpp
+  src/roboplan_cartesian_path_adapter.cpp
+  src/roboplan_cartesian_trajectory_dynamics.cpp
   src/roboplan_projection_backend.cpp
   src/roboplan_focused_adapters.cpp
   src/roboplan_execution_backend.cpp
@@ -117,6 +120,7 @@ target_link_libraries(manyforge_roboplan
   roboplan_rrt::roboplan_rrt
   roboplan_toppra::roboplan_toppra
   roboplan_simple_ik::roboplan_simple_ik
+  roboplan_cartesian_planning::roboplan_cartesian_planning
   roboplan_example_models::roboplan_example_models
   manyforge_collision
   fmt::fmt
@@ -192,6 +196,13 @@ if(BUILD_TESTING)
     target_link_libraries(test_roboplan_gripper_command_backend PRIVATE
       manyforge_roboplan GTest::gtest_main)
 
+    add_executable(test_roboplan_scene_generation
+      test/test_roboplan_scene_generation.cpp)
+    target_link_libraries(test_roboplan_scene_generation PRIVATE
+      roboplan::roboplan
+      roboplan_example_models::roboplan_example_models
+      GTest::gtest_main)
+
     # Informational perf measurement for the collision-ownership Chunk 1
     # mapper. Not a ctest case: invoked by scripts/run-collision-mapper-perf.sh
     # and reports JSON to stdout / MANYFORGE_PERF_JSON_OUT. Phase 1 is
@@ -260,6 +271,12 @@ if(BUILD_TESTING)
       DISCOVERY_EXTRA_ARGS --gtest_filter=*)
 
     gtest_discover_tests(test_roboplan_gripper_command_backend
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
+      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+
+    gtest_discover_tests(test_roboplan_scene_generation
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}

@@ -312,6 +312,30 @@ def test_execution_history_and_export_use_trace_sink(tmp_path):
         assert all("timelineId" in record for record in medkit["records"])
 
 
+def test_debug_export_preserves_string_valued_kernel_metric():
+    class SourceIdentityMetricsKernel(MockKernelClient):
+        def get_metrics(self) -> dict[str, int | str]:
+            metrics = super().get_metrics()
+            metrics["runtime_collision_freshest_observed_source_id"] = (
+                "predicted_state"
+            )
+            return metrics
+
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=SourceIdentityMetricsKernel(),
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        response = client.get("/api/debug/export")
+
+    assert response.status_code == 200
+    assert response.json()["kernelMetrics"][
+        "runtime_collision_freshest_observed_source_id"
+    ] == "predicted_state"
+
+
 def test_execution_channels_and_debug_export_surface_incident_snapshot(tmp_path):
     state = ComposerState(
         catalog_path=_CATALOG_PATH,

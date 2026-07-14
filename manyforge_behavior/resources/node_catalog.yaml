@@ -135,6 +135,66 @@ schema_types:
         length: 3
     mutually_exclusive:
       - [orientation_xyzw, orientation_rpy_deg]
+  cartesian_path_waypoint:
+    type: object
+    additional_properties: false
+    required: [position_m]
+    properties:
+      position_m:
+        type: array
+        items: float
+        length: 3
+      orientation_xyzw:
+        type: array
+        items: float
+        length: 4
+      orientation_rpy_deg:
+        type: array
+        items: float
+        length: 3
+    exactly_one:
+      - [orientation_xyzw, orientation_rpy_deg]
+  cartesian_path:
+    type: object
+    additional_properties: false
+    required: [waypoints]
+    properties:
+      waypoints:
+        type: array
+        min_items: 2
+        max_items: 4096
+        items:
+          schema_ref: "#/schema_types/cartesian_path_waypoint"
+      max_translation_step_m:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+      max_rotation_step_rad:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+      speed_mode:
+        type: enum
+        values: [bounded]
+      max_linear_speed_mps:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+      max_angular_speed_rad_s:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+      max_linear_acceleration_mps2:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+      max_angular_acceleration_rad_s2:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+      fallback_policy:
+        type: enum
+        values: [fail_closed, allow_joint_space_fallback]
   shape:
     type: object
     additional_properties: false
@@ -533,7 +593,7 @@ entries:
       - name: motion_type
         schema:
           type: enum
-          values: [joint_goal, pose_goal, relative_move]
+          values: [joint_goal, pose_goal, relative_move, cartesian_path]
         required: true
         enum_options:
           - value: joint_goal
@@ -543,6 +603,9 @@ entries:
               min_profile: v0.1
             required_capabilities:
               - context.pose.resolve_reference
+          - value: cartesian_path
+            required_capabilities:
+              - planning.motion.cartesian_path
         description: The type of motion to plan.
       - name: joint_goal_names
         schema:
@@ -595,6 +658,16 @@ entries:
           which the xyz/rpy offset is expressed; if omitted, it defaults to target_reference.
           Use `robot_link` for current TCP/link-relative moves, `frame` for arbitrary scene
           frames, and `pose` for either an inline reference pose or a declared pose field_ref.
+      - name: cartesian_path
+        schema_ref: "#/schema_types/cartesian_path"
+        required: false
+        visible_when:
+          param: motion_type
+          equals: cartesian_path
+        description: >-
+          Portable single-TCP Cartesian path expressed in base_frame. The
+          complete waypoint sequence is authoritative; adapters may not reduce
+          it to the final waypoint or silently select joint-space fallback.
       - name: base_frame
         schema:
           type: string
