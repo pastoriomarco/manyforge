@@ -6,12 +6,19 @@ import { DeploymentPanel } from './DeploymentPanel';
 import { ProgramPanel } from './ProgramPanel';
 import { ScenePanel } from './ScenePanel';
 import { useProgramStore } from '../store/programStore';
+import { useDeploymentStore } from '../store/deploymentStore';
 import { profileSatisfies } from '../utils/profiles';
+import {
+  deploymentCapabilityKeys,
+  supportsRequiredCapabilities,
+} from '../utils/deploymentCapabilities';
 
 function NodePaletteContent() {
   const { loading, error, fetchCatalog, getByCategory } = useCatalogStore();
   const { mode } = useComposerStore();
   const programProfile = useProgramStore((state) => state.programInfo?.programProfile ?? null);
+  const deployment = useDeploymentStore((state) => state.deployment);
+  const availableCapabilities = deploymentCapabilityKeys(deployment);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
@@ -27,7 +34,13 @@ function NodePaletteContent() {
       category,
       programProfile == null
         ? items
-        : items.filter((entry) => profileSatisfies(entry.profilesMin, programProfile)),
+        : items.filter(
+            (entry) => profileSatisfies(entry.profilesMin, programProfile)
+              && supportsRequiredCapabilities(
+                availableCapabilities,
+                entry.requiredCapabilities,
+              ),
+          ),
     ]),
   );
   const isRunMode = mode === 'run';

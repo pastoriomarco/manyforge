@@ -38,11 +38,14 @@ RoboPlanPlanningQualificationRecorder::collision_probe_snapshot()
 
 bool RoboPlanPlanningQualificationRecorder::try_begin_invocation(
     const core::PlanRequestDTO&) noexcept {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!accepting_) {
-    return false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!accepting_) {
+      return false;
+    }
+    ++in_flight_;
   }
-  ++in_flight_;
+  active_cv_.notify_all();
   return true;
 }
 
@@ -88,8 +91,11 @@ RoboPlanPlanningQualificationRecorder::drain() {
 }
 
 void RoboPlanPlanningQualificationRecorder::close_admission() noexcept {
-  std::lock_guard<std::mutex> lock(mutex_);
-  accepting_ = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    accepting_ = false;
+  }
+  active_cv_.notify_all();
 }
 
 RoboPlanPlanningQualificationBatch
@@ -110,6 +116,14 @@ bool RoboPlanPlanningQualificationRecorder::wait_until_idle(
     std::chrono::milliseconds timeout) {
   std::unique_lock<std::mutex> lock(mutex_);
   return idle_cv_.wait_for(lock, timeout, [&] { return in_flight_ == 0; });
+}
+
+bool RoboPlanPlanningQualificationRecorder::wait_until_active(
+    std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  active_cv_.wait_for(lock, timeout,
+                      [&] { return in_flight_ > 0 || !accepting_; });
+  return in_flight_ > 0;
 }
 
 std::uint64_t RoboPlanPlanningQualificationRecorder::dropped_total()

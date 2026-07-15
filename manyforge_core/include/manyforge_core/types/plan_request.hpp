@@ -28,6 +28,7 @@ struct PlanRequestDTO {
   TolerancesDTO tolerances;
   SpeedProfileDTO speed_profile;
   double planning_timeout_s = 5.0;  // > 0
+  PlanningProfileDTO planning_profile = PlanningProfileDTO::kFirstFeasible;
   /// Kernel-owned zero-based attempt ordinal for this logical motion plan.
   /// Candidate producers may combine it with a deployment seed to make retry
   /// diversity reproducible. It is execution metadata, not program intent.

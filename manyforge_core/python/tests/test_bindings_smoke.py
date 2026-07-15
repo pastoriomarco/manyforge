@@ -429,19 +429,24 @@ def test_reference_dto_pose():
     assert r.pose.position_m.x_m == 0.3
 
 
-def test_relative_move_dto():
-    """Test RelativeMoveDTO creation and attributes."""
+def test_orthogonal_relative_motion_contract():
+    """Relative targeting is mode/reference metadata on a typed motion."""
     import manyforge_core_py
-    
+
     ref = manyforge_core_py.ReferenceDTO(manyforge_core_py.ReferenceType.kFrame, "base_link")
-    offset = manyforge_core_py.Pose3DTO(
+    req = manyforge_core_py.ExecuteRequestDTO()
+    req.target_mode = manyforge_core_py.MotionTargetMode.kRelative
+    req.planning_profile = manyforge_core_py.PlanningProfile.kBalanced
+    req.target_reference = ref
+    req.motion = manyforge_core_py.PoseGoalDTO(manyforge_core_py.Pose3DTO(
         manyforge_core_py.Vector3DTO(0.1, 0.0, 0.0),
         manyforge_core_py.QuaternionDTO(0.0, 0.0, 0.0, 1.0)
-    )
-    
-    r = manyforge_core_py.RelativeMoveDTO(ref, offset)
-    assert r.target_reference.id == "base_link"
-    assert r.offset_reference is None
+    ))
+
+    assert req.target_mode == manyforge_core_py.MotionTargetMode.kRelative
+    assert req.planning_profile == manyforge_core_py.PlanningProfile.kBalanced
+    assert req.target_reference.id == "base_link"
+    assert req.offset_reference is None
 
 
 def test_cartesian_path_dto():

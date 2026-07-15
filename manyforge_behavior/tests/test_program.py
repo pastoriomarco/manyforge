@@ -182,7 +182,7 @@ def _minimal_program(**overrides) -> dict:
         "api_version": "manyforge.program.v0",
         "program_profile": "v0.0",
         "name": "test",
-        "catalog_version": "0.2.0",
+        "catalog_version": "0.3.0",
         "robot": {
             "robot_id": "ur5",
             "group_id": "arm",
@@ -206,7 +206,7 @@ def test_collect_per_move_tcp_speed_caps_resolves_overrides(catalog):
         "api_version": "manyforge.program.v0",
         "program_profile": "v0.0",
         "name": "tcp_override_test",
-        "catalog_version": "0.2.0",
+        "catalog_version": "0.3.0",
         "robot": {
             "robot_id": "ur5",
             "group_id": "arm",
@@ -231,7 +231,7 @@ def test_collect_per_move_tcp_speed_caps_resolves_overrides(catalog):
                     "name": "move_to_pick",
                     "params": {
                         "move_id": "m",
-                        "motion_type": "joint_goal",
+                        "motion_type": "joint",
                         "joint_goal_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
                         "joint_goal_positions_rad": [0.2, -1.2, 1.0, -1.5, -1.3, 0.4],
                         "max_tcp_linear_speed_mps": "${param:tcp_cap}",
@@ -1169,6 +1169,23 @@ class TestProgramValidation:
             Program(path, catalog)
         os.unlink(path)
 
+    def test_rejects_unexpanded_authoring_macro(self, catalog):
+        data = _minimal_program()
+        data["program_profile"] = "v0.1"
+        data["tree"] = {
+            "id": "pick_plan_subtree",
+            "name": "unexpanded_pick_macro",
+        }
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match="Authoring macro 'pick_plan_subtree' cannot be persisted",
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
     def test_rejects_node_when_program_profile_below_catalog_min_profile(self, catalog):
         data = _minimal_program()
         data["tree"] = {
@@ -1195,7 +1212,7 @@ class TestProgramValidation:
         finally:
             os.unlink(path)
 
-    def test_rejects_relative_move_when_program_profile_below_v0_1(self, catalog):
+    def test_rejects_relative_target_mode_when_program_profile_below_v0_1(self, catalog):
         data = _minimal_program()
         data["tree"] = {
             "id": "sequence",
@@ -1203,19 +1220,18 @@ class TestProgramValidation:
             "children": [
                 {
                     "id": "move_manipulator_action",
-                    "name": "relative_move_step",
+                    "name": "relative_pose_step",
                     "params": {
                         "move_id": "move_1",
-                        "motion_type": "relative_move",
-                        "relative_move": {
-                            "target_reference": {
-                                "type": "frame",
-                                "id": "base_link",
-                            },
-                            "offset": {
-                                "position_m": [0.0, 0.0, 0.1],
-                                "orientation_rpy_deg": [0.0, 0.0, 0.0],
-                            },
+                        "motion_type": "pose",
+                        "target_mode": "relative",
+                        "target_reference": {
+                            "type": "frame",
+                            "id": "base_link",
+                        },
+                        "pose_goal": {
+                            "position_m": [0.0, 0.0, 0.1],
+                            "orientation_rpy_deg": [0.0, 0.0, 0.0],
                         },
                     },
                 }
@@ -1225,7 +1241,7 @@ class TestProgramValidation:
         try:
             with pytest.raises(
                 ProgramValidationError,
-                match=r"motion_type value 'relative_move' requires program profile >= v0\.1, got v0\.0",
+                match=r"target_mode value 'relative' requires program profile >= v0\.1, got v0\.0",
             ):
                 Program(path, catalog)
         finally:
@@ -1450,7 +1466,7 @@ class TestProgramValidation:
                     "name": "bad_move",
                     "params": {
                         "move_id": "pick",
-                        "motion_type": "joint_goal",
+                        "motion_type": "joint",
                         "joint_goal_names": ["j1"],
                         "joint_goal_positions_rad": [0.1],
                         "velocity_scale": "${param:missing_velocity_scale}",
@@ -1555,7 +1571,7 @@ class TestProgramValidation:
                     "name": "bad_move",
                     "params": {
                         "move_id": "pick",
-                        "motion_type": "joint_goal",
+                        "motion_type": "joint",
                         "joint_goal_names": ["j1"],
                         "joint_goal_positions_rad": [0.1],
                         "velocity_scale": -0.1,
@@ -1579,7 +1595,7 @@ class TestProgramValidation:
                     "name": "bad_move",
                     "params": {
                         "move_id": "pick",
-                        "motion_type": "joint_goal",
+                        "motion_type": "joint",
                     },
                 },
             ],
@@ -1600,7 +1616,7 @@ class TestProgramValidation:
                     "name": "trace_tcp",
                     "params": {
                         "move_id": "trace_tcp",
-                        "motion_type": "cartesian_path",
+                        "motion_type": "cartesian",
                         "base_frame": "base_link",
                         "tcp_frame": "tool0",
                         "cartesian_path": {
@@ -1625,7 +1641,7 @@ class TestProgramValidation:
         try:
             program = Program(path, catalog)
             params = program.tree.children[0].params
-            assert params["motion_type"] == "cartesian_path"
+            assert params["motion_type"] == "cartesian"
             assert len(params["cartesian_path"]["waypoints"]) == 2
         finally:
             os.unlink(path)
@@ -1641,7 +1657,7 @@ class TestProgramValidation:
                     "name": "bad_cartesian",
                     "params": {
                         "move_id": "bad_cartesian",
-                        "motion_type": "cartesian_path",
+                        "motion_type": "cartesian",
                     },
                 },
             ],
@@ -1650,7 +1666,7 @@ class TestProgramValidation:
         try:
             with pytest.raises(
                 ProgramValidationError,
-                match="cartesian_path is required when motion_type=cartesian_path",
+                match="cartesian_path is required when motion_type=cartesian",
             ):
                 Program(path, catalog)
         finally:
@@ -1667,7 +1683,7 @@ class TestProgramValidation:
                     "name": "dynamic_pose_goal",
                     "params": {
                         "move_id": "pick_pose",
-                        "motion_type": "pose_goal",
+                        "motion_type": "pose",
                         "pose_goal": {
                             "field_ref": {
                                 "namespace": "grasp_plan",
@@ -1699,7 +1715,7 @@ class TestProgramValidation:
         finally:
             os.unlink(path)
 
-    def test_allows_relative_move_field_ref_for_motion_nodes(self, catalog):
+    def test_allows_relative_pose_reference_field_ref_for_motion_nodes(self, catalog):
         data = _minimal_program(
             program_profile="v0.1",
             blackboard={
@@ -1721,24 +1737,23 @@ class TestProgramValidation:
             "children": [
                 {
                     "id": "move_manipulator_action",
-                    "name": "dynamic_relative_move",
+                    "name": "dynamic_relative_pose",
                     "params": {
                         "move_id": "pick_pose",
-                        "motion_type": "relative_move",
-                        "relative_move": {
-                            "target_reference": {
-                                "type": "pose",
-                                "pose": {
-                                    "field_ref": {
-                                        "namespace": "approach_pose",
-                                        "field": "pose",
-                                    },
+                        "motion_type": "pose",
+                        "target_mode": "relative",
+                        "target_reference": {
+                            "type": "pose",
+                            "pose": {
+                                "field_ref": {
+                                    "namespace": "approach_pose",
+                                    "field": "pose",
                                 },
                             },
-                            "offset": {
-                                "position_m": [0.0, 0.0, 0.1],
-                                "orientation_rpy_deg": [0.0, 0.0, 0.0],
-                            },
+                        },
+                        "pose_goal": {
+                            "position_m": [0.0, 0.0, 0.1],
+                            "orientation_rpy_deg": [0.0, 0.0, 0.0],
                         },
                     },
                 },
@@ -1747,35 +1762,78 @@ class TestProgramValidation:
         path = _write_program(data)
         try:
             program = Program(path, catalog)
-            relative_move = program.tree.children[0].params["relative_move"]
-            assert relative_move["target_reference"]["pose"] == {
+            params = program.tree.children[0].params
+            assert params["target_reference"]["pose"] == {
                 "field_ref": {"namespace": "approach_pose", "field": "pose"}
             }
         finally:
             os.unlink(path)
 
-    def test_relative_move_required_capabilities_include_reference_resolution(self, catalog):
+    def test_relative_target_mode_requires_reference_resolution_capability(self, catalog):
         data = _minimal_program(program_profile="v0.1")
         data["tree"] = {
             "id": "move_manipulator_action",
-            "name": "relative_move_step",
+            "name": "relative_pose_step",
             "params": {
                 "move_id": "move_1",
-                "motion_type": "relative_move",
-                "relative_move": {
-                    "target_reference": {
-                        "type": "frame",
-                        "id": "base_link",
-                    },
-                    "offset": {
-                        "position_m": [0.0, 0.0, 0.1],
-                        "orientation_rpy_deg": [0.0, 0.0, 0.0],
-                    },
+                "motion_type": "pose",
+                "target_mode": "relative",
+                "target_reference": {
+                    "type": "frame",
+                    "id": "base_link",
+                },
+                "pose_goal": {
+                    "position_m": [0.0, 0.0, 0.1],
+                    "orientation_rpy_deg": [0.0, 0.0, 0.0],
                 },
             },
         }
         program = Program.from_dict(data, catalog)
         assert "context.pose.resolve_reference" in program.required_capabilities()
+
+    def test_relative_joint_does_not_require_spatial_reference_resolution(self, catalog):
+        data = _minimal_program(program_profile="v0.1")
+        data["tree"] = {
+            "id": "move_manipulator_action",
+            "name": "relative_joint_step",
+            "params": {
+                "move_id": "move_1",
+                "motion_type": "joint",
+                "target_mode": "relative",
+                "joint_goal_names": ["joint1"],
+                "joint_goal_positions_rad": [0.1],
+            },
+        }
+        program = Program.from_dict(data, catalog)
+        required = program.required_capabilities()
+        assert "context.pose.resolve_reference" not in required
+        assert "planning.profile.first_feasible" in required
+
+    @pytest.mark.parametrize(
+        ("profile", "capability"),
+        [
+            ("first_feasible", "planning.profile.first_feasible"),
+            ("balanced", "planning.profile.balanced"),
+            ("quality_bounded", "planning.profile.quality_bounded"),
+        ],
+    )
+    def test_planning_profile_selects_matching_capability(
+        self, catalog, profile, capability
+    ):
+        data = _minimal_program()
+        data["tree"] = {
+            "id": "move_manipulator_action",
+            "name": "profiled_move",
+            "params": {
+                "move_id": "move_1",
+                "motion_type": "joint",
+                "planning_profile": profile,
+                "joint_goal_names": ["joint1"],
+                "joint_goal_positions_rad": [0.1],
+            },
+        }
+        program = Program.from_dict(data, catalog)
+        assert capability in program.required_capabilities()
 
     def test_allows_typed_query_model_template_variable_bindings(self, catalog):
         data = _minimal_program(
@@ -1892,7 +1950,7 @@ class TestProgramValidation:
             Program(path, catalog)
         os.unlink(path)
 
-    def test_rejects_relative_move_raw_blackboard_reference_for_motion_nodes(self, catalog):
+    def test_rejects_relative_pose_raw_blackboard_reference_for_motion_nodes(self, catalog):
         data = _minimal_program(program_profile="v0.1")
         data["tree"] = {
             "id": "sequence",
@@ -1900,19 +1958,18 @@ class TestProgramValidation:
             "children": [
                 {
                     "id": "move_manipulator_action",
-                    "name": "dynamic_relative_move",
+                    "name": "dynamic_relative_pose",
                     "params": {
                         "move_id": "pick_pose",
-                        "motion_type": "relative_move",
-                        "relative_move": {
-                            "target_reference": {
-                                "type": "pose",
-                                "pose": _raw_blackboard_reference("perception/approach_pose"),
-                            },
-                            "offset": {
-                                "position_m": [0.0, 0.0, 0.1],
-                                "orientation_rpy_deg": [0.0, 0.0, 0.0],
-                            },
+                        "motion_type": "pose",
+                        "target_mode": "relative",
+                        "target_reference": {
+                            "type": "pose",
+                            "pose": _raw_blackboard_reference("perception/approach_pose"),
+                        },
+                        "pose_goal": {
+                            "position_m": [0.0, 0.0, 0.1],
+                            "orientation_rpy_deg": [0.0, 0.0, 0.0],
                         },
                     },
                 },
@@ -1921,7 +1978,7 @@ class TestProgramValidation:
         path = _write_program(data)
         with pytest.raises(
             ProgramValidationError,
-            match=r"relative_move\.target_reference\.pose must be an object",
+            match=r"target_reference\.pose must be an object",
         ):
             Program(path, catalog)
         os.unlink(path)
@@ -1955,7 +2012,7 @@ class TestProgramValidation:
             node_id=node_id,
             params={
                 "move_id": "probe_a",
-                "motion_type": "joint_goal",
+                "motion_type": "joint",
                 "policy_id": "trip",
                 "stop_mode": "spring_back_hold",
             },
@@ -1979,7 +2036,7 @@ class TestProgramValidation:
             node_id=node_id,
             params={
                 "move_id": "probe_a",
-                "motion_type": "joint_goal",
+                "motion_type": "joint",
                 "joint_goal_names": ["j1", "j2"],
                 "joint_goal_positions_rad": [0.1],
                 "policy_id": "trip",
@@ -1997,6 +2054,30 @@ class TestProgramValidation:
             os.unlink(path)
 
     @pytest.mark.parametrize(
+        "node_id",
+        ["move_manipulator_action", "move_until_signal", "probe_search_move"],
+    )
+    def test_motion_node_rejects_duplicate_joint_names(self, catalog, node_id):
+        params = {
+            "move_id": "move_a",
+            "motion_type": "joint",
+            "joint_goal_names": ["j1", "j1"],
+            "joint_goal_positions_rad": [0.1, 0.2],
+        }
+        if node_id != "move_manipulator_action":
+            params.update(policy_id="trip", stop_mode="spring_back_hold")
+        data = self._scoped_program(node_id=node_id, params=params)
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match="joint_goal_names must not contain duplicates",
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
         "node_id", ["move_until_signal", "probe_search_move"]
     )
     def test_scoped_node_rejects_pose_goal_without_pose(self, catalog, node_id):
@@ -2004,7 +2085,7 @@ class TestProgramValidation:
             node_id=node_id,
             params={
                 "move_id": "probe_a",
-                "motion_type": "pose_goal",
+                "motion_type": "pose",
                 "policy_id": "trip",
                 "stop_mode": "spring_back_hold",
             },
@@ -2013,7 +2094,7 @@ class TestProgramValidation:
         try:
             with pytest.raises(
                 ProgramValidationError,
-                match="pose_goal is required when motion_type=pose_goal",
+                match="pose_goal is required when motion_type=pose",
             ):
                 Program(path, catalog)
         finally:
@@ -2022,44 +2103,18 @@ class TestProgramValidation:
     @pytest.mark.parametrize(
         "node_id", ["move_until_signal", "probe_search_move"]
     )
-    def test_scoped_node_rejects_relative_move_without_request(
+    def test_scoped_node_rejects_relative_pose_without_target_reference(
         self, catalog, node_id
     ):
         data = self._scoped_program(
             node_id=node_id,
             params={
                 "move_id": "probe_a",
-                "motion_type": "relative_move",
-                "policy_id": "trip",
-                "stop_mode": "spring_back_hold",
-            },
-        )
-        path = _write_program(data)
-        try:
-            with pytest.raises(
-                ProgramValidationError,
-                match="relative_move is required when motion_type=relative_move",
-            ):
-                Program(path, catalog)
-        finally:
-            os.unlink(path)
-
-    @pytest.mark.parametrize(
-        "node_id", ["move_until_signal", "probe_search_move"]
-    )
-    def test_scoped_node_rejects_malformed_relative_move(
-        self, catalog, node_id
-    ):
-        data = self._scoped_program(
-            node_id=node_id,
-            params={
-                "move_id": "probe_a",
-                "motion_type": "relative_move",
-                # Missing target_reference is a structural defect that
-                # would surface at runtime in the kernel without
-                # validation parity.
-                "relative_move": {
-                    "offset": {"position_m": [0.0, 0.0, 0.01]},
+                "motion_type": "pose",
+                "target_mode": "relative",
+                "pose_goal": {
+                    "position_m": [0.0, 0.0, 0.01],
+                    "orientation_rpy_deg": [0.0, 0.0, 0.0],
                 },
                 "policy_id": "trip",
                 "stop_mode": "spring_back_hold",
@@ -2068,7 +2123,38 @@ class TestProgramValidation:
         path = _write_program(data)
         try:
             with pytest.raises(
-                ProgramValidationError, match="target_reference is required"
+                ProgramValidationError,
+                match="target_reference is required for relative pose or Cartesian motion",
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        "node_id", ["move_until_signal", "probe_search_move"]
+    )
+    def test_scoped_node_rejects_malformed_relative_pose_reference(
+        self, catalog, node_id
+    ):
+        data = self._scoped_program(
+            node_id=node_id,
+            params={
+                "move_id": "probe_a",
+                "motion_type": "pose",
+                "target_mode": "relative",
+                "target_reference": {"type": "object"},
+                "pose_goal": {
+                    "position_m": [0.0, 0.0, 0.01],
+                    "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                },
+                "policy_id": "trip",
+                "stop_mode": "spring_back_hold",
+            },
+        )
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError, match="target_reference.id is required"
             ):
                 Program(path, catalog)
         finally:
@@ -2084,7 +2170,7 @@ class TestProgramValidation:
             node_id=node_id,
             params={
                 "move_id": "probe_a",
-                "motion_type": "joint_goal",
+                "motion_type": "joint",
                 "joint_goal_names": ["j1", "j2"],
                 "joint_goal_positions_rad": [0.1, -0.2],
                 "policy_id": "trip",

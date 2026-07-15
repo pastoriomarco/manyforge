@@ -396,9 +396,22 @@ run_qualification_soak_tests() {
 
 run_ros_tests() {
     section "ROS adapter tests"
+    if [ -f /opt/ros/jazzy/setup.bash ]; then
+        # The Isaac/ROS lane does not source ROS for non-interactive shells.
+        # Probe and execute against the lane's actual ROS environment rather
+        # than reporting a misleading zero-suite success.
+        # shellcheck disable=SC1091
+        set +u
+        source /opt/ros/jazzy/setup.bash
+        set -u
+    fi
     cd "$WORKSPACE"
     setup_pythonpath
     export PYTHONPATH="$WORKSPACE/manyforge_ros:${PYTHONPATH:-}"
+    local roboplan_build="$BUILD_DIR/roboplan"
+    if ls "$roboplan_build"/manyforge_roboplan_py*.so 1>/dev/null 2>&1; then
+        export PYTHONPATH="$roboplan_build:$WORKSPACE/manyforge_roboplan/python:${PYTHONPATH:-}"
+    fi
     if ! python_has_modules rclpy control_msgs trajectory_msgs action_msgs; then
         skip "Missing ROS 2 Python deps; run in the ros-jazzy image"
         return

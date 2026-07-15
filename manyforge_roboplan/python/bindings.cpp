@@ -20,6 +20,7 @@
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <manyforge_core/execution_collision_support.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
+#include <manyforge_core/motion_target_resolution.hpp>
 #ifdef MANYFORGE_ROS2_CONTROL_ENABLED
 #include <manyforge_roboplan/ros2_control_kernel_factory.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
@@ -476,87 +477,18 @@ py::dict pose_to_python(const Pose3DTO& pose) {
   return d;
 }
 
-Pose3DTO multiply_poses_for_direct_plan(const Pose3DTO& a, const Pose3DTO& b) {
-  auto pose_to_matrix = [](const Pose3DTO& pose) {
-    Eigen::Matrix4d matrix = Eigen::Matrix4d::Identity();
-    const double x = pose.orientation.x;
-    const double y = pose.orientation.y;
-    const double z = pose.orientation.z;
-    const double w = pose.orientation.w;
-    matrix(0, 0) = 1 - 2 * y * y - 2 * z * z;
-    matrix(0, 1) = 2 * x * y - 2 * z * w;
-    matrix(0, 2) = 2 * x * z + 2 * y * w;
-    matrix(1, 0) = 2 * x * y + 2 * z * w;
-    matrix(1, 1) = 1 - 2 * x * x - 2 * z * z;
-    matrix(1, 2) = 2 * y * z - 2 * x * w;
-    matrix(2, 0) = 2 * x * z - 2 * y * w;
-    matrix(2, 1) = 2 * y * z + 2 * x * w;
-    matrix(2, 2) = 1 - 2 * x * x - 2 * y * y;
-    matrix(0, 3) = pose.position_m.x_m;
-    matrix(1, 3) = pose.position_m.y_m;
-    matrix(2, 3) = pose.position_m.z_m;
-    return matrix;
-  };
-
-  auto matrix_to_pose = [](const Eigen::Matrix4d& matrix) {
-    Pose3DTO pose;
-    pose.position_m = {matrix(0, 3), matrix(1, 3), matrix(2, 3)};
-
-    const Eigen::Matrix3d rotation = matrix.block<3, 3>(0, 0);
-    Eigen::Quaterniond quaternion(rotation);
-    quaternion.normalize();
-    pose.orientation = {
-        quaternion.x(), quaternion.y(), quaternion.z(), quaternion.w()};
-    return pose;
-  };
-
-  return matrix_to_pose(pose_to_matrix(a) * pose_to_matrix(b));
-}
-
-Pose3DTO pose_with_position_and_orientation_for_direct_plan(
-    const Vector3DTO& position,
-    const QuaternionDTO& orientation) {
-  Pose3DTO pose;
-  pose.position_m = position;
-  pose.orientation = orientation;
-  return pose;
-}
-
 std::optional<ErrorDTO> resolve_motion_spec_for_direct_plan(
     NativeKernelBundle& bundle,
     const ExecuteRequestDTO& request,
     const SceneRevisionBindingDTO& scene_binding,
+    const RobotStateDTO& start_state,
     MotionSpecDTO& resolved_motion) {
-  if (const auto* relative_move = std::get_if<RelativeMoveDTO>(&request.motion)) {
-    auto target_pose = bundle.reference_resolver->resolve_reference_pose(
-        relative_move->target_reference, request.base_frame, scene_binding);
-    if (!target_pose.ok()) {
-      return target_pose.error();
-    }
-
-    Pose3DTO offset_basis_pose = target_pose.value();
-    if (relative_move->offset_reference.has_value()) {
-      auto offset_reference_pose =
-          bundle.reference_resolver->resolve_reference_pose(
-              *relative_move->offset_reference, request.base_frame,
-              scene_binding);
-      if (!offset_reference_pose.ok()) {
-        return offset_reference_pose.error();
-      }
-      offset_basis_pose = offset_reference_pose.value();
-    }
-
-    PoseGoalDTO pose_goal;
-    pose_goal.goal = multiply_poses_for_direct_plan(
-        pose_with_position_and_orientation_for_direct_plan(
-            target_pose.value().position_m,
-            offset_basis_pose.orientation),
-        relative_move->offset);
-    resolved_motion = MotionSpecDTO{pose_goal};
-    return std::nullopt;
+  auto result = resolve_motion_target(
+      request, scene_binding, &start_state, *bundle.reference_resolver);
+  if (!result.ok()) {
+    return result.error();
   }
-
-  resolved_motion = request.motion;
+  resolved_motion = std::move(result.value());
   return std::nullopt;
 }
 
@@ -730,7 +662,7 @@ MotionSpecDTO motion_spec_from_python(const py::dict& request) {
   }
   const auto motion_type = request["motion_type"].cast<std::string>();
 
-  if (motion_type == "joint_goal") {
+  if (motion_type == "joint") {
     JointGoalDTO goal;
     goal.joint_names =
         request["joint_goal_names"].cast<std::vector<std::string>>();
@@ -738,33 +670,17 @@ MotionSpecDTO motion_spec_from_python(const py::dict& request) {
         request["joint_goal_positions_rad"].cast<std::vector<double>>();
     return goal;
   }
-  if (motion_type == "pose_goal") {
+  if (motion_type == "pose") {
     PoseGoalDTO goal;
     goal.goal = complete_pose_from_python(
         request["pose_goal"].cast<py::dict>(), "pose_goal");
     return goal;
   }
-  if (motion_type == "relative_move") {
-    const auto relative = request["relative_move"].cast<py::dict>();
-    RelativeMoveDTO goal;
-    goal.target_reference = reference_from_python(
-        relative["target_reference"].cast<py::dict>(),
-        "relative_move.target_reference");
-    if (relative.contains("offset_reference") &&
-        !relative["offset_reference"].is_none()) {
-      goal.offset_reference = reference_from_python(
-          relative["offset_reference"].cast<py::dict>(),
-          "relative_move.offset_reference");
-    }
-    goal.offset = complete_pose_from_python(
-        relative["offset"].cast<py::dict>(), "relative_move.offset");
-    return goal;
-  }
-  if (motion_type == "cartesian_path") {
+  if (motion_type == "cartesian") {
     if (!request.contains("cartesian_path") ||
         request["cartesian_path"].is_none()) {
       throw std::invalid_argument(
-          "cartesian_path is required for motion_type cartesian_path");
+          "cartesian_path is required for motion_type cartesian");
     }
     const auto path = request["cartesian_path"].cast<py::dict>();
     static const std::set<std::string> kAllowedCartesianFields{
@@ -873,6 +789,68 @@ MotionSpecDTO motion_spec_from_python(const py::dict& request) {
   }
 
   throw std::invalid_argument("Unsupported motion_type '" + motion_type + "'");
+}
+
+void populate_motion_contract_from_python(ExecuteRequestDTO& req,
+                                          const py::dict& request) {
+  const auto target_mode =
+      request.attr("get")("target_mode", std::string("absolute"))
+          .cast<std::string>();
+  if (target_mode == "absolute") {
+    req.target_mode = MotionTargetModeDTO::kAbsolute;
+  } else if (target_mode == "relative") {
+    req.target_mode = MotionTargetModeDTO::kRelative;
+  } else {
+    throw std::invalid_argument(
+        "target_mode must be 'absolute' or 'relative'");
+  }
+
+  const auto planning_profile =
+      request.attr("get")("planning_profile", std::string("first_feasible"))
+          .cast<std::string>();
+  if (planning_profile == "first_feasible") {
+    req.planning_profile = PlanningProfileDTO::kFirstFeasible;
+  } else if (planning_profile == "balanced") {
+    req.planning_profile = PlanningProfileDTO::kBalanced;
+  } else if (planning_profile == "quality_bounded") {
+    req.planning_profile = PlanningProfileDTO::kQualityBounded;
+  } else {
+    throw std::invalid_argument(
+        "planning_profile must be 'first_feasible', 'balanced', or "
+        "'quality_bounded'");
+  }
+
+  if (request.contains("target_reference") &&
+      !request["target_reference"].is_none()) {
+    req.target_reference = reference_from_python(
+        request["target_reference"].cast<py::dict>(), "target_reference");
+  }
+  if (request.contains("offset_reference") &&
+      !request["offset_reference"].is_none()) {
+    req.offset_reference = reference_from_python(
+        request["offset_reference"].cast<py::dict>(), "offset_reference");
+  }
+  req.motion = motion_spec_from_python(request);
+
+  if (request["motion_type"].cast<std::string>() == "pose") {
+    const auto pose = request["pose_goal"].cast<py::dict>();
+    const bool has_frame =
+        pose.contains("frame_id") && !pose["frame_id"].is_none() &&
+        !pose["frame_id"].cast<std::string>().empty();
+    if (req.target_mode == MotionTargetModeDTO::kAbsolute) {
+      if (!has_frame) {
+        throw std::invalid_argument(
+            "pose_goal.frame_id is required for an absolute pose target");
+      }
+      if (pose["frame_id"].cast<std::string>() != req.base_frame) {
+        throw std::invalid_argument(
+            "pose_goal.frame_id must equal the resolved request base_frame");
+      }
+    } else if (pose.contains("frame_id")) {
+      throw std::invalid_argument(
+          "pose_goal.frame_id is forbidden for a relative pose offset");
+    }
+  }
 }
 
 std::vector<SupportContactDTO> support_contacts_from_python(const py::dict& request) {
@@ -1038,39 +1016,16 @@ py::object optional_to_python(const std::optional<T>& value) {
   return value.has_value() ? py::cast(*value) : py::none();
 }
 
-py::dict reference_to_python(const ReferenceDTO& reference) {
-  py::dict d;
-  switch (reference.type) {
-    case ReferenceDTO::Type::kFrame:
-      d["type"] = "frame";
-      break;
-    case ReferenceDTO::Type::kObject:
-      d["type"] = "object";
-      break;
-    case ReferenceDTO::Type::kRobotLink:
-      d["type"] = "robot_link";
-      break;
-    case ReferenceDTO::Type::kPose:
-      d["type"] = "pose";
-      break;
-  }
-  d["id"] = reference.id;
-  if (reference.pose.has_value()) {
-    d["pose"] = pose_to_python(*reference.pose);
-  }
-  return d;
-}
-
 py::dict motion_spec_to_python(const MotionSpecDTO& motion) {
   py::dict d;
   if (const auto* joint = std::get_if<JointGoalDTO>(&motion)) {
-    d["type"] = "joint_goal";
+    d["type"] = "joint";
     d["joint_names"] = joint->joint_names;
     d["positions_rad"] = joint->positions_rad;
     return d;
   }
   if (const auto* pose = std::get_if<PoseGoalDTO>(&motion)) {
-    d["type"] = "pose_goal";
+    d["type"] = "pose";
     d["pose"] = pose_to_python(pose->goal);
     return d;
   }
@@ -1079,20 +1034,8 @@ py::dict motion_spec_to_python(const MotionSpecDTO& motion) {
     d["name"] = named->name;
     return d;
   }
-  if (const auto* relative = std::get_if<RelativeMoveDTO>(&motion)) {
-    d["type"] = "relative_move";
-    d["target_reference"] = reference_to_python(relative->target_reference);
-    d["offset"] = pose_to_python(relative->offset);
-    if (relative->offset_reference.has_value()) {
-      d["offset_reference"] =
-          reference_to_python(*relative->offset_reference);
-    } else {
-      d["offset_reference"] = py::none();
-    }
-    return d;
-  }
   const auto& cartesian = std::get<CartesianPathDTO>(motion);
-  d["type"] = "cartesian_path";
+  d["type"] = "cartesian";
   py::list waypoints;
   for (const auto& waypoint : cartesian.waypoints) {
     waypoints.append(pose_to_python(waypoint));
@@ -1136,6 +1079,17 @@ py::dict plan_request_to_python(const PlanRequestDTO& request) {
       optional_to_python(request.speed_profile.max_tcp_linear_speed_mps);
   d["speed_profile"] = std::move(speed_profile);
   d["planning_timeout_s"] = request.planning_timeout_s;
+  switch (request.planning_profile) {
+    case PlanningProfileDTO::kFirstFeasible:
+      d["planning_profile"] = "first_feasible";
+      break;
+    case PlanningProfileDTO::kBalanced:
+      d["planning_profile"] = "balanced";
+      break;
+    case PlanningProfileDTO::kQualityBounded:
+      d["planning_profile"] = "quality_bounded";
+      break;
+  }
   d["planning_attempt_index"] = request.planning_attempt_index;
   py::dict limits;
   for (const auto& [joint_name, limit] : request.per_joint_dynamics_limits) {
@@ -1269,6 +1223,11 @@ const char* kernel_event_type_to_string(KernelEventType type) {
     case KernelEventType::kPlanCompleted: return "plan_completed";
     case KernelEventType::kCacheHit: return "cache_hit";
     case KernelEventType::kCacheMiss: return "cache_miss";
+    case KernelEventType::kCacheRevalidationCandidate:
+      return "cache_revalidation_candidate";
+    case KernelEventType::kCacheRevalidated: return "cache_revalidated";
+    case KernelEventType::kCacheRevalidationFailed:
+      return "cache_revalidation_failed";
     case KernelEventType::kCacheInvalidated: return "cache_invalidated";
     case KernelEventType::kValidationStarted: return "validation_started";
     case KernelEventType::kValidationPassed: return "validation_passed";
@@ -1558,6 +1517,9 @@ py::dict metrics_to_python(const MetricsSnapshot& metrics) {
   py::dict d;
   d["cache_hits"] = metrics.cache_hits;
   d["cache_misses"] = metrics.cache_misses;
+  d["cache_revalidation_candidates"] = metrics.cache_revalidation_candidates;
+  d["cache_revalidations_succeeded"] = metrics.cache_revalidations_succeeded;
+  d["cache_revalidations_failed"] = metrics.cache_revalidations_failed;
   d["cache_invalidations"] = metrics.cache_invalidations;
   d["plans_succeeded"] = metrics.plans_succeeded;
   d["plans_failed"] = metrics.plans_failed;
@@ -2655,7 +2617,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         std::string cache_mode_str = request.attr("get")("cache_mode", "default").cast<std::string>();
         req.cache_mode = (cache_mode_str == "disable") ? CacheMode::kDisable : CacheMode::kDefault;
 
-        req.motion = motion_spec_from_python(request);
+        populate_motion_contract_from_python(req, request);
 
         // Motion-scoped interrupt scopes
         // (spec/210 §3.10 + spec/260 §2.6). Parse each scope's
@@ -2955,7 +2917,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         std::string cache_mode_str = request.attr("get")("cache_mode", "default").cast<std::string>();
         req.cache_mode = (cache_mode_str == "disable") ? CacheMode::kDisable : CacheMode::kDefault;
 
-        req.motion = motion_spec_from_python(request);
+        populate_motion_contract_from_python(req, request);
 
         auto kernel = require_open_kernel(self);
         if (auto admission_error =
@@ -2995,7 +2957,8 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }
         MotionSpecDTO resolved_motion;
         if (auto error = resolve_motion_spec_for_direct_plan(
-                self, req, plan_request.scene_binding, resolved_motion)) {
+                self, req, plan_request.scene_binding, start_state,
+                resolved_motion)) {
           py::dict result;
           result["ok"] = false;
           result["error"] = error->message;
@@ -3005,6 +2968,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         plan_request.motion = std::move(resolved_motion);
         plan_request.tolerances = req.tolerances;
         plan_request.speed_profile = req.speed_profile;
+        plan_request.planning_profile = req.planning_profile;
         plan_request.per_joint_dynamics_limits = req.per_joint_dynamics_limits;
         plan_request.planning_timeout_s = req.timeouts.planning_timeout_s;
 
@@ -3114,7 +3078,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         std::string cache_mode_str = request.attr("get")("cache_mode", "default").cast<std::string>();
         req.cache_mode = (cache_mode_str == "disable") ? CacheMode::kDisable : CacheMode::kDefault;
 
-        req.motion = motion_spec_from_python(request);
+        populate_motion_contract_from_python(req, request);
 
         auto kernel = require_open_kernel(self);
         if (auto admission_error =
@@ -3154,7 +3118,8 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }
         MotionSpecDTO resolved_motion;
         if (auto error = resolve_motion_spec_for_direct_plan(
-                self, req, plan_request.scene_binding, resolved_motion)) {
+                self, req, plan_request.scene_binding, start_state,
+                resolved_motion)) {
           py::dict result;
           result["ok"] = false;
           result["error"] = error->message;
@@ -3164,6 +3129,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         plan_request.motion = std::move(resolved_motion);
         plan_request.tolerances = req.tolerances;
         plan_request.speed_profile = req.speed_profile;
+        plan_request.planning_profile = req.planning_profile;
         plan_request.per_joint_dynamics_limits = req.per_joint_dynamics_limits;
         plan_request.planning_timeout_s = req.timeouts.planning_timeout_s;
 

@@ -2194,11 +2194,13 @@ class ExecutionKernelTest : public ::testing::Test {
       const std::string& move_id,
       const std::string& object_id) {
     auto request = make_test_request(move_id);
-    RelativeMoveDTO relative;
-    relative.target_reference.type = ReferenceDTO::Type::kObject;
-    relative.target_reference.id = object_id;
-    relative.offset.orientation.w = 1.0;
-    request.motion = relative;
+    request.target_mode = MotionTargetModeDTO::kRelative;
+    request.target_reference = ReferenceDTO{};
+    request.target_reference->type = ReferenceDTO::Type::kObject;
+    request.target_reference->id = object_id;
+    PoseGoalDTO offset;
+    offset.goal.orientation.w = 1.0;
+    request.motion = offset;
     return request;
   }
 
@@ -2534,13 +2536,10 @@ TEST_F(ExecutionKernelTest, Execute_HappyPath_CallsPlanner) {
 }
 
 TEST_F(ExecutionKernelTest, Execute_RelativeMove_ResolvesToPoseGoalBeforePlanning) {
-  ExecuteRequestDTO req = make_test_request("relative_move");
-  RelativeMoveDTO relative_move;
-  relative_move.target_reference.type = ReferenceDTO::Type::kObject;
-  relative_move.target_reference.id = "graspable";
-  relative_move.offset.position_m = {0.0, 0.0, 0.1};
-  relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
-  req.motion = relative_move;
+  ExecuteRequestDTO req =
+      make_relative_object_request("relative_pose", "graspable");
+  auto& relative_offset = std::get<PoseGoalDTO>(req.motion);
+  relative_offset.goal.position_m = {0.0, 0.0, 0.1};
 
   Pose3DTO resolved_reference;
   resolved_reference.position_m = {0.3, -0.2, 0.15};
@@ -2559,17 +2558,20 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMove_ResolvesToPoseGoalBeforePlannin
 }
 
 TEST_F(ExecutionKernelTest, Execute_RelativeMove_PoseReference_ResolvesToPoseGoalBeforePlanning) {
-  ExecuteRequestDTO req = make_test_request("relative_move");
-  RelativeMoveDTO relative_move;
-  relative_move.target_reference.type = ReferenceDTO::Type::kPose;
-  relative_move.target_reference.pose = Pose3DTO{};
-  relative_move.target_reference.pose->position_m = {0.25, -0.15, 0.2};
-  relative_move.target_reference.pose->orientation = {0.0, 0.0, 0.0, 1.0};
-  relative_move.offset.position_m = {0.0, 0.0, 0.1};
-  relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
-  req.motion = relative_move;
+  ExecuteRequestDTO req = make_test_request("relative_pose");
+  req.target_mode = MotionTargetModeDTO::kRelative;
+  req.target_reference = ReferenceDTO{};
+  req.target_reference->type = ReferenceDTO::Type::kPose;
+  req.target_reference->pose = Pose3DTO{};
+  req.target_reference->pose->position_m = {0.25, -0.15, 0.2};
+  req.target_reference->pose->orientation = {0.0, 0.0, 0.0, 1.0};
+  PoseGoalDTO relative_offset;
+  relative_offset.goal.position_m = {0.0, 0.0, 0.1};
+  relative_offset.goal.orientation = {0.0, 0.0, 0.0, 1.0};
+  req.motion = relative_offset;
 
-  context.next_reference_pose = Result<Pose3DTO>::Ok(relative_move.target_reference.pose.value());
+  context.next_reference_pose =
+      Result<Pose3DTO>::Ok(req.target_reference->pose.value());
 
   auto result = execute_sync(req);
   ASSERT_TRUE(result.ok());
@@ -2583,19 +2585,16 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMove_PoseReference_ResolvesToPoseGoa
 
 TEST_F(ExecutionKernelTest, Execute_RelativeMove_OffsetReference_UsesIndependentBasis) {
   constexpr double kInvSqrt2 = 0.7071067811865476;
-  ExecuteRequestDTO req = make_test_request("relative_move");
-  RelativeMoveDTO relative_move;
-  relative_move.target_reference.type = ReferenceDTO::Type::kObject;
-  relative_move.target_reference.id = "graspable";
+  ExecuteRequestDTO req =
+      make_relative_object_request("relative_pose", "graspable");
 
   ReferenceDTO offset_reference;
   offset_reference.type = ReferenceDTO::Type::kFrame;
   offset_reference.id = "base_link";
-  relative_move.offset_reference = offset_reference;
+  req.offset_reference = offset_reference;
 
-  relative_move.offset.position_m = {0.1, 0.0, 0.0};
-  relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
-  req.motion = relative_move;
+  auto& relative_offset = std::get<PoseGoalDTO>(req.motion);
+  relative_offset.goal.position_m = {0.1, 0.0, 0.0};
 
   Pose3DTO target_pose;
   target_pose.position_m = {0.3, -0.2, 0.15};
@@ -3019,6 +3018,89 @@ TEST_F(ExecutionKernelTest, Execute_CacheHit_SkipsPlanning) {
   EXPECT_EQ(execution.execute_count, 1);
 }
 
+TEST_F(ExecutionKernelTest,
+       Execute_CrossRevisionCacheCandidateRevalidatesWithoutPlanning) {
+  std::atomic<int> candidate_events{0};
+  std::atomic<int> success_events{0};
+  kernel.subscribe_events([&](const KernelEvent& event) {
+    if (event.type == KernelEventType::kCacheRevalidationCandidate) {
+      candidate_events.fetch_add(1, std::memory_order_relaxed);
+    } else if (event.type == KernelEventType::kCacheRevalidated) {
+      success_events.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+  const auto request = make_test_request("move_cross_revision_valid");
+  store_cache(request, make_test_trajectory());
+  auto current_world = make_test_collision_world_snapshot();
+  current_world.revision = {2, "current-collision-world"};
+  collision_world_publisher.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(current_world));
+
+  const auto result = execute_sync(request);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_GE(context.validate_count, 1);
+  EXPECT_EQ(execution.execute_count, 1);
+  const auto metrics = kernel.get_metrics();
+  EXPECT_EQ(metrics.cache_hits, 0u);
+  EXPECT_EQ(metrics.cache_revalidation_candidates, 1u);
+  EXPECT_EQ(metrics.cache_revalidations_succeeded, 1u);
+  EXPECT_EQ(candidate_events.load(std::memory_order_relaxed), 1);
+  EXPECT_EQ(success_events.load(std::memory_order_relaxed), 1);
+  const auto stored_revision = cache.revision_of(request.move_id);
+  ASSERT_TRUE(stored_revision.has_value());
+  EXPECT_EQ(stored_revision->revision_id, 2u);
+  EXPECT_EQ(stored_revision->content_hash, "current-collision-world");
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_FailedCrossRevisionCacheCandidateInvalidatesAndReplansOnce) {
+  std::atomic<int> candidate_events{0};
+  std::atomic<int> failure_events{0};
+  kernel.subscribe_events([&](const KernelEvent& event) {
+    if (event.type == KernelEventType::kCacheRevalidationCandidate) {
+      candidate_events.fetch_add(1, std::memory_order_relaxed);
+    } else if (event.type == KernelEventType::kCacheRevalidationFailed) {
+      failure_events.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+  const auto request = make_test_request("move_cross_revision_invalid");
+  store_cache(request, make_test_trajectory());
+  auto current_world = make_test_collision_world_snapshot();
+  current_world.revision = {2, "current-collision-world"};
+  collision_world_publisher.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(current_world));
+
+  int collision_queries = 0;
+  collision_engine->result_for_query =
+      [&collision_queries](const CollisionQuery&) -> std::optional<CollisionResult> {
+    CollisionResult result = collision_queries++ == 0
+                                 ? make_authoritative_collision_result()
+                                 : CollisionResult{};
+    if (!result.in_collision) {
+      result.engine_status = CollisionEngineStatus::kOk;
+      result.decision = CollisionDecisionResult::kPass;
+    }
+    return result;
+  };
+
+  const auto result = execute_sync(request);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(execution.execute_count, 1);
+  const auto metrics = kernel.get_metrics();
+  EXPECT_EQ(metrics.cache_revalidation_candidates, 1u);
+  EXPECT_EQ(metrics.cache_revalidations_failed, 1u);
+  EXPECT_EQ(candidate_events.load(std::memory_order_relaxed), 1);
+  EXPECT_EQ(failure_events.load(std::memory_order_relaxed), 1);
+  EXPECT_EQ(metrics.cache_invalidations, 1u);
+  const auto stored_revision = cache.revision_of(request.move_id);
+  ASSERT_TRUE(stored_revision.has_value());
+  EXPECT_EQ(stored_revision->revision_id, 2u);
+}
+
 // Planner-intent cache admission: an existing uncapped entry must not be
 // served to a request carrying per-joint dynamics caps.
 TEST_F(ExecutionKernelTest, Execute_PerJointDynamicsLimitsBypassCacheAndReplan) {
@@ -3152,13 +3234,8 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithUnchangedResolvedGoal_SkipsPlanning) {
-  auto req = make_test_request("move_relative_same");
-  RelativeMoveDTO relative_move;
-  relative_move.target_reference.type = ReferenceDTO::Type::kObject;
-  relative_move.target_reference.id = "box";
-  relative_move.offset.position_m = {0.0, 0.0, 0.1};
-  relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
-  req.motion = relative_move;
+  auto req = make_relative_object_request("move_relative_same", "box");
+  std::get<PoseGoalDTO>(req.motion).goal.position_m = {0.0, 0.0, 0.1};
 
   context.next_reference_pose = Result<Pose3DTO>::Ok(make_pose(0.3, -0.2, 0.15));
   context.next_fk = make_pose(0.3, -0.2, 0.25);
@@ -3176,13 +3253,8 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithUnchangedResolvedGoa
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithMovedObject_InvalidatesAndReplans) {
-  auto req = make_test_request("move_relative_changed");
-  RelativeMoveDTO relative_move;
-  relative_move.target_reference.type = ReferenceDTO::Type::kObject;
-  relative_move.target_reference.id = "box";
-  relative_move.offset.position_m = {0.0, 0.0, 0.1};
-  relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
-  req.motion = relative_move;
+  auto req = make_relative_object_request("move_relative_changed", "box");
+  std::get<PoseGoalDTO>(req.motion).goal.position_m = {0.0, 0.0, 0.1};
 
   context.next_reference_pose = Result<Pose3DTO>::Ok(make_pose(0.5, -0.2, 0.15));
   context.next_fk = make_pose(0.3, -0.2, 0.25);
@@ -3206,13 +3278,9 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithMovedObject_Invalida
 
 TEST_F(ExecutionKernelTest, Execute_RelativeMoveMissingReference_DoesNotUseStaleCache) {
   store_cache("move_missing_reference", make_test_trajectory());
-  auto req = make_test_request("move_missing_reference");
-  RelativeMoveDTO relative_move;
-  relative_move.target_reference.type = ReferenceDTO::Type::kObject;
-  relative_move.target_reference.id = "missing_box";
-  relative_move.offset.position_m = {0.0, 0.0, 0.1};
-  relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
-  req.motion = relative_move;
+  auto req =
+      make_relative_object_request("move_missing_reference", "missing_box");
+  std::get<PoseGoalDTO>(req.motion).goal.position_m = {0.0, 0.0, 0.1};
 
   context.next_reference_pose = Result<Pose3DTO>::Err(
       ErrorDTO{kErrorMissingReference, "Object reference not found", {}});

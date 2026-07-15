@@ -84,7 +84,10 @@ TrajectoryCacheLookupResult TrajectoryCache::lookup_with_revision(
   // - Expected tagged, stored unset: adapter started publishing revisions
   //   after this entry was stored. The stored entry is no longer trusted;
   //   evict and miss so the kernel revalidates.
-  // - Both tagged: must match exactly. Mismatch evicts the stale entry.
+  // - Both tagged: exact match is a hit. A same-intent entry is a
+  //   revalidation candidate only when the authoritative revision advanced.
+  //   Revision rollback or a different hash under the same revision is an
+  //   integrity failure, not an "older snapshot", and is evicted fail-closed.
   if (expected_is_unset) {
     return {TrajectoryCacheLookupDisposition::kAuthoritativeRevisionUnavailable,
             std::nullopt};
@@ -94,21 +97,28 @@ TrajectoryCacheLookupResult TrajectoryCache::lookup_with_revision(
     return {TrajectoryCacheLookupDisposition::kRevisionMismatch,
             std::nullopt};
   }
-  if (stored.revision_id != expected_revision.revision_id ||
-      stored.content_hash != expected_revision.content_hash) {
-    erase_locked(move_id);
-    return {TrajectoryCacheLookupDisposition::kRevisionMismatch,
-            std::nullopt};
-  }
   if (it->second.intent_identity != expected_intent_identity) {
     erase_locked(move_id);
     return {TrajectoryCacheLookupDisposition::kIntentMismatch, std::nullopt};
+  }
+  const bool revision_matches =
+      stored.revision_id == expected_revision.revision_id &&
+      stored.content_hash == expected_revision.content_hash;
+  const bool authoritative_revision_advanced =
+      expected_revision.revision_id > stored.revision_id;
+  if (!revision_matches && !authoritative_revision_advanced) {
+    erase_locked(move_id);
+    return {TrajectoryCacheLookupDisposition::kRevisionMismatch,
+            std::nullopt};
   }
   // Hold the shared payload, then deep-copy outside the lock so the hit
   // path's lock hold time stays O(1).
   std::shared_ptr<const TrajectoryDTO> found = it->second.trajectory;
   lock.unlock();
-  return {TrajectoryCacheLookupDisposition::kHit, *found};
+  return {revision_matches
+              ? TrajectoryCacheLookupDisposition::kHit
+              : TrajectoryCacheLookupDisposition::kRevalidationCandidate,
+          *found};
 }
 
 std::optional<CollisionWorldRevision> TrajectoryCache::revision_of(

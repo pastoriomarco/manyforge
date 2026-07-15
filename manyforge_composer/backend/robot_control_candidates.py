@@ -1226,12 +1226,12 @@ class _CandidatePlanner:
         move_id = f"rc_candidate_joint_{uuid.uuid4().hex}"
         exec_request = self._build_execute_request(
             move_id=move_id,
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_names=kernel_joint_names,
             joint_positions=target_positions,
         )
         dispatch_params = {
-            "motion_type": "joint_goal",
+            "motion_type": "joint",
             "joint_goal_names": kernel_joint_names,
             "joint_goal_positions_rad": target_positions,
         }
@@ -1330,13 +1330,13 @@ class _CandidatePlanner:
         move_id = f"rc_candidate_cartesian_{uuid.uuid4().hex}"
         exec_request = self._build_execute_request(
             move_id=move_id,
-            motion_type="cartesian_path",
+            motion_type="cartesian",
             cartesian_path=cartesian_path,
             base_frame=candidate_base_frame,
             tcp_frame=candidate_tcp_frame,
         )
         dispatch_params = {
-            "motion_type": "cartesian_path",
+            "motion_type": "cartesian",
             "cartesian_path": cartesian_path,
             "base_frame": candidate_base_frame,
             "tcp_frame": candidate_tcp_frame,
@@ -2735,7 +2735,7 @@ def create_robot_control_candidates_router(state: ComposerState) -> APIRouter:
 
         # Optimistic joint cache update for joint goals (mirrors direct-jog) so
         # the panel does not snap back while the move completes.
-        if dispatch_params["motion_type"] == "joint_goal":
+        if dispatch_params["motion_type"] == "joint":
             state.record_current_joint_positions(
                 list(dispatch_params["joint_goal_positions_rad"])
             )

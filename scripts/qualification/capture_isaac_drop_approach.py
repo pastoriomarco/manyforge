@@ -108,8 +108,10 @@ def _resolved_drop_goal(
     program: dict[str, Any], scene_state: dict[str, Any]
 ) -> dict[str, Any]:
     node = _find_node(program["tree"], "move_to_drop_approach")
-    relative = node["params"]["relative_move"]
-    target_id = relative["target_reference"]["id"]
+    params = node["params"]
+    if params.get("motion_type") != "pose" or params.get("target_mode") != "relative":
+        raise ValueError("capture requires a portable relative pose request")
+    target_id = params["target_reference"]["id"]
     target = next(
         item for item in scene_state["objects"] if item["object_id"] == target_id
     )
@@ -123,13 +125,13 @@ def _resolved_drop_goal(
         base_orientation,
         [world_target[index] - base_position[index] for index in range(3)],
     )
-    offset_reference = relative.get("offset_reference") or {}
+    offset_reference = params.get("offset_reference") or {}
     if (
         offset_reference.get("type") != "frame"
         or offset_reference.get("id") != scene_state["robot"]["base_frame"]
     ):
         raise ValueError("capture supports the authored base-frame offset only")
-    offset = relative["offset"]
+    offset = params["pose_goal"]
     offset_position = [float(value) for value in offset["position_m"]]
     offset_orientation = _quaternion_from_rpy_deg(
         [float(value) for value in offset["orientation_rpy_deg"]]
@@ -144,7 +146,7 @@ def _resolved_drop_goal(
             "orientation_xyzw": offset_orientation,
         },
         "source": {
-            "target_reference": relative["target_reference"],
+            "target_reference": params["target_reference"],
             "offset_reference": offset_reference,
             "offset_pose": {
                 "position_m": offset_position,

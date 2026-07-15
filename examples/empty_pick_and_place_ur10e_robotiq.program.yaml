@@ -7,7 +7,7 @@ description: |
   demo, but ships with NO scene resources, NO tree nodes, NO
   parameters, and NO blackboard keys — the assistant builds the
   scene + tree from scratch via the PnP_01 → PnP_20 prompt sequence.
-catalog_version: "0.2.0"
+catalog_version: "0.3.0"
 robot:
   robot_id: ur10e
   group_id: arm

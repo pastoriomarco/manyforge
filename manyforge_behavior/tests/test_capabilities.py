@@ -13,8 +13,8 @@ from manyforge_behavior.capabilities import (
 
 class TestV00RequiredKeys:
     def test_v0_0_required_keys_count(self):
-        """Verify V0_0_REQUIRED_KEYS has exactly 20 keys."""
-        assert len(V0_0_REQUIRED_KEYS) == 20
+        """Verify V0_0_REQUIRED_KEYS has exactly 23 keys."""
+        assert len(V0_0_REQUIRED_KEYS) == 23
 
     def test_v0_0_required_keys_is_frozenset(self):
         """Verify V0_0_REQUIRED_KEYS is a frozenset (immutable)."""
@@ -24,6 +24,9 @@ class TestV00RequiredKeys:
         """Verify planning capability keys are present."""
         assert "planning.motion.joint_goal" in V0_0_REQUIRED_KEYS
         assert "planning.motion.pose_goal" in V0_0_REQUIRED_KEYS
+        assert "planning.profile.first_feasible" in V0_0_REQUIRED_KEYS
+        assert "planning.profile.balanced" in V0_0_REQUIRED_KEYS
+        assert "planning.profile.quality_bounded" in V0_0_REQUIRED_KEYS
         assert "planning.trajectory.time_parameterized" in V0_0_REQUIRED_KEYS
 
     def test_v0_0_required_keys_contains_context_keys(self):
@@ -67,7 +70,7 @@ class TestGetRequiredKeys:
     def test_v0_1_includes_v0_0_plus_object_relative_keys(self):
         """v0.1 is additive over v0.0 for object-relative manipulation."""
         assert V0_0_REQUIRED_KEYS.issubset(V0_1_REQUIRED_KEYS)
-        assert len(V0_1_REQUIRED_KEYS) == 24
+        assert len(V0_1_REQUIRED_KEYS) == 27
         assert "context.pose.resolve_reference" in V0_1_REQUIRED_KEYS
         assert "context.scene.object_query" in V0_1_REQUIRED_KEYS
         assert "scene.edit.attach_detach" in V0_1_REQUIRED_KEYS
@@ -79,6 +82,9 @@ class TestGetRequiredKeys:
 
     def test_registry_contains_optional_node_capabilities(self):
         assert "planning.motion.cartesian_path" in CAPABILITY_REGISTRY
+        assert "planning.profile.first_feasible" in CAPABILITY_REGISTRY
+        assert "planning.profile.balanced" in CAPABILITY_REGISTRY
+        assert "planning.profile.quality_bounded" in CAPABILITY_REGISTRY
         assert "scene.edit.upsert" in CAPABILITY_REGISTRY
         assert "tool.gripper.command" in CAPABILITY_REGISTRY
         assert "execution.contact.force_torque" in CAPABILITY_REGISTRY

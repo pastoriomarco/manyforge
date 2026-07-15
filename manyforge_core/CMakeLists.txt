@@ -25,6 +25,7 @@ add_library(manyforge_core
   src/kernel_flight_recorder.cpp
   src/kernel_event_factories.cpp
   src/motion_trip_stop_coordinator.cpp
+  src/motion_target_resolution.cpp
   src/operator_stop_worker.cpp
   src/observed_robot_state_publication.cpp
   src/observed_robot_state_provider.cpp
@@ -65,6 +66,25 @@ if(BUILD_TESTING)
   include(GoogleTest)
   set(MANYFORGE_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
       "Per-test timeout for manyforge_core gtest cases")
+
+  # Planner-neutral conformance support. This target intentionally has no
+  # GTest or concrete-planner dependency so any adapter test package can reuse
+  # it without linking that planner into manyforge_core.
+  add_library(manyforge_planner_conformance_test_support
+    test_support/src/planner_backend_conformance.cpp)
+  add_library(manyforge::planner_conformance_test_support ALIAS
+    manyforge_planner_conformance_test_support)
+  target_include_directories(manyforge_planner_conformance_test_support PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test_support/include>)
+  target_link_libraries(manyforge_planner_conformance_test_support PUBLIC
+    manyforge_core)
+
+  add_executable(test_planner_backend_conformance
+    test/test_planner_backend_conformance.cpp)
+  target_link_libraries(test_planner_backend_conformance PRIVATE
+    manyforge_planner_conformance_test_support GTest::gtest_main)
+  gtest_discover_tests(test_planner_backend_conformance
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_version test/test_version.cpp)
   target_link_libraries(test_version PRIVATE manyforge_core GTest::gtest_main)
@@ -176,6 +196,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_pose_math PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_pose_math
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_motion_target_resolution
+    test/test_motion_target_resolution.cpp)
+  target_link_libraries(test_motion_target_resolution PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_motion_target_resolution
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_operator_stop_worker

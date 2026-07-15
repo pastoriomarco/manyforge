@@ -33,7 +33,7 @@ struct IkRequestDTO {
 /// Result of a single-shot IK solve.
 struct IkResultDTO {
     bool ok = false;
-    /// Joint names in dispatch order (matches the planner's group order).
+    /// Canonical joint names in dispatch order.
     std::vector<std::string> joint_names;
     /// Resolved joint positions in the same order.
     std::vector<double> positions_rad;
@@ -87,7 +87,8 @@ class IPlannerBackend {
         result.error = ErrorDTO{
             std::string(to_string(ErrorCode::kUnsupportedCapability)),
             "single-shot IK not supported by this planner backend",
-            {}};
+            {{"reason", "single_shot_ik_unsupported"},
+             {"capability", "planning.ik.single_shot"}}};
         return result;
     }
 };

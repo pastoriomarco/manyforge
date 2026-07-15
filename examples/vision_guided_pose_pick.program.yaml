@@ -15,7 +15,7 @@ description: >-
   simulator state (Isaac Sim) or a dedicated 6D-pose model; the model's role is
   visual SELECTION and reasoning, never coordinate invention. Until then this
   scenario demonstrates the wiring and the fail-closed boundary only.
-catalog_version: "0.2.0"
+catalog_version: "0.3.0"
 
 robot:
   robot_id: ur5
@@ -104,7 +104,7 @@ tree:
       name: move_to_approach_pose
       params:
         move_id: vlm_approach_pose
-        motion_type: pose_goal
+        motion_type: pose
         pose_goal:
           field_ref:
             namespace: grasp_plan
@@ -115,7 +115,7 @@ tree:
       name: move_to_grasp_pose
       params:
         move_id: vlm_grasp_pose
-        motion_type: pose_goal
+        motion_type: pose
         pose_goal:
           field_ref:
             namespace: grasp_plan
@@ -133,24 +133,24 @@ tree:
       name: retreat_after_grasp
       params:
         move_id: vlm_retreat_pose
-        motion_type: relative_move
-        relative_move:
-          target_reference:
-            type: robot_link
-            id: tool0
-          offset_reference:
-            type: frame
-            id: base_link
-          offset:
-            position_m: [0.0, 0.0, 0.08]
-            orientation_rpy_deg: [180.0, 0.0, -90.0]
+        motion_type: pose
+        target_mode: relative
+        target_reference:
+          type: robot_link
+          id: tool0
+        offset_reference:
+          type: frame
+          id: base_link
+        pose_goal:
+          position_m: [0.0, 0.0, 0.08]
+          orientation_rpy_deg: [180.0, 0.0, -90.0]
         velocity_scale: 0.35
 
     - id: move_manipulator_action
       name: move_to_place_pose
       params:
         move_id: vlm_place_pose
-        motion_type: pose_goal
+        motion_type: pose
         pose_goal:
           frame_id: base_link
           position_m: [0.22, 0.0, 0.30]

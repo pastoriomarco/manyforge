@@ -43,7 +43,7 @@ body:
   name: move_to_named_config
   params:
     move_id: "move_to_${param:config_name}"
-    motion_type: joint_goal
+    motion_type: joint
     joint_goal_names: "${param:joint_names}"
     joint_goal_positions_rad: "${param:joint_positions_rad}"
     velocity_scale: "${param:velocity_scale}"

@@ -193,7 +193,7 @@ TEST(ContractsCompile, GeometryTypes) {
   pose.orientation = quat;
 }
 
-// Test MotionSpecDTO variant with all 5 goal types
+// Test MotionSpecDTO variants and orthogonal target-policy fields.
 TEST(ContractsCompile, MotionSpecVariant) {
   using namespace manyforge::core;
 
@@ -215,29 +215,30 @@ TEST(ContractsCompile, MotionSpecVariant) {
   MotionSpecDTO m3 = named_target;
   EXPECT_TRUE(std::holds_alternative<NamedTargetDTO>(m3));
 
-  // Relative move
-  RelativeMoveDTO relative_move;
-  relative_move.target_reference.type = ReferenceDTO::Type::kFrame;
-  relative_move.target_reference.id = "world";
-  MotionSpecDTO m4 = relative_move;
-  EXPECT_TRUE(std::holds_alternative<RelativeMoveDTO>(m4));
-
   ReferenceDTO pose_ref;
   pose_ref.type = ReferenceDTO::Type::kPose;
   pose_ref.pose = Pose3DTO{};
   pose_ref.pose->position_m = {0.1, 0.2, 0.3};
   pose_ref.pose->orientation = {0.0, 0.0, 0.0, 1.0};
-  relative_move.target_reference = pose_ref;
-  relative_move.offset_reference = pose_ref;
-  MotionSpecDTO m4_pose = relative_move;
-  EXPECT_TRUE(std::holds_alternative<RelativeMoveDTO>(m4_pose));
+  ExecuteRequestDTO relative_pose_request;
+  relative_pose_request.motion = pose_goal;
+  relative_pose_request.target_mode = MotionTargetModeDTO::kRelative;
+  relative_pose_request.target_reference = pose_ref;
+  relative_pose_request.offset_reference = pose_ref;
+  relative_pose_request.planning_profile = PlanningProfileDTO::kBalanced;
+  EXPECT_TRUE(std::holds_alternative<PoseGoalDTO>(
+      relative_pose_request.motion));
+  EXPECT_EQ(relative_pose_request.target_mode,
+            MotionTargetModeDTO::kRelative);
+  EXPECT_EQ(relative_pose_request.planning_profile,
+            PlanningProfileDTO::kBalanced);
 
   // Cartesian path
   CartesianPathDTO cartesian_path;
   cartesian_path.max_translation_step_m = 0.01;
   cartesian_path.max_rotation_step_rad = 0.05;
-  MotionSpecDTO m5 = cartesian_path;
-  EXPECT_TRUE(std::holds_alternative<CartesianPathDTO>(m5));
+  MotionSpecDTO m4 = cartesian_path;
+  EXPECT_TRUE(std::holds_alternative<CartesianPathDTO>(m4));
 }
 
 // Test CollisionShapeDTO variant with all 4 shapes

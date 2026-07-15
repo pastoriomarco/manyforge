@@ -29,8 +29,7 @@ import {
   PoseEditor,
   PoseEnvelopeEditor,
   PoseMapEditor,
-  RelativeMoveEditor,
-  RelativeMoveReferenceParamEditor,
+  MotionReferenceParamEditor,
 } from './property/MotionEditors';
 import {
   FixedFloatListEditor,
@@ -46,6 +45,10 @@ import {
   SUPPORTED_PROGRAM_PARAMETER_TYPES,
 } from './property/ProgramParameterBindingEditor';
 import { profileSatisfies } from '../utils/profiles';
+import {
+  deploymentCapabilityKeys,
+  supportsRequiredCapabilities,
+} from '../utils/deploymentCapabilities';
 import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
 import { DraftTextInput } from './common/DraftInputs';
 
@@ -78,6 +81,12 @@ const SCENE_OBJECT_ID_NODE_IDS = new Set([
   'detach_object_from_link',
 ]);
 
+const MOTION_NODE_IDS = new Set([
+  'move_manipulator_action',
+  'move_until_signal',
+  'probe_search_move',
+]);
+
 const GRIPPER_PRESET_MAX_EFFORT = 40.0;
 const GRIPPER_PRESET_DURATION_S = 1.0;
 const GRIPPER_PRESET_TIMEOUT_S = 0.0;
@@ -85,6 +94,7 @@ const GRIPPER_PRESET_TIMEOUT_S = 0.0;
 function enumOptionsForProgramProfile(
   param: CatalogParameter,
   programProfile: string | null | undefined,
+  availableCapabilities: ReadonlySet<string>,
 ): { value: string; label: string }[] {
   const options: CatalogEnumOption[] = param.enumOptions.length > 0
     ? param.enumOptions
@@ -96,7 +106,13 @@ function enumOptionsForProgramProfile(
         requiredCapabilities: [],
       }));
   return options
-    .filter((option) => profileSatisfies(option.profilesMin, programProfile))
+    .filter(
+      (option) => profileSatisfies(option.profilesMin, programProfile)
+        && supportsRequiredCapabilities(
+          availableCapabilities,
+          option.requiredCapabilities,
+        ),
+    )
     .map((option) => ({
       value: option.value,
       label: option.label || option.value,
@@ -522,6 +538,10 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
   const { entries } = useCatalogStore();
   const cycleState = useCycleStore((state) => state.state);
   const deployment = useDeploymentStore((state) => state.deployment);
+  const availableCapabilities = useMemo(
+    () => deploymentCapabilityKeys(deployment),
+    [deployment],
+  );
   const globalTcpCap = deployment?.robotConfig?.globalMaxTcpLinearSpeedMps;
   const hasTcpCap = typeof globalTcpCap === 'number' && globalTcpCap > 0;
   const selectedNode = selectedNodeId ? nodes.find(n => n.id === selectedNodeId) : undefined;
@@ -809,6 +829,57 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
   );
 
   useEffect(() => {
+    if (
+      isRunMode
+      || !MOTION_NODE_IDS.has(selectedCatalogId)
+      || nodeParams.motion_type !== 'pose'
+    ) {
+      return;
+    }
+    const poseGoal = nodeParams.pose_goal;
+    if (
+      !poseGoal
+      || typeof poseGoal !== 'object'
+      || Array.isArray(poseGoal)
+      || getFieldRefTarget(poseGoal)
+    ) {
+      return;
+    }
+
+    const pose = poseGoal as Record<string, unknown>;
+    const targetMode = nodeParams.target_mode === 'relative' ? 'relative' : 'absolute';
+    if (targetMode === 'relative' && 'frame_id' in pose) {
+      const nextPose = { ...pose };
+      delete nextPose.frame_id;
+      handleParamPatch({ pose_goal: nextPose });
+      return;
+    }
+    if (
+      targetMode === 'absolute'
+      && (typeof pose.frame_id !== 'string' || pose.frame_id.trim().length === 0)
+    ) {
+      const baseFrame =
+        (typeof nodeParams.base_frame === 'string' && nodeParams.base_frame.trim())
+        || sceneState?.robot?.base_frame
+        || programInfo?.robot.baseFrame
+        || '';
+      if (baseFrame) {
+        handleParamPatch({ pose_goal: { ...pose, frame_id: baseFrame } });
+      }
+    }
+  }, [
+    handleParamPatch,
+    isRunMode,
+    nodeParams.base_frame,
+    nodeParams.motion_type,
+    nodeParams.pose_goal,
+    nodeParams.target_mode,
+    programInfo?.robot.baseFrame,
+    sceneState?.robot?.base_frame,
+    selectedCatalogId,
+  ]);
+
+  useEffect(() => {
     if (isRunMode || !selectedNodeId) {
       return;
     }
@@ -941,12 +1012,24 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       return true;
     }
 
+    // The catalog's portable visibility contract supports one controlling
+    // field. Relative spatial references additionally depend on motion_type;
+    // joint-relative requests are named deltas and intentionally have no
+    // spatial reference controls.
+    if (
+      (param.name === 'target_reference' || param.name === 'offset_reference')
+      && MOTION_NODE_IDS.has(selectedCatalogId)
+      && nodeParams.motion_type === 'joint'
+    ) {
+      return false;
+    }
+
     const controllingParam = catalogEntry?.parameters.find(
       (candidate) => candidate.name === param.visibleWhen?.param,
     );
     const controllingValue = nodeParams[param.visibleWhen.param] ?? controllingParam?.default;
     return valuesEqual(controllingValue, param.visibleWhen.equals);
-  }, [catalogEntry?.parameters, nodeParams, programProfile]);
+  }, [catalogEntry?.parameters, nodeParams, programProfile, selectedCatalogId]);
   const blackboardOutputOptions = collectDeclaredBlackboardOutputOptions(blackboardNamespaces);
   const blackboardKeyOptions = collectBlackboardKeyOptions(blackboardKeys);
   const blackboardFieldOptions = collectBlackboardFieldOptions(blackboardNamespaces);
@@ -1368,7 +1451,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       if (selectedNode?.data.catalogId !== 'move_manipulator_action') {
         return null;
       }
-      if (nodeParams.motion_type !== 'joint_goal') {
+      if (nodeParams.motion_type !== 'joint') {
         return null;
       }
 
@@ -1376,10 +1459,10 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       const jointPositions = Array.isArray(nodeParams.joint_goal_positions_rad) ? nodeParams.joint_goal_positions_rad : [];
 
       if (param.name === 'joint_goal_names' && jointNames.length === 0) {
-        return 'At least one joint name is required when motion_type=joint_goal';
+        return 'At least one joint name is required when motion_type=joint';
       }
       if (param.name === 'joint_goal_positions_rad' && jointPositions.length === 0) {
-        return 'At least one joint position is required when motion_type=joint_goal';
+        return 'At least one joint position is required when motion_type=joint';
       }
       if (
         (param.name === 'joint_goal_names' || param.name === 'joint_goal_positions_rad')
@@ -1520,6 +1603,15 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     }
 
     if (param.uiEditor === 'pose_or_blackboard_field_selector') {
+      const isMotionPose =
+        param.name === 'pose_goal'
+        && MOTION_NODE_IDS.has(selectedCatalogId);
+      const isRelativeMotionPose = isMotionPose && nodeParams.target_mode === 'relative';
+      const absoluteBaseFrame =
+        (typeof nodeParams.base_frame === 'string' && nodeParams.base_frame.trim())
+        || sceneState?.robot?.base_frame
+        || programInfo?.robot.baseFrame
+        || '';
       return (
         <LiteralOrFieldReferenceEditor
           currentValue={currentValue}
@@ -1534,6 +1626,9 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
           literalLabel="Literal pose"
           fieldLabel="Declared pose field"
           createDefaultLiteral={() => ({
+            ...(isMotionPose && !isRelativeMotionPose && absoluteBaseFrame
+              ? { frame_id: absoluteBaseFrame }
+              : {}),
             position_m: [0, 0, 0],
             orientation_rpy_deg: [0, 0, 0],
           })}
@@ -1542,29 +1637,19 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
               currentValue={literalValue}
               isRunMode={isRunMode}
               onCommit={onCommitLiteral}
+              frameRequirement={isMotionPose
+                ? isRelativeMotionPose ? 'forbidden' : 'required'
+                : 'optional'}
+              frameOptions={sceneReferenceOptions.frameOptions}
             />
           )}
         />
       );
     }
 
-    if (param.uiEditor === 'relative_move') {
+    if (param.uiEditor === 'motion_reference') {
       return (
-        <RelativeMoveEditor
-          currentValue={currentValue}
-          isRunMode={isRunMode}
-          onCommit={(value) => handleParamChange(param.name, value)}
-          fieldOptions={poseReferenceFieldOptions}
-          frameOptions={sceneReferenceOptions.frameOptions}
-          robotLinkOptions={sceneReferenceOptions.robotLinkOptions}
-          objectOptions={sceneReferenceOptions.objectOptions}
-        />
-      );
-    }
-
-    if (param.uiEditor === 'relative_move_reference') {
-      return (
-        <RelativeMoveReferenceParamEditor
+        <MotionReferenceParamEditor
           currentValue={currentValue}
           isRunMode={isRunMode}
           onCommit={(value) => handleParamChange(param.name, value)}
@@ -1787,6 +1872,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
           const enumOptions = enumOptionsForProgramProfile(
             param,
             programProfile,
+            availableCapabilities,
           );
           const enumValues = enumOptions.map((option) => option.value);
           const normalizedEnumValue =
@@ -1924,7 +2010,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
           <h3 className="text-xs text-gray-400 uppercase mb-2">Parameters</h3>
           {selectedNode.data.catalogId === 'move_manipulator_action' && (
             <div className="mb-3 rounded border border-gray-700 bg-gray-900/50 px-3 py-2 text-[11px] text-gray-400">
-              Showing fields for <span className="text-gray-200">{String(nodeParams.motion_type ?? 'joint_goal')}</span>.
+              Showing fields for <span className="text-gray-200">{String(nodeParams.motion_type ?? 'joint')}</span>.
             </div>
           )}
           <div className="space-y-3">
@@ -2017,7 +2103,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
                   </div>
                   {selectedNode.data.catalogId === 'move_manipulator_action'
                     && param.name === 'motion_type'
-                    && nodeParams.motion_type === 'joint_goal' && (
+                    && nodeParams.motion_type === 'joint' && (
                       <JointGoalEditor
                         jointNames={sceneState?.robot?.joint_names ?? []}
                         currentJointNames={Array.isArray(nodeParams.joint_goal_names) ? nodeParams.joint_goal_names.map((value) => String(value)) : []}

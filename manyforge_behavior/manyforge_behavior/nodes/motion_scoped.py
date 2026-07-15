@@ -57,8 +57,10 @@ from manyforge_behavior.motion_runtime import (
     MotionExecutionCoordinator,
 )
 from manyforge_behavior.nodes.motion import (
+    _motion_reference_object_ids,
+    _normalize_cartesian_path_dict,
+    _normalize_motion_reference,
     _normalize_pose_dict,
-    _relative_move_object_ids,
 )
 from manyforge_behavior.parameters import resolve_blackboard_value
 from manyforge_behavior.runtime_pause import (
@@ -83,8 +85,8 @@ class _MotionScopedBase(
     _not_found_default: bool = False
     _allow_natural_completion_default: bool = False
     # Subclasses may override to bias the default motion_type to
-    # "pose_goal" (precision contact) vs "joint_goal" (generic).
-    _default_motion_type: str = "joint_goal"
+    # "pose" (precision contact) vs "joint" (generic).
+    _default_motion_type: str = "joint"
 
     def __init__(self, name: str, **kwargs: Any) -> None:
         runtime_pause_registry = kwargs.pop("runtime_pause_registry", None)
@@ -235,18 +237,25 @@ class _MotionScopedBase(
 
     def _resolve_motion_inputs(
         self,
-    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None] | str:
-        """Resolve pose_goal and relative_move from authored params or
-        blackboard references, then normalize orientations (RPY→XYZW).
-        Returns the resolved tuple, or an error string if resolution
-        or validation fails. Mirrors `MoveManipulatorAction.update`
-        lines 213-276."""
+    ) -> tuple[
+        dict[str, Any] | None,
+        dict[str, Any] | None,
+        dict[str, Any] | None,
+        dict[str, Any] | None,
+    ] | str:
+        """Resolve the same portable motion fields as MoveManipulatorAction."""
         try:
             pose_goal = resolve_blackboard_value(
                 self.blackboard, self._params.get("pose_goal")
             )
-            relative_move = resolve_blackboard_value(
-                self.blackboard, self._params.get("relative_move")
+            cartesian_path = resolve_blackboard_value(
+                self.blackboard, self._params.get("cartesian_path")
+            )
+            target_reference = resolve_blackboard_value(
+                self.blackboard, self._params.get("target_reference")
+            )
+            offset_reference = resolve_blackboard_value(
+                self.blackboard, self._params.get("offset_reference")
             )
         except (AttributeError, KeyError) as exc:
             return str(exc)
@@ -255,65 +264,25 @@ class _MotionScopedBase(
             return "pose_goal blackboard reference must resolve to a mapping"
         pose_goal = _normalize_pose_dict(pose_goal)
 
-        if relative_move:
-            if not isinstance(relative_move, dict):
-                return (
-                    "relative_move blackboard reference must resolve to a "
-                    "mapping"
-                )
-            relative_move = dict(relative_move)
-            target_reference = relative_move.get("target_reference")
-            if target_reference:
-                if not isinstance(target_reference, dict):
-                    return (
-                        "relative_move.target_reference must be a mapping"
-                    )
-                target_reference = dict(target_reference)
-                if target_reference.get("type") == "pose":
-                    pose_inner = target_reference.get("pose")
-                    if pose_inner is not None and not isinstance(
-                        pose_inner, dict
-                    ):
-                        return (
-                            "relative_move.target_reference.pose must "
-                            "resolve to a mapping"
-                        )
-                    target_reference["pose"] = _normalize_pose_dict(
-                        pose_inner
-                    )
-                relative_move["target_reference"] = target_reference
-            offset_reference = relative_move.get("offset_reference")
-            if offset_reference:
-                if not isinstance(offset_reference, dict):
-                    return (
-                        "relative_move.offset_reference must be a mapping"
-                    )
-                offset_reference = dict(offset_reference)
-                if offset_reference.get("type") == "pose":
-                    pose_inner = offset_reference.get("pose")
-                    if pose_inner is not None and not isinstance(
-                        pose_inner, dict
-                    ):
-                        return (
-                            "relative_move.offset_reference.pose must "
-                            "resolve to a mapping"
-                        )
-                    offset_reference["pose"] = _normalize_pose_dict(
-                        pose_inner
-                    )
-                relative_move["offset_reference"] = offset_reference
-            if relative_move.get("offset") is not None and not isinstance(
-                relative_move.get("offset"), dict
-            ):
-                return "relative_move.offset must be a mapping"
-            relative_move["offset"] = _normalize_pose_dict(
-                relative_move.get("offset")
+        if cartesian_path is not None and not isinstance(cartesian_path, dict):
+            return "cartesian_path blackboard reference must resolve to a mapping"
+        try:
+            cartesian_path = _normalize_cartesian_path_dict(cartesian_path)
+            target_reference = _normalize_motion_reference(
+                target_reference, "target_reference"
             )
+            offset_reference = _normalize_motion_reference(
+                offset_reference, "offset_reference"
+            )
+        except ValueError as exc:
+            return str(exc)
 
-        return pose_goal, relative_move
+        return pose_goal, cartesian_path, target_reference, offset_reference
 
     def _apply_pose_source_callbacks(
-        self, relative_move: dict[str, Any] | None
+        self,
+        target_reference: dict[str, Any] | None,
+        offset_reference: dict[str, Any] | None,
     ) -> str | None:
         """Invoke pose-source apply callbacks before dispatch.
 
@@ -322,7 +291,9 @@ class _MotionScopedBase(
         not just objects referenced by this node. The between-nodes callback
         remains scoped to relative-move references.
         """
-        referenced_object_ids = _relative_move_object_ids(relative_move)
+        referenced_object_ids = _motion_reference_object_ids(
+            target_reference, offset_reference
+        )
         callbacks = [
             ("pose_source_apply_callback", "before-planning", []),
         ]
@@ -365,8 +336,10 @@ class _MotionScopedBase(
         resolved = self._resolve_motion_inputs()
         if isinstance(resolved, str):
             return resolved
-        pose_goal, relative_move = resolved
-        cb_error = self._apply_pose_source_callbacks(relative_move)
+        pose_goal, cartesian_path, target_reference, offset_reference = resolved
+        cb_error = self._apply_pose_source_callbacks(
+            target_reference, offset_reference
+        )
         if cb_error is not None:
             self._request_error_recoverable = True
             return cb_error
@@ -380,12 +353,18 @@ class _MotionScopedBase(
             motion_type=str(
                 self._params.get("motion_type", self._default_motion_type)
             ),
+            target_mode=str(self._params.get("target_mode", "absolute")),
+            target_reference=target_reference,
+            offset_reference=offset_reference,
+            planning_profile=str(
+                self._params.get("planning_profile", "first_feasible")
+            ),
             joint_goal_names=list(self._params.get("joint_goal_names", [])),
             joint_goal_positions_rad=list(
                 self._params.get("joint_goal_positions_rad", [])
             ),
             pose_goal=pose_goal,
-            relative_move=relative_move,
+            cartesian_path=cartesian_path,
             velocity_scale=self._velocity_scale,
             acceleration_scale=self._acceleration_scale,
             max_tcp_linear_speed_mps=(
@@ -670,7 +649,7 @@ class MoveUntilSignal(_MotionScopedBase):
     _catalog_node_id = "move_until_signal"
     _not_found_default = False
     _allow_natural_completion_default = True
-    _default_motion_type = "joint_goal"
+    _default_motion_type = "joint"
 
 
 class ProbeSearchMove(_MotionScopedBase):
@@ -684,7 +663,7 @@ class ProbeSearchMove(_MotionScopedBase):
     _catalog_node_id = "probe_search_move"
     _not_found_default = True
     _allow_natural_completion_default = False
-    _default_motion_type = "pose_goal"
+    _default_motion_type = "pose"
 
     def __init__(self, name: str, **kwargs: Any) -> None:
         # Default activation mode for precision contact: require

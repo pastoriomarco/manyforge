@@ -8,6 +8,7 @@
 #include <manyforge_roboplan/roboplan_planner_options.hpp>
 
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
+#include <manyforge_core/testing/planner_backend_conformance.hpp>
 
 #include <Eigen/Dense>
 #include <algorithm>
@@ -66,6 +67,7 @@ TEST(RoboPlanPlanningQualificationRecorderTest,
   metrics.total_duration_ns = 42;
 
   EXPECT_TRUE(recorder.try_begin_invocation(request));
+  EXPECT_TRUE(recorder.wait_until_active(std::chrono::milliseconds(1)));
   EXPECT_EQ(recorder.in_flight(), 1U);
   EXPECT_FALSE(recorder.wait_until_idle(std::chrono::milliseconds(1)));
   recorder.record(request, result, metrics);
@@ -109,6 +111,7 @@ TEST(RoboPlanPlanningQualificationRecorderTest,
 
   recorder.close_admission();
 
+  EXPECT_FALSE(recorder.wait_until_active(std::chrono::milliseconds(1)));
   EXPECT_FALSE(recorder.try_begin_invocation(request));
   const auto batch = recorder.drain_with_status();
   EXPECT_TRUE(batch.records.empty());
@@ -441,6 +444,36 @@ TEST(RoboPlanCompatibilityOptionsTest,
   EXPECT_EQ(ik.max_restarts, 50);
   EXPECT_DOUBLE_EQ(ik.max_time, 1.0);
   EXPECT_TRUE(ik.fast_return);
+}
+
+TEST(RoboPlanCompatibilityOptionsTest,
+     PortablePlanningProfilesMapToExplicitRoboPlanPolicies) {
+  const auto base_rrt = production_rrt_options("arm", 2.5);
+  const auto first = planning_profile_rrt_options(
+      base_rrt, PlanningProfileDTO::kFirstFeasible);
+  EXPECT_FALSE(first.rrt_star);
+  EXPECT_TRUE(first.fast_return);
+
+  const auto balanced = planning_profile_rrt_options(
+      base_rrt, PlanningProfileDTO::kBalanced);
+  EXPECT_TRUE(balanced.rrt_star);
+  EXPECT_TRUE(balanced.fast_return);
+
+  const auto quality = planning_profile_rrt_options(
+      base_rrt, PlanningProfileDTO::kQualityBounded);
+  EXPECT_TRUE(quality.rrt_star);
+  EXPECT_FALSE(quality.fast_return);
+
+  const auto base_ik = production_planning_ik_options("arm");
+  EXPECT_TRUE(planning_profile_ik_options(
+                  base_ik, PlanningProfileDTO::kFirstFeasible)
+                  .fast_return);
+  EXPECT_TRUE(planning_profile_ik_options(
+                  base_ik, PlanningProfileDTO::kBalanced)
+                  .fast_return);
+  EXPECT_FALSE(planning_profile_ik_options(
+                   base_ik, PlanningProfileDTO::kQualityBounded)
+                   .fast_return);
 }
 
 class NativeKernelTest : public ::testing::Test {
@@ -1051,6 +1084,114 @@ TEST_F(NativeKernelTest,
       std::pow(actual.position_m.y_m - goal.goal.position_m.y_m, 2) +
       std::pow(actual.position_m.z_m - goal.goal.position_m.z_m, 2));
   EXPECT_LE(translation_error, request.tolerances.translation_tol_m);
+}
+
+TEST_F(NativeKernelTest,
+       PlannerNeutralConformanceHarnessPassesRoboPlan05Adapter) {
+  roboplan::RRTOptions rrt_options =
+      production_rrt_options(bundle_->group_name, 0.08);
+  rrt_options.max_nodes = 100'000;
+  const auto planning_ik =
+      production_planning_ik_options(bundle_->group_name);
+  const auto single_shot_ik =
+      production_single_shot_ik_options(bundle_->group_name, 0.2);
+  RoboPlanPlannerBackend planner(
+      bundle_->scene_projection, bundle_->scene, rrt_options,
+      bundle_->scene_mutex, planning_ik, single_shot_ik, 42U);
+
+  PlanRequestDTO joint;
+  joint.robot_id = bundle_->robot_id;
+  joint.group_id = bundle_->group_name;
+  joint.move_id = "rp5_6_joint";
+  joint.base_frame = "base_link";
+  joint.tcp_frame = "tool0";
+  joint.start_state = current_state();
+  joint.tolerances = {0.05, 0.01, 0.1};
+  joint.speed_profile = {0.5, 0.5, 0.05};
+  joint.planning_timeout_s = 2.0;
+  auto joint_positions = joint.start_state.positions_rad;
+  joint_positions.back() += 0.03;
+  joint.motion = JointGoalDTO{joint.start_state.joint_names, joint_positions};
+  bind_plan_request(joint);
+
+  auto pose = joint;
+  pose.move_id = "rp5_6_pose";
+  RobotStateDTO pose_target_state = pose.start_state;
+  pose_target_state.positions_rad.back() += 0.025;
+  const Pose3DTO pose_target = forward_kinematics(
+      FkRequestDTO{pose_target_state, pose.tcp_frame, pose.base_frame});
+  pose.motion = PoseGoalDTO{pose_target};
+  bind_plan_request(pose);
+
+  auto cartesian = make_cartesian_request("rp5_6_cartesian");
+  cartesian.planning_timeout_s = 2.0;
+
+  const auto cancellation_recorder =
+      std::make_shared<RoboPlanPlanningQualificationRecorder>(8U);
+  RoboPlanPlannerBackend cancellation_planner(
+      bundle_->scene_projection, bundle_->scene,
+      [&] {
+        auto options = production_rrt_options(bundle_->group_name, 0.75);
+        options.max_nodes = 5'000'000;
+        options.max_connection_distance = 1e-9;
+        options.collision_check_step_size = 1e-9;
+        options.goal_biasing_probability = 0.0;
+        return options;
+      }(),
+      bundle_->scene_mutex, planning_ik, single_shot_ik, 43U,
+      cancellation_recorder);
+  auto cancellation = joint;
+  cancellation.move_id = "rp5_6_cancel_in_flight";
+  cancellation.planning_timeout_s = 2.0;
+  auto& cancellation_goal = std::get<JointGoalDTO>(cancellation.motion);
+  cancellation_goal.positions_rad = {2.6, -2.4, 2.2, -2.0, -1.8, 1.6};
+  bind_plan_request(cancellation);
+
+  manyforge::core::testing::PlannerBackendConformanceInput input;
+  input.adapter_id = "planning.roboplan";
+  input.planner = &planner;
+  input.capabilities = manyforge::core::testing::PlannerCapabilityProfile{
+      true, true, true, true, true, true, true};
+  input.plan_cases = manyforge::core::testing::make_portable_planner_matrix(
+      joint, pose, cartesian);
+  input.forward_kinematics = [this](const FkRequestDTO& request) {
+    return bundle_->kinematics->forward_kinematics(request);
+  };
+  auto invalid_binding = joint;
+  invalid_binding.move_id = "rp5_6_invalid_binding";
+  invalid_binding.scene_binding = {};
+  input.expected_failures.push_back(
+      manyforge::core::testing::PlannerExpectedFailureCase{
+          "invalid_scene_binding", invalid_binding, kErrorInvalidRequest,
+          "planner_scene_binding_invalid"});
+  auto unavailable_lease = joint;
+  unavailable_lease.move_id = "rp5_6_unavailable_projection_lease";
+  unavailable_lease.scene_binding.projection_lease_id =
+      "rp5_6_missing_projection_lease";
+  input.expected_failures.push_back(
+      manyforge::core::testing::PlannerExpectedFailureCase{
+          "unavailable_projection_lease", unavailable_lease,
+          kErrorSceneChangedDuringValidation,
+          "planner_projection_lease_unavailable"});
+  input.ik_case = manyforge::core::testing::PlannerIkConformanceCase{
+      "single_shot_ik",
+      IkRequestDTO{pose_target, pose.base_frame, pose.tcp_frame,
+                   pose.start_state, 0.2}};
+  input.cancellation_case =
+      manyforge::core::testing::PlannerCancellationConformanceCase{
+          "cooperative_cancellation", &cancellation_planner, cancellation,
+          [cancellation_recorder](std::chrono::milliseconds timeout) {
+            return cancellation_recorder->wait_until_active(timeout);
+          },
+          std::chrono::milliseconds(0),
+          std::chrono::milliseconds(1000)};
+  input.max_plan_wall_time = std::chrono::milliseconds(3000);
+
+  const auto report =
+      manyforge::core::testing::run_planner_backend_conformance(input);
+
+  EXPECT_TRUE(report.passed()) << report.summary();
+  EXPECT_EQ(report.completed_cases.size(), 13U);
 }
 
 TEST_F(NativeKernelTest,

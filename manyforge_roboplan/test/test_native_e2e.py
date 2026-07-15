@@ -804,7 +804,7 @@ def make_request(move_id, goal, cache_mode="default"):
         move_id=move_id,
         base_frame="base_link",
         tcp_frame="tool0",
-        motion_type="joint_goal",
+        motion_type="joint",
         joint_goal_names=UR5_JOINTS,
         joint_goal_positions_rad=goal,
         velocity_scale=1.0,
@@ -828,7 +828,7 @@ def make_request_for_joints(
         move_id=move_id,
         base_frame="base_link",
         tcp_frame="tool0",
-        motion_type="joint_goal",
+        motion_type="joint",
         joint_goal_names=joint_names,
         joint_goal_positions_rad=goal,
         velocity_scale=1.0,
@@ -847,7 +847,7 @@ def make_ur10e_joint_preview_request(move_id, goal):
         move_id=move_id,
         base_frame="base_link",
         tcp_frame="grasp_frame",
-        motion_type="joint_goal",
+        motion_type="joint",
         joint_goal_names=UR10E_ARM_JOINTS,
         joint_goal_positions_rad=goal,
         velocity_scale=1.0,
@@ -865,7 +865,7 @@ def make_cartesian_request(move_id):
         move_id=move_id,
         base_frame="base_link",
         tcp_frame="tool0",
-        motion_type="cartesian_path",
+        motion_type="cartesian",
         cartesian_path={
             "waypoints": [
                 {
@@ -903,7 +903,7 @@ def test_cartesian_request_serialization_is_portable_and_non_mutating():
 
     serialized = client._request_to_native_dict(request)
 
-    assert serialized["motion_type"] == "cartesian_path"
+    assert serialized["motion_type"] == "cartesian"
     assert serialized["cartesian_path"]["waypoints"][0][
         "orientation_xyzw"
     ] == pytest.approx([1.0, 0.0, 0.0, 0.0])
@@ -1065,19 +1065,18 @@ def test_native_parser_rejects_invalid_optional_tcp_speed_limit(invalid_limit):
     ("motion_type", "request_field", "message"),
     [
         (
-            "pose_goal",
+            "pose",
             {"pose_goal": {"position_m": [0.4, 0.0, 0.3]}},
             "pose_goal requires position_m and orientation_xyzw",
         ),
         (
-            "relative_move",
+            "pose",
             {
-                "relative_move": {
-                    "target_reference": {"type": "frame", "id": "base_link"},
-                    "offset": {"position_m": [0.0, 0.0, 0.1]},
-                }
+                "target_mode": "relative",
+                "target_reference": {"type": "frame", "id": "base_link"},
+                "pose_goal": {"position_m": [0.0, 0.0, 0.1]},
             },
-            "relative_move.offset requires position_m and orientation_xyzw",
+            "pose_goal requires position_m and orientation_xyzw",
         ),
     ],
 )
@@ -1099,6 +1098,35 @@ def test_shared_native_motion_parser_never_defaults_incomplete_poses(
         bundle.close()
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("motion_type", "relative_move", "Unsupported motion_type 'relative_move'"),
+        ("target_mode", "incremental", "target_mode must be 'absolute' or 'relative'"),
+        (
+            "planning_profile",
+            "rrt_star",
+            "planning_profile must be 'first_feasible', 'balanced', or 'quality_bounded'",
+        ),
+    ],
+)
+def test_native_motion_parser_rejects_deprecated_or_backend_native_enums(
+    field, value, message
+):
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+    bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
+    request = NativeKernelClient(bundle)._request_to_native_dict(
+        make_request("nonportable_motion_enum", GOAL_A)
+    )
+    request[field] = value
+    try:
+        with pytest.raises(ValueError, match=message):
+            bundle.preview_motion(request, None)
+    finally:
+        bundle.close()
+
+
 def make_relative_request(
     move_id,
     object_id,
@@ -1112,13 +1140,12 @@ def make_relative_request(
         move_id=move_id,
         base_frame="base_link",
         tcp_frame="tool0",
-        motion_type="relative_move",
-        relative_move={
-            "target_reference": {"type": "object", "id": object_id},
-            "offset": {
-                "position_m": list(offset_position_m),
-                "orientation_rpy_deg": list(offset_orientation_rpy_deg),
-            },
+        motion_type="pose",
+        target_mode="relative",
+        target_reference={"type": "object", "id": object_id},
+        pose_goal={
+            "position_m": list(offset_position_m),
+            "orientation_rpy_deg": list(offset_orientation_rpy_deg),
         },
         velocity_scale=1.0,
         acceleration_scale=1.0,
@@ -1136,15 +1163,10 @@ def make_relative_reference_request(
     offset_reference=None,
     cache_mode="disable",
 ):
-    relative_move = {
-        "target_reference": reference,
-        "offset": {
-            "position_m": list(offset_position_m),
-            "orientation_rpy_deg": list(offset_orientation_rpy_deg),
-        },
+    pose_goal = {
+        "position_m": list(offset_position_m),
+        "orientation_rpy_deg": list(offset_orientation_rpy_deg),
     }
-    if offset_reference is not None:
-        relative_move["offset_reference"] = offset_reference
 
     return ExecuteRequest(
         robot_id="robot1",
@@ -1152,8 +1174,11 @@ def make_relative_reference_request(
         move_id=move_id,
         base_frame="base_link",
         tcp_frame="tool0",
-        motion_type="relative_move",
-        relative_move=relative_move,
+        motion_type="pose",
+        target_mode="relative",
+        target_reference=reference,
+        offset_reference=offset_reference,
+        pose_goal=pose_goal,
         velocity_scale=1.0,
         acceleration_scale=1.0,
         planning_timeout_s=10.0,
@@ -1245,7 +1270,7 @@ class TestNativeKernelBasics:
             "move_id": "native_null_optional_correlation",
             "base_frame": "base_link",
             "tcp_frame": "tool0",
-            "motion_type": "joint_goal",
+            "motion_type": "joint",
             "joint_goal_names": UR5_JOINTS,
             "joint_goal_positions_rad": GOAL_A,
             "velocity_scale": 1.0,
@@ -1873,7 +1898,7 @@ class TestNativeSceneEdits:
         assert trace[-1]["pose_in_frame"] is not None
         assert trace[-1]["pose_in_universe"] is not None
 
-    def test_relative_move_resolves_object_reference_at_execute_time(self, native_kernel):
+    def test_relative_pose_resolves_object_reference_at_execute_time(self, native_kernel):
         reset_to_demo_rest(native_kernel)
         native_kernel.scene_edit(SceneEditRequest(
             operation="add", object_id="ref_box", shape_type="box",
@@ -1901,7 +1926,7 @@ class TestNativeSceneEdits:
         assert pose["position_m"][1] == pytest.approx(-0.3, abs=0.03)
         assert pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
 
-    def test_relative_move_resolves_object_reference_for_preview_motion(self, native_kernel):
+    def test_relative_pose_resolves_object_reference_for_preview_motion(self, native_kernel):
         reset_to_demo_rest(native_kernel)
         add_result = native_kernel.scene_edit(SceneEditRequest(
             operation="add", object_id="preview_ref_box", shape_type="box",
@@ -1927,7 +1952,7 @@ class TestNativeSceneEdits:
         assert preview.final_tcp_pose["position_m"][1] == pytest.approx(-0.3, abs=0.03)
         assert preview.final_tcp_pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
 
-    def test_relative_move_resolves_object_reference_for_plan_motion(self, native_kernel):
+    def test_relative_pose_resolves_object_reference_for_plan_motion(self, native_kernel):
         reset_to_demo_rest(native_kernel)
         add_result = native_kernel.scene_edit(SceneEditRequest(
             operation="add", object_id="plan_ref_box", shape_type="box",
@@ -1955,7 +1980,7 @@ class TestNativeSceneEdits:
         assert preview.final_tcp_pose["position_m"][1] == pytest.approx(-0.3, abs=0.03)
         assert preview.final_tcp_pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
 
-    def test_relative_move_recomputes_goal_after_object_pose_changes(self, native_kernel):
+    def test_relative_pose_recomputes_goal_after_object_pose_changes(self, native_kernel):
         reset_to_demo_rest(native_kernel)
         native_kernel.scene_edit(SceneEditRequest(
             operation="add", object_id="dynamic_box", shape_type="box",
@@ -1996,7 +2021,7 @@ class TestNativeSceneEdits:
         assert pose_b["position_m"][0] == pytest.approx(0.38, abs=0.03)
         assert pose_b["position_m"][1] == pytest.approx(-0.18, abs=0.03)
 
-    def test_relative_move_resolves_robot_link_reference_at_execute_time(self, native_kernel):
+    def test_relative_pose_resolves_robot_link_reference_at_execute_time(self, native_kernel):
         reset_to_demo_rest(native_kernel)
         start_pose = native_kernel.get_link_pose("tool0", "base_link")
         assert start_pose is not None
@@ -2022,7 +2047,7 @@ class TestNativeSceneEdits:
                 start_pose["position_m"][axis] + expected_delta[axis], abs=0.03
             )
 
-    def test_relative_move_resolves_frame_reference_at_execute_time(self, native_kernel):
+    def test_relative_pose_resolves_frame_reference_at_execute_time(self, native_kernel):
         reset_to_demo_rest(native_kernel)
 
         result = native_kernel.execute(
@@ -2042,7 +2067,7 @@ class TestNativeSceneEdits:
         assert pose["position_m"][1] == pytest.approx(-0.3, abs=0.03)
         assert pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
 
-    def test_relative_move_resolves_pose_reference_at_execute_time(self, native_kernel):
+    def test_relative_pose_resolves_pose_reference_at_execute_time(self, native_kernel):
         reset_to_demo_rest(native_kernel)
 
         result = native_kernel.execute(
@@ -2068,7 +2093,7 @@ class TestNativeSceneEdits:
         assert pose["position_m"][1] == pytest.approx(-0.3, abs=0.03)
         assert pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
 
-    def test_relative_move_uses_independent_offset_reference_at_execute_time(self, native_kernel):
+    def test_relative_pose_uses_independent_offset_reference_at_execute_time(self, native_kernel):
         reset_to_demo_rest(native_kernel)
         native_kernel.scene_edit(SceneEditRequest(
             operation="add", object_id="dynamic_box", shape_type="box",
@@ -2486,7 +2511,7 @@ class TestTcpSpeedEnforcement:
             move_id=move_id,
             base_frame="base_link",
             tcp_frame="tool0",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=UR5_JOINTS,
             joint_goal_positions_rad=goal,
             velocity_scale=1.0,

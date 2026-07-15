@@ -31,7 +31,7 @@ def make_request(move_id: str = "move_1") -> ExecuteRequest:
         move_id=move_id,
         base_frame="base_link",
         tcp_frame="tool0",
-        motion_type="joint_goal",
+        motion_type="joint",
         joint_goal_names=["j1", "j2"],
         joint_goal_positions_rad=[0.5, 1.0],
     )
@@ -97,6 +97,35 @@ class TestMockKernelExecute:
         result = kernel.execute(make_request())
         assert not result.ok
         assert kernel.get_status().state == ExecutionState.FAILED
+
+    def test_relative_joint_resolution_rejects_unknown_joint_without_admission(self):
+        kernel = MockKernelClient(joint_names=["j1", "j2"])
+        request = make_request()
+        request.target_mode = "relative"
+        request.joint_goal_names = ["j1", "missing"]
+
+        result = kernel.execute(request)
+
+        assert not result.ok
+        assert "absent from the start state" in (result.error or "")
+        assert kernel.get_status().state == ExecutionState.IDLE
+        assert kernel.get_status().execution_id == 0
+
+    @pytest.mark.parametrize("target_mode", ["absolute", "relative"])
+    def test_joint_resolution_rejects_duplicate_names_without_admission(
+        self, target_mode
+    ):
+        kernel = MockKernelClient(joint_names=["j1", "j2"])
+        request = make_request()
+        request.target_mode = target_mode
+        request.joint_goal_names = ["j1", "j1"]
+
+        result = kernel.execute(request)
+
+        assert not result.ok
+        assert "must not contain duplicates" in (result.error or "")
+        assert kernel.get_status().state == ExecutionState.IDLE
+        assert kernel.get_status().execution_id == 0
 
     def test_execute_stamps_action_span_and_contact_policy(self, kernel):
         request = make_request()

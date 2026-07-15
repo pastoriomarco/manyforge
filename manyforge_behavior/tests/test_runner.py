@@ -49,6 +49,9 @@ def _v0_0_adapter_configs() -> dict:
             "capability_keys": [
                 "planning.motion.joint_goal",
                 "planning.motion.pose_goal",
+                "planning.profile.first_feasible",
+                "planning.profile.balanced",
+                "planning.profile.quality_bounded",
                 "planning.trajectory.time_parameterized",
             ],
             "config": {},
@@ -124,7 +127,7 @@ class TestRunnerLoading:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.1",
                 "name": "parallel_policy_program",
-                "catalog_version": "0.2.0",
+                "catalog_version": "0.3.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -303,7 +306,7 @@ class TestRunnerExecution:
                     "api_version": "manyforge.program.v0",
                     "program_profile": "v0.0",
                     "name": "skill_program",
-                    "catalog_version": "0.2.0",
+                    "catalog_version": "0.3.0",
                     "description": "skill-authored test program",
                     "robot": {
                         "robot_id": "ur5",
@@ -356,7 +359,7 @@ class TestRunnerChildCardinality:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "invalid_leaf_children",
-                "catalog_version": "0.2.0",
+                "catalog_version": "0.3.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -377,7 +380,7 @@ class TestRunnerChildCardinality:
                     "api_version": "manyforge.program.v0",
                     "program_profile": "v0.0",
                     "name": "single_wait",
-                    "catalog_version": "0.2.0",
+                    "catalog_version": "0.3.0",
                     "robot": {
                         "robot_id": "ur5",
                         "group_id": "arm",
@@ -407,7 +410,7 @@ class TestRunnerChildCardinality:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "invalid_decorator_children",
-                "catalog_version": "0.2.0",
+                "catalog_version": "0.3.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -430,7 +433,7 @@ class TestRunnerChildCardinality:
                     "api_version": "manyforge.program.v0",
                     "program_profile": "v0.0",
                     "name": "second_wait",
-                    "catalog_version": "0.2.0",
+                    "catalog_version": "0.3.0",
                     "robot": {
                         "robot_id": "ur5",
                         "group_id": "arm",
@@ -454,14 +457,17 @@ class TestRunnerChildCardinality:
             runner.build_tree()
 
 
-class TestRelativeMoveValidation:
+class TestRelativeTargetValidation:
     @staticmethod
-    def _base_program_dict(relative_move: dict) -> dict:
+    def _base_program_dict(
+        target_reference: dict,
+        pose_goal: dict | None = None,
+    ) -> dict:
         return {
             "api_version": "manyforge.program.v0",
             "program_profile": "v0.1",
-            "name": "relative_move_validation",
-            "catalog_version": "0.2.0",
+            "name": "relative_target_validation",
+            "catalog_version": "0.3.0",
             "robot": {
                 "robot_id": "ur5",
                 "group_id": "arm",
@@ -470,65 +476,62 @@ class TestRelativeMoveValidation:
             },
             "tree": {
                 "id": "move_manipulator_action",
-                "name": "relative_move_step",
+                "name": "relative_pose_step",
                 "params": {
                     "move_id": "move_1",
-                    "motion_type": "relative_move",
-                    "relative_move": relative_move,
+                    "motion_type": "pose",
+                    "target_mode": "relative",
+                    "target_reference": target_reference,
+                    "pose_goal": pose_goal
+                    or {
+                        "position_m": [0.0, 0.0, 0.08],
+                        "orientation_rpy_deg": [180.0, 0.0, 0.0],
+                    },
                 },
             },
         }
 
-    def test_program_rejects_relative_move_pose_reference_without_pose(self):
+    def test_program_rejects_pose_reference_without_pose(self):
         catalog = NodeCatalog(CATALOG_PATH)
 
         with pytest.raises(
             ProgramValidationError,
-            match="relative_move.target_reference.pose is required when relative_move.target_reference.type='pose'",
+            match="target_reference.pose is required when target_reference.type='pose'",
         ):
             Program.from_dict(
                 self._base_program_dict(
-                    {
-                        "target_reference": {"type": "pose"},
-                        "offset": {
-                            "position_m": [0.0, 0.0, 0.08],
-                            "orientation_rpy_deg": [180.0, 0.0, 0.0],
-                        },
-                    }
+                    {"type": "pose"}
                 ),
                 catalog,
             )
 
-    def test_program_rejects_relative_move_frame_reference_without_id(self):
+    def test_program_rejects_frame_reference_without_id(self):
         catalog = NodeCatalog(CATALOG_PATH)
 
         with pytest.raises(
             ProgramValidationError,
-            match="relative_move.target_reference.id is required when relative_move.target_reference.type='frame'",
+            match="target_reference.id is required when target_reference.type='frame'",
         ):
             Program.from_dict(
                 self._base_program_dict(
-                    {
-                        "target_reference": {"type": "frame"},
-                        "offset": {
-                            "position_m": [0.0, 0.0, 0.08],
-                            "orientation_rpy_deg": [180.0, 0.0, 0.0],
-                        },
-                    }
+                    {"type": "frame"}
                 ),
                 catalog,
             )
 
-    def test_program_rejects_relative_move_without_offset(self):
+    def test_program_rejects_relative_pose_without_pose_goal(self):
         catalog = NodeCatalog(CATALOG_PATH)
 
-        with pytest.raises(ProgramValidationError, match="offset is required"):
+        program = self._base_program_dict(
+            {"type": "object", "id": "target_object"}
+        )
+        del program["tree"]["params"]["pose_goal"]
+        with pytest.raises(
+            ProgramValidationError,
+            match="pose_goal is required when motion_type=pose",
+        ):
             Program.from_dict(
-                self._base_program_dict(
-                    {
-                        "target_reference": {"type": "object", "id": "target_object"},
-                    }
-                ),
+                program,
                 catalog,
             )
 
@@ -659,7 +662,7 @@ class TestRunnerDeployment:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "query_model_program",
-                "catalog_version": "0.2.0",
+                "catalog_version": "0.3.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -894,7 +897,7 @@ class TestRunnerDeployment:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "vlm_pose_goal_program",
-                "catalog_version": "0.2.0",
+                "catalog_version": "0.3.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -933,7 +936,7 @@ class TestRunnerDeployment:
                             "name": "execute_grasp_pose",
                             "params": {
                                 "move_id": "vlm_pose_goal",
-                                "motion_type": "pose_goal",
+                                "motion_type": "pose",
                                 "pose_goal": {
                                     "field_ref": {
                                         "namespace": "vlm_grasp",

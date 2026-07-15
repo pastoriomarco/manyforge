@@ -55,6 +55,7 @@ _STABILITY_LEVELS = {
     "experimental",
     "deprecated",
 }
+_NODE_KINDS = {"leaf", "decorator", "composite", "macro", "authoring_macro"}
 
 
 @dataclass
@@ -551,6 +552,11 @@ class NodeCatalog:
 
     def _validate_entry(self, entry: CatalogEntry) -> None:
         # Kind/children consistency
+        if entry.kind not in _NODE_KINDS:
+            allowed = ", ".join(sorted(_NODE_KINDS))
+            raise CatalogValidationError(
+                f"Entry '{entry.id}': kind must be one of: {allowed}"
+            )
         if entry.stability not in _STABILITY_LEVELS:
             allowed = ", ".join(sorted(_STABILITY_LEVELS))
             raise CatalogValidationError(
@@ -564,6 +570,15 @@ class NodeCatalog:
             if entry.children_min != 1 or entry.children_max != 1:
                 raise CatalogValidationError(
                     f"Entry '{entry.id}': decorator must have children min=1, max=1"
+                )
+        if entry.kind == "authoring_macro":
+            if entry.children_min != 0 or entry.children_max != 0:
+                raise CatalogValidationError(
+                    f"Entry '{entry.id}': authoring macro must have children min=0, max=0"
+                )
+            if entry.runners:
+                raise CatalogValidationError(
+                    f"Entry '{entry.id}': authoring macro must not declare runtime runners"
                 )
 
         # Enum parameters must have enum_values
@@ -705,8 +720,9 @@ class NodeCatalog:
                         f"Entry '{entry.id}': {field_name} references unknown parameter '{param_name}'"
                     )
 
-        # Must have py_trees runner
-        if "py_trees" not in entry.runners:
+        # Runtime entries must be executable. Authoring macros are expanded by
+        # Composer and are deliberately absent from the persisted/runtime graph.
+        if entry.kind != "authoring_macro" and "py_trees" not in entry.runners:
             raise CatalogValidationError(
                 f"Entry '{entry.id}': must have a 'py_trees' runner"
             )

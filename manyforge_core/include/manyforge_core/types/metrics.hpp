@@ -8,6 +8,9 @@ namespace manyforge::core {
 struct MetricsSnapshot {
   uint64_t cache_hits = 0;
   uint64_t cache_misses = 0;
+  uint64_t cache_revalidation_candidates = 0;
+  uint64_t cache_revalidations_succeeded = 0;
+  uint64_t cache_revalidations_failed = 0;
   uint64_t cache_invalidations = 0;
   uint64_t plans_succeeded = 0;
   uint64_t plans_failed = 0;

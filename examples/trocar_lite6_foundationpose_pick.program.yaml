@@ -5,7 +5,7 @@ description: Isaac-compatible Lite6 pick-and-place program for the trocar scene.
   deployment latches a FoundationPose Detection3DArray pose source for the `graspable`
   object before planning, then this program plans and executes a top-down pick sequence
   against the updated scene object.
-catalog_version: 0.2.0
+catalog_version: "0.3.0"
 robot:
   robot_id: lite6
   group_id: lite6
@@ -119,7 +119,7 @@ tree:
     name: move_to_rest
     params:
       move_id: lite6_rest
-      motion_type: joint_goal
+      motion_type: joint
       joint_goal_names:
       - joint1
       - joint2
@@ -201,7 +201,7 @@ tree:
     name: move_to_planned_pick_approach
     params:
       move_id: lite6_fp_pick_approach
-      motion_type: pose_goal
+      motion_type: pose
       pose_goal:
         field_ref:
           namespace: pick_plan
@@ -213,7 +213,7 @@ tree:
     name: move_to_planned_pick
     params:
       move_id: lite6_fp_pick_down
-      motion_type: pose_goal
+      motion_type: pose
       pose_goal:
         field_ref:
           namespace: pick_plan
@@ -255,7 +255,7 @@ tree:
     name: retreat_after_pick
     params:
       move_id: lite6_fp_pick_retreat
-      motion_type: pose_goal
+      motion_type: pose
       pose_goal:
         field_ref:
           namespace: pick_plan
@@ -267,7 +267,7 @@ tree:
     name: move_to_drop_approach
     params:
       move_id: lite6_drop_approach
-      motion_type: pose_goal
+      motion_type: pose
       pose_goal:
         frame_id: link_base
         position_m:
@@ -285,7 +285,7 @@ tree:
     name: move_to_drop
     params:
       move_id: lite6_drop_down
-      motion_type: pose_goal
+      motion_type: pose
       pose_goal:
         frame_id: link_base
         position_m:
@@ -319,7 +319,7 @@ tree:
     name: drop_retreat
     params:
       move_id: lite6_drop_retreat
-      motion_type: pose_goal
+      motion_type: pose
       pose_goal:
         frame_id: link_base
         position_m:
@@ -339,7 +339,7 @@ tree:
     name: return_rest
     params:
       move_id: lite6_return_rest
-      motion_type: joint_goal
+      motion_type: joint
       joint_goal_names:
       - joint1
       - joint2

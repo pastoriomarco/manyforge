@@ -543,6 +543,11 @@ class OrchestratorRunner:
         """Recursively build a py_trees node from a TreeNode."""
         tree_node = self._expand_tree_node(tree_node)
         entry = self._catalog.get(tree_node.id)
+        if entry.kind == "authoring_macro":
+            raise ValueError(
+                f"Authoring macro '{tree_node.id}' reached the runtime tree; "
+                "Composer must expand it before apply/save"
+            )
         explicit_operator_stop_policy = tree_node.operator_stop_policy != "inherit"
         if explicit_operator_stop_policy:
             effective_operator_stop_policy = tree_node.operator_stop_policy

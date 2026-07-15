@@ -2081,9 +2081,9 @@ def test_catalog_entry_includes_ui_editor_hints(client):
     data = response.json()
     params = {param["name"]: param for param in data["parameters"]}
     assert params["pick_offset_envelope"]["uiEditor"] == "pose_envelope"
-    assert params["pick_offset_reference"]["uiEditor"] == "relative_move_reference"
+    assert params["pick_offset_reference"]["uiEditor"] == "motion_reference"
     assert params["approach_offset_envelope"]["uiEditor"] == "pose_envelope"
-    assert params["approach_offset_reference"]["uiEditor"] == "relative_move_reference"
+    assert params["approach_offset_reference"]["uiEditor"] == "motion_reference"
     assert params["approach_move_node_name"]["schema"]["type"] == "string"
     assert params["pick_move_node_name"]["schema"]["type"] == "string"
     assert params["retreat_move_node_name"]["schema"]["type"] == "string"
@@ -2098,20 +2098,21 @@ def test_catalog_entry_includes_interrupt_metadata(client):
     assert data["interruptible"] is True
     assert data["defaultInterruptScope"] == "kernel_motion"
     params = {param["name"]: param for param in data["parameters"]}
-    motion_type = params["motion_type"]
-    relative_move_option = next(
+    target_mode = params["target_mode"]
+    relative_option = next(
         option
-        for option in motion_type["enumOptions"]
-        if option["value"] == "relative_move"
+        for option in target_mode["enumOptions"]
+        if option["value"] == "relative"
     )
-    assert relative_move_option["profilesMin"] == "v0.1"
-    assert relative_move_option["requiredCapabilities"] == [
-        "context.pose.resolve_reference"
-    ]
-    assert params["relative_move"]["profilesMin"] == "v0.1"
-    assert params["relative_move"]["visibleWhen"] == {
-        "param": "motion_type",
-        "equals": "relative_move",
+    assert relative_option["profilesMin"] == "v0.1"
+    # The shared target-mode option also covers relative joint deltas, which
+    # need only the authority-selected start state. Program validation adds
+    # context.pose.resolve_reference for relative pose/Cartesian requests.
+    assert relative_option["requiredCapabilities"] == []
+    assert params["target_reference"]["profilesMin"] == "v0.1"
+    assert params["target_reference"]["visibleWhen"] == {
+        "param": "target_mode",
+        "equals": "relative",
     }
 
 
@@ -2503,7 +2504,7 @@ def test_program_validate_flags_per_move_tcp_above_global(client, state):
                 "name": "move_to_pick",
                 "params": {
                     "move_id": "m",
-                    "motion_type": "joint_goal",
+                    "motion_type": "joint",
                     "joint_goal_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
                     "joint_goal_positions_rad": [0.2, -1.2, 1.0, -1.5, -1.3, 0.4],
                     "max_tcp_linear_speed_mps": 0.4,
@@ -3255,7 +3256,7 @@ def test_validate_program_tree_reports_parameter_errors(client):
                 "name": "bad_move",
                 "params": {
                     "move_id": "pick",
-                    "motion_type": "joint_goal",
+                    "motion_type": "joint",
                     "joint_goal_names": ["j1"],
                     "joint_goal_positions_rad": [0.1],
                     "velocity_scale": -0.1,
@@ -5437,7 +5438,9 @@ def test_kernel_events_drains_direct_kernel_events():
                 move_id="direct",
                 base_frame="base_link",
                 tcp_frame="tool0",
-                motion_type="joint_goal",
+                motion_type="joint",
+                joint_goal_names=["joint_1"],
+                joint_goal_positions_rad=[0.1],
             )
         )
 

@@ -1854,12 +1854,12 @@ function MoveToTargetGhost() {
   }, [robotPanelActive, robotMode]);
 
   const storedPoses = useMemo(() => {
-    const out: { nodeName: string; motionType: 'pose_goal' | 'joint_goal'; params: Record<string, unknown> }[] = [];
+    const out: { nodeName: string; motionType: 'pose' | 'joint'; params: Record<string, unknown> }[] = [];
     function visit(node: TreeNode | null): void {
       if (node === null) return;
       if (node.id === 'move_manipulator_action') {
         const mt = node.params['motion_type'];
-        if (mt === 'pose_goal' || mt === 'joint_goal') {
+        if (mt === 'pose' || mt === 'joint') {
           out.push({ nodeName: node.name, motionType: mt, params: node.params });
         }
       }

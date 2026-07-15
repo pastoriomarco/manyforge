@@ -4,7 +4,7 @@ name: native_simple_motion_ur5
 description: >-
   Native-kernel qualification program with deterministic joint-goal motions on
   the UR5 demo model. Intended for live planner/executor requalification.
-catalog_version: "0.2.0"
+catalog_version: "0.3.0"
 
 robot:
   robot_id: ur5
@@ -31,7 +31,7 @@ tree:
       name: move_to_start
       params:
         move_id: move_start
-        motion_type: joint_goal
+        motion_type: joint
         joint_goal_names:
           - shoulder_pan_joint
           - shoulder_lift_joint
@@ -48,7 +48,7 @@ tree:
       name: move_to_end
       params:
         move_id: move_end
-        motion_type: joint_goal
+        motion_type: joint
         joint_goal_names:
           - shoulder_pan_joint
           - shoulder_lift_joint

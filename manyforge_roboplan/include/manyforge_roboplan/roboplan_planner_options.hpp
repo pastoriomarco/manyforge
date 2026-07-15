@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 
+#include <manyforge_core/types/motion_spec.hpp>
 #include <roboplan/core/path_utils.hpp>
 #include <roboplan_rrt/rrt.hpp>
 #include <roboplan_simple_ik/simple_ik.hpp>
@@ -21,6 +22,29 @@ inline roboplan::RRTOptions production_rrt_options(
   // budget-spending and optimal variants, but they remain opt-in capabilities.
   options.rrt_star = false;
   options.fast_return = true;
+  return options;
+}
+
+inline roboplan::RRTOptions planning_profile_rrt_options(
+    roboplan::RRTOptions options,
+    core::PlanningProfileDTO profile) {
+  switch (profile) {
+    case core::PlanningProfileDTO::kFirstFeasible:
+      options.rrt_star = false;
+      options.fast_return = true;
+      break;
+    case core::PlanningProfileDTO::kBalanced:
+      // Rewire while searching, but return the first complete candidate. This
+      // improves the in-search tree without deliberately spending the
+      // remaining request budget after feasibility has been established.
+      options.rrt_star = true;
+      options.fast_return = true;
+      break;
+    case core::PlanningProfileDTO::kQualityBounded:
+      options.rrt_star = true;
+      options.fast_return = false;
+      break;
+  }
   return options;
 }
 
@@ -52,6 +76,17 @@ inline roboplan::SimpleIkOptions production_planning_ik_options(
   options.max_restarts = 50;
   options.max_time = 1.0;
   options.fast_return = true;
+  return options;
+}
+
+inline roboplan::SimpleIkOptions planning_profile_ik_options(
+    roboplan::SimpleIkOptions options,
+    core::PlanningProfileDTO profile) {
+  // Quality-bounded planning searches the bounded restart set for the
+  // seed-nearest feasible solution. The other profiles return the first
+  // feasible IK candidate; Balanced spends quality effort in path search.
+  options.fast_return =
+      profile != core::PlanningProfileDTO::kQualityBounded;
   return options;
 }
 

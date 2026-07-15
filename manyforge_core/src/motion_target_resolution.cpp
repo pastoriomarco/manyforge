@@ -1,0 +1,171 @@
+#include <manyforge_core/motion_target_resolution.hpp>
+
+#include <manyforge_core/geometry/pose_math.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace manyforge::core {
+
+Result<MotionSpecDTO> resolve_motion_target(
+    const ExecuteRequestDTO& request,
+    const SceneRevisionBindingDTO& scene_binding,
+    const RobotStateDTO* observed_start_state,
+    const IReferencePoseResolver& reference_resolver) {
+  const auto invalid_target_shape = [](std::string message,
+                                       std::string reason) {
+    return Result<MotionSpecDTO>::Err(ErrorDTO{
+        kErrorInvalidRequest, std::move(message),
+        {{"reason", std::move(reason)}}});
+  };
+
+  const auto* joint_goal = std::get_if<JointGoalDTO>(&request.motion);
+  if (joint_goal != nullptr) {
+    if (joint_goal->joint_names.empty()) {
+      return invalid_target_shape(
+          "Joint target must contain at least one joint",
+          "joint_target_empty");
+    }
+    if (joint_goal->joint_names.size() != joint_goal->positions_rad.size()) {
+      return invalid_target_shape(
+          "Joint names and positions must have the same length",
+          "joint_target_shape_mismatch");
+    }
+    std::unordered_set<std::string> target_joint_names;
+    target_joint_names.reserve(joint_goal->joint_names.size());
+    for (const auto& joint_name : joint_goal->joint_names) {
+      if (joint_name.empty()) {
+        return invalid_target_shape(
+            "Joint target names must be non-empty",
+            "joint_target_empty_joint");
+      }
+      if (!target_joint_names.insert(joint_name).second) {
+        return invalid_target_shape(
+            "Joint target names must not contain duplicates",
+            "joint_target_duplicate_joint");
+      }
+    }
+    if (!std::all_of(joint_goal->positions_rad.begin(),
+                     joint_goal->positions_rad.end(),
+                     [](double value) { return std::isfinite(value); })) {
+      return invalid_target_shape(
+          "Joint target positions must be finite",
+          "joint_target_value_not_finite");
+    }
+  }
+
+  if (request.target_mode == MotionTargetModeDTO::kAbsolute) {
+    if (request.target_reference.has_value() ||
+        request.offset_reference.has_value()) {
+      return invalid_target_shape(
+          "Absolute motion must not carry target references",
+          "absolute_target_has_reference");
+    }
+    return Result<MotionSpecDTO>::Ok(request.motion);
+  }
+
+  if (joint_goal != nullptr) {
+    if (request.target_reference.has_value() ||
+        request.offset_reference.has_value()) {
+      return invalid_target_shape(
+          "Relative joint motion uses named joint deltas and cannot carry a "
+          "spatial reference",
+          "relative_joint_has_reference");
+    }
+    if (observed_start_state == nullptr) {
+      return Result<MotionSpecDTO>::Err(ErrorDTO{
+          kErrorStartStateMismatch,
+          "Relative joint motion requires a fresh authority-selected start state",
+          {{"reason", "relative_joint_start_state_unavailable"}}});
+    }
+    if (observed_start_state->joint_names.size() !=
+        observed_start_state->positions_rad.size()) {
+      return invalid_target_shape(
+          "Observed start state is incomplete for relative joint resolution",
+          "relative_joint_start_state_incomplete");
+    }
+
+    std::unordered_map<std::string, double> start_by_name;
+    start_by_name.reserve(observed_start_state->joint_names.size());
+    for (std::size_t index = 0;
+         index < observed_start_state->joint_names.size(); ++index) {
+      if (!start_by_name
+               .emplace(observed_start_state->joint_names[index],
+                        observed_start_state->positions_rad[index])
+               .second) {
+        return invalid_target_shape(
+            "Observed start state has duplicate joint names",
+            "relative_joint_start_state_duplicate_joint");
+      }
+    }
+
+    JointGoalDTO resolved = *joint_goal;
+    for (std::size_t index = 0; index < resolved.joint_names.size(); ++index) {
+      const auto start = start_by_name.find(resolved.joint_names[index]);
+      if (start == start_by_name.end()) {
+        return Result<MotionSpecDTO>::Err(ErrorDTO{
+            kErrorInvalidRequest,
+            "Relative joint target names a joint absent from the start state",
+            {{"reason", "relative_joint_unknown_joint"},
+             {"joint", resolved.joint_names[index]}}});
+      }
+      resolved.positions_rad[index] += start->second;
+      if (!std::isfinite(resolved.positions_rad[index])) {
+        return invalid_target_shape(
+            "Relative joint resolution produced a non-finite target",
+            "relative_joint_result_not_finite");
+      }
+    }
+    return Result<MotionSpecDTO>::Ok(MotionSpecDTO{std::move(resolved)});
+  }
+
+  if (std::holds_alternative<NamedTargetDTO>(request.motion)) {
+    return invalid_target_shape(
+        "Named targets are absolute-only", "relative_named_target_unsupported");
+  }
+  if (!request.target_reference.has_value()) {
+    return invalid_target_shape(
+        "Relative pose and Cartesian motion require target_reference",
+        "relative_target_reference_missing");
+  }
+
+  auto target_pose = reference_resolver.resolve_reference_pose(
+      *request.target_reference, request.base_frame, scene_binding);
+  if (!target_pose.ok()) {
+    return Result<MotionSpecDTO>::Err(target_pose.error());
+  }
+  Pose3DTO offset_basis_pose = target_pose.value();
+  if (request.offset_reference.has_value()) {
+    auto offset_reference_pose = reference_resolver.resolve_reference_pose(
+        *request.offset_reference, request.base_frame, scene_binding);
+    if (!offset_reference_pose.ok()) {
+      return Result<MotionSpecDTO>::Err(offset_reference_pose.error());
+    }
+    offset_basis_pose = offset_reference_pose.value();
+  }
+  const auto resolve_offset = [&](const Pose3DTO& offset) {
+    Pose3DTO basis;
+    basis.position_m = target_pose.value().position_m;
+    basis.orientation = offset_basis_pose.orientation;
+    return multiply_poses(basis, offset);
+  };
+
+  if (const auto* pose_goal = std::get_if<PoseGoalDTO>(&request.motion)) {
+    return Result<MotionSpecDTO>::Ok(
+        MotionSpecDTO{PoseGoalDTO{resolve_offset(pose_goal->goal)}});
+  }
+  if (const auto* path = std::get_if<CartesianPathDTO>(&request.motion)) {
+    CartesianPathDTO resolved = *path;
+    for (auto& waypoint : resolved.waypoints) {
+      waypoint = resolve_offset(waypoint);
+    }
+    return Result<MotionSpecDTO>::Ok(MotionSpecDTO{std::move(resolved)});
+  }
+  return invalid_target_shape(
+      "Relative target mode is unsupported for this motion payload",
+      "relative_motion_type_unsupported");
+}
+
+}  // namespace manyforge::core

@@ -2,7 +2,7 @@ api_version: manyforge.program.v0
 program_profile: v0.0
 name: test_pick_and_place
 description: Test pick and place program.
-catalog_version: "0.2.0"
+catalog_version: "0.3.0"
 
 robot:
   robot_id: ur5
@@ -37,7 +37,7 @@ tree:
       name: move_to_pick
       params:
         move_id: pick_approach
-        motion_type: joint_goal
+        motion_type: joint
         joint_goal_names: [j1, j2, j3, j4, j5, j6]
         joint_goal_positions_rad: [0.2, -1.2, 1.0, -1.5, -1.3, 0.4]
         velocity_scale: "${param:pick_velocity_scale}"

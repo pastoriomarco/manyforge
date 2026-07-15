@@ -245,6 +245,59 @@ Existence is not enough. Before a real pick attempt, compare the transformed
 trocar pose against Isaac Sim ground truth for the trocar object. A plausible
 but inaccurate camera transform will produce a plausible but wrong pick pose.
 
+## Plan Pick Authoring And Execution
+
+`Plan Pick Sequence` is a no-motion planning node. It reads the selected
+detached object from the backend-authoritative scene, synthesizes bounded pick
+and approach poses, and validates the three planning legs before publishing a
+`pick_plan_v1` blackboard bundle. It does not close the gripper, attach the
+object, or execute an arm trajectory.
+
+In Composer, **Pick Plan Subtree** inserts the ordinary editable nodes needed
+for the pick half of the workflow:
+
+```text
+Sequence
+  Plan Pick Sequence
+  Sequence
+    Move to approach
+    Cartesian descend to pick
+    Close gripper
+    Attach selected object
+    Cartesian retreat to approach
+```
+
+Insertion requires exactly one active deployment gripper and one selected,
+detached scene object. Failure is atomic: Composer adds no partial nodes or
+blackboard declarations. The generated nodes remain fully visible and editable;
+the template itself is never saved or run. Repeated insertions receive one
+deterministic suffix across node names and the generated blackboard namespace.
+
+The approach move is an absolute pose motion. Descend and retreat are
+fail-closed Cartesian paths and require the deployment to advertise
+`planning.motion.cartesian_path`. Each generated motion has independent
+selectors for motion type (`joint`, `pose`, `cartesian`), target mode
+(`absolute`, `relative`), and planner-neutral planning profile
+(`first_feasible`, `balanced`, `quality_bounded`). Relative describes how a
+target is resolved; it is not a motion type. Unsupported choices are rejected
+instead of silently falling back to another planner behavior.
+
+When a stage fails, inspect the Plan Pick report and the failing motion node.
+The report retains the requested stage target/path and identifies whether pose
+synthesis, planning, collision validation, support-contact release, or another
+authoritative gate failed. A failed Cartesian descend or retreat is not retried
+as endpoint-only pose planning.
+
+Use a narrow `contact_grasp` policy only for the intended tool/object contact.
+After attachment, `touch_links` are the only gripper/object collision allowance.
+Support-contact release remains a separate object/support policy and may not be
+replaced by a broad collision exemption. Preview and execution must use the same
+object, frames, contact policy, scene lease, and validation path.
+
+Program artifacts persist joint angles and angular pose fields in radians.
+Composer may display degrees for operator convenience, but it converts back to
+radians before applying or saving the program.
+
 ## Current Bootstrap Limits
 
 The current `/output` evidence from Isaac ROS 4.4 is usable for wiring but weak

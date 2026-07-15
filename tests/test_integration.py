@@ -237,7 +237,7 @@ class TestRunnerWithNativeKernel:
             move_id="test_move",
             base_frame="base_link",
             tcp_frame="tool0",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=UR5_JOINTS,
             joint_goal_positions_rad=[0.1, -0.5, 0.5, -0.5, -0.5, 0.0],
             velocity_scale=1.0,
@@ -256,7 +256,7 @@ class TestRunnerWithNativeKernel:
         request1 = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="move1",
             base_frame="base_link", tcp_frame="tool0",
-            motion_type="joint_goal", joint_goal_names=UR5_JOINTS,
+            motion_type="joint", joint_goal_names=UR5_JOINTS,
             joint_goal_positions_rad=[0.1, -0.5, 0.5, -0.5, -0.5, 0.0],
             velocity_scale=1.0, acceleration_scale=1.0,
             planning_timeout_s=10.0, execution_timeout_s=60.0,
@@ -271,7 +271,7 @@ class TestRunnerWithNativeKernel:
         request2 = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="move2",
             base_frame="base_link", tcp_frame="tool0",
-            motion_type="joint_goal", joint_goal_names=UR5_JOINTS,
+            motion_type="joint", joint_goal_names=UR5_JOINTS,
             joint_goal_positions_rad=[0.2, -0.8, 0.8, -0.3, -0.8, 0.1],
             velocity_scale=1.0, acceleration_scale=1.0,
             planning_timeout_s=10.0, execution_timeout_s=60.0,
@@ -287,7 +287,7 @@ class TestRunnerWithNativeKernel:
         request = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="move1",
             base_frame="base_link", tcp_frame="tool0",
-            motion_type="joint_goal", joint_goal_names=UR5_JOINTS,
+            motion_type="joint", joint_goal_names=UR5_JOINTS,
             joint_goal_positions_rad=[0.1, -0.5, 0.5, -0.5, -0.5, 0.0],
             velocity_scale=1.0, acceleration_scale=1.0,
             planning_timeout_s=10.0, execution_timeout_s=60.0,
@@ -303,7 +303,7 @@ class TestRunnerWithNativeKernel:
         request2 = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="move2",
             base_frame="base_link", tcp_frame="tool0",
-            motion_type="joint_goal", joint_goal_names=UR5_JOINTS,
+            motion_type="joint", joint_goal_names=UR5_JOINTS,
             joint_goal_positions_rad=[0.2, -0.8, 0.8, -0.3, -0.8, 0.1],
             velocity_scale=1.0, acceleration_scale=1.0,
             planning_timeout_s=10.0, execution_timeout_s=60.0,
@@ -319,7 +319,7 @@ class TestRunnerWithNativeKernel:
         request = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="move1",
             base_frame="base_link", tcp_frame="tool0",
-            motion_type="joint_goal", joint_goal_names=UR5_JOINTS,
+            motion_type="joint", joint_goal_names=UR5_JOINTS,
             joint_goal_positions_rad=[0.1, -0.5, 0.5, -0.5, -0.5, 0.0],
             velocity_scale=1.0, acceleration_scale=1.0,
             planning_timeout_s=10.0, execution_timeout_s=60.0,
@@ -350,7 +350,7 @@ class TestErrorPaths:
         request = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="test_move",
             base_frame="base_link", tcp_frame="tcp",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=["j1", "j2", "j3", "j4", "j5", "j6"],
             joint_goal_positions_rad=[0.1, 0.1, 0.1, 0.0, 0.0, 0.0],
             velocity_scale=1.0, acceleration_scale=1.0,
@@ -372,7 +372,7 @@ class TestErrorPaths:
         request1 = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="move1",
             base_frame="base_link", tcp_frame="tcp",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=["j1", "j2", "j3", "j4", "j5", "j6"],
             joint_goal_positions_rad=[0.1, 0.1, 0.1, 0.0, 0.0, 0.0],
             velocity_scale=1.0, acceleration_scale=1.0,
@@ -384,7 +384,7 @@ class TestErrorPaths:
         request2 = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="move2",
             base_frame="base_link", tcp_frame="tcp",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=["j1", "j2", "j3", "j4", "j5", "j6"],
             joint_goal_positions_rad=[0.2, 0.2, 0.2, 0.0, 0.0, 0.0],
             velocity_scale=1.0, acceleration_scale=1.0,
@@ -412,7 +412,7 @@ class TestErrorPaths:
         request = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="move1",
             base_frame="base_link", tcp_frame="tcp",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=["j1", "j2", "j3", "j4", "j5", "j6"],
             joint_goal_positions_rad=[0.1, 0.1, 0.1, 0.0, 0.0, 0.0],
             velocity_scale=1.0, acceleration_scale=1.0,

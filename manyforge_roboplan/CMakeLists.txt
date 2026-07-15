@@ -171,7 +171,8 @@ if(BUILD_TESTING)
 
     add_executable(test_native_backends test/test_native_backends.cpp)
     target_link_libraries(test_native_backends PRIVATE
-      manyforge_roboplan GTest::gtest_main)
+      manyforge_roboplan manyforge_planner_conformance_test_support
+      GTest::gtest_main)
 
     add_executable(test_collision_body_id_mapper
       test/test_collision_body_id_mapper.cpp)

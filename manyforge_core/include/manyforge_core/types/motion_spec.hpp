@@ -9,6 +9,20 @@
 
 namespace manyforge::core {
 
+/// How the typed motion payload is interpreted at kernel admission.
+enum class MotionTargetModeDTO {
+  kAbsolute,
+  kRelative,
+};
+
+/// Planner-neutral candidate-selection policy. Adapters map these semantics to
+/// native algorithms; requests never expose backend-specific flags.
+enum class PlanningProfileDTO {
+  kFirstFeasible,
+  kBalanced,
+  kQualityBounded,
+};
+
 /// Joint goal for motion planning (spec §4.1)
 struct JointGoalDTO {
   std::vector<std::string> joint_names;
@@ -36,13 +50,6 @@ struct ReferenceDTO {
   Type type;
   std::string id;
   std::optional<Pose3DTO> pose;
-};
-
-/// Relative move goal (spec §4.4)
-struct RelativeMoveDTO {
-  ReferenceDTO target_reference;
-  std::optional<ReferenceDTO> offset_reference;
-  Pose3DTO offset;  // delta pose expressed in the offset reference frame
 };
 
 /// Cartesian path goal (spec §4.5)
@@ -74,6 +81,7 @@ struct CartesianPathDTO {
 };
 
 /// Motion specification as a tagged union (spec §4)
-using MotionSpecDTO = std::variant<JointGoalDTO, PoseGoalDTO, NamedTargetDTO, RelativeMoveDTO, CartesianPathDTO>;
+using MotionSpecDTO =
+    std::variant<JointGoalDTO, PoseGoalDTO, NamedTargetDTO, CartesianPathDTO>;
 
 }  // namespace manyforge::core

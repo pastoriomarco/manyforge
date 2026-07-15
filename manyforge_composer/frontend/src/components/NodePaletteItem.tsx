@@ -4,6 +4,8 @@ const KIND_ICONS: Record<string, string> = {
   leaf: '⬤',       // action/condition node
   composite: '◆',   // sequence/selector/parallel
   decorator: '◇',   // inverter/repeat/retry
+  macro: '▦',       // runtime/code-generator expansion
+  authoring_macro: '▦', // Composer-only subtree template
 };
 
 interface Props {

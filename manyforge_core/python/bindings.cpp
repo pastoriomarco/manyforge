@@ -54,6 +54,17 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .value("kDisable", manyforge::core::CacheMode::kDisable)
         .export_values();
 
+    py::enum_<manyforge::core::MotionTargetModeDTO>(m, "MotionTargetMode")
+        .value("kAbsolute", manyforge::core::MotionTargetModeDTO::kAbsolute)
+        .value("kRelative", manyforge::core::MotionTargetModeDTO::kRelative);
+
+    py::enum_<manyforge::core::PlanningProfileDTO>(m, "PlanningProfile")
+        .value("kFirstFeasible",
+               manyforge::core::PlanningProfileDTO::kFirstFeasible)
+        .value("kBalanced", manyforge::core::PlanningProfileDTO::kBalanced)
+        .value("kQualityBounded",
+               manyforge::core::PlanningProfileDTO::kQualityBounded);
+
     py::enum_<manyforge::core::ErrorCode>(m, "ErrorCode")
         .value("kSuccess", manyforge::core::ErrorCode::kSuccess)
         .value("kInvalidRequest", manyforge::core::ErrorCode::kInvalidRequest)
@@ -249,28 +260,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                 .format(py::cast(r.type), r.id, py::cast(r.pose));
         });
 
-    py::class_<manyforge::core::RelativeMoveDTO>(m, "RelativeMoveDTO")
-        .def(py::init<>())
-        .def(py::init([](manyforge::core::ReferenceDTO target_reference,
-                         manyforge::core::Pose3DTO offset,
-                         std::optional<manyforge::core::ReferenceDTO> offset_reference) {
-            manyforge::core::RelativeMoveDTO move;
-            move.target_reference = std::move(target_reference);
-            move.offset = std::move(offset);
-            move.offset_reference = std::move(offset_reference);
-            return move;
-        }),
-             py::arg("target_reference"),
-             py::arg("offset"),
-             py::arg("offset_reference") = std::nullopt)
-        .def_readwrite("target_reference", &manyforge::core::RelativeMoveDTO::target_reference)
-        .def_readwrite("offset_reference", &manyforge::core::RelativeMoveDTO::offset_reference)
-        .def_readwrite("offset", &manyforge::core::RelativeMoveDTO::offset)
-        .def("__repr__", [](const manyforge::core::RelativeMoveDTO& r) {
-            return py::str("RelativeMoveDTO(target_reference={}, offset_reference={}, offset={})")
-                .format(py::cast(r.target_reference), py::cast(r.offset_reference), py::cast(r.offset));
-        });
-
     py::enum_<manyforge::core::CartesianSpeedModeDTO>(m, "CartesianSpeedMode")
         .value("kBounded", manyforge::core::CartesianSpeedModeDTO::kBounded);
 
@@ -416,6 +405,14 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("timeouts", &manyforge::core::ExecuteRequestDTO::timeouts)
         .def_readwrite("cache_mode", &manyforge::core::ExecuteRequestDTO::cache_mode)
         .def_readwrite("motion", &manyforge::core::ExecuteRequestDTO::motion)
+        .def_readwrite("planning_profile",
+                       &manyforge::core::ExecuteRequestDTO::planning_profile)
+        .def_readwrite("target_mode",
+                       &manyforge::core::ExecuteRequestDTO::target_mode)
+        .def_readwrite("target_reference",
+                       &manyforge::core::ExecuteRequestDTO::target_reference)
+        .def_readwrite("offset_reference",
+                       &manyforge::core::ExecuteRequestDTO::offset_reference)
         .def("__repr__", [](const manyforge::core::ExecuteRequestDTO& r) {
             return py::str("ExecuteRequestDTO(robot_id='{}', group_id='{}', move_id='{}')")
                 .format(r.robot_id, r.group_id, r.move_id);
@@ -489,6 +486,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("tolerances", &manyforge::core::PlanRequestDTO::tolerances)
         .def_readwrite("speed_profile", &manyforge::core::PlanRequestDTO::speed_profile)
         .def_readwrite("planning_timeout_s", &manyforge::core::PlanRequestDTO::planning_timeout_s)
+        .def_readwrite("planning_profile",
+                       &manyforge::core::PlanRequestDTO::planning_profile)
         .def_readwrite("per_joint_dynamics_limits", &manyforge::core::PlanRequestDTO::per_joint_dynamics_limits)
         .def_readwrite("scene_binding", &manyforge::core::PlanRequestDTO::scene_binding)
         .def("__repr__", [](const manyforge::core::PlanRequestDTO& p) {

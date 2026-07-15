@@ -8,6 +8,7 @@
 #include <manyforge_core/execution_interrupt_support.hpp>
 #include <manyforge_core/execution_stop_support.hpp>
 #include <manyforge_core/geometry/pose_math.hpp>
+#include <manyforge_core/motion_target_resolution.hpp>
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 #include <manyforge_core/types/error_code_mapping.hpp>
 #include <manyforge_core/types/kernel_event_factories.hpp>
@@ -62,16 +63,15 @@ std::unordered_set<std::string> observed_target_object_ids(
     const ExecuteRequestDTO& request,
     const std::optional<CollisionPolicySnapshot>& policy_snapshot) {
   std::unordered_set<std::string> out;
-  if (const auto* relative = std::get_if<RelativeMoveDTO>(&request.motion)) {
-    if (relative->target_reference.type == ReferenceDTO::Type::kObject &&
-        !relative->target_reference.id.empty()) {
-      out.insert(relative->target_reference.id);
-    }
-    if (relative->offset_reference.has_value() &&
-        relative->offset_reference->type == ReferenceDTO::Type::kObject &&
-        !relative->offset_reference->id.empty()) {
-      out.insert(relative->offset_reference->id);
-    }
+  if (request.target_reference.has_value() &&
+      request.target_reference->type == ReferenceDTO::Type::kObject &&
+      !request.target_reference->id.empty()) {
+    out.insert(request.target_reference->id);
+  }
+  if (request.offset_reference.has_value() &&
+      request.offset_reference->type == ReferenceDTO::Type::kObject &&
+      !request.offset_reference->id.empty()) {
+    out.insert(request.offset_reference->id);
   }
   if (!request.contact_policy_id.empty() && policy_snapshot.has_value()) {
     for (const auto& grasp : policy_snapshot->contact_grasps) {
@@ -4149,6 +4149,7 @@ ExecutionKernel::execute_worker_plan_phase(
     const SceneRevisionBindingDTO& scene_binding,
     std::uint64_t exec_id,
     std::optional<TrajectoryDTO> cached_trajectory,
+    bool cache_revalidation_candidate,
     ExecutionState worker_entry_state,
     ActiveMotionExecution& motion_state) {
   ExecuteWorkerPlanPhaseResult result;
@@ -4163,6 +4164,8 @@ ExecutionKernel::execute_worker_plan_phase(
 
   const bool cache_hit = cached_trajectory.has_value();
   result.active_trajectory_from_cache = cache_hit;
+  result.cache_revalidation_candidate =
+      cache_hit && cache_revalidation_candidate;
   if (cache_hit) {
     result.trajectory = std::move(*cached_trajectory);
     return result;
@@ -4413,13 +4416,15 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     std::uint64_t exec_id,
     TrajectoryDTO& trajectory,
     bool& active_trajectory_from_cache,
+    bool& cache_revalidation_candidate,
     const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
     const SceneRevisionBindingDTO& scene_binding,
     const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
     ActiveMotionExecution& motion_state) {
   ExecuteWorkerValidationPhaseResult phase_result;
-  const int max_authoritative_validation_attempts =
-      std::max(1, 1 + config_.authoritative_validation_collision_replan_attempts);
+  const int max_authoritative_validation_attempts = std::max(
+      cache_revalidation_candidate ? 2 : 1,
+      1 + config_.authoritative_validation_collision_replan_attempts);
   int authoritative_validation_attempt = 0;
   Result<CollisionValidationSuccess> val_result =
       Result<CollisionValidationSuccess>::Err(ErrorCode::kInternalError);
@@ -4438,8 +4443,23 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       break;
     }
     const auto& validation_error = val_result.error();
+    const bool failed_revalidation_candidate =
+        cache_revalidation_candidate && active_trajectory_from_cache;
+    if (failed_revalidation_candidate) {
+      emit_event({KernelEventType::kCacheRevalidationFailed,
+                  exec_id,
+                  clock_.now(),
+                  {},
+                  {},
+                  validation_error,
+                  {{"move_id", request.move_id},
+                   {"reason", "current_validation_failed"}}});
+      std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
+      metrics_.cache_revalidations_failed++;
+    }
     const bool can_replan_authoritative_collision =
-        authoritative_collision_replan_candidate(validation_error) &&
+        (failed_revalidation_candidate ||
+         authoritative_collision_replan_candidate(validation_error)) &&
         authoritative_validation_attempt + 1 <
             max_authoritative_validation_attempts &&
         sm_.status().state == ExecutionState::kValidating &&
@@ -4450,7 +4470,10 @@ ExecutionKernel::execute_worker_validate_replan_phase(
 
     std::map<std::string, std::string> retry_details =
         validation_error.details;
-    retry_details["reason"] = "authoritative_validation_replan";
+    retry_details["reason"] =
+        failed_revalidation_candidate
+            ? "cache_revalidation_failed_replan"
+            : "authoritative_validation_replan";
     retry_details["attempt_index"] =
         std::to_string(authoritative_validation_attempt);
     retry_details["next_attempt_index"] =
@@ -4471,7 +4494,10 @@ ExecutionKernel::execute_worker_validate_replan_phase(
                   {},
                   std::nullopt,
                   {{"move_id", request.move_id},
-                   {"reason", "authoritative_validation_replan"}}});
+                   {"reason",
+                    failed_revalidation_candidate
+                        ? "cache_revalidation_failed"
+                        : "authoritative_validation_replan"}}});
       {
         std::lock_guard<std::mutex> lock(metrics_mutex_);
         metrics_.cache_invalidations++;
@@ -4741,6 +4767,7 @@ ExecutionKernel::execute_worker_validate_replan_phase(
 
     trajectory = std::move(replan_result.value());
     active_trajectory_from_cache = false;
+    cache_revalidation_candidate = false;
     emit_event({KernelEventType::kPlanCompleted,
                 exec_id,
                 clock_.now(),
@@ -4977,6 +5004,7 @@ ExecutionKernel::execute_worker_dispatch_phase(
     std::uint64_t exec_id,
     const TrajectoryDTO& trajectory,
     bool active_trajectory_from_cache,
+    bool cache_revalidation_candidate,
     const CollisionWorldRevision& validation_world_revision,
     const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
     ActiveMotionExecution& motion_state) {
@@ -5193,13 +5221,26 @@ ExecutionKernel::execute_worker_dispatch_phase(
   // intent. This prevents same-endpoint Cartesian paths, speed profiles, or
   // per-joint cap variants from sharing a move_id cache entry.
   if (request.cache_mode != CacheMode::kDisable &&
-      !active_trajectory_from_cache &&
+      (!active_trajectory_from_cache || cache_revalidation_candidate) &&
       collision_world_revision_is_set(validation_world_revision)) {
     // Tag every cache entry with the immutable snapshot revision that
     // validation actually used. If live pose-source updates publish newer
     // revisions before the next lookup, lookup_with_revision declines the hit.
     cache_.store(request.move_id, trajectory, validation_world_revision,
                  trajectory_cache_intent_identity(request));
+    if (cache_revalidation_candidate) {
+      emit_event({KernelEventType::kCacheRevalidated,
+                  exec_id,
+                  clock_.now(),
+                  {},
+                  {},
+                  std::nullopt,
+                  {{"move_id", request.move_id},
+                   {"revision_id",
+                    std::to_string(validation_world_revision.revision_id)}}});
+      std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
+      metrics_.cache_revalidations_succeeded++;
+    }
   }
 
   {
@@ -5562,6 +5603,7 @@ void ExecutionKernel::execute_worker_finalize_phase(
 void ExecutionKernel::async_execute_worker(
     std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,
     std::optional<TrajectoryDTO> cached_trajectory,
+    bool cache_revalidation_candidate,
     RetainedSceneSnapshotLease retained_scene,
     std::optional<SceneSnapshotLease> scene_snapshot_lease) {
   // Worker-local motion-execution state. Lives on this
@@ -5627,6 +5669,7 @@ void ExecutionKernel::async_execute_worker(
 
     auto plan_phase = execute_worker_plan_phase(
         st, request, scene_binding, exec_id, std::move(cached_trajectory),
+        cache_revalidation_candidate,
         worker_entry_state, motion_state);
     if (plan_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
       return;
@@ -5634,9 +5677,11 @@ void ExecutionKernel::async_execute_worker(
     TrajectoryDTO trajectory = std::move(plan_phase.trajectory);
     bool active_trajectory_from_cache =
         plan_phase.active_trajectory_from_cache;
+    cache_revalidation_candidate = plan_phase.cache_revalidation_candidate;
 
     auto validation_phase = execute_worker_validate_replan_phase(
         st, request, exec_id, trajectory, active_trajectory_from_cache,
+        cache_revalidation_candidate,
         retained_scene.inventory(), scene_binding, scene_snapshot_lease,
         motion_state);
     if (validation_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
@@ -5647,6 +5692,7 @@ void ExecutionKernel::async_execute_worker(
 
     auto dispatch_phase = execute_worker_dispatch_phase(
         request, exec_id, trajectory, active_trajectory_from_cache,
+        cache_revalidation_candidate,
         validation_world_revision, validation_phase.scene_snapshot_lease,
         motion_state);
     if (dispatch_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
@@ -6717,8 +6763,17 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   scene_snapshot_lease = build_scene_snapshot_lease(
       retained_scene.inventory(), request, exec_id);
 
+  std::optional<RobotStateDTO> synced_state;
+  auto observed_start = observed_state_.current_state(clock_.now());
+  if (observed_start.ok()) {
+    synced_state = std::move(observed_start.value());
+  }
+
   ExecuteRequestDTO resolved_request(request);
-  auto resolved_motion = resolve_motion_spec(request, scene_binding);
+  auto resolved_motion = resolve_motion_target(
+      request, scene_binding,
+      synced_state.has_value() ? &*synced_state : nullptr,
+      reference_resolver_);
   if (!resolved_motion.ok()) {
     if (request.cache_mode != CacheMode::kDisable &&
         cache_.contains(request.move_id)) {
@@ -6738,25 +6793,22 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   }
   resolved_request.motion = std::move(resolved_motion.value());
 
-  std::optional<RobotStateDTO> synced_state;
-  auto observed_start = observed_state_.current_state(clock_.now());
-  if (observed_start.ok()) {
-    synced_state = std::move(observed_start.value());
-  }
-
   PreparedExecutionStart prepared;
   if (request.cache_mode != CacheMode::kDisable) {
-    // Gate cache hits on the authoritative snapshot revision, not on the
-    // planner context. A cached trajectory validated under revision N MUST NOT
-    // be served when the collision-world snapshot is at revision N+1.
-    // A default revision means the authoritative publisher is unavailable; the
-    // cache then declines to serve a hit and validation fails closed later.
+    // Exact-revision entries are cache hits. A same-intent older-revision entry
+    // is only a current-snapshot revalidation candidate; it carries no stale
+    // proof and cannot dispatch until the ordinary validation gate restamps it.
     const auto active_revision = scene_binding.revision;
     const auto intent_identity =
         trajectory_cache_intent_identity(resolved_request);
     auto cache_lookup = cache_.lookup_with_revision(
         request.move_id, active_revision, intent_identity);
-    if (cache_lookup.disposition == TrajectoryCacheLookupDisposition::kHit &&
+    const bool exact_cache_hit =
+        cache_lookup.disposition == TrajectoryCacheLookupDisposition::kHit;
+    const bool revalidation_candidate =
+        cache_lookup.disposition ==
+        TrajectoryCacheLookupDisposition::kRevalidationCandidate;
+    if ((exact_cache_hit || revalidation_candidate) &&
         cache_lookup.trajectory.has_value()) {
       auto& cached = *cache_lookup.trajectory;
       const auto goal_match =
@@ -6769,7 +6821,8 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
                     request.tolerances.joint_position_tol_rad)
               : incompatible_cache("start_state_changed");
       if (goal_match.compatible && start_match.compatible) {
-        prepared.cache_hit = true;
+        prepared.cache_hit = exact_cache_hit;
+        prepared.cache_revalidation_candidate = revalidation_candidate;
         prepared.trajectory = std::move(cached);
       } else {
         cache_.invalidate(request.move_id);
@@ -6875,8 +6928,9 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   }
 
   const auto initial_state =
-      prepared.cache_hit ? ExecutionState::kValidating
-                         : ExecutionState::kPlanning;
+      (prepared.cache_hit || prepared.cache_revalidation_candidate)
+          ? ExecutionState::kValidating
+          : ExecutionState::kPlanning;
   if (initial_state != ExecutionState::kPlanning) {
     auto cache_hit_transition = sm_.try_transition(initial_state);
     if (!cache_hit_transition.ok()) {
@@ -6907,6 +6961,18 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
         {KernelEventType::kCacheHit, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
     std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
     metrics_.cache_hits++;
+  } else if (prepared.cache_revalidation_candidate) {
+    emit_event({KernelEventType::kCacheRevalidationCandidate,
+                exec_id,
+                clock_.now(),
+                {},
+                {},
+                std::nullopt,
+                {{"move_id", request.move_id},
+                 {"current_revision_id",
+                  std::to_string(scene_binding.revision.revision_id)}}});
+    std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
+    metrics_.cache_revalidation_candidates++;
   } else {
     if (prepared.cache_miss) {
       emit_event({KernelEventType::kCacheMiss, exec_id, clock_.now(),
@@ -6936,9 +7002,12 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   worker_thread_ = std::jthread(
       [this, request_copy = std::move(resolved_request),
        exec_id,
-       cached_trajectory = prepared.cache_hit
-                               ? std::make_optional(std::move(prepared.trajectory))
-                               : std::nullopt,
+       cached_trajectory =
+           (prepared.cache_hit || prepared.cache_revalidation_candidate)
+               ? std::make_optional(std::move(prepared.trajectory))
+               : std::nullopt,
+       cache_revalidation_candidate =
+           prepared.cache_revalidation_candidate,
        retained_scene = std::move(retained_scene),
        scene_snapshot_lease = std::move(scene_snapshot_lease),
        worker_start_gate](std::stop_token st) mutable {
@@ -6947,6 +7016,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
         }
         async_execute_worker(st, std::move(request_copy), exec_id,
                              std::move(cached_trajectory),
+                             cache_revalidation_candidate,
                              std::move(retained_scene),
                              std::move(scene_snapshot_lease));
       });
@@ -9159,10 +9229,6 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
     return Result<TrajectoryDTO>::Err(current_state_result.error());
   }
   auto current_state = std::move(current_state_result.value());
-  auto resolved_motion = resolve_motion_spec(request, scene_binding);
-  if (!resolved_motion.ok()) {
-    return Result<TrajectoryDTO>::Err(resolved_motion.error());
-  }
 
   PlanRequestDTO plan_req;
   plan_req.robot_id = request.robot_id;
@@ -9171,9 +9237,12 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
   plan_req.base_frame = request.base_frame;
   plan_req.tcp_frame = request.tcp_frame;
   plan_req.start_state = current_state;
-  plan_req.motion = std::move(resolved_motion.value());
+  // Execute admission resolves target mode exactly once against the retained
+  // scene/start-state authority. Worker replans reuse that immutable result.
+  plan_req.motion = request.motion;
   plan_req.tolerances = request.tolerances;
   plan_req.speed_profile = request.speed_profile;
+  plan_req.planning_profile = request.planning_profile;
   plan_req.per_joint_dynamics_limits = request.per_joint_dynamics_limits;
   plan_req.action_span = request.action_span;
   plan_req.contact_policy_id = request.contact_policy_id;
@@ -9239,38 +9308,6 @@ Result<TrajectoryDTO> ExecutionKernel::plan_resume_trajectory(
          {"resume_phase", "current_state"},
          {"exception", reason_codes::kUnknownNonStdException}}});
   }
-}
-
-Result<MotionSpecDTO> ExecutionKernel::resolve_motion_spec(
-    const ExecuteRequestDTO& request,
-    const SceneRevisionBindingDTO& scene_binding) {
-  if (auto* relative_move = std::get_if<RelativeMoveDTO>(&request.motion)) {
-    auto target_pose = reference_resolver_.resolve_reference_pose(
-        relative_move->target_reference, request.base_frame, scene_binding);
-    if (!target_pose.ok()) {
-      return Result<MotionSpecDTO>::Err(target_pose.error());
-    }
-
-    Pose3DTO offset_basis_pose = target_pose.value();
-    if (relative_move->offset_reference.has_value()) {
-      auto offset_reference_pose = reference_resolver_.resolve_reference_pose(
-          *relative_move->offset_reference, request.base_frame, scene_binding);
-      if (!offset_reference_pose.ok()) {
-        return Result<MotionSpecDTO>::Err(offset_reference_pose.error());
-      }
-      offset_basis_pose = offset_reference_pose.value();
-    }
-
-    PoseGoalDTO pose_goal;
-    pose_goal.goal = multiply_poses(
-        pose_with_position_and_orientation(
-            target_pose.value().position_m,
-            offset_basis_pose.orientation),
-        relative_move->offset);
-    return Result<MotionSpecDTO>::Ok(MotionSpecDTO{pose_goal});
-  }
-
-  return Result<MotionSpecDTO>::Ok(request.motion);
 }
 
 Result<ExecutionKernel::CollisionValidationSuccess>

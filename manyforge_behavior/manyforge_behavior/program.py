@@ -615,10 +615,10 @@ def _validate_scene_resource_value(value: Any) -> str | None:
     return None
 
 
-_RELATIVE_MOVE_REFERENCE_TYPES = {"frame", "object", "robot_link", "pose"}
+_MOTION_REFERENCE_TYPES = {"frame", "object", "robot_link", "pose"}
 
 
-def _validate_relative_move_reference(
+def _validate_motion_reference(
     value: Any,
     path_label: str,
     namespace_by_id: Mapping[str, BlackboardNamespace],
@@ -628,10 +628,10 @@ def _validate_relative_move_reference(
         return f"{path_label} must be a mapping"
 
     reference_type = value.get("type")
-    if reference_type not in _RELATIVE_MOVE_REFERENCE_TYPES:
+    if reference_type not in _MOTION_REFERENCE_TYPES:
         return (
             f"{path_label}.type must be one of "
-            f"{sorted(_RELATIVE_MOVE_REFERENCE_TYPES)}, got {reference_type!r}"
+            f"{sorted(_MOTION_REFERENCE_TYPES)}, got {reference_type!r}"
         )
 
     if reference_type == "pose":
@@ -662,47 +662,6 @@ def _validate_relative_move_reference(
     reference_id = value.get("id")
     if not isinstance(reference_id, str) or not reference_id.strip():
         return f"{path_label}.id is required when {path_label}.type={reference_type!r}"
-    return None
-
-
-def _validate_relative_move_value(
-    value: Any,
-    namespace_by_id: Mapping[str, BlackboardNamespace],
-    namespace_fields_by_id: Mapping[str, Mapping[str, BlackboardNamespaceField]],
-) -> str | None:
-    if not isinstance(value, dict):
-        return "must be a mapping"
-
-    target_reference = value.get("target_reference")
-    if target_reference is None:
-        return "target_reference is required"
-    target_error = _validate_relative_move_reference(
-        target_reference,
-        "relative_move.target_reference",
-        namespace_by_id,
-        namespace_fields_by_id,
-    )
-    if target_error is not None:
-        return target_error
-
-    offset_reference = value.get("offset_reference")
-    if offset_reference is not None:
-        offset_ref_error = _validate_relative_move_reference(
-            offset_reference,
-            "relative_move.offset_reference",
-            namespace_by_id,
-            namespace_fields_by_id,
-        )
-        if offset_ref_error is not None:
-            return offset_ref_error
-
-    offset = value.get("offset")
-    if offset is None:
-        return "offset is required"
-    offset_error = _validate_pose_value(offset)
-    if offset_error is not None:
-        return f"offset {offset_error}"
-
     return None
 
 
@@ -866,8 +825,8 @@ def _validate_tree_node_semantics(
     # full parameter set in the catalog for motion-field parity). The
     # original validator only covered `move_manipulator_action`, so
     # `move_until_signal` / `probe_search_move` would load with
-    # missing joint targets / mismatched arrays / missing pose_goal /
-    # malformed relative_move, and the error would surface at runtime
+    # missing joint targets / mismatched arrays / malformed relative target,
+    # and the error would surface at runtime
     # in the kernel. For industrial contact/search motion, fail-fast
     # at program load. Treat all three IDs uniformly here.
     if node.id in {
@@ -876,21 +835,21 @@ def _validate_tree_node_semantics(
         "probe_search_move",
     }:
         motion_type = resolved_params.get("motion_type")
-        if motion_type == "joint_goal":
+        if motion_type == "joint":
             joint_names = resolved_params.get("joint_goal_names")
             joint_positions = resolved_params.get("joint_goal_positions_rad")
             if not joint_names:
                 issues.append(
                     TreeValidationIssue(
                         path=f"{path}.params.joint_goal_names",
-                        message="joint_goal_names is required when motion_type=joint_goal",
+                        message="joint_goal_names is required when motion_type=joint",
                     )
                 )
             if not joint_positions:
                 issues.append(
                     TreeValidationIssue(
                         path=f"{path}.params.joint_goal_positions_rad",
-                        message="joint_goal_positions_rad is required when motion_type=joint_goal",
+                        message="joint_goal_positions_rad is required when motion_type=joint",
                     )
                 )
             if (
@@ -908,34 +867,34 @@ def _validate_tree_node_semantics(
                         ),
                     )
                 )
-        elif motion_type == "pose_goal" and not resolved_params.get("pose_goal"):
+            if isinstance(joint_names, list):
+                invalid_joint_names = [
+                    name
+                    for name in joint_names
+                    if not isinstance(name, str) or not name.strip()
+                ]
+                if invalid_joint_names:
+                    issues.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.joint_goal_names",
+                            message="joint_goal_names must contain non-empty strings",
+                        )
+                    )
+                elif len(set(joint_names)) != len(joint_names):
+                    issues.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.joint_goal_names",
+                            message="joint_goal_names must not contain duplicates",
+                        )
+                    )
+        elif motion_type == "pose" and not resolved_params.get("pose_goal"):
             issues.append(
                 TreeValidationIssue(
                     path=f"{path}.params.pose_goal",
-                    message="pose_goal is required when motion_type=pose_goal",
+                    message="pose_goal is required when motion_type=pose",
                 )
             )
-        elif motion_type == "relative_move" and not resolved_params.get("relative_move"):
-            issues.append(
-                TreeValidationIssue(
-                    path=f"{path}.params.relative_move",
-                    message="relative_move is required when motion_type=relative_move",
-                )
-            )
-        elif motion_type == "relative_move":
-            relative_move_error = _validate_relative_move_value(
-                resolved_params.get("relative_move"),
-                namespace_by_id,
-                namespace_fields_by_id,
-            )
-            if relative_move_error is not None:
-                issues.append(
-                    TreeValidationIssue(
-                        path=f"{path}.params.relative_move",
-                        message=relative_move_error,
-                    )
-                )
-        elif motion_type == "cartesian_path" and not resolved_params.get(
+        elif motion_type == "cartesian" and not resolved_params.get(
             "cartesian_path"
         ):
             issues.append(
@@ -943,10 +902,93 @@ def _validate_tree_node_semantics(
                     path=f"{path}.params.cartesian_path",
                     message=(
                         "cartesian_path is required when "
-                        "motion_type=cartesian_path"
+                        "motion_type=cartesian"
                     ),
                 )
             )
+
+        target_mode = resolved_params.get("target_mode", "absolute")
+        pose_goal = resolved_params.get("pose_goal")
+        if motion_type == "pose" and isinstance(pose_goal, dict):
+            frame_id = pose_goal.get("frame_id")
+            if target_mode == "absolute" and (
+                not isinstance(frame_id, str) or not frame_id.strip()
+            ):
+                issues.append(
+                    TreeValidationIssue(
+                        path=f"{path}.params.pose_goal.frame_id",
+                        message="frame_id is required for an absolute pose target",
+                    )
+                )
+            elif target_mode == "relative" and frame_id is not None:
+                issues.append(
+                    TreeValidationIssue(
+                        path=f"{path}.params.pose_goal.frame_id",
+                        message=(
+                            "frame_id is forbidden for a relative pose offset; "
+                            "target_reference defines its origin"
+                        ),
+                    )
+                )
+        target_reference = resolved_params.get("target_reference")
+        offset_reference = resolved_params.get("offset_reference")
+        if target_mode == "absolute" and (
+            target_reference is not None or offset_reference is not None
+        ):
+            issues.append(
+                TreeValidationIssue(
+                    path=f"{path}.params.target_reference",
+                    message="absolute motion must not define target references",
+                )
+            )
+        elif target_mode == "relative" and motion_type == "joint" and (
+            target_reference is not None or offset_reference is not None
+        ):
+            issues.append(
+                TreeValidationIssue(
+                    path=f"{path}.params.target_reference",
+                    message="relative joint motion cannot define spatial references",
+                )
+            )
+        elif target_mode == "relative" and motion_type in {"pose", "cartesian"}:
+            if target_reference is None:
+                issues.append(
+                    TreeValidationIssue(
+                        path=f"{path}.params.target_reference",
+                        message=(
+                            "target_reference is required for relative pose "
+                            "or Cartesian motion"
+                        ),
+                    )
+                )
+            else:
+                target_error = _validate_motion_reference(
+                    target_reference,
+                    "target_reference",
+                    namespace_by_id,
+                    namespace_fields_by_id,
+                )
+                if target_error is not None:
+                    issues.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.target_reference",
+                            message=target_error,
+                        )
+                    )
+            if offset_reference is not None:
+                offset_error = _validate_motion_reference(
+                    offset_reference,
+                    "offset_reference",
+                    namespace_by_id,
+                    namespace_fields_by_id,
+                )
+                if offset_error is not None:
+                    issues.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.offset_reference",
+                            message=offset_error,
+                        )
+                    )
 
     has_schema_backed_shape = any(
         param.name == "shape" and getattr(param, "schema", None) is not None
@@ -1043,11 +1085,23 @@ def _effective_node_required_capabilities(
 ) -> set[str]:
     required = set(entry.required_capabilities)
     for param in getattr(entry, "parameters", []):
-        if getattr(param, "type", None) != "enum" or param.name not in resolved_params:
+        if getattr(param, "type", None) != "enum":
             continue
-        option = _enum_option_for_value(param, resolved_params.get(param.name))
+        selected_value = resolved_params.get(param.name, param.default)
+        if selected_value is None:
+            continue
+        option = _enum_option_for_value(param, selected_value)
         if option is not None:
             required.update(option.required_capabilities)
+    if (
+        entry.id
+        in {"move_manipulator_action", "move_until_signal", "probe_search_move"}
+        and resolved_params.get("target_mode", "absolute") == "relative"
+        and resolved_params.get("motion_type") in {"pose", "cartesian"}
+    ):
+        # Relative joint deltas need only the authority-selected start state.
+        # Spatial resolution is required only for pose/path references.
+        required.add("context.pose.resolve_reference")
     return required
 
 
@@ -1293,6 +1347,18 @@ def collect_tree_validation_issues(
                 TreeValidationIssue(
                     path=path,
                     message=f"Unknown catalog entry: '{current.id}'",
+                )
+            )
+            return
+
+        if entry.kind == "authoring_macro":
+            errors.append(
+                TreeValidationIssue(
+                    path=path,
+                    message=(
+                        f"Authoring macro '{current.id}' cannot be persisted; "
+                        "insert it through Composer so it expands into ordinary nodes"
+                    ),
                 )
             )
             return

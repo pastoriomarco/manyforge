@@ -8,7 +8,7 @@ description: >-
   node confirms the selection before planning a pick sequence. The planner
   validates current->approach, approach->pick, and pick->approach; later
   place logic stays outside the planner.
-catalog_version: "0.2.0"
+catalog_version: "0.3.0"
 
 robot:
   robot_id: ur5
@@ -191,7 +191,7 @@ tree:
       name: move_to_planned_approach_pose
       params:
         move_id: planned_pick_approach
-        motion_type: pose_goal
+        motion_type: pose
         pose_goal:
           field_ref:
             namespace: pick_plan
@@ -202,7 +202,7 @@ tree:
       name: move_to_planned_pick_pose
       params:
         move_id: planned_pick_descend
-        motion_type: pose_goal
+        motion_type: pose
         pose_goal:
           field_ref:
             namespace: pick_plan
@@ -232,7 +232,7 @@ tree:
       name: retreat_after_pick
       params:
         move_id: planned_pick_exit
-        motion_type: pose_goal
+        motion_type: pose
         pose_goal:
           field_ref:
             namespace: pick_plan
@@ -243,26 +243,26 @@ tree:
       name: move_to_place_approach
       params:
         move_id: planned_place_approach
-        motion_type: relative_move
-        relative_move:
-          target_reference:
-            type: pose
-            pose:
-              position_m: [0.22, 0.0, 0.30]
-              orientation_rpy_deg: [180.0, 0.0, 0.0]
-          offset_reference:
-            type: frame
-            id: base_link
-          offset:
-            position_m: [0.0, 0.0, 0.08]
+        motion_type: pose
+        target_mode: relative
+        target_reference:
+          type: pose
+          pose:
+            position_m: [0.22, 0.0, 0.30]
             orientation_rpy_deg: [180.0, 0.0, 0.0]
+        offset_reference:
+          type: frame
+          id: base_link
+        pose_goal:
+          position_m: [0.0, 0.0, 0.08]
+          orientation_rpy_deg: [180.0, 0.0, 0.0]
         velocity_scale: 0.30
 
     - id: move_manipulator_action
       name: move_to_place_pose
       params:
         move_id: planned_place_descend
-        motion_type: pose_goal
+        motion_type: pose
         pose_goal:
           frame_id: base_link
           position_m: [0.22, 0.0, 0.30]
@@ -292,17 +292,17 @@ tree:
       name: retreat_after_place
       params:
         move_id: planned_place_retreat
-        motion_type: relative_move
-        relative_move:
-          target_reference:
-            type: pose
-            pose:
-              position_m: [0.22, 0.0, 0.30]
-              orientation_rpy_deg: [180.0, 0.0, 0.0]
-          offset_reference:
-            type: frame
-            id: base_link
-          offset:
-            position_m: [0.0, 0.0, 0.08]
+        motion_type: pose
+        target_mode: relative
+        target_reference:
+          type: pose
+          pose:
+            position_m: [0.22, 0.0, 0.30]
             orientation_rpy_deg: [180.0, 0.0, 0.0]
+        offset_reference:
+          type: frame
+          id: base_link
+        pose_goal:
+          position_m: [0.0, 0.0, 0.08]
+          orientation_rpy_deg: [180.0, 0.0, 0.0]
         velocity_scale: 0.30

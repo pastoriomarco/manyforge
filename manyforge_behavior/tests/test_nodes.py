@@ -114,7 +114,7 @@ class TestMoveManipulatorAction:
         node = MoveManipulatorAction(
             name="test_move",
             move_id="m1",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=["j1"],
             joint_goal_positions_rad=[1.0],
         )
@@ -139,7 +139,7 @@ class TestMoveManipulatorAction:
         node = MoveManipulatorAction(
             name="test_move_qualification",
             move_id="drop_approach",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=["j1"],
             joint_goal_positions_rad=[1.0],
         )
@@ -163,7 +163,7 @@ class TestMoveManipulatorAction:
         node = MoveManipulatorAction(
             name="test_move_fail",
             move_id="m1",
-            motion_type="joint_goal",
+            motion_type="joint",
             runtime_pause_registry=runtime_pause_registry,
         )
         status = _tick_node(node)
@@ -183,7 +183,7 @@ class TestMoveManipulatorAction:
         node = MoveManipulatorAction(
             name="test_move_busy",
             move_id="m1",
-            motion_type="joint_goal",
+            motion_type="joint",
         )
         status = _tick_node(node)
         assert status == py_trees.common.Status.RUNNING
@@ -203,7 +203,7 @@ class TestMoveManipulatorAction:
         node = MoveManipulatorAction(
             name="test_move_params",
             move_id="m_tcp",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=["j1"],
             joint_goal_positions_rad=[1.0],
             velocity_scale=0.5,
@@ -235,7 +235,7 @@ class TestMoveManipulatorAction:
         node = MoveManipulatorAction(
             name="test_move_async",
             move_id="m_async",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=["j1"],
             joint_goal_positions_rad=[1.0],
             velocity_scale=0.5,
@@ -259,33 +259,31 @@ class TestMoveManipulatorAction:
         assert kernel.last_execute_request is not None
         assert kernel.last_execute_request.velocity_scale == pytest.approx(0.5)
 
-    def test_relative_move_request_normalizes_offset_orientation(self, kernel, bb_with_kernel):
+    def test_relative_pose_request_normalizes_offset_orientation(self, kernel, bb_with_kernel):
         node = MoveManipulatorAction(
-            name="test_relative_move",
+            name="test_relative_pose",
             move_id="m_rel",
-            motion_type="relative_move",
-            relative_move={
-                "target_reference": {"type": "object", "id": "graspable"},
-                "offset": {
-                    "position_m": [0.0, 0.0, 0.1],
-                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
-                },
+            motion_type="pose",
+            target_mode="relative",
+            target_reference={"type": "object", "id": "graspable"},
+            pose_goal={
+                "position_m": [0.0, 0.0, 0.1],
+                "orientation_rpy_deg": [180.0, 0.0, -90.0],
             },
         )
 
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
         assert kernel.last_execute_request is not None
-        assert kernel.last_execute_request.motion_type == "relative_move"
-        assert kernel.last_execute_request.relative_move is not None
-        assert kernel.last_execute_request.relative_move["target_reference"] == {
+        assert kernel.last_execute_request.motion_type == "pose"
+        assert kernel.last_execute_request.target_mode == "relative"
+        assert kernel.last_execute_request.target_reference == {
             "type": "object",
-
             "id": "graspable",
         }
-        assert "offset_reference" not in kernel.last_execute_request.relative_move
-        assert "orientation_rpy_deg" not in kernel.last_execute_request.relative_move["offset"]
-        assert kernel.last_execute_request.relative_move["offset"]["orientation_xyzw"] == pytest.approx(
+        assert kernel.last_execute_request.offset_reference is None
+        assert "orientation_rpy_deg" not in kernel.last_execute_request.pose_goal
+        assert kernel.last_execute_request.pose_goal["orientation_xyzw"] == pytest.approx(
             [0.70710678, -0.70710678, -4.32978028e-17, 4.32978028e-17],
             abs=1e-6,
         )
@@ -296,7 +294,7 @@ class TestMoveManipulatorAction:
         node = MoveManipulatorAction(
             name="test_cartesian_path",
             move_id="m_cartesian",
-            motion_type="cartesian_path",
+            motion_type="cartesian",
             cartesian_path={
                 "waypoints": [
                     {
@@ -316,7 +314,7 @@ class TestMoveManipulatorAction:
         assert _tick_node(node) == py_trees.common.Status.SUCCESS
         request = kernel.last_execute_request
         assert request is not None
-        assert request.motion_type == "cartesian_path"
+        assert request.motion_type == "cartesian"
         assert request.pose_goal is None
         assert request.cartesian_path is not None
         assert request.cartesian_path["fallback_policy"] == "fail_closed"
@@ -326,7 +324,7 @@ class TestMoveManipulatorAction:
             "orientation_xyzw"
         ] == pytest.approx([0.0, 0.0, 0.0, 1.0])
 
-    def test_relative_move_applies_pose_source_before_planning(self, kernel, bb_with_kernel):
+    def test_relative_pose_applies_pose_source_before_planning(self, kernel, bb_with_kernel):
         calls = []
 
         def apply_pose_source(**kwargs):
@@ -341,13 +339,12 @@ class TestMoveManipulatorAction:
         client.pose_source_apply_callback = apply_pose_source
 
         node = MoveManipulatorAction(
-            name="test_relative_move_apply_source",
+            name="test_relative_pose_apply_source",
             move_id="m_rel_source",
-            motion_type="relative_move",
-            relative_move={
-                "target_reference": {"type": "object", "id": "graspable"},
-                "offset": {"position_m": [0.0, 0.0, 0.1]},
-            },
+            motion_type="pose",
+            target_mode="relative",
+            target_reference={"type": "object", "id": "graspable"},
+            pose_goal={"position_m": [0.0, 0.0, 0.1]},
         )
 
         status = _tick_node(node)
@@ -356,10 +353,10 @@ class TestMoveManipulatorAction:
         assert len(calls) == 1
         span = calls[0].pop("action_span")
         assert span.action_source == "program_node"
-        assert "test_relative_move_apply_source" in (span.node_instance_id or "")
+        assert "test_relative_pose_apply_source" in (span.node_instance_id or "")
         assert calls[0] == {
             "object_ids": [],
-            "reason": "motion_node:test_relative_move_apply_source",
+            "reason": "motion_node:test_relative_pose_apply_source",
         }
 
     def test_pose_goal_applies_all_pose_sources_before_planning(self, kernel, bb_with_kernel):
@@ -379,7 +376,7 @@ class TestMoveManipulatorAction:
         node = MoveManipulatorAction(
             name="test_pose_goal_apply_source",
             move_id="m_pose_source",
-            motion_type="pose_goal",
+            motion_type="pose",
             pose_goal={
                 "position_m": [0.1, 0.2, 0.3],
                 "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
@@ -398,7 +395,7 @@ class TestMoveManipulatorAction:
             "reason": "motion_node:test_pose_goal_apply_source",
         }
 
-    def test_relative_move_holds_when_before_planning_pose_source_fails(
+    def test_relative_pose_holds_when_before_planning_pose_source_fails(
         self,
         kernel,
         bb_with_kernel,
@@ -414,13 +411,12 @@ class TestMoveManipulatorAction:
         client.pose_source_apply_callback = apply_pose_source
 
         node = MoveManipulatorAction(
-            name="test_relative_move_apply_source_fail",
+            name="test_relative_pose_apply_source_fail",
             move_id="m_rel_source_fail",
-            motion_type="relative_move",
-            relative_move={
-                "target_reference": {"type": "object", "id": "graspable"},
-                "offset": {"position_m": [0.0, 0.0, 0.1]},
-            },
+            motion_type="pose",
+            target_mode="relative",
+            target_reference={"type": "object", "id": "graspable"},
+            pose_goal={"position_m": [0.0, 0.0, 0.1]},
         )
 
         status = _tick_node(node)
@@ -428,7 +424,7 @@ class TestMoveManipulatorAction:
         assert status == py_trees.common.Status.RUNNING
         assert node.feedback_message == "no fresh pose-source update for: graspable"
 
-    def test_relative_move_applies_between_nodes_pose_source(self, kernel, bb_with_kernel):
+    def test_relative_pose_applies_between_nodes_pose_source(self, kernel, bb_with_kernel):
         calls = []
 
         def apply_between_nodes(**kwargs):
@@ -443,13 +439,12 @@ class TestMoveManipulatorAction:
         client.pose_source_between_nodes_callback = apply_between_nodes
 
         node = MoveManipulatorAction(
-            name="test_relative_move_between_nodes_source",
+            name="test_relative_pose_between_nodes_source",
             move_id="m_rel_between_nodes",
-            motion_type="relative_move",
-            relative_move={
-                "target_reference": {"type": "object", "id": "graspable"},
-                "offset": {"position_m": [0.0, 0.0, 0.1]},
-            },
+            motion_type="pose",
+            target_mode="relative",
+            target_reference={"type": "object", "id": "graspable"},
+            pose_goal={"position_m": [0.0, 0.0, 0.1]},
         )
 
         status = _tick_node(node)
@@ -459,39 +454,37 @@ class TestMoveManipulatorAction:
         between_nodes = calls[0]
         span = between_nodes.pop("action_span")
         assert span.action_source == "program_node"
-        assert "test_relative_move_between_nodes_source" in (
+        assert "test_relative_pose_between_nodes_source" in (
             span.node_instance_id or ""
         )
         assert between_nodes == {
             "object_ids": ["graspable"],
-            "reason": "motion_node:test_relative_move_between_nodes_source",
+            "reason": "motion_node:test_relative_pose_between_nodes_source",
         }
 
-    def test_relative_move_pose_reference_normalizes_inline_pose_orientation(self, kernel, bb_with_kernel):
+    def test_relative_pose_reference_normalizes_inline_pose_orientation(self, kernel, bb_with_kernel):
         node = MoveManipulatorAction(
-            name="test_relative_move_pose_ref",
+            name="test_relative_pose_ref",
             move_id="m_rel_pose",
-            motion_type="relative_move",
-            relative_move={
-                "target_reference": {
-                    "type": "pose",
-                    "pose": {
-                        "position_m": [0.3, -0.2, 0.15],
-                        "orientation_rpy_deg": [180.0, 0.0, -90.0],
-                    },
+            motion_type="pose",
+            target_mode="relative",
+            target_reference={
+                "type": "pose",
+                "pose": {
+                    "position_m": [0.3, -0.2, 0.15],
+                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
                 },
-                "offset": {
-                    "position_m": [0.0, 0.0, 0.1],
-                    "orientation_rpy_deg": [0.0, 0.0, 0.0],
-                },
+            },
+            pose_goal={
+                "position_m": [0.0, 0.0, 0.1],
+                "orientation_rpy_deg": [0.0, 0.0, 0.0],
             },
         )
 
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
         assert kernel.last_execute_request is not None
-        assert kernel.last_execute_request.relative_move is not None
-        ref = kernel.last_execute_request.relative_move["target_reference"]
+        ref = kernel.last_execute_request.target_reference
         assert ref["type"] == "pose"
         assert "orientation_rpy_deg" not in ref["pose"]
         assert ref["pose"]["orientation_xyzw"] == pytest.approx(
@@ -499,32 +492,30 @@ class TestMoveManipulatorAction:
             abs=1e-6,
         )
 
-    def test_relative_move_offset_reference_normalizes_inline_pose_orientation(self, kernel, bb_with_kernel):
+    def test_relative_pose_offset_reference_normalizes_inline_pose_orientation(self, kernel, bb_with_kernel):
         node = MoveManipulatorAction(
-            name="test_relative_move_offset_ref",
+            name="test_relative_pose_offset_ref",
             move_id="m_rel_offset_ref",
-            motion_type="relative_move",
-            relative_move={
-                "target_reference": {"type": "object", "id": "graspable"},
-                "offset_reference": {
-                    "type": "pose",
-                    "pose": {
-                        "position_m": [0.0, 0.0, 0.0],
-                        "orientation_rpy_deg": [0.0, 0.0, 90.0],
-                    },
+            motion_type="pose",
+            target_mode="relative",
+            target_reference={"type": "object", "id": "graspable"},
+            offset_reference={
+                "type": "pose",
+                "pose": {
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation_rpy_deg": [0.0, 0.0, 90.0],
                 },
-                "offset": {
-                    "position_m": [0.1, 0.0, 0.0],
-                    "orientation_rpy_deg": [0.0, 0.0, 0.0],
-                },
+            },
+            pose_goal={
+                "position_m": [0.1, 0.0, 0.0],
+                "orientation_rpy_deg": [0.0, 0.0, 0.0],
             },
         )
 
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
         assert kernel.last_execute_request is not None
-        assert kernel.last_execute_request.relative_move is not None
-        ref = kernel.last_execute_request.relative_move["offset_reference"]
+        ref = kernel.last_execute_request.offset_reference
         assert ref["type"] == "pose"
         assert "orientation_rpy_deg" not in ref["pose"]
         assert ref["pose"]["orientation_xyzw"] == pytest.approx(
@@ -552,7 +543,7 @@ class TestMoveManipulatorAction:
         node = MoveManipulatorAction(
             name="test_pose_goal_bb_ref",
             move_id="m_pose_bb",
-            motion_type="pose_goal",
+            motion_type="pose",
             pose_goal=make_runtime_field_ref("perception", "grasp_pose"),
         )
 
@@ -571,7 +562,7 @@ class TestMoveManipulatorAction:
         node = MoveManipulatorAction(
             name="test_pose_goal_bb_missing",
             move_id="m_pose_missing",
-            motion_type="pose_goal",
+            motion_type="pose",
             pose_goal=make_runtime_field_ref("perception", "missing_grasp_pose"),
         )
 
@@ -579,7 +570,7 @@ class TestMoveManipulatorAction:
         assert status == py_trees.common.Status.FAILURE
         assert kernel.execute_count == 0
 
-    def test_relative_move_pose_reference_can_resolve_blackboard_pose(self, kernel, bb_with_kernel):
+    def test_relative_pose_reference_can_resolve_blackboard_pose(self, kernel, bb_with_kernel):
         bb_with_kernel.register_key(
             key="perception",
             access=py_trees.common.Access.WRITE,
@@ -597,42 +588,40 @@ class TestMoveManipulatorAction:
         )
 
         node = MoveManipulatorAction(
-            name="test_relative_move_bb_ref",
+            name="test_relative_pose_bb_ref",
             move_id="m_rel_bb",
-            motion_type="relative_move",
-            relative_move={
-                "target_reference": {
-                    "type": "pose",
-                    "pose": make_runtime_field_ref("perception", "approach_pose"),
-                },
-                "offset": {
-                    "position_m": [0.0, 0.0, 0.1],
-                    "orientation_rpy_deg": [0.0, 0.0, 0.0],
-                },
+            motion_type="pose",
+            target_mode="relative",
+            target_reference={
+                "type": "pose",
+                "pose": make_runtime_field_ref("perception", "approach_pose"),
+            },
+            pose_goal={
+                "position_m": [0.0, 0.0, 0.1],
+                "orientation_rpy_deg": [0.0, 0.0, 0.0],
             },
         )
 
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
         assert kernel.last_execute_request is not None
-        ref = kernel.last_execute_request.relative_move["target_reference"]
+        ref = kernel.last_execute_request.target_reference
         assert ref["type"] == "pose"
         assert ref["pose"]["orientation_xyzw"] == pytest.approx(
             [0.70710678, -0.70710678, -4.32978028e-17, 4.32978028e-17],
             abs=1e-6,
         )
 
-    def test_repeat_resubmits_relative_move_without_manual_cache_reset(self, kernel, bb_with_kernel):
+    def test_repeat_resubmits_relative_pose_without_manual_cache_reset(self, kernel, bb_with_kernel):
         node = MoveManipulatorAction(
             name="dynamic_pick_move",
             move_id="pick_dynamic_box",
-            motion_type="relative_move",
-            relative_move={
-                "target_reference": {"type": "object", "id": "dynamic_box"},
-                "offset": {
-                    "position_m": [0.0, 0.0, 0.1],
-                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
-                },
+            motion_type="pose",
+            target_mode="relative",
+            target_reference={"type": "object", "id": "dynamic_box"},
+            pose_goal={
+                "position_m": [0.0, 0.0, 0.1],
+                "orientation_rpy_deg": [180.0, 0.0, -90.0],
             },
             cache_mode="default",
         )
@@ -649,9 +638,9 @@ class TestMoveManipulatorAction:
         assert kernel.invalidate_count == 0
         assert kernel.last_execute_request is not None
         assert kernel.last_execute_request.move_id == "pick_dynamic_box"
-        assert kernel.last_execute_request.motion_type == "relative_move"
-        assert kernel.last_execute_request.relative_move is not None
-        assert kernel.last_execute_request.relative_move["target_reference"] == {
+        assert kernel.last_execute_request.motion_type == "pose"
+        assert kernel.last_execute_request.target_mode == "relative"
+        assert kernel.last_execute_request.target_reference == {
             "type": "object",
             "id": "dynamic_box",
         }

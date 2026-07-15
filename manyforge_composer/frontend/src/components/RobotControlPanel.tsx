@@ -596,11 +596,11 @@ function MoveToBody() {
 
   const storedPoses = useMemo<StoredPoseTarget[]>(() => {
     const out: StoredPoseTarget[] = [];
-    for (const m of collectMoveNodes(appliedTree, 'pose_goal')) {
-      out.push({ nodeName: m.name, motionType: 'pose_goal', params: m.params });
+    for (const m of collectMoveNodes(appliedTree, 'pose')) {
+      out.push({ nodeName: m.name, motionType: 'pose', params: m.params });
     }
-    for (const m of collectMoveNodes(appliedTree, 'joint_goal')) {
-      out.push({ nodeName: m.name, motionType: 'joint_goal', params: m.params });
+    for (const m of collectMoveNodes(appliedTree, 'joint')) {
+      out.push({ nodeName: m.name, motionType: 'joint', params: m.params });
     }
     return out;
   }, [appliedTree]);
@@ -1516,11 +1516,11 @@ function rpyRadToQuat(rpy: [number, number, number]): [number, number, number, n
  * For `mode='joint'`: snapshots `robot.joint_positions` ordered by
  * `robot.joint_names` into `joint_goal_positions_rad`. Filters
  * target dropdown to move_manipulator_action nodes with
- * motion_type=joint_goal.
+ * motion_type=joint.
  *
  * For `mode='cartesian'`: snapshots `robot.tcp_pose_in_base` into
  * `pose_goal: {position_m, orientation_xyzw}`. Filters to nodes
- * with motion_type=pose_goal.
+ * with motion_type=pose.
  */
 /**
  * Per-deployment gripper widget. Mirrors what the BT `command_gripper`
@@ -1818,7 +1818,7 @@ function PoseEditSnapshotSection({
 }) {
   const appliedTree = useProgramStore((s) => s.appliedTree);
   const editLocked = useEditLocked();
-  const wantMotionType = mode === 'joint' ? 'joint_goal' : 'pose_goal';
+  const wantMotionType = mode === 'joint' ? 'joint' : 'pose';
   const editableNodes = useMemo(
     () => collectMoveNodes(appliedTree, wantMotionType),
     [appliedTree, wantMotionType],
@@ -1992,7 +1992,7 @@ function PoseEditSnapshotSection({
 
 function collectMoveNodes(
   tree: TreeNode | null,
-  motionType: 'joint_goal' | 'pose_goal' | 'relative_move',
+  motionType: 'joint' | 'pose' | 'cartesian',
 ): Array<{ name: string; params: Record<string, unknown> }> {
   const out: Array<{ name: string; params: Record<string, unknown> }> = [];
   function visit(node: TreeNode): void {

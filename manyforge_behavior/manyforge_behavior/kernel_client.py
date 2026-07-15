@@ -251,11 +251,14 @@ class ExecuteRequest:
     move_id: str
     base_frame: str
     tcp_frame: str
-    motion_type: str  # joint_goal | pose_goal | relative_move | cartesian_path
+    motion_type: str  # joint | pose | cartesian
+    target_mode: str = "absolute"  # absolute | relative
+    target_reference: Optional[Dict[str, Any]] = None
+    offset_reference: Optional[Dict[str, Any]] = None
+    planning_profile: str = "first_feasible"
     joint_goal_names: List[str] = field(default_factory=list)
     joint_goal_positions_rad: List[float] = field(default_factory=list)
     pose_goal: Optional[Dict[str, Any]] = None
-    relative_move: Optional[Dict[str, Any]] = None
     cartesian_path: Optional[Dict[str, Any]] = None
     velocity_scale: float = 1.0
     acceleration_scale: float = 1.0
@@ -1406,6 +1409,9 @@ class MockKernelClient(KernelClient):
         self._metrics = {
             "cache_hits": 0,
             "cache_misses": 0,
+            "cache_revalidation_candidates": 0,
+            "cache_revalidations_succeeded": 0,
+            "cache_revalidations_failed": 0,
             "cache_invalidations": 0,
             "plans_succeeded": 0,
             "plans_failed": 0,
@@ -1612,6 +1618,53 @@ class MockKernelClient(KernelClient):
             self._last_error_details = {}
         if self._state != ExecutionState.IDLE:
             return ExecuteResult(ok=False, error="Not in IDLE state")
+        if request.motion_type == "joint":
+            if not request.joint_goal_names:
+                return ExecuteResult(
+                    ok=False,
+                    error="Joint target must contain at least one joint",
+                )
+            if len(request.joint_goal_names) != len(
+                request.joint_goal_positions_rad
+            ):
+                return ExecuteResult(
+                    ok=False,
+                    error="Joint names and positions must have the same length",
+                )
+            if any(
+                not isinstance(name, str) or not name.strip()
+                for name in request.joint_goal_names
+            ):
+                return ExecuteResult(ok=False, error="Joint names must be non-empty")
+            if len(set(request.joint_goal_names)) != len(request.joint_goal_names):
+                return ExecuteResult(
+                    ok=False,
+                    error="Joint names must not contain duplicates",
+                )
+            try:
+                finite_positions = all(
+                    math.isfinite(float(value))
+                    for value in request.joint_goal_positions_rad
+                )
+            except (TypeError, ValueError):
+                finite_positions = False
+            if not finite_positions:
+                return ExecuteResult(
+                    ok=False,
+                    error="Joint positions must be finite",
+                )
+        if request.motion_type == "joint" and request.target_mode == "relative":
+            unknown_joints = [
+                name for name in request.joint_goal_names if name not in self._joint_names
+            ]
+            if unknown_joints:
+                return ExecuteResult(
+                    ok=False,
+                    error=(
+                        "Relative joint target names joints absent from the start state: "
+                        + ", ".join(unknown_joints)
+                    ),
+                )
         self._authorize_mock_gripper_commands()
         if self.fail_next_execute:
             self.fail_next_execute = False
@@ -1655,11 +1708,17 @@ class MockKernelClient(KernelClient):
         return ExecuteResult(ok=True, execution_id=eid)
 
     def _positions_for_request(self, request: ExecuteRequest) -> List[float]:
-        if (
-            request.motion_type == "joint_goal"
-            and request.joint_goal_positions_rad
-        ):
-            return [float(v) for v in request.joint_goal_positions_rad]
+        if request.motion_type == "joint" and request.joint_goal_positions_rad:
+            goals = [float(v) for v in request.joint_goal_positions_rad]
+            if request.target_mode != "relative":
+                return goals
+            current_by_name = dict(
+                zip(self._joint_names, self._last_joint_positions_rad)
+            )
+            return [
+                current_by_name[name] + delta
+                for name, delta in zip(request.joint_goal_names, goals)
+            ]
         return list(self._last_joint_positions_rad)
 
     def _stamp_outcome(
@@ -1726,13 +1785,13 @@ class MockKernelClient(KernelClient):
             velocities_rad_s=[],
         )
         final_tcp_pose: Optional[Dict[str, Any]] = None
-        if request.motion_type == "pose_goal" and request.pose_goal is not None:
+        if request.motion_type == "pose" and request.pose_goal is not None:
             final_tcp_pose = {
                 "position_m": list(request.pose_goal.get("position_m", [])),
                 "orientation_xyzw": list(request.pose_goal.get("orientation_xyzw", [])),
             }
         elif (
-            request.motion_type == "cartesian_path"
+            request.motion_type == "cartesian"
             and request.cartesian_path is not None
         ):
             waypoints = request.cartesian_path.get("waypoints", [])

@@ -1,6 +1,9 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
 import { useCatalogStore } from './catalogStore';
+import { useDeploymentStore } from './deploymentStore';
+import { useSceneStateStore } from './sceneStateStore';
+import { useViewerSelectionStore } from './viewerSelectionStore';
 import type {
   CatalogParameter,
   TreeNode,
@@ -15,6 +18,10 @@ import type {
 import { Position } from '@xyflow/react';
 import type { Node, Edge } from '@xyflow/react';
 import { profileSatisfies } from '../utils/profiles';
+import {
+  deploymentCapabilityKeys,
+  supportsRequiredCapabilities,
+} from '../utils/deploymentCapabilities';
 
 export type LayoutDirection = 'vertical' | 'horizontal';
 
@@ -126,6 +133,7 @@ function cloneSceneResources(sceneResources?: ProgramSceneResource[] | null): Pr
 function defaultEnumValue(
   param: CatalogParameter,
   programProfile: string | null | undefined,
+  availableCapabilities: ReadonlySet<string>,
 ): string | null {
   const options = param.enumOptions.length > 0
     ? param.enumOptions
@@ -136,7 +144,13 @@ function defaultEnumValue(
         profilesMin: 'v0.0',
         requiredCapabilities: [],
       }));
-  return options.find((option) => profileSatisfies(option.profilesMin, programProfile))?.value ?? null;
+  return options.find(
+    (option) => profileSatisfies(option.profilesMin, programProfile)
+      && supportsRequiredCapabilities(
+        availableCapabilities,
+        option.requiredCapabilities,
+      ),
+  )?.value ?? null;
 }
 
 function buildDefaultNodeParams(
@@ -144,6 +158,9 @@ function buildDefaultNodeParams(
   programProfile: string | null | undefined,
 ): Record<string, unknown> {
   const entry = useCatalogStore.getState().entries.find((candidate) => candidate.id === catalogId);
+  const availableCapabilities = deploymentCapabilityKeys(
+    useDeploymentStore.getState().deployment,
+  );
   const defaults: Record<string, unknown> = {};
 
   for (const param of entry?.parameters ?? []) {
@@ -151,11 +168,39 @@ function buildDefaultNodeParams(
       continue;
     }
     if (param.default !== undefined && param.default !== null) {
+      if (param.type === 'enum') {
+        const options = param.enumOptions.length > 0
+          ? param.enumOptions
+          : param.enumValues.map((value) => ({
+              value,
+              label: value,
+              description: '',
+              profilesMin: 'v0.0',
+              requiredCapabilities: [],
+            }));
+        const defaultOption = options.find(
+          (option) => option.value === param.default,
+        );
+        if (
+          defaultOption == null
+          || !profileSatisfies(defaultOption.profilesMin, programProfile)
+          || !supportsRequiredCapabilities(
+            availableCapabilities,
+            defaultOption.requiredCapabilities,
+          )
+        ) {
+          continue;
+        }
+      }
       defaults[param.name] = structuredClone(param.default);
       continue;
     }
     if (param.required && param.type === 'enum') {
-      const value = defaultEnumValue(param, programProfile);
+      const value = defaultEnumValue(
+        param,
+        programProfile,
+        availableCapabilities,
+      );
       if (value != null) {
         defaults[param.name] = value;
       }
@@ -203,6 +248,334 @@ function buildDefaultNodeParams(
   }
 
   return defaults;
+}
+
+const PICK_PLAN_SUBTREE_ID = 'pick_plan_subtree';
+const PICK_PLAN_NODE_IDS = [
+  'sequence',
+  'plan_pick_sequence',
+  'move_manipulator_action',
+  'command_gripper',
+  'attach_object_to_link',
+] as const;
+
+const PICK_PLAN_BASE_NAMES = [
+  'pick_plan_master_sequence',
+  'plan_pick_sequence',
+  'pick_plan_motion_sequence',
+  'move_to_approach',
+  'move_to_pick',
+  'close_gripper',
+  'attach_object',
+  'move_retreat',
+] as const;
+
+function nodeLabel(node: Node): string {
+  return String((node.data as { label?: string }).label ?? '');
+}
+
+function pickPlanInsertionSuffix(
+  nodes: Node[],
+  namespaces: BlackboardNamespace[],
+): string {
+  const labels = new Set(nodes.map(nodeLabel));
+  const namespaceIds = new Set(namespaces.map((namespace) => namespace.id));
+  const namespacePrefixes = new Set(namespaces.map((namespace) => namespace.prefix));
+  for (let ordinal = 1; ; ordinal += 1) {
+    const suffix = ordinal === 1 ? '' : `_${ordinal}`;
+    const namesAvailable = PICK_PLAN_BASE_NAMES.every(
+      (name) => !labels.has(`${name}${suffix}`),
+    );
+    if (
+      namesAvailable
+      && !namespaceIds.has(`pick_plan${suffix}`)
+      && !namespacePrefixes.has(`planning/pick_plan${suffix}`)
+    ) {
+      return suffix;
+    }
+  }
+}
+
+function makePickPlanFlowNode(
+  catalogId: string,
+  label: string,
+  params: Record<string, unknown>,
+  position: { x: number; y: number },
+  direction: LayoutDirection,
+  reservedIds: Set<string>,
+): Node {
+  const stem = `node-${label.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+  let id = stem;
+  for (let ordinal = 2; reservedIds.has(id); ordinal += 1) {
+    id = `${stem}-${ordinal}`;
+  }
+  reservedIds.add(id);
+  return {
+    id,
+    type: 'btNode',
+    position,
+    ...getNodeHandlePositions(direction),
+    data: {
+      label,
+      catalogId,
+      params,
+      operatorStopPolicy: 'inherit',
+      modificationPolicy: {},
+    },
+  };
+}
+
+function pickPlanPose(frameId?: string): Record<string, unknown> {
+  return {
+    ...(frameId ? { frame_id: frameId } : {}),
+    position_m: [0, 0, 0],
+    orientation_rpy_deg: [0, 0, 0],
+  };
+}
+
+interface PickPlanSubtreeInsertion {
+  nodes: Node[];
+  edges: Edge[];
+  namespace: BlackboardNamespace;
+  selectedNodeId: string;
+}
+
+function buildPickPlanSubtreeInsertion(
+  position: { x: number; y: number },
+): PickPlanSubtreeInsertion | string {
+  const program = useProgramStore.getState();
+  const deployment = useDeploymentStore.getState().deployment;
+  const selectedObjectId = useViewerSelectionStore.getState().selectedId;
+  const scene = useSceneStateStore.getState().scene;
+  const catalog = useCatalogStore.getState().entries;
+
+  const missingCatalogIds = PICK_PLAN_NODE_IDS.filter(
+    (id) => !catalog.some((entry) => entry.id === id),
+  );
+  if (missingCatalogIds.length > 0) {
+    return `Pick Plan Subtree is unavailable because catalog entries are missing: ${missingCatalogIds.join(', ')}`;
+  }
+  if (!program.programInfo) {
+    return 'Load a program before inserting Pick Plan Subtree';
+  }
+  if (!deployment) {
+    return 'Load the program deployment before inserting Pick Plan Subtree';
+  }
+  const macro = catalog.find((entry) => entry.id === 'pick_plan_subtree');
+  const availableCapabilities = deploymentCapabilityKeys(deployment);
+  const missingCapabilities = (macro?.requiredCapabilities ?? []).filter(
+    (capability) => !availableCapabilities.has(capability),
+  );
+  if (missingCapabilities.length > 0) {
+    return (
+      'Pick Plan Subtree is unavailable because the deployment is missing capabilities: '
+      + missingCapabilities.join(', ')
+    );
+  }
+  if (
+    deployment.robotConfig.robotId !== program.programInfo.robot.robotId
+    || deployment.robotConfig.groupId !== program.programInfo.robot.groupId
+  ) {
+    return 'The loaded program and deployment select different robot/group authorities';
+  }
+  if (!selectedObjectId) {
+    return 'Select a detached collision-scene object before inserting Pick Plan Subtree';
+  }
+  const selectedObject = scene?.objects.find(
+    (object) => object.object_id === selectedObjectId,
+  );
+  if (!selectedObject) {
+    return `Selected item '${selectedObjectId}' is not a current collision-scene object`;
+  }
+  if (selectedObject.attached) {
+    return `Selected object '${selectedObjectId}' is already attached and cannot seed a pick subtree`;
+  }
+
+  const grippers = Object.entries(deployment.grippers);
+  if (grippers.length !== 1) {
+    return (
+      'Pick Plan Subtree requires exactly one active deployment gripper; '
+      + `found ${grippers.length}`
+    );
+  }
+  const [gripperId, gripper] = grippers[0];
+  const closedPosition = gripper.srdfPresets[gripper.closedStateRef];
+  if (!Number.isFinite(closedPosition)) {
+    return (
+      `Gripper '${gripperId}' closed_state_ref '${gripper.closedStateRef}' `
+      + 'does not resolve to a finite SRDF preset'
+    );
+  }
+  if (!gripper.attachFrame.trim()) {
+    return `Gripper '${gripperId}' has no attach frame`;
+  }
+
+  const suffix = pickPlanInsertionSuffix(
+    program.nodes,
+    program.blackboardNamespaces,
+  );
+  const names = Object.fromEntries(
+    PICK_PLAN_BASE_NAMES.map((name) => [name, `${name}${suffix}`]),
+  ) as Record<(typeof PICK_PLAN_BASE_NAMES)[number], string>;
+  const namespaceId = `pick_plan${suffix}`;
+  const baseFrame = program.programInfo.robot.baseFrame;
+  const tcpFrame = program.programInfo.robot.tcpFrame;
+  const direction = program.layoutDirection;
+  const reservedIds = new Set(program.nodes.map((node) => node.id));
+  const created: Node[] = [];
+
+  const add = (
+    catalogId: string,
+    label: string,
+    overrides: Record<string, unknown>,
+    order: number,
+  ): Node => {
+    const seed = direction === 'vertical'
+      ? { x: order * 10, y: 0 }
+      : { x: 0, y: order * 10 };
+    const node = makePickPlanFlowNode(
+      catalogId,
+      label,
+      {
+        ...buildDefaultNodeParams(
+          catalogId,
+          program.programInfo?.programProfile ?? null,
+        ),
+        ...overrides,
+      },
+      seed,
+      direction,
+      reservedIds,
+    );
+    created.push(node);
+    return node;
+  };
+
+  const root = add('sequence', names.pick_plan_master_sequence, {}, 0);
+  const planner = add(
+    'plan_pick_sequence',
+    names.plan_pick_sequence,
+    {
+      selected_object_id: selectedObjectId,
+      output_key_prefix: { namespace_ref: namespaceId },
+      tcp_frame: tcpFrame,
+      approach_move_node_name: names.move_to_approach,
+      pick_move_node_name: names.move_to_pick,
+      retreat_move_node_name: names.move_retreat,
+    },
+    0,
+  );
+  const motionSequence = add('sequence', names.pick_plan_motion_sequence, {}, 1);
+  const approach = add(
+    'move_manipulator_action',
+    names.move_to_approach,
+    {
+      move_id: names.move_to_approach,
+      motion_type: 'pose',
+      target_mode: 'absolute',
+      planning_profile: 'first_feasible',
+      pose_goal: pickPlanPose(baseFrame),
+      base_frame: baseFrame,
+      tcp_frame: tcpFrame,
+    },
+    0,
+  );
+  const cartesianPath = {
+    waypoints: [pickPlanPose(), pickPlanPose()],
+    fallback_policy: 'fail_closed',
+  };
+  const pick = add(
+    'move_manipulator_action',
+    names.move_to_pick,
+    {
+      move_id: names.move_to_pick,
+      motion_type: 'cartesian',
+      target_mode: 'absolute',
+      planning_profile: 'first_feasible',
+      cartesian_path: structuredClone(cartesianPath),
+      base_frame: baseFrame,
+      tcp_frame: tcpFrame,
+    },
+    1,
+  );
+  const close = add(
+    'command_gripper',
+    names.close_gripper,
+    {
+      gripper_id: gripperId,
+      position: closedPosition,
+      duration_s: gripper.motionTimeS,
+    },
+    2,
+  );
+  const attach = add(
+    'attach_object_to_link',
+    names.attach_object,
+    {
+      object_id: selectedObjectId,
+      link_frame: gripper.attachFrame,
+      gripper_id: gripperId,
+    },
+    3,
+  );
+  const retreat = add(
+    'move_manipulator_action',
+    names.move_retreat,
+    {
+      move_id: names.move_retreat,
+      motion_type: 'cartesian',
+      target_mode: 'absolute',
+      planning_profile: 'first_feasible',
+      cartesian_path: structuredClone(cartesianPath),
+      base_frame: baseFrame,
+      tcp_frame: tcpFrame,
+    },
+    4,
+  );
+
+  const edge = (source: Node, target: Node): Edge => ({
+    id: `edge-${source.id}-${target.id}`,
+    source: source.id,
+    target: target.id,
+    type: 'statusEdge',
+  });
+  const edges = [
+    edge(root, planner),
+    edge(root, motionSequence),
+    edge(motionSequence, approach),
+    edge(motionSequence, pick),
+    edge(motionSequence, close),
+    edge(motionSequence, attach),
+    edge(motionSequence, retreat),
+  ];
+  const locallyLayouted = layoutFlow(created, edges, direction);
+  const layoutedRoot = locallyLayouted.find((node) => node.id === root.id)!;
+  const offsetX = position.x - layoutedRoot.position.x;
+  const offsetY = position.y - layoutedRoot.position.y;
+
+  return {
+    nodes: locallyLayouted.map((node) => ({
+      ...node,
+      position: {
+        x: node.position.x + offsetX,
+        y: node.position.y + offsetY,
+      },
+    })),
+    edges,
+    namespace: {
+      id: namespaceId,
+      contract: 'pick_plan_v1',
+      prefix: `planning/pick_plan${suffix}`,
+      description: `Generated pick-plan output for ${selectedObjectId}.`,
+      fields: [
+        { name: 'selected_object_id', type: 'string', description: 'Selected scene object.' },
+        { name: 'approach_pose', type: 'pose', description: 'Generated approach pose.' },
+        { name: 'pick_pose', type: 'pose', description: 'Generated pick pose.' },
+        { name: 'retreat_pose', type: 'pose', description: 'Generated retreat pose.' },
+      ],
+    },
+    selectedNodeId: root.id,
+  };
 }
 
 function getNodeWidth(node: Node): number {
@@ -744,6 +1117,25 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
     }),
 
   addNode: (catalogId, position) => {
+    if (catalogId === PICK_PLAN_SUBTREE_ID) {
+      const insertion = buildPickPlanSubtreeInsertion(position);
+      if (typeof insertion === 'string') {
+        set({ error: insertion });
+        return;
+      }
+      set((state) => ({
+        nodes: [...state.nodes, ...insertion.nodes],
+        edges: [...state.edges, ...insertion.edges],
+        blackboardNamespaces: [
+          ...state.blackboardNamespaces,
+          insertion.namespace,
+        ],
+        selectedNodeId: insertion.selectedNodeId,
+        isDirty: true,
+        error: null,
+      }));
+      return;
+    }
     const id = `node-${Date.now()}`;
     const newNode: Node = {
       id,

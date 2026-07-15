@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-07-12 06:05:07 UTC
+  Last regenerated: 2026-07-15 02:15:26 UTC
   Generator source: scripts/regen-public-contracts.py:gen_assistant_provider_contract
 -->
 

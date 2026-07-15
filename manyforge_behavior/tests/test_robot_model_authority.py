@@ -395,14 +395,13 @@ def test_lite6_arm_pick_validation_preserves_open_gripper_state_when_binding_ava
             move_id=move_id,
             base_frame="link_base",
             tcp_frame="link_tcp",
-            motion_type="relative_move",
-            relative_move={
-                "target_reference": {"type": "object", "id": "graspable"},
-                "offset_reference": {"type": "frame", "id": "link_base"},
-                "offset": {
-                    "position_m": [0.0, 0.0, z_offset_m],
-                    "orientation_rpy_deg": [180.0, 0.0, 0.0],
-                },
+            motion_type="pose",
+            target_mode="relative",
+            target_reference={"type": "object", "id": "graspable"},
+            offset_reference={"type": "frame", "id": "link_base"},
+            pose_goal={
+                "position_m": [0.0, 0.0, z_offset_m],
+                "orientation_rpy_deg": [180.0, 0.0, 0.0],
             },
             velocity_scale=0.4,
             planning_timeout_s=10.0,

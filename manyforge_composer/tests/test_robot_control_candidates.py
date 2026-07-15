@@ -306,7 +306,7 @@ def test_cartesian_candidate_honors_frame_id_and_tcp_frame(tmp_path: Path) -> No
     assert kernel.last_preview_request is not None
     assert kernel.last_preview_request.base_frame == "custom_world"
     assert kernel.last_preview_request.tcp_frame == "gripper_tip"
-    assert kernel.last_preview_request.motion_type == "cartesian_path"
+    assert kernel.last_preview_request.motion_type == "cartesian"
     assert kernel.last_preview_request.pose_goal is None
     path = kernel.last_preview_request.cartesian_path
     assert path is not None
@@ -338,7 +338,7 @@ def test_cartesian_candidate_defaults_use_program_frames(tmp_path: Path) -> None
     # The fixture program robot uses base_frame=base_link, tcp_frame=tool0.
     assert kernel.last_preview_request.base_frame == "base_link"
     assert kernel.last_preview_request.tcp_frame == "tool0"
-    assert kernel.last_preview_request.motion_type == "cartesian_path"
+    assert kernel.last_preview_request.motion_type == "cartesian"
     assert kernel.last_preview_request.cartesian_path is not None
 
 
@@ -966,7 +966,7 @@ def test_execute_fresh_cartesian_candidate_dispatches_with_pose_frame(
         time.sleep(0.02)
     assert kernel.execute_count >= 1
     assert kernel.last_execute_request is not None
-    assert kernel.last_execute_request.motion_type == "cartesian_path"
+    assert kernel.last_execute_request.motion_type == "cartesian"
     assert kernel.last_execute_request.pose_goal is None
     assert kernel.last_execute_request.cartesian_path is not None
     assert kernel.last_execute_request.cartesian_path == preview_path
@@ -992,7 +992,7 @@ def test_execute_fresh_cartesian_candidate_preserves_custom_frames(
         time.sleep(0.02)
     assert kernel.execute_count >= 1
     assert kernel.last_execute_request is not None
-    assert kernel.last_execute_request.motion_type == "cartesian_path"
+    assert kernel.last_execute_request.motion_type == "cartesian"
     assert kernel.last_execute_request.pose_goal is None
     assert kernel.last_execute_request.cartesian_path is not None
     assert kernel.last_execute_request.cartesian_path["fallback_policy"] == "fail_closed"
@@ -1442,7 +1442,7 @@ def _ready_store_candidate():
             response=ready,
             snapshot=_EMPTY_PLANNING_SNAPSHOT,
             dispatch_params={
-                "motion_type": "joint_goal",
+                "motion_type": "joint",
                 "joint_goal_names": ["joint1"],
                 "joint_goal_positions_rad": [0.3],
             },

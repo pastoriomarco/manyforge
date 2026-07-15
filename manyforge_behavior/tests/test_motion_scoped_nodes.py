@@ -64,7 +64,7 @@ def _move_until_signal(**overrides):
         move_id="probe_a",
         base_frame="base_link",
         tcp_frame="tool0",
-        motion_type="joint_goal",
+        motion_type="joint",
         joint_goal_names=["j1", "j2"],
         joint_goal_positions_rad=[0.5, -0.5],
         policy_id="probe_trip",
@@ -82,7 +82,7 @@ def _probe_search_move(**overrides):
         move_id="probe_a",
         base_frame="base_link",
         tcp_frame="tool0",
-        motion_type="pose_goal",
+        motion_type="pose",
         pose_goal={"position_m": [0.4, 0.0, 0.2], "orientation": [0, 0, 0, 1]},
         policy_id="probe_trip",
         scope_id="probe_a_scope",
@@ -578,7 +578,7 @@ def test_probe_search_move_stop_requested_blocks_new_motion_dispatch():
     assert kernel.last_execute_request is None
 
 
-def test_pose_source_apply_callback_invoked_for_object_relative_move():
+def test_pose_source_apply_callback_invoked_for_object_relative_pose():
     # If the relative move references a scene object, the pose-source
     # apply callback must run before the kernel sees the request.
     kernel = MockKernelClient()
@@ -595,13 +595,12 @@ def test_pose_source_apply_callback_invoked_for_object_relative_move():
         return {"success": True}
 
     node = _move_until_signal(
-        motion_type="relative_move",
+        motion_type="pose",
+        target_mode="relative",
         joint_goal_names=[],
         joint_goal_positions_rad=[],
-        relative_move={
-            "target_reference": {"type": "object", "id": "part_a"},
-            "offset": {"position_m": [0.01, 0, 0]},
-        },
+        target_reference={"type": "object", "id": "part_a"},
+        pose_goal={"position_m": [0.01, 0, 0]},
     )
     bb = _wire_with_optional_keys(
         node,
@@ -634,13 +633,12 @@ def test_pose_source_apply_callback_failure_pauses_without_dispatch():
 
     node = _move_until_signal(
         runtime_pause_registry=registry,
-        motion_type="relative_move",
+        motion_type="pose",
+        target_mode="relative",
         joint_goal_names=[],
         joint_goal_positions_rad=[],
-        relative_move={
-            "target_reference": {"type": "object", "id": "part_a"},
-            "offset": {"position_m": [0.01, 0, 0]},
-        },
+        target_reference={"type": "object", "id": "part_a"},
+        pose_goal={"position_m": [0.01, 0, 0]},
     )
     bb = _wire_with_optional_keys(
         node,

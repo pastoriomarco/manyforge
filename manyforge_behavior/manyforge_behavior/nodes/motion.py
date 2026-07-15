@@ -65,13 +65,30 @@ def _normalize_cartesian_path_dict(
     return normalized
 
 
-def _relative_move_object_ids(relative_move: dict[str, Any] | None) -> list[str]:
-    """Return scene object IDs referenced by a relative move request."""
-    if not isinstance(relative_move, dict):
-        return []
+def _normalize_motion_reference(
+    reference: dict[str, Any] | None,
+    field_name: str,
+) -> dict[str, Any] | None:
+    if reference is None:
+        return None
+    if not isinstance(reference, dict):
+        raise ValueError(f"{field_name} must resolve to a mapping")
+    normalized = dict(reference)
+    if normalized.get("type") == "pose":
+        pose = normalized.get("pose")
+        if pose is not None and not isinstance(pose, dict):
+            raise ValueError(f"{field_name}.pose must resolve to a mapping")
+        normalized["pose"] = _normalize_pose_dict(pose)
+    return normalized
+
+
+def _motion_reference_object_ids(
+    target_reference: dict[str, Any] | None,
+    offset_reference: dict[str, Any] | None,
+) -> list[str]:
+    """Return scene object IDs referenced by a relative target."""
     object_ids: list[str] = []
-    for key in ("target_reference", "offset_reference"):
-        reference = relative_move.get(key)
+    for reference in (target_reference, offset_reference):
         if not isinstance(reference, dict):
             continue
         if reference.get("type") != "object":
@@ -276,8 +293,11 @@ class MoveManipulatorAction(
                 pose_goal = resolve_blackboard_value(
                     self.blackboard, self._params.get("pose_goal")
                 )
-                relative_move = resolve_blackboard_value(
-                    self.blackboard, self._params.get("relative_move")
+                target_reference = resolve_blackboard_value(
+                    self.blackboard, self._params.get("target_reference")
+                )
+                offset_reference = resolve_blackboard_value(
+                    self.blackboard, self._params.get("offset_reference")
                 )
                 cartesian_path = resolve_blackboard_value(
                     self.blackboard, self._params.get("cartesian_path")
@@ -302,55 +322,20 @@ class MoveManipulatorAction(
                 self.feedback_message = str(exc)
                 return py_trees.common.Status.FAILURE
 
-            if relative_move:
-                if not isinstance(relative_move, dict):
-                    self.feedback_message = "relative_move blackboard reference must resolve to a mapping"
-                    return py_trees.common.Status.FAILURE
-                relative_move = dict(relative_move)
-                target_reference = relative_move.get("target_reference")
-                if target_reference:
-                    if not isinstance(target_reference, dict):
-                        self.feedback_message = "relative_move.target_reference must be a mapping"
-                        return py_trees.common.Status.FAILURE
-                    target_reference = dict(target_reference)
-                    if target_reference.get("type") == "pose":
-                        if (
-                            target_reference.get("pose") is not None
-                            and not isinstance(target_reference.get("pose"), dict)
-                        ):
-                            self.feedback_message = (
-                                "relative_move.target_reference.pose must resolve to a mapping"
-                            )
-                            return py_trees.common.Status.FAILURE
-                        target_reference["pose"] = _normalize_pose_dict(target_reference.get("pose"))
-                    relative_move["target_reference"] = target_reference
-                offset_reference = relative_move.get("offset_reference")
-                if offset_reference:
-                    if not isinstance(offset_reference, dict):
-                        self.feedback_message = "relative_move.offset_reference must be a mapping"
-                        return py_trees.common.Status.FAILURE
-                    offset_reference = dict(offset_reference)
-                    if offset_reference.get("type") == "pose":
-                        if (
-                            offset_reference.get("pose") is not None
-                            and not isinstance(offset_reference.get("pose"), dict)
-                        ):
-                            self.feedback_message = (
-                                "relative_move.offset_reference.pose must resolve to a mapping"
-                            )
-                            return py_trees.common.Status.FAILURE
-                        offset_reference["pose"] = _normalize_pose_dict(offset_reference.get("pose"))
-                    relative_move["offset_reference"] = offset_reference
-                if relative_move.get("offset") is not None and not isinstance(
-                    relative_move.get("offset"), dict
-                ):
-                    self.feedback_message = "relative_move.offset must be a mapping"
-                    return py_trees.common.Status.FAILURE
-                relative_move["offset"] = _normalize_pose_dict(
-                    relative_move.get("offset")
+            try:
+                target_reference = _normalize_motion_reference(
+                    target_reference, "target_reference"
                 )
+                offset_reference = _normalize_motion_reference(
+                    offset_reference, "offset_reference"
+                )
+            except ValueError as exc:
+                self.feedback_message = str(exc)
+                return py_trees.common.Status.FAILURE
 
-            referenced_object_ids = _relative_move_object_ids(relative_move)
+            referenced_object_ids = _motion_reference_object_ids(
+                target_reference, offset_reference
+            )
             callbacks = [
                 (
                     "pose_source_apply_callback",
@@ -400,13 +385,18 @@ class MoveManipulatorAction(
                 move_id=self._params.get("move_id", ""),
                 base_frame=self._params.get("base_frame", ""),
                 tcp_frame=self._params.get("tcp_frame", ""),
-                motion_type=self._params.get("motion_type", "joint_goal"),
+                motion_type=self._params.get("motion_type", "joint"),
+                target_mode=self._params.get("target_mode", "absolute"),
+                target_reference=target_reference,
+                offset_reference=offset_reference,
+                planning_profile=self._params.get(
+                    "planning_profile", "first_feasible"
+                ),
                 joint_goal_names=self._params.get("joint_goal_names", []),
                 joint_goal_positions_rad=self._params.get(
                     "joint_goal_positions_rad", []
                 ),
                 pose_goal=pose_goal,
-                relative_move=relative_move,
                 cartesian_path=cartesian_path,
                 velocity_scale=effective_velocity_scale,
                 acceleration_scale=float(

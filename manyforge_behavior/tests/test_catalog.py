@@ -21,7 +21,7 @@ class TestCatalogLoading:
     def test_loads_shipped_catalog(self):
         catalog = NodeCatalog(CATALOG_PATH)
         assert len(catalog.entries) > 0
-        assert catalog.version == "0.2.0"
+        assert catalog.version == "0.3.0"
         assert catalog.api_version == "manyforge.node_catalog.v1"
         assert all(
             param.schema is not None
@@ -65,21 +65,32 @@ class TestCatalogLoading:
         assert len(move.parameters) > 0
         move_id_param = next(p for p in move.parameters if p.name == "move_id")
         assert move_id_param.required is True
-        motion_type_param = next(p for p in move.parameters if p.name == "motion_type")
-        relative_move_option = next(
+        target_mode_param = next(p for p in move.parameters if p.name == "target_mode")
+        relative_option = next(
             option
-            for option in motion_type_param.enum_options
-            if option.value == "relative_move"
+            for option in target_mode_param.enum_options
+            if option.value == "relative"
         )
-        assert relative_move_option.profiles_min == "v0.1"
-        assert relative_move_option.required_capabilities == [
-            "context.pose.resolve_reference"
-        ]
-        relative_move_param = next(p for p in move.parameters if p.name == "relative_move")
-        assert relative_move_param.profiles_min == "v0.1"
-        assert relative_move_param.visible_when is not None
-        assert relative_move_param.visible_when.param == "motion_type"
-        assert relative_move_param.visible_when.equals == "relative_move"
+        assert relative_option.profiles_min == "v0.1"
+        assert relative_option.required_capabilities == []
+        planning_profile_param = next(
+            p for p in move.parameters if p.name == "planning_profile"
+        )
+        assert {
+            option.value: option.required_capabilities
+            for option in planning_profile_param.enum_options
+        } == {
+            "first_feasible": ["planning.profile.first_feasible"],
+            "balanced": ["planning.profile.balanced"],
+            "quality_bounded": ["planning.profile.quality_bounded"],
+        }
+        target_reference = next(
+            p for p in move.parameters if p.name == "target_reference"
+        )
+        assert target_reference.profiles_min == "v0.1"
+        assert target_reference.visible_when is not None
+        assert target_reference.visible_when.param == "target_mode"
+        assert target_reference.visible_when.equals == "relative"
 
     def test_blackboard_metadata_loaded_for_shipped_entries(self):
         catalog = NodeCatalog(CATALOG_PATH)
@@ -144,7 +155,8 @@ class TestCatalogLoading:
         assert "move_until_signal" not in v0_ids
         assert "probe_search_move" not in v0_ids
         assert "confirm_gripper_grasp" not in v0_ids
-        assert len(v0_entries) == len(catalog.entries) - 11
+        assert "pick_plan_subtree" not in v0_ids
+        assert len(v0_entries) == len(catalog.entries) - 12
 
     def test_command_gripper_is_marked_experimental(self):
         catalog = NodeCatalog(CATALOG_PATH)
@@ -154,9 +166,20 @@ class TestCatalogLoading:
     def test_all_entries_have_py_trees_runner(self):
         catalog = NodeCatalog(CATALOG_PATH)
         for entry in catalog.entries:
+            if entry.kind == "authoring_macro":
+                assert entry.runners == {}
+                continue
             assert "py_trees" in entry.runners, (
                 f"Entry '{entry.id}' missing py_trees runner"
             )
+
+    def test_pick_plan_subtree_is_authoring_only(self):
+        catalog = NodeCatalog(CATALOG_PATH)
+        macro = catalog.get("pick_plan_subtree")
+        assert macro.kind == "authoring_macro"
+        assert macro.children_min == 0
+        assert macro.children_max == 0
+        assert macro.runners == {}
 
 
 class TestCatalogValidation:
@@ -725,6 +748,46 @@ class TestCatalogValidation:
             ],
         })
         with pytest.raises(CatalogValidationError, match="py_trees"):
+            NodeCatalog(path)
+        os.unlink(path)
+
+    def test_authoring_macro_requires_no_runtime_runner(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
+            "entries": [
+                {
+                    "id": "authoring_template",
+                    "name": "AuthoringTemplate",
+                    "kind": "authoring_macro",
+                    "children": {"min": 0, "max": 0},
+                    "runners": {},
+                },
+            ],
+        })
+        try:
+            catalog = NodeCatalog(path)
+            assert catalog.get("authoring_template").runners == {}
+        finally:
+            os.unlink(path)
+
+    def test_rejects_runtime_runner_on_authoring_macro(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
+            "entries": [
+                {
+                    "id": "bad_authoring_template",
+                    "name": "BadAuthoringTemplate",
+                    "kind": "authoring_macro",
+                    "children": {"min": 0, "max": 0},
+                    "runners": {
+                        "py_trees": {"implementation_kind": "plugin"},
+                    },
+                },
+            ],
+        })
+        with pytest.raises(CatalogValidationError, match="must not declare runtime runners"):
             NodeCatalog(path)
         os.unlink(path)
 

@@ -296,6 +296,9 @@ class TestLauncherKernelCreation:
             "planning.motion.joint_goal",
             "planning.motion.pose_goal",
             "planning.motion.cartesian_path",
+            "planning.profile.first_feasible",
+            "planning.profile.balanced",
+            "planning.profile.quality_bounded",
             "planning.trajectory.time_parameterized",
         ]
         deploy_path = _write_yaml(data)
@@ -338,6 +341,9 @@ class TestLauncherKernelCreation:
                         "planning.motion.joint_goal",
                         "planning.motion.pose_goal",
                         "planning.motion.cartesian_path",
+                        "planning.profile.first_feasible",
+                        "planning.profile.balanced",
+                        "planning.profile.quality_bounded",
                         "planning.trajectory.time_parameterized",
                     ],
                     "config": {},

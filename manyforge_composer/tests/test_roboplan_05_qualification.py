@@ -251,12 +251,10 @@ def test_isaac_light_drop_release_keeps_attached_object_clear_of_klt(
         return [node, *[nested for child in children for nested in descendants(child)]]
 
     nodes = {str(node.get("name")): node for node in descendants(program["tree"])}
-    approach_offset = nodes["move_to_drop_approach"]["params"]["relative_move"][
-        "offset"
-    ]["position_m"]
-    release_offset = nodes["move_to_drop"]["params"]["relative_move"]["offset"][
+    approach_offset = nodes["move_to_drop_approach"]["params"]["pose_goal"][
         "position_m"
     ]
+    release_offset = nodes["move_to_drop"]["params"]["pose_goal"]["position_m"]
 
     assert approach_offset == [0, 0, 0.4]
     assert release_offset == [0, 0, 0.35]
@@ -1262,19 +1260,19 @@ def _capture_program() -> dict:
                     "id": "move_manipulator_action",
                     "name": "move_to_drop_approach",
                     "params": {
-                        "relative_move": {
-                            "target_reference": {
-                                "type": "object",
-                                "id": "drop_box",
-                            },
-                            "offset_reference": {
-                                "type": "frame",
-                                "id": "base_link",
-                            },
-                            "offset": {
-                                "position_m": [0.0, 0.0, 0.4],
-                                "orientation_rpy_deg": [0.0, 0.0, 0.0],
-                            },
+                        "motion_type": "pose",
+                        "target_mode": "relative",
+                        "target_reference": {
+                            "type": "object",
+                            "id": "drop_box",
+                        },
+                        "offset_reference": {
+                            "type": "frame",
+                            "id": "base_link",
+                        },
+                        "pose_goal": {
+                            "position_m": [0.0, 0.0, 0.4],
+                            "orientation_rpy_deg": [0.0, 0.0, 0.0],
                         }
                     },
                 },

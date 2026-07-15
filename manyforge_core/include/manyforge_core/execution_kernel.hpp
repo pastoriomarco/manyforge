@@ -468,9 +468,6 @@ class ExecutionKernel {
   std::string dump_flight_record(const char* reason) noexcept;
 
  private:
-  Result<MotionSpecDTO> resolve_motion_spec(
-      const ExecuteRequestDTO& request,
-      const SceneRevisionBindingDTO& scene_binding);
   Result<TrajectoryDTO> plan_trajectory(
       const ExecuteRequestDTO& request,
       const SceneRevisionBindingDTO& scene_binding,
@@ -526,6 +523,7 @@ class ExecutionKernel {
                             ExecuteRequestDTO request,
                             uint64_t exec_id,
                             std::optional<TrajectoryDTO> cached_trajectory,
+                            bool cache_revalidation_candidate,
                             RetainedSceneSnapshotLease retained_scene,
                             std::optional<SceneSnapshotLease>
                                 scene_snapshot_lease);
@@ -732,6 +730,7 @@ class ExecutionKernel {
     ExecuteWorkerPhaseStatus status = ExecuteWorkerPhaseStatus::kContinue;
     TrajectoryDTO trajectory;
     bool active_trajectory_from_cache = false;
+    bool cache_revalidation_candidate = false;
   };
 
   struct ExecuteWorkerValidationPhaseResult {
@@ -776,6 +775,7 @@ class ExecutionKernel {
       const SceneRevisionBindingDTO& scene_binding,
       std::uint64_t exec_id,
       std::optional<TrajectoryDTO> cached_trajectory,
+      bool cache_revalidation_candidate,
       ExecutionState worker_entry_state,
       ActiveMotionExecution& motion_state);
 
@@ -785,6 +785,7 @@ class ExecutionKernel {
       std::uint64_t exec_id,
       TrajectoryDTO& trajectory,
       bool& active_trajectory_from_cache,
+      bool& cache_revalidation_candidate,
       const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
       const SceneRevisionBindingDTO& scene_binding,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
@@ -795,6 +796,7 @@ class ExecutionKernel {
       std::uint64_t exec_id,
       const TrajectoryDTO& trajectory,
       bool active_trajectory_from_cache,
+      bool cache_revalidation_candidate,
       const CollisionWorldRevision& validation_world_revision,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
       ActiveMotionExecution& motion_state);

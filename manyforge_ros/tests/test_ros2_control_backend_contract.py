@@ -90,7 +90,7 @@ def _execute_joint_goal(bundle, move_id: str):
             "move_id": move_id,
             "base_frame": "world",
             "tcp_frame": "tool0",
-            "motion_type": "joint_goal",
+            "motion_type": "joint",
             "joint_goal_names": JOINTS,
             "joint_goal_positions_rad": GOAL_POSITIONS,
             "planning_timeout_s": 1.0,

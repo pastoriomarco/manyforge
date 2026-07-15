@@ -15,6 +15,10 @@ namespace manyforge::core {
 
 enum class TrajectoryCacheLookupDisposition {
   kHit,
+  /// Same canonical intent, but validated against an older authoritative
+  /// revision. The trajectory carries no authority until current validation
+  /// succeeds and atomically restamps it.
+  kRevalidationCandidate,
   kMiss,
   kAuthoritativeRevisionUnavailable,
   kRevisionMismatch,
@@ -32,8 +36,9 @@ struct TrajectoryCacheLookupResult {
 /// One trajectory per move_id. No LRU, no TTL.
 /// Thread-safe.
 ///
-/// Revision or planner-intent mismatches remove the stale entry atomically and
-/// return a structured disposition so the kernel can make cache loss visible.
+/// Planner-intent mismatches remove the stale entry atomically. A strictly
+/// newer authoritative revision retains a same-intent entry as an immutable
+/// revalidation candidate; rollback and same-revision/hash conflicts evict.
 class TrajectoryCache {
  public:
   explicit TrajectoryCache(CacheConfig config = {});
@@ -55,9 +60,9 @@ class TrajectoryCache {
   /// planning/execution callers must use lookup_with_revision.
   std::optional<TrajectoryDTO> peek_unvalidated(const std::string& move_id) const;
 
-  /// Look up trajectory by move_id, returning the trajectory only when its
-  /// stored revision and canonical planner-intent identity match. Any mismatch is
-  /// removed while holding the cache mutex and identified in the result.
+  /// Look up trajectory by move_id. Exact revision+intent returns kHit;
+  /// same-intent older revision returns kRevalidationCandidate; intent mismatch
+  /// is removed while holding the cache mutex.
   ///
   /// An expected revision with both `revision_id == 0` and an empty
   /// `content_hash` is treated as "no authoritative revision available";

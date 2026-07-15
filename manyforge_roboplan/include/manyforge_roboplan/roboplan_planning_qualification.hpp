@@ -47,6 +47,7 @@ class RoboPlanPlanningQualificationRecorder final
   void close_admission() noexcept;
   std::vector<RoboPlanPlanningQualificationRecord> drain();
   RoboPlanPlanningQualificationBatch drain_with_status();
+  bool wait_until_active(std::chrono::milliseconds timeout);
   bool wait_until_idle(std::chrono::milliseconds timeout);
   std::uint64_t dropped_total() const noexcept;
   std::size_t in_flight() const noexcept;
@@ -54,6 +55,7 @@ class RoboPlanPlanningQualificationRecorder final
  private:
   const std::size_t capacity_;
   mutable std::mutex mutex_;
+  std::condition_variable active_cv_;
   std::condition_variable idle_cv_;
   std::deque<RoboPlanPlanningQualificationRecord> records_;
   std::uint64_t next_sequence_ = 1;

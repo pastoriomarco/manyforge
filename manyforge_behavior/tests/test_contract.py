@@ -52,7 +52,7 @@ def make_joint_goal_request(move_id: str = "test_move") -> ExecuteRequest:
         move_id=move_id,
         base_frame="base_link",
         tcp_frame="tool0",
-        motion_type="joint_goal",
+        motion_type="joint",
         joint_goal_names=["j1", "j2", "j3", "j4", "j5", "j6"],
         joint_goal_positions_rad=[0.0, -1.57, 1.57, -1.57, 1.57, 0.0],
         velocity_scale=0.5,
@@ -70,7 +70,7 @@ def make_pose_goal_request(move_id: str = "test_pose") -> ExecuteRequest:
         move_id=move_id,
         base_frame="base_link",
         tcp_frame="tool0",
-        motion_type="pose_goal",
+        motion_type="pose",
         pose_goal={
             "position_m": [0.3, 0.0, 0.3],
             "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
@@ -223,7 +223,7 @@ class TestExecuteRequestInvariants:
         """
         INVARIANT: Joint_goal motion type must complete successfully.
         
-        Execute with motion_type="joint_goal" must transition to COMPLETED
+        Execute with motion_type="joint" must transition to COMPLETED
         and return ok=True.
         """
         request = make_joint_goal_request()
@@ -235,7 +235,7 @@ class TestExecuteRequestInvariants:
         """
         INVARIANT: Pose_goal motion type must complete successfully.
         
-        Execute with motion_type="pose_goal" must transition to COMPLETED
+        Execute with motion_type="pose" must transition to COMPLETED
         and return ok=True.
         """
         request = make_pose_goal_request()

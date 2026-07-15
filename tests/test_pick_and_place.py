@@ -203,7 +203,7 @@ class TestSceneEditPipeline:
         request = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="avoid_obstacle",
             base_frame="base_link", tcp_frame="tcp",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=["j1", "j2", "j3", "j4", "j5", "j6"],
             joint_goal_positions_rad=[0.1, 0.1, 0.1, 0.0, 0.0, 0.0],
             velocity_scale=1.0, acceleration_scale=1.0,
@@ -236,7 +236,7 @@ class TestErrorRecoveryPipeline:
         request = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="failing_move",
             base_frame="base_link", tcp_frame="tcp",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=["j1", "j2", "j3", "j4", "j5", "j6"],
             joint_goal_positions_rad=[0.1, 0.1, 0.1, 0.0, 0.0, 0.0],
             velocity_scale=1.0, acceleration_scale=1.0,
@@ -260,7 +260,7 @@ class TestErrorRecoveryPipeline:
         request = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="cycle_move",
             base_frame="base_link", tcp_frame="tcp",
-            motion_type="joint_goal",
+            motion_type="joint",
             joint_goal_names=["j1", "j2", "j3", "j4", "j5", "j6"],
             joint_goal_positions_rad=[0.1, 0.1, 0.1, 0.0, 0.0, 0.0],
             velocity_scale=1.0, acceleration_scale=1.0,

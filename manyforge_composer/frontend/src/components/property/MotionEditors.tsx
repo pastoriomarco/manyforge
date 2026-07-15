@@ -15,21 +15,15 @@ interface PoseEnvelopeValue {
   orientation_rpy_max_deg: number[];
 }
 
-type RelativeMoveReferenceType = 'frame' | 'object' | 'robot_link' | 'pose';
+type MotionReferenceType = 'frame' | 'object' | 'robot_link' | 'pose';
 
-interface RelativeMoveReferenceValue {
-  type: RelativeMoveReferenceType;
+interface MotionReferenceValue {
+  type: MotionReferenceType;
   id?: string;
   pose?: Record<string, unknown>;
 }
 
-interface RelativeMoveValue {
-  target_reference: RelativeMoveReferenceValue;
-  offset_reference?: RelativeMoveReferenceValue;
-  offset: Record<string, unknown>;
-}
-
-interface RelativeMoveReferenceInventory {
+interface MotionReferenceInventory {
   frameOptions: string[];
   objectOptions: string[];
   robotLinkOptions: string[];
@@ -41,7 +35,7 @@ interface JointGoalRow {
   selected: boolean;
 }
 
-const RELATIVE_MOVE_REFERENCE_TYPES: RelativeMoveReferenceType[] = [
+const MOTION_REFERENCE_TYPES: MotionReferenceType[] = [
   'frame',
   'object',
   'robot_link',
@@ -75,15 +69,15 @@ function normalizePoseEnvelope(value: unknown): PoseEnvelopeValue {
   };
 }
 
-function normalizeRelativeMoveReference(
+function normalizeMotionReference(
   value: unknown,
-  fallbackType: RelativeMoveReferenceType = 'object',
-): RelativeMoveReferenceValue {
+  fallbackType: MotionReferenceType = 'object',
+): MotionReferenceValue {
   const reference = value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
-  const type = RELATIVE_MOVE_REFERENCE_TYPES.includes(reference.type as RelativeMoveReferenceType)
-    ? reference.type as RelativeMoveReferenceType
+  const type = MOTION_REFERENCE_TYPES.includes(reference.type as MotionReferenceType)
+    ? reference.type as MotionReferenceType
     : fallbackType;
 
   if (type === 'pose') {
@@ -101,7 +95,7 @@ function normalizeRelativeMoveReference(
   };
 }
 
-function sanitizeRelativeMoveReference(value: RelativeMoveReferenceValue): Record<string, unknown> {
+function sanitizeMotionReference(value: MotionReferenceValue): Record<string, unknown> {
   if (value.type === 'pose') {
     return {
       type: value.type,
@@ -118,24 +112,6 @@ function sanitizeRelativeMoveReference(value: RelativeMoveReferenceValue): Recor
   };
 }
 
-function normalizeRelativeMove(value: unknown): RelativeMoveValue {
-  const relativeMove = value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
-  const hasOffsetReference =
-    relativeMove.offset_reference && typeof relativeMove.offset_reference === 'object' && !Array.isArray(relativeMove.offset_reference);
-
-  return {
-    target_reference: normalizeRelativeMoveReference(relativeMove.target_reference, 'object'),
-    offset_reference: hasOffsetReference
-      ? normalizeRelativeMoveReference(relativeMove.offset_reference, 'frame')
-      : undefined,
-    offset: relativeMove.offset && typeof relativeMove.offset === 'object' && !Array.isArray(relativeMove.offset)
-      ? relativeMove.offset as Record<string, unknown>
-      : {},
-  };
-}
-
 function normalizeReferenceOptions(values: string[]): string[] {
   return Array.from(
     new Set(
@@ -147,8 +123,8 @@ function normalizeReferenceOptions(values: string[]): string[] {
 }
 
 function referenceOptionsForType(
-  type: RelativeMoveReferenceType,
-  inventory: RelativeMoveReferenceInventory,
+  type: MotionReferenceType,
+  inventory: MotionReferenceInventory,
 ): string[] {
   if (type === 'frame') {
     return inventory.frameOptions;
@@ -162,13 +138,13 @@ function referenceOptionsForType(
   return [];
 }
 
-function validateRelativeMoveReference(
-  value: RelativeMoveReferenceValue,
+function validateMotionReference(
+  value: MotionReferenceValue,
   label: string,
-  inventory: RelativeMoveReferenceInventory,
+  inventory: MotionReferenceInventory,
   options?: { allowEmptyFrameId?: boolean },
 ): string | null {
-  if (!RELATIVE_MOVE_REFERENCE_TYPES.includes(value.type)) {
+  if (!MOTION_REFERENCE_TYPES.includes(value.type)) {
     return `${label} type is invalid`;
   }
   if (value.type === 'pose') {
@@ -217,58 +193,6 @@ function validateRelativeMoveReference(
   return null;
 }
 
-function validateRelativeMove(
-  value: RelativeMoveValue,
-  inventory: RelativeMoveReferenceInventory,
-): string | null {
-  const targetError = validateRelativeMoveReference(value.target_reference, 'Target reference', inventory);
-  if (targetError) {
-    return targetError;
-  }
-
-  if (value.offset_reference) {
-    const offsetReferenceError = validateRelativeMoveReference(value.offset_reference, 'Offset reference', inventory);
-    if (offsetReferenceError) {
-      return offsetReferenceError;
-    }
-  }
-
-  if (!value.offset || typeof value.offset !== 'object' || Array.isArray(value.offset)) {
-    return 'Offset is required';
-  }
-  const offset = value.offset as Record<string, unknown>;
-  if ('position_m' in offset) {
-    const position = offset.position_m;
-    if (!Array.isArray(position) || position.length !== 3 || position.some((entry) => typeof entry !== 'number' || !Number.isFinite(entry))) {
-      return 'Offset position_m must be a list of 3 numbers';
-    }
-  }
-  if ('orientation_rpy_deg' in offset) {
-    const orientation = offset.orientation_rpy_deg;
-    if (!Array.isArray(orientation) || orientation.length !== 3 || orientation.some((entry) => typeof entry !== 'number' || !Number.isFinite(entry))) {
-      return 'Offset orientation_rpy_deg must be a list of 3 numbers';
-    }
-  }
-  if ('orientation_xyzw' in offset) {
-    const orientation = offset.orientation_xyzw;
-    if (!Array.isArray(orientation) || orientation.length !== 4 || orientation.some((entry) => typeof entry !== 'number' || !Number.isFinite(entry))) {
-      return 'Offset orientation_xyzw must be a list of 4 numbers';
-    }
-  }
-  return null;
-}
-
-function sanitizeRelativeMove(value: RelativeMoveValue): Record<string, unknown> {
-  const result: Record<string, unknown> = {
-    target_reference: sanitizeRelativeMoveReference(value.target_reference),
-    offset: value.offset,
-  };
-  if (value.offset_reference) {
-    result.offset_reference = sanitizeRelativeMoveReference(value.offset_reference);
-  }
-  return result;
-}
-
 function validatePoseEnvelope(value: PoseEnvelopeValue): string | null {
   const checks: Array<{
     label: string;
@@ -300,7 +224,7 @@ function validatePoseEnvelope(value: PoseEnvelopeValue): string | null {
   return null;
 }
 
-function relativeReferenceHelp(label: string): string {
+function motionReferenceHelp(label: string): string {
   return `${label} basis for XYZ offsets. For Plan Pick Sequence, robot_link matching the node tcp_frame uses the generated candidate pick TCP basis; another robot_link uses the live robot link pose before planning.`;
 }
 
@@ -423,10 +347,14 @@ export function PoseEditor({
   currentValue,
   isRunMode,
   onCommit,
+  frameRequirement = 'optional',
+  frameOptions = [],
 }: {
   currentValue: unknown;
   isRunMode: boolean;
   onCommit: (value: unknown) => void;
+  frameRequirement?: 'required' | 'optional' | 'forbidden';
+  frameOptions?: string[];
 }) {
   const pose = currentValue && typeof currentValue === 'object' && !Array.isArray(currentValue)
     ? currentValue as Record<string, unknown>
@@ -436,9 +364,51 @@ export function PoseEditor({
   const orientation = usesQuaternion
     ? normalizeNumberArray(pose.orientation_xyzw, 4, [0, 0, 0, 1])
     : normalizeNumberArray(pose.orientation_rpy_deg, 3, [180, 0, 0]);
+  const frameId = typeof pose.frame_id === 'string' ? pose.frame_id : '';
+  const knownFrames = normalizeReferenceOptions(frameOptions);
+
+  const commitPose = (patch: Record<string, unknown>) => {
+    const updated: Record<string, unknown> = { ...pose, ...patch };
+    if (frameRequirement === 'forbidden') {
+      delete updated.frame_id;
+    }
+    onCommit(updated);
+  };
 
   return (
     <div className="space-y-2">
+      {frameRequirement !== 'forbidden' && (
+        <div>
+          <div className="mb-1 text-[11px] text-gray-500">
+            Frame{frameRequirement === 'required' ? ' (required)' : ''}
+          </div>
+          {knownFrames.length > 0 ? (
+            <select
+              value={frameId}
+              disabled={isRunMode}
+              onChange={(event) => commitPose({ frame_id: event.target.value })}
+              className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-xs text-white ${isRunMode ? 'cursor-not-allowed bg-gray-800 opacity-50' : ''}`}
+            >
+              <option value="">Select frame</option>
+              {frameId && !knownFrames.includes(frameId) && (
+                <option value={frameId}>{frameId} (not in current scene)</option>
+              )}
+              {knownFrames.map((frame) => (
+                <option key={frame} value={frame}>{frame}</option>
+              ))}
+            </select>
+          ) : (
+            <DraftTextInput
+              type="text"
+              value={frameId}
+              disabled={isRunMode}
+              onCommit={(value) => commitPose({ frame_id: value.trim() })}
+              className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-xs text-white ${isRunMode ? 'cursor-not-allowed bg-gray-800 opacity-50' : ''}`}
+              placeholder="base frame"
+            />
+          )}
+        </div>
+      )}
       <div>
         <div className="mb-1 text-[11px] text-gray-500">Position (m)</div>
         <VectorInput
@@ -457,7 +427,7 @@ export function PoseEditor({
               updated.orientation_rpy_deg = orientation;
               delete updated.orientation_xyzw;
             }
-            onCommit(updated);
+            commitPose(updated);
           }}
         />
       </div>
@@ -481,7 +451,7 @@ export function PoseEditor({
               updated.orientation_rpy_deg = next;
               delete updated.orientation_xyzw;
             }
-            onCommit(updated);
+            commitPose(updated);
           }}
         />
       </div>
@@ -576,7 +546,7 @@ export function PoseMapEditor({
   );
 }
 
-function RelativeMoveReferenceEditor({
+function MotionReferenceEditor({
   label,
   value,
   isRunMode,
@@ -587,11 +557,11 @@ function RelativeMoveReferenceEditor({
   emptyFrameLabel = 'Planning base frame',
 }: {
   label: string;
-  value: RelativeMoveReferenceValue;
+  value: MotionReferenceValue;
   isRunMode: boolean;
-  onChange: (value: RelativeMoveReferenceValue) => void;
+  onChange: (value: MotionReferenceValue) => void;
   fieldOptions: BlackboardFieldOption[];
-  inventory: RelativeMoveReferenceInventory;
+  inventory: MotionReferenceInventory;
   allowEmptyFrameId?: boolean;
   emptyFrameLabel?: string;
 }) {
@@ -613,7 +583,7 @@ function RelativeMoveReferenceEditor({
       ? 'Select a frame'
       : 'Select an object';
   const hasEmptyFrameOption = value.type === 'frame' && allowEmptyFrameId;
-  const helpText = relativeReferenceHelp(label);
+  const helpText = motionReferenceHelp(label);
 
   return (
     <div className="space-y-2 rounded border border-gray-700 p-2" title={helpText}>
@@ -621,7 +591,7 @@ function RelativeMoveReferenceEditor({
       <select
         value={value.type}
         onChange={(event) => {
-          const nextType = event.target.value as RelativeMoveReferenceType;
+          const nextType = event.target.value as MotionReferenceType;
           if (nextType === 'pose') {
             onChange({
               type: nextType,
@@ -640,7 +610,7 @@ function RelativeMoveReferenceEditor({
         title={helpText}
         className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${disabledClasses}`}
       >
-        {RELATIVE_MOVE_REFERENCE_TYPES.map((referenceType) => (
+        {MOTION_REFERENCE_TYPES.map((referenceType) => (
           <option key={referenceType} value={referenceType}>
             {referenceType}
           </option>
@@ -702,7 +672,7 @@ function RelativeMoveReferenceEditor({
   );
 }
 
-export function RelativeMoveReferenceParamEditor({
+export function MotionReferenceParamEditor({
   currentValue,
   isRunMode,
   onCommit,
@@ -723,7 +693,7 @@ export function RelativeMoveReferenceParamEditor({
   allowEmptyFrameId?: boolean;
   emptyFrameLabel?: string;
 }) {
-  const inventory = useMemo<RelativeMoveReferenceInventory>(
+  const inventory = useMemo<MotionReferenceInventory>(
     () => ({
       frameOptions: normalizeReferenceOptions(frameOptions),
       objectOptions: normalizeReferenceOptions(objectOptions),
@@ -731,12 +701,12 @@ export function RelativeMoveReferenceParamEditor({
     }),
     [frameOptions, objectOptions, robotLinkOptions],
   );
-  const [draft, setDraft] = useState<RelativeMoveReferenceValue>(() => (
-    normalizeRelativeMoveReference(currentValue, 'frame')
+  const [draft, setDraft] = useState<MotionReferenceValue>(() => (
+    normalizeMotionReference(currentValue, 'frame')
   ));
   const [error, setError] = useState<string | null>(() => (
-    validateRelativeMoveReference(
-      normalizeRelativeMoveReference(currentValue, 'frame'),
+    validateMotionReference(
+      normalizeMotionReference(currentValue, 'frame'),
       'Reference',
       inventory,
       { allowEmptyFrameId },
@@ -744,9 +714,9 @@ export function RelativeMoveReferenceParamEditor({
   ));
 
   useEffect(() => {
-    const normalized = normalizeRelativeMoveReference(currentValue, 'frame');
+    const normalized = normalizeMotionReference(currentValue, 'frame');
     setDraft(normalized);
-    setError(validateRelativeMoveReference(
+    setError(validateMotionReference(
       normalized,
       'Reference',
       inventory,
@@ -754,9 +724,9 @@ export function RelativeMoveReferenceParamEditor({
     ));
   }, [currentValue, inventory.frameOptions, inventory.objectOptions, inventory.robotLinkOptions, allowEmptyFrameId]);
 
-  const commit = (nextDraft: RelativeMoveReferenceValue) => {
+  const commit = (nextDraft: MotionReferenceValue) => {
     setDraft(nextDraft);
-    const validationError = validateRelativeMoveReference(
+    const validationError = validateMotionReference(
       nextDraft,
       'Reference',
       inventory,
@@ -764,13 +734,13 @@ export function RelativeMoveReferenceParamEditor({
     );
     setError(validationError);
     if (!validationError) {
-      onCommit(sanitizeRelativeMoveReference(nextDraft));
+      onCommit(sanitizeMotionReference(nextDraft));
     }
   };
 
   return (
     <div className="space-y-2">
-      <RelativeMoveReferenceEditor
+      <MotionReferenceEditor
         label="Reference"
         value={draft}
         isRunMode={isRunMode}
@@ -780,112 +750,6 @@ export function RelativeMoveReferenceParamEditor({
         allowEmptyFrameId={allowEmptyFrameId}
         emptyFrameLabel={emptyFrameLabel}
       />
-      {error && <div className="text-[11px] text-red-400">{error}</div>}
-    </div>
-  );
-}
-
-export function RelativeMoveEditor({
-  currentValue,
-  isRunMode,
-  onCommit,
-  fieldOptions,
-  frameOptions,
-  objectOptions,
-  robotLinkOptions,
-}: {
-  currentValue: unknown;
-  isRunMode: boolean;
-  onCommit: (value: unknown) => void;
-  fieldOptions: BlackboardFieldOption[];
-  frameOptions: string[];
-  objectOptions: string[];
-  robotLinkOptions: string[];
-}) {
-  const inventory = useMemo<RelativeMoveReferenceInventory>(
-    () => ({
-      frameOptions: normalizeReferenceOptions(frameOptions),
-      objectOptions: normalizeReferenceOptions(objectOptions),
-      robotLinkOptions: normalizeReferenceOptions(robotLinkOptions),
-    }),
-    [frameOptions, objectOptions, robotLinkOptions],
-  );
-  const [draft, setDraft] = useState<RelativeMoveValue>(() => normalizeRelativeMove(currentValue));
-  const [error, setError] = useState<string | null>(() => validateRelativeMove(normalizeRelativeMove(currentValue), inventory));
-
-  useEffect(() => {
-    const normalized = normalizeRelativeMove(currentValue);
-    setDraft(normalized);
-    setError(validateRelativeMove(normalized, inventory));
-  }, [currentValue, inventory.frameOptions, inventory.objectOptions, inventory.robotLinkOptions]);
-
-  const commit = (nextDraft: RelativeMoveValue) => {
-    setDraft(nextDraft);
-    const validationError = validateRelativeMove(nextDraft, inventory);
-    setError(validationError);
-    if (!validationError) {
-      onCommit(sanitizeRelativeMove(nextDraft));
-    }
-  };
-
-  return (
-    <div className="space-y-3">
-      <RelativeMoveReferenceEditor
-        label="Target reference"
-        value={draft.target_reference}
-        isRunMode={isRunMode}
-        onChange={(nextValue) => commit({ ...draft, target_reference: nextValue })}
-        fieldOptions={fieldOptions}
-        inventory={inventory}
-      />
-
-      <div className="space-y-2 rounded border border-gray-700 p-2">
-        <label className="flex items-center gap-2 text-xs text-gray-300">
-          <input
-            type="checkbox"
-            checked={draft.offset_reference !== undefined}
-            disabled={isRunMode}
-            onChange={(event) => {
-              if (event.target.checked) {
-                commit({
-                  ...draft,
-                  offset_reference: normalizeRelativeMoveReference(draft.offset_reference, 'frame'),
-                });
-                return;
-              }
-              commit({
-                ...draft,
-                offset_reference: undefined,
-              });
-            }}
-            className={`${isRunMode ? 'opacity-50 cursor-not-allowed' : ''}`}
-          />
-          Use separate offset reference
-        </label>
-        {draft.offset_reference ? (
-          <RelativeMoveReferenceEditor
-            label="Offset reference"
-            value={draft.offset_reference}
-            isRunMode={isRunMode}
-            onChange={(nextValue) => commit({ ...draft, offset_reference: nextValue })}
-            fieldOptions={fieldOptions}
-            inventory={inventory}
-          />
-        ) : (
-          <div className="text-[11px] text-gray-500">
-            Offset will be expressed in the target reference frame.
-          </div>
-        )}
-      </div>
-
-      <div className="rounded border border-gray-700 p-2">
-        <div className="mb-2 text-xs font-medium text-gray-300">Offset</div>
-        <PoseEditor
-          currentValue={draft.offset}
-          isRunMode={isRunMode}
-          onCommit={(nextOffset) => commit({ ...draft, offset: nextOffset as Record<string, unknown> })}
-        />
-      </div>
       {error && <div className="text-[11px] text-red-400">{error}</div>}
     </div>
   );

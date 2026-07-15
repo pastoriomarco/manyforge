@@ -7,7 +7,7 @@
 # Capability keys: docs/spec/240-supported-backend-capability-profile.md
 
 api_version: manyforge.node_catalog.v1
-catalog_version: "0.2.0"
+catalog_version: "0.3.0"
 
 schema_types:
   orientation_reference:
@@ -88,15 +88,12 @@ schema_types:
       - [orientation_xyzw, orientation_rpy_deg, rotate_local_rpy_deg,
          rotate_world_rpy_deg, rpy_delta_deg, orientation_from]
   motion_pose_goal:
-    # ADR-0023 §3.8: a commanded absolute motion goal is unambiguous:
-    # frame_id + position_m + exactly one orientation form. Relative-move
-    # deltas use the separate loose `motion_pose_offset`.
-    # NOTE: this is the ABSOLUTE goal schema. Relative-move deltas use the
-    # separate loose `motion_pose_offset` (an offset has no frame_id of its own
-    # and may be position- or orientation-only).
+    # The same typed payload carries an absolute pose or a relative offset.
+    # Program semantic validation requires frame_id for absolute mode and
+    # forbids it for relative mode; both require a complete pose.
     type: object
     additional_properties: false
-    required: [frame_id, position_m]
+    required: [position_m]
     properties:
       frame_id:
         type: string
@@ -113,27 +110,6 @@ schema_types:
         items: float
         length: 3
     exactly_one:
-      - [orientation_xyzw, orientation_rpy_deg]
-  motion_pose_offset:
-    # A relative-move delta: expressed in the offset_reference frame, so it
-    # carries no frame_id and may be position-only, orientation-only, or both.
-    # Ambiguity is still bounded: at most one orientation form.
-    type: object
-    additional_properties: false
-    properties:
-      position_m:
-        type: array
-        items: float
-        length: 3
-      orientation_xyzw:
-        type: array
-        items: float
-        length: 4
-      orientation_rpy_deg:
-        type: array
-        items: float
-        length: 3
-    mutually_exclusive:
       - [orientation_xyzw, orientation_rpy_deg]
   cartesian_path_waypoint:
     type: object
@@ -242,7 +218,7 @@ schema_types:
             min_exclusive: 0.0
         length: 3
         allowed_when: {type: mesh}
-  relative_move_reference:
+  motion_target_reference:
     type: object
     additional_properties: false
     required: [type]
@@ -255,17 +231,6 @@ schema_types:
       pose:
         type: object
         additional_properties: true
-  relative_move:
-    type: object
-    additional_properties: false
-    required: [target_reference, offset]
-    properties:
-      target_reference:
-        schema_ref: "#/schema_types/relative_move_reference"
-      offset_reference:
-        schema_ref: "#/schema_types/relative_move_reference"
-      offset:
-        schema_ref: "#/schema_types/motion_pose_offset"
   per_joint_deceleration_limits:
     type: object
     additional_properties:
@@ -593,20 +558,50 @@ entries:
       - name: motion_type
         schema:
           type: enum
-          values: [joint_goal, pose_goal, relative_move, cartesian_path]
+          values: [joint, pose, cartesian]
         required: true
         enum_options:
-          - value: joint_goal
-          - value: pose_goal
-          - value: relative_move
-            profiles:
-              min_profile: v0.1
-            required_capabilities:
-              - context.pose.resolve_reference
-          - value: cartesian_path
+          - value: joint
+          - value: pose
+          - value: cartesian
             required_capabilities:
               - planning.motion.cartesian_path
         description: The type of motion to plan.
+      - name: target_mode
+        schema:
+          type: enum
+          values: [absolute, relative]
+        required: false
+        default: absolute
+        enum_options:
+          - value: absolute
+          - value: relative
+            profiles:
+              min_profile: v0.1
+        description: >-
+          Whether the typed target is absolute or resolved once, at kernel
+          admission, relative to the authority-selected start/reference state.
+      - name: planning_profile
+        schema:
+          type: enum
+          values: [first_feasible, balanced, quality_bounded]
+        required: false
+        default: first_feasible
+        enum_options:
+          - value: first_feasible
+            required_capabilities:
+              - planning.profile.first_feasible
+          - value: balanced
+            required_capabilities:
+              - planning.profile.balanced
+          - value: quality_bounded
+            required_capabilities:
+              - planning.profile.quality_bounded
+        description: >-
+          Planner-neutral candidate policy. first_feasible minimizes latency;
+          balanced uses bounded in-search quality improvement without spending
+          the remaining budget; quality_bounded spends the configured bound and
+          returns the best candidate found.
       - name: joint_goal_names
         schema:
           type: array
@@ -614,9 +609,10 @@ entries:
         required: false
         visible_when:
           param: motion_type
-          equals: joint_goal
+          equals: joint
         description: >-
-          Joint names for joint_goal motion type. Required when motion_type=joint_goal.
+          Joint names for joint motion. Values are absolute targets or relative
+          deltas according to target_mode.
       - name: joint_goal_positions_rad
         schema:
           type: array
@@ -624,48 +620,56 @@ entries:
         required: false
         visible_when:
           param: motion_type
-          equals: joint_goal
+          equals: joint
         description: >-
-          Joint positions in radians for joint_goal. Required when motion_type=joint_goal.
+          Joint positions or deltas in radians. Required for joint motion.
       - name: pose_goal
         schema_ref: "#/schema_types/motion_pose_goal"
         required: false
         visible_when:
           param: motion_type
-          equals: pose_goal
+          equals: pose
         ui_editor: pose_or_blackboard_field_selector
         blackboard_role: field_reader
         blackboard_value_type: pose
         description: >-
-          Target end-effector pose in base_frame for pose_goal motion type.
-          Required when motion_type=pose_goal. May be an inline pose or a
-          declared blackboard field_ref.
-      - name: relative_move
-        schema_ref: "#/schema_types/relative_move"
+          Absolute end-effector pose or relative pose offset according to
+          target_mode. Absolute poses require frame_id; relative offsets must
+          omit it. May be inline or a declared blackboard field_ref.
+      - name: target_reference
+        schema_ref: "#/schema_types/motion_target_reference"
         required: false
         profiles:
           min_profile: v0.1
         visible_when:
-          param: motion_type
-          equals: relative_move
-        ui_editor: relative_move
+          param: target_mode
+          equals: relative
+        ui_editor: motion_reference
         description: >-
-          Relative move goal for motion_type=relative_move. Structure:
-          {target_reference: {type: frame|object|robot_link|pose, id?: ..., pose?: inline_pose|field_ref},
-          offset_reference?: {type: frame|object|robot_link|pose, id?: ..., pose?: inline_pose|field_ref},
-          offset: {position_m: [...], orientation_xyzw|orientation_rpy_deg: [...]}}.
-          target_reference selects the target origin pose. offset_reference selects the axes in
-          which the xyz/rpy offset is expressed; if omitted, it defaults to target_reference.
-          Use `robot_link` for current TCP/link-relative moves, `frame` for arbitrary scene
-          frames, and `pose` for either an inline reference pose or a declared pose field_ref.
+          Required for relative pose/Cartesian motion and forbidden for joint
+          motion. Selects the relative target origin.
+      - name: offset_reference
+        schema_ref: "#/schema_types/motion_target_reference"
+        required: false
+        profiles:
+          min_profile: v0.1
+        visible_when:
+          param: target_mode
+          equals: relative
+        ui_editor: motion_reference
+        description: >-
+          Optional axes for relative pose/Cartesian offsets. Defaults to
+          target_reference and is forbidden for joint motion.
       - name: cartesian_path
         schema_ref: "#/schema_types/cartesian_path"
         required: false
         visible_when:
           param: motion_type
-          equals: cartesian_path
+          equals: cartesian
         description: >-
-          Portable single-TCP Cartesian path expressed in base_frame. The
+          Portable single-TCP Cartesian path. In absolute mode waypoints are in
+          base_frame; in relative mode each waypoint is an offset from the same
+          resolved target/reference basis. The
           complete waypoint sequence is authoritative; adapters may not reduce
           it to the final waypoint or silently select joint-space fallback.
       - name: base_frame
@@ -842,17 +846,42 @@ entries:
       - name: motion_type
         schema:
           type: enum
-          values: [joint_goal, pose_goal, relative_move]
+          values: [joint, pose, cartesian]
         required: true
         enum_options:
-          - value: joint_goal
-          - value: pose_goal
-          - value: relative_move
-            profiles:
-              min_profile: v0.2
+          - value: joint
+          - value: pose
+          - value: cartesian
             required_capabilities:
-              - context.pose.resolve_reference
+              - planning.motion.cartesian_path
         description: The type of motion to plan.
+      - name: target_mode
+        schema:
+          type: enum
+          values: [absolute, relative]
+        required: false
+        default: absolute
+        enum_options:
+          - value: absolute
+          - value: relative
+        description: Independent absolute/relative target interpretation.
+      - name: planning_profile
+        schema:
+          type: enum
+          values: [first_feasible, balanced, quality_bounded]
+        required: false
+        default: first_feasible
+        enum_options:
+          - value: first_feasible
+            required_capabilities:
+              - planning.profile.first_feasible
+          - value: balanced
+            required_capabilities:
+              - planning.profile.balanced
+          - value: quality_bounded
+            required_capabilities:
+              - planning.profile.quality_bounded
+        description: Planner-neutral candidate-selection policy.
       - name: joint_goal_names
         schema:
           type: array
@@ -860,9 +889,9 @@ entries:
         required: false
         visible_when:
           param: motion_type
-          equals: joint_goal
+          equals: joint
         description: >-
-          Joint names for joint_goal motion type. Required when motion_type=joint_goal.
+          Joint names for joint motion.
       - name: joint_goal_positions_rad
         schema:
           type: array
@@ -870,30 +899,44 @@ entries:
         required: false
         visible_when:
           param: motion_type
-          equals: joint_goal
+          equals: joint
         description: >-
-          Joint positions in radians for joint_goal. Required when motion_type=joint_goal.
+          Joint positions or relative deltas in radians.
       - name: pose_goal
         schema_ref: "#/schema_types/motion_pose_goal"
         required: false
         visible_when:
           param: motion_type
-          equals: pose_goal
+          equals: pose
         ui_editor: pose_or_blackboard_field_selector
         blackboard_role: field_reader
         blackboard_value_type: pose
         description: >-
-          Target end-effector pose in base_frame for pose_goal motion type.
-          May be an inline pose or a declared blackboard field_ref.
-      - name: relative_move
-        schema_ref: "#/schema_types/relative_move"
+          Absolute pose or relative pose offset. May be inline or a declared
+          blackboard field_ref.
+      - name: target_reference
+        schema_ref: "#/schema_types/motion_target_reference"
+        required: false
+        visible_when:
+          param: target_mode
+          equals: relative
+        ui_editor: motion_reference
+        description: Target origin for relative pose/Cartesian motion.
+      - name: offset_reference
+        schema_ref: "#/schema_types/motion_target_reference"
+        required: false
+        visible_when:
+          param: target_mode
+          equals: relative
+        ui_editor: motion_reference
+        description: Optional axes for the relative offsets.
+      - name: cartesian_path
+        schema_ref: "#/schema_types/cartesian_path"
         required: false
         visible_when:
           param: motion_type
-          equals: relative_move
-        ui_editor: relative_move
-        description: >-
-          Relative move goal (see move_manipulator_action for structure).
+          equals: cartesian
+        description: Portable single-TCP Cartesian path or relative offset path.
       - name: policy_id
         schema:
           type: string
@@ -1126,17 +1169,42 @@ entries:
       - name: motion_type
         schema:
           type: enum
-          values: [joint_goal, pose_goal, relative_move]
+          values: [joint, pose, cartesian]
         required: true
         enum_options:
-          - value: joint_goal
-          - value: pose_goal
-          - value: relative_move
-            profiles:
-              min_profile: v0.2
+          - value: joint
+          - value: pose
+          - value: cartesian
             required_capabilities:
-              - context.pose.resolve_reference
-        description: The type of motion to plan (default pose_goal for contact moves).
+              - planning.motion.cartesian_path
+        description: The type of motion to plan (default pose for contact moves).
+      - name: target_mode
+        schema:
+          type: enum
+          values: [absolute, relative]
+        required: false
+        default: absolute
+        enum_options:
+          - value: absolute
+          - value: relative
+        description: Independent absolute/relative target interpretation.
+      - name: planning_profile
+        schema:
+          type: enum
+          values: [first_feasible, balanced, quality_bounded]
+        required: false
+        default: first_feasible
+        enum_options:
+          - value: first_feasible
+            required_capabilities:
+              - planning.profile.first_feasible
+          - value: balanced
+            required_capabilities:
+              - planning.profile.balanced
+          - value: quality_bounded
+            required_capabilities:
+              - planning.profile.quality_bounded
+        description: Planner-neutral candidate-selection policy.
       - name: joint_goal_names
         schema:
           type: array
@@ -1144,8 +1212,8 @@ entries:
         required: false
         visible_when:
           param: motion_type
-          equals: joint_goal
-        description: Joint names when motion_type=joint_goal.
+          equals: joint
+        description: Joint names when motion_type=joint.
       - name: joint_goal_positions_rad
         schema:
           type: array
@@ -1153,26 +1221,41 @@ entries:
         required: false
         visible_when:
           param: motion_type
-          equals: joint_goal
-        description: Joint positions in radians when motion_type=joint_goal.
+          equals: joint
+        description: Joint positions or relative deltas in radians.
       - name: pose_goal
         schema_ref: "#/schema_types/motion_pose_goal"
         required: false
         visible_when:
           param: motion_type
-          equals: pose_goal
+          equals: pose
         ui_editor: pose_or_blackboard_field_selector
         blackboard_role: field_reader
         blackboard_value_type: pose
-        description: Target probe-search end pose for motion_type=pose_goal.
-      - name: relative_move
-        schema_ref: "#/schema_types/relative_move"
+        description: Absolute probe pose or relative probe offset.
+      - name: target_reference
+        schema_ref: "#/schema_types/motion_target_reference"
+        required: false
+        visible_when:
+          param: target_mode
+          equals: relative
+        ui_editor: motion_reference
+        description: Target origin for relative pose/Cartesian motion.
+      - name: offset_reference
+        schema_ref: "#/schema_types/motion_target_reference"
+        required: false
+        visible_when:
+          param: target_mode
+          equals: relative
+        ui_editor: motion_reference
+        description: Optional axes for the relative offsets.
+      - name: cartesian_path
+        schema_ref: "#/schema_types/cartesian_path"
         required: false
         visible_when:
           param: motion_type
-          equals: relative_move
-        ui_editor: relative_move
-        description: Relative move goal (see move_manipulator_action).
+          equals: cartesian
+        description: Portable single-TCP Cartesian path or relative offset path.
       - name: policy_id
         schema:
           type: string
@@ -3095,6 +3178,31 @@ entries:
       emits_events: []
       consumes_events: []
 
+  - id: pick_plan_subtree
+    name: Pick Plan Subtree
+    category: motion
+    description: >-
+      Composer authoring template. Inserts a visible, editable pick-planning
+      subtree containing Plan Pick Sequence, approach, Cartesian descend,
+      gripper-close, attach, and Cartesian retreat nodes. Requires one active
+      semantic gripper and a selected detached scene object. This macro never
+      enters a saved or running behavior tree.
+    tags: [planning, pick, authoring, macro]
+    profiles:
+      min_profile: v0.1
+    kind: authoring_macro
+    children:
+      min: 0
+      max: 0
+    parameters: []
+    required_capabilities:
+      - planning.motion.pose_goal
+      - planning.motion.cartesian_path
+      - planning.profile.first_feasible
+      - tool.gripper.command
+      - scene.edit.attach_detach
+    runners: {}
+
   - id: plan_pick_sequence
     name: Plan Pick Sequence
     category: motion
@@ -3216,9 +3324,9 @@ entries:
           planner-base RPY offsets and are ignored when force_vertical_pick is
           true.
       - name: pick_offset_reference
-        schema_ref: "#/schema_types/relative_move_reference"
+        schema_ref: "#/schema_types/motion_target_reference"
         required: false
-        ui_editor: relative_move_reference
+        ui_editor: motion_reference
         default:
           type: frame
           id: ""
@@ -3243,9 +3351,9 @@ entries:
           RPY modifiers remain planner-base RPY offsets and are ignored when
           force_vertical_pick is true.
       - name: approach_offset_reference
-        schema_ref: "#/schema_types/relative_move_reference"
+        schema_ref: "#/schema_types/motion_target_reference"
         required: false
-        ui_editor: relative_move_reference
+        ui_editor: motion_reference
         default:
           type: frame
           id: ""
@@ -3366,8 +3474,8 @@ entries:
         default: ""
         description: >-
           Optional move_manipulator_action instance name to receive the generated
-          approach pose_goal for operator inspection. Best effort; the linked
-          node should be authored with motion_type=pose_goal.
+          approach pose_goal for operator inspection and execution. Best effort;
+          the linked node must be authored with motion_type=pose.
       - name: pick_move_node_name
         schema:
           type: string
@@ -3375,8 +3483,8 @@ entries:
         default: ""
         description: >-
           Optional move_manipulator_action instance name to receive the generated
-          pick pose_goal for operator inspection. Best effort; the linked node
-          should be authored with motion_type=pose_goal.
+          approach-to-pick Cartesian path for operator inspection and execution.
+          Best effort; the linked node must use motion_type=cartesian.
       - name: retreat_move_node_name
         schema:
           type: string
@@ -3384,10 +3492,11 @@ entries:
         default: ""
         description: >-
           Optional move_manipulator_action instance name to receive the generated
-          retreat pose_goal for operator inspection. Best effort; the linked
-          node should be authored with motion_type=pose_goal.
+          pick-to-retreat Cartesian path for operator inspection and execution.
+          Best effort; the linked node must use motion_type=cartesian.
     required_capabilities:
       - planning.motion.pose_goal
+      - planning.profile.first_feasible
       - planning.trajectory.time_parameterized
       - context.state.current
       - context.validation.trajectory

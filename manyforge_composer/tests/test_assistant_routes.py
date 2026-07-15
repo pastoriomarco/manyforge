@@ -3315,6 +3315,9 @@ def _deterministic_assistant_deployment() -> Deployment:
                     "capability_keys": [
                         "planning.motion.joint_goal",
                         "planning.motion.pose_goal",
+                        "planning.profile.first_feasible",
+                        "planning.profile.balanced",
+                        "planning.profile.quality_bounded",
                         "planning.trajectory.time_parameterized",
                     ],
                     "config": {},
@@ -3397,6 +3400,9 @@ def _assistant_mode_deployment(
                     "capability_keys": [
                         "planning.motion.joint_goal",
                         "planning.motion.pose_goal",
+                        "planning.profile.first_feasible",
+                        "planning.profile.balanced",
+                        "planning.profile.quality_bounded",
                         "planning.trajectory.time_parameterized",
                     ],
                     "config": {},
@@ -3653,7 +3659,7 @@ def _write_minimal_program(tmp_path: Path) -> Path:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "minimal",
-                "catalog_version": "0.2.0",
+                "catalog_version": "0.3.0",
                 "description": "minimal program",
                 "robot": {
                     "robot_id": "ur5",
@@ -3692,7 +3698,7 @@ def _write_pose_target_program(tmp_path: Path) -> Path:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.1",
                 "name": "pose_target",
-                "catalog_version": "0.2.0",
+                "catalog_version": "0.3.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",

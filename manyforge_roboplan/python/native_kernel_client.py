@@ -308,6 +308,17 @@ def _normalize_pose_dict(pose: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
     return pose
 
 
+def _normalize_reference_dict(
+    reference: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if reference is None:
+        return None
+    normalized = dict(reference)
+    if normalized.get("type") == "pose":
+        normalized["pose"] = _normalize_pose_dict(normalized.get("pose"))
+    return normalized
+
+
 class NativeKernelClient(KernelClient):
     """KernelClient backed by an all-C++ NativeKernelBundle.
 
@@ -351,27 +362,6 @@ class NativeKernelClient(KernelClient):
             attach_metadata(self.robot_model_authority_metadata)
 
     def _request_to_native_dict(self, request: ExecuteRequest) -> dict[str, Any]:
-        relative_move = request.relative_move
-        if relative_move is not None:
-            relative_move = dict(relative_move)
-            target_reference = relative_move.get("target_reference")
-            if target_reference is not None:
-                target_reference = dict(target_reference)
-                if target_reference.get("type") == "pose":
-                    target_reference["pose"] = _normalize_pose_dict(
-                        target_reference.get("pose")
-                    )
-                relative_move["target_reference"] = target_reference
-            offset_reference = relative_move.get("offset_reference")
-            if offset_reference is not None:
-                offset_reference = dict(offset_reference)
-                if offset_reference.get("type") == "pose":
-                    offset_reference["pose"] = _normalize_pose_dict(
-                        offset_reference.get("pose")
-                    )
-                relative_move["offset_reference"] = offset_reference
-            relative_move["offset"] = _normalize_pose_dict(relative_move.get("offset"))
-
         cartesian_path = request.cartesian_path
         if cartesian_path is not None:
             cartesian_path = dict(cartesian_path)
@@ -387,6 +377,8 @@ class NativeKernelClient(KernelClient):
             "base_frame": request.base_frame,
             "tcp_frame": request.tcp_frame,
             "motion_type": request.motion_type,
+            "target_mode": request.target_mode,
+            "planning_profile": request.planning_profile,
             "velocity_scale": request.velocity_scale,
             "acceleration_scale": request.acceleration_scale,
             "planning_timeout_s": request.planning_timeout_s,
@@ -396,6 +388,12 @@ class NativeKernelClient(KernelClient):
             "rotation_tol_rad": request.rotation_tol_rad,
             "cache_mode": request.cache_mode,
         }
+        target_reference = _normalize_reference_dict(request.target_reference)
+        if target_reference is not None:
+            req_dict["target_reference"] = target_reference
+        offset_reference = _normalize_reference_dict(request.offset_reference)
+        if offset_reference is not None:
+            req_dict["offset_reference"] = offset_reference
 
         if request.max_tcp_linear_speed_mps is not None:
             req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
@@ -406,14 +404,12 @@ class NativeKernelClient(KernelClient):
         if dyn_limits is not None:
             req_dict["per_joint_dynamics_limits"] = dyn_limits
 
-        if request.motion_type == "joint_goal":
+        if request.motion_type == "joint":
             req_dict["joint_goal_names"] = request.joint_goal_names
             req_dict["joint_goal_positions_rad"] = request.joint_goal_positions_rad
-        elif request.motion_type == "pose_goal":
+        elif request.motion_type == "pose":
             req_dict["pose_goal"] = request.pose_goal
-        elif request.motion_type == "relative_move":
-            req_dict["relative_move"] = relative_move
-        elif request.motion_type == "cartesian_path":
+        elif request.motion_type == "cartesian":
             req_dict["cartesian_path"] = cartesian_path
         return req_dict
 

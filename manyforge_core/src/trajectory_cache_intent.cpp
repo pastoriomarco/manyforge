@@ -131,15 +131,6 @@ void mix_motion(IntentIdentityBuilder& identity, const MotionSpecDTO& motion) {
           mix_pose(identity, value.goal);
         } else if constexpr (std::is_same_v<T, NamedTargetDTO>) {
           identity.mix("named_target").mix(value.name);
-        } else if constexpr (std::is_same_v<T, RelativeMoveDTO>) {
-          identity.mix("relative_move");
-          mix_reference(identity, value.target_reference);
-          identity.mix(
-              static_cast<std::int64_t>(value.offset_reference.has_value()));
-          if (value.offset_reference.has_value()) {
-            mix_reference(identity, *value.offset_reference);
-          }
-          mix_pose(identity, value.offset);
         } else if constexpr (std::is_same_v<T, CartesianPathDTO>) {
           identity.mix("cartesian_path")
               .mix(static_cast<std::uint64_t>(value.waypoints.size()));
@@ -164,12 +155,23 @@ void mix_motion(IntentIdentityBuilder& identity, const MotionSpecDTO& motion) {
 std::string trajectory_cache_intent_identity(
     const ExecuteRequestDTO& request) {
   IntentIdentityBuilder identity;
-  identity.mix("manyforge_core/trajectory_cache_intent/v2")
+  identity.mix("manyforge_core/trajectory_cache_intent/v3")
       .mix(request.robot_id)
       .mix(request.group_id)
       .mix(request.base_frame)
       .mix(request.tcp_frame)
-      .mix(request.contact_policy_id);
+      .mix(request.contact_policy_id)
+      .mix(static_cast<std::int64_t>(request.target_mode))
+      .mix(static_cast<std::int64_t>(request.planning_profile))
+      .mix(static_cast<std::int64_t>(request.target_reference.has_value()));
+  if (request.target_reference.has_value()) {
+    mix_reference(identity, *request.target_reference);
+  }
+  identity.mix(
+      static_cast<std::int64_t>(request.offset_reference.has_value()));
+  if (request.offset_reference.has_value()) {
+    mix_reference(identity, *request.offset_reference);
+  }
   mix_motion(identity, request.motion);
   identity.mix(request.tolerances.joint_position_tol_rad)
       .mix(request.tolerances.translation_tol_m)

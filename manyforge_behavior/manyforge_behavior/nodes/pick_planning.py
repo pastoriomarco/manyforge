@@ -1122,12 +1122,20 @@ class PlanPickSequenceNode(
                     "orientation_xyzw": list(approach_pose["orientation_xyzw"]),
                     "orientation_rpy_deg": list(approach_pose["orientation_rpy_deg"]),
                 }
+                pick_cartesian_path = self._linked_cartesian_path(
+                    self._pick_move_node_name,
+                    [approach_pose, pick_pose],
+                )
+                retreat_cartesian_path = self._linked_cartesian_path(
+                    self._retreat_move_node_name,
+                    [pick_pose, retreat_pose],
+                )
                 candidate_stage_report = self._new_candidate_stage_report(
                     selected_object_id=selected_object_id,
                     candidate_index=attempted_candidates,
                     approach_pose=approach_pose,
-                    pick_pose=pick_pose,
-                    retreat_pose=retreat_pose,
+                    pick_cartesian_path=pick_cartesian_path,
+                    retreat_cartesian_path=retreat_cartesian_path,
                 )
                 candidate_stage_reports.append(candidate_stage_report)
                 candidate_response = self._make_candidate_response(
@@ -1145,6 +1153,8 @@ class PlanPickSequenceNode(
                     ),
                     pick_offset_reference=pick_offset_reference,
                     approach_offset_reference=approach_offset_reference,
+                    pick_cartesian_path=pick_cartesian_path,
+                    retreat_cartesian_path=retreat_cartesian_path,
                     candidate_stage_report=candidate_stage_report,
                     candidate_stage_reports=candidate_stage_reports,
                 )
@@ -1210,8 +1220,8 @@ class PlanPickSequenceNode(
 
                 try:
                     pick_preview = kernel.preview_motion(
-                        self._make_pose_goal_request(
-                            "pick_descend_preview", pick_pose
+                        self._make_cartesian_path_request(
+                            "pick_descend_preview", pick_cartesian_path
                         ),
                         start_state=approach_preview.final_state,
                     )
@@ -1251,8 +1261,8 @@ class PlanPickSequenceNode(
 
                 try:
                     exit_preview = kernel.preview_motion(
-                        self._make_pose_goal_request(
-                            "pick_exit_preview", approach_pose
+                        self._make_cartesian_path_request(
+                            "pick_exit_preview", retreat_cartesian_path
                         ),
                         start_state=pick_preview.final_state,
                     )
@@ -1374,8 +1384,8 @@ class PlanPickSequenceNode(
         selected_object_id: str,
         candidate_index: int,
         approach_pose: dict[str, Any],
-        pick_pose: dict[str, Any],
-        retreat_pose: dict[str, Any],
+        pick_cartesian_path: dict[str, Any],
+        retreat_cartesian_path: dict[str, Any],
     ) -> dict[str, Any]:
         return {
             "candidate_index": candidate_index,
@@ -1385,10 +1395,21 @@ class PlanPickSequenceNode(
                 self._initial_stage_report(
                     "approach",
                     "pick_approach_preview",
-                    approach_pose,
+                    motion_type="pose",
+                    pose_goal=self._pose_output(approach_pose),
                 ),
-                self._initial_stage_report("pick", "pick_descend_preview", pick_pose),
-                self._initial_stage_report("retreat", "pick_exit_preview", retreat_pose),
+                self._initial_stage_report(
+                    "pick",
+                    "pick_descend_preview",
+                    motion_type="cartesian",
+                    cartesian_path=pick_cartesian_path,
+                ),
+                self._initial_stage_report(
+                    "retreat",
+                    "pick_exit_preview",
+                    motion_type="cartesian",
+                    cartesian_path=retreat_cartesian_path,
+                ),
             ],
         }
 
@@ -1396,17 +1417,25 @@ class PlanPickSequenceNode(
         self,
         stage: str,
         move_id: str,
-        pose: dict[str, Any],
+        *,
+        motion_type: str,
+        pose_goal: dict[str, Any] | None = None,
+        cartesian_path: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return {
+        report = {
             "stage": stage,
             "move_id": move_id,
-            "pose_goal": self._pose_output(pose),
+            "motion_type": motion_type,
             "status": "not_run",
             "kinematic_ik": "not_run",
             "collision_check": "not_run",
             "failures": [],
         }
+        if pose_goal is not None:
+            report["pose_goal"] = copy.deepcopy(pose_goal)
+        if cartesian_path is not None:
+            report["cartesian_path"] = copy.deepcopy(cartesian_path)
+        return report
 
     @staticmethod
     def _stage_report(report: dict[str, Any], stage: str) -> dict[str, Any]:
@@ -1473,6 +1502,8 @@ class PlanPickSequenceNode(
         min_tcp_z_applied: bool,
         pick_offset_reference: dict[str, Any],
         approach_offset_reference: dict[str, Any],
+        pick_cartesian_path: dict[str, Any],
+        retreat_cartesian_path: dict[str, Any],
         candidate_stage_report: Optional[dict[str, Any]] = None,
         candidate_stage_reports: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
@@ -1481,6 +1512,8 @@ class PlanPickSequenceNode(
             "approach_pose": self._pose_output(approach_pose),
             "pick_pose": self._pose_output(pick_pose),
             "retreat_pose": self._pose_output(retreat_pose),
+            "pick_cartesian_path": copy.deepcopy(pick_cartesian_path),
+            "retreat_cartesian_path": copy.deepcopy(retreat_cartesian_path),
             "attempted_candidates": attempted_candidates,
             "planning_score": planning_score,
             "outcome": outcome,
@@ -1518,7 +1551,7 @@ class PlanPickSequenceNode(
             move_id=move_id,
             base_frame=self._base_frame,
             tcp_frame=self._tcp_frame,
-            motion_type="pose_goal",
+            motion_type="pose",
             pose_goal={
                 "frame_id": self._base_frame,
                 "position_m": list(pose["position_m"]),
@@ -1534,6 +1567,62 @@ class PlanPickSequenceNode(
             action_span=self._child_action_span(move_id),
             contact_policy_id=self._contact_policy_id,
         )
+
+    def _make_cartesian_path_request(
+        self,
+        move_id: str,
+        cartesian_path: dict[str, Any],
+    ) -> ExecuteRequest:
+        return ExecuteRequest(
+            robot_id=self._robot_id,
+            group_id=self._group_id,
+            move_id=move_id,
+            base_frame=self._base_frame,
+            tcp_frame=self._tcp_frame,
+            motion_type="cartesian",
+            cartesian_path=copy.deepcopy(cartesian_path),
+            velocity_scale=self._velocity_scale,
+            acceleration_scale=self._acceleration_scale,
+            max_tcp_linear_speed_mps=self._max_tcp_linear_speed_mps,
+            planning_timeout_s=self._planning_timeout_s,
+            execution_timeout_s=0.0,
+            cache_mode="disable",
+            program_run_id=read_program_run_id(self._bb),
+            action_span=self._child_action_span(move_id),
+            contact_policy_id=self._contact_policy_id,
+        )
+
+    @staticmethod
+    def _cartesian_waypoint(pose: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "position_m": list(pose["position_m"]),
+            "orientation_xyzw": list(pose["orientation_xyzw"]),
+        }
+
+    def _linked_cartesian_path(
+        self,
+        linked_node_name: str,
+        waypoints: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Build the exact path shared by preview and linked execution."""
+        path: dict[str, Any] = {}
+        if linked_node_name:
+            for behaviour in self._iter_tree_behaviours():
+                if getattr(behaviour, "name", "") != linked_node_name:
+                    continue
+                params = getattr(behaviour, "_params", None)
+                if (
+                    not isinstance(params, dict)
+                    or params.get("motion_type") != "cartesian"
+                ):
+                    continue
+                configured_path = params.get("cartesian_path")
+                if isinstance(configured_path, dict):
+                    path = copy.deepcopy(configured_path)
+                break
+        path["waypoints"] = [self._cartesian_waypoint(pose) for pose in waypoints]
+        path.setdefault("fallback_policy", "fail_closed")
+        return path
 
     def _write_candidate_response(self, response: dict[str, Any]) -> None:
         self._populate_linked_move_nodes(response)
@@ -1571,32 +1660,77 @@ class PlanPickSequenceNode(
         self._write_namespace_output(copy.deepcopy(response), status="failed")
 
     def _populate_linked_move_nodes(self, response: dict[str, Any]) -> None:
-        name_to_pose = {
-            str(self._approach_move_node_name or ""): response.get("approach_pose"),
-            str(self._pick_move_node_name or ""): response.get("pick_pose"),
-            str(self._retreat_move_node_name or ""): response.get("retreat_pose"),
+        approach_pose = response.get("approach_pose")
+        pick_pose = response.get("pick_pose")
+        retreat_pose = response.get("retreat_pose")
+        pick_cartesian_path = response.get("pick_cartesian_path")
+        retreat_cartesian_path = response.get("retreat_cartesian_path")
+        linked_specs = {
+            str(self._approach_move_node_name or ""): {
+                "motion_type": "pose",
+                "pose": approach_pose,
+            },
+            str(self._pick_move_node_name or ""): {
+                "motion_type": "cartesian",
+                "waypoints": [approach_pose, pick_pose],
+                "cartesian_path": pick_cartesian_path,
+            },
+            str(self._retreat_move_node_name or ""): {
+                "motion_type": "cartesian",
+                "waypoints": [pick_pose, retreat_pose],
+                "cartesian_path": retreat_cartesian_path,
+            },
         }
-        name_to_pose = {
-            name: pose
-            for name, pose in name_to_pose.items()
-            if name and isinstance(pose, dict)
+        linked_specs = {
+            name: spec
+            for name, spec in linked_specs.items()
+            if name
+            and (
+                (
+                    spec["motion_type"] == "pose"
+                    and isinstance(spec.get("pose"), dict)
+                )
+                or (
+                    spec["motion_type"] == "cartesian"
+                    and len(spec.get("waypoints", [])) == 2
+                    and all(
+                        isinstance(waypoint, dict)
+                        for waypoint in spec["waypoints"]
+                    )
+                )
+            )
         }
-        if not name_to_pose:
+        if not linked_specs:
             return
         for behaviour in self._iter_tree_behaviours():
-            pose = name_to_pose.get(getattr(behaviour, "name", ""))
-            if pose is None:
+            spec = linked_specs.get(getattr(behaviour, "name", ""))
+            if spec is None:
                 continue
             params = getattr(behaviour, "_params", None)
             if not isinstance(params, dict):
                 continue
-            if params.get("motion_type") != "pose_goal":
+            motion_type = str(spec["motion_type"])
+            if params.get("motion_type") != motion_type:
                 continue
-            params["pose_goal"] = {
-                "frame_id": pose["frame_id"],
-                "position_m": list(pose["position_m"]),
-                "orientation_xyzw": list(pose["orientation_xyzw"]),
-            }
+            params["target_mode"] = "absolute"
+            params.pop("target_reference", None)
+            params.pop("offset_reference", None)
+            if motion_type == "pose":
+                pose = spec["pose"]
+                params.pop("cartesian_path", None)
+                params["pose_goal"] = {
+                    "frame_id": pose["frame_id"],
+                    "position_m": list(pose["position_m"]),
+                    "orientation_xyzw": list(pose["orientation_xyzw"]),
+                }
+            else:
+                params.pop("pose_goal", None)
+                cartesian_path = spec.get("cartesian_path")
+                if not isinstance(cartesian_path, dict):
+                    cartesian_path = self._linked_cartesian_path(
+                        getattr(behaviour, "name", ""), spec["waypoints"]
+                    )
+                params["cartesian_path"] = copy.deepcopy(cartesian_path)
             if self._contact_policy_id:
                 params["contact_policy_id"] = self._contact_policy_id
             params["parent_node_attempt_id"] = self._current_action_span(

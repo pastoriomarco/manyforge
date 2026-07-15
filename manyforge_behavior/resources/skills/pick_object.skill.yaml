@@ -72,27 +72,27 @@ body:
       name: approach
       params:
         move_id: "pick_approach_${param:object_id}"
-        motion_type: relative_move
-        relative_move:
-          target_reference:
-            type: object
-            id: "${param:object_id}"
-          offset:
-            position_m: [0.0, 0.0, "${param:approach_height_m}"]
-            orientation_rpy_deg: "${param:tool_orientation_rpy_deg}"
+        motion_type: pose
+        target_mode: relative
+        target_reference:
+          type: object
+          id: "${param:object_id}"
+        pose_goal:
+          position_m: [0.0, 0.0, "${param:approach_height_m}"]
+          orientation_rpy_deg: "${param:tool_orientation_rpy_deg}"
         velocity_scale: "${param:velocity_scale}"
     - id: move_manipulator_action
       name: descend
       params:
         move_id: "pick_descend_${param:object_id}"
-        motion_type: relative_move
-        relative_move:
-          target_reference:
-            type: object
-            id: "${param:object_id}"
-          offset:
-            position_m: [0.0, 0.0, "${param:grasp_offset_z_m}"]
-            orientation_rpy_deg: "${param:tool_orientation_rpy_deg}"
+        motion_type: pose
+        target_mode: relative
+        target_reference:
+          type: object
+          id: "${param:object_id}"
+        pose_goal:
+          position_m: [0.0, 0.0, "${param:grasp_offset_z_m}"]
+          orientation_rpy_deg: "${param:tool_orientation_rpy_deg}"
         velocity_scale: "${param:velocity_scale}"
     - id: set_gripper_state
       name: close_gripper
@@ -109,17 +109,17 @@ body:
       name: retreat
       params:
         move_id: "pick_retreat_${param:object_id}"
-        motion_type: relative_move
-        relative_move:
-          target_reference:
-            type: robot_link
-            id: "${param:tcp_frame}"
-          offset_reference:
-            type: frame
-            id: base_link
-          offset:
-            position_m: [0.0, 0.0, "${param:approach_height_m}"]
-            orientation_rpy_deg: "${param:tool_orientation_rpy_deg}"
+        motion_type: pose
+        target_mode: relative
+        target_reference:
+          type: robot_link
+          id: "${param:tcp_frame}"
+        offset_reference:
+          type: frame
+          id: base_link
+        pose_goal:
+          position_m: [0.0, 0.0, "${param:approach_height_m}"]
+          orientation_rpy_deg: "${param:tool_orientation_rpy_deg}"
         velocity_scale: "${param:velocity_scale}"
     - id: reset_trajectories
       name: invalidate_after_pick

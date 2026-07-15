@@ -5,7 +5,7 @@ description: >-
   Isaac-compatible Lite6 pick-and-place program. It uses the same static scene
   and behavior sequence as the native Lite6 pick-and-place example while
   targeting the ros2_control / Isaac execution deployment.
-catalog_version: "0.2.0"
+catalog_version: "0.3.0"
 robot:
   robot_id: lite6
   group_id: lite6
@@ -60,7 +60,7 @@ tree:
     name: move_to_rest
     params:
       move_id: lite6_rest
-      motion_type: joint_goal
+      motion_type: joint
       joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
       joint_goal_positions_rad: [0.0, -0.785, 0.785, 0.0, 1.57, 0.0]
       velocity_scale: ${param:velocity_scale}
@@ -70,7 +70,7 @@ tree:
     name: scan_left
     params:
       move_id: lite6_scan_left
-      motion_type: joint_goal
+      motion_type: joint
       joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
       joint_goal_positions_rad: [-0.175, -0.419, 1.378, 0.349, 1.535, -0.977]
       velocity_scale: ${param:velocity_scale}
@@ -80,7 +80,7 @@ tree:
     name: scan_right
     params:
       move_id: lite6_scan_right
-      motion_type: joint_goal
+      motion_type: joint
       joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
       joint_goal_positions_rad: [0.733, -0.297, 1.378, -0.576, 1.692, 1.291]
       velocity_scale: ${param:velocity_scale}
@@ -90,17 +90,17 @@ tree:
     name: move_to_pick_approach
     params:
       move_id: lite6_pick_approach
-      motion_type: relative_move
-      relative_move:
-        target_reference:
-          type: object
-          id: graspable
-        offset_reference:
-          type: frame
-          id: link_base
-        offset:
-          position_m: [0.0, 0.0, 0.08]
-          orientation_rpy_deg: [180.0, 0.0, 0.0]
+      motion_type: pose
+      target_mode: relative
+      target_reference:
+        type: object
+        id: graspable
+      offset_reference:
+        type: frame
+        id: link_base
+      pose_goal:
+        position_m: [0.0, 0.0, 0.08]
+        orientation_rpy_deg: [180.0, 0.0, 0.0]
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
@@ -108,17 +108,17 @@ tree:
     name: move_to_pick
     params:
       move_id: lite6_pick_down
-      motion_type: relative_move
-      relative_move:
-        target_reference:
-          type: object
-          id: graspable
-        offset_reference:
-          type: frame
-          id: link_base
-        offset:
-          position_m: [0.0, 0.0, 0.035]
-          orientation_rpy_deg: [180.0, 0.0, 0.0]
+      motion_type: pose
+      target_mode: relative
+      target_reference:
+        type: object
+        id: graspable
+      offset_reference:
+        type: frame
+        id: link_base
+      pose_goal:
+        position_m: [0.0, 0.0, 0.035]
+        orientation_rpy_deg: [180.0, 0.0, 0.0]
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
@@ -140,14 +140,14 @@ tree:
     name: pick_retreat
     params:
       move_id: lite6_pick_retreat
-      motion_type: relative_move
-      relative_move:
-        target_reference:
-          type: robot_link
-          id: link_tcp
-        offset:
-          position_m: [0.0, 0.0, -0.08]
-          orientation_rpy_deg: [0.0, 0.0, 0.0]
+      motion_type: pose
+      target_mode: relative
+      target_reference:
+        type: robot_link
+        id: link_tcp
+      pose_goal:
+        position_m: [0.0, 0.0, -0.08]
+        orientation_rpy_deg: [0.0, 0.0, 0.0]
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
@@ -157,7 +157,7 @@ tree:
     name: move_to_drop_approach
     params:
       move_id: lite6_drop_approach
-      motion_type: pose_goal
+      motion_type: pose
       pose_goal:
         frame_id: link_base
         position_m: [0.16, 0.08, 0.20]
@@ -169,7 +169,7 @@ tree:
     name: move_to_drop
     params:
       move_id: lite6_drop_down
-      motion_type: pose_goal
+      motion_type: pose
       pose_goal:
         frame_id: link_base
         position_m: [0.16, 0.08, 0.17]
@@ -194,7 +194,7 @@ tree:
     name: drop_retreat
     params:
       move_id: lite6_drop_retreat
-      motion_type: pose_goal
+      motion_type: pose
       pose_goal:
         frame_id: link_base
         position_m: [0.16, 0.08, 0.22]
@@ -208,7 +208,7 @@ tree:
     name: return_rest
     params:
       move_id: lite6_return_rest
-      motion_type: joint_goal
+      motion_type: joint
       joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
       joint_goal_positions_rad: [0.0, -0.785, 0.785, 0.0, 1.57, 0.0]
       velocity_scale: ${param:velocity_scale}

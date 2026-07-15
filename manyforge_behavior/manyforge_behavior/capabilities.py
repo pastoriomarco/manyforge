@@ -10,6 +10,9 @@ CAPABILITY_REGISTRY: frozenset[str] = frozenset({
     "planning.motion.pose_goal",
     "planning.motion.cartesian_path",
     "planning.motion.named_target",
+    "planning.profile.first_feasible",
+    "planning.profile.balanced",
+    "planning.profile.quality_bounded",
     "planning.trajectory.time_parameterized",
     # Planning context
     "context.state.current",
@@ -98,6 +101,9 @@ _PLANNING_ROBOPLAN_CAPABILITY_KEYS = frozenset({
     "planning.motion.joint_goal",
     "planning.motion.pose_goal",
     "planning.motion.cartesian_path",
+    "planning.profile.first_feasible",
+    "planning.profile.balanced",
+    "planning.profile.quality_bounded",
     "planning.trajectory.time_parameterized",
 })
 
@@ -175,6 +181,9 @@ V0_0_REQUIRED_KEYS: frozenset[str] = frozenset({
     # Planning
     "planning.motion.joint_goal",
     "planning.motion.pose_goal",
+    "planning.profile.first_feasible",
+    "planning.profile.balanced",
+    "planning.profile.quality_bounded",
     "planning.trajectory.time_parameterized",
     # Context
     "context.state.current",

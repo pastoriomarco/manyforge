@@ -46,7 +46,7 @@ export type MoveToTarget = CartesianMoveTarget | JointMoveTarget;
 export interface StoredPoseTarget {
   /** Move node name (uniquely identifies it within the program tree). */
   nodeName: string;
-  motionType: 'pose_goal' | 'joint_goal';
+  motionType: 'pose' | 'joint';
   params: Record<string, unknown>;
 }
 
@@ -217,9 +217,9 @@ function resolveStoredPoseTarget(
   const pose = storedPoses.find((p) => p.nodeName === moveTo.poseNodeName);
   if (pose === undefined) return null;
 
-  if (pose.motionType === 'joint_goal') {
+  if (pose.motionType === 'joint') {
     // Program YAML stores joint_goal as flat sibling keys, not nested:
-    //   motion_type: joint_goal
+    //   motion_type: joint
     //   joint_goal_names: [...]
     //   joint_goal_positions_rad: [...]
     const jointNames = pose.params['joint_goal_names'];

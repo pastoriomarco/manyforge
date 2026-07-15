@@ -340,7 +340,7 @@ def _program_with_move_tcp(tcp_value=None, *, parameters=None) -> dict:
     ``${param:...}`` reference)."""
     move_params = {
         "move_id": "pick_approach",
-        "motion_type": "joint_goal",
+        "motion_type": "joint",
         "joint_goal_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
         "joint_goal_positions_rad": [0.2, -1.2, 1.0, -1.5, -1.3, 0.4],
         "velocity_scale": 0.5,
@@ -353,7 +353,7 @@ def _program_with_move_tcp(tcp_value=None, *, parameters=None) -> dict:
         "api_version": "manyforge.program.v0",
         "program_profile": "v0.0",
         "name": "tcp_cap_test",
-        "catalog_version": "0.2.0",
+        "catalog_version": "0.3.0",
         "robot": {
             "robot_id": "ur5",
             "group_id": "arm",
@@ -382,7 +382,7 @@ def _minimal_program(**overrides) -> dict:
         "api_version": "manyforge.program.v0",
         "program_profile": "v0.0",
         "name": "test_program",
-        "catalog_version": "0.2.0",
+        "catalog_version": "0.3.0",
         "robot": {
             "robot_id": "ur5",
             "group_id": "arm",
@@ -2608,6 +2608,9 @@ class TestDeploymentLoading:
         data["adapters"]["planning"]["capability_keys"] = [
             "planning.motion.joint_goal",
             "planning.motion.pose_goal",
+            "planning.profile.first_feasible",
+            "planning.profile.balanced",
+            "planning.profile.quality_bounded",
             "planning.trajectory.time_parameterized",
         ]
         data["adapters"]["context"]["capability_keys"] = [
@@ -3318,7 +3321,7 @@ class TestCrossArtifactValidation:
             "api_version": "manyforge.program.v0",
             "program_profile": "v0.1",  # different from deployment
             "name": "test",
-            "catalog_version": "0.2.0",
+            "catalog_version": "0.3.0",
             "robot": {
                 "robot_id": "ur5",
                 "group_id": "arm",
@@ -3339,7 +3342,7 @@ class TestCrossArtifactValidation:
             "api_version": "manyforge.program.v0",
             "program_profile": "v0.0",
             "name": "test",
-            "catalog_version": "0.2.0",
+            "catalog_version": "0.3.0",
             "robot": {
                 "robot_id": "ur10",  # different from deployment
                 "group_id": "arm",
@@ -3360,7 +3363,7 @@ class TestCrossArtifactValidation:
             "api_version": "manyforge.program.v0",
             "program_profile": "v0.0",
             "name": "test",
-            "catalog_version": "0.2.0",
+            "catalog_version": "0.3.0",
             "robot": {
                 "robot_id": "ur5",
                 "group_id": "manipulator",  # different from deployment
@@ -4234,6 +4237,9 @@ class TestAdapterCapabilityKeys:
             "planning.motion.joint_goal",
             "planning.motion.pose_goal",
             "planning.motion.cartesian_path",
+            "planning.profile.first_feasible",
+            "planning.profile.balanced",
+            "planning.profile.quality_bounded",
             "planning.trajectory.time_parameterized",
         ]
         
@@ -4390,6 +4396,9 @@ class TestValidateCapabilities:
         data["adapters"]["planning"]["capability_keys"] = [
             "planning.motion.joint_goal",
             "planning.motion.pose_goal",
+            "planning.profile.first_feasible",
+            "planning.profile.balanced",
+            "planning.profile.quality_bounded",
             "planning.trajectory.time_parameterized",
         ]
         data["adapters"]["context"]["capability_keys"] = [
@@ -4449,6 +4458,9 @@ class TestValidateCapabilities:
         data["adapters"]["planning"]["capability_keys"] = [
             "planning.motion.joint_goal",
             "planning.motion.pose_goal",
+            "planning.profile.first_feasible",
+            "planning.profile.balanced",
+            "planning.profile.quality_bounded",
             "planning.trajectory.time_parameterized",
         ]
         data["adapters"]["context"]["capability_keys"] = [

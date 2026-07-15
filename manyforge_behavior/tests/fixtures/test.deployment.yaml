@@ -15,6 +15,9 @@ adapters:
     capability_keys:
       - planning.motion.joint_goal
       - planning.motion.pose_goal
+      - planning.profile.first_feasible
+      - planning.profile.balanced
+      - planning.profile.quality_bounded
       - planning.trajectory.time_parameterized
     config: {}
   context:

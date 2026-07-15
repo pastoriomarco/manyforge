@@ -687,8 +687,10 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
         // may query one Scene concurrently.
         planning_collision_query.emplace(
             roboplan::CollisionQueryView::forSerializedScene(planning_scene));
-        planning_ik =
-            std::make_shared<roboplan::SimpleIk>(planning_scene, ik_options_);
+        auto request_ik_options = planning_profile_ik_options(
+            ik_options_, request.planning_profile);
+        planning_ik = std::make_shared<roboplan::SimpleIk>(
+            planning_scene, request_ik_options);
         const auto shortcutting_options = production_shortcutting_options(
             rrt_options_.group_name, performance_metrics.rng_seed);
         performance_metrics.shortcut_rng_seed_argument =
@@ -1062,7 +1064,8 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     // Plan path with an RRT instance configured for this request's timeout.
     // This gives the native backend a hard, cooperative planning bound instead
     // of relying only on a post-hoc stop request in the kernel.
-    auto request_rrt_options = rrt_options_;
+    auto request_rrt_options = planning_profile_rrt_options(
+        rrt_options_, request.planning_profile);
     if (request.planning_timeout_s > 0.0) {
       if (request_rrt_options.max_planning_time > 0.0) {
         request_rrt_options.max_planning_time =

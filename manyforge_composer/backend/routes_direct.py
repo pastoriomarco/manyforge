@@ -225,7 +225,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
         the joints they touched); the backend reads the current full
         joint vector from the kernel and overlays the requested
         positions before submitting a single-leaf intervention tree
-        with `move_manipulator_action` set to `motion_type=joint_goal`.
+        with `move_manipulator_action` set to `motion_type=joint`.
         This reuses the existing intervention machinery so the cycle
         manager transitions to DIRECT_CONTROL, the planner produces a
         bounded trajectory, the kernel executes it, and the cycle
@@ -324,7 +324,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
             "name": instance_name,
             "params": {
                 "move_id": instance_name,
-                "motion_type": "joint_goal",
+                "motion_type": "joint",
                 "joint_goal_names": kernel_joint_names,
                 "joint_goal_positions_rad": target_positions,
             },
@@ -436,7 +436,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
         jog gizmo (Day 5c.2).
 
         Same intervention-machinery wrapping as /api/direct/joint-jog
-        but with motion_type=pose_goal. The frontend sends the
+        but with motion_type=pose. The frontend sends the
         target TCP pose already expressed in the robot's base frame
         (the same convention the catalog's `pose_goal` parameter
         speaks). The cycle returns to IDLE on success, enabling
@@ -473,7 +473,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
             "name": instance_name,
             "params": {
                 "move_id": instance_name,
-                "motion_type": "pose_goal",
+                "motion_type": "pose",
                 "pose_goal": {
                     "frame_id": base_frame,
                     "position_m": [float(v) for v in request.position_m],

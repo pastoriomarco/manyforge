@@ -557,7 +557,7 @@ class JointJogRequest(BaseModel):
     POST one of these. The backend reads the current full joint state
     from the kernel, applies the requested partial update, and submits
     a one-leaf intervention tree (single `move_manipulator_action` with
-    `motion_type=joint_goal`) through the existing intervention
+    `motion_type=joint`) through the existing intervention
     machinery. No new kernel API is needed because the kernel already
     drives joints exclusively through behavior-tree execution.
     """

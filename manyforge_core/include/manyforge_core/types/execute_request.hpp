@@ -27,6 +27,14 @@ struct ExecuteRequestDTO {
   TimeoutsDTO timeouts;
   CacheMode cache_mode;
   MotionSpecDTO motion;
+  PlanningProfileDTO planning_profile = PlanningProfileDTO::kFirstFeasible;
+  MotionTargetModeDTO target_mode = MotionTargetModeDTO::kAbsolute;
+  /// Required for relative pose/Cartesian targets; forbidden for joint and
+  /// absolute targets. Resolution is kernel-owned and revision-bound.
+  std::optional<ReferenceDTO> target_reference;
+  /// Optional coordinate basis for relative pose/Cartesian offsets. Defaults
+  /// to target_reference when omitted.
+  std::optional<ReferenceDTO> offset_reference;
   /// Per-move bindings that arm `scope_kind == kMove` interrupt
   /// policies for exactly this execute request (spec/260 §2.6 +
   /// spec/210 §3.10). Atomic with dispatch: the kernel arms scopes

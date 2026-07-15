@@ -191,26 +191,44 @@ TEST_F(TrajectoryCacheTest, RevisionAware_StoreAndLookupSucceedsOnExactMatch) {
   EXPECT_EQ(result->joint_names[0], "t1");
 }
 
-TEST_F(TrajectoryCacheTest, RevisionAware_MismatchRevisionMissesAndEvicts) {
+TEST_F(TrajectoryCacheTest, RevisionAware_MismatchRevisionReturnsCandidate) {
   CollisionWorldRevision rev_old{7, "abc"};
   CollisionWorldRevision rev_new{8, "def"};
   store("move_1", make_trajectory("t1"), rev_old);
 
-  auto miss = lookup("move_1", rev_new);
-  EXPECT_FALSE(miss.has_value());
-
-  // Subsequent lookup-by-key sees the entry was evicted.
-  EXPECT_FALSE(cache.peek_unvalidated("move_1").has_value());
-  EXPECT_EQ(cache.size(), 0u);
+  const auto candidate =
+      cache.lookup_with_revision("move_1", rev_new, "intent-a");
+  EXPECT_EQ(candidate.disposition,
+            TrajectoryCacheLookupDisposition::kRevalidationCandidate);
+  ASSERT_TRUE(candidate.trajectory.has_value());
+  EXPECT_EQ(candidate.trajectory->joint_names[0], "t1");
+  EXPECT_TRUE(cache.peek_unvalidated("move_1").has_value());
+  EXPECT_EQ(cache.size(), 1u);
 }
 
-TEST_F(TrajectoryCacheTest, RevisionAware_DifferentHashSameIdIsMiss) {
+TEST_F(TrajectoryCacheTest, RevisionAware_DifferentHashSameIdEvictsFailClosed) {
   CollisionWorldRevision rev_a{7, "abc"};
   CollisionWorldRevision rev_b{7, "xyz"};
   store("move_1", make_trajectory("t1"), rev_a);
 
-  EXPECT_FALSE(lookup("move_1", rev_b).has_value());
-  // Stale entry was evicted.
+  const auto result =
+      cache.lookup_with_revision("move_1", rev_b, "intent-a");
+  EXPECT_EQ(result.disposition,
+            TrajectoryCacheLookupDisposition::kRevisionMismatch);
+  EXPECT_FALSE(result.trajectory.has_value());
+  EXPECT_EQ(cache.size(), 0u);
+}
+
+TEST_F(TrajectoryCacheTest, RevisionAware_RevisionRollbackEvictsFailClosed) {
+  const CollisionWorldRevision rev_newer{8, "def"};
+  const CollisionWorldRevision rev_older{7, "abc"};
+  store("move_1", make_trajectory("t1"), rev_newer);
+
+  const auto result =
+      cache.lookup_with_revision("move_1", rev_older, "intent-a");
+  EXPECT_EQ(result.disposition,
+            TrajectoryCacheLookupDisposition::kRevisionMismatch);
+  EXPECT_FALSE(result.trajectory.has_value());
   EXPECT_EQ(cache.size(), 0u);
 }
 
@@ -274,6 +292,51 @@ TEST(TrajectoryCacheIntentTest, ContactPolicyChangesIdentity) {
 
   EXPECT_NE(trajectory_cache_intent_identity(lhs),
             trajectory_cache_intent_identity(rhs));
+}
+
+TEST(TrajectoryCacheIntentTest, CanonicalModelBindingChangesIdentity) {
+  const auto baseline = make_cartesian_request();
+  const auto baseline_identity = trajectory_cache_intent_identity(baseline);
+
+  for (const auto& changed : {
+           [&] {
+             auto request = baseline;
+             request.robot_id = "robot1";
+             return request;
+           }(),
+           [&] {
+             auto request = baseline;
+             request.group_id = "secondary_arm";
+             return request;
+           }(),
+           [&] {
+             auto request = baseline;
+             request.base_frame = "mobile_base";
+             return request;
+           }(),
+           [&] {
+             auto request = baseline;
+             request.tcp_frame = "alternate_tcp";
+             return request;
+           }(),
+       }) {
+    EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(changed));
+  }
+}
+
+TEST(TrajectoryCacheIntentTest, TargetModeReferenceAndProfileChangeIdentity) {
+  auto baseline = make_cartesian_request();
+  auto relative = baseline;
+  relative.target_mode = MotionTargetModeDTO::kRelative;
+  relative.target_reference = ReferenceDTO{};
+  relative.target_reference->type = ReferenceDTO::Type::kFrame;
+  relative.target_reference->id = "fixture";
+  auto balanced = baseline;
+  balanced.planning_profile = PlanningProfileDTO::kBalanced;
+
+  const auto baseline_identity = trajectory_cache_intent_identity(baseline);
+  EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(relative));
+  EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(balanced));
 }
 
 TEST(TrajectoryCacheIntentTest, DynamicsAndCartesianOptionsChangeIdentity) {
@@ -364,9 +427,17 @@ TEST_F(TrajectoryCacheTest, RevisionAware_OverwriteUpdatesRevision) {
   store("move_1", make_trajectory("t1"), rev_a);
   store("move_1", make_trajectory("t1_updated"), rev_b);
 
-  // Old revision no longer matches.
-  EXPECT_FALSE(lookup("move_1", rev_a).has_value());
-  // After the failed lookup the entry was evicted.
+  const auto exact =
+      cache.lookup_with_revision("move_1", rev_b, "intent-a");
+  EXPECT_EQ(exact.disposition, TrajectoryCacheLookupDisposition::kHit);
+  ASSERT_TRUE(exact.trajectory.has_value());
+  EXPECT_EQ(exact.trajectory->joint_names[0], "t1_updated");
+
+  const auto rollback =
+      cache.lookup_with_revision("move_1", rev_a, "intent-a");
+  EXPECT_EQ(rollback.disposition,
+            TrajectoryCacheLookupDisposition::kRevisionMismatch);
+  EXPECT_FALSE(rollback.trajectory.has_value());
   EXPECT_EQ(cache.size(), 0u);
 }
 

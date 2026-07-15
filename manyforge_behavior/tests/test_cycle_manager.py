@@ -618,7 +618,7 @@ class TestCycleManagerRun:
 program_profile: v0.0
 name: missing_bb_failure
 description: Motion node fails on missing blackboard key.
-catalog_version: "0.2.0"
+catalog_version: "0.3.0"
 
 robot:
   robot_id: ur5
@@ -647,7 +647,7 @@ tree:
       name: move_missing_pose_goal
       params:
         move_id: missing_pose
-        motion_type: pose_goal
+        motion_type: pose
         pose_goal:
           field_ref:
             namespace: missing_pose
@@ -869,7 +869,7 @@ class TestCycleManagerMotionStop:
             "program_profile": "v0.1" if success_policy is not None else "v0.0",
             "name": "motion_stop_parallel_test",
             "description": "Motion stop cooperative ticking test.",
-            "catalog_version": "0.2.0",
+            "catalog_version": "0.3.0",
             "robot": {
                 "robot_id": "ur5",
                 "group_id": "arm",
@@ -885,7 +885,7 @@ class TestCycleManagerMotionStop:
                         "name": "held_motion",
                         "params": {
                             "move_id": "held_motion",
-                            "motion_type": "joint_goal",
+                            "motion_type": "joint",
                             "joint_goal_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
                             "joint_goal_positions_rad": [0.1, -0.8, 0.7, -1.0, -0.9, 0.2],
                             "planning_timeout_s": 2.0,
@@ -2623,7 +2623,9 @@ class TestKernelEventBridge:
         req = ExecuteRequest(
             robot_id="r", group_id="g", move_id="m1",
             base_frame="base_link", tcp_frame="tool0",
-            motion_type="joint_goal",
+            motion_type="joint",
+            joint_goal_names=["joint1"],
+            joint_goal_positions_rad=[0.0],
         )
         kernel.execute(req)
         events = kernel.drain_kernel_events()
@@ -2639,7 +2641,9 @@ class TestKernelEventBridge:
         req = ExecuteRequest(
             robot_id="r", group_id="g", move_id="m1",
             base_frame="base_link", tcp_frame="tool0",
-            motion_type="joint_goal",
+            motion_type="joint",
+            joint_goal_names=["joint1"],
+            joint_goal_positions_rad=[0.0],
         )
         kernel.execute(req)
         kernel.drain_kernel_events()  # clear
@@ -2657,7 +2661,9 @@ class TestKernelEventBridge:
         req = ExecuteRequest(
             robot_id="r", group_id="g", move_id="m1",
             base_frame="base_link", tcp_frame="tool0",
-            motion_type="joint_goal",
+            motion_type="joint",
+            joint_goal_names=["joint1"],
+            joint_goal_positions_rad=[0.0],
         )
         kernel.execute(req)
         first = kernel.drain_kernel_events()
@@ -2730,7 +2736,9 @@ class TestKernelEventBridge:
             move_id="direct",
             base_frame="base_link",
             tcp_frame="tool0",
-            motion_type="joint_goal",
+            motion_type="joint",
+            joint_goal_names=["joint1"],
+            joint_goal_positions_rad=[0.0],
         )
         kernel.execute(req)
 

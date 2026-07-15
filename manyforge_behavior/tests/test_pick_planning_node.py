@@ -182,6 +182,22 @@ class TestPlanPickSequenceNode:
         assert metrics["plans_succeeded"] == 3
         assert metrics["validations_passed"] == 3
         assert len(kernel.preview_requests) == 3
+        assert [
+            request.motion_type for request in kernel.preview_requests
+        ] == ["pose", "cartesian", "cartesian"]
+        assert kernel.preview_requests[1].cartesian_path == plan_value[
+            "pick_cartesian_path"
+        ]
+        assert kernel.preview_requests[2].cartesian_path == plan_value[
+            "retreat_cartesian_path"
+        ]
+        pick_stage = plan_value["candidate_stage_report"]["stages"][1]
+        retreat_stage = plan_value["candidate_stage_report"]["stages"][2]
+        assert pick_stage["motion_type"] == "cartesian"
+        assert pick_stage["cartesian_path"] == plan_value["pick_cartesian_path"]
+        assert retreat_stage["cartesian_path"] == plan_value[
+            "retreat_cartesian_path"
+        ]
         parent_attempts = {
             request.action_span.parent_node_attempt_id
             for request in kernel.preview_requests
@@ -1160,17 +1176,31 @@ class TestPlanPickSequenceNode:
             reason_code="no_feasible_pick_plan",
         )
 
-    def test_failure_populates_linked_move_pose_goals(self, kernel, bb_with_kernel):
+    def test_failure_populates_linked_pose_and_cartesian_moves(
+        self, kernel, bb_with_kernel
+    ):
         class PickFailureKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__()
+                self.pick_request = None
+
             def preview_motion(self, request, start_state=None):
                 if request.move_id == "pick_approach_preview":
                     return MotionPreviewResult(ok=True, final_state=RobotStateSnapshot())
+                self.pick_request = request
                 return MotionPreviewResult(ok=False, error="IK failed")
 
         class MoveStub(py_trees.behaviour.Behaviour):
-            def __init__(self, name: str):
+            def __init__(self, name: str, motion_type: str):
                 super().__init__(name=name)
-                self._params = {"motion_type": "pose_goal", "pose_goal": None}
+                self._params = {
+                    "motion_type": motion_type,
+                    "pose_goal": None,
+                    "cartesian_path": {
+                        "waypoints": [],
+                        "max_translation_step_m": 0.01,
+                    },
+                }
 
             def update(self):
                 return py_trees.common.Status.SUCCESS
@@ -1193,9 +1223,9 @@ class TestPlanPickSequenceNode:
             retreat_move_node_name="move_to_retreat",
             no_feasible_plan_policy="condition_failure",
         )
-        approach_move = MoveStub("move_to_approach")
-        pick_move = MoveStub("move_to_pick")
-        retreat_move = MoveStub("move_to_retreat")
+        approach_move = MoveStub("move_to_approach", "pose")
+        pick_move = MoveStub("move_to_pick", "cartesian")
+        retreat_move = MoveStub("move_to_retreat", "cartesian")
         root = py_trees.composites.Sequence(name="root", memory=True)
         root.add_children([planner, approach_move, pick_move, retreat_move])
 
@@ -1208,5 +1238,36 @@ class TestPlanPickSequenceNode:
         assert plan_bundle["meta"]["status"] == "failed"
         assert plan_value["outcome"] == "no_feasible_plan"
         assert approach_move._params["pose_goal"] == plan_value["approach_pose"]
-        assert pick_move._params["pose_goal"] == plan_value["pick_pose"]
-        assert retreat_move._params["pose_goal"] == plan_value["retreat_pose"]
+        assert "cartesian_path" not in approach_move._params
+        assert "pose_goal" not in pick_move._params
+        assert "pose_goal" not in retreat_move._params
+
+        def path_pose(pose):
+            return {
+                "position_m": pose["position_m"],
+                "orientation_xyzw": pose["orientation_xyzw"],
+            }
+
+        assert pick_move._params["cartesian_path"]["waypoints"] == [
+            path_pose(plan_value["approach_pose"]),
+            path_pose(plan_value["pick_pose"]),
+        ]
+        assert retreat_move._params["cartesian_path"]["waypoints"] == [
+            path_pose(plan_value["pick_pose"]),
+            path_pose(plan_value["retreat_pose"]),
+        ]
+        assert pick_move._params["cartesian_path"][
+            "max_translation_step_m"
+        ] == 0.01
+        assert failure_kernel.pick_request is not None
+        assert failure_kernel.pick_request.motion_type == "cartesian"
+        assert failure_kernel.pick_request.cartesian_path == pick_move._params[
+            "cartesian_path"
+        ]
+        assert pick_move._params["cartesian_path"][
+            "fallback_policy"
+        ] == "fail_closed"
+        assert all(
+            move._params["target_mode"] == "absolute"
+            for move in (approach_move, pick_move, retreat_move)
+        )
