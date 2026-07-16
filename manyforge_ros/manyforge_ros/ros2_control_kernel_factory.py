@@ -42,10 +42,16 @@ def create_ros2_control_kernel(
     *,
     deployment: Deployment,
     collision_monitor_period_ns: int | None = None,
-    runtime_collision_query_timeout_ns: int | None = None,
+    runtime_collision_immediate_query_budget_ns: int | None = None,
     validation_collision_query_timeout_ns: int | None = None,
     validation_collision_wall_timeout_ns: int | None = None,
     runtime_dynamic_body_max_age_cap_ns: int | None = None,
+    validation_collision_workers: int | None = None,
+    runtime_collision_lookahead_cycle_budget_ns: int | None = None,
+    runtime_collision_lookahead_query_budget_ns: int | None = None,
+    runtime_collision_lookahead_horizon_ns: int | None = None,
+    runtime_collision_lookahead_max_samples: int | None = None,
+    runtime_collision_lookahead_workers: int | None = None,
 ):
     """Create a KernelClient that plans with RoboPlan and executes via C++ ROS."""
     robot_config = deployment.robot_config
@@ -86,9 +92,9 @@ def create_ros2_control_kernel(
     kernel_config: dict[str, Any] = {}
     if collision_monitor_period_ns is not None:
         kernel_config["collision_monitor_period_ns"] = collision_monitor_period_ns
-    if runtime_collision_query_timeout_ns is not None:
-        kernel_config["runtime_collision_query_timeout_ns"] = (
-            runtime_collision_query_timeout_ns
+    if runtime_collision_immediate_query_budget_ns is not None:
+        kernel_config["runtime_collision_immediate_query_budget_ns"] = (
+            runtime_collision_immediate_query_budget_ns
         )
     if validation_collision_query_timeout_ns is not None:
         kernel_config["validation_collision_query_timeout_ns"] = (
@@ -101,6 +107,30 @@ def create_ros2_control_kernel(
     if runtime_dynamic_body_max_age_cap_ns is not None:
         kernel_config["runtime_dynamic_body_max_age_cap_ns"] = (
             runtime_dynamic_body_max_age_cap_ns
+        )
+    if validation_collision_workers is not None:
+        kernel_config["validation_collision_workers"] = (
+            validation_collision_workers
+        )
+    if runtime_collision_lookahead_cycle_budget_ns is not None:
+        kernel_config["runtime_collision_lookahead_cycle_budget_ns"] = (
+            runtime_collision_lookahead_cycle_budget_ns
+        )
+    if runtime_collision_lookahead_query_budget_ns is not None:
+        kernel_config["runtime_collision_lookahead_query_budget_ns"] = (
+            runtime_collision_lookahead_query_budget_ns
+        )
+    if runtime_collision_lookahead_horizon_ns is not None:
+        kernel_config["runtime_collision_lookahead_horizon_ns"] = (
+            runtime_collision_lookahead_horizon_ns
+        )
+    if runtime_collision_lookahead_max_samples is not None:
+        kernel_config["runtime_collision_lookahead_max_samples"] = (
+            runtime_collision_lookahead_max_samples
+        )
+    if runtime_collision_lookahead_workers is not None:
+        kernel_config["runtime_collision_lookahead_workers"] = (
+            runtime_collision_lookahead_workers
         )
     for key in (
         "single_shot_ik_timeout_s",

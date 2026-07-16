@@ -1771,6 +1771,39 @@ def test_kernel_metrics_returns_counter_payload():
     assert expected_keys.issubset(data.keys())
 
 
+def test_kernel_metrics_preserves_structured_observed_source_telemetry():
+    client, state, kernel = make_client()
+    kernel.get_metrics = lambda: {  # type: ignore[method-assign]
+        "validations_passed": 1,
+        "controller_observed_state_sources": [
+            {
+                "source_kind": "controller_state",
+                "source_id": "controller_state",
+                "published_total": 42,
+                "incomplete_total": 0,
+                "writer_busy_total": 0,
+                "latest_received_timestamp_ns": 123,
+                "max_interarrival_ns": 456,
+            }
+        ],
+    }
+
+    response = client.get("/api/kernel/metrics")
+
+    assert response.status_code == 200
+    assert response.json()["controller_observed_state_sources"] == [
+        {
+            "source_kind": "controller_state",
+            "source_id": "controller_state",
+            "published_total": 42,
+            "incomplete_total": 0,
+            "writer_busy_total": 0,
+            "latest_received_timestamp_ns": 123,
+            "max_interarrival_ns": 456,
+        }
+    ]
+
+
 def test_live_scene_edit_rejected_during_resumable_stopped():
     """A resumable STOPPED cycle owns the live scene: POST /api/scene/edit must
     be refused with a 409, because resuming against an externally-mutated scene

@@ -408,7 +408,7 @@ class NativeKernelClient(KernelClient):
             req_dict["joint_goal_names"] = request.joint_goal_names
             req_dict["joint_goal_positions_rad"] = request.joint_goal_positions_rad
         elif request.motion_type == "pose":
-            req_dict["pose_goal"] = request.pose_goal
+            req_dict["pose_goal"] = _normalize_pose_dict(request.pose_goal)
         elif request.motion_type == "cartesian":
             req_dict["cartesian_path"] = cartesian_path
         return req_dict

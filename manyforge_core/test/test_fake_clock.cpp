@@ -1,6 +1,7 @@
-#include <manyforge_core/time/fake_clock.hpp>
-
 #include <gtest/gtest.h>
+
+#include <manyforge_core/time/fake_clock.hpp>
+#include <thread>
 
 namespace manyforge::core {
 
@@ -74,6 +75,24 @@ TEST(FakeClockTest, LargeDurations) {
 
   clock.advance(-500'000'000'000LL);
   EXPECT_EQ(clock.now(), 500'000'000'000LL);
+}
+
+TEST(FakeClockTest, ConcurrentAdvancesRemainRaceFreeAndExact) {
+  FakeClock clock;
+  std::thread first([&clock]() {
+    for (int i = 0; i < 10'000; ++i) {
+      clock.advance(1);
+    }
+  });
+  std::thread second([&clock]() {
+    for (int i = 0; i < 10'000; ++i) {
+      clock.advance(1);
+    }
+  });
+
+  first.join();
+  second.join();
+  EXPECT_EQ(clock.now(), 20'000);
 }
 
 }  // namespace manyforge::core

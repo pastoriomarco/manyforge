@@ -81,6 +81,25 @@ struct CollisionValidationPassConfig {
   /// Concrete per-request contact policy. Empty means free-space validation.
   std::string contact_policy_id;
 
+  /// Optional plan-global sample fractions for a bounded runtime-lookahead
+  /// prefix. Contact-grasp terminal windows are properties of the accepted
+  /// expanded trajectory; a truncated prefix must never renormalize itself to
+  /// [0, 1] and admit contact early. When present, this vector must correspond
+  /// one-to-one with the pass trajectory and be strictly increasing in [0, 1].
+  std::optional<std::vector<double>> original_trajectory_sample_fractions;
+
+  /// Optional exact prefix state for runtime-lookahead passes. Ordinary
+  /// pre-dispatch validation leaves these empty and starts at trajectory
+  /// waypoint zero. Supplying one without the other for a support-contact
+  /// policy is invalid and fails closed in the ordered merger.
+  std::optional<SupportContactEvaluationStateMap> entering_support_contact_state;
+  std::optional<ContactReleaseEvaluationStateMap> entering_contact_release_state;
+
+  /// End-of-trajectory release obligations apply only when the selected pass
+  /// reaches the accepted trajectory end. Runtime lookahead clears this for a
+  /// time/waypoint-truncated prefix while retaining recontact/depth checks.
+  bool enforce_contact_release_trajectory_end = true;
+
   const CollisionPolicySnapshot& effective_policy_snapshot() const {
     return policy_snapshot_ref ? *policy_snapshot_ref : policy_snapshot;
   }
@@ -171,6 +190,29 @@ class CollisionValidationCoordinator {
       std::size_t begin_index,
       std::size_t end_index,
       const CollisionCancellationToken& cancel);
+
+  /// Query one contiguous range without applying collision policy. This is the
+  /// first phase of ordered stateful parallel validation: workers perform every
+  /// expensive engine query exactly once, then publish bounded prefix
+  /// summaries before policy finalization. Returned waypoint indices are local
+  /// to the range.
+  CollisionValidationDecisionBundle query_trajectory_range_unclassified(
+      const CollisionWorldSnapshot& snapshot, ICollisionQueryEngine& engine,
+      const TrajectoryDTO& trajectory, std::size_t begin_index, std::size_t end_index,
+      const CollisionCancellationToken& cancel);
+
+  /// Apply policy classification to an already-queried range using the exact
+  /// support-contact state entering that chunk. This never calls the collision
+  /// engine. It reclassifies the already-owned worker-local records so the
+  /// complete diagnostic stream remains serial-identical; this policy-only
+  /// work stays parallel. Contact-release end constraints are left to the
+  /// bounded ordered-summary merger, and the global coordinator never replays
+  /// trajectory records.
+  CollisionValidationDecisionBundle finalize_prequeried_range(
+      const CollisionWorldSnapshot& snapshot, const TrajectoryDTO& trajectory,
+      CollisionValidationDecisionBundle queried,
+      const SupportContactEvaluationStateMap& entering_support_state,
+      SupportContactEvaluationStateMap* exiting_support_state);
 
   /// Snapshot view of the active policy.
   const CollisionPolicySnapshot& policy_snapshot() const {

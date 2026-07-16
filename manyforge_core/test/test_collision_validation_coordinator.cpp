@@ -414,6 +414,33 @@ TEST(CollisionValidationCoordinatorTest,
 }
 
 TEST(CollisionValidationCoordinatorTest,
+     ContactReleaseReportsEarlierMissingClearanceBeforeLaterRecontact) {
+  CollisionPairId pair{"robot/grasp", "object/box"};
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[0] = make_pass_result_with_clearance(pair, -0.003);
+  engine.result_by_waypoint[1] = make_pass_result_without_clearance();
+  engine.result_by_waypoint[2] = make_pass_result_with_clearance(pair, -0.001);
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot =
+      make_contact_release_snapshot(pair, /*max_start=*/0.005,
+                                    /*require_separation_by_end=*/false,
+                                    /*require_strictly_decreasing_penetration=*/false);
+  CollisionValidationCoordinator coord(cfg);
+
+  const auto bundle =
+      coord.validate_trajectory(make_snapshot(), engine, make_trivial_trajectory(3), cancel);
+
+  ASSERT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  ASSERT_TRUE(bundle.decision.first_failing_waypoint);
+  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 1);
+  EXPECT_EQ(bundle.waypoint_records[1].result.raw_diagnostics.at("contact_release_violation"),
+            "missing_contact_release_clearance");
+}
+
+TEST(CollisionValidationCoordinatorTest,
      ContactReleaseStrictlyDecreasingPenetrationPasses) {
   // Initial contact with penetration <= max_start, depth monotonically
   // decreases to 0 (clearance crosses positive at the end). Must pass.
@@ -653,6 +680,70 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_EQ(bundle.waypoint_records[1]
                 .result.raw_diagnostics.at("contact_grasp_violation"),
             "contact_before_terminal_window");
+}
+
+TEST(CollisionValidationCoordinatorTest, ContactGraspRuntimePrefixUsesOriginalTrajectoryFraction) {
+  const CollisionPairId pair{"object/part/shape/0", "robot/arm/link/finger_left/collision/0"};
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[2] = make_colliding_result_with_clearance(pair, -0.001);
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_contact_grasp_snapshot();
+  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.original_trajectory_sample_fractions = {0.25, 0.5, 0.74};
+  CollisionValidationCoordinator coord(cfg);
+
+  const auto bundle =
+      coord.validate_trajectory(make_snapshot(), engine, make_trivial_trajectory(3), cancel);
+
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kReject);
+  ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 2);
+  EXPECT_EQ(bundle.waypoint_records[2].result.raw_diagnostics.at("contact_grasp_violation"),
+            "contact_before_terminal_window");
+}
+
+TEST(CollisionValidationCoordinatorTest,
+     ContactGraspRuntimeTerminalPrefixDoesNotBecomeInitialSample) {
+  const CollisionPairId pair{"object/part/shape/0", "robot/arm/link/finger_left/collision/0"};
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[0] = make_colliding_result_with_clearance(pair, -0.001);
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_contact_grasp_snapshot();
+  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.original_trajectory_sample_fractions = {0.9};
+  CollisionValidationCoordinator coord(cfg);
+
+  const auto bundle =
+      coord.validate_trajectory(make_snapshot(), engine, make_trivial_trajectory(1), cancel);
+
+  EXPECT_TRUE(bundle.decision.accepted);
+  ASSERT_EQ(bundle.waypoint_records[0].result.normalized_pairs_classified.size(), 1u);
+  EXPECT_EQ(bundle.waypoint_records[0].result.normalized_pairs_classified.front().classification,
+            CollisionPairClassification::kAllowedContactGrasp);
+}
+
+TEST(CollisionValidationCoordinatorTest, InvalidRuntimeContactGraspFractionsFailClosed) {
+  MockCollisionQueryEngine engine;
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_contact_grasp_snapshot();
+  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.original_trajectory_sample_fractions = {0.5, 0.4};
+  CollisionValidationCoordinator coord(cfg);
+
+  const auto bundle =
+      coord.validate_trajectory(make_snapshot(), engine, make_trivial_trajectory(2), cancel);
+
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  EXPECT_EQ(bundle.waypoint_records.front().result.raw_diagnostics.at("contact_grasp_violation"),
+            "invalid_contact_grasp_sample_fractions");
 }
 
 TEST(CollisionValidationCoordinatorTest,

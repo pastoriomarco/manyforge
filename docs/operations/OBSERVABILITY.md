@@ -196,7 +196,7 @@ observability artifacts.
 | `MANYFORGE_PROGRESS_MODE=plain` | Force plain (no ANSI redraw) launcher progress output for CI logs. |
 | `MANYFORGE_VISUAL_STATE_PUBLISH_HZ` | Visual snapshot publisher cadence (`routes_scene.py:73`). |
 | `MANYFORGE_VISUAL_STATE_STALE_AFTER_MS` | Snapshot staleness budget; affects fallback reason on `/api/scene/state`. |
-| `MANYFORGE_VALIDATION_COLLISION_WORKERS` | Trajectory-validation worker pool size. Default 4 (commit `25f5e3c`). Lower to 1-2 only when controller/observer latency qualification shows CPU headroom is tight. |
+| `MANYFORGE_VALIDATION_COLLISION_WORKERS` | Direct-factory development/CI fallback for trajectory-validation worker count. Production uses the materialized `orchestrator.config.validation_collision_workers` deployment property (default 4); this variable never overrides an explicit deployment. |
 | `MANYFORGE_API_TOKEN` | Bearer token for the Composer REST API. |
 | `MANYFORGE_CORS_ORIGINS` | CORS allowlist. |
 | `MANYFORGE_FS_ROOTS` | Filesystem-read allowlist for scene/mesh routes. |
@@ -253,5 +253,7 @@ For a reproducible failure, capture the following before tearing down:
    (or the equivalent service name for the lane).
 5. If assistant: copy `$LOG_DIR/known-good-bridge-audit.jsonl` and
    `$LOG_DIR/known-good-bridge.log`.
-6. Note the launcher invocation (lane + assistant + scenario) and
-   the value of `MANYFORGE_VALIDATION_COLLISION_WORKERS` if set.
+6. Note the launcher invocation (lane + assistant + scenario), the deployment's
+   requested/reported-effective collision-validation worker counts, and the
+   value of `MANYFORGE_VALIDATION_COLLISION_WORKERS` only when a direct-factory
+   development/CI run used that fallback.

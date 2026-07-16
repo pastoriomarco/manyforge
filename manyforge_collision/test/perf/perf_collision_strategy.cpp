@@ -24,6 +24,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -132,6 +133,7 @@ struct Options {
   std::string query_class;
   int warmup_queries = 1000;
   int measured_queries = 10000;
+  int batch_size = 1;
   std::optional<std::string> urdf_override;
   std::optional<std::string> srdf_override;
   std::vector<std::filesystem::path> package_path_overrides;
@@ -235,6 +237,8 @@ Options parse_options(int argc, char** argv) {
       options.warmup_queries = std::stoi(next());
     } else if (arg == "--queries") {
       options.measured_queries = std::stoi(next());
+    } else if (arg == "--batch-size") {
+      options.batch_size = std::stoi(next());
     } else if (arg == "--urdf") {
       options.urdf_override = next();
     } else if (arg == "--srdf") {
@@ -250,7 +254,8 @@ Options parse_options(int argc, char** argv) {
     throw std::invalid_argument(
         "--corpus, --fixture, and --query-class are required");
   }
-  if (options.warmup_queries < 0 || options.measured_queries < 1) {
+  if (options.warmup_queries < 0 || options.measured_queries < 1 ||
+      options.batch_size < 1 || options.batch_size > 4096) {
     throw std::invalid_argument("invalid query count");
   }
   return options;
@@ -635,6 +640,17 @@ int main(int argc, char** argv) {
     RobotStateDTO state;
     state.joint_names = model.joint_names;
     state.positions_rad = fixture.robot_state;
+    // One row-major immutable matrix exercises the same ownership shape as a
+    // bounded trajectory batch without adding a production API. Repeating the
+    // fixture state makes general/runtime decisions exactly comparable and
+    // attributes any difference to query coordination rather than geometry.
+    std::vector<double> batch_positions;
+    batch_positions.reserve(static_cast<std::size_t>(options.batch_size) *
+                            state.positions_rad.size());
+    for (int index = 0; index < options.batch_size; ++index) {
+      batch_positions.insert(batch_positions.end(), state.positions_rad.begin(),
+                             state.positions_rad.end());
+    }
     CollisionQuery query;
     query.query_id = options.fixture_id + "_" + options.query_class;
     query.surface = options.query_class.rfind("runtime_", 0) == 0
@@ -684,36 +700,47 @@ int main(int argc, char** argv) {
       const auto wall_started = std::chrono::steady_clock::now();
       const auto cpu_started = thread_cpu_time_ns();
       g_count_allocations.store(measured, std::memory_order_release);
-      if (runtime) {
-        RuntimeCollisionQueryRequest request;
-        request.positions_rad = state.positions_rad;
-        request.state_time_ns = 1;
-        request.timeout_budget_ns = 1'000'000'000;
-        request.require_distance = options.query_class == "runtime_distance";
-        const auto result = engine.check_runtime(snapshot, request);
-        outcome_matches &= fixture.expected_collision
-                               ? result.status ==
-                                     RuntimeCollisionQueryStatus::kCollision
-                               : result.status ==
-                                     RuntimeCollisionQueryStatus::kClear;
-        pair_count = result.collision_pairs.size();
-        clearance_count = result.clearance_pairs.size();
-      } else {
-        const CollisionResult result = engine.check(snapshot, query, policy, cancel);
-        outcome_matches &=
-            result.engine_status == CollisionEngineStatus::kOk &&
-            result.in_collision == fixture.expected_collision;
-        pair_count = result.normalized_pairs.size();
-        clearance_count = result.pair_clearances.size();
-        min_clearance = result.min_clearance_m;
-        if (fixture.support_contact_policy) {
-          auto support = std::find_if(
-              result.pair_clearances.begin(), result.pair_clearances.end(),
-              [&](const auto& clearance) {
-                return clearance.pair == support_pair;
-              });
-          if (support != result.pair_clearances.end()) {
-            support_clearance = support->signed_clearance_m;
+      for (int batch_index = 0; batch_index < options.batch_size;
+           ++batch_index) {
+        const auto offset = static_cast<std::size_t>(batch_index) *
+                            state.positions_rad.size();
+        const std::span<const double> row(
+            batch_positions.data() + offset, state.positions_rad.size());
+        if (runtime) {
+          RuntimeCollisionQueryRequest request;
+          request.positions_rad = row;
+          request.state_time_ns = batch_index + 1;
+          request.timeout_budget_ns = 1'000'000'000;
+          request.require_distance =
+              options.query_class == "runtime_distance";
+          const auto result = engine.check_runtime(snapshot, request);
+          outcome_matches &= fixture.expected_collision
+                                 ? result.status ==
+                                       RuntimeCollisionQueryStatus::kCollision
+                                 : result.status ==
+                                       RuntimeCollisionQueryStatus::kClear;
+          pair_count = result.collision_pairs.size();
+          clearance_count = result.clearance_pairs.size();
+        } else {
+          query.robot_state.positions_rad.assign(row.begin(), row.end());
+          query.state_time_ns = batch_index + 1;
+          const CollisionResult result =
+              engine.check(snapshot, query, policy, cancel);
+          outcome_matches &=
+              result.engine_status == CollisionEngineStatus::kOk &&
+              result.in_collision == fixture.expected_collision;
+          pair_count = result.normalized_pairs.size();
+          clearance_count = result.pair_clearances.size();
+          min_clearance = result.min_clearance_m;
+          if (fixture.support_contact_policy) {
+            auto support = std::find_if(
+                result.pair_clearances.begin(), result.pair_clearances.end(),
+                [&](const auto& clearance) {
+                  return clearance.pair == support_pair;
+                });
+            if (support != result.pair_clearances.end()) {
+              support_clearance = support->signed_clearance_m;
+            }
           }
         }
       }
@@ -740,15 +767,42 @@ int main(int argc, char** argv) {
     const bool passed = outcome_matches;
     std::ostringstream out;
     out << std::setprecision(17)
-        << "{\"record_type\":\"collision_query\""
+        << "{\"record_type\":\""
+        << (options.batch_size == 1 ? "collision_query"
+                                    : "collision_query_batch")
+        << "\""
         << ",\"fixture_id\":\"" << json_escape(fixture.id) << "\""
         << ",\"query_class\":\"" << json_escape(options.query_class)
         << "\""
         << ",\"passed\":" << (passed ? "true" : "false")
         << ",\"sample_count\":" << options.measured_queries
+        << ",\"batch_size\":" << options.batch_size
+        << ",\"state_query_count\":"
+        << static_cast<std::uint64_t>(options.measured_queries) *
+               static_cast<std::uint64_t>(options.batch_size)
         << ",\"warmup_count\":" << options.warmup_queries
         << ",\"latency_ns\":";
     append_latency(out, wall_ns);
+    if (options.batch_size > 1) {
+      auto per_state_wall_ns = wall_ns;
+      auto per_state_cpu_ns = cpu_ns;
+      auto per_state_allocations = allocations;
+      for (auto& value : per_state_wall_ns) {
+        value /= static_cast<std::uint64_t>(options.batch_size);
+      }
+      for (auto& value : per_state_cpu_ns) {
+        value /= static_cast<std::uint64_t>(options.batch_size);
+      }
+      for (auto& value : per_state_allocations) {
+        value /= static_cast<std::uint64_t>(options.batch_size);
+      }
+      out << ",\"per_state_latency_ns\":";
+      append_latency(out, per_state_wall_ns);
+      out << ",\"per_state_cpu_time_ns\":";
+      append_latency(out, per_state_cpu_ns);
+      out << ",\"per_state_allocation_count\":";
+      append_latency(out, per_state_allocations);
+    }
     out << ",\"cpu_time_ns\":";
     append_latency(out, cpu_ns);
     out << ",\"allocation_count\":";

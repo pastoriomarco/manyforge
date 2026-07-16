@@ -829,7 +829,7 @@ def test_engine_matrix_translation_preserves_revision_and_validation_evidence() 
                 {
                     "fixture": "support",
                     "passed": True,
-                    "support_contact_fallback_verified": True,
+                    "support_contact_ordered_summary_verified": True,
                     "runtime_query": {
                         "revision_change": {
                             "p50_us": 1.0,
@@ -843,6 +843,27 @@ def test_engine_matrix_translation_preserves_revision_and_validation_evidence() 
                         "enabled": True,
                         "runs": 9,
                         "decision_match": True,
+                        "worker_sweep": [
+                            {
+                                "workers_requested": 1,
+                                "decision_match": True,
+                                "cold_snapshot_sync": {
+                                    "wall_us": 120.0,
+                                    "process_cpu_us": 115.0,
+                                    "allocations": 10,
+                                },
+                            },
+                            {
+                                "workers_requested": 2,
+                                "decision_match": True,
+                                "ordered_contact_summary_used": True,
+                                "cold_snapshot_sync": {
+                                    "wall_us": 90.0,
+                                    "process_cpu_us": 170.0,
+                                    "allocations": 20,
+                                },
+                            },
+                        ],
                     },
                     "noncollision_validation": {
                         "enabled": True,
@@ -861,7 +882,92 @@ def test_engine_matrix_translation_preserves_revision_and_validation_evidence() 
         "trajectory_validation",
     ]
     assert records[0]["latency_ns"]["p95"] == 2000.0
-    assert records[1]["details"]["support_contact_fallback_verified"] is True
+    assert (
+        records[1]["details"]["support_contact_ordered_summary_verified"]
+        is True
+    )
+
+
+def _ordered_summary_validation_record() -> dict:
+    worker_sweep = [
+        {
+            "workers_requested": 1,
+            "decision_match": True,
+            "cold_snapshot_sync": {
+                "wall_us": 100.0,
+                "process_cpu_us": 95.0,
+                "allocations": 10,
+            },
+        },
+        {
+            "workers_requested": 2,
+            "decision_match": True,
+            "ordered_contact_summary_used": True,
+            "cold_snapshot_sync": {
+                "wall_us": 75.0,
+                "process_cpu_us": 140.0,
+                "allocations": 20,
+            },
+        },
+    ]
+    return {
+        "record_type": "trajectory_validation",
+        "fixture_id": "support_contact_ordered_summary",
+        "passed": True,
+        "sample_count": 30,
+        "details": {
+            "collision_validation": {
+                "enabled": True,
+                "runs": 30,
+                "waypoints": 96,
+                "workers": 2,
+                "decision_match": True,
+                "serial_p95_us": 100.0,
+                "parallel_p95_us": 80.0,
+                "support_contact_active": True,
+                "fallback_reason": "",
+                "worker_sweep": worker_sweep,
+                "waypoint_sweep": [
+                    {"waypoints": 8, "worker_sweep": worker_sweep},
+                    {"waypoints": 16, "worker_sweep": worker_sweep},
+                ],
+            },
+            "noncollision_validation": {"enabled": False},
+            "support_contact_ordered_summary_verified": True,
+        },
+    }
+
+
+def test_evidence_validator_accepts_ordered_validation_crossover_sweep() -> None:
+    _MODULE._validate_rp5_record(  # noqa: SLF001
+        _ordered_summary_validation_record(),
+        "record",
+        formal=True,
+    )
+
+
+def test_evidence_validator_rejects_unordered_validation_crossover_sweep() -> None:
+    record = _ordered_summary_validation_record()
+    record["details"]["collision_validation"]["waypoint_sweep"].reverse()
+    with pytest.raises(_MODULE.ValidationError, match="must be strictly ordered"):
+        _MODULE._validate_rp5_record(  # noqa: SLF001
+            record,
+            "record",
+            formal=True,
+        )
+
+
+def test_evidence_validator_rejects_formal_warm_only_worker_sweep() -> None:
+    record = _ordered_summary_validation_record()
+    del record["details"]["collision_validation"]["worker_sweep"][0][
+        "cold_snapshot_sync"
+    ]
+    with pytest.raises(_MODULE.ValidationError, match="cold_snapshot_sync"):
+        _MODULE._validate_rp5_record(  # noqa: SLF001
+            record,
+            "record",
+            formal=True,
+        )
 
 
 def test_live_summary_omits_p99_for_thirty_sample_stratum() -> None:

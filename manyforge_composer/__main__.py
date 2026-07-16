@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -217,20 +218,20 @@ def _collision_monitor_period_ns_from_deployment(
     return int(period_ms * 1_000_000.0)
 
 
-def _runtime_collision_query_timeout_ns_from_deployment(
+def _runtime_collision_immediate_query_budget_ns_from_deployment(
     deployment: Deployment | None,
 ) -> int | None:
     if deployment is None or deployment.orchestrator is None:
         return None
     raw_value = deployment.orchestrator.config.get(
-        "runtime_collision_query_timeout_ms"
+        "runtime_collision_immediate_query_budget_ms"
     )
     if raw_value is None:
         return None
     timeout_ms = float(raw_value)
     if timeout_ms <= 0.0:
         raise ValueError(
-            "orchestrator.config.runtime_collision_query_timeout_ms must be > 0"
+            "orchestrator.config.runtime_collision_immediate_query_budget_ms must be > 0"
         )
     return int(timeout_ms * 1_000_000.0)
 
@@ -271,6 +272,141 @@ def _validation_collision_wall_timeout_ns_from_deployment(
     return int(timeout_ms * 1_000_000.0)
 
 
+def _validation_collision_workers_from_deployment(
+    deployment: Deployment | None,
+) -> int | None:
+    if deployment is None or deployment.orchestrator is None:
+        return None
+    raw_value = deployment.orchestrator.config.get("validation_collision_workers")
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, bool) or not isinstance(raw_value, int):
+        raise ValueError(
+            "orchestrator.config.validation_collision_workers must be an integer"
+        )
+    if raw_value < 1 or raw_value > 64:
+        raise ValueError(
+            "orchestrator.config.validation_collision_workers must be in [1, 64]"
+        )
+    return raw_value
+
+
+def _runtime_collision_lookahead_from_deployment(
+    deployment: Deployment | None,
+) -> tuple[int | None, int | None, int | None, int | None, int | None]:
+    if deployment is None or deployment.orchestrator is None:
+        return None, None, None, None, None
+    config = deployment.orchestrator.config
+    for removed_key in (
+        "runtime_collision_lookahead_period_ms",
+        "runtime_collision_lookahead_max_waypoints",
+        "runtime_collision_query_timeout_ms",
+    ):
+        if removed_key in config:
+            raise ValueError(
+                f"orchestrator.config.{removed_key} was removed by RT-8C.3"
+            )
+    # Deployment objects materialize these defaults. The fallback keeps
+    # lightweight test/composition objects behaviorally identical to a parsed
+    # production deployment instead of accidentally disabling lookahead.
+    raw_cycle_budget_ms = config.get(
+        "runtime_collision_lookahead_cycle_budget_ms", 200.0
+    )
+    raw_horizon_s = config.get("runtime_collision_lookahead_s", 2.0)
+    raw_query_budget_ms = config.get(
+        "runtime_collision_lookahead_query_budget_ms", 75.0
+    )
+    if isinstance(raw_cycle_budget_ms, bool) or not isinstance(
+        raw_cycle_budget_ms, (int, float)
+    ):
+        raise ValueError(
+            "orchestrator.config.runtime_collision_lookahead_cycle_budget_ms "
+            "must be a number"
+        )
+    if isinstance(raw_horizon_s, bool) or not isinstance(
+        raw_horizon_s, (int, float)
+    ):
+        raise ValueError(
+            "orchestrator.config.runtime_collision_lookahead_s must be a number"
+        )
+    if isinstance(raw_query_budget_ms, bool) or not isinstance(
+        raw_query_budget_ms, (int, float)
+    ):
+        raise ValueError(
+            "orchestrator.config.runtime_collision_lookahead_query_budget_ms "
+            "must be a number"
+        )
+    cycle_budget_ms = float(raw_cycle_budget_ms)
+    horizon_s = float(raw_horizon_s)
+    query_budget_ms = float(raw_query_budget_ms)
+    immediate_budget_ms = config.get(
+        "runtime_collision_immediate_query_budget_ms", 50.0
+    )
+    monitor_period_ms = config.get("collision_monitor_period_ms", 50.0)
+    for key, value in (
+        ("runtime_collision_immediate_query_budget_ms", immediate_budget_ms),
+        ("collision_monitor_period_ms", monitor_period_ms),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"orchestrator.config.{key} must be a number")
+        if not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise ValueError(
+                f"orchestrator.config.{key} must be finite and > 0"
+            )
+    if float(immediate_budget_ms) > float(monitor_period_ms):
+        raise ValueError(
+            "orchestrator.config.runtime_collision_immediate_query_budget_ms "
+            "must be <= collision_monitor_period_ms"
+        )
+    max_samples = config.get("runtime_collision_lookahead_max_samples", 32)
+    workers = config.get("runtime_collision_lookahead_workers", 2)
+    if not math.isfinite(cycle_budget_ms) or cycle_budget_ms <= 0.0:
+        raise ValueError(
+            "orchestrator.config.runtime_collision_lookahead_cycle_budget_ms "
+            "must be finite and > 0"
+        )
+    if not math.isfinite(horizon_s) or horizon_s <= 0.0:
+        raise ValueError(
+            "orchestrator.config.runtime_collision_lookahead_s "
+            "must be finite and > 0"
+        )
+    if not math.isfinite(query_budget_ms) or query_budget_ms <= 0.0:
+        raise ValueError(
+            "orchestrator.config.runtime_collision_lookahead_query_budget_ms "
+            "must be finite and > 0"
+        )
+    if query_budget_ms > cycle_budget_ms:
+        raise ValueError(
+            "orchestrator.config.runtime_collision_lookahead_query_budget_ms must be "
+            "<= runtime_collision_lookahead_cycle_budget_ms"
+        )
+    if (
+        isinstance(max_samples, bool)
+        or not isinstance(max_samples, int)
+        or not 2 <= max_samples <= 4096
+    ):
+        raise ValueError(
+            "orchestrator.config.runtime_collision_lookahead_max_samples "
+            "must be in [2, 4096]"
+        )
+    if (
+        isinstance(workers, bool)
+        or not isinstance(workers, int)
+        or not 1 <= workers <= 64
+    ):
+        raise ValueError(
+            "orchestrator.config.runtime_collision_lookahead_workers "
+            "must be in [1, 64]"
+        )
+    return (
+        int(cycle_budget_ms * 1_000_000.0),
+        int(horizon_s * 1_000_000_000.0),
+        max_samples,
+        workers,
+        int(query_budget_ms * 1_000_000.0),
+    )
+
+
 def _runtime_dynamic_body_max_age_cap_ns_from_deployment(
     deployment: Deployment | None,
 ) -> int | None:
@@ -295,17 +431,23 @@ def _kernel_config_from_deployment(
     deployment: Deployment | None,
     *,
     collision_monitor_period_ns: int | None,
-    runtime_collision_query_timeout_ns: int | None,
+    runtime_collision_immediate_query_budget_ns: int | None,
     validation_collision_query_timeout_ns: int | None,
     validation_collision_wall_timeout_ns: int | None,
     runtime_dynamic_body_max_age_cap_ns: int | None,
+    validation_collision_workers: int | None = None,
+    runtime_collision_lookahead_cycle_budget_ns: int | None = None,
+    runtime_collision_lookahead_query_budget_ns: int | None = None,
+    runtime_collision_lookahead_horizon_ns: int | None = None,
+    runtime_collision_lookahead_max_samples: int | None = None,
+    runtime_collision_lookahead_workers: int | None = None,
 ) -> dict[str, Any] | None:
     config: dict[str, Any] = {}
     if collision_monitor_period_ns is not None:
         config["collision_monitor_period_ns"] = collision_monitor_period_ns
-    if runtime_collision_query_timeout_ns is not None:
-        config["runtime_collision_query_timeout_ns"] = (
-            runtime_collision_query_timeout_ns
+    if runtime_collision_immediate_query_budget_ns is not None:
+        config["runtime_collision_immediate_query_budget_ns"] = (
+            runtime_collision_immediate_query_budget_ns
         )
     if validation_collision_query_timeout_ns is not None:
         config["validation_collision_query_timeout_ns"] = (
@@ -318,6 +460,28 @@ def _kernel_config_from_deployment(
     if runtime_dynamic_body_max_age_cap_ns is not None:
         config["runtime_dynamic_body_max_age_cap_ns"] = (
             runtime_dynamic_body_max_age_cap_ns
+        )
+    if validation_collision_workers is not None:
+        config["validation_collision_workers"] = validation_collision_workers
+    if runtime_collision_lookahead_cycle_budget_ns is not None:
+        config["runtime_collision_lookahead_cycle_budget_ns"] = (
+            runtime_collision_lookahead_cycle_budget_ns
+        )
+    if runtime_collision_lookahead_query_budget_ns is not None:
+        config["runtime_collision_lookahead_query_budget_ns"] = (
+            runtime_collision_lookahead_query_budget_ns
+        )
+    if runtime_collision_lookahead_horizon_ns is not None:
+        config["runtime_collision_lookahead_horizon_ns"] = (
+            runtime_collision_lookahead_horizon_ns
+        )
+    if runtime_collision_lookahead_max_samples is not None:
+        config["runtime_collision_lookahead_max_samples"] = (
+            runtime_collision_lookahead_max_samples
+        )
+    if runtime_collision_lookahead_workers is not None:
+        config["runtime_collision_lookahead_workers"] = (
+            runtime_collision_lookahead_workers
         )
 
     execution = deployment.adapters.get("execution") if deployment is not None else None
@@ -400,10 +564,16 @@ def _make_ros2_control_kernel(
     deployment: Deployment,
     *,
     collision_monitor_period_ns: int | None,
-    runtime_collision_query_timeout_ns: int | None,
+    runtime_collision_immediate_query_budget_ns: int | None,
     validation_collision_query_timeout_ns: int | None,
     validation_collision_wall_timeout_ns: int | None,
     runtime_dynamic_body_max_age_cap_ns: int | None,
+    validation_collision_workers: int | None,
+    runtime_collision_lookahead_cycle_budget_ns: int | None,
+    runtime_collision_lookahead_query_budget_ns: int | None,
+    runtime_collision_lookahead_horizon_ns: int | None,
+    runtime_collision_lookahead_max_samples: int | None,
+    runtime_collision_lookahead_workers: int | None,
 ):
     """Create the ROS 2 controller-backed kernel.
 
@@ -449,7 +619,7 @@ def _make_ros2_control_kernel(
         return create_ros2_control_kernel(
             deployment=deployment,
             collision_monitor_period_ns=collision_monitor_period_ns,
-            runtime_collision_query_timeout_ns=runtime_collision_query_timeout_ns,
+            runtime_collision_immediate_query_budget_ns=runtime_collision_immediate_query_budget_ns,
             validation_collision_query_timeout_ns=(
                 validation_collision_query_timeout_ns
             ),
@@ -457,6 +627,22 @@ def _make_ros2_control_kernel(
                 validation_collision_wall_timeout_ns
             ),
             runtime_dynamic_body_max_age_cap_ns=runtime_dynamic_body_max_age_cap_ns,
+            validation_collision_workers=validation_collision_workers,
+            runtime_collision_lookahead_cycle_budget_ns=(
+                runtime_collision_lookahead_cycle_budget_ns
+            ),
+            runtime_collision_lookahead_query_budget_ns=(
+                runtime_collision_lookahead_query_budget_ns
+            ),
+            runtime_collision_lookahead_horizon_ns=(
+                runtime_collision_lookahead_horizon_ns
+            ),
+            runtime_collision_lookahead_max_samples=(
+                runtime_collision_lookahead_max_samples
+            ),
+            runtime_collision_lookahead_workers=(
+                runtime_collision_lookahead_workers
+            ),
         )
     except Exception as exc:
         # Adapter installed but the runtime build failed — check ROS endpoint
@@ -524,8 +710,8 @@ def _make_kernel(
     collision_monitor_period_ns = _collision_monitor_period_ns_from_deployment(
         deployment
     )
-    runtime_collision_query_timeout_ns = (
-        _runtime_collision_query_timeout_ns_from_deployment(deployment)
+    runtime_collision_immediate_query_budget_ns = (
+        _runtime_collision_immediate_query_budget_ns_from_deployment(deployment)
     )
     validation_collision_query_timeout_ns = (
         _validation_collision_query_timeout_ns_from_deployment(deployment)
@@ -533,6 +719,16 @@ def _make_kernel(
     validation_collision_wall_timeout_ns = (
         _validation_collision_wall_timeout_ns_from_deployment(deployment)
     )
+    validation_collision_workers = _validation_collision_workers_from_deployment(
+        deployment
+    )
+    (
+        runtime_collision_lookahead_cycle_budget_ns,
+        runtime_collision_lookahead_horizon_ns,
+        runtime_collision_lookahead_max_samples,
+        runtime_collision_lookahead_workers,
+        runtime_collision_lookahead_query_budget_ns,
+    ) = _runtime_collision_lookahead_from_deployment(deployment)
     runtime_dynamic_body_max_age_cap_ns = (
         _runtime_dynamic_body_max_age_cap_ns_from_deployment(deployment)
     )
@@ -544,7 +740,7 @@ def _make_kernel(
         return _make_ros2_control_kernel(
             deployment,
             collision_monitor_period_ns=collision_monitor_period_ns,
-            runtime_collision_query_timeout_ns=runtime_collision_query_timeout_ns,
+            runtime_collision_immediate_query_budget_ns=runtime_collision_immediate_query_budget_ns,
             validation_collision_query_timeout_ns=(
                 validation_collision_query_timeout_ns
             ),
@@ -552,6 +748,22 @@ def _make_kernel(
                 validation_collision_wall_timeout_ns
             ),
             runtime_dynamic_body_max_age_cap_ns=runtime_dynamic_body_max_age_cap_ns,
+            validation_collision_workers=validation_collision_workers,
+            runtime_collision_lookahead_cycle_budget_ns=(
+                runtime_collision_lookahead_cycle_budget_ns
+            ),
+            runtime_collision_lookahead_query_budget_ns=(
+                runtime_collision_lookahead_query_budget_ns
+            ),
+            runtime_collision_lookahead_horizon_ns=(
+                runtime_collision_lookahead_horizon_ns
+            ),
+            runtime_collision_lookahead_max_samples=(
+                runtime_collision_lookahead_max_samples
+            ),
+            runtime_collision_lookahead_workers=(
+                runtime_collision_lookahead_workers
+            ),
         )
     if execution_adapter_id not in {"execution.roboplan_native", "execution.test"}:
         raise RuntimeError(
@@ -571,7 +783,7 @@ def _make_kernel(
         kernel_config = _kernel_config_from_deployment(
             deployment,
             collision_monitor_period_ns=collision_monitor_period_ns,
-            runtime_collision_query_timeout_ns=runtime_collision_query_timeout_ns,
+            runtime_collision_immediate_query_budget_ns=runtime_collision_immediate_query_budget_ns,
             validation_collision_query_timeout_ns=(
                 validation_collision_query_timeout_ns
             ),
@@ -579,6 +791,22 @@ def _make_kernel(
                 validation_collision_wall_timeout_ns
             ),
             runtime_dynamic_body_max_age_cap_ns=runtime_dynamic_body_max_age_cap_ns,
+            validation_collision_workers=validation_collision_workers,
+            runtime_collision_lookahead_cycle_budget_ns=(
+                runtime_collision_lookahead_cycle_budget_ns
+            ),
+            runtime_collision_lookahead_query_budget_ns=(
+                runtime_collision_lookahead_query_budget_ns
+            ),
+            runtime_collision_lookahead_horizon_ns=(
+                runtime_collision_lookahead_horizon_ns
+            ),
+            runtime_collision_lookahead_max_samples=(
+                runtime_collision_lookahead_max_samples
+            ),
+            runtime_collision_lookahead_workers=(
+                runtime_collision_lookahead_workers
+            ),
         )
         resolved_model = _resolved_robot_model_from_deployment(deployment)
         if resolved_model is not None:

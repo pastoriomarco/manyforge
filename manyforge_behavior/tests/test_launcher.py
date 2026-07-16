@@ -417,7 +417,15 @@ class TestLauncherKernelCreation:
             str((tmp_path / "assets").resolve()),
             str((tmp_path / "../shared_assets").resolve()),
         ]
-        assert recorded["config"] == {}
+        assert recorded["config"] == {
+            "runtime_collision_immediate_query_budget_ns": 50_000_000,
+            "runtime_collision_lookahead_query_budget_ns": 75_000_000,
+            "runtime_collision_lookahead_cycle_budget_ns": 200_000_000,
+            "runtime_collision_lookahead_horizon_ns": 2_000_000_000,
+            "runtime_collision_lookahead_max_samples": 32,
+            "runtime_collision_lookahead_workers": 2,
+            "validation_collision_workers": 4,
+        }
         assert kernel.robot_model_authority_metadata["view_changed"] is False
         assert kernel.robot_model_authority_metadata["canonical_urdf_path"] == (
             str(tmp_path / "robots" / "custom.urdf")

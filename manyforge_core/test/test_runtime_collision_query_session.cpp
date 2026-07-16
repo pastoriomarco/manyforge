@@ -180,13 +180,14 @@ class FixedRuntimeEngine final : public ICollisionQueryEngine {
       const CollisionWorldSnapshot&,
       const RuntimeCollisionQueryRequest& request) noexcept override {
     ++query_count_;
+    last_timeout_budget_ns_ = request.timeout_budget_ns;
     last_positions_[0] = request.positions_rad[0];
     last_positions_[1] = request.positions_rad[1];
     RuntimeCollisionQueryResultView result;
     result.status = status_;
     result.failure_reason = failure_reason_;
     result.engine_status = engine_status_;
-    result.query_duration_ns = 1'000;
+    result.query_duration_ns = query_duration_ns_;
     if (return_oversized_collision_observations_) {
       result.collision_pairs = oversized_observations_;
     } else if (status_ == RuntimeCollisionQueryStatus::kCollision) {
@@ -230,6 +231,8 @@ class FixedRuntimeEngine final : public ICollisionQueryEngine {
   std::array<double, 2> last_positions_{};
   std::size_t prepared_joint_count_ = 0;
   std::uint64_t query_count_ = 0;
+  std::int64_t last_timeout_budget_ns_ = 0;
+  std::int64_t query_duration_ns_ = 1'000;
   bool return_oversized_collision_observations_ = false;
   bool return_oversized_clearance_observations_ = false;
 };
@@ -364,6 +367,35 @@ TEST(RuntimeCollisionQuerySessionTest,
   EXPECT_EQ(error->details.at("reason"),
             "runtime_collision_query_budget_below_qualified_wcet");
   EXPECT_EQ(engine->query_count_, 0u);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     ReturnedQueryTimeoutPreservesBudgetAndFailClosedClassification) {
+  CollisionPolicySnapshot policy;
+  policy.revision = {1, "runtime-policy"};
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  engine->status_ = RuntimeCollisionQueryStatus::kInconclusive;
+  engine->failure_reason_ = RuntimeCollisionQueryFailureReason::kTimeout;
+  engine->engine_status_ = CollisionEngineStatus::kTimeout;
+  engine->query_duration_ns_ = 12'000'000;
+  constexpr std::int64_t kImmediateQueryBudgetNs = 10'000'000;
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       kImmediateQueryBudgetNs);
+  ASSERT_FALSE(session.prepare(publisher.bundle).has_value());
+
+  const std::array<double, 2> positions{0.0, 0.0};
+  const auto outcome = session.tick(publisher.bundle, positions, 1);
+
+  EXPECT_EQ(engine->last_timeout_budget_ns_, kImmediateQueryBudgetNs);
+  EXPECT_TRUE(outcome.query_executed);
+  EXPECT_EQ(outcome.status, RuntimeCollisionTickStatus::kInconclusive);
+  EXPECT_EQ(outcome.reason, RuntimeCollisionTickReason::kEngineInconclusive);
+  EXPECT_EQ(outcome.engine_failure_reason,
+            RuntimeCollisionQueryFailureReason::kTimeout);
+  EXPECT_EQ(outcome.engine_status, CollisionEngineStatus::kTimeout);
+  EXPECT_EQ(outcome.query_duration_ns, engine->query_duration_ns_);
 }
 
 TEST(RuntimeCollisionQuerySessionTest,
@@ -672,6 +704,12 @@ TEST(RuntimeCollisionQuerySessionTest,
   engine->collide(pair, -0.001);
   EXPECT_EQ(session.tick(publisher.bundle, positions, 1).status,
             RuntimeCollisionTickStatus::kClear);
+  const auto contact_state = session.contact_release_state_snapshot();
+  ASSERT_TRUE(contact_state.valid);
+  ASSERT_EQ(contact_state.count, 1U);
+  EXPECT_EQ(contact_state.binding_owner, publisher.bundle);
+  ASSERT_NE(contact_state.entries[0].pair, nullptr);
+  EXPECT_EQ(*contact_state.entries[0].pair, pair);
 
   engine->collide(pair, -0.003);
   const auto blocked = session.tick(publisher.bundle, positions, 2);

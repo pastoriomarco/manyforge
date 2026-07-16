@@ -37,6 +37,10 @@ struct ExecutionSnapshot {
 struct ExecutionHandle {
   std::function<bool(int64_t timeout_ns)> wait_for_completion;
   std::function<ExecutionSnapshot()> get_snapshot;
+  /// Backend generation opened by this exact dispatch. Zero means the backend
+  /// cannot support generation-fenced runtime lookahead and admission must
+  /// fail closed when lookahead is enabled.
+  std::uint64_t execution_generation = 0;
 };
 
 /// Stop result (spec 220 §4.2)

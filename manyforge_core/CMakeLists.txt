@@ -28,10 +28,13 @@ add_library(manyforge_core
   src/motion_target_resolution.cpp
   src/operator_stop_worker.cpp
   src/observed_robot_state_publication.cpp
+  src/execution_progress_publication.cpp
+  src/trajectory_progress_projection.cpp
   src/observed_robot_state_provider.cpp
   src/pose_math.cpp
   src/runtime_collision_monitor.cpp
   src/runtime_collision_query_session.cpp
+  src/runtime_collision_lookahead_session.cpp
   src/scene_authority.cpp
   src/scene_snapshot_lease.cpp
   src/stop_policy.cpp
@@ -41,6 +44,7 @@ add_library(manyforge_core
   src/trajectory_sampler.cpp
   src/collision_policy_evaluator.cpp
   src/collision_validation_coordinator.cpp
+  src/ordered_contact_validation.cpp
   src/parallel_collision_validation_worker_pool.cpp
   src/collision_world_snapshot_builder.cpp
   src/interrupt_manager.cpp
@@ -133,6 +137,27 @@ if(BUILD_TESTING)
   target_link_libraries(test_runtime_collision_query_session PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_runtime_collision_query_session
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_execution_progress_publication
+    test/test_execution_progress_publication.cpp)
+  target_link_libraries(test_execution_progress_publication PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_execution_progress_publication
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_trajectory_progress_projection
+    test/test_trajectory_progress_projection.cpp)
+  target_link_libraries(test_trajectory_progress_projection PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_trajectory_progress_projection
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_runtime_collision_lookahead_session
+    test/test_runtime_collision_lookahead_session.cpp)
+  target_link_libraries(test_runtime_collision_lookahead_session PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_runtime_collision_lookahead_session
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_motion_trip_stop_coordinator
@@ -276,6 +301,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_parallel_collision_validation_worker_pool PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_parallel_collision_validation_worker_pool
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_ordered_contact_validation
+    test/test_ordered_contact_validation.cpp)
+  target_link_libraries(test_ordered_contact_validation PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_ordered_contact_validation
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_collision_engine_mismatch_ledger

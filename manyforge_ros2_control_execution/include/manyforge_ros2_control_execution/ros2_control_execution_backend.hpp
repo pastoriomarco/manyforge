@@ -37,6 +37,7 @@
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
+#include <manyforge_core/trajectory/trajectory_progress_projection.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
 
 namespace manyforge::ros2_control_execution {
@@ -136,6 +137,10 @@ class Ros2ControlExecutionBackend final
   const core::ObservedRobotStatePublication*
   observed_robot_state_publication() const noexcept override {
     return observed_state_publication_.get();
+  }
+  const core::ExecutionProgressPublication*
+  execution_progress_publication() const noexcept override {
+    return execution_progress_publication_.get();
   }
   const std::atomic<std::uint64_t>* authored_state_authority_epoch()
       const noexcept {
@@ -241,6 +246,7 @@ class Ros2ControlExecutionBackend final
     }
     validate_config();
     initialize_observed_state_publication();
+    initialize_execution_progress_publication();
     snapshot_.timestamp_ns = clock_.now();
     initialize_authored_state();
   }
@@ -473,6 +479,7 @@ class Ros2ControlExecutionBackend final
 
   void validate_config() const;
   void initialize_observed_state_publication();
+  void initialize_execution_progress_publication();
   void initialize_authored_state();
   void publish_observed_robot_state(
       core::ObservedRobotStateSourceKind source,
@@ -665,6 +672,8 @@ class Ros2ControlExecutionBackend final
   Ros2ControlExecutionBackendConfig config_;
   std::unique_ptr<core::ObservedRobotStatePublication>
       observed_state_publication_;
+  std::unique_ptr<core::ExecutionProgressPublication>
+      execution_progress_publication_;
   // Command/predicted authority has one backend-owned writer domain. This leaf
   // lock is never used by ROS measured-state ingress or by publication readers;
   // it only orders the monitor and lifecycle terminal writers so an old monitor

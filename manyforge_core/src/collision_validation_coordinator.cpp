@@ -1,14 +1,14 @@
-#include <manyforge_core/collision/collision_validation_coordinator.hpp>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <manyforge_core/collision/collision_validation_coordinator.hpp>
+#include <manyforge_core/collision/ordered_contact_validation.hpp>
+#include <manyforge_core/types/reason_codes.hpp>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <utility>
-
-#include <manyforge_core/types/reason_codes.hpp>
 
 namespace manyforge::core {
 
@@ -163,8 +163,7 @@ std::string pair_text(const CollisionPairId& pair) {
 }
 
 void set_contact_release_diagnostic(CollisionValidationWaypointRecord& record,
-                                    const SupportContactPolicyEntry& entry,
-                                    std::string reason,
+                                    const SupportContactPolicyEntry& entry, std::string reason,
                                     std::optional<double> initial_depth,
                                     std::optional<double> current_depth) {
   record.result.raw_diagnostics["contact_release_violation"] =
@@ -375,7 +374,7 @@ void CollisionValidationCoordinator::apply_contact_release_constraints(
                                    std::move(reason),
                                    initial_depth,
                                    current_depth);
-    if (!first_failing_waypoint.has_value()) {
+    if (!first_failing_waypoint.has_value() || record.waypoint_index < *first_failing_waypoint) {
       first_failing_waypoint = record.waypoint_index;
       first_failing_time_ns = record.time_from_start_ns;
     }
@@ -410,8 +409,7 @@ void CollisionValidationCoordinator::apply_contact_release_constraints(
 
     for (std::size_t i = 0; i < bundle.waypoint_records.size(); ++i) {
       auto& record = bundle.waypoint_records[i];
-      const auto clearance = clearance_for_pair(record.result,
-                                                support_entry.pair);
+      const auto clearance = clearance_for_pair(record.result, support_entry.pair);
       if (!clearance || !std::isfinite(*clearance)) {
         record_violation(record,
                          support_entry,
@@ -462,27 +460,16 @@ void CollisionValidationCoordinator::apply_contact_release_constraints(
         continue;
       }
 
-      if (separated) {
-        if (depth > tolerance && !separated_now) {
-          if (!support_entry.allow_recontact) {
-            record_violation(record,
-                             support_entry,
-                             CollisionDecisionResult::kFail,
-                             "recontact_after_release",
-                             initial_depth,
-                             depth);
-            break;
-          }
-          if (support_entry.enforce_max_start_penetration &&
-              depth > max_start + tolerance) {
-            record_violation(record,
-                             support_entry,
-                             CollisionDecisionResult::kFail,
-                             "recontact_penetration_exceeds_policy",
-                             initial_depth,
-                             depth);
-            break;
-          }
+      if (separated && depth > tolerance && !separated_now) {
+        if (!support_entry.allow_recontact) {
+          record_violation(record, support_entry, CollisionDecisionResult::kFail,
+                           "recontact_after_release", initial_depth, depth);
+          break;
+        }
+        if (support_entry.enforce_max_start_penetration && depth > max_start + tolerance) {
+          record_violation(record, support_entry, CollisionDecisionResult::kFail,
+                           "recontact_penetration_exceeds_policy", initial_depth, depth);
+          break;
         }
       }
 
@@ -580,6 +567,30 @@ void CollisionValidationCoordinator::apply_contact_grasp_constraints(
     return;
   }
 
+  const auto* original_fractions = config_.original_trajectory_sample_fractions
+                                       ? &*config_.original_trajectory_sample_fractions
+                                       : nullptr;
+  if (original_fractions != nullptr) {
+    bool valid = original_fractions->size() == bundle.waypoint_records.size();
+    double previous = -1.0;
+    for (const auto fraction : *original_fractions) {
+      if (!std::isfinite(fraction) || fraction < 0.0 || fraction > 1.0 || fraction <= previous) {
+        valid = false;
+        break;
+      }
+      previous = fraction;
+    }
+    if (!valid) {
+      auto& first = bundle.waypoint_records.front();
+      first.result.decision = CollisionDecisionResult::kInconclusiveFail;
+      first.produced_decision_change = true;
+      first.result.raw_diagnostics["contact_grasp_violation"] =
+          reason_codes::kInvalidContactGraspSampleFractions;
+      first.result.raw_diagnostics["contact_grasp_policy_id"] = active->policy_id;
+      return;
+    }
+  }
+
   const auto last_index =
       bundle.waypoint_records.size() > 1 ? bundle.waypoint_records.size() - 1 : 1;
   for (std::size_t i = 0; i < bundle.waypoint_records.size(); ++i) {
@@ -587,10 +598,11 @@ void CollisionValidationCoordinator::apply_contact_grasp_constraints(
     if (record.result.engine_status != CollisionEngineStatus::kOk) {
       continue;
     }
-    const double fraction =
-        bundle.waypoint_records.size() <= 1
-            ? 1.0
-            : static_cast<double>(i) / static_cast<double>(last_index);
+    const double fraction = original_fractions != nullptr ? (*original_fractions)[i]
+                            : bundle.waypoint_records.size() <= 1
+                                ? 1.0
+                                : static_cast<double>(i) / static_cast<double>(last_index);
+    const bool is_plan_initial_sample = original_fractions != nullptr ? fraction <= 1e-12 : i == 0;
     bool changed = false;
     for (auto& classified : record.result.normalized_pairs_classified) {
       if (classified.classification !=
@@ -610,7 +622,7 @@ void CollisionValidationCoordinator::apply_contact_grasp_constraints(
         continue;
       }
       const double depth = std::max(0.0, -*clearance);
-      if (i == 0) {
+      if (is_plan_initial_sample) {
         set_contact_grasp_diagnostic(record,
                                      *active,
                                      classified.pair,
@@ -857,6 +869,137 @@ CollisionValidationCoordinator::validate_trajectory_range(
                        begin_index,
                        end_index,
                        cancel);
+}
+
+CollisionValidationDecisionBundle
+CollisionValidationCoordinator::query_trajectory_range_unclassified(
+    const CollisionWorldSnapshot& snapshot, ICollisionQueryEngine& engine,
+    const TrajectoryDTO& trajectory, std::size_t begin_index, std::size_t end_index,
+    const CollisionCancellationToken& cancel) {
+  CollisionValidationDecisionBundle bundle;
+  bundle.borrowed_world_revision = snapshot.revision;
+  bundle.final_world_revision = snapshot.revision;
+  bundle.decision.accepted = true;
+  bundle.decision.severity = CollisionDecisionSeverity::kNone;
+  bundle.decision.action = CollisionDecisionAction::kDispatch;
+  bundle.decision.collision_world_revision = snapshot.revision;
+
+  begin_index = std::min(begin_index, trajectory.waypoints.size());
+  end_index = std::min(end_index, trajectory.waypoints.size());
+  if (end_index < begin_index) {
+    end_index = begin_index;
+  }
+
+  RobotStateDTO state;
+  state.joint_names = trajectory.joint_names;
+  for (std::size_t i = begin_index; i < end_index; ++i) {
+    const auto local_index = static_cast<std::int64_t>(i - begin_index);
+    const auto time_from_start_ns = waypoint_time_from_start_ns(trajectory, i);
+    if (cancel.is_cancel_requested()) {
+      mark_cancelled(bundle, local_index, time_from_start_ns, cancel.reason());
+      return bundle;
+    }
+
+    state.positions_rad = trajectory.waypoints[i].positions_rad;
+    auto query = make_query(state, local_index, time_from_start_ns, bundle.borrowed_world_revision);
+    CollisionValidationWaypointRecord record;
+    record.waypoint_index = local_index;
+    record.time_from_start_ns = time_from_start_ns;
+    record.result = engine.check(snapshot, query, *policy_snapshot_, cancel);
+    const bool engine_cancelled = record.result.engine_status == CollisionEngineStatus::kCancelled;
+    std::string cancellation_reason;
+    if (engine_cancelled) {
+      const auto reason_it = record.result.raw_diagnostics.find("cancel_reason");
+      cancellation_reason =
+          reason_it == record.result.raw_diagnostics.end() ? cancel.reason() : reason_it->second;
+    }
+    bundle.waypoint_records.push_back(std::move(record));
+    if (engine_cancelled) {
+      mark_cancelled(bundle, local_index, time_from_start_ns, std::move(cancellation_reason));
+      return bundle;
+    }
+  }
+  if (cancel.is_cancel_requested()) {
+    const auto local_index = begin_index >= end_index
+                                 ? std::int64_t{0}
+                                 : static_cast<std::int64_t>(end_index - begin_index - 1);
+    const auto global_index = begin_index >= end_index ? begin_index : end_index - 1;
+    mark_cancelled(bundle, local_index, waypoint_time_from_start_ns(trajectory, global_index),
+                   cancel.reason());
+  }
+  return bundle;
+}
+
+CollisionValidationDecisionBundle CollisionValidationCoordinator::finalize_prequeried_range(
+    const CollisionWorldSnapshot& snapshot, const TrajectoryDTO& trajectory,
+    CollisionValidationDecisionBundle queried,
+    const SupportContactEvaluationStateMap& entering_support_state,
+    SupportContactEvaluationStateMap* exiting_support_state) {
+  evaluator_.reset();
+  if (!evaluator_.restore_support_contact_state(entering_support_state)) {
+    throw std::invalid_argument("ordered collision-validation support state does not match policy");
+  }
+
+  const bool was_cancelled = queried.cancelled;
+  const auto cancellation_reason = queried.cancellation_reason;
+  const auto cancelled_at = queried.cancelled_at_waypoint_index;
+
+  for (auto& record : queried.waypoint_records) {
+    record = classify_result(std::move(record.result), record.waypoint_index,
+                             record.time_from_start_ns, queried.borrowed_world_revision);
+  }
+
+  // Contact-grasp validation remains an explicit serial shape. Keeping this
+  // call here makes the primitive complete and prevents a future caller from
+  // accidentally omitting it when using prequeried records serially.
+  apply_contact_grasp_constraints(trajectory, queried);
+
+  CollisionDecisionResult worst = CollisionDecisionResult::kPass;
+  CollisionDecisionSeverity worst_severity = CollisionDecisionSeverity::kNone;
+  std::optional<std::int64_t> first_failing_waypoint;
+  std::optional<std::int64_t> first_failing_time_ns;
+  for (const auto& record : queried.waypoint_records) {
+    const auto decision = record.result.decision;
+    const auto severity = severity_for(decision);
+    if (severity > worst_severity ||
+        (severity == worst_severity && decision != CollisionDecisionResult::kPass &&
+         worst == CollisionDecisionResult::kPass)) {
+      worst = decision;
+      worst_severity = severity;
+    }
+    if (decision != CollisionDecisionResult::kPass && !first_failing_waypoint) {
+      first_failing_waypoint = record.waypoint_index;
+      first_failing_time_ns = record.time_from_start_ns;
+    }
+  }
+
+  queried.decision.accepted = worst == CollisionDecisionResult::kPass;
+  queried.decision.severity = worst_severity;
+  queried.decision.action = action_for(worst);
+  queried.decision.first_failing_waypoint = first_failing_waypoint;
+  queried.decision.first_failing_time_ns = first_failing_time_ns;
+  queried.decision.collision_world_revision = snapshot.revision;
+  queried.final_world_revision = snapshot.revision;
+
+  if (was_cancelled) {
+    queried.cancelled = false;
+    queried.cancellation_reason.reset();
+    queried.cancelled_at_waypoint_index.reset();
+    mark_cancelled(
+        queried,
+        cancelled_at.value_or(
+            queried.waypoint_records.empty() ? 0 : queried.waypoint_records.back().waypoint_index),
+        cancelled_at && *cancelled_at >= 0 &&
+                static_cast<std::size_t>(*cancelled_at) < queried.waypoint_records.size()
+            ? queried.waypoint_records[static_cast<std::size_t>(*cancelled_at)].time_from_start_ns
+            : std::nullopt,
+        cancellation_reason.value_or("collision_validation_cancelled"));
+  }
+
+  if (exiting_support_state != nullptr) {
+    *exiting_support_state = evaluator_.support_contact_state();
+  }
+  return queried;
 }
 
 }  // namespace manyforge::core

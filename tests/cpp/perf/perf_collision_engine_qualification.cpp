@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
@@ -110,6 +111,8 @@ using manyforge::core::CollisionShapeDTO;
 using manyforge::core::CollisionSurface;
 using manyforge::core::CollisionWorldBody;
 using manyforge::core::CollisionWorldSnapshot;
+using manyforge::core::CollisionWorldSnapshotPtr;
+using manyforge::core::CollisionValidationPassConfig;
 using manyforge::core::CylinderShapeDTO;
 using manyforge::core::ICollisionQueryEngine;
 using manyforge::core::ParallelCollisionValidationWorkerPool;
@@ -355,6 +358,23 @@ bool same_decision(const manyforge::core::CollisionDecision& a,
          a.first_failing_time_ns == b.first_failing_time_ns;
 }
 
+bool same_semantic_diagnostics(
+    const std::map<std::string, std::string>& left,
+    const std::map<std::string, std::string>& right) {
+  static const std::array<std::string, 2> kVolatileTimingKeys{
+      "snapshot_sync_duration_ns",
+      "total_call_duration_ns",
+  };
+  auto semantic_copy = [](const auto& diagnostics) {
+    auto copy = diagnostics;
+    for (const auto& key : kVolatileTimingKeys) {
+      copy.erase(key);
+    }
+    return copy;
+  };
+  return semantic_copy(left) == semantic_copy(right);
+}
+
 bool same_waypoint_records(
     const std::vector<manyforge::core::CollisionValidationWaypointRecord>& a,
     const std::vector<manyforge::core::CollisionValidationWaypointRecord>& b) {
@@ -364,10 +384,38 @@ bool same_waypoint_records(
   for (std::size_t i = 0; i < a.size(); ++i) {
     if (a[i].waypoint_index != b[i].waypoint_index ||
         a[i].time_from_start_ns != b[i].time_from_start_ns ||
+        a[i].produced_decision_change != b[i].produced_decision_change ||
         a[i].result.engine_status != b[i].result.engine_status ||
         a[i].result.decision != b[i].result.decision ||
-        a[i].result.normalized_pairs != b[i].result.normalized_pairs) {
+        a[i].result.normalized_pairs != b[i].result.normalized_pairs ||
+        !same_semantic_diagnostics(a[i].result.raw_diagnostics,
+                                   b[i].result.raw_diagnostics) ||
+        a[i].result.normalized_pairs_classified.size() !=
+            b[i].result.normalized_pairs_classified.size() ||
+        a[i].result.pair_clearances.size() !=
+            b[i].result.pair_clearances.size()) {
       return false;
+    }
+    for (std::size_t pair_index = 0;
+         pair_index < a[i].result.normalized_pairs_classified.size();
+         ++pair_index) {
+      const auto& left = a[i].result.normalized_pairs_classified[pair_index];
+      const auto& right = b[i].result.normalized_pairs_classified[pair_index];
+      if (left.pair != right.pair ||
+          left.classification != right.classification ||
+          left.is_first_failure != right.is_first_failure) {
+        return false;
+      }
+    }
+    for (std::size_t clearance_index = 0;
+         clearance_index < a[i].result.pair_clearances.size();
+         ++clearance_index) {
+      const auto& left = a[i].result.pair_clearances[clearance_index];
+      const auto& right = b[i].result.pair_clearances[clearance_index];
+      if (left.pair != right.pair ||
+          left.signed_clearance_m != right.signed_clearance_m) {
+        return false;
+      }
     }
   }
   return true;
@@ -379,22 +427,165 @@ bool same_bundle(
   return same_decision(a.decision, b.decision) &&
          a.scene_changed_during_validation == b.scene_changed_during_validation &&
          a.cancelled == b.cancelled &&
+         a.cancellation_reason == b.cancellation_reason &&
          a.cancelled_at_waypoint_index == b.cancelled_at_waypoint_index &&
          same_waypoint_records(a.waypoint_records, b.waypoint_records);
 }
 
 std::int64_t measure_validation_ns(
     ParallelCollisionValidationWorkerPool& pool,
-    const manyforge::core::CollisionWorldSnapshot& snapshot,
-    const std::vector<ICollisionQueryEngine*>& engines,
+    const CollisionWorldSnapshotPtr& snapshot,
+    const std::vector<std::shared_ptr<ICollisionQueryEngine>>& engines,
     const TrajectoryDTO& trajectory,
-    CollisionCancellationToken& cancel,
-    manyforge::core::CollisionValidationDecisionBundle* bundle) {
+    const std::shared_ptr<CollisionCancellationToken>& cancel,
+    CollisionValidationPassConfig pass_config,
+    manyforge::core::CollisionValidationDecisionBundle* bundle,
+    std::int64_t* process_cpu_ns = nullptr) {
+  timespec cpu_start{};
+  timespec cpu_end{};
+  if (process_cpu_ns != nullptr) {
+    (void)::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start);
+  }
   const auto start = std::chrono::steady_clock::now();
-  *bundle = pool.validate_trajectory(snapshot, engines, trajectory, cancel);
+  *bundle = pool.validate_trajectory(
+      snapshot, engines, trajectory, cancel, std::move(pass_config));
   const auto end = std::chrono::steady_clock::now();
+  if (process_cpu_ns != nullptr) {
+    (void)::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_end);
+    *process_cpu_ns =
+        static_cast<std::int64_t>(cpu_end.tv_sec - cpu_start.tv_sec) *
+            1'000'000'000LL +
+        static_cast<std::int64_t>(cpu_end.tv_nsec - cpu_start.tv_nsec);
+  }
   return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
       .count();
+}
+
+struct ValidationWorkerEvidence {
+  int workers_requested = 0;
+  int workers_effective = 0;
+  int workers_used = 0;
+  std::string fallback_reason;
+  bool ordered_contact_summary_used = false;
+  bool decision_match = false;
+  double wall_p50_us = 0.0;
+  double wall_p95_us = 0.0;
+  double wall_p99_us = 0.0;
+  double wall_max_us = 0.0;
+  double process_cpu_p50_us = 0.0;
+  double process_cpu_p95_us = 0.0;
+  double process_cpu_p99_us = 0.0;
+  double process_cpu_max_us = 0.0;
+  std::uint64_t allocations_total = 0;
+  double allocations_per_run = 0.0;
+  double cold_wall_us = 0.0;
+  double cold_process_cpu_us = 0.0;
+  std::uint64_t cold_allocations = 0;
+};
+
+struct ValidationWaypointSweepEvidence {
+  int waypoint_count = 0;
+  std::vector<ValidationWorkerEvidence> workers;
+};
+
+std::vector<ValidationWorkerEvidence> measure_validation_worker_sweep(
+    const CollisionWorldSnapshot& snapshot,
+    const CollisionPolicySnapshot& policy,
+    const TrajectoryDTO& trajectory,
+    int max_worker_count,
+    int validation_runs) {
+  std::optional<manyforge::core::CollisionValidationDecisionBundle>
+      serial_reference;
+  std::vector<ValidationWorkerEvidence> sweep;
+  sweep.reserve(static_cast<std::size_t>(max_worker_count));
+  const auto snapshot_owner =
+      std::make_shared<const CollisionWorldSnapshot>(snapshot);
+
+  for (int worker_count = 1; worker_count <= max_worker_count;
+       ++worker_count) {
+    std::vector<std::shared_ptr<ICollisionQueryEngine>> engines;
+    engines.reserve(static_cast<std::size_t>(worker_count));
+    for (int i = 0; i < worker_count; ++i) {
+      engines.push_back(make_engine("ur5_gripper", "arm"));
+    }
+
+    ParallelCollisionValidationWorkerPool::Config pool_config;
+    pool_config.pass_config.policy_snapshot = policy;
+    pool_config.worker_count = worker_count;
+    pool_config.min_waypoints_for_parallel = 1;
+    ParallelCollisionValidationWorkerPool pool(pool_config);
+    auto worker_cancel = std::make_shared<CollisionCancellationToken>();
+    manyforge::core::CollisionValidationDecisionBundle bundle_result;
+    std::int64_t cold_process_cpu_ns = 0;
+    g_allocation_count.store(0, std::memory_order_relaxed);
+    g_count_allocations.store(true, std::memory_order_release);
+    const auto cold_wall_ns = measure_validation_ns(pool,
+                                                    snapshot_owner,
+                                                    engines,
+                                                    trajectory,
+                                                    worker_cancel,
+                                                    pool_config.pass_config,
+                                                    &bundle_result,
+                                                    &cold_process_cpu_ns);
+    g_count_allocations.store(false, std::memory_order_release);
+    const auto cold_allocations =
+        g_allocation_count.load(std::memory_order_relaxed);
+
+    std::vector<std::int64_t> wall_samples;
+    std::vector<std::int64_t> cpu_samples;
+    wall_samples.reserve(validation_runs);
+    cpu_samples.reserve(validation_runs);
+    g_allocation_count.store(0, std::memory_order_relaxed);
+    g_count_allocations.store(true, std::memory_order_release);
+    for (int run = 0; run < validation_runs; ++run) {
+      std::int64_t process_cpu_ns = 0;
+      wall_samples.push_back(measure_validation_ns(pool,
+                                                   snapshot_owner,
+                                                   engines,
+                                                   trajectory,
+                                                   worker_cancel,
+                                                   pool_config.pass_config,
+                                                   &bundle_result,
+                                                   &process_cpu_ns));
+      cpu_samples.push_back(process_cpu_ns);
+    }
+    g_count_allocations.store(false, std::memory_order_release);
+
+    if (worker_count == 1) {
+      serial_reference = bundle_result;
+    }
+    ValidationWorkerEvidence sample;
+    const auto telemetry = pool.last_telemetry();
+    sample.workers_requested = telemetry.workers_requested;
+    sample.workers_effective = telemetry.workers_effective;
+    sample.workers_used = telemetry.workers_actually_used;
+    sample.fallback_reason = telemetry.fallback_reason;
+    sample.ordered_contact_summary_used =
+        telemetry.ordered_contact_summary_used;
+    sample.decision_match =
+        serial_reference && same_bundle(*serial_reference, bundle_result);
+    sample.wall_p50_us = percentile_us(wall_samples, 0.50);
+    sample.wall_p95_us = percentile_us(wall_samples, 0.95);
+    sample.wall_p99_us = percentile_us(wall_samples, 0.99);
+    sample.wall_max_us = percentile_us(wall_samples, 1.0);
+    sample.process_cpu_p50_us = percentile_us(cpu_samples, 0.50);
+    sample.process_cpu_p95_us = percentile_us(cpu_samples, 0.95);
+    sample.process_cpu_p99_us = percentile_us(cpu_samples, 0.99);
+    sample.process_cpu_max_us = percentile_us(cpu_samples, 1.0);
+    sample.allocations_total =
+        g_allocation_count.load(std::memory_order_relaxed);
+    sample.allocations_per_run =
+        validation_runs > 0
+            ? static_cast<double>(sample.allocations_total) /
+                  static_cast<double>(validation_runs)
+            : 0.0;
+    sample.cold_wall_us = static_cast<double>(cold_wall_ns) / 1'000.0;
+    sample.cold_process_cpu_us =
+        static_cast<double>(cold_process_cpu_ns) / 1'000.0;
+    sample.cold_allocations = cold_allocations;
+    sweep.push_back(std::move(sample));
+  }
+  return sweep;
 }
 
 struct FixtureConfig {
@@ -402,7 +593,7 @@ struct FixtureConfig {
   std::string profile;
   bool expect_manyforge_vs_roboplan_match = true;
   bool expect_unsupported_fail_closed = false;
-  bool expect_support_contact_fallback = false;
+  bool expect_support_contact_ordered_summary = false;
   bool expect_attached_object = false;
   bool isaac_scene_fixture = false;
   bool query_enabled = true;
@@ -412,6 +603,7 @@ struct FixtureConfig {
   int validation_waypoints = 96;
   int validation_runs = 9;
   int worker_count = 4;
+  std::vector<int> validation_waypoint_sweep;
 };
 
 struct FixtureEvidence {
@@ -440,7 +632,7 @@ struct FixtureEvidence {
   bool manyforge_vs_roboplan_match = false;
   bool unsupported_fail_closed = false;
   bool validation_match = true;
-  bool support_contact_fallback_verified = false;
+  bool support_contact_ordered_summary_verified = false;
   int validation_workers = 0;
   std::string validation_fallback_reason;
   bool validation_support_contact_active = false;
@@ -450,6 +642,8 @@ struct FixtureEvidence {
   double query_max_us = 0.0;
   double validation_serial_p95_us = 0.0;
   double validation_parallel_p95_us = 0.0;
+  std::vector<ValidationWorkerEvidence> validation_worker_sweep;
+  std::vector<ValidationWaypointSweepEvidence> validation_waypoint_sweep;
   double noncollision_validation_p50_us = 0.0;
   double noncollision_validation_p95_us = 0.0;
   double noncollision_validation_p99_us = 0.0;
@@ -599,7 +793,7 @@ bool setup_fixture(NativeKernelBundle& bundle, FixtureEvidence& evidence) {
                                          pose(0.95, 0.20, 0.18)),
                               evidence);
   }
-  if (name == "support_contact_serial_fallback") {
+  if (name == "support_contact_ordered_summary") {
     return add_object_checked(bundle,
                               box_object("phase4_support_object",
                                          Vector3DTO{0.05, 0.05, 0.05},
@@ -620,10 +814,13 @@ CollisionPolicySnapshot policy_for_fixture(const FixtureConfig& config) {
   policy.policy_id = "phase4_" + config.name;
   policy.revision.revision_id = 1;
   policy.revision.content_hash = "phase4_policy_" + config.name;
-  if (config.expect_support_contact_fallback) {
+  if (config.expect_support_contact_ordered_summary) {
     SupportContactPolicyEntry entry;
-    entry.pair = canonical_pair("object/phase4_support_fixture/shape/0",
+    entry.pair = canonical_pair(
+                                "robot/ur5_gripper/link/wrist_3_link/collision/0",
                                 "object/phase4_support_object/shape/0");
+    entry.max_start_penetration_m = 0.10;
+    entry.min_release_progress_m = 0.001;
     entry.require_separation_by_end = true;
     policy.support_contacts.push_back(std::move(entry));
   }
@@ -694,9 +891,9 @@ void run_validation_probe(
     return;
   }
   CollisionCancellationToken cancel;
-  const auto trajectory =
-      repeated_trajectory(observed_state(bundle),
-                          evidence.config.validation_waypoints);
+  const auto validation_state = observed_state(bundle);
+  const auto trajectory = repeated_trajectory(
+      validation_state, evidence.config.validation_waypoints);
 
   ValidationOptionsDTO noncollision_options;
   noncollision_options.run_collision_checks = false;
@@ -743,65 +940,64 @@ void run_validation_probe(
   evidence.noncollision_validation_max_us =
       percentile_us(noncollision_validation_ns, 1.0);
 
-  auto serial_engine = make_engine("ur5_gripper", "arm");
-  std::vector<ICollisionQueryEngine*> serial_engines{serial_engine.get()};
+  evidence.validation_worker_sweep = measure_validation_worker_sweep(
+      snapshot,
+      policy,
+      trajectory,
+      evidence.config.worker_count,
+      evidence.config.validation_runs);
 
-  std::vector<std::shared_ptr<ManyForgeCollisionEngine>> parallel_owned;
-  std::vector<ICollisionQueryEngine*> parallel_engines;
-  parallel_owned.reserve(evidence.config.worker_count);
-  parallel_engines.reserve(evidence.config.worker_count);
-  for (int i = 0; i < evidence.config.worker_count; ++i) {
-    parallel_owned.push_back(make_engine("ur5_gripper", "arm"));
-    parallel_engines.push_back(parallel_owned.back().get());
+  evidence.validation_waypoint_sweep.clear();
+  evidence.validation_waypoint_sweep.reserve(
+      evidence.config.validation_waypoint_sweep.size());
+  for (const int waypoint_count :
+       evidence.config.validation_waypoint_sweep) {
+    ValidationWaypointSweepEvidence sample;
+    sample.waypoint_count = waypoint_count;
+    if (waypoint_count == evidence.config.validation_waypoints) {
+      sample.workers = evidence.validation_worker_sweep;
+    } else {
+      sample.workers = measure_validation_worker_sweep(
+          snapshot,
+          policy,
+          repeated_trajectory(validation_state, waypoint_count),
+          evidence.config.worker_count,
+          evidence.config.validation_runs);
+    }
+    evidence.validation_waypoint_sweep.push_back(std::move(sample));
   }
 
-  ParallelCollisionValidationWorkerPool::Config serial_cfg;
-  serial_cfg.pass_config.policy_snapshot = policy;
-  serial_cfg.worker_count = 1;
-  serial_cfg.min_waypoints_for_parallel = 1;
-  ParallelCollisionValidationWorkerPool serial_pool(serial_cfg);
-
-  ParallelCollisionValidationWorkerPool::Config parallel_cfg;
-  parallel_cfg.pass_config.policy_snapshot = policy;
-  parallel_cfg.worker_count = evidence.config.worker_count;
-  parallel_cfg.min_waypoints_for_parallel = 1;
-  ParallelCollisionValidationWorkerPool parallel_pool(parallel_cfg);
-
-  manyforge::core::CollisionValidationDecisionBundle serial_bundle;
-  manyforge::core::CollisionValidationDecisionBundle parallel_bundle;
-  (void)measure_validation_ns(serial_pool, snapshot, serial_engines, trajectory,
-                              cancel, &serial_bundle);
-  (void)measure_validation_ns(parallel_pool, snapshot, parallel_engines,
-                              trajectory, cancel, &parallel_bundle);
-
-  std::vector<std::int64_t> serial_validation_ns;
-  std::vector<std::int64_t> parallel_validation_ns;
-  serial_validation_ns.reserve(evidence.config.validation_runs);
-  parallel_validation_ns.reserve(evidence.config.validation_runs);
-  for (int i = 0; i < evidence.config.validation_runs; ++i) {
-    serial_validation_ns.push_back(measure_validation_ns(
-        serial_pool, snapshot, serial_engines, trajectory, cancel,
-        &serial_bundle));
-    parallel_validation_ns.push_back(measure_validation_ns(
-        parallel_pool, snapshot, parallel_engines, trajectory, cancel,
-        &parallel_bundle));
-  }
-
-  evidence.validation_serial_p95_us =
-      percentile_us(serial_validation_ns, 0.95);
-  evidence.validation_parallel_p95_us =
-      percentile_us(parallel_validation_ns, 0.95);
-  evidence.validation_match = same_bundle(serial_bundle, parallel_bundle);
-  evidence.validation_workers =
-      parallel_pool.last_telemetry().workers_actually_used;
-  evidence.validation_fallback_reason =
-      parallel_pool.last_telemetry().fallback_reason;
-  evidence.validation_support_contact_active =
-      parallel_pool.last_telemetry().support_contact_active;
-  evidence.support_contact_fallback_verified =
+  const auto& serial = evidence.validation_worker_sweep.front();
+  const auto& selected = evidence.validation_worker_sweep.back();
+  evidence.validation_serial_p95_us = serial.wall_p95_us;
+  evidence.validation_parallel_p95_us = selected.wall_p95_us;
+  evidence.validation_match = std::all_of(
+      evidence.validation_worker_sweep.begin(),
+      evidence.validation_worker_sweep.end(),
+      [](const ValidationWorkerEvidence& sample) {
+        return sample.decision_match;
+      });
+  evidence.validation_match =
+      evidence.validation_match &&
+      std::all_of(evidence.validation_waypoint_sweep.begin(),
+                  evidence.validation_waypoint_sweep.end(),
+                  [](const ValidationWaypointSweepEvidence& point) {
+                    return !point.workers.empty() &&
+                           std::all_of(
+                               point.workers.begin(),
+                               point.workers.end(),
+                               [](const ValidationWorkerEvidence& sample) {
+                                 return sample.decision_match;
+                               });
+                  });
+  evidence.validation_workers = selected.workers_used;
+  evidence.validation_fallback_reason = selected.fallback_reason;
+  evidence.validation_support_contact_active = !policy.support_contacts.empty();
+  evidence.support_contact_ordered_summary_verified =
       evidence.validation_support_contact_active &&
-      evidence.validation_workers == 1 &&
-      evidence.validation_fallback_reason == "support_contact_policy_active";
+      selected.workers_used > 1 &&
+      selected.fallback_reason.empty() &&
+      selected.ordered_contact_summary_used;
 }
 
 void run_runtime_query_probe(
@@ -1131,9 +1327,10 @@ FixtureEvidence run_fixture(const FixtureConfig& config) {
       !evidence.unsupported_fail_closed) {
     evidence.errors.push_back("unsupported geometry did not fail closed");
   }
-  if (config.expect_support_contact_fallback &&
-      !evidence.support_contact_fallback_verified) {
-    evidence.errors.push_back("support-contact serial fallback not verified");
+  if (config.expect_support_contact_ordered_summary &&
+      !evidence.support_contact_ordered_summary_verified) {
+    evidence.errors.push_back(
+        "support-contact ordered-summary parallel path not verified");
   }
   if (config.expect_attached_object && evidence.attached_object_count <= 0) {
     evidence.errors.push_back("attached object missing from snapshot");
@@ -1179,8 +1376,8 @@ std::string fixture_to_json(const FixtureEvidence& e) {
       << json_bool(e.manyforge_vs_roboplan_match) << ",";
   out << "\"unsupported_fail_closed\":"
       << json_bool(e.unsupported_fail_closed) << ",";
-  out << "\"support_contact_fallback_verified\":"
-      << json_bool(e.support_contact_fallback_verified) << ",";
+  out << "\"support_contact_ordered_summary_verified\":"
+      << json_bool(e.support_contact_ordered_summary_verified) << ",";
   out << "\"isaac_scene_fixture\":"
       << json_bool(e.config.isaac_scene_fixture) << ",";
   out << "\"query_enabled\":" << json_bool(e.config.query_enabled) << ",";
@@ -1241,7 +1438,58 @@ std::string fixture_to_json(const FixtureEvidence& e) {
       << json_escape(e.validation_fallback_reason)
       << "\",\"support_contact_active\":"
       << json_bool(e.validation_support_contact_active)
-      << ",\"decision_match\":" << json_bool(e.validation_match) << "},";
+      << ",\"decision_match\":" << json_bool(e.validation_match)
+      << ",\"worker_sweep\":[";
+  const auto write_worker = [&out](const ValidationWorkerEvidence& sample) {
+    out << "{\"workers_requested\":" << sample.workers_requested
+        << ",\"workers_effective\":" << sample.workers_effective
+        << ",\"workers_used\":" << sample.workers_used
+        << ",\"fallback_reason\":\""
+        << json_escape(sample.fallback_reason)
+        << "\",\"ordered_contact_summary_used\":"
+        << json_bool(sample.ordered_contact_summary_used)
+        << ",\"decision_match\":" << json_bool(sample.decision_match)
+        << ",\"wall_us\":{\"p50\":" << sample.wall_p50_us
+        << ",\"p95\":" << sample.wall_p95_us
+        << ",\"p99\":" << sample.wall_p99_us
+        << ",\"max\":" << sample.wall_max_us
+        << "},\"process_cpu_us\":{\"p50\":"
+        << sample.process_cpu_p50_us
+        << ",\"p95\":" << sample.process_cpu_p95_us
+        << ",\"p99\":" << sample.process_cpu_p99_us
+        << ",\"max\":" << sample.process_cpu_max_us
+        << "},\"allocations_total\":" << sample.allocations_total
+        << ",\"allocations_per_run\":" << sample.allocations_per_run
+        << ",\"cold_snapshot_sync\":{\"wall_us\":"
+        << sample.cold_wall_us
+        << ",\"process_cpu_us\":" << sample.cold_process_cpu_us
+        << ",\"allocations\":" << sample.cold_allocations << "}"
+        << "}";
+  };
+  for (std::size_t i = 0; i < e.validation_worker_sweep.size(); ++i) {
+    if (i != 0) {
+      out << ",";
+    }
+    write_worker(e.validation_worker_sweep[i]);
+  }
+  out << "],\"waypoint_sweep\":[";
+  for (std::size_t i = 0; i < e.validation_waypoint_sweep.size(); ++i) {
+    if (i != 0) {
+      out << ",";
+    }
+    const auto& point = e.validation_waypoint_sweep[i];
+    out << "{\"waypoints\":" << point.waypoint_count
+        << ",\"worker_sweep\":[";
+    for (std::size_t worker_index = 0;
+         worker_index < point.workers.size(); ++worker_index) {
+      if (worker_index != 0) {
+        out << ",";
+      }
+      write_worker(point.workers[worker_index]);
+    }
+    out << "]}";
+  }
+  out << "]},";
   out << "\"noncollision_validation\":{\"enabled\":"
       << json_bool(e.config.validate_trajectory)
       << ",\"runs\":" << e.config.validation_runs
@@ -1268,35 +1516,44 @@ int main() {
   const std::vector<FixtureConfig> fixtures = {
       FixtureConfig{.name = "primitive_dense_ur5_gripper",
                     .profile = "primitive_box",
-                    .expect_manyforge_vs_roboplan_match = true},
+                    .expect_manyforge_vs_roboplan_match = true,
+                    .validation_waypoint_sweep = {}},
       FixtureConfig{.name = "runtime_capacity_envelope",
                     .profile = "runtime_capacity_bound",
                     .expect_manyforge_vs_roboplan_match = false,
                     .query_enabled = false,
                     .runtime_capacity_fixture = true,
                     .validate_trajectory = false,
-                    .query_iterations = 10},
+                    .query_iterations = 10,
+                    .validation_waypoint_sweep = {}},
       FixtureConfig{.name = "cylinder_dense_ur5_gripper",
                     .profile = "primitive_cylinder",
-                    .expect_manyforge_vs_roboplan_match = true},
+                    .expect_manyforge_vs_roboplan_match = true,
+                    .validation_waypoint_sweep = {}},
       FixtureConfig{.name = "attached_object_ur5_gripper",
                     .profile = "attached_primitive",
                     .expect_manyforge_vs_roboplan_match = true,
-                    .expect_attached_object = true},
+                    .expect_attached_object = true,
+                    .validation_waypoint_sweep = {}},
       FixtureConfig{.name = "unsupported_mesh_fail_closed",
                     .profile = "unsupported_mesh",
                     .expect_manyforge_vs_roboplan_match = false,
                     .expect_unsupported_fail_closed = true,
                     .validate_trajectory = false,
-                    .query_iterations = 30},
+                    .query_iterations = 30,
+                    .validation_waypoint_sweep = {}},
       FixtureConfig{.name = "isaac_like_primitive_cell",
                     .profile = "isaac_like_primitive",
                     .expect_manyforge_vs_roboplan_match = true,
-                    .isaac_scene_fixture = true},
-      FixtureConfig{.name = "support_contact_serial_fallback",
+                    .isaac_scene_fixture = true,
+                    .validation_runs = 30,
+                    .validation_waypoint_sweep = {8, 16, 32, 64, 96, 192}},
+      FixtureConfig{.name = "support_contact_ordered_summary",
                     .profile = "support_contact_policy",
                     .expect_manyforge_vs_roboplan_match = true,
-                    .expect_support_contact_fallback = true},
+                    .expect_support_contact_ordered_summary = true,
+                    .validation_runs = 30,
+                    .validation_waypoint_sweep = {8, 16, 32, 64, 96, 192}},
   };
 
   std::vector<FixtureEvidence> results;

@@ -4,17 +4,18 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <manyforge_core/collision/collision_validation_coordinator.hpp>
+#include <manyforge_core/collision/i_collision_query_engine.hpp>
+#include <manyforge_core/time/iclock.hpp>
+#include <manyforge_core/time/ischeduler.hpp>
+#include <manyforge_core/types/collision_world_snapshot.hpp>
+#include <manyforge_core/types/trajectory_dto.hpp>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-#include <manyforge_core/collision/collision_validation_coordinator.hpp>
-#include <manyforge_core/collision/i_collision_query_engine.hpp>
-#include <manyforge_core/types/collision_world_snapshot.hpp>
-#include <manyforge_core/types/trajectory_dto.hpp>
 
 namespace manyforge::core {
 
@@ -27,15 +28,18 @@ namespace manyforge::core {
 /// `Config::serial_reference_mode`). Hot-path runs MUST NOT pay the cost of
 /// the serial reference; the field stays `std::nullopt`.
 struct ParallelValidationTelemetry {
-  /// Number of workers that actually executed in parallel. 1 means the pool
-  /// took the serial fallback.
+  /// Deployment-requested and admitted worker counts. They are equal on the
+  /// production path; a mismatch is observable and cannot silently weaken a
+  /// declared deployment.
+  int workers_requested = 1;
+  int workers_effective = 1;
+
+  /// Number of workers that actually executed validation jobs. 1 means the
+  /// pool took the serial path; values above 1 mean parallel work ran.
   int workers_actually_used = 1;
 
-  /// Reason the pool fell back to serial. Empty when parallel ran. Use the
-  /// canonical reasons from the parallelism plan. Current worker-pool causes
-  /// are "support_contact_policy_active", "worker_count_one",
-  /// "trajectory_too_short", and "no_worker_contexts"; scene-aware
-  /// engine-specific causes land with the manyforge_collision chunks.
+  /// Reason the pool fell back to serial. Empty when parallel ran. Values are
+  /// stable structured reason codes documented by the parallelism plan.
   std::string fallback_reason;
 
   /// Total wall time of the call (ns).
@@ -54,6 +58,9 @@ struct ParallelValidationTelemetry {
   /// but pool ran parallel because the refusal flag is off" from "no
   /// support_contact at all" in dashboards.
   bool support_contact_active = false;
+
+  bool contact_release_active = false;
+  bool ordered_contact_summary_used = false;
 
   /// Collision geometry count sourced from `CollisionWorldSnapshot`
   /// metadata when available; 0 means "not sourced" (Phase 2 not yet
@@ -91,6 +98,18 @@ struct FallbackLogEvent {
   bool support_contact_active = false;
 };
 
+/// Lock-free diagnostic snapshot for the persistent validation worker pool.
+/// Counters are monotonic for one pool lifetime. Queue depth and active workers
+/// are instantaneous and may change immediately after this value is returned.
+struct ParallelValidationPoolStatus {
+  std::uint64_t queued_jobs = 0;
+  std::uint64_t active_workers = 0;
+  std::uint64_t completed_jobs_total = 0;
+  std::uint64_t cancelled_jobs_total = 0;
+  std::uint64_t dropped_jobs_total = 0;
+  std::uint64_t abandoned_jobs_total = 0;
+};
+
 /// ParallelCollisionValidationWorkerPool (spec COLLISION_CHECKING_OWNERSHIP_PLAN
 /// Chunk 7, TRAJECTORY_VALIDATION_PARALLELISM_PLAN Chunks 1-3).
 ///
@@ -104,13 +123,13 @@ struct FallbackLogEvent {
 /// preserves the determinism contract from the parallelism plan.
 ///
 /// Falls back to serial validation when:
-///   - the policy snapshot declares any support_contacts (state-machine
-///     ordering between chunks not yet specified — Chunk 4 of the parallelism
-///     plan);
+///   - a stateful policy is not represented by the qualified bounded summary;
 ///   - worker_count <= 1;
 ///   - the trajectory is shorter than `min_waypoints_for_parallel`;
-///   - the caller did not provide enough worker_engines to back the requested
-///     worker count.
+///   - the caller did not provide enough independent worker engines to back
+///     the requested worker count;
+///   - engine mutable-context identity is absent or duplicated;
+///   - the stateful policy exceeds its admitted identity bound.
 ///
 /// The pool owns persistent worker threads and fallback-log rate limiter state.
 /// Reuse one instance per validation call site to avoid per-call thread spawn
@@ -133,18 +152,19 @@ class ParallelCollisionValidationWorkerPool {
     /// Pass-scoped configuration shared by every worker's coordinator.
     CollisionValidationPassConfig pass_config;
 
-    /// Desired worker count. Pool clamps this to [1, worker_contexts.size()].
+    /// Deployment-admitted worker capacity. Production startup validates this
+    /// value and supplies exactly one independent query context per worker.
     int worker_count = 1;
 
     /// Minimum trajectory length to bother parallelizing. Defaults to 8 to
     /// avoid sub-millisecond contention overheads.
     int min_waypoints_for_parallel = 8;
 
-    /// When true, the pool will refuse to parallelize trajectories whose
-    /// policy snapshot has any support_contacts entries. The plan's Chunk 4
-    /// (parallelism) defines the chunk-summary merge semantics that would
-    /// remove this restriction; until that is implemented, leave this true.
-    bool refuse_parallel_with_support_contacts = true;
+    /// Enable the qualified two-phase ordered-summary path for support-contact
+    /// and contact-release validation. Every collision query remains
+    /// sequential inside one worker chunk; only bounded summaries cross back
+    /// to the coordinator. Disable only for qualification/debug comparison.
+    bool enable_ordered_support_contact_summaries = true;
 
     /// Optional sink for structured fallback-log events. When set, the
     /// pool calls the sink at most once per cause per `fallback_log_window`.
@@ -169,10 +189,20 @@ class ParallelCollisionValidationWorkerPool {
     /// Wall-clock liveness budget for one validation call. Zero preserves the
     /// historical cooperative-only behavior. Positive values make the pool
     /// request cancellation and return a structured fail-closed timeout when
-    /// workers do not finish in time; wedged workers are abandoned and future
-    /// calls create fresh worker threads.
+    /// workers do not finish in time. Retired workers retain their contexts;
+    /// later calls fail closed until every retired worker finishes and is
+    /// joined, so a timed-out mutable context is never reused concurrently.
     std::chrono::nanoseconds validation_wall_timeout =
         std::chrono::nanoseconds::zero();
+
+    /// Deadline authority for `validation_wall_timeout`. Production kernel
+    /// wiring supplies its injected clock/scheduler pair; deterministic tests
+    /// use FakeClock/ManualScheduler. Both are mandatory when the timeout is
+    /// positive so core never invents a second wall-clock authority. The
+    /// timeout callback runs on the Monitoring watchdog lane, never on
+    /// ControllerCommand, RuntimeSafety, or StopControl.
+    IClock* clock = nullptr;
+    IScheduler* scheduler = nullptr;
   };
 
   explicit ParallelCollisionValidationWorkerPool(Config config);
@@ -235,9 +265,21 @@ class ParallelCollisionValidationWorkerPool {
       const std::shared_ptr<CollisionCancellationToken>& cancel,
       CollisionValidationPassConfig pass_config);
 
-  const ParallelValidationTelemetry& last_telemetry() const {
-    return last_telemetry_;
-  }
+  /// Ownership-preserving production overload. The immutable snapshot owner is
+  /// retained by queued or timed-out jobs, avoiding a deep copy of mesh/octomap
+  /// geometry at every validation admission. `absolute_wall_deadline` may only
+  /// tighten the configured wall timeout; it lets a caller include bounded
+  /// pre-pool work in one end-to-end deadline without creating another clock
+  /// authority.
+  CollisionValidationDecisionBundle validate_trajectory(
+      CollisionWorldSnapshotPtr snapshot,
+      const std::vector<std::shared_ptr<ICollisionQueryEngine>>& worker_engines,
+      const TrajectoryDTO& trajectory, const std::shared_ptr<CollisionCancellationToken>& cancel,
+      CollisionValidationPassConfig pass_config,
+      std::optional<TimePoint> absolute_wall_deadline = std::nullopt);
+
+  ParallelValidationTelemetry last_telemetry() const;
+  ParallelValidationPoolStatus status() const;
 
  private:
   struct EngineRef {
@@ -245,27 +287,31 @@ class ParallelCollisionValidationWorkerPool {
     std::shared_ptr<ICollisionQueryEngine> owner;
   };
   struct WorkerSlot;
+  struct PoolCounters;
 
   /// Emit a fallback-log event through the sink, rate-limited.
   void maybe_emit_fallback_log(const FallbackLogEvent& event);
   void ensure_worker_threads(int count);
   void stop_worker_threads();
-  static void worker_loop(std::shared_ptr<WorkerSlot> slot);
   void abandon_worker_threads();
+  bool reap_abandoned_worker_threads_if_drained();
+  void release_abandoned_worker_threads();
+  static void worker_loop(std::shared_ptr<WorkerSlot> slot);
   CollisionValidationDecisionBundle validate_trajectory_impl(
-      const CollisionWorldSnapshot& snapshot,
-      const std::vector<EngineRef>& worker_engines,
-      const TrajectoryDTO& trajectory,
-      const std::shared_ptr<CollisionCancellationToken>& cancel,
-      CollisionValidationPassConfig pass_config);
+      const CollisionWorldSnapshot& snapshot, const std::vector<EngineRef>& worker_engines,
+      const TrajectoryDTO& trajectory, const std::shared_ptr<CollisionCancellationToken>& cancel,
+      CollisionValidationPassConfig pass_config, CollisionWorldSnapshotPtr snapshot_owner = nullptr,
+      std::optional<TimePoint> absolute_wall_deadline = std::nullopt);
 
   Config config_;
   ParallelValidationTelemetry last_telemetry_{};
-  std::unordered_map<std::string, std::chrono::steady_clock::time_point>
-      last_fallback_log_at_;
-  std::mutex validation_call_mutex_;
+  std::shared_ptr<PoolCounters> counters_;
+  std::unordered_map<std::string, TimePoint> last_fallback_log_at_;
+  mutable std::mutex validation_call_mutex_;
   std::mutex worker_slots_mutex_;
   std::vector<std::shared_ptr<WorkerSlot>> worker_slots_;
+  std::mutex abandoned_worker_slots_mutex_;
+  std::vector<std::shared_ptr<WorkerSlot>> abandoned_worker_slots_;
 };
 
 /// Read the `MANYFORGE_VALIDATION_COLLISION_WORKERS` env var. Returns the
@@ -277,5 +323,10 @@ class ParallelCollisionValidationWorkerPool {
 /// operators cannot accidentally spin up unbounded thread counts via a
 /// runaway env override. Unparseable values fall back to `default_value`.
 int env_validation_collision_workers(int default_value, int max_workers = 64);
+
+/// Resolve the startup worker count without allowing a development/CI
+/// environment override to replace an explicit production deployment value.
+int resolve_validation_collision_workers(int configured_value, bool deployment_declared,
+                                         int max_workers = 64);
 
 }  // namespace manyforge::core

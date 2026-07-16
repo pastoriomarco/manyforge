@@ -397,11 +397,13 @@ For where logs and observability endpoints live, see
   the helper reprints the full status block every 30 s instead of
   redrawing.
 - **Collision validation worker sizing** → authoritative trajectory
-  validation defaults to `MANYFORGE_VALIDATION_COLLISION_WORKERS=4`.
-  This is the baseline for Jetson Orin Nano-class and larger systems.
-  Use `MANYFORGE_VALIDATION_COLLISION_WORKERS=1` or `2` only when a
-  deployment's controller / observer latency qualification shows that
-  CPU headroom is too tight.
+  validation uses the materialized deployment property
+  `orchestrator.config.validation_collision_workers` (default `4`; `1` is
+  explicit serial mode). Select the value from target-specific wall-time and
+  controller/runtime-interference evidence. The default is not an Orin Nano
+  qualification claim. `MANYFORGE_VALIDATION_COLLISION_WORKERS` is only a
+  direct-factory development/CI fallback when no deployment value exists; it
+  never overrides an explicit deployment.
 - **`HEALTH_TIMEOUT_S` from old runbooks** → deprecated alias for
   `COMPOSER_READY_TIMEOUT_S`. Both work for one release; you'll see a
   one-time warning per launch. Switch your runbooks to the per-service

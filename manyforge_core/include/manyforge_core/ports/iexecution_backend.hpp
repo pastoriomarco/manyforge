@@ -1,11 +1,11 @@
 #pragma once
 
+#include <manyforge_core/execution_progress_publication.hpp>
+#include <manyforge_core/observed_robot_state_publication.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_result.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
-#include <manyforge_core/observed_robot_state_publication.hpp>
-
 #include <stop_token>
 
 namespace manyforge::core {
@@ -87,6 +87,13 @@ class IExecutionBackend {
     /// closed; production backends are required to override it.
     virtual const ObservedRobotStatePublication*
     observed_robot_state_publication() const noexcept {
+      return nullptr;
+    }
+
+    /// Dedicated exact trajectory-time cursor publication (spec/210 §3.14).
+    /// This is distinct from lifecycle progress and observed robot state. A
+    /// null result means generation-fenced runtime lookahead is unavailable.
+    virtual const ExecutionProgressPublication* execution_progress_publication() const noexcept {
       return nullptr;
     }
 

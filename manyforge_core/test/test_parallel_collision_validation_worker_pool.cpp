@@ -1,23 +1,30 @@
 // Chunk 7 unit tests for ParallelCollisionValidationWorkerPool:
-// deterministic merge, serial fallback for support-contact / short
-// trajectories / worker_count_one, equivalence with serial coordinator on
-// fixture trajectories, and telemetry shape.
-
-#include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
-#include <manyforge_core/collision/i_collision_query_engine.hpp>
-#include <manyforge_core/types/reason_codes.hpp>
+// deterministic stateless and ordered-contact merge, named serial fallbacks,
+// equivalence with the serial coordinator, timeout ownership, and telemetry.
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <functional>
+#include <manyforge_core/collision/i_collision_query_engine.hpp>
+#include <manyforge_core/collision/ordered_contact_validation.hpp>
+#include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
+#include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_core/types/reason_codes.hpp>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace manyforge::core {
@@ -30,22 +37,28 @@ class MockCollisionQueryEngine : public ICollisionQueryEngine {
   std::map<std::int64_t, CollisionResult> result_by_waypoint;
   std::atomic<int> call_count{0};
   bool throw_on_check = false;
+  std::optional<std::int64_t> throw_on_waypoint;
   bool record_thread_ids = false;
   bool block_on_check = false;
+  std::chrono::microseconds check_delay{0};
+  std::function<void(const CollisionQuery&)> on_check;
   std::mutex thread_ids_mutex;
   std::set<std::thread::id> thread_ids;
   std::mutex block_mutex;
   std::condition_variable block_cv;
   bool release_blocked_checks = false;
   std::atomic<int> blocked_check_count{0};
+  std::atomic<const CollisionWorldSnapshot*> observed_snapshot{nullptr};
 
   MockCollisionQueryEngine() {
+    static std::atomic<std::uint64_t> next_context_id{1};
     default_result.in_collision = false;
     default_result.engine_status = CollisionEngineStatus::kOk;
     default_result.decision = CollisionDecisionResult::kPass;
     capability_.engine_id = "mock_engine";
     capability_.engine_version = "test";
     capability_.library_lineage = "unit_test";
+    capability_.mutable_context_id = "mock_context_" + std::to_string(next_context_id.fetch_add(1));
     capability_.supported_geometry_kinds = {"box"};
     capability_.thread_safety =
         CollisionEngineThreadSafetyClass::kSingleContextExclusive;
@@ -60,6 +73,8 @@ class MockCollisionQueryEngine : public ICollisionQueryEngine {
     capability_.thread_safety = thread_safety;
   }
 
+  void set_mutable_context_id(std::string id) { capability_.mutable_context_id = std::move(id); }
+
   std::set<std::thread::id> observed_thread_ids() {
     std::lock_guard<std::mutex> lock(thread_ids_mutex);
     return thread_ids;
@@ -70,16 +85,24 @@ class MockCollisionQueryEngine : public ICollisionQueryEngine {
                         const CollisionPolicySnapshot&,
                         const CollisionCancellationToken& cancel) override {
     call_count.fetch_add(1);
+    observed_snapshot.store(&snapshot, std::memory_order_relaxed);
     if (record_thread_ids) {
       std::lock_guard<std::mutex> lock(thread_ids_mutex);
       thread_ids.insert(std::this_thread::get_id());
     }
-    if (throw_on_check) {
+    if (check_delay > std::chrono::microseconds::zero()) {
+      std::this_thread::sleep_for(check_delay);
+    }
+    if (on_check) {
+      on_check(query);
+    }
+    if (throw_on_check || (throw_on_waypoint && query.waypoint_index == throw_on_waypoint)) {
       throw std::runtime_error("mock engine failure");
     }
     if (block_on_check) {
-      blocked_check_count.fetch_add(1);
       std::unique_lock<std::mutex> lock(block_mutex);
+      blocked_check_count.fetch_add(1);
+      block_cv.notify_all();
       block_cv.wait(lock, [this]() { return release_blocked_checks; });
     }
     CollisionResult result = default_result;
@@ -117,6 +140,12 @@ class MockCollisionQueryEngine : public ICollisionQueryEngine {
     block_cv.notify_all();
   }
 
+  void wait_until_blocked(int expected_count = 1) {
+    std::unique_lock<std::mutex> lock(block_mutex);
+    block_cv.wait(
+        lock, [this, expected_count]() { return blocked_check_count.load() >= expected_count; });
+  }
+
  private:
   CollisionEngineCapabilityDescriptor capability_;
 };
@@ -139,14 +168,115 @@ CollisionResult cancelled_result(std::string reason) {
   return r;
 }
 
+CollisionResult contact_result(const CollisionPairId& pair, double signed_clearance_m) {
+  CollisionResult result;
+  result.in_collision = signed_clearance_m < 0.0;
+  if (result.in_collision) {
+    result.normalized_pairs = {pair};
+  }
+  result.pair_clearances = {CollisionPairClearance{pair, signed_clearance_m}};
+  result.min_clearance_m = signed_clearance_m;
+  result.min_clearance_pair = pair;
+  result.engine_status = CollisionEngineStatus::kOk;
+  result.decision =
+      result.in_collision ? CollisionDecisionResult::kFail : CollisionDecisionResult::kPass;
+  return result;
+}
+
+CollisionPolicySnapshot contact_release_snapshot(const CollisionPairId& pair) {
+  CollisionPolicySnapshot policy;
+  policy.policy_id = "contact_release";
+  policy.revision.revision_id = 3;
+  policy.require_full_diagnostics = true;
+  SupportContactPolicyEntry entry;
+  entry.pair = pair;
+  entry.max_start_penetration_m = 0.10;
+  entry.release_tolerance_m = 1e-5;
+  entry.min_release_progress_m = 0.001;
+  entry.min_separation_clearance_m = 0.0;
+  entry.require_separation_by_end = true;
+  entry.require_strictly_decreasing_penetration = true;
+  policy.support_contacts.push_back(entry);
+  return policy;
+}
+
+void assign_parallel_results(const std::vector<MockCollisionQueryEngine*>& engines,
+                             const std::vector<CollisionResult>& results) {
+  for (auto* engine : engines) {
+    engine->result_by_waypoint.clear();
+  }
+  const int worker_count = static_cast<int>(engines.size());
+  const int waypoint_count = static_cast<int>(results.size());
+  const int per_worker = waypoint_count / worker_count;
+  const int leftover = waypoint_count % worker_count;
+  int cursor = 0;
+  for (int worker = 0; worker < worker_count; ++worker) {
+    const int length = per_worker + (worker < leftover ? 1 : 0);
+    for (int local = 0; local < length; ++local) {
+      engines[static_cast<std::size_t>(worker)]->result_by_waypoint[local] =
+          results[static_cast<std::size_t>(cursor + local)];
+    }
+    cursor += length;
+  }
+}
+
+CollisionResult multi_contact_result(
+    const std::vector<std::pair<CollisionPairId, double>>& clearances) {
+  CollisionResult result;
+  result.engine_status = CollisionEngineStatus::kOk;
+  result.decision = CollisionDecisionResult::kPass;
+  for (const auto& [pair, clearance] : clearances) {
+    result.pair_clearances.push_back({pair, clearance});
+    if (!result.min_clearance_m || clearance < *result.min_clearance_m) {
+      result.min_clearance_m = clearance;
+      result.min_clearance_pair = pair;
+    }
+    if (clearance < 0.0) {
+      result.in_collision = true;
+      result.normalized_pairs.push_back(pair);
+      result.decision = CollisionDecisionResult::kFail;
+    }
+  }
+  return result;
+}
+
+void expect_policy_equivalent(const CollisionValidationDecisionBundle& parallel,
+                              const CollisionValidationDecisionBundle& serial) {
+  EXPECT_EQ(parallel.decision.accepted, serial.decision.accepted);
+  EXPECT_EQ(parallel.decision.action, serial.decision.action);
+  EXPECT_EQ(parallel.decision.severity, serial.decision.severity);
+  EXPECT_EQ(parallel.decision.first_failing_waypoint, serial.decision.first_failing_waypoint);
+  EXPECT_EQ(parallel.decision.first_failing_time_ns, serial.decision.first_failing_time_ns);
+  ASSERT_EQ(parallel.waypoint_records.size(), serial.waypoint_records.size());
+  for (std::size_t i = 0; i < parallel.waypoint_records.size(); ++i) {
+    const auto& left = parallel.waypoint_records[i];
+    const auto& right = serial.waypoint_records[i];
+    EXPECT_EQ(left.waypoint_index, right.waypoint_index) << i;
+    EXPECT_EQ(left.result.decision, right.result.decision) << i;
+    ASSERT_EQ(left.result.normalized_pairs_classified.size(),
+              right.result.normalized_pairs_classified.size())
+        << i;
+    for (std::size_t pair_index = 0; pair_index < left.result.normalized_pairs_classified.size();
+         ++pair_index) {
+      EXPECT_EQ(left.result.normalized_pairs_classified[pair_index].classification,
+                right.result.normalized_pairs_classified[pair_index].classification)
+          << i << ":" << pair_index;
+      EXPECT_EQ(left.result.normalized_pairs_classified[pair_index].is_first_failure,
+                right.result.normalized_pairs_classified[pair_index].is_first_failure)
+          << i << ":" << pair_index;
+    }
+    EXPECT_EQ(left.result.raw_diagnostics, right.result.raw_diagnostics) << i;
+  }
+}
+
 TrajectoryDTO long_trajectory(int n) {
   TrajectoryDTO t;
   t.joint_names = {"j0"};
   for (int i = 0; i < n; ++i) {
     TrajectoryWaypointDTO wp;
-    wp.positions_rad = {0.01 * i};
+    wp.positions_rad.push_back(0.01 * i);
     wp.time_from_start_s = 0.01 * i;
-    t.waypoints.push_back(wp);
+    t.waypoints.push_back(std::move(wp));
   }
   return t;
 }
@@ -191,6 +321,13 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   EXPECT_TRUE(pool.last_telemetry().fallback_reason.empty());
   EXPECT_EQ(pool.last_telemetry().collision_geometry_count, 99);
   EXPECT_EQ(engine_a.call_count.load() + engine_b.call_count.load(), 12);
+  const auto status = pool.status();
+  EXPECT_EQ(status.queued_jobs, 0u);
+  EXPECT_EQ(status.active_workers, 0u);
+  EXPECT_EQ(status.completed_jobs_total, 2u);
+  EXPECT_EQ(status.cancelled_jobs_total, 0u);
+  EXPECT_EQ(status.dropped_jobs_total, 0u);
+  EXPECT_EQ(status.abandoned_jobs_total, 0u);
 }
 
 TEST(ParallelCollisionValidationWorkerPoolTest,
@@ -225,6 +362,27 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   observed.insert(b_threads.begin(), b_threads.end());
   EXPECT_GE(observed.size(), 2u);
   EXPECT_LE(observed.size(), 2u);
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OwnedSnapshotOverloadRetainsPublishedSnapshotWithoutCopying) {
+  auto engine_a = std::make_shared<MockCollisionQueryEngine>();
+  auto engine_b = std::make_shared<MockCollisionQueryEngine>();
+  std::vector<std::shared_ptr<ICollisionQueryEngine>> engines{engine_a, engine_b};
+  auto snapshot = std::make_shared<const CollisionWorldSnapshot>(test_snapshot());
+  auto cancel = std::make_shared<CollisionCancellationToken>();
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = freespace_snapshot();
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 1;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+
+  const auto bundle =
+      pool.validate_trajectory(snapshot, engines, long_trajectory(8), cancel, cfg.pass_config);
+
+  ASSERT_TRUE(bundle.decision.accepted);
+  EXPECT_EQ(engine_a->observed_snapshot.load(std::memory_order_relaxed), snapshot.get());
+  EXPECT_EQ(engine_b->observed_snapshot.load(std::memory_order_relaxed), snapshot.get());
 }
 
 TEST(ParallelCollisionValidationWorkerPoolTest,
@@ -403,27 +561,645 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
 }
 
 TEST(ParallelCollisionValidationWorkerPoolTest,
-     EngineBackedPathUsesSerialFallbackForSupportContacts) {
+     DistinctEngineWrappersSharingMutableContextFallBackToSerial) {
   MockCollisionQueryEngine engine_a;
   MockCollisionQueryEngine engine_b;
+  engine_a.set_mutable_context_id("shared_context");
+  engine_b.set_mutable_context_id("shared_context");
   ParallelCollisionValidationWorkerPool::Config cfg;
   cfg.pass_config.policy_snapshot = freespace_snapshot();
-  SupportContactPolicyEntry entry;
-  entry.pair = CollisionPairId{"gripper", "object"};
-  cfg.pass_config.policy_snapshot.support_contacts.push_back(entry);
   cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 2;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+
+  CollisionCancellationToken cancel;
+  const auto bundle = pool.validate_trajectory(
+      test_snapshot(), std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b},
+      long_trajectory(8), cancel);
+
+  EXPECT_TRUE(bundle.decision.accepted);
+  EXPECT_EQ(pool.last_telemetry().workers_actually_used, 1);
+  EXPECT_EQ(pool.last_telemetry().workers_effective, 1);
+  EXPECT_EQ(pool.last_telemetry().fallback_reason, "single_context_duplicate_engine");
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest, MissingMutableContextIdentityFailsClosedToSerial) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  engine_b.set_mutable_context_id("");
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = freespace_snapshot();
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 2;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+
+  CollisionCancellationToken cancel;
+  (void)pool.validate_trajectory(test_snapshot(),
+                                 std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b},
+                                 long_trajectory(8), cancel);
+
+  EXPECT_EQ(pool.last_telemetry().workers_actually_used, 1);
+  EXPECT_EQ(pool.last_telemetry().workers_effective, 1);
+  EXPECT_EQ(pool.last_telemetry().fallback_reason, "single_context_missing_mutable_context_id");
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedContactReleaseMatchesSerialAcrossChunkBoundaries) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  MockCollisionQueryEngine engine_c;
+  MockCollisionQueryEngine serial_engine;
+  const CollisionPairId pair{"gripper", "object"};
+  const std::vector<double> clearances{-0.050, -0.045, -0.040, -0.030, -0.020, -0.010,
+                                       -0.005, 0.001,  0.004,  0.006,  0.008,  0.010};
+  std::vector<CollisionResult> results;
+  for (double clearance : clearances) {
+    results.push_back(contact_result(pair, clearance));
+  }
+  assign_parallel_results({&engine_a, &engine_b, &engine_c}, results);
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] = results[i];
+  }
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  cfg.worker_count = 3;
   cfg.min_waypoints_for_parallel = 4;
   ParallelCollisionValidationWorkerPool pool(cfg);
 
   CollisionCancellationToken cancel;
-  std::vector<ICollisionQueryEngine*> engines{&engine_a, &engine_b};
-  (void)pool.validate_trajectory(test_snapshot(), engines,
-                                 long_trajectory(8), cancel);
+  std::vector<ICollisionQueryEngine*> engines{&engine_a, &engine_b, &engine_c};
+  const auto trajectory = long_trajectory(12);
+  auto parallel = pool.validate_trajectory(test_snapshot(), engines, trajectory, cancel);
 
-  EXPECT_EQ(pool.last_telemetry().workers_actually_used, 1);
-  EXPECT_EQ(pool.last_telemetry().fallback_reason,
-            "support_contact_policy_active");
+  CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+  CollisionCancellationToken serial_cancel;
+  auto serial = serial_coordinator.validate_trajectory(test_snapshot(), serial_engine, trajectory,
+                                                       serial_cancel);
+
+  expect_policy_equivalent(parallel, serial);
+  EXPECT_TRUE(parallel.decision.accepted);
+  EXPECT_EQ(pool.last_telemetry().workers_actually_used, 3);
+  EXPECT_TRUE(pool.last_telemetry().fallback_reason.empty());
   EXPECT_TRUE(pool.last_telemetry().support_contact_active);
+  EXPECT_TRUE(pool.last_telemetry().contact_release_active);
+  EXPECT_TRUE(pool.last_telemetry().ordered_contact_summary_used);
+  EXPECT_EQ(engine_a.call_count.load() + engine_b.call_count.load() + engine_c.call_count.load(),
+            12);
+  const auto status = pool.status();
+  EXPECT_EQ(status.queued_jobs, 0u);
+  EXPECT_EQ(status.active_workers, 0u);
+  EXPECT_EQ(status.completed_jobs_total, 6u);
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedContactReleaseDetectsBoundaryDepthIncreaseWithSerialDiagnostics) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  MockCollisionQueryEngine serial_engine;
+  const CollisionPairId pair{"gripper", "object"};
+  const std::vector<double> clearances{-0.050, -0.040, -0.030, -0.020,
+                                       -0.030, -0.020, -0.010, 0.001};
+  std::vector<CollisionResult> results;
+  for (double clearance : clearances) {
+    results.push_back(contact_result(pair, clearance));
+  }
+  assign_parallel_results({&engine_a, &engine_b}, results);
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] = results[i];
+  }
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 4;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+  const auto trajectory = long_trajectory(8);
+  CollisionCancellationToken cancel;
+  auto parallel = pool.validate_trajectory(
+      test_snapshot(), std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b}, trajectory,
+      cancel);
+  CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+  CollisionCancellationToken serial_cancel;
+  auto serial = serial_coordinator.validate_trajectory(test_snapshot(), serial_engine, trajectory,
+                                                       serial_cancel);
+
+  expect_policy_equivalent(parallel, serial);
+  ASSERT_TRUE(parallel.decision.first_failing_waypoint);
+  EXPECT_EQ(*parallel.decision.first_failing_waypoint, 4);
+  EXPECT_EQ(parallel.waypoint_records[4].result.raw_diagnostics.at("contact_release_violation"),
+            "penetration_increased");
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedContactReleaseDetectsContactBeginningAtChunkBoundary) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  MockCollisionQueryEngine serial_engine;
+  const CollisionPairId pair{"gripper", "object"};
+  const std::vector<double> clearances{0.010, 0.010, 0.010, 0.010, -0.010, -0.005, 0.001, 0.002};
+  std::vector<CollisionResult> results;
+  for (const double clearance : clearances) {
+    results.push_back(contact_result(pair, clearance));
+  }
+  assign_parallel_results({&engine_a, &engine_b}, results);
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] = results[i];
+  }
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 1;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+  const auto trajectory = long_trajectory(static_cast<int>(results.size()));
+  CollisionCancellationToken parallel_cancel;
+  const auto parallel = pool.validate_trajectory(
+      test_snapshot(), std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b}, trajectory,
+      parallel_cancel);
+  CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+  CollisionCancellationToken serial_cancel;
+  const auto serial = serial_coordinator.validate_trajectory(test_snapshot(), serial_engine,
+                                                             trajectory, serial_cancel);
+
+  expect_policy_equivalent(parallel, serial);
+  ASSERT_TRUE(parallel.decision.first_failing_waypoint);
+  EXPECT_EQ(*parallel.decision.first_failing_waypoint, 4);
+  EXPECT_EQ(parallel.waypoint_records[4].result.raw_diagnostics.at("contact_release_violation"),
+            "new_active_contact_after_clear_start");
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedContactReleaseDetectsNoProgressPlateauAcrossChunkBoundary) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  MockCollisionQueryEngine serial_engine;
+  const CollisionPairId pair{"gripper", "object"};
+  const std::vector<double> clearances{-0.0500, -0.0499, -0.0499, -0.0499,
+                                       -0.0499, -0.0499, -0.0499, -0.0499};
+  std::vector<CollisionResult> results;
+  for (const double clearance : clearances) {
+    results.push_back(contact_result(pair, clearance));
+  }
+  assign_parallel_results({&engine_a, &engine_b}, results);
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] = results[i];
+  }
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  auto& release = cfg.pass_config.policy_snapshot.support_contacts.front();
+  release.require_separation_by_end = false;
+  release.min_release_progress_m = 0.010;
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 1;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+  const auto trajectory = long_trajectory(static_cast<int>(results.size()));
+  CollisionCancellationToken parallel_cancel;
+  const auto parallel = pool.validate_trajectory(
+      test_snapshot(), std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b}, trajectory,
+      parallel_cancel);
+  CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+  CollisionCancellationToken serial_cancel;
+  const auto serial = serial_coordinator.validate_trajectory(test_snapshot(), serial_engine,
+                                                             trajectory, serial_cancel);
+
+  expect_policy_equivalent(parallel, serial);
+  ASSERT_TRUE(parallel.decision.first_failing_waypoint);
+  EXPECT_EQ(*parallel.decision.first_failing_waypoint, 7);
+  EXPECT_EQ(parallel.waypoint_records[7].result.raw_diagnostics.at("contact_release_violation"),
+            "insufficient_release_progress");
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedContactReleaseDetectsBoundaryRecontactWithSerialDiagnostics) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  MockCollisionQueryEngine serial_engine;
+  const CollisionPairId pair{"gripper", "object"};
+  const std::vector<double> clearances{-0.050, -0.030, -0.010, 0.002, -0.005, 0.003, 0.004, 0.005};
+  std::vector<CollisionResult> results;
+  for (double clearance : clearances) {
+    results.push_back(contact_result(pair, clearance));
+  }
+  assign_parallel_results({&engine_a, &engine_b}, results);
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] = results[i];
+  }
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 4;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+  const auto trajectory = long_trajectory(8);
+  CollisionCancellationToken cancel;
+  auto parallel = pool.validate_trajectory(
+      test_snapshot(), std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b}, trajectory,
+      cancel);
+  CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+  CollisionCancellationToken serial_cancel;
+  auto serial = serial_coordinator.validate_trajectory(test_snapshot(), serial_engine, trajectory,
+                                                       serial_cancel);
+
+  expect_policy_equivalent(parallel, serial);
+  ASSERT_TRUE(parallel.decision.first_failing_waypoint);
+  EXPECT_EQ(*parallel.decision.first_failing_waypoint, 4);
+  EXPECT_EQ(parallel.waypoint_records[4].result.raw_diagnostics.at("contact_release_violation"),
+            "recontact_after_release");
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedContactReleaseMissingClearanceAtBoundaryMatchesSerial) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  MockCollisionQueryEngine serial_engine;
+  const CollisionPairId pair{"gripper", "object"};
+  std::vector<CollisionResult> results{contact_result(pair, -0.050),
+                                       contact_result(pair, -0.040),
+                                       contact_result(pair, -0.030),
+                                       contact_result(pair, -0.020),
+                                       CollisionResult{},
+                                       contact_result(pair, -0.010),
+                                       contact_result(pair, 0.001),
+                                       contact_result(pair, 0.002)};
+  results[4].engine_status = CollisionEngineStatus::kOk;
+  results[4].decision = CollisionDecisionResult::kPass;
+  assign_parallel_results({&engine_a, &engine_b}, results);
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] = results[i];
+  }
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 4;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+  const auto trajectory = long_trajectory(8);
+  CollisionCancellationToken cancel;
+  auto parallel = pool.validate_trajectory(
+      test_snapshot(), std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b}, trajectory,
+      cancel);
+  CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+  CollisionCancellationToken serial_cancel;
+  auto serial = serial_coordinator.validate_trajectory(test_snapshot(), serial_engine, trajectory,
+                                                       serial_cancel);
+
+  expect_policy_equivalent(parallel, serial);
+  ASSERT_TRUE(parallel.decision.first_failing_waypoint);
+  EXPECT_EQ(*parallel.decision.first_failing_waypoint, 4);
+  EXPECT_EQ(parallel.decision.action, CollisionDecisionAction::kInconclusive);
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedContactReleaseMatchesSerialForEverySmallPartitionAndPattern) {
+  const CollisionPairId pair{"gripper", "object"};
+  const std::array<std::optional<double>, 4> sample_kinds{std::nullopt, -0.040, -0.015, 0.002};
+  constexpr int waypoint_count = 5;
+  constexpr int pattern_count = 4 * 4 * 4 * 4 * 4;
+
+  for (int worker_count = 2; worker_count <= waypoint_count; ++worker_count) {
+    std::vector<std::unique_ptr<MockCollisionQueryEngine>> engine_storage;
+    std::vector<MockCollisionQueryEngine*> engines;
+    for (int i = 0; i < worker_count; ++i) {
+      engine_storage.push_back(std::make_unique<MockCollisionQueryEngine>());
+      engines.push_back(engine_storage.back().get());
+    }
+    MockCollisionQueryEngine serial_engine;
+    ParallelCollisionValidationWorkerPool::Config cfg;
+    cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+    cfg.worker_count = worker_count;
+    cfg.min_waypoints_for_parallel = 1;
+    ParallelCollisionValidationWorkerPool pool(cfg);
+    const auto trajectory = long_trajectory(waypoint_count);
+
+    for (int encoded_pattern = 0; encoded_pattern < pattern_count; ++encoded_pattern) {
+      SCOPED_TRACE("workers=" + std::to_string(worker_count) +
+                   " pattern=" + std::to_string(encoded_pattern));
+      std::vector<CollisionResult> results;
+      results.reserve(waypoint_count);
+      int cursor = encoded_pattern;
+      for (int waypoint = 0; waypoint < waypoint_count; ++waypoint) {
+        const auto& selected = sample_kinds[static_cast<std::size_t>(cursor % 4)];
+        cursor /= 4;
+        if (selected) {
+          results.push_back(contact_result(pair, *selected));
+        } else {
+          CollisionResult missing;
+          missing.engine_status = CollisionEngineStatus::kOk;
+          missing.decision = CollisionDecisionResult::kPass;
+          results.push_back(std::move(missing));
+        }
+      }
+      assign_parallel_results(engines, results);
+      serial_engine.result_by_waypoint.clear();
+      for (std::size_t i = 0; i < results.size(); ++i) {
+        serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] = results[i];
+      }
+
+      CollisionCancellationToken parallel_cancel;
+      const auto parallel = pool.validate_trajectory(
+          test_snapshot(), std::vector<ICollisionQueryEngine*>(engines.begin(), engines.end()),
+          trajectory, parallel_cancel);
+      CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+      CollisionCancellationToken serial_cancel;
+      const auto serial = serial_coordinator.validate_trajectory(test_snapshot(), serial_engine,
+                                                                 trajectory, serial_cancel);
+      expect_policy_equivalent(parallel, serial);
+    }
+  }
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedContactReleaseMatchesSerialForMultipleContactIdentities) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  MockCollisionQueryEngine engine_c;
+  MockCollisionQueryEngine serial_engine;
+  const CollisionPairId pair_a{"left_finger", "object"};
+  const CollisionPairId pair_b{"right_finger", "object"};
+  const std::vector<double> a{-0.05, -0.04, -0.03, -0.02, -0.01, 0.001, 0.002, 0.003, 0.004};
+  const std::vector<double> b{-0.04, -0.03, -0.02, -0.01, 0.001, 0.002, 0.003, 0.004, 0.005};
+  std::vector<CollisionResult> results;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    results.push_back(multi_contact_result({{pair_a, a[i]}, {pair_b, b[i]}}));
+  }
+  assign_parallel_results({&engine_a, &engine_b, &engine_c}, results);
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] = results[i];
+  }
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair_a);
+  auto second_entry = cfg.pass_config.policy_snapshot.support_contacts.front();
+  second_entry.pair = pair_b;
+  cfg.pass_config.policy_snapshot.support_contacts.push_back(second_entry);
+  cfg.worker_count = 3;
+  cfg.min_waypoints_for_parallel = 1;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+  const auto trajectory = long_trajectory(static_cast<int>(results.size()));
+  CollisionCancellationToken parallel_cancel;
+  const auto parallel = pool.validate_trajectory(
+      test_snapshot(), std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b, &engine_c},
+      trajectory, parallel_cancel);
+  CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+  CollisionCancellationToken serial_cancel;
+  const auto serial = serial_coordinator.validate_trajectory(test_snapshot(), serial_engine,
+                                                             trajectory, serial_cancel);
+
+  expect_policy_equivalent(parallel, serial);
+  EXPECT_TRUE(parallel.decision.accepted);
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedSupportStateHonorsTouchLinkPrecedenceExactlyLikeSerial) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  MockCollisionQueryEngine serial_engine;
+  const CollisionPairId pair{"gripper", "object"};
+  const std::vector<double> clearances{-0.04, -0.03, 0.002, -0.02, 0.003, 0.004};
+  std::vector<CollisionResult> results;
+  for (const double clearance : clearances) {
+    results.push_back(contact_result(pair, clearance));
+  }
+  assign_parallel_results({&engine_a, &engine_b}, results);
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] = results[i];
+  }
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  cfg.pass_config.policy_snapshot.support_contacts.front().allow_recontact = true;
+  cfg.pass_config.policy_snapshot.allowed_touch_link_pairs.push_back(pair);
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 2;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+  const auto trajectory = long_trajectory(static_cast<int>(results.size()));
+  CollisionCancellationToken parallel_cancel;
+  const auto parallel = pool.validate_trajectory(
+      test_snapshot(), std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b}, trajectory,
+      parallel_cancel);
+  CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+  CollisionCancellationToken serial_cancel;
+  const auto serial = serial_coordinator.validate_trajectory(test_snapshot(), serial_engine,
+                                                             trajectory, serial_cancel);
+
+  expect_policy_equivalent(parallel, serial);
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedContactReleaseCancellationIsFailClosedAndDoesNotRunSummaryMerge) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  const CollisionPairId pair{"gripper", "object"};
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 1;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+
+  CollisionCancellationToken cancel;
+  cancel.request_cancel("operator_stop");
+  const auto bundle = pool.validate_trajectory(
+      test_snapshot(), std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b},
+      long_trajectory(8), cancel);
+
+  EXPECT_TRUE(bundle.cancelled);
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  EXPECT_EQ(bundle.cancellation_reason, std::optional<std::string>{"operator_stop"});
+  EXPECT_TRUE(pool.last_telemetry().ordered_contact_summary_used);
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedContactReleaseMidChunkCancellationMatchesSerialPrefix) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  MockCollisionQueryEngine engine_c;
+  MockCollisionQueryEngine serial_engine;
+  const CollisionPairId pair{"gripper", "object"};
+  const std::vector<double> clearances{-0.05,  -0.04, -0.03, -0.02, -0.015, -0.01,
+                                       -0.005, 0.001, 0.002, 0.003, 0.004,  0.005};
+  std::vector<CollisionResult> results;
+  for (const double clearance : clearances) {
+    results.push_back(contact_result(pair, clearance));
+  }
+  results[5] = cancelled_result("operator_stop");
+  assign_parallel_results({&engine_a, &engine_b, &engine_c}, results);
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] = results[i];
+  }
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  cfg.worker_count = 3;
+  cfg.min_waypoints_for_parallel = 2;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+  const auto trajectory = long_trajectory(static_cast<int>(results.size()));
+  CollisionCancellationToken parallel_cancel;
+  const auto parallel = pool.validate_trajectory(
+      test_snapshot(), std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b, &engine_c},
+      trajectory, parallel_cancel);
+  CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+  CollisionCancellationToken serial_cancel;
+  const auto serial = serial_coordinator.validate_trajectory(test_snapshot(), serial_engine,
+                                                             trajectory, serial_cancel);
+
+  EXPECT_EQ(parallel.cancelled, serial.cancelled);
+  EXPECT_EQ(parallel.cancellation_reason, serial.cancellation_reason);
+  EXPECT_EQ(parallel.cancelled_at_waypoint_index, serial.cancelled_at_waypoint_index);
+  EXPECT_EQ(parallel.decision.action, serial.decision.action);
+  EXPECT_EQ(parallel.decision.first_failing_waypoint, serial.decision.first_failing_waypoint);
+  ASSERT_EQ(parallel.waypoint_records.size(), serial.waypoint_records.size());
+  ASSERT_FALSE(parallel.waypoint_records.empty());
+  EXPECT_EQ(parallel.waypoint_records.back().waypoint_index, 5);
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedContactReleaseIsIndependentOfWorkerCompletionOrder) {
+  const CollisionPairId pair{"gripper", "object"};
+  const std::vector<double> clearances{-0.05, -0.04, -0.03, -0.02, -0.03, -0.02,
+                                       -0.01, 0.001, 0.002, 0.003, 0.004, 0.005};
+  std::vector<CollisionResult> results;
+  for (const double clearance : clearances) {
+    results.push_back(contact_result(pair, clearance));
+  }
+  MockCollisionQueryEngine serial_engine;
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] = results[i];
+  }
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  cfg.worker_count = 3;
+  cfg.min_waypoints_for_parallel = 2;
+  const auto trajectory = long_trajectory(static_cast<int>(results.size()));
+  CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+  CollisionCancellationToken serial_cancel;
+  const auto serial = serial_coordinator.validate_trajectory(test_snapshot(), serial_engine,
+                                                             trajectory, serial_cancel);
+
+  const std::array<std::array<int, 3>, 6> completion_orders{{
+      {{0, 1, 2}},
+      {{0, 2, 1}},
+      {{1, 0, 2}},
+      {{1, 2, 0}},
+      {{2, 0, 1}},
+      {{2, 1, 0}},
+  }};
+  for (const auto& order : completion_orders) {
+    SCOPED_TRACE("completion_order=" + std::to_string(order[0]) + std::to_string(order[1]) +
+                 std::to_string(order[2]));
+    MockCollisionQueryEngine engine_a;
+    MockCollisionQueryEngine engine_b;
+    MockCollisionQueryEngine engine_c;
+    std::array<MockCollisionQueryEngine*, 3> engines{&engine_a, &engine_b, &engine_c};
+    for (std::size_t rank = 0; rank < order.size(); ++rank) {
+      engines[static_cast<std::size_t>(order[rank])]->check_delay =
+          std::chrono::microseconds(static_cast<int>(rank) * 50);
+    }
+    assign_parallel_results({engines[0], engines[1], engines[2]}, results);
+    ParallelCollisionValidationWorkerPool pool(cfg);
+    CollisionCancellationToken cancel;
+    const auto parallel = pool.validate_trajectory(
+        test_snapshot(), std::vector<ICollisionQueryEngine*>{engines[0], engines[1], engines[2]},
+        trajectory, cancel);
+    expect_policy_equivalent(parallel, serial);
+  }
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedContactReleaseWorkerExceptionPreservesStructuredEngineFailure) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  const CollisionPairId pair{"gripper", "object"};
+  engine_b.throw_on_check = true;
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 1;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+
+  CollisionCancellationToken cancel;
+  const auto bundle = pool.validate_trajectory(
+      test_snapshot(), std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b},
+      long_trajectory(8), cancel);
+
+  ASSERT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  const auto failure =
+      std::find_if(bundle.waypoint_records.begin(), bundle.waypoint_records.end(),
+                   [](const CollisionValidationWaypointRecord& record) {
+                     const auto it = record.result.raw_diagnostics.find("reason_code");
+                     return it != record.result.raw_diagnostics.end() &&
+                            it->second == reason_codes::kCollisionValidationWorkerException;
+                   });
+  ASSERT_NE(failure, bundle.waypoint_records.end());
+  EXPECT_EQ(failure->waypoint_index, 4);
+  EXPECT_EQ(failure->result.raw_diagnostics.count("ordered_contact_summary_error"), 0u);
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     StatefulUnsupportedModesAndIdentityBoundsFallBackSerially) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  const CollisionPairId pair{"gripper", "object"};
+
+  auto run_with_policy = [&](CollisionPolicySnapshot policy, bool summaries_enabled) {
+    ParallelCollisionValidationWorkerPool::Config cfg;
+    cfg.pass_config.policy_snapshot = std::move(policy);
+    cfg.worker_count = 2;
+    cfg.min_waypoints_for_parallel = 1;
+    cfg.enable_ordered_support_contact_summaries = summaries_enabled;
+    ParallelCollisionValidationWorkerPool pool(cfg);
+    CollisionCancellationToken cancel;
+    (void)pool.validate_trajectory(test_snapshot(),
+                                   std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b},
+                                   long_trajectory(8), cancel);
+    return pool.last_telemetry().fallback_reason;
+  };
+
+  auto process_policy = contact_release_snapshot(pair);
+  process_policy.support_contacts.front().mode = CollisionContactPolicyMode::kContactProcess;
+  EXPECT_EQ(run_with_policy(std::move(process_policy), true), "contact_process_policy_active");
+  EXPECT_EQ(run_with_policy(contact_release_snapshot(pair), false),
+            "support_contact_policy_active");
+
+  auto over_bound = contact_release_snapshot(pair);
+  over_bound.support_contacts.clear();
+  for (std::size_t i = 0; i <= kMaxOrderedSupportContactIdentities; ++i) {
+    SupportContactPolicyEntry entry;
+    entry.pair = {"robot_" + std::to_string(i), "object_" + std::to_string(i)};
+    over_bound.support_contacts.push_back(std::move(entry));
+  }
+  EXPECT_EQ(run_with_policy(std::move(over_bound), true),
+            "support_contact_identity_bound_exceeded");
+
+  auto duplicate = contact_release_snapshot(pair);
+  duplicate.support_contacts.push_back(duplicate.support_contacts.front());
+  EXPECT_EQ(run_with_policy(std::move(duplicate), true), "duplicate_support_contact_identity");
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     EffectiveCapacityRemainsVisibleWhenTrajectoryUsesFewerWorkers) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  MockCollisionQueryEngine engine_c;
+  MockCollisionQueryEngine engine_d;
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = freespace_snapshot();
+  cfg.worker_count = 4;
+  cfg.min_waypoints_for_parallel = 2;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+  CollisionCancellationToken cancel;
+  (void)pool.validate_trajectory(
+      test_snapshot(),
+      std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b, &engine_c, &engine_d},
+      long_trajectory(3), cancel);
+
+  EXPECT_EQ(pool.last_telemetry().workers_requested, 4);
+  EXPECT_EQ(pool.last_telemetry().workers_effective, 4);
+  EXPECT_EQ(pool.last_telemetry().workers_actually_used, 3);
+  EXPECT_EQ(pool.last_telemetry().per_worker_waypoint_counts, (std::vector<int>{1, 1, 1}));
 }
 
 TEST(ParallelCollisionValidationWorkerPoolTest,
@@ -511,29 +1287,43 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   engine_a->block_on_check = true;
 
   ParallelCollisionValidationWorkerPool::Config cfg;
+  FakeClock clock;
+  ManualScheduler scheduler;
   cfg.pass_config.policy_snapshot = freespace_snapshot();
   cfg.worker_count = 2;
   cfg.min_waypoints_for_parallel = 4;
   cfg.validation_wall_timeout = std::chrono::milliseconds(20);
+  cfg.clock = &clock;
+  cfg.scheduler = &scheduler;
   ParallelCollisionValidationWorkerPool pool(cfg);
 
   auto cancel = std::make_shared<CollisionCancellationToken>();
   std::vector<std::shared_ptr<ICollisionQueryEngine>> engines{engine_a, engine_b};
-  const auto started = std::chrono::steady_clock::now();
-  auto bundle = pool.validate_trajectory(test_snapshot(), engines,
-                                         long_trajectory(12), cancel);
-  const auto elapsed = std::chrono::steady_clock::now() - started;
+  std::optional<CollisionValidationDecisionBundle> bundle;
+  std::thread caller([&]() {
+    bundle = pool.validate_trajectory(test_snapshot(), engines, long_trajectory(12), cancel);
+  });
+  engine_a->wait_until_blocked();
+  clock.advance(20'000'000);
+  scheduler.advance_to(clock.now());
+  caller.join();
 
-  EXPECT_LT(elapsed, std::chrono::milliseconds(500));
-  EXPECT_FALSE(bundle.decision.accepted);
-  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
-  EXPECT_TRUE(bundle.cancelled);
-  ASSERT_TRUE(bundle.cancellation_reason.has_value());
-  EXPECT_EQ(*bundle.cancellation_reason, "collision_validation_wall_timeout");
+  ASSERT_TRUE(bundle.has_value());
+  EXPECT_FALSE(bundle->decision.accepted);
+  EXPECT_EQ(bundle->decision.action, CollisionDecisionAction::kInconclusive);
+  EXPECT_TRUE(bundle->cancelled);
+  ASSERT_TRUE(bundle->cancellation_reason.has_value());
+  EXPECT_EQ(*bundle->cancellation_reason, "collision_validation_wall_timeout");
+  ASSERT_FALSE(bundle->waypoint_records.empty());
+  EXPECT_EQ(bundle->waypoint_records.front().result.raw_diagnostics.at("elapsed_ns"), "20000000");
   EXPECT_TRUE(cancel->is_cancel_requested());
   EXPECT_EQ(cancel->reason(), "collision_validation_wall_timeout");
+  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::Monitoring);
   EXPECT_EQ(pool.last_telemetry().fallback_reason,
             "validation_wall_timeout");
+  const auto status = pool.status();
+  EXPECT_EQ(status.queued_jobs, 0u);
+  EXPECT_GE(status.abandoned_jobs_total, 1u);
 
   engine_a->release_blocked();
 }
@@ -544,30 +1334,141 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   engine->block_on_check = true;
 
   ParallelCollisionValidationWorkerPool::Config cfg;
+  FakeClock clock;
+  ManualScheduler scheduler;
   cfg.pass_config.policy_snapshot = freespace_snapshot();
   cfg.worker_count = 1;
   cfg.min_waypoints_for_parallel = 4;
   cfg.validation_wall_timeout = std::chrono::milliseconds(20);
+  cfg.clock = &clock;
+  cfg.scheduler = &scheduler;
   ParallelCollisionValidationWorkerPool pool(cfg);
 
   auto cancel = std::make_shared<CollisionCancellationToken>();
   std::vector<std::shared_ptr<ICollisionQueryEngine>> engines{engine};
-  const auto started = std::chrono::steady_clock::now();
-  auto bundle = pool.validate_trajectory(test_snapshot(), engines,
-                                         long_trajectory(12), cancel);
-  const auto elapsed = std::chrono::steady_clock::now() - started;
+  std::optional<CollisionValidationDecisionBundle> bundle;
+  std::thread caller([&]() {
+    bundle = pool.validate_trajectory(test_snapshot(), engines, long_trajectory(12), cancel);
+  });
+  engine->wait_until_blocked();
+  clock.advance(20'000'000);
+  scheduler.advance_to(clock.now());
+  caller.join();
 
-  EXPECT_LT(elapsed, std::chrono::milliseconds(500));
+  ASSERT_TRUE(bundle.has_value());
+  EXPECT_FALSE(bundle->decision.accepted);
+  EXPECT_EQ(bundle->decision.action, CollisionDecisionAction::kInconclusive);
+  EXPECT_TRUE(bundle->cancelled);
+  ASSERT_TRUE(bundle->cancellation_reason.has_value());
+  EXPECT_EQ(*bundle->cancellation_reason, "collision_validation_wall_timeout");
+  ASSERT_FALSE(bundle->waypoint_records.empty());
+  EXPECT_EQ(bundle->waypoint_records.front().result.raw_diagnostics.at("elapsed_ns"), "20000000");
+  EXPECT_TRUE(cancel->is_cancel_requested());
+  EXPECT_EQ(pool.last_telemetry().workers_actually_used, 1);
+  EXPECT_EQ(pool.last_telemetry().fallback_reason, "validation_wall_timeout");
+  EXPECT_EQ(pool.last_telemetry().total_worker_wall_ns, 0);
+  EXPECT_EQ(pool.last_telemetry().per_worker_waypoint_counts, (std::vector<int>{0}));
+  const auto status = pool.status();
+  EXPECT_EQ(status.queued_jobs, 0u);
+  EXPECT_EQ(status.abandoned_jobs_total, 1u);
+
+  engine->release_blocked();
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     AbsoluteDeadlineIncludesCallerWorkAndDoesNotStartAQueryWhenExpired) {
+  auto engine = std::make_shared<MockCollisionQueryEngine>();
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  cfg.pass_config.policy_snapshot = freespace_snapshot();
+  cfg.worker_count = 1;
+  cfg.min_waypoints_for_parallel = 4;
+  cfg.validation_wall_timeout = std::chrono::milliseconds(20);
+  cfg.clock = &clock;
+  cfg.scheduler = &scheduler;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+
+  clock.set(10'000'000);
+  auto cancel = std::make_shared<CollisionCancellationToken>();
+  const std::vector<std::shared_ptr<ICollisionQueryEngine>> engines{engine};
+  const auto snapshot = std::make_shared<const CollisionWorldSnapshot>(test_snapshot());
+  const auto bundle =
+      pool.validate_trajectory(snapshot, engines, long_trajectory(12), cancel, cfg.pass_config,
+                               /*absolute_wall_deadline=*/5'000'000);
+
+  EXPECT_EQ(engine->call_count.load(), 0);
   EXPECT_FALSE(bundle.decision.accepted);
   EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
   EXPECT_TRUE(bundle.cancelled);
   ASSERT_TRUE(bundle.cancellation_reason.has_value());
   EXPECT_EQ(*bundle.cancellation_reason, "collision_validation_wall_timeout");
+  ASSERT_FALSE(bundle.waypoint_records.empty());
+  EXPECT_EQ(
+      bundle.waypoint_records.front().result.raw_diagnostics.at("timeout_ns"),
+      "0");
   EXPECT_TRUE(cancel->is_cancel_requested());
-  EXPECT_EQ(pool.last_telemetry().workers_actually_used, 1);
-  EXPECT_EQ(pool.last_telemetry().fallback_reason, "worker_count_one");
+  EXPECT_EQ(pool.last_telemetry().workers_actually_used, 0);
+  EXPECT_EQ(pool.last_telemetry().fallback_reason, "validation_wall_timeout");
+}
 
-  engine->release_blocked();
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     TimeoutDoesNotReuseSingleContextUntilAbandonedWorkerIsJoined) {
+  auto engine_a = std::make_shared<MockCollisionQueryEngine>();
+  auto engine_b = std::make_shared<MockCollisionQueryEngine>();
+  engine_a->block_on_check = true;
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  cfg.pass_config.policy_snapshot = freespace_snapshot();
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 1;
+  cfg.validation_wall_timeout = std::chrono::milliseconds(20);
+  cfg.clock = &clock;
+  cfg.scheduler = &scheduler;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+  const std::vector<std::shared_ptr<ICollisionQueryEngine>> engines{engine_a, engine_b};
+  const auto snapshot = std::make_shared<const CollisionWorldSnapshot>(test_snapshot());
+
+  auto first_cancel = std::make_shared<CollisionCancellationToken>();
+  std::optional<CollisionValidationDecisionBundle> first;
+  std::thread caller([&]() {
+    first = pool.validate_trajectory(snapshot, engines, long_trajectory(12), first_cancel,
+                                     cfg.pass_config);
+  });
+  engine_a->wait_until_blocked();
+  clock.advance(20'000'000);
+  scheduler.advance_to(clock.now());
+  caller.join();
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(first->cancelled);
+  const int calls_while_blocked = engine_a->call_count.load() + engine_b->call_count.load();
+
+  auto retry_cancel = std::make_shared<CollisionCancellationToken>();
+  const auto retry = pool.validate_trajectory(snapshot, engines, long_trajectory(12), retry_cancel,
+                                              cfg.pass_config);
+  EXPECT_FALSE(retry.decision.accepted);
+  EXPECT_EQ(retry.decision.action, CollisionDecisionAction::kInconclusive);
+  ASSERT_FALSE(retry.waypoint_records.empty());
+  EXPECT_EQ(retry.waypoint_records.front().result.raw_diagnostics.at("reason_code"),
+            "collision_validation_workers_draining_after_timeout");
+  EXPECT_EQ(engine_a->call_count.load() + engine_b->call_count.load(), calls_while_blocked);
+  EXPECT_FALSE(retry_cancel->is_cancel_requested());
+  EXPECT_EQ(pool.last_telemetry().fallback_reason, "validation_workers_draining_after_timeout");
+
+  engine_a->release_blocked();
+  while (pool.status().active_workers != 0) {
+    std::this_thread::yield();
+  }
+  ASSERT_EQ(pool.status().active_workers, 0u);
+
+  auto recovered_cancel = std::make_shared<CollisionCancellationToken>();
+  const auto recovered = pool.validate_trajectory(snapshot, engines, long_trajectory(12),
+                                                  recovered_cancel, cfg.pass_config);
+  EXPECT_TRUE(recovered.decision.accepted);
+  EXPECT_GT(engine_a->call_count.load() + engine_b->call_count.load(), calls_while_blocked);
 }
 
 TEST(ParallelCollisionValidationWorkerPoolTest,
@@ -576,9 +1477,13 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   engine->block_on_check = true;
 
   ParallelCollisionValidationWorkerPool::Config cfg;
+  FakeClock clock;
+  ManualScheduler scheduler;
   cfg.pass_config.policy_snapshot = freespace_snapshot();
   cfg.worker_count = 1;
   cfg.validation_wall_timeout = std::chrono::milliseconds(20);
+  cfg.clock = &clock;
+  cfg.scheduler = &scheduler;
   ParallelCollisionValidationWorkerPool pool(cfg);
 
   CollisionCancellationToken cancel;
@@ -597,6 +1502,13 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   EXPECT_EQ(pool.last_telemetry().workers_actually_used, 0);
   EXPECT_EQ(pool.last_telemetry().fallback_reason,
             "validation_wall_timeout_requires_owned_lifetimes");
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     PositiveWallTimeoutRequiresInjectedDeadlineAuthority) {
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.validation_wall_timeout = std::chrono::milliseconds(20);
+  EXPECT_THROW(ParallelCollisionValidationWorkerPool pool(cfg), std::invalid_argument);
 }
 
 TEST(EnvValidationCollisionWorkers, ReturnsDefaultWhenUnset) {
@@ -634,6 +1546,30 @@ TEST(EnvValidationCollisionWorkers, FallsBackOnGarbage) {
   ::setenv("MANYFORGE_VALIDATION_COLLISION_WORKERS", "4x", 1);
   EXPECT_EQ(env_validation_collision_workers(2), 2);
   ::unsetenv("MANYFORGE_VALIDATION_COLLISION_WORKERS");
+}
+
+TEST(EnvValidationCollisionWorkers, ExplicitDeploymentValueCannotBeOverriddenByEnvironment) {
+  ::setenv("MANYFORGE_VALIDATION_COLLISION_WORKERS", "7", 1);
+  EXPECT_EQ(resolve_validation_collision_workers(
+                /*configured_value=*/3,
+                /*deployment_declared=*/true),
+            3);
+  EXPECT_EQ(resolve_validation_collision_workers(
+                /*configured_value=*/3,
+                /*deployment_declared=*/false),
+            7);
+  ::unsetenv("MANYFORGE_VALIDATION_COLLISION_WORKERS");
+}
+
+TEST(EnvValidationCollisionWorkers, InvalidExplicitDeploymentValueFailsInsteadOfClamping) {
+  EXPECT_THROW(resolve_validation_collision_workers(
+                   /*configured_value=*/0,
+                   /*deployment_declared=*/true),
+               std::invalid_argument);
+  EXPECT_THROW(resolve_validation_collision_workers(
+                   /*configured_value=*/65,
+                   /*deployment_declared=*/true),
+               std::invalid_argument);
 }
 
 TEST(CollisionCancellationToken, FirstCancelReasonWins) {

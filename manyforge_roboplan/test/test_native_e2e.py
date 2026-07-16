@@ -189,19 +189,99 @@ def native_kernel_ur10e_robotiq():
     return NativeKernelClient(bundle)
 
 
-def test_create_native_kernel_accepts_collision_monitor_config():
+def test_create_native_kernel_accepts_and_reports_runtime_collision_budgets():
     if not HAS_NATIVE:
         pytest.skip("manyforge_roboplan_py not available")
 
     bundle = manyforge_roboplan_py.create_native_kernel(
         "ur5_gripper",
         "arm",
-        {"collision_monitor_period_ns": 25_000_000},
+        {
+            "collision_monitor_period_ns": 25_000_000,
+            "runtime_collision_immediate_query_budget_ns": 20_000_000,
+            "runtime_collision_lookahead_cycle_budget_ns": 100_000_000,
+            "runtime_collision_lookahead_query_budget_ns": 60_000_000,
+            "runtime_collision_lookahead_horizon_ns": 1_500_000_000,
+            "runtime_collision_lookahead_max_samples": 16,
+            "runtime_collision_lookahead_workers": 1,
+        },
     )
-    kernel = NativeKernelClient(bundle)
-    status = kernel.get_status()
+    try:
+        kernel = NativeKernelClient(bundle)
+        assert kernel.get_status().state == ExecutionState.IDLE
+        metrics = kernel.get_metrics()
+        assert metrics["runtime_collision_monitor_period_ns"] == 25_000_000
+        assert (
+            metrics["runtime_collision_immediate_query_budget_ns"]
+            == 20_000_000
+        )
+        assert (
+            metrics["runtime_collision_lookahead_cycle_budget_ns"]
+            == 100_000_000
+        )
+        assert (
+            metrics["runtime_collision_lookahead_query_budget_ns"]
+            == 60_000_000
+        )
+        assert metrics["runtime_collision_lookahead_horizon_ns"] == 1_500_000_000
+        assert metrics["runtime_collision_lookahead_max_samples"] == 16
+    finally:
+        bundle.close()
 
-    assert status.state == ExecutionState.IDLE
+
+@pytest.mark.parametrize(
+    "removed_key",
+    [
+        "runtime_collision_lookahead_period_ns",
+        "runtime_collision_lookahead_max_waypoints",
+        "runtime_collision_query_timeout_ns",
+    ],
+)
+def test_create_native_kernel_rejects_removed_runtime_collision_keys(removed_key):
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    with pytest.raises(ValueError, match="removed by RT-8C.3"):
+        manyforge_roboplan_py.create_native_kernel(
+            "ur5_gripper", "arm", {removed_key: 1}
+        )
+
+
+def test_create_native_kernel_reports_declared_validation_collision_workers():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    bundle = manyforge_roboplan_py.create_native_kernel(
+        "ur5_gripper",
+        "arm",
+        {"validation_collision_workers": 2},
+    )
+    try:
+        metrics = NativeKernelClient(bundle).get_metrics()
+        assert metrics["validation_collision_workers_requested"] == 2
+        assert metrics["validation_collision_workers_effective"] == 2
+        assert metrics["validation_collision_jobs_queued"] == 0
+        assert metrics["validation_collision_workers_active"] == 0
+    finally:
+        bundle.close()
+
+
+@pytest.mark.parametrize(
+    "workers",
+    [True, False, 0, -1, 65, 2.5, "2"],
+)
+def test_create_native_kernel_rejects_invalid_validation_collision_workers(
+    workers,
+):
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    with pytest.raises(ValueError, match="validation_collision_workers"):
+        manyforge_roboplan_py.create_native_kernel(
+            "ur5_gripper",
+            "arm",
+            {"validation_collision_workers": workers},
+        )
 
 
 def test_factory_keeps_planner_model_name_private_from_logical_robot_id():
@@ -909,6 +989,36 @@ def test_cartesian_request_serialization_is_portable_and_non_mutating():
     ] == pytest.approx([1.0, 0.0, 0.0, 0.0])
     assert "orientation_rpy_deg" not in serialized["cartesian_path"]["waypoints"][0]
     assert request.cartesian_path["waypoints"] == original_waypoints
+
+
+def test_pose_request_serialization_is_portable_and_non_mutating():
+    if not HAS_NATIVE_CLIENT:
+        pytest.skip("native client adapter unavailable")
+    pose_goal = {
+        "position_m": [0.1, -0.2, 0.3],
+        "orientation_rpy_deg": [0.0, 0.0, -45.0],
+    }
+    request = ExecuteRequest(
+        robot_id="robot1",
+        group_id="arm",
+        move_id="pose_serialization",
+        base_frame="base_link",
+        tcp_frame="tool0",
+        motion_type="pose",
+        target_mode="relative",
+        target_reference={"type": "object", "id": "part"},
+        pose_goal=pose_goal,
+    )
+    client = NativeKernelClient(object())
+
+    serialized = client._request_to_native_dict(request)
+
+    assert serialized["motion_type"] == "pose"
+    assert serialized["pose_goal"]["orientation_xyzw"] == pytest.approx(
+        [0.0, 0.0, -0.3826834323650898, 0.9238795325112867]
+    )
+    assert "orientation_rpy_deg" not in serialized["pose_goal"]
+    assert request.pose_goal == pose_goal
 
 
 def test_native_cartesian_candidate_preview_runs_full_portable_path(native_kernel):

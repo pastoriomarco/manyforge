@@ -55,6 +55,9 @@ enum class TrajectorySampleError : std::uint8_t {
   /// be ordered relative to the waypoint timeline, so the call is
   /// rejected before any comparison runs.
   kNonFiniteSampleTime,
+  /// A caller-supplied precomputed segment does not contain `time_s`
+  /// according to the sampler's right-continuous boundary rules.
+  kSegmentHintMismatch,
 };
 
 inline std::string_view to_string(TrajectorySampleError e) {
@@ -71,6 +74,8 @@ inline std::string_view to_string(TrajectorySampleError e) {
       return "trajectory_sample_non_finite_waypoint_time";
     case TrajectorySampleError::kNonFiniteSampleTime:
       return "trajectory_sample_non_finite_sample_time";
+    case TrajectorySampleError::kSegmentHintMismatch:
+      return "trajectory_sample_segment_hint_mismatch";
   }
   return "trajectory_sample_unknown";
 }
@@ -154,6 +159,17 @@ Result<void> validate_trajectory_for_sampling(const TrajectoryDTO& trajectory);
 /// The trajectory must not be mutated between validation and sampling.
 Result<void> sample_trajectory_prevalidated(const TrajectoryDTO& trajectory,
                                             double time_s,
+                                            TrajectorySampleResult& out);
+
+/// O(1) segment-hint overload for callers sampling monotonically increasing
+/// times from one immutable, prevalidated trajectory. `segment_index` must be
+/// the exact segment selected by the normal right-continuous boundary rules;
+/// a mismatched hint is rejected rather than sampled from a different segment.
+/// Pre/post-trajectory clamps and single-waypoint trajectories remain the
+/// responsibility of the ordinary overload.
+Result<void> sample_trajectory_prevalidated(const TrajectoryDTO& trajectory,
+                                            double time_s,
+                                            std::size_t segment_index,
                                             TrajectorySampleResult& out);
 
 }  // namespace manyforge::core

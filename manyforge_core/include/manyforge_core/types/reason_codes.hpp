@@ -49,6 +49,8 @@ inline constexpr char kGraspContactPenetrationExceeded[] =
 inline constexpr char kUnknownContactPolicyId[] = "unknown_contact_policy_id";
 inline constexpr char kInvalidContactGraspPolicy[] =
     "invalid_contact_grasp_policy";
+inline constexpr char kInvalidContactGraspSampleFractions[] =
+    "invalid_contact_grasp_sample_fractions";
 inline constexpr char kMissingSignedClearance[] = "missing_signed_clearance";
 inline constexpr char kInitialSampleInContact[] = "initial_sample_in_contact";
 inline constexpr char kContactBeforeTerminalWindow[] =

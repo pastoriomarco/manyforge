@@ -439,8 +439,7 @@ bool RuntimeCollisionQuerySession::bind_policy(
        bundle->policy_index->support_contact_index) {
     const auto state_index = release_state_count_;
     release_states_[state_index] =
-        ContactReleaseState{&pair, &policy, 0.0, 0.0, std::nullopt, false,
-                            false};
+        ContactReleaseState{&pair, &policy, 0.0, 0.0, 0.0, std::nullopt, false, false, false};
     ++release_state_count_;
   }
   policy_binding_valid_ = true;
@@ -640,6 +639,8 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::update_contact_release
       state.initialized = true;
       state.initial_penetration_m = depth;
       state.last_penetration_m = depth;
+      state.best_penetration_m = depth;
+      state.started_in_contact = depth > tolerance && !separated;
       state.separated = separated;
       continue;
     }
@@ -657,6 +658,7 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::update_contact_release
       return clear;
     }
     state.last_penetration_m = depth;
+    state.best_penetration_m = std::min(state.best_penetration_m, depth);
     state.separated = state.separated || separated;
   }
   clear.pair = nullptr;
@@ -665,6 +667,32 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::update_contact_release
   clear.previous_penetration_m.reset();
   clear.current_penetration_m.reset();
   return clear;
+}
+
+RuntimeContactReleaseStateSnapshot RuntimeCollisionQuerySession::contact_release_state_snapshot()
+    const noexcept {
+  RuntimeContactReleaseStateSnapshot snapshot;
+  snapshot.count = release_state_count_;
+  snapshot.valid = policy_binding_valid_;
+  snapshot.binding_owner = bound_bundle_;
+  for (std::size_t index = 0; index < release_state_count_; ++index) {
+    const auto& source = release_states_[index];
+    auto& target = snapshot.entries[index];
+    target.pair = source.pair;
+    target.release_state.initialized = source.initialized;
+    target.release_state.started_in_contact = source.started_in_contact;
+    target.release_state.separated = source.separated;
+    if (source.initialized && source.started_in_contact) {
+      target.release_state.initial_depth_m = source.initial_penetration_m;
+    }
+    target.release_state.previous_depth_m = source.last_penetration_m;
+    target.release_state.best_depth_m = source.best_penetration_m;
+    target.support_state = !source.initialized || !source.started_in_contact
+                               ? SupportContactEvaluationState::kNotInContact
+                           : source.separated ? SupportContactEvaluationState::kSeparated
+                                              : SupportContactEvaluationState::kContactActive;
+  }
+  return snapshot;
 }
 
 RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::tick(

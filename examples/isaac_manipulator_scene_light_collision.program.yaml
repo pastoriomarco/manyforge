@@ -123,7 +123,7 @@ parameters:
 saved_with_deployment:
   name: isaac_manipulator_scene_light_ros2_control_collision
   source_path: /workspace/examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml
-  content_sha256: a9af22559174a1def206f723950f65f01d11dc78f14b9c2393e9e041eb0b6f7f
+  content_sha256: 6a051132720fe0cb91e6a2b7f58e37f4b4b8f4e4194e75ca0d40bcaf92f0e12c
 tree:
   id: parallel
   name: parallel
@@ -135,7 +135,9 @@ tree:
     - id: timer
       name: timer
       params:
-        duration_s: 1.5
+        # Leave enough room for a cold first plan; the obstacle must enter an
+        # executing trajectory rather than race pre-dispatch validation.
+        duration_s: 5
     - id: add_collision_object
       name: add_collision_object
       params:
@@ -159,7 +161,7 @@ tree:
     - id: timer
       name: timer2
       params:
-        duration_s: 2
+        duration_s: 1
     - id: remove_collision_object
       name: remove_collision_object
       params:

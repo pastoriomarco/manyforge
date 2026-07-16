@@ -67,6 +67,10 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   observed_robot_state_publication() const noexcept override {
     return observed_state_publication_.get();
   }
+  const core::ExecutionProgressPublication*
+  execution_progress_publication() const noexcept override {
+    return execution_progress_publication_.get();
+  }
   const std::atomic<std::uint64_t>* observed_state_authority_epoch()
       const noexcept {
     return observed_state_publication_ != nullptr
@@ -127,7 +131,8 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   bool update_scene_positions(const std::vector<double>& joint_positions,
                               SceneUpdateMode mode = SceneUpdateMode::kBlocking,
                               std::int64_t source_timestamp_ns = 0);
-  void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory);
+  void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory,
+                        std::uint64_t execution_generation);
   void request_active_controlled_stop();
   void begin_controlled_stop_runtime_scale_freeze();
   bool end_controlled_stop_runtime_scale_freeze();
@@ -151,6 +156,9 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   RoboPlanExecutionBackendConfig config_;
   std::unique_ptr<core::ObservedRobotStatePublication>
       observed_state_publication_;
+  std::unique_ptr<core::ExecutionProgressPublication>
+      execution_progress_publication_;
+  std::atomic<std::uint64_t> next_execution_progress_generation_{1};
   std::vector<double> observed_at_rest_velocities_;
   mutable std::mutex observed_state_publication_mutex_;
   std::atomic<std::uint64_t> observed_state_authority_epoch_{1};

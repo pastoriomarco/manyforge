@@ -123,17 +123,23 @@ def test_ros2_control_adapter_dispatches_to_runtime_factory(monkeypatch):
         *,
         deployment,
         collision_monitor_period_ns,
-        runtime_collision_query_timeout_ns,
+        runtime_collision_immediate_query_budget_ns,
         validation_collision_query_timeout_ns,
         validation_collision_wall_timeout_ns,
         runtime_dynamic_body_max_age_cap_ns,
+        validation_collision_workers,
+        runtime_collision_lookahead_cycle_budget_ns,
+        runtime_collision_lookahead_query_budget_ns,
+        runtime_collision_lookahead_horizon_ns,
+        runtime_collision_lookahead_max_samples,
+        runtime_collision_lookahead_workers,
     ):
         calls.append(
             {
                 "deployment": deployment,
                 "collision_monitor_period_ns": collision_monitor_period_ns,
-                "runtime_collision_query_timeout_ns": (
-                    runtime_collision_query_timeout_ns
+                "runtime_collision_immediate_query_budget_ns": (
+                    runtime_collision_immediate_query_budget_ns
                 ),
                 "validation_collision_query_timeout_ns": (
                     validation_collision_query_timeout_ns
@@ -143,6 +149,22 @@ def test_ros2_control_adapter_dispatches_to_runtime_factory(monkeypatch):
                 ),
                 "runtime_dynamic_body_max_age_cap_ns": (
                     runtime_dynamic_body_max_age_cap_ns
+                ),
+                "validation_collision_workers": validation_collision_workers,
+                "runtime_collision_lookahead_cycle_budget_ns": (
+                    runtime_collision_lookahead_cycle_budget_ns
+                ),
+                "runtime_collision_lookahead_query_budget_ns": (
+                    runtime_collision_lookahead_query_budget_ns
+                ),
+                "runtime_collision_lookahead_horizon_ns": (
+                    runtime_collision_lookahead_horizon_ns
+                ),
+                "runtime_collision_lookahead_max_samples": (
+                    runtime_collision_lookahead_max_samples
+                ),
+                "runtime_collision_lookahead_workers": (
+                    runtime_collision_lookahead_workers
                 ),
             }
         )
@@ -163,10 +185,16 @@ def test_ros2_control_adapter_dispatches_to_runtime_factory(monkeypatch):
         {
             "deployment": deployment,
             "collision_monitor_period_ns": 50_000_000,
-            "runtime_collision_query_timeout_ns": None,
+            "runtime_collision_immediate_query_budget_ns": None,
             "validation_collision_query_timeout_ns": None,
             "validation_collision_wall_timeout_ns": None,
             "runtime_dynamic_body_max_age_cap_ns": None,
+            "validation_collision_workers": None,
+            "runtime_collision_lookahead_cycle_budget_ns": 200_000_000,
+            "runtime_collision_lookahead_query_budget_ns": 75_000_000,
+            "runtime_collision_lookahead_horizon_ns": 2_000_000_000,
+            "runtime_collision_lookahead_max_samples": 32,
+            "runtime_collision_lookahead_workers": 2,
         }
     ]
 
@@ -184,6 +212,13 @@ def test_ros2_control_adapter_passes_dynamic_body_max_age_cap(monkeypatch):
                 "collision_monitor_period_ms": 50.0,
                 "runtime_dynamic_body_max_age_cap_ms": 250.0,
                 "validation_collision_wall_timeout_ms": 1250.0,
+                "validation_collision_workers": 3,
+                "runtime_collision_lookahead_cycle_budget_ms": 75.0,
+                "runtime_collision_immediate_query_budget_ms": 25.0,
+                "runtime_collision_lookahead_query_budget_ms": 60.0,
+                "runtime_collision_lookahead_s": 1.5,
+                "runtime_collision_lookahead_max_samples": 48,
+                "runtime_collision_lookahead_workers": 4,
             }
         ),
     )
@@ -205,6 +240,13 @@ def test_ros2_control_adapter_passes_dynamic_body_max_age_cap(monkeypatch):
 
     assert calls[0]["runtime_dynamic_body_max_age_cap_ns"] == 250_000_000
     assert calls[0]["validation_collision_wall_timeout_ns"] == 1_250_000_000
+    assert calls[0]["validation_collision_workers"] == 3
+    assert calls[0]["runtime_collision_lookahead_cycle_budget_ns"] == 75_000_000
+    assert calls[0]["runtime_collision_immediate_query_budget_ns"] == 25_000_000
+    assert calls[0]["runtime_collision_lookahead_query_budget_ns"] == 60_000_000
+    assert calls[0]["runtime_collision_lookahead_horizon_ns"] == 1_500_000_000
+    assert calls[0]["runtime_collision_lookahead_max_samples"] == 48
+    assert calls[0]["runtime_collision_lookahead_workers"] == 4
 
 
 def test_native_kernel_factory_passes_validation_collision_timeouts(monkeypatch):
@@ -219,6 +261,13 @@ def test_native_kernel_factory_passes_validation_collision_timeouts(monkeypatch)
             config={
                 "validation_collision_query_timeout_ms": 275.0,
                 "validation_collision_wall_timeout_ms": 3250.0,
+                "validation_collision_workers": 2,
+                "runtime_collision_lookahead_cycle_budget_ms": 80.0,
+                "runtime_collision_immediate_query_budget_ms": 40.0,
+                "runtime_collision_lookahead_query_budget_ms": 70.0,
+                "runtime_collision_lookahead_s": 1.25,
+                "runtime_collision_lookahead_max_samples": 24,
+                "runtime_collision_lookahead_workers": 3,
             }
         ),
     )
@@ -260,6 +309,108 @@ def test_native_kernel_factory_passes_validation_collision_timeouts(monkeypatch)
         recorded["config"]["validation_collision_wall_timeout_ns"]
         == 3_250_000_000
     )
+    assert recorded["config"]["validation_collision_workers"] == 2
+    assert recorded["config"]["runtime_collision_lookahead_cycle_budget_ns"] == 80_000_000
+    assert recorded["config"]["runtime_collision_immediate_query_budget_ns"] == 40_000_000
+    assert recorded["config"]["runtime_collision_lookahead_query_budget_ns"] == 70_000_000
+    assert (
+        recorded["config"]["runtime_collision_lookahead_horizon_ns"]
+        == 1_250_000_000
+    )
+    assert recorded["config"]["runtime_collision_lookahead_max_samples"] == 24
+    assert recorded["config"]["runtime_collision_lookahead_workers"] == 3
+
+
+def test_runtime_collision_lookahead_defaults_match_deployment_contract():
+    deployment = SimpleNamespace(
+        adapters={},
+        orchestrator=SimpleNamespace(config={}),
+    )
+
+    assert composer_main._runtime_collision_lookahead_from_deployment(deployment) == (
+        200_000_000,
+        2_000_000_000,
+        32,
+        2,
+        75_000_000,
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("runtime_collision_lookahead_cycle_budget_ms", 0.0),
+        ("runtime_collision_lookahead_cycle_budget_ms", 49.0),
+        ("runtime_collision_lookahead_cycle_budget_ms", "100"),
+        ("runtime_collision_lookahead_cycle_budget_ms", float("inf")),
+        ("runtime_collision_lookahead_s", True),
+        ("runtime_collision_lookahead_s", -1.0),
+        ("runtime_collision_lookahead_s", float("nan")),
+        ("runtime_collision_lookahead_max_samples", True),
+        ("runtime_collision_lookahead_max_samples", 0),
+        ("runtime_collision_lookahead_max_samples", 1),
+        ("runtime_collision_lookahead_max_samples", 4097),
+        ("runtime_collision_lookahead_workers", False),
+        ("runtime_collision_lookahead_workers", 0),
+        ("runtime_collision_lookahead_workers", 65),
+        ("runtime_collision_immediate_query_budget_ms", 201.0),
+        ("runtime_collision_lookahead_query_budget_ms", True),
+        ("runtime_collision_lookahead_query_budget_ms", 0.0),
+        ("runtime_collision_lookahead_query_budget_ms", 201.0),
+        ("runtime_collision_lookahead_query_budget_ms", float("inf")),
+    ],
+)
+def test_runtime_collision_lookahead_rejects_invalid_deployment_values(key, value):
+    deployment = SimpleNamespace(
+        adapters={},
+        orchestrator=SimpleNamespace(config={key: value}),
+    )
+
+    with pytest.raises(ValueError, match=key):
+        composer_main._runtime_collision_lookahead_from_deployment(deployment)
+
+
+@pytest.mark.parametrize(
+    "removed_key",
+    [
+        "runtime_collision_lookahead_period_ms",
+        "runtime_collision_lookahead_max_waypoints",
+        "runtime_collision_query_timeout_ms",
+    ],
+)
+def test_runtime_collision_lookahead_rejects_removed_deployment_keys(removed_key):
+    deployment = SimpleNamespace(
+        adapters={},
+        orchestrator=SimpleNamespace(config={removed_key: 1}),
+    )
+    with pytest.raises(ValueError, match="removed by RT-8C.3"):
+        composer_main._runtime_collision_lookahead_from_deployment(deployment)
+
+
+@pytest.mark.parametrize("workers", [1, 2, 4, 64])
+def test_validation_collision_workers_is_parsed_from_deployment(workers):
+    deployment = SimpleNamespace(
+        adapters={},
+        orchestrator=SimpleNamespace(
+            config={"validation_collision_workers": workers}
+        ),
+    )
+    assert (
+        composer_main._validation_collision_workers_from_deployment(deployment)
+        == workers
+    )
+
+
+@pytest.mark.parametrize("workers", [True, 0, -1, 65, 2.5, "4"])
+def test_validation_collision_workers_rejects_invalid_values(workers):
+    deployment = SimpleNamespace(
+        adapters={},
+        orchestrator=SimpleNamespace(
+            config={"validation_collision_workers": workers}
+        ),
+    )
+    with pytest.raises(ValueError, match="validation_collision_workers"):
+        composer_main._validation_collision_workers_from_deployment(deployment)
 
 
 def test_runtime_dynamic_body_max_age_cap_zero_is_passed_through():
@@ -353,7 +504,7 @@ def test_kernel_config_forwards_single_shot_ik_timeout():
     config = composer_main._kernel_config_from_deployment(
         deployment,
         collision_monitor_period_ns=None,
-        runtime_collision_query_timeout_ns=None,
+        runtime_collision_immediate_query_budget_ns=None,
         validation_collision_query_timeout_ns=None,
         validation_collision_wall_timeout_ns=None,
         runtime_dynamic_body_max_age_cap_ns=None,
@@ -378,7 +529,7 @@ def test_kernel_config_forwards_planner_budget_from_planning_adapter():
     config = composer_main._kernel_config_from_deployment(
         deployment,
         collision_monitor_period_ns=None,
-        runtime_collision_query_timeout_ns=None,
+        runtime_collision_immediate_query_budget_ns=None,
         validation_collision_query_timeout_ns=None,
         validation_collision_wall_timeout_ns=None,
         runtime_dynamic_body_max_age_cap_ns=None,
@@ -400,7 +551,7 @@ def test_kernel_config_forwards_planner_rng_seed_from_planning_adapter():
     config = composer_main._kernel_config_from_deployment(
         deployment,
         collision_monitor_period_ns=None,
-        runtime_collision_query_timeout_ns=None,
+        runtime_collision_immediate_query_budget_ns=None,
         validation_collision_query_timeout_ns=None,
         validation_collision_wall_timeout_ns=None,
         runtime_dynamic_body_max_age_cap_ns=None,
@@ -425,7 +576,7 @@ def test_kernel_config_forwards_baseline_collision_policy_snapshot():
     config = composer_main._kernel_config_from_deployment(
         deployment,
         collision_monitor_period_ns=None,
-        runtime_collision_query_timeout_ns=None,
+        runtime_collision_immediate_query_budget_ns=None,
         validation_collision_query_timeout_ns=None,
         validation_collision_wall_timeout_ns=None,
         runtime_dynamic_body_max_age_cap_ns=None,
@@ -445,7 +596,7 @@ def test_kernel_config_omits_single_shot_ik_timeout_when_absent():
     config = composer_main._kernel_config_from_deployment(
         deployment,
         collision_monitor_period_ns=50_000_000,
-        runtime_collision_query_timeout_ns=None,
+        runtime_collision_immediate_query_budget_ns=None,
         validation_collision_query_timeout_ns=None,
         validation_collision_wall_timeout_ns=None,
         runtime_dynamic_body_max_age_cap_ns=None,
@@ -524,7 +675,13 @@ def test_native_kernel_factory_attaches_robot_model_authority_metadata(
     assert recorded["urdf_path"] == str(urdf)
     assert recorded["srdf_path"] == str(srdf)
     assert recorded["package_paths"] == [str(tmp_path)]
-    assert recorded["config"] is None
+    assert recorded["config"] == {
+        "runtime_collision_lookahead_cycle_budget_ns": 200_000_000,
+        "runtime_collision_lookahead_horizon_ns": 2_000_000_000,
+        "runtime_collision_lookahead_max_samples": 32,
+        "runtime_collision_lookahead_workers": 2,
+        "runtime_collision_lookahead_query_budget_ns": 75_000_000,
+    }
     assert kernel.robot_model_authority_metadata["view_changed"] is False
     assert kernel.robot_model_authority_metadata["canonical_urdf_path"] == str(urdf)
     assert kernel.kwargs["robot_model_authority_metadata"] == (

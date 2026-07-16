@@ -135,21 +135,33 @@ double seconds_since(std::chrono::steady_clock::time_point t,
   return std::chrono::duration<double>(now - t).count();
 }
 
-bool wait_for_fjt_action_server(
-    const rclcpp_action::Client<control_msgs::action::FollowJointTrajectory>::SharedPtr&
-        client,
+template <typename ActionT>
+bool wait_for_action_server_until(
+    const std::shared_ptr<rclcpp_action::Client<ActionT>>& client,
     double timeout_s) {
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::duration<double>(std::max(0.0, timeout_s));
-  do {
-    // Audit 6C (finding 2.12): no trailing sleep — wait_for_action_server
-    // already blocks on graph discovery events for the slice; an extra
-    // sleep only added startup latency per iteration.
-    if (client->wait_for_action_server(std::chrono::milliseconds(100))) {
+  if (!client) {
+    return false;
+  }
+  const auto budget = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(std::max(0.0, timeout_s)));
+  const auto deadline = std::chrono::steady_clock::now() + budget;
+  while (true) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return client->action_server_is_ready();
+    }
+    // Graph discovery can wake a wait before every action endpoint is ready.
+    // Retry bounded slices until the caller's single overall deadline.
+    const auto remaining = deadline - now;
+    const auto slice = std::min(
+        remaining,
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::milliseconds(100)));
+    if (client->wait_for_action_server(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(slice))) {
       return true;
     }
-  } while (std::chrono::steady_clock::now() < deadline);
-  return client->wait_for_action_server(std::chrono::milliseconds(0));
+  }
 }
 
 void add_unique_evidence(std::vector<std::string>& evidence,
@@ -208,6 +220,7 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
   }
   validate_config();
   initialize_observed_state_publication();
+  initialize_execution_progress_publication();
   snapshot_.timestamp_ns = clock_.now();
   initialize_authored_state();
   start_ros();
@@ -299,6 +312,20 @@ void Ros2ControlExecutionBackend::validate_config() const {
       config_.final_tolerance_rad < 0.0 ||
       config_.tracking_error_tolerance_rad < 0.0 ||
       config_.tracking_error_timeout_s < 0.0 ||
+      !std::isfinite(config_.execution_progress_projection_period_s) ||
+      config_.execution_progress_projection_period_s <= 0.0 ||
+      !std::isfinite(
+          config_.execution_progress_projection_max_rms_distance_rad) ||
+      config_.execution_progress_projection_max_rms_distance_rad < 0.0 ||
+      !std::isfinite(
+          config_.execution_progress_projection_ambiguity_epsilon_rad) ||
+      config_.execution_progress_projection_ambiguity_epsilon_rad < 0.0 ||
+      !std::isfinite(
+          config_.execution_progress_projection_ambiguity_time_s) ||
+      config_.execution_progress_projection_ambiguity_time_s < 0.0 ||
+      !std::isfinite(
+          config_.execution_progress_projection_regression_tolerance_s) ||
+      config_.execution_progress_projection_regression_tolerance_s < 0.0 ||
       config_.stop_completion_timeout_s < 0.0 ||
       config_.sim_reset_motion_duration_s < 0.0 ||
       !std::isfinite(config_.soft_on_path_stop_traj_delta_s) ||
@@ -394,6 +421,26 @@ void Ros2ControlExecutionBackend::initialize_observed_state_publication() {
   observed_state_publication_ =
       std::make_unique<core::ObservedRobotStatePublication>(
       config_.required_joints, std::move(sources));
+}
+
+void Ros2ControlExecutionBackend::initialize_execution_progress_publication() {
+  const bool commanded = uses_authored_backend_state();
+  const auto freshness_budget_ns =
+      commanded
+          ? std::int64_t{0}
+          : static_cast<std::int64_t>(
+                config_.joint_state_max_age_s * 1'000'000'000.0);
+  execution_progress_publication_ =
+      std::make_unique<core::ExecutionProgressPublication>(
+          commanded
+              ? core::ExecutionProgressSourceKind::kBackendCommanded
+              : core::ExecutionProgressSourceKind::kMeasuredProjection,
+          commanded
+              ? core::ExecutionProgressAuthorityProfile::kCommandedSimulation
+              : core::ExecutionProgressAuthorityProfile::kMeasuredPhysical,
+          commanded ? "ros2_control_commanded_progress_v1"
+                    : "ros2_control_measured_progress_v1",
+          freshness_budget_ns);
 }
 
 void Ros2ControlExecutionBackend::initialize_authored_state() {
@@ -1070,8 +1117,8 @@ core::Result<void> Ros2ControlExecutionBackend::command_sim_initial_state(
          {"state_source_mode", config_.execution_state_source_mode}},
     });
   }
-  if (!wait_for_fjt_action_server(action_client_,
-                                  config_.wait_for_action_server_timeout_s)) {
+  if (!wait_for_action_server_until(action_client_,
+                                    config_.wait_for_action_server_timeout_s)) {
     set_command_gate(false);
     return core::Result<void>::Err(core::ErrorDTO{
         core::kErrorExecutionAborted,
@@ -1340,6 +1387,9 @@ void Ros2ControlExecutionBackend::set_running_locked(bool running) noexcept {
   running_ = running;
   if (!running) {
     running_flag_.store(false, std::memory_order_release);
+    if (execution_progress_publication_ != nullptr) {
+      execution_progress_publication_->invalidate();
+    }
   }
 }
 
@@ -2531,6 +2581,7 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
   }
 
   std::vector<double> start_positions;
+  std::int64_t progress_source_timestamp_ns = clock_.now();
   if (uses_authored_backend_state()) {
     if (trajectory.waypoints.empty()) {
       fail_execution("Trajectory has no waypoints",
@@ -2583,13 +2634,17 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
           [this]() { return get_execution_snapshot(); }};
     }
     start_positions = positions_for_joints(*start_sample, config_.required_joints);
+    progress_source_timestamp_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            start_sample->received_at.time_since_epoch())
+            .count();
   }
 
   update_scene_positions(start_positions, SceneUpdateMode::kBestEffort);
   publish_snapshot(core::ExecutionState::kExecuting, 0.0, start_positions);
 
-  if (!wait_for_fjt_action_server(action_client_,
-                                  config_.wait_for_action_server_timeout_s)) {
+  if (!wait_for_action_server_until(action_client_,
+                                    config_.wait_for_action_server_timeout_s)) {
     fail_execution("FollowJointTrajectory action server unavailable: " +
                        config_.action_name,
                    core::ErrorCode::kExecutionRejected,
@@ -2709,6 +2764,23 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
     set_command_gate(true);
   }
 
+  const auto progress_received_ns = clock_.now();
+  const auto initial_progress = execution_progress_publication_->publish(
+      dispatch_generation, 0, progress_source_timestamp_ns,
+      progress_received_ns);
+  if (!initial_progress.published) {
+    cancel_goal_if_known(goal_handle);
+    fail_execution(
+        "Execution progress authority could not be armed",
+        core::ErrorCode::kExecutionRejected,
+        "execution_progress_publication_rejected",
+        {{"reason", initial_progress.reason}});
+    return core::ExecutionHandle{
+        [](int64_t) { return true; },
+        [this]() { return get_execution_snapshot(); },
+        0};
+  }
+
   if (monitor_thread_.joinable() && monitor_active_.load()) {
     fail_execution("Previous ros2_control monitor thread is still shutting down",
                    core::ErrorCode::kExecutionRejected,
@@ -2737,7 +2809,8 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
         execution_cv_.wait(lock, [this]() { return terminal_; });
         return true;
       },
-      [this]() { return get_execution_snapshot(); }};
+      [this]() { return get_execution_snapshot(); },
+      dispatch_generation};
 }
 
 void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory) {
@@ -2769,6 +2842,9 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
   core::TrajectorySampleResult predicted_sample;
   auto last_monitor_tick = std::chrono::steady_clock::now();
   double trajectory_time_s = 0.0;
+  double measured_progress_time_s = 0.0;
+  auto last_progress_projection_at =
+      std::chrono::steady_clock::time_point::min();
   double applied_runtime_scale =
       applied_runtime_velocity_scale_.load(std::memory_order_acquire);
   while (true) {
@@ -2895,11 +2971,21 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
     }
     applied_runtime_velocity_scale_.store(
         applied_runtime_scale, std::memory_order_release);
-    trajectory_time_s += dt_s * applied_runtime_scale;
+    trajectory_time_s = std::min(
+        total_duration_s, trajectory_time_s + dt_s * applied_runtime_scale);
     {
       std::lock_guard<std::mutex> lock(execution_mutex_);
       active_trajectory_time_s_ = trajectory_time_s;
       active_runtime_velocity_scale_ = applied_runtime_scale;
+    }
+    if (uses_authored_backend_state()) {
+      const auto now_ns = clock_.now();
+      (void)execution_progress_publication_->publish(
+          monitor_generation,
+          static_cast<std::int64_t>(
+              std::max(0.0, trajectory_time_s) * 1e9),
+          now_ns,
+          now_ns);
     }
     const double progress =
         total_duration_s <= 1e-9 ? 1.0 : clamp_progress(trajectory_time_s / total_duration_s);
@@ -2946,6 +3032,45 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
     if (sample.has_value()) {
       try {
         auto observed = positions_for_joints(*sample, trajectory.joint_names);
+        if (!uses_authored_backend_state() &&
+            (last_progress_projection_at ==
+                 std::chrono::steady_clock::time_point::min() ||
+             seconds_since(last_progress_projection_at, now) >=
+                 config_.execution_progress_projection_period_s)) {
+          core::TrajectoryProgressProjectionConfig projection_config;
+          projection_config.max_rms_distance_rad =
+              config_.execution_progress_projection_max_rms_distance_rad;
+          projection_config.ambiguity_distance_epsilon_rad =
+              config_.execution_progress_projection_ambiguity_epsilon_rad;
+          projection_config.ambiguity_time_separation_s =
+              config_.execution_progress_projection_ambiguity_time_s;
+          projection_config.regression_tolerance_s =
+              config_.execution_progress_projection_regression_tolerance_s;
+          const auto projected = core::project_trajectory_progress(
+              trajectory, observed, measured_progress_time_s,
+              projection_config);
+          last_progress_projection_at = now;
+          if (projected.status ==
+              core::TrajectoryProgressProjectionStatus::kProjected) {
+            measured_progress_time_s = projected.trajectory_time_s;
+            const auto source_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    sample->received_at.time_since_epoch())
+                    .count();
+            (void)execution_progress_publication_->publish(
+                monitor_generation,
+                static_cast<std::int64_t>(
+                    measured_progress_time_s * 1e9),
+                source_ns,
+                clock_.now());
+          } else {
+            // A wrong cursor is less safe than no cursor. The lookahead
+            // authority observes this invalidation and stops fail-closed; the
+            // controller callback/JTC path remains untouched.
+            (void)execution_progress_publication_->invalidate_generation(
+                monitor_generation);
+          }
+        }
         if (!uses_authored_backend_state()) {
           snapshot_positions = observed;
         }
@@ -5448,10 +5573,9 @@ core::GripperCommandResultDTO Ros2ControlExecutionBackend::command_gripper(
   }
 
   if (runtime_config.transport_kind == "ros_gripper_command") {
-    const auto wait_timeout = std::chrono::duration<double>(
-        runtime->config.wait_for_action_server_timeout_s);
-    if (!runtime->action_client ||
-        !runtime->action_client->wait_for_action_server(wait_timeout)) {
+    if (!wait_for_action_server_until(
+            runtime->action_client,
+            runtime->config.wait_for_action_server_timeout_s)) {
       return rejected_gripper_command(
           ros2_control_fault_reason::kGripperActionServerUnavailable,
           "Timed out waiting for gripper action server " +
@@ -6210,8 +6334,8 @@ bool Ros2ControlExecutionBackend::send_fjt_replacement_trajectory(
     previous_time = waypoint.time_from_start_s;
   }
 
-  if (!wait_for_fjt_action_server(action_client_,
-                                  config_.wait_for_action_server_timeout_s)) {
+  if (!wait_for_action_server_until(action_client_,
+                                    config_.wait_for_action_server_timeout_s)) {
     fail_terminal(
         "FollowJointTrajectory action server unavailable for soft_on_path path ramp",
         "action_server_unavailable");

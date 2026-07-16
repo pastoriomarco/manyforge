@@ -134,6 +134,130 @@ class OrchestratorConfig:
     config: dict[str, Any] = field(default_factory=dict)
 
 
+_MAX_VALIDATION_COLLISION_WORKERS = 64
+_DEFAULT_VALIDATION_COLLISION_WORKERS = 4
+_MAX_RUNTIME_COLLISION_LOOKAHEAD_WORKERS = 64
+_DEFAULT_RUNTIME_COLLISION_LOOKAHEAD_WORKERS = 2
+_DEFAULT_RUNTIME_COLLISION_LOOKAHEAD_CYCLE_BUDGET_MS = 200.0
+_DEFAULT_RUNTIME_COLLISION_LOOKAHEAD_S = 2.0
+_DEFAULT_RUNTIME_COLLISION_LOOKAHEAD_MAX_SAMPLES = 32
+_DEFAULT_RUNTIME_COLLISION_IMMEDIATE_QUERY_BUDGET_MS = 50.0
+_DEFAULT_RUNTIME_COLLISION_LOOKAHEAD_QUERY_BUDGET_MS = 75.0
+
+
+def _validated_orchestrator_config(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise DeploymentValidationError("orchestrator.config must be a mapping")
+    config = copy.deepcopy(raw)
+    removed_keys = {
+        "runtime_collision_lookahead_period_ms",
+        "runtime_collision_lookahead_max_waypoints",
+        "runtime_collision_query_timeout_ms",
+    }
+    present_removed = sorted(removed_keys.intersection(config))
+    if present_removed:
+        raise DeploymentValidationError(
+            "orchestrator.config contains removed RT-8C.3 keys: "
+            + ", ".join(present_removed)
+        )
+    config.setdefault(
+        "validation_collision_workers", _DEFAULT_VALIDATION_COLLISION_WORKERS
+    )
+    value = config["validation_collision_workers"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DeploymentValidationError(
+            "orchestrator.config.validation_collision_workers must be an integer"
+        )
+    if value < 1 or value > _MAX_VALIDATION_COLLISION_WORKERS:
+        raise DeploymentValidationError(
+            "orchestrator.config.validation_collision_workers must be in [1, 64]"
+        )
+    config.setdefault(
+        "runtime_collision_lookahead_cycle_budget_ms",
+        _DEFAULT_RUNTIME_COLLISION_LOOKAHEAD_CYCLE_BUDGET_MS,
+    )
+    config.setdefault(
+        "runtime_collision_lookahead_s",
+        _DEFAULT_RUNTIME_COLLISION_LOOKAHEAD_S,
+    )
+    config.setdefault(
+        "runtime_collision_lookahead_max_samples",
+        _DEFAULT_RUNTIME_COLLISION_LOOKAHEAD_MAX_SAMPLES,
+    )
+    config.setdefault(
+        "runtime_collision_lookahead_workers",
+        _DEFAULT_RUNTIME_COLLISION_LOOKAHEAD_WORKERS,
+    )
+    config.setdefault(
+        "runtime_collision_immediate_query_budget_ms",
+        _DEFAULT_RUNTIME_COLLISION_IMMEDIATE_QUERY_BUDGET_MS,
+    )
+    config.setdefault(
+        "runtime_collision_lookahead_query_budget_ms",
+        _DEFAULT_RUNTIME_COLLISION_LOOKAHEAD_QUERY_BUDGET_MS,
+    )
+    for key in (
+        "runtime_collision_lookahead_cycle_budget_ms",
+        "runtime_collision_lookahead_s",
+        "runtime_collision_immediate_query_budget_ms",
+        "runtime_collision_lookahead_query_budget_ms",
+    ):
+        candidate = config[key]
+        if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+            raise DeploymentValidationError(
+                f"orchestrator.config.{key} must be a number"
+            )
+        candidate = float(candidate)
+        if not math.isfinite(candidate) or candidate <= 0.0:
+            raise DeploymentValidationError(
+                f"orchestrator.config.{key} must be finite and > 0"
+            )
+        config[key] = candidate
+    for key, lower, upper in (
+        ("runtime_collision_lookahead_max_samples", 2, 4096),
+        (
+            "runtime_collision_lookahead_workers",
+            1,
+            _MAX_RUNTIME_COLLISION_LOOKAHEAD_WORKERS,
+        ),
+    ):
+        candidate = config[key]
+        if isinstance(candidate, bool) or not isinstance(candidate, int):
+            raise DeploymentValidationError(
+                f"orchestrator.config.{key} must be an integer"
+            )
+        if candidate < lower or candidate > upper:
+            raise DeploymentValidationError(
+                f"orchestrator.config.{key} must be in [{lower}, {upper}]"
+            )
+    monitor_period_ms = config.get("collision_monitor_period_ms", 50.0)
+    if isinstance(monitor_period_ms, bool) or not isinstance(
+        monitor_period_ms, (int, float)
+    ):
+        raise DeploymentValidationError(
+            "orchestrator.config.collision_monitor_period_ms must be a number"
+        )
+    monitor_period_ms = float(monitor_period_ms)
+    if not math.isfinite(monitor_period_ms) or monitor_period_ms <= 0.0:
+        raise DeploymentValidationError(
+            "orchestrator.config.collision_monitor_period_ms must be finite and > 0"
+        )
+    if config["runtime_collision_immediate_query_budget_ms"] > monitor_period_ms:
+        raise DeploymentValidationError(
+            "orchestrator.config.runtime_collision_immediate_query_budget_ms must be "
+            "<= collision_monitor_period_ms"
+        )
+    if (
+        config["runtime_collision_lookahead_query_budget_ms"]
+        > config["runtime_collision_lookahead_cycle_budget_ms"]
+    ):
+        raise DeploymentValidationError(
+            "orchestrator.config.runtime_collision_lookahead_query_budget_ms must be "
+            "<= runtime_collision_lookahead_cycle_budget_ms"
+        )
+    return config
+
+
 @dataclass
 class RunnerConfig:
     module: str
@@ -3612,7 +3736,9 @@ class Deployment:
             )
         self.orchestrator = OrchestratorConfig(
             engine=orchestrator_data["engine"],
-            config=orchestrator_data.get("config", {}),
+            config=_validated_orchestrator_config(
+                orchestrator_data.get("config", {})
+            ),
         )
 
         # Launch
@@ -4384,7 +4510,9 @@ class Deployment:
             oc = data["orchestrator"]
             self.orchestrator = OrchestratorConfig(
                 engine=oc.get("engine", self.orchestrator.engine),
-                config=oc.get("config", self.orchestrator.config),
+                config=_validated_orchestrator_config(
+                    oc.get("config", self.orchestrator.config)
+                ),
             )
         if "launch" in data:
             lc = data["launch"]

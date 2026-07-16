@@ -321,12 +321,14 @@ class JointStatePublisher {
   }
 
   ~JointStatePublisher() {
-    publisher_.reset();
-    node_.reset();
+    // Stop the isolated ROS context before destroying its DDS endpoints so
+    // transport callbacks cannot retain payloads across publisher teardown.
     if (context_) {
       context_->shutdown("test shutdown");
-      context_.reset();
     }
+    publisher_.reset();
+    node_.reset();
+    context_.reset();
   }
 
   bool wait_for_subscription() const {
@@ -1007,6 +1009,13 @@ TEST(Ros2ControlExecutionBackendTest,
   config.executor_thread_count = 3;
   Ros2ControlExecutionBackend backend(sink, "arm", clock, scheduler, config);
   EXPECT_TRUE(backend.testing_action_progress_has_dedicated_callback_group());
+  const auto* execution_progress = backend.execution_progress_publication();
+  ASSERT_NE(execution_progress, nullptr);
+  EXPECT_EQ(execution_progress->source_kind(),
+            core::ExecutionProgressSourceKind::kMeasuredProjection);
+  EXPECT_EQ(execution_progress->authority_profile(),
+            core::ExecutionProgressAuthorityProfile::kMeasuredPhysical);
+  EXPECT_GT(execution_progress->freshness_budget_ns(), 0);
 
   ASSERT_TRUE(publisher.wait_for_subscription());
   bool initial_sample_observed = false;
@@ -1024,6 +1033,7 @@ TEST(Ros2ControlExecutionBackendTest,
 
   auto handle =
       backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
+  ASSERT_NE(handle.execution_generation, 0u);
   ASSERT_TRUE(server.wait_for_goal());
 
   ASSERT_TRUE(server.publish_feedback(0.0));
@@ -1040,6 +1050,21 @@ TEST(Ros2ControlExecutionBackendTest,
   }
   ASSERT_TRUE(feedback_observed)
       << "backend did not consume an explicitly published action feedback";
+
+  core::ExecutionProgressCursorSnapshotDTO measured_progress;
+  const auto progress_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < progress_deadline) {
+    measured_progress = execution_progress->acquire();
+    if (measured_progress.valid) {
+      break;
+    }
+    std::this_thread::sleep_for(5ms);
+  }
+  ASSERT_TRUE(measured_progress.valid);
+  EXPECT_EQ(measured_progress.execution_generation,
+            handle.execution_generation);
+  EXPECT_EQ(measured_progress.source_kind,
+            core::ExecutionProgressSourceKind::kMeasuredProjection);
 
   ASSERT_TRUE(server.succeed_current_goal());
   bool observed_terminal_flag = false;
@@ -1078,6 +1103,7 @@ TEST(Ros2ControlExecutionBackendTest,
          "callback waits, not sleep until wait_for_state_timeout_s";
   const auto& snapshot = *terminal_snapshot;
   EXPECT_EQ(snapshot.state, core::ExecutionState::kCompleted);
+  EXPECT_FALSE(execution_progress->acquire().valid);
   ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
   EXPECT_NEAR(snapshot.joint_positions_rad.front(), 0.42, 1e-9);
 
@@ -1355,6 +1381,13 @@ TEST(Ros2ControlExecutionBackendTest,
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
       clock, scheduler, config);
+  const auto* progress = backend.execution_progress_publication();
+  ASSERT_NE(progress, nullptr);
+  EXPECT_EQ(progress->source_kind(),
+            core::ExecutionProgressSourceKind::kMeasuredProjection);
+  EXPECT_EQ(progress->authority_profile(),
+            core::ExecutionProgressAuthorityProfile::kMeasuredPhysical);
+  EXPECT_GT(progress->freshness_budget_ns(), 0);
 
   const auto base = std::chrono::steady_clock::time_point{1s};
   backend.testing_store_action_feedback_sample(
@@ -1424,6 +1457,13 @@ TEST(Ros2ControlExecutionBackendTest,
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
       clock, scheduler, config);
+  const auto* progress = backend.execution_progress_publication();
+  ASSERT_NE(progress, nullptr);
+  EXPECT_EQ(progress->source_kind(),
+            core::ExecutionProgressSourceKind::kBackendCommanded);
+  EXPECT_EQ(progress->authority_profile(),
+            core::ExecutionProgressAuthorityProfile::kCommandedSimulation);
+  EXPECT_EQ(progress->freshness_budget_ns(), 0);
   const auto now = std::chrono::steady_clock::time_point{1s};
   backend.testing_store_action_feedback_sample(
       {"joint_1"}, {0.25}, {0.0}, now);
@@ -1459,6 +1499,13 @@ TEST(Ros2ControlExecutionBackendTest,
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
       clock, scheduler, config);
+  const auto* progress = backend.execution_progress_publication();
+  ASSERT_NE(progress, nullptr);
+  EXPECT_EQ(progress->source_kind(),
+            core::ExecutionProgressSourceKind::kBackendCommanded);
+  EXPECT_EQ(progress->authority_profile(),
+            core::ExecutionProgressAuthorityProfile::kCommandedSimulation);
+  EXPECT_EQ(progress->freshness_budget_ns(), 0);
 
   auto initial = backend.observed_robot_state_publication()->acquire(clock.now());
   ASSERT_TRUE(initial);

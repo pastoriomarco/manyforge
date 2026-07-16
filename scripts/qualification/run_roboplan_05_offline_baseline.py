@@ -122,8 +122,8 @@ def _engine_matrix_records(raw: dict[str, Any]) -> list[dict[str, Any]]:
             details = {
                 "collision_validation": validation,
                 "noncollision_validation": noncollision,
-                "support_contact_fallback_verified": fixture.get(
-                    "support_contact_fallback_verified", False
+                "support_contact_ordered_summary_verified": fixture.get(
+                    "support_contact_ordered_summary_verified", False
                 ),
             }
             record: dict[str, Any] = {

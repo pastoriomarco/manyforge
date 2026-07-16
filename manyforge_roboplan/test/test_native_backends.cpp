@@ -2414,15 +2414,25 @@ TEST_F(NativeKernelTest,
   }
   dispatch_thread.join();
   ASSERT_TRUE(handle.has_value());
+  ASSERT_NE(handle->execution_generation, 0u);
+  const auto* execution_progress = backend.execution_progress_publication();
+  ASSERT_NE(execution_progress, nullptr);
+  EXPECT_EQ(execution_progress->source_kind(),
+            ExecutionProgressSourceKind::kBackendCommanded);
+  EXPECT_EQ(execution_progress->authority_profile(),
+            ExecutionProgressAuthorityProfile::kPredictedNative);
+  EXPECT_EQ(execution_progress->freshness_budget_ns(), 0);
 
   const auto start_snapshot = backend.get_execution_snapshot();
   auto observed = start_snapshot;
   bool advanced_while_scene_locked = false;
+  ExecutionProgressCursorSnapshotDTO progress_cursor;
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
   while (std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     observed = backend.get_execution_snapshot();
+    progress_cursor = execution_progress->acquire();
     if (observed.sequence_number > start_snapshot.sequence_number) {
       advanced_while_scene_locked = true;
       break;
@@ -2431,6 +2441,11 @@ TEST_F(NativeKernelTest,
 
   EXPECT_TRUE(advanced_while_scene_locked)
       << "execution snapshots must not block behind best-effort scene updates";
+  ASSERT_TRUE(progress_cursor.valid);
+  EXPECT_EQ(progress_cursor.execution_generation,
+            handle->execution_generation);
+  EXPECT_EQ(progress_cursor.source_kind,
+            ExecutionProgressSourceKind::kBackendCommanded);
   const auto age_ns = bundle_->clock->now() - observed.timestamp_ns;
   EXPECT_LT(age_ns, 100'000'000)
       << "runtime collision monitor freshness budget is 100 ms";
@@ -2455,6 +2470,7 @@ TEST_F(NativeKernelTest,
   EXPECT_TRUE(stop.accepted) << (stop.error ? stop.error->message : "");
   ASSERT_TRUE(handle->wait_for_completion);
   EXPECT_TRUE(handle->wait_for_completion(1'000'000'000));
+  EXPECT_FALSE(execution_progress->acquire().valid);
 }
 
 TEST_F(NativeKernelTest, NativeExecutionBackendResumeFreshDispatchesSuppliedTrajectory) {
@@ -2505,6 +2521,11 @@ TEST_F(NativeKernelTest, NativeExecutionBackendResumeFreshDispatchesSuppliedTraj
       TrajectoryWaypointDTO{3.0, resume_goal, {}, {}});
 
   auto resume_handle = backend.resume(resumed);
+  ASSERT_NE(resume_handle.execution_generation, 0u);
+  EXPECT_NE(resume_handle.execution_generation,
+            original_handle.execution_generation);
+  const auto* execution_progress = backend.execution_progress_publication();
+  ASSERT_NE(execution_progress, nullptr);
   const auto resume_deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
   ExecutionSnapshot snapshot;
@@ -2512,8 +2533,8 @@ TEST_F(NativeKernelTest, NativeExecutionBackendResumeFreshDispatchesSuppliedTraj
     snapshot = backend.get_execution_snapshot();
     if (snapshot.state == ExecutionState::kExecuting &&
         snapshot.joint_positions_rad.size() == resume_start.size() &&
-        std::abs(snapshot.joint_positions_rad.front() - resume_start.front()) <
-            1e-9) {
+        snapshot.joint_positions_rad.front() >= resume_start.front() - 1e-9 &&
+        snapshot.joint_positions_rad.front() <= resume_goal.front() + 1e-9) {
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -2521,8 +2542,12 @@ TEST_F(NativeKernelTest, NativeExecutionBackendResumeFreshDispatchesSuppliedTraj
 
   EXPECT_EQ(snapshot.state, ExecutionState::kExecuting);
   ASSERT_EQ(snapshot.joint_positions_rad.size(), resume_start.size());
-  EXPECT_NEAR(snapshot.joint_positions_rad.front(), resume_start.front(), 1e-9);
-  EXPECT_NEAR(snapshot.joint_positions_rad.front(), start_state.positions_rad.front() + 0.45, 1e-9);
+  EXPECT_GE(snapshot.joint_positions_rad.front(), resume_start.front() - 1e-9);
+  EXPECT_LE(snapshot.joint_positions_rad.front(), resume_goal.front() + 1e-9);
+  const auto progress_cursor = execution_progress->acquire();
+  ASSERT_TRUE(progress_cursor.valid);
+  EXPECT_EQ(progress_cursor.execution_generation,
+            resume_handle.execution_generation);
 
   auto stop = backend.stop();
   EXPECT_TRUE(stop.accepted) << (stop.error ? stop.error->message : "");

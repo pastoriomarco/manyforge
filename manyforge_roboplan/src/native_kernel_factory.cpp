@@ -618,24 +618,36 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
       bundle->owned_gripper_command_backend.get();
 
   const int collision_worker_count =
-      core::env_validation_collision_workers(
-          std::max(1, kernel_config.validation_collision_workers));
+      core::resolve_validation_collision_workers(
+          kernel_config.validation_collision_workers,
+          kernel_config.validation_collision_workers_declared);
+  const auto collision_shared_model =
+      manyforge::collision::ManyForgeCollisionEngine::load_shared_model(
+          model_name, std::filesystem::path(urdf_path),
+          std::filesystem::path(srdf_path), pkg_paths, group_name);
+  const auto runtime_scene_cache =
+      manyforge::collision::ManyForgeCollisionEngine::make_shared_scene_cache(
+          collision_shared_model);
+  const auto non_realtime_scene_cache =
+      manyforge::collision::ManyForgeCollisionEngine::make_shared_scene_cache(
+          collision_shared_model);
   bundle->collision_runtime_monitor_engine =
       std::make_shared<manyforge::collision::ManyForgeCollisionEngine>(
-          model_name,
-          std::filesystem::path(urdf_path),
-          std::filesystem::path(srdf_path),
-          pkg_paths,
-          group_name);
+          collision_shared_model, runtime_scene_cache);
   bundle->collision_validation_engines.reserve(collision_worker_count);
   for (int i = 0; i < collision_worker_count; ++i) {
     bundle->collision_validation_engines.push_back(
         std::make_shared<manyforge::collision::ManyForgeCollisionEngine>(
-            model_name,
-            std::filesystem::path(urdf_path),
-            std::filesystem::path(srdf_path),
-            pkg_paths,
-            group_name));
+            collision_shared_model, non_realtime_scene_cache));
+  }
+  const int lookahead_worker_count =
+      kernel_config.runtime_collision_lookahead_workers;
+  bundle->collision_runtime_lookahead_engines.reserve(
+      lookahead_worker_count);
+  for (int i = 0; i < lookahead_worker_count; ++i) {
+    bundle->collision_runtime_lookahead_engines.push_back(
+        std::make_shared<manyforge::collision::ManyForgeCollisionEngine>(
+            collision_shared_model, non_realtime_scene_cache));
   }
   {
     core::CollisionPipelineResources collision_resources;
@@ -644,6 +656,8 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
         bundle->collision_runtime_monitor_engine;
     collision_resources.validation_engines =
         bundle->collision_validation_engines;
+    collision_resources.runtime_lookahead_engines =
+        bundle->collision_runtime_lookahead_engines;
     const auto admission =
         core::CollisionResourceManager::validate_admission(
             collision_resources, /*runtime_protection_active=*/true);
@@ -656,6 +670,8 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
 
   core::ExecutionKernelConfig resolved_kernel_config = kernel_config;
   resolved_kernel_config.validation_collision_workers = collision_worker_count;
+  resolved_kernel_config.runtime_collision_lookahead_workers =
+      lookahead_worker_count;
   // This factory publishes an explicitly qualified predicted-native source,
   // never measured robot feedback. Derive recovery policy from that authority
   // instead of leaving the backend-neutral measured default enabled.
@@ -687,7 +703,8 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   bundle->kernel->set_collision_resources(
       *bundle->scene_authority,
       bundle->collision_runtime_monitor_engine,
-      bundle->collision_validation_engines);
+      bundle->collision_validation_engines,
+      bundle->collision_runtime_lookahead_engines);
 
   // Auto-subscribe event collector
   bundle->event_collector.subscribe(*bundle->kernel);

@@ -228,7 +228,17 @@ adapters:
 orchestrator:
   engine: py_trees
   config:
-    collision_monitor_period_ms: 50
+    # The cooked-mesh cell produced a 57.6 ms immediate query under sustained
+    # lookahead load. Qualify this profile at 10 Hz with a separate 75 ms query
+    # limit so one outlier does not become a nuisance stop, while overruns still
+    # fail closed before the next 100 ms admission.
+    collision_monitor_period_ms: 100
+    runtime_collision_immediate_query_budget_ms: 75
+    runtime_collision_lookahead_query_budget_ms: 75
+    runtime_collision_lookahead_cycle_budget_ms: 250
+    runtime_collision_lookahead_s: 2
+    runtime_collision_lookahead_max_samples: 32
+    runtime_collision_lookahead_workers: 4
 launch:
   runner:
     module: manyforge_behavior.runner

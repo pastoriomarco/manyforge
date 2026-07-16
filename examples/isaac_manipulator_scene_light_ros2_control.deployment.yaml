@@ -254,7 +254,22 @@ adapters:
 orchestrator:
   engine: py_trees
   config:
-    collision_monitor_period_ms: 50.0
+    # Live mesh-scene qualification found a 57.6 ms immediate query while the
+    # lower-priority lookahead pool was saturated. Keep this heavy profile at a
+    # predictable 10 Hz cadence with a distinct 75 ms query limit and 25 ms of
+    # scheduling margin; lighter deployments retain the 50 ms default.
+    collision_monitor_period_ms: 100.0
+    # The mesh-heavy UR10 cell uses four independent lower-priority contexts.
+    # The immediate monitor keeps its own reserved context and never
+    # participates in this pool. The lookahead runs work-conservingly from
+    # clear immediate-monitor permits; 250 ms is its complete-job deadline,
+    # not a fixed period.
+    runtime_collision_immediate_query_budget_ms: 75.0
+    runtime_collision_lookahead_query_budget_ms: 75.0
+    runtime_collision_lookahead_cycle_budget_ms: 250.0
+    runtime_collision_lookahead_s: 2.0
+    runtime_collision_lookahead_max_samples: 32
+    runtime_collision_lookahead_workers: 4
     # The simulation_interfaces source runs at 4 Hz and timestamps at poll
     # admission. Three source periods cover bounded acquisition/delivery jitter
     # while remaining stricter than the source's 1 s stale contract.

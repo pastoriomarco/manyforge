@@ -182,6 +182,8 @@ struct NativeKernelBundle {
   std::shared_ptr<core::ICollisionQueryEngine> collision_runtime_monitor_engine;
   std::vector<std::shared_ptr<core::ICollisionQueryEngine>>
       collision_validation_engines;
+  std::vector<std::shared_ptr<core::ICollisionQueryEngine>>
+      collision_runtime_lookahead_engines;
 
  private:
   mutable std::mutex close_mutex_;

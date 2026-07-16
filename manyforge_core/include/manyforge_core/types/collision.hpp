@@ -213,6 +213,7 @@ enum class CollisionSurface {
   kPreExecutionValidation,
   kPredictedRuntimeMonitor,
   kObservedRuntimeMonitor,
+  kObservedRuntimeLookahead,
   kDiagnosticCompare,
   kPlannerHint,
 };

@@ -1,13 +1,18 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <functional>
 #include <manyforge_core/cache/trajectory_cache.hpp>
-#include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
-#include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <manyforge_core/collision/collision_resource_manager.hpp>
+#include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
+#include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
-#include <manyforge_core/execution_correlation_tracker.hpp>
 #include <manyforge_core/execution_collision_support.hpp>
+#include <manyforge_core/execution_correlation_tracker.hpp>
+#include <manyforge_core/execution_recovery_support.hpp>
 #include <manyforge_core/execution_snapshot_publisher.hpp>
 #include <manyforge_core/execution_worker_signals.hpp>
 #include <manyforge_core/interrupt/interrupt_manager.hpp>
@@ -23,26 +28,21 @@
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
 #include <manyforge_core/ports/irobot_kinematics.hpp>
 #include <manyforge_core/ports/itrajectory_validator.hpp>
+#include <manyforge_core/runtime_collision_lookahead_session.hpp>
 #include <manyforge_core/runtime_collision_monitor.hpp>
 #include <manyforge_core/runtime_collision_query_session.hpp>
 #include <manyforge_core/state_machine.hpp>
-#include <manyforge_core/terminal_committer.hpp>
 #include <manyforge_core/stop_policy.hpp>
+#include <manyforge_core/terminal_committer.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
+#include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/execute_request.hpp>
 #include <manyforge_core/types/execution_result.hpp>
-#include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/kernel_event.hpp>
 #include <manyforge_core/types/metrics.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/recovery.hpp>
-#include <manyforge_core/execution_recovery_support.hpp>
-
-#include <atomic>
-#include <chrono>
-#include <cstdint>
-#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -57,6 +57,16 @@ namespace manyforge::core {
 
 struct ExecutionKernelConfig {
   Duration collision_monitor_period_ns = 50'000'000;  // 50 ms / 20 Hz
+
+  // Lower-priority, bounded future-trajectory collision checking. This never
+  // replaces or borrows from the reserved current-state monitor above.
+  Duration runtime_collision_lookahead_cycle_budget_ns = 200'000'000;
+  Duration runtime_collision_lookahead_horizon_ns = 2'000'000'000;  // 2 s
+  std::size_t runtime_collision_lookahead_max_samples = 32;
+  int runtime_collision_lookahead_workers = 2;
+  bool runtime_collision_lookahead_workers_declared = false;
+  int runtime_collision_lookahead_min_waypoints_for_parallel = 8;
+  Duration runtime_collision_lookahead_query_budget_ns = 75'000'000;
 
   // RT-8B recovery readiness policy (spec/230 §3.7.1). Measured-observation
   // enforcement is fail-closed before RT-8C wires the dedicated observed-state
@@ -76,7 +86,7 @@ struct ExecutionKernelConfig {
   // p95 <= 50% of `collision_monitor_period_ns`, but the fail-closed timeout
   // must allow contact-rich distance queries to complete within the full
   // configured monitor period before preempting execution.
-  Duration runtime_collision_query_timeout_ns = 50'000'000;  // 50 ms
+  Duration runtime_collision_immediate_query_budget_ns = 50'000'000;  // 50 ms
 
   // Pre-dispatch trajectory collision validation may perform cold
   // collision-world snapshot synchronization before any robot motion is
@@ -132,11 +142,12 @@ struct ExecutionKernelConfig {
   // Authoritative collision validation worker-pool sizing. The concrete
   // engines are injected through core-owned ports; this knob only selects how
   // many injected workers the kernel asks the pool to use. Four workers is the
-  // production default: it gives useful trajectory-validation speedup on Jetson
-  // Orin Nano-class systems while leaving CPU headroom for ROS/controller,
-  // observer, and Composer lanes. Values < 1 are normalized to 1 by the kernel;
-  // deployments can override with MANYFORGE_VALIDATION_COLLISION_WORKERS.
+  // production default pending target qualification. A deployment declaration
+  // is authoritative and validated in [1, 64]. The environment override is a
+  // development/CI input only and is considered solely when no deployment
+  // value was declared.
   int validation_collision_workers = 4;
+  bool validation_collision_workers_declared = false;
   int validation_collision_min_waypoints_for_parallel = 8;
 
   // Deployment-configured RRT planning budget ceiling. Per-request
@@ -387,7 +398,8 @@ class ExecutionKernel {
   void set_collision_resources(
       ICollisionWorldSnapshotPublisher& publisher,
       std::shared_ptr<ICollisionQueryEngine> runtime_monitor_engine,
-      std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines);
+      std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines,
+      std::vector<std::shared_ptr<ICollisionQueryEngine>> runtime_lookahead_engines = {});
 
   /// Optional pose-source / per-state retry configuration for the
   /// CollisionValidationCoordinator. Has no effect until a policy snapshot is
@@ -509,6 +521,7 @@ class ExecutionKernel {
     CollisionWorldRevision collision_world_revision;
     TrajectoryDTO collision_trajectory;
     std::optional<SceneSnapshotLease> scene_snapshot_lease;
+    ParallelValidationTelemetry telemetry;
   };
 
   Result<CollisionValidationSuccess> validate_trajectory(
@@ -563,6 +576,20 @@ class ExecutionKernel {
       RuntimeCollisionMonitorRelease release,
       std::optional<std::uint64_t> expected_generation = std::nullopt,
       bool drain_callbacks = false);
+  void arm_runtime_collision_lookahead(std::uint64_t execution_id,
+                                       std::uint64_t execution_generation,
+                                       std::shared_ptr<const TrajectoryDTO> collision_trajectory,
+                                       const std::string& contact_policy_id);
+  void revoke_runtime_collision_lookahead_clear_permits() noexcept;
+  void apply_runtime_collision_lookahead_result(
+      RuntimeCollisionLookaheadResult result,
+      const RuntimeCollisionLookaheadSession* source_session = nullptr);
+  RuntimeCollisionLookaheadAuthorityDisposition
+  apply_runtime_collision_lookahead_authority(
+      RuntimeCollisionLookaheadResult& result,
+      const RuntimeCollisionLookaheadSession* source_session);
+  void emit_runtime_collision_lookahead_evidence(
+      RuntimeCollisionLookaheadResult result);
   RuntimeCollisionProtectionSnapshot runtime_collision_protection_snapshot()
       const;
   bool refresh_published_runtime_collision_snapshot(
@@ -737,6 +764,7 @@ class ExecutionKernel {
     ExecuteWorkerPhaseStatus status = ExecuteWorkerPhaseStatus::kContinue;
     CollisionWorldRevision collision_world_revision;
     std::optional<SceneSnapshotLease> scene_snapshot_lease;
+    std::shared_ptr<const TrajectoryDTO> collision_trajectory;
   };
 
   struct ExecuteWorkerDispatchPhaseResult {
@@ -792,13 +820,11 @@ class ExecutionKernel {
       ActiveMotionExecution& motion_state);
 
   ExecuteWorkerDispatchPhaseResult execute_worker_dispatch_phase(
-      const ExecuteRequestDTO& request,
-      std::uint64_t exec_id,
-      const TrajectoryDTO& trajectory,
-      bool active_trajectory_from_cache,
-      bool cache_revalidation_candidate,
+      const ExecuteRequestDTO& request, std::uint64_t exec_id, const TrajectoryDTO& trajectory,
+      bool active_trajectory_from_cache, bool cache_revalidation_candidate,
       const CollisionWorldRevision& validation_world_revision,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
+      std::shared_ptr<const TrajectoryDTO> collision_trajectory,
       ActiveMotionExecution& motion_state);
 
   void execute_worker_finalize_phase(
@@ -887,6 +913,7 @@ class ExecutionKernel {
   CollisionResourceManager collision_resources_;
   std::unique_ptr<ParallelCollisionValidationWorkerPool>
       collision_validation_worker_pool_;
+  std::atomic<std::uint64_t> validation_collision_workers_effective_{0};
   mutable std::mutex runtime_collision_protection_mutex_;
   RuntimeCollisionProtectionSnapshot runtime_collision_protection_;
   std::uint64_t runtime_collision_protection_next_generation_ = 0;
@@ -927,6 +954,8 @@ class ExecutionKernel {
   std::atomic<std::uint64_t> runtime_collision_snapshot_invalidation_epoch_{0};
   std::atomic<std::shared_ptr<RuntimeCollisionQuerySession>>
       runtime_collision_query_session_;
+  std::atomic<std::shared_ptr<RuntimeCollisionLookaheadSession>>
+      runtime_collision_lookahead_session_;
   mutable std::mutex runtime_collision_query_prepare_error_mutex_;
   std::optional<ErrorDTO> runtime_collision_query_prepare_error_;
   mutable std::mutex validation_cancel_mutex_;

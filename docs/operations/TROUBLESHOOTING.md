@@ -295,4 +295,7 @@ docker logs --tail 2000 manyforge-e2e-composer > composer.log
 
 Attach also the launcher invocation
 (`./scripts/launch.sh --lane … --assistant … --scenario …`) and the
-value of `MANYFORGE_VALIDATION_COLLISION_WORKERS` if set.
+deployment's `orchestrator.config.validation_collision_workers` requested and
+reported effective values. Also record
+`MANYFORGE_VALIDATION_COLLISION_WORKERS` when a direct-factory development/CI
+run used that fallback.

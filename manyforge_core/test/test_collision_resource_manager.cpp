@@ -126,6 +126,26 @@ TEST(CollisionResourceManagerTest,
           resources, ExecutionState::kExecuting));
 }
 
+TEST(CollisionResourceManagerTest, ValidationWorkerCapacityRejectsAliasedOrUnidentifiedContexts) {
+  auto first = std::make_shared<DummyEngine>(
+      "first", CollisionEngineThreadSafetyClass::kSingleContextExclusive, "first_context");
+  auto second = std::make_shared<DummyEngine>(
+      "second", CollisionEngineThreadSafetyClass::kSingleContextExclusive, "second_context");
+  auto capacity = CollisionResourceManager::inspect_validation_worker_capacity({first, second});
+  EXPECT_EQ(capacity.effective_contexts, 2u);
+  EXPECT_FALSE(capacity.mismatch_reason.has_value());
+
+  capacity = CollisionResourceManager::inspect_validation_worker_capacity({first, first});
+  EXPECT_EQ(capacity.effective_contexts, 1u);
+  EXPECT_EQ(capacity.mismatch_reason, std::optional<std::string>{"duplicate_engine_instance"});
+
+  auto unidentified = std::make_shared<DummyEngine>(
+      "unidentified", CollisionEngineThreadSafetyClass::kSingleContextExclusive);
+  capacity = CollisionResourceManager::inspect_validation_worker_capacity({unidentified, second});
+  EXPECT_EQ(capacity.effective_contexts, 1u);
+  EXPECT_EQ(capacity.mismatch_reason, std::optional<std::string>{"missing_mutable_context_id"});
+}
+
 TEST(CollisionResourceManagerTest,
      DistinctSingleContextWrappersSharingMutableContextConflict) {
   DummyPublisher publisher;
@@ -265,6 +285,38 @@ TEST(CollisionResourceManagerTest,
                 kRuntimeQueryCapabilityUnsupported);
   EXPECT_EQ(admission.resource_conflict_reason,
             "unsupported_memory_model");
+}
+
+TEST(CollisionResourceManagerTest, LookaheadContextsCannotAliasRuntimeValidationOrEachOther) {
+  DummyPublisher publisher;
+  auto runtime = std::make_shared<DummyEngine>(
+      "runtime", CollisionEngineThreadSafetyClass::kSingleContextExclusive, "runtime_context");
+  auto validation = std::make_shared<DummyEngine>(
+      "validation", CollisionEngineThreadSafetyClass::kSingleContextExclusive,
+      "validation_context");
+  auto lookahead = std::make_shared<DummyEngine>(
+      "lookahead", CollisionEngineThreadSafetyClass::kSingleContextExclusive, "lookahead_context");
+  CollisionResourceManager manager;
+  manager.configure(publisher, runtime, {validation}, {lookahead});
+  EXPECT_FALSE(CollisionResourceManager::runtime_lookahead_resource_conflict(manager.snapshot())
+                   .has_value());
+
+  manager.configure(publisher, runtime, {validation}, {validation});
+  auto conflict = CollisionResourceManager::runtime_lookahead_resource_conflict(manager.snapshot());
+  ASSERT_TRUE(conflict.has_value());
+  EXPECT_EQ(*conflict, "lookahead_validation_same_engine_instance");
+  const auto admission = CollisionResourceManager::validate_admission(
+      manager.snapshot(), /*runtime_protection_active=*/false);
+  EXPECT_EQ(admission.status,
+            CollisionValidationAdmissionStatus::kRuntimeLookaheadResourceConflict);
+
+  auto alias = std::make_shared<DummyEngine>(
+      "lookahead_alias", CollisionEngineThreadSafetyClass::kSingleContextExclusive,
+      "lookahead_context");
+  manager.configure(publisher, runtime, {validation}, {lookahead, alias});
+  conflict = CollisionResourceManager::runtime_lookahead_resource_conflict(manager.snapshot());
+  ASSERT_TRUE(conflict.has_value());
+  EXPECT_EQ(*conflict, "lookahead_internal_shared_mutable_context_id");
 }
 
 }  // namespace manyforge::core

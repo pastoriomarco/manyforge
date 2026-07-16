@@ -694,6 +694,45 @@ TEST(TrajectorySampler, PrevalidatedSamplingIsBitIdenticalWithReusedBuffer) {
                    .ok());
 }
 
+TEST(TrajectorySampler,
+     PrevalidatedSegmentHintIsBitIdenticalAndRejectsWrongSegment) {
+  using manyforge::core::sample_trajectory_prevalidated;
+  using manyforge::core::validate_trajectory_for_sampling;
+
+  TrajectoryDTO traj;
+  traj.joint_names = {"j1", "j2"};
+  traj.waypoints.push_back(
+      WaypointPVA(0.0, {0.0, 1.0}, {0.4, -0.2}, {0.1, 0.0}));
+  traj.waypoints.push_back(
+      WaypointPVA(0.7, {0.5, 0.6}, {0.9, 0.3}, {-0.2, 0.05}));
+  traj.waypoints.push_back(TrajectoryWaypointDTO{
+      1.4, {1.0, 0.2}, {0.0, 0.0}, {}});
+  ASSERT_TRUE(validate_trajectory_for_sampling(traj).ok());
+
+  for (const auto& [time_s, segment] :
+       std::vector<std::pair<double, std::size_t>>{{0.2, 0}, {0.7, 1},
+                                                   {1.1, 1}, {1.4, 1}}) {
+    TrajectorySampleResult ordinary;
+    TrajectorySampleResult hinted;
+    ASSERT_TRUE(sample_trajectory_prevalidated(traj, time_s, ordinary).ok());
+    ASSERT_TRUE(
+        sample_trajectory_prevalidated(traj, time_s, segment, hinted).ok());
+    EXPECT_EQ(ordinary.positions_rad, hinted.positions_rad);
+    EXPECT_EQ(ordinary.velocities_rad_s, hinted.velocities_rad_s);
+    EXPECT_EQ(ordinary.accelerations_rad_s2, hinted.accelerations_rad_s2);
+    EXPECT_EQ(ordinary.segment_index, hinted.segment_index);
+    EXPECT_EQ(ordinary.degree, hinted.degree);
+    EXPECT_EQ(ordinary.fallback_reason, hinted.fallback_reason);
+  }
+
+  TrajectorySampleResult output;
+  const auto wrong_segment =
+      sample_trajectory_prevalidated(traj, 0.2, 1, output);
+  ASSERT_FALSE(wrong_segment.ok());
+  EXPECT_EQ(wrong_segment.error().code,
+            "trajectory_sample_segment_hint_mismatch");
+}
+
 TEST(TrajectorySampler, ValidateForSamplingMatchesClassicRejections) {
   using manyforge::core::validate_trajectory_for_sampling;
 

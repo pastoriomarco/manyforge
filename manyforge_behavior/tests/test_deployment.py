@@ -1407,7 +1407,161 @@ class TestDeploymentLoading:
     def test_orchestrator_parsed(self):
         deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
         assert deploy.orchestrator.engine == "py_trees"
-        assert deploy.orchestrator.config == {"collision_monitor_period_ms": 50.0}
+        assert deploy.orchestrator.config == {
+            "collision_monitor_period_ms": 50.0,
+            "validation_collision_workers": 4,
+            "runtime_collision_lookahead_cycle_budget_ms": 200.0,
+            "runtime_collision_lookahead_s": 2.0,
+            "runtime_collision_lookahead_max_samples": 32,
+            "runtime_collision_lookahead_workers": 2,
+            "runtime_collision_immediate_query_budget_ms": 50.0,
+            "runtime_collision_lookahead_query_budget_ms": 75.0,
+        }
+
+    def test_validation_collision_workers_materializes_production_default(self):
+        deploy = Deployment.from_dict(_minimal_deployment())
+
+        assert deploy.orchestrator.config["validation_collision_workers"] == 4
+        assert (
+            deploy.to_dict()["orchestrator"]["config"][
+                "validation_collision_workers"
+            ]
+            == 4
+        )
+
+    def test_validation_collision_workers_roundtrips(self):
+        data = _minimal_deployment(
+            orchestrator={
+                "engine": "py_trees",
+                "config": {"validation_collision_workers": 3},
+            }
+        )
+        deploy = Deployment.from_dict(data)
+        assert deploy.orchestrator.config["validation_collision_workers"] == 3
+        assert (
+            deploy.to_dict()["orchestrator"]["config"][
+                "validation_collision_workers"
+            ]
+            == 3
+        )
+
+    def test_runtime_collision_lookahead_materializes_production_defaults(self):
+        deploy = Deployment.from_dict(_minimal_deployment())
+
+        assert deploy.orchestrator.config == {
+            "validation_collision_workers": 4,
+            "runtime_collision_lookahead_cycle_budget_ms": 200.0,
+            "runtime_collision_lookahead_s": 2.0,
+            "runtime_collision_lookahead_max_samples": 32,
+            "runtime_collision_lookahead_workers": 2,
+            "runtime_collision_immediate_query_budget_ms": 50.0,
+            "runtime_collision_lookahead_query_budget_ms": 75.0,
+        }
+        assert deploy.to_dict()["orchestrator"]["config"] == (
+            deploy.orchestrator.config
+        )
+
+    def test_runtime_collision_lookahead_roundtrips_explicit_values(self):
+        config = {
+            "runtime_collision_lookahead_cycle_budget_ms": 75,
+            "runtime_collision_lookahead_s": 1.5,
+            "runtime_collision_lookahead_max_samples": 48,
+            "runtime_collision_lookahead_workers": 4,
+            "runtime_collision_immediate_query_budget_ms": 25,
+            "runtime_collision_lookahead_query_budget_ms": 60,
+        }
+        deploy = Deployment.from_dict(
+            _minimal_deployment(
+                orchestrator={"engine": "py_trees", "config": config}
+            )
+        )
+
+        assert deploy.orchestrator.config[
+            "runtime_collision_lookahead_cycle_budget_ms"
+        ] == 75.0
+        assert deploy.orchestrator.config["runtime_collision_lookahead_s"] == 1.5
+        assert (
+            deploy.orchestrator.config["runtime_collision_lookahead_max_samples"]
+            == 48
+        )
+        assert deploy.orchestrator.config["runtime_collision_lookahead_workers"] == 4
+        assert (
+            deploy.orchestrator.config[
+                "runtime_collision_immediate_query_budget_ms"
+            ]
+            == 25.0
+        )
+        assert (
+            deploy.orchestrator.config[
+                "runtime_collision_lookahead_query_budget_ms"
+            ]
+            == 60.0
+        )
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("runtime_collision_lookahead_cycle_budget_ms", True),
+            ("runtime_collision_lookahead_cycle_budget_ms", 0),
+            ("runtime_collision_lookahead_cycle_budget_ms", 49),
+            ("runtime_collision_lookahead_cycle_budget_ms", "100"),
+            ("runtime_collision_lookahead_cycle_budget_ms", float("inf")),
+            ("runtime_collision_lookahead_s", -1),
+            ("runtime_collision_lookahead_s", float("nan")),
+            ("runtime_collision_lookahead_max_samples", False),
+            ("runtime_collision_lookahead_max_samples", 0),
+            ("runtime_collision_lookahead_max_samples", 1),
+            ("runtime_collision_lookahead_max_samples", 4097),
+            ("runtime_collision_lookahead_workers", True),
+            ("runtime_collision_lookahead_workers", 0),
+            ("runtime_collision_lookahead_workers", 65),
+            ("runtime_collision_immediate_query_budget_ms", True),
+            ("runtime_collision_immediate_query_budget_ms", 0),
+            ("runtime_collision_immediate_query_budget_ms", 201),
+            ("runtime_collision_lookahead_query_budget_ms", True),
+            ("runtime_collision_lookahead_query_budget_ms", 0),
+            ("runtime_collision_lookahead_query_budget_ms", 201),
+            ("runtime_collision_lookahead_query_budget_ms", float("inf")),
+        ],
+    )
+    def test_runtime_collision_lookahead_rejects_invalid_values(self, key, value):
+        data = _minimal_deployment(
+            orchestrator={"engine": "py_trees", "config": {key: value}}
+        )
+
+        with pytest.raises(DeploymentValidationError, match=key):
+            Deployment.from_dict(data)
+
+    @pytest.mark.parametrize(
+        "removed_key",
+        [
+            "runtime_collision_lookahead_period_ms",
+            "runtime_collision_lookahead_max_waypoints",
+            "runtime_collision_query_timeout_ms",
+        ],
+    )
+    def test_runtime_collision_lookahead_rejects_removed_keys(self, removed_key):
+        data = _minimal_deployment(
+            orchestrator={"engine": "py_trees", "config": {removed_key: 1}}
+        )
+        with pytest.raises(
+            DeploymentValidationError, match="removed RT-8C.3 keys"
+        ):
+            Deployment.from_dict(data)
+
+    @pytest.mark.parametrize("value", [True, 0, -1, 65, 2.5, "4"])
+    def test_validation_collision_workers_rejects_invalid_values(self, value):
+        data = _minimal_deployment(
+            orchestrator={
+                "engine": "py_trees",
+                "config": {"validation_collision_workers": value},
+            }
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="validation_collision_workers",
+        ):
+            Deployment.from_dict(data)
 
     def test_launch_parsed(self):
         deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)

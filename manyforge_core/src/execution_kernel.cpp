@@ -193,11 +193,50 @@ ErrorDTO validation_admission_error(
       return authoritative_collision_validation_config_error(
           "runtime_collision_query_capability_unsupported",
           {{"resource_conflict_reason", admission.resource_conflict_reason}});
+    case CollisionValidationAdmissionStatus::kRuntimeLookaheadResourceConflict:
+      return authoritative_collision_validation_config_error(
+          "runtime_collision_lookahead_resource_conflict",
+          {{"resource_conflict_reason", admission.resource_conflict_reason}});
     case CollisionValidationAdmissionStatus::kAdmitted:
       break;
   }
   return authoritative_collision_validation_config_error(
       "unknown_collision_validation_admission_failure");
+}
+
+bool runtime_lookahead_requires_authority(
+    const RuntimeCollisionLookaheadResult& result) noexcept {
+  return result.status == RuntimeCollisionLookaheadResultStatus::kCollision ||
+         result.status == RuntimeCollisionLookaheadResultStatus::kInconclusive;
+}
+
+std::map<std::string, std::string> runtime_lookahead_authority_details(
+    const RuntimeCollisionLookaheadResult& result) {
+  std::map<std::string, std::string> details{
+      {"surface", "observed_runtime_lookahead"},
+      {"reason_code", "runtime_collision_lookahead"},
+      {"reason", result.reason},
+      {"execution_generation", std::to_string(result.execution_generation)},
+      {"runtime_bundle_epoch", std::to_string(result.runtime_bundle_epoch)},
+      {"collision_world_revision_id",
+       std::to_string(result.collision_world_revision.revision_id)},
+      {"collision_world_content_hash",
+       result.collision_world_revision.content_hash},
+      {"lookahead_cursor_time_ns", std::to_string(result.cursor_time_ns)},
+      {"lookahead_covered_until_time_ns",
+       std::to_string(result.covered_until_time_ns)},
+      {"lookahead_checked_samples", std::to_string(result.checked_samples)},
+      {"lookahead_termination",
+       runtime_collision_lookahead_termination_name(result.termination)}};
+  if (result.first_failing_waypoint) {
+    details["collision_result_first_failure_waypoint"] =
+        std::to_string(*result.first_failing_waypoint);
+  }
+  if (result.first_failing_time_ns) {
+    details["collision_result_first_failure_time_ns"] =
+        std::to_string(*result.first_failing_time_ns);
+  }
+  return details;
 }
 
 }  // namespace
@@ -335,9 +374,31 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
   if (config_.collision_monitor_period_ns <= 0) {
     throw std::invalid_argument("collision_monitor_period_ns must be > 0");
   }
-  if (config_.runtime_collision_query_timeout_ns <= 0) {
+  if (config_.runtime_collision_lookahead_cycle_budget_ns <= 0 ||
+      config_.runtime_collision_lookahead_horizon_ns <= 0 ||
+      config_.runtime_collision_lookahead_max_samples < 2 ||
+      config_.runtime_collision_lookahead_max_samples > 4096 ||
+      config_.runtime_collision_lookahead_workers < 1 ||
+      config_.runtime_collision_lookahead_workers > 64 ||
+      config_.runtime_collision_lookahead_min_waypoints_for_parallel < 1) {
+    throw std::invalid_argument("runtime collision lookahead configuration is invalid");
+  }
+  if (config_.runtime_collision_immediate_query_budget_ns <= 0) {
     throw std::invalid_argument(
-        "runtime_collision_query_timeout_ns must be > 0");
+        "runtime_collision_immediate_query_budget_ns must be > 0");
+  }
+  if (config_.runtime_collision_immediate_query_budget_ns >
+      config_.collision_monitor_period_ns) {
+    throw std::invalid_argument(
+        "runtime_collision_immediate_query_budget_ns must be <= "
+        "collision_monitor_period_ns");
+  }
+  if (config_.runtime_collision_lookahead_query_budget_ns <= 0 ||
+      config_.runtime_collision_lookahead_query_budget_ns >
+          config_.runtime_collision_lookahead_cycle_budget_ns) {
+    throw std::invalid_argument(
+        "runtime_collision_lookahead_query_budget_ns must be > 0 and <= "
+        "runtime_collision_lookahead_cycle_budget_ns");
   }
   if (config_.validation_collision_query_timeout_ns <= 0) {
     throw std::invalid_argument(
@@ -400,12 +461,22 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
   if (config_.authoritative_validation_collision_replan_attempts < 0) {
     config_.authoritative_validation_collision_replan_attempts = 0;
   }
-  if (config_.validation_collision_workers < 1) {
-    config_.validation_collision_workers = 1;
+  if (config_.validation_collision_workers < 1 || config_.validation_collision_workers > 64) {
+    throw std::invalid_argument("validation_collision_workers must be in [1, 64]");
   }
   if (config_.validation_collision_min_waypoints_for_parallel < 1) {
     config_.validation_collision_min_waypoints_for_parallel = 1;
   }
+  ParallelCollisionValidationWorkerPool::Config validation_pool_config;
+  validation_pool_config.worker_count = config_.validation_collision_workers;
+  validation_pool_config.min_waypoints_for_parallel =
+      config_.validation_collision_min_waypoints_for_parallel;
+  validation_pool_config.validation_wall_timeout =
+      std::chrono::nanoseconds(config_.validation_collision_wall_timeout_ns);
+  validation_pool_config.clock = &clock_;
+  validation_pool_config.scheduler = &scheduler_;
+  collision_validation_worker_pool_ =
+      std::make_unique<ParallelCollisionValidationWorkerPool>(std::move(validation_pool_config));
   // The operator-stop profile is invoked by `ExecutionKernel::stop()` on the
   // dedicated operator-stop worker so controlled-stop failures can be inspected
   // and escalated. The stop-policy callback stays the legacy hard-stop path
@@ -459,6 +530,15 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
 }
 
 ExecutionKernel::~ExecutionKernel() {
+  // Retire the lower-priority lookahead workers while every kernel authority
+  // they may call is still alive. Relying on member destruction order would
+  // permit a final result callback into partially torn-down state.
+  auto lookahead =
+      runtime_collision_lookahead_session_.exchange(nullptr, std::memory_order_acq_rel);
+  if (lookahead) {
+    lookahead->disarm();
+    lookahead.reset();
+  }
   const auto drain_scheduler_or_terminate = [this](const char* phase) {
     constexpr auto kSchedulerDrainTimeout = std::chrono::seconds(1);
     if (!scheduler_.drain_all_for(kSchedulerDrainTimeout)) {
@@ -1916,6 +1996,11 @@ void ExecutionKernel::schedule_latched_interrupt_preemption(
           InterruptPreemptionAction::kPreemptTrajectory) {
     return;
   }
+  // Stop authority has priority over speculative future checks. Invalidate
+  // queued and in-flight permits before the preempt worker can block or issue
+  // backend control so lower-priority collision work cannot survive into the
+  // stop window.
+  revoke_runtime_collision_lookahead_clear_permits();
   const auto latch_id = result.active_latch->latch_id;
   const auto source_id = result.active_latch->source_id;
   const auto policy_id = result.active_latch->policy_id;
@@ -3765,7 +3850,7 @@ std::uint64_t ExecutionKernel::start_collision_monitoring(
         std::move(*projection), *resources.snapshot_publisher,
         resources.runtime_monitor_engine,
         runtime_collision_monitor_.active_contact_policy_id(),
-        static_cast<std::int64_t>(config_.runtime_collision_query_timeout_ns));
+        static_cast<std::int64_t>(config_.runtime_collision_immediate_query_budget_ns));
     query_prepare_error = query_session->prepare(initial_bundle);
     if (query_prepare_error) {
       query_session.reset();
@@ -3813,6 +3898,10 @@ void ExecutionKernel::stop_collision_monitoring(
       coverage_execution_id = runtime_collision_protection_.execution_id;
       runtime_collision_protection_.active = false;
       runtime_collision_protection_.reason.clear();
+      if (const auto lookahead =
+              runtime_collision_lookahead_session_.load(std::memory_order_acquire)) {
+        lookahead->disarm();
+      }
     }
     if (!release_current && expected_generation.has_value()) {
       return;
@@ -3870,6 +3959,197 @@ void ExecutionKernel::stop_collision_monitoring(
   }
   if (coverage_summary.has_value()) {
     emit_event(std::move(*coverage_summary));
+  }
+}
+
+void ExecutionKernel::arm_runtime_collision_lookahead(
+    std::uint64_t execution_id, std::uint64_t execution_generation,
+    std::shared_ptr<const TrajectoryDTO> collision_trajectory,
+    const std::string& contact_policy_id) {
+  const auto lookahead = runtime_collision_lookahead_session_.load(std::memory_order_acquire);
+  if (!lookahead) {
+    return;
+  }
+
+  bool invalid_authority = false;
+  {
+    std::lock_guard<std::mutex> lock(runtime_collision_protection_mutex_);
+    const auto state = sm_.status().state;
+    if (!runtime_collision_protection_.active ||
+        runtime_collision_protection_.execution_id != execution_id ||
+        (state != ExecutionState::kExecuting && state != ExecutionState::kPaused)) {
+      return;
+    }
+    invalid_authority = execution_generation == 0 || !collision_trajectory ||
+                        collision_trajectory->waypoints.empty();
+    if (!invalid_authority) {
+      lookahead->arm(execution_id, execution_generation, std::move(collision_trajectory),
+                     contact_policy_id);
+      return;
+    }
+  }
+
+  RuntimeCollisionLookaheadResult failure;
+  failure.execution_id = execution_id;
+  failure.execution_generation = execution_generation;
+  failure.status = RuntimeCollisionLookaheadResultStatus::kInconclusive;
+  failure.reason = execution_generation == 0 ? "execution_progress_generation_unavailable"
+                                             : "runtime_lookahead_trajectory_unavailable";
+  apply_runtime_collision_lookahead_result(std::move(failure));
+}
+
+void ExecutionKernel::apply_runtime_collision_lookahead_result(
+    RuntimeCollisionLookaheadResult result,
+    const RuntimeCollisionLookaheadSession* source_session) {
+  if (apply_runtime_collision_lookahead_authority(result, source_session) ==
+      RuntimeCollisionLookaheadAuthorityDisposition::kAccepted) {
+    emit_runtime_collision_lookahead_evidence(std::move(result));
+  }
+}
+
+RuntimeCollisionLookaheadAuthorityDisposition
+ExecutionKernel::apply_runtime_collision_lookahead_authority(
+    RuntimeCollisionLookaheadResult& result,
+    const RuntimeCollisionLookaheadSession* source_session) {
+  if (!runtime_lookahead_requires_authority(result)) {
+    return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
+  }
+
+  // Keep pre-authority metadata fixed-size. Exact sample lists and engine
+  // diagnostics are observer evidence and may be large at the configured
+  // sample cap; building them before latching the stop would delay authority.
+  auto authority_details = runtime_lookahead_authority_details(result);
+
+  CollisionCheckResultDTO check;
+  check.in_collision = result.status == RuntimeCollisionLookaheadResultStatus::kCollision;
+  if (result.first_failing_pair) {
+    check.contact_body_a = result.first_failing_pair->body_a;
+    check.contact_body_b = result.first_failing_pair->body_b;
+    authority_details["contact_a"] = result.first_failing_pair->body_a;
+    authority_details["contact_b"] = result.first_failing_pair->body_b;
+  }
+
+  InterruptIngestResult interrupt;
+  {
+    EventDeferralScope event_scope(*this);
+    std::unique_lock<std::mutex> lock(runtime_collision_protection_mutex_);
+    if (result.arm_generation != 0) {
+      const auto current_session =
+          runtime_collision_lookahead_session_.load(std::memory_order_acquire);
+      if (!current_session || current_session.get() != source_session ||
+          !current_session->accept_result_for_current_arm(
+              result.execution_id, result.execution_generation,
+              result.arm_generation, result.permit_generation)) {
+        return RuntimeCollisionLookaheadAuthorityDisposition::kStale;
+      }
+    }
+    const auto state = sm_.status().state;
+    if (!runtime_collision_protection_.active ||
+        runtime_collision_protection_.execution_id != result.execution_id ||
+        (state != ExecutionState::kExecuting && state != ExecutionState::kPaused) ||
+        motion_trip_stop_.active() || operator_stop_worker_.active() ||
+        fault_preempt_stop_active()) {
+      return RuntimeCollisionLookaheadAuthorityDisposition::kStale;
+    }
+    cache_.invalidate_all();
+    // Authority first. Any event/status publication below is evidence of a
+    // stop request that has already been latched, never a predictor of one.
+    interrupt =
+        publish_runtime_collision_fault_interrupt(check, authority_details);
+    lock.unlock();
+    event_scope.flush();
+  }
+
+  result.stop_authority_signalled = !interrupt.rejected;
+  result.authority_rejected = interrupt.rejected;
+  result.authority_rejection_reason = interrupt.reason;
+  return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
+}
+
+void ExecutionKernel::emit_runtime_collision_lookahead_evidence(
+    RuntimeCollisionLookaheadResult result) {
+  if (!runtime_lookahead_requires_authority(result)) {
+    return;
+  }
+
+  auto authority_details = runtime_lookahead_authority_details(result);
+  CollisionCheckResultDTO check;
+  check.in_collision =
+      result.status == RuntimeCollisionLookaheadResultStatus::kCollision;
+  if (result.first_failing_pair) {
+    check.contact_body_a = result.first_failing_pair->body_a;
+    check.contact_body_b = result.first_failing_pair->body_b;
+    authority_details["contact_a"] = result.first_failing_pair->body_a;
+    authority_details["contact_b"] = result.first_failing_pair->body_b;
+  }
+
+  std::string sampled_times_ns;
+  for (const auto time_ns : result.sample_times_ns) {
+    if (!sampled_times_ns.empty()) {
+      sampled_times_ns.push_back(',');
+    }
+    sampled_times_ns += std::to_string(time_ns);
+  }
+  auto details = authority_details;
+  details["stop_authority_signalled"] =
+      result.stop_authority_signalled ? "true" : "false";
+  details["lookahead_eligible_source_waypoints"] =
+      std::to_string(result.eligible_source_waypoints);
+  details["lookahead_sampling_reduced"] =
+      result.sampling_reduced ? "true" : "false";
+  details["lookahead_sample_times_ns"] = std::move(sampled_times_ns);
+  details["lookahead_workers_used"] = std::to_string(result.workers_used);
+  details["lookahead_cycle_duration_ns"] =
+      std::to_string(result.cycle_duration_ns);
+  details["lookahead_worker_active_duration_ns"] =
+      std::to_string(result.worker_active_duration_ns);
+  details["lookahead_start_jitter_ns"] =
+      std::to_string(result.start_jitter_ns);
+  details["lookahead_cycle_deadline_exceeded"] =
+      result.cycle_deadline_exceeded ? "true" : "false";
+  for (const auto& [key, value] : result.failure_details) {
+    if (key == "collision_result_waypoint_index") {
+      details["collision_result_lookahead_local_sample_index"] = value;
+      continue;
+    }
+    details.try_emplace(key, value);
+  }
+
+  KernelEvent event;
+  event.type =
+      check.in_collision ? KernelEventType::kCollisionDetected : KernelEventType::kErrorRaised;
+  event.execution_id = result.execution_id;
+  event.timestamp_ns = clock_.now();
+  event.details = details;
+  if (!check.in_collision) {
+    event.error =
+        ErrorDTO{kErrorExecutionAborted,
+                 runtime_collision_lookahead_error_message(result.reason), details};
+  }
+  emit_event(std::move(event));
+  if (check.in_collision) {
+    std::lock_guard<std::mutex> collision_metrics_lock(metrics_mutex_);
+    ++metrics_.collision_detections;
+  }
+  if (result.authority_rejected) {
+    emit_event({KernelEventType::kErrorRaised,
+                result.execution_id,
+                clock_.now(),
+                {},
+                {},
+                ErrorDTO{kErrorInvalidRequest,
+                         "Runtime lookahead interrupt signal rejected",
+                         {{"reason", result.authority_rejection_reason}}},
+                {{"reason", result.authority_rejection_reason},
+                 {"surface", "observed_runtime_lookahead"}}});
+  }
+}
+
+void ExecutionKernel::revoke_runtime_collision_lookahead_clear_permits()
+    noexcept {
+  if (const auto lookahead =
+          runtime_collision_lookahead_session_.load(std::memory_order_acquire)) {
+    lookahead->revoke_clear_permits();
   }
 }
 
@@ -4916,8 +5196,21 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     return phase_result;
   }
 
-  emit_event({KernelEventType::kValidationPassed, exec_id, clock_.now(),
-              {}, {}, std::nullopt, {}});
+  const auto& validation_telemetry = val_result.value().telemetry;
+  emit_event(
+      {KernelEventType::kValidationPassed,
+       exec_id,
+       clock_.now(),
+       {},
+       {},
+       std::nullopt,
+       {{"collision_workers_requested", std::to_string(validation_telemetry.workers_requested)},
+        {"collision_workers_effective", std::to_string(validation_telemetry.workers_effective)},
+        {"collision_workers_used", std::to_string(validation_telemetry.workers_actually_used)},
+        {"collision_parallel_fallback_reason", validation_telemetry.fallback_reason},
+        {"collision_ordered_contact_summary_used",
+         validation_telemetry.ordered_contact_summary_used ? "true" : "false"},
+        {"collision_validation_wall_ns", std::to_string(validation_telemetry.total_wall_ns)}}});
   {
     std::lock_guard<std::mutex> lock(metrics_mutex_);
     metrics_.validations_passed++;
@@ -4995,18 +5288,17 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       val_result.value().collision_world_revision;
   phase_result.scene_snapshot_lease =
       std::move(val_result.value().scene_snapshot_lease);
+  phase_result.collision_trajectory =
+      std::make_shared<const TrajectoryDTO>(std::move(val_result.value().collision_trajectory));
   return phase_result;
 }
 
-ExecutionKernel::ExecuteWorkerDispatchPhaseResult
-ExecutionKernel::execute_worker_dispatch_phase(
-    const ExecuteRequestDTO& request,
-    std::uint64_t exec_id,
-    const TrajectoryDTO& trajectory,
-    bool active_trajectory_from_cache,
-    bool cache_revalidation_candidate,
+ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worker_dispatch_phase(
+    const ExecuteRequestDTO& request, std::uint64_t exec_id, const TrajectoryDTO& trajectory,
+    bool active_trajectory_from_cache, bool cache_revalidation_candidate,
     const CollisionWorldRevision& validation_world_revision,
     const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
+    std::shared_ptr<const TrajectoryDTO> collision_trajectory,
     ActiveMotionExecution& motion_state) {
   ExecuteWorkerDispatchPhaseResult phase_result;
 
@@ -5351,6 +5643,8 @@ ExecutionKernel::execute_worker_dispatch_phase(
       start_collision_monitoring("execute_dispatch");
   phase_result.execution_handle =
       execution_backend_.execute_trajectory(trajectory);
+  arm_runtime_collision_lookahead(exec_id, phase_result.execution_handle.execution_generation,
+                                  std::move(collision_trajectory), request.contact_policy_id);
   return phase_result;
 }
 
@@ -5691,10 +5985,9 @@ void ExecutionKernel::async_execute_worker(
         validation_phase.collision_world_revision;
 
     auto dispatch_phase = execute_worker_dispatch_phase(
-        request, exec_id, trajectory, active_trajectory_from_cache,
-        cache_revalidation_candidate,
+        request, exec_id, trajectory, active_trajectory_from_cache, cache_revalidation_candidate,
         validation_world_revision, validation_phase.scene_snapshot_lease,
-        motion_state);
+        std::move(validation_phase.collision_trajectory), motion_state);
     if (dispatch_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
       return;
     }
@@ -6372,11 +6665,30 @@ void ExecutionKernel::async_execute_worker(
           }
           set_runtime_collision_state_projection(
               std::move(resume_projection.value()));
+          auto resume_collision_trajectory = std::make_shared<const TrajectoryDTO>(
+              std::move(resume_validation.value().collision_trajectory));
 
-          emit_event({KernelEventType::kValidationPassed, exec_id, clock_.now(),
-                      {}, {}, std::nullopt,
-                      {{"reason", "resume_replan"},
-                       {"resume_phase", "validation"}}});
+          const auto& resume_validation_telemetry = resume_validation.value().telemetry;
+          emit_event(
+              {KernelEventType::kValidationPassed,
+               exec_id,
+               clock_.now(),
+               {},
+               {},
+               std::nullopt,
+               {{"reason", "resume_replan"},
+                {"resume_phase", "validation"},
+                {"collision_workers_requested",
+                 std::to_string(resume_validation_telemetry.workers_requested)},
+                {"collision_workers_effective",
+                 std::to_string(resume_validation_telemetry.workers_effective)},
+                {"collision_workers_used",
+                 std::to_string(resume_validation_telemetry.workers_actually_used)},
+                {"collision_parallel_fallback_reason", resume_validation_telemetry.fallback_reason},
+                {"collision_ordered_contact_summary_used",
+                 resume_validation_telemetry.ordered_contact_summary_used ? "true" : "false"},
+                {"collision_validation_wall_ns",
+                 std::to_string(resume_validation_telemetry.total_wall_ns)}}});
           {
             std::lock_guard<std::mutex> lock(metrics_mutex_);
             metrics_.validations_passed++;
@@ -6455,6 +6767,9 @@ void ExecutionKernel::async_execute_worker(
           motion_state.runtime_collision_protection_generation =
               start_collision_monitoring("resume_dispatch");
           execution_handle = execution_backend_.resume(resumed_trajectory);
+          arm_runtime_collision_lookahead(exec_id, execution_handle.execution_generation,
+                                          std::move(resume_collision_trajectory),
+                                          request.contact_policy_id);
         }
 
         if (completed) {
@@ -7069,6 +7384,10 @@ bool ExecutionKernel::control_command_epoch_matches(
 
 StopResultDTO ExecutionKernel::stop() {
   EventDeferralScope event_scope(*this);
+  // Operator stop intent outranks future-trajectory warning work even if the
+  // lifecycle mutex is busy or the backend later rejects the stop command.
+  // The session invalidates lock-free first and only try-locks its leaf state.
+  revoke_runtime_collision_lookahead_clear_permits();
   bool stop_epoch_bumped = false;
   const auto accepted_stop = [this, &stop_epoch_bumped](
                                  bool lifecycle_held = true) {
@@ -7422,6 +7741,7 @@ ResetResultDTO ExecutionKernel::reset(
         // first publishes execute_admission_interruptible_=false. Seeing true
         // here therefore establishes the reset boundary before that thread can
         // process it, and makes immediate gripper invalidation race-free.
+        revoke_runtime_collision_lookahead_clear_permits();
         invalidate_gripper_authority(GripperInvalidationReason::kReset);
         return ResetResultDTO{true, std::nullopt};
       }
@@ -7434,6 +7754,7 @@ ResetResultDTO ExecutionKernel::reset(
   if (auto stale = reject_if_stale()) {
     return *stale;
   }
+  revoke_runtime_collision_lookahead_clear_permits();
   lifecycle_stop_requested_while_busy_.store(false,
                                              std::memory_order_seq_cst);
   lifecycle_stop_requested_event_emitted_.store(false,
@@ -8733,6 +9054,17 @@ MetricsSnapshot ExecutionKernel::get_metrics() const {
   snapshot.events_emitted =
       event_sequence_.load(std::memory_order_relaxed);
   snapshot.flight_recorder_records = flight_recorder_.recorded_total();
+  snapshot.validation_collision_workers_requested =
+      static_cast<std::uint64_t>(config_.validation_collision_workers);
+  snapshot.validation_collision_workers_effective =
+      validation_collision_workers_effective_.load(std::memory_order_relaxed);
+  const auto validation_pool_status = collision_validation_worker_pool_->status();
+  snapshot.validation_collision_jobs_queued = validation_pool_status.queued_jobs;
+  snapshot.validation_collision_workers_active = validation_pool_status.active_workers;
+  snapshot.validation_collision_jobs_completed = validation_pool_status.completed_jobs_total;
+  snapshot.validation_collision_jobs_cancelled = validation_pool_status.cancelled_jobs_total;
+  snapshot.validation_collision_jobs_dropped = validation_pool_status.dropped_jobs_total;
+  snapshot.validation_collision_jobs_abandoned = validation_pool_status.abandoned_jobs_total;
   snapshot.runtime_collision_ticks_started =
       runtime_collision_ticks_started_.load(std::memory_order_relaxed);
   snapshot.runtime_collision_ticks_completed =
@@ -8788,6 +9120,99 @@ MetricsSnapshot ExecutionKernel::get_metrics() const {
   snapshot.validation_deferred_runtime_monitor_active =
       validation_deferred_runtime_monitor_active_.load(
           std::memory_order_relaxed);
+  snapshot.runtime_collision_monitor_period_ns =
+      static_cast<std::uint64_t>(config_.collision_monitor_period_ns);
+  snapshot.runtime_collision_immediate_query_budget_ns =
+      static_cast<std::uint64_t>(
+          config_.runtime_collision_immediate_query_budget_ns);
+  snapshot.runtime_collision_lookahead_cycle_budget_ns =
+      static_cast<std::uint64_t>(config_.runtime_collision_lookahead_cycle_budget_ns);
+  snapshot.runtime_collision_lookahead_query_budget_ns =
+      static_cast<std::uint64_t>(config_.runtime_collision_lookahead_query_budget_ns);
+  snapshot.runtime_collision_lookahead_horizon_ns =
+      static_cast<std::uint64_t>(config_.runtime_collision_lookahead_horizon_ns);
+  snapshot.runtime_collision_lookahead_max_samples =
+      config_.runtime_collision_lookahead_max_samples;
+  snapshot.runtime_collision_lookahead_workers_requested =
+      static_cast<std::uint64_t>(config_.runtime_collision_lookahead_workers);
+  if (const auto lookahead = runtime_collision_lookahead_session_.load(std::memory_order_acquire)) {
+    const auto lookahead_status = lookahead->status();
+    snapshot.runtime_collision_lookahead_workers_effective =
+        static_cast<std::uint64_t>(lookahead_status.effective_workers);
+    snapshot.runtime_collision_lookahead_armed = lookahead_status.armed;
+    snapshot.runtime_collision_lookahead_job_active = lookahead_status.job_active;
+    snapshot.runtime_collision_lookahead_permit_pending =
+        lookahead_status.permit_pending;
+    snapshot.runtime_collision_lookahead_execution_id = lookahead_status.execution_id;
+    snapshot.runtime_collision_lookahead_execution_generation =
+        lookahead_status.execution_generation;
+    snapshot.runtime_collision_lookahead_cursor_valid = lookahead_status.cursor_valid;
+    snapshot.runtime_collision_lookahead_cursor_source_kind = lookahead_status.cursor_source_kind;
+    snapshot.runtime_collision_lookahead_cursor_authority_profile =
+        lookahead_status.cursor_authority_profile;
+    snapshot.runtime_collision_lookahead_cursor_age_ns =
+        static_cast<std::uint64_t>(std::max<std::int64_t>(0, lookahead_status.cursor_age_ns));
+    snapshot.runtime_collision_lookahead_jobs_started = lookahead_status.jobs_started_total;
+    snapshot.runtime_collision_lookahead_jobs_clear = lookahead_status.jobs_clear_total;
+    snapshot.runtime_collision_lookahead_jobs_collision = lookahead_status.jobs_collision_total;
+    snapshot.runtime_collision_lookahead_jobs_inconclusive =
+        lookahead_status.jobs_inconclusive_total;
+    snapshot.runtime_collision_lookahead_jobs_query_timeout =
+        lookahead_status.jobs_query_timeout_total;
+    snapshot.runtime_collision_lookahead_jobs_cycle_timeout =
+        lookahead_status.jobs_cycle_timeout_total;
+    snapshot.runtime_collision_lookahead_jobs_superseded = lookahead_status.jobs_superseded_total;
+    snapshot.runtime_collision_lookahead_reruns_coalesced = lookahead_status.reruns_coalesced_total;
+    snapshot.runtime_collision_lookahead_clear_permits_invalidated =
+        lookahead_status.clear_permits_invalidated_total;
+    snapshot.runtime_collision_lookahead_clear_permit_try_lock_misses =
+        lookahead_status.clear_permit_try_lock_misses_total;
+    snapshot.runtime_collision_lookahead_stale_results =
+        lookahead_status.stale_generation_results_total;
+    snapshot.runtime_collision_lookahead_last_cycle_duration_ns =
+        static_cast<std::uint64_t>(
+            std::max<std::int64_t>(0,
+                                   lookahead_status.last_cycle_duration_ns));
+    snapshot.runtime_collision_lookahead_max_cycle_duration_ns =
+        static_cast<std::uint64_t>(
+            std::max<std::int64_t>(0,
+                                   lookahead_status.max_cycle_duration_ns));
+    snapshot.runtime_collision_lookahead_last_worker_active_duration_ns =
+        static_cast<std::uint64_t>(std::max<std::int64_t>(
+            0, lookahead_status.last_worker_active_duration_ns));
+    snapshot.runtime_collision_lookahead_max_worker_active_duration_ns =
+        static_cast<std::uint64_t>(std::max<std::int64_t>(
+            0, lookahead_status.max_worker_active_duration_ns));
+    snapshot.runtime_collision_lookahead_max_start_jitter_ns =
+        static_cast<std::uint64_t>(std::max<std::int64_t>(0, lookahead_status.max_start_jitter_ns));
+    snapshot.runtime_collision_lookahead_last_inter_job_gap_ns =
+        static_cast<std::uint64_t>(
+            std::max<std::int64_t>(0, lookahead_status.last_inter_job_gap_ns));
+    snapshot.runtime_collision_lookahead_active_time_total_ns =
+        static_cast<std::uint64_t>(
+            std::max<std::int64_t>(0, lookahead_status.active_time_total_ns));
+    snapshot.runtime_collision_lookahead_duty_window_ns =
+        static_cast<std::uint64_t>(
+            std::max<std::int64_t>(0, lookahead_status.duty_window_ns));
+    snapshot.runtime_collision_lookahead_duty_cycle_ppm =
+        lookahead_status.duty_cycle_ppm;
+    snapshot.runtime_collision_lookahead_last_cursor_time_ns =
+        static_cast<std::uint64_t>(std::max<std::int64_t>(0, lookahead_status.last_cursor_time_ns));
+    snapshot.runtime_collision_lookahead_last_covered_until_time_ns = static_cast<std::uint64_t>(
+        std::max<std::int64_t>(0, lookahead_status.last_covered_until_time_ns));
+    snapshot.runtime_collision_lookahead_last_checked_samples =
+        lookahead_status.last_checked_samples;
+    snapshot.runtime_collision_lookahead_last_eligible_source_waypoints =
+        lookahead_status.last_eligible_source_waypoints;
+    snapshot.runtime_collision_lookahead_last_sampling_reduced =
+        lookahead_status.last_sampling_reduced;
+    snapshot.runtime_collision_lookahead_last_sample_times_ns =
+        lookahead_status.last_sample_times_ns;
+    snapshot.runtime_collision_lookahead_last_workers_used =
+        static_cast<std::uint64_t>(std::max(0, lookahead_status.last_workers_used));
+    snapshot.runtime_collision_lookahead_last_termination =
+        runtime_collision_lookahead_termination_name(lookahead_status.last_termination);
+  }
   return snapshot;
 }
 
@@ -8798,6 +9223,13 @@ Result<void> ExecutionKernel::collision_check_tick() {
   const bool fault_preempt_stop_active = this->fault_preempt_stop_active();
   const bool stop_path_active =
       trip_stop_active || operator_stop_active || fault_preempt_stop_active;
+  if (stop_path_active) {
+    // Defensive backstop for stop paths that become active between API
+    // admission and this monitor tick. Repeated revocation is idempotent for
+    // authority and keeps the lower-priority worker out of the deceleration
+    // window.
+    revoke_runtime_collision_lookahead_clear_permits();
+  }
   const auto stop_coverage_generation =
       stop_path_active
           ? runtime_collision_stop_coverage_.active_generation()
@@ -8839,6 +9271,10 @@ Result<void> ExecutionKernel::collision_check_tick() {
        stop_coverage_generation](
           CollisionCheckResultDTO check,
           std::map<std::string, std::string> details) -> Result<void> {
+      // A future check is authorized only by the most recent clear immediate
+      // tick. Withdraw that authority before any fault/stop evidence is
+      // emitted; permit generations make queued and in-flight work stale.
+      revoke_runtime_collision_lookahead_clear_permits();
       record_tick_metric(true);
       details["surface"] = "observed_runtime_monitor";
       const auto stop_owner = [&]() -> const char* {
@@ -9137,6 +9573,18 @@ Result<void> ExecutionKernel::collision_check_tick() {
                                                   observed_now_ns);
   }
   if (outcome.status == RuntimeCollisionTickStatus::kClear) {
+    if (!stop_path_active) {
+      if (const auto lookahead =
+              runtime_collision_lookahead_session_.load(std::memory_order_acquire)) {
+        // The immediate current-state query is always first. Only its clear
+        // outcome may open one lower-priority, capacity-one future check.
+        // Start the lower-priority cycle only after the reserved immediate
+        // query has cleared. Its cycle budget must not charge time owned by
+        // the higher-priority monitor.
+        lookahead->request(clock_.now(), std::move(published_bundle),
+                           query_session->contact_release_state_snapshot());
+      }
+    }
     record_tick_metric(false);
     return Result<void>::Ok();
   }
@@ -9488,26 +9936,9 @@ ExecutionKernel::validate_trajectory(
     cfg.surface = CollisionSurface::kPreExecutionValidation;
     cfg.contact_policy_id = request.contact_policy_id;
 
-    ParallelCollisionValidationWorkerPool::Config pool_cfg;
-    pool_cfg.pass_config = cfg;
-    pool_cfg.worker_count = config_.validation_collision_workers;
-    pool_cfg.min_waypoints_for_parallel =
-        config_.validation_collision_min_waypoints_for_parallel;
-    pool_cfg.validation_wall_timeout =
-        std::chrono::nanoseconds(config_.validation_collision_wall_timeout_ns);
-    if (!collision_validation_worker_pool_) {
-      collision_validation_worker_pool_ =
-          std::make_unique<ParallelCollisionValidationWorkerPool>(
-              std::move(pool_cfg));
-    }
-
     AuthoritativeValidationAttempt attempt;
     attempt.bundle = collision_validation_worker_pool_->validate_trajectory(
-        *world_snapshot,
-        validation_engines,
-        collision_trajectory,
-        cancel,
-        cfg);
+        world_snapshot, validation_engines, collision_trajectory, cancel, cfg);
     attempt.telemetry = collision_validation_worker_pool_->last_telemetry();
     return Result<AuthoritativeValidationAttempt>::Ok(std::move(attempt));
   };
@@ -9523,9 +9954,8 @@ ExecutionKernel::validate_trajectory(
 
   if (bundle.decision.accepted) {
     return Result<CollisionValidationSuccess>::Ok(
-        CollisionValidationSuccess{bundle.borrowed_world_revision,
-                                   std::move(collision_trajectory),
-                                   std::move(effective_scene_snapshot_lease)});
+        CollisionValidationSuccess{bundle.borrowed_world_revision, std::move(collision_trajectory),
+                                   std::move(effective_scene_snapshot_lease), telemetry});
   }
   std::map<std::string, std::string> details;
   if (bundle.decision.first_failing_waypoint) {
@@ -9555,6 +9985,10 @@ ExecutionKernel::validate_trajectory(
       bundle.borrowed_world_revision.content_hash;
   details["workers_used"] =
       std::to_string(telemetry.workers_actually_used);
+  details["workers_requested"] = std::to_string(telemetry.workers_requested);
+  details["workers_effective"] = std::to_string(telemetry.workers_effective);
+  details["ordered_contact_summary_used"] =
+      telemetry.ordered_contact_summary_used ? "true" : "false";
   if (!telemetry.fallback_reason.empty()) {
     details["parallel_fallback_reason"] = telemetry.fallback_reason;
   }
@@ -9615,10 +10049,90 @@ void ExecutionKernel::set_collision_validation_policy_snapshot(
 void ExecutionKernel::set_collision_resources(
     ICollisionWorldSnapshotPublisher& publisher,
     std::shared_ptr<ICollisionQueryEngine> runtime_monitor_engine,
-    std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines) {
-  collision_resources_.configure(publisher,
-                                 std::move(runtime_monitor_engine),
-                                 std::move(validation_engines));
+    std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines,
+    std::vector<std::shared_ptr<ICollisionQueryEngine>> runtime_lookahead_engines) {
+  const auto capacity =
+      CollisionResourceManager::inspect_validation_worker_capacity(validation_engines);
+  if (config_.validation_collision_workers_declared &&
+      (capacity.mismatch_reason ||
+       capacity.effective_contexts !=
+           static_cast<std::size_t>(config_.validation_collision_workers))) {
+    throw std::invalid_argument(
+        "declared validation collision worker capacity is not backed by "
+        "independent contexts: requested=" +
+        std::to_string(config_.validation_collision_workers) +
+        " effective=" + std::to_string(capacity.effective_contexts) +
+        " reason=" + capacity.mismatch_reason.value_or("count_mismatch"));
+  }
+  const auto lookahead_capacity =
+      CollisionResourceManager::inspect_validation_worker_capacity(runtime_lookahead_engines);
+  if ((!runtime_lookahead_engines.empty() &&
+       (lookahead_capacity.mismatch_reason ||
+        lookahead_capacity.effective_contexts !=
+            static_cast<std::size_t>(config_.runtime_collision_lookahead_workers))) ||
+      (config_.runtime_collision_lookahead_workers_declared && runtime_lookahead_engines.empty())) {
+    throw std::invalid_argument(
+        "declared runtime collision lookahead capacity is not backed by "
+        "independent contexts: requested=" +
+        std::to_string(config_.runtime_collision_lookahead_workers) +
+        " effective=" + std::to_string(lookahead_capacity.effective_contexts) + " reason=" +
+        lookahead_capacity.mismatch_reason.value_or(
+            runtime_lookahead_engines.empty() ? "missing_contexts" : "count_mismatch"));
+  }
+
+  CollisionPipelineResources candidate;
+  candidate.snapshot_publisher = &publisher;
+  candidate.runtime_monitor_engine = runtime_monitor_engine;
+  candidate.validation_engines = validation_engines;
+  candidate.runtime_lookahead_engines = runtime_lookahead_engines;
+  if (const auto conflict =
+          CollisionResourceManager::runtime_lookahead_resource_conflict(candidate)) {
+    throw std::invalid_argument("runtime collision lookahead resource ownership conflict: " +
+                                *conflict);
+  }
+
+  std::shared_ptr<RuntimeCollisionLookaheadSession> next_lookahead;
+  if (!runtime_lookahead_engines.empty()) {
+    const auto* progress = execution_backend_.execution_progress_publication();
+    if (progress == nullptr) {
+      throw std::invalid_argument(
+          "runtime collision lookahead requires backend progress authority");
+    }
+    RuntimeCollisionLookaheadSession::Config lookahead_config;
+    lookahead_config.cycle_budget_ns =
+        config_.runtime_collision_lookahead_cycle_budget_ns;
+    lookahead_config.horizon_ns = config_.runtime_collision_lookahead_horizon_ns;
+    lookahead_config.max_samples = config_.runtime_collision_lookahead_max_samples;
+    lookahead_config.workers = config_.runtime_collision_lookahead_workers;
+    lookahead_config.min_waypoints_for_parallel =
+        config_.runtime_collision_lookahead_min_waypoints_for_parallel;
+    lookahead_config.query_budget_ns =
+        config_.runtime_collision_lookahead_query_budget_ns;
+    lookahead_config.dynamic_body_max_age_cap_ns = config_.runtime_dynamic_body_max_age_cap_ns;
+    next_lookahead = std::make_shared<RuntimeCollisionLookaheadSession>(
+        lookahead_config, clock_, scheduler_, publisher, *progress, runtime_lookahead_engines,
+        [this](const RuntimeCollisionLookaheadSession* source_session,
+               RuntimeCollisionLookaheadResult result) {
+          (void)source_session;
+          emit_runtime_collision_lookahead_evidence(std::move(result));
+        },
+        [this](const RuntimeCollisionLookaheadSession* source_session,
+               RuntimeCollisionLookaheadResult& result) {
+          return apply_runtime_collision_lookahead_authority(result,
+                                                             source_session);
+        });
+  }
+
+  collision_resources_.configure(publisher, std::move(runtime_monitor_engine),
+                                 std::move(validation_engines),
+                                 std::move(runtime_lookahead_engines));
+  validation_collision_workers_effective_.store(capacity.effective_contexts,
+                                                std::memory_order_relaxed);
+  auto previous_lookahead = runtime_collision_lookahead_session_.exchange(
+      std::move(next_lookahead), std::memory_order_acq_rel);
+  if (previous_lookahead) {
+    previous_lookahead->disarm();
+  }
   const auto protection = runtime_collision_protection_snapshot();
   if (protection.active) {
     runtime_collision_query_session_.store(nullptr, std::memory_order_release);

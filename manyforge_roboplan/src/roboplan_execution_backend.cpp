@@ -116,6 +116,12 @@ RoboPlanExecutionBackend::RoboPlanExecutionBackend(
     observed_at_rest_velocities_.assign(config_.observed_joint_names.size(),
                                         0.0);
   }
+  execution_progress_publication_ =
+      std::make_unique<core::ExecutionProgressPublication>(
+          core::ExecutionProgressSourceKind::kBackendCommanded,
+          core::ExecutionProgressAuthorityProfile::kPredictedNative,
+          "native_predicted_progress_v1",
+          /*freshness_budget_ns=*/0);
   state_.snapshot.timestamp_ns = clock_.now();
 }
 
@@ -382,7 +388,9 @@ void RoboPlanExecutionBackend::stop_terminal_scene_projection_retry_worker()
   }
 }
 
-void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::TrajectoryDTO trajectory) {
+void RoboPlanExecutionBackend::execution_worker(
+    std::stop_token st, core::TrajectoryDTO trajectory,
+    std::uint64_t execution_generation) {
   const double total_duration_s = trajectory.waypoints.empty()
                                       ? 0.0
                                       : trajectory.waypoints.back().time_from_start_s;
@@ -395,6 +403,8 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
     state_.natural_completion_stop_requested.store(false,
                                                    std::memory_order_release);
     execution_cv_.notify_all();
+    (void)execution_progress_publication_->invalidate_generation(
+        execution_generation);
     return;
   }
 
@@ -461,12 +471,19 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
     } else {
       applied_runtime_scale = target_scale;
     }
-    trajectory_time_s += dt_s * applied_runtime_scale;
+    trajectory_time_s = std::min(
+        total_duration_s, trajectory_time_s + dt_s * applied_runtime_scale);
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       state_.active_trajectory_time_s = trajectory_time_s;
       state_.active_runtime_velocity_scale = applied_runtime_scale;
     }
+    (void)execution_progress_publication_->publish(
+        execution_generation,
+        static_cast<std::int64_t>(
+            std::max(0.0, trajectory_time_s) * 1e9),
+        now_ns,
+        now_ns);
 
     const double progress =
         total_duration_s <= 1e-9 ? 1.0 : clamp_progress(trajectory_time_s / total_duration_s);
@@ -529,6 +546,8 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
   state_.pause_requested.store(false);
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
+  (void)execution_progress_publication_->invalidate_generation(
+      execution_generation);
   execution_cv_.notify_all();
 }
 
@@ -544,6 +563,26 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
   state_.pause_requested.store(false);
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
+  const auto execution_generation =
+      next_execution_progress_generation_.fetch_add(
+          1, std::memory_order_acq_rel);
+  execution_progress_publication_->invalidate();
+  const auto progress_started_at_ns = clock_.now();
+  const auto initial_progress = execution_progress_publication_->publish(
+      execution_generation, 0, progress_started_at_ns,
+      progress_started_at_ns);
+  if (!initial_progress.published) {
+    state_.running.store(false);
+    publish_snapshot(
+        core::ExecutionState::kFailed, 0.0, initial_positions,
+        core::ErrorDTO{core::kErrorExecutionRejected,
+                       "Native execution progress authority could not be armed",
+                       {{"reason", initial_progress.reason}}});
+    return core::ExecutionHandle{
+        [](int64_t) { return true; },
+        [this]() { return get_execution_snapshot(); },
+        0};
+  }
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_.active_trajectory =
@@ -558,9 +597,11 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
                          initial_snapshot_ns);
 
   worker_thread_ = std::jthread(
-      [this, trajectory_copy = core::TrajectoryDTO(trajectory)](
+      [this, trajectory_copy = core::TrajectoryDTO(trajectory),
+       execution_generation](
           std::stop_token st) mutable {
-        execution_worker(st, std::move(trajectory_copy));
+        execution_worker(st, std::move(trajectory_copy),
+                         execution_generation);
       });
 
   return core::ExecutionHandle{
@@ -574,7 +615,8 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
         execution_cv_.wait(lock, [this]() { return !state_.running.load(); });
         return true;
       },
-      [this]() { return get_execution_snapshot(); }};
+      [this]() { return get_execution_snapshot(); },
+      execution_generation};
 }
 
 core::Result<void> RoboPlanExecutionBackend::sync_observed_state_before_planning() {
@@ -1364,6 +1406,7 @@ core::ResetResultDTO RoboPlanExecutionBackend::reset() {
       std::chrono::duration<double>(config_.reset_completion_timeout_s);
 
   state_.pause_requested.store(false);
+  execution_progress_publication_->invalidate();
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
   request_active_controlled_stop();

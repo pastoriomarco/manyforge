@@ -285,11 +285,126 @@ std::string classified_pairs_text(const CollisionResult& result) {
 // --- Independence ---------------------------------------------------------
 
 TEST(ManyForgeCollisionEngineTest,
-     TwoInstancesHaveDistinctInternalScenes) {
+     ConvenienceInstancesOwnDistinctInternalAssets) {
   auto engine_a = make_engine();
   auto engine_b = make_engine();
   EXPECT_NE(engine_a->internal_model_identity(),
             engine_b->internal_model_identity());
+  EXPECT_NE(engine_a->internal_scene_cache_identity(),
+            engine_b->internal_scene_cache_identity());
+  EXPECT_NE(engine_a->capability().mutable_context_id,
+            engine_b->capability().mutable_context_id);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     FactoryContextsShareImmutableAssetsButIsolateRuntimePreparation) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  ASSERT_FALSE(bundle->collision_validation_engines.empty());
+  ASSERT_FALSE(bundle->collision_runtime_lookahead_engines.empty());
+
+  auto runtime = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
+      bundle->collision_runtime_monitor_engine);
+  auto validation = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
+      bundle->collision_validation_engines.front());
+  auto lookahead = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
+      bundle->collision_runtime_lookahead_engines.front());
+  ASSERT_TRUE(runtime);
+  ASSERT_TRUE(validation);
+  ASSERT_TRUE(lookahead);
+
+  EXPECT_EQ(runtime->internal_model_identity(),
+            validation->internal_model_identity());
+  EXPECT_EQ(validation->internal_model_identity(),
+            lookahead->internal_model_identity());
+  EXPECT_NE(runtime->internal_scene_cache_identity(),
+            validation->internal_scene_cache_identity());
+  EXPECT_EQ(validation->internal_scene_cache_identity(),
+            lookahead->internal_scene_cache_identity());
+  EXPECT_NE(runtime->capability().mutable_context_id,
+            validation->capability().mutable_context_id);
+  EXPECT_NE(validation->capability().mutable_context_id,
+            lookahead->capability().mutable_context_id);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     FactoryValidationAndLookaheadReuseOnePreparedRevision) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  auto snapshot = bundle->scene_authority->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  ASSERT_FALSE(bundle->collision_validation_engines.empty());
+  ASSERT_FALSE(bundle->collision_runtime_lookahead_engines.empty());
+  auto validation = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
+      bundle->collision_validation_engines.front());
+  auto lookahead = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
+      bundle->collision_runtime_lookahead_engines.front());
+  ASSERT_TRUE(validation);
+  ASSERT_TRUE(lookahead);
+
+  CollisionQuery query;
+  query.query_id = "shared-prepared-revision";
+  query.robot_state = observed_state(*bundle);
+  auto first = check_snapshot(*validation, *snapshot, query);
+  ASSERT_EQ(first.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(first.raw_diagnostics);
+  auto second = check_snapshot(*lookahead, *snapshot, query);
+  ASSERT_EQ(second.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(second.raw_diagnostics);
+
+  EXPECT_EQ(validation->internal_prepared_scene_identity(),
+            lookahead->internal_prepared_scene_identity());
+  EXPECT_EQ(validation->internal_prepared_scene_build_count(), 1u);
+  EXPECT_EQ(lookahead->internal_prepared_scene_build_count(), 1u);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     ConcurrentColdContextsPublishOnePreparedRevision) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  ASSERT_FALSE(bundle->collision_validation_engines.empty());
+  ASSERT_FALSE(bundle->collision_runtime_lookahead_engines.empty());
+  auto validation = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
+      bundle->collision_validation_engines.front());
+  auto lookahead = std::dynamic_pointer_cast<ManyForgeCollisionEngine>(
+      bundle->collision_runtime_lookahead_engines.front());
+  ASSERT_TRUE(validation);
+  ASSERT_TRUE(lookahead);
+  auto snapshot = bundle->scene_authority->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+
+  CollisionQuery query;
+  query.query_id = "shared-prepared-concurrent-cold-revision";
+  query.robot_state = observed_state(*bundle);
+  std::atomic<int> ready{0};
+  std::atomic<bool> release{false};
+  CollisionResult validation_result;
+  CollisionResult lookahead_result;
+  auto run = [&](ManyForgeCollisionEngine& engine, CollisionResult& result) {
+    ready.fetch_add(1, std::memory_order_release);
+    while (!release.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    result = check_snapshot(engine, *snapshot, query);
+  };
+  std::thread validation_thread(run, std::ref(*validation),
+                                std::ref(validation_result));
+  std::thread lookahead_thread(run, std::ref(*lookahead),
+                               std::ref(lookahead_result));
+  while (ready.load(std::memory_order_acquire) != 2) {
+    std::this_thread::yield();
+  }
+  release.store(true, std::memory_order_release);
+  validation_thread.join();
+  lookahead_thread.join();
+
+  ASSERT_EQ(validation_result.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(validation_result.raw_diagnostics);
+  ASSERT_EQ(lookahead_result.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(lookahead_result.raw_diagnostics);
+  EXPECT_EQ(validation->internal_prepared_scene_identity(),
+            lookahead->internal_prepared_scene_identity());
+  EXPECT_EQ(validation->internal_prepared_scene_build_count(), 1u);
 }
 
 TEST(ManyForgeCollisionEngineTest, EngineExposesStableIdAndVersion) {
@@ -555,6 +670,42 @@ TEST(ManyForgeCollisionEngineTest,
   EXPECT_EQ(result.engine_status, CollisionEngineStatus::kOk)
       << diagnostics_text(result.raw_diagnostics);
   ASSERT_TRUE(result.query_duration_ns.has_value());
+  const auto sync_duration_ns =
+      diagnostic_int64(result.raw_diagnostics, "snapshot_sync_duration_ns");
+  const auto total_duration_ns =
+      diagnostic_int64(result.raw_diagnostics, "total_call_duration_ns");
+  EXPECT_GE(sync_duration_ns, 0);
+  EXPECT_GE(total_duration_ns, sync_duration_ns);
+  EXPECT_GE(total_duration_ns, *result.query_duration_ns);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     ObservedRuntimeLookaheadExcludesSnapshotSyncFromPerQueryBudget) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  ASSERT_TRUE(bundle->scene_authority->add_object(make_mesh_object("mesh_a")).success);
+  auto snapshot = bundle->scene_authority->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  ASSERT_TRUE(snapshot->contains_mesh_geometry);
+
+  auto engine = make_engine("ur5_gripper", "arm");
+  CollisionQuery q;
+  q.query_id = "observed-runtime-lookahead-sync-separate";
+  q.surface = CollisionSurface::kObservedRuntimeLookahead;
+  q.robot_state = observed_state(*bundle);
+  q.collision_world_revision = snapshot->revision;
+  // One nanosecond deterministically forces the post-sync collision query over
+  // budget without relying on machine-specific mesh ingestion timing.
+  q.timeout_budget_ns = 1;
+  CollisionPolicySnapshot policy;
+  CollisionCancellationToken cancel;
+
+  auto result = engine->check(*snapshot, q, policy, cancel);
+  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kTimeout);
+  EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail);
+  ASSERT_TRUE(result.query_duration_ns.has_value());
+  EXPECT_EQ(result.raw_diagnostics.at("timeout_includes_snapshot_sync"),
+            "false");
   const auto sync_duration_ns =
       diagnostic_int64(result.raw_diagnostics, "snapshot_sync_duration_ns");
   const auto total_duration_ns =

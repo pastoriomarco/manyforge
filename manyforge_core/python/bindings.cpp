@@ -745,8 +745,9 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                manyforge::core::CollisionSurface::kPredictedRuntimeMonitor)
         .value("kObservedRuntimeMonitor",
                manyforge::core::CollisionSurface::kObservedRuntimeMonitor)
-        .value("kDiagnosticCompare",
-               manyforge::core::CollisionSurface::kDiagnosticCompare)
+        .value("kObservedRuntimeLookahead",
+               manyforge::core::CollisionSurface::kObservedRuntimeLookahead)
+        .value("kDiagnosticCompare", manyforge::core::CollisionSurface::kDiagnosticCompare)
         .value("kPlannerHint", manyforge::core::CollisionSurface::kPlannerHint);
 
     py::enum_<manyforge::core::CollisionSamplingMode>(m, "CollisionSamplingMode")

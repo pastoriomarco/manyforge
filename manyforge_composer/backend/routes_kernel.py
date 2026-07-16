@@ -77,7 +77,7 @@ def build_kernel_snapshot_payload(state: ComposerState) -> dict[str, Any]:
     ).model_dump()
 
 
-def build_kernel_metrics_payload(state: ComposerState) -> dict[str, int | str]:
+def build_kernel_metrics_payload(state: ComposerState) -> dict[str, Any]:
     """Build kernel metrics payload."""
     if state.kernel is None:
         raise HTTPException(status_code=500, detail="Kernel not available")
@@ -94,7 +94,7 @@ def create_kernel_router(state: ComposerState) -> APIRouter:
         return await run_route_background(lambda: build_kernel_snapshot_payload(state))
 
     @router.get("/metrics")
-    async def get_kernel_metrics() -> dict[str, int | str]:
+    async def get_kernel_metrics() -> dict[str, Any]:
         """Get kernel performance metrics."""
         return await run_route_background(lambda: build_kernel_metrics_payload(state))
 

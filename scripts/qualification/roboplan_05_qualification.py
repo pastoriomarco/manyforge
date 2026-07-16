@@ -904,6 +904,44 @@ def _nonnegative_scalar(value: Any, field: str) -> float:
     return result
 
 
+def _validate_collision_validation_worker_sample(
+    sample: Any,
+    field: str,
+    *,
+    passed: bool,
+    require_cold_sync: bool,
+) -> int:
+    if not isinstance(sample, dict):
+        raise ValidationError(f"{field} must be a mapping")
+    requested = _positive_integer(
+        sample.get("workers_requested"), f"{field}.workers_requested"
+    )
+    if not isinstance(sample.get("decision_match"), bool):
+        raise ValidationError(f"{field}.decision_match must be boolean")
+    if passed and sample.get("decision_match") is not True:
+        raise ValidationError(f"{field}.decision_match must be true")
+
+    cold_sync = sample.get("cold_snapshot_sync")
+    if require_cold_sync and not isinstance(cold_sync, dict):
+        raise ValidationError(
+            f"{field}.cold_snapshot_sync must be an object for formal evidence"
+        )
+    if isinstance(cold_sync, dict):
+        _nonnegative_scalar(
+            cold_sync.get("wall_us"),
+            f"{field}.cold_snapshot_sync.wall_us",
+        )
+        _nonnegative_scalar(
+            cold_sync.get("process_cpu_us"),
+            f"{field}.cold_snapshot_sync.process_cpu_us",
+        )
+        _nonnegative_integer(
+            cold_sync.get("allocations"),
+            f"{field}.cold_snapshot_sync.allocations",
+        )
+    return requested
+
+
 def _validate_collision_revision_record(
     record: dict[str, Any], field: str, *, formal: bool
 ) -> None:
@@ -986,18 +1024,92 @@ def _validate_trajectory_validation_record(
         fallback_reason = collision.get("fallback_reason")
         if not isinstance(fallback_reason, str):
             raise ValidationError(f"{collision_field}.fallback_reason must be a string")
-        fallback_verified = details.get("support_contact_fallback_verified")
-        if not isinstance(fallback_verified, bool):
+        summary_contract_declared = (
+            "support_contact_ordered_summary_verified" in details
+        )
+        summary_verified = details.get(
+            "support_contact_ordered_summary_verified"
+        )
+        if summary_contract_declared and not isinstance(summary_verified, bool):
             raise ValidationError(
-                f"{field}.details.support_contact_fallback_verified must be boolean"
+                f"{field}.details.support_contact_ordered_summary_verified "
+                "must be boolean when the ordered-summary contract is declared"
             )
-        if support_active is True and (
-            workers != 1
-            or not fallback_reason
-            or fallback_verified is not True
+        if summary_verified is not None and not isinstance(summary_verified, bool):
+            raise ValidationError(
+                f"{field}.details.support_contact_ordered_summary_verified "
+                "must be boolean when present"
+            )
+        worker_sweep = collision.get("worker_sweep", [])
+        if not isinstance(worker_sweep, list):
+            raise ValidationError(
+                f"{collision_field}.worker_sweep must be a list"
+            )
+        if summary_contract_declared and not worker_sweep:
+            raise ValidationError(
+                f"{collision_field}.worker_sweep must be a non-empty list"
+            )
+        previous_requested = 0
+        for sample_index, sample in enumerate(worker_sweep):
+            sample_field = f"{collision_field}.worker_sweep[{sample_index}]"
+            requested = _validate_collision_validation_worker_sample(
+                sample,
+                sample_field,
+                passed=record.get("passed") is True,
+                require_cold_sync=formal,
+            )
+            if requested <= previous_requested:
+                raise ValidationError(
+                    f"{collision_field}.worker_sweep must be strictly ordered"
+                )
+            previous_requested = requested
+        waypoint_sweep = collision.get("waypoint_sweep", [])
+        if not isinstance(waypoint_sweep, list):
+            raise ValidationError(
+                f"{collision_field}.waypoint_sweep must be a list"
+            )
+        previous_waypoint_count = 0
+        for point_index, point in enumerate(waypoint_sweep):
+            point_field = (
+                f"{collision_field}.waypoint_sweep[{point_index}]"
+            )
+            if not isinstance(point, dict):
+                raise ValidationError(f"{point_field} must be a mapping")
+            waypoint_count = _positive_integer(
+                point.get("waypoints"), f"{point_field}.waypoints"
+            )
+            if waypoint_count <= previous_waypoint_count:
+                raise ValidationError(
+                    f"{collision_field}.waypoint_sweep must be strictly ordered"
+                )
+            previous_waypoint_count = waypoint_count
+            point_workers = point.get("worker_sweep")
+            if not isinstance(point_workers, list) or not point_workers:
+                raise ValidationError(
+                    f"{point_field}.worker_sweep must be a non-empty list"
+                )
+            previous_point_workers = 0
+            for sample_index, sample in enumerate(point_workers):
+                sample_field = f"{point_field}.worker_sweep[{sample_index}]"
+                requested = _validate_collision_validation_worker_sample(
+                    sample,
+                    sample_field,
+                    passed=record.get("passed") is True,
+                    require_cold_sync=formal,
+                )
+                if requested <= previous_point_workers:
+                    raise ValidationError(
+                        f"{point_field}.worker_sweep must be strictly ordered"
+                    )
+                previous_point_workers = requested
+        if support_active is True and summary_contract_declared and (
+            workers <= 1
+            or fallback_reason
+            or summary_verified is not True
+            or worker_sweep[-1].get("ordered_contact_summary_used") is not True
         ):
             raise ValidationError(
-                f"{collision_field} must prove the serial support-contact fallback"
+                f"{collision_field} must prove the ordered support-contact summary path"
             )
 
     if noncollision_enabled:

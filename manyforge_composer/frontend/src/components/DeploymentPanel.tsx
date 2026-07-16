@@ -53,6 +53,7 @@ function FieldInput({
   help,
   placeholder,
   min,
+  max,
   step,
 }: {
   label: string;
@@ -63,6 +64,7 @@ function FieldInput({
   help?: string;
   placeholder?: string;
   min?: number;
+  max?: number;
   step?: number;
 }) {
   return (
@@ -74,6 +76,7 @@ function FieldInput({
         onCommit={onChange}
         disabled={disabled}
         min={min}
+        max={max}
         step={step}
         placeholder={placeholder}
         className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
@@ -2682,6 +2685,94 @@ export function DeploymentPanel() {
           value={deployment.orchestrator.engine}
           onChange={(v) => setNestedField('orchestrator.engine', v)}
           disabled={editLocked}
+        />
+        <FieldInput
+          label="Collision Validation Workers"
+          value={Number(deployment.orchestrator.config.validation_collision_workers ?? 4)}
+          onChange={(value) => {
+            const workers = Number(value);
+            if (Number.isInteger(workers)) {
+              setNestedField('orchestrator.config.validation_collision_workers', workers);
+            }
+          }}
+          type="number"
+          min={1}
+          max={64}
+          step={1}
+          disabled={editLocked}
+          help="Independent pre-dispatch collision-query workers. One selects serial validation; changes require Apply and runtime restart."
+        />
+        <FieldInput
+          label="Immediate Collision Query Budget (ms)"
+          value={Number(deployment.orchestrator.config.runtime_collision_immediate_query_budget_ms ?? 50)}
+          onChange={(value) => setNestedField('orchestrator.config.runtime_collision_immediate_query_budget_ms', Number(value))}
+          type="number"
+          min={1}
+          step={1}
+          disabled={editLocked}
+          help="Post-return budget for the reserved current-state query. It cannot exceed the collision-monitor period."
+        />
+        <FieldInput
+          label="Runtime Lookahead Query Budget (ms)"
+          value={Number(deployment.orchestrator.config.runtime_collision_lookahead_query_budget_ms ?? 75)}
+          onChange={(value) => setNestedField('orchestrator.config.runtime_collision_lookahead_query_budget_ms', Number(value))}
+          type="number"
+          min={1}
+          step={1}
+          disabled={editLocked}
+          help="Post-return budget for one lower-priority sampled-state query. It cannot exceed the complete lookahead cycle budget."
+        />
+        <FieldInput
+          label="Runtime Lookahead Cycle Budget (ms)"
+          value={Number(deployment.orchestrator.config.runtime_collision_lookahead_cycle_budget_ms ?? 200)}
+          onChange={(value) => setNestedField('orchestrator.config.runtime_collision_lookahead_cycle_budget_ms', Number(value))}
+          type="number"
+          min={1}
+          step={1}
+          disabled={editLocked}
+          help="Absolute request-to-result deadline for one work-conserving lookahead job. This is a budget, not a fixed cadence."
+        />
+        <FieldInput
+          label="Runtime Lookahead Horizon (s)"
+          value={Number(deployment.orchestrator.config.runtime_collision_lookahead_s ?? 2)}
+          onChange={(value) => setNestedField('orchestrator.config.runtime_collision_lookahead_s', Number(value))}
+          type="number"
+          min={0.01}
+          step={0.1}
+          disabled={editLocked}
+          help="Maximum future trajectory time considered by one bounded check."
+        />
+        <FieldInput
+          label="Runtime Lookahead Sample Cap"
+          value={Number(deployment.orchestrator.config.runtime_collision_lookahead_max_samples ?? 32)}
+          onChange={(value) => {
+            const samples = Number(value);
+            if (Number.isInteger(samples)) {
+              setNestedField('orchestrator.config.runtime_collision_lookahead_max_samples', samples);
+            }
+          }}
+          type="number"
+          min={2}
+          max={4096}
+          step={1}
+          disabled={editLocked}
+          help="Number of deterministic front-loaded samples across the full requested time horizon. The exact endpoint is always included."
+        />
+        <FieldInput
+          label="Runtime Lookahead Workers"
+          value={Number(deployment.orchestrator.config.runtime_collision_lookahead_workers ?? 2)}
+          onChange={(value) => {
+            const workers = Number(value);
+            if (Number.isInteger(workers)) {
+              setNestedField('orchestrator.config.runtime_collision_lookahead_workers', workers);
+            }
+          }}
+          type="number"
+          min={1}
+          max={64}
+          step={1}
+          disabled={editLocked}
+          help="Independent lower-priority query contexts. One selects deterministic serial lookahead."
         />
         <ConfigTextarea
           label="Config"

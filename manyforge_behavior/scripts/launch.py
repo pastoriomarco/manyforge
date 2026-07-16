@@ -42,15 +42,44 @@ def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, A
             )
         config["collision_monitor_period_ns"] = int(period_ms * 1_000_000.0)
     timeout_ms = deployment.orchestrator.config.get(
-        "runtime_collision_query_timeout_ms"
+        "runtime_collision_immediate_query_budget_ms"
     )
     if timeout_ms is not None:
         timeout_ms = float(timeout_ms)
         if timeout_ms <= 0.0:
             raise ValueError(
-                "orchestrator.config.runtime_collision_query_timeout_ms must be > 0"
+                "orchestrator.config.runtime_collision_immediate_query_budget_ms must be > 0"
             )
-        config["runtime_collision_query_timeout_ns"] = int(timeout_ms * 1_000_000.0)
+        config["runtime_collision_immediate_query_budget_ns"] = int(timeout_ms * 1_000_000.0)
+    lookahead_query_ms = deployment.orchestrator.config.get(
+        "runtime_collision_lookahead_query_budget_ms"
+    )
+    if lookahead_query_ms is not None:
+        config["runtime_collision_lookahead_query_budget_ns"] = int(
+            float(lookahead_query_ms) * 1_000_000.0
+        )
+    lookahead_cycle_ms = deployment.orchestrator.config.get(
+        "runtime_collision_lookahead_cycle_budget_ms"
+    )
+    if lookahead_cycle_ms is not None:
+        config["runtime_collision_lookahead_cycle_budget_ns"] = int(
+            float(lookahead_cycle_ms) * 1_000_000.0
+        )
+    lookahead_horizon_s = deployment.orchestrator.config.get(
+        "runtime_collision_lookahead_s"
+    )
+    if lookahead_horizon_s is not None:
+        config["runtime_collision_lookahead_horizon_ns"] = int(
+            float(lookahead_horizon_s) * 1_000_000_000.0
+        )
+    for deployment_key, kernel_key in (
+        ("runtime_collision_lookahead_max_samples", "runtime_collision_lookahead_max_samples"),
+        ("runtime_collision_lookahead_workers", "runtime_collision_lookahead_workers"),
+        ("validation_collision_workers", "validation_collision_workers"),
+    ):
+        value = deployment.orchestrator.config.get(deployment_key)
+        if value is not None:
+            config[kernel_key] = int(value)
     timeout_ms = deployment.orchestrator.config.get(
         "validation_collision_query_timeout_ms"
     )

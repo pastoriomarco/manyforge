@@ -1,10 +1,4 @@
 #include <gtest/gtest.h>
-#include <manyforge_core/execution_interrupt_support.hpp>
-#include <manyforge_core/execution_kernel.hpp>
-#include <manyforge_core/cache/trajectory_cache_intent.hpp>
-#include <manyforge_core/time/fake_clock.hpp>
-#include <manyforge_core/time/manual_scheduler.hpp>
-#include <manyforge_core/types/reason_codes.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -15,7 +9,14 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <manyforge_core/cache/trajectory_cache_intent.hpp>
+#include <manyforge_core/execution_interrupt_support.hpp>
+#include <manyforge_core/execution_kernel.hpp>
+#include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_core/types/reason_codes.hpp>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -1043,6 +1044,7 @@ class ControlledExecution : public IExecutionBackend {
     if (on_execute) {
       on_execute();
     }
+    std::uint64_t execution_generation = 0;
     {
       std::lock_guard<std::mutex> lock(mu_);
       ++execute_count;
@@ -1054,9 +1056,15 @@ class ControlledExecution : public IExecutionBackend {
       if (!trajectory.waypoints.empty()) {
         snapshot.joint_positions_rad = trajectory.waypoints.front().positions_rad;
       }
+      if (execution_progress_publication_) {
+        execution_generation = ++execution_generation_;
+      }
+    }
+    if (execution_progress_publication_) {
+      (void)execution_progress_publication_->publish(execution_generation, 0, 0, 0);
     }
     cv_.notify_all();
-    return make_handle();
+    return make_handle(execution_generation);
   }
 
   Result<void> sync_observed_state_before_planning() override {
@@ -1137,6 +1145,7 @@ class ControlledExecution : public IExecutionBackend {
     if (on_resume) {
       on_resume();
     }
+    std::uint64_t execution_generation = 0;
     {
       std::lock_guard<std::mutex> lock(mu_);
       ++resume_count;
@@ -1148,9 +1157,15 @@ class ControlledExecution : public IExecutionBackend {
       if (running_) {
         snapshot.state = ExecutionState::kExecuting;
       }
+      if (execution_progress_publication_) {
+        execution_generation = ++execution_generation_;
+      }
+    }
+    if (execution_progress_publication_) {
+      (void)execution_progress_publication_->publish(execution_generation, 0, 0, 0);
     }
     cv_.notify_all();
-    return make_handle();
+    return make_handle(execution_generation);
   }
 
   ResetResultDTO reset() override {
@@ -1178,6 +1193,17 @@ class ControlledExecution : public IExecutionBackend {
   const ObservedRobotStatePublication*
   observed_robot_state_publication() const noexcept override {
     return &observed_publication_;
+  }
+
+  void enable_execution_progress_publication() {
+    execution_progress_publication_ = std::make_unique<ExecutionProgressPublication>(
+        ExecutionProgressSourceKind::kBackendCommanded,
+        ExecutionProgressAuthorityProfile::kPredictedNative, "test_predicted_native",
+        1'000'000'000);
+  }
+
+  const ExecutionProgressPublication* execution_progress_publication() const noexcept override {
+    return execution_progress_publication_.get();
   }
 
   void publish_observed_state(std::int64_t timestamp_ns,
@@ -1536,7 +1562,7 @@ class ControlledExecution : public IExecutionBackend {
   }
 
  private:
-  ExecutionHandle make_handle() {
+  ExecutionHandle make_handle(std::uint64_t execution_generation = 0) {
     return ExecutionHandle{
         [this](int64_t timeout_ns) {
           std::unique_lock<std::mutex> lock(mu_);
@@ -1557,7 +1583,8 @@ class ControlledExecution : public IExecutionBackend {
         [this]() {
           std::lock_guard<std::mutex> lock(mu_);
           return snapshot;
-        }};
+        },
+        execution_generation};
   }
 
   mutable std::mutex mu_;
@@ -1570,6 +1597,8 @@ class ControlledExecution : public IExecutionBackend {
   bool running_ = false;
   bool paused_ = false;
   ObservedRobotStatePublication observed_publication_;
+  std::unique_ptr<ExecutionProgressPublication> execution_progress_publication_;
+  std::uint64_t execution_generation_ = 0;
 };
 
 class ThreadSafeManualScheduler final : public IScheduler {
@@ -2095,18 +2124,21 @@ KernelRecoveryActionResultDTO apply_recovery_action_after_projection(
     ExecutionKernel& kernel, RecoveryAction action,
     std::string principal_id = "operator_test",
     std::string reason = "test recovery action") {
-  auto request = bound_recovery_request(kernel, action, principal_id, reason);
-  auto result = kernel.apply_recovery_action(request);
-  if (result.accepted || !result.error.has_value() ||
-      !result.error->details.contains("reason") ||
-      result.error->details.at("reason") !=
-          reason_codes::kRecoveryStaleAssessment) {
-    return result;
+  constexpr int kMaxAssessmentRebinds = 8;
+  auto assessment = kernel.get_recovery_assessment();
+  for (int attempt = 0; attempt <= kMaxAssessmentRebinds; ++attempt) {
+    auto request =
+        bound_recovery_request(assessment, action, principal_id, reason,
+                               "test-recovery-action-after-projection-" + std::to_string(attempt));
+    auto result = kernel.apply_recovery_action(request);
+    if (result.accepted || !result.error.has_value() || !result.error->details.contains("reason") ||
+        result.error->details.at("reason") != reason_codes::kRecoveryStaleAssessment ||
+        attempt == kMaxAssessmentRebinds) {
+      return result;
+    }
+    assessment = result.resulting_assessment;
   }
-  request = bound_recovery_request(
-      result.resulting_assessment, action, std::move(principal_id),
-      std::move(reason), "test-recovery-action-after-projection");
-  return kernel.apply_recovery_action(request);
+  std::terminate();
 }
 
 // --- Test fixture ---
@@ -2256,18 +2288,18 @@ class ExecutionKernelTest : public ::testing::Test {
   }
 
   void configure_runtime_collision_monitoring(
-      ExecutionKernel& target_kernel,
-      MockCollisionWorldPublisher& publisher,
+      ExecutionKernel& target_kernel, MockCollisionWorldPublisher& publisher,
       const std::shared_ptr<MockCollisionEngine>& validation_engine,
-      const std::shared_ptr<MockCollisionEngine>& runtime_engine) {
+      const std::shared_ptr<MockCollisionEngine>& runtime_engine,
+      std::vector<std::shared_ptr<ICollisionQueryEngine>> lookahead_engines = {}) {
     publisher.current_snapshot =
         std::make_shared<const CollisionWorldSnapshot>(
             make_test_collision_world_snapshot());
     publisher.current_policy = make_test_collision_policy_snapshot();
     target_kernel.set_collision_validation_policy_snapshot(
         make_test_collision_policy_snapshot());
-    target_kernel.set_collision_resources(publisher, runtime_engine,
-                                          {validation_engine});
+    target_kernel.set_collision_resources(publisher, runtime_engine, {validation_engine},
+                                          std::move(lookahead_engines));
   }
 };
 
@@ -2653,6 +2685,35 @@ TEST_F(ExecutionKernelTest,
   ok_config.validation_collision_wall_timeout_ns = 5'000'000'000;
   EXPECT_NO_THROW((ExecutionKernel{planner, context, execution, clock, scheduler,
                                    cache, ok_config}));
+}
+
+TEST_F(ExecutionKernelTest, Config_ValidationCollisionWorkersRejectsOutOfRangeWithoutClamping) {
+  for (const int bad : {0, 65}) {
+    ExecutionKernelConfig config;
+    config.validation_collision_workers = bad;
+    EXPECT_THROW((ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}),
+                 std::invalid_argument);
+  }
+
+  for (const int admitted : {1, 64}) {
+    ExecutionKernelConfig config;
+    config.validation_collision_workers = admitted;
+    EXPECT_NO_THROW(
+        (ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}));
+  }
+}
+
+TEST_F(ExecutionKernelTest, DeclaredValidationWorkerCapacityRejectsInsufficientResources) {
+  ExecutionKernelConfig config;
+  config.validation_collision_workers = 2;
+  config.validation_collision_workers_declared = true;
+  ExecutionKernel declared_kernel{planner, context, execution, clock, scheduler, cache, config};
+
+  EXPECT_THROW(declared_kernel.set_collision_resources(collision_world_publisher,
+                                                       std::make_shared<MockCollisionEngine>(),
+                                                       {std::make_shared<MockCollisionEngine>()}),
+               std::invalid_argument);
+  EXPECT_EQ(declared_kernel.get_metrics().validation_collision_workers_effective, 0u);
 }
 
 TEST_F(ExecutionKernelTest, Execute_HappyPath_ValidatesTrajectory) {
@@ -4828,6 +4889,7 @@ TEST_F(ExecutionKernelTest, Pause_KeepsRuntimeMonitorArmed) {
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 0;
   MockCollisionWorldPublisher local_publisher;
   auto validation_engine = std::make_shared<MockCollisionEngine>();
@@ -4868,6 +4930,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 0;
   MockCollisionWorldPublisher local_publisher;
   auto shared_engine = std::make_shared<MockCollisionEngine>();
@@ -4913,6 +4976,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 0;
   config.runtime_dynamic_body_max_age_cap_ns = 5'000'000'000;
   MockCollisionWorldPublisher local_publisher;
@@ -4984,6 +5048,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 0;
   MockCollisionWorldPublisher local_publisher;
   auto shared_engine = std::make_shared<MockCollisionEngine>();
@@ -5021,6 +5086,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 0;
   MockCollisionWorldPublisher local_publisher;
   auto shared_engine = std::make_shared<MockCollisionEngine>();
@@ -5067,6 +5133,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 0;
   MockCollisionWorldPublisher local_publisher;
   auto validation_engine = std::make_shared<MockCollisionEngine>();
@@ -5212,6 +5279,23 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ReplansFromFreshCurrentState) {
   EXPECT_EQ(count_resume_audit_event(KernelEventType::kPlanCompleted), 1);
   EXPECT_EQ(count_resume_audit_event(KernelEventType::kValidationStarted), 1);
   EXPECT_EQ(count_resume_audit_event(KernelEventType::kValidationPassed), 1);
+  std::map<std::string, std::string> resume_validation_details;
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    const auto it = std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
+      const auto reason = event.details.find("reason");
+      return event.type == KernelEventType::kValidationPassed && reason != event.details.end() &&
+             reason->second == "resume_replan";
+    });
+    ASSERT_NE(it, events.end());
+    resume_validation_details = it->details;
+  }
+  EXPECT_TRUE(resume_validation_details.contains("collision_workers_requested"));
+  EXPECT_TRUE(resume_validation_details.contains("collision_workers_effective"));
+  EXPECT_TRUE(resume_validation_details.contains("collision_workers_used"));
+  EXPECT_TRUE(resume_validation_details.contains("collision_parallel_fallback_reason"));
+  EXPECT_TRUE(resume_validation_details.contains("collision_ordered_contact_summary_used"));
+  EXPECT_TRUE(resume_validation_details.contains("collision_validation_wall_ns"));
 
   controlled_execution.complete();
   controlled_kernel.wait_for_completion();
@@ -5565,7 +5649,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;  // Keep this scheduler test fast.
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MockCollisionWorldPublisher local_collision_world;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
@@ -5681,6 +5765,182 @@ TEST_F(ExecutionKernelTest,
                   }));
 }
 
+TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBeforeTelemetry) {
+  ControlledExecution controlled_execution;
+  controlled_execution.enable_execution_progress_publication();
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
+  config.runtime_collision_lookahead_cycle_budget_ns = 10'000'000;
+  config.runtime_collision_lookahead_query_budget_ns = 10'000'000;
+  config.runtime_collision_lookahead_horizon_ns = 2'000'000'000;
+  config.runtime_collision_lookahead_max_samples = 8;
+  config.runtime_collision_lookahead_workers = 1;
+  config.runtime_collision_lookahead_workers_declared = true;
+  config.runtime_collision_lookahead_min_waypoints_for_parallel = 2;
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_validation_engine = std::make_shared<MockCollisionEngine>();
+  auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  auto local_lookahead_engine = std::make_shared<MockCollisionEngine>();
+  local_lookahead_engine->default_result = make_authoritative_collision_result();
+  std::mutex events_mu;
+  std::condition_variable events_cv;
+  std::vector<KernelEvent> events;
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+                                         local_validation_engine, local_runtime_engine,
+                                         {local_lookahead_engine});
+  controlled_kernel.subscribe_events([&](const KernelEvent& event) {
+    {
+      std::lock_guard<std::mutex> lock(events_mu);
+      events.push_back(event);
+    }
+    events_cv.notify_all();
+  });
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
+
+  local_clock.advance(10'000'000);
+  local_scheduler.advance_to(local_clock.now());
+
+  std::vector<KernelEvent> captured_events;
+  {
+    std::unique_lock<std::mutex> lock(events_mu);
+    ASSERT_TRUE(events_cv.wait_for(lock, std::chrono::seconds(2), [&]() {
+      return std::any_of(events.begin(), events.end(), [](const KernelEvent& event) {
+        const auto surface = event.details.find("surface");
+        return event.type == KernelEventType::kCollisionDetected &&
+               surface != event.details.end() && surface->second == "observed_runtime_lookahead";
+      });
+    })) << "future collision did not reach kernel telemetry";
+    captured_events = events;
+  }
+
+  const auto lookahead_event =
+      std::find_if(captured_events.begin(), captured_events.end(), [](const KernelEvent& event) {
+        const auto surface = event.details.find("surface");
+        return event.type == KernelEventType::kCollisionDetected &&
+               surface != event.details.end() && surface->second == "observed_runtime_lookahead";
+      });
+  ASSERT_NE(lookahead_event, captured_events.end());
+  EXPECT_EQ(lookahead_event->details.at("stop_authority_signalled"), "true");
+  EXPECT_EQ(lookahead_event->details.at("lookahead_checked_samples"), "8");
+  EXPECT_FALSE(lookahead_event->details.at("lookahead_sample_times_ns").empty());
+  EXPECT_TRUE(
+      lookahead_event->details.contains("collision_result_first_failure_time_ns"));
+  const auto interrupt_event =
+      std::find_if(captured_events.begin(), captured_events.end(), [&](const KernelEvent& event) {
+        return event.type == KernelEventType::kInterruptLatched &&
+               event.execution_id == result.value();
+      });
+  ASSERT_NE(interrupt_event, captured_events.end());
+  EXPECT_GT(interrupt_event->sequence, 0u);
+  EXPECT_LT(interrupt_event->sequence, lookahead_event->sequence);
+
+  for (int attempt = 0; attempt < 1000; ++attempt) {
+    const auto metrics = controlled_kernel.get_metrics();
+    if (metrics.runtime_collision_lookahead_jobs_collision > 0) {
+      EXPECT_EQ(metrics.runtime_collision_monitor_period_ns, 10'000'000u);
+      EXPECT_EQ(metrics.runtime_collision_immediate_query_budget_ns,
+                10'000'000u);
+      EXPECT_EQ(metrics.runtime_collision_lookahead_cycle_budget_ns,
+                10'000'000u);
+      EXPECT_EQ(metrics.runtime_collision_lookahead_query_budget_ns,
+                10'000'000u);
+      EXPECT_EQ(metrics.runtime_collision_lookahead_execution_id, result.value());
+      EXPECT_EQ(metrics.runtime_collision_lookahead_execution_generation, 1u);
+      EXPECT_EQ(metrics.runtime_collision_lookahead_cursor_source_kind, "backend_commanded");
+      EXPECT_EQ(metrics.runtime_collision_lookahead_cursor_authority_profile,
+                "test_predicted_native");
+      EXPECT_EQ(metrics.runtime_collision_lookahead_last_checked_samples, 8u);
+      break;
+    }
+    ASSERT_LT(attempt, 999) << "lookahead metrics were not published";
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  ASSERT_TRUE(controlled_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  EXPECT_GE(local_runtime_engine->check_count.load(), 1);
+  EXPECT_GE(local_lookahead_engine->check_count.load(), 1);
+  const auto latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->source_id, "manyforge.kernel.runtime_collision_fault");
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionLookahead_OperatorStopRevokesInFlightClearPermit) {
+  ControlledExecution controlled_execution;
+  controlled_execution.enable_execution_progress_publication();
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
+  config.runtime_collision_lookahead_cycle_budget_ns = 100'000'000;
+  config.runtime_collision_lookahead_query_budget_ns = 75'000'000;
+  config.runtime_collision_lookahead_horizon_ns = 2'000'000'000;
+  config.runtime_collision_lookahead_max_samples = 8;
+  config.runtime_collision_lookahead_workers = 1;
+  config.runtime_collision_lookahead_workers_declared = true;
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_validation_engine = std::make_shared<MockCollisionEngine>();
+  auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  auto local_lookahead_engine = std::make_shared<MockCollisionEngine>();
+  local_lookahead_engine->block_until_cancel_requested = true;
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler,
+      local_cache, config};
+  configure_runtime_collision_monitoring(
+      controlled_kernel, local_collision_world, local_validation_engine,
+      local_runtime_engine, {local_lookahead_engine});
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
+
+  local_clock.advance(10'000'000);
+  local_scheduler.advance_to(local_clock.now());
+  {
+    std::unique_lock<std::mutex> lock(local_lookahead_engine->block_mutex);
+    ASSERT_TRUE(local_lookahead_engine->block_cv.wait_for(
+        lock, std::chrono::seconds(2), [&]() {
+          return local_lookahead_engine->blocked_check_count.load(
+                     std::memory_order_acquire) > 0;
+        }));
+  }
+
+  const auto stop = controlled_kernel.stop();
+  ASSERT_TRUE(stop.accepted);
+  for (int attempt = 0; attempt < 1000; ++attempt) {
+    if (local_lookahead_engine->cancel_observed_count.load(
+            std::memory_order_acquire) > 0) {
+      break;
+    }
+    ASSERT_LT(attempt, 999)
+        << "lookahead query did not observe operator-stop revocation";
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  {
+    std::lock_guard<std::mutex> lock(
+        local_lookahead_engine->cancel_reason_mutex);
+    EXPECT_EQ(local_lookahead_engine->last_cancel_reason,
+              "lookahead_clear_permit_revoked");
+  }
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kStopped);
+}
+
 TEST_F(ExecutionKernelTest,
        CollisionMonitoring_RetryAfterRuntimeCollisionDoesNotRelatchStaleEdge) {
   ControlledExecution controlled_execution;
@@ -5689,7 +5949,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.recovery_ready_dwell_ns = 0;
   config.recovery_ready_min_samples = 1;
   MockCollisionWorldPublisher local_collision_world;
@@ -5824,7 +6084,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
   fault_profile.profile_id = "pending_retry_guard";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
@@ -5935,7 +6195,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
   fault_profile.profile_id = "active_stop_retry_guard";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
@@ -6069,7 +6329,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
   fault_profile.profile_id = "failed_preempt_retry_guard";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
@@ -6190,7 +6450,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MockCollisionWorldPublisher local_collision_world;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
@@ -6276,7 +6536,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
   fault_profile.profile_id = "runtime_collision_fault_stop";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
@@ -6342,7 +6602,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MockCollisionWorldPublisher local_collision_world;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
@@ -6436,7 +6696,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   // The deployment opts the kernel into controlled-stop semantics for
   // fault interrupts that don't carry a per-policy stop_profile (which
   // includes the kernel's built-in runtime_collision_fault policy).
@@ -6691,7 +6951,7 @@ TEST_F(ExecutionKernelTest,
   config.operator_stop_profile =
       std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 5'000'000'000;
   config.runtime_dynamic_body_max_age_cap_ns = 5'000'000'000;
 
@@ -6798,7 +7058,7 @@ TEST_F(ExecutionKernelTest,
   config.operator_stop_profile =
       std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
 
   MockCollisionWorldPublisher local_publisher;
   auto validation_engine = std::make_shared<MockCollisionEngine>();
@@ -6895,7 +7155,7 @@ TEST_F(ExecutionKernelTest,
   config.operator_stop_profile =
       std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 5'000'000'000;
   config.runtime_dynamic_body_max_age_cap_ns = 5'000'000'000;
 
@@ -7691,7 +7951,7 @@ TEST_F(ExecutionKernelTest,
   config.operator_stop_profile =
       std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 5'000'000'000;
   config.runtime_dynamic_body_max_age_cap_ns = 5'000'000'000;
 
@@ -8374,7 +8634,7 @@ TEST_F(ExecutionKernelTest,
   // Tighten the collision monitor cadence so the test fires within
   // a deterministic 10 ms advance.
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   // Operator profile IS configured (would route ExecutionKernel::stop()
   // through controlled-stop)…
   MotionInterruptStopProfileDTO op_profile;
@@ -8464,7 +8724,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
   fault_profile.profile_id = "fault_spring_back";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
@@ -8582,7 +8842,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
   fault_profile.profile_id = "fault_spring_back";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
@@ -8716,7 +8976,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 5'000'000'000;
   config.runtime_dynamic_body_max_age_cap_ns = 5'000'000'000;
   // This test isolates stop/intervention mechanics for an explicitly
@@ -8906,7 +9166,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 5'000'000'000;
   config.runtime_dynamic_body_max_age_cap_ns = 5'000'000'000;
   config.recovery_require_measured_observation = false;
@@ -8982,7 +9242,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   MotionInterruptStopProfileDTO fault_profile;
   fault_profile.profile_id = "fault_pending_bound";
   fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
@@ -9793,7 +10053,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 50'000'000;  // 50 ms
-  config.runtime_collision_query_timeout_ns = 25'000'000;  // 25 ms
+  config.runtime_collision_immediate_query_budget_ns = 25'000'000;  // 25 ms
   MockCollisionWorldPublisher local_collision_world;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
@@ -10929,10 +11189,22 @@ TEST_F(ExecutionKernelTest, MetricsCounters) {
   execute_sync(make_test_request());
 
   auto metrics = kernel.get_metrics();
+  // Terminal publication does not wait for the lower-priority lookahead
+  // worker. Generation retirement cancels it, and it must become quiescent
+  // within the bounded test window without delaying the terminal transition.
+  for (int attempt = 0; attempt < 1000 && metrics.validation_collision_workers_active != 0;
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    metrics = kernel.get_metrics();
+  }
   EXPECT_EQ(metrics.cache_misses, 1u);
   EXPECT_EQ(metrics.plans_succeeded, 1u);
   EXPECT_EQ(metrics.validations_passed, 1u);
   EXPECT_EQ(metrics.executions_completed, 1u);
+  EXPECT_EQ(metrics.validation_collision_workers_requested, 4u);
+  EXPECT_EQ(metrics.validation_collision_workers_effective, 1u);
+  EXPECT_EQ(metrics.validation_collision_jobs_queued, 0u);
+  EXPECT_EQ(metrics.validation_collision_workers_active, 0u);
   EXPECT_GT(metrics.events_emitted, 0u);
   EXPECT_EQ(metrics.flight_recorder_records, metrics.events_emitted);
 }
@@ -12048,7 +12320,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
 
   MockCollisionWorldPublisher local_collision_world;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
@@ -12163,7 +12435,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
-  config.runtime_collision_query_timeout_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   // Keep the observed/dynamic-body freshness budgets generous: the test-double
   // does not refresh its snapshot timestamp while the stop is blocked.
   config.runtime_observed_state_max_age_ns = 5'000'000'000;
@@ -12250,6 +12522,7 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
 
   MockCollisionWorldPublisher local_collision_world;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();

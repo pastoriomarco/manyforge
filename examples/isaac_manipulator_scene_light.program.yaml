@@ -135,7 +135,7 @@ parameters:
 saved_with_deployment:
   name: isaac_manipulator_scene_light_ros2_control
   source_path: /workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml
-  content_sha256: 443702218f517b698e0dcce3ef5bbe60e89c98d7c79833e8277874bc8c112d6f
+  content_sha256: fb624008ecb63cd7cf08f9729a052eb41b64e9d308263808a59428f61fa026d1
 tree:
   id: sequence
   name: run_sequence

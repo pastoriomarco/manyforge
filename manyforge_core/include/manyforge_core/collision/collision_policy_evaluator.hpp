@@ -37,6 +37,35 @@ struct CollisionPolicyIndex {
       contact_grasp_index;
 };
 
+/// Trajectory-scoped state for one support-contact identity. This state is
+/// public so the ordered parallel validator can transfer a bounded chunk
+/// prefix between independent worker-local evaluators. It is not deployment or
+/// scene state and must never survive across validation attempts.
+enum class SupportContactEvaluationState {
+  kNotInContact,
+  kInitialContact,
+  kContactActive,
+  kSeparated,
+  kRecontactViolation,
+};
+
+using SupportContactEvaluationStateMap =
+    std::map<CollisionPairId, SupportContactEvaluationState, std::less<>>;
+
+/// Exact prefix state required to continue contact-release validation without
+/// re-baselining at a runtime-lookahead boundary.
+struct ContactReleaseEvaluationState {
+  bool initialized = false;
+  bool started_in_contact = false;
+  bool separated = false;
+  std::optional<double> initial_depth_m;
+  double previous_depth_m = 0.0;
+  double best_depth_m = 0.0;
+};
+
+using ContactReleaseEvaluationStateMap =
+    std::map<CollisionPairId, ContactReleaseEvaluationState, std::less<>>;
+
 std::shared_ptr<const CollisionPolicyIndex> build_collision_policy_index(
     const CollisionPolicySnapshot& snapshot);
 
@@ -72,6 +101,16 @@ class CollisionPolicyEvaluator {
   /// independent validation passes.
   void reset();
 
+  /// Replace the complete trajectory-scoped support-contact state. The input
+  /// must contain exactly the canonical support-contact identities from the
+  /// immutable policy index. Returns false without changing state when it does
+  /// not match; callers must fail closed rather than guessing a prefix.
+  bool restore_support_contact_state(const SupportContactEvaluationStateMap& state);
+
+  const SupportContactEvaluationStateMap& support_contact_state() const {
+    return support_contact_state_;
+  }
+
   /// Classify the observed pairs.
   ///
   /// @param observed_pairs Pairs reported in collision by the engine.
@@ -94,23 +133,12 @@ class CollisionPolicyEvaluator {
   const CollisionPolicySnapshot& snapshot() const { return *snapshot_; }
 
  private:
-  /// Support-contact state machine states (per the plan's explicit
-  /// transition spec). Mapped by canonical CollisionPairId.
-  enum class SupportContactState {
-    kNotInContact,
-    kInitialContact,
-    kContactActive,
-    kSeparated,
-    kRecontactViolation,
-  };
-
   std::shared_ptr<const CollisionPolicySnapshot> snapshot_;
   std::shared_ptr<const CollisionPolicyIndex> index_;
 
   /// Pair lookups built from `snapshot_` at construction so classify()
   /// runs in O(N log N) where N is the number of observed pairs.
-  std::map<CollisionPairId, SupportContactState, std::less<>>
-      support_contact_state_;
+  SupportContactEvaluationStateMap support_contact_state_;
 };
 
 }  // namespace manyforge::core

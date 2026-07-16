@@ -61,8 +61,27 @@ CollisionPolicyEvaluator::CollisionPolicyEvaluator(
 void CollisionPolicyEvaluator::reset() {
   support_contact_state_.clear();
   for (const auto& [pair, _] : index_->support_contact_index) {
-    support_contact_state_[pair] = SupportContactState::kNotInContact;
+    support_contact_state_[pair] = SupportContactEvaluationState::kNotInContact;
   }
+}
+
+bool CollisionPolicyEvaluator::restore_support_contact_state(
+    const SupportContactEvaluationStateMap& state) {
+  if (state.size() != index_->support_contact_index.size()) {
+    return false;
+  }
+  for (const auto& [pair, _] : index_->support_contact_index) {
+    if (state.find(pair) == state.end()) {
+      return false;
+    }
+  }
+  for (const auto& [pair, _] : state) {
+    if (index_->support_contact_index.find(pair) == index_->support_contact_index.end()) {
+      return false;
+    }
+  }
+  support_contact_state_ = state;
+  return true;
 }
 
 EvaluatedPairs CollisionPolicyEvaluator::classify(
@@ -87,8 +106,8 @@ EvaluatedPairs CollisionPolicyEvaluator::classify(
   // kContactActive to kSeparated.
   std::vector<CollisionPairId> previously_active;
   for (const auto& [pair, state] : support_contact_state_) {
-    if (state == SupportContactState::kInitialContact ||
-        state == SupportContactState::kContactActive) {
+    if (state == SupportContactEvaluationState::kInitialContact ||
+        state == SupportContactEvaluationState::kContactActive) {
       previously_active.push_back(pair);
     }
   }
@@ -137,27 +156,27 @@ EvaluatedPairs CollisionPolicyEvaluator::classify(
     if (support_it != index_->support_contact_index.end()) {
       auto& state = support_contact_state_[pair];
       switch (state) {
-        case SupportContactState::kNotInContact:
-          state = SupportContactState::kInitialContact;
+        case SupportContactEvaluationState::kNotInContact:
+          state = SupportContactEvaluationState::kInitialContact;
           entry.classification = CollisionPairClassification::kSupportContactStart;
           break;
-        case SupportContactState::kInitialContact:
-        case SupportContactState::kContactActive:
-          state = SupportContactState::kContactActive;
+        case SupportContactEvaluationState::kInitialContact:
+        case SupportContactEvaluationState::kContactActive:
+          state = SupportContactEvaluationState::kContactActive;
           entry.classification = CollisionPairClassification::kSupportContactContinued;
           break;
-        case SupportContactState::kSeparated:
+        case SupportContactEvaluationState::kSeparated:
           if (support_it->second.allow_recontact) {
-            state = SupportContactState::kContactActive;
+            state = SupportContactEvaluationState::kContactActive;
             entry.classification =
                 CollisionPairClassification::kSupportContactContinued;
           } else {
-            state = SupportContactState::kRecontactViolation;
+            state = SupportContactEvaluationState::kRecontactViolation;
             entry.classification =
                 CollisionPairClassification::kSupportContactRecontactViolation;
           }
           break;
-        case SupportContactState::kRecontactViolation:
+        case SupportContactEvaluationState::kRecontactViolation:
           entry.classification =
               CollisionPairClassification::kSupportContactRecontactViolation;
           break;
@@ -181,7 +200,7 @@ EvaluatedPairs CollisionPolicyEvaluator::classify(
     if (still_in_contact) continue;
     auto state_it = support_contact_state_.find(prev);
     if (state_it == support_contact_state_.end()) continue;
-    state_it->second = SupportContactState::kSeparated;
+    state_it->second = SupportContactEvaluationState::kSeparated;
 
     CollisionPairResult sep_entry;
     sep_entry.pair = prev;

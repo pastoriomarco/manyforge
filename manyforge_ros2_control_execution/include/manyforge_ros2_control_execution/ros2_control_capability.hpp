@@ -40,6 +40,14 @@ struct Ros2ControlExecutionBackendConfig {
   double tracking_error_tolerance_rad = 0.05;
   double tracking_error_timeout_s = 0.1;
   double monitor_period_s = 0.01;
+  // Lower-priority measured-trajectory cursor projection. This never runs in
+  // a ROS callback or controller-manager update thread. Command-authoritative
+  // profiles publish their commanded cursor without geometric projection.
+  double execution_progress_projection_period_s = 0.1;
+  double execution_progress_projection_max_rms_distance_rad = 0.25;
+  double execution_progress_projection_ambiguity_epsilon_rad = 1e-4;
+  double execution_progress_projection_ambiguity_time_s = 0.05;
+  double execution_progress_projection_regression_tolerance_s = 0.005;
   double stop_completion_timeout_s = 0.5;
   double sim_reset_motion_duration_s = 2.0;
   bool require_fresh_state_before_planning = true;

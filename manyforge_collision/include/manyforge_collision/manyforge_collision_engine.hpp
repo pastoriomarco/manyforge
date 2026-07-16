@@ -29,6 +29,31 @@ namespace manyforge::collision {
 /// closed until the snapshot contract carries a qualified decomposition.
 class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
  public:
+  /// Immutable robot-model assets shared by all collision contexts created by
+  /// one kernel factory. The concrete type is intentionally opaque: callers
+  /// may share ownership but cannot mutate model state.
+  struct SharedModel;
+
+  /// Revision-preparation domain. Workers in one non-real-time pool share a
+  /// cache; the immediate runtime monitor receives a separate cache so lower-
+  /// priority preparation can never block its safety context.
+  struct SharedSceneCache;
+
+  using SharedModelPtr = std::shared_ptr<const SharedModel>;
+  using SharedSceneCachePtr = std::shared_ptr<SharedSceneCache>;
+
+  /// Parse URDF/SRDF and load immutable Pinocchio model assets once.
+  static SharedModelPtr load_shared_model(
+      const std::string& model_name,
+      const std::filesystem::path& urdf_path,
+      const std::filesystem::path& srdf_path,
+      const std::vector<std::filesystem::path>& package_paths,
+      std::string group_name);
+
+  /// Create an independently-owned revision cache over a shared model.
+  static SharedSceneCachePtr make_shared_scene_cache(
+      SharedModelPtr shared_model);
+
   /// Construct an independent collision query engine from a ManyForge-owned
   /// model descriptor: URDF/SRDF paths, package-resolution paths, and the
   /// planning group used for compact RobotStateDTO vectors.
@@ -38,6 +63,10 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
       const std::filesystem::path& srdf_path,
       const std::vector<std::filesystem::path>& package_paths,
       std::string group_name);
+
+  /// Construct one mutable query context over shared immutable assets.
+  ManyForgeCollisionEngine(SharedModelPtr shared_model,
+                           SharedSceneCachePtr scene_cache);
 
   core::CollisionResult check(
       const core::CollisionWorldSnapshot& snapshot,
@@ -63,31 +92,22 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
   std::string engine_id() const override { return engine_id_; }
   std::string engine_version() const override { return engine_version_; }
 
-  /// Test helper: returns a stable pointer to this engine's immutable
-  /// Pinocchio model. Used by integration tests to assert worker instances do
-  /// not share mutable planner state.
-  const void* internal_model_identity() const {
-    return static_cast<const void*>(&model_);
-  }
+  /// Test helpers for ownership and cache-reuse regressions.
+  const void* internal_model_identity() const;
+  const void* internal_scene_cache_identity() const;
+  const void* internal_prepared_scene_identity() const;
+  std::uint64_t internal_prepared_scene_build_count() const;
 
  private:
-  pinocchio::Model model_;
-  pinocchio::GeometryModel base_collision_model_;
-  std::vector<std::filesystem::path> package_paths_;
-  std::vector<std::string> group_joint_names_;
-  std::string group_name_;
+  struct PreparedScene;
+
+  SharedModelPtr shared_model_;
+  SharedSceneCachePtr scene_cache_;
   std::string engine_id_;
   std::string engine_version_;
   core::CollisionEngineCapabilityDescriptor capability_;
 
-  std::optional<core::CollisionWorldRevision> synced_snapshot_revision_;
-  std::vector<std::string> synced_scene_geometry_names_;
-  std::map<std::string, core::CollisionBodyId> synced_raw_name_to_body_id_;
-  /// Full raw-geometry-name -> body-id map (scene + robot links), rebuilt
-  /// once per synced snapshot revision instead of parsed on every check.
-  std::map<std::string, core::CollisionBodyId> synced_raw_to_body_map_;
-  std::set<std::string> builtin_collision_geometry_names_;
-  std::optional<pinocchio::GeometryModel> active_collision_model_;
+  std::shared_ptr<const PreparedScene> active_prepared_scene_;
   std::optional<pinocchio::GeometryData> active_collision_data_;
   /// Reusable FK scratch for collision queries: constructed once per
   /// engine (the kinematic model never changes after construction);
@@ -96,22 +116,15 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
   /// kSingleContextExclusive by contract.
   std::optional<pinocchio::Data> reusable_model_data_;
 
-  struct RuntimePairBinding {
-    bool mapped = false;
-    core::CollisionPairId pair;
-  };
   std::vector<std::size_t> runtime_joint_q_indices_;
   Eigen::VectorXd runtime_q_neutral_;
   Eigen::VectorXd runtime_q_scratch_;
   bool runtime_query_prepared_ = false;
   bool runtime_query_is_full_configuration_ = false;
-  std::vector<RuntimePairBinding> runtime_pair_bindings_;
   std::vector<core::RuntimeCollisionPairObservation>
       runtime_collision_observations_;
   std::vector<core::RuntimeCollisionPairObservation>
       runtime_clearance_observations_;
-  std::map<std::string, std::shared_ptr<coal::CollisionGeometry>>
-      prepared_mesh_geometry_cache_;
 
   /// Internal mutex serializes concurrent check() calls on the same
   /// instance. Separate instances do not share this mutex.
@@ -120,7 +133,6 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
   std::optional<std::string> sync_snapshot_locked(
       const core::CollisionWorldSnapshot& snapshot,
       bool allow_resource_io = true);
-  std::optional<std::string> rebuild_runtime_pair_bindings_locked();
   core::CollisionResult check_locked(
       const core::CollisionQuery& query,
       const core::CollisionWorldSnapshot* snapshot,

@@ -24,8 +24,10 @@ REQUIRED_FIXTURES = {
     "attached_object_ur5_gripper",
     "unsupported_mesh_fail_closed",
     "isaac_like_primitive_cell",
-    "support_contact_serial_fallback",
+    "support_contact_ordered_summary",
 }
+
+REQUIRED_VALIDATION_WAYPOINT_SWEEP = (8, 16, 32, 64, 96, 192)
 
 REQUIRED_EXTERNAL_EVIDENCE = {
     "race": "ThreadSanitizer / race evidence",
@@ -338,7 +340,7 @@ def validate_collision_matrix(
         "cylinder_dense_ur5_gripper",
         "attached_object_ur5_gripper",
         "isaac_like_primitive_cell",
-        "support_contact_serial_fallback",
+        "support_contact_ordered_summary",
     ):
         fixture = fixtures_by_name.get(name)
         if fixture is None:
@@ -354,10 +356,52 @@ def validate_collision_matrix(
         checks.append(check(bool(mesh_fixture.get("unsupported_fail_closed")),
                             "unsupported mesh fixture fails closed", failures))
 
-    support_fixture = fixtures_by_name.get("support_contact_serial_fallback")
+    support_fixture = fixtures_by_name.get("support_contact_ordered_summary")
     if support_fixture is not None:
-        checks.append(check(bool(support_fixture.get("support_contact_fallback_verified")),
-                            "support-contact fixture uses observable serial fallback", failures))
+        checks.append(check(
+            bool(support_fixture.get("support_contact_ordered_summary_verified")),
+            "support-contact fixture uses the ordered-summary path", failures))
+        worker_sweep = support_fixture.get("validation", {}).get(
+            "worker_sweep", []
+        )
+        checks.append(check(
+            bool(worker_sweep) and
+            all(bool(sample.get("decision_match")) for sample in worker_sweep),
+            "support-contact worker sweep preserves serial decisions", failures))
+
+    for name in (
+        "isaac_like_primitive_cell",
+        "support_contact_ordered_summary",
+    ):
+        fixture = fixtures_by_name.get(name)
+        if fixture is None:
+            continue
+        waypoint_sweep = fixture.get("validation", {}).get(
+            "waypoint_sweep", []
+        )
+        waypoint_counts = tuple(
+            sample.get("waypoints") for sample in waypoint_sweep
+            if isinstance(sample, dict)
+        )
+        checks.append(check(
+            waypoint_counts == REQUIRED_VALIDATION_WAYPOINT_SWEEP,
+            f"{name} covers the required waypoint crossover sweep", failures))
+        checks.append(check(
+            bool(waypoint_sweep) and all(
+                isinstance(point, dict)
+                and bool(point.get("worker_sweep"))
+                and all(
+                    bool(sample.get("decision_match"))
+                    for sample in point["worker_sweep"]
+                    if isinstance(sample, dict)
+                )
+                and all(
+                    isinstance(sample, dict)
+                    for sample in point["worker_sweep"]
+                )
+                for point in waypoint_sweep
+            ),
+            f"{name} waypoint sweep preserves serial decisions", failures))
 
     attached_fixture = fixtures_by_name.get("attached_object_ur5_gripper")
     if attached_fixture is not None:

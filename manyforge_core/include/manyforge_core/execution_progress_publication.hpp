@@ -1,0 +1,101 @@
+#pragma once
+
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <string_view>
+
+namespace manyforge::core {
+
+enum class ExecutionProgressSourceKind {
+  kBackendCommanded,
+  kMeasuredProjection,
+};
+
+enum class ExecutionProgressAuthorityProfile {
+  kCommandedSimulation,
+  kPredictedNative,
+  kMeasuredPhysical,
+};
+
+const char* execution_progress_source_kind_name(ExecutionProgressSourceKind kind) noexcept;
+const char* execution_progress_authority_profile_name(
+    ExecutionProgressAuthorityProfile profile) noexcept;
+
+struct ExecutionProgressCursorSnapshotDTO {
+  std::uint64_t sequence = 0;
+  std::uint64_t execution_generation = 0;
+  std::int64_t trajectory_time_ns = 0;
+  ExecutionProgressSourceKind source_kind = ExecutionProgressSourceKind::kBackendCommanded;
+  std::string_view authority_profile;
+  std::int64_t source_timestamp_ns = 0;
+  std::int64_t received_timestamp_ns = 0;
+  std::int64_t freshness_budget_ns = 0;
+  bool valid = false;
+};
+
+struct ExecutionProgressPublishResult {
+  bool published = false;
+  std::uint64_t sequence = 0;
+  const char* reason = "";
+};
+
+/// Scalar, latest-only execution-progress publication (spec/210 section 3.14).
+/// Writers serialize on one leaf mutex; readers perform bounded atomic
+/// snapshots and never take that mutex. The publication owns no trajectory and
+/// cannot infer authority: the backend constructor fixes source/profile for its
+/// lifetime.
+class ExecutionProgressPublication final {
+ public:
+  ExecutionProgressPublication(ExecutionProgressSourceKind source_kind,
+                               ExecutionProgressAuthorityProfile profile,
+                               std::string authority_profile_id, std::int64_t freshness_budget_ns);
+
+  ExecutionProgressPublication(const ExecutionProgressPublication&) = delete;
+  ExecutionProgressPublication& operator=(const ExecutionProgressPublication&) = delete;
+
+  ExecutionProgressPublishResult publish(std::uint64_t execution_generation,
+                                         std::int64_t trajectory_time_ns,
+                                         std::int64_t source_timestamp_ns,
+                                         std::int64_t received_timestamp_ns) noexcept;
+
+  /// Lifecycle-bound invalidation is guaranteed, not best effort, and retires
+  /// the current generation. Readers see either the preceding complete even
+  /// epoch or the resulting invalid epoch; only a newer generation can restore
+  /// validity.
+  void invalidate() noexcept;
+  bool invalidate_generation(std::uint64_t expected_generation) noexcept;
+
+  [[nodiscard]] ExecutionProgressCursorSnapshotDTO acquire() const noexcept;
+
+  [[nodiscard]] ExecutionProgressSourceKind source_kind() const noexcept { return source_kind_; }
+  [[nodiscard]] ExecutionProgressAuthorityProfile authority_profile() const noexcept {
+    return authority_profile_;
+  }
+  [[nodiscard]] const std::string& authority_profile_id() const noexcept {
+    return authority_profile_id_;
+  }
+  [[nodiscard]] std::int64_t freshness_budget_ns() const noexcept { return freshness_budget_ns_; }
+
+ private:
+  void begin_write() noexcept;
+  void end_write() noexcept;
+
+  const ExecutionProgressSourceKind source_kind_;
+  const ExecutionProgressAuthorityProfile authority_profile_;
+  const std::string authority_profile_id_;
+  const std::int64_t freshness_budget_ns_;
+
+  mutable std::mutex writer_mutex_;
+  std::atomic<std::uint64_t> epoch_{0};
+  std::atomic<std::uint64_t> next_sequence_{1};
+  std::atomic<std::uint64_t> sequence_{0};
+  std::atomic<std::uint64_t> execution_generation_{0};
+  std::atomic<std::int64_t> trajectory_time_ns_{0};
+  std::atomic<std::int64_t> source_timestamp_ns_{0};
+  std::atomic<std::int64_t> received_timestamp_ns_{0};
+  std::atomic<bool> valid_{false};
+};
+
+}  // namespace manyforge::core

@@ -246,6 +246,13 @@ def test_ros2_control_factory_forwards_validation_collision_timeout(
         deployment=deployment,
         validation_collision_query_timeout_ns=275_000_000,
         validation_collision_wall_timeout_ns=3_000_000_000,
+        validation_collision_workers=3,
+        runtime_collision_immediate_query_budget_ns=25_000_000,
+        runtime_collision_lookahead_cycle_budget_ns=75_000_000,
+        runtime_collision_lookahead_query_budget_ns=60_000_000,
+        runtime_collision_lookahead_horizon_ns=1_500_000_000,
+        runtime_collision_lookahead_max_samples=48,
+        runtime_collision_lookahead_workers=4,
     )
 
     assert recorded["kernel_config"]["validation_collision_query_timeout_ns"] == (
@@ -254,6 +261,27 @@ def test_ros2_control_factory_forwards_validation_collision_timeout(
     assert recorded["kernel_config"]["validation_collision_wall_timeout_ns"] == (
         3_000_000_000
     )
+    assert recorded["kernel_config"]["validation_collision_workers"] == 3
+    assert (
+        recorded["kernel_config"]["runtime_collision_immediate_query_budget_ns"]
+        == 25_000_000
+    )
+    assert (
+        recorded["kernel_config"]["runtime_collision_lookahead_cycle_budget_ns"]
+        == 75_000_000
+    )
+    assert (
+        recorded["kernel_config"]["runtime_collision_lookahead_query_budget_ns"]
+        == 60_000_000
+    )
+    assert (
+        recorded["kernel_config"]["runtime_collision_lookahead_horizon_ns"]
+        == 1_500_000_000
+    )
+    assert (
+        recorded["kernel_config"]["runtime_collision_lookahead_max_samples"] == 48
+    )
+    assert recorded["kernel_config"]["runtime_collision_lookahead_workers"] == 4
 
 
 def test_ros2_control_factory_keeps_ros_gripper_config_canonical_and_seeds_scene(

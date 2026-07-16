@@ -1525,6 +1525,22 @@ py::dict metrics_to_python(const MetricsSnapshot& metrics) {
   d["plans_failed"] = metrics.plans_failed;
   d["validations_passed"] = metrics.validations_passed;
   d["validations_failed"] = metrics.validations_failed;
+  d["validation_collision_workers_requested"] =
+      metrics.validation_collision_workers_requested;
+  d["validation_collision_workers_effective"] =
+      metrics.validation_collision_workers_effective;
+  d["validation_collision_jobs_queued"] =
+      metrics.validation_collision_jobs_queued;
+  d["validation_collision_workers_active"] =
+      metrics.validation_collision_workers_active;
+  d["validation_collision_jobs_completed"] =
+      metrics.validation_collision_jobs_completed;
+  d["validation_collision_jobs_cancelled"] =
+      metrics.validation_collision_jobs_cancelled;
+  d["validation_collision_jobs_dropped"] =
+      metrics.validation_collision_jobs_dropped;
+  d["validation_collision_jobs_abandoned"] =
+      metrics.validation_collision_jobs_abandoned;
   d["executions_completed"] = metrics.executions_completed;
   d["executions_failed"] = metrics.executions_failed;
   d["stops_issued"] = metrics.stops_issued;
@@ -1579,6 +1595,96 @@ py::dict metrics_to_python(const MetricsSnapshot& metrics) {
       metrics.validation_deferred_runtime_monitor_active;
   d["runtime_collision_snapshot_refresh_failures"] =
       metrics.runtime_collision_snapshot_refresh_failures;
+  d["runtime_collision_lookahead_cycle_budget_ns"] =
+      metrics.runtime_collision_lookahead_cycle_budget_ns;
+  d["runtime_collision_monitor_period_ns"] =
+      metrics.runtime_collision_monitor_period_ns;
+  d["runtime_collision_immediate_query_budget_ns"] =
+      metrics.runtime_collision_immediate_query_budget_ns;
+  d["runtime_collision_lookahead_query_budget_ns"] =
+      metrics.runtime_collision_lookahead_query_budget_ns;
+  d["runtime_collision_lookahead_horizon_ns"] =
+      metrics.runtime_collision_lookahead_horizon_ns;
+  d["runtime_collision_lookahead_max_samples"] =
+      metrics.runtime_collision_lookahead_max_samples;
+  d["runtime_collision_lookahead_workers_requested"] =
+      metrics.runtime_collision_lookahead_workers_requested;
+  d["runtime_collision_lookahead_workers_effective"] =
+      metrics.runtime_collision_lookahead_workers_effective;
+  d["runtime_collision_lookahead_armed"] =
+      metrics.runtime_collision_lookahead_armed;
+  d["runtime_collision_lookahead_job_active"] =
+      metrics.runtime_collision_lookahead_job_active;
+  d["runtime_collision_lookahead_permit_pending"] =
+      metrics.runtime_collision_lookahead_permit_pending;
+  d["runtime_collision_lookahead_execution_id"] =
+      metrics.runtime_collision_lookahead_execution_id;
+  d["runtime_collision_lookahead_execution_generation"] =
+      metrics.runtime_collision_lookahead_execution_generation;
+  d["runtime_collision_lookahead_cursor_valid"] =
+      metrics.runtime_collision_lookahead_cursor_valid;
+  d["runtime_collision_lookahead_cursor_source_kind"] =
+      metrics.runtime_collision_lookahead_cursor_source_kind;
+  d["runtime_collision_lookahead_cursor_authority_profile"] =
+      metrics.runtime_collision_lookahead_cursor_authority_profile;
+  d["runtime_collision_lookahead_cursor_age_ns"] =
+      metrics.runtime_collision_lookahead_cursor_age_ns;
+  d["runtime_collision_lookahead_jobs_started"] =
+      metrics.runtime_collision_lookahead_jobs_started;
+  d["runtime_collision_lookahead_jobs_clear"] =
+      metrics.runtime_collision_lookahead_jobs_clear;
+  d["runtime_collision_lookahead_jobs_collision"] =
+      metrics.runtime_collision_lookahead_jobs_collision;
+  d["runtime_collision_lookahead_jobs_inconclusive"] =
+      metrics.runtime_collision_lookahead_jobs_inconclusive;
+  d["runtime_collision_lookahead_jobs_query_timeout"] =
+      metrics.runtime_collision_lookahead_jobs_query_timeout;
+  d["runtime_collision_lookahead_jobs_cycle_timeout"] =
+      metrics.runtime_collision_lookahead_jobs_cycle_timeout;
+  d["runtime_collision_lookahead_jobs_superseded"] =
+      metrics.runtime_collision_lookahead_jobs_superseded;
+  d["runtime_collision_lookahead_reruns_coalesced"] =
+      metrics.runtime_collision_lookahead_reruns_coalesced;
+  d["runtime_collision_lookahead_clear_permits_invalidated"] =
+      metrics.runtime_collision_lookahead_clear_permits_invalidated;
+  d["runtime_collision_lookahead_clear_permit_try_lock_misses"] =
+      metrics.runtime_collision_lookahead_clear_permit_try_lock_misses;
+  d["runtime_collision_lookahead_stale_results"] =
+      metrics.runtime_collision_lookahead_stale_results;
+  d["runtime_collision_lookahead_last_cycle_duration_ns"] =
+      metrics.runtime_collision_lookahead_last_cycle_duration_ns;
+  d["runtime_collision_lookahead_max_cycle_duration_ns"] =
+      metrics.runtime_collision_lookahead_max_cycle_duration_ns;
+  d["runtime_collision_lookahead_last_worker_active_duration_ns"] =
+      metrics.runtime_collision_lookahead_last_worker_active_duration_ns;
+  d["runtime_collision_lookahead_max_worker_active_duration_ns"] =
+      metrics.runtime_collision_lookahead_max_worker_active_duration_ns;
+  d["runtime_collision_lookahead_max_start_jitter_ns"] =
+      metrics.runtime_collision_lookahead_max_start_jitter_ns;
+  d["runtime_collision_lookahead_last_inter_job_gap_ns"] =
+      metrics.runtime_collision_lookahead_last_inter_job_gap_ns;
+  d["runtime_collision_lookahead_active_time_total_ns"] =
+      metrics.runtime_collision_lookahead_active_time_total_ns;
+  d["runtime_collision_lookahead_duty_window_ns"] =
+      metrics.runtime_collision_lookahead_duty_window_ns;
+  d["runtime_collision_lookahead_duty_cycle_ppm"] =
+      metrics.runtime_collision_lookahead_duty_cycle_ppm;
+  d["runtime_collision_lookahead_last_cursor_time_ns"] =
+      metrics.runtime_collision_lookahead_last_cursor_time_ns;
+  d["runtime_collision_lookahead_last_covered_until_time_ns"] =
+      metrics.runtime_collision_lookahead_last_covered_until_time_ns;
+  d["runtime_collision_lookahead_last_checked_samples"] =
+      metrics.runtime_collision_lookahead_last_checked_samples;
+  d["runtime_collision_lookahead_last_eligible_source_waypoints"] =
+      metrics.runtime_collision_lookahead_last_eligible_source_waypoints;
+  d["runtime_collision_lookahead_last_sampling_reduced"] =
+      metrics.runtime_collision_lookahead_last_sampling_reduced;
+  d["runtime_collision_lookahead_last_sample_times_ns"] =
+      metrics.runtime_collision_lookahead_last_sample_times_ns;
+  d["runtime_collision_lookahead_last_workers_used"] =
+      metrics.runtime_collision_lookahead_last_workers_used;
+  d["runtime_collision_lookahead_last_termination"] =
+      metrics.runtime_collision_lookahead_last_termination;
   d["snapshots_published"] = metrics.snapshots_published;
   d["event_subscriber_exceptions"] = metrics.event_subscriber_exceptions;
   d["observer_lag_max_ns"] = metrics.observer_lag_max_ns;
@@ -1766,7 +1872,8 @@ std::optional<double> optional_positive_normal_from_python(
 
 [[maybe_unused]] std::size_t size_t_from_python(const py::handle& value,
                                                 const char* field_name) {
-  if (!py::isinstance<py::int_>(value)) {
+  if (py::isinstance<py::bool_>(value) ||
+      !py::isinstance<py::int_>(value)) {
     throw std::invalid_argument(std::string(field_name) + " must be an integer");
   }
   std::int64_t parsed = 0;
@@ -2084,6 +2191,15 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
   }
 
   py::dict config_dict = config_obj.cast<py::dict>();
+  for (const auto* removed_key : {"runtime_collision_lookahead_period_ns",
+                                  "runtime_collision_lookahead_max_waypoints",
+                                  "runtime_collision_query_timeout_ns"}) {
+    if (config_dict.contains(removed_key)) {
+      throw std::invalid_argument(std::string(removed_key) +
+                                  " was removed by RT-8C.3; use the split "
+                                  "cycle/sample/query budget fields");
+    }
+  }
   auto read_seconds = [&](const char* s_key, const char* ms_key,
                           double current) {
     if (config_dict.contains(s_key)) {
@@ -2105,16 +2221,72 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
     config.collision_monitor_period_ns =
         static_cast<int64_t>(period_ns);
   }
-  if (config_dict.contains("runtime_collision_query_timeout_ns")) {
+  if (config_dict.contains("runtime_collision_lookahead_cycle_budget_ns")) {
+    const double period_ns = finite_scale_from_python(
+        config_dict["runtime_collision_lookahead_cycle_budget_ns"],
+        "runtime_collision_lookahead_cycle_budget_ns");
+    if (period_ns <= 0.0) {
+      throw std::invalid_argument(
+          "runtime_collision_lookahead_cycle_budget_ns must be > 0");
+    }
+    config.runtime_collision_lookahead_cycle_budget_ns =
+        static_cast<int64_t>(period_ns);
+  }
+  if (config_dict.contains("runtime_collision_lookahead_horizon_ns")) {
+    const double horizon_ns = finite_scale_from_python(
+        config_dict["runtime_collision_lookahead_horizon_ns"],
+        "runtime_collision_lookahead_horizon_ns");
+    if (horizon_ns <= 0.0) {
+      throw std::invalid_argument(
+          "runtime_collision_lookahead_horizon_ns must be > 0");
+    }
+    config.runtime_collision_lookahead_horizon_ns =
+        static_cast<int64_t>(horizon_ns);
+  }
+  if (config_dict.contains(
+          "runtime_collision_lookahead_max_samples")) {
+    const auto max_waypoints = size_t_from_python(
+        config_dict["runtime_collision_lookahead_max_samples"],
+        "runtime_collision_lookahead_max_samples");
+    if (max_waypoints < 2 || max_waypoints > 4096) {
+      throw std::invalid_argument(
+          "runtime_collision_lookahead_max_samples must be in [2, 4096]");
+    }
+    config.runtime_collision_lookahead_max_samples = max_waypoints;
+  }
+  if (config_dict.contains("runtime_collision_lookahead_workers")) {
+    const auto workers = size_t_from_python(
+        config_dict["runtime_collision_lookahead_workers"],
+        "runtime_collision_lookahead_workers");
+    if (workers < 1 || workers > 64) {
+      throw std::invalid_argument(
+          "runtime_collision_lookahead_workers must be in [1, 64]");
+    }
+    config.runtime_collision_lookahead_workers =
+        static_cast<int>(workers);
+    config.runtime_collision_lookahead_workers_declared = true;
+  }
+  if (config_dict.contains("runtime_collision_immediate_query_budget_ns")) {
     const double timeout_ns =
-        finite_scale_from_python(config_dict["runtime_collision_query_timeout_ns"],
-                                 "runtime_collision_query_timeout_ns");
+        finite_scale_from_python(config_dict["runtime_collision_immediate_query_budget_ns"],
+                                 "runtime_collision_immediate_query_budget_ns");
     if (timeout_ns <= 0.0) {
       throw std::invalid_argument(
-          "runtime_collision_query_timeout_ns must be > 0");
+          "runtime_collision_immediate_query_budget_ns must be > 0");
     }
-    config.runtime_collision_query_timeout_ns =
+    config.runtime_collision_immediate_query_budget_ns =
         static_cast<int64_t>(timeout_ns);
+  }
+  if (config_dict.contains("runtime_collision_lookahead_query_budget_ns")) {
+    const double budget_ns = finite_scale_from_python(
+        config_dict["runtime_collision_lookahead_query_budget_ns"],
+        "runtime_collision_lookahead_query_budget_ns");
+    if (budget_ns <= 0.0) {
+      throw std::invalid_argument(
+          "runtime_collision_lookahead_query_budget_ns must be > 0");
+    }
+    config.runtime_collision_lookahead_query_budget_ns =
+        static_cast<int64_t>(budget_ns);
   }
   if (config_dict.contains("runtime_observed_state_max_age_ns")) {
     const double max_age_ns = finite_scale_from_python(
@@ -2178,6 +2350,17 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
     }
     config.validation_collision_wall_timeout_ns =
         static_cast<int64_t>(timeout_ns);
+  }
+  if (config_dict.contains("validation_collision_workers")) {
+    const auto workers = size_t_from_python(
+        config_dict["validation_collision_workers"],
+        "validation_collision_workers");
+    if (workers < 1 || workers > 64) {
+      throw std::invalid_argument(
+          "validation_collision_workers must be in [1, 64]");
+    }
+    config.validation_collision_workers = static_cast<int>(workers);
+    config.validation_collision_workers_declared = true;
   }
   if (config_dict.contains("runtime_dynamic_body_max_age_cap_ns")) {
     const double cap_ns = finite_scale_from_python(

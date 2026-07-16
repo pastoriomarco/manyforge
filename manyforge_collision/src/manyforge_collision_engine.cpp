@@ -2,6 +2,7 @@
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -201,6 +202,7 @@ bool supported_required_capability(const std::string& capability,
 bool timeout_budget_covers_snapshot_sync(core::CollisionSurface surface) {
   switch (surface) {
     case core::CollisionSurface::kObservedRuntimeMonitor:
+    case core::CollisionSurface::kObservedRuntimeLookahead:
       return false;
     default:
       return true;
@@ -581,18 +583,53 @@ std::map<std::string, core::CollisionBodyId> build_raw_to_body_map(
 
 }  // namespace
 
-ManyForgeCollisionEngine::ManyForgeCollisionEngine(
+struct ManyForgeCollisionEngine::SharedModel {
+  std::string model_name;
+  pinocchio::Model model;
+  pinocchio::GeometryModel base_collision_model;
+  std::vector<std::filesystem::path> package_paths;
+  std::vector<std::string> group_joint_names;
+  std::string group_name;
+};
+
+struct ManyForgeCollisionEngine::PreparedScene {
+  struct RuntimePairBinding {
+    bool mapped = false;
+    core::CollisionPairId pair;
+  };
+
+  core::CollisionWorldRevision revision;
+  pinocchio::GeometryModel collision_model;
+  std::vector<std::string> scene_geometry_names;
+  std::map<std::string, core::CollisionBodyId> raw_name_to_body_id;
+  std::map<std::string, core::CollisionBodyId> raw_to_body_map;
+  std::vector<RuntimePairBinding> runtime_pair_bindings;
+};
+
+struct ManyForgeCollisionEngine::SharedSceneCache {
+  explicit SharedSceneCache(SharedModelPtr model)
+      : shared_model(std::move(model)) {}
+
+  SharedModelPtr shared_model;
+  std::atomic<std::shared_ptr<const PreparedScene>> latest;
+  std::atomic<std::uint64_t> build_count{0};
+  std::mutex mesh_cache_mutex;
+  std::map<std::string, std::shared_ptr<coal::CollisionGeometry>>
+      mesh_geometry_cache;
+};
+
+ManyForgeCollisionEngine::SharedModelPtr
+ManyForgeCollisionEngine::load_shared_model(
     const std::string& model_name,
     const std::filesystem::path& urdf_path,
     const std::filesystem::path& srdf_path,
     const std::vector<std::filesystem::path>& package_paths,
-    std::string group_name)
-    : group_name_(std::move(group_name)),
-      engine_id_("manyforge_collision/" + model_name),
-      engine_version_(MANYFORGE_COLLISION_ENGINE_VERSION) {
-  package_paths_ = package_paths;
-  pinocchio::urdf::buildModel(urdf_path.string(),
-                              model_,
+    std::string group_name) {
+  auto shared = std::make_shared<SharedModel>();
+  shared->model_name = model_name;
+  shared->package_paths = package_paths;
+  shared->group_name = std::move(group_name);
+  pinocchio::urdf::buildModel(urdf_path.string(), shared->model,
                               /*verbose=*/false,
                               /*mimic=*/true);
   std::vector<std::string> package_path_strings;
@@ -600,20 +637,57 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
   for (const auto& path : package_paths) {
     package_path_strings.push_back(path.string());
   }
-  pinocchio::urdf::buildGeom(model_,
-                             urdf_path.string(),
+  pinocchio::urdf::buildGeom(shared->model, urdf_path.string(),
                              pinocchio::COLLISION,
-                             base_collision_model_,
+                             shared->base_collision_model,
                              package_path_strings);
   if (!srdf_path.empty() && std::filesystem::exists(srdf_path)) {
-    pinocchio::srdf::removeCollisionPairs(model_,
-                                          base_collision_model_,
-                                          srdf_path.string(),
-                                          false);
+    pinocchio::srdf::removeCollisionPairs(shared->model,
+                                          shared->base_collision_model,
+                                          srdf_path.string(), false);
   }
-  group_joint_names_ =
-      group_joint_names_from_srdf(srdf_path, urdf_path, group_name_);
-  reusable_model_data_.emplace(model_);
+  shared->group_joint_names =
+      group_joint_names_from_srdf(srdf_path, urdf_path, shared->group_name);
+  return shared;
+}
+
+ManyForgeCollisionEngine::SharedSceneCachePtr
+ManyForgeCollisionEngine::make_shared_scene_cache(SharedModelPtr shared_model) {
+  if (!shared_model) {
+    throw std::invalid_argument("collision scene cache requires a shared model");
+  }
+  return std::make_shared<SharedSceneCache>(std::move(shared_model));
+}
+
+ManyForgeCollisionEngine::ManyForgeCollisionEngine(
+    const std::string& model_name,
+    const std::filesystem::path& urdf_path,
+    const std::filesystem::path& srdf_path,
+    const std::vector<std::filesystem::path>& package_paths,
+    std::string group_name)
+    : ManyForgeCollisionEngine(
+          load_shared_model(model_name, urdf_path, srdf_path, package_paths,
+                            std::move(group_name)),
+          nullptr) {}
+
+ManyForgeCollisionEngine::ManyForgeCollisionEngine(
+    SharedModelPtr shared_model, SharedSceneCachePtr scene_cache)
+    : shared_model_(std::move(shared_model)),
+      scene_cache_(std::move(scene_cache)),
+      engine_id_(shared_model_ ? "manyforge_collision/" + shared_model_->model_name
+                               : "manyforge_collision/invalid"),
+      engine_version_(MANYFORGE_COLLISION_ENGINE_VERSION) {
+  if (!shared_model_) {
+    throw std::invalid_argument("collision engine requires a shared model");
+  }
+  if (!scene_cache_) {
+    scene_cache_ = make_shared_scene_cache(shared_model_);
+  }
+  if (scene_cache_->shared_model.get() != shared_model_.get()) {
+    throw std::invalid_argument(
+        "collision engine scene cache belongs to a different shared model");
+  }
+  reusable_model_data_.emplace(shared_model_->model);
 
   capability_.engine_id = engine_id_;
   capability_.engine_version = engine_version_;
@@ -647,6 +721,23 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
       "continuous_collision"};
 }
 
+const void* ManyForgeCollisionEngine::internal_model_identity() const {
+  return static_cast<const void*>(shared_model_.get());
+}
+
+const void* ManyForgeCollisionEngine::internal_scene_cache_identity() const {
+  return static_cast<const void*>(scene_cache_.get());
+}
+
+const void* ManyForgeCollisionEngine::internal_prepared_scene_identity() const {
+  std::lock_guard<std::mutex> lock(scene_mutex_);
+  return static_cast<const void*>(active_prepared_scene_.get());
+}
+
+std::uint64_t ManyForgeCollisionEngine::internal_prepared_scene_build_count() const {
+  return scene_cache_->build_count.load(std::memory_order_acquire);
+}
+
 core::RuntimeCollisionQueryPrepareStatus
 ManyForgeCollisionEngine::prepare_runtime_query(
     std::span<const std::string> canonical_joint_names) noexcept {
@@ -661,17 +752,18 @@ ManyForgeCollisionEngine::prepare_runtime_query(
     runtime_joint_q_indices_.clear();
     runtime_joint_q_indices_.reserve(canonical_joint_names.size());
     for (const auto& joint_name : canonical_joint_names) {
-      if (!model_.existJointName(joint_name)) {
+      if (!shared_model_->model.existJointName(joint_name)) {
         runtime_query_prepared_ = false;
         return core::RuntimeCollisionQueryPrepareStatus::kInvalidJointOrder;
       }
-      const auto joint_id = model_.getJointId(joint_name);
-      if (joint_id >= model_.idx_qs.size() || joint_id >= model_.nqs.size() ||
-          model_.nqs[joint_id] != 1) {
+      const auto joint_id = shared_model_->model.getJointId(joint_name);
+      if (joint_id >= shared_model_->model.idx_qs.size() ||
+          joint_id >= shared_model_->model.nqs.size() ||
+          shared_model_->model.nqs[joint_id] != 1) {
         runtime_query_prepared_ = false;
         return core::RuntimeCollisionQueryPrepareStatus::kInvalidJointOrder;
       }
-      const auto q_index = model_.idx_qs[joint_id];
+      const auto q_index = shared_model_->model.idx_qs[joint_id];
       if (std::find(runtime_joint_q_indices_.begin(),
                     runtime_joint_q_indices_.end(), q_index) !=
           runtime_joint_q_indices_.end()) {
@@ -681,7 +773,8 @@ ManyForgeCollisionEngine::prepare_runtime_query(
       runtime_joint_q_indices_.push_back(q_index);
     }
     runtime_query_is_full_configuration_ =
-        static_cast<Eigen::Index>(canonical_joint_names.size()) == model_.nq;
+        static_cast<Eigen::Index>(canonical_joint_names.size()) ==
+        shared_model_->model.nq;
     if (runtime_query_is_full_configuration_) {
       for (std::size_t i = 0; i < runtime_joint_q_indices_.size(); ++i) {
         if (runtime_joint_q_indices_[i] != i) {
@@ -690,7 +783,7 @@ ManyForgeCollisionEngine::prepare_runtime_query(
         }
       }
     }
-    runtime_q_neutral_ = pinocchio::neutral(model_);
+    runtime_q_neutral_ = pinocchio::neutral(shared_model_->model);
     runtime_q_scratch_ = runtime_q_neutral_;
     runtime_query_prepared_ = true;
     return core::RuntimeCollisionQueryPrepareStatus::kReady;
@@ -775,7 +868,7 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
     }
     const std::size_t expected_positions =
         runtime_query_is_full_configuration_
-            ? static_cast<std::size_t>(model_.nq)
+            ? static_cast<std::size_t>(shared_model_->model.nq)
             : runtime_joint_q_indices_.size();
     if (request.positions_rad.size() != expected_positions) {
       return finish(
@@ -798,14 +891,15 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
           core::RuntimeCollisionQueryFailureReason::kSnapshotSyncFailed,
           core::CollisionEngineStatus::kDiagnosticIncomplete);
     }
-    if (!active_collision_model_ || !active_collision_data_ ||
-        runtime_pair_bindings_.size() !=
-            active_collision_model_->collisionPairs.size() ||
+    const auto prepared_scene = active_prepared_scene_;
+    if (!prepared_scene || !active_collision_data_ ||
+        prepared_scene->runtime_pair_bindings.size() !=
+            prepared_scene->collision_model.collisionPairs.size() ||
         active_collision_data_->collisionResults.size() !=
-            active_collision_model_->collisionPairs.size() ||
+            prepared_scene->collision_model.collisionPairs.size() ||
         (request.require_distance &&
          active_collision_data_->distanceResults.size() !=
-             active_collision_model_->collisionPairs.size())) {
+             prepared_scene->collision_model.collisionPairs.size())) {
       return finish(
           core::RuntimeCollisionQueryStatus::kInconclusive,
           core::RuntimeCollisionQueryFailureReason::kSnapshotInvalid,
@@ -826,19 +920,21 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
     }
 
     const bool in_collision = pinocchio::computeCollisions(
-        model_, *reusable_model_data_, *active_collision_model_,
+        shared_model_->model, *reusable_model_data_,
+        prepared_scene->collision_model,
         *active_collision_data_, runtime_q_scratch_,
         /*stop_at_first_collision=*/false);
     if (request.require_distance) {
       for (auto& distance_request : active_collision_data_->distanceRequests) {
         distance_request.enable_signed_distance = true;
       }
-      pinocchio::computeDistances(model_, *reusable_model_data_,
-                                  *active_collision_model_,
+      pinocchio::computeDistances(shared_model_->model, *reusable_model_data_,
+                                  prepared_scene->collision_model,
                                   *active_collision_data_, runtime_q_scratch_);
     }
 
-    const auto pair_count = active_collision_model_->collisionPairs.size();
+    const auto pair_count =
+        prepared_scene->collision_model.collisionPairs.size();
     if (runtime_collision_observations_.capacity() < pair_count ||
         (request.require_distance &&
          runtime_clearance_observations_.capacity() < pair_count)) {
@@ -848,8 +944,8 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
           core::CollisionEngineStatus::kDiagnosticIncomplete);
     }
     for (std::size_t i = 0; i < pair_count; ++i) {
-      if (i >= runtime_pair_bindings_.size() ||
-          !runtime_pair_bindings_[i].mapped) {
+      if (i >= prepared_scene->runtime_pair_bindings.size() ||
+          !prepared_scene->runtime_pair_bindings[i].mapped) {
         if (active_collision_data_->collisionResults[i].isCollision()) {
           return finish(
               core::RuntimeCollisionQueryStatus::kInconclusive,
@@ -858,7 +954,8 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
         }
         continue;
       }
-      const auto* pair = &runtime_pair_bindings_[i].pair;
+      const auto* pair =
+          &prepared_scene->runtime_pair_bindings[i].pair;
       std::optional<double> clearance;
       if (request.require_distance &&
           i < active_collision_data_->distanceResults.size()) {
@@ -1010,10 +1107,10 @@ core::CollisionResult ManyForgeCollisionEngine::check(
     result.raw_diagnostics["total_call_duration_ns"] =
         std::to_string(total_call_duration_ns);
     // Offline validation treats snapshot ingestion as part of the blocking
-    // validation call. Observed runtime monitors have a different contract:
-    // the per-tick query budget measures the already-synchronized collision
-    // query, while scene freshness is monitored separately by the publisher /
-    // monitor cadence. Counting cold snapshot ingestion as a collision-query
+    // validation call. Observed runtime surfaces have a different contract:
+    // the per-state budget measures the already-synchronized collision query,
+    // while each owning session independently bounds the complete tick/job and
+    // verifies scene freshness. Counting cold snapshot ingestion as a query
     // timeout causes false runtime interrupts when a live object publishes a
     // new revision with no robot collision.
     if (timeout_budget_covers_snapshot_sync(query.surface)) {
@@ -1090,6 +1187,7 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
   }
 
   try {
+    const auto prepared_scene = active_prepared_scene_;
     std::string q_error;
     auto q_opt = full_configuration_from_query(query, q_error);
     if (!q_opt) {
@@ -1110,7 +1208,7 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
                   "penetration_depth") != query.required_capabilities.end();
 
     if (snapshot != nullptr) {
-      if (!active_collision_model_ || !active_collision_data_) {
+      if (!prepared_scene || !active_collision_data_) {
         finish_with_duration();
         result.engine_status =
             core::CollisionEngineStatus::kDiagnosticIncomplete;
@@ -1120,9 +1218,9 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
         return result;
       }
       result.in_collision =
-          pinocchio::computeCollisions(model_,
+          pinocchio::computeCollisions(shared_model_->model,
                                        *reusable_model_data_,
-                                       *active_collision_model_,
+                                       prepared_scene->collision_model,
                                        *active_collision_data_,
                                        q,
                                        /* stop_at_first_collision */ !needs_distance);
@@ -1130,9 +1228,9 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
         for (auto& request : active_collision_data_->distanceRequests) {
           request.enable_signed_distance = true;
         }
-        pinocchio::computeDistances(model_,
+        pinocchio::computeDistances(shared_model_->model,
                                     *reusable_model_data_,
-                                    *active_collision_model_,
+                                    prepared_scene->collision_model,
                                     *active_collision_data_,
                                     q);
       }
@@ -1151,22 +1249,22 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
       result.raw_diagnostics["cancel_reason"] = cancel->reason();
       return result;
     }
-    const auto& raw_to_body = synced_raw_to_body_map_;
+    const auto& raw_to_body = prepared_scene->raw_to_body_map;
     if (result.in_collision) {
       std::vector<std::pair<std::string, std::string>> raw_pairs;
       if (snapshot != nullptr) {
         if (!needs_distance) {
           // Re-run without early-exit to enumerate ALL colliding pairs for
           // diagnostics — same reusable scratch, no second Data build.
-          pinocchio::computeCollisions(model_,
+          pinocchio::computeCollisions(shared_model_->model,
                                        *reusable_model_data_,
-                                       *active_collision_model_,
+                                       prepared_scene->collision_model,
                                        *active_collision_data_,
                                        q,
                                        /* stop_at_first_collision */ false);
         }
-        raw_pairs = collision_pairs_from_geometry_data(*active_collision_model_,
-                                                       *active_collision_data_);
+        raw_pairs = collision_pairs_from_geometry_data(
+            prepared_scene->collision_model, *active_collision_data_);
       } else {
         raw_pairs = {};
       }
@@ -1215,22 +1313,26 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
     if (needs_distance) {
       bool any_unknown_distance = false;
       std::map<core::CollisionPairId, double> min_clearance_by_pair;
-      const auto pair_count = std::min(active_collision_model_->collisionPairs.size(),
-                                       active_collision_data_->distanceResults.size());
+      const auto pair_count = std::min(
+          prepared_scene->collision_model.collisionPairs.size(),
+          active_collision_data_->distanceResults.size());
       for (std::size_t pair_index = 0; pair_index < pair_count; ++pair_index) {
         if (pair_index >= active_collision_data_->activeCollisionPairs.size() ||
             !active_collision_data_->activeCollisionPairs[pair_index]) {
           continue;
         }
-        const auto& pair = active_collision_model_->collisionPairs[pair_index];
-        if (pair.first >= active_collision_model_->geometryObjects.size() ||
-            pair.second >= active_collision_model_->geometryObjects.size()) {
+        const auto& pair =
+            prepared_scene->collision_model.collisionPairs[pair_index];
+        if (pair.first >=
+                prepared_scene->collision_model.geometryObjects.size() ||
+            pair.second >=
+                prepared_scene->collision_model.geometryObjects.size()) {
           continue;
         }
         const auto raw_a =
-            active_collision_model_->geometryObjects[pair.first].name;
+            prepared_scene->collision_model.geometryObjects[pair.first].name;
         const auto raw_b =
-            active_collision_model_->geometryObjects[pair.second].name;
+            prepared_scene->collision_model.geometryObjects[pair.second].name;
         auto a = raw_to_body.find(raw_a);
         auto b = raw_to_body.find(raw_b);
         if (a == raw_to_body.end() || b == raw_to_body.end()) {
@@ -1308,32 +1410,32 @@ ManyForgeCollisionEngine::full_configuration_from_query(
     error = "robot_state.positions_rad is empty";
     return std::nullopt;
   }
-  if (static_cast<Eigen::Index>(positions.size()) == model_.nq) {
-    Eigen::VectorXd q(model_.nq);
+  if (static_cast<Eigen::Index>(positions.size()) == shared_model_->model.nq) {
+    Eigen::VectorXd q(shared_model_->model.nq);
     for (std::size_t i = 0; i < positions.size(); ++i) {
       q(static_cast<Eigen::Index>(i)) = positions[i];
     }
     return q;
   }
 
-  Eigen::VectorXd q = pinocchio::neutral(model_);
+  Eigen::VectorXd q = pinocchio::neutral(shared_model_->model);
   auto fill_joint = [&](const std::string& joint_name,
                         double value) -> bool {
-    if (!model_.existJointName(joint_name)) {
+    if (!shared_model_->model.existJointName(joint_name)) {
       error = "joint not present in model: " + joint_name;
       return false;
     }
-    const auto joint_id = model_.getJointId(joint_name);
-    if (joint_id >= model_.idx_qs.size() ||
-        joint_id >= model_.nqs.size()) {
+    const auto joint_id = shared_model_->model.getJointId(joint_name);
+    if (joint_id >= shared_model_->model.idx_qs.size() ||
+        joint_id >= shared_model_->model.nqs.size()) {
       error = "joint index out of range for: " + joint_name;
       return false;
     }
-    if (model_.nqs[joint_id] != 1) {
+    if (shared_model_->model.nqs[joint_id] != 1) {
       error = "joint is not scalar in current primitive profile: " + joint_name;
       return false;
     }
-    q(model_.idx_qs[joint_id]) = value;
+    q(shared_model_->model.idx_qs[joint_id]) = value;
     return true;
   };
 
@@ -1346,9 +1448,9 @@ ManyForgeCollisionEngine::full_configuration_from_query(
     return q;
   }
 
-  if (group_joint_names_.size() == positions.size()) {
+  if (shared_model_->group_joint_names.size() == positions.size()) {
     for (std::size_t i = 0; i < positions.size(); ++i) {
-      if (!fill_joint(group_joint_names_[i], positions[i])) {
+      if (!fill_joint(shared_model_->group_joint_names[i], positions[i])) {
         return std::nullopt;
       }
     }
@@ -1356,25 +1458,44 @@ ManyForgeCollisionEngine::full_configuration_from_query(
   }
 
   error = "robot_state.positions_rad size " + std::to_string(positions.size()) +
-          " does not match model.nq " + std::to_string(model_.nq) +
-          ", robot_state.joint_names, or SRDF group '" + group_name_ + "'";
+          " does not match model.nq " + std::to_string(shared_model_->model.nq) +
+          ", robot_state.joint_names, or SRDF group '" + shared_model_->group_name + "'";
   return std::nullopt;
 }
 
 std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
     const core::CollisionWorldSnapshot& snapshot, bool allow_resource_io) {
-  if (synced_snapshot_revision_ &&
-      synced_snapshot_revision_->revision_id == snapshot.revision.revision_id &&
-      synced_snapshot_revision_->content_hash == snapshot.revision.content_hash) {
+  const auto revision_matches = [&](const std::shared_ptr<const PreparedScene>& prepared) {
+    return prepared &&
+           prepared->revision.revision_id == snapshot.revision.revision_id &&
+           prepared->revision.content_hash == snapshot.revision.content_hash;
+  };
+  const auto bind_prepared_scene = [&](std::shared_ptr<const PreparedScene> prepared) {
+    active_prepared_scene_ = std::move(prepared);
+    active_collision_data_.emplace(active_prepared_scene_->collision_model);
+    runtime_collision_observations_.clear();
+    runtime_clearance_observations_.clear();
+    const auto pair_count =
+        active_prepared_scene_->collision_model.collisionPairs.size();
+    runtime_collision_observations_.reserve(pair_count);
+    runtime_clearance_observations_.reserve(pair_count);
+  };
+
+  if (revision_matches(active_prepared_scene_)) {
+    return std::nullopt;
+  }
+  if (auto cached = scene_cache_->latest.load(std::memory_order_acquire);
+      revision_matches(cached)) {
+    bind_prepared_scene(std::move(cached));
     return std::nullopt;
   }
 
-  synced_scene_geometry_names_.clear();
-  synced_raw_name_to_body_id_.clear();
-  synced_raw_to_body_map_.clear();
-  synced_snapshot_revision_.reset();
-  active_collision_model_.reset();
+  active_prepared_scene_.reset();
   active_collision_data_.reset();
+  runtime_collision_observations_.clear();
+  runtime_clearance_observations_.clear();
+  auto prepared = std::make_shared<PreparedScene>();
+  prepared->revision = snapshot.revision;
 
   std::map<std::string, std::map<int, core::CollisionBodyId>>
       robot_ids_by_link_index;
@@ -1396,11 +1517,11 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
 
   std::map<std::string, core::CollisionBodyId> builtin_raw_to_body_id;
   std::map<std::string, int> next_collision_index_by_link;
-  for (const auto& geometry_object : base_collision_model_.geometryObjects) {
-    if (geometry_object.parentFrame >= model_.frames.size()) {
+  for (const auto& geometry_object : shared_model_->base_collision_model.geometryObjects) {
+    if (geometry_object.parentFrame >= shared_model_->model.frames.size()) {
       continue;
     }
-    const auto link_name = model_.frames[geometry_object.parentFrame].name;
+    const auto link_name = shared_model_->model.frames[geometry_object.parentFrame].name;
     const int collision_index = next_collision_index_by_link[link_name]++;
     auto link_it = robot_ids_by_link_index.find(link_name);
     if (link_it == robot_ids_by_link_index.end()) {
@@ -1414,15 +1535,15 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
   }
 
   std::set<std::pair<std::string, std::string>> active_robot_body_pairs;
-  for (const auto& pair : base_collision_model_.collisionPairs) {
-    if (pair.first >= base_collision_model_.geometryObjects.size() ||
-        pair.second >= base_collision_model_.geometryObjects.size()) {
+  for (const auto& pair : shared_model_->base_collision_model.collisionPairs) {
+    if (pair.first >= shared_model_->base_collision_model.geometryObjects.size() ||
+        pair.second >= shared_model_->base_collision_model.geometryObjects.size()) {
       continue;
     }
     auto a = builtin_raw_to_body_id.find(
-        base_collision_model_.geometryObjects[pair.first].name);
+        shared_model_->base_collision_model.geometryObjects[pair.first].name);
     auto b = builtin_raw_to_body_id.find(
-        base_collision_model_.geometryObjects[pair.second].name);
+        shared_model_->base_collision_model.geometryObjects[pair.second].name);
     if (a == builtin_raw_to_body_id.end() ||
         b == builtin_raw_to_body_id.end()) {
       continue;
@@ -1430,21 +1551,20 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
     active_robot_body_pairs.insert(canonical_pair(a->second, b->second));
   }
 
-  active_collision_model_.emplace();
   pinocchio::SE3 model_from_world = pinocchio::SE3::Identity();
   if (snapshot.robot_model_frames.size() > 1) {
     return "manyforge_collision currently supports one robot_model_frame per snapshot";
   }
   if (!snapshot.robot_model_frames.empty()) {
     const auto& frame = snapshot.robot_model_frames.front();
-    if (!model_.existFrame(frame.model_frame_id)) {
+    if (!shared_model_->model.existFrame(frame.model_frame_id)) {
       return "robot_model_frame model_frame_id not present in engine model: " +
              frame.model_frame_id;
     }
-    pinocchio::Data neutral_data(model_);
-    const Eigen::VectorXd q_neutral = pinocchio::neutral(model_);
-    pinocchio::framesForwardKinematics(model_, neutral_data, q_neutral);
-    const auto frame_id = model_.getFrameId(frame.model_frame_id);
+    pinocchio::Data neutral_data(shared_model_->model);
+    const Eigen::VectorXd q_neutral = pinocchio::neutral(shared_model_->model);
+    pinocchio::framesForwardKinematics(shared_model_->model, neutral_data, q_neutral);
+    const auto frame_id = shared_model_->model.getFrameId(frame.model_frame_id);
     if (frame_id >= neutral_data.oMf.size()) {
       return "robot_model_frame frame index out of range: " +
              frame.model_frame_id;
@@ -1516,34 +1636,38 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
                  body.body_id;
         }
         const auto cache_key = mesh_cache_key(*geom.source_uri, scale);
-        auto cached = prepared_mesh_geometry_cache_.find(cache_key);
-        if (cached != prepared_mesh_geometry_cache_.end()) {
-          shape = cached->second;
-          break;
+        {
+          std::lock_guard<std::mutex> cache_lock(
+              scene_cache_->mesh_cache_mutex);
+          auto cached = scene_cache_->mesh_geometry_cache.find(cache_key);
+          if (cached != scene_cache_->mesh_geometry_cache.end()) {
+            shape = cached->second;
+          } else {
+            if (!allow_resource_io) {
+              return "runtime snapshot references an unprepared triangle mesh: " +
+                     body.body_id;
+            }
+            if (scene_cache_->mesh_geometry_cache.size() >=
+                capability_.runtime_query_max_world_bodies) {
+              return "prepared triangle-mesh cache exceeds qualified body bound";
+            }
+            std::string mesh_error;
+            auto mesh_path = resolve_mesh_resource_uri(
+                *geom.source_uri, shared_model_->package_paths, mesh_error);
+            if (!mesh_path) {
+              return "triangle mesh geometry could not resolve source_uri for " +
+                     body.body_id + ": " + mesh_error;
+            }
+            coal::MeshLoader loader;
+            auto mesh = loader.load(mesh_path->string(), scale);
+            if (!mesh) {
+              return "triangle mesh loader returned null for " + body.body_id +
+                     ": " + mesh_path->string();
+            }
+            shape = std::move(mesh);
+            scene_cache_->mesh_geometry_cache[cache_key] = shape;
+          }
         }
-        if (!allow_resource_io) {
-          return "runtime snapshot references an unprepared triangle mesh: " +
-                 body.body_id;
-        }
-        if (prepared_mesh_geometry_cache_.size() >=
-            capability_.runtime_query_max_world_bodies) {
-          return "prepared triangle-mesh cache exceeds qualified body bound";
-        }
-        std::string mesh_error;
-        auto mesh_path = resolve_mesh_resource_uri(
-            *geom.source_uri, package_paths_, mesh_error);
-        if (!mesh_path) {
-          return "triangle mesh geometry could not resolve source_uri for " +
-                 body.body_id + ": " + mesh_error;
-        }
-        coal::MeshLoader loader;
-        auto mesh = loader.load(mesh_path->string(), scale);
-        if (!mesh) {
-          return "triangle mesh loader returned null for " + body.body_id +
-                 ": " + mesh_path->string();
-        }
-        shape = mesh;
-        prepared_mesh_geometry_cache_[cache_key] = mesh;
         break;
       }
       case core::CollisionGeometryKind::kCapsule:
@@ -1555,12 +1679,12 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
 
     std::optional<pinocchio::GeometryObject> object;
     if (target_frame != "universe") {
-      if (!model_.existFrame(target_frame)) {
+      if (!shared_model_->model.existFrame(target_frame)) {
         return "target frame not present in model: " + target_frame +
                " for body " + body.body_id;
       }
-      const auto frame_id = model_.getFrameId(target_frame);
-      const auto& frame = model_.frames[frame_id];
+      const auto frame_id = shared_model_->model.getFrameId(target_frame);
+      const auto& frame = shared_model_->model.frames[frame_id];
       const auto frame_relative_placement =
           body.owner_kind == core::CollisionOwnerKind::kRobotLink
               ? pose_to_se3(geom.local_pose)
@@ -1580,42 +1704,42 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
                      body_geometry_in_model,
                      shape);
     }
-    active_collision_model_->addGeometryObject(*object, model_);
-    synced_scene_geometry_names_.push_back(raw_name);
-    synced_raw_name_to_body_id_[raw_name] = body.body_id;
+    prepared->collision_model.addGeometryObject(*object, shared_model_->model);
+    prepared->scene_geometry_names.push_back(raw_name);
+    prepared->raw_name_to_body_id[raw_name] = body.body_id;
   }
 
   std::map<std::string, std::size_t> synced_index_by_name;
-  for (std::size_t i = 0; i < active_collision_model_->geometryObjects.size();
+  for (std::size_t i = 0; i < prepared->collision_model.geometryObjects.size();
        ++i) {
-    const auto& name = active_collision_model_->geometryObjects[i].name;
-    if (synced_raw_name_to_body_id_.count(name) > 0) {
+    const auto& name = prepared->collision_model.geometryObjects[i].name;
+    if (prepared->raw_name_to_body_id.count(name) > 0) {
       synced_index_by_name[name] = i;
     }
   }
   std::set<std::pair<std::size_t, std::size_t>> active_pair_indices;
-  for (const auto& pair : active_collision_model_->collisionPairs) {
+  for (const auto& pair : prepared->collision_model.collisionPairs) {
     const auto first = std::min(pair.first, pair.second);
     const auto second = std::max(pair.first, pair.second);
     active_pair_indices.insert({first, second});
   }
   for (auto it_a = synced_index_by_name.begin();
        it_a != synced_index_by_name.end(); ++it_a) {
-    auto body_a = synced_raw_name_to_body_id_.find(it_a->first);
-    if (body_a == synced_raw_name_to_body_id_.end()) {
+    auto body_a = prepared->raw_name_to_body_id.find(it_a->first);
+    if (body_a == prepared->raw_name_to_body_id.end()) {
       continue;
     }
     auto it_b = it_a;
     ++it_b;
     for (; it_b != synced_index_by_name.end(); ++it_b) {
-      auto body_b = synced_raw_name_to_body_id_.find(it_b->first);
-      if (body_b == synced_raw_name_to_body_id_.end()) {
+      auto body_b = prepared->raw_name_to_body_id.find(it_b->first);
+      if (body_b == prepared->raw_name_to_body_id.end()) {
         continue;
       }
       const bool a_motion_relevant =
-          body_is_motion_relevant(body_a->second, model_, group_joint_names_);
+          body_is_motion_relevant(body_a->second, shared_model_->model, shared_model_->group_joint_names);
       const bool b_motion_relevant =
-          body_is_motion_relevant(body_b->second, model_, group_joint_names_);
+          body_is_motion_relevant(body_b->second, shared_model_->model, shared_model_->group_joint_names);
       if (!a_motion_relevant && !b_motion_relevant) {
         continue;
       }
@@ -1636,65 +1760,78 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
           return "runtime collision-pair count exceeds qualified bound";
         }
         active_pair_indices.insert({first, second});
-        active_collision_model_->addCollisionPair(
+        prepared->collision_model.addCollisionPair(
             pinocchio::CollisionPair(first, second));
       }
     }
   }
-  active_collision_data_.emplace(*active_collision_model_);
 
   // Revision-stable: every input to this map was just rebuilt above, so
   // build it once here instead of re-parsing body ids on every check.
-  synced_raw_to_body_map_ = build_raw_to_body_map(model_,
-                                                  *active_collision_model_,
-                                                  snapshot,
-                                                  synced_scene_geometry_names_,
-                                                  synced_raw_name_to_body_id_);
+  prepared->raw_to_body_map = build_raw_to_body_map(
+      shared_model_->model, prepared->collision_model, snapshot,
+      prepared->scene_geometry_names, prepared->raw_name_to_body_id);
 
-  if (auto runtime_binding_error = rebuild_runtime_pair_bindings_locked()) {
-    return runtime_binding_error;
-  }
-
-  synced_snapshot_revision_ = snapshot.revision;
-  return std::nullopt;
-}
-
-std::optional<std::string>
-ManyForgeCollisionEngine::rebuild_runtime_pair_bindings_locked() {
-  runtime_pair_bindings_.clear();
-  runtime_collision_observations_.clear();
-  runtime_clearance_observations_.clear();
-  if (!active_collision_model_) {
-    return "runtime collision model is not initialized";
-  }
-  const auto pair_count = active_collision_model_->collisionPairs.size();
+  const auto pair_count = prepared->collision_model.collisionPairs.size();
   if (pair_count > capability_.runtime_query_max_collision_pairs) {
     return "runtime collision-pair count exceeds qualified bound";
   }
-  runtime_pair_bindings_.resize(pair_count);
-  runtime_collision_observations_.reserve(pair_count);
-  runtime_clearance_observations_.reserve(pair_count);
+  prepared->runtime_pair_bindings.resize(pair_count);
   for (std::size_t i = 0; i < pair_count; ++i) {
-    const auto& pair = active_collision_model_->collisionPairs[i];
-    if (pair.first >= active_collision_model_->geometryObjects.size() ||
-        pair.second >= active_collision_model_->geometryObjects.size()) {
+    const auto& pair = prepared->collision_model.collisionPairs[i];
+    if (pair.first >= prepared->collision_model.geometryObjects.size() ||
+        pair.second >= prepared->collision_model.geometryObjects.size()) {
       continue;
     }
-    const auto& raw_a = active_collision_model_->geometryObjects[pair.first].name;
-    const auto& raw_b = active_collision_model_->geometryObjects[pair.second].name;
-    const auto body_a = synced_raw_to_body_map_.find(raw_a);
-    const auto body_b = synced_raw_to_body_map_.find(raw_b);
-    if (body_a == synced_raw_to_body_map_.end() ||
-        body_b == synced_raw_to_body_map_.end()) {
+    const auto& raw_a =
+        prepared->collision_model.geometryObjects[pair.first].name;
+    const auto& raw_b =
+        prepared->collision_model.geometryObjects[pair.second].name;
+    const auto body_a = prepared->raw_to_body_map.find(raw_a);
+    const auto body_b = prepared->raw_to_body_map.find(raw_b);
+    if (body_a == prepared->raw_to_body_map.end() ||
+        body_b == prepared->raw_to_body_map.end()) {
       continue;
     }
-    auto& binding = runtime_pair_bindings_[i];
+    auto& binding = prepared->runtime_pair_bindings[i];
     binding.mapped = true;
     binding.pair = {body_a->second, body_b->second};
     if (binding.pair.body_b < binding.pair.body_a) {
       std::swap(binding.pair.body_a, binding.pair.body_b);
     }
   }
+
+  // Publish immutable preparation with monotonic revision ownership. Parallel
+  // cold misses may build equivalent candidates, but only one becomes the
+  // shared value. Publication itself is lock-free; mesh-resource reuse remains
+  // serialized only inside this NRT cache domain.
+  std::shared_ptr<const PreparedScene> selected = prepared;
+  auto observed = scene_cache_->latest.load(std::memory_order_acquire);
+  for (;;) {
+    if (revision_matches(observed)) {
+      selected = std::move(observed);
+      break;
+    }
+    if (observed &&
+        observed->revision.revision_id == snapshot.revision.revision_id &&
+        observed->revision.content_hash != snapshot.revision.content_hash) {
+      return "collision snapshot revision reused with different content hash";
+    }
+    if (observed &&
+        observed->revision.revision_id > snapshot.revision.revision_id) {
+      // An older in-flight validation may finish after a newer publication.
+      // Use its prepared value locally without regressing the shared cache.
+      break;
+    }
+    if (scene_cache_->latest.compare_exchange_weak(
+            observed, prepared, std::memory_order_release,
+            std::memory_order_acquire)) {
+      scene_cache_->build_count.fetch_add(1, std::memory_order_relaxed);
+      break;
+    }
+  }
+
+  bind_prepared_scene(std::move(selected));
   return std::nullopt;
 }
 

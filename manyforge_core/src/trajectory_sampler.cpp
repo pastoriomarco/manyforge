@@ -241,6 +241,36 @@ Result<void> make_void_error(TrajectorySampleError code) {
   return Result<void>::Err(std::move(dto));
 }
 
+void sample_prevalidated_segment(const TrajectoryDTO& trajectory, double time_s,
+                                 std::size_t segment_index,
+                                 TrajectorySampleResult& out) {
+  const auto& a = trajectory.waypoints[segment_index];
+  const auto& b = trajectory.waypoints[segment_index + 1];
+  const double T = b.time_from_start_s - a.time_from_start_s;
+  const double s = (time_s - a.time_from_start_s) / T;
+  const std::size_t joint_count = trajectory.joint_names.size();
+  const EndpointSamples classification =
+      classify_endpoints(a, b, joint_count);
+
+  out.segment_index = segment_index;
+  out.clamped = false;
+
+  if (classification.both_have_velocity &&
+      classification.both_have_acceleration) {
+    emit_quintic(a, b, s, T, joint_count, out);
+    out.fallback_reason = TrajectorySampleFallback::kNone;
+  } else if (classification.both_have_velocity) {
+    emit_cubic(a, b, s, T, joint_count, out);
+    out.fallback_reason = classification.acceleration_reason;
+  } else {
+    emit_linear(a, b, s, T, joint_count, out);
+    out.fallback_reason =
+        classification.velocity_reason != TrajectorySampleFallback::kNone
+            ? classification.velocity_reason
+            : classification.acceleration_reason;
+  }
+}
+
 // Fill `out` with a clamped hold at `positions` (or an empty clamp when
 // `positions == nullptr`). Every field is written so `out` can be reused
 // across calls without leaking prior state.
@@ -376,42 +406,34 @@ Result<void> sample_trajectory_prevalidated(const TrajectoryDTO& trajectory,
     }
   }
 
-  const auto& a = trajectory.waypoints[seg_idx];
-  const auto& b = trajectory.waypoints[seg_idx + 1];
-  const double T = b.time_from_start_s - a.time_from_start_s;
-  // T > 0 here: duplicate times were rejected earlier, and non-monotonic
-  // times were rejected too.
-  const double s = (time_s - a.time_from_start_s) / T;
+  // Segment duration is positive because structural validation rejected
+  // duplicate and regressing waypoint times.
+  sample_prevalidated_segment(trajectory, time_s, seg_idx, out);
 
-  EndpointSamples classification = classify_endpoints(a, b, joint_count);
+  return Result<void>::Ok();
+}
 
-  out.segment_index = seg_idx;
-  out.clamped = false;
-
-  if (classification.both_have_velocity &&
-      classification.both_have_acceleration) {
-    emit_quintic(a, b, s, T, joint_count, out);
-    out.fallback_reason = TrajectorySampleFallback::kNone;
-  } else if (classification.both_have_velocity) {
-    emit_cubic(a, b, s, T, joint_count, out);
-    // If the natural target was quintic but we degraded because of
-    // acceleration data, report the acceleration-side reason; otherwise
-    // this is the natural cubic path.
-    out.fallback_reason = classification.acceleration_reason;
-  } else {
-    emit_linear(a, b, s, T, joint_count, out);
-    // Report a velocity-side reason if velocity data was present but
-    // unusable; otherwise leave it as kNone (natural linear path). If
-    // acceleration data was supplied without velocity, the acceleration
-    // reason still applies because we couldn't use it.
-    if (classification.velocity_reason !=
-        TrajectorySampleFallback::kNone) {
-      out.fallback_reason = classification.velocity_reason;
-    } else {
-      out.fallback_reason = classification.acceleration_reason;
-    }
+Result<void> sample_trajectory_prevalidated(const TrajectoryDTO& trajectory,
+                                            double time_s,
+                                            std::size_t segment_index,
+                                            TrajectorySampleResult& out) {
+  if (!std::isfinite(time_s)) {
+    return make_void_error(TrajectorySampleError::kNonFiniteSampleTime);
   }
-
+  if (trajectory.waypoints.size() < 2 ||
+      segment_index >= trajectory.waypoints.size() - 1) {
+    return make_void_error(TrajectorySampleError::kSegmentHintMismatch);
+  }
+  const auto& a = trajectory.waypoints[segment_index];
+  const auto& b = trajectory.waypoints[segment_index + 1];
+  const bool final_endpoint =
+      segment_index + 1 == trajectory.waypoints.size() - 1 &&
+      time_s == b.time_from_start_s;
+  if (time_s < a.time_from_start_s ||
+      (time_s >= b.time_from_start_s && !final_endpoint)) {
+    return make_void_error(TrajectorySampleError::kSegmentHintMismatch);
+  }
+  sample_prevalidated_segment(trajectory, time_s, segment_index, out);
   return Result<void>::Ok();
 }
 

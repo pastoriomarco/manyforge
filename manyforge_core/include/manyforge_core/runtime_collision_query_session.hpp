@@ -79,6 +79,21 @@ struct RuntimeCollisionTickOutcome {
       RuntimeContactGraspViolation::kNone;
 };
 
+struct RuntimeContactReleaseStateEntry {
+  const CollisionPairId* pair = nullptr;
+  SupportContactEvaluationState support_state = SupportContactEvaluationState::kNotInContact;
+  ContactReleaseEvaluationState release_state;
+};
+
+struct RuntimeContactReleaseStateSnapshot {
+  std::array<RuntimeContactReleaseStateEntry, 64> entries{};
+  std::size_t count = 0;
+  bool valid = false;
+  /// Pins the immutable policy index that owns every `entry.pair` pointer.
+  /// The lookahead worker may outlive the immediate-query session generation.
+  RuntimeCollisionQueryBundlePtr binding_owner;
+};
+
 /// Execution-bound, single-consumer runtime collision query state. Construction
 /// and prepare() are NRT monitor-arm operations. One session remains continuous
 /// across motion-to-controlled-stop protection-owner generations so contact
@@ -110,6 +125,10 @@ class RuntimeCollisionQuerySession final {
   [[nodiscard]] const std::string& active_contact_policy_id() const noexcept {
     return active_contact_policy_id_;
   }
+  /// Single-consumer snapshot taken immediately after a clear tick. Pair
+  /// pointers remain valid because the returned snapshot pins the immutable
+  /// runtime bundle that owns the bound policy index.
+  [[nodiscard]] RuntimeContactReleaseStateSnapshot contact_release_state_snapshot() const noexcept;
 
  private:
   struct ContactReleaseState {
@@ -117,8 +136,10 @@ class RuntimeCollisionQuerySession final {
     const SupportContactPolicyEntry* policy = nullptr;
     double initial_penetration_m = 0.0;
     double last_penetration_m = 0.0;
+    double best_penetration_m = 0.0;
     std::optional<double> observed_clearance_m;
     bool initialized = false;
+    bool started_in_contact = false;
     bool separated = false;
   };
 

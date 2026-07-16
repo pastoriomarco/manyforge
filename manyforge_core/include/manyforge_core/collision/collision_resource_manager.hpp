@@ -1,9 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
 #include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/types/execution_status.hpp>
-
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -17,6 +17,7 @@ struct CollisionPipelineResources {
   ICollisionWorldSnapshotPublisher* snapshot_publisher = nullptr;
   std::shared_ptr<ICollisionQueryEngine> runtime_monitor_engine;
   std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines;
+  std::vector<std::shared_ptr<ICollisionQueryEngine>> runtime_lookahead_engines;
 };
 
 enum class CollisionValidationAdmissionStatus {
@@ -26,6 +27,7 @@ enum class CollisionValidationAdmissionStatus {
   kMissingValidationResource,
   kRuntimeQueryCapabilityUnsupported,
   kRuntimeMonitorLeaseActiveSharedResource,
+  kRuntimeLookaheadResourceConflict,
 };
 
 struct CollisionValidationAdmission {
@@ -38,16 +40,74 @@ struct CollisionValidationAdmission {
   }
 };
 
+struct CollisionValidationWorkerCapacity {
+  std::size_t effective_contexts = 0;
+  std::optional<std::string> mismatch_reason;
+};
+
 /// Role-aware collision resource registry. Runtime monitoring and validation
 /// are separate roles even when a legacy/test caller wires the same engine into
 /// both; validation admission can then fail closed instead of borrowing the
 /// runtime monitor's active resource.
 class CollisionResourceManager {
  public:
-  void configure(ICollisionWorldSnapshotPublisher& publisher,
-                 std::shared_ptr<ICollisionQueryEngine> runtime_monitor_engine,
-                 std::vector<std::shared_ptr<ICollisionQueryEngine>>
-                     validation_engines) {
+  /// Inspect how many validation contexts can be proven independent. A
+  /// single-context engine without an identity can still serve the serial
+  /// fallback, but it cannot substantiate a declared parallel capacity.
+  [[nodiscard]] static CollisionValidationWorkerCapacity inspect_validation_worker_capacity(
+      const std::vector<std::shared_ptr<ICollisionQueryEngine>>& engines) {
+    CollisionValidationWorkerCapacity result;
+    std::vector<const ICollisionQueryEngine*> admitted_instances;
+    std::vector<std::string> admitted_single_context_ids;
+    bool has_usable_engine = false;
+
+    for (const auto& engine : engines) {
+      if (!engine) {
+        continue;
+      }
+      has_usable_engine = true;
+      if (std::find(admitted_instances.begin(), admitted_instances.end(), engine.get()) !=
+          admitted_instances.end()) {
+        if (!result.mismatch_reason) {
+          result.mismatch_reason = "duplicate_engine_instance";
+        }
+        continue;
+      }
+      admitted_instances.push_back(engine.get());
+
+      const auto& capability = engine->capability();
+      if (capability.thread_safety == CollisionEngineThreadSafetyClass::kSingleContextExclusive) {
+        if (capability.mutable_context_id.empty()) {
+          if (!result.mismatch_reason) {
+            result.mismatch_reason = "missing_mutable_context_id";
+          }
+          continue;
+        }
+        if (std::find(admitted_single_context_ids.begin(), admitted_single_context_ids.end(),
+                      capability.mutable_context_id) != admitted_single_context_ids.end()) {
+          if (!result.mismatch_reason) {
+            result.mismatch_reason = "duplicate_mutable_context_id";
+          }
+          continue;
+        }
+        admitted_single_context_ids.push_back(capability.mutable_context_id);
+      }
+      ++result.effective_contexts;
+    }
+
+    if (result.mismatch_reason && has_usable_engine) {
+      // This is the capacity the pool can safely use after its named serial
+      // fallback. It must not be reported as the requested parallel capacity.
+      result.effective_contexts = 1;
+    }
+    return result;
+  }
+
+  void configure(
+      ICollisionWorldSnapshotPublisher& publisher,
+      std::shared_ptr<ICollisionQueryEngine> runtime_monitor_engine,
+      std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines,
+      std::vector<std::shared_ptr<ICollisionQueryEngine>> runtime_lookahead_engines = {}) {
     CollisionPipelineResources next;
     next.snapshot_publisher = &publisher;
     next.runtime_monitor_engine = std::move(runtime_monitor_engine);
@@ -55,6 +115,12 @@ class CollisionResourceManager {
     for (auto& engine : validation_engines) {
       if (engine) {
         next.validation_engines.push_back(std::move(engine));
+      }
+    }
+    next.runtime_lookahead_engines.reserve(runtime_lookahead_engines.size());
+    for (auto& engine : runtime_lookahead_engines) {
+      if (engine) {
+        next.runtime_lookahead_engines.push_back(std::move(engine));
       }
     }
     std::lock_guard<std::mutex> lock(mutex_);
@@ -115,6 +181,55 @@ class CollisionResourceManager {
     return false;
   }
 
+  /// Return a structured reason when lookahead aliases either the reserved
+  /// immediate monitor, authoritative validation, or another lookahead
+  /// context. Distinct wrapper objects are not sufficient: mutable context
+  /// identity is the resource authority for single-context engines.
+  [[nodiscard]] static std::optional<std::string> runtime_lookahead_resource_conflict(
+      const CollisionPipelineResources& resources) {
+    const auto conflict =
+        [](const std::shared_ptr<ICollisionQueryEngine>& lhs,
+           const std::shared_ptr<ICollisionQueryEngine>& rhs) -> std::optional<std::string> {
+      if (!lhs || !rhs) {
+        return std::nullopt;
+      }
+      if (lhs.get() == rhs.get()) {
+        return "same_engine_instance";
+      }
+      const auto& lhs_cap = lhs->capability();
+      const auto& rhs_cap = rhs->capability();
+      if (lhs_cap.thread_safety != CollisionEngineThreadSafetyClass::kSingleContextExclusive ||
+          rhs_cap.thread_safety != CollisionEngineThreadSafetyClass::kSingleContextExclusive) {
+        return std::nullopt;
+      }
+      if (lhs_cap.mutable_context_id.empty() || rhs_cap.mutable_context_id.empty()) {
+        return "missing_mutable_context_id";
+      }
+      if (lhs_cap.mutable_context_id == rhs_cap.mutable_context_id) {
+        return "shared_mutable_context_id";
+      }
+      return std::nullopt;
+    };
+
+    for (std::size_t index = 0; index < resources.runtime_lookahead_engines.size(); ++index) {
+      const auto& lookahead = resources.runtime_lookahead_engines[index];
+      if (const auto reason = conflict(lookahead, resources.runtime_monitor_engine)) {
+        return "lookahead_runtime_" + *reason;
+      }
+      for (const auto& validation : resources.validation_engines) {
+        if (const auto reason = conflict(lookahead, validation)) {
+          return "lookahead_validation_" + *reason;
+        }
+      }
+      for (std::size_t prior = 0; prior < index; ++prior) {
+        if (const auto reason = conflict(lookahead, resources.runtime_lookahead_engines[prior])) {
+          return "lookahead_internal_" + *reason;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
   [[nodiscard]] static CollisionValidationAdmission validate_admission(
       const CollisionPipelineResources& resources,
       bool runtime_protection_active) {
@@ -151,6 +266,9 @@ class CollisionResourceManager {
                 kRuntimeMonitorLeaseActiveSharedResource,
             conflict_reason};
       }
+    }
+    if (const auto conflict = runtime_lookahead_resource_conflict(resources)) {
+      return {CollisionValidationAdmissionStatus::kRuntimeLookaheadResourceConflict, *conflict};
     }
     return {};
   }

@@ -829,8 +829,6 @@ def test_ros2_control_backend_reset_clears_inflight_gripper_command():
                 "result_timeout_s": 10.0,
             },
         )
-        time.sleep(1.0)
-
         first = _command_gripper(
             bundle, target_position=0.0, duration_s=10.0, max_effort=5.0
         )
@@ -952,8 +950,6 @@ def test_ros2_control_gripper_updates_roboplan_scene_group_state():
                 "result_timeout_s": 2.0,
             },
         )
-        time.sleep(0.2)
-
         result = _command_gripper(
             bundle,
             target_position=0.7,
@@ -1044,8 +1040,6 @@ def test_ros2_control_gripper_driver_result_accepts_success_without_reached_goal
                 "result_timeout_s": 2.0,
             },
         )
-        time.sleep(0.2)
-
         result = _command_gripper(
             bundle,
             target_position=0.7,
