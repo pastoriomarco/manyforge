@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import subprocess
 
+import pytest
+
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HELPER = _REPO_ROOT / "scripts" / "lib" / "realtime-resources.sh"
@@ -14,8 +16,12 @@ def _available_cpus() -> list[int]:
     return sorted(os.sched_getaffinity(0))
 
 
-def _profile_environment() -> dict[str, str]:
-    cpus = _available_cpus()
+def _profile_environment(cpus: list[int] | None = None) -> dict[str, str]:
+    # Policy-unit tests use a synthetic four-CPU launch topology. Physical CPU
+    # availability is a separate admission rule and has its own real-host test
+    # below, so hosted CI does not need four actual CPUs to exercise the strict
+    # isolation and priority contracts.
+    cpus = cpus or [0, 1, 2, 3]
     assert len(cpus) >= 4
     return {
         "MANYFORGE_RT_RESOURCE_PROFILE": "strict",
@@ -26,13 +32,26 @@ def _profile_environment() -> dict[str, str]:
     }
 
 
-def _validate(environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+_SYNTHETIC_CPU_AVAILABILITY_PROBE = r"""
+taskset() {
+    if [[ "$#" -eq 3 && "$1" == "--cpu-list" && "$3" == "true" ]]; then
+        return 0
+    fi
+    command taskset "$@"
+}
+"""
+
+
+def _run_shell(
+    script: str,
+    environment: dict[str, str],
+    *,
+    assume_profile_cpus_available: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    if assume_profile_cpus_available:
+        script = f"{_SYNTHETIC_CPU_AVAILABILITY_PROBE}\n{script}"
     return subprocess.run(
-        [
-            "bash",
-            "-lc",
-            f"source {str(_HELPER)!r}; manyforge_validate_rt_resource_profile",
-        ],
+        ["bash", "-lc", script],
         cwd=_REPO_ROOT,
         env={**os.environ, **environment},
         capture_output=True,
@@ -41,8 +60,33 @@ def _validate(environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _validate(
+    environment: dict[str, str],
+    *,
+    assume_profile_cpus_available: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return _run_shell(
+        f"source {str(_HELPER)!r}; manyforge_validate_rt_resource_profile",
+        environment,
+        assume_profile_cpus_available=assume_profile_cpus_available,
+    )
+
+
 def test_strict_resource_profile_accepts_disjoint_ordered_reservations():
     completed = _validate(_profile_environment())
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_strict_resource_profile_accepts_real_launch_topology_when_capacity_available():
+    cpus = _available_cpus()
+    if len(cpus) < 4:
+        pytest.skip("launch context does not expose four CPUs")
+
+    completed = _validate(
+        _profile_environment(cpus[:4]),
+        assume_profile_cpus_available=False,
+    )
 
     assert completed.returncode == 0, completed.stderr
 
@@ -79,22 +123,33 @@ def test_strict_resource_profile_rejects_unbounded_cpu_range():
     assert "out-of-range CPU token" in completed.stderr
 
 
+def test_strict_resource_profile_rejects_cpu_unavailable_to_launch_context():
+    available = set(_available_cpus())
+    unavailable = next((cpu for cpu in range(1024) if cpu not in available), None)
+    if unavailable is None:
+        pytest.skip("launch context exposes every taskset CPU in the supported test range")
+    environment = _profile_environment()
+    # NRT is checked first, so the test isolates the physical-admission rule
+    # before any synthetic reservation can affect the result.
+    environment["MANYFORGE_NRT_CPU_AFFINITY"] = str(unavailable)
+
+    completed = _validate(
+        environment,
+        assume_profile_cpus_available=False,
+    )
+
+    assert completed.returncode != 0
+    assert "selects a CPU unavailable to this launch context" in completed.stderr
+
+
 def test_native_composer_strict_profile_forwards_minimum_container_contract():
-    completed = subprocess.run(
-        [
-            "bash",
-            "-lc",
-            (
-                f"source {str(_COMPOSE_HELPER)!r}; "
-                "prepare_native_composer_rt_docker_args; "
-                "printf '<%s>\\n' \"${NATIVE_COMPOSER_RT_DOCKER_ARGS[@]}\""
-            ),
-        ],
-        cwd=_REPO_ROOT,
-        env={**os.environ, **_profile_environment()},
-        capture_output=True,
-        text=True,
-        check=False,
+    completed = _run_shell(
+        (
+            f"source {str(_COMPOSE_HELPER)!r}; "
+            "prepare_native_composer_rt_docker_args; "
+            "printf '<%s>\\n' \"${NATIVE_COMPOSER_RT_DOCKER_ARGS[@]}\""
+        ),
+        _profile_environment(),
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -123,20 +178,12 @@ def test_native_profile_can_reclaim_absent_controller_manager_cpu_for_nrt():
             environment["MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY"],
         ]
     )
-    completed = subprocess.run(
-        [
-            "bash",
-            "-lc",
-            (
-                f"source {str(_COMPOSE_HELPER)!r}; "
-                "prepare_native_composer_rt_docker_args"
-            ),
-        ],
-        cwd=_REPO_ROOT,
-        env={**os.environ, **environment},
-        capture_output=True,
-        text=True,
-        check=False,
+    completed = _run_shell(
+        (
+            f"source {str(_COMPOSE_HELPER)!r}; "
+            "prepare_native_composer_rt_docker_args"
+        ),
+        environment,
     )
 
     assert completed.returncode == 0, completed.stderr

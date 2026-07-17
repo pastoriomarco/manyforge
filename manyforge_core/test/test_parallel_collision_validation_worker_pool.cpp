@@ -299,6 +299,21 @@ CollisionWorldSnapshot test_snapshot(std::int64_t geometry_count = 42) {
   return snapshot;
 }
 
+// Call-local results become available just before the worker tail publishes
+// its instantaneous accounting. Tests that inspect settled counters therefore
+// wait boundedly for that separate diagnostic boundary.
+template <typename Predicate>
+ParallelValidationPoolStatus wait_for_pool_status(
+    const ParallelCollisionValidationWorkerPool& pool, Predicate predicate,
+    std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  auto status = pool.status();
+  while (!predicate(status) && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    status = pool.status();
+  }
+  return status;
+}
 
 TEST(ParallelCollisionValidationWorkerPoolTest,
      EngineBackedPathDistributesWaypointsAndUsesSnapshotGeometryCount) {
@@ -321,7 +336,10 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   EXPECT_TRUE(pool.last_telemetry().fallback_reason.empty());
   EXPECT_EQ(pool.last_telemetry().collision_geometry_count, 99);
   EXPECT_EQ(engine_a.call_count.load() + engine_b.call_count.load(), 12);
-  const auto status = pool.status();
+  const auto status = wait_for_pool_status(pool, [](const auto& current) {
+    return current.queued_jobs == 0 && current.active_workers == 0 &&
+           current.completed_jobs_total >= 2;
+  });
   EXPECT_EQ(status.queued_jobs, 0u);
   EXPECT_EQ(status.active_workers, 0u);
   EXPECT_EQ(status.completed_jobs_total, 2u);
@@ -646,7 +664,10 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   EXPECT_TRUE(pool.last_telemetry().ordered_contact_summary_used);
   EXPECT_EQ(engine_a.call_count.load() + engine_b.call_count.load() + engine_c.call_count.load(),
             12);
-  const auto status = pool.status();
+  const auto status = wait_for_pool_status(pool, [](const auto& current) {
+    return current.queued_jobs == 0 && current.active_workers == 0 &&
+           current.completed_jobs_total >= 6;
+  });
   EXPECT_EQ(status.queued_jobs, 0u);
   EXPECT_EQ(status.active_workers, 0u);
   EXPECT_EQ(status.completed_jobs_total, 6u);
@@ -1459,10 +1480,10 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   EXPECT_EQ(pool.last_telemetry().fallback_reason, "validation_workers_draining_after_timeout");
 
   engine_a->release_blocked();
-  while (pool.status().active_workers != 0) {
-    std::this_thread::yield();
-  }
-  ASSERT_EQ(pool.status().active_workers, 0u);
+  const auto released_status = wait_for_pool_status(pool, [](const auto& current) {
+    return current.active_workers == 0;
+  });
+  ASSERT_EQ(released_status.active_workers, 0u);
 
   auto recovered_cancel = std::make_shared<CollisionCancellationToken>();
   const auto recovered = pool.validate_trajectory(snapshot, engines, long_trajectory(12),
