@@ -1025,6 +1025,13 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
   const auto counters = counters_;
   call_state->pending_jobs = active_workers;
   call_state->outputs.resize(static_cast<std::size_t>(active_workers));
+  // Arm the absolute wall deadline before any worker can enter the engine.
+  // Otherwise a blocked query can exist briefly without watchdog ownership.
+  std::unique_ptr<ValidationDeadlineAlarm> phase_one_deadline;
+  if (config_.validation_wall_timeout > std::chrono::nanoseconds::zero()) {
+    phase_one_deadline = std::make_unique<ValidationDeadlineAlarm>(
+        *config_.clock, *config_.scheduler, wall_deadline, call_state, cancel);
+  }
   ensure_worker_threads(active_workers);
   {
     std::lock_guard<std::mutex> slots_lock(worker_slots_mutex_);
@@ -1052,11 +1059,6 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
       }
       slot->cv.notify_one();
     }
-  }
-  std::unique_ptr<ValidationDeadlineAlarm> phase_one_deadline;
-  if (config_.validation_wall_timeout > std::chrono::nanoseconds::zero()) {
-    phase_one_deadline = std::make_unique<ValidationDeadlineAlarm>(
-        *config_.clock, *config_.scheduler, wall_deadline, call_state, cancel);
   }
   bool completed = false;
   {
@@ -1125,6 +1127,13 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
     auto phase_outputs = std::make_shared<std::vector<WorkerOut>>(std::move(outputs));
     auto finalize_state = std::make_shared<ValidationCallState>();
     finalize_state->pending_jobs = active_workers;
+    // The ordered-contact finalize pass is independently dispatched and needs
+    // the same arm-before-dispatch guarantee as the query pass above.
+    std::unique_ptr<ValidationDeadlineAlarm> phase_two_deadline;
+    if (config_.validation_wall_timeout > std::chrono::nanoseconds::zero()) {
+      phase_two_deadline = std::make_unique<ValidationDeadlineAlarm>(
+          *config_.clock, *config_.scheduler, wall_deadline, finalize_state, cancel);
+    }
     {
       std::lock_guard<std::mutex> slots_lock(worker_slots_mutex_);
       for (int w = 0; w < active_workers; ++w) {
@@ -1166,12 +1175,6 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
         }
         slot->cv.notify_one();
       }
-    }
-
-    std::unique_ptr<ValidationDeadlineAlarm> phase_two_deadline;
-    if (config_.validation_wall_timeout > std::chrono::nanoseconds::zero()) {
-      phase_two_deadline = std::make_unique<ValidationDeadlineAlarm>(
-          *config_.clock, *config_.scheduler, wall_deadline, finalize_state, cancel);
     }
     bool finalized = false;
     {

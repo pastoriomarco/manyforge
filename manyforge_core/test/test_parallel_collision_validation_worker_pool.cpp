@@ -1325,6 +1325,7 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
     bundle = pool.validate_trajectory(test_snapshot(), engines, long_trajectory(12), cancel);
   });
   engine_a->wait_until_blocked();
+  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::Monitoring);
   clock.advance(20'000'000);
   scheduler.advance_to(clock.now());
   caller.join();
@@ -1339,7 +1340,6 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   EXPECT_EQ(bundle->waypoint_records.front().result.raw_diagnostics.at("elapsed_ns"), "20000000");
   EXPECT_TRUE(cancel->is_cancel_requested());
   EXPECT_EQ(cancel->reason(), "collision_validation_wall_timeout");
-  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::Monitoring);
   EXPECT_EQ(pool.last_telemetry().fallback_reason,
             "validation_wall_timeout");
   const auto status = pool.status();
