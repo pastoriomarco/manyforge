@@ -311,6 +311,13 @@ class PoseSourceMeasuredTcpConfig:
     entity: str
     tcp_frame_id: str = ""
     frame_id: str = ""
+    entity_to_tcp_position_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    entity_to_tcp_orientation_xyzw: tuple[float, float, float, float] = (
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    )
 
 
 @dataclass(frozen=True)
@@ -1153,10 +1160,79 @@ class Deployment:
                 get_alias(raw, "frame_id", "frameId", ""),
                 f"{field_path}.frame_id",
             )
+            entity_to_tcp = get_alias(
+                raw, "entity_to_tcp", "entityToTcp", {}
+            )
+            if not isinstance(entity_to_tcp, dict):
+                raise DeploymentValidationError(
+                    f"{field_path}.entity_to_tcp must be a mapping"
+                )
+
+            def parse_fixed_vector(
+                value: Any,
+                *,
+                size: int,
+                vector_path: str,
+            ) -> tuple[float, ...]:
+                if not isinstance(value, (list, tuple)) or len(value) != size:
+                    raise DeploymentValidationError(
+                        f"{vector_path} must contain exactly {size} numbers"
+                    )
+                if any(
+                    isinstance(component, bool)
+                    or not isinstance(component, (int, float))
+                    for component in value
+                ):
+                    raise DeploymentValidationError(
+                        f"{vector_path} must contain only numbers"
+                    )
+                parsed = tuple(float(component) for component in value)
+                if not all(math.isfinite(component) for component in parsed):
+                    raise DeploymentValidationError(
+                        f"{vector_path} must contain only finite numbers"
+                    )
+                return parsed
+
+            position = parse_fixed_vector(
+                get_alias(
+                    entity_to_tcp,
+                    "position_xyz",
+                    "positionXYZ",
+                    [0.0, 0.0, 0.0],
+                ),
+                size=3,
+                vector_path=f"{field_path}.entity_to_tcp.position_xyz",
+            )
+            orientation = parse_fixed_vector(
+                get_alias(
+                    entity_to_tcp,
+                    "orientation_xyzw",
+                    "orientationXYZW",
+                    [0.0, 0.0, 0.0, 1.0],
+                ),
+                size=4,
+                vector_path=f"{field_path}.entity_to_tcp.orientation_xyzw",
+            )
+            norm = math.sqrt(sum(component * component for component in orientation))
+            if abs(norm - 1.0) > 1e-6:
+                raise DeploymentValidationError(
+                    f"{field_path}.entity_to_tcp.orientation_xyzw must be a unit quaternion"
+                )
             return PoseSourceMeasuredTcpConfig(
                 entity=entity,
                 tcp_frame_id=tcp_frame_id,
                 frame_id=frame_id_value,
+                entity_to_tcp_position_xyz=(
+                    position[0],
+                    position[1],
+                    position[2],
+                ),
+                entity_to_tcp_orientation_xyzw=(
+                    orientation[0],
+                    orientation[1],
+                    orientation[2],
+                    orientation[3],
+                ),
             )
 
         def parse_measured_robot_config(
@@ -4330,6 +4406,20 @@ class Deployment:
                         source_d["measured_tcp"]["frame_id"] = (
                             source.measured_tcp.frame_id
                         )
+                    if (
+                        source.measured_tcp.entity_to_tcp_position_xyz
+                        != (0.0, 0.0, 0.0)
+                        or source.measured_tcp.entity_to_tcp_orientation_xyzw
+                        != (0.0, 0.0, 0.0, 1.0)
+                    ):
+                        source_d["measured_tcp"]["entity_to_tcp"] = {
+                            "position_xyz": list(
+                                source.measured_tcp.entity_to_tcp_position_xyz
+                            ),
+                            "orientation_xyzw": list(
+                                source.measured_tcp.entity_to_tcp_orientation_xyzw
+                            ),
+                        }
                 if source.measured_robot is not None:
                     source_d["measured_robot"] = {
                         "joint_state_topic": source.measured_robot.joint_state_topic,

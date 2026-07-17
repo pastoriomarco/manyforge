@@ -1586,6 +1586,10 @@ class TestDeploymentLoading:
                         "entity": "/World/tool0",
                         "tcp_frame_id": "tool0",
                         "frame_id": "universe",
+                        "entity_to_tcp": {
+                            "position_xyz": [0.0, 0.0, 0.2],
+                            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                        },
                     },
                     "measured_robot": {
                         "joint_state_topic": "/joint_states",
@@ -1644,6 +1648,7 @@ class TestDeploymentLoading:
         assert source.measured_tcp is not None
         assert source.measured_tcp.entity == "/World/tool0"
         assert source.measured_tcp.tcp_frame_id == "tool0"
+        assert source.measured_tcp.entity_to_tcp_position_xyz == (0.0, 0.0, 0.2)
         assert source.measured_robot is not None
         assert source.measured_robot.joint_state_topic == "/joint_states"
         assert set(source.objects) == {"isaac_cheese_box", "isaac_soup_can"}
@@ -1691,6 +1696,12 @@ class TestDeploymentLoading:
 
         serialized = deploy.to_dict()
         reloaded = Deployment.from_dict(serialized)
+        assert (
+            reloaded.pose_sources[
+                "isaac_scene_objects"
+            ].measured_tcp.entity_to_tcp_position_xyz
+            == (0.0, 0.0, 0.2)
+        )
         assert reloaded.pose_sources["isaac_scene_objects"].objects[
             "isaac_soup_can"
         ].apply_policy == "observe_only"
@@ -1725,6 +1736,57 @@ class TestDeploymentLoading:
             ].measured_robot.joint_state_topic
             == "/joint_states"
         )
+
+    def test_pose_source_measured_tcp_rejects_non_unit_fixed_rotation(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "isaac_scene_objects",
+                    "kind": "simulation_interfaces",
+                    "measured_tcp": {
+                        "entity": "/World/tool0",
+                        "tcp_frame_id": "tool0",
+                        "entity_to_tcp": {
+                            "orientation_xyzw": [0.0, 0.0, 0.0, 2.0],
+                        },
+                    },
+                    "objects": {},
+                }
+            ]
+        )
+
+        with pytest.raises(
+            DeploymentValidationError,
+            match="orientation_xyzw must be a unit quaternion",
+        ):
+            Deployment.from_dict(data)
+
+    @pytest.mark.parametrize("invalid_component", [True, "0.0"])
+    def test_pose_source_measured_tcp_rejects_non_numeric_fixed_transform(
+        self, invalid_component
+    ):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "isaac_scene_objects",
+                    "kind": "simulation_interfaces",
+                    "measured_tcp": {
+                        "entity": "/World/tool0",
+                        "tcp_frame_id": "tool0",
+                        "entity_to_tcp": {
+                            "position_xyz": [invalid_component, 0.0, 0.2],
+                        },
+                    },
+                    "objects": {},
+                }
+            ]
+        )
+
+        with pytest.raises(
+            DeploymentValidationError,
+            match="position_xyz must contain only numbers",
+        ):
+            Deployment.from_dict(data)
 
     def test_pose_source_observe_only_defaults_to_visualization_admission(self):
         deploy = Deployment.from_dict(
@@ -3668,15 +3730,57 @@ class TestCrossArtifactValidation:
         assert adapter_timeout_s == gripper.transport["result_timeout_s"]
         assert backend_deadline_s == pytest.approx(15.8)
         assert bridge_timeout_s == pytest.approx(20.0)
+
         assert bridge_timeout_s > backend_deadline_s
         assert bridge_parameters["commanded_joint"] == gripper.joint_name
-        assert bridge_parameters["joint_names"] == [gripper.joint_name]
-        assert bridge_parameters["multipliers"] == [1.0]
-        assert bridge_parameters["offsets"] == [0.0]
+        assert bridge_parameters["command_joint_names"] == [gripper.joint_name]
+        assert bridge_parameters["command_multipliers"] == [1.0]
+        assert bridge_parameters["command_offsets"] == [0.0]
+        assert bridge_parameters["completion_joint_names"] == [
+            "finger_joint",
+            "left_inner_finger_joint",
+            "left_inner_knuckle_joint",
+            "right_inner_knuckle_joint",
+            "right_outer_knuckle_joint",
+            "right_inner_finger_joint",
+        ]
+        assert bridge_parameters["completion_multipliers"] == [
+            1.0,
+            1.0,
+            -1.0,
+            -1.0,
+            -1.0,
+            1.0,
+        ]
+        assert bridge_parameters["completion_offsets"] == [0.0] * 6
+        assert bridge_parameters["completion_settle_time_s"] == pytest.approx(0.1)
+        assert bridge_parameters["completion_min_samples"] == 3
         assert bridge_parameters["require_all_state_joints"] is True
         assert gripper.transport["position_tolerance"] == pytest.approx(
             bridge_parameters["completion_tolerance_rad"]
         )
+
+    @pytest.mark.parametrize(
+        "deployment_path",
+        [
+            ISAAC_LIGHT_ROS2_CONTROL_DEPLOYMENT_PATH,
+            ISAAC_LIGHT_ROS2_CONTROL_COLLISION_DEPLOYMENT_PATH,
+            ISAAC_LIGHT_ASSISTANT_DEPLOYMENT_PATH,
+        ],
+    )
+    def test_isaac_light_measured_tcp_tracks_composed_ur10e_hierarchy(
+        self, deployment_path
+    ):
+        deploy = Deployment(deployment_path)
+
+        measured_tcp = deploy.pose_sources["isaac_scene_objects"].measured_tcp
+        assert measured_tcp.entity == (
+            "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/"
+            "ee_link/robotiq_arg2f_base_link"
+        )
+        assert measured_tcp.tcp_frame_id == "grasp_frame"
+        assert measured_tcp.entity_to_tcp_position_xyz == (0.0, 0.0, 0.2)
+        assert measured_tcp.entity_to_tcp_orientation_xyzw == (0.0, 0.0, 0.0, 1.0)
 
     def test_validate_against_isaac_lite6_ros2_control_program_success(self, catalog):
         """The Isaac Lite6 ROS execution deployment matches its pick-and-place program."""
@@ -3849,7 +3953,8 @@ class TestCrossArtifactValidation:
         assert bridge_config["action_name"] == "/lite_gripper_controller/gripper_cmd"
         assert bridge_config["command_topic"] == "/isaac_joint_commands_gripper"
         assert bridge_config["commanded_joint"] == "right_finger_joint"
-        assert bridge_config["joint_names"] == ["right_finger_joint"]
+        assert bridge_config["command_joint_names"] == ["right_finger_joint"]
+        assert bridge_config["completion_joint_names"] == ["right_finger_joint"]
 
     def test_lite6_authority_runtime_contract_validator_accepts_static_scaffold(self):
         """The non-live RMA-7 validator pins the Lite6 Isaac static contract."""

@@ -60,6 +60,9 @@ class IsaacDemoSupervisor(Node):
         self.declare_parameter(
             "gripper_action_name", "/robotiq_gripper_controller/gripper_cmd"
         )
+        self.declare_parameter(
+            "gripper_readiness_topic", "/manyforge/isaac_gripper_bridge/ready"
+        )
         self.declare_parameter("require_gripper_action", True)
         self.declare_parameter(
             # Supervisor-owned veto topic. Deliberately distinct from the
@@ -113,6 +116,9 @@ class IsaacDemoSupervisor(Node):
         )
         arm_action_name = str(self.get_parameter("arm_action_name").value)
         gripper_action_name = str(self.get_parameter("gripper_action_name").value)
+        gripper_readiness_topic = str(
+            self.get_parameter("gripper_readiness_topic").value
+        )
         self._require_gripper_action = bool(
             self.get_parameter("require_gripper_action").value
         )
@@ -133,6 +139,8 @@ class IsaacDemoSupervisor(Node):
             Bool, supervisor_enable_topic, gate_qos
         )
         self._status_pub = self.create_publisher(String, status_topic, 1)
+        self._gripper_bridge_ready = False
+        self._last_gripper_readiness_s: float | None = None
         self.create_subscription(
             JointState, isaac_joint_state_topic, self._on_isaac_joint_state, 10
         )
@@ -142,6 +150,13 @@ class IsaacDemoSupervisor(Node):
             self._on_controller_state,
             10,
         )
+        if self._require_gripper_action:
+            self.create_subscription(
+                Bool,
+                gripper_readiness_topic,
+                self._on_gripper_readiness,
+                gate_qos,
+            )
         self._arm_client = ActionClient(self, FollowJointTrajectory, arm_action_name)
         self._gripper_client = (
             ActionClient(self, GripperCommand, gripper_action_name)
@@ -170,6 +185,10 @@ class IsaacDemoSupervisor(Node):
 
     def _on_controller_state(self, _msg: JointTrajectoryControllerState) -> None:
         self._last_controller_state_s = time.monotonic()
+
+    def _on_gripper_readiness(self, msg: Bool) -> None:
+        self._gripper_bridge_ready = bool(msg.data)
+        self._last_gripper_readiness_s = time.monotonic()
 
     def _tick(self) -> None:
         readiness = self._readiness()
@@ -243,6 +262,11 @@ class IsaacDemoSupervisor(Node):
             and not self._gripper_client.wait_for_server(timeout_sec=0.0)
         ):
             missing.append("gripper_action")
+        if self._require_gripper_action and (
+            not self._gripper_bridge_ready
+            or not self._is_fresh(self._last_gripper_readiness_s, now)
+        ):
+            missing.append("gripper_state_contract")
         return _Readiness(ready=not missing, missing=missing)
 
     def _is_fresh(self, timestamp_s: float | None, now_s: float) -> bool:
@@ -427,6 +451,20 @@ class IsaacDemoSupervisor(Node):
                         True,
                         "Direct Isaac JointState effort transport is configured in the ManyForge execution backend",
                     )
+                ),
+                component(
+                    "gripper_state_contract",
+                    "Gripper state contract",
+                    "gripper",
+                    (
+                        not self._require_gripper_action
+                        or "gripper_state_contract" not in missing
+                    ),
+                    (
+                        "Fresh finite feedback covers every configured gripper joint"
+                        if "gripper_state_contract" not in missing
+                        else "Waiting for the configured Isaac gripper joint topology"
+                    ),
                 ),
                 {
                     "id": "command_gate",

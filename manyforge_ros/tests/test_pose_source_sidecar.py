@@ -1,8 +1,28 @@
 from __future__ import annotations
 
 import threading
+from math import nan
 
 import pytest
+
+
+def test_measured_tcp_fixed_offset_rejects_non_finite_entity_position():
+    from manyforge_ros.pose_source_sidecar import _compose_pose_with_local_offset
+    from manyforge_ros.scene_mirror_probe import PoseSnapshot
+
+    pose = PoseSnapshot(
+        frame_id="world",
+        stamp_sec=1.0,
+        position_xyz=(nan, 0.0, 0.0),
+        orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+    )
+
+    with pytest.raises(ValueError, match="entity position contains non-finite"):
+        _compose_pose_with_local_offset(
+            pose,
+            (0.0, 0.0, 0.2),
+            (0.0, 0.0, 0.0, 1.0),
+        )
 
 
 def test_simulation_interfaces_pose_source_polls_latest_wins_state():
@@ -42,11 +62,13 @@ def test_simulation_interfaces_pose_source_polls_latest_wins_state():
             response.state.pose.position.x = 0.5
             response.state.pose.position.y = 0.0
             response.state.pose.position.z = 0.25
+            response.state.pose.orientation.z = 2.0**-0.5
+            response.state.pose.orientation.w = 2.0**-0.5
         else:
             response.state.pose.position.x = x_position["value"]
             response.state.pose.position.y = 2.0
             response.state.pose.position.z = 3.0
-        response.state.pose.orientation.w = 1.0
+            response.state.pose.orientation.w = 1.0
         return response
 
     services.append(
@@ -81,6 +103,7 @@ def test_simulation_interfaces_pose_source_polls_latest_wins_state():
                 entity="/World/tool0",
                 tcp_frame_id="tool0",
                 frame_id="world",
+                entity_to_tcp_position_xyz=(0.2, 0.0, 0.0),
             ),
             max_update_hz=4.0,
             stale_after_s=1.0,
@@ -105,10 +128,14 @@ def test_simulation_interfaces_pose_source_polls_latest_wins_state():
         assert live.objects[0].update.pose.position_xyz == (4.0, 2.0, 3.0)
         assert live.measured_tcp is not None
         assert live.measured_tcp.tcp_frame_id == "tool0"
-        assert live.measured_tcp.pose.position_xyz == (0.5, 0.0, 0.25)
+        assert live.measured_tcp.pose.position_xyz == pytest.approx(
+            (0.5, 0.2, 0.25)
+        )
         payload = live.to_dict()
         assert payload["measuredTcp"]["tcpFrameId"] == "tool0"
-        assert payload["measuredTcp"]["pose"]["positionXYZ"] == [0.5, 0.0, 0.25]
+        assert payload["measuredTcp"]["pose"]["positionXYZ"] == pytest.approx(
+            [0.5, 0.2, 0.25]
+        )
 
         stale = source.state.snapshot(monotonic_s=102.0)
         assert stale.status == POSE_SOURCE_STATUS_STALE

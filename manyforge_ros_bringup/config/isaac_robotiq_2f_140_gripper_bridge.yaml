@@ -4,16 +4,24 @@ manyforge_isaac_gripper_action_bridge:
     command_topic: /isaac_gripper_state
     state_topic: /isaac_joint_states
     commanded_joint: finger_joint
-    # The USD articulation couples the remaining Robotiq joints mechanically.
-    # Publishing targets for those passive/fixed joints over-constrains the
-    # articulation and can destabilize it across repeated cycles. Keep the
-    # canonical RMA command authority on the single independent drive joint;
-    # /isaac_joint_states remains the observed source for the complete gripper.
-    joint_names:
+    # One master receives commands; five PhysX mimic joints provide independent
+    # completion evidence that the complete linkage converged coherently.
+    command_joint_names:
       - finger_joint
-    multipliers: [1.0]
-    offsets: [0.0]
+    command_multipliers: [1.0]
+    command_offsets: [0.0]
+    completion_joint_names:
+      - finger_joint
+      - left_inner_finger_joint
+      - left_inner_knuckle_joint
+      - right_inner_knuckle_joint
+      - right_outer_knuckle_joint
+      - right_inner_finger_joint
+    completion_multipliers: [1.0, 1.0, -1.0, -1.0, -1.0, 1.0]
+    completion_offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     completion_tolerance_rad: 0.04
+    completion_settle_time_s: 0.1
+    completion_min_samples: 3
     state_freshness_timeout_s: 1.0
     # Emergency ceiling only. The ManyForge C++ ROS gripper owner normally
     # cancels first at motion_time_s + result_timeout_s (15.8 s in the light

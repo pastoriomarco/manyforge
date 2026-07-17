@@ -57,6 +57,10 @@ branch/commit workflow).
   - Operator runbook for exporting Isaac Sim scene meshes and loading
     them through Composer.
 
+- [`operations/ISAAC_UR10E_ROBOTIQ_GRIPPER.md`](operations/ISAAC_UR10E_ROBOTIQ_GRIPPER.md)
+  - UR10e/Robotiq Isaac command authority, six-joint settled completion,
+    readiness, measured-TCP binding, live smoke checks, and failure diagnosis.
+
 - [`operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md`](operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md)
   - Multi-machine Lite6 trocar workflow with Isaac Sim, Isaac ROS 4.4
     YOLOv8/FoundationPose perception, ManyForge ROS control, DDS/QoS

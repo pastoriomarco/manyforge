@@ -4,10 +4,14 @@ manyforge_isaac_gripper_action_bridge:
     command_topic: /isaac_joint_commands_gripper
     state_topic: /isaac_joint_states
     commanded_joint: right_finger_joint
-    joint_names:
+    command_joint_names:
       - right_finger_joint
-    multipliers: [1.0]
-    offsets: [0.0]
+    command_multipliers: [1.0]
+    command_offsets: [0.0]
+    completion_joint_names:
+      - right_finger_joint
+    completion_multipliers: [1.0]
+    completion_offsets: [0.0]
     actuation_kind: pneumatic
     completion_policy: dwell_elapsed
     open_position: 0.0081
@@ -17,6 +21,8 @@ manyforge_isaac_gripper_action_bridge:
     dwell_s: 0.8
     publish_nominal_position: true
     completion_tolerance_rad: 0.004
+    completion_settle_time_s: 0.0
+    completion_min_samples: 1
     state_freshness_timeout_s: 1.0
     goal_timeout_s: 5.0
     publish_period_s: 0.05

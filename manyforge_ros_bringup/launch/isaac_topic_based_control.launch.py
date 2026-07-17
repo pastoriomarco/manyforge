@@ -196,6 +196,11 @@ def generate_launch_description() -> LaunchDescription:
                 description="Isaac Sim JointState feedback topic used by the gripper bridge.",
             ),
             DeclareLaunchArgument(
+                "gripper_readiness_topic",
+                default_value="/manyforge/isaac_gripper_bridge/ready",
+                description="Fail-closed gripper topology/readiness signal.",
+            ),
+            DeclareLaunchArgument(
                 "start_gripper_action_bridge",
                 default_value="auto",
                 description=(
@@ -447,6 +452,9 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 "state_topic": LaunchConfiguration("gripper_state_topic").perform(
                     context
                 ),
+                "readiness_topic": LaunchConfiguration(
+                    "gripper_readiness_topic"
+                ).perform(context),
             }
         ],
     )
@@ -493,6 +501,9 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 "controller_state_topic": f"/{arm_controller_name}/controller_state",
                 "arm_action_name": f"/{arm_controller_name}/follow_joint_trajectory",
                 "gripper_action_name": gripper_action_name,
+                "gripper_readiness_topic": LaunchConfiguration(
+                    "gripper_readiness_topic"
+                ).perform(context),
                 "require_gripper_action": start_bridge,
                 "supervisor_enable_topic": LaunchConfiguration(
                     "supervisor_command_gate_enable_topic"

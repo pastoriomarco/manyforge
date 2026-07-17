@@ -44,6 +44,13 @@ class PoseSourceMeasuredTcpBinding:
     entity: str
     tcp_frame_id: str
     frame_id: str = ""
+    entity_to_tcp_position_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    entity_to_tcp_orientation_xyzw: tuple[float, float, float, float] = (
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    )
 
 
 @dataclass(frozen=True)
@@ -429,6 +436,20 @@ class SimulationInterfacesPoseSource:
                 entity=getattr(measured_tcp_raw, "entity"),
                 tcp_frame_id=getattr(measured_tcp_raw, "tcp_frame_id"),
                 frame_id=getattr(measured_tcp_raw, "frame_id", ""),
+                entity_to_tcp_position_xyz=tuple(
+                    getattr(
+                        measured_tcp_raw,
+                        "entity_to_tcp_position_xyz",
+                        (0.0, 0.0, 0.0),
+                    )
+                ),
+                entity_to_tcp_orientation_xyzw=tuple(
+                    getattr(
+                        measured_tcp_raw,
+                        "entity_to_tcp_orientation_xyzw",
+                        (0.0, 0.0, 0.0, 1.0),
+                    )
+                ),
             )
         return cls(
             client=client,
@@ -520,12 +541,17 @@ class SimulationInterfacesPoseSource:
                         "measured_tcp entity state did not include pose",
                     )
                 else:
+                    measured_pose = _compose_pose_with_local_offset(
+                        _pose_with_frame(entity.pose, self.measured_tcp.frame_id),
+                        self.measured_tcp.entity_to_tcp_position_xyz,
+                        self.measured_tcp.entity_to_tcp_orientation_xyzw,
+                    )
                     measured_tcp_update = PoseSourceMeasuredTcpUpdate(
                         pose_source_id=self.pose_source_id,
                         entity=self.measured_tcp.entity,
                         tcp_frame_id=self.measured_tcp.tcp_frame_id,
                         frame_id=self.measured_tcp.frame_id or entity.pose.frame_id,
-                        pose=_pose_with_frame(entity.pose, self.measured_tcp.frame_id),
+                        pose=measured_pose,
                         monotonic_s=now,
                     )
         except Exception as exc:  # pragma: no cover - exercised through ROS errors.
@@ -1539,6 +1565,39 @@ def _transform_pose_snapshot(
         stamp_sec=pose.stamp_sec,
         position_xyz=transformed_position,
         orientation_xyzw=transformed_orientation,
+    )
+
+
+def _compose_pose_with_local_offset(
+    pose: PoseSnapshot,
+    position_xyz: tuple[float, float, float],
+    orientation_xyzw: tuple[float, float, float, float],
+) -> PoseSnapshot:
+    """Compose a source-entity world pose with its fixed entity-to-TCP pose."""
+
+    entity_orientation = _normalize_quaternion(
+        pose.orientation_xyzw,
+        label="measured TCP entity orientation quaternion",
+    )
+    offset_orientation = _normalize_quaternion(
+        orientation_xyzw,
+        label="measured TCP fixed-offset orientation quaternion",
+    )
+    if not all(isfinite(component) for component in pose.position_xyz):
+        raise ValueError("measured TCP entity position contains non-finite values")
+    if not all(isfinite(component) for component in position_xyz):
+        raise ValueError("measured TCP fixed-offset position contains non-finite values")
+    return PoseSnapshot(
+        frame_id=pose.frame_id,
+        stamp_sec=pose.stamp_sec,
+        position_xyz=_vector_add(
+            pose.position_xyz,
+            _rotate_vector(entity_orientation, position_xyz),
+        ),
+        orientation_xyzw=_normalize_quaternion(
+            _quaternion_multiply(entity_orientation, offset_orientation),
+            label="measured TCP composed orientation quaternion",
+        ),
     )
 
 
