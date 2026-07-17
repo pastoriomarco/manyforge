@@ -69,6 +69,8 @@ inline constexpr char kEventSubscriberException[] =
 inline constexpr char kGripperStateUnavailable[] = "gripper_state_unavailable";
 inline constexpr char kUnknownNonStdException[] = "unknown_non_std_exception";
 inline constexpr char kTrackingSampleInvalid[] = "tracking_sample_invalid";
+inline constexpr char kTerminalPublicationInProgress[] =
+    "terminal_publication_in_progress";
 
 // Recovery assessment/admission (spec/230 §3.7.1, spec/210 §3.12).
 inline constexpr char kRecoveryNoneActive[] = "no_recovery_active";

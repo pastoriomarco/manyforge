@@ -7,6 +7,7 @@ import pytest
 
 from manyforge_behavior.kernel_client import (
     ActionSpan,
+    CommandResult,
     ExecuteRequest,
     ExecutionState,
     GripperCommandRequest,
@@ -17,6 +18,7 @@ from manyforge_behavior.kernel_client import (
     SceneObjectSnapshot,
     SceneEditRequest,
 )
+from manyforge_behavior.motion_runtime import MotionExecutionCoordinator
 
 
 @pytest.fixture
@@ -86,6 +88,38 @@ class TestMockKernelExecute:
 
         result = kernel.execute(make_request("move_2"))
         assert result.ok
+
+    def test_motion_coordinator_retries_terminal_publication_in_progress(
+        self, kernel
+    ):
+        execution = kernel.execute(make_request())
+        assert execution.ok
+        coordinator = MotionExecutionCoordinator(kernel)
+        acknowledge_completed = kernel.acknowledge_completed
+        attempts = 0
+
+        def acknowledge_with_publication_race(execution_id, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return CommandResult(
+                    accepted=False,
+                    error="Completed execution evidence is still being published",
+                    reason_code="terminal_publication_in_progress",
+                    details={"retryable": "true"},
+                )
+            return acknowledge_completed(execution_id, **kwargs)
+
+        kernel.acknowledge_completed = acknowledge_with_publication_race
+
+        first = coordinator.update(execution.execution_id)
+        assert first.state == "running"
+        assert kernel.get_status().state == ExecutionState.COMPLETED
+
+        second = coordinator.update(execution.execution_id)
+        assert second.state == "succeeded"
+        assert kernel.get_status().state == ExecutionState.IDLE
+        assert attempts == 2
 
     def test_execute_from_non_terminal_non_idle_fails(self, kernel):
         kernel._state = ExecutionState.EXECUTING

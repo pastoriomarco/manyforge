@@ -37,6 +37,41 @@ ErrorDTO stale_control_command_error() {
                   {{"reason_code", "stale_control_command"}}};
 }
 
+// Per-attempt state: keeps terminal acknowledgement behind the complete
+// normal-completion event/outcome batch without holding a lock across event
+// subscriber callbacks.
+class CompletionPublicationGuard {
+ public:
+  CompletionPublicationGuard(std::atomic<std::uint64_t>& owner,
+                             std::uint64_t execution_id)
+      : owner_(owner), execution_id_(execution_id) {
+    std::uint64_t expected = 0;
+    if (!owner_.compare_exchange_strong(expected, execution_id_,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+      throw std::logic_error(
+          "overlapping normal-completion publication attempts");
+    }
+  }
+
+  CompletionPublicationGuard(const CompletionPublicationGuard&) = delete;
+  CompletionPublicationGuard& operator=(const CompletionPublicationGuard&) =
+      delete;
+
+  ~CompletionPublicationGuard() {
+    std::uint64_t expected = execution_id_;
+    if (!owner_.compare_exchange_strong(expected, 0,
+                                        std::memory_order_release,
+                                        std::memory_order_relaxed)) {
+      std::terminate();
+    }
+  }
+
+ private:
+  std::atomic<std::uint64_t>& owner_;
+  std::uint64_t execution_id_;
+};
+
 double clamp_unit_interval(double value) {
   return std::max(0.0, std::min(1.0, value));
 }
@@ -5817,6 +5852,8 @@ void ExecutionKernel::execute_worker_finalize_phase(
   }
 
   auto prev_state4 = sm_.status().state;
+  CompletionPublicationGuard completion_publication{
+      completion_publication_execution_id_, exec_id};
   auto completed_transition =
       commit_terminal(ExecutionState::kCompleted, "terminal_commit");
   if (completed_transition.committed != ExecutionState::kCompleted) {
@@ -8153,6 +8190,17 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
                  {{"reason_code", "mismatched_execution_id"},
                   {"current_execution_id", std::to_string(status.execution_id)},
                   {"requested_execution_id", std::to_string(execution_id)}}}};
+  }
+  if (completion_publication_execution_id_.load(std::memory_order_acquire) ==
+      execution_id) {
+    return AcknowledgeCompletedResultDTO{
+        false,
+        ErrorDTO{kErrorExecutionRejected,
+                 "Completed execution evidence is still being published",
+                 {{"reason_code",
+                   reason_codes::kTerminalPublicationInProgress},
+                  {"retryable", "true"},
+                  {"execution_id", std::to_string(execution_id)}}}};
   }
 
   auto result = sm_.reset();

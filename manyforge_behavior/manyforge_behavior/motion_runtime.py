@@ -57,6 +57,16 @@ class MotionExecutionCoordinator:
                 )
             ack = self._kernel.acknowledge_completed(execution_id)
             if not ack.accepted:
+                # The kernel has already committed Completed, but its native
+                # terminal event/outcome batch may still be in flight. Keep
+                # this transaction alive and retry on the next BT tick so the
+                # acknowledgement cannot overtake that causal evidence.
+                retryable = ack.details.get("retryable")
+                if (
+                    ack.reason_code == "terminal_publication_in_progress"
+                    and retryable in (True, 1, "1", "true")
+                ):
+                    return MotionTransactionUpdate(state="running", status=status)
                 return MotionTransactionUpdate(
                     state="failed",
                     status=status,

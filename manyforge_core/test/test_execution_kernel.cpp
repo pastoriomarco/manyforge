@@ -10459,6 +10459,95 @@ TEST_F(ExecutionKernelTest, Events_HappyPath_PlanAndExecute) {
 }
 
 TEST_F(ExecutionKernelTest,
+       AcknowledgeCompleted_CannotOvertakeTerminalPublication) {
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool execute_completed_callback_entered = false;
+  bool release_execute_completed_callback = false;
+
+  kernel.subscribe_events([&](const KernelEvent& event) {
+    {
+      std::lock_guard<std::mutex> lock(events_mutex);
+      events.push_back(event);
+    }
+    if (event.type != KernelEventType::kExecuteCompleted) {
+      return;
+    }
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    execute_completed_callback_entered = true;
+    gate_cv.notify_all();
+    gate_cv.wait(lock, [&] { return release_execute_completed_callback; });
+  });
+
+  const auto execution =
+      kernel.execute(make_test_request("terminal_publication_gate"));
+  ASSERT_TRUE(execution.ok());
+
+  bool callback_entered = false;
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    callback_entered = gate_cv.wait_for(
+        lock, std::chrono::seconds(2),
+        [&] { return execute_completed_callback_entered; });
+  }
+
+  std::optional<AcknowledgeCompletedResultDTO> early_ack;
+  if (callback_entered) {
+    EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+    early_ack = kernel.acknowledge_completed(execution.value());
+  }
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    release_execute_completed_callback = true;
+  }
+  gate_cv.notify_all();
+
+  ASSERT_TRUE(callback_entered);
+  ASSERT_TRUE(early_ack.has_value());
+  EXPECT_FALSE(early_ack->accepted);
+  ASSERT_TRUE(early_ack->error.has_value());
+  EXPECT_EQ(early_ack->error->details.at("reason_code"),
+            reason_codes::kTerminalPublicationInProgress);
+  EXPECT_EQ(early_ack->error->details.at("retryable"), "true");
+
+  ASSERT_TRUE(kernel.wait_for_completion(2'000'000'000));
+  const auto final_ack = kernel.acknowledge_completed(execution.value());
+  ASSERT_TRUE(final_ack.accepted)
+      << (final_ack.error.has_value() ? final_ack.error->message
+                                     : std::string{});
+
+  std::lock_guard<std::mutex> lock(events_mutex);
+  const auto execute_completed =
+      std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
+        return event.type == KernelEventType::kExecuteCompleted;
+      });
+  const auto completed_transition =
+      std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
+        return event.type == KernelEventType::kStateTransition &&
+               event.to_state == ExecutionState::kCompleted;
+      });
+  const auto acknowledged =
+      std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
+        return event.type == KernelEventType::kCompletedAcknowledged;
+      });
+  const auto idle_transition =
+      std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
+        return event.type == KernelEventType::kStateTransition &&
+               event.from_state == ExecutionState::kCompleted &&
+               event.to_state == ExecutionState::kIdle;
+      });
+  ASSERT_NE(execute_completed, events.end());
+  ASSERT_NE(completed_transition, events.end());
+  ASSERT_NE(acknowledged, events.end());
+  ASSERT_NE(idle_transition, events.end());
+  EXPECT_LT(execute_completed, completed_transition);
+  EXPECT_LT(completed_transition, acknowledged);
+  EXPECT_LT(acknowledged, idle_transition);
+}
+
+TEST_F(ExecutionKernelTest,
        ExecuteAdmissionEventsFlushBeforeFastWorkerTerminalEvents) {
   std::mutex events_mutex;
   std::vector<KernelEventType> events;
