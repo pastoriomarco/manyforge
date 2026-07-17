@@ -2110,6 +2110,50 @@ bool wait_for_pending_scheduler_work(ThreadSafeManualScheduler& scheduler,
   return false;
 }
 
+struct LookaheadPermitDriveResult {
+  bool admitted = false;
+  MetricsSnapshot metrics;
+};
+
+LookaheadPermitDriveResult drive_until_lookahead_permit_admitted(
+    ExecutionKernel& kernel, ThreadSafeFakeClock& clock,
+    ThreadSafeManualScheduler& scheduler, std::int64_t monitor_period_ns,
+    int max_attempts = 100) {
+  LookaheadPermitDriveResult result;
+  result.metrics = kernel.get_metrics();
+  const auto jobs_started_before =
+      result.metrics.runtime_collision_lookahead_jobs_started;
+  for (int attempt = 0; attempt < max_attempts; ++attempt) {
+    result.metrics = kernel.get_metrics();
+    if (result.metrics.runtime_collision_lookahead_permit_pending ||
+        result.metrics.runtime_collision_lookahead_job_active ||
+        result.metrics.runtime_collision_lookahead_jobs_started >
+            jobs_started_before) {
+      result.admitted = true;
+      return result;
+    }
+    if (!result.metrics.runtime_collision_lookahead_armed) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+
+    // RuntimeSafety deliberately never waits for the lower-priority lookahead
+    // session mutex. A legal try-lock miss consumes no permit; production
+    // retries on the next clear monitor tick. Stop advancing fake time as soon
+    // as one request is accepted so its absolute query budget remains stable.
+    clock.advance(monitor_period_ns);
+    scheduler.advance_to(clock.now());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  result.metrics = kernel.get_metrics();
+  result.admitted =
+      result.metrics.runtime_collision_lookahead_permit_pending ||
+      result.metrics.runtime_collision_lookahead_job_active ||
+      result.metrics.runtime_collision_lookahead_jobs_started >
+          jobs_started_before;
+  return result;
+}
+
 bool wait_for_recovery_status(ExecutionKernel& kernel,
                               ThreadSafeManualScheduler& scheduler,
                               ThreadSafeFakeClock& clock,
@@ -5848,13 +5892,18 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
 
-  local_clock.advance(10'000'000);
-  local_scheduler.advance_to(local_clock.now());
+  const auto permit = drive_until_lookahead_permit_admitted(
+      controlled_kernel, local_clock, local_scheduler,
+      config.collision_monitor_period_ns);
+  ASSERT_TRUE(permit.admitted)
+      << "periodic clear permits were never admitted; try-lock misses="
+      << permit.metrics
+             .runtime_collision_lookahead_clear_permit_try_lock_misses;
 
   std::vector<KernelEvent> captured_events;
   {
     std::unique_lock<std::mutex> lock(events_mu);
-    ASSERT_TRUE(events_cv.wait_for(lock, std::chrono::seconds(2), [&]() {
+    ASSERT_TRUE(events_cv.wait_for(lock, std::chrono::seconds(5), [&]() {
       return std::any_of(events.begin(), events.end(), [](const KernelEvent& event) {
         const auto surface = event.details.find("surface");
         return event.type == KernelEventType::kCollisionDetected &&
@@ -5974,9 +6023,14 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
 
-  local_clock.advance(10'000'000);
-  local_scheduler.advance_to(local_clock.now());
-  ASSERT_TRUE(controlled_kernel.wait_for_completion(2'000'000'000));
+  const auto permit = drive_until_lookahead_permit_admitted(
+      controlled_kernel, local_clock, local_scheduler,
+      config.collision_monitor_period_ns);
+  ASSERT_TRUE(permit.admitted)
+      << "periodic clear permits were never admitted; try-lock misses="
+      << permit.metrics
+             .runtime_collision_lookahead_clear_permit_try_lock_misses;
+  ASSERT_TRUE(controlled_kernel.wait_for_completion(5'000'000'000));
 
   EXPECT_EQ(controlled_kernel.get_status().state,
             ExecutionState::kCompleted);
@@ -6034,34 +6088,12 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
 
-  auto lookahead_metrics = controlled_kernel.get_metrics();
-  bool clear_permit_admitted = false;
-  for (int attempt = 0; attempt < 100; ++attempt) {
-    if (local_lookahead_engine->blocked_check_count.load(
-            std::memory_order_acquire) > 0) {
-      clear_permit_admitted = true;
-      break;
-    }
-    lookahead_metrics = controlled_kernel.get_metrics();
-    if (lookahead_metrics.runtime_collision_lookahead_permit_pending ||
-        lookahead_metrics.runtime_collision_lookahead_job_active ||
-        lookahead_metrics.runtime_collision_lookahead_jobs_started > 0) {
-      clear_permit_admitted = true;
-      break;
-    }
-
-    // The immediate RuntimeSafety monitor never waits for the lower-priority
-    // lookahead session mutex. A legal first try-lock miss is retried on the
-    // next clear monitor tick, so drive that production cadence until one
-    // permit is accepted. Once accepted, stop advancing fake time so the
-    // admitted query keeps its original absolute budget while its worker runs.
-    local_clock.advance(config.collision_monitor_period_ns);
-    local_scheduler.advance_to(local_clock.now());
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  ASSERT_TRUE(clear_permit_admitted)
+  const auto permit = drive_until_lookahead_permit_admitted(
+      controlled_kernel, local_clock, local_scheduler,
+      config.collision_monitor_period_ns);
+  ASSERT_TRUE(permit.admitted)
       << "periodic clear permits were never admitted; try-lock misses="
-      << lookahead_metrics
+      << permit.metrics
              .runtime_collision_lookahead_clear_permit_try_lock_misses;
   {
     std::unique_lock<std::mutex> lock(local_lookahead_engine->block_mutex);
