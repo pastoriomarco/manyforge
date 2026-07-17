@@ -235,10 +235,23 @@ orchestrator:
     collision_monitor_period_ms: 100
     runtime_collision_immediate_query_budget_ms: 75
     runtime_collision_lookahead_query_budget_ms: 75
-    runtime_collision_lookahead_cycle_budget_ms: 250
+    # Complete-cycle liveness bound, including capacity-one queue delay and
+    # worker time. It does not pace the work-conserving lookahead or weaken the
+    # independent 100 ms immediate monitor. The prior 250 ms bound nuisance-
+    # tripped at 250.44 ms in the normal 32-sample qualification profile.
+    runtime_collision_lookahead_cycle_budget_ms: 350
     runtime_collision_lookahead_s: 2
+    # Keep the qualified 32-sample collision profile. A 16-sample throughput
+    # candidate removed cycle overruns under concurrent load but missed the
+    # injected-wall lookahead case that 32 samples detected; the immediate
+    # monitor caught it only at the current pose. Resource isolation must
+    # recover timing margin without silently reducing this known coverage.
     runtime_collision_lookahead_max_samples: 32
     runtime_collision_lookahead_workers: 4
+    # The simulation_interfaces source runs at 4 Hz and timestamps at poll
+    # admission. Three source periods cover bounded acquisition/delivery jitter
+    # while remaining stricter than the source's 1 s stale contract.
+    runtime_dynamic_body_max_age_cap_ms: 750
 launch:
   runner:
     module: manyforge_behavior.runner

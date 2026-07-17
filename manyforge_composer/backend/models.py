@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from typing import Any, Optional, List, Dict, Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 _ALIAS_CFG = ConfigDict(populate_by_name=True)
 _ALIAS_EXTRA_CFG = ConfigDict(populate_by_name=True, extra="allow")
@@ -1869,7 +1869,10 @@ class DebugExportResponse(BaseModel):
     program: DebugExportProgramResponse
     deployment: DebugExportDeploymentResponse
     kernel_snapshot: Dict[str, Any] = Field(alias="kernelSnapshot")
-    kernel_metrics: Dict[str, int | str] = Field(alias="kernelMetrics")
+    # Kernel telemetry includes bounded scalar, vector, and structured-source
+    # fields. JsonValue keeps the export contract exact without accepting
+    # arbitrary Python objects that cannot be persisted or transferred.
+    kernel_metrics: Dict[str, JsonValue] = Field(alias="kernelMetrics")
     execution_digest: Dict[str, Any] = Field(alias="executionDigest")
     execution_history: Dict[str, Any] = Field(alias="executionHistory")
     event_channels: Dict[str, List[Dict[str, Any]]] = Field(

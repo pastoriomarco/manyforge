@@ -97,6 +97,20 @@ class IExecutionBackend {
       return nullptr;
     }
 
+    /// Retire exactly one backend progress generation after the kernel has
+    /// disarmed every runtime-lookahead consumer for that execution. Stop,
+    /// reset, failure, and authority-loss paths still invalidate eagerly;
+    /// this handoff exists so natural completion cannot masquerade as cursor
+    /// loss in the backend-result -> kernel-terminal interval.
+    virtual void retire_execution_progress_generation(
+        std::uint64_t execution_generation) noexcept = 0;
+
+    /// Atomically arbitrate runtime-lookahead stop authority against natural
+    /// completion for the exact backend dispatch generation.
+    virtual ExecutionProgressHazardClaimResult
+    claim_execution_progress_hazard(
+        std::uint64_t execution_generation) noexcept = 0;
+
     /// Update the runtime velocity scale used by active execution.
     ///
     /// ADR-0018: this is a live control surface, not a trajectory planning

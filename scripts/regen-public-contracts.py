@@ -55,6 +55,15 @@ DEFAULT_CATALOG_PATH = str(
     REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml"
 )
 
+# The repository is a mixed colcon/Python workspace: Composer is importable
+# from the repository root, while manyforge_behavior uses a nested package
+# root. Make the documented direct invocation deterministic instead of relying
+# on an ambient PYTHONPATH from a particular test or launch wrapper.
+for source_root in (REPO_ROOT, REPO_ROOT / "manyforge_behavior"):
+    source_text = str(source_root)
+    if source_text not in sys.path:
+        sys.path.insert(0, source_text)
+
 
 def _build_composer_state():
     """Construct a minimal ComposerState suitable for OpenAPI / MCP introspection.

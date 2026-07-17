@@ -33,12 +33,23 @@ struct ExecutionProgressCursorSnapshotDTO {
   std::int64_t received_timestamp_ns = 0;
   std::int64_t freshness_budget_ns = 0;
   bool valid = false;
+  // A terminal marker is an explicit backend-to-kernel handoff, not an
+  // invalid cursor. It prevents queued lookahead work from treating normal
+  // completion as progress-authority loss until the kernel disarms and
+  // retires the generation.
+  bool terminal = false;
 };
 
 struct ExecutionProgressPublishResult {
   bool published = false;
   std::uint64_t sequence = 0;
   const char* reason = "";
+};
+
+enum class ExecutionProgressHazardClaimResult {
+  kClaimed,
+  kTerminal,
+  kGenerationMismatch,
 };
 
 /// Scalar, latest-only execution-progress publication (spec/210 section 3.14).
@@ -60,6 +71,23 @@ class ExecutionProgressPublication final {
                                          std::int64_t source_timestamp_ns,
                                          std::int64_t received_timestamp_ns) noexcept;
 
+  /// Publish the definitive natural-completion boundary for one generation.
+  /// The marker remains valid until kernel terminal handoff retires it. Once
+  /// terminal, late same-generation progress callbacks cannot reopen motion.
+  ExecutionProgressPublishResult publish_terminal(
+      std::uint64_t execution_generation,
+      std::int64_t trajectory_time_ns,
+      std::int64_t source_timestamp_ns,
+      std::int64_t received_timestamp_ns) noexcept;
+
+  /// Atomically arbitrate a completed lookahead hazard against natural
+  /// completion for one generation. The first authority boundary wins:
+  /// terminal prevents a hazard claim, while a hazard claim prevents a late
+  /// terminal callback from erasing the stop decision. An invalid active
+  /// cursor remains claimable so authority loss still fails closed.
+  ExecutionProgressHazardClaimResult claim_hazard_authority(
+      std::uint64_t execution_generation) noexcept;
+
   /// Lifecycle-bound invalidation is guaranteed, not best effort, and retires
   /// the current generation. Readers see either the preceding complete even
   /// epoch or the resulting invalid epoch; only a newer generation can restore
@@ -79,6 +107,12 @@ class ExecutionProgressPublication final {
   [[nodiscard]] std::int64_t freshness_budget_ns() const noexcept { return freshness_budget_ns_; }
 
  private:
+  ExecutionProgressPublishResult publish_impl(
+      std::uint64_t execution_generation,
+      std::int64_t trajectory_time_ns,
+      std::int64_t source_timestamp_ns,
+      std::int64_t received_timestamp_ns,
+      bool terminal) noexcept;
   void begin_write() noexcept;
   void end_write() noexcept;
 
@@ -88,6 +122,7 @@ class ExecutionProgressPublication final {
   const std::int64_t freshness_budget_ns_;
 
   mutable std::mutex writer_mutex_;
+  bool hazard_authority_claimed_ = false;
   std::atomic<std::uint64_t> epoch_{0};
   std::atomic<std::uint64_t> next_sequence_{1};
   std::atomic<std::uint64_t> sequence_{0};
@@ -96,6 +131,7 @@ class ExecutionProgressPublication final {
   std::atomic<std::int64_t> source_timestamp_ns_{0};
   std::atomic<std::int64_t> received_timestamp_ns_{0};
   std::atomic<bool> valid_{false};
+  std::atomic<bool> terminal_{false};
 };
 
 }  // namespace manyforge::core

@@ -126,10 +126,7 @@ def _resolved_robot_model_from_deployment(
     )
 
 
-def build_program_loaded_callback(
-    *,
-    bundle,
-):
+def build_program_loaded_callback():
     """Build the Composer program-load callback for runtime visual state.
 
     The native viewer path is always active: behavior-tree scene mutations
@@ -193,7 +190,7 @@ def build_program_loaded_callback(
         st.cycle_manager._on_run_from_idle = _refresh_runtime_visuals
         st.cycle_manager.reset()
         initial_positions = _get_simulator_initial_joint_positions(st)
-        runtime_bundle = getattr(st, "kernel_bundle", None) or bundle
+        runtime_bundle = getattr(st, "kernel_bundle", None)
         if runtime_bundle is not None and initial_positions:
             runtime_bundle.set_joint_positions(initial_positions)
             logger.info("Applied simulator-only initial joint positions from deployment")
@@ -899,6 +896,10 @@ def _run_mcp(args):
         trace_max_bytes=args.trace_max_bytes,
         allowed_fs_roots=security.allowed_fs_roots,
     )
+    # ComposerState is the sole runtime owner. Keeping the initial bundle in
+    # this long-lived stack frame would retain its scheduler/ROS resources
+    # after a deployment-specific kernel replaces it.
+    bundle = None
     _configure_assistant_provider(
         state,
         args.assistant_provider,
@@ -1108,9 +1109,10 @@ def main():
     )
     state.public_api_base_url = _default_public_api_base_url(args.host, args.port)
 
-    state._on_program_loaded = build_program_loaded_callback(
-        bundle=bundle,
-    )
+    state._on_program_loaded = build_program_loaded_callback()
+    # The state owns the active bundle. Do not retain the unconfigured startup
+    # bundle in main() after a deployment load replaces and closes it.
+    bundle = None
 
     if not security.api_token and args.host != "127.0.0.1":
         logger.warning(

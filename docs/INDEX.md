@@ -48,6 +48,11 @@ branch/commit workflow).
     editable deployment fields, mandatory hard-stop floor, stop history,
     offline qualification, and live validation checklist.
 
+- [`operations/REALTIME_RESOURCE_PROFILE.md`](operations/REALTIME_RESOURCE_PROFILE.md)
+  - Opt-in Linux scheduler/affinity/memlock profile, JTC-first priority order,
+    live `/proc` verification, and the boundary between process-level
+    acceptance and full PREEMPT_RT/CPU-isolation qualification.
+
 - [`operations/ISAAC_SCENE_AUTHORING.md`](operations/ISAAC_SCENE_AUTHORING.md)
   - Operator runbook for exporting Isaac Sim scene meshes and loading
     them through Composer.

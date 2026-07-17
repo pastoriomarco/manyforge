@@ -41,6 +41,14 @@ _KERNEL_CONTROL_CALL_TIMEOUT_S = float(
 _RESET_PHASE_DEADLINE_S = float(
     os.environ.get("MANYFORGE_RESET_PHASE_DEADLINE_S", "20.0")
 )
+# Reset has already requested robot quiescence before joining the NRT behavior
+# loop. A tick may still be completing one bounded adapter/scene operation, so
+# the former 25 ms grace produced false zombie reports and claimed IDLE before
+# the tree actually stopped. Keep this independently bounded and configurable.
+_TICK_JOIN_DEADLINE_S = max(
+    0.05,
+    float(os.environ.get("MANYFORGE_TICK_JOIN_DEADLINE_S", "1.0")),
+)
 _SIGNAL_PROVIDER_POLL_TICKS = max(
     1,
     int(os.environ.get("MANYFORGE_SIGNAL_PROVIDER_POLL_TICKS", "10")),
@@ -680,6 +688,7 @@ class CycleManager:
             kernel_state_name,
             _STOP_SETTLE_DEADLINE_S,
         )
+        self._refresh_recovery_offer_best_effort("motion stop escalation")
 
     def _await_motion_stop_terminal(self, generation: int) -> None:
         deadline = time.monotonic() + _STOP_SETTLE_DEADLINE_S
@@ -740,6 +749,7 @@ class CycleManager:
     ) -> None:
         clear_motion_stop_flag = False
         set_stop_requested = False
+        recovery_state_changed = False
         with self._lock:
             if generation is not None and self._motion_stop_generation != generation:
                 return
@@ -763,6 +773,7 @@ class CycleManager:
                 set_stop_requested = True
             else:
                 self._motion_stop_state = "held"
+            recovery_state_changed = True
             if generation is not None and self._motion_stop_generation == generation:
                 self._motion_stop_thread = None
         if clear_motion_stop_flag:
@@ -775,6 +786,8 @@ class CycleManager:
                 True,
                 client_name="cycle_manager_motion_stop_failed",
             )
+        if recovery_state_changed:
+            self._refresh_recovery_offer_best_effort("motion stop completion")
 
     def _clear_motion_stop_after_tree_terminal_locked(self) -> bool:
         if self._motion_stop_state == "idle":
@@ -1729,6 +1742,7 @@ class CycleManager:
             True,
             client_name="cycle_manager_motion_soft_fail_failed",
         )
+        self._refresh_recovery_offer_best_effort("motion soft-stop failure")
 
     def _kernel_events_require_intervention(self, events: list[dict[str, Any]]) -> bool:
         """True when freshly drained kernel events prove intervention is latched.
@@ -1872,11 +1886,13 @@ class CycleManager:
                 snapshot_details,
             )
         # Snapshot has nothing — try the event stream. Walk recent events
-        # newest-first looking for a record that carries diagnostics worth
-        # surfacing. `collision_detected` is the strongest signal (full
-        # collision-result map); `interrupt_latched` is next (policy +
-        # latch identity). Other event types are not currently mapped.
-        event_code, event_details = self._harvest_kernel_event_diagnostics()
+        # newest-first looking for a record from this exact execution that
+        # carries diagnostics worth surfacing. `collision_detected` is the
+        # strongest signal (full collision-result map), then `error_raised`,
+        # then `interrupt_latched` (policy + latch identity).
+        event_code, event_details = self._harvest_kernel_event_diagnostics(
+            execution_id=int(getattr(snapshot, "execution_id", 0) or 0),
+        )
         if event_code or event_details:
             return event_code, event_details
         # Gripper faults never reach the execution snapshot or the kernel
@@ -1922,9 +1938,16 @@ class CycleManager:
 
     def _harvest_kernel_event_diagnostics(
         self,
+        *,
+        execution_id: int,
     ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
         """Scan recent buffered kernel events for a structured cause when
         the snapshot's error field is empty.
+
+        Only events for ``execution_id`` are eligible. Execution identifiers
+        are monotonic and authoritative; borrowing an older execution's rich
+        collision payload can make a later timeout look like a collision with
+        an object that is no longer present.
 
         Event priority (not chronology):
           1. `collision_detected` — carries the colliding pair, the
@@ -1935,7 +1958,9 @@ class CycleManager:
              monitor publishes collision_detected BEFORE interrupt_latched
              during a fault sequence, so a naive newest-first walk would
              pick the latch event and discard the richer collision data.
-          2. `interrupt_latched` — fallback when no collision_detected is
+          2. `error_raised` — the canonical ErrorDTO for non-collision runtime
+             failures such as lookahead deadline exhaustion.
+          3. `interrupt_latched` — fallback when neither stronger record is
              present in the window (e.g. drift-fault interrupts, operator-
              initiated preempts, etc.). Carries the policy id + latch
              identity but no causal diagnostics.
@@ -1946,6 +1971,9 @@ class CycleManager:
         the most recent event (newest-first), so a fresh collision wins
         over a stale one from earlier in the cycle.
         """
+        if execution_id <= 0:
+            return None, None
+
         try:
             self._drain_kernel_events()
         except Exception:  # noqa: BLE001 — drain is best-effort here
@@ -1955,19 +1983,49 @@ class CycleManager:
             events = list(self._kernel_events)[-64:]
 
         latest_collision: Optional[dict[str, Any]] = None
+        latest_error: Optional[tuple[Optional[str], dict[str, Any]]] = None
         latest_latch: Optional[dict[str, Any]] = None
         for event in reversed(events):
+            try:
+                event_execution_id = int(event.get("execution_id", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if event_execution_id != execution_id:
+                continue
             event_type = event.get("type") or event.get("event_type") or ""
             details = event.get("details")
-            if not isinstance(details, dict) or not details:
-                continue
-            if event_type == "collision_detected" and latest_collision is None:
-                latest_collision = dict(details)
+            event_details = dict(details) if isinstance(details, dict) else {}
+            if (
+                event_type == "collision_detected"
+                and event_details
+                and latest_collision is None
+            ):
+                latest_collision = event_details
                 # We have the highest-priority signal; no need to keep
                 # scanning for older latches.
                 break
-            if event_type == "interrupt_latched" and latest_latch is None:
-                latest_latch = dict(details)
+            if event_type == "error_raised" and latest_error is None:
+                error = event.get("error")
+                error_code: Optional[str] = None
+                if isinstance(error, dict):
+                    raw_code = error.get("code")
+                    if isinstance(raw_code, str) and raw_code:
+                        error_code = raw_code
+                    error_details = error.get("details")
+                    if isinstance(error_details, dict):
+                        # ErrorDTO details are the canonical cause. Event
+                        # details add correlation fields but cannot replace it.
+                        event_details.update(error_details)
+                latest_error = (
+                    preferred_structured_error_code(error_code, event_details),
+                    event_details,
+                )
+            if (
+                event_type == "interrupt_latched"
+                and event_details
+                and latest_latch is None
+            ):
+                latest_latch = event_details
                 # Don't break — keep scanning in case an older
                 # collision_detected is still in the window.
 
@@ -1978,6 +2036,8 @@ class CycleManager:
             # and the runtime monitor latched. Use a separate code so
             # the viewer can route to the right operator-facing copy.
             return "runtime_collision", latest_collision
+        if latest_error is not None:
+            return latest_error
         if latest_latch is not None:
             return "motion_interrupt_latched", latest_latch
         return None, None
@@ -2312,6 +2372,21 @@ class CycleManager:
             self._capture_recovery_facts(),
         )
         return offer.to_wire() if offer is not None else None
+
+    def _refresh_recovery_offer_best_effort(self, boundary: str) -> None:
+        """Project recovery facts after an NRT cycle-state boundary.
+
+        Callers have already released cycle state locks. Projection failure
+        must not undo a completed stop transition; the next authority boundary
+        can refresh the immutable offer again.
+        """
+        try:
+            self.refresh_recovery_offer()
+        except Exception:  # noqa: BLE001 - completed stop remains fail-closed.
+            logger.exception(
+                "Recovery offer projection failed after %s",
+                boundary,
+            )
 
     def get_recovery_offer(self) -> Optional[dict[str, Any]]:
         offer = self._recovery_coordinator.current_offer()
@@ -3417,7 +3492,7 @@ class CycleManager:
                 status="started",
                 request_id=request_id,
             )
-            if not self._tick_exit_event.wait(timeout=0.025):
+            if not self._tick_exit_event.wait(timeout=_TICK_JOIN_DEADLINE_S):
                 tick_join_duration_s = time.monotonic() - tick_join_started
                 blocked_stack = None
                 if thread_to_join.ident is not None:
@@ -3426,20 +3501,24 @@ class CycleManager:
                         blocked_stack = "".join(traceback.format_stack(frame))
                 if blocked_stack:
                     logger.error(
-                        "Tick thread did not terminate during reset grace window — zombie thread detected\n"
+                        "Tick thread did not quiesce within the reset deadline\n"
                         "Blocked tick thread stack follows:\n%s",
                         blocked_stack,
                     )
                 else:
                     logger.error(
-                        "Tick thread did not terminate during reset grace window — zombie thread detected"
+                        "Tick thread did not quiesce within the reset deadline"
                     )
                 with self._lock:
-                    self._error = "tick thread did not terminate"
-                    self._error_code = "tick_thread_zombie"
-                    self._error_details = None
-                    self._state = CycleState.IDLE
-                    self._pending_delegated_recovery = None
+                    # Reset has not reached its kernel/scene phases. Never
+                    # claim IDLE while the old tree can still execute effects.
+                    self._error = "behavior tree did not quiesce before reset deadline"
+                    self._error_code = "tick_thread_quiesce_timeout"
+                    self._error_details = {
+                        "deadline_s": f"{_TICK_JOIN_DEADLINE_S:g}",
+                        "phase": "tick_join",
+                    }
+                    self._state = CycleState.STOPPED
                     cleanup_alive = (
                         self._tick_cleanup_thread is not None
                         and self._tick_cleanup_thread.is_alive()
@@ -3457,8 +3536,11 @@ class CycleManager:
                     status="failed",
                     request_id=request_id,
                     duration_s=tick_join_duration_s,
-                    error="tick thread did not terminate",
-                    error_code="tick_thread_zombie",
+                    error="behavior tree did not quiesce before reset deadline",
+                    error_code="tick_thread_quiesce_timeout",
+                )
+                self._refresh_recovery_offer_best_effort(
+                    "tick thread quiesce timeout"
                 )
                 return
             with self._lock:
@@ -3633,16 +3715,22 @@ class CycleManager:
         5. Sleep remainder of 10ms period
         """
         period_s = 0.010  # 10ms = 100Hz
+        runtime_fault_revision = -1
+        runtime_faults: tuple[Any, ...] = ()
+        projected_runtime_fault_signature: tuple[tuple[str, int, str], ...] = ()
         
         while not self._tick_stop_event.is_set():
             # Wait for pause event (blocks when paused)
             if not self._tick_pause_event.wait(timeout=_PAUSED_TICK_WAIT_S):
                 continue  # Paused, loop again
 
+            # Bound the complete supervisory iteration. Signal ingestion is
+            # NRT work, but it still counts against the documented 100 Hz
+            # cadence and must not make a fault-held loop run faster.
+            start_time = time.monotonic()
             self._refresh_signal_registry()
 
             # Tick the tree
-            start_time = time.monotonic()
             try:
                 with self._tree_tick_lock:
                     self._tree.tick()
@@ -3695,29 +3783,49 @@ class CycleManager:
             with self._lock:
                 self._node_statuses = statuses
 
-            runtime_faults = sorted(
-                self._runtime_pause_registry.active_faults(),
-                key=lambda item: (item.generation, item.fault_id),
-            )
+            current_fault_revision = self._runtime_pause_registry.revision
+            if current_fault_revision != runtime_fault_revision:
+                runtime_fault_revision, fault_snapshot = (
+                    self._runtime_pause_registry.active_fault_snapshot()
+                )
+                runtime_faults = tuple(
+                    sorted(
+                        fault_snapshot,
+                        key=lambda item: (item.generation, item.fault_id),
+                    )
+                )
             if runtime_faults:
                 fault = runtime_faults[0]
-                self._enter_motion_paused_state(
-                    fault.message,
-                    runtime_reason_code=fault.reason_code,
-                    runtime_details={
-                        **fault.details,
-                        "runtime_fault_id": fault.fault_id,
-                        "runtime_fault_generation": fault.generation,
-                        "runtime_fault_domain": fault.domain,
-                        "runtime_fault_node_name": fault.node_name,
-                        "runtime_fault_node_id": fault.node_id,
-                    },
+                fault_signature = tuple(
+                    (item.fault_id, item.generation, item.state)
+                    for item in runtime_faults
                 )
-                try:
-                    self.refresh_recovery_offer()
-                except Exception:  # noqa: BLE001 - fault remains fail-closed.
-                    logger.exception("Recovery offer projection failed for runtime fault")
+                if fault_signature != projected_runtime_fault_signature:
+                    self._enter_motion_paused_state(
+                        fault.message,
+                        runtime_reason_code=fault.reason_code,
+                        runtime_details={
+                            **fault.details,
+                            "runtime_fault_id": fault.fault_id,
+                            "runtime_fault_generation": fault.generation,
+                            "runtime_fault_domain": fault.domain,
+                            "runtime_fault_node_name": fault.node_name,
+                            "runtime_fault_node_id": fault.node_id,
+                        },
+                    )
+                    self._refresh_recovery_offer_best_effort("runtime fault")
+                    projected_runtime_fault_signature = fault_signature
+
+                # A runtime motion fault holds the motion branch while
+                # continue-policy siblings keep ticking. It must therefore
+                # retain the normal supervisory cadence rather than bypassing
+                # the deadline wait and monopolizing one Python core.
+                elapsed = time.monotonic() - start_time
+                sleep_time = period_s - elapsed
+                if sleep_time > 0:
+                    self._tick_stop_event.wait(timeout=sleep_time)
                 continue
+            projected_runtime_fault_signature = ()
 
             # Check if tree completed
             status = self._tree.root.status

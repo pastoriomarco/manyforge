@@ -71,6 +71,21 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   execution_progress_publication() const noexcept override {
     return execution_progress_publication_.get();
   }
+  void retire_execution_progress_generation(
+      std::uint64_t execution_generation) noexcept override {
+    if (execution_progress_publication_) {
+      (void)execution_progress_publication_->invalidate_generation(
+          execution_generation);
+    }
+  }
+  core::ExecutionProgressHazardClaimResult claim_execution_progress_hazard(
+      std::uint64_t execution_generation) noexcept override {
+    return execution_progress_publication_
+               ? execution_progress_publication_->claim_hazard_authority(
+                     execution_generation)
+               : core::ExecutionProgressHazardClaimResult::
+                     kGenerationMismatch;
+  }
   const std::atomic<std::uint64_t>* observed_state_authority_epoch()
       const noexcept {
     return observed_state_publication_ != nullptr

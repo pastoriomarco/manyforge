@@ -1029,6 +1029,159 @@ def test_live_success_requires_behavior_consumption_of_kernel_completion() -> No
     assert _LIVE._successful_drop_execution_ids(events) == [4]
 
 
+def test_live_runtime_metrics_capture_is_complete_and_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        key: 0
+        for key in (
+            _LIVE._KERNEL_RUNTIME_REQUIRED_METRICS
+            | _LIVE._KERNEL_RUNTIME_COUNTER_METRICS
+        )
+    }
+    payload["runtime_collision_lookahead_max_samples"] = 32
+    payload["unrelated_metric"] = 99
+
+    def request_json(_base_url: str, path: str, **_kwargs: object) -> dict:
+        assert path == "/api/kernel/metrics"
+        return payload
+
+    monkeypatch.setattr(_LIVE, "_request_json", request_json)
+    captured = _LIVE._kernel_runtime_metrics("http://composer")
+
+    assert captured["runtime_collision_lookahead_max_samples"] == 32
+    assert "controller_command_progress_samples_total" in captured
+    assert "unrelated_metric" not in captured
+
+
+def test_live_runtime_metric_deltas_reject_counter_regression() -> None:
+    before = {key: 7 for key in _LIVE._KERNEL_RUNTIME_COUNTER_METRICS}
+    after = {key: 9 for key in _LIVE._KERNEL_RUNTIME_COUNTER_METRICS}
+
+    deltas = _LIVE._kernel_runtime_counter_deltas(before, after)
+    assert set(deltas) == set(_LIVE._KERNEL_RUNTIME_COUNTER_METRICS)
+    assert set(deltas.values()) == {2}
+
+    after["runtime_collision_ticks_completed"] = 6
+    with pytest.raises(
+        RuntimeError, match="runtime_collision_ticks_completed.*regressed"
+    ):
+        _LIVE._kernel_runtime_counter_deltas(before, after)
+
+
+def test_live_runtime_metrics_require_fresh_attributable_baseline() -> None:
+    baseline = {
+        key: 0 for key in _LIVE._KERNEL_RUNTIME_FRESH_BASELINE_METRICS
+    }
+    _LIVE._require_fresh_kernel_runtime_baseline(baseline)
+
+    baseline["runtime_collision_lookahead_jobs_started"] = 1
+    with pytest.raises(
+        RuntimeError,
+        match="fresh kernel metric baseline.*lookahead_jobs_started=1",
+    ):
+        _LIVE._require_fresh_kernel_runtime_baseline(baseline)
+
+
+def test_live_failed_run_retains_cycle_and_kernel_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = {
+        key: 0
+        for key in (
+            _LIVE._KERNEL_RUNTIME_REQUIRED_METRICS
+            | _LIVE._KERNEL_RUNTIME_COUNTER_METRICS
+        )
+    }
+
+    def request_json(_base_url: str, path: str, **_kwargs: object) -> dict:
+        if path == "/api/cycle/status":
+            return {"state": "stopped", "errorCode": "execution_aborted"}
+        if path == "/api/kernel/metrics":
+            return metrics
+        raise AssertionError(path)
+
+    monkeypatch.setattr(_LIVE, "_request_json", request_json)
+    evidence = _LIVE._failure_runtime_evidence("http://composer")
+
+    assert evidence["cycle_status"]["errorCode"] == "execution_aborted"
+    assert "runtime_collision_ticks_completed" in evidence["kernel_runtime_metrics"]
+    assert "capture_errors" not in evidence
+
+
+def test_live_failed_run_records_secondary_capture_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_request(*_args: object, **_kwargs: object) -> dict:
+        raise ConnectionError("offline")
+
+    monkeypatch.setattr(_LIVE, "_request_json", fail_request)
+
+    evidence = _LIVE._failure_runtime_evidence("http://composer")
+
+    assert set(evidence["capture_errors"]) == {
+        "cycle_status",
+        "kernel_runtime_metrics",
+    }
+
+
+def test_live_wait_prepares_fresh_plan_after_nonfinal_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required_types = (
+        "plan_started",
+        "plan_completed",
+        "validation_started",
+        "validation_passed",
+        "execute_started",
+        "execute_completed",
+        "acknowledge_completed",
+    )
+
+    def success_batch(execution_id: int, first_index: int) -> list[dict]:
+        return [
+            {
+                "type": event_type,
+                "execution_id": execution_id,
+                "event_index": first_index + offset,
+                "sequence": first_index + offset,
+                "details": {"move_id": "drop_approach"},
+            }
+            for offset, event_type in enumerate(required_types)
+        ]
+
+    batches = [success_batch(1, 1), success_batch(2, 8)]
+
+    def request_json(_base_url: str, path: str) -> dict:
+        if path.startswith("/api/kernel/events"):
+            batch = batches.pop(0)
+            return {"events": batch}
+        if path == "/api/cycle/status":
+            return {"state": "running"}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(_LIVE, "_request_json", request_json)
+    monkeypatch.setattr(_LIVE, "_enforce_viewer_stratum", lambda *args, **kwargs: 0)
+    invalidations: list[str] = []
+    tracker = _LIVE._KernelSequenceTracker(0)
+    events, cursor, invalidated_count = _LIVE._wait_for_successes(
+        "http://composer",
+        cursor=0,
+        sequence_tracker=tracker,
+        required_successes=2,
+        timeout_s=1.0,
+        viewer_stratum="disconnected",
+        focused_attested=False,
+        poll_period_s=0.0,
+        prepare_next_fresh_plan=lambda: invalidations.append("clear"),
+    )
+
+    assert len(events) == 14
+    assert cursor == 14
+    assert invalidated_count == 1
+    assert invalidations == ["clear"]
+
+
 def test_live_sample_reports_true_behavior_node_envelope() -> None:
     timestamps = {
         "plan_started": 110,

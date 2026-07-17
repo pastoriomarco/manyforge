@@ -743,6 +743,7 @@ class ExecutionKernel {
     bool outcome_emitted = false;
     bool correlation_captured = false;
     std::uint64_t runtime_collision_protection_generation = 0;
+    std::uint64_t execution_progress_generation = 0;
     std::optional<ActionSpanDTO> action_span;
     std::string contact_policy_id;
     std::optional<InterruptLatch> motion_trip_latch;

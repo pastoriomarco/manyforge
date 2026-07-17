@@ -397,6 +397,7 @@ void RoboPlanExecutionBackend::execution_worker(
   std::vector<double> latest_positions =
       trajectory.waypoints.empty() ? std::vector<double>{}
                                    : trajectory.waypoints.front().positions_rad;
+  bool completed_normally = false;
 
   if (st.stop_requested()) {
     state_.running.store(false);
@@ -533,6 +534,12 @@ void RoboPlanExecutionBackend::execution_worker(
                                SceneUpdateMode::kBlocking,
                                completed_snapshot_ns);
       }
+      const auto terminal_progress_ns = clock_.now();
+      (void)execution_progress_publication_->publish_terminal(
+          execution_generation,
+          static_cast<std::int64_t>(std::max(0.0, total_duration_s) * 1e9),
+          terminal_progress_ns, terminal_progress_ns);
+      completed_normally = true;
       break;
     }
 
@@ -546,8 +553,10 @@ void RoboPlanExecutionBackend::execution_worker(
   state_.pause_requested.store(false);
   state_.natural_completion_stop_requested.store(false,
                                                  std::memory_order_release);
-  (void)execution_progress_publication_->invalidate_generation(
-      execution_generation);
+  if (!completed_normally) {
+    (void)execution_progress_publication_->invalidate_generation(
+        execution_generation);
+  }
   execution_cv_.notify_all();
 }
 

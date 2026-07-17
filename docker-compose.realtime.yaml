@@ -1,0 +1,44 @@
+# Opt-in strict target resource profile.
+#
+# Activated only when scripts/lib/compose.sh sees
+# MANYFORGE_RT_RESOURCE_PROFILE=strict. It grants the minimum container-level
+# capability needed for controller_manager and ManyForge's named native worker
+# threads to request their own policies. Python, routes, planner/validation,
+# viewer, recorder, and DDS threads remain SCHED_OTHER and inherit the NRT CPU
+# set selected by the startup wrappers. Host-wide CPU/IRQ isolation and an RT
+# kernel remain deployment properties and are reported rather than implied.
+
+services:
+  composer-ros:
+    cap_add:
+      - SYS_NICE
+    ulimits:
+      rtprio:
+        soft: 99
+        hard: 99
+    environment: &manyforge-rt-environment
+      - MANYFORGE_RT_RESOURCE_PROFILE=${MANYFORGE_RT_RESOURCE_PROFILE}
+      - MANYFORGE_RT_CONTROLLER_MANAGER_PRESENT=${MANYFORGE_RT_CONTROLLER_MANAGER_PRESENT:-true}
+      - MANYFORGE_NRT_CPU_AFFINITY=${MANYFORGE_NRT_CPU_AFFINITY}
+      - MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY=${MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY}
+      - MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY=${MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY:-50}
+      - MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY=${MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY:-true}
+      - MANYFORGE_RT_SCHED_POLICY=${MANYFORGE_RT_SCHED_POLICY:-FIFO}
+      - MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY=${MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY:-45}
+      - MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY=${MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY}
+      - MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY=${MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY:-40}
+      - MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY=${MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY}
+      - MANYFORGE_RT_STOP_CONTROL_PRIORITY=${MANYFORGE_RT_STOP_CONTROL_PRIORITY:-35}
+      - MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY=${MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY}
+
+  isaac-topic-control:
+    cap_add:
+      - SYS_NICE
+    ulimits:
+      rtprio:
+        soft: 99
+        hard: 99
+      memlock:
+        soft: -1
+        hard: -1
+    environment: *manyforge-rt-environment

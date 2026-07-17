@@ -53,6 +53,7 @@ def _create_bundle(
     urdf_path: Path = URDF_PATH,
     srdf_path: Path = SRDF_PATH,
     package_paths: list[str] | None = None,
+    defer_ros_executor_start: bool = False,
 ):
     module = _native_module()
     config = {
@@ -79,6 +80,8 @@ def _create_bundle(
         package_paths,
         config,
         kernel_config_overrides,
+        "",
+        defer_ros_executor_start,
     )
 
 
@@ -160,13 +163,16 @@ def _assert_nonfinite_gripper_action_sample_fails_closed(sample_kind: str) -> No
                 feedback.effort = 0.0
                 feedback.stalled = False
                 feedback.reached_goal = False
-                goal_handle.publish_feedback(feedback)
                 deadline = time.monotonic() + 2.0
                 while (
                     not goal_handle.is_cancel_requested
                     and not stop_event.is_set()
                     and time.monotonic() < deadline
                 ):
+                    # A real controller streams feedback. Re-publish until the
+                    # client cancels so this contract test cannot lose its only
+                    # sample in the action goal-response/feedback handshake.
+                    goal_handle.publish_feedback(feedback)
                     time.sleep(0.01)
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
@@ -209,6 +215,7 @@ def _assert_nonfinite_gripper_action_sample_fails_closed(sample_kind: str) -> No
             "/controller_state"
         ),
         wait_s=0.05,
+        defer_ros_executor_start=True,
     )
     try:
         bundle.configure_ros_gripper_action(
@@ -219,6 +226,7 @@ def _assert_nonfinite_gripper_action_sample_fails_closed(sample_kind: str) -> No
                 "result_timeout_s": 2.0,
             },
         )
+        bundle.complete_ros2_control_configuration()
         result = _command_gripper(
             bundle, target_position=0.7, duration_s=0.1, max_effort=5.0
         )
@@ -326,6 +334,7 @@ def test_ros2_control_commanded_sim_uses_backend_initial_state_without_observed_
     node = rclpy.create_node(f"manyforge_contract_commanded_sim_{suffix}")
     fake_server = None
     bundle = None
+    spin_thread = None
     gate_messages: list[bool] = []
 
     try:
@@ -395,9 +404,11 @@ def test_ros2_control_commanded_sim_uses_backend_initial_state_without_observed_
                 bundle.reset()
             except RuntimeError:
                 pass
+        executor.shutdown()
+        if spin_thread is not None:
+            spin_thread.join(timeout=1.0)
         if fake_server is not None:
             fake_server.destroy()
-        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
@@ -427,6 +438,8 @@ def test_ros2_control_backend_preserves_fjt_abort_diagnostics():
     stop_event = threading.Event()
     fake_server = None
     bundle = None
+    spin_thread = None
+    publish_thread = None
 
     try:
         fake_server = FakeFollowJointTrajectoryServer(
@@ -496,9 +509,13 @@ def test_ros2_control_backend_preserves_fjt_abort_diagnostics():
                 bundle.reset()
             except RuntimeError:
                 pass
+        executor.shutdown()
+        if spin_thread is not None:
+            spin_thread.join(timeout=1.0)
+        if publish_thread is not None:
+            publish_thread.join(timeout=1.0)
         if fake_server is not None:
             fake_server.destroy()
-        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
@@ -528,6 +545,8 @@ def test_ros2_control_backend_preserves_monitor_failure_after_late_result():
     stop_event = threading.Event()
     fake_server = None
     bundle = None
+    spin_thread = None
+    publish_thread = None
 
     try:
         fake_server = FakeFollowJointTrajectoryServer(
@@ -607,9 +626,13 @@ def test_ros2_control_backend_preserves_monitor_failure_after_late_result():
                 bundle.reset()
             except RuntimeError:
                 pass
+        executor.shutdown()
+        if spin_thread is not None:
+            spin_thread.join(timeout=1.0)
+        if publish_thread is not None:
+            publish_thread.join(timeout=1.0)
         if fake_server is not None:
             fake_server.destroy()
-        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
@@ -650,6 +673,8 @@ def test_ros2_control_backend_resyncs_after_fault_before_next_run():
     stop_event = threading.Event()
     fake_server = None
     bundle = None
+    spin_thread = None
+    publish_thread = None
 
     try:
         fake_server = FakeFollowJointTrajectoryServer(
@@ -746,9 +771,13 @@ def test_ros2_control_backend_resyncs_after_fault_before_next_run():
                 bundle.reset()
             except RuntimeError:
                 pass
+        executor.shutdown()
+        if spin_thread is not None:
+            spin_thread.join(timeout=1.0)
+        if publish_thread is not None:
+            publish_thread.join(timeout=1.0)
         if fake_server is not None:
             fake_server.destroy()
-        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
@@ -816,6 +845,7 @@ def test_ros2_control_backend_reset_clears_inflight_gripper_command():
         joint_state_topic=f"/manyforge_contract_gripper_reset_{suffix}/joint_states",
         controller_state_topic=f"/manyforge_contract_gripper_reset_{suffix}/controller_state",
         wait_s=0.05,
+        defer_ros_executor_start=True,
     )
     try:
         if not hasattr(bundle, "configure_ros_gripper_action"):
@@ -829,6 +859,7 @@ def test_ros2_control_backend_reset_clears_inflight_gripper_command():
                 "result_timeout_s": 10.0,
             },
         )
+        bundle.complete_ros2_control_configuration()
         first = _command_gripper(
             bundle, target_position=0.0, duration_s=10.0, max_effort=5.0
         )
@@ -934,6 +965,7 @@ def test_ros2_control_gripper_updates_roboplan_scene_group_state():
             "initial_joint_positions_rad": START_POSITIONS,
             "disable_controller_path_tolerances": True,
         },
+        defer_ros_executor_start=True,
     )
     try:
         if not hasattr(bundle, "configure_ros_gripper_action"):
@@ -950,6 +982,7 @@ def test_ros2_control_gripper_updates_roboplan_scene_group_state():
                 "result_timeout_s": 2.0,
             },
         )
+        bundle.complete_ros2_control_configuration()
         result = _command_gripper(
             bundle,
             target_position=0.7,
@@ -1026,6 +1059,7 @@ def test_ros2_control_gripper_driver_result_accepts_success_without_reached_goal
         joint_state_topic=f"/manyforge_contract_gripper_driver_{suffix}/joint_states",
         controller_state_topic=f"/manyforge_contract_gripper_driver_{suffix}/controller_state",
         wait_s=0.05,
+        defer_ros_executor_start=True,
     )
     try:
         if not hasattr(bundle, "configure_ros_gripper_action"):
@@ -1040,6 +1074,7 @@ def test_ros2_control_gripper_driver_result_accepts_success_without_reached_goal
                 "result_timeout_s": 2.0,
             },
         )
+        bundle.complete_ros2_control_configuration()
         result = _command_gripper(
             bundle,
             target_position=0.7,
@@ -1112,6 +1147,7 @@ def test_ros2_control_isaac_effort_gripper_publishes_joint_state_and_dwell_compl
             "initial_joint_positions_rad": START_POSITIONS,
             "disable_controller_path_tolerances": True,
         },
+        defer_ros_executor_start=True,
     )
     try:
         if not hasattr(bundle, "configure_ros_gripper_action"):
@@ -1135,6 +1171,7 @@ def test_ros2_control_isaac_effort_gripper_publishes_joint_state_and_dwell_compl
                 "state_freshness_timeout_s": 0.05,
             },
         )
+        bundle.complete_ros2_control_configuration()
         observed = JointState()
         observed.name = ["finger_joint"]
         observed.position = [0.004]

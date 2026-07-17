@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-07-15 13:38:27 UTC
+  Last regenerated: 2026-07-16 23:53:24 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -47,6 +47,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/debug/export` | debug | Debug Export |
 | `GET` | `/api/debug/export/ros2-medkit` | debug | Debug Export Ros2 Medkit |
 | `GET` | `/api/debug/qualification/environment` | debug | Debug Qualification Environment |
+| `POST` | `/api/debug/qualification/planning-cache/invalidate` | debug | Debug Invalidate Planning Cache |
 | `POST` | `/api/debug/qualification/planning-capture/drain` | debug | Debug Drain Planning Capture |
 | `POST` | `/api/debug/qualification/planning-capture/start` | debug | Debug Start Planning Capture |
 | `POST` | `/api/debug/qualification/planning-capture/stop` | debug | Debug Stop Planning Capture |

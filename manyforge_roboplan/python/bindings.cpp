@@ -3767,6 +3767,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               progress_metrics.max_stop_confirmation_latency_ns;
           out["controller_observed_state_reader_retry_exhausted_total"] =
               progress_metrics.observed_state_reader_retry_exhausted_total;
+          out["controller_jtc_cancel_reference_publications_total"] =
+              progress_metrics.jtc_cancel_reference_publications_total;
+          out["controller_jtc_cancel_reference_rejections_total"] =
+              progress_metrics.jtc_cancel_reference_rejections_total;
           py::list observed_sources;
           for (const auto& source : progress_metrics.observed_state_sources) {
             py::dict source_metrics;
@@ -3870,6 +3874,12 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                 gripper_id, std::move(config));
           },
           py::arg("gripper_id"), py::arg("config"))
+      .def("complete_ros2_control_configuration",
+          [](NativeKernelBundle& self) {
+            auto& backend = require_ros2_control_execution(self);
+            py::gil_scoped_release release;
+            backend.complete_ros_configuration();
+          })
       // Command-enable gate: the ros2_control backend is the single
       // publishing authority (reliable + transient_local). Returns false
       // when the deployment configures no gate topic.
@@ -4758,11 +4768,13 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         [](const std::string& model_name, const std::string& group_name,
            const std::string& urdf_path, const std::string& srdf_path,
            const std::vector<std::string>& package_paths, py::object ros_config,
-           py::object kernel_config, const std::string& logical_robot_id) {
+           py::object kernel_config, const std::string& logical_robot_id,
+           bool defer_ros_executor_start) {
           return create_ros2_control_kernel(
               model_name, group_name, urdf_path, srdf_path, package_paths,
               ros2_control_config_from_python(ros_config),
-              kernel_config_from_python(kernel_config), logical_robot_id);
+              kernel_config_from_python(kernel_config), logical_robot_id,
+              defer_ros_executor_start);
         },
         py::arg("model_name"),
         py::arg("group_name"),
@@ -4772,6 +4784,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         py::arg("ros_config") = py::none(),
         py::arg("kernel_config") = py::none(),
         py::arg("logical_robot_id") = "",
+        py::arg("defer_ros_executor_start") = false,
         "Create a native C++ kernel with RoboPlan planning and ros2_control execution.");
 #endif
 }

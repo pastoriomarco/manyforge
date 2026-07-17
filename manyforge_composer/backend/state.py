@@ -949,27 +949,32 @@ class ComposerState:
             self._prune_published_scene_snapshots()
             return self._published_scene_snapshots.get(snapshot_id)
 
-    def _bind_cycle_manager_callbacks(self) -> None:
-        if self.cycle_manager is None:
-            return
-        self.cycle_manager.set_parent_run_id_provider(
+    def _configure_cycle_manager_callbacks(self, manager: CycleManager) -> None:
+        """Bind callbacks on a manager before it becomes session-visible."""
+        manager.set_parent_run_id_provider(
             self._current_or_last_run_id_for_recovery,
         )
-        self.cycle_manager.set_on_delegated_recovery_requested(
+        manager.set_on_delegated_recovery_requested(
             self._record_delegated_recovery_requested,
         )
-        self.cycle_manager.set_on_reset_phase_event(
+        manager.set_on_reset_phase_event(
             self._record_cycle_reset_phase,
         )
-        self.cycle_manager.set_recovery_context_provider(
+        manager.set_recovery_context_provider(
             self._cycle_recovery_context,
         )
-        self.cycle_manager.set_on_recovery_offer_published(
+        manager.set_on_recovery_offer_published(
             self._record_recovery_offer_published,
         )
-        self.cycle_manager.set_on_recovery_action_event(
+        manager.set_on_recovery_action_event(
             self._record_recovery_action_event,
         )
+
+    def _bind_cycle_manager_callbacks(self) -> None:
+        manager = self.cycle_manager
+        if manager is None:
+            return
+        self._configure_cycle_manager_callbacks(manager)
         self._recovery_offer_pump_wake.set()
 
     def _rotate_kernel_event_source(
@@ -1004,6 +1009,43 @@ class ComposerState:
             reason=reason,
             drain_error=drain_error,
             next_source_identity=id(next_manager),
+        )
+
+    @staticmethod
+    def _close_kernel_candidate(
+        kernel: KernelClient,
+        *,
+        reason: str,
+        suppress_errors: bool,
+    ) -> None:
+        """Deterministically retire a kernel that no session owns.
+
+        Kernel factories construct native workers before runner validation is
+        complete. A rejected candidate and a successfully replaced kernel must
+        therefore both be closed explicitly; waiting for Python refcounting
+        leaves controller gates, ROS executors, and scheduler workers alive.
+        """
+        try:
+            kernel.close()
+        except Exception:  # noqa: BLE001 - caller selects rollback semantics.
+            logger.exception("Kernel close failed during %s", reason)
+            if not suppress_errors:
+                raise
+
+    def _retire_replaced_kernel(
+        self,
+        previous_kernel: KernelClient,
+        next_kernel: KernelClient,
+        *,
+        reason: str,
+    ) -> None:
+        """Close a previous kernel after the new session owns its replacement."""
+        if previous_kernel is next_kernel:
+            return
+        self._close_kernel_candidate(
+            previous_kernel,
+            reason=reason,
+            suppress_errors=False,
         )
 
     def start_recovery_offer_pump(self) -> None:
@@ -1835,6 +1877,20 @@ class ComposerState:
             raise RuntimeError("Runtime overrides may only be changed in IDLE or DIRECT_CONTROL")
         return cycle_state
 
+    @staticmethod
+    def _query_drivable_joint_names(kernel: Any | None) -> list[str]:
+        if kernel is None:
+            return []
+        try:
+            return [str(name) for name in kernel.get_joint_names()]
+        except Exception:
+            logger.debug(
+                "drivable joint-name refresh failed",
+                exc_info=True,
+                extra={"event": "manyforge.visual.drivable_joint_names_refresh_failed"},
+            )
+            return []
+
     def refresh_drivable_joint_names(self, *, kernel: Any | None = None) -> list[str]:
         """Refresh and return the ordered drivable joint-name cache.
 
@@ -1843,16 +1899,7 @@ class ComposerState:
         """
 
         source = kernel if kernel is not None else self.kernel
-        names: list[str] = []
-        if source is not None:
-            try:
-                names = [str(name) for name in source.get_joint_names()]
-            except Exception:
-                logger.debug(
-                    "drivable joint-name refresh failed",
-                    exc_info=True,
-                    extra={"event": "manyforge.visual.drivable_joint_names_refresh_failed"},
-                )
+        names = self._query_drivable_joint_names(source)
         with self._joint_state_lock:
             self._drivable_joint_names = list(names)
             return list(self._drivable_joint_names)
@@ -2823,32 +2870,70 @@ class ComposerState:
         if self.cycle_manager is not None:
             self.cycle_manager.reset()
 
-        if deployment is not None and self._kernel_factory is not None:
-            self._kernel, self.kernel_bundle = self._kernel_factory(deployment)
-        drivable_joints = self.refresh_drivable_joint_names(kernel=self._kernel)
-        if deployment is not None and drivable_joints:
-            deployment.validate_robot_control_joint_limits_against(drivable_joints)
+        kernel = previous_kernel
+        kernel_bundle = self.kernel_bundle
+        try:
+            if deployment is not None and self._kernel_factory is not None:
+                kernel, kernel_bundle = self._kernel_factory(deployment)
+            drivable_joints = self._query_drivable_joint_names(kernel)
+            if deployment is not None and drivable_joints:
+                deployment.validate_robot_control_joint_limits_against(drivable_joints)
 
-        runner = OrchestratorRunner(
-            catalog_path=self._catalog_path,
-            program_path=self.program_source_path or "<memory>",
-            kernel=self._kernel,
-            deployment_path=self.deployment_source_path or None,
-            program=effective_program or program,
-            deployment=deployment,
-            skill_catalog=self.skill_catalog,
-            event_recorder=self.event_recorder,
-            scene_snapshot_provider=scene_snapshot_provider,
-            scene_snapshot_url_publisher=self.publish_scene_snapshot,
-            pose_source_apply_callback=self.apply_pose_sources_before_planning,
-            pose_source_between_nodes_callback=self.apply_pose_sources_between_nodes,
-            simulation_control_callback=self.simulation_control_for_behavior_node,
-        )
-        runner.load()
+            runner = OrchestratorRunner(
+                catalog_path=self._catalog_path,
+                program_path=self.program_source_path or "<memory>",
+                kernel=kernel,
+                deployment_path=self.deployment_source_path or None,
+                program=effective_program or program,
+                deployment=deployment,
+                skill_catalog=self.skill_catalog,
+                event_recorder=self.event_recorder,
+                scene_snapshot_provider=scene_snapshot_provider,
+                scene_snapshot_url_publisher=self.publish_scene_snapshot,
+                pose_source_apply_callback=self.apply_pose_sources_before_planning,
+                pose_source_between_nodes_callback=self.apply_pose_sources_between_nodes,
+                simulation_control_callback=self.simulation_control_for_behavior_node,
+            )
+            runner.load()
+        except Exception:
+            if kernel is not previous_kernel:
+                self._close_kernel_candidate(
+                    kernel,
+                    reason="failed runtime-rebuild candidate rollback",
+                    suppress_errors=True,
+                )
+            raise
+
+        try:
+            # Construct and configure the complete manager, then fence the old
+            # event source, before publishing any candidate session field. A
+            # constructor/callback/recorder failure must not leave a new kernel
+            # paired with the previous cycle manager.
+            next_manager = CycleManager(runner, kernel)
+            self._configure_cycle_manager_callbacks(next_manager)
+            self._rotate_kernel_event_source(
+                previous_manager,
+                next_manager,
+                previous_kernel,
+                kernel,
+                reason="runtime_rebuild",
+            )
+        except Exception:
+            if kernel is not previous_kernel:
+                self._close_kernel_candidate(
+                    kernel,
+                    reason="failed runtime-rebuild cutover staging",
+                    suppress_errors=True,
+                )
+            raise
 
         self.program = program
         self._effective_program = effective_program or program
         self.deployment = deployment
+        self._kernel = kernel
+        self.kernel_bundle = kernel_bundle
+        with self._joint_state_lock:
+            self._drivable_joint_names = list(drivable_joints)
         self._evaluate_stop_capability()
         self._update_program_tree_hash()
         with self._runtime_generation_lock:
@@ -2857,16 +2942,13 @@ class ComposerState:
         self._clear_published_scene_snapshots()
         self.clear_pose_source_snapshots()
         self.clear_visual_state_snapshot()
-        next_manager = CycleManager(runner, self._kernel)
-        self._rotate_kernel_event_source(
-            previous_manager,
-            next_manager,
-            previous_kernel,
-            self._kernel,
-            reason="runtime_rebuild",
-        )
         self.cycle_manager = next_manager
-        self._bind_cycle_manager_callbacks()
+        self._recovery_offer_pump_wake.set()
+        self._retire_replaced_kernel(
+            previous_kernel,
+            kernel,
+            reason="successful runtime-rebuild cutover",
+        )
         self.reset_backend_authoritative_sim_if_needed(reason="program_load")
         # Explicit load-time scene seed: populate the live planning scene with
         # the program's authored objects now, so they are visible at idle before
@@ -3201,37 +3283,67 @@ class ComposerState:
 
         kernel = self._kernel
         kernel_bundle = self.kernel_bundle
-        if deployment is not None and self._kernel_factory is not None:
-            kernel, kernel_bundle = self._kernel_factory(deployment)
+        try:
+            if deployment is not None and self._kernel_factory is not None:
+                kernel, kernel_bundle = self._kernel_factory(deployment)
 
-        # Spec/430 §3.2 cross-validation requires the bound robot's drivable
-        # joint list. Run it for both /api/session/apply and /api/program/load
-        # so typo'd per-joint Robot Control caps fail at load time, not on first use.
-        drivable_joints: list[str] = []
-        if deployment is not None and kernel is not None:
-            try:
-                drivable_joints = [str(name) for name in kernel.get_joint_names()]
-            except Exception:
-                drivable_joints = []
-            if drivable_joints:
-                deployment.validate_robot_control_joint_limits_against(drivable_joints)
+            # Spec/430 §3.2 cross-validation requires the bound robot's drivable
+            # joint list. Run it for both /api/session/apply and /api/program/load
+            # so typo'd per-joint Robot Control caps fail at load time, not on first use.
+            drivable_joints: list[str] = []
+            if deployment is not None and kernel is not None:
+                drivable_joints = self._query_drivable_joint_names(kernel)
+                if drivable_joints:
+                    deployment.validate_robot_control_joint_limits_against(drivable_joints)
 
-        # Create runner
-        runner = OrchestratorRunner(
-            catalog_path=self._catalog_path,
-            program_path=program_path,
-            kernel=kernel,
-            deployment_path=deployment_path,
-            deployment=deployment,
-            skill_catalog=self.skill_catalog,
-            event_recorder=self.event_recorder,
-            scene_snapshot_provider=scene_snapshot_provider,
-            scene_snapshot_url_publisher=self.publish_scene_snapshot,
-            pose_source_apply_callback=self.apply_pose_sources_before_planning,
-            pose_source_between_nodes_callback=self.apply_pose_sources_between_nodes,
-            simulation_control_callback=self.simulation_control_for_behavior_node,
-        )
-        runner.load()
+            # Create runner. The candidate kernel remains local until the
+            # complete program/deployment validation has succeeded.
+            runner = OrchestratorRunner(
+                catalog_path=self._catalog_path,
+                program_path=program_path,
+                kernel=kernel,
+                deployment_path=deployment_path,
+                deployment=deployment,
+                skill_catalog=self.skill_catalog,
+                event_recorder=self.event_recorder,
+                scene_snapshot_provider=scene_snapshot_provider,
+                scene_snapshot_url_publisher=self.publish_scene_snapshot,
+                pose_source_apply_callback=self.apply_pose_sources_before_planning,
+                pose_source_between_nodes_callback=self.apply_pose_sources_between_nodes,
+                simulation_control_callback=self.simulation_control_for_behavior_node,
+            )
+            runner.load()
+        except Exception:
+            if kernel is not previous_kernel:
+                self._close_kernel_candidate(
+                    kernel,
+                    reason="failed program-load candidate rollback",
+                    suppress_errors=True,
+                )
+            raise
+
+        try:
+            # Keep manager construction, callback binding, and sequence-domain
+            # fencing on the unpublished side of the cutover. Any failure here
+            # retires the candidate and preserves the previous authoritative
+            # kernel/manager pairing.
+            next_manager = CycleManager(runner, kernel)
+            self._configure_cycle_manager_callbacks(next_manager)
+            self._rotate_kernel_event_source(
+                previous_manager,
+                next_manager,
+                previous_kernel,
+                kernel,
+                reason="program_load",
+            )
+        except Exception:
+            if kernel is not previous_kernel:
+                self._close_kernel_candidate(
+                    kernel,
+                    reason="failed program-load cutover staging",
+                    suppress_errors=True,
+                )
+            raise
 
         self.program = runner.program
         self._effective_program = runner.program
@@ -3260,16 +3372,13 @@ class ComposerState:
         self.clear_pose_source_snapshots()
         self.clear_visual_scene_objects_snapshot()
         self.clear_visual_state_snapshot()
-        next_manager = CycleManager(runner, self._kernel)
-        self._rotate_kernel_event_source(
-            previous_manager,
-            next_manager,
+        self.cycle_manager = next_manager
+        self._recovery_offer_pump_wake.set()
+        self._retire_replaced_kernel(
             previous_kernel,
             kernel,
-            reason="program_load",
+            reason="successful program-load cutover",
         )
-        self.cycle_manager = next_manager
-        self._bind_cycle_manager_callbacks()
         if not defer_initial_runtime_reset:
             self.reset_backend_authoritative_sim_if_needed(reason="program_load")
             # Explicit load-time scene seed (see _rebuild_runtime): populate the

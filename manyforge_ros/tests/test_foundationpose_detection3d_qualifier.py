@@ -30,6 +30,7 @@ def _publisher_code(
 ) -> str:
     return textwrap.dedent(
         f"""
+        import signal
         import time
 
         import rclpy
@@ -38,8 +39,15 @@ def _publisher_code(
         rclpy.init(args=None)
         node = rclpy.create_node("foundationpose_qualifier_test_publisher")
         publisher = node.create_publisher(Detection3DArray, {topic!r}, 1)
+        stop_requested = False
+
+        def request_stop(_signum, _frame):
+            global stop_requested
+            stop_requested = True
+
+        signal.signal(signal.SIGTERM, request_stop)
         deadline = time.time() + 6.0
-        while time.time() < deadline:
+        while not stop_requested and time.time() < deadline:
             msg = Detection3DArray()
             msg.header.frame_id = {frame_id!r}
             msg.header.stamp = node.get_clock().now().to_msg()

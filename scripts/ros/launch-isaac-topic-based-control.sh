@@ -14,6 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
+source "${REPO_ROOT}/scripts/lib/realtime-resources.sh"
 ROS_DISTRO="${ROS_DISTRO:-jazzy}"
 WORKSPACE="${WORKSPACE:-${REPO_ROOT}}"
 ISAAC_ROS_WS="${ISAAC_ROS_WS:-/home/tndlux/workspaces/isaac_ros-dev}"
@@ -127,8 +128,11 @@ if [ -z "${isaac_profile}" ]; then
     esac
 fi
 
-exec ros2 launch manyforge_ros_bringup isaac_topic_based_control.launch.py \
+manyforge_exec_with_nrt_affinity ros2 launch manyforge_ros_bringup isaac_topic_based_control.launch.py \
     isaac_profile:="${isaac_profile}" \
+    controller_manager_lock_memory:="${MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY:-false}" \
+    controller_manager_thread_priority:="${MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY:-50}" \
+    controller_manager_cpu_affinity:="${MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY:-}" \
     composer_url:="${COMPOSER_URL:-http://127.0.0.1:9000}" \
     program_path:="${PROGRAM_PATH:-/workspace/examples/isaac_manipulator_scene_light.program.yaml}" \
     deployment_path:="${DEPLOYMENT_PATH:-/workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml}" \

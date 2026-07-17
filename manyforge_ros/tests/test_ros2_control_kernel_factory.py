@@ -132,7 +132,15 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
         baseline_collision_policy_snapshot=lambda: None,
     )
     recorded: dict[str, object] = {}
-    fake_native_bundle = object()
+
+    class FakeNativeBundle:
+        def __init__(self):
+            self.configuration_completed = False
+
+        def complete_ros2_control_configuration(self):
+            self.configuration_completed = True
+
+    fake_native_bundle = FakeNativeBundle()
 
     fake_roboplan = ModuleType("manyforge_roboplan_py")
 
@@ -145,6 +153,7 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
         ros_config,
         kernel_config,
         logical_robot_id,
+        defer_ros_executor_start,
     ):
         recorded["model_name"] = model_name
         recorded["group_name"] = group_name
@@ -154,6 +163,7 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
         recorded["ros_config"] = ros_config
         recorded["kernel_config"] = kernel_config
         recorded["logical_robot_id"] = logical_robot_id
+        recorded["defer_ros_executor_start"] = defer_ros_executor_start
         return fake_native_bundle
 
     fake_roboplan.create_ros2_control_kernel_from_paths = (
@@ -179,6 +189,8 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
     assert recorded["model_name"] == "robot"
     assert recorded["group_name"] == "arm"
     assert recorded["logical_robot_id"] == "logical_robot"
+    assert recorded["defer_ros_executor_start"] is True
+    assert fake_native_bundle.configuration_completed is True
     assert recorded["urdf_path"] == str(urdf)
     assert recorded["srdf_path"] == str(srdf)
     assert recorded["package_paths"] == [str(tmp_path)]
@@ -223,9 +235,14 @@ def test_ros2_control_factory_forwards_validation_collision_timeout(
     recorded: dict[str, object] = {}
     fake_roboplan = ModuleType("manyforge_roboplan_py")
 
+    class FakeNativeBundle:
+        def complete_ros2_control_configuration(self):
+            recorded["configuration_completed"] = True
+
     def create_ros2_control_kernel_from_paths(*args):
         recorded["kernel_config"] = args[6]
-        return object()
+        recorded["defer_ros_executor_start"] = args[8]
+        return FakeNativeBundle()
 
     fake_roboplan.create_ros2_control_kernel_from_paths = (
         create_ros2_control_kernel_from_paths
@@ -258,6 +275,8 @@ def test_ros2_control_factory_forwards_validation_collision_timeout(
     assert recorded["kernel_config"]["validation_collision_query_timeout_ns"] == (
         275_000_000
     )
+    assert recorded["defer_ros_executor_start"] is True
+    assert recorded["configuration_completed"] is True
     assert recorded["kernel_config"]["validation_collision_wall_timeout_ns"] == (
         3_000_000_000
     )
@@ -346,6 +365,9 @@ def test_ros2_control_factory_keeps_ros_gripper_config_canonical_and_seeds_scene
         def configure_ros_gripper_action(self, gripper_id, config):
             self.gripper_actions[gripper_id] = dict(config)
 
+        def complete_ros2_control_configuration(self):
+            self.configuration_completed = True
+
         def set_robot_model_authority_metadata(self, metadata):
             self.robot_model_authority_metadata = dict(metadata)
 
@@ -390,6 +412,7 @@ def test_ros2_control_factory_keeps_ros_gripper_config_canonical_and_seeds_scene
         "driver_result"
     )
     assert fake_native_bundle.seeded_positions == [("gripper", [0.0081])]
+    assert fake_native_bundle.configuration_completed is True
     assert fake_native_bundle.robot_model_authority_metadata[
         "canonical_to_view_joint_names"
     ]["right_finger_joint"] == view_joint
@@ -470,6 +493,9 @@ def test_ros2_control_factory_configures_isaac_effort_gripper_transport(
         def configure_ros_gripper_action(self, gripper_id, config):
             self.gripper_actions[gripper_id] = dict(config)
 
+        def complete_ros2_control_configuration(self):
+            self.configuration_completed = True
+
         def set_robot_model_authority_metadata(self, metadata):
             self.robot_model_authority_metadata = dict(metadata)
 
@@ -505,3 +531,4 @@ def test_ros2_control_factory_configures_isaac_effort_gripper_transport(
     assert config["close_effort"] == -5.0
     assert config["publish_nominal_position"] is True
     assert config["state_freshness_timeout_s"] == 1.5
+    assert fake_native_bundle.configuration_completed is True

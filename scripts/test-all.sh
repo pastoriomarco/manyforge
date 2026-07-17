@@ -366,8 +366,13 @@ run_qualification_native_tests() {
     cd "$WORKSPACE"
     setup_pythonpath
     export PYTHONPATH="$WORKSPACE/manyforge_roboplan/python:${PYTHONPATH:-}"
+    local roboplan_build="$BUILD_DIR/roboplan"
+    if ls "$roboplan_build"/manyforge_roboplan_py*.so 1>/dev/null 2>&1; then
+        export PYTHONPATH="$roboplan_build:${PYTHONPATH:-}"
+    fi
     if ! python_has_modules fastapi py_trees httpx uvicorn yaml manyforge_roboplan_py native_kernel_client; then
-        skip "Missing Python deps for native qualification runner (need manyforge_roboplan_py, native_kernel_client)"
+        echo -e "${RED}  FAIL: missing Python deps for native qualification runner (need manyforge_roboplan_py, native_kernel_client)${NC}"
+        FAIL=$((FAIL + 1))
         return
     fi
     chmod +x ./scripts/qualify-native-scenarios.sh ./scripts/run-scenarios.py
@@ -407,6 +412,10 @@ run_ros_tests() {
     fi
     cd "$WORKSPACE"
     setup_pythonpath
+    # These are hermetic adapter/unit tests with in-process fake services. Do
+    # not let an active Isaac or hardware graph on domain 0 answer the same
+    # standard simulation_interfaces service names nondeterministically.
+    export ROS_DOMAIN_ID="${MANYFORGE_TEST_ROS_DOMAIN_ID:-119}"
     export PYTHONPATH="$WORKSPACE/manyforge_ros:${PYTHONPATH:-}"
     local roboplan_build="$BUILD_DIR/roboplan"
     if ls "$roboplan_build"/manyforge_roboplan_py*.so 1>/dev/null 2>&1; then

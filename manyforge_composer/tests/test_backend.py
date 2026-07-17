@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import logging
+import subprocess
+import sys
 import threading
 import time
 import pytest
@@ -54,6 +57,23 @@ _SEMANTIC_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "semantic_shape_pick.d
 _ISAAC_LITE6_DEPLOYMENT_PATH = str(
     _REPO_ROOT / "examples" / "isaac_lite6_lite_gripper_pick_and_place.deployment.yaml"
 )
+
+
+@contextmanager
+def _capture_app_logger(caplog, level: int):
+    """Capture request logs without depending on process-wide root handlers."""
+    logger = logging.getLogger("manyforge_composer.backend.app")
+    previous_level = logger.level
+    previous_propagate = logger.propagate
+    logger.setLevel(level)
+    logger.propagate = False
+    logger.addHandler(caplog.handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.propagate = previous_propagate
+        logger.setLevel(previous_level)
 
 
 def _script_ready_recovery(
@@ -3957,6 +3977,14 @@ def test_load_program_rebuilds_kernel_from_deployment_config():
     """Program load rebuilds the kernel from deployment-derived config when a factory is set."""
     calls = []
 
+    class CloseTrackingKernel(MockKernelClient):
+        def __init__(self):
+            super().__init__()
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
     class RebuiltKernel(MockKernelClient):
         pass
 
@@ -3964,9 +3992,10 @@ def test_load_program_rebuilds_kernel_from_deployment_config():
         calls.append(deployment)
         return RebuiltKernel(), {"bundle": len(calls)}
 
+    initial_kernel = CloseTrackingKernel()
     state = ComposerState(
         catalog_path=_CATALOG_PATH,
-        kernel=MockKernelClient(),
+        kernel=initial_kernel,
         kernel_factory=kernel_factory,
     )
     app = create_app(state, security=_TEST_SECURITY)
@@ -3987,6 +4016,138 @@ def test_load_program_rebuilds_kernel_from_deployment_config():
     assert state.deployment.orchestrator.config["collision_monitor_period_ms"] == 50.0
     assert isinstance(state._kernel, RebuiltKernel)
     assert state.kernel_bundle == {"bundle": 1}
+    assert initial_kernel.close_count == 1
+
+
+def test_failed_program_load_closes_unpublished_kernel_candidate():
+    class CloseTrackingKernel(MockKernelClient):
+        def __init__(self):
+            super().__init__()
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    initial_kernel = CloseTrackingKernel()
+    candidates: list[CloseTrackingKernel] = []
+
+    def kernel_factory(_deployment):
+        candidate = CloseTrackingKernel()
+        candidates.append(candidate)
+        return candidate, {"candidate": len(candidates)}
+
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=initial_kernel,
+        kernel_factory=kernel_factory,
+    )
+    try:
+        with pytest.raises(Exception):
+            state.load_program(
+                "/definitely/missing/manyforge.program.yaml",
+                _EXAMPLE_DEPLOYMENT_PATH,
+            )
+
+        assert len(candidates) == 1
+        assert candidates[0].close_count == 1
+        assert initial_kernel.close_count == 0
+        assert state._kernel is initial_kernel
+    finally:
+        state.event_recorder.close()
+
+
+def test_session_rebuild_closes_previous_kernel_after_cutover():
+    class CloseTrackingKernel(MockKernelClient):
+        def __init__(self):
+            super().__init__()
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    initial_kernel = CloseTrackingKernel()
+    candidates: list[CloseTrackingKernel] = []
+
+    def kernel_factory(_deployment):
+        candidate = CloseTrackingKernel()
+        candidates.append(candidate)
+        return candidate, {"candidate": len(candidates)}
+
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=initial_kernel,
+        kernel_factory=kernel_factory,
+    )
+    try:
+        state.load_program(_EXAMPLE_PROGRAM_PATH, _EXAMPLE_DEPLOYMENT_PATH)
+        assert initial_kernel.close_count == 1
+        first_runtime_kernel = candidates[0]
+        assert state.program is not None
+        assert state.deployment is not None
+
+        state.apply_models(state.program, state.deployment)
+
+        assert len(candidates) == 2
+        assert first_runtime_kernel.close_count == 1
+        assert state._kernel is candidates[1]
+        assert candidates[1].close_count == 0
+    finally:
+        state._kernel.close()
+        state.event_recorder.close()
+
+
+def test_session_rebuild_staging_failure_preserves_active_kernel_manager_pair(
+    monkeypatch,
+):
+    class CloseTrackingKernel(MockKernelClient):
+        def __init__(self):
+            super().__init__()
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    initial_kernel = CloseTrackingKernel()
+    candidates: list[CloseTrackingKernel] = []
+
+    def kernel_factory(_deployment):
+        candidate = CloseTrackingKernel()
+        candidates.append(candidate)
+        return candidate, {"candidate": len(candidates)}
+
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=initial_kernel,
+        kernel_factory=kernel_factory,
+    )
+    try:
+        state.load_program(_EXAMPLE_PROGRAM_PATH, _EXAMPLE_DEPLOYMENT_PATH)
+        active_kernel = candidates[0]
+        active_manager = state.cycle_manager
+        assert active_manager is not None
+
+        def reject_event_source_cutover(*_args, **_kwargs):
+            raise RuntimeError("injected event-source cutover failure")
+
+        monkeypatch.setattr(
+            state,
+            "_rotate_kernel_event_source",
+            reject_event_source_cutover,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="injected event-source cutover failure",
+        ):
+            state.apply_models(state.program, state.deployment)
+
+        assert len(candidates) == 2
+        assert state._kernel is active_kernel
+        assert state.cycle_manager is active_manager
+        assert active_kernel.close_count == 0
+        assert candidates[1].close_count == 1
+    finally:
+        state._kernel.close()
+        state.event_recorder.close()
 
 
 def test_put_deployment(client, state):
@@ -4588,45 +4749,29 @@ def test_save_program_persists_updated_scene_resources(client, tmp_path):
 
 def test_json_log_format():
     """setup_logging produces JSON with level, event, timestamp keys."""
-    import io
     import json
-    import logging
-    from manyforge_composer.backend.logging_config import setup_logging
 
-    root_logger = logging.getLogger()
-    uvicorn_access_logger = logging.getLogger("uvicorn.access")
-    original_handlers = tuple(root_logger.handlers)
-    original_root_level = root_logger.level
-    original_uvicorn_access_level = uvicorn_access_logger.level
+    # setup_logging intentionally replaces process-wide root handlers. Exercise
+    # that production behavior in an isolated process so this test cannot evict
+    # pytest's capture handler and make later request-log assertions flaky.
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import logging; "
+                "from manyforge_composer.backend.logging_config import setup_logging; "
+                "setup_logging('INFO'); "
+                "logging.getLogger('test.json_format').info('hello world')"
+            ),
+        ],
+        cwd=_REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
-    try:
-        setup_logging("INFO")
-        configured_handlers = tuple(root_logger.handlers)
-        test_logger = logging.getLogger("test.json_format")
-        buf = io.StringIO()
-        handler = logging.StreamHandler(buf)
-        handler.setFormatter(root_logger.handlers[0].formatter)
-        test_logger.addHandler(handler)
-        try:
-            test_logger.info("hello world")
-        finally:
-            test_logger.removeHandler(handler)
-            handler.close()
-    finally:
-        # setup_logging() intentionally replaces the process-wide root handlers.
-        # This test must put pytest's capture handler back or later caplog tests
-        # become order-dependent while production logging remains correct.
-        for configured_handler in tuple(root_logger.handlers):
-            root_logger.removeHandler(configured_handler)
-        for original_handler in original_handlers:
-            root_logger.addHandler(original_handler)
-        root_logger.setLevel(original_root_level)
-        uvicorn_access_logger.setLevel(original_uvicorn_access_level)
-        for configured_handler in configured_handlers:
-            if configured_handler not in original_handlers:
-                configured_handler.close()
-
-    line = buf.getvalue().strip()
+    line = completed.stderr.strip()
     record = json.loads(line)
     assert "timestamp" in record
     assert record["level"] == "INFO"
@@ -4647,17 +4792,7 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
     py_trees.blackboard.Blackboard.clear()
 
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
-    class DummyBundle:
-        def __init__(self):
-            self.set_calls = 0
-
-        def set_joint_positions(self, positions):
-            self.set_calls += 1
-
-    bundle = DummyBundle()
-    state._on_program_loaded = build_program_loaded_callback(
-        bundle=bundle,
-    )
+    state._on_program_loaded = build_program_loaded_callback()
 
     with caplog.at_level(logging.ERROR):
         state.load_program(_PROGRAM_PATH)
@@ -4665,7 +4800,6 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
     assert not any("on_program_loaded callback failed" in rec.message for rec in caplog.records)
     assert state.cycle_manager._on_run_from_idle is not None
     assert state.cycle_manager._tree is not None
-    assert bundle.set_calls == 0
 
     bb = py_trees.blackboard.Client(name="test_scene_edit_callback")
     bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.READ)
@@ -4699,9 +4833,7 @@ def test_program_load_callback_installs_native_visuals(caplog):
     py_trees.blackboard.Blackboard.clear()
 
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
-    state._on_program_loaded = build_program_loaded_callback(
-        bundle=None,
-    )
+    state._on_program_loaded = build_program_loaded_callback()
 
     with caplog.at_level(logging.ERROR):
         state.load_program(_PROGRAM_PATH)
@@ -4745,10 +4877,12 @@ def test_program_load_callback_applies_simulator_bootstrap_from_deployment(caplo
             self.set_calls.append(list(positions))
 
     bundle = DummyBundle()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
-    state._on_program_loaded = build_program_loaded_callback(
-        bundle=bundle,
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        kernel_bundle=bundle,
     )
+    state._on_program_loaded = build_program_loaded_callback()
 
     with caplog.at_level(logging.ERROR):
         state.load_program(_EXAMPLE_PROGRAM_PATH, deployment_path=_EXAMPLE_DEPLOYMENT_PATH)
@@ -4848,6 +4982,7 @@ def test_debug_planning_qualification_routes_preserve_generation_and_snapshot():
         def __init__(self):
             super().__init__()
             self.active_generation = 0
+            self.cache_invalidations = 0
 
         def get_scene_authority_snapshot(self):
             return {
@@ -4895,7 +5030,12 @@ def test_debug_planning_qualification_routes_preserve_generation_and_snapshot():
                 "in_flight": 0,
             }
 
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=QualificationKernel())
+        def invalidate_trajectories(self, action_span=None):
+            del action_span
+            self.cache_invalidations += 1
+
+    kernel = QualificationKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
     app = create_app(state)
     with TestClient(app) as client:
         snapshot = client.get(
@@ -4907,6 +5047,14 @@ def test_debug_planning_qualification_routes_preserve_generation_and_snapshot():
         )
         drained = client.post(
             "/api/debug/qualification/planning-capture/drain",
+            json={"generation": 9},
+        )
+        stale_invalidation = client.post(
+            "/api/debug/qualification/planning-cache/invalidate",
+            json={"generation": 8},
+        )
+        invalidated = client.post(
+            "/api/debug/qualification/planning-cache/invalidate",
             json={"generation": 9},
         )
         stopped = client.post(
@@ -4921,6 +5069,14 @@ def test_debug_planning_qualification_routes_preserve_generation_and_snapshot():
     assert drained.json()["status"]["in_flight"] == 1
     assert drained.json()["status"]["behavior_dropped_total"] == 3
     assert drained.json()["status"]["behavior_in_flight"] == 2
+    assert stale_invalidation.status_code == 409
+    assert kernel.cache_invalidations == 1
+    assert invalidated.json() == {
+        "generation": 9,
+        "invalidated": True,
+        "scope": "all_trajectories",
+        "purpose": "fresh_planning_sample",
+    }
     assert stopped.json()["status"]["generation"] == 9
     assert stopped.json()["status"]["dropped_total"] == 2
     assert stopped.json()["status"]["behavior_dropped_total"] == 4
@@ -5654,9 +5810,7 @@ class TestRequestIdAndLogThrottling:
         kernel = MockKernelClient()
         state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
         app = create_app(state, security=_TEST_SECURITY)
-        with caplog.at_level(
-            logging.INFO, logger="manyforge_composer.backend.app"
-        ):
+        with _capture_app_logger(caplog, logging.INFO):
             with TestClient(app) as local_client:
                 for _ in range(5):
                     assert local_client.get("/api/health").status_code == 200
@@ -5672,9 +5826,7 @@ class TestRequestIdAndLogThrottling:
         kernel = MockKernelClient()
         state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
         app = create_app(state, security=_TEST_SECURITY)
-        with caplog.at_level(
-            logging.INFO, logger="manyforge_composer.backend.app"
-        ):
+        with _capture_app_logger(caplog, logging.INFO):
             with TestClient(app) as local_client:
                 local_client.post("/api/cycle/reset")
                 local_client.post("/api/cycle/reset")
@@ -5709,7 +5861,7 @@ def test_internal_error_response_carries_request_id(caplog):
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
 
-    with caplog.at_level(logging.ERROR, logger="manyforge_composer.backend.app"):
+    with _capture_app_logger(caplog, logging.ERROR):
         with TestClient(app, raise_server_exceptions=False) as local_client:
             response = local_client.get(
                 "/api/kernel/metrics",

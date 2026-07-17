@@ -336,6 +336,49 @@ def test_debug_export_preserves_string_valued_kernel_metric():
     ] == "predicted_state"
 
 
+def test_debug_export_preserves_structured_runtime_collision_metrics():
+    class StructuredMetricsKernel(MockKernelClient):
+        def get_metrics(self) -> dict[str, object]:
+            metrics: dict[str, object] = dict(super().get_metrics())
+            metrics["runtime_collision_lookahead_last_sample_times_ns"] = [
+                100_000_000,
+                175_000_000,
+                250_000_000,
+            ]
+            metrics["controller_observed_state_sources"] = [
+                {
+                    "source_id": "joint_states",
+                    "authority": "measured",
+                    "fresh": True,
+                }
+            ]
+            return metrics
+
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=StructuredMetricsKernel(),
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        response = client.get("/api/debug/export")
+
+    assert response.status_code == 200
+    metrics = response.json()["kernelMetrics"]
+    assert metrics["runtime_collision_lookahead_last_sample_times_ns"] == [
+        100_000_000,
+        175_000_000,
+        250_000_000,
+    ]
+    assert metrics["controller_observed_state_sources"] == [
+        {
+            "source_id": "joint_states",
+            "authority": "measured",
+            "fresh": True,
+        }
+    ]
+
+
 def test_execution_channels_and_debug_export_surface_incident_snapshot(tmp_path):
     state = ComposerState(
         catalog_path=_CATALOG_PATH,

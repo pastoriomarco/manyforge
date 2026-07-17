@@ -912,6 +912,14 @@ class MockExecution : public IExecutionBackend {
     return &observed_publication_;
   }
 
+  void retire_execution_progress_generation(
+      std::uint64_t /*execution_generation*/) noexcept override {}
+
+  ExecutionProgressHazardClaimResult claim_execution_progress_hazard(
+      std::uint64_t /*execution_generation*/) noexcept override {
+    return ExecutionProgressHazardClaimResult::kGenerationMismatch;
+  }
+
   void publish_observed_state(std::int64_t timestamp_ns,
                               const std::vector<double>& positions,
                               const std::vector<double>& velocities) {
@@ -1206,6 +1214,22 @@ class ControlledExecution : public IExecutionBackend {
     return execution_progress_publication_.get();
   }
 
+  void retire_execution_progress_generation(
+      std::uint64_t execution_generation) noexcept override {
+    if (execution_progress_publication_) {
+      (void)execution_progress_publication_->invalidate_generation(
+          execution_generation);
+    }
+  }
+
+  ExecutionProgressHazardClaimResult claim_execution_progress_hazard(
+      std::uint64_t execution_generation) noexcept override {
+    return execution_progress_publication_
+               ? execution_progress_publication_->claim_hazard_authority(
+                     execution_generation)
+               : ExecutionProgressHazardClaimResult::kGenerationMismatch;
+  }
+
   void publish_observed_state(std::int64_t timestamp_ns,
                               const std::vector<double>& positions,
                               const std::vector<double>& velocities) {
@@ -1399,6 +1423,8 @@ class ControlledExecution : public IExecutionBackend {
   }
 
   void complete() {
+    std::uint64_t execution_generation = 0;
+    std::int64_t terminal_time_ns = 0;
     {
       std::lock_guard<std::mutex> lock(mu_);
       running_ = false;
@@ -1410,7 +1436,15 @@ class ControlledExecution : public IExecutionBackend {
                                : &last_execute_trajectory;
       if (!source->waypoints.empty()) {
         snapshot.joint_positions_rad = source->waypoints.back().positions_rad;
+        terminal_time_ns = static_cast<std::int64_t>(
+            source->waypoints.back().time_from_start_s * 1e9);
       }
+      execution_generation = execution_generation_;
+    }
+    if (execution_progress_publication_ && execution_generation != 0) {
+      (void)execution_progress_publication_->publish_terminal(
+          execution_generation, terminal_time_ns, terminal_time_ns,
+          terminal_time_ns);
     }
     cv_.notify_all();
   }
@@ -5768,6 +5802,7 @@ TEST_F(ExecutionKernelTest,
 TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBeforeTelemetry) {
   ControlledExecution controlled_execution;
   controlled_execution.enable_execution_progress_publication();
+  controlled_execution.block_controlled_stop = true;
   ThreadSafeFakeClock local_clock;
   ThreadSafeManualScheduler local_scheduler;
   TrajectoryCache local_cache{CacheConfig{10}};
@@ -5781,6 +5816,11 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   config.runtime_collision_lookahead_workers = 1;
   config.runtime_collision_lookahead_workers_declared = true;
   config.runtime_collision_lookahead_min_waypoints_for_parallel = 2;
+  MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.profile_id = "lookahead_late_completion_race";
+  fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  config.default_fault_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(fault_profile);
   MockCollisionWorldPublisher local_collision_world;
   auto local_validation_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
@@ -5845,6 +5885,20 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   EXPECT_GT(interrupt_event->sequence, 0u);
   EXPECT_LT(interrupt_event->sequence, lookahead_event->sequence);
 
+  // Hold the fault stop after lookahead has atomically claimed this dispatch,
+  // then deliver a late natural-completion callback. The callback must not
+  // publish a terminal marker or replace the already-latched collision
+  // authority, even though the backend handle itself becomes complete.
+  ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  const auto* progress =
+      controlled_execution.execution_progress_publication();
+  ASSERT_NE(progress, nullptr);
+  controlled_execution.complete();
+  const auto after_late_completion = progress->acquire();
+  EXPECT_TRUE(after_late_completion.valid);
+  EXPECT_FALSE(after_late_completion.terminal);
+  controlled_execution.release_controlled_stop();
+
   for (int attempt = 0; attempt < 1000; ++attempt) {
     const auto metrics = controlled_kernel.get_metrics();
     if (metrics.runtime_collision_lookahead_jobs_collision > 0) {
@@ -5874,6 +5928,76 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   const auto latch = controlled_kernel.get_active_interrupt_latch();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->source_id, "manyforge.kernel.runtime_collision_fault");
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionLookahead_NaturalCompletionTerminalHandoffFencesRacingResult) {
+  ControlledExecution controlled_execution;
+  controlled_execution.enable_execution_progress_publication();
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
+  config.runtime_collision_lookahead_cycle_budget_ns = 100'000'000;
+  config.runtime_collision_lookahead_query_budget_ns = 75'000'000;
+  config.runtime_collision_lookahead_horizon_ns = 2'000'000'000;
+  config.runtime_collision_lookahead_max_samples = 8;
+  config.runtime_collision_lookahead_workers = 1;
+  config.runtime_collision_lookahead_workers_declared = true;
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_validation_engine = std::make_shared<MockCollisionEngine>();
+  auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  auto local_lookahead_engine = std::make_shared<MockCollisionEngine>();
+  local_lookahead_engine->default_result =
+      make_authoritative_collision_result();
+  local_lookahead_engine->on_check = [&](const CollisionQuery&) {
+    controlled_execution.complete();
+  };
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler,
+      local_cache, config};
+  configure_runtime_collision_monitoring(
+      controlled_kernel, local_collision_world, local_validation_engine,
+      local_runtime_engine, {local_lookahead_engine});
+  controlled_kernel.subscribe_events([&](const KernelEvent& event) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(event);
+  });
+
+  const auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
+
+  local_clock.advance(10'000'000);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_TRUE(controlled_kernel.wait_for_completion(2'000'000'000));
+
+  EXPECT_EQ(controlled_kernel.get_status().state,
+            ExecutionState::kCompleted);
+  EXPECT_FALSE(controlled_kernel.get_active_interrupt_latch().has_value());
+  EXPECT_GT(local_lookahead_engine->check_count.load(), 0);
+  const auto* progress =
+      controlled_execution.execution_progress_publication();
+  ASSERT_NE(progress, nullptr);
+  EXPECT_FALSE(progress->acquire().valid)
+      << "kernel worker completion must retire the terminal generation";
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    EXPECT_FALSE(std::any_of(
+        events.begin(), events.end(), [](const KernelEvent& event) {
+          const auto surface = event.details.find("surface");
+          return surface != event.details.end() &&
+                 surface->second == "observed_runtime_lookahead" &&
+                 (event.type == KernelEventType::kCollisionDetected ||
+                  event.type == KernelEventType::kErrorRaised);
+        }));
+  }
 }
 
 TEST_F(ExecutionKernelTest,

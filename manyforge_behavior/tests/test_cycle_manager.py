@@ -1043,6 +1043,81 @@ class TestCycleManagerMotionStop:
             manager.full_stop()
             os.unlink(program_path)
 
+    def test_persistent_runtime_fault_retains_bounded_tick_cadence(self):
+        """A held runtime fault must not turn the 100 Hz tick into a busy loop."""
+        slow_kernel = MockKernelClient(execute_duration_s=5.0)
+        program_path = self._parallel_motion_timer_program(timer_duration_s=5.0)
+        runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+        tick_count = 0
+        tick_count_lock = threading.Lock()
+        recovery_boundaries: list[str] = []
+        original_refresh = manager._refresh_signal_registry
+
+        def counted_refresh() -> None:
+            nonlocal tick_count
+            # Keep the probe deterministic: the old unbounded branch would
+            # still execute hundreds of these calls in the observation window.
+            time.sleep(0.0005)
+            original_refresh()
+            with tick_count_lock:
+                tick_count += 1
+
+        manager._refresh_signal_registry = counted_refresh
+        manager._refresh_recovery_offer_best_effort = recovery_boundaries.append
+
+        try:
+            manager.run()
+            deadline = time.monotonic() + 1.0
+            while slow_kernel.execute_count == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert slow_kernel.execute_count == 1
+
+            runner.runtime_pause_registry.raise_fault(
+                node_name="runtime_collision_probe",
+                node_id="move_manipulator_action",
+                domain="motion",
+                reason_code="runtime_collision",
+                message="runtime collision",
+                details={"body_id": "probe"},
+            )
+            deadline = time.monotonic() + 1.0
+            while manager.motion_stop_state != "held" and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert manager.motion_stop_state == "held"
+
+            with tick_count_lock:
+                count_before = tick_count
+            time.sleep(0.20)
+            with tick_count_lock:
+                ticks_while_held = tick_count - count_before
+
+            # Loaded CI may delay an NRT thread, hence the permissive lower
+            # bound. The upper bound distinguishes the intended cadence from
+            # the former unbounded loop by a wide margin.
+            assert 2 <= ticks_while_held <= 45
+            assert recovery_boundaries.count("runtime fault") == 1
+
+            runner.runtime_pause_registry.raise_fault(
+                node_name="second_fault_probe",
+                node_id="move_manipulator_action",
+                domain="motion",
+                reason_code="runtime_collision",
+                message="second runtime collision",
+            )
+            deadline = time.monotonic() + 0.5
+            while (
+                recovery_boundaries.count("runtime fault") < 2
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            assert recovery_boundaries.count("runtime fault") == 2
+            time.sleep(0.05)
+            assert recovery_boundaries.count("runtime fault") == 2
+        finally:
+            manager.reset()
+            os.unlink(program_path)
+
     def test_motion_soft_fail_keeps_continue_branch_ticking(self):
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         program_path = self._parallel_motion_timer_program(timer_duration_s=0.3)
@@ -1229,6 +1304,63 @@ class TestCycleManagerReset:
         assert manager.state == CycleState.IDLE
         assert manager.error is None
         assert manager._tick_thread is None or not manager._tick_thread.is_alive()
+
+    def test_reset_waits_for_inflight_nrt_tick_before_claiming_idle(self, kernel):
+        """A bounded scene/adapter call may outlive 25 ms without being a zombie."""
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager.reset()
+        assert manager._tree is not None
+
+        tick_entered = threading.Event()
+        original_tick = manager._tree.tick
+
+        def delayed_tick(*args, **kwargs):
+            tick_entered.set()
+            time.sleep(0.08)
+            return original_tick(*args, **kwargs)
+
+        manager._tree.tick = delayed_tick
+        manager.run()
+        assert tick_entered.wait(timeout=1.0)
+
+        started = time.monotonic()
+        manager.reset()
+        elapsed_s = time.monotonic() - started
+
+        assert elapsed_s >= 0.05
+        assert manager.state == CycleState.IDLE
+        assert manager.error_code != "tick_thread_quiesce_timeout"
+        assert manager._tick_thread is None or not manager._tick_thread.is_alive()
+        assert manager._tick_exit_event.is_set()
+
+    def test_reset_timeout_never_claims_idle_with_live_tick(self, kernel, monkeypatch):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager.reset()
+        assert manager._tree is not None
+
+        tick_entered = threading.Event()
+        release_tick = threading.Event()
+
+        def blocked_tick(*_args, **_kwargs):
+            tick_entered.set()
+            release_tick.wait(timeout=1.0)
+
+        manager._tree.tick = blocked_tick
+        monkeypatch.setattr(cycle_manager_module, "_TICK_JOIN_DEADLINE_S", 0.05)
+        manager.run()
+        assert tick_entered.wait(timeout=1.0)
+
+        try:
+            manager.reset()
+            assert manager.state == CycleState.STOPPED
+            assert manager.error_code == "tick_thread_quiesce_timeout"
+            assert manager._tick_thread is not None
+            assert manager._tick_thread.is_alive()
+        finally:
+            release_tick.set()
+            assert manager._tick_exit_event.wait(timeout=1.0)
     
     def test_reset_from_idle_is_noop(self, kernel):
         """reset() from IDLE prepares a fresh software/runtime cycle state."""
@@ -1444,6 +1576,7 @@ class TestCycleManagerReset:
         rejection is a distinct operator event)."""
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
+        kernel._execution_id = 1
 
         # Mirror the live event sequence: collision_detected at lower
         # event_index, interrupt_latched after it. The kernel's runtime
@@ -1501,6 +1634,7 @@ class TestCycleManagerReset:
         returning (None, None)."""
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
+        kernel._execution_id = 1
 
         with manager._lock:
             manager._kernel_event_index += 1
@@ -1522,6 +1656,68 @@ class TestCycleManagerReset:
         assert details["policy_id"] == (
             "manyforge.kernel.drift_fault.preempt_trajectory"
         )
+
+    def test_event_harvest_never_reuses_collision_from_older_execution(
+        self, kernel
+    ):
+        """A rich collision from execution 2 must not mask execution 5's
+        lookahead deadline error after the object has already disappeared."""
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        kernel._execution_id = 5
+
+        with manager._lock:
+            manager._kernel_event_index += 1
+            manager._kernel_events.append({
+                "type": "collision_detected",
+                "execution_id": 2,
+                "timestamp_ns": 1_000,
+                "event_index": manager._kernel_event_index,
+                "details": {
+                    "collision_result_first_failure_pair":
+                        "object/removed_wall <-> robot/wrist_1_link",
+                    "reason_code": "runtime_collision_monitor",
+                },
+            })
+            manager._kernel_event_index += 1
+            manager._kernel_events.append({
+                "type": "error_raised",
+                "execution_id": 5,
+                "timestamp_ns": 2_000,
+                "event_index": manager._kernel_event_index,
+                "details": {
+                    "program_run_id": "run-current",
+                    "node_instance_id": "move_to_drop_approach",
+                },
+                "error": {
+                    "code": "runtime_lookahead_deadline_exceeded",
+                    "message": "Runtime collision lookahead exceeded its deadline",
+                    "details": {
+                        "reason": "runtime_lookahead_deadline_exceeded",
+                        "cycle_duration_ns": "250474540",
+                        "worker_active_ns": "159705599",
+                    },
+                },
+            })
+            manager._kernel_event_index += 1
+            manager._kernel_events.append({
+                "type": "interrupt_latched",
+                "execution_id": 5,
+                "timestamp_ns": 3_000,
+                "event_index": manager._kernel_event_index,
+                "details": {
+                    "latch_id": "interrupt-5",
+                    "source_id": "manyforge.kernel.runtime_fault",
+                },
+            })
+
+        code, details = manager._capture_kernel_error_diagnostics()
+
+        assert code == "runtime_lookahead_deadline_exceeded"
+        assert details is not None
+        assert details["worker_active_ns"] == "159705599"
+        assert details["node_instance_id"] == "move_to_drop_approach"
+        assert "collision_result_first_failure_pair" not in details
 
     def test_snapshot_error_promotes_ros2_backend_reason_code(self, kernel):
         """ROS2-control backend faults keep the top-level ErrorDTO code
@@ -1935,7 +2131,7 @@ class TestErrorPropagation:
 # =========================================================================
 
 class TestZombieThread:
-    """Verify zombie tick-thread guards work."""
+    """Verify fail-closed guards for a tick that cannot quiesce promptly."""
 
     def test_run_refused_while_zombie_thread_alive(self, kernel):
         """run() raises RuntimeError if the previous tick thread is still alive."""
@@ -1960,22 +2156,27 @@ class TestZombieThread:
         manager._tree.tick = blocking_tick
 
         # Ensure the thread is inside the blocking tick before we reset
-        entered_tick.wait(timeout=2.0)
+        assert entered_tick.wait(timeout=2.0)
 
-        # Reset — this should detect the zombie because join(1.0) will timeout
+        # Reset must remain bounded without claiming the old tree is gone.
         manager.reset()
 
-        # The zombie guard should have set an error
-        assert manager.error is not None
-        assert "terminate" in manager.error
+        assert manager.state == CycleState.STOPPED
+        assert manager.error_code == "tick_thread_quiesce_timeout"
+        assert manager.error == "behavior tree did not quiesce before reset deadline"
+        old_tick_thread = manager._tick_thread
+        assert old_tick_thread is not None and old_tick_thread.is_alive()
 
-        # Attempting to run again should raise
-        with pytest.raises(RuntimeError, match="still alive"):
+        # Run may surface the exact reset-only recovery offer rather than the
+        # lower-level thread guard, but it must never start a replacement tree.
+        with pytest.raises(RuntimeError):
             manager.run()
+        assert manager.state == CycleState.STOPPED
+        assert manager._tick_thread is old_tick_thread
 
         # Clean up — unblock the thread so it can exit
         block_event.set()
-        time.sleep(0.2)
+        assert manager._tick_exit_event.wait(timeout=1.0)
 
     def test_reset_detects_zombie_and_sets_error(self, kernel):
         """reset() sets error when tick thread does not exit within timeout."""
@@ -1995,17 +2196,27 @@ class TestZombieThread:
             block_event.wait(timeout=5.0)
 
         manager._tree.tick = blocking_tick
-        entered_tick.wait(timeout=2.0)
+        assert entered_tick.wait(timeout=2.0)
 
         manager.reset()
 
-        assert manager.state == CycleState.IDLE
-        assert manager.error is not None
-        assert "terminate" in manager.error
+        assert manager.state == CycleState.STOPPED
+        assert manager.error_code == "tick_thread_quiesce_timeout"
+        assert manager.error == "behavior tree did not quiesce before reset deadline"
+        assert manager._tick_thread is not None
+        assert manager._tick_thread.is_alive()
 
-        # Clean up
+        # Once the old tree really exits, a new Reset can safely rebuild and
+        # publish IDLE. The cleanup watcher must not leave stale ownership.
         block_event.set()
-        time.sleep(0.2)
+        assert manager._tick_exit_event.wait(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while manager._tick_thread is not None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert manager._tick_thread is None
+        manager.reset()
+        assert manager.state == CycleState.IDLE
+        assert manager.error is None
 
 
 # =========================================================================
@@ -4165,6 +4376,38 @@ class TestRuntimePauseReadAllocation:
         for _ in range(200):
             manager._active_runtime_fault_facts()
         assert len(py_trees.blackboard.Blackboard.clients) == clients_before
+
+    def test_active_fault_snapshot_is_revision_coherent_and_defensive(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        registry = runner.runtime_pause_registry
+
+        initial_revision, initial_faults = registry.active_fault_snapshot()
+        assert initial_faults == ()
+
+        fault = registry.raise_fault(
+            node_name="snapshot_probe",
+            node_id="test",
+            domain="test",
+            reason_code="test_fault",
+            message="test fault",
+            details={"nested": {"value": 1}},
+        )
+        active_revision, active_faults = registry.active_fault_snapshot()
+        assert active_revision > initial_revision
+        assert [item.fault_id for item in active_faults] == [fault.fault_id]
+
+        active_faults[0].details["nested"]["value"] = 99
+        stored = registry.get(fault.fault_id)
+        assert stored is not None
+        assert stored.details == {"nested": {"value": 1}}
+
+        assert registry.request_resume(
+            (fault.fault_id,),
+            recovery_request_id="snapshot-probe-resume",
+        )
+        resumed_revision, resumed_faults = registry.active_fault_snapshot()
+        assert resumed_revision > active_revision
+        assert resumed_faults[0].state == "resume_requested"
 
 
 class TestCycleShutdown:

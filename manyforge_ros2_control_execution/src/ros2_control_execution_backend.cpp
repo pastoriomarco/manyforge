@@ -6,6 +6,7 @@
 #include <cmath>
 #include <future>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -210,6 +211,28 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
     core::IClock& clock,
     core::IScheduler& scheduler,
     Ros2ControlExecutionBackendConfig config)
+    : Ros2ControlExecutionBackend(
+          false, std::move(execution_state_sink), std::move(group_name), clock,
+          scheduler, std::move(config)) {}
+
+Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
+    DeferredRosExecutorStartTag,
+    std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+    std::string group_name,
+    core::IClock& clock,
+    core::IScheduler& scheduler,
+    Ros2ControlExecutionBackendConfig config)
+    : Ros2ControlExecutionBackend(
+          true, std::move(execution_state_sink), std::move(group_name), clock,
+          scheduler, std::move(config)) {}
+
+Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
+    bool defer_ros_executor_start,
+    std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+    std::string group_name,
+    core::IClock& clock,
+    core::IScheduler& scheduler,
+    Ros2ControlExecutionBackendConfig config)
     : execution_state_sink_(std::move(execution_state_sink)),
       group_name_(std::move(group_name)),
       clock_(clock),
@@ -223,7 +246,10 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
   initialize_execution_progress_publication();
   snapshot_.timestamp_ns = clock_.now();
   initialize_authored_state();
-  start_ros();
+  initialize_ros();
+  if (!defer_ros_executor_start) {
+    complete_ros_configuration();
+  }
 }
 
 Ros2ControlExecutionBackend::~Ros2ControlExecutionBackend() {
@@ -548,7 +574,7 @@ bool Ros2ControlExecutionBackend::publish_authored_robot_state(
   return false;
 }
 
-void Ros2ControlExecutionBackend::start_ros() {
+void Ros2ControlExecutionBackend::initialize_ros() {
   context_ = std::make_shared<rclcpp::Context>();
   int argc = 0;
   char** argv = nullptr;
@@ -622,7 +648,21 @@ void Ros2ControlExecutionBackend::start_ros() {
   executor_ = std::make_shared<rclcpp::executors::MultiThreadedExecutor>(
       executor_options, config_.executor_thread_count);
   executor_->add_node(node_);
-  spin_thread_ = std::thread([this]() { executor_->spin(); });
+}
+
+void Ros2ControlExecutionBackend::complete_ros_configuration() {
+  std::lock_guard<std::mutex> lock(ros_configuration_mutex_);
+  if (ros_configuration_complete_) {
+    throw std::logic_error(
+        "ros2_control backend configuration was already completed");
+  }
+  if (!executor_ || !node_) {
+    throw std::logic_error(
+        "ros2_control backend cannot start without initialized ROS resources");
+  }
+  auto spin_thread = std::thread([this]() { executor_->spin(); });
+  spin_thread_ = std::move(spin_thread);
+  ros_configuration_complete_ = true;
 }
 
 void Ros2ControlExecutionBackend::stop_ros() {
@@ -666,6 +706,122 @@ void Ros2ControlExecutionBackend::on_joint_state(
   sync_idle_scene_from_latest_sample();
 }
 
+std::uint64_t
+Ros2ControlExecutionBackend::begin_jtc_cancel_reference_authority_locked()
+    noexcept {
+  if (!is_commanded_sim_mode() ||
+      jtc_cancel_reference_authority_token_.load(std::memory_order_acquire) !=
+          0) {
+    return 0;
+  }
+  auto token = next_jtc_cancel_reference_authority_token_++;
+  if (token == 0) {
+    token = next_jtc_cancel_reference_authority_token_++;
+  }
+  jtc_cancel_reference_authority_token_.store(token,
+                                               std::memory_order_release);
+  return token;
+}
+
+void Ros2ControlExecutionBackend::end_jtc_cancel_reference_authority(
+    std::uint64_t token) noexcept {
+  if (token == 0) {
+    return;
+  }
+  // The callback holds execution_mutex_ through the bounded publication, so
+  // once this returns no callback from this delegation can publish later.
+  std::lock_guard<std::mutex> lock(execution_mutex_);
+  if (jtc_cancel_reference_authority_token_.load(
+          std::memory_order_acquire) == token) {
+    jtc_cancel_reference_authority_token_.store(0,
+                                                 std::memory_order_release);
+  }
+}
+
+bool Ros2ControlExecutionBackend::publish_jtc_cancel_reference(
+    const std::vector<std::string>& joint_names,
+    const std::vector<double>& positions,
+    const std::vector<double>& velocities,
+    std::int64_t received_timestamp_ns,
+    std::uint64_t expected_token) noexcept {
+  const auto reject = [this]() {
+    jtc_cancel_reference_rejections_total_.fetch_add(
+        1, std::memory_order_relaxed);
+    return false;
+  };
+  if (expected_token == 0 ||
+      jtc_cancel_reference_authority_token_.load(
+          std::memory_order_acquire) != expected_token) {
+    return reject();
+  }
+  if (joint_names.size() != positions.size() ||
+      (!velocities.empty() && velocities.size() != joint_names.size())) {
+    return reject();
+  }
+
+  std::vector<double> remapped_positions;
+  std::vector<double> remapped_velocities;
+  std::span<const double> ordered_positions = positions;
+  std::span<const double> ordered_velocities = velocities;
+  if (joint_names == config_.required_joints) {
+    if (!std::all_of(positions.begin(), positions.end(),
+                     [](double value) { return std::isfinite(value); }) ||
+        !std::all_of(velocities.begin(), velocities.end(),
+                     [](double value) { return std::isfinite(value); })) {
+      return reject();
+    }
+  } else {
+    // JTC normally publishes canonical order, so the steady stop path above
+    // adds no allocations. Keep a correct bounded remap for adapters whose
+    // controller order differs from the deployment order.
+    remapped_positions.reserve(config_.required_joints.size());
+    if (!velocities.empty()) {
+      remapped_velocities.reserve(config_.required_joints.size());
+    }
+    for (const auto& required_joint : config_.required_joints) {
+      const auto first =
+          std::find(joint_names.begin(), joint_names.end(), required_joint);
+      if (first == joint_names.end() ||
+          std::find(std::next(first), joint_names.end(), required_joint) !=
+              joint_names.end()) {
+        return reject();
+      }
+      const auto index = static_cast<std::size_t>(
+          std::distance(joint_names.begin(), first));
+      if (!std::isfinite(positions[index])) {
+        return reject();
+      }
+      remapped_positions.push_back(positions[index]);
+      if (!velocities.empty()) {
+        if (!std::isfinite(velocities[index])) {
+          return reject();
+        }
+        remapped_velocities.push_back(velocities[index]);
+      }
+    }
+    ordered_positions = remapped_positions;
+    ordered_velocities = remapped_velocities;
+  }
+
+  // Token revalidation and publication are one execution-owned operation.
+  // This closes both late-callback and old-stop/new-stop ABA windows without
+  // making measured feedback authoritative in commanded_sim.
+  std::lock_guard<std::mutex> lock(execution_mutex_);
+  if (jtc_cancel_reference_authority_token_.load(
+          std::memory_order_acquire) != expected_token) {
+    return reject();
+  }
+  const bool published = publish_authored_robot_state(
+      ordered_positions, ordered_velocities, received_timestamp_ns,
+      std::nullopt, /*invalidate_before_publish=*/false);
+  if (!published) {
+    return reject();
+  }
+  jtc_cancel_reference_publications_total_.fetch_add(
+      1, std::memory_order_relaxed);
+  return true;
+}
+
 void Ros2ControlExecutionBackend::on_controller_state(
     const control_msgs::msg::JointTrajectoryControllerState::SharedPtr msg) {
   state_callbacks_total_.fetch_add(1, std::memory_order_relaxed);
@@ -674,6 +830,13 @@ void Ros2ControlExecutionBackend::on_controller_state(
       core::ObservedRobotStateSourceKind::kControllerState,
       msg->joint_names, msg->feedback.positions, msg->feedback.velocities,
       ros_stamp_ns(msg->header.stamp), received_timestamp_ns);
+  const auto jtc_cancel_reference_token =
+      jtc_cancel_reference_authority_token_.load(std::memory_order_acquire);
+  if (jtc_cancel_reference_token != 0) {
+    (void)publish_jtc_cancel_reference(
+        msg->joint_names, msg->reference.positions, msg->reference.velocities,
+        received_timestamp_ns, jtc_cancel_reference_token);
+  }
   JointSample sample;
   sample.joint_names = msg->joint_names;
   sample.positions = msg->feedback.positions;
@@ -884,8 +1047,21 @@ void Ros2ControlExecutionBackend::on_action_result(
 
   {
     std::lock_guard<std::mutex> lock(execution_mutex_);
+    const auto terminal_progress_generation =
+        running_generation_.load(std::memory_order_acquire);
+    const auto terminal_trajectory_time_s =
+        active_trajectory_ && !active_trajectory_->waypoints.empty()
+            ? active_trajectory_->waypoints.back().time_from_start_s
+            : active_trajectory_time_s_;
     terminal_ = true;
-    set_running_locked(false);
+    set_running_locked(
+        false, ProgressRetirement::kPreserveTerminalHandoff);
+    const auto terminal_progress_ns = clock_.now();
+    (void)execution_progress_publication_->publish_terminal(
+        terminal_progress_generation,
+        static_cast<std::int64_t>(
+            std::max(0.0, terminal_trajectory_time_s) * 1e9),
+        terminal_progress_ns, terminal_progress_ns);
     natural_completion_stop_requested_ = false;
     active_goal_handle_.reset();
     active_goal_id_.reset();
@@ -1374,7 +1550,8 @@ void Ros2ControlExecutionBackend::assign_joint_sample(
   sample.topic = topic;
 }
 
-void Ros2ControlExecutionBackend::set_running_locked(bool running) noexcept {
+void Ros2ControlExecutionBackend::set_running_locked(
+    bool running, ProgressRetirement progress_retirement) noexcept {
   if (running_ != running) {
     // This generation fences goal callbacks, monitor snapshots, and authored
     // observed-state publication in both directions. In particular, terminal
@@ -1387,7 +1564,8 @@ void Ros2ControlExecutionBackend::set_running_locked(bool running) noexcept {
   running_ = running;
   if (!running) {
     running_flag_.store(false, std::memory_order_release);
-    if (execution_progress_publication_ != nullptr) {
+    if (progress_retirement == ProgressRetirement::kRetireImmediately &&
+        execution_progress_publication_ != nullptr) {
       execution_progress_publication_->invalidate();
     }
   }
@@ -1477,6 +1655,12 @@ Ros2ControlExecutionBackend::controller_progress_metrics() const {
       last_stop_confirmation_latency_ns_.load(std::memory_order_relaxed);
   metrics.max_stop_confirmation_latency_ns =
       max_stop_confirmation_latency_ns_.load(std::memory_order_relaxed);
+  metrics.jtc_cancel_reference_publications_total =
+      jtc_cancel_reference_publications_total_.load(
+          std::memory_order_relaxed);
+  metrics.jtc_cancel_reference_rejections_total =
+      jtc_cancel_reference_rejections_total_.load(
+          std::memory_order_relaxed);
   if (observed_state_publication_ != nullptr) {
     metrics.observed_state_reader_retry_exhausted_total =
         observed_state_publication_->metrics().reader_retry_exhausted_total;
@@ -4564,6 +4748,8 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
   // the cancel branch (not fail_execution).
   const auto cancel_start_ns = std::chrono::steady_clock::now();
   GoalHandleFJT::SharedPtr active_goal_to_cancel;
+  std::uint64_t jtc_cancel_reference_token = 0;
+  bool jtc_cancel_reference_authority_busy = false;
   {
     std::lock_guard<std::mutex> lock(execution_mutex_);
     if (!running_ && terminal_) {
@@ -4575,6 +4761,24 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
           {{"reason", "controlled_stop_no_execution_in_flight"}}};
       return result;
     }
+    if (profile.stop_mode ==
+            core::MotionInterruptStopMode::kHardDeceleration &&
+        is_commanded_sim_mode()) {
+      jtc_cancel_reference_token =
+          begin_jtc_cancel_reference_authority_locked();
+      jtc_cancel_reference_authority_busy =
+          jtc_cancel_reference_token == 0;
+    }
+    if (jtc_cancel_reference_authority_busy) {
+      result.accepted = false;
+      result.backend_stop_confirmed = false;
+      result.error = core::ErrorDTO{
+          std::string(core::kErrorMotionInterruptBackendStopFailed),
+          "another JTC cancel command-reference delegation is still active",
+          {{"reason", "jtc_cancel_reference_authority_busy"},
+           {"mode", "hard_deceleration"}}};
+      return result;
+    }
     stop_requested_ = true;
     natural_completion_stop_requested_ = false;
     pause_requested_ = false;
@@ -4583,6 +4787,11 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
       active_goal_to_cancel = active_goal_handle_;
     }
   }
+  const auto jtc_cancel_reference_scope = std::shared_ptr<void>(
+      nullptr, [this, jtc_cancel_reference_token](void*) {
+        end_jtc_cancel_reference_authority(jtc_cancel_reference_token);
+      });
+  (void)jtc_cancel_reference_scope;
   execution_cv_.notify_all();
   cancel_goal_if_known(active_goal_to_cancel);
 
@@ -4780,6 +4989,10 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
     // endpoint — `decelerate_on_cancel` stopped it mid-flight, and
     // an off-path interrupt with progress=1.0 would falsely signal
     // trajectory completion to downstream stop-snapshot consumers.
+    // End the controller-reference delegation before publishing the settled
+    // terminal authority. end_jtc... serializes with callbacks, so no late
+    // reference can overwrite this final measured stop position.
+    end_jtc_cancel_reference_authority(jtc_cancel_reference_token);
     const auto terminal_scene_source_ns = clock_.now();
     publish_snapshot(core::ExecutionState::kStopped,
                      observed_progress_at_stop, post_stop_positions,
@@ -5042,6 +5255,12 @@ void Ros2ControlExecutionBackend::configure_gripper_action(
   if (config.group_id.empty() != config.joint_name.empty()) {
     throw std::invalid_argument(
         "gripper group_id and joint_name must be configured together");
+  }
+  std::lock_guard<std::mutex> ros_configuration_lock(
+      ros_configuration_mutex_);
+  if (ros_configuration_complete_) {
+    throw std::logic_error(
+        "gripper transports must be configured before the ROS executor starts");
   }
   auto runtime = std::make_shared<GripperRuntime>();
   runtime->config = std::move(config);

@@ -16,6 +16,7 @@ _MANYFORGE_LIB_COMPOSE=1
 
 source "$(dirname "${BASH_SOURCE[0]}")/runner.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/preflight.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/realtime-resources.sh"
 
 # launch.sh exports MANYFORGE_ROOT; fall back to deriving it from this file's
 # location so compose targeting works even if this lib is sourced standalone.
@@ -23,9 +24,44 @@ source "$(dirname "${BASH_SOURCE[0]}")/preflight.sh"
 
 # Result variable for compose_set_lane.
 declare -a COMPOSE_CMD
+declare -a NATIVE_COMPOSER_RT_DOCKER_ARGS
+
+prepare_native_composer_rt_docker_args() {
+    NATIVE_COMPOSER_RT_DOCKER_ARGS=()
+    if ! manyforge_rt_profile_enabled; then
+        return 0
+    fi
+    export MANYFORGE_RT_CONTROLLER_MANAGER_PRESENT=false
+    manyforge_validate_rt_resource_profile
+    NATIVE_COMPOSER_RT_DOCKER_ARGS=(
+        --cap-add SYS_NICE
+        --ulimit rtprio=99:99
+        -e "MANYFORGE_RT_RESOURCE_PROFILE=${MANYFORGE_RT_RESOURCE_PROFILE}"
+        -e "MANYFORGE_RT_CONTROLLER_MANAGER_PRESENT=${MANYFORGE_RT_CONTROLLER_MANAGER_PRESENT}"
+        -e "MANYFORGE_NRT_CPU_AFFINITY=${MANYFORGE_NRT_CPU_AFFINITY}"
+        -e "MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY=${MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY}"
+        -e "MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY=${MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY}"
+        -e "MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY=${MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY}"
+        -e "MANYFORGE_RT_SCHED_POLICY=${MANYFORGE_RT_SCHED_POLICY}"
+        -e "MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY=${MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY}"
+        -e "MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY=${MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY}"
+        -e "MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY=${MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY}"
+        -e "MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY=${MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY}"
+        -e "MANYFORGE_RT_STOP_CONTROL_PRIORITY=${MANYFORGE_RT_STOP_CONTROL_PRIORITY}"
+        -e "MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY=${MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY}"
+    )
+}
 
 compose_set_lane() {
     local lane="$1"
+    case "${lane}" in
+        manyforge-only) export MANYFORGE_RT_CONTROLLER_MANAGER_PRESENT=false ;;
+        isaac-sim) export MANYFORGE_RT_CONTROLLER_MANAGER_PRESENT=true ;;
+        *)
+            fail "compose_set_lane: unknown lane '${lane}'"
+            return 1
+            ;;
+    esac
     # Pin --project-directory + -f so compose resolves the same project
     # ("manyforge") and services regardless of the caller's CWD. Without this,
     # invoking launch.sh from a directory with no compose file (e.g. the
@@ -37,6 +73,12 @@ compose_set_lane() {
         --project-directory "${MANYFORGE_ROOT}"
         -f "${MANYFORGE_ROOT}/docker-compose.yaml"
     )
+    if manyforge_rt_profile_enabled; then
+        manyforge_validate_rt_resource_profile
+        base+=(
+            -f "${MANYFORGE_ROOT}/docker-compose.realtime.yaml"
+        )
+    fi
     case "${lane}" in
         manyforge-only)
             COMPOSE_CMD=("${base[@]}")
@@ -44,10 +86,7 @@ compose_set_lane() {
         isaac-sim)
             COMPOSE_CMD=("${base[@]}" --profile ros-full)
             ;;
-        *)
-            fail "compose_set_lane: unknown lane '${lane}'"
-            return 1
-            ;;
+        *) return 1 ;;
     esac
 }
 
@@ -126,10 +165,19 @@ stop_vllm_status_watcher() {
 start_composer_dev_container() {
     local container_name="${COMPOSER_CONTAINER:-manyforge-e2e-composer}"
     local composer_port="${COMPOSER_PORT:-9000}"
+    prepare_native_composer_rt_docker_args
     start_vllm_status_watcher  # idempotent; covers both reuse and fresh-start paths
     if container_running "${container_name}"; then
-        info "Reusing existing ${container_name}"
-        return 0
+        if manyforge_rt_profile_enabled; then
+            # docker run has no compose reconciliation. Recreate instead of
+            # silently reusing a container whose capabilities, env, or NRT
+            # affinity may belong to an older/off profile.
+            info "Recreating ${container_name} to admit the strict RT profile"
+            docker rm -f "${container_name}" >/dev/null 2>&1 || true
+        else
+            info "Reusing existing ${container_name}"
+            return 0
+        fi
     fi
     docker rm -f "${container_name}" >/dev/null 2>&1 || true
     local assistant_env=()
@@ -164,6 +212,7 @@ start_composer_dev_container() {
         -e MANYFORGE_COMPOSER_PORT="${composer_port}" \
         -e MANYFORGE_TRACE_DIR="${MANYFORGE_TRACE_DIR:-/workspace/.manyforge-var/traces}" \
         -e CTEST_TEST_TIMEOUT_S="${CTEST_TEST_TIMEOUT_S:-60}" \
+        "${NATIVE_COMPOSER_RT_DOCKER_ARGS[@]}" \
         "${assistant_env[@]}" \
         manyforge-dev:latest \
         bash -lc '
@@ -181,7 +230,8 @@ start_composer_dev_container() {
             source /workspace/scripts/lib/frontend.sh
             manyforge_build_frontend_dist /workspace/manyforge_composer/frontend /tmp/manyforge-build
             export PYTHONPATH="/tmp/manyforge-build/roboplan:/workspace/manyforge_roboplan/python:${PYTHONPATH:-}"
-            exec python -m manyforge_composer \
+            source /workspace/scripts/lib/realtime-resources.sh
+            manyforge_exec_with_nrt_affinity python -m manyforge_composer \
                 --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \
                 --host 0.0.0.0 \
                 --port "${MANYFORGE_COMPOSER_PORT:-9000}" \

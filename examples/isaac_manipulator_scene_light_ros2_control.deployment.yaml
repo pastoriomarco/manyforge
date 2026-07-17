@@ -262,11 +262,15 @@ orchestrator:
     # The mesh-heavy UR10 cell uses four independent lower-priority contexts.
     # The immediate monitor keeps its own reserved context and never
     # participates in this pool. The lookahead runs work-conservingly from
-    # clear immediate-monitor permits; 250 ms is its complete-job deadline,
-    # not a fixed period.
+    # clear immediate-monitor permits. The 350 ms complete-cycle deadline
+    # includes capacity-one queue delay and worker time; it is a liveness
+    # bound, not a fixed period or an added sleep. The former 250 ms limit
+    # nuisance-tripped at 250.44 ms; the corrected 30-observation, 32-sample
+    # preflight measured a 306.04 ms maximum complete cycle, leaving 43.96 ms
+    # before this bound without reducing collision samples or adding workers.
     runtime_collision_immediate_query_budget_ms: 75.0
     runtime_collision_lookahead_query_budget_ms: 75.0
-    runtime_collision_lookahead_cycle_budget_ms: 250.0
+    runtime_collision_lookahead_cycle_budget_ms: 350.0
     runtime_collision_lookahead_s: 2.0
     runtime_collision_lookahead_max_samples: 32
     runtime_collision_lookahead_workers: 4

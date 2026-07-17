@@ -245,6 +245,8 @@ class RuntimeCollisionLookaheadSession final {
   void worker_loop(std::stop_token stop_token);
   RuntimeCollisionLookaheadResult run_job(const Job& job);
   void record_result(const RuntimeCollisionLookaheadResult& result);
+  [[nodiscard]] bool progress_generation_is_terminal(
+      std::uint64_t execution_generation) const noexcept;
 
   Config config_;
   IClock* clock_ = nullptr;

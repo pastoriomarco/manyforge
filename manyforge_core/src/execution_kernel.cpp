@@ -4051,6 +4051,12 @@ ExecutionKernel::apply_runtime_collision_lookahead_authority(
         fault_preempt_stop_active()) {
       return RuntimeCollisionLookaheadAuthorityDisposition::kStale;
     }
+    if (result.arm_generation != 0 &&
+        execution_backend_.claim_execution_progress_hazard(
+            result.execution_generation) !=
+            ExecutionProgressHazardClaimResult::kClaimed) {
+      return RuntimeCollisionLookaheadAuthorityDisposition::kStale;
+    }
     cache_.invalidate_all();
     // Authority first. Any event/status publication below is evidence of a
     // stop request that has already been latched, never a predictor of one.
@@ -5911,9 +5917,18 @@ void ExecutionKernel::async_execute_worker(
   motion_state.move_id = request.move_id;
   struct WorkerCompletionGuard {
     ExecutionKernel* self;
+    ActiveMotionExecution& motion_state;
     RetainedSceneSnapshotLease& retained_scene;
     std::optional<SceneSnapshotLease>& scene_snapshot_lease;
     ~WorkerCompletionGuard() {
+      // Backend natural completion leaves an explicit terminal cursor valid
+      // until the kernel has disarmed lookahead and completed terminal
+      // processing. Retire the exact generation at this final worker-owned
+      // handoff; stop/reset/failure paths make this idempotent.
+      if (motion_state.execution_progress_generation != 0) {
+        self->execution_backend_.retire_execution_progress_generation(
+            motion_state.execution_progress_generation);
+      }
       // Completion is the quiescence boundary observed by reset, tests, and
       // callers. Release every worker-owned scene authority handle before
       // publishing it; otherwise a waiter can race retained-lease cleanup.
@@ -5942,7 +5957,7 @@ void ExecutionKernel::async_execute_worker(
   };
   // Reverse destruction order is intentional: the outcome is made durable
   // first, then scene authority is released, then completion is signalled.
-  WorkerCompletionGuard completion_guard{this, retained_scene,
+  WorkerCompletionGuard completion_guard{this, motion_state, retained_scene,
                                           scene_snapshot_lease};
   MotionOutcomeGuard outcome_guard{this, motion_state};
   const auto finalize_overridden_terminal_authority =
@@ -5992,6 +6007,8 @@ void ExecutionKernel::async_execute_worker(
       return;
     }
     auto execution_handle = std::move(dispatch_phase.execution_handle);
+    motion_state.execution_progress_generation =
+        execution_handle.execution_generation;
     const auto exec_start_ns = dispatch_phase.exec_start_ns;
     const int64_t exec_timeout_ns = dispatch_phase.exec_timeout_ns;
     core::ExecutionSnapshot latest_backend_snapshot =
@@ -6767,6 +6784,8 @@ void ExecutionKernel::async_execute_worker(
           motion_state.runtime_collision_protection_generation =
               start_collision_monitoring("resume_dispatch");
           execution_handle = execution_backend_.resume(resumed_trajectory);
+          motion_state.execution_progress_generation =
+              execution_handle.execution_generation;
           arm_runtime_collision_lookahead(exec_id, execution_handle.execution_generation,
                                           std::move(resume_collision_trajectory),
                                           request.contact_policy_id);

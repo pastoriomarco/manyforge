@@ -287,11 +287,27 @@ class RuntimePauseRegistry:
             return self._clone_fault(fault) if fault is not None else None
 
     def active_faults(self) -> tuple[RuntimePauseFault, ...]:
+        _, faults = self.active_fault_snapshot()
+        return faults
+
+    def active_fault_snapshot(
+        self,
+    ) -> tuple[int, tuple[RuntimePauseFault, ...]]:
+        """Return one revision-coherent snapshot of active runtime faults.
+
+        The cycle tick loop uses the revision to reuse an immutable snapshot
+        while no fault changes. Returning both values under the registry's leaf
+        lock avoids a check-then-read window that could otherwise cache old
+        faults under a newer revision.
+        """
         with self._lock:
-            return tuple(
-                self._clone_fault(fault)
-                for fault in self._faults.values()
-                if fault.state in {"active", "resume_requested"}
+            return (
+                self._revision,
+                tuple(
+                    self._clone_fault(fault)
+                    for fault in self._faults.values()
+                    if fault.state in {"active", "resume_requested"}
+                ),
             )
 
     def request_resume(

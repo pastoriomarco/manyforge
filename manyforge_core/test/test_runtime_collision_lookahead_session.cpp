@@ -465,6 +465,106 @@ TEST(RuntimeCollisionLookaheadSessionTest, MapsEarliestFailureBackToOriginalTraj
   EXPECT_EQ(result.first_failing_pair->body_b, "robot");
 }
 
+TEST(RuntimeCollisionLookaheadSessionTest,
+     TerminalProgressMarkerDoesNotAdmitNewLookaheadWork) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  publisher.bundle = make_bundle(1, 10);
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  ASSERT_TRUE(progress.publish(3, 300'000'000, clock.now(), clock.now())
+                  .published);
+  ASSERT_TRUE(progress.publish_terminal(
+                          3, 400'000'000, clock.now(), clock.now())
+                  .published);
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-terminal");
+  std::atomic<int> result_calls{0};
+  std::atomic<int> authority_calls{0};
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  config.horizon_ns = 300'000'000;
+  config.max_samples = 4;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&result_calls](const RuntimeCollisionLookaheadSession*,
+                      RuntimeCollisionLookaheadResult) {
+        result_calls.fetch_add(1, std::memory_order_relaxed);
+      },
+      [&authority_calls](const RuntimeCollisionLookaheadSession*,
+                         RuntimeCollisionLookaheadResult&) {
+        authority_calls.fetch_add(1, std::memory_order_relaxed);
+        return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
+      });
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+
+  session.request(clock.now(),
+                  publisher.published_runtime_collision_query_bundle(), {});
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  const auto status = session.status();
+  EXPECT_EQ(status.jobs_started_total, 0u);
+  EXPECT_FALSE(status.permit_pending);
+  EXPECT_EQ(engine->check_calls.load(std::memory_order_relaxed), 0u);
+  EXPECT_EQ(authority_calls.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(result_calls.load(std::memory_order_relaxed), 0);
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     TerminalProgressMarkerFencesInFlightCollisionBeforeAuthority) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  publisher.bundle = make_bundle(1, 10);
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  ASSERT_TRUE(progress.publish(3, 50'000'000, clock.now(), clock.now())
+                  .published);
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-terminal-race");
+  engine->collision_local_waypoint = 0;
+  engine->on_check = [&]() {
+    (void)progress.publish_terminal(
+        3, 400'000'000, clock.now(), clock.now());
+  };
+  std::atomic<int> result_calls{0};
+  std::atomic<int> authority_calls{0};
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  config.horizon_ns = 300'000'000;
+  config.max_samples = 4;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&result_calls](const RuntimeCollisionLookaheadSession*,
+                      RuntimeCollisionLookaheadResult) {
+        result_calls.fetch_add(1, std::memory_order_relaxed);
+      },
+      [&authority_calls](const RuntimeCollisionLookaheadSession*,
+                         RuntimeCollisionLookaheadResult&) {
+        authority_calls.fetch_add(1, std::memory_order_relaxed);
+        return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
+      });
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < deadline &&
+         session.status().job_active) {
+    std::this_thread::yield();
+  }
+
+  const auto status = session.status();
+  EXPECT_FALSE(status.job_active);
+  EXPECT_GT(status.stale_generation_results_total, 0u);
+  EXPECT_GT(engine->check_calls.load(std::memory_order_relaxed), 0u);
+  EXPECT_EQ(authority_calls.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(result_calls.load(std::memory_order_relaxed), 0);
+}
+
 TEST(RuntimeCollisionLookaheadSessionTest, PreparesChangedSnapshotOnceBeforeWorkerFanout) {
   FakeClock clock;
   clock.set(1'000'000'000);

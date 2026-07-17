@@ -28,6 +28,10 @@
 #include <string>
 #include <thread>
 
+#ifdef __linux__
+#include <sched.h>
+#endif
+
 using namespace manyforge::roboplan_backend;
 using namespace manyforge::core;
 
@@ -1820,6 +1824,173 @@ TEST(NativeSchedulerTest, StopControlLaneFiresWhileLowerRolesAreBlocked) {
   EXPECT_TRUE(scheduler.drain_all_for(std::chrono::seconds(1)));
 }
 
+TEST(NativeSchedulerTest, StrictEnvironmentProfileIsExplicitAndOrdered) {
+#ifdef __linux__
+  const std::map<std::string, std::string> environment = {
+      {"MANYFORGE_RT_RESOURCE_PROFILE", "strict"},
+      {"MANYFORGE_RT_SCHED_POLICY", "FIFO"},
+      {"MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY", "45"},
+      {"MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY", "4"},
+      {"MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY", "40"},
+      {"MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY", "5-6"},
+      {"MANYFORGE_RT_STOP_CONTROL_PRIORITY", "35"},
+  };
+
+  const auto config = SimpleSchedulerConfig::from_environment(environment);
+  const auto& controller =
+      config.workers[scheduler_priority_index(SchedulerPriority::ControllerCommand)];
+  const auto& safety =
+      config.workers[scheduler_priority_index(SchedulerPriority::RuntimeSafety)];
+  const auto& stop =
+      config.workers[scheduler_priority_index(SchedulerPriority::StopControl)];
+
+  ASSERT_TRUE(controller.policy.has_value());
+  EXPECT_EQ(*controller.policy, SCHED_FIFO);
+  EXPECT_EQ(controller.priority, 45);
+  EXPECT_EQ(controller.cpu_affinity, std::vector<int>({4}));
+  EXPECT_TRUE(controller.required);
+  EXPECT_EQ(safety.priority, 40);
+  EXPECT_EQ(safety.cpu_affinity, std::vector<int>({5, 6}));
+  EXPECT_EQ(stop.priority, 35);
+  EXPECT_EQ(stop.cpu_affinity, controller.cpu_affinity)
+      << "StopControl deliberately shares the controller-command reservation "
+         "unless deployment selects a separate CPU";
+  EXPECT_FALSE(
+      config.workers[scheduler_priority_index(SchedulerPriority::Lifecycle)]
+          .requested());
+#else
+  GTEST_SKIP() << "strict scheduler profiles are Linux-only";
+#endif
+}
+
+TEST(NativeSchedulerTest, StrictEnvironmentProfileRejectsMissingSafetyCpu) {
+#ifdef __linux__
+  const std::map<std::string, std::string> environment = {
+      {"MANYFORGE_RT_RESOURCE_PROFILE", "strict"},
+      {"MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY", "2"},
+  };
+  EXPECT_THROW(
+      (void)SimpleSchedulerConfig::from_environment(environment),
+      std::invalid_argument);
+#else
+  GTEST_SKIP() << "strict scheduler profiles are Linux-only";
+#endif
+}
+
+TEST(NativeSchedulerTest, StrictEnvironmentProfileRejectsUnboundedCpuRange) {
+#ifdef __linux__
+  const std::map<std::string, std::string> environment = {
+      {"MANYFORGE_RT_RESOURCE_PROFILE", "strict"},
+      {"MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY", "0-2147483647"},
+      {"MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY", "1"},
+  };
+  EXPECT_THROW(
+      (void)SimpleSchedulerConfig::from_environment(environment),
+      std::invalid_argument);
+#else
+  GTEST_SKIP() << "strict scheduler profiles are Linux-only";
+#endif
+}
+
+TEST(NativeSchedulerTest, StrictEnvironmentProfileRejectsInvertedPriorities) {
+#ifdef __linux__
+  const std::map<std::string, std::string> environment = {
+      {"MANYFORGE_RT_RESOURCE_PROFILE", "strict"},
+      {"MANYFORGE_RT_CONTROLLER_COMMAND_PRIORITY", "40"},
+      {"MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY", "4"},
+      {"MANYFORGE_RT_RUNTIME_SAFETY_PRIORITY", "45"},
+      {"MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY", "5"},
+      {"MANYFORGE_RT_STOP_CONTROL_PRIORITY", "35"},
+  };
+  EXPECT_THROW(
+      (void)SimpleSchedulerConfig::from_environment(environment),
+      std::invalid_argument);
+#else
+  GTEST_SKIP() << "strict scheduler profiles are Linux-only";
+#endif
+}
+
+TEST(NativeSchedulerTest, StrictEnvironmentProfileRejectsSafetyCpuOverlap) {
+#ifdef __linux__
+  const std::map<std::string, std::string> environment = {
+      {"MANYFORGE_RT_RESOURCE_PROFILE", "strict"},
+      {"MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY", "4"},
+      {"MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY", "4"},
+  };
+  EXPECT_THROW(
+      (void)SimpleSchedulerConfig::from_environment(environment),
+      std::invalid_argument);
+#else
+  GTEST_SKIP() << "strict scheduler profiles are Linux-only";
+#endif
+}
+
+TEST(NativeSchedulerTest, RequiredWorkerAffinityIsAppliedBeforeCallbacks) {
+#ifdef __linux__
+  cpu_set_t inherited_set;
+  CPU_ZERO(&inherited_set);
+  ASSERT_EQ(sched_getaffinity(0, sizeof(inherited_set), &inherited_set), 0);
+  int selected_cpu = -1;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (CPU_ISSET(cpu, &inherited_set)) {
+      selected_cpu = cpu;
+      break;
+    }
+  }
+  ASSERT_GE(selected_cpu, 0);
+
+  SimpleSchedulerConfig config;
+  auto& background =
+      config.workers[scheduler_priority_index(SchedulerPriority::Background)];
+  background.policy = SCHED_OTHER;
+  background.priority = 0;
+  background.cpu_affinity = {selected_cpu};
+  background.required = true;
+  SimpleScheduler scheduler(std::move(config));
+
+  std::promise<std::pair<int, bool>> observed;
+  auto observed_future = observed.get_future();
+  const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  scheduler.schedule(
+      now_ns,
+      [&]() {
+        cpu_set_t callback_set;
+        CPU_ZERO(&callback_set);
+        const bool exact_affinity =
+            sched_getaffinity(0, sizeof(callback_set), &callback_set) == 0 &&
+            CPU_COUNT(&callback_set) == 1 &&
+            CPU_ISSET(selected_cpu, &callback_set);
+        observed.set_value({sched_getscheduler(0), exact_affinity});
+      },
+      SchedulerPriority::Background);
+
+  ASSERT_EQ(observed_future.wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+  const auto [policy, exact_affinity] = observed_future.get();
+  EXPECT_EQ(policy, SCHED_OTHER);
+  EXPECT_TRUE(exact_affinity);
+#else
+  GTEST_SKIP() << "worker affinity is Linux-only";
+#endif
+}
+
+TEST(NativeSchedulerTest, RequiredInvalidAffinityFailsConstructionClosed) {
+#ifdef __linux__
+  SimpleSchedulerConfig config;
+  auto& controller =
+      config.workers[scheduler_priority_index(SchedulerPriority::ControllerCommand)];
+  controller.policy = SCHED_OTHER;
+  controller.priority = 0;
+  controller.cpu_affinity = {CPU_SETSIZE};
+  controller.required = true;
+  EXPECT_THROW(SimpleScheduler scheduler(std::move(config)), std::runtime_error);
+#else
+  GTEST_SKIP() << "worker affinity is Linux-only";
+#endif
+}
+
 TEST(NativeSchedulerTest, DestructionWakesParkedWorkersOnAllRoles) {
   auto scheduler = std::make_unique<SimpleScheduler>();
   const auto far_future =
@@ -2554,6 +2725,44 @@ TEST_F(NativeKernelTest, NativeExecutionBackendResumeFreshDispatchesSuppliedTraj
   ASSERT_TRUE(resume_handle.wait_for_completion);
   EXPECT_TRUE(resume_handle.wait_for_completion(1'000'000'000));
   (void)original_handle;
+}
+
+TEST_F(NativeKernelTest,
+       NativeExecutionCompletionKeepsTerminalProgressUntilKernelRetirement) {
+  RoboPlanExecutionBackend backend(
+      bundle_->scene, "arm", *bundle_->clock, nullptr);
+  const auto start_state = current_state();
+  ASSERT_FALSE(start_state.joint_names.empty());
+
+  TrajectoryDTO trajectory;
+  trajectory.joint_names = start_state.joint_names;
+  trajectory.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  auto goal = start_state.positions_rad;
+  goal.front() += 0.001;
+  trajectory.waypoints.push_back(
+      TrajectoryWaypointDTO{0.02, goal, {}, {}});
+
+  auto handle = backend.execute_trajectory(trajectory);
+  ASSERT_NE(handle.execution_generation, 0u);
+  ASSERT_TRUE(handle.wait_for_completion);
+  ASSERT_TRUE(handle.wait_for_completion(1'000'000'000));
+  ASSERT_TRUE(handle.get_snapshot);
+  EXPECT_EQ(handle.get_snapshot().state, ExecutionState::kCompleted);
+
+  const auto* progress = backend.execution_progress_publication();
+  ASSERT_NE(progress, nullptr);
+  const auto terminal = progress->acquire();
+  EXPECT_TRUE(terminal.valid);
+  EXPECT_TRUE(terminal.terminal);
+  EXPECT_EQ(terminal.execution_generation, handle.execution_generation);
+  EXPECT_EQ(terminal.trajectory_time_ns, 20'000'000);
+
+  backend.retire_execution_progress_generation(
+      handle.execution_generation);
+  const auto retired = progress->acquire();
+  EXPECT_FALSE(retired.valid);
+  EXPECT_FALSE(retired.terminal);
 }
 
 TEST_F(NativeKernelTest, PlannerUsesPerRequestPlanningTimeout) {

@@ -13,6 +13,8 @@
 
 set -euo pipefail
 
+source /workspace/scripts/lib/realtime-resources.sh
+
 ./scripts/ros/build-ros2-control-runtime.sh
 
 source /workspace/scripts/lib/frontend.sh
@@ -41,7 +43,7 @@ elif [[ -n "${MANYFORGE_QUALIFICATION_LD_PRELOAD:-}" ]]; then
 fi
 COMPOSER_PORT="${MANYFORGE_COMPOSER_PORT:-${COMPOSER_PORT:-9000}}"
 
-exec python -m manyforge_composer \
+manyforge_exec_with_nrt_affinity python -m manyforge_composer \
     --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \
     --host 0.0.0.0 \
     --port "${COMPOSER_PORT}" \

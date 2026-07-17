@@ -497,7 +497,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
 
   Ros2GripperActionConfig gripper;
   gripper.action_name = "/manyforge_missing_gripper_" + unique_suffix();
@@ -528,7 +529,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
 
   auto gripper = isaac_gripper_config(
       "/manyforge_non_finite_start_gripper_" + unique_suffix());
@@ -553,7 +555,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
 
   Ros2GripperActionConfig gripper;
   gripper.transport_kind = "isaac_joint_state_effort";
@@ -609,7 +612,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
   backend.configure_gripper_action(
       "tool", isaac_gripper_config(
                   "/manyforge_stale_grasp_loss_" + unique_suffix()));
@@ -645,7 +649,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   RejectingScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
   backend.configure_gripper_action(
       "tool", isaac_gripper_config(
                   "/manyforge_schedule_failure_" + unique_suffix()));
@@ -671,7 +676,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
   backend.configure_gripper_action(
       "tool", isaac_gripper_config(
                   "/manyforge_autonomous_gripper_" + unique_suffix()));
@@ -709,7 +715,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
   backend.configure_gripper_action(
       "tool", isaac_gripper_config(
                   "/manyforge_reset_fenced_gripper_" + unique_suffix()));
@@ -746,7 +753,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
   backend.configure_gripper_action(
       "tool", isaac_gripper_config(
                   "/manyforge_projection_retry_gripper_" + unique_suffix()));
@@ -794,7 +802,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
   backend.configure_gripper_action(
       "tool", isaac_gripper_config(
                   "/manyforge_projection_race_gripper_" + unique_suffix()));
@@ -832,7 +841,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
   backend.configure_gripper_action(
       "tool", isaac_gripper_config(
                   "/manyforge_replaced_gripper_a_" + unique_suffix()));
@@ -853,6 +863,28 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     GripperConfigurationIsClosedBeforeExecutorStartup) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_prestart_gripper_" + unique_suffix()));
+
+  backend.complete_ros_configuration();
+
+  EXPECT_THROW(
+      backend.configure_gripper_action(
+          "late", isaac_gripper_config(
+                      "/manyforge_late_gripper_" + unique_suffix())),
+      std::logic_error);
+  EXPECT_THROW(backend.complete_ros_configuration(), std::logic_error);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      GripperConfigurationReplacementRejectsInFlightPreflight) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   sink->set_joint_position("gripper", "finger_joint", 0.7);
@@ -860,7 +892,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
   backend.configure_gripper_action(
       "tool", isaac_gripper_config(
                   "/manyforge_preflight_gripper_a_" + unique_suffix()));
@@ -897,7 +930,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
   backend.configure_gripper_action(
       "tool", isaac_gripper_config(
                   "/manyforge_preflight_invalidation_" + unique_suffix()));
@@ -926,7 +960,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
-      sink, "arm", clock, scheduler, base_config());
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{}, sink, "arm",
+      clock, scheduler, base_config());
   backend.configure_gripper_action(
       "tool", isaac_gripper_config(
                   "/manyforge_independent_gripper_a_" + unique_suffix()));
@@ -1103,6 +1138,12 @@ TEST(Ros2ControlExecutionBackendTest,
          "callback waits, not sleep until wait_for_state_timeout_s";
   const auto& snapshot = *terminal_snapshot;
   EXPECT_EQ(snapshot.state, core::ExecutionState::kCompleted);
+  const auto terminal_progress = execution_progress->acquire();
+  EXPECT_TRUE(terminal_progress.valid);
+  EXPECT_TRUE(terminal_progress.terminal);
+  EXPECT_EQ(terminal_progress.execution_generation,
+            handle.execution_generation);
+  backend.retire_execution_progress_generation(handle.execution_generation);
   EXPECT_FALSE(execution_progress->acquire().valid);
   ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
   EXPECT_NEAR(snapshot.joint_positions_rad.front(), 0.42, 1e-9);
@@ -1537,6 +1578,84 @@ TEST(Ros2ControlExecutionBackendTest,
   EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.75);
   ASSERT_EQ(selected.velocities_rad_s().size(), 1u);
   EXPECT_DOUBLE_EQ(selected.velocities_rad_s()[0], 0.0);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     CommandedSimPublishesJtcCancelReferenceWithScopedToken) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.required_joints = {"joint_1", "joint_2"};
+  config.initial_joint_positions_rad = {0.0, 0.0};
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
+      clock, scheduler, config);
+  backend.testing_set_running_state(true);
+
+  const auto first_token =
+      backend.testing_begin_jtc_cancel_reference_authority();
+  ASSERT_NE(first_token, 0u);
+  ASSERT_TRUE(backend.testing_publish_jtc_cancel_reference(
+      {"joint_2", "joint_1"}, {0.8, 0.4}, {0.2, 0.1}, 100,
+      first_token));
+
+  auto selected = backend.observed_robot_state_publication()->acquire(100);
+  ASSERT_TRUE(selected);
+  EXPECT_EQ(selected.source_kind(),
+            core::ObservedRobotStateSourceKind::kCommandedState);
+  ASSERT_EQ(selected.positions_rad().size(), 2u);
+  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.4);
+  EXPECT_DOUBLE_EQ(selected.positions_rad()[1], 0.8);
+  ASSERT_EQ(selected.velocities_rad_s().size(), 2u);
+  EXPECT_DOUBLE_EQ(selected.velocities_rad_s()[0], 0.1);
+  EXPECT_DOUBLE_EQ(selected.velocities_rad_s()[1], 0.2);
+
+  backend.testing_end_jtc_cancel_reference_authority(first_token);
+  const auto second_token =
+      backend.testing_begin_jtc_cancel_reference_authority();
+  ASSERT_NE(second_token, 0u);
+  ASSERT_NE(second_token, first_token);
+  EXPECT_FALSE(backend.testing_publish_jtc_cancel_reference(
+      {"joint_1", "joint_2"}, {0.9, 0.9}, {0.0, 0.0}, 200,
+      first_token));
+  ASSERT_TRUE(backend.testing_publish_jtc_cancel_reference(
+      {"joint_1", "joint_2"}, {0.5, 0.6}, {0.0, 0.0}, 201,
+      second_token));
+  backend.testing_end_jtc_cancel_reference_authority(second_token);
+
+  selected = backend.observed_robot_state_publication()->acquire(201);
+  ASSERT_TRUE(selected);
+  ASSERT_EQ(selected.positions_rad().size(), 2u);
+  EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.5);
+  EXPECT_DOUBLE_EQ(selected.positions_rad()[1], 0.6);
+  const auto metrics = backend.controller_progress_metrics();
+  EXPECT_EQ(metrics.jtc_cancel_reference_publications_total, 2u);
+  EXPECT_EQ(metrics.jtc_cancel_reference_rejections_total, 1u);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ObservedRos2NeverDelegatesAuthorityToJtcCommandReference) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "observed_ros2";
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{}, sink, "arm",
+      clock, scheduler, config);
+  backend.testing_set_running_state(true);
+
+  EXPECT_EQ(backend.testing_begin_jtc_cancel_reference_authority(), 0u);
+  EXPECT_FALSE(backend.testing_publish_jtc_cancel_reference(
+      {"joint_1"}, {0.5}, {0.0}, 100, 1));
+  EXPECT_EQ(backend.controller_progress_metrics()
+                .jtc_cancel_reference_publications_total,
+            0u);
+  EXPECT_EQ(backend.controller_progress_metrics()
+                .jtc_cancel_reference_rejections_total,
+            1u);
 }
 
 TEST(Ros2ControlExecutionBackendTest,

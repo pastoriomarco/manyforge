@@ -176,10 +176,17 @@ def create_ros2_control_kernel(
         ros_config,
         kernel_config_arg,
         robot_config.robot_id,
+        True,
     )
 
     attach_robot_model_metadata(native_bundle, runtime_model)
     _configure_ros_grippers(native_bundle, deployment, config, runtime_model)
+    if not hasattr(native_bundle, "complete_ros2_control_configuration"):
+        raise RuntimeError(
+            "ros2_control native bundle lacks the required configuration "
+            "finalization surface"
+        )
+    native_bundle.complete_ros2_control_configuration()
 
     bundle = Ros2ControlRuntimeBundle(
         native_bundle=native_bundle,

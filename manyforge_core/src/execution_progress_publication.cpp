@@ -69,6 +69,24 @@ void ExecutionProgressPublication::end_write() noexcept {
 ExecutionProgressPublishResult ExecutionProgressPublication::publish(
     std::uint64_t execution_generation, std::int64_t trajectory_time_ns,
     std::int64_t source_timestamp_ns, std::int64_t received_timestamp_ns) noexcept {
+  return publish_impl(execution_generation, trajectory_time_ns,
+                      source_timestamp_ns, received_timestamp_ns,
+                      /*terminal=*/false);
+}
+
+ExecutionProgressPublishResult ExecutionProgressPublication::publish_terminal(
+    std::uint64_t execution_generation, std::int64_t trajectory_time_ns,
+    std::int64_t source_timestamp_ns,
+    std::int64_t received_timestamp_ns) noexcept {
+  return publish_impl(execution_generation, trajectory_time_ns,
+                      source_timestamp_ns, received_timestamp_ns,
+                      /*terminal=*/true);
+}
+
+ExecutionProgressPublishResult ExecutionProgressPublication::publish_impl(
+    std::uint64_t execution_generation, std::int64_t trajectory_time_ns,
+    std::int64_t source_timestamp_ns, std::int64_t received_timestamp_ns,
+    bool terminal) noexcept {
   if (execution_generation == 0 || trajectory_time_ns < 0 || received_timestamp_ns < 0) {
     return {false, 0, "invalid_progress_sample"};
   }
@@ -76,14 +94,30 @@ ExecutionProgressPublishResult ExecutionProgressPublication::publish(
   const auto current_generation = execution_generation_.load(std::memory_order_relaxed);
   const auto current_time = trajectory_time_ns_.load(std::memory_order_relaxed);
   const bool current_valid = valid_.load(std::memory_order_relaxed);
+  const bool current_terminal = terminal_.load(std::memory_order_relaxed);
   if (current_generation > execution_generation) {
     return {false, 0, "execution_generation_regressed"};
   }
   // Invalidation retires the current generation. A late callback from that
   // dispatch must not restore progress authority after stop/reset/terminal
   // retirement; only a strictly newer dispatch may publish again.
-  if (!current_valid && current_generation != 0 && current_generation == execution_generation) {
+  if (!current_valid && current_generation != 0 &&
+      current_generation == execution_generation) {
     return {false, 0, "execution_generation_retired"};
+  }
+  if (current_valid && current_generation == execution_generation &&
+      current_terminal) {
+    return terminal
+               ? ExecutionProgressPublishResult{true,
+                                                sequence_.load(
+                                                    std::memory_order_relaxed),
+                                                "already_terminal"}
+               : ExecutionProgressPublishResult{
+                     false, 0, "execution_generation_terminal"};
+  }
+  if (current_generation == execution_generation &&
+      hazard_authority_claimed_) {
+    return {false, 0, "execution_generation_hazard_claimed"};
   }
   if (current_valid && current_generation == execution_generation &&
       trajectory_time_ns < current_time) {
@@ -98,14 +132,35 @@ ExecutionProgressPublishResult ExecutionProgressPublication::publish(
   source_timestamp_ns_.store(source_timestamp_ns, std::memory_order_relaxed);
   received_timestamp_ns_.store(received_timestamp_ns, std::memory_order_relaxed);
   valid_.store(true, std::memory_order_relaxed);
+  terminal_.store(terminal, std::memory_order_relaxed);
+  hazard_authority_claimed_ = false;
   end_write();
   return {true, sequence, ""};
+}
+
+ExecutionProgressHazardClaimResult
+ExecutionProgressPublication::claim_hazard_authority(
+    std::uint64_t execution_generation) noexcept {
+  std::lock_guard<std::mutex> lock(writer_mutex_);
+  if (execution_generation == 0 ||
+      execution_generation_.load(std::memory_order_relaxed) !=
+          execution_generation) {
+    return ExecutionProgressHazardClaimResult::kGenerationMismatch;
+  }
+  if (valid_.load(std::memory_order_relaxed) &&
+      terminal_.load(std::memory_order_relaxed)) {
+    return ExecutionProgressHazardClaimResult::kTerminal;
+  }
+  hazard_authority_claimed_ = true;
+  return ExecutionProgressHazardClaimResult::kClaimed;
 }
 
 void ExecutionProgressPublication::invalidate() noexcept {
   std::lock_guard<std::mutex> lock(writer_mutex_);
   begin_write();
   valid_.store(false, std::memory_order_relaxed);
+  terminal_.store(false, std::memory_order_relaxed);
+  hazard_authority_claimed_ = false;
   sequence_.store(next_sequence_.fetch_add(1, std::memory_order_relaxed),
                   std::memory_order_relaxed);
   end_write();
@@ -119,6 +174,8 @@ bool ExecutionProgressPublication::invalidate_generation(
   }
   begin_write();
   valid_.store(false, std::memory_order_relaxed);
+  terminal_.store(false, std::memory_order_relaxed);
+  hazard_authority_claimed_ = false;
   sequence_.store(next_sequence_.fetch_add(1, std::memory_order_relaxed),
                   std::memory_order_relaxed);
   end_write();
@@ -141,6 +198,7 @@ ExecutionProgressCursorSnapshotDTO ExecutionProgressPublication::acquire() const
     snapshot.source_timestamp_ns = source_timestamp_ns_.load(std::memory_order_relaxed);
     snapshot.received_timestamp_ns = received_timestamp_ns_.load(std::memory_order_relaxed);
     snapshot.valid = valid_.load(std::memory_order_relaxed);
+    snapshot.terminal = terminal_.load(std::memory_order_relaxed);
     const auto after = epoch_.load(std::memory_order_acquire);
     if (before == after && (after & 1u) == 0u) {
       return snapshot;

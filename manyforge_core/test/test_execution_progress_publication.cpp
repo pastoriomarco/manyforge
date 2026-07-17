@@ -15,6 +15,7 @@ TEST(ExecutionProgressPublicationTest,
   ASSERT_TRUE(first.published);
   auto snapshot = publication.acquire();
   EXPECT_TRUE(snapshot.valid);
+  EXPECT_FALSE(snapshot.terminal);
   EXPECT_EQ(snapshot.execution_generation, 7u);
   EXPECT_EQ(snapshot.trajectory_time_ns, 100);
   EXPECT_EQ(snapshot.authority_profile, "isaac_command_authority");
@@ -41,6 +42,78 @@ TEST(ExecutionProgressPublicationTest,
   snapshot = publication.acquire();
   EXPECT_EQ(snapshot.execution_generation, 8u);
   EXPECT_EQ(snapshot.trajectory_time_ns, 0);
+}
+
+TEST(ExecutionProgressPublicationTest,
+     TerminalHandoffFencesLateCallbacksUntilExactRetirement) {
+  ExecutionProgressPublication publication(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation,
+      "isaac_command_authority", 0);
+
+  ASSERT_TRUE(publication.publish(11, 400, 100, 101).published);
+  const auto terminal = publication.publish_terminal(11, 500, 102, 103);
+  ASSERT_TRUE(terminal.published);
+  auto snapshot = publication.acquire();
+  EXPECT_TRUE(snapshot.valid);
+  EXPECT_TRUE(snapshot.terminal);
+  EXPECT_EQ(snapshot.execution_generation, 11u);
+  EXPECT_EQ(snapshot.trajectory_time_ns, 500);
+
+  const auto duplicate = publication.publish_terminal(11, 500, 104, 105);
+  EXPECT_TRUE(duplicate.published);
+  EXPECT_STREQ(duplicate.reason, "already_terminal");
+  EXPECT_EQ(duplicate.sequence, terminal.sequence);
+
+  const auto late_callback = publication.publish(11, 501, 106, 107);
+  EXPECT_FALSE(late_callback.published);
+  EXPECT_STREQ(late_callback.reason, "execution_generation_terminal");
+  EXPECT_FALSE(publication.invalidate_generation(10));
+  EXPECT_TRUE(publication.acquire().terminal);
+  EXPECT_TRUE(publication.invalidate_generation(11));
+  snapshot = publication.acquire();
+  EXPECT_FALSE(snapshot.valid);
+  EXPECT_FALSE(snapshot.terminal);
+  const auto late_terminal =
+      publication.publish_terminal(11, 500, 110, 111);
+  EXPECT_FALSE(late_terminal.published);
+  EXPECT_STREQ(late_terminal.reason, "execution_generation_retired");
+
+  const auto replacement = publication.publish(12, 0, 108, 109);
+  ASSERT_TRUE(replacement.published);
+  snapshot = publication.acquire();
+  EXPECT_TRUE(snapshot.valid);
+  EXPECT_FALSE(snapshot.terminal);
+  EXPECT_EQ(snapshot.execution_generation, 12u);
+}
+
+TEST(ExecutionProgressPublicationTest,
+     HazardAndTerminalAuthoritiesAreAtomicallyOrdered) {
+  ExecutionProgressPublication terminal_first(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation,
+      "terminal_first", 0);
+  ASSERT_TRUE(terminal_first.publish(20, 100, 1, 1).published);
+  ASSERT_TRUE(
+      terminal_first.publish_terminal(20, 200, 2, 2).published);
+  EXPECT_EQ(terminal_first.claim_hazard_authority(20),
+            ExecutionProgressHazardClaimResult::kTerminal);
+
+  ExecutionProgressPublication hazard_first(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation,
+      "hazard_first", 0);
+  ASSERT_TRUE(hazard_first.publish(30, 100, 1, 1).published);
+  EXPECT_EQ(hazard_first.claim_hazard_authority(30),
+            ExecutionProgressHazardClaimResult::kClaimed);
+  const auto losing_terminal =
+      hazard_first.publish_terminal(30, 200, 2, 2);
+  EXPECT_FALSE(losing_terminal.published);
+  EXPECT_STREQ(losing_terminal.reason,
+               "execution_generation_hazard_claimed");
+  EXPECT_FALSE(hazard_first.publish(30, 150, 3, 3).published);
+  EXPECT_EQ(hazard_first.claim_hazard_authority(31),
+            ExecutionProgressHazardClaimResult::kGenerationMismatch);
 }
 
 TEST(ExecutionProgressPublicationTest,

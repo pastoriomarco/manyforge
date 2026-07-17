@@ -536,6 +536,10 @@ void RuntimeCollisionLookaheadSession::request(
   // cursor form one permit. Re-reading progress on the lower-priority worker
   // could otherwise apply an old clear observation to a newer robot state.
   pending.cursor = progress_publication_->acquire();
+  if (pending.cursor.valid && pending.cursor.terminal &&
+      pending.cursor.execution_generation == arm_.execution_generation) {
+    return;
+  }
   pending.permit_generation = permit_generation;
   pending_job_.emplace(std::move(pending));
   {
@@ -584,7 +588,9 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
                  arm_.trajectory != nullptr &&
                  accepting_clear_permits_.load(std::memory_order_acquire) &&
                  permit_generation_.load(std::memory_order_acquire) ==
-                     job.permit_generation;
+                     job.permit_generation &&
+                 !progress_generation_is_terminal(
+                     job.arm.execution_generation);
       if (admitted) {
         job.arm.trajectory = arm_.trajectory;
         job.arm.contact_policy_id = arm_.contact_policy_id;
@@ -642,7 +648,8 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
              arm_.execution_generation == job.arm.execution_generation &&
              permit_generation_.load(std::memory_order_acquire) ==
                  job.permit_generation &&
-             accepting_clear_permits_.load(std::memory_order_acquire);
+             accepting_clear_permits_.load(std::memory_order_acquire) &&
+             !progress_generation_is_terminal(job.arm.execution_generation);
     };
 
     bool stale_arm = false;
@@ -1034,12 +1041,23 @@ bool RuntimeCollisionLookaheadSession::accept_result_for_current_arm(
                        arm_.execution_generation == execution_generation &&
                        arm_.arm_generation == arm_generation &&
                        permit_generation_.load(std::memory_order_acquire) ==
-                           permit_generation;
+                           permit_generation &&
+                       !progress_generation_is_terminal(execution_generation);
   if (!current) {
     std::lock_guard<std::mutex> status_lock(status_mutex_);
     ++status_.stale_generation_results_total;
   }
   return current;
+}
+
+bool RuntimeCollisionLookaheadSession::progress_generation_is_terminal(
+    std::uint64_t execution_generation) const noexcept {
+  const auto cursor = progress_publication_->acquire();
+  // Only a coherent, explicit terminal marker suppresses authority. A
+  // transiently unreadable or invalid cursor remains fail-closed and is
+  // handled by the normal inconclusive path.
+  return cursor.valid && cursor.terminal &&
+         cursor.execution_generation == execution_generation;
 }
 
 RuntimeCollisionLookaheadStatus RuntimeCollisionLookaheadSession::status() const {
@@ -1065,7 +1083,7 @@ RuntimeCollisionLookaheadStatus RuntimeCollisionLookaheadSession::status() const
   const bool fresh =
       timestamp_valid && (cursor.freshness_budget_ns == 0 ||
                           now_ns - cursor.received_timestamp_ns <= cursor.freshness_budget_ns);
-  snapshot.cursor_valid = snapshot.armed && cursor.valid && fresh &&
+  snapshot.cursor_valid = snapshot.armed && cursor.valid && !cursor.terminal && fresh &&
                           cursor.execution_generation == snapshot.execution_generation;
   snapshot.cursor_age_ns = timestamp_valid ? now_ns - cursor.received_timestamp_ns : 0;
   return snapshot;

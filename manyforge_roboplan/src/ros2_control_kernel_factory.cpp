@@ -35,7 +35,8 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
     const std::vector<std::string>& package_paths,
     const ros2_exec::Ros2ControlExecutionBackendConfig& ros_config,
     const core::ExecutionKernelConfig& kernel_config,
-    const std::string& logical_robot_id) {
+    const std::string& logical_robot_id,
+    bool defer_ros_executor_start) {
   auto bundle = std::make_shared<NativeKernelBundle>();
   const std::string robot_id =
       logical_robot_id.empty() ? model_name : logical_robot_id;
@@ -99,10 +100,17 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
   resolved_ros_config.execution_progress_projection_period_s =
       std::min(resolved_ros_config.execution_progress_projection_period_s,
                monitor_period_s);
-  auto ros_execution =
-      std::make_unique<ros2_exec::Ros2ControlExecutionBackend>(
-      bundle->execution_state_sink, group_name, *bundle->clock,
-      *bundle->scheduler, resolved_ros_config);
+  std::unique_ptr<ros2_exec::Ros2ControlExecutionBackend> ros_execution;
+  if (defer_ros_executor_start) {
+    ros_execution = std::make_unique<ros2_exec::Ros2ControlExecutionBackend>(
+        ros2_exec::Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{},
+        bundle->execution_state_sink, group_name, *bundle->clock,
+        *bundle->scheduler, resolved_ros_config);
+  } else {
+    ros_execution = std::make_unique<ros2_exec::Ros2ControlExecutionBackend>(
+        bundle->execution_state_sink, group_name, *bundle->clock,
+        *bundle->scheduler, resolved_ros_config);
+  }
   auto* ros_execution_ptr = ros_execution.get();
   bundle->gripper_command_backend = ros_execution_ptr;
   bundle->execution = std::move(ros_execution);

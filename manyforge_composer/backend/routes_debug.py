@@ -1,6 +1,7 @@
 """Debug/export routes - /api/debug/*"""
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Callable
 
@@ -325,6 +326,48 @@ def stop_planning_qualification_capture_payload(
     }
 
 
+def invalidate_planning_qualification_cache_payload(
+    state: ComposerState, *, generation: int
+) -> dict[str, Any]:
+    """Clear cached trajectories for an active planning qualification run.
+
+    The live planning-stage probe needs independent planner samples even when
+    the production program correctly reuses a validated trajectory. Requiring
+    the active capture generation prevents a stale or unrelated debug caller
+    from changing cache behavior under a different qualification run.
+    """
+    if state.kernel is None:
+        raise HTTPException(status_code=503, detail="Kernel is not available")
+    try:
+        status = dict(state.kernel.planning_qualification_capture_status())
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    active_generation = int(status.get("generation") or 0)
+    if active_generation != generation:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "planning qualification cache invalidation requires the active "
+                f"capture generation (requested {generation}, active "
+                f"{active_generation})"
+            ),
+        )
+    try:
+        state.kernel.invalidate_trajectories()
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "generation": generation,
+        "invalidated": True,
+        "scope": "all_trajectories",
+        "purpose": "fresh_planning_sample",
+    }
+
+
 def _qualification_generation(request: dict[str, Any]) -> int:
     generation = request.get("generation")
     if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
@@ -368,6 +411,10 @@ def create_debug_router(
 ) -> APIRouter:
     """Create debug/export routes."""
     router = APIRouter()
+    # Serializes the qualification capture generation boundary with explicit
+    # cache control. A stale invalidate request must not pass its generation
+    # check while the stop route concurrently retires that capture.
+    qualification_control_lock = threading.Lock()
 
     @router.get("/scene-trace")
     async def debug_scene_trace(limit: int = 200) -> dict[str, Any]:
@@ -424,10 +471,14 @@ def create_debug_router(
 
     @router.post("/qualification/planning-capture/start")
     async def debug_start_planning_capture(request: dict[str, Any]) -> dict[str, Any]:
+        def command() -> dict[str, Any]:
+            with qualification_control_lock:
+                return start_planning_qualification_capture_payload(
+                    state, capacity=request.get("capacity", 128)
+                )
+
         return await run_route_background(
-            lambda: start_planning_qualification_capture_payload(
-                state, capacity=request.get("capacity", 128)
-            )
+            command
         )
 
     @router.post("/qualification/planning-capture/drain")
@@ -440,12 +491,31 @@ def create_debug_router(
 
     @router.post("/qualification/planning-capture/stop")
     async def debug_stop_planning_capture(request: dict[str, Any]) -> dict[str, Any]:
+        def command() -> dict[str, Any]:
+            with qualification_control_lock:
+                return stop_planning_qualification_capture_payload(
+                    state,
+                    generation=_qualification_generation(request),
+                    idle_timeout_ms=request.get("idle_timeout_ms", 10_000),
+                )
+
         return await run_route_background(
-            lambda: stop_planning_qualification_capture_payload(
-                state,
-                generation=_qualification_generation(request),
-                idle_timeout_ms=request.get("idle_timeout_ms", 10_000),
-            )
+            command
+        )
+
+    @router.post("/qualification/planning-cache/invalidate")
+    async def debug_invalidate_planning_cache(
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        def command() -> dict[str, Any]:
+            with qualification_control_lock:
+                return invalidate_planning_qualification_cache_payload(
+                    state,
+                    generation=_qualification_generation(request),
+                )
+
+        return await run_route_background(
+            command
         )
 
     @router.post("/collision/compare-positions")

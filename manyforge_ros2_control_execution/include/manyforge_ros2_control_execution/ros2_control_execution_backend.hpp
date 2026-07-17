@@ -94,6 +94,8 @@ struct Ros2ControlControllerProgressMetrics {
   std::uint64_t last_stop_confirmation_latency_ns = 0;
   std::uint64_t max_stop_confirmation_latency_ns = 0;
   std::uint64_t observed_state_reader_retry_exhausted_total = 0;
+  std::uint64_t jtc_cancel_reference_publications_total = 0;
+  std::uint64_t jtc_cancel_reference_rejections_total = 0;
   std::vector<core::ObservedRobotStateSourceMetrics> observed_state_sources;
 };
 
@@ -106,6 +108,9 @@ struct Ros2ControlControllerProgressMetrics {
 ///
 /// Lock-order contract:
 /// - Do not hold state_mutex_ while taking execution_mutex_.
+/// - The scoped JTC cancel-reference writer may take execution_mutex_ then the
+///   authored-state publication leaf lock; the leaf lock never takes
+///   execution_mutex_.
 /// - Do not hold gripper_map_mutex_ while taking execution_mutex_ or state_mutex_.
 /// - monitor/callback paths must use best-effort execution-state sink updates
 ///   so long validation sweeps cannot block reset/stop completion.
@@ -119,13 +124,28 @@ class Ros2ControlExecutionBackend final
     : public core::IExecutionBackend,
       public core::IGripperCommandBackend {
  public:
+  struct DeferredRosExecutorStartTag {};
+
   Ros2ControlExecutionBackend(std::shared_ptr<core::IExecutionStateSink>
                                   execution_state_sink,
                               std::string group_name,
                               core::IClock& clock,
                               core::IScheduler& scheduler,
                               Ros2ControlExecutionBackendConfig config);
+  Ros2ControlExecutionBackend(
+      DeferredRosExecutorStartTag,
+      std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+      std::string group_name,
+      core::IClock& clock,
+      core::IScheduler& scheduler,
+      Ros2ControlExecutionBackendConfig config);
   ~Ros2ControlExecutionBackend() override;
+
+  // Deployment-owned ROS entities, including gripper transports, must be
+  // installed before this one-way transition. Mutating the ROS graph while the
+  // executor spins is rejected because rclcpp/rcutils graph construction is not
+  // a runtime-safe reconfiguration boundary.
+  void complete_ros_configuration();
 
   core::ExecutionHandle execute_trajectory(const core::TrajectoryDTO& trajectory) override;
   core::Result<void> sync_observed_state_before_planning() override;
@@ -141,6 +161,21 @@ class Ros2ControlExecutionBackend final
   const core::ExecutionProgressPublication*
   execution_progress_publication() const noexcept override {
     return execution_progress_publication_.get();
+  }
+  void retire_execution_progress_generation(
+      std::uint64_t execution_generation) noexcept override {
+    if (execution_progress_publication_) {
+      (void)execution_progress_publication_->invalidate_generation(
+          execution_generation);
+    }
+  }
+  core::ExecutionProgressHazardClaimResult claim_execution_progress_hazard(
+      std::uint64_t execution_generation) noexcept override {
+    return execution_progress_publication_
+               ? execution_progress_publication_->claim_hazard_authority(
+                     execution_generation)
+               : core::ExecutionProgressHazardClaimResult::
+                     kGenerationMismatch;
   }
   const std::atomic<std::uint64_t>* authored_state_authority_epoch()
       const noexcept {
@@ -373,6 +408,26 @@ class Ros2ControlExecutionBackend final
         lock, stop_token, timeout,
         [this]() { return managed_fjt_terminal_result_received_; });
   }
+
+  std::uint64_t testing_begin_jtc_cancel_reference_authority() {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    return begin_jtc_cancel_reference_authority_locked();
+  }
+
+  void testing_end_jtc_cancel_reference_authority(std::uint64_t token) {
+    end_jtc_cancel_reference_authority(token);
+  }
+
+  bool testing_publish_jtc_cancel_reference(
+      const std::vector<std::string>& joint_names,
+      const std::vector<double>& positions,
+      const std::vector<double>& velocities,
+      std::int64_t received_timestamp_ns,
+      std::uint64_t expected_token) {
+    return publish_jtc_cancel_reference(
+        joint_names, positions, velocities, received_timestamp_ns,
+        expected_token);
+  }
 #endif
 
  private:
@@ -494,12 +549,27 @@ class Ros2ControlExecutionBackend final
       std::int64_t timestamp_ns,
       std::optional<std::uint64_t> expected_running_generation,
       bool invalidate_before_publish) noexcept;
-  void start_ros();
+  Ros2ControlExecutionBackend(
+      bool defer_ros_executor_start,
+      std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+      std::string group_name,
+      core::IClock& clock,
+      core::IScheduler& scheduler,
+      Ros2ControlExecutionBackendConfig config);
+  void initialize_ros();
   void stop_ros();
 
   void on_joint_state(const sensor_msgs::msg::JointState::SharedPtr msg);
   void on_controller_state(
       const control_msgs::msg::JointTrajectoryControllerState::SharedPtr msg);
+  std::uint64_t begin_jtc_cancel_reference_authority_locked() noexcept;
+  void end_jtc_cancel_reference_authority(std::uint64_t token) noexcept;
+  bool publish_jtc_cancel_reference(
+      const std::vector<std::string>& joint_names,
+      const std::vector<double>& positions,
+      const std::vector<double>& velocities,
+      std::int64_t received_timestamp_ns,
+      std::uint64_t expected_token) noexcept;
   void on_action_feedback(
       GoalHandleFJT::SharedPtr,
       const std::shared_ptr<const FollowJointTrajectory::Feedback> feedback);
@@ -529,7 +599,14 @@ class Ros2ControlExecutionBackend final
                                   const std::string& source,
                                   const std::string& topic);
   void sync_idle_scene_from_latest_sample();
-  void set_running_locked(bool running) noexcept;
+  enum class ProgressRetirement {
+    kRetireImmediately,
+    kPreserveTerminalHandoff,
+  };
+  void set_running_locked(
+      bool running,
+      ProgressRetirement progress_retirement =
+          ProgressRetirement::kRetireImmediately) noexcept;
   void testing_store_latest_joint_sample_impl(
       std::vector<std::string> joint_names,
       std::vector<double> positions,
@@ -687,6 +764,8 @@ class Ros2ControlExecutionBackend final
   std::shared_ptr<rclcpp::Context> context_;
   rclcpp::Node::SharedPtr node_;
   std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
+  mutable std::mutex ros_configuration_mutex_;
+  bool ros_configuration_complete_ = false;
   std::thread spin_thread_;
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr action_client_;
   rclcpp::CallbackGroup::SharedPtr action_callback_group_;
@@ -727,6 +806,14 @@ class Ros2ControlExecutionBackend final
   bool first_feedback_seen_ = false;
   bool result_received_ = false;
   bool controlled_stop_preempt_in_progress_ = false;
+  // While JTC owns a qualified `decelerate_on_cancel`, commanded-simulation
+  // authority follows JointTrajectoryControllerState.reference. The scoped
+  // token is generation-like: zero is inactive and every delegation gets a
+  // distinct value, so a callback prepared for an older stop cannot publish
+  // into a later stop. Access that crosses publication is serialized by
+  // execution_mutex_ (execution -> authored-state leaf lock).
+  std::atomic<std::uint64_t> jtc_cancel_reference_authority_token_{0};
+  std::uint64_t next_jtc_cancel_reference_authority_token_ = 1;
   bool resync_required_ = false;
   bool resync_in_progress_ = false;
   GoalHandleFJT::SharedPtr active_goal_handle_;
@@ -831,6 +918,8 @@ class Ros2ControlExecutionBackend final
   std::atomic<std::uint64_t> max_cancel_latency_ns_{0};
   std::atomic<std::uint64_t> last_stop_confirmation_latency_ns_{0};
   std::atomic<std::uint64_t> max_stop_confirmation_latency_ns_{0};
+  std::atomic<std::uint64_t> jtc_cancel_reference_publications_total_{0};
+  std::atomic<std::uint64_t> jtc_cancel_reference_rejections_total_{0};
   mutable std::mutex terminal_scene_projection_retry_mutex_;
   std::condition_variable_any terminal_scene_projection_retry_cv_;
   std::optional<PendingTerminalSceneProjection> pending_terminal_scene_projection_;

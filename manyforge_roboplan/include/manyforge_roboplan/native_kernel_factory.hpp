@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,6 +30,31 @@
 
 namespace manyforge::roboplan_backend {
 
+/// Linux scheduling request for one native scheduler role.
+///
+/// The default (no policy and no affinity) preserves inherited SCHED_OTHER
+/// behavior. A strict deployment profile marks its controller/safety/stop
+/// requests required so kernel construction fails before any callback can run
+/// when the OS rejects the requested resource contract.
+struct SchedulerWorkerOsConfig {
+  std::optional<int> policy;
+  int priority = 0;
+  std::vector<int> cpu_affinity;
+  bool required = false;
+
+  bool requested() const {
+    return policy.has_value() || !cpu_affinity.empty();
+  }
+};
+
+struct SimpleSchedulerConfig {
+  std::array<SchedulerWorkerOsConfig, core::kSchedulerPriorityCount> workers;
+
+  static SimpleSchedulerConfig from_environment();
+  static SimpleSchedulerConfig from_environment(
+      const std::map<std::string, std::string>& environment);
+};
+
 /// Wall clock using std::chrono::steady_clock.
 class WallClock final : public core::IClock {
  public:
@@ -47,6 +73,7 @@ class WallClock final : public core::IClock {
 class SimpleScheduler final : public core::IScheduler {
  public:
   SimpleScheduler();
+  explicit SimpleScheduler(SimpleSchedulerConfig config);
   ~SimpleScheduler() override;
 
   core::ScheduleHandle schedule(
@@ -78,6 +105,11 @@ class SimpleScheduler final : public core::IScheduler {
     std::uint64_t queue_generation = 0;
     core::SchedulerPriority priority = core::SchedulerPriority::Lifecycle;
     const char* thread_name = nullptr;
+    SchedulerWorkerOsConfig os_config;
+    std::mutex startup_mutex;
+    std::condition_variable startup_cv;
+    bool startup_complete = false;
+    std::string startup_error;
 
     void worker_loop(std::stop_token st);
     void ensure_started_locked(Worker* self);

@@ -22,7 +22,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 
 def _repo_root_from_script() -> Path:
@@ -53,6 +53,96 @@ _ISAAC_DEPLOYMENT = (
 )
 _ISAAC_PROGRAM_NAME = "isaac_manipulator_scene_light"
 
+_KERNEL_RUNTIME_METRIC_PREFIXES = (
+    "controller_",
+    "runtime_collision_",
+    "validation_collision_",
+)
+_KERNEL_RUNTIME_REQUIRED_METRICS = frozenset(
+    {
+        "controller_command_progress_samples_total",
+        "controller_executor_thread_count",
+        "controller_max_command_progress_latency_ns",
+        "runtime_collision_tick_late_periods",
+        "runtime_collision_tick_max_ns",
+        "runtime_collision_tick_missed_periods",
+        "runtime_collision_ticks_completed",
+        "runtime_collision_ticks_faulted",
+        "runtime_collision_ticks_started",
+        "runtime_collision_lookahead_cycle_budget_ns",
+        "runtime_collision_lookahead_jobs_clear",
+        "runtime_collision_lookahead_jobs_cycle_timeout",
+        "runtime_collision_lookahead_jobs_inconclusive",
+        "runtime_collision_lookahead_jobs_query_timeout",
+        "runtime_collision_lookahead_jobs_started",
+        "runtime_collision_lookahead_max_cycle_duration_ns",
+        "runtime_collision_lookahead_max_start_jitter_ns",
+        "runtime_collision_lookahead_max_worker_active_duration_ns",
+        "runtime_collision_lookahead_max_samples",
+        "runtime_collision_lookahead_workers_effective",
+        "runtime_collision_stop_longest_unavailable_ns",
+        "runtime_collision_stop_unavailable_ticks",
+        "runtime_collision_stop_zero_check_windows",
+        "validation_collision_workers_effective",
+    }
+)
+_KERNEL_RUNTIME_COUNTER_METRICS = frozenset(
+    {
+        "controller_action_feedback_callbacks_total",
+        "controller_action_result_callbacks_total",
+        "controller_cancel_confirmations_total",
+        "controller_command_progress_samples_total",
+        "controller_jtc_cancel_reference_publications_total",
+        "controller_jtc_cancel_reference_rejections_total",
+        "controller_observed_state_reader_retry_exhausted_total",
+        "controller_state_callbacks_total",
+        "controller_stop_confirmations_total",
+        "runtime_collision_stop_queries_executed",
+        "runtime_collision_stop_ticks_attempted",
+        "runtime_collision_stop_unavailable_ticks",
+        "runtime_collision_stop_windows_completed",
+        "runtime_collision_stop_windows_started",
+        "runtime_collision_stop_zero_check_windows",
+        "runtime_collision_tick_late_periods",
+        "runtime_collision_tick_missed_periods",
+        "runtime_collision_ticks_completed",
+        "runtime_collision_ticks_faulted",
+        "runtime_collision_ticks_started",
+        "runtime_collision_lookahead_clear_permit_try_lock_misses",
+        "runtime_collision_lookahead_clear_permits_invalidated",
+        "runtime_collision_lookahead_jobs_clear",
+        "runtime_collision_lookahead_jobs_collision",
+        "runtime_collision_lookahead_jobs_cycle_timeout",
+        "runtime_collision_lookahead_jobs_inconclusive",
+        "runtime_collision_lookahead_jobs_query_timeout",
+        "runtime_collision_lookahead_jobs_started",
+        "runtime_collision_lookahead_jobs_superseded",
+        "runtime_collision_lookahead_reruns_coalesced",
+        "runtime_collision_lookahead_stale_results",
+        "validation_collision_jobs_abandoned",
+        "validation_collision_jobs_cancelled",
+        "validation_collision_jobs_completed",
+        "validation_collision_jobs_dropped",
+    }
+)
+_KERNEL_RUNTIME_FRESH_BASELINE_METRICS = frozenset(
+    {
+        "controller_command_progress_samples_total",
+        "controller_max_command_progress_latency_ns",
+        "runtime_collision_tick_max_ns",
+        "runtime_collision_ticks_started",
+        "runtime_collision_lookahead_jobs_started",
+        "runtime_collision_lookahead_max_cycle_duration_ns",
+        "runtime_collision_lookahead_max_start_jitter_ns",
+        "runtime_collision_lookahead_max_worker_active_duration_ns",
+        "validation_collision_jobs_abandoned",
+        "validation_collision_jobs_cancelled",
+        "validation_collision_jobs_completed",
+        "validation_collision_jobs_dropped",
+        "validation_collision_jobs_queued",
+    }
+)
+
 
 def _request_json(
     base_url: str,
@@ -78,6 +168,88 @@ def _request_json(
     if not isinstance(value, dict):
         raise RuntimeError(f"{method} {path} returned a non-object payload")
     return value
+
+
+def _kernel_runtime_metrics(
+    base_url: str, *, timeout_s: float = 15.0
+) -> dict[str, Any]:
+    """Capture the native counters that prove controller/RT interference."""
+
+    payload = _request_json(
+        base_url, "/api/kernel/metrics", timeout_s=timeout_s
+    )
+    missing = sorted(_KERNEL_RUNTIME_REQUIRED_METRICS - payload.keys())
+    if missing:
+        raise RuntimeError(
+            "kernel metrics omitted required runtime evidence: "
+            + ", ".join(missing)
+        )
+    return {
+        key: payload[key]
+        for key in sorted(payload)
+        if key.startswith(_KERNEL_RUNTIME_METRIC_PREFIXES)
+    }
+
+
+def _kernel_runtime_counter_deltas(
+    before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, int]:
+    """Derive explicit deltas without treating gauges/maxima as counters."""
+
+    deltas: dict[str, int] = {}
+    for key in sorted(_KERNEL_RUNTIME_COUNTER_METRICS):
+        before_value = before.get(key)
+        after_value = after.get(key)
+        if (
+            isinstance(before_value, bool)
+            or not isinstance(before_value, int)
+            or isinstance(after_value, bool)
+            or not isinstance(after_value, int)
+        ):
+            raise RuntimeError(f"kernel runtime counter {key!r} is not an integer")
+        if after_value < before_value:
+            raise RuntimeError(f"kernel runtime counter {key!r} regressed")
+        deltas[key] = after_value - before_value
+    return deltas
+
+
+def _require_fresh_kernel_runtime_baseline(metrics: dict[str, Any]) -> None:
+    """Make maxima/counters attributable to exactly this live stratum."""
+
+    dirty = {
+        key: metrics.get(key)
+        for key in sorted(_KERNEL_RUNTIME_FRESH_BASELINE_METRICS)
+        if metrics.get(key) != 0
+    }
+    if dirty:
+        details = ", ".join(f"{key}={value!r}" for key, value in dirty.items())
+        raise RuntimeError(
+            "live qualification requires a fresh kernel metric baseline; "
+            "reload the matched program/deployment before retrying: "
+            + details
+        )
+
+
+def _failure_runtime_evidence(base_url: str) -> dict[str, Any]:
+    """Retain actionable native/cycle state even when collection aborts."""
+
+    evidence: dict[str, Any] = {}
+    capture_errors: dict[str, str] = {}
+    try:
+        evidence["cycle_status"] = _request_json(
+            base_url, "/api/cycle/status", timeout_s=2.0
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the original failure.
+        capture_errors["cycle_status"] = f"{type(exc).__name__}: {exc}"
+    try:
+        evidence["kernel_runtime_metrics"] = _kernel_runtime_metrics(
+            base_url, timeout_s=2.0
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the original failure.
+        capture_errors["kernel_runtime_metrics"] = f"{type(exc).__name__}: {exc}"
+    if capture_errors:
+        evidence["capture_errors"] = capture_errors
+    return evidence
 
 
 def _percentile(sorted_values: list[int], percentile: float) -> float:
@@ -408,11 +580,14 @@ def _wait_for_successes(
     viewer_stratum: str,
     focused_attested: bool,
     poll_period_s: float,
-) -> tuple[list[dict[str, Any]], int]:
+    prepare_next_fresh_plan: Callable[[], None],
+) -> tuple[list[dict[str, Any]], int, int]:
     deadline = time.monotonic() + timeout_s
     events: list[dict[str, Any]] = []
     last_viewer_check = 0.0
     last_status_check = 0.0
+    prepared_through_success_count = 0
+    cache_invalidation_calls = 0
     while time.monotonic() < deadline:
         payload = _request_json(base_url, f"/api/kernel/events?since={cursor}")
         batch = list(payload.get("events") or [])
@@ -420,11 +595,21 @@ def _wait_for_successes(
             sequence_tracker.observe(batch)
             events.extend(batch)
             cursor = int(batch[-1].get("event_index") or cursor)
-            if (
-                len(_successful_drop_execution_ids(events)) >= required_successes
-                and sequence_tracker.settled
-            ):
-                return events, cursor
+            successful_count = len(_successful_drop_execution_ids(events))
+            if successful_count >= required_successes:
+                if sequence_tracker.settled:
+                    return events, cursor, cache_invalidation_calls
+                # The final sample exists; only sequence settlement remains.
+                # Do not perturb cache contents after the measured population.
+            elif successful_count > prepared_through_success_count:
+                # The production program deliberately reuses trajectories. This
+                # probe measures fresh planning, so clear the cache only after a
+                # complete target action and only while this qualification
+                # capture still owns its generation. One clear is enough even
+                # when a delayed poll observes more than one new completion.
+                prepare_next_fresh_plan()
+                cache_invalidation_calls += 1
+                prepared_through_success_count = successful_count
         now = time.monotonic()
         if now - last_viewer_check >= 1.0:
             _enforce_viewer_stratum(
@@ -709,6 +894,9 @@ def _aggregate_live_record(
     failed_observations: list[dict[str, Any]],
     authority_before: dict[str, Any],
     authority_after: dict[str, Any],
+    cache_control: dict[str, Any],
+    kernel_metrics_before: dict[str, Any],
+    kernel_metrics_after: dict[str, Any],
 ) -> dict[str, Any]:
     wall_keys = (
         "admission_to_plan_start",
@@ -779,6 +967,7 @@ def _aggregate_live_record(
         "details": {
             "viewer_stratum": stratum,
             "measurement_mode": measurement_mode,
+            "qualification_cache_control": cache_control,
             "viewer_state_websocket_clients": viewer_clients,
             "viewer_focus_evidence": (
                 "operator_attested_and_state_client_connected"
@@ -805,6 +994,13 @@ def _aggregate_live_record(
             },
             "pipeline_before": pipeline_before,
             "pipeline_after": pipeline_after,
+            "kernel_runtime_metrics": {
+                "before": kernel_metrics_before,
+                "after": kernel_metrics_after,
+                "counter_deltas": _kernel_runtime_counter_deltas(
+                    kernel_metrics_before, kernel_metrics_after
+                ),
+            },
             "scene_authority_before": authority_before,
             "scene_authority_after": authority_after,
             "failed_or_timeout_observations": failed_observations,
@@ -980,6 +1176,8 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     initial_batch = list(initial_events.get("events") or [])
     cursor = int(initial_events.get("last_event_index") or 0)
     pipeline_before = _pipeline_status(base_url)
+    kernel_metrics_before = _kernel_runtime_metrics(base_url)
+    _require_fresh_kernel_runtime_baseline(kernel_metrics_before)
     baseline_sequence = max(
         [int(event.get("sequence") or 0) for event in initial_batch]
         + [int(pipeline_before.get("last_sequence_seen") or 0)]
@@ -995,12 +1193,36 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     if generation <= 0:
         raise RuntimeError("planning qualification capture did not start")
 
+    cache_control = {
+        "mode": "explicit_fresh_planning_samples",
+        "scope": "all_trajectories",
+        "initial_invalidations": 0,
+        "post_sample_invalidations": 0,
+        "production_cache_configuration_changed": False,
+        "production_cache_contents_intentionally_invalidated": True,
+    }
+
+    def invalidate_qualification_cache() -> None:
+        response = _request_json(
+            base_url,
+            "/api/debug/qualification/planning-cache/invalidate",
+            method="POST",
+            payload={"generation": generation},
+        )
+        if (
+            response.get("invalidated") is not True
+            or response.get("scope") != "all_trajectories"
+        ):
+            raise RuntimeError("qualification cache invalidation was not confirmed")
+
     sampler = _ProcessCpuSampler(args.composer_pid, args.cpu_sample_period_s)
     sampler_started = False
     cycle_started = False
     captured_events: list[dict[str, Any]] = []
     stopped_capture: dict[str, Any] | None = None
     try:
+        invalidate_qualification_cache()
+        cache_control["initial_invalidations"] = 1
         reset_and_start_simulation(base_url, 30.0)
         time.sleep(args.simulation_settle_s)
         authority_before = _scene_authority_identity(
@@ -1013,7 +1235,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         sampler_started = True
         _request_json(base_url, "/api/cycle/run", method="POST", payload={})
         cycle_started = True
-        captured_events, cursor = _wait_for_successes(
+        captured_events, cursor, post_sample_invalidations = _wait_for_successes(
             base_url,
             cursor=cursor,
             sequence_tracker=sequence_tracker,
@@ -1022,7 +1244,9 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
             viewer_stratum=args.viewer_stratum,
             focused_attested=args.operator_attests_viewer_focused,
             poll_period_s=args.poll_period_s,
+            prepare_next_fresh_plan=invalidate_qualification_cache,
         )
+        cache_control["post_sample_invalidations"] = post_sample_invalidations
         _request_json(base_url, "/api/cycle/full-stop", method="POST", payload={})
         cycle_started = False
         # Drain terminal stop events so sequence/loss checks cover the complete
@@ -1098,6 +1322,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         captured_events, through_execution_id=selected_ids[-1]
     )
     pipeline_after = _pipeline_status(base_url)
+    kernel_metrics_after = _kernel_runtime_metrics(base_url)
     for key in (
         "collector_dropped_total",
         "manager_dropped_total",
@@ -1129,6 +1354,9 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         failed_observations=failed_observations,
         authority_before=authority_before,
         authority_after=authority_after,
+        cache_control=cache_control,
+        kernel_metrics_before=kernel_metrics_before,
+        kernel_metrics_after=kernel_metrics_after,
     )
     return {
         "schema_version": EVIDENCE_SCHEMA,
@@ -1190,6 +1418,9 @@ def _failed_evidence(
                             "type": type(failure).__name__,
                         }
                     ],
+                    "runtime_failure_evidence": _failure_runtime_evidence(
+                        args.composer_url.rstrip("/")
+                    ),
                 },
             }
         ],

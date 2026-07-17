@@ -49,6 +49,31 @@ def generate_launch_description() -> LaunchDescription:
                 description="Name of the ros2_control controller_manager node.",
             ),
             DeclareLaunchArgument(
+                "controller_manager_lock_memory",
+                default_value="false",
+                description=(
+                    "Lock controller_manager memory for a strict target resource "
+                    "profile. Requires a matching memlock limit."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "controller_manager_thread_priority",
+                default_value="50",
+                description=(
+                    "SCHED_FIFO priority requested by the controller_manager "
+                    "update thread. The target profile keeps this above every "
+                    "ManyForge native scheduler role."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "controller_manager_cpu_affinity",
+                default_value="",
+                description=(
+                    "Comma/range CPU set reserved for controller_manager, for "
+                    "example '13' or '12-13'. Empty preserves inherited affinity."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "arm_controller_name",
                 default_value="isaac_arm_controller",
                 description="JointTrajectoryController to spawn for the UR arm.",
@@ -318,6 +343,28 @@ def _launch_setup(context, *_, **__) -> list[object]:
         LaunchConfiguration("start_gripper_action_bridge").perform(context),
         isaac_profile=isaac_profile,
     )
+    controller_manager_lock_memory = _parse_bool_launch_value(
+        LaunchConfiguration("controller_manager_lock_memory").perform(context),
+        name="controller_manager_lock_memory",
+    )
+    controller_manager_thread_priority = _parse_bounded_int_launch_value(
+        LaunchConfiguration("controller_manager_thread_priority").perform(context),
+        name="controller_manager_thread_priority",
+        minimum=1,
+        maximum=99,
+    )
+    controller_manager_cpu_affinity = _parse_cpu_affinity_launch_value(
+        LaunchConfiguration("controller_manager_cpu_affinity").perform(context),
+        name="controller_manager_cpu_affinity",
+    )
+    controller_manager_resources: dict[str, object] = {
+        "lock_memory": controller_manager_lock_memory,
+        "thread_priority": controller_manager_thread_priority,
+    }
+    if controller_manager_cpu_affinity:
+        controller_manager_resources["cpu_affinity"] = (
+            controller_manager_cpu_affinity
+        )
 
     ros2_control_node = Node(
         package="controller_manager",
@@ -326,6 +373,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
         output="screen",
         parameters=[
             {"robot_description": robot_description},
+            controller_manager_resources,
             str(controller_config),
         ],
     )
@@ -515,3 +563,72 @@ def _resolve_start_gripper_action_bridge(value: str, *, isaac_profile: str) -> b
         "start_gripper_action_bridge must be auto, true, or false; "
         f"got {value!r}"
     )
+
+
+def _parse_bool_launch_value(value: str, *, name: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true or false; got {value!r}")
+
+
+def _parse_bounded_int_launch_value(
+    value: str,
+    *,
+    name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        parsed = int(value.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(f"{name} must be in [{minimum}, {maximum}]")
+    return parsed
+
+
+def _parse_cpu_affinity_launch_value(value: str, *, name: str) -> list[int]:
+    # controller_manager and the native scheduler ultimately use Linux
+    # cpu_set_t. Bound expansion before constructing a Python range so a
+    # malformed deployment value cannot consume startup memory or CPU.
+    maximum_cpu_index = 1023
+    normalized = value.strip()
+    if not normalized:
+        return []
+    cpus: set[int] = set()
+    for raw_token in normalized.split(","):
+        token = raw_token.strip()
+        if not token:
+            raise ValueError(f"{name} contains an empty CPU token")
+        if "-" not in token:
+            cpus.add(
+                _parse_bounded_int_launch_value(
+                    token,
+                    name=name,
+                    minimum=0,
+                    maximum=maximum_cpu_index,
+                )
+            )
+            continue
+        pieces = token.split("-")
+        if len(pieces) != 2:
+            raise ValueError(f"{name} contains an invalid CPU range: {token!r}")
+        first = _parse_bounded_int_launch_value(
+            pieces[0],
+            name=name,
+            minimum=0,
+            maximum=maximum_cpu_index,
+        )
+        last = _parse_bounded_int_launch_value(
+            pieces[1],
+            name=name,
+            minimum=0,
+            maximum=maximum_cpu_index,
+        )
+        if last < first:
+            raise ValueError(f"{name} contains a descending CPU range: {token!r}")
+        cpus.update(range(first, last + 1))
+    return sorted(cpus)
