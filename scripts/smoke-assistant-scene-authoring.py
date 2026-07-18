@@ -160,6 +160,7 @@ def _run_api_smoke(args: argparse.Namespace, repo_root: Path) -> dict[str, Any]:
     from fastapi.testclient import TestClient
 
     from manyforge_behavior.kernel_client import MockKernelClient
+    from manyforge_behavior.node_environment import build_node_environment
     from manyforge_composer.backend import routes_assistant
     from manyforge_composer.backend.app import create_app
     from manyforge_composer.backend.security import SecurityConfig
@@ -177,7 +178,10 @@ def _run_api_smoke(args: argparse.Namespace, repo_root: Path) -> dict[str, Any]:
     catalog_path = args.catalog_path or str(
         repo_root / "manyforge_behavior" / "resources" / "node_catalog.yaml"
     )
-    state = ComposerState(catalog_path=catalog_path, kernel=MockKernelClient())
+    state = ComposerState(
+        node_environment=build_node_environment(catalog_path),
+        kernel=MockKernelClient(),
+    )
     app = create_app(
         state,
         security=SecurityConfig(
@@ -391,7 +395,7 @@ def _write_minimal_program(directory: Path) -> Path:
                 "api_version: manyforge.program.v0",
                 "program_profile: v0.0",
                 "name: assistant_smoke_minimal",
-                'catalog_version: "0.3.0"',
+                'catalog_version: "0.4.0"',
                 "description: Minimal program for assistant proposal lifecycle smoke.",
                 "robot:",
                 "  robot_id: ur5",

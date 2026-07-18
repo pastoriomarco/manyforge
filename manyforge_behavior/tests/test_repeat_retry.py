@@ -7,6 +7,7 @@ retry(5) over a fail-then-succeed child takes N+1 tree ticks (N failures + 1 suc
 
 import py_trees
 from pathlib import Path
+from manyforge_behavior.node_environment import build_node_environment
 
 from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
 from manyforge_behavior.catalog import NodeCatalog
@@ -253,7 +254,7 @@ class TestFixtureProgram:
         # Build and run via the runner
         kernel = MockKernelClient()
         runner = OrchestratorRunner(
-            catalog_path=str(catalog_path),
+            node_environment=build_node_environment(catalog_path),
             program_path=str(program_path),
             kernel=kernel,
         )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -111,6 +112,9 @@ class CatalogEntry:
     runners: dict[str, Any] = field(default_factory=dict)
     interruptible: bool = False
     default_interrupt_scope: Optional[str] = None
+    operator_stop_policy: str = "hold"
+    runtime_injections: list[str] = field(default_factory=list)
+    runtime_resources: list[dict[str, Any]] = field(default_factory=list)
     # Optional swap-compatibility family. When two entries declare the
     # same swap_class, tree_draft_change_node_kind treats them as
     # semantically interchangeable (subject to arity and param
@@ -135,18 +139,35 @@ class NodeCatalog:
 
     def __init__(self, path: str | Path):
         self._path = Path(path)
+        with open(self._path) as f:
+            data = yaml.safe_load(f)
+        self._initialize(data)
+
+    @classmethod
+    def from_data(
+        cls,
+        data: dict[str, Any],
+        *,
+        source: str = "<effective-catalog>",
+    ) -> "NodeCatalog":
+        """Construct a catalog from already assembled descriptor data."""
+        self = cls.__new__(cls)
+        self._path = Path(source)
+        self._initialize(data)
+        return self
+
+    def _initialize(self, data: Any) -> None:
         self._entries: dict[str, CatalogEntry] = {}
         self._version: str = ""
         self._api_version: str = ""
         self._schema_registry = CatalogSchemaRegistry()
-        self._load_and_validate()
+        self._raw_data: dict[str, Any] = {}
+        self._load_and_validate(data)
 
-    def _load_and_validate(self) -> None:
-        with open(self._path) as f:
-            data = yaml.safe_load(f)
-
+    def _load_and_validate(self, data: Any) -> None:
         if not isinstance(data, dict):
             raise CatalogValidationError("Catalog must be a YAML mapping")
+        self._raw_data = deepcopy(data)
 
         # Validate api_version
         api_version = data.get("api_version")
@@ -327,6 +348,12 @@ class NodeCatalog:
             runners=raw.get("runners", {}),
             interruptible=bool(raw.get("interruptible", False)),
             default_interrupt_scope=raw.get("default_interrupt_scope"),
+            operator_stop_policy=raw.get(
+                "operator_stop_policy",
+                "inherit" if raw.get("kind") in {"composite", "decorator"} else "hold",
+            ),
+            runtime_injections=list(raw.get("runtime_injections", [])),
+            runtime_resources=list(raw.get("runtime_resources", [])),
             swap_class=swap_class,
             swap_param_aliases=swap_param_aliases,
         )
@@ -679,7 +706,12 @@ class NodeCatalog:
                     f"blackboard_value_type must be one of: {allowed}"
                 )
 
-        declared_params = {p.name for p in entry.parameters}
+        declared_param_names = [p.name for p in entry.parameters]
+        declared_params = set(declared_param_names)
+        if len(declared_param_names) != len(declared_params):
+            raise CatalogValidationError(
+                f"Entry '{entry.id}': parameters contains duplicate names"
+            )
         self._validate_profile_min(entry.profiles_min, f"Entry '{entry.id}'")
         for p in entry.parameters:
             if p.visible_when is None:
@@ -735,6 +767,27 @@ class NodeCatalog:
             raise CatalogValidationError(
                 f"Entry '{entry.id}': default_interrupt_scope requires interruptible=true"
             )
+        if entry.operator_stop_policy not in {"hold", "continue", "inherit"}:
+            raise CatalogValidationError(
+                f"Entry '{entry.id}': operator_stop_policy must be hold, continue, or inherit"
+            )
+        allowed_injections = {
+            "runtime_pause_registry",
+            "robot_defaults",
+            "scene_snapshot_provider",
+            "base_frame_default",
+        }
+        unknown_injections = sorted(set(entry.runtime_injections) - allowed_injections)
+        if unknown_injections:
+            raise CatalogValidationError(
+                f"Entry '{entry.id}': unknown runtime_injections {unknown_injections}"
+            )
+        if not isinstance(entry.runtime_resources, list) or not all(
+            isinstance(item, dict) for item in entry.runtime_resources
+        ):
+            raise CatalogValidationError(
+                f"Entry '{entry.id}': runtime_resources must be a list of mappings"
+            )
 
     @staticmethod
     def _validate_profile_min(value: str, context: str) -> None:
@@ -770,6 +823,11 @@ class NodeCatalog:
     @property
     def schema_registry(self) -> CatalogSchemaRegistry:
         return self._schema_registry
+
+    @property
+    def raw_data(self) -> dict[str, Any]:
+        """Return a defensive copy suitable for effective-catalog assembly."""
+        return deepcopy(self._raw_data)
 
 
 def _profile_satisfied(min_profile: str, target: str) -> bool:

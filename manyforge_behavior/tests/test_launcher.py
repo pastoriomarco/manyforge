@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from manyforge_behavior.node_environment import build_node_environment
+
 import argparse
 import os
 import sys
 import tempfile
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import py_trees
 import pytest
 import yaml
 
@@ -17,16 +20,22 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.deployment import Deployment, DeploymentValidationError
 from manyforge_behavior.kernel_client import MockKernelClient
 from manyforge_behavior.program import Program
 from manyforge_behavior.runner import OrchestratorRunner
+from manyforge_behavior.runtime_resources import (
+    RuntimeResourceError,
+    RuntimeResourceFactoryRegistry,
+)
 
 # Import launcher functions
 from scripts.launch import _native_kernel_config_from_deployment, create_kernel, main
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
+NODE_ENVIRONMENT = build_node_environment(CATALOG_PATH)
 DEPLOYMENT_FIXTURE_PATH = (
     Path(__file__).parent / "fixtures" / "ur5_roboplan.deployment.yaml"
 )
@@ -236,6 +245,131 @@ class TestLauncherArgParser:
         assert args.catalog == "catalog.yaml"
         assert args.auto_run is True
         assert args.max_ticks == 100
+
+
+class TestLauncherRuntimeResources:
+    class _Deployment:
+        external_nodes = SimpleNamespace(strict=False)
+        runtime_resources = {
+            "plc_clients": {
+                "default": {
+                    "provider": "fake",
+                    "endpoint_alias": "cell_plc",
+                }
+            }
+        }
+
+        def validate_against_program(self, program):
+            return None
+
+        def validate_capabilities(self, program):
+            return None
+
+    class _Kernel:
+        def __init__(self):
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    class _Handle:
+        def __init__(self):
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    class _Runner:
+        created = None
+
+        def __init__(self, **kwargs):
+            type(self).created = self
+            self.runtime_resources = kwargs["runtime_resources"]
+            self._tree = SimpleNamespace(
+                root=SimpleNamespace(status=py_trees.common.Status.SUCCESS)
+            )
+
+        def load(self):
+            return None
+
+    class _CycleManager:
+        created = None
+
+        def __init__(self, runner, kernel):
+            type(self).created = self
+            self.state = CycleState.IDLE
+            self.ran = False
+            self.shutdown_calls = 0
+
+        def run(self):
+            self.ran = True
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+            return True
+
+    def _run_main(self, factories: RuntimeResourceFactoryRegistry):
+        kernel = self._Kernel()
+        self.last_kernel = kernel
+        environment = SimpleNamespace(catalog=object())
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "manyforge-launch",
+                    "--program",
+                    "program.yaml",
+                    "--deployment",
+                    "deployment.yaml",
+                    "--catalog",
+                    "catalog.yaml",
+                    "--auto-run",
+                ],
+            ),
+            patch("scripts.launch.Deployment", return_value=self._Deployment()),
+            patch("scripts.launch.build_node_environment", return_value=environment),
+            patch("scripts.launch.Program", return_value=object()),
+            patch("scripts.launch.validate_environment_availability"),
+            patch("scripts.launch.create_kernel", return_value=kernel),
+            patch("scripts.launch.OrchestratorRunner", self._Runner),
+            patch("scripts.launch.CycleManager", self._CycleManager),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main(runtime_resource_factories=factories)
+        return exc_info.value.code, kernel
+
+    def test_launcher_builds_injects_and_closes_deployment_resources(self):
+        handle = self._Handle()
+        seen_config = None
+
+        def factory(config):
+            nonlocal seen_config
+            seen_config = dict(config)
+            return handle
+
+        code, kernel = self._run_main(
+            RuntimeResourceFactoryRegistry({"fake": factory})
+        )
+
+        assert code == 0
+        assert seen_config == {"endpoint_alias": "cell_plc"}
+        assert self._Runner.created.runtime_resources.resources["plc_clients"][
+            "default"
+        ] is handle
+        assert self._CycleManager.created.ran is True
+        assert self._CycleManager.created.shutdown_calls == 1
+        assert handle.closed == 1
+        assert kernel.closed == 1
+
+    def test_launcher_rejects_unregistered_provider_before_runner_creation(self):
+        self._Runner.created = None
+
+        with pytest.raises(RuntimeResourceError, match="provider 'fake'"):
+            self._run_main(RuntimeResourceFactoryRegistry())
+
+        assert self._Runner.created is None
+        assert self.last_kernel.closed == 1
 
 
 class TestLauncherKernelCreation:
@@ -616,7 +750,7 @@ class TestLauncherIntegration:
 
         # Create runner
         runner = OrchestratorRunner(
-            catalog_path=str(CATALOG_PATH),
+            node_environment=NODE_ENVIRONMENT,
             program_path=str(PROGRAM_FIXTURE_PATH),
             kernel=kernel,
             deployment_path=str(DEPLOYMENT_FIXTURE_PATH),
@@ -638,7 +772,7 @@ class TestLauncherIntegration:
         """Runner loads deployment and validates against program."""
         kernel = MockKernelClient()
         runner = OrchestratorRunner(
-            str(CATALOG_PATH),
+            NODE_ENVIRONMENT,
             str(PROGRAM_FIXTURE_PATH),
             kernel,
             deployment_path=str(DEPLOYMENT_FIXTURE_PATH),

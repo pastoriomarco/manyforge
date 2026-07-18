@@ -1095,6 +1095,27 @@ class EventRecorder:
         exactness-sensitive callers (debug export, recovery correlation)
         pass ``force=True`` to bypass the budget (audit 6B, finding 2.16).
         """
+        environment = getattr(state, "node_environment", None)
+        run_provenance = None
+        if environment is not None:
+            run_provenance = {
+                "catalog_version": environment.catalog.version,
+                "effective_catalog_hash": environment.effective_catalog_hash,
+                "node_environment_generation": environment.generation,
+                "node_sources": [
+                    {
+                        "node_id": source.node_id,
+                        "kind": source.kind,
+                        "path": source.path,
+                        "content_hash": source.content_hash,
+                    }
+                    for source in environment.sources
+                ],
+                "program_source_path": getattr(state, "program_source_path", ""),
+                "deployment_source_path": getattr(
+                    state, "deployment_source_path", ""
+                ),
+            }
         with self._lock:
             now = time.monotonic()
             if not force:
@@ -1110,6 +1131,7 @@ class EventRecorder:
                     self._last_cycle_state,
                     cycle_state,
                     runner_run_id=getattr(cycle_manager, "program_run_id", None),
+                    run_provenance=run_provenance,
                 )
                 self._last_cycle_state = cycle_state
 
@@ -2997,9 +3019,10 @@ class EventRecorder:
         previous_state: Optional[str],
         current_state: Optional[str],
         runner_run_id: Optional[str] = None,
+        run_provenance: Optional[dict[str, Any]] = None,
     ) -> None:
         if current_state == "running" and previous_state in {None, "idle"}:
-            self._start_run(runner_run_id)
+            self._start_run(runner_run_id, run_provenance=run_provenance)
 
         self._record_event(
             event_type="cycle_state_changed",
@@ -3628,7 +3651,12 @@ class EventRecorder:
                 )
             self._last_intervention_event_index = max_event_index
 
-    def _start_run(self, runner_run_id: Optional[str] = None) -> None:
+    def _start_run(
+        self,
+        runner_run_id: Optional[str] = None,
+        *,
+        run_provenance: Optional[dict[str, Any]] = None,
+    ) -> None:
         now_ns = time.monotonic_ns()
         self._run_counter += 1
         if runner_run_id:
@@ -3664,8 +3692,7 @@ class EventRecorder:
                 metric: {} for metric in ("plan", "validate", "execute")
             }
             self._latency_run_id = run_id
-        self._append_run_index_line(
-            {
+        index_record = {
                 "kind": "run_started",
                 "run_id": run_id,
                 "program_run_id": runner_run_id,
@@ -3673,7 +3700,9 @@ class EventRecorder:
                 "started_wall": _wall_timestamp_iso(),
                 "started_at_ns": now_ns,
             }
-        )
+        if run_provenance is not None:
+            index_record["node_environment"] = run_provenance
+        self._append_run_index_line(index_record)
         # Re-record the stored clock anchor as the first event of the new run
         # so every run file is self-contained for wall-time derivation — no
         # reader has to hunt an earlier file for the anchor. The pair itself

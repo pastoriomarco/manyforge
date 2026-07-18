@@ -5,7 +5,12 @@ description: >-
   Isaac-compatible Lite6 pick-and-place program. It uses the same static scene
   and behavior sequence as the native Lite6 pick-and-place example while
   targeting the ros2_control / Isaac execution deployment.
-catalog_version: "0.3.0"
+compatibility:
+  lanes: [isaac-sim]
+  assistant: forbidden
+  requires: [ros2_control, lite_gripper]
+  tags: [pick-and-place, isaac-sim, lite6]
+catalog_version: "0.4.0"
 robot:
   robot_id: lite6
   group_id: lite6

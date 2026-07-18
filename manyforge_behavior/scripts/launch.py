@@ -10,7 +10,6 @@ from typing import Any
 
 import py_trees
 
-from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.cycle_manager import CycleManager, CycleState
 from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.kernel_client import KernelClient, MockKernelClient
@@ -24,6 +23,16 @@ from manyforge_behavior.robot_model_runtime import (
 )
 from manyforge_behavior.program import Program
 from manyforge_behavior.runner import OrchestratorRunner
+from manyforge_behavior.node_environment import (
+    build_node_environment,
+    configured_node_roots,
+    validate_environment_availability,
+)
+from manyforge_behavior.runtime_resources import (
+    RuntimeResourceFactoryRegistry,
+    RuntimeResourceRegistry,
+    build_runtime_resource_registry,
+)
 
 _ROS2_CONTROL_EXECUTION_ADAPTER_IDS = {
     "execution.ros2_control_fjt",
@@ -219,7 +228,10 @@ def create_kernel(deployment: Deployment) -> KernelClient:
     return MockKernelClient()
 
 
-def main():
+def main(
+    *,
+    runtime_resource_factories: RuntimeResourceFactoryRegistry | None = None,
+):
     parser = argparse.ArgumentParser(description="Launch a ManyForge program")
     parser.add_argument("--program", required=True, help="Path to program YAML")
     parser.add_argument("--deployment", required=True, help="Path to deployment YAML")
@@ -233,47 +245,77 @@ def main():
     deployment = Deployment(args.deployment)
 
     print(f"Loading program: {args.program}")
-    # Use catalog for program validation
-    catalog = NodeCatalog(args.catalog)
+    environment = build_node_environment(
+        args.catalog,
+        external_roots=configured_node_roots(),
+        strict=deployment.external_nodes.strict,
+    )
+    catalog = environment.catalog
 
     # Cross-validate
     program = Program(args.program, catalog)
     deployment.validate_against_program(program)
     deployment.validate_capabilities(program)
+    validate_environment_availability(environment, deployment, program)
 
-    # 2. Create kernel based on deployment adapter config
     kernel = create_kernel(deployment)
-
-    # 3. Create runner
-    runner = OrchestratorRunner(
-        catalog_path=args.catalog,
-        program_path=args.program,
-        kernel=kernel,
-        deployment_path=args.deployment,
-    )
-    runner.load()
-    cycle_manager = CycleManager(runner, kernel)
-
-    # 4. Run
-    if args.auto_run:
-        print("Running program...")
-        cycle_manager.run()
-        while cycle_manager.state == CycleState.RUNNING:
-            time.sleep(0.01)
-        success = bool(
-            runner._tree is not None
-            and runner._tree.root.status == py_trees.common.Status.SUCCESS
+    runtime_resources: RuntimeResourceRegistry | None = None
+    cycle_manager: CycleManager | None = None
+    try:
+        runtime_resources = build_runtime_resource_registry(
+            deployment.runtime_resources,
+            runtime_resource_factories or RuntimeResourceFactoryRegistry(),
         )
-        status = "SUCCESS" if success else "FAILED"
-        print(f"Program {status}")
-        sys.exit(0 if success else 1)
-    else:
+
+        runner = OrchestratorRunner(
+            node_environment=environment,
+            program_path=args.program,
+            kernel=kernel,
+            deployment_path=args.deployment,
+            program=program,
+            deployment=deployment,
+            runtime_resources=runtime_resources,
+        )
+        runner.load()
+        cycle_manager = CycleManager(runner, kernel)
+
+        if args.auto_run:
+            print("Running program...")
+            cycle_manager.run()
+            while cycle_manager.state == CycleState.RUNNING:
+                time.sleep(0.01)
+            success = bool(
+                runner._tree is not None
+                and runner._tree.root.status == py_trees.common.Status.SUCCESS
+            )
+            status = "SUCCESS" if success else "FAILED"
+            print(f"Program {status}")
+            sys.exit(0 if success else 1)
+
         print("Ready. Re-run with --auto-run to execute, or press Ctrl+C to exit.")
         try:
             while True:
                 time.sleep(1.0)
         except KeyboardInterrupt:
             print("\nShutting down...")
+    finally:
+        cleanup_errors: list[str] = []
+        if cycle_manager is not None and not cycle_manager.shutdown():
+            cleanup_errors.append("cycle manager did not quiesce before shutdown")
+        if runtime_resources is not None:
+            try:
+                runtime_resources.close()
+            except (Exception, SystemExit) as exc:  # Keep retiring independent owners.
+                cleanup_errors.append(f"runtime resources: {type(exc).__name__}: {exc}")
+        try:
+            kernel.close()
+        except (Exception, SystemExit) as exc:  # Keep retiring independent owners.
+            cleanup_errors.append(f"kernel: {type(exc).__name__}: {exc}")
+        if cleanup_errors:
+            message = "launcher shutdown incomplete: " + "; ".join(cleanup_errors)
+            if sys.exc_info()[0] is None:
+                raise RuntimeError(message)
+            print(f"ERROR: {message}", file=sys.stderr)
 
 
 if __name__ == "__main__":

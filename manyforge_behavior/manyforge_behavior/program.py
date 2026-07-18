@@ -38,6 +38,10 @@ from manyforge_behavior.skill_loader import (
 
 
 EXPECTED_API_VERSION = "manyforge.program.v0"
+_COMPATIBILITY_LANES = frozenset({"manyforge-only", "isaac-sim"})
+_COMPATIBILITY_ASSISTANT_POLICIES = frozenset(
+    {"required", "optional", "forbidden"}
+)
 BLACKBOARD_REF_RE = re.compile(r"^\$\{bb:([^}]+)\}$")
 _REMOVED_COOPERATIVE_INTERRUPT_FIELDS = frozenset(
     {
@@ -132,6 +136,68 @@ class RobotProfile:
     base_frame: str
     tcp_frame: str
     base_pose: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ProgramCompatibility:
+    lanes: tuple[str, ...]
+    assistant: str = "optional"
+    requires: tuple[str, ...] = ()
+    tags: tuple[str, ...] = ()
+
+
+def _compatibility_string_list(
+    raw: Any,
+    *,
+    path: str,
+    required: bool = False,
+) -> tuple[str, ...]:
+    if raw is None and not required:
+        return ()
+    if not isinstance(raw, list) or (required and not raw) or not all(
+        isinstance(item, str) and item.strip() for item in raw
+    ):
+        qualifier = "non-empty " if required else ""
+        raise ProgramValidationError(
+            f"{path} must be a {qualifier}list of non-empty strings"
+        )
+    values = tuple(item.strip() for item in raw)
+    if len(values) != len(set(values)):
+        raise ProgramValidationError(f"{path} must not contain duplicates")
+    return values
+
+
+def _parse_program_compatibility(raw: Any) -> ProgramCompatibility | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProgramValidationError("compatibility must be a mapping")
+    unknown = sorted(set(raw) - {"lanes", "assistant", "requires", "tags"})
+    if unknown:
+        raise ProgramValidationError(
+            f"compatibility contains unknown fields: {unknown}"
+        )
+    lanes = _compatibility_string_list(
+        raw.get("lanes"), path="compatibility.lanes", required=True
+    )
+    unknown_lanes = sorted(set(lanes) - _COMPATIBILITY_LANES)
+    if unknown_lanes:
+        raise ProgramValidationError(
+            f"compatibility.lanes contains unknown lanes: {unknown_lanes}"
+        )
+    assistant = raw.get("assistant", "optional")
+    if assistant not in _COMPATIBILITY_ASSISTANT_POLICIES:
+        raise ProgramValidationError(
+            "compatibility.assistant must be required, optional, or forbidden"
+        )
+    return ProgramCompatibility(
+        lanes=lanes,
+        assistant=assistant,
+        requires=_compatibility_string_list(
+            raw.get("requires"), path="compatibility.requires"
+        ),
+        tags=_compatibility_string_list(raw.get("tags"), path="compatibility.tags"),
+    )
 
 
 class ProgramValidationError(Exception):
@@ -1966,6 +2032,7 @@ class Program:
         self.description: str = ""
         self.program_profile: str = ""
         self.catalog_version: str = ""
+        self.compatibility: ProgramCompatibility | None = None
         self.robot: Optional[RobotProfile] = None
         self.scene: list[SceneResource] = []
         self.parameters: dict[str, ProgramParameter] = {}
@@ -2004,12 +2071,14 @@ class Program:
         self.description = ""
         self.program_profile = ""
         self.catalog_version = ""
+        self.compatibility = None
         self.robot = None
         self.scene = []
         self.parameters = {}
         self.blackboard_namespaces = {}
         self.blackboard_keys = {}
         self.saved_with_deployment = None
+        self.compatibility = None
         self.tree = None
         self._load_from_data_and_validate(data)
         return self
@@ -2195,6 +2264,7 @@ class Program:
 
         self.catalog_version = data.get("catalog_version", "")
         self.name = data.get("name", "")
+        self.compatibility = _parse_program_compatibility(data.get("compatibility"))
         # Optional save-time pointer to the deployment this program was paired
         # with. None when absent (legacy programs); validated only as a dict so
         # legacy YAMLs keep loading. The picker uses this to highlight the
@@ -2439,6 +2509,13 @@ class Program:
         }
         if self.catalog_version:
             d["catalog_version"] = self.catalog_version
+        if self.compatibility is not None:
+            d["compatibility"] = {
+                "lanes": list(self.compatibility.lanes),
+                "assistant": self.compatibility.assistant,
+                "requires": list(self.compatibility.requires),
+                "tags": list(self.compatibility.tags),
+            }
         d["robot"] = {
             "robot_id": self.robot.robot_id,
             "group_id": self.robot.group_id,

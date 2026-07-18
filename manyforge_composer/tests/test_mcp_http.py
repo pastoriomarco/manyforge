@@ -6,6 +6,8 @@ principal propagation, and session eviction.
 
 from __future__ import annotations
 
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
+
 import json
 import time
 from pathlib import Path
@@ -40,7 +42,7 @@ _TEST_SECURITY = SecurityConfig(
 def state():
     kernel = MockKernelClient()
     return ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=kernel,
         allowed_fs_roots=[str(_REPO_ROOT), "/workspace", "/tmp"],
     )

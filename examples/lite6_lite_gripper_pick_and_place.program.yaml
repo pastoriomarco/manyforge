@@ -6,7 +6,12 @@ description: 'Basic ManyForge pick-and-place program for UFACTORY Lite6 + lite p
   rest/scan joint poses are copied from ManyMove, the scene uses simple primitive
   boxes, and pick/place goals are expressed as backend-resolved relative moves plus
   runtime attach/detach.'
-catalog_version: "0.3.0"
+compatibility:
+  lanes: [manyforge-only]
+  assistant: forbidden
+  requires: [lite_gripper]
+  tags: [pick-and-place, lite6]
+catalog_version: "0.4.0"
 robot:
   robot_id: lite6
   group_id: lite6

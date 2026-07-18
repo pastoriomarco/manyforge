@@ -307,6 +307,25 @@ def _find_failure_feedback(node) -> Optional[str]:
     return None
 
 
+def _find_failure_diagnostics(
+    node: Any,
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Return the deepest node-owned structured failure, if one exists."""
+    if hasattr(node, "children"):
+        for child in reversed(node.children):
+            child_diagnostics = _find_failure_diagnostics(child)
+            if child_diagnostics[0] or child_diagnostics[1]:
+                return child_diagnostics
+    if node.status != py_trees.common.Status.FAILURE:
+        return None, None
+    code = getattr(node, "_manyforge_failure_code", None)
+    details = getattr(node, "_manyforge_failure_details", None)
+    return (
+        code if isinstance(code, str) and code else None,
+        deepcopy(details) if isinstance(details, dict) and details else None,
+    )
+
+
 class CycleManager:
     """Runtime lifecycle controller for continuous robot programs.
 
@@ -3833,6 +3852,9 @@ class CycleManager:
                 self._tick_stop_event.set()
                 if status == py_trees.common.Status.FAILURE:
                     failure_feedback = _find_failure_feedback(self._tree.root)
+                    failure_code, failure_details = _find_failure_diagnostics(
+                        self._tree.root
+                    )
                     delegated_candidate = self._find_delegated_recovery_candidate(statuses)
                     if delegated_candidate is not None:
                         delegate_policy = delegated_candidate.modification_policy.get(
@@ -3862,9 +3884,9 @@ class CycleManager:
                             with self._lock:
                                 self._error = failure_feedback
                                 self._error_code = (
-                                    tick_code or "recovery_exhausted"
+                                    tick_code or failure_code or "recovery_exhausted"
                                 )
-                                self._error_details = tick_details
+                                self._error_details = tick_details or failure_details
                                 self._state = CycleState.STOPPED
                                 self._tick_thread = None
                                 clear_motion_stop_flag = (
@@ -3896,9 +3918,11 @@ class CycleManager:
                         with self._lock:
                             self._error = failure_feedback
                             self._error_code = (
-                                delegated_code or "delegated_recovery_requested"
+                                delegated_code
+                                or failure_code
+                                or "delegated_recovery_requested"
                             )
-                            self._error_details = delegated_details
+                            self._error_details = delegated_details or failure_details
                             self._pending_delegated_recovery = request
                             self._state = CycleState.STOPPED
                             self._tick_thread = None
@@ -3922,9 +3946,9 @@ class CycleManager:
                     if status == py_trees.common.Status.FAILURE:
                         self._error = failure_feedback
                         self._error_code = (
-                            terminal_code or "tree_failed"
+                            terminal_code or failure_code or "tree_failed"
                         )
-                        self._error_details = terminal_details
+                        self._error_details = terminal_details or failure_details
                     else:
                         self._error = None
                         self._error_code = None

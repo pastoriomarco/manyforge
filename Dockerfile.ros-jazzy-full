@@ -175,6 +175,11 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
 
 WORKDIR /workspace
 
+# Keep the source-tree CLI available to direct `docker exec` commands. The
+# wrapper establishes its own PYTHONPATH, so it does not depend on PID 1's
+# entrypoint environment.
+ENV PATH="/workspace/scripts:${PATH}"
+
 RUN set -eux; \
     if ! getent group 1000 >/dev/null; then groupadd --gid 1000 manyforge; fi; \
     if ! getent passwd 1000 >/dev/null; then \

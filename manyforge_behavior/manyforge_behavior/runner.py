@@ -8,53 +8,13 @@ from typing import Any, Callable, Optional
 import py_trees
 
 from manyforge_behavior.blackboard_bindings import resolve_runtime_blackboard_bindings
-from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.kernel_client import KernelClient, SceneEditRequest
 from manyforge_behavior.motion_runtime import MotionExecutionCoordinator
+from manyforge_behavior.node_environment import NodeEnvironment
+from manyforge_behavior.node_registry import NodeFactoryContext
 from manyforge_behavior.runtime_pause import RuntimePauseRegistry
-from manyforge_behavior.nodes.geometry import CheckPoseDistance, GetLinkPose
-from manyforge_behavior.nodes.logic import (
-    CheckKeyBoolValue,
-    CheckSignalBool,
-    CommandGripper,
-    ConfirmGripperGrasp,
-    CheckGripperState,
-    SetKeyBoolValue,
-    SetSignalBool,
-    SetGripperState,
-    WaitForKeyBool,
-    WaitForSignalBool,
-    WaitForSignalEdge,
-    WaitForGripperState,
-)
-from manyforge_behavior.nodes.motion import (
-    MoveManipulatorAction,
-    ResetTrajectories,
-    _rpy_deg_to_xyzw,
-)
-from manyforge_behavior.nodes.simulation import (
-    ResetSimulation,
-    SetEntityState,
-    SetSimulationState,
-    StepSimulation,
-)
-from manyforge_behavior.nodes.motion_scoped import MoveUntilSignal, ProbeSearchMove
-from manyforge_behavior.nodes.scene import (
-    AddCollisionObject,
-    AttachObjectToLink,
-    DetachObjectFromLink,
-    RemoveCollisionObject,
-    UpdateCollisionObjectPose,
-    UpsertCollisionObject,
-)
-from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
-from manyforge_behavior.nodes.model import QueryModelNode
-from manyforge_behavior.nodes.pick_planning import PlanPickSequenceNode
-from manyforge_behavior.nodes.recovery import FallbackOverrideNode, RecoverySkillNode
-from manyforge_behavior.nodes.selection import (
-    BuildSceneSelectionContextNode,
-    ValidateSceneSelectionNode,
-)
+from manyforge_behavior.runtime_resources import RuntimeResourceRegistry
+from manyforge_behavior.nodes.motion import _rpy_deg_to_xyzw
 from manyforge_behavior.nodes.stop_policy import OperatorMotionStopPolicy
 from manyforge_behavior.parameters import ParameterResolver
 from manyforge_behavior.program import Program, TreeNode, tree_node_from_dict
@@ -65,154 +25,12 @@ from manyforge_behavior.skill_loader import (
 )
 
 
-# Map catalog IDs to node constructors.
-# Composites/decorators are handled separately since they need children.
-PLUGIN_FACTORY: dict[str, type] = {
-    "move_manipulator_action": MoveManipulatorAction,
-    # Motion-scoped trip nodes (spec/260 §2.6). Authored
-    # programs reference these by catalog id; constructor kwargs map
-    # to the node's __init__ parameters (move_id, policy_id, stop_mode,
-    # etc.). The kernel owns signal arbitration; these nodes only
-    # submit the request and consume the terminal MotionExecutionOutcome.
-    "move_until_signal": MoveUntilSignal,
-    "probe_search_move": ProbeSearchMove,
-    "reset_trajectories": ResetTrajectories,
-    "reset_simulation": ResetSimulation,
-    "set_simulation_state": SetSimulationState,
-    "step_simulation": StepSimulation,
-    "set_entity_state": SetEntityState,
-    "add_collision_object": AddCollisionObject,
-    "upsert_collision_object": UpsertCollisionObject,
-    "remove_collision_object": RemoveCollisionObject,
-    "update_collision_object_pose": UpdateCollisionObjectPose,
-    "attach_object_to_link": AttachObjectToLink,
-    "detach_object_from_link": DetachObjectFromLink,
-    "check_key_bool_value": CheckKeyBoolValue,
-    "set_key_bool_value": SetKeyBoolValue,
-    "wait_for_key_bool": WaitForKeyBool,
-    "check_signal_bool": CheckSignalBool,
-    "set_signal_bool": SetSignalBool,
-    "wait_for_signal_bool": WaitForSignalBool,
-    "wait_for_signal_edge": WaitForSignalEdge,
-    "command_gripper": CommandGripper,
-    "confirm_gripper_grasp": ConfirmGripperGrasp,
-    "check_gripper_state": CheckGripperState,
-    "set_gripper_state": SetGripperState,
-    "wait_for_gripper_state": WaitForGripperState,
-    "get_link_pose": GetLinkPose,
-    "check_pose_distance": CheckPoseDistance,
-    "plan_pick_sequence": PlanPickSequenceNode,
-    "validate_scene_selection": ValidateSceneSelectionNode,
-}
-
-_CONTROL_FLOW_NODE_IDS = frozenset(
-    {
-        "sequence",
-        "fallback",
-        "parallel",
-        "inverter",
-        "repeat",
-        "retry",
-        "fallback_override_node",
-        "recovery_skill_node",
-    }
-)
-_RUNTIME_PAUSE_NODE_IDS = frozenset(
-    {
-        "move_manipulator_action",
-        "move_until_signal",
-        "probe_search_move",
-        "command_gripper",
-        "confirm_gripper_grasp",
-        "plan_pick_sequence",
-        "build_scene_selection_context",
-        "add_collision_object",
-        "upsert_collision_object",
-        "remove_collision_object",
-        "update_collision_object_pose",
-        "attach_object_to_link",
-        "detach_object_from_link",
-        "reset_simulation",
-        "set_simulation_state",
-        "step_simulation",
-        "set_entity_state",
-        "query_model",
-    }
-)
-_MOTION_STOP_HOLD_DEFAULT_NODE_IDS = frozenset(
-    {
-        "move_manipulator_action",
-        "move_until_signal",
-        "probe_search_move",
-        "reset_trajectories",
-        "reset_simulation",
-        "set_simulation_state",
-        "step_simulation",
-        "set_entity_state",
-        "add_collision_object",
-        "upsert_collision_object",
-        "remove_collision_object",
-        "update_collision_object_pose",
-        "attach_object_to_link",
-        "detach_object_from_link",
-        "set_key_bool_value",
-        "set_signal_bool",
-        "command_gripper",
-        "confirm_gripper_grasp",
-        "set_gripper_state",
-        "plan_pick_sequence",
-        "query_model",
-    }
-)
-_MOTION_STOP_CONTINUE_DEFAULT_NODE_IDS = frozenset(
-    {
-        "timer",
-        "check_key_bool_value",
-        "wait_for_key_bool",
-        "check_signal_bool",
-        "wait_for_signal_bool",
-        "wait_for_signal_edge",
-        "check_gripper_state",
-        "wait_for_gripper_state",
-        "get_link_pose",
-        "check_pose_distance",
-        "validate_scene_selection",
-        "build_scene_selection_context",
-    }
-)
-
-
-def _catalog_operator_stop_default(node_id: str) -> str:
-    """Return conservative default policy for operator Motion Stop."""
-    if node_id in _CONTROL_FLOW_NODE_IDS:
-        return "inherit"
-    if node_id in _MOTION_STOP_CONTINUE_DEFAULT_NODE_IDS:
-        return "continue"
-    if node_id in _MOTION_STOP_HOLD_DEFAULT_NODE_IDS:
-        return "hold"
-    return "hold"
-
-
-def _parallel_success_policy_from_params(
-    params: dict[str, Any],
-) -> py_trees.common.ParallelPolicy.Base:
-    """Build the py_trees Parallel success policy from catalog parameters."""
-    success_policy = str(params.get("success_policy", "success_on_all") or "").strip()
-    if success_policy in {"", "success_on_all"}:
-        return py_trees.common.ParallelPolicy.SuccessOnAll()
-    if success_policy == "success_on_one":
-        return py_trees.common.ParallelPolicy.SuccessOnOne()
-    raise ValueError(
-        "Parallel success_policy must be one of: success_on_all, success_on_one"
-    )
-
-
 class OrchestratorRunner:
     """Main entry point: load, build, and run a ManyForge program."""
 
     def __init__(
         self,
-        catalog_path: str,
+        node_environment: NodeEnvironment,
         program_path: str,
         kernel: KernelClient,
         overrides: Optional[dict[str, Any]] = None,
@@ -237,8 +55,9 @@ class OrchestratorRunner:
         simulation_reset_callback: Optional[
             Callable[..., dict[str, Any]]
         ] = None,
+        runtime_resources: RuntimeResourceRegistry | None = None,
     ):
-        self._catalog_path = catalog_path
+        self._node_environment = node_environment
         self._program_path = program_path
         self._kernel = kernel
         self._overrides = overrides or {}
@@ -246,7 +65,8 @@ class OrchestratorRunner:
         self._provided_program = program
         self._provided_deployment = deployment
         self._provided_skill_catalog = skill_catalog
-        self._catalog: Optional[NodeCatalog] = None
+        self._catalog = node_environment.catalog
+        self._node_registry = node_environment.registry
         self._program: Optional[Program] = None
         self._resolver: Optional[ParameterResolver] = None
         self._tree: Optional[py_trees.trees.BehaviourTree] = None
@@ -259,6 +79,7 @@ class OrchestratorRunner:
         self._pose_source_between_nodes_callback = pose_source_between_nodes_callback
         self._simulation_control_callback = simulation_control_callback
         self._simulation_reset_callback = simulation_reset_callback
+        self._runtime_resources = runtime_resources or RuntimeResourceRegistry.empty()
         self._motion_coordinator = MotionExecutionCoordinator(kernel)
         self._runtime_pause_registry = RuntimePauseRegistry()
         # Intervention context — set by cycle_manager before building
@@ -272,7 +93,6 @@ class OrchestratorRunner:
 
     def load(self) -> None:
         """Load catalog, program, validate, set up parameter resolver."""
-        self._catalog = NodeCatalog(self._catalog_path)
         if self._provided_skill_catalog is None:
             self._skill_catalog = load_skill_catalog(
                 default_skills_dir(),
@@ -312,14 +132,19 @@ class OrchestratorRunner:
 
         root = self._build_node(self._program.tree)
         tree = py_trees.trees.BehaviourTree(root=root)
-        tree.setup()
 
-        # Store kernel on the blackboard
+        # Publish setup-time services before calling BehaviourTree.setup().
+        # External nodes are explicitly allowed to acquire deployment-owned
+        # handles in setup(), so creating these keys afterward would make their
+        # lifecycle depend on an incidental first-tick fallback.
         bb = py_trees.blackboard.Client(name="runner")
         bb.register_key(key="kernel", access=py_trees.common.Access.WRITE)
         bb.kernel = self._kernel
         bb.register_key(key="motion_coordinator", access=py_trees.common.Access.WRITE)
         bb.motion_coordinator = self._motion_coordinator
+        bb.register_key(key="runtime_resources", access=py_trees.common.Access.WRITE)
+        bb.runtime_resources = self._runtime_resources
+        tree.setup()
 
         # Inject robot profile defaults for motion nodes
         bb.register_key(key="robot_id", access=py_trees.common.Access.WRITE)
@@ -554,11 +379,10 @@ class OrchestratorRunner:
         elif inherited_operator_stop_policy_explicit:
             effective_operator_stop_policy = inherited_operator_stop_policy
         else:
-            default_operator_stop_policy = _catalog_operator_stop_default(tree_node.id)
             effective_operator_stop_policy = (
                 inherited_operator_stop_policy
-                if default_operator_stop_policy == "inherit"
-                else default_operator_stop_policy
+                if entry.operator_stop_policy == "inherit"
+                else entry.operator_stop_policy
             )
         n_children = len(tree_node.children)
         if n_children < entry.children_min:
@@ -578,8 +402,6 @@ class OrchestratorRunner:
             blackboard_namespaces=self._program.blackboard_namespaces,
             blackboard_keys=self._program.blackboard_keys,
         )
-        if tree_node.id in _RUNTIME_PAUSE_NODE_IDS:
-            resolved_params["runtime_pause_registry"] = self._runtime_pause_registry
         children = [
             self._build_node(
                 c,
@@ -601,206 +423,37 @@ class OrchestratorRunner:
                 policy=effective_operator_stop_policy,
             )
 
-        # Inject robot profile defaults for motion nodes
-        if tree_node.id in (
-            "move_manipulator_action",
-            # Motion-scoped trip nodes are full motion
-            # nodes — they need the same robot/frame defaults injected
-            # so authored programs don't have to repeat them on every
-            # MoveUntilSignal / ProbeSearchMove invocation.
-            "move_until_signal",
-            "probe_search_move",
-        ):
-            if "robot_id" not in resolved_params:
-                resolved_params["robot_id"] = self._program.robot.robot_id
-            if "group_id" not in resolved_params:
-                resolved_params["group_id"] = self._program.robot.group_id
-            if "base_frame" not in resolved_params:
-                resolved_params["base_frame"] = self._program.robot.base_frame
-            if "tcp_frame" not in resolved_params:
-                resolved_params["tcp_frame"] = self._program.robot.tcp_frame
-        if tree_node.id == "plan_pick_sequence":
-            if "robot_id" not in resolved_params:
-                resolved_params["robot_id"] = self._program.robot.robot_id
-            if "group_id" not in resolved_params:
-                resolved_params["group_id"] = self._program.robot.group_id
-            if "base_frame" not in resolved_params:
-                resolved_params["base_frame"] = self._program.robot.base_frame
-            if "tcp_frame" not in resolved_params:
-                resolved_params["tcp_frame"] = self._program.robot.tcp_frame
-            resolved_params["scene_snapshot_provider"] = self._scene_snapshot_provider
-        if tree_node.id == "build_scene_selection_context":
-            if "base_frame" not in resolved_params:
-                resolved_params["base_frame"] = self._program.robot.base_frame
-            resolved_params["scene_snapshot_provider"] = self._scene_snapshot_provider
+        for injection in entry.runtime_injections:
+            if injection == "runtime_pause_registry":
+                resolved_params["runtime_pause_registry"] = (
+                    self._runtime_pause_registry
+                )
+            elif injection == "robot_defaults":
+                resolved_params.setdefault("robot_id", self._program.robot.robot_id)
+                resolved_params.setdefault("group_id", self._program.robot.group_id)
+                resolved_params.setdefault("base_frame", self._program.robot.base_frame)
+                resolved_params.setdefault("tcp_frame", self._program.robot.tcp_frame)
+            elif injection == "base_frame_default":
+                resolved_params.setdefault("base_frame", self._program.robot.base_frame)
+            elif injection == "scene_snapshot_provider":
+                resolved_params["scene_snapshot_provider"] = self._scene_snapshot_provider
 
-        # Control flow composites
-        if tree_node.id == "sequence":
-            return finalize(
-                py_trees.composites.Sequence(
-                    name=tree_node.name, memory=True, children=children
-                )
-            )
-        if tree_node.id == "fallback":
-            return finalize(
-                py_trees.composites.Selector(
-                    name=tree_node.name, memory=True, children=children
-                )
-            )
-        if tree_node.id == "parallel":
-            return finalize(
-                py_trees.composites.Parallel(
-                    name=tree_node.name,
-                    policy=_parallel_success_policy_from_params(resolved_params),
-                    children=children,
-                )
-            )
-        if tree_node.id == "inverter":
-            if not children:
-                raise ValueError(
-                    f"Inverter '{tree_node.name}' requires exactly one child"
-                )
-            return finalize(
-                py_trees.decorators.Inverter(
-                    name=tree_node.name, child=children[0]
-                )
-            )
-        if tree_node.id == "repeat":
-            if not children:
-                raise ValueError(
-                    f"Repeat '{tree_node.name}' requires exactly one child"
-                )
-            num_cycles = int(resolved_params.get("num_cycles", -1))
-            return finalize(
-                RepeatDecorator(
-                    name=tree_node.name,
-                    child=children[0],
-                    num_cycles=num_cycles,
-                )
-            )
-        if tree_node.id == "retry":
-            if not children:
-                raise ValueError(
-                    f"Retry '{tree_node.name}' requires exactly one child"
-                )
-            num_attempts = int(resolved_params.get("num_attempts", -1))
-            return finalize(
-                RetryDecorator(
-                    name=tree_node.name,
-                    child=children[0],
-                    num_attempts=num_attempts,
-                )
-            )
-        if tree_node.id == "fallback_override_node":
-            if not children:
-                raise ValueError(
-                    f"FallbackOverride '{tree_node.name}' requires exactly one child"
-                )
-            fallback_params = resolved_params.get("fallback_params", {})
-            max_retries = int(resolved_params.get("max_retries", 1))
-            return finalize(
-                FallbackOverrideNode(
-                    name=tree_node.name,
-                    child=children[0],
-                    fallback_params=fallback_params,
-                    max_retries=max_retries,
-                )
-            )
-        if tree_node.id == "recovery_skill_node":
-            if not children:
-                raise ValueError(
-                    f"RecoverySkill '{tree_node.name}' requires exactly one child"
-                )
-            recovery_skill_id = resolved_params.get("recovery_skill_id", "")
-            recovery_params = resolved_params.get("recovery_params", {})
-            max_retries = int(resolved_params.get("max_retries", 1))
-            skill_expander = self._make_skill_expander()
-            return finalize(
-                RecoverySkillNode(
-                    name=tree_node.name,
-                    child=children[0],
-                    recovery_skill_id=recovery_skill_id,
-                    recovery_params=recovery_params,
-                    max_retries=max_retries,
-                    skill_expander=skill_expander,
-                )
-            )
-        if tree_node.id == "query_model":
-            endpoint_alias = resolved_params.get("model_endpoint_alias", "")
-            template_id = resolved_params.get("prompt_template_id", "")
-            endpoint = None
-            template = None
-            audit_policy = None
-            if self._deployment is not None:
-                endpoint = self._deployment.model_endpoints.get(endpoint_alias)
-                template = self._deployment.prompt_templates.get(template_id)
-                audit_policy = self._deployment.model_audit_policy
-            event_recorder = self._event_recorder
-            # Thread intervention context (session_id, principal_id, run_id)
-            # into the node so audit events are correctly attributed.
-            ctx = self._intervention_context or {}
-            return finalize(
-                QueryModelNode(
-                    name=tree_node.name,
-                    model_endpoint_alias=endpoint_alias,
-                    prompt_template_id=template_id,
-                    template_variables=resolved_params.get("template_variables", {}),
-                    output_key_prefix=resolved_params.get("output_key_prefix", f"model/{tree_node.name}"),
-                    timeout_s=float(resolved_params.get("timeout_s", 30.0)),
-                    min_confidence=float(resolved_params.get("min_confidence", 0.0)),
-                    retry_on_parse_failure=bool(
-                        resolved_params.get("retry_on_parse_failure", False)
-                    ),
-                    include_scene_snapshot=bool(resolved_params.get("include_scene_snapshot", False)),
-                    scene_snapshot_transport=str(
-                        resolved_params.get("scene_snapshot_transport", "inline_data_url")
-                    ),
-                    scene_snapshot_width=int(resolved_params.get("scene_snapshot_width", 640)),
-                    scene_snapshot_height=int(resolved_params.get("scene_snapshot_height", 480)),
-                    scene_snapshot_format=str(resolved_params.get("scene_snapshot_format", "jpeg")),
-                    model_runtime_failure_policy=str(
-                        resolved_params.get(
-                            "model_runtime_failure_policy",
-                            "pause_for_operator",
-                        )
-                    ),
-                    model_low_confidence_policy=str(
-                        resolved_params.get(
-                            "model_low_confidence_policy",
-                            "pause_for_operator",
-                        )
-                    ),
-                    endpoint=endpoint,
-                    template=template,
-                    event_recorder=event_recorder,
-                    audit_policy=audit_policy,
-                    scene_snapshot_provider=self._scene_snapshot_provider,
-                    scene_snapshot_url_publisher=self._scene_snapshot_url_publisher,
-                    run_id=ctx.get("run_id"),
-                    session_id=ctx.get("session_id"),
-                    principal_id=ctx.get("principal_id"),
-                    parent_run_id=ctx.get("parent_run_id"),
-                    runtime_pause_registry=self._runtime_pause_registry,
-                )
-            )
-        if tree_node.id == "build_scene_selection_context":
-            return finalize(
-                BuildSceneSelectionContextNode(
-                    name=tree_node.name,
-                    **resolved_params,
-                )
-            )
-        if tree_node.id == "timer":
-            duration = float(resolved_params.get("duration_s", 1.0))
-            return finalize(
-                py_trees.timers.Timer(
-                    name=tree_node.name, duration=duration
-                )
-            )
-
-        # Plugin nodes
-        if tree_node.id in PLUGIN_FACTORY:
-            cls = PLUGIN_FACTORY[tree_node.id]
-            return finalize(cls(name=tree_node.name, **resolved_params))
-
-        raise ValueError(f"Unknown node type: '{tree_node.id}'")
+        services = {
+            "deployment": self._deployment,
+            "event_recorder": self._event_recorder,
+            "intervention_context": self._intervention_context,
+            "runtime_pause_registry": self._runtime_pause_registry,
+            "scene_snapshot_provider": self._scene_snapshot_provider,
+            "scene_snapshot_url_publisher": self._scene_snapshot_url_publisher,
+            "skill_expander": self._make_skill_expander(),
+        }
+        behavior = self._node_registry.instantiate(
+            tree_node.id,
+            NodeFactoryContext(
+                name=tree_node.name,
+                params=resolved_params,
+                children=tuple(children),
+                services=services,
+            ),
+        )
+        return finalize(behavior)

@@ -11,6 +11,7 @@ import type {
   ProgramParameter,
   ProgramSceneResource,
   ProgramBlackboard,
+  ProgramCompatibility,
   BlackboardNamespace,
   BlackboardKey,
   RuntimeOverrideStatus,
@@ -49,6 +50,9 @@ interface ProgramStore {
   programParameters: ProgramParameter[];
   appliedProgramParameters: ProgramParameter[];
   savedProgramParameters: ProgramParameter[];
+  programCompatibility: ProgramCompatibility | null;
+  appliedProgramCompatibility: ProgramCompatibility | null;
+  savedProgramCompatibility: ProgramCompatibility | null;
   sceneResources: ProgramSceneResource[];
   appliedSceneResources: ProgramSceneResource[];
   savedSceneResources: ProgramSceneResource[];
@@ -96,6 +100,7 @@ interface ProgramStore {
   addProgramParameter: (parameter: ProgramParameter) => void;
   deleteProgramParameter: (name: string) => void;
   setSceneResources: (sceneResources: ProgramSceneResource[]) => void;
+  setProgramCompatibility: (compatibility: ProgramCompatibility | null) => void;
   updateBlackboardNamespace: (id: string, patch: Partial<BlackboardNamespace>) => void;
   addBlackboardNamespace: (namespace: BlackboardNamespace) => void;
   deleteBlackboardNamespace: (id: string) => void;
@@ -128,6 +133,12 @@ function cloneBlackboard(blackboard?: ProgramBlackboard | null): ProgramBlackboa
 
 function cloneSceneResources(sceneResources?: ProgramSceneResource[] | null): ProgramSceneResource[] {
   return structuredClone(sceneResources ?? []);
+}
+
+function cloneProgramCompatibility(
+  compatibility?: ProgramCompatibility | null,
+): ProgramCompatibility | null {
+  return compatibility == null ? null : structuredClone(compatibility);
 }
 
 function defaultEnumValue(
@@ -920,6 +931,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   programParameters: [],
   appliedProgramParameters: [],
   savedProgramParameters: [],
+  programCompatibility: null,
+  appliedProgramCompatibility: null,
+  savedProgramCompatibility: null,
   sceneResources: [],
   appliedSceneResources: [],
   savedSceneResources: [],
@@ -950,6 +964,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
         programParameters: structuredClone(info.parameters ?? []),
         appliedProgramParameters: structuredClone(info.parameters ?? []),
         savedProgramParameters: structuredClone(info.parameters ?? []),
+        programCompatibility: cloneProgramCompatibility(info.compatibility),
+        appliedProgramCompatibility: cloneProgramCompatibility(info.compatibility),
+        savedProgramCompatibility: cloneProgramCompatibility(info.compatibility),
         blackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
         appliedBlackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
         savedBlackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
@@ -980,6 +997,11 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
         programParameters: structuredClone(info.parameters ?? []),
         appliedProgramParameters: structuredClone(info.parameters ?? []),
         savedProgramParameters: structuredClone(savedInfo?.parameters ?? info.parameters ?? []),
+        programCompatibility: cloneProgramCompatibility(info.compatibility),
+        appliedProgramCompatibility: cloneProgramCompatibility(info.compatibility),
+        savedProgramCompatibility: cloneProgramCompatibility(
+          savedInfo ? savedInfo.compatibility : info.compatibility,
+        ),
         blackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
         appliedBlackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
         savedBlackboardNamespaces: cloneBlackboard(savedInfo?.blackboard ?? info.blackboard).namespaces,
@@ -1027,6 +1049,13 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
         programParameters: structuredClone(programInfo.parameters ?? []),
         appliedProgramParameters: structuredClone(programInfo.parameters ?? []),
         savedProgramParameters: structuredClone(savedProgramInfo?.parameters ?? programInfo.parameters ?? []),
+        programCompatibility: cloneProgramCompatibility(programInfo.compatibility),
+        appliedProgramCompatibility: cloneProgramCompatibility(programInfo.compatibility),
+        savedProgramCompatibility: cloneProgramCompatibility(
+          savedProgramInfo
+            ? savedProgramInfo.compatibility
+            : programInfo.compatibility,
+        ),
         blackboardNamespaces: cloneBlackboard(programInfo.blackboard).namespaces,
         appliedBlackboardNamespaces: cloneBlackboard(programInfo.blackboard).namespaces,
         savedBlackboardNamespaces: cloneBlackboard(savedProgramInfo?.blackboard ?? programInfo.blackboard).namespaces,
@@ -1311,6 +1340,20 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
     }));
   },
 
+  setProgramCompatibility: (compatibility) => {
+    set((state) => ({
+      programCompatibility: cloneProgramCompatibility(compatibility),
+      programInfo: state.programInfo
+        ? {
+            ...state.programInfo,
+            compatibility: cloneProgramCompatibility(compatibility),
+          }
+        : state.programInfo,
+      error: null,
+      isDirty: true,
+    }));
+  },
+
   updateBlackboardNamespace: (id, patch) => {
     set((state) => {
       const blackboardNamespaces = state.blackboardNamespaces.map((namespace) =>
@@ -1481,12 +1524,23 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       edges,
       sceneResources: cloneSceneResources(get().appliedSceneResources),
       programParameters: structuredClone(get().appliedProgramParameters),
+      programCompatibility: cloneProgramCompatibility(
+        get().appliedProgramCompatibility,
+      ),
       blackboardNamespaces: structuredClone(get().appliedBlackboardNamespaces),
       blackboardKeys: structuredClone(get().appliedBlackboardKeys),
       selectedNodeId: null,
       isDirty: false,
       error: null,
       layoutRevision: get().layoutRevision + 1,
+      programInfo: get().programInfo
+        ? {
+            ...get().programInfo!,
+            compatibility: cloneProgramCompatibility(
+              get().appliedProgramCompatibility,
+            ),
+          }
+        : null,
     });
   },
 
@@ -1496,6 +1550,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       appliedTree: tree,
       appliedSceneResources: cloneSceneResources(get().sceneResources),
       appliedProgramParameters: structuredClone(get().programParameters),
+      appliedProgramCompatibility: cloneProgramCompatibility(
+        get().programCompatibility,
+      ),
       appliedBlackboardNamespaces: structuredClone(get().blackboardNamespaces),
       appliedBlackboardKeys: structuredClone(get().blackboardKeys),
       programInfo: state.programInfo
@@ -1505,6 +1562,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
             sceneCount: state.sceneResources.length,
             parameters: structuredClone(state.programParameters),
             parameterCount: state.programParameters.length,
+            compatibility: cloneProgramCompatibility(state.programCompatibility),
             blackboard: {
               namespaces: structuredClone(state.blackboardNamespaces),
               keys: structuredClone(state.blackboardKeys),
@@ -1520,6 +1578,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       savedTree: tree,
       savedSceneResources: cloneSceneResources(get().sceneResources),
       savedProgramParameters: structuredClone(get().programParameters),
+      savedProgramCompatibility: cloneProgramCompatibility(
+        get().programCompatibility,
+      ),
       savedBlackboardNamespaces: structuredClone(get().blackboardNamespaces),
       savedBlackboardKeys: structuredClone(get().blackboardKeys),
       isDirty: false,
@@ -1548,7 +1609,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
     const result = await api.program.saveTree(path, tree, get().sceneResources, get().programParameters, {
       namespaces: get().blackboardNamespaces,
       keys: get().blackboardKeys,
-    });
+    }, get().programCompatibility);
     const savedPath =
       typeof result === 'object' && result !== null && 'path' in result && typeof result.path === 'string'
         ? result.path
@@ -1557,6 +1618,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       savedTree: tree,
       savedSceneResources: cloneSceneResources(state.sceneResources),
       savedProgramParameters: structuredClone(state.programParameters),
+      savedProgramCompatibility: cloneProgramCompatibility(
+        state.programCompatibility,
+      ),
       savedBlackboardNamespaces: structuredClone(state.blackboardNamespaces),
       savedBlackboardKeys: structuredClone(state.blackboardKeys),
       isDirty: false,
@@ -1568,6 +1632,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
             sceneCount: state.sceneResources.length,
             parameters: structuredClone(state.programParameters),
             parameterCount: state.programParameters.length,
+            compatibility: cloneProgramCompatibility(state.programCompatibility),
             blackboard: {
               namespaces: structuredClone(state.blackboardNamespaces),
               keys: structuredClone(state.blackboardKeys),

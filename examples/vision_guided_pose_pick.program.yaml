@@ -15,7 +15,12 @@ description: >-
   simulator state (Isaac Sim) or a dedicated 6D-pose model; the model's role is
   visual SELECTION and reasoning, never coordinate invention. Until then this
   scenario demonstrates the wiring and the fail-closed boundary only.
-catalog_version: "0.3.0"
+compatibility:
+  lanes: [manyforge-only]
+  assistant: required
+  requires: [vision_pose_inference]
+  tags: [vision-pick, ur5]
+catalog_version: "0.4.0"
 
 robot:
   robot_id: ur5

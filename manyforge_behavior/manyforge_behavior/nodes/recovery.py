@@ -24,7 +24,7 @@ class FallbackOverrideNode(py_trees.decorators.Decorator):
     """Decorator that retries its child with overridden parameters on failure.
 
     On child FAILURE, applies ``fallback_params`` directly to the child node's
-    ``_params`` dict (the convention used by all PLUGIN_FACTORY action nodes)
+    ``_params`` dict (the convention used by parameterized action nodes)
     and retries the child up to ``max_retries`` times.  This ensures the child
     re-reads the overridden values in its ``initialise()``/``update()`` cycle.
 
@@ -97,7 +97,7 @@ class FallbackOverrideNode(py_trees.decorators.Decorator):
     def _apply_fallback_to_child(self) -> None:
         """Apply fallback_params to the child node's _params dict.
 
-        All PLUGIN_FACTORY action nodes store their runtime parameters in
+        Parameterized action nodes store their runtime parameters in
         ``self._params`` (captured from **kwargs at __init__).  Mutating that
         dict is the only reliable way to change the child's behaviour on
         retry, because nodes like MoveManipulatorAction build their

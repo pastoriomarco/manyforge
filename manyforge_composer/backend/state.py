@@ -11,12 +11,20 @@ import threading
 import time
 import uuid
 import weakref
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 from urllib.parse import urlparse
 
 from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.node_environment import (
+    NodeDiscoveryDiagnostic,
+    NodeDiscoveryReport,
+    NodeEnvironment,
+    NodeEnvironmentBuildError,
+    validate_environment_availability,
+)
 from manyforge_behavior.program import (
     Program,
     apply_tree_param_overrides,
@@ -27,6 +35,11 @@ from manyforge_behavior.program import (
 from manyforge_behavior.deployment import Deployment, PoseSourceSceneAdmissionConfig
 from manyforge_behavior.cycle_manager import CycleManager
 from manyforge_behavior.runner import OrchestratorRunner
+from manyforge_behavior.runtime_resources import (
+    RuntimeResourceFactoryRegistry,
+    RuntimeResourceRegistry,
+    build_runtime_resource_registry,
+)
 from manyforge_behavior.kernel_client import (
     KernelClient,
     SceneEditRequest,
@@ -261,8 +274,10 @@ class ComposerState:
 
     def __init__(
         self,
-        catalog_path: str,
+        node_environment: NodeEnvironment,
         kernel: KernelClient,
+        node_environment_factory: Optional[Callable[[int], NodeEnvironment]] = None,
+        runtime_resource_factories: RuntimeResourceFactoryRegistry | None = None,
         kernel_factory: Optional[Callable[[Optional[Deployment]], tuple[KernelClient, Any]]] = None,
         kernel_bundle: Any = None,
         trace_dir: str | None = None,
@@ -273,9 +288,27 @@ class ComposerState:
         trace_max_age_s: float | None = None,
         trace_max_bytes: int | None = None,
         allowed_fs_roots: list[str] | None = None,
+        scenario_roots: list[str] | None = None,
     ):
-        self.catalog = NodeCatalog(catalog_path)
-        self._catalog_path = str(Path(catalog_path).resolve())
+        self._node_environment_lock = threading.Lock()
+        active_node_report = replace(node_environment.report, activated=True)
+        self._node_environment = replace(
+            node_environment,
+            report=active_node_report,
+        )
+        self._node_environment_factory = node_environment_factory
+        self._latest_node_discovery_report = active_node_report
+        self._runtime_resource_factories = (
+            runtime_resource_factories or RuntimeResourceFactoryRegistry()
+        )
+        self._runtime_resources = RuntimeResourceRegistry.empty()
+        self.scenario_roots = tuple(
+            Path(root).expanduser()
+            for root in (
+                scenario_roots
+                or [str(Path(__file__).resolve().parents[2] / "examples")]
+            )
+        )
         self._kernel = kernel
         self._kernel_factory = kernel_factory
         self.kernel_bundle = kernel_bundle
@@ -335,6 +368,12 @@ class ComposerState:
         # handlers may hold this while calling apply_models(), so it must be
         # reentrant.
         self._program_edit_lock = threading.RLock()
+        # NRT admission handshake between Run and node-environment reload.
+        # The lock is held only while changing these counters/flags, never while
+        # calling the kernel, importing nodes, or rebuilding a runtime.
+        self._runtime_admission_lock = threading.Lock()
+        self._runtime_admissions_in_flight = 0
+        self._node_environment_reload_in_progress = False
         # Leaf lock for generation tokens only. Recovery projection must not
         # queue behind long program-model edits or assistant draft work.
         self._runtime_generation_lock = threading.Lock()
@@ -428,7 +467,7 @@ class ComposerState:
         self._recovery_offer_pump_wake = threading.Event()
         self.skill_catalog: SkillCatalog = load_skill_catalog(
             default_skills_dir(),
-            catalog=self.catalog,
+            catalog=self.node_catalog,
             strict=True,
         )
         _COMPOSER_STATE_INSTANCES.add(self)
@@ -1181,6 +1220,292 @@ class ComposerState:
         return self._kernel
 
     @property
+    def node_environment(self) -> NodeEnvironment:
+        with self._node_environment_lock:
+            return self._node_environment
+
+    @contextmanager
+    def runtime_admission_guard(self) -> Iterator[None]:
+        """Fence Run admission against node-environment publication.
+
+        Concurrent Run calls may still occupy the lifecycle executor. The leaf
+        lock is released before any RPC, while the in-flight count makes reload
+        fail closed. Stop and controller-command paths never acquire it.
+        """
+        with self._runtime_admission_lock:
+            if self._node_environment_reload_in_progress:
+                raise RuntimeError("node_environment_reload_in_progress")
+            self._runtime_admissions_in_flight += 1
+        try:
+            yield
+        finally:
+            with self._runtime_admission_lock:
+                self._runtime_admissions_in_flight -= 1
+
+    def close_runtime_resources(self) -> None:
+        """Retire deployment-owned NRT handles exactly once at shutdown."""
+        with self._program_edit_lock:
+            resources = self._runtime_resources
+            self._runtime_resources = RuntimeResourceRegistry.empty()
+        resources.close()
+
+    @staticmethod
+    def _retire_runtime_resources_after_cutover(
+        resources: RuntimeResourceRegistry,
+        *,
+        reason: str,
+    ) -> bool:
+        """Retire an unpublished/replaced registry without lying about cutover.
+
+        Once a candidate failed or a replacement was published, a provider
+        cleanup error cannot be rolled back. Report it, but preserve the
+        original failure or the already-authoritative successful cutover.
+        Explicit process shutdown still uses ``close_runtime_resources()`` and
+        propagates cleanup failure to the lifespan owner.
+        """
+        try:
+            resources.close()
+            return True
+        except (Exception, SystemExit):
+            logger.exception(
+                "Runtime resource retirement failed after %s",
+                reason,
+                extra={
+                    "event": "manyforge.runtime_resource.retirement_failed",
+                    "reason": reason,
+                },
+            )
+            return False
+
+    @property
+    def node_catalog(self) -> NodeCatalog:
+        return self.node_environment.catalog
+
+    @property
+    def latest_node_discovery_report(self) -> NodeDiscoveryReport:
+        with self._node_environment_lock:
+            return self._latest_node_discovery_report
+
+    def reload_node_environment(self) -> NodeDiscoveryReport:
+        """Run one idle-only reload transaction without blocking Stop."""
+        if self._node_environment_factory is None:
+            raise RuntimeError("node environment reload is not configured")
+
+        with self._program_edit_lock:
+            previous_environment = self.node_environment
+            cycle_state = self._current_cycle_state()
+            with self._runtime_admission_lock:
+                conflict = None
+                if self._node_environment_reload_in_progress:
+                    conflict = "node_environment_reload_in_progress"
+                elif self._runtime_admissions_in_flight:
+                    conflict = "run_admission_in_progress"
+                elif cycle_state != "idle":
+                    conflict = f"execution_not_idle:{cycle_state}"
+                else:
+                    self._node_environment_reload_in_progress = True
+            if conflict is not None:
+                report = replace(
+                    previous_environment.report,
+                    attempted_at_ns=time.time_ns(),
+                    previous_catalog_hash=previous_environment.effective_catalog_hash,
+                    activated=False,
+                    conflict=conflict,
+                )
+                with self._node_environment_lock:
+                    self._latest_node_discovery_report = report
+                raise RuntimeError(conflict)
+
+        try:
+            return self._reload_node_environment_impl()
+        finally:
+            with self._runtime_admission_lock:
+                self._node_environment_reload_in_progress = False
+
+    def _reload_node_environment_impl(self) -> NodeDiscoveryReport:
+        """Build, revalidate, and atomically publish an idle catalog/registry pair."""
+        factory = self._node_environment_factory
+        if factory is None:
+            raise RuntimeError("node environment reload is not configured")
+
+        # Reject an already-busy session before scanning or importing extension
+        # code. Run admission uses this same NRT guard; after candidate build we
+        # acquire it again and recheck generations/state before publication.
+        with self._program_edit_lock:
+            previous_environment = self.node_environment
+            cycle_state = self._current_cycle_state()
+            if cycle_state != "idle":
+                conflict = f"execution_not_idle:{cycle_state}"
+                report = replace(
+                    previous_environment.report,
+                    attempted_at_ns=time.time_ns(),
+                    previous_catalog_hash=previous_environment.effective_catalog_hash,
+                    activated=False,
+                    conflict=conflict,
+                )
+                with self._node_environment_lock:
+                    self._latest_node_discovery_report = report
+                raise RuntimeError(conflict)
+            with self._runtime_generation_lock:
+                program_generation = self._program_session_generation
+                deployment_generation = self._deployment_session_generation
+        next_generation = previous_environment.generation + 1
+        try:
+            candidate = factory(next_generation)
+        except NodeEnvironmentBuildError as exc:
+            report = replace(
+                exc.report,
+                previous_catalog_hash=(
+                    previous_environment.effective_catalog_hash
+                ),
+            )
+            with self._node_environment_lock:
+                self._latest_node_discovery_report = report
+            raise NodeEnvironmentBuildError(str(exc), report) from exc
+
+        previous_sources = {
+            source.node_id: source.content_hash
+            for source in previous_environment.sources
+        }
+        candidate_sources = {
+            source.node_id: source.content_hash for source in candidate.sources
+        }
+        previous_ids = set(previous_sources)
+        candidate_ids = set(candidate_sources)
+        candidate_report = replace(
+            candidate.report,
+            previous_catalog_hash=previous_environment.effective_catalog_hash,
+            added_count=len(candidate_ids - previous_ids),
+            removed_count=len(previous_ids - candidate_ids),
+            changed_count=sum(
+                previous_sources[node_id] != candidate_sources[node_id]
+                for node_id in previous_ids & candidate_ids
+            ),
+            unchanged_count=sum(
+                previous_sources[node_id] == candidate_sources[node_id]
+                for node_id in previous_ids & candidate_ids
+            ),
+        )
+        candidate = replace(candidate, report=candidate_report)
+
+        try:
+            candidate_skills = load_skill_catalog(
+                default_skills_dir(), catalog=candidate.catalog, strict=True
+            )
+            candidate_program = None
+            if self.program is not None:
+                candidate_program = Program.from_dict(
+                    self.program.to_dict(),
+                    candidate.catalog,
+                    path=self.program_source_path or "<memory>",
+                    skill_catalog=candidate_skills,
+                    deployment_capability_keys=(
+                        self.deployment.capability_keys() if self.deployment else None
+                    ),
+                )
+            if self.deployment is not None:
+                self.deployment.validate_assistant_modes(
+                    candidate.catalog, candidate_skills
+                )
+                if candidate_program is not None:
+                    self.deployment.validate_against_program(candidate_program)
+                    self.deployment.validate_capabilities(candidate_program)
+                validate_environment_availability(
+                    candidate, self.deployment, candidate_program
+                )
+        except Exception as exc:
+            report = replace(
+                candidate.report,
+                rejected_count=candidate.report.rejected_count + 1,
+                diagnostics=candidate.report.diagnostics
+                + (
+                    NodeDiscoveryDiagnostic(
+                        path="<active-artifacts>",
+                        status="rejected",
+                        error_code="active_artifact_validation_failed",
+                        message=str(exc),
+                    ),
+                ),
+                conflict="active_artifact_validation_failed",
+            )
+            with self._node_environment_lock:
+                self._latest_node_discovery_report = report
+            raise NodeEnvironmentBuildError(
+                f"candidate node environment does not validate active artifacts: {exc}",
+                report,
+            ) from exc
+
+        with self._program_edit_lock:
+            with self._runtime_generation_lock:
+                generations_match = (
+                    program_generation == self._program_session_generation
+                    and deployment_generation == self._deployment_session_generation
+                )
+            cycle_state = self._current_cycle_state()
+            if not generations_match or cycle_state != "idle":
+                conflict = (
+                    "artifacts_changed_during_reload"
+                    if not generations_match
+                    else f"execution_not_idle:{cycle_state}"
+                )
+                report = replace(candidate.report, conflict=conflict)
+                with self._node_environment_lock:
+                    self._latest_node_discovery_report = report
+                raise RuntimeError(conflict)
+
+            if candidate_program is None:
+                active_report = replace(candidate.report, activated=True)
+                candidate = replace(candidate, report=active_report)
+                with self._node_environment_lock:
+                    self._node_environment = candidate
+                    self._latest_node_discovery_report = active_report
+                self.skill_catalog = candidate_skills
+            else:
+                effective_program = Program.from_dict(
+                    (self._effective_program or self.program).to_dict(),
+                    candidate.catalog,
+                    path=self.program_source_path or "<memory>",
+                    skill_catalog=candidate_skills,
+                    deployment_capability_keys=(
+                        self.deployment.capability_keys() if self.deployment else None
+                    ),
+                )
+                active_candidate = replace(
+                    candidate,
+                    report=replace(candidate.report, activated=True),
+                )
+                try:
+                    self._rebuild_runtime(
+                        candidate_program,
+                        self.deployment,
+                        effective_program=effective_program,
+                        node_environment=active_candidate,
+                        skill_catalog=candidate_skills,
+                        preserve_backend_state=True,
+                    )
+                except Exception as exc:
+                    report = replace(
+                        candidate.report,
+                        rejected_count=candidate.report.rejected_count + 1,
+                        diagnostics=candidate.report.diagnostics
+                        + (
+                            NodeDiscoveryDiagnostic(
+                                path="<runtime-rebuild>",
+                                status="rejected",
+                                error_code="runtime_rebuild_failed",
+                                message=str(exc),
+                            ),
+                        ),
+                        conflict="runtime_rebuild_failed",
+                    )
+                    with self._node_environment_lock:
+                        self._latest_node_discovery_report = report
+                    raise RuntimeError(
+                        f"node environment runtime rebuild failed: {exc}"
+                    ) from exc
+        return self.latest_node_discovery_report
+
+    @property
     def effective_program(self) -> Optional[Program]:
         """Program snapshot currently bound into the runtime runner."""
         return self._effective_program
@@ -1268,7 +1593,7 @@ class ComposerState:
         program_data["tree"] = effective_tree.to_dict()
         return Program.from_dict(
             program_data,
-            self.catalog,
+            self.node_catalog,
             path=self.program_source_path or "<memory>",
             skill_catalog=self.skill_catalog,
             deployment_capability_keys=self._deployment_capability_keys(),
@@ -2862,40 +3187,68 @@ class ComposerState:
         deployment: Optional[Deployment],
         *,
         effective_program: Optional[Program] = None,
+        node_environment: NodeEnvironment | None = None,
+        skill_catalog: SkillCatalog | None = None,
+        preserve_backend_state: bool = False,
     ) -> None:
         """Rebuild runner + cycle manager from already-validated in-memory models."""
         scene_snapshot_provider = self._resolve_scene_snapshot_provider()
+        environment = node_environment or self.node_environment
+        effective_skill_catalog = skill_catalog or self.skill_catalog
+        previous_runtime_resources = self._runtime_resources
+        runtime_resources = (
+            previous_runtime_resources
+            if preserve_backend_state
+            else build_runtime_resource_registry(
+                deployment.runtime_resources if deployment else {},
+                self._runtime_resource_factories,
+            )
+        )
         previous_manager = self.cycle_manager
         previous_kernel = self._kernel
-        if self.cycle_manager is not None:
+        if self.cycle_manager is not None and not preserve_backend_state:
             self.cycle_manager.reset()
 
         kernel = previous_kernel
         kernel_bundle = self.kernel_bundle
         try:
-            if deployment is not None and self._kernel_factory is not None:
+            if (
+                not preserve_backend_state
+                and deployment is not None
+                and self._kernel_factory is not None
+            ):
                 kernel, kernel_bundle = self._kernel_factory(deployment)
             drivable_joints = self._query_drivable_joint_names(kernel)
             if deployment is not None and drivable_joints:
                 deployment.validate_robot_control_joint_limits_against(drivable_joints)
 
             runner = OrchestratorRunner(
-                catalog_path=self._catalog_path,
+                node_environment=environment,
                 program_path=self.program_source_path or "<memory>",
                 kernel=kernel,
                 deployment_path=self.deployment_source_path or None,
                 program=effective_program or program,
                 deployment=deployment,
-                skill_catalog=self.skill_catalog,
+                skill_catalog=effective_skill_catalog,
                 event_recorder=self.event_recorder,
                 scene_snapshot_provider=scene_snapshot_provider,
                 scene_snapshot_url_publisher=self.publish_scene_snapshot,
                 pose_source_apply_callback=self.apply_pose_sources_before_planning,
                 pose_source_between_nodes_callback=self.apply_pose_sources_between_nodes,
                 simulation_control_callback=self.simulation_control_for_behavior_node,
+                runtime_resources=runtime_resources,
             )
             runner.load()
+            if deployment is not None:
+                validate_environment_availability(
+                    environment, deployment, runner.program
+                )
         except Exception:
+            if runtime_resources is not previous_runtime_resources:
+                self._retire_runtime_resources_after_cutover(
+                    runtime_resources,
+                    reason="failed runtime-rebuild candidate rollback",
+                )
             if kernel is not previous_kernel:
                 self._close_kernel_candidate(
                     kernel,
@@ -2919,6 +3272,11 @@ class ComposerState:
                 reason="runtime_rebuild",
             )
         except Exception:
+            if runtime_resources is not previous_runtime_resources:
+                self._retire_runtime_resources_after_cutover(
+                    runtime_resources,
+                    reason="failed runtime-rebuild cutover staging",
+                )
             if kernel is not previous_kernel:
                 self._close_kernel_candidate(
                     kernel,
@@ -2930,6 +3288,13 @@ class ComposerState:
         self.program = program
         self._effective_program = effective_program or program
         self.deployment = deployment
+        with self._node_environment_lock:
+            self._node_environment = environment
+            self._latest_node_discovery_report = replace(
+                environment.report, activated=True
+            )
+        self.skill_catalog = effective_skill_catalog
+        self._runtime_resources = runtime_resources
         self._kernel = kernel
         self.kernel_bundle = kernel_bundle
         with self._joint_state_lock:
@@ -2949,6 +3314,13 @@ class ComposerState:
             kernel,
             reason="successful runtime-rebuild cutover",
         )
+        if previous_runtime_resources is not runtime_resources:
+            self._retire_runtime_resources_after_cutover(
+                previous_runtime_resources,
+                reason="successful runtime-rebuild cutover",
+            )
+        if preserve_backend_state:
+            return
         self.reset_backend_authoritative_sim_if_needed(reason="program_load")
         # Explicit load-time scene seed: populate the live planning scene with
         # the program's authored objects now, so they are visible at idle before
@@ -3276,13 +3648,18 @@ class ComposerState:
         deployment_source_path = self.deployment_source_path
         if deployment_path:
             deployment = Deployment(deployment_path)
-            deployment.validate_assistant_modes(self.catalog, self.skill_catalog)
+            deployment.validate_assistant_modes(self.node_catalog, self.skill_catalog)
             deployment_source_path = deployment_path
         elif deployment is not None:
-            deployment.validate_assistant_modes(self.catalog, self.skill_catalog)
+            deployment.validate_assistant_modes(self.node_catalog, self.skill_catalog)
 
         kernel = self._kernel
         kernel_bundle = self.kernel_bundle
+        previous_runtime_resources = self._runtime_resources
+        runtime_resources = build_runtime_resource_registry(
+            deployment.runtime_resources if deployment else {},
+            self._runtime_resource_factories,
+        )
         try:
             if deployment is not None and self._kernel_factory is not None:
                 kernel, kernel_bundle = self._kernel_factory(deployment)
@@ -3299,7 +3676,7 @@ class ComposerState:
             # Create runner. The candidate kernel remains local until the
             # complete program/deployment validation has succeeded.
             runner = OrchestratorRunner(
-                catalog_path=self._catalog_path,
+                node_environment=self.node_environment,
                 program_path=program_path,
                 kernel=kernel,
                 deployment_path=deployment_path,
@@ -3311,9 +3688,18 @@ class ComposerState:
                 pose_source_apply_callback=self.apply_pose_sources_before_planning,
                 pose_source_between_nodes_callback=self.apply_pose_sources_between_nodes,
                 simulation_control_callback=self.simulation_control_for_behavior_node,
+                runtime_resources=runtime_resources,
             )
             runner.load()
+            if deployment is not None:
+                validate_environment_availability(
+                    self.node_environment, deployment, runner.program
+                )
         except Exception:
+            self._retire_runtime_resources_after_cutover(
+                runtime_resources,
+                reason="failed program-load candidate rollback",
+            )
             if kernel is not previous_kernel:
                 self._close_kernel_candidate(
                     kernel,
@@ -3337,6 +3723,10 @@ class ComposerState:
                 reason="program_load",
             )
         except Exception:
+            self._retire_runtime_resources_after_cutover(
+                runtime_resources,
+                reason="failed program-load cutover staging",
+            )
             if kernel is not previous_kernel:
                 self._close_kernel_candidate(
                     kernel,
@@ -3352,6 +3742,7 @@ class ComposerState:
         self.deployment_source_path = deployment_source_path
         self._kernel = kernel
         self.kernel_bundle = kernel_bundle
+        self._runtime_resources = runtime_resources
         self._evaluate_stop_capability()
         joint_names_to_cache = (
             drivable_joints
@@ -3377,6 +3768,10 @@ class ComposerState:
         self._retire_replaced_kernel(
             previous_kernel,
             kernel,
+            reason="successful program-load cutover",
+        )
+        self._retire_runtime_resources_after_cutover(
+            previous_runtime_resources,
             reason="successful program-load cutover",
         )
         if not defer_initial_runtime_reset:

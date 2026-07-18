@@ -1,5 +1,5 @@
 api_version: manyforge.deployment.v0
-schema_version: 0.1.0
+schema_version: 0.2.0
 name: trocar_lite6_foundationpose_pick
 description: >-
   Isaac Sim pick-and-place deployment for UFACTORY Lite6 with the lite
@@ -7,6 +7,15 @@ description: >-
   trocar object. Planning and validation use ManyForge's static Lite6 model;
   execution is delegated to a stock ros2_control JointTrajectoryController
   exposed through Isaac's topic_based_ros2_control bridge.
+compatibility:
+  lane: isaac-sim
+  provides: [ros2_control, lite_gripper, foundationpose]
+  tags: [pick-and-place, isaac-sim, lite6, foundationpose]
+  scenarios:
+    - name: isaac-lite6-trocar-foundationpose
+      program: trocar_lite6_foundationpose_pick.program.yaml
+      description: Isaac Lite6 trocar pick using FoundationPose detections
+      aliases: []
 program_profile: v0.1
 grasp_risk_policy:
   open_loop_grasp:

@@ -1,10 +1,19 @@
 api_version: manyforge.deployment.v0
-schema_version: 0.1.0
+schema_version: 0.2.0
 name: lite6_lite_gripper_pick_and_place
 description: >-
   Native ManyForge pick-and-place deployment for UFACTORY Lite6 with the lite
   pneumatic gripper. The model bundle is self-contained; xarm_ros2 is a
   generation-time / real-robot runtime dependency only.
+compatibility:
+  lane: manyforge-only
+  provides: [lite_gripper]
+  tags: [pick-and-place, lite6]
+  scenarios:
+    - name: lite6-pick-place
+      program: lite6_lite_gripper_pick_and_place.program.yaml
+      description: UFACTORY Lite6 + lite gripper self-contained pick-and-place
+      aliases: []
 program_profile: v0.1
 grasp_risk_policy:
   open_loop_grasp:

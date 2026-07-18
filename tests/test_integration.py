@@ -21,6 +21,7 @@ from manyforge_behavior.kernel_client import (
 from manyforge_behavior.cycle_manager import CycleManager
 from manyforge_behavior.runner import OrchestratorRunner
 from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
 
 # Native kernel (optional — requires roboplan + manyforge_roboplan_py)
@@ -96,7 +97,7 @@ class TestRunnerWithMockKernel:
     ):
         """Program loads and tree builds."""
         runner = OrchestratorRunner(
-            catalog_path=node_catalog_path,
+            node_environment=build_node_environment(node_catalog_path),
             program_path=simple_motion_program_path,
             kernel=mock_kernel,
         )
@@ -110,7 +111,7 @@ class TestRunnerWithMockKernel:
     ):
         """Program runs, tree ticks through, motions execute."""
         runner = OrchestratorRunner(
-            catalog_path=node_catalog_path,
+            node_environment=build_node_environment(node_catalog_path),
             program_path=simple_motion_program_path,
             kernel=mock_kernel,
         )
@@ -124,7 +125,7 @@ class TestRunnerWithMockKernel:
     ):
         """Runner.run() returns True (success)."""
         runner = OrchestratorRunner(
-            catalog_path=node_catalog_path,
+            node_environment=build_node_environment(node_catalog_path),
             program_path=simple_motion_program_path,
             kernel=mock_kernel,
         )
@@ -141,7 +142,7 @@ class TestRunnerWithMockKernel:
         assert status.state == ExecutionState.IDLE
 
         runner = OrchestratorRunner(
-            catalog_path=node_catalog_path,
+            node_environment=build_node_environment(node_catalog_path),
             program_path=simple_motion_program_path,
             kernel=mock_kernel,
         )
@@ -157,7 +158,7 @@ class TestRunnerWithMockKernel:
     ):
         """velocity_scale override reaches the kernel."""
         runner = OrchestratorRunner(
-            catalog_path=node_catalog_path,
+            node_environment=build_node_environment(node_catalog_path),
             program_path=simple_motion_program_path,
             kernel=mock_kernel,
             overrides={"velocity_scale": 0.8},
@@ -172,7 +173,7 @@ class TestRunnerWithMockKernel:
     ):
         """Execute, rebuild the tree, execute again works."""
         runner = OrchestratorRunner(
-            catalog_path=node_catalog_path,
+            node_environment=build_node_environment(node_catalog_path),
             program_path=simple_motion_program_path,
             kernel=mock_kernel,
         )
@@ -193,7 +194,7 @@ class TestRunnerWithMockKernel:
     ):
         """Both moves in sequence execute successfully."""
         runner = OrchestratorRunner(
-            catalog_path=node_catalog_path,
+            node_environment=build_node_environment(node_catalog_path),
             program_path=simple_motion_program_path,
             kernel=mock_kernel,
         )
@@ -221,7 +222,7 @@ class TestRunnerWithNativeKernel:
     ):
         """Program loads with native kernel."""
         runner = OrchestratorRunner(
-            catalog_path=node_catalog_path,
+            node_environment=build_node_environment(node_catalog_path),
             program_path=simple_motion_program_path,
             kernel=native_kernel,
         )
@@ -453,7 +454,7 @@ class TestSceneEdits:
     ):
         """Program with empty scene[] runs without scene_edit calls."""
         runner = OrchestratorRunner(
-            catalog_path=node_catalog_path,
+            node_environment=build_node_environment(node_catalog_path),
             program_path=simple_motion_program_path,
             kernel=mock_kernel,
         )

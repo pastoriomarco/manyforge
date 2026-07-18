@@ -1,6 +1,7 @@
 """Tests for the CycleManager."""
 
 from pathlib import Path
+from manyforge_behavior.node_environment import build_node_environment
 import threading
 import time
 import tempfile
@@ -32,6 +33,7 @@ from manyforge_behavior.cycle_manager import (
 )
 
 CATALOG_PATH = str(Path(__file__).parent.parent / "resources" / "node_catalog.yaml")
+NODE_ENVIRONMENT = build_node_environment(CATALOG_PATH)
 FIXTURE_PATH = str(
     Path(__file__).parent / "fixtures" / "pick_and_place.program.yaml"
 )
@@ -136,13 +138,13 @@ class TestCycleManagerInitialState:
     
     def test_initial_state_idle(self, kernel):
         """CycleManager starts in IDLE state."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         assert manager.state == CycleState.IDLE
     
     def test_velocity_scale_default_1_0(self, kernel):
         """Velocity scale defaults to 1.0."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         assert manager.velocity_scale == 1.0
 
@@ -152,7 +154,7 @@ class TestCycleManagerRun:
     
     def test_run_from_idle_starts_ticking(self, kernel):
         """run() from IDLE builds tree and starts tick thread."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         
         assert manager.state == CycleState.IDLE
@@ -167,7 +169,7 @@ class TestCycleManagerRun:
     def test_run_from_idle_after_reset_reuses_prepared_tree_and_scene(self, kernel):
         """Idle start after Reset uses the prepared baseline without rebuilding scene/tree again."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.reset()
@@ -183,7 +185,7 @@ class TestCycleManagerRun:
 
     def test_reset_clears_generation_scoped_runtime_faults(self, kernel):
         """Reset rebuilds the cycle and invalidates every old node fault handle."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         fault = runner.runtime_pause_registry.raise_fault(
             node_name="stale_motion",
@@ -201,7 +203,7 @@ class TestCycleManagerRun:
     def test_run_from_running_is_noop(self, kernel):
         """run() from RUNNING state is a no-op."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
         
         manager.run()
@@ -214,7 +216,7 @@ class TestCycleManagerRun:
     def test_run_from_stopped_consumes_exact_replan_offer(self, kernel):
         """A terminal stop resumes only through the current certified offer."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         try:
@@ -252,7 +254,7 @@ class TestCycleManagerRun:
     ):
         """A request cannot cross a structural scene-admission generation."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         try:
@@ -298,7 +300,7 @@ class TestCycleManagerRun:
             manager.reset()
 
     def test_reset_recovery_request_is_idempotent_across_response_retry(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager._state = CycleState.STOPPED
         manager._error = "cycle fault"
@@ -355,7 +357,7 @@ class TestCycleManagerRun:
     def test_recovery_offer_projects_within_server_deadline_after_kernel_event(
         self, kernel
     ):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager._state = CycleState.STOPPED
         _script_ready_recovery(kernel)
@@ -377,7 +379,7 @@ class TestCycleManagerRun:
         assert (publication_times[0] - emitted_at) < 0.050
 
     def test_concurrent_duplicate_recovery_request_never_repeats_reset(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager._state = CycleState.STOPPED
         manager._error = "cycle fault"
@@ -426,7 +428,7 @@ class TestCycleManagerRun:
         assert first_result[0]["accepted"] is True
 
     def test_unexpected_recovery_exception_consumes_request_id(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         calls = 0
 
@@ -459,7 +461,7 @@ class TestCycleManagerRun:
     def test_run_from_held_runtime_fault_consumes_exact_cycle_offer(self, kernel):
         """Run can consume a certified automatic runtime-step offer only."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
         try:
             manager.reset()
@@ -492,7 +494,7 @@ class TestCycleManagerRun:
     def test_run_keeps_held_recovery_unchanged_while_offer_is_waiting(self):
         """Run cannot infer or execute an action from a waiting assessment."""
         retry_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, retry_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, retry_kernel)
         manager = CycleManager(runner, retry_kernel)
         manager.reset()
         _script_ready_recovery(
@@ -521,7 +523,7 @@ class TestCycleManagerRun:
     def test_run_requires_explicit_choice_for_intervention_offer(self):
         """Run cannot choose acknowledge versus reset for an intervention."""
         retry_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, retry_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, retry_kernel)
         manager = CycleManager(runner, retry_kernel)
         manager.reset()
         _script_ready_recovery(
@@ -545,7 +547,7 @@ class TestCycleManagerRun:
 
     def test_unoffered_recovery_action_has_no_kernel_side_effect(self):
         retry_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, retry_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, retry_kernel)
         manager = CycleManager(runner, retry_kernel)
         manager.reset()
         _script_ready_recovery(
@@ -578,7 +580,7 @@ class TestCycleManagerRun:
     def test_run_consumes_registry_fault_before_tick_loop_promotes_hold(self, kernel):
         """An exact node fault closes the pre-promotion successful-no-op race."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
         manager.reset()
         fault = runner.runtime_pause_registry.raise_fault(
@@ -618,7 +620,7 @@ class TestCycleManagerRun:
 program_profile: v0.0
 name: missing_bb_failure
 description: Motion node fails on missing blackboard key.
-catalog_version: "0.3.0"
+catalog_version: "0.4.0"
 
 robot:
   robot_id: ur5
@@ -657,7 +659,7 @@ tree:
 """,
             encoding="utf-8",
         )
-        runner = OrchestratorRunner(CATALOG_PATH, str(failing_program), kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, str(failing_program), kernel)
         manager = CycleManager(runner, kernel)
 
         manager.run()
@@ -677,7 +679,7 @@ class TestCycleManagerStop:
     def test_stop_from_running(self, kernel):
         """stop() from RUNNING sets state to STOPPED."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
         
         manager.run()
@@ -703,7 +705,7 @@ class TestCycleManagerStop:
                 return super().stop()
 
         slow_kernel = BlockingStopKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -751,7 +753,7 @@ class TestCycleManagerStop:
                 )
 
         slow_kernel = AsyncStoppingKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -776,7 +778,7 @@ class TestCycleManagerStop:
         `_tick_stop_event.wait(timeout=...)` so a stop request wakes it
         immediately; reverting to a bare time.sleep() fails this guard."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         wait_timeouts = []
@@ -798,7 +800,7 @@ class TestCycleManagerStop:
         )
 
     def test_paused_tick_loop_uses_bounded_event_wait(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager._tick_pause_event.clear()
         manager._tick_stop_event.clear()
@@ -817,7 +819,7 @@ class TestCycleManagerStop:
     def test_stop_from_stopped_is_noop(self, kernel):
         """stop() from STOPPED is a no-op."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
         
         manager.run()
@@ -831,7 +833,7 @@ class TestCycleManagerStop:
     
     def test_stop_from_idle_is_noop(self, kernel):
         """stop() from IDLE is a no-op."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         
         assert manager.state == CycleState.IDLE
@@ -843,7 +845,7 @@ class TestCycleManagerStop:
         controlled stop (kernel.stop()), not a resumable pause. The controlled
         stop is the industrial default operator-stop path."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -869,7 +871,7 @@ class TestCycleManagerMotionStop:
             "program_profile": "v0.1" if success_policy is not None else "v0.0",
             "name": "motion_stop_parallel_test",
             "description": "Motion stop cooperative ticking test.",
-            "catalog_version": "0.3.0",
+            "catalog_version": "0.4.0",
             "robot": {
                 "robot_id": "ur5",
                 "group_id": "arm",
@@ -907,7 +909,7 @@ class TestCycleManagerMotionStop:
 
     def test_motion_stop_keeps_cycle_running_and_holds_motion(self):
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         try:
@@ -931,7 +933,7 @@ class TestCycleManagerMotionStop:
 
     def test_motion_stop_resume_redispatches_held_motion(self):
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         try:
@@ -982,7 +984,7 @@ class TestCycleManagerMotionStop:
                 return CommandResult(accepted=True)
 
         kernel = NaturalCompletionStopKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         try:
@@ -1017,7 +1019,7 @@ class TestCycleManagerMotionStop:
     def test_parallel_continue_branch_ticks_while_motion_is_held(self):
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         program_path = self._parallel_motion_timer_program(timer_duration_s=0.2)
-        runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, program_path, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         try:
@@ -1047,7 +1049,7 @@ class TestCycleManagerMotionStop:
         """A held runtime fault must not turn the 100 Hz tick into a busy loop."""
         slow_kernel = MockKernelClient(execute_duration_s=5.0)
         program_path = self._parallel_motion_timer_program(timer_duration_s=5.0)
-        runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, program_path, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
         tick_count = 0
         tick_count_lock = threading.Lock()
@@ -1121,7 +1123,7 @@ class TestCycleManagerMotionStop:
     def test_motion_soft_fail_keeps_continue_branch_ticking(self):
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         program_path = self._parallel_motion_timer_program(timer_duration_s=0.3)
-        runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, program_path, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         try:
@@ -1158,7 +1160,7 @@ class TestCycleManagerMotionStop:
             timer_duration_s=60.0,
             success_policy="success_on_one",
         )
-        runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, program_path, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
         bb = py_trees.blackboard.Client(name="test_terminal_motion_hold_clear")
         bb.register_key(key="motion_stop_active", access=py_trees.common.Access.READ)
@@ -1200,7 +1202,7 @@ class TestCycleManagerMotionStop:
     def test_motion_soft_fail_intervention_required_fails_closed(self):
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         program_path = self._parallel_motion_timer_program(timer_duration_s=0.3)
-        runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, program_path, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         try:
@@ -1233,7 +1235,7 @@ class TestCycleManagerMotionStop:
         """
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         program_path = self._parallel_motion_timer_program(timer_duration_s=0.3)
-        runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, program_path, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         try:
@@ -1280,7 +1282,7 @@ class TestCycleManagerReset:
     
     def test_reset_from_running(self, kernel):
         """reset() from RUNNING stops then resets."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         
         manager.run()
@@ -1292,7 +1294,7 @@ class TestCycleManagerReset:
     def test_reset_from_stopped(self, kernel):
         """reset() from STOPPED resets to IDLE."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
         
         manager.run()
@@ -1307,7 +1309,7 @@ class TestCycleManagerReset:
 
     def test_reset_waits_for_inflight_nrt_tick_before_claiming_idle(self, kernel):
         """A bounded scene/adapter call may outlive 25 ms without being a zombie."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager.reset()
         assert manager._tree is not None
@@ -1335,7 +1337,7 @@ class TestCycleManagerReset:
         assert manager._tick_exit_event.is_set()
 
     def test_reset_timeout_never_claims_idle_with_live_tick(self, kernel, monkeypatch):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager.reset()
         assert manager._tree is not None
@@ -1364,7 +1366,7 @@ class TestCycleManagerReset:
     
     def test_reset_from_idle_is_noop(self, kernel):
         """reset() from IDLE prepares a fresh software/runtime cycle state."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         assert manager.state == CycleState.IDLE
@@ -1379,7 +1381,7 @@ class TestCycleManagerReset:
 
     def test_reset_records_phase_events(self, kernel):
         """Reset emits durable phase spans so a slow reset is diagnosable."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         events: list[dict] = []
         manager.set_on_reset_phase_event(events.append)
@@ -1411,7 +1413,7 @@ class TestCycleManagerReset:
         monkeypatch.setattr(cycle_manager_module, "_RESET_PHASE_DEADLINE_S", 0.001)
         slow_kernel = SlowResetKernel()
         slow_kernel._state = ExecutionState.STOPPED  # noqa: SLF001
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
         events: list[dict] = []
         manager.set_on_reset_phase_event(events.append)
@@ -1446,7 +1448,7 @@ class TestCycleManagerReset:
 
         refused_kernel = RefusingResetKernel()
         refused_kernel._state = ExecutionState.INTERVENTION_REQUIRED
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, refused_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, refused_kernel)
         manager = CycleManager(runner, refused_kernel)
 
         manager.reset()
@@ -1464,7 +1466,7 @@ class TestCycleManagerReset:
         plan."""
         from manyforge_behavior.kernel_client import SceneEditRequest
 
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         # Materialise the authored scene first.
         manager.reset()
@@ -1498,7 +1500,7 @@ class TestCycleManagerReset:
         apply_scene() will not re-add it."""
         from manyforge_behavior.kernel_client import SceneEditRequest
 
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager.reset()
 
@@ -1535,7 +1537,7 @@ class TestCycleManagerReset:
         is exactly the scenario the user is testing with Isaac live."""
         from manyforge_behavior.kernel_client import SceneEditRequest
 
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager.reset()
         # Authored objects are present after the initial scene apply.
@@ -1574,7 +1576,7 @@ class TestCycleManagerReset:
         of buffer order, and the harvest emits the `runtime_collision`
         code (not `validation_collision` — pre-execute validation
         rejection is a distinct operator event)."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         kernel._execution_id = 1
 
@@ -1632,7 +1634,7 @@ class TestCycleManagerReset:
         publish `interrupt_latched` without a preceding `collision_detected`.
         In that case the harvest must surface the latch details rather than
         returning (None, None)."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         kernel._execution_id = 1
 
@@ -1662,7 +1664,7 @@ class TestCycleManagerReset:
     ):
         """A rich collision from execution 2 must not mask execution 5's
         lookahead deadline error after the object has already disappeared."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         kernel._execution_id = 5
 
@@ -1743,7 +1745,7 @@ class TestCycleManagerReset:
                 return snapshot
 
         fault_kernel = TrackingFaultKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, fault_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, fault_kernel)
         manager = CycleManager(runner, fault_kernel)
 
         code, details = manager._capture_kernel_error_diagnostics()
@@ -1760,7 +1762,7 @@ class TestCycleManagerReset:
         shapes the next plan."""
         from manyforge_behavior.kernel_client import SceneEditRequest
 
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager.reset()
         kernel.scene_edit(
@@ -1802,7 +1804,7 @@ class TestCycleManagerSignalRegistry:
             ]
 
     def test_external_signal_mirrors_to_blackboard_and_clears_when_stale(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         manager.publish_signal(
@@ -1827,7 +1829,7 @@ class TestCycleManagerSignalRegistry:
         self,
         kernel,
     ):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager._signal_provider_poll_ticks = 3
         provider = self._CountingProvider()
@@ -1857,7 +1859,7 @@ class TestCycleManagerSignalRegistry:
         assert len(sync_calls) == 1
 
     def test_force_current_evidence_publishes_bounded_boolean_signal(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         result = manager.publish_force_current_evidence(
@@ -1902,7 +1904,7 @@ class TestCycleManagerSignalRegistry:
         )
 
     def test_force_current_evidence_clears_when_stale(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         manager.publish_force_current_evidence(
@@ -1928,7 +1930,7 @@ class TestCycleManagerSignalRegistry:
         self,
         kernel,
     ):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         with pytest.raises(ValueError, match="requires min_value or max_value"):
@@ -1959,7 +1961,7 @@ class TestCycleManagerVelocityScale:
     
     def test_velocity_scale_clamped(self, kernel):
         """velocity_scale is clamped to [0.0, 1.0]."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         
         # Test clamping below 0
@@ -1985,7 +1987,7 @@ class TestCycleManagerVelocityScale:
     
     def test_velocity_scale_forwarded_to_runtime_kernel(self, kernel):
         """velocity_scale is written to blackboard and forwarded as live control."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         
         manager.set_velocity_scale(0.75, principal_id="operator_alice")
@@ -2001,7 +2003,7 @@ class TestCycleManagerVelocityScale:
     def test_stop_flag_blocks_new_motion(self, kernel):
         """stop_requested flag is written to blackboard."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
         
         manager.run()
@@ -2023,7 +2025,7 @@ class TestCycleManagerProgramCompletion:
     
     def test_program_completes_through_cycle_manager(self, kernel):
         """A simple program completes when run through CycleManager."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         
         manager.run()
@@ -2041,7 +2043,7 @@ class TestCycleManagerProgramCompletion:
 
     def test_run_from_idle_after_completion_is_noop_until_reset(self, kernel):
         """A terminal idle tree requires Reset before another run can start."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         manager.run()
@@ -2071,7 +2073,7 @@ class TestErrorPropagation:
         STOPPED + error surface (spec/410's uniform failure contract), never
         a bare IDLE that hides the fault."""
         slow_kernel = MockKernelClient(execute_duration_s=2.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -2096,7 +2098,7 @@ class TestErrorPropagation:
     def test_error_cleared_on_next_run(self, kernel):
         """run() resuming a stopped cycle clears a stale error field."""
         slow_kernel = MockKernelClient(execute_duration_s=2.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -2136,7 +2138,7 @@ class TestZombieThread:
     def test_run_refused_while_zombie_thread_alive(self, kernel):
         """run() raises RuntimeError if the previous tick thread is still alive."""
         slow_kernel = MockKernelClient(execute_duration_s=5.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -2181,7 +2183,7 @@ class TestZombieThread:
     def test_reset_detects_zombie_and_sets_error(self, kernel):
         """reset() sets error when tick thread does not exit within timeout."""
         slow_kernel = MockKernelClient(execute_duration_s=5.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -2229,7 +2231,7 @@ class TestConcurrentRapidCycles:
     def test_rapid_run_stop_reset_cycles(self, kernel):
         """20 rapid run/stop/reset cycles must not crash or deadlock."""
         slow_kernel = MockKernelClient(execute_duration_s=0.5)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         for i in range(20):
@@ -2247,7 +2249,7 @@ class TestConcurrentRapidCycles:
     def test_rapid_run_reset_without_stop(self, kernel):
         """Rapid run/reset cycles (skipping explicit stop) must be stable."""
         slow_kernel = MockKernelClient(execute_duration_s=0.5)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         for i in range(15):
@@ -2261,7 +2263,7 @@ class TestConcurrentRapidCycles:
     def test_concurrent_status_reads_during_cycles(self, kernel):
         """get_node_statuses() called from another thread during rapid cycles must not crash."""
         slow_kernel = MockKernelClient(execute_duration_s=0.5)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         errors = []
@@ -2304,7 +2306,7 @@ class TestObserverLagIndependence:
     def test_slow_status_reader_does_not_block_ticks(self, kernel):
         """A slow get_node_statuses() consumer must not delay tick execution."""
         slow_kernel = MockKernelClient(execute_duration_s=2.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -2345,7 +2347,7 @@ class TestIntervention:
     def _make_manager(self, kernel, execute_duration_s=0.0):
         if execute_duration_s > 0:
             kernel = MockKernelClient(execute_duration_s=execute_duration_s)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         # Load program so _build_node works
         runner.load()
@@ -2772,7 +2774,7 @@ class TestIntervention:
 
     def test_execute_intervention_loads_runner_when_needed(self, kernel):
         """Intervention can bootstrap the runner if it was not preloaded."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         session = manager.execute_intervention(
@@ -2884,7 +2886,7 @@ class TestKernelEventBridge:
 
     def test_cycle_manager_collects_kernel_events(self, kernel):
         """CycleManager collects kernel events during execution."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         # No events initially
@@ -2910,7 +2912,7 @@ class TestKernelEventBridge:
         manager.reset()
 
     def test_get_kernel_events_since_matches_full_scan_after_ring_wrap(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         with manager._lock:
@@ -2937,7 +2939,7 @@ class TestKernelEventBridge:
 
     def test_cycle_manager_drains_direct_kernel_events_on_demand(self, kernel):
         """Direct kernel calls can be surfaced without waiting for a tree tick."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         from manyforge_behavior.kernel_client import ExecuteRequest
@@ -3135,7 +3137,7 @@ class TestCycleManagerRecoveryActions:
 
     def _make_manager(self) -> tuple[CycleManager, MockKernelClient]:
         kernel = MockKernelClient(execute_duration_s=0.5)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         return manager, kernel
 
@@ -3511,7 +3513,7 @@ class TestGripperFaultDiagnostics:
         bb.set("gripper_fault_details", details)
 
     def test_classified_gripper_fault_is_promoted(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         self._write_fault(
             {
@@ -3528,7 +3530,7 @@ class TestGripperFaultDiagnostics:
         assert details["surface"] == "command_gripper"
 
     def test_unknown_reason_token_is_not_promoted(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         self._write_fault({"reason_code": "not_a_real_token", "gripper_id": "g"})
 
@@ -3539,7 +3541,7 @@ class TestGripperFaultDiagnostics:
     def test_snapshot_error_wins_over_gripper_record(self, kernel):
         from types import SimpleNamespace
 
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         kernel.get_execution_snapshot = lambda: SimpleNamespace(
             error_code="execution_aborted",
@@ -3552,7 +3554,7 @@ class TestGripperFaultDiagnostics:
         assert details == {"reason_code": "tracking_error_exceeded"}
 
     def test_no_sources_returns_nothing(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         code, details = manager._capture_kernel_error_diagnostics()
         assert code is None
@@ -3588,7 +3590,7 @@ class TestStopQuiescesPreparationPhase:
             return CommandResult(accepted=True)
 
     def _quiesce(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager._quiesce_runtime(
             client_name="test_stop_quiesce",
@@ -3662,7 +3664,7 @@ class TestTickLoopContainment:
 
     def test_tick_exception_stops_kernel_and_parks_stopped(self):
         slow_kernel = MockKernelClient(execute_duration_s=5.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -3687,7 +3689,7 @@ class TestTickLoopContainment:
 
     def test_tick_exception_refuses_run_and_allows_reset(self):
         slow_kernel = MockKernelClient(execute_duration_s=5.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -3724,7 +3726,7 @@ class TestTickLoopContainment:
                 raise RuntimeError("kernel unreachable")
 
         kernel = StopRaisesKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         manager.run()
@@ -3778,7 +3780,7 @@ class TestStopWatcherEscalation:
 
         monkeypatch.setattr(cm, "_STOP_SETTLE_DEADLINE_S", 0.2)
         kernel = self._NeverSettlingKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         manager.run()
@@ -3830,7 +3832,7 @@ class TestStopWatcherEscalation:
                 return super().get_status()
 
         kernel = StatusDiesAfterStopKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         manager.run()
@@ -3847,7 +3849,7 @@ class TestStopWatcherEscalation:
 
         monkeypatch.setattr(cm, "_STOP_SETTLE_DEADLINE_S", 0.2)
         kernel = self._NeverSettlingKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         manager.run()
@@ -3880,7 +3882,7 @@ class TestStopWatcherEscalation:
 
         monkeypatch.setattr(cm, "_RESET_PHASE_DEADLINE_S", 0.02)
         kernel = BlockingStatusKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         started = time.monotonic()
@@ -3915,7 +3917,7 @@ class TestStopWatcherEscalation:
 
         monkeypatch.setattr(cm, "_KERNEL_CONTROL_CALL_TIMEOUT_S", 0.02)
         kernel = BlockingStatusKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager._state = CycleState.RUNNING
 
@@ -3960,7 +3962,7 @@ class TestStopWatcherEscalation:
 
         monkeypatch.setattr(cm, "_KERNEL_CONTROL_CALL_TIMEOUT_S", 0.02)
         kernel = BlockingPostStopStatusKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager._state = CycleState.RUNNING
 
@@ -3986,7 +3988,7 @@ class TestCycleManagerStopLivenessResiduals:
 
     @staticmethod
     def _stopped_manager(kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager.run()
         deadline = time.monotonic() + 1.0
@@ -4018,7 +4020,7 @@ class TestCycleManagerStopLivenessResiduals:
                 return super().get_recovery_assessment()
 
         kernel = BlockingAssessmentKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager._prepare_fresh_cycle()  # noqa: SLF001 - resumable fixture.
         with manager._lock:
@@ -4096,7 +4098,7 @@ class TestCycleManagerStopLivenessResiduals:
             0.02,
         )
         kernel = BlockingRecoveryKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager._prepare_fresh_cycle()  # noqa: SLF001 - resumable fixture.
         with manager._lock:
@@ -4160,7 +4162,7 @@ class TestCycleManagerStopLivenessResiduals:
             0.02,
         )
         kernel = BlockingStatusKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         errors: list[BaseException] = []
@@ -4207,7 +4209,7 @@ class TestCycleManagerStopLivenessResiduals:
                 return super().get_scene_objects()
 
         kernel = BlockingSceneKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         manager.run()
         deadline = time.monotonic() + 1.0
@@ -4267,7 +4269,7 @@ class TestCycleManagerStopLivenessResiduals:
             0.02,
         )
         kernel = TerminalThenBlockingSceneKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         runner.load()
         manager = CycleManager(runner, kernel)
         manager._state = CycleState.RUNNING
@@ -4361,7 +4363,7 @@ class TestRuntimePauseReadAllocation:
     """Runtime-fault observation must not grow py_trees global state."""
 
     def test_runtime_fault_reads_do_not_register_blackboard_clients(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         runner.runtime_pause_registry.raise_fault(
             node_name="allocation_probe",
@@ -4378,7 +4380,7 @@ class TestRuntimePauseReadAllocation:
         assert len(py_trees.blackboard.Blackboard.clients) == clients_before
 
     def test_active_fault_snapshot_is_revision_coherent_and_defensive(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         registry = runner.runtime_pause_registry
 
         initial_revision, initial_faults = registry.active_fault_snapshot()
@@ -4415,7 +4417,7 @@ class TestCycleShutdown:
 
     def test_shutdown_stops_running_cycle_and_joins_tick_thread(self):
         slow_kernel = MockKernelClient(execute_duration_s=5.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -4448,7 +4450,7 @@ class TestCycleShutdown:
                 raise RuntimeError("kernel unreachable")
 
         kernel = StopRaisesKernel()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         manager.run()
@@ -4461,7 +4463,7 @@ class TestCycleShutdown:
         assert tick_thread is None or not tick_thread.is_alive()
 
     def test_shutdown_from_idle_is_safe(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         assert manager.shutdown(timeout_s=1.0) is True
 
@@ -4474,7 +4476,7 @@ class TestProgramRunIdThreading:
 
     def test_run_mints_id_and_threads_it_to_kernel_and_events(self):
         slow_kernel = MockKernelClient(execute_duration_s=5.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -4504,7 +4506,7 @@ class TestProgramRunIdThreading:
 
     def test_fresh_start_mints_new_id_resume_keeps_it(self):
         slow_kernel = MockKernelClient(execute_duration_s=5.0)
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
 
         manager.run()
@@ -4556,7 +4558,7 @@ class TestControlCommandEpoch:
         )
         kernel = BlockingResumeKernel(execute_duration_s=5.0)
         kernel._state = ExecutionState.PAUSED  # noqa: SLF001
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         runner.load()
         manager = CycleManager(runner, kernel)
         manager._tree = runner.build_tree()  # noqa: SLF001
@@ -4597,7 +4599,7 @@ class TestControlCommandEpoch:
         )
         kernel = FirstRunStatusBlocksKernel()
         kernel._state = ExecutionState.PAUSED  # noqa: SLF001
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         runner.load()
         manager = CycleManager(runner, kernel)
         manager._tree = runner.build_tree()  # noqa: SLF001
@@ -4689,7 +4691,7 @@ class TestControlCommandEpoch:
         monkeypatch.setattr(cycle_manager_module, "_RESET_PHASE_DEADLINE_S", 0.02)
         kernel = BlockingResetKernel()
         kernel._state = ExecutionState.STOPPED  # noqa: SLF001
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         with pytest.raises(RuntimeError, match="kernel_reset"):
@@ -4708,7 +4710,7 @@ class TestKernelEventPipelineStatus:
     """OW1: pipeline loss accounting is monotonic and observable."""
 
     def test_collector_and_manager_drops_are_reported(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         status = manager.kernel_event_pipeline_status()
@@ -4736,7 +4738,7 @@ class TestKernelEventPipelineStatus:
         assert status["manager_dropped_total"] > 0
 
     def test_sequence_high_water_does_not_regress_on_reordered_delivery(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
         with kernel._kernel_events_lock:

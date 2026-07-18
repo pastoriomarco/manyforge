@@ -1,11 +1,21 @@
 api_version: manyforge.deployment.v0
-schema_version: "0.1.0"
+schema_version: "0.2.0"
 name: ur5_roboplan_local_semantic_shape_pick
 description: >-
   Local deployment for the semantic object-selection demo. A VLM selects one
   backend-authoritative scene object from a deterministic manifest plus an
   auxiliary viewer snapshot, and the backend computes the actual pick sequence
   deterministically from backend scene state.
+
+compatibility:
+  lane: manyforge-only
+  provides: [semantic_shape_inference]
+  tags: [semantic-pick, ur5]
+  scenarios:
+    - name: ur5-semantic-shape-pick
+      program: semantic_shape_pick.program.yaml
+      description: "UR5 semantic shape pick (text model, no image source)"
+      aliases: [shape-pick]
 
 program_profile: v0.1
 

@@ -1,11 +1,21 @@
 api_version: manyforge.deployment.v0
-schema_version: "0.1.0"
+schema_version: "0.2.0"
 name: ur10e_robotiq_assistant_modes_scene_authoring
 description: >-
   Local deployment fixture for v0.1 assistant-mode catalog plumbing on the
   UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic
   scene-authoring provider enabled while declaring the finite tools visible to
   query and composer-assistant requests.
+
+compatibility:
+  lane: manyforge-only
+  provides: [robotiq_2f_140_gripper, scene_authoring_tools]
+  tags: [scene-authoring, ur10e, robotiq]
+  scenarios:
+    - name: ur10e-scene-authoring
+      program: pick_and_place_ur10e_robotiq.program.yaml
+      description: UR10e + Robotiq with full assistant and scene authoring
+      aliases: [assistant-authoring]
 
 program_profile: v0.1
 

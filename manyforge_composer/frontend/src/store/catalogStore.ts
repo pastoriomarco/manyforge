@@ -1,10 +1,13 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
-import type { CatalogEntry } from '../types/api';
+import type { CatalogEntry, NodeCatalogSource } from '../types/api';
 
 interface CatalogStore {
   entries: CatalogEntry[];
   version: string;
+  effectiveCatalogHash: string;
+  generation: number;
+  sources: NodeCatalogSource[];
   loading: boolean;
   error: string | null;
   fetchCatalog: () => Promise<void>;
@@ -14,6 +17,9 @@ interface CatalogStore {
 export const useCatalogStore = create<CatalogStore>((set, get) => ({
   entries: [],
   version: '',
+  effectiveCatalogHash: '',
+  generation: 0,
+  sources: [],
   loading: false,
   error: null,
 
@@ -21,7 +27,14 @@ export const useCatalogStore = create<CatalogStore>((set, get) => ({
     set({ loading: true, error: null });
     try {
       const data = await api.catalog.list();
-      set({ entries: data.entries, version: data.version, loading: false });
+      set({
+        entries: data.entries,
+        version: data.version,
+        effectiveCatalogHash: data.effectiveCatalogHash,
+        generation: data.generation,
+        sources: data.sources,
+        loading: false,
+      });
     } catch (e) {
       set({ error: (e as Error).message, loading: false });
     }

@@ -111,6 +111,9 @@ export function HeaderBar() {
     programParameters,
     appliedProgramParameters,
     savedProgramParameters,
+    programCompatibility,
+    appliedProgramCompatibility,
+    savedProgramCompatibility,
     sceneResources,
     appliedSceneResources,
     savedSceneResources,
@@ -200,6 +203,10 @@ export function HeaderBar() {
     signature(programParameters) === signature(appliedProgramParameters);
   const programParametersSaved =
     signature(programParameters) === signature(savedProgramParameters);
+  const programCompatibilityApplied =
+    signature(programCompatibility) === signature(appliedProgramCompatibility);
+  const programCompatibilitySaved =
+    signature(programCompatibility) === signature(savedProgramCompatibility);
   const blackboardNamespacesApplied =
     signature(blackboardNamespaces) === signature(appliedBlackboardNamespaces);
   const blackboardNamespacesSaved =
@@ -212,6 +219,7 @@ export function HeaderBar() {
     signature(appliedTree) === signature(savedTree)
     && signature(appliedSceneResources) === signature(savedSceneResources)
     && signature(appliedProgramParameters) === signature(savedProgramParameters)
+    && signature(appliedProgramCompatibility) === signature(savedProgramCompatibility)
     && signature(appliedBlackboardNamespaces) === signature(savedBlackboardNamespaces)
     && signature(appliedBlackboardKeys) === signature(savedBlackboardKeys);
   const deploymentApplied = signature(deployment) === signature(appliedDeployment);
@@ -221,6 +229,7 @@ export function HeaderBar() {
     !programApplied
     || !sceneApplied
     || !programParametersApplied
+    || !programCompatibilityApplied
     || !blackboardNamespacesApplied
     || !blackboardKeysApplied
     || !deploymentApplied;
@@ -228,6 +237,7 @@ export function HeaderBar() {
     !programSaved
     || !sceneSaved
     || !programParametersSaved
+    || !programCompatibilitySaved
     || !blackboardNamespacesSaved
     || !blackboardKeysSaved
     || !deploymentSaved;
@@ -305,6 +315,7 @@ export function HeaderBar() {
       scene?: typeof sceneResources;
       deployment?: FullDeployment;
       programParameters?: typeof programParameters;
+      compatibility?: typeof programCompatibility;
       blackboard?: { namespaces: typeof blackboardNamespaces; keys: typeof blackboardKeys };
     } = {};
     const draftGraphError = validateDraftGraph();
@@ -325,13 +336,16 @@ export function HeaderBar() {
     if (!programParametersApplied) {
       payload.programParameters = programParameters;
     }
+    if (!programCompatibilityApplied) {
+      payload.compatibility = programCompatibility;
+    }
     if (!blackboardNamespacesApplied || !blackboardKeysApplied) {
       payload.blackboard = {
         namespaces: blackboardNamespaces,
         keys: blackboardKeys,
       };
     }
-    if (!payload.tree && !payload.scene && !payload.deployment && !payload.programParameters && !payload.blackboard) {
+    if (!payload.tree && !payload.scene && !payload.deployment && !payload.programParameters && !payload.blackboard && payload.compatibility === undefined) {
       return;
     }
 
@@ -353,7 +367,7 @@ export function HeaderBar() {
       ...payload,
       forceDiscardOverrides,
     });
-    if (payload.tree || payload.scene || payload.programParameters || payload.blackboard) {
+    if (payload.tree || payload.scene || payload.programParameters || payload.blackboard || payload.compatibility !== undefined) {
       setAppliedToDraft();
     }
     if (payload.deployment) {
@@ -368,6 +382,8 @@ export function HeaderBar() {
     sceneResources,
     programParameters,
     programParametersApplied,
+    programCompatibility,
+    programCompatibilityApplied,
     blackboardNamespaces,
     blackboardNamespacesApplied,
     blackboardKeys,
@@ -384,6 +400,7 @@ export function HeaderBar() {
       programSaved
       && sceneSaved
       && programParametersSaved
+      && programCompatibilitySaved
       && blackboardNamespacesSaved
       && blackboardKeysSaved;
     if (!programArtifactSaved && programInfo?.sourcePath) {
@@ -402,6 +419,7 @@ export function HeaderBar() {
     deploymentSourcePath,
     sceneSaved,
     programParametersSaved,
+    programCompatibilitySaved,
     blackboardNamespacesSaved,
     blackboardKeysSaved,
     programInfo?.sourcePath,
@@ -617,6 +635,7 @@ export function HeaderBar() {
       scene?: typeof sceneResources;
       deployment?: FullDeployment;
       programParameters?: typeof programParameters;
+      compatibility?: typeof savedProgramCompatibility;
       blackboard?: {
         namespaces: typeof savedBlackboardNamespaces;
         keys: typeof savedBlackboardKeys;
@@ -634,6 +653,9 @@ export function HeaderBar() {
     if (signature(appliedProgramParameters) !== signature(savedProgramParameters)) {
       payload.programParameters = savedProgramParameters;
     }
+    if (signature(appliedProgramCompatibility) !== signature(savedProgramCompatibility)) {
+      payload.compatibility = savedProgramCompatibility;
+    }
     if (
       signature(appliedBlackboardNamespaces) !== signature(savedBlackboardNamespaces)
       || signature(appliedBlackboardKeys) !== signature(savedBlackboardKeys)
@@ -646,7 +668,7 @@ export function HeaderBar() {
     if (!deploymentAppliedMatchesSaved && savedDeployment) {
       payload.deployment = savedDeployment;
     }
-    if (!payload.tree && !payload.scene && !payload.deployment && !payload.programParameters && !payload.blackboard) {
+    if (!payload.tree && !payload.scene && !payload.deployment && !payload.programParameters && !payload.blackboard && payload.compatibility === undefined) {
       return;
     }
     try {
@@ -657,6 +679,7 @@ export function HeaderBar() {
         payload.tree ? fetchTree() : Promise.resolve(true),
         payload.deployment ? fetchDeployment() : Promise.resolve(true),
         payload.tree || payload.programParameters || payload.blackboard
+          || payload.compatibility !== undefined
           || payload.scene
           ? fetchProgramInfo()
           : Promise.resolve(true),
@@ -674,6 +697,7 @@ export function HeaderBar() {
     hasAppliedUnsavedChanges,
     hasRuntimeOverrides,
     appliedProgramParameters,
+    appliedProgramCompatibility,
     appliedSceneResources,
     appliedBlackboardKeys,
     appliedBlackboardNamespaces,
@@ -683,6 +707,7 @@ export function HeaderBar() {
     savedBlackboardKeys,
     savedBlackboardNamespaces,
     savedProgramParameters,
+    savedProgramCompatibility,
     savedTree,
     setActionError,
     cycleState,

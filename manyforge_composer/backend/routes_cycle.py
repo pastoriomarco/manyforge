@@ -140,7 +140,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
     async def run_cycle(request: Request) -> dict:
         """Start the cycle (IDLE→RUNNING or STOPPED→RUNNING)."""
 
-        def command() -> dict:
+        def command_locked() -> dict:
             if state.cycle_manager is None:
                 raise HTTPException(
                     status_code=409,
@@ -216,6 +216,22 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                 )
             logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
             return _cycle_command_payload(state.cycle_manager)
+
+        def command() -> dict:
+            try:
+                with state.runtime_admission_guard():
+                    return command_locked()
+            except RuntimeError as exc:
+                if str(exc) != "node_environment_reload_in_progress":
+                    raise
+                raise HTTPException(
+                    status_code=409,
+                    detail=_structured_command_error(
+                        state,
+                        "Run is temporarily unavailable while the node catalog reloads",
+                        error_code="node_environment_reload_in_progress",
+                    ),
+                ) from exc
 
         return await _run_cycle_lifecycle(command)
 

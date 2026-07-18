@@ -135,7 +135,7 @@ def build_infra_status_payload(state: ComposerState) -> dict[str, Any]:
     # ManyForge Composer
     components["composer"] = {
         "status": "healthy",
-        "catalog_version": state.catalog.version if state.catalog else None,
+        "catalog_version": state.node_catalog.version if state.node_catalog else None,
         "program_loaded": state.program is not None,
         "program_name": state.program.name if state.program else None,
         "cycle_state": (
@@ -382,7 +382,7 @@ def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
         "components": {
             "composer": {
                 "status": "healthy",
-                "catalog_version": state.catalog.version if state.catalog else None,
+                "catalog_version": state.node_catalog.version if state.node_catalog else None,
             },
             "kernel": kernel_payload,
             "failure_archive": archive_status,

@@ -58,6 +58,11 @@ CAPABILITY_REGISTRY: frozenset[str] = frozenset({
     "io.gpio.set_output",
     "io.gpio.get_input",
     "io.gpio.wait_for_input",
+    # Deployment-owned NRT PLC resource providers. These authorize external
+    # orchestration leaves; they never place PLC work in a controller or
+    # RuntimeSafety lane.
+    "plc.siemens.s7.read",
+    "plc.siemens.s7.write",
     # Gripper / tooling
     "tool.gripper.command",
     "tool.gripper.feedback",

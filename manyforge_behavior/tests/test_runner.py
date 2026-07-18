@@ -1,6 +1,7 @@
 """Tests for the orchestrator runner."""
 
 from pathlib import Path
+from manyforge_behavior.node_environment import build_node_environment
 from unittest.mock import patch
 
 import pytest
@@ -14,6 +15,7 @@ from manyforge_behavior.program import Program, ProgramValidationError, SceneRes
 from manyforge_behavior.runner import OrchestratorRunner
 
 CATALOG_PATH = str(Path(__file__).parent.parent / "resources" / "node_catalog.yaml")
+NODE_ENVIRONMENT = build_node_environment(CATALOG_PATH)
 FIXTURE_PATH = str(
     Path(__file__).parent / "fixtures" / "pick_and_place.program.yaml"
 )
@@ -106,14 +108,14 @@ def kernel():
 
 class TestRunnerLoading:
     def test_load_succeeds(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         runner.load()
         assert runner.catalog is not None
         assert runner.program is not None
         assert runner.program.name == "test_pick_and_place"
 
     def test_build_tree(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         runner.load()
         tree = runner.build_tree()
         assert tree is not None
@@ -127,7 +129,7 @@ class TestRunnerLoading:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.1",
                 "name": "parallel_policy_program",
-                "catalog_version": "0.3.0",
+                "catalog_version": "0.4.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -157,7 +159,7 @@ class TestRunnerLoading:
 
     def test_parallel_default_policy_is_success_on_all(self, kernel):
         program = self._parallel_program()
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel, program=program)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel, program=program)
         runner.load()
         tree = runner.build_tree()
 
@@ -168,7 +170,7 @@ class TestRunnerLoading:
 
     def test_parallel_success_on_one_policy_is_honored(self, kernel):
         program = self._parallel_program(params={"success_policy": "success_on_one"})
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel, program=program)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel, program=program)
         runner.load()
         tree = runner.build_tree()
 
@@ -180,7 +182,7 @@ class TestRunnerLoading:
 
 class TestRunnerSceneApplication:
     def test_apply_scene(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         runner.load()
         runner.apply_scene()
         assert len(kernel.scene_edits) == 1
@@ -196,7 +198,7 @@ class TestRunnerSceneApplication:
             "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
         }
         runner = OrchestratorRunner(
-            CATALOG_PATH, FIXTURE_PATH, kernel, program=program
+            NODE_ENVIRONMENT, FIXTURE_PATH, kernel, program=program
         )
         runner.load()
         runner.apply_scene()
@@ -222,7 +224,7 @@ class TestRunnerSceneApplication:
             )
         ]
         runner = OrchestratorRunner(
-            CATALOG_PATH, FIXTURE_PATH, kernel, program=program
+            NODE_ENVIRONMENT, FIXTURE_PATH, kernel, program=program
         )
         runner.load()
         runner.apply_scene()
@@ -237,7 +239,7 @@ class TestRunnerSceneApplication:
 
     def test_apply_scene_failure(self, kernel):
         kernel.fail_next_scene_edit = True
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         runner.load()
         with pytest.raises(RuntimeError, match="Failed to add scene"):
             runner.apply_scene()
@@ -245,7 +247,7 @@ class TestRunnerSceneApplication:
 
 class TestRunnerExecution:
     def test_full_run(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         runner.load()
         runner.build_tree()
         runner.apply_scene()
@@ -257,7 +259,7 @@ class TestRunnerExecution:
 
     def test_run_with_override(self, kernel):
         runner = OrchestratorRunner(
-            CATALOG_PATH,
+            NODE_ENVIRONMENT,
             FIXTURE_PATH,
             kernel,
             overrides={"pick_velocity_scale": 0.8},
@@ -270,7 +272,7 @@ class TestRunnerExecution:
 
     def test_run_fails_on_execute_failure(self, kernel):
         kernel.fail_next_execute = True
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         runner.load()
         runner.build_tree()
         runner.apply_scene()
@@ -278,12 +280,12 @@ class TestRunnerExecution:
         assert result is False
 
     def test_run_without_load_raises(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         with pytest.raises(RuntimeError):
             runner.build_tree()
 
     def test_run_without_build_raises(self, kernel):
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         runner.load()
         with pytest.raises(RuntimeError):
             runner.run()
@@ -291,7 +293,7 @@ class TestRunnerExecution:
     def test_max_ticks_returns_false(self, kernel):
         """If tree doesn't complete within max_ticks, return False."""
         # Normal run completes quickly, so use max_ticks=0
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         runner.load()
         runner.build_tree()
         result = runner.run(max_ticks=0)
@@ -306,7 +308,7 @@ class TestRunnerExecution:
                     "api_version": "manyforge.program.v0",
                     "program_profile": "v0.0",
                     "name": "skill_program",
-                    "catalog_version": "0.3.0",
+                    "catalog_version": "0.4.0",
                     "description": "skill-authored test program",
                     "robot": {
                         "robot_id": "ur5",
@@ -339,7 +341,7 @@ class TestRunnerExecution:
             encoding="utf-8",
         )
 
-        runner = OrchestratorRunner(CATALOG_PATH, str(program_path), kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, str(program_path), kernel)
         runner.load()
         tree = runner.build_tree()
 
@@ -359,7 +361,7 @@ class TestRunnerChildCardinality:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "invalid_leaf_children",
-                "catalog_version": "0.3.0",
+                "catalog_version": "0.4.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -380,7 +382,7 @@ class TestRunnerChildCardinality:
                     "api_version": "manyforge.program.v0",
                     "program_profile": "v0.0",
                     "name": "single_wait",
-                    "catalog_version": "0.3.0",
+                    "catalog_version": "0.4.0",
                     "robot": {
                         "robot_id": "ur5",
                         "group_id": "arm",
@@ -397,7 +399,7 @@ class TestRunnerChildCardinality:
             ).tree
         )
 
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel, program=program)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel, program=program)
         runner.load()
 
         with pytest.raises(ValueError, match="allows at most 0 children"):
@@ -410,7 +412,7 @@ class TestRunnerChildCardinality:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "invalid_decorator_children",
-                "catalog_version": "0.3.0",
+                "catalog_version": "0.4.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -433,7 +435,7 @@ class TestRunnerChildCardinality:
                     "api_version": "manyforge.program.v0",
                     "program_profile": "v0.0",
                     "name": "second_wait",
-                    "catalog_version": "0.3.0",
+                    "catalog_version": "0.4.0",
                     "robot": {
                         "robot_id": "ur5",
                         "group_id": "arm",
@@ -450,7 +452,7 @@ class TestRunnerChildCardinality:
             ).tree
         )
 
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel, program=program)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel, program=program)
         runner.load()
 
         with pytest.raises(ValueError, match="allows at most 1 child"):
@@ -467,7 +469,7 @@ class TestRelativeTargetValidation:
             "api_version": "manyforge.program.v0",
             "program_profile": "v0.1",
             "name": "relative_target_validation",
-            "catalog_version": "0.3.0",
+            "catalog_version": "0.4.0",
             "robot": {
                 "robot_id": "ur5",
                 "group_id": "arm",
@@ -540,7 +542,7 @@ class TestRunnerDeployment:
     def test_load_with_deployment(self, kernel):
         """Runner loads deployment and validates against program."""
         runner = OrchestratorRunner(
-            CATALOG_PATH, FIXTURE_PATH, kernel,
+            NODE_ENVIRONMENT, FIXTURE_PATH, kernel,
             deployment_path=DEPLOYMENT_FIXTURE)
         runner.load()
         assert runner.deployment is not None
@@ -572,7 +574,7 @@ class TestRunnerDeployment:
         yaml.dump(data, f)
         f.close()
         runner = OrchestratorRunner(
-            CATALOG_PATH, FIXTURE_PATH, kernel,
+            NODE_ENVIRONMENT, FIXTURE_PATH, kernel,
             deployment_path=f.name)
         from manyforge_behavior.deployment import DeploymentValidationError
         with pytest.raises(DeploymentValidationError):
@@ -583,7 +585,7 @@ class TestRunnerDeployment:
     def test_global_tcp_speed_on_blackboard(self, kernel):
         """After build_tree with deployment, global TCP speed is on blackboard."""
         runner = OrchestratorRunner(
-            CATALOG_PATH, FIXTURE_PATH, kernel,
+            NODE_ENVIRONMENT, FIXTURE_PATH, kernel,
             deployment_path=DEPLOYMENT_FIXTURE)
         runner.load()
         runner.build_tree()
@@ -631,7 +633,7 @@ class TestRunnerDeployment:
             )
         )
         runner = OrchestratorRunner(
-            CATALOG_PATH,
+            NODE_ENVIRONMENT,
             FIXTURE_PATH,
             kernel,
             deployment_path=str(deployment_path),
@@ -649,7 +651,7 @@ class TestRunnerDeployment:
 
     def test_runner_without_deployment_still_works(self, kernel):
         """Existing behavior unchanged when no deployment_path."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         runner.load()
         assert runner.deployment is None
         runner.build_tree()  # Should not raise
@@ -662,7 +664,7 @@ class TestRunnerDeployment:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "query_model_program",
-                "catalog_version": "0.3.0",
+                "catalog_version": "0.4.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -734,7 +736,7 @@ class TestRunnerDeployment:
             return b"fake-image"
 
         runner = OrchestratorRunner(
-            CATALOG_PATH,
+            NODE_ENVIRONMENT,
             FIXTURE_PATH,
             kernel,
             program=program,
@@ -764,7 +766,7 @@ class TestRunnerDeployment:
         }
 
         runner = OrchestratorRunner(
-            CATALOG_PATH,
+            NODE_ENVIRONMENT,
             VISION_PROGRAM_EXAMPLE,
             kernel,
             deployment_path=VISION_DEPLOYMENT_EXAMPLE,
@@ -809,7 +811,7 @@ class TestRunnerDeployment:
         }
 
         runner = OrchestratorRunner(
-            CATALOG_PATH,
+            NODE_ENVIRONMENT,
             VISION_POSE_PROGRAM_EXAMPLE,
             kernel,
             deployment_path=VISION_POSE_DEPLOYMENT_EXAMPLE,
@@ -855,7 +857,7 @@ class TestRunnerDeployment:
         }
 
         runner = OrchestratorRunner(
-            CATALOG_PATH,
+            NODE_ENVIRONMENT,
             SEMANTIC_SHAPE_PROGRAM_EXAMPLE,
             kernel,
             deployment_path=SEMANTIC_SHAPE_DEPLOYMENT_EXAMPLE,
@@ -897,7 +899,7 @@ class TestRunnerDeployment:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "vlm_pose_goal_program",
-                "catalog_version": "0.3.0",
+                "catalog_version": "0.4.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -1013,7 +1015,7 @@ class TestRunnerDeployment:
         )
 
         runner = OrchestratorRunner(
-            CATALOG_PATH,
+            NODE_ENVIRONMENT,
             FIXTURE_PATH,
             kernel,
             program=program,
@@ -1038,7 +1040,7 @@ class TestRunnerCapabilities:
     def test_runner_validates_capabilities_on_load(self, kernel):
         """Deployment with capability keys → load succeeds."""
         runner = OrchestratorRunner(
-            CATALOG_PATH, FIXTURE_PATH, kernel,
+            NODE_ENVIRONMENT, FIXTURE_PATH, kernel,
             deployment_path=DEPLOYMENT_FIXTURE)
         runner.load()  # Should not raise
         assert runner.deployment is not None
@@ -1110,7 +1112,7 @@ class TestRunnerCapabilities:
         yaml.dump(data, f)
         f.close()
         runner = OrchestratorRunner(
-            CATALOG_PATH, FIXTURE_PATH, kernel,
+            NODE_ENVIRONMENT, FIXTURE_PATH, kernel,
             deployment_path=f.name)
         from manyforge_behavior.deployment import DeploymentValidationError
         with pytest.raises(DeploymentValidationError, match="Missing capability keys"):

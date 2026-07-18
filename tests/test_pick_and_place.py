@@ -15,6 +15,7 @@ from manyforge_behavior.kernel_client import (
     MockKernelClient, ExecuteRequest, ExecutionState, SceneEditRequest,
 )
 from manyforge_behavior.runner import OrchestratorRunner
+from manyforge_behavior.node_environment import build_node_environment
 
 
 # ============================================================================
@@ -22,6 +23,7 @@ from manyforge_behavior.runner import OrchestratorRunner
 # ============================================================================
 
 CATALOG_PATH = str(_REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml")
+NODE_ENVIRONMENT = build_node_environment(CATALOG_PATH)
 PICK_PLACE_PROGRAM = str(_REPO_ROOT / "tests" / "fixtures" / "pick_and_place.program.yaml")
 SIMPLE_PROGRAM = str(_REPO_ROOT / "tests" / "fixtures" / "simple_motion.program.yaml")
 
@@ -42,7 +44,7 @@ class TestPickAndPlacePipeline:
     def test_pick_place_program_loads(self, kernel):
         """Program with scene edits loads and validates."""
         runner = OrchestratorRunner(
-            catalog_path=CATALOG_PATH,
+            node_environment=NODE_ENVIRONMENT,
             program_path=PICK_PLACE_PROGRAM,
             kernel=kernel,
         )
@@ -53,7 +55,7 @@ class TestPickAndPlacePipeline:
     def test_pick_place_apply_scene(self, kernel):
         """apply_scene() adds the table from the scene section."""
         runner = OrchestratorRunner(
-            catalog_path=CATALOG_PATH,
+            node_environment=NODE_ENVIRONMENT,
             program_path=PICK_PLACE_PROGRAM,
             kernel=kernel,
         )
@@ -66,7 +68,7 @@ class TestPickAndPlacePipeline:
     def test_pick_place_full_run(self, kernel):
         """Full pick-and-place program runs to completion."""
         runner = OrchestratorRunner(
-            catalog_path=CATALOG_PATH,
+            node_environment=NODE_ENVIRONMENT,
             program_path=PICK_PLACE_PROGRAM,
             kernel=kernel,
         )
@@ -79,7 +81,7 @@ class TestPickAndPlacePipeline:
     def test_pick_place_state_after_completion(self, kernel):
         """Runtime acknowledges completed motions and leaves kernel idle after full run."""
         runner = OrchestratorRunner(
-            catalog_path=CATALOG_PATH,
+            node_environment=NODE_ENVIRONMENT,
             program_path=PICK_PLACE_PROGRAM,
             kernel=kernel,
         )
@@ -95,7 +97,7 @@ class TestPickAndPlacePipeline:
     def test_pick_place_reset_and_rerun(self, kernel):
         """Program can be reset and run again."""
         runner = OrchestratorRunner(
-            catalog_path=CATALOG_PATH,
+            node_environment=NODE_ENVIRONMENT,
             program_path=PICK_PLACE_PROGRAM,
             kernel=kernel,
         )
@@ -116,7 +118,7 @@ class TestPickAndPlacePipeline:
     def test_pick_place_with_parameter_override(self, kernel):
         """velocity_scale override propagates through pick-and-place."""
         runner = OrchestratorRunner(
-            catalog_path=CATALOG_PATH,
+            node_environment=NODE_ENVIRONMENT,
             program_path=PICK_PLACE_PROGRAM,
             kernel=kernel,
             overrides={"velocity_scale": 0.3},

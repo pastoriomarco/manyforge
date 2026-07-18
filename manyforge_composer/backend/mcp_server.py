@@ -412,7 +412,7 @@ def create_mcp_server(state: ComposerState):
                 program_data["tree"] = tree
                 updated_program = Program.from_dict(
                     program_data,
-                    state.catalog,
+                    state.node_catalog,
                     path=state.program_source_path or "<memory>",
                     skill_catalog=state.skill_catalog,
                     deployment_capability_keys=capability_keys,
@@ -464,7 +464,7 @@ def create_mcp_server(state: ComposerState):
         )
         errors, warnings = collect_tree_validation_issues(
             tree_node,
-            state.catalog,
+            state.node_catalog,
             parameter_defaults=parameter_defaults,
             skill_catalog=state.skill_catalog,
             program_profile=(
@@ -518,47 +518,59 @@ def create_mcp_server(state: ComposerState):
             return json.dumps({"error": "No program loaded"})
 
         if command == "run":
-            # Fail closed: same stop-capability gate as POST /api/cycle/run, so
-            # the MCP control surface cannot arm a program whose configured stop
-            # profile the backend can't honor.
-            stop_block = state.motion_arm_admission_block_reason()
-            if stop_block:
-                return json.dumps({
-                    "error": stop_block["message"],
-                    "error_code": stop_block["error_code"],
-                })
-            override_status = state.runtime_override_status()
-            if (
-                state.cycle_manager.state.value == "stopped"
-                and override_status["has_staged"]
-            ):
-                return json.dumps({
-                    "error": (
-                        "Staged runtime overrides cannot be activated while resuming from STOPPED; "
-                        "reset the cycle first"
-                    )
-                })
-            if (
-                state.cycle_manager.state.value == "idle"
-                and override_status["has_staged"]
-            ):
+            def admitted_run() -> str:
+                # Fail closed: same stop-capability gate as POST /api/cycle/run, so
+                # the MCP control surface cannot arm a program whose configured stop
+                # profile the backend can't honor.
+                stop_block = state.motion_arm_admission_block_reason()
+                if stop_block:
+                    return json.dumps({
+                        "error": stop_block["message"],
+                        "error_code": stop_block["error_code"],
+                    })
+                override_status = state.runtime_override_status()
+                if (
+                    state.cycle_manager.state.value == "stopped"
+                    and override_status["has_staged"]
+                ):
+                    return json.dumps({
+                        "error": (
+                            "Staged runtime overrides cannot be activated while resuming from STOPPED; "
+                            "reset the cycle first"
+                        )
+                    })
+                if (
+                    state.cycle_manager.state.value == "idle"
+                    and override_status["has_staged"]
+                ):
+                    try:
+                        state.activate_staged_runtime_overrides()
+                    except RuntimeError as exc:
+                        return json.dumps({"error": str(exc)})
                 try:
-                    state.activate_staged_runtime_overrides()
+                    state.cycle_manager.run()
                 except RuntimeError as exc:
+                    # Cycle-manager recovery refusals (e.g. explicit operator
+                    # recovery required for INTERVENTION_REQUIRED) and other
+                    # resume-path refusals surface as RuntimeError. Return them
+                    # as structured errors so MCP clients see a consistent shape
+                    # rather than an internal exception.
                     return json.dumps({"error": str(exc)})
+                return json.dumps({
+                    "state": state.cycle_manager.state.value,
+                    "motion_stop_state": state.cycle_manager.motion_stop_state,
+                })
+
             try:
-                state.cycle_manager.run()
+                with state.runtime_admission_guard():
+                    return admitted_run()
             except RuntimeError as exc:
-                # Cycle-manager recovery refusals (e.g. explicit operator
-                # recovery required for INTERVENTION_REQUIRED) and other
-                # resume-path refusals surface as RuntimeError. Return them
-                # as structured errors so MCP clients see a consistent shape
-                # rather than an internal exception.
-                return json.dumps({"error": str(exc)})
-            return json.dumps({
-                "state": state.cycle_manager.state.value,
-                "motion_stop_state": state.cycle_manager.motion_stop_state,
-            })
+                if str(exc) == "node_environment_reload_in_progress":
+                    return json.dumps({
+                        "error": "Run is temporarily unavailable while the node catalog reloads",
+                        "error_code": "node_environment_reload_in_progress",
+                    })
+                raise
         elif command == "stop":
             state.cycle_manager.stop()
             return json.dumps({
@@ -729,7 +741,7 @@ def create_mcp_server(state: ComposerState):
                 capability_keys = state.deployment.capability_keys()
             errors, _warnings = collect_tree_validation_issues(
                 tree_node,
-                state.catalog,
+                state.node_catalog,
                 parameter_defaults=(
                     state.program.get_parameter_defaults()
                     if state.program is not None
@@ -742,7 +754,7 @@ def create_mcp_server(state: ComposerState):
                 ),
                 blackboard_keys=merged_intervention_blackboard_keys(
                     tree_node,
-                    state.catalog,
+                    state.node_catalog,
                     base_keys=(
                         state.program.blackboard_keys
                         if state.program is not None
@@ -1054,13 +1066,13 @@ def create_mcp_server(state: ComposerState):
         """
         if entry_id is not None:
             try:
-                entry = state.catalog.get(entry_id)
+                entry = state.node_catalog.get(entry_id)
             except KeyError:
                 return json.dumps({"error": f"Entry '{entry_id}' not found"})
             return json.dumps(_catalog_entry_dict(entry))
 
-        entries = [_catalog_entry_dict(entry) for entry in state.catalog.entries]
-        return json.dumps({"version": state.catalog.version, "entries": entries})
+        entries = [_catalog_entry_dict(entry) for entry in state.node_catalog.entries]
+        return json.dumps({"version": state.node_catalog.version, "entries": entries})
 
     # ── Scene Snapshot ──────────────────────────────────────────────────
 

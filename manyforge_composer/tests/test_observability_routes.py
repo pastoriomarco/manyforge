@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
+
 from concurrent.futures import ThreadPoolExecutor
 import builtins
 import importlib.util
@@ -48,7 +50,7 @@ _REQUIRES_PINOCCHIO_VISUAL_FK = pytest.mark.skipif(
 
 def make_client(*, joint_names: list[str] | None = None) -> tuple[TestClient, ComposerState, MockKernelClient]:
     kernel = MockKernelClient(joint_names=joint_names)
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state)
     return TestClient(app), state, kernel
 
@@ -201,7 +203,7 @@ def test_scene_state_pending_robot_includes_authority_metadata():
             )
 
     kernel = AuthorityKernel(joint_names=["joint_a"])
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
         scene=[],
@@ -258,7 +260,7 @@ def test_scene_state_visual_snapshot_fk_uses_independent_model_when_enabled(
         lambda _state: ("base_link", "link_1"),
     )
     kernel = VisualKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="link_1", base_pose={}),
         scene=[],
@@ -327,7 +329,7 @@ def test_scene_state_visual_snapshot_reports_missing_pinocchio(
         lambda _state: ("base_link", "link_1"),
     )
     kernel = VisualKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="link_1", base_pose={}),
         scene=[],
@@ -392,7 +394,7 @@ def test_visual_state_publisher_uses_cached_scene_objects_without_backend_scene_
         lambda _state: ("base_link", "link_1"),
     )
     kernel = VisualObjectKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="link_1", base_pose={}),
         scene=[],
@@ -456,7 +458,7 @@ def test_visual_state_publisher_uses_cached_joint_names(
         lambda _state: ("base_link", "link_1"),
     )
     kernel = VisualKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="link_1", base_pose={}),
         scene=[],
@@ -526,7 +528,7 @@ def test_scene_state_visual_snapshot_uses_rma_private_view_for_sibling_mimic(
         },
     )
     kernel = VisualMimicKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="right_link", base_pose={}),
         scene=[],
@@ -597,7 +599,7 @@ def test_scene_state_visual_snapshot_includes_gripper_feedback_in_fk(
         lambda _state: ("base_link", "link_1", "finger_link"),
     )
     kernel = VisualGripperKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="finger_link", base_pose={}),
         scene=[],
@@ -665,7 +667,7 @@ def test_preview_link_poses_joint_falls_back_to_visual_fk_for_gripper_links(
     entry = SimpleNamespace(urdf_path=str(urdf_path))
     monkeypatch.setattr(routes_urdf, "get_urdf_entry", lambda _state: entry)
     monkeypatch.setattr(routes_urdf, "active_urdf_model_key", lambda _state: "toy-gripper-key")
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=EmptyNativeFkKernel())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=EmptyNativeFkKernel())
     client = TestClient(create_app(state))
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="finger_link", base_pose={}),
@@ -714,7 +716,7 @@ def test_scene_routes_read_cached_visual_snapshot_without_backend_calls(
 
     monkeypatch.setattr(routes_scene, "_load_model_frame_names", lambda _state: {"base_link"})
     kernel = BlockingKernel(joint_names=["joint_a"])
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
         scene=[],
@@ -783,7 +785,7 @@ def test_scene_state_deployment_only_uses_cached_visual_snapshot(
             raise AssertionError("loaded deployment route must not read mutable scene objects")
 
     kernel = BlockingKernel(joint_names=["joint_a"])
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.deployment = SimpleNamespace(
         robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
         adapters={},
@@ -819,7 +821,7 @@ def test_scene_state_marks_stale_visual_snapshot_without_blocking(
 ):
     monkeypatch.setenv("MANYFORGE_VISUAL_STATE_STALE_AFTER_MS", "50")
     kernel = MockKernelClient(joint_names=["joint_a"])
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
         scene=[],
@@ -860,7 +862,7 @@ def test_scene_state_marks_stale_visual_snapshot_without_blocking(
 def test_scene_state_does_not_wait_for_blocked_visual_publisher(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
         scene=[],
@@ -908,7 +910,7 @@ def test_scene_state_visual_snapshot_uses_cached_objects_without_scene_read(
 
     monkeypatch.setattr(routes_urdf, "visual_link_names_for_fk", lambda _state: ())
     kernel = ObjectCacheKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(scene=[])
     scene_object = SceneObjectSnapshot(
         object_id="cached_box",
@@ -947,7 +949,7 @@ def test_scene_state_empty_visual_object_cache_queues_refresh_without_scene_read
 
     monkeypatch.setattr(routes_urdf, "visual_link_names_for_fk", lambda _state: ())
     kernel = ObjectCacheKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(scene=[])
     publish_reasons: list[str] = []
     state.ensure_visual_state_publisher = lambda builder, period_s: None
@@ -977,7 +979,7 @@ def test_scene_state_does_not_wait_for_blocked_object_refresh(
             return []
 
     kernel = BlockingRefreshKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(scene=[])
     publish_reasons: list[str] = []
     state.ensure_visual_state_publisher = lambda builder, period_s: None
@@ -1047,7 +1049,7 @@ def test_scene_edit_updates_visual_cache_without_backend_refresh(
 def test_attached_visual_object_pose_is_composed_from_link_pose(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.update_visual_state_snapshot(
         VisualSceneSnapshotResponse(
             sequence_number=1,
@@ -1110,7 +1112,7 @@ def test_attached_visual_object_pose_is_composed_from_link_pose(
 def test_visual_object_refresh_derives_attachment_offset_from_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.update_visual_state_snapshot(
         VisualSceneSnapshotResponse(
             sequence_number=1,
@@ -1157,7 +1159,7 @@ def test_visual_object_refresh_derives_attachment_offset_from_snapshot(
 def test_visual_object_reader_lazily_derives_missing_attachment_offset(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.update_visual_scene_objects_snapshot(
         [
             SceneObjectSnapshot(
@@ -1247,7 +1249,7 @@ def test_scene_frames_visual_snapshot_avoids_legacy_batch_fk(
         lambda _state: ("base_link", "link_1"),
     )
     kernel = VisualFrameKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
         scene=[],
@@ -1281,7 +1283,7 @@ def test_scene_frames_does_not_wait_for_blocked_visual_publisher(
         "_load_model_frame_names",
         lambda _state: {"base_link", "tool0"},
     )
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
         scene=[],
@@ -1448,7 +1450,7 @@ def test_scene_state_does_not_advance_gripper_commands_on_read_path(
     monkeypatch.setattr(routes_urdf, "visual_link_names_for_fk", lambda _state: ("finger",))
     monkeypatch.setattr(routes_urdf, "active_urdf_model_key", lambda _state: "ordered")
     kernel = OrderedKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base", tcp_frame="tcp", base_pose={}),
         scene=[],
@@ -1539,7 +1541,7 @@ def test_scene_frames_never_call_batch_fk_on_observer_route(monkeypatch):
         lambda _state: {"link_a", "link_b"},
     )
     kernel = BatchKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
         robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
         scene=[],

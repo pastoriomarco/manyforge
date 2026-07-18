@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
+
 from pathlib import Path
 import tarfile
 
@@ -52,7 +54,7 @@ class _AllStopModesCapabilityBundle:
 
 def test_basic_pick_and_place_scenario_runs_to_completion():
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(execute_duration_s=0.05),
         kernel_bundle=_AllStopModesCapabilityBundle(),
         allowed_fs_roots=[str(_REPO_ROOT), "/tmp", "/workspace"],
@@ -86,7 +88,7 @@ def test_runner_can_assert_visual_scene_consistency_without_manual_inspection():
         )
     )
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=kernel,
         allowed_fs_roots=[str(_REPO_ROOT), "/tmp", "/workspace"],
     )
@@ -133,7 +135,7 @@ def test_runner_can_assert_visual_scene_consistency_without_manual_inspection():
 
 def test_runner_writes_metadata_and_matrix_summary(tmp_path):
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(execute_duration_s=0.05),
         kernel_bundle=_AllStopModesCapabilityBundle(),
         allowed_fs_roots=[str(_REPO_ROOT), "/tmp", "/workspace"],
@@ -231,7 +233,7 @@ scenarios:
 
 def test_runner_can_assert_scene_snapshot_and_archive_matrix_output(tmp_path):
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(execute_duration_s=0.05),
         kernel_bundle=_AllStopModesCapabilityBundle(),
         allowed_fs_roots=[str(_REPO_ROOT), "/tmp", "/workspace"],

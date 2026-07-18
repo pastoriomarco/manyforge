@@ -6,7 +6,12 @@ description: "Pick-and-place demo with UR5 + RoboPlan: approach/pick/retreat/dro
   \ (RRT + TOPPRA), gripper simulation, and cache invalidation. Sequence follows manymove\
   \ pattern: approach \u2192 pick \u2192 retreat \u2192 approach drop \u2192 drop\
   \ \u2192 retreat \u2192 rest."
-catalog_version: "0.3.0"
+compatibility:
+  lanes: [manyforge-only]
+  assistant: forbidden
+  requires: []
+  tags: [pick-and-place, ur5]
+catalog_version: "0.4.0"
 robot:
   robot_id: ur5
   group_id: arm

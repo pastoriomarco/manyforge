@@ -74,8 +74,12 @@ def _build_composer_state():
     introspect the FastAPI/MCP shape after construction.
     """
     from manyforge_behavior.kernel_client import MockKernelClient
+    from manyforge_behavior.node_environment import build_node_environment
     from manyforge_composer.backend.state import ComposerState
-    return ComposerState(catalog_path=DEFAULT_CATALOG_PATH, kernel=MockKernelClient())
+    return ComposerState(
+        node_environment=build_node_environment(DEFAULT_CATALOG_PATH),
+        kernel=MockKernelClient(),
+    )
 HEADER_TEMPLATE = (
     "<!--\n"
     "  THIS FILE IS GENERATED — do not hand-edit. Source of truth: code.\n"

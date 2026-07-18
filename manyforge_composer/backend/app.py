@@ -27,6 +27,8 @@ from .state import ComposerState
 from .ws_state import StateHub
 from .routes_cycle import create_cycle_router
 from .routes_catalog import create_catalog_router
+from .routes_nodes import create_nodes_router
+from .routes_scenarios import create_scenarios_router
 from .routes_program import create_program_router
 from .routes_filesystem import create_filesystem_router
 from .routes_kernel import create_kernel_router
@@ -123,6 +125,10 @@ def create_app(
                 logger.exception("Shutdown: final event flush failed")
         state.stop_visual_state_publisher()
         hub.stop()
+        try:
+            await asyncio.to_thread(state.close_runtime_resources)
+        except Exception:  # noqa: BLE001 — continue to kernel/recorder teardown
+            logger.exception("Shutdown: runtime resource close failed")
         if state.kernel is not None:
             try:
                 await asyncio.to_thread(state.kernel.close)
@@ -253,7 +259,7 @@ def create_app(
             "status": "ok",
             "components": {
                 "backend": "ok",
-                "catalog": "ok" if state.catalog else "unavailable",
+                "catalog": "ok" if state.node_catalog else "unavailable",
                 "program": "loaded" if state.program else "none",
                 "cycle": state.cycle_manager.state.value if state.cycle_manager else "none",
             },
@@ -262,6 +268,12 @@ def create_app(
 
     app.include_router(create_cycle_router(state), prefix="/api/cycle", tags=["cycle"])
     app.include_router(create_catalog_router(state), prefix="/api/catalog", tags=["catalog"])
+    app.include_router(create_nodes_router(state), prefix="/api/nodes", tags=["nodes"])
+    app.include_router(
+        create_scenarios_router(state),
+        prefix="/api/scenarios",
+        tags=["scenarios"],
+    )
     app.include_router(create_program_router(state), prefix="/api", tags=["program"])
     app.include_router(
         create_filesystem_router(allowed_roots=security.allowed_fs_roots),

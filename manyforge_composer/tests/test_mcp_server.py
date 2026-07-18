@@ -1,6 +1,8 @@
 """Tests for ManyForge MCP Server."""
 from __future__ import annotations
 
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
+
 import asyncio
 import json
 import logging
@@ -94,7 +96,7 @@ def _write_program_with_failing_delegate_policy(
 def _make_state(execute_duration_s: float = 0.0) -> ComposerState:
     kernel = MockKernelClient(execute_duration_s=execute_duration_s)
     return ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=kernel,
         allowed_fs_roots=[str(_REPO_ROOT), "/workspace", "/tmp"],
     )
@@ -453,7 +455,7 @@ class TestCycleControl:
 
     def test_run_blocks_unsupported_configured_stop_profile(self, tmp_path):
         state = ComposerState(
-            catalog_path=_CATALOG_PATH,
+            node_environment=node_environment_for_catalog(_CATALOG_PATH),
             kernel=MockKernelClient(execute_duration_s=0.0),
             kernel_bundle=_StopCapabilityBundle(),
             allowed_fs_roots=[str(_REPO_ROOT), "/workspace", "/tmp"],
@@ -743,7 +745,7 @@ class TestIntervention:
 
     def test_intervention_execute_blocks_unsupported_configured_stop_profile(self, tmp_path):
         state = ComposerState(
-            catalog_path=_CATALOG_PATH,
+            node_environment=node_environment_for_catalog(_CATALOG_PATH),
             kernel=MockKernelClient(execute_duration_s=0.0),
             kernel_bundle=_StopCapabilityBundle(),
             allowed_fs_roots=[str(_REPO_ROOT), "/workspace", "/tmp"],
@@ -1333,7 +1335,7 @@ class TestFileBrowser:
 
     def test_browse_default(self, tmp_path):
         state = ComposerState(
-            catalog_path=_CATALOG_PATH,
+            node_environment=node_environment_for_catalog(_CATALOG_PATH),
             kernel=MockKernelClient(),
             allowed_fs_roots=[str(tmp_path)],
         )
@@ -1349,7 +1351,7 @@ class TestFileBrowser:
 
     def test_browse_kind_filter(self, tmp_path):
         state = ComposerState(
-            catalog_path=_CATALOG_PATH,
+            node_environment=node_environment_for_catalog(_CATALOG_PATH),
             kernel=MockKernelClient(),
             allowed_fs_roots=[str(tmp_path)],
         )

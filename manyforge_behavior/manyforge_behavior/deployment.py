@@ -5,12 +5,14 @@ from __future__ import annotations
 import copy
 import hashlib
 import math
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
+from types import MappingProxyType
 
 from manyforge_behavior.capabilities import (
     CAPABILITY_REGISTRY,
@@ -692,6 +694,8 @@ _ALLOWED_ASSISTANT_REVIEW_POLICIES = {
 }
 _QUERY_ASSISTANT_MODE_ID = "query"
 _COMPOSER_ASSISTANT_MODE_ID = "composer-assistant"
+_COMPATIBILITY_LANES = frozenset({"manyforge-only", "isaac-sim"})
+_SCENARIO_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 def _validate_capability_keys(value: Any, path: str) -> list[str]:
@@ -810,6 +814,147 @@ class PromptTemplate:
         return hashlib.sha256(self.template_text.encode()).hexdigest()[:16]
 
 
+@dataclass(frozen=True)
+class ExternalNodesConfig:
+    # None means every installed external node is enabled. An explicit empty
+    # tuple means this deployment enables none of them.
+    enabled: tuple[str, ...] | None = None
+    strict: bool = False
+
+
+@dataclass(frozen=True)
+class DeploymentScenario:
+    name: str
+    program: str
+    description: str
+    aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DeploymentCompatibility:
+    lane: str
+    provides: tuple[str, ...] = ()
+    tags: tuple[str, ...] = ()
+    scenarios: tuple[DeploymentScenario, ...] = ()
+
+
+def _unique_text_tuple(raw: Any, *, path: str) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(
+        isinstance(item, str) and item.strip() for item in raw
+    ):
+        raise DeploymentValidationError(
+            f"{path} must be a list of non-empty strings"
+        )
+    values = tuple(item.strip() for item in raw)
+    if len(values) != len(set(values)):
+        raise DeploymentValidationError(f"{path} must not contain duplicates")
+    return values
+
+
+def _parse_external_nodes(raw: Any) -> ExternalNodesConfig:
+    if raw is None:
+        return ExternalNodesConfig()
+    if not isinstance(raw, dict):
+        raise DeploymentValidationError("external_nodes must be a mapping")
+    unknown = sorted(set(raw) - {"enabled", "strict"})
+    if unknown:
+        raise DeploymentValidationError(
+            f"external_nodes contains unknown fields: {unknown}"
+        )
+    strict = raw.get("strict", False)
+    if not isinstance(strict, bool):
+        raise DeploymentValidationError("external_nodes.strict must be a boolean")
+    return ExternalNodesConfig(
+        enabled=(
+            _unique_text_tuple(raw["enabled"], path="external_nodes.enabled")
+            if "enabled" in raw
+            else None
+        ),
+        strict=strict,
+    )
+
+
+def _parse_deployment_compatibility(raw: Any) -> DeploymentCompatibility | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise DeploymentValidationError("compatibility must be a mapping")
+    unknown = sorted(set(raw) - {"lane", "provides", "tags", "scenarios"})
+    if unknown:
+        raise DeploymentValidationError(
+            f"compatibility contains unknown fields: {unknown}"
+        )
+    lane = raw.get("lane")
+    if lane not in _COMPATIBILITY_LANES:
+        raise DeploymentValidationError(
+            "compatibility.lane must be manyforge-only or isaac-sim"
+        )
+    raw_scenarios = raw.get("scenarios", [])
+    if not isinstance(raw_scenarios, list):
+        raise DeploymentValidationError("compatibility.scenarios must be a list")
+    scenarios: list[DeploymentScenario] = []
+    names: set[str] = set()
+    aliases: set[str] = set()
+    for index, item in enumerate(raw_scenarios):
+        path = f"compatibility.scenarios[{index}]"
+        if not isinstance(item, dict):
+            raise DeploymentValidationError(f"{path} must be a mapping")
+        unknown_item = sorted(set(item) - {"name", "program", "description", "aliases"})
+        if unknown_item:
+            raise DeploymentValidationError(
+                f"{path} contains unknown fields: {unknown_item}"
+            )
+        name = item.get("name")
+        program = item.get("program")
+        description = item.get("description")
+        for field_name, value in (
+            ("name", name), ("program", program), ("description", description)
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise DeploymentValidationError(
+                    f"{path}.{field_name} must be a non-empty string"
+                )
+        name = name.strip()
+        if not _SCENARIO_ID_RE.fullmatch(name):
+            raise DeploymentValidationError(
+                f"{path}.name must use lowercase letters, digits, and hyphens"
+            )
+        scenario_aliases = _unique_text_tuple(
+            item.get("aliases"), path=f"{path}.aliases"
+        )
+        for alias in scenario_aliases:
+            if not _SCENARIO_ID_RE.fullmatch(alias):
+                raise DeploymentValidationError(
+                    f"{path}.aliases contains invalid alias '{alias}'"
+                )
+        if name in names or name in aliases or any(
+            alias in names or alias in aliases for alias in scenario_aliases
+        ):
+            raise DeploymentValidationError(
+                f"{path} duplicates a scenario name or alias"
+            )
+        names.add(name)
+        aliases.update(scenario_aliases)
+        scenarios.append(
+            DeploymentScenario(
+                name=name,
+                program=program.strip(),
+                description=description.strip(),
+                aliases=scenario_aliases,
+            )
+        )
+    return DeploymentCompatibility(
+        lane=lane,
+        provides=_unique_text_tuple(
+            raw.get("provides"), path="compatibility.provides"
+        ),
+        tags=_unique_text_tuple(raw.get("tags"), path="compatibility.tags"),
+        scenarios=tuple(scenarios),
+    )
+
+
 class Deployment:
     """Loads and validates a ManyForge deployment artifact from YAML."""
 
@@ -837,6 +982,9 @@ class Deployment:
         self.assistant_modes: dict[str, AssistantModeDefinition] = {}
         self.tool_catalog: dict[str, AssistantToolDefinition] = {}
         self.prompt_templates: dict[str, PromptTemplate] = {}
+        self.external_nodes = ExternalNodesConfig()
+        self.runtime_resources: Mapping[str, Any] = MappingProxyType({})
+        self.compatibility: DeploymentCompatibility | None = None
         self._load_and_validate()
 
     @property
@@ -874,6 +1022,9 @@ class Deployment:
         self.assistant_modes = {}
         self.tool_catalog = {}
         self.prompt_templates = {}
+        self.external_nodes = ExternalNodesConfig()
+        self.runtime_resources = MappingProxyType({})
+        self.compatibility = None
         self._load_from_data_and_validate(data)
         return self
 
@@ -3718,6 +3869,9 @@ class Deployment:
         self.assistant_modes = {}
         self.tool_catalog = {}
         self.prompt_templates = {}
+        self.external_nodes = ExternalNodesConfig()
+        self.runtime_resources = MappingProxyType({})
+        self.compatibility = None
 
         if not isinstance(data, dict):
             raise DeploymentValidationError("Deployment must be a YAML mapping")
@@ -3758,6 +3912,14 @@ class Deployment:
         if not isinstance(self.name, str) or not self.name.strip():
             raise DeploymentValidationError("name is required")
         self.description = data.get("description", "")
+        self.external_nodes = _parse_external_nodes(data.get("external_nodes"))
+        runtime_resources = data.get("runtime_resources", {})
+        if not isinstance(runtime_resources, dict):
+            raise DeploymentValidationError("runtime_resources must be a mapping")
+        self.runtime_resources = MappingProxyType(copy.deepcopy(runtime_resources))
+        self.compatibility = _parse_deployment_compatibility(
+            data.get("compatibility")
+        )
         self.grasp_risk_policy = self._parse_grasp_risk_policy(
             data.get("grasp_risk_policy", data.get("graspRiskPolicy"))
         )
@@ -4056,6 +4218,25 @@ class Deployment:
             capability_keys.update(adapter.capability_keys)
         if self.simulation_control is not None:
             capability_keys.update(self.simulation_control.capability_keys())
+        def collect_resource_capabilities(value: Any) -> None:
+            if isinstance(value, dict):
+                declared = value.get("capabilities")
+                if isinstance(declared, list):
+                    capability_keys.update(
+                        item for item in declared if isinstance(item, str)
+                    )
+                for child in value.values():
+                    collect_resource_capabilities(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect_resource_capabilities(child)
+
+        collect_resource_capabilities(dict(self.runtime_resources))
+        unknown = sorted(capability_keys - CAPABILITY_REGISTRY)
+        if unknown:
+            raise DeploymentValidationError(
+                f"runtime_resources declare unknown capability keys: {unknown}"
+            )
         return capability_keys
 
     def baseline_collision_policy_snapshot(self) -> dict[str, Any] | None:
@@ -4378,6 +4559,27 @@ class Deployment:
                 }
                 for template_id, template in self.prompt_templates.items()
             }
+        if self.external_nodes.enabled is not None or self.external_nodes.strict:
+            d["external_nodes"] = {"strict": self.external_nodes.strict}
+            if self.external_nodes.enabled is not None:
+                d["external_nodes"]["enabled"] = list(self.external_nodes.enabled)
+        if self.runtime_resources:
+            d["runtime_resources"] = copy.deepcopy(dict(self.runtime_resources))
+        if self.compatibility is not None:
+            d["compatibility"] = {
+                "lane": self.compatibility.lane,
+                "provides": list(self.compatibility.provides),
+                "tags": list(self.compatibility.tags),
+                "scenarios": [
+                    {
+                        "name": scenario.name,
+                        "program": scenario.program,
+                        "description": scenario.description,
+                        "aliases": list(scenario.aliases),
+                    }
+                    for scenario in self.compatibility.scenarios
+                ],
+            }
         if self.pose_sources:
             d["pose_sources"] = []
             for source in self.pose_sources.values():
@@ -4561,6 +4763,17 @@ class Deployment:
             self.description = data["description"]
         if "program_profile" in data:
             self.program_profile = data["program_profile"]
+        if "external_nodes" in data:
+            self.external_nodes = _parse_external_nodes(data["external_nodes"])
+        if "runtime_resources" in data:
+            runtime_resources = data["runtime_resources"]
+            if not isinstance(runtime_resources, dict):
+                raise DeploymentValidationError("runtime_resources must be a mapping")
+            self.runtime_resources = MappingProxyType(copy.deepcopy(runtime_resources))
+        if "compatibility" in data:
+            self.compatibility = _parse_deployment_compatibility(
+                data["compatibility"]
+            )
         if "robot_config" in data:
             self.robot_config = self._parse_robot_config(
                 data["robot_config"],

@@ -1,5 +1,5 @@
 api_version: manyforge.deployment.v0
-schema_version: "0.1.0"
+schema_version: "0.2.0"
 name: isaac_manipulator_scene_light_assistant
 description: >
   Isaac Sim preview deployment for the saved light manipulator scene, with the
@@ -19,6 +19,16 @@ description: >
   authored state on review/apply — the assistant_modes.composer-assistant
   authority block sets review=required for exactly this reason; no edit
   reaches Isaac until an operator approves it.
+
+compatibility:
+  lane: isaac-sim
+  provides: [ros2_control, robotiq_2f_140_gripper, scene_authoring_tools]
+  tags: [pick-and-place, assistant, isaac-sim, ur10e, robotiq]
+  scenarios:
+    - name: isaac-ur10e-light-scene-assistant
+      program: isaac_manipulator_scene_light.program.yaml
+      description: Isaac UR10e light scene with full assistant overlay
+      aliases: [isaac-assistant]
 
 program_profile: v0.1
 

@@ -21,7 +21,7 @@ class TestCatalogLoading:
     def test_loads_shipped_catalog(self):
         catalog = NodeCatalog(CATALOG_PATH)
         assert len(catalog.entries) > 0
-        assert catalog.version == "0.3.0"
+        assert catalog.version == "0.4.0"
         assert catalog.api_version == "manyforge.node_catalog.v1"
         assert all(
             param.schema is not None
@@ -172,6 +172,38 @@ class TestCatalogLoading:
             assert "py_trees" in entry.runners, (
                 f"Entry '{entry.id}' missing py_trees runner"
             )
+
+    def test_runtime_pause_service_injection_matches_builtin_contract(self):
+        catalog = NodeCatalog(CATALOG_PATH)
+        injected = {
+            entry.id
+            for entry in catalog.entries
+            if "runtime_pause_registry" in entry.runtime_injections
+        }
+
+        # Runtime services are catalog-owned metadata after the registry cutover.
+        # Pin the complete migrated set so a permissive **kwargs constructor cannot
+        # silently hide a missing pause/fault channel again.
+        assert injected == {
+            "add_collision_object",
+            "attach_object_to_link",
+            "build_scene_selection_context",
+            "command_gripper",
+            "confirm_gripper_grasp",
+            "detach_object_from_link",
+            "move_manipulator_action",
+            "move_until_signal",
+            "plan_pick_sequence",
+            "probe_search_move",
+            "query_model",
+            "remove_collision_object",
+            "reset_simulation",
+            "set_entity_state",
+            "set_simulation_state",
+            "step_simulation",
+            "update_collision_object_pose",
+            "upsert_collision_object",
+        }
 
     def test_pick_plan_subtree_is_authoring_only(self):
         catalog = NodeCatalog(CATALOG_PATH)

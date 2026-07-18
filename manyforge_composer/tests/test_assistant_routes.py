@@ -1,6 +1,8 @@
 """Tests for Composer assistant routes."""
 from __future__ import annotations
 
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
+
 import asyncio
 import hashlib
 import json
@@ -49,7 +51,7 @@ _TEST_SECURITY = SecurityConfig(
 
 @pytest.fixture
 def state() -> ComposerState:
-    return ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    return ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
 
 
 @pytest.fixture
@@ -3659,7 +3661,7 @@ def _write_minimal_program(tmp_path: Path) -> Path:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "minimal",
-                "catalog_version": "0.3.0",
+                "catalog_version": "0.4.0",
                 "description": "minimal program",
                 "robot": {
                     "robot_id": "ur5",
@@ -3698,7 +3700,7 @@ def _write_pose_target_program(tmp_path: Path) -> Path:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.1",
                 "name": "pose_target",
-                "catalog_version": "0.3.0",
+                "catalog_version": "0.4.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",

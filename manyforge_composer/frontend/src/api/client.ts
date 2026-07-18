@@ -11,6 +11,7 @@ import type {
   ProgramInfo,
   ProgramParameter,
   ProgramBlackboard,
+  ProgramCompatibility,
   ProgramTree,
   ProgramValidateResponse,
   TreeNode,
@@ -48,6 +49,8 @@ import type {
   SimulationSetStateRequest,
   SimulationStepRequest,
   SimulationResetResponse,
+  NodeDiscoveryReport,
+  ScenarioCatalogResponse,
 } from '../types/api';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -253,6 +256,7 @@ export const api = {
       scene?: ProgramInfo['sceneResources'],
       parameters?: ProgramInfo['parameters'],
       blackboard?: ProgramBlackboard,
+      compatibility?: ProgramCompatibility | null,
     ) =>
       request<unknown>('POST', '/api/program/save', {
         path,
@@ -260,7 +264,15 @@ export const api = {
         scene,
         parameters,
         blackboard,
+        compatibility,
       }),
+  },
+  nodes: {
+    diagnostics: () => request<NodeDiscoveryReport>('GET', '/api/nodes/diagnostics'),
+    reload: () => request<NodeDiscoveryReport>('POST', '/api/nodes/reload'),
+  },
+  scenarios: {
+    list: () => request<ScenarioCatalogResponse>('GET', '/api/scenarios'),
   },
   deployment: {
     load: (path: string) =>
@@ -282,6 +294,7 @@ export const api = {
       deployment?: FullDeployment;
       programParameters?: ProgramParameter[];
       blackboard?: ProgramBlackboard;
+      compatibility?: ProgramCompatibility | null;
       forceDiscardOverrides?: boolean;
     }) =>
       request<ApplySessionResponse>('POST', '/api/session/apply', payload),

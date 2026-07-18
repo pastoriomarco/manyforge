@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
+
 from pathlib import Path
 import threading
 import time
@@ -69,7 +71,7 @@ def _minimal_deployment(*, pose_sources: list[dict] | None = None) -> Deployment
 def _client(tmp_path: Path) -> tuple[TestClient, ComposerState]:
     kernel = MockKernelClient()
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=kernel,
         allowed_fs_roots=[str(tmp_path), str(_REPO_ROOT)],
     )

@@ -12,6 +12,8 @@ These assert the candidate contract:
 """
 from __future__ import annotations
 
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
+
 import threading
 import time
 from pathlib import Path
@@ -56,7 +58,7 @@ def _client(tmp_path: Path) -> tuple[TestClient, ComposerState, MockKernelClient
     """Bare client (no program loaded) — for input-validation tests."""
     kernel = MockKernelClient()
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=kernel,
         allowed_fs_roots=[str(tmp_path), str(_REPO_ROOT)],
     )
@@ -81,7 +83,7 @@ def _loaded_client(
     robot profile, a cycle manager (for Approve), and a start joint state."""
     kernel = MockKernelClient(execute_duration_s=execute_duration_s)
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=kernel,
         kernel_bundle=kernel_bundle,
         allowed_fs_roots=[str(tmp_path), str(_REPO_ROOT)],
@@ -257,7 +259,7 @@ def _recording_loaded_client(
 ) -> tuple[TestClient, ComposerState, _PreviewRecordingKernel]:
     kernel = _PreviewRecordingKernel()
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=kernel,
         allowed_fs_roots=[str(tmp_path), str(_REPO_ROOT)],
     )
@@ -529,7 +531,7 @@ def _fk_recording_loaded_client(
 ) -> tuple[TestClient, ComposerState, _FkRecordingKernel]:
     kernel = _FkRecordingKernel()
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=kernel,
         allowed_fs_roots=[str(tmp_path), str(_REPO_ROOT)],
     )
@@ -1258,7 +1260,7 @@ def _gripper_status_client(
 ) -> tuple[TestClient, ComposerState, _GripperStatusKernel]:
     kernel = _GripperStatusKernel()
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=kernel,
         kernel_bundle=_AllStopModesCapabilityBundle(),
         allowed_fs_roots=[str(tmp_path), str(_REPO_ROOT)],

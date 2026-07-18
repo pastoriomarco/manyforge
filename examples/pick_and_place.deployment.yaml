@@ -1,7 +1,21 @@
 api_version: manyforge.deployment.v0
-schema_version: "0.1.0"
+schema_version: "0.2.0"
 name: ur5_roboplan_local_pick_place
 description: Local deployment with native in-process RoboPlan planning and simulated execution for the backend-authoritative pick-and-place demo.
+
+compatibility:
+  lane: manyforge-only
+  provides: []
+  tags: [pick-and-place, ur5]
+  scenarios:
+    - name: ur5-pick-place
+      program: pick_and_place.program.yaml
+      description: UR5 pick-and-place baseline (12-step)
+      aliases: [pick-place]
+    - name: ur5-simple-pick-place
+      program: pick_and_place_minimal.program.yaml
+      description: "UR5 minimal smoke: one move and one scene edit"
+      aliases: []
 
 program_profile: v0.1
 

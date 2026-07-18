@@ -10,9 +10,12 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Marco Pastorio" }]
 requires-python = ">=3.11"
 dependencies = [
-    "py_trees>=2.2",
+    "py_trees==2.4.0",
     "pyyaml>=6.0",
 ]
+
+[project.scripts]
+manyforge = "manyforge_behavior.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -23,7 +23,7 @@ def reset_blackboard():
 # ---------------------------------------------------------------------------
 
 class ConfigurableLeaf(py_trees.behaviour.Behaviour):
-    """Leaf that reads behaviour from self._params dict (PLUGIN_FACTORY convention)."""
+    """Leaf that reads behaviour from the action-node ``_params`` convention."""
 
     def __init__(self, name, fail_until=0, **params):
         super().__init__(name)

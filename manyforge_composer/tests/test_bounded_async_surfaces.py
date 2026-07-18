@@ -1,6 +1,8 @@
 """Regression tests for bounded backend async surfaces and in-memory stores."""
 from __future__ import annotations
 
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
+
 import asyncio
 import threading
 import time
@@ -35,7 +37,7 @@ _TEST_SECURITY = SecurityConfig(
 
 def _state() -> ComposerState:
     return ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         allowed_fs_roots=[str(_REPO_ROOT), "/workspace", "/tmp"],
     )

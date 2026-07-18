@@ -5,49 +5,49 @@
 # The launcher exposes `--scenario NAME` as shorthand, or `--program / --deployment`
 # for free-form invocations.
 #
-# Update this table when new program/deployment pairs are added under examples/.
+# Scenario names, aliases, and pairings are discovered from deployment YAML.
 
 if [[ -n "${_MANYFORGE_LIB_SCENARIOS:-}" ]]; then return 0; fi
 _MANYFORGE_LIB_SCENARIOS=1
 
 source "$(dirname "${BASH_SOURCE[0]}")/runner.sh"
 
-# Each line: name|lane|assistant|program|deployment|description
-_SCENARIO_TABLE=(
-    "ur5-pick-place|manyforge-only|off|/workspace/examples/pick_and_place.program.yaml|/workspace/examples/pick_and_place.deployment.yaml|UR5 pick-and-place baseline (12-step)"
-    "ur5-simple-pick-place|manyforge-only|off|/workspace/examples/pick_and_place_minimal.program.yaml|/workspace/examples/pick_and_place.deployment.yaml|UR5 minimal smoke: one move + scene edit (was demo.sh --simple)"
-    "ur10e-pick-place|manyforge-only|off|/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml|/workspace/examples/pick_and_place_ur10e_robotiq.deployment.yaml|UR10e + Robotiq 2F-140 self-contained preview"
-    "lite6-pick-place|manyforge-only|off|/workspace/examples/lite6_lite_gripper_pick_and_place.program.yaml|/workspace/examples/lite6_lite_gripper_pick_and_place.deployment.yaml|UFACTORY Lite6 + lite gripper self-contained pick-and-place"
-    "ur5-semantic-shape-pick|manyforge-only|on|/workspace/examples/semantic_shape_pick.program.yaml|/workspace/examples/semantic_shape_pick.deployment.yaml|UR5 semantic shape pick (text LLM: image_source=none)"
-    "ur5-vision-pose-pick|manyforge-only|on|/workspace/examples/vision_guided_pose_pick.program.yaml|/workspace/examples/vision_guided_pose_pick.deployment.yaml|UR5 vision-guided pose pick (vision LLM)"
-    "ur10e-scene-authoring|manyforge-only|on|/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml|/workspace/examples/assistant_modes_scene_authoring.deployment.yaml|UR10e + Robotiq with full Cosmos assistant + scene authoring"
-    "isaac-ur10e-light-scene|isaac-sim|off|/workspace/examples/isaac_manipulator_scene_light.program.yaml|/workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml|Isaac commanded sim with UR10e light manipulator scene"
-    "isaac-ur10e-light-scene-collision|isaac-sim|off|/workspace/examples/isaac_manipulator_scene_light_collision.program.yaml|/workspace/examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml|Isaac commanded sim with UR10e light scene + popup collision object for runtime-fault testing"
-    "isaac-ur10e-light-scene-assistant|isaac-sim|on|/workspace/examples/isaac_manipulator_scene_light.program.yaml|/workspace/examples/isaac_manipulator_scene_light_assistant.deployment.yaml|Isaac commanded sim with UR10e light manipulator scene + full Cosmos assistant overlay"
-    "isaac-lite6-pick-place|isaac-sim|off|/workspace/examples/isaac_lite6_lite_gripper_pick_and_place.program.yaml|/workspace/examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml|Isaac commanded sim with UFACTORY Lite6 + lite gripper pick-and-place"
-    "isaac-lite6-trocar-foundationpose|isaac-sim|off|/workspace/examples/trocar_lite6_foundationpose_pick.program.yaml|/workspace/examples/trocar_lite6_foundationpose_pick.deployment.yaml|Isaac commanded sim with Lite6 trocar pick using FoundationPose Detection3DArray"
-)
+_SCENARIO_TABLE=()
+_SCENARIO_ALIASES=()
+_SCENARIOS_LOADED=0
 
-# _SCENARIO_ALIASES — backward-compat for the old short names that the
-# v1 launcher shipped with. Old runbooks keep working; the user sees a
-# one-time deprecation warning per launch invocation pointing at the
-# canonical name.
-#
-# Format: old_name|canonical_name
-_SCENARIO_ALIASES=(
-    "pick-place|ur5-pick-place"
-    "ur10e|ur10e-pick-place"
-    "shape-pick|ur5-semantic-shape-pick"
-    "vision-pose|ur5-vision-pose-pick"
-    "assistant-authoring|ur10e-scene-authoring"
-    "isaac-light|isaac-ur10e-light-scene"
-    "isaac-assistant|isaac-ur10e-light-scene-assistant"
-)
+_load_scenarios() {
+    if [[ "${_SCENARIOS_LOADED}" == "1" ]]; then
+        return 0
+    fi
+    local loader="${MANYFORGE_ROOT:?MANYFORGE_ROOT not set}/scripts/lib/scenarios_loader.py"
+    local output row aliases alias
+    if ! output="$(python3 "${loader}")"; then
+        fail "Scenario discovery failed; validate the deployment compatibility metadata"
+        return 1
+    fi
+    mapfile -t _SCENARIO_TABLE <<<"${output}"
+    if [[ ${#_SCENARIO_TABLE[@]} -eq 0 || -z "${_SCENARIO_TABLE[0]}" ]]; then
+        fail "Scenario discovery returned no named scenarios"
+        return 1
+    fi
+    for row in "${_SCENARIO_TABLE[@]}"; do
+        aliases="$(scenario_field "${row}" 7)"
+        if [[ -z "${aliases}" ]]; then
+            continue
+        fi
+        while IFS= read -r alias; do
+            [[ -n "${alias}" ]] && _SCENARIO_ALIASES+=("${alias}|${row%%|*}")
+        done < <(tr ',' '\n' <<<"${aliases}")
+    done
+    _SCENARIOS_LOADED=1
+}
 
 # scenario_canonical NAME — resolve alias to canonical; echo canonical
 # (or the input unchanged if not an alias). Emits a one-time deprecation
 # warning per launch invocation via the _MANYFORGE_ALIAS_WARNED sentinel.
 scenario_canonical() {
+    _load_scenarios || return 1
     local name="$1"
     local row alias canonical
     for row in "${_SCENARIO_ALIASES[@]}"; do
@@ -68,6 +68,7 @@ scenario_canonical() {
 # scenario_lookup NAME  — echoes the matching pipe-delimited row to stdout.
 # Returns 1 if no match.
 scenario_lookup() {
+    _load_scenarios || return 1
     local name="$1"
     # Resolve any deprecated alias to its canonical name first; this emits
     # a one-time deprecation warning per launch invocation via
@@ -92,6 +93,7 @@ scenario_field() {
 # scenarios_for LANE ASSISTANT  — list scenario names compatible with the
 # selected lane + assistant axis. Use ASSISTANT="any" to skip the filter.
 scenarios_for() {
+    _load_scenarios || return 1
     local lane="$1"
     local assistant="$2"
     local row name row_lane row_assistant
@@ -121,6 +123,7 @@ scenario_describe() {
 }
 
 scenarios_print_table() {
+    _load_scenarios || return 1
     printf '\n  %-36s %-15s %-11s %s\n' "scenario" "lane" "assistant" "description" >&2
     printf '  %-36s %-15s %-11s %s\n' "--------" "----" "---------" "-----------" >&2
     local row name lane assistant description

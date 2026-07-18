@@ -491,7 +491,7 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             if not isinstance(input_schema, dict):
                 input_schema = assistant_tool_input_schema(
                     tool_id,
-                    catalog=state.catalog,
+                    catalog=state.node_catalog,
                     node_ids=node_id_set,
                 ) or {
                     "type": "object",
@@ -526,9 +526,9 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             _catalog_entry_payload(
                 entry,
                 include_parameters=True,
-                catalog=state.catalog,
+                catalog=state.node_catalog,
             )
-            for entry in state.catalog.entries
+            for entry in state.node_catalog.entries
             if entry.id in node_id_set
         ]
         # Skill payload also follows the read-function-shape rule:
@@ -1634,7 +1634,7 @@ def _resolve_bridge_tool_context(
             detail="No deployment assistant_modes are loaded",
         )
     try:
-        deployment.validate_assistant_modes(state.catalog, state.skill_catalog)
+        deployment.validate_assistant_modes(state.node_catalog, state.skill_catalog)
         resolved_catalog = deployment.resolve_assistant_mode_catalog(assistant_mode)
     except DeploymentValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1670,7 +1670,7 @@ def _with_catalog_projected_tool_schemas(
     ]
     projected["tools"] = enrich_assistant_tool_descriptors(
         tools,
-        catalog=state.catalog,
+        catalog=state.node_catalog,
         node_ids=node_ids,
         field_policy=field_policy,
     )
@@ -1734,11 +1734,11 @@ def _execute_bridge_read_only_tool_sync(
         if not isinstance(include_parameters, bool):
             raise HTTPException(status_code=400, detail="catalog_read includeParameters must be boolean")
         selected = set(entry_ids)
-        missing = sorted(selected - {entry.id for entry in state.catalog.entries})
+        missing = sorted(selected - {entry.id for entry in state.node_catalog.entries})
         if missing:
             raise HTTPException(status_code=404, detail=f"Unknown catalog entry IDs: {missing}")
         entries = []
-        for entry in state.catalog.entries:
+        for entry in state.node_catalog.entries:
             if selected and entry.id not in selected:
                 continue
             if isinstance(category, str) and category and entry.category != category:
@@ -1749,11 +1749,11 @@ def _execute_bridge_read_only_tool_sync(
                 _catalog_entry_payload(
                     entry,
                     include_parameters=include_parameters,
-                    catalog=state.catalog,
+                    catalog=state.node_catalog,
                 )
             )
         return {
-            "version": state.catalog.version,
+            "version": state.node_catalog.version,
             "entryCount": len(entries),
             "entries": entries,
         }
@@ -1790,7 +1790,7 @@ def _execute_bridge_read_only_tool_sync(
             try:
                 candidate = Program.from_dict(
                     program_data,
-                    state.catalog,
+                    state.node_catalog,
                     path=snapshot["programSourcePath"] or "<memory>",
                     skill_catalog=state.skill_catalog,
                     deployment_capability_keys=_deployment_capability_keys(state),
@@ -3166,7 +3166,7 @@ def _apply_program_draft_data(
     try:
         candidate = Program.from_dict(
             program_data,
-            state.catalog,
+            state.node_catalog,
             path=state.program_source_path or "<memory>",
             skill_catalog=state.skill_catalog,
             deployment_capability_keys=_deployment_capability_keys(state),
@@ -4232,9 +4232,9 @@ def _apply_tree_draft_change_node_kind(
     old_id = target.get("id")
 
     # Catalog lookup for the new id.
-    new_entry = state.catalog.entries_by_id().get(new_id) if hasattr(state.catalog, "entries_by_id") else None
+    new_entry = state.node_catalog.entries_by_id().get(new_id) if hasattr(state.node_catalog, "entries_by_id") else None
     if new_entry is None:
-        for candidate in state.catalog.entries:
+        for candidate in state.node_catalog.entries:
             if candidate.id == new_id:
                 new_entry = candidate
                 break
@@ -4357,7 +4357,7 @@ def _apply_tree_draft_change_node_kind(
     # carry a swap_class field and they differ).
     old_entry = None
     if isinstance(old_id, str):
-        for candidate in state.catalog.entries:
+        for candidate in state.node_catalog.entries:
             if candidate.id == old_id:
                 old_entry = candidate
                 break
@@ -4481,7 +4481,7 @@ def _apply_tree_draft_wrap_node(
     # entry: 'X'" from program validation with no recovery hint and loops.
     wrapper_id = wrapper.get("id")
     if isinstance(wrapper_id, str):
-        catalog_ids = sorted({entry.id for entry in state.catalog.entries})
+        catalog_ids = sorted({entry.id for entry in state.node_catalog.entries})
         if wrapper_id not in catalog_ids:
             # Heuristic shortlist: ids that share a substring with the wrong one.
             related = sorted(
@@ -4850,7 +4850,7 @@ def _assistant_provider_context(
                 detail="assistantMode is required for this deployment's assistant modes",
             )
         try:
-            deployment.validate_assistant_modes(state.catalog, state.skill_catalog)
+            deployment.validate_assistant_modes(state.node_catalog, state.skill_catalog)
             resolved_catalog = deployment.resolve_assistant_mode_catalog(assistant_mode)
         except DeploymentValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -4887,9 +4887,9 @@ def _assistant_provider_context(
             _catalog_entry_payload(
                 entry,
                 include_parameters=True,
-                catalog=state.catalog,
+                catalog=state.node_catalog,
             )
-            for entry in state.catalog.entries
+            for entry in state.node_catalog.entries
             if entry.id in _visible_node_id_set
         ]
         # Skill payload uses _skills_payload for the same single-source-
@@ -5144,7 +5144,7 @@ def _materialize_scene_resource_add(
     try:
         candidate = Program.from_dict(
             program_data,
-            state.catalog,
+            state.node_catalog,
             path=snapshot["programSourcePath"] or "<memory>",
             skill_catalog=state.skill_catalog,
             deployment_capability_keys=_deployment_capability_keys(state),

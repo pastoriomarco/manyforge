@@ -1,6 +1,8 @@
 """Tests for ManyForge Composer Backend."""
 from __future__ import annotations
 
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
+
 import copy
 from contextlib import contextmanager
 import logging
@@ -32,6 +34,7 @@ from manyforge_behavior.kernel_client import (
 import manyforge_behavior.cycle_manager as cycle_manager_module
 from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.deployment import Deployment
+from manyforge_behavior.runtime_resources import RuntimeResourceRegistry
 from manyforge_composer.backend.state import ComposerState, RuntimeOverrideRecord
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.models import (
@@ -544,7 +547,38 @@ def _write_program_with_failing_delegate_policy(
 def state():
     """Create a fresh ComposerState for each test."""
     kernel = MockKernelClient()
-    return ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    return ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
+
+
+def test_replaced_runtime_resource_cleanup_failure_does_not_relabel_cutover(
+    state: ComposerState,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailingHandle:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("provider cleanup failed")
+
+    handle = FailingHandle()
+    resources = RuntimeResourceRegistry(
+        {"plc_clients": {"default": handle}}
+    )
+
+    with caplog.at_level(
+        logging.ERROR,
+        logger="manyforge_composer.backend.state",
+    ):
+        retired = state._retire_runtime_resources_after_cutover(
+            resources,
+            reason="test cutover",
+        )
+
+    assert retired is False
+    assert handle.close_calls == 1
+    assert "Runtime resource retirement failed after test cutover" in caplog.text
 
 
 @pytest.fixture
@@ -557,7 +591,7 @@ def client(state):
 def make_client(execute_duration_s: float = 0.0) -> TestClient:
     """Create a TestClient with a configurable mock execution duration."""
     kernel = MockKernelClient(execute_duration_s=execute_duration_s)
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     return TestClient(app)
 
@@ -851,7 +885,7 @@ def test_kernel_snapshot_preserves_backend_reason_details():
             }
             return snapshot
 
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=TrackingFaultKernel())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=TrackingFaultKernel())
     app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
@@ -1031,7 +1065,7 @@ def test_reset_from_running(client, state):
 
 def test_cycle_lifecycle_routes_use_lifecycle_executor():
     manager = _ExecutorProbeCycleManager()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.cycle_manager = manager
     state.reset_backend_authoritative_sim_if_needed = lambda **_kwargs: None
     state.clear_visual_state_snapshot = lambda: None
@@ -1068,7 +1102,7 @@ def test_cycle_lifecycle_routes_use_lifecycle_executor():
 
 def test_full_stop_uses_reserved_control_executor_when_lifecycle_pool_blocked():
     manager = _ExecutorProbeCycleManager()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.cycle_manager = manager
     app = create_app(state, security=_TEST_SECURITY)
 
@@ -1116,7 +1150,7 @@ def test_route_executor_roles_are_explicit():
 def test_kernel_stop_backstop_uses_reserved_control_executor():
     kernel = _ThreadProbeKernel()
     kernel._state = ExecutionState.EXECUTING  # noqa: SLF001 - test active kernel
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as local_client:
@@ -1147,7 +1181,7 @@ def test_kernel_stop_backstop_singleflight_does_not_starve_full_stop():
 
     kernel = BlockingStopKernel()
     manager = _ExecutorProbeCycleManager()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.cycle_manager = manager
     app = create_app(state, security=_TEST_SECURITY)
 
@@ -1193,7 +1227,7 @@ def test_kernel_stop_backstop_singleflight_does_not_starve_full_stop():
 
 def test_cycle_stop_uses_reserved_control_executor():
     manager = _ExecutorProbeCycleManager()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.cycle_manager = manager
     app = create_app(state, security=_TEST_SECURITY)
 
@@ -1229,7 +1263,7 @@ def test_debug_history_and_snapshot_routes_use_background_executor(monkeypatch):
         "build_execution_history_payload",
         fake_history_payload,
     )
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.snapshot_broker = SnapshotBrokerProbe()
     app = create_app(state, security=_TEST_SECURITY)
 
@@ -1286,7 +1320,7 @@ def test_route_background_executor_rejects_above_admission_limit():
 
 
 def test_route_executors_restart_after_app_lifespan_shutdown():
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as local_client:
@@ -1307,7 +1341,7 @@ def test_route_executors_restart_after_app_lifespan_shutdown():
 
 def test_full_stop_is_not_blocked_by_saturated_background_routes(monkeypatch):
     manager = _ExecutorProbeCycleManager()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.cycle_manager = manager
     app = create_app(state, security=_TEST_SECURITY)
     background_workers = route_execution.route_executor_status()["background"][
@@ -1371,7 +1405,7 @@ def test_reset_phase_timeout_returns_structured_409(monkeypatch):
 
     monkeypatch.setattr(cycle_manager_module, "_RESET_PHASE_DEADLINE_S", 0.001)
     kernel = SlowResetKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as local_client:
@@ -2546,7 +2580,7 @@ def test_program_validate_flags_per_move_tcp_above_global(client, state):
 
 def test_runtime_override_staged_in_direct_control_requires_reset_before_stopped_resume(tmp_path):
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     program_path = _write_program_with_runtime_policy(tmp_path)
 
@@ -2581,7 +2615,7 @@ def test_runtime_override_staged_in_direct_control_requires_reset_before_stopped
 
 def test_runtime_override_activate_from_idle_promotes_staged_override(tmp_path):
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     program_path = _write_program_with_runtime_policy(tmp_path)
 
@@ -2613,7 +2647,7 @@ def test_runtime_override_status_caches_staged_effective_tree(
     monkeypatch,
 ):
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     program_path = _write_program_with_runtime_policy(tmp_path)
     state.load_program(program_path)
     state.cycle_manager._state = CycleState.DIRECT_CONTROL
@@ -2645,7 +2679,7 @@ def test_runtime_override_status_caches_staged_effective_tree(
 
 def test_runtime_override_status_is_safe_during_concurrent_mutation(tmp_path):
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     program_path = _write_program_with_runtime_policy(tmp_path)
     state.load_program(program_path)
     state.cycle_manager._state = CycleState.DIRECT_CONTROL
@@ -2722,7 +2756,7 @@ def test_runtime_override_status_is_safe_during_concurrent_mutation(tmp_path):
 
 def test_runtime_override_materialized_tree_supports_staged_view(tmp_path):
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     program_path = _write_program_with_runtime_policy(tmp_path)
 
@@ -2778,7 +2812,7 @@ def test_runtime_override_promote_loaded_program_materializes_and_clears_ledger(
 
 def test_runtime_override_promote_loaded_program_rejects_dropping_staged_overrides(tmp_path):
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     program_path = _write_program_with_runtime_policy(tmp_path)
 
@@ -3049,7 +3083,7 @@ def test_runtime_override_revalidate_endpoint_no_stale(client, tmp_path):
 def test_stale_override_detected_after_hash_change(tmp_path):
     """Simulate a program change by mutating _program_tree_hash; override becomes stale."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     program_path = _write_program_with_runtime_policy(tmp_path)
 
@@ -3085,7 +3119,7 @@ def test_stale_override_detected_after_hash_change(tmp_path):
 def test_stale_override_blocks_materialized_tree(tmp_path):
     """Stale overrides prevent materialized-tree preview."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     program_path = _write_program_with_runtime_policy(tmp_path)
 
@@ -3112,7 +3146,7 @@ def test_stale_override_blocks_materialized_tree(tmp_path):
 def test_stale_override_revalidation_succeeds(tmp_path):
     """Revalidation updates the hash when the override is still valid."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     program_path = _write_program_with_runtime_policy(tmp_path)
 
@@ -3174,7 +3208,7 @@ def test_stale_override_revalidation_succeeds(tmp_path):
 def test_stale_override_invalidation_removes_from_ledger(tmp_path):
     """Revalidation removes overrides whose target node no longer exists."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     program_path = _write_program_with_runtime_policy(tmp_path)
 
@@ -3577,7 +3611,7 @@ def test_runtime_status_reports_stop_capability_audit_fields_without_poll_requer
         },
     })
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         kernel_bundle=bundle,
     )
@@ -3630,7 +3664,7 @@ def test_runtime_status_uses_kernel_stop_capability_when_bundle_absent(
         "capability_profile_id": "native_client_stop_capability",
         "hard_stop_level": "native_immediate_hold",
     })
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     deployment_path = _write_deployment_with_stop_profile(
         tmp_path, stop_mode="soft_on_path"
@@ -3654,7 +3688,7 @@ def test_runtime_status_uses_kernel_stop_capability_when_bundle_absent(
 
 
 def test_stop_capability_query_failure_blocks_configured_profile(tmp_path: Path):
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     app = create_app(state, security=_TEST_SECURITY)
     deployment_path = _write_deployment_with_stop_profile(
         tmp_path, stop_mode="spring_back_hold"
@@ -3697,7 +3731,7 @@ def test_missing_required_fault_stop_profile_blocks_motion_arm(tmp_path: Path):
         "hard_stop_level": "jtc_cancel_unprofiled_hold",
     })
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         kernel_bundle=bundle,
     )
@@ -3736,7 +3770,7 @@ def test_missing_hard_stop_floor_blocks_motion_arm(tmp_path: Path):
         "hard_stop_level": "unavailable",
     })
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         kernel_bundle=bundle,
     )
@@ -3775,7 +3809,7 @@ def test_stop_capability_accessor_throw_blocks_motion_arm(tmp_path: Path):
         "hard_stop_level": "jtc_cancel_unprofiled_hold",
     })
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         kernel_bundle=bundle,
     )
@@ -3806,7 +3840,7 @@ def test_unsupported_stop_profile_blocks_direct_intervention(tmp_path: Path):
         "hard_stop_level": "jtc_cancel_unprofiled_hold",
     })
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         kernel_bundle=bundle,
     )
@@ -3842,7 +3876,7 @@ def test_unsupported_stop_profile_blocks_direct_joint_jog(
     tmp_path: Path,
 ):
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         kernel_bundle=_StopCapabilityBundle({
             "supported_stop_modes": ["spring_back_hold"],
@@ -3994,7 +4028,7 @@ def test_load_program_rebuilds_kernel_from_deployment_config():
 
     initial_kernel = CloseTrackingKernel()
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=initial_kernel,
         kernel_factory=kernel_factory,
     )
@@ -4037,7 +4071,7 @@ def test_failed_program_load_closes_unpublished_kernel_candidate():
         return candidate, {"candidate": len(candidates)}
 
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=initial_kernel,
         kernel_factory=kernel_factory,
     )
@@ -4074,7 +4108,7 @@ def test_session_rebuild_closes_previous_kernel_after_cutover():
         return candidate, {"candidate": len(candidates)}
 
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=initial_kernel,
         kernel_factory=kernel_factory,
     )
@@ -4116,7 +4150,7 @@ def test_session_rebuild_staging_failure_preserves_active_kernel_manager_pair(
         return candidate, {"candidate": len(candidates)}
 
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=initial_kernel,
         kernel_factory=kernel_factory,
     )
@@ -4791,7 +4825,7 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
     """Program-load callback wires scene callbacks without raising or logging errors."""
     py_trees.blackboard.Blackboard.clear()
 
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state._on_program_loaded = build_program_loaded_callback()
 
     with caplog.at_level(logging.ERROR):
@@ -4832,7 +4866,7 @@ def test_program_load_callback_installs_native_visuals(caplog):
     """Native visual scene-edit wiring works."""
     py_trees.blackboard.Blackboard.clear()
 
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state._on_program_loaded = build_program_loaded_callback()
 
     with caplog.at_level(logging.ERROR):
@@ -4878,7 +4912,7 @@ def test_program_load_callback_applies_simulator_bootstrap_from_deployment(caplo
 
     bundle = DummyBundle()
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         kernel_bundle=bundle,
     )
@@ -4894,7 +4928,7 @@ def test_program_load_callback_applies_simulator_bootstrap_from_deployment(caplo
 def test_debug_scene_trace_endpoint_returns_backend_and_visual_observability():
     """Debug scene trace endpoint exposes current backend/native-viewer trace scope."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.load_program(_PROGRAM_PATH)
 
     kernel.scene_edit(
@@ -4959,7 +4993,7 @@ def test_debug_collision_compare_trajectory_endpoint_uses_cached_waypoint():
             }
 
     kernel = CompareKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state)
 
     with TestClient(app) as client:
@@ -5035,7 +5069,7 @@ def test_debug_planning_qualification_routes_preserve_generation_and_snapshot():
             self.cache_invalidations += 1
 
     kernel = QualificationKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state)
     with TestClient(app) as client:
         snapshot = client.get(
@@ -5085,7 +5119,7 @@ def test_debug_planning_qualification_routes_preserve_generation_and_snapshot():
 
 
 def test_debug_qualification_environment_reports_state_websocket_clients():
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     app = create_app(state)
     with TestClient(app) as client:
         disconnected = client.get("/api/debug/qualification/environment")
@@ -5113,7 +5147,7 @@ def test_debug_collision_compare_positions_endpoint_uses_explicit_positions():
             }
 
     kernel = CompareKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state)
 
     with TestClient(app) as client:
@@ -5132,7 +5166,7 @@ def test_debug_collision_compare_positions_endpoint_uses_explicit_positions():
 def test_scene_snapshot_returns_503_without_snapshot_source():
     """GET /api/scene/snapshot returns 503 when no viewer snapshot source exists."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state)
     with TestClient(app) as client:
         response = client.get("/api/scene/snapshot")
@@ -5143,7 +5177,7 @@ def test_scene_snapshot_returns_503_without_snapshot_source():
 def test_scene_snapshot_returns_image_from_native_broker():
     """GET /api/scene/snapshot returns image bytes from the native snapshot broker."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
 
     # Minimal JPEG-like byte sequence is enough here; the route serves the
     # renderer bytes verbatim and does not decode image content.
@@ -5168,7 +5202,7 @@ def test_scene_snapshot_returns_image_from_native_broker():
 def test_published_scene_snapshot_returns_stored_image():
     """GET /api/scene/snapshots/{id} serves the exact published bytes."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.public_api_base_url = "http://localhost:9000"
     published = state.publish_scene_snapshot(
         b"\xff\xd8fake-jpeg",
@@ -5188,7 +5222,7 @@ def test_published_scene_snapshot_returns_stored_image():
 def test_publish_scene_snapshot_rejects_invalid_explicit_fetch_base_url():
     """Explicit fetch_base_url must be an absolute HTTP(S) URL with a host."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
 
     with pytest.raises(RuntimeError, match="absolute http\\(s\\) URL with a host"):
         state.publish_scene_snapshot(
@@ -5203,7 +5237,7 @@ def test_publish_scene_snapshot_rejects_invalid_explicit_fetch_base_url():
 def test_publish_scene_snapshot_rejects_invalid_public_api_base_url():
     """Configured public_api_base_url must also be an absolute HTTP(S) URL with a host."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.public_api_base_url = "/relative/base"
 
     with pytest.raises(RuntimeError, match="absolute http\\(s\\) URL with a host"):
@@ -5218,7 +5252,7 @@ def test_publish_scene_snapshot_rejects_invalid_public_api_base_url():
 def test_published_scene_snapshot_404_for_missing_id():
     """GET /api/scene/snapshots/{id} returns 404 for unknown ids."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state)
     with TestClient(app) as client:
         response = client.get("/api/scene/snapshots/missing")
@@ -5253,7 +5287,7 @@ def test_direct_abort_no_program_409(client):
 def test_direct_status_no_session_404():
     """GET /api/direct/status returns 404 when no intervention has run."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -5263,7 +5297,7 @@ def test_direct_status_no_session_404():
 
 def test_direct_pending_recovery_404_when_no_request():
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -5295,7 +5329,7 @@ def _wait_for_no_pending_recovery(client, *, timeout_s: float = 2.0):
 
 def test_delegated_recovery_request_created_on_node_failure(tmp_path):
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     program_path = _write_program_with_failing_delegate_policy(
         tmp_path,
@@ -5327,7 +5361,7 @@ def test_delegated_recovery_request_created_on_node_failure(tmp_path):
 
 def test_direct_execute_delegated_recovery_consumes_pending_request(tmp_path):
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     program_path = _write_program_with_failing_delegate_policy(
         tmp_path,
@@ -5364,7 +5398,7 @@ def test_direct_execute_delegated_recovery_consumes_pending_request(tmp_path):
 
 def test_direct_execute_delegated_recovery_enforces_pending_authority(tmp_path):
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     program_path = _write_program_with_failing_delegate_policy(
         tmp_path,
@@ -5398,7 +5432,7 @@ def test_direct_execute_and_status():
     import time
 
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -5436,7 +5470,7 @@ def test_direct_execute_and_status():
 
 def test_direct_cartesian_jog_preserves_requested_frames():
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         load = client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -5471,7 +5505,7 @@ def test_direct_promote_blackboard_value_after_intervention():
     import time
 
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -5507,7 +5541,7 @@ def test_direct_promote_blackboard_value_after_intervention():
 def test_direct_execute_from_idle_requires_human_approval():
     """POST /api/direct/execute rejects unapproved IDLE direct control."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -5531,7 +5565,7 @@ def test_direct_execute_from_idle_requires_human_approval():
 def test_direct_execute_while_running_409():
     """POST /api/direct/execute returns 409 when cycle is RUNNING."""
     kernel = MockKernelClient(execute_duration_s=1.0)
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -5557,7 +5591,7 @@ def test_direct_execute_while_running_409():
 def test_direct_abort_no_running_intervention():
     """POST /api/direct/abort returns 409 when no intervention is running."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -5583,7 +5617,7 @@ def test_kernel_events_drains_direct_kernel_events():
     from manyforge_behavior.kernel_client import ExecuteRequest
 
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -5613,7 +5647,7 @@ def test_kernel_events_after_execution():
     import time
 
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -5640,7 +5674,7 @@ def test_kernel_events_have_correct_structure():
     import time
 
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -5662,7 +5696,7 @@ def test_kernel_stop_route_stops_active_kernel_without_cycle_layer():
     """POST /api/kernel/stop is the operator backstop: it must stop an active
     kernel regardless of what the cycle layer believes its state is."""
     kernel = MockKernelClient(execute_duration_s=5.0)
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
@@ -5683,7 +5717,7 @@ def test_kernel_stop_route_reports_rejection_honestly():
     """A kernel with nothing to stop must report the rejection, not a fake
     success."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
@@ -5707,7 +5741,7 @@ def test_lifespan_shutdown_closes_kernel_before_recorder():
             call_order.append("kernel_close")
 
     kernel = ClosableKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
 
     original_recorder_close = state.event_recorder.close
 
@@ -5729,7 +5763,7 @@ def test_lifespan_shutdown_quiesces_running_cycle():
     and the quiesce's own kernel events must be drained into durable history
     before the recorder closes — not left behind in the kernel buffer."""
     kernel = MockKernelClient(execute_duration_s=10.0)
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
 
     flush_calls: list[str] = []
     original_record = state.event_recorder.record_native_kernel_events
@@ -5808,7 +5842,7 @@ class TestRequestIdAndLogThrottling:
 
     def test_successful_get_logs_are_throttled_per_route(self, caplog):
         kernel = MockKernelClient()
-        state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+        state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
         app = create_app(state, security=_TEST_SECURITY)
         with _capture_app_logger(caplog, logging.INFO):
             with TestClient(app) as local_client:
@@ -5824,7 +5858,7 @@ class TestRequestIdAndLogThrottling:
 
     def test_mutations_and_failures_always_log(self, caplog):
         kernel = MockKernelClient()
-        state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+        state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
         app = create_app(state, security=_TEST_SECURITY)
         with _capture_app_logger(caplog, logging.INFO):
             with TestClient(app) as local_client:
@@ -5858,7 +5892,7 @@ def test_internal_error_response_carries_request_id(caplog):
             raise ValueError("unhandled route failure")
 
     kernel = MetricsBoomKernel()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
 
     with _capture_app_logger(caplog, logging.ERROR):
@@ -5965,7 +5999,7 @@ def test_kernel_events_route_records_drop_gap_evidence():
     the recorder so collector-overflow loss becomes durable gap evidence even
     when no websocket client ever connects."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -5997,7 +6031,7 @@ def test_kernel_events_route_records_drop_gap_evidence():
 def test_kernel_events_route_records_drop_advance_with_empty_batch():
     """RT-8F: loss accounting is independent of retained event delivery."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -6027,7 +6061,7 @@ def test_kernel_events_route_records_drop_advance_with_empty_batch():
 def test_state_hub_records_drop_advance_without_browser_or_events():
     """RT-8F: the always-on NRT pump makes empty-batch loss durable."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -6059,7 +6093,7 @@ def test_heartbeat_degrades_on_kernel_event_pipeline_drops():
     """OW1 regression: nonzero pipeline drop totals degrade the heartbeat and
     the component carries the gap-record accounting fields."""
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})

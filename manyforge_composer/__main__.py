@@ -19,10 +19,15 @@ from manyforge_behavior.model_paths import (
     default_package_paths,
     resolve_robot_model,
 )
+from manyforge_behavior.node_environment import (
+    build_node_environment,
+    configured_node_roots,
+)
 from manyforge_behavior.robot_model_runtime import (
     attach_robot_model_metadata,
     prepare_roboplan_runtime_model_view,
 )
+from manyforge_behavior.scenarios import configured_scenario_root_values
 from manyforge_composer.backend.logging_config import setup_logging
 from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
@@ -38,6 +43,30 @@ _ROS2_CONTROL_EXECUTION_ADAPTER_IDS = {
     "execution.ros2_control_fjt",
     "execution.ros2_control_follow_joint_trajectory",
 }
+
+
+def _node_environment_factory(catalog_path: str):
+    roots = configured_node_roots()
+    strict = os.environ.get("MANYFORGE_NODE_STRICT", "").lower() in {
+        "1", "true", "yes", "on"
+    }
+
+    def build(generation: int):
+        return build_node_environment(
+            catalog_path,
+            external_roots=roots,
+            strict=strict,
+            generation=generation,
+        )
+
+    return build
+
+
+def _scenario_roots() -> list[str]:
+    configured = configured_scenario_root_values()
+    if configured:
+        return list(configured)
+    return [str(Path(__file__).resolve().parents[1] / "examples")]
 
 
 def _configure_assistant_provider(
@@ -882,8 +911,10 @@ def _run_mcp(args):
 
     security = SecurityConfig.from_env()
     kernel, bundle = _make_kernel()
+    environment_factory = _node_environment_factory(args.catalog_path)
     state = ComposerState(
-        catalog_path=args.catalog_path,
+        node_environment=environment_factory(1),
+        node_environment_factory=environment_factory,
         kernel=kernel,
         kernel_factory=_make_kernel,
         kernel_bundle=bundle,
@@ -895,6 +926,7 @@ def _run_mcp(args):
         trace_max_age_s=args.trace_max_age_s,
         trace_max_bytes=args.trace_max_bytes,
         allowed_fs_roots=security.allowed_fs_roots,
+        scenario_roots=_scenario_roots(),
     )
     # ComposerState is the sole runtime owner. Keeping the initial bundle in
     # this long-lived stack frame would retain its scheduler/ROS resources
@@ -1081,9 +1113,11 @@ def main():
         kernel_mode=args.kernel_mode,
         mock_execute_duration_s=args.mock_execute_duration_s,
     )
+    environment_factory = _node_environment_factory(args.catalog_path)
 
     state = ComposerState(
-        catalog_path=args.catalog_path,
+        node_environment=environment_factory(1),
+        node_environment_factory=environment_factory,
         kernel=kernel,
         kernel_factory=lambda deployment=None: _make_kernel(
             deployment,
@@ -1099,6 +1133,7 @@ def main():
         trace_max_age_s=args.trace_max_age_s,
         trace_max_bytes=args.trace_max_bytes,
         allowed_fs_roots=security.allowed_fs_roots,
+        scenario_roots=_scenario_roots(),
     )
     _configure_assistant_provider(
         state,

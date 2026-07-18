@@ -167,6 +167,17 @@ export interface CatalogEntry {
 export interface CatalogResponse {
   version: string;
   entries: CatalogEntry[];
+  effectiveCatalogHash: string;
+  generation: number;
+  sources: NodeCatalogSource[];
+}
+
+export interface NodeCatalogSource {
+  nodeId: string;
+  kind: string;
+  path: string;
+  contentHash: string;
+  version: string;
 }
 
 // Program
@@ -201,6 +212,14 @@ export interface ProgramInfo {
   sourcePath: string;
   programSessionGeneration: number;
   programTreeHash: string;
+  compatibility?: ProgramCompatibility | null;
+}
+
+export interface ProgramCompatibility {
+  lanes: Array<'manyforge-only' | 'isaac-sim'>;
+  assistant: 'required' | 'optional' | 'forbidden';
+  requires: string[];
+  tags: string[];
 }
 
 export interface ProgramSceneResource {
@@ -743,6 +762,26 @@ export interface DeploymentInfo {
   robotConfig: RobotConfig;
   grippers: Record<string, GripperConfig>;
   graspRiskPolicy: GraspRiskPolicy;
+  compatibility?: DeploymentCompatibility | null;
+}
+
+export interface ExternalNodesConfig {
+  enabled: string[] | null;
+  strict: boolean;
+}
+
+export interface DeploymentScenario {
+  name: string;
+  program: string;
+  description: string;
+  aliases: string[];
+}
+
+export interface DeploymentCompatibility {
+  lane: 'manyforge-only' | 'isaac-sim';
+  provides: string[];
+  tags: string[];
+  scenarios: DeploymentScenario[];
 }
 
 export interface FullDeployment {
@@ -767,7 +806,55 @@ export interface FullDeployment {
   authorityMatrix: Record<string, AuthorityDomainConfig>;
   poseSources: PoseSourceConfig[];
   simulationControl?: SimulationControlConfig | null;
+  externalNodes: ExternalNodesConfig;
+  runtimeResources: Record<string, unknown>;
+  compatibility?: DeploymentCompatibility | null;
   sourcePath: string;
+}
+
+export interface NodeDiscoveryResult {
+  path: string;
+  nodeId?: string | null;
+  version?: string | null;
+  status: 'accepted' | 'rejected' | 'warning' | string;
+  errorCode?: string | null;
+  messages: string[];
+}
+
+export interface NodeDiscoveryReport {
+  status: 'ok' | 'rejected' | 'conflict';
+  attemptedAtNs: number;
+  roots: string[];
+  strict: boolean;
+  previousCatalogHash?: string | null;
+  effectiveCatalogHash?: string | null;
+  activeEffectiveCatalogHash: string;
+  activeGeneration: number;
+  activated: boolean;
+  conflict?: string | null;
+  summary: {
+    accepted: number;
+    rejected: number;
+    added: number;
+    changed: number;
+    removed: number;
+    unchanged: number;
+  };
+  results: NodeDiscoveryResult[];
+}
+
+export interface ScenarioDescriptor {
+  name: string;
+  lane: 'manyforge-only' | 'isaac-sim';
+  assistant: 'on' | 'off';
+  programPath: string;
+  deploymentPath: string;
+  description: string;
+  aliases: string[];
+}
+
+export interface ScenarioCatalogResponse {
+  scenarios: ScenarioDescriptor[];
 }
 
 export interface ApplySessionResponse {

@@ -1,6 +1,8 @@
 """Security tests for ManyForge Composer backend."""
 from __future__ import annotations
 
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
+
 from pathlib import Path
 
 import pytest
@@ -29,7 +31,7 @@ def _make_app(
     allowed_fs_roots: list[str] | None = None,
 ) -> tuple[TestClient, ComposerState]:
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     sec = SecurityConfig(
         cors_origins=cors_origins or ["http://localhost:3000"],
         api_token=api_token,

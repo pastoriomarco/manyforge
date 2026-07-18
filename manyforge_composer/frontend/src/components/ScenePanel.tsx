@@ -4,6 +4,7 @@ import { useEditLocked } from '../store/cycleStore';
 import { useProgramStore } from '../store/programStore';
 import type {
   ProgramSceneResource,
+  ProgramCompatibility,
   SceneFrameState,
   SceneObjectState,
   SceneStateResponse,
@@ -1202,6 +1203,12 @@ function LiveSceneObjectCard({
 export function ScenePanel() {
   const sceneResources = useProgramStore((state) => state.sceneResources);
   const setSceneResources = useProgramStore((state) => state.setSceneResources);
+  const programCompatibility = useProgramStore(
+    (state) => state.programCompatibility,
+  );
+  const setProgramCompatibility = useProgramStore(
+    (state) => state.setProgramCompatibility,
+  );
   const editLocked = useEditLocked();
   const [sceneState, setSceneState] = useState<SceneStateResponse | null>(null);
   const [frames, setFrames] = useState<SceneFrameState[]>([]);
@@ -1221,6 +1228,19 @@ export function ScenePanel() {
   const [newPosition, setNewPosition] = useState<number[]>([0.4, 0.0, 0.1]);
   const [newRpyDegrees, setNewRpyDegrees] = useState<number[]>([0, 0, 0]);
   const [newObjectOpen, setNewObjectOpen] = useState(false);
+
+  const updateCompatibility = useCallback(
+    (patch: Partial<ProgramCompatibility>) => {
+      const current = programCompatibility ?? {
+        lanes: ['manyforge-only'],
+        assistant: 'optional',
+        requires: [],
+        tags: [],
+      };
+      setProgramCompatibility({ ...current, ...patch });
+    },
+    [programCompatibility, setProgramCompatibility],
+  );
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -1420,6 +1440,86 @@ export function ScenePanel() {
           Refresh Live Scene
         </button>
       </div>
+
+      <Section title="Program Compatibility">
+        <label className="flex items-center gap-2 text-xs text-gray-300">
+          <input
+            type="checkbox"
+            checked={programCompatibility !== null}
+            onChange={(event) => {
+              setProgramCompatibility(
+                event.target.checked
+                  ? {
+                      lanes: ['manyforge-only'],
+                      assistant: 'optional',
+                      requires: [],
+                      tags: [],
+                    }
+                  : null,
+              );
+            }}
+            disabled={editLocked}
+          />
+          Enabled
+        </label>
+        {programCompatibility && (
+          <div className="rounded border border-gray-700 bg-gray-900/40 p-3 space-y-2">
+            <div className="grid grid-cols-2 gap-2">
+              {(['manyforge-only', 'isaac-sim'] as const).map((lane) => (
+                <label key={lane} className="flex items-center gap-2 text-xs text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={programCompatibility.lanes.includes(lane)}
+                    onChange={(event) => {
+                      const lanes = event.target.checked
+                        ? Array.from(new Set([...programCompatibility.lanes, lane]))
+                        : programCompatibility.lanes.filter((value) => value !== lane);
+                      if (lanes.length > 0) updateCompatibility({ lanes });
+                    }}
+                    disabled={editLocked}
+                  />
+                  {lane}
+                </label>
+              ))}
+            </div>
+            <label className="block">
+              <span className="text-[11px] text-gray-400">Assistant</span>
+              <select
+                value={programCompatibility.assistant}
+                onChange={(event) => updateCompatibility({
+                  assistant: event.target.value as ProgramCompatibility['assistant'],
+                })}
+                disabled={editLocked}
+                className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50"
+              >
+                <option value="required">required</option>
+                <option value="optional">optional</option>
+                <option value="forbidden">forbidden</option>
+              </select>
+            </label>
+            <TextInput
+              label="Required deployment tokens"
+              value={programCompatibility.requires.join(', ')}
+              onChange={(value) => updateCompatibility({
+                requires: Array.from(new Set(
+                  value.split(',').map((item) => item.trim()).filter(Boolean),
+                )),
+              })}
+              disabled={editLocked}
+            />
+            <TextInput
+              label="Tags"
+              value={programCompatibility.tags.join(', ')}
+              onChange={(value) => updateCompatibility({
+                tags: Array.from(new Set(
+                  value.split(',').map((item) => item.trim()).filter(Boolean),
+                )),
+              })}
+              disabled={editLocked}
+            />
+          </div>
+        )}
+      </Section>
 
       <Section title="Viewer Frames">
         {!viewerAvailable && (

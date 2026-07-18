@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+if [ -n "${MANYFORGE_ROOT:-}" ]; then
+    REPO_ROOT=$MANYFORGE_ROOT
+elif [ -d /workspace/manyforge_behavior ]; then
+    REPO_ROOT=/workspace
+else
+    SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    REPO_ROOT=$(dirname -- "$SCRIPT_DIR")
+fi
+export PYTHONPATH="$REPO_ROOT/manyforge_ros:$REPO_ROOT/manyforge_behavior:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+exec python -m manyforge_behavior.cli "$@"

@@ -148,6 +148,11 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
 
 WORKDIR /workspace
 
+# Source-mounted development images expose the same CLI name as an installed
+# manyforge_behavior package. ENV (rather than entrypoint-only export) keeps it
+# available to `docker exec` operator workflows as well as PID 1.
+ENV PATH="/workspace/scripts:${PATH}"
+
 RUN useradd --create-home --shell /bin/bash --uid 1000 manyforge \
     && mkdir -p /tmp/manyforge-build /workspace \
     && chown -R manyforge:manyforge /tmp/manyforge-build /home/manyforge /workspace
@@ -161,8 +166,8 @@ RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # Copy built frontend from Stage 1
 COPY --from=frontend-builder --chown=manyforge:manyforge /build/dist/ /opt/manyforge-frontend/dist/
 
-# Install manyforge_behavior in editable mode (mounted at runtime)
-# This is done via an entrypoint script so the volume mount exists
+# The source-mounted behavior package is exposed through PYTHONPATH by the
+# entrypoint; /workspace/scripts/manyforge is its container CLI shim.
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

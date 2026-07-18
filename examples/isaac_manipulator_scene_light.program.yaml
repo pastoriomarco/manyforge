@@ -5,7 +5,12 @@ description: 'Isaac Sim light-scene reproduction for UR10e + Robotiq 2F-140: rob
   base pose and selected table/object meshes are authored from the live Isaac scene.
   The pick-and-place behavior tree is adapted from the known-good Robotiq demo and
   targets the Isaac cheese box instead of the legacy graspable.'
-catalog_version: "0.3.0"
+compatibility:
+  lanes: [isaac-sim]
+  assistant: optional
+  requires: [ros2_control, robotiq_2f_140_gripper]
+  tags: [pick-and-place, isaac-sim, ur10e, robotiq]
+catalog_version: "0.4.0"
 robot:
   robot_id: ur10e
   group_id: arm

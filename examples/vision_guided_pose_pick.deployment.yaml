@@ -1,10 +1,20 @@
 api_version: manyforge.deployment.v0
-schema_version: "0.1.0"
+schema_version: "0.2.0"
 name: ur5_roboplan_local_vision_guided_pose_pick
 description: >-
   Local deployment for the vision-guided pose-pick example. Requires the viewer
   to be running with at least one connected native viewer snapshot client so `query_model` can
   attach a live scene snapshot.
+
+compatibility:
+  lane: manyforge-only
+  provides: [vision_pose_inference]
+  tags: [vision-pick, ur5]
+  scenarios:
+    - name: ur5-vision-pose-pick
+      program: vision_guided_pose_pick.program.yaml
+      description: UR5 vision-guided pose pick
+      aliases: [vision-pose]
 
 program_profile: v0.1
 

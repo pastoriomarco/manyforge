@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-07-16 23:53:24 UTC
+  Last regenerated: 2026-07-18 00:37:56 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -83,6 +83,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/kernel/metrics` | kernel | Get Kernel Metrics |
 | `GET` | `/api/kernel/snapshot` | kernel | Get Kernel Snapshot |
 | `POST` | `/api/kernel/stop` | kernel | Kernel Stop |
+| `GET` | `/api/nodes/diagnostics` | nodes | Node Diagnostics |
+| `GET` | `/api/nodes/discovered` | nodes | Discovered Nodes |
+| `POST` | `/api/nodes/reload` | nodes | Reload Nodes |
+| `GET` | `/api/nodes/{node_id}/source` | nodes | Node Source |
 | `GET` | `/api/program` | program | Get Program |
 | `POST` | `/api/program/load` | program | Load Program |
 | `GET` | `/api/program/runtime-overrides` | program | Get Runtime Override Status |
@@ -105,6 +109,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `POST` | `/api/robot-control/candidates/{candidate_id}/revert` | robot-control | Revert Candidate |
 | `POST` | `/api/runtime/external/{provider_id}` | runtime | Update External Runtime Status |
 | `GET` | `/api/runtime/status` | runtime | Runtime Status |
+| `GET` | `/api/scenarios` | scenarios | List Scenarios |
 | `GET` | `/api/scene/diagnostics` | scene | Get Scene Diagnostics |
 | `POST` | `/api/scene/edit` | scene | Edit Scene |
 | `GET` | `/api/scene/frames` | scene | Get Scene Frames |

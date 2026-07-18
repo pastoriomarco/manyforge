@@ -160,8 +160,8 @@ stop_vllm_status_watcher() {
 # into the container and have the inline Python command read them. The
 # host process binds directly on the chosen ports.
 #
-# Optional env (forwarded to Composer): MANYFORGE_ASSISTANT_PROVIDER,
-# MANYFORGE_ASSISTANT_ENDPOINT_URL, MANYFORGE_ASSISTANT_TIMEOUT_S.
+# Optional env (forwarded to Composer): assistant settings plus
+# MANYFORGE_NODE_ROOTS, MANYFORGE_NODE_STRICT, and MANYFORGE_SCENARIO_ROOTS.
 start_composer_dev_container() {
     local container_name="${COMPOSER_CONTAINER:-manyforge-e2e-composer}"
     local composer_port="${COMPOSER_PORT:-9000}"
@@ -189,6 +189,15 @@ start_composer_dev_container() {
     fi
     if [[ -n "${MANYFORGE_ASSISTANT_TIMEOUT_S:-}" ]]; then
         assistant_env+=(-e "MANYFORGE_ASSISTANT_TIMEOUT_S=${MANYFORGE_ASSISTANT_TIMEOUT_S}")
+    fi
+    if [[ -n "${MANYFORGE_NODE_ROOTS:-}" ]]; then
+        assistant_env+=(-e "MANYFORGE_NODE_ROOTS=${MANYFORGE_NODE_ROOTS}")
+    fi
+    if [[ -n "${MANYFORGE_NODE_STRICT:-}" ]]; then
+        assistant_env+=(-e "MANYFORGE_NODE_STRICT=${MANYFORGE_NODE_STRICT}")
+    fi
+    if [[ -n "${MANYFORGE_SCENARIO_ROOTS:-}" ]]; then
+        assistant_env+=(-e "MANYFORGE_SCENARIO_ROOTS=${MANYFORGE_SCENARIO_ROOTS}")
     fi
     # Frontend dev-build knobs must cross the docker boundary or
     # `MANYFORGE_FRONTEND_SOURCE_MODE=worktree launch.sh restart` silently

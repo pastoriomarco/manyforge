@@ -222,7 +222,7 @@ def _validate_deployment_against_catalogs(
     state: ComposerState,
     deployment: Deployment,
 ) -> None:
-    deployment.validate_assistant_modes(state.catalog, state.skill_catalog)
+    deployment.validate_assistant_modes(state.node_catalog, state.skill_catalog)
 
 
 def _strip_readonly_deployment_response_fields(data: dict) -> dict:
@@ -237,6 +237,11 @@ def _strip_readonly_deployment_response_fields(data: dict) -> dict:
     cleaned = dict(data)
     cleaned.pop("source_path", None)
     cleaned.pop("sourcePath", None)
+    external_nodes = cleaned.get("external_nodes")
+    if isinstance(external_nodes, dict) and external_nodes.get("enabled") is None:
+        external_nodes = dict(external_nodes)
+        external_nodes.pop("enabled", None)
+        cleaned["external_nodes"] = external_nodes
     grippers = cleaned.get("grippers")
     if isinstance(grippers, dict):
         cleaned_grippers: dict[str, dict] = {}
@@ -608,6 +613,16 @@ def _deployment_to_full_response(
             if deployment.simulation_control is not None
             else None
         ),
+        externalNodes={
+            "enabled": (
+                list(deployment.external_nodes.enabled)
+                if deployment.external_nodes.enabled is not None
+                else None
+            ),
+            "strict": deployment.external_nodes.strict,
+        },
+        runtimeResources=dict(deployment.runtime_resources),
+        compatibility=_deployment_compatibility_payload(deployment),
         sourcePath=source_path,
     ).model_dump(by_alias=True)
 
@@ -664,6 +679,38 @@ def _program_blackboard_to_response(program: Program) -> dict:
                 "description": key.description,
             }
             for key in program.blackboard_keys.values()
+        ],
+    }
+
+
+def _program_compatibility_payload(program: Program) -> dict | None:
+    compatibility = program.compatibility
+    if compatibility is None:
+        return None
+    return {
+        "lanes": list(compatibility.lanes),
+        "assistant": compatibility.assistant,
+        "requires": list(compatibility.requires),
+        "tags": list(compatibility.tags),
+    }
+
+
+def _deployment_compatibility_payload(deployment: Deployment) -> dict | None:
+    compatibility = deployment.compatibility
+    if compatibility is None:
+        return None
+    return {
+        "lane": compatibility.lane,
+        "provides": list(compatibility.provides),
+        "tags": list(compatibility.tags),
+        "scenarios": [
+            {
+                "name": scenario.name,
+                "program": scenario.program,
+                "description": scenario.description,
+                "aliases": list(scenario.aliases),
+            }
+            for scenario in compatibility.scenarios
         ],
     }
 
@@ -733,6 +780,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             parameterCount=len(program.parameters),
             parameters=_program_parameters_to_response(program),
             blackboard=_program_blackboard_to_response(program),
+            compatibility=_program_compatibility_payload(program),
             sourcePath=state.program_source_path,
             programSessionGeneration=state.program_session_generation,
             programTreeHash=state.program_tree_hash,
@@ -762,6 +810,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             parameterCount=len(program.parameters),
             parameters=_program_parameters_to_response(program),
             blackboard=_program_blackboard_to_response(program),
+            compatibility=_program_compatibility_payload(program),
             sourcePath=state.program_source_path,
             programSessionGeneration=state.program_session_generation,
             programTreeHash=state.program_tree_hash,
@@ -775,7 +824,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
         try:
             saved_program = Program(
                 state.program_source_path,
-                state.catalog,
+                state.node_catalog,
                 skill_catalog=state.skill_catalog,
                 deployment_capability_keys=_deployment_capability_keys(state),
             )
@@ -799,6 +848,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             parameterCount=len(saved_program.parameters),
             parameters=_program_parameters_to_response(saved_program),
             blackboard=_program_blackboard_to_response(saved_program),
+            compatibility=_program_compatibility_payload(saved_program),
             sourcePath=state.program_source_path,
             programSessionGeneration=0,
             programTreeHash="",
@@ -864,7 +914,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             }
         errors, warnings = collect_tree_validation_issues(
             tree,
-            state.catalog,
+            state.node_catalog,
             parameter_defaults=parameter_defaults,
             blackboard_namespaces=blackboard_namespaces,
             blackboard_keys=blackboard_keys,
@@ -1101,7 +1151,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
         try:
             saved_program = Program(
                 state.program_source_path,
-                state.catalog,
+                state.node_catalog,
                 skill_catalog=state.skill_catalog,
                 deployment_capability_keys=_deployment_capability_keys(state),
             )
@@ -1161,6 +1211,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 for gripper_id, gripper in deployment.grippers.items()
             },
             graspRiskPolicy=_grasp_risk_policy_to_serialized_dict(deployment),
+            compatibility=_deployment_compatibility_payload(deployment),
         ).model_dump(by_alias=True)
 
     @router.get("/deployment", response_model=DeploymentResponse, response_model_by_alias=True)
@@ -1196,6 +1247,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 for gripper_id, gripper in deployment.grippers.items()
             },
             graspRiskPolicy=_grasp_risk_policy_to_serialized_dict(deployment),
+            compatibility=_deployment_compatibility_payload(deployment),
         ).model_dump(by_alias=True)
 
     @router.get("/deployment/full", response_model=FullDeploymentResponse, response_model_by_alias=True)
@@ -1235,7 +1287,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             program_data["tree"] = request.tree.model_dump()
             updated_program = Program.from_dict(
                 program_data,
-                state.catalog,
+                state.node_catalog,
                 path=state.program_source_path or "<memory>",
                 skill_catalog=state.skill_catalog,
                 deployment_capability_keys=_deployment_capability_keys(state),
@@ -1303,9 +1355,14 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 ]
             if request.blackboard is not None:
                 program_data["blackboard"] = request.blackboard.model_dump(by_alias=True)
+            if "compatibility" in request.model_fields_set:
+                if request.compatibility is None:
+                    program_data.pop("compatibility", None)
+                else:
+                    program_data["compatibility"] = request.compatibility.model_dump()
             Program.from_dict(
                 program_data,
-                state.catalog,
+                state.node_catalog,
                 path=target_path,
                 skill_catalog=state.skill_catalog,
                 deployment_capability_keys=_deployment_capability_keys(state),
@@ -1415,6 +1472,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 or request.scene is not None
                 or request.program_parameters is not None
                 or request.blackboard is not None
+                or "compatibility" in request.model_fields_set
             ):
                 program_data = state.program.to_dict()
                 if request.tree is not None:
@@ -1431,9 +1489,16 @@ def create_program_router(state: ComposerState) -> APIRouter:
                     ]
                 if request.blackboard is not None:
                     program_data["blackboard"] = request.blackboard.model_dump(by_alias=True)
+                if "compatibility" in request.model_fields_set:
+                    if request.compatibility is None:
+                        program_data.pop("compatibility", None)
+                    else:
+                        program_data["compatibility"] = (
+                            request.compatibility.model_dump()
+                        )
                 program = Program.from_dict(
                     program_data,
-                    state.catalog,
+                    state.node_catalog,
                     path=state.program_source_path or "<memory>",
                     skill_catalog=state.skill_catalog,
                     deployment_capability_keys=deployment_capability_keys,

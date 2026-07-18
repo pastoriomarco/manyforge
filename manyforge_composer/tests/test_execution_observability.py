@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
+
 import time
 import os
 import tempfile
@@ -42,7 +44,7 @@ def _write_yaml_file(data: dict, *, suffix: str = ".yaml") -> str:
     return handle.name
 
 def test_execution_blackboard_snapshot_after_reset():
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
@@ -64,7 +66,7 @@ def test_execution_blackboard_snapshot_after_reset():
 
 def test_execution_digest_reports_running_state_and_object_summary():
     kernel = MockKernelClient(execute_duration_s=1.0)
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
@@ -84,7 +86,7 @@ def test_execution_digest_reports_running_state_and_object_summary():
 
 def test_execution_digest_reports_held_motion_stop_as_resume_required():
     kernel = MockKernelClient(execute_duration_s=1.0)
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
@@ -112,7 +114,7 @@ def test_execution_digest_reports_held_motion_stop_as_resume_required():
 
 def test_execution_digest_reports_held_intervention_as_explicit_recovery_required():
     kernel = MockKernelClient(execute_duration_s=1.0)
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
@@ -192,7 +194,7 @@ def test_execution_digest_reports_structured_backend_fault_details():
             }
             return snapshot
 
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=TrackingFaultKernel())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=TrackingFaultKernel())
     app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
@@ -219,7 +221,7 @@ def test_execution_digest_reports_latest_incident_headline_cause():
             snapshot.error_details = {"reason_code": "planning_timeout"}
             return snapshot
 
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=PlanningTimeoutKernel())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=PlanningTimeoutKernel())
     app = create_app(state, security=_TEST_SECURITY)
     state.event_recorder._record_event(
         event_type="plan_failed",
@@ -262,7 +264,7 @@ def test_execution_digest_reports_latest_incident_headline_cause():
 def test_execution_history_and_export_use_trace_sink(tmp_path):
     kernel = MockKernelClient(execute_duration_s=1.0)
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=kernel,
         trace_dir=str(tmp_path),
     )
@@ -322,7 +324,7 @@ def test_debug_export_preserves_string_valued_kernel_metric():
             return metrics
 
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=SourceIdentityMetricsKernel(),
     )
     app = create_app(state, security=_TEST_SECURITY)
@@ -355,7 +357,7 @@ def test_debug_export_preserves_structured_runtime_collision_metrics():
             return metrics
 
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=StructuredMetricsKernel(),
     )
     app = create_app(state, security=_TEST_SECURITY)
@@ -381,7 +383,7 @@ def test_debug_export_preserves_structured_runtime_collision_metrics():
 
 def test_execution_channels_and_debug_export_surface_incident_snapshot(tmp_path):
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         trace_dir=str(tmp_path),
     )
@@ -420,7 +422,7 @@ def test_execution_channels_and_debug_export_surface_incident_snapshot(tmp_path)
 
 def test_infra_heartbeat_reports_kernel_and_archive_status(tmp_path):
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         trace_dir=str(tmp_path),
     )
@@ -444,7 +446,7 @@ def test_infra_heartbeat_reports_kernel_and_archive_status(tmp_path):
 
 def test_infra_heartbeat_degrades_when_failure_archives_drop(tmp_path):
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         trace_dir=str(tmp_path),
     )
@@ -474,7 +476,7 @@ def test_scene_diagnostics_reports_native_visual_mismatch():
             frame_id="universe",
         )
     )
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.update_visual_scene_objects_snapshot(
         [
             SceneObjectSnapshot(
@@ -513,7 +515,7 @@ def test_execution_digest_and_debug_export_report_signal_provider_health():
             raise RuntimeError("connector offline")
 
     kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
@@ -649,7 +651,7 @@ def test_latency_histograms_endpoint_and_debug_export(tmp_path):
     per-run payload is reachable via its endpoint and the debug export."""
     kernel = MockKernelClient(execute_duration_s=0.2)
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=kernel,
         trace_dir=str(tmp_path),
     )
@@ -695,7 +697,7 @@ def test_latency_histograms_endpoint_and_debug_export(tmp_path):
 def test_heartbeat_reports_stop_latency_component(tmp_path):
     """OW6: the heartbeat carries an informational stop-latency summary."""
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         trace_dir=str(tmp_path),
     )
@@ -715,7 +717,7 @@ def test_heartbeat_reports_stop_latency_component(tmp_path):
 def test_heartbeat_reports_realtime_components(tmp_path):
     """RT-6: heartbeat carries runtime-safety and route-executor evidence."""
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         trace_dir=str(tmp_path),
     )
@@ -746,7 +748,7 @@ def test_heartbeat_degrades_on_runtime_collision_tick_fault(tmp_path):
             return metrics
 
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=FaultedRuntimeSafetyKernel(),
         trace_dir=str(tmp_path),
     )
@@ -773,7 +775,7 @@ def test_heartbeat_degrades_on_runtime_collision_missed_period(tmp_path):
             return metrics
 
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=LateRuntimeSafetyKernel(),
         trace_dir=str(tmp_path),
     )
@@ -795,7 +797,7 @@ def test_heartbeat_degrades_when_runtime_safety_metrics_unavailable(tmp_path):
             raise RuntimeError("metrics unavailable")
 
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MetricsUnavailableKernel(),
         trace_dir=str(tmp_path),
     )
@@ -821,7 +823,7 @@ def test_heartbeat_degrades_when_route_executor_status_unavailable(
 
     monkeypatch.setattr(routes_infra, "route_executor_status", raise_status_error)
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         trace_dir=str(tmp_path),
     )
@@ -852,7 +854,7 @@ def _seed_runs_at_walls(rec, monkeypatch, runs):
 
 def test_cross_run_history_endpoint_windows_by_wall(tmp_path, monkeypatch):
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         trace_dir=str(tmp_path),
     )
@@ -919,7 +921,7 @@ def test_cross_run_history_endpoint_windows_by_wall(tmp_path, monkeypatch):
 
 def test_debug_export_includes_run_index(tmp_path, monkeypatch):
     state = ComposerState(
-        catalog_path=_CATALOG_PATH,
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
         kernel=MockKernelClient(),
         trace_dir=str(tmp_path),
     )

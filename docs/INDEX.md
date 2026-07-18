@@ -85,7 +85,12 @@ branch/commit workflow).
 - [`operations/OBSERVABILITY.md`](operations/OBSERVABILITY.md)
   - Log file locations, observability REST endpoints (health, kernel
     events/metrics/snapshot, execution history, debug export, scene
-    diagnostics), diagnostic scripts, env vars, and container names.
+  diagnostics), diagnostic scripts, env vars, and container names.
+
+- [`operations/EXTERNAL_NODES.md`](operations/EXTERNAL_NODES.md)
+  - Trusted external behavior-node installation, container-root configuration,
+    validation CLI, deployment enablement and resource aliases, idle-only
+    Composer reload, diagnostics, and supplier delivery checklist.
 
 - [`operations/TROUBLESHOOTING.md`](operations/TROUBLESHOOTING.md)
   - Cross-cutting symptom → cause → diagnostic-step matrix.

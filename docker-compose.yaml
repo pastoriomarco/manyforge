@@ -38,6 +38,9 @@ services:
       - build-cache:/tmp/manyforge-build
     environment:
       MANYFORGE_VALIDATION_COLLISION_WORKERS: ${MANYFORGE_VALIDATION_COLLISION_WORKERS:-}
+      MANYFORGE_NODE_ROOTS: ${MANYFORGE_NODE_ROOTS:-}
+      MANYFORGE_NODE_STRICT: ${MANYFORGE_NODE_STRICT:-}
+      MANYFORGE_SCENARIO_ROOTS: ${MANYFORGE_SCENARIO_ROOTS:-}
       # Traces live under the repo bind mount so they survive reboots and
       # container recreation with correct (host-user) ownership; a fresh
       # named volume would be root-owned while Composer runs non-root.
@@ -70,6 +73,9 @@ services:
       - build-cache:/tmp/manyforge-build
     environment:
       MANYFORGE_VALIDATION_COLLISION_WORKERS: ${MANYFORGE_VALIDATION_COLLISION_WORKERS:-}
+      MANYFORGE_NODE_ROOTS: ${MANYFORGE_NODE_ROOTS:-}
+      MANYFORGE_NODE_STRICT: ${MANYFORGE_NODE_STRICT:-}
+      MANYFORGE_SCENARIO_ROOTS: ${MANYFORGE_SCENARIO_ROOTS:-}
       MANYFORGE_TRACE_DIR: /workspace/.manyforge-var/traces
     working_dir: /workspace
     command: ["bash", "-lc", "python -m manyforge_composer --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml --host 0.0.0.0 --port 9000"]
@@ -184,6 +190,9 @@ services:
       - MANYFORGE_VALIDATION_COLLISION_WORKERS=${MANYFORGE_VALIDATION_COLLISION_WORKERS:-}
       - MANYFORGE_FRONTEND_SOURCE_MODE=${MANYFORGE_FRONTEND_SOURCE_MODE:-committed}
       - MANYFORGE_FRONTEND_FORCE_REBUILD=${MANYFORGE_FRONTEND_FORCE_REBUILD:-}
+      - MANYFORGE_NODE_ROOTS=${MANYFORGE_NODE_ROOTS:-}
+      - MANYFORGE_NODE_STRICT=${MANYFORGE_NODE_STRICT:-}
+      - MANYFORGE_SCENARIO_ROOTS=${MANYFORGE_SCENARIO_ROOTS:-}
       # Opt-in RP5 qualification instrumentation. The start script exports the
       # preload only after the requested probe has built successfully, so
       # normal runtime commands never inherit a missing or test-only library.

@@ -6,7 +6,12 @@ description: >-
   joint-goal move plus a scene edit. Owned by examples/ so the launcher does
   not depend on test fixtures (which stay pinned to v0.0 for the behavior
   suite, while shipped deployments declare v0.1 and profile match is exact).
-catalog_version: "0.3.0"
+compatibility:
+  lanes: [manyforge-only]
+  assistant: forbidden
+  requires: []
+  tags: [smoke, pick-and-place, ur5]
+catalog_version: "0.4.0"
 
 robot:
   robot_id: ur5

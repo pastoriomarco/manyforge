@@ -3,6 +3,8 @@ import { useShallow } from 'zustand/react/shallow';
 import { api } from '../api/client';
 import type {
   AssistantConfig,
+  DeploymentCompatibility,
+  DeploymentScenario,
   FullDeployment,
   ModelEndpointCapabilities,
   ModelEndpointCatalog,
@@ -15,8 +17,10 @@ import type {
   SceneFrameState,
   SceneUrdfManifest,
   RobotControlJointLimit,
+  NodeDiscoveryReport,
 } from '../types/api';
 import { useDeploymentStore } from '../store/deploymentStore';
+import { useCatalogStore } from '../store/catalogStore';
 import { useEditLocked } from '../store/cycleStore';
 import { useStatusPolling, useStatusStore } from '../store/statusStore';
 import { robotControlJointNamesForGroup } from '../utils/robotModelAuthority';
@@ -39,9 +43,16 @@ import {
   gripperCompletionNotice,
   gripperTransportKind,
 } from '../utils/gripperSemantics';
+import { NodeDiscoveryDiagnostics } from './NodeDiscoveryDiagnostics';
 
 function signature(value: unknown): string {
   return JSON.stringify(value ?? null);
+}
+
+function commaSeparatedValues(value: string): string[] {
+  return Array.from(new Set(
+    value.split(',').map((item) => item.trim()).filter(Boolean),
+  ));
 }
 
 function FieldInput({
@@ -2138,12 +2149,30 @@ export function DeploymentPanel() {
     })),
   );
   const editLocked = useEditLocked();
+  const catalogSources = useCatalogStore((state) => state.sources);
+  const fetchCatalog = useCatalogStore((state) => state.fetchCatalog);
   useStatusPolling();
   const runtime = useStatusStore((state) => state.runtime);
   const stopProfileView = buildStopProfileView(runtime);
   const [modelEndpointCatalog, setModelEndpointCatalog] = useState<ModelEndpointCatalog | null>(null);
   const [sceneFrames, setSceneFrames] = useState<SceneFrameState[]>([]);
   const [urdfManifest, setUrdfManifest] = useState<SceneUrdfManifest | null>(null);
+  const [nodeDiscoveryReport, setNodeDiscoveryReport] = useState<NodeDiscoveryReport | null>(null);
+  const [nodeReloading, setNodeReloading] = useState(false);
+  const [nodeReloadError, setNodeReloadError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void api.nodes.diagnostics()
+      .then((report) => {
+        if (!cancelled) setNodeDiscoveryReport(report);
+      })
+      .catch(() => {
+        if (!cancelled) setNodeDiscoveryReport(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   useEffect(() => {
     let cancelled = false;
     void api.urdf.manifest()
@@ -2328,6 +2357,57 @@ export function DeploymentPanel() {
       enabled: true,
     });
   }, [setField]);
+
+  const reloadNodeCatalog = useCallback(async () => {
+    setNodeReloading(true);
+    setNodeReloadError(null);
+    try {
+      const report = await api.nodes.reload();
+      await fetchCatalog();
+      const catalogRefreshError = useCatalogStore.getState().error;
+      if (catalogRefreshError) {
+        throw new Error(
+          `Node catalog reloaded, but the Composer palette refresh failed: ${catalogRefreshError}`,
+        );
+      }
+      setNodeDiscoveryReport(report);
+    } catch (reloadError) {
+      setNodeReloadError((reloadError as Error).message);
+      try {
+        setNodeDiscoveryReport(await api.nodes.diagnostics());
+      } catch {
+        // Preserve the original reload error when diagnostics are unavailable.
+      }
+    } finally {
+      setNodeReloading(false);
+    }
+  }, [fetchCatalog]);
+
+  const updateCompatibility = useCallback(
+    (patch: Partial<DeploymentCompatibility>) => {
+      if (!deployment) return;
+      const current = deployment.compatibility ?? {
+        lane: 'manyforge-only',
+        provides: [],
+        tags: [],
+        scenarios: [],
+      };
+      setField('compatibility', { ...current, ...patch });
+    },
+    [deployment, setField],
+  );
+
+  const updateScenario = useCallback(
+    (index: number, patch: Partial<DeploymentScenario>) => {
+      if (!deployment?.compatibility) return;
+      updateCompatibility({
+        scenarios: deployment.compatibility.scenarios.map((scenario, position) => (
+          position === index ? { ...scenario, ...patch } : scenario
+        )),
+      });
+    },
+    [deployment?.compatibility, updateCompatibility],
+  );
 
   if (!deployment) {
     return (
@@ -2780,6 +2860,175 @@ export function DeploymentPanel() {
           onChange={(v) => setNestedField('orchestrator.config', v)}
           disabled={editLocked}
         />
+      </Section>
+
+      <Section title="External Nodes">
+        <label className="block">
+          <span className="text-xs text-gray-400">Availability</span>
+          <select
+            value={deployment.externalNodes.enabled === null ? 'all' : 'selected'}
+            onChange={(event) => setField('externalNodes', {
+              ...deployment.externalNodes,
+              enabled: event.target.value === 'all' ? null : [],
+            })}
+            disabled={editLocked}
+            className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50"
+          >
+            <option value="all">All installed nodes</option>
+            <option value="selected">Selected nodes</option>
+          </select>
+        </label>
+        {deployment.externalNodes.enabled !== null && (
+          <div className="space-y-1">
+            {catalogSources.filter((source) => source.kind === 'external_python').map((source) => (
+              <label key={source.nodeId} className="flex items-center gap-2 text-xs text-gray-300">
+                <input
+                  type="checkbox"
+                  checked={deployment.externalNodes.enabled?.includes(source.nodeId) ?? false}
+                  onChange={(event) => {
+                    const enabled = new Set(deployment.externalNodes.enabled ?? []);
+                    if (event.target.checked) enabled.add(source.nodeId);
+                    else enabled.delete(source.nodeId);
+                    setField('externalNodes', {
+                      ...deployment.externalNodes,
+                      enabled: Array.from(enabled).sort(),
+                    });
+                  }}
+                  disabled={editLocked}
+                />
+                {source.nodeId}
+              </label>
+            ))}
+            {catalogSources.every((source) => source.kind !== 'external_python') && (
+              <div className="text-xs text-gray-500">No external nodes installed.</div>
+            )}
+          </div>
+        )}
+        <CheckboxInput
+          label="Strict discovery"
+          checked={deployment.externalNodes.strict}
+          onChange={(strict) => setField('externalNodes', {
+            ...deployment.externalNodes,
+            strict,
+          })}
+          disabled={editLocked}
+        />
+        <ConfigTextarea
+          label="Runtime resources"
+          value={deployment.runtimeResources}
+          onChange={(value) => setField('runtimeResources', value)}
+          disabled={editLocked}
+        />
+        <button
+          type="button"
+          onClick={() => void reloadNodeCatalog()}
+          disabled={editLocked || nodeReloading}
+          className="w-full rounded border border-gray-600 px-3 py-2 text-sm text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {nodeReloading ? 'Reloading Node Catalog' : 'Reload Node Catalog'}
+        </button>
+        <NodeDiscoveryDiagnostics
+          report={nodeDiscoveryReport}
+          error={nodeReloadError}
+        />
+      </Section>
+
+      <Section title="Deployment Compatibility">
+        <label className="flex items-center gap-2 text-xs text-gray-300">
+          <input
+            type="checkbox"
+            checked={deployment.compatibility != null}
+            onChange={(event) => setField('compatibility', event.target.checked ? {
+              lane: 'manyforge-only',
+              provides: [],
+              tags: [],
+              scenarios: [],
+            } : null)}
+            disabled={editLocked}
+          />
+          Enabled
+        </label>
+        {deployment.compatibility && (
+          <div className="space-y-2">
+            <label className="block">
+              <span className="text-xs text-gray-400">Lane</span>
+              <select
+                value={deployment.compatibility.lane}
+                onChange={(event) => updateCompatibility({
+                  lane: event.target.value as DeploymentCompatibility['lane'],
+                })}
+                disabled={editLocked}
+                className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50"
+              >
+                <option value="manyforge-only">manyforge-only</option>
+                <option value="isaac-sim">isaac-sim</option>
+              </select>
+            </label>
+            <FieldInput
+              label="Provided tokens"
+              value={deployment.compatibility.provides.join(', ')}
+              onChange={(value) => updateCompatibility({ provides: commaSeparatedValues(value) })}
+              disabled={editLocked}
+            />
+            <FieldInput
+              label="Tags"
+              value={deployment.compatibility.tags.join(', ')}
+              onChange={(value) => updateCompatibility({ tags: commaSeparatedValues(value) })}
+              disabled={editLocked}
+            />
+            {deployment.compatibility.scenarios.map((scenario, index) => (
+              <div key={`${scenario.name}:${index}`} className="space-y-2 border-t border-gray-700 pt-2">
+                <FieldInput
+                  label="Scenario name"
+                  value={scenario.name}
+                  onChange={(value) => updateScenario(index, { name: value })}
+                  disabled={editLocked}
+                />
+                <FieldInput
+                  label="Program artifact"
+                  value={scenario.program}
+                  onChange={(value) => updateScenario(index, { program: value })}
+                  disabled={editLocked}
+                />
+                <FieldInput
+                  label="Description"
+                  value={scenario.description}
+                  onChange={(value) => updateScenario(index, { description: value })}
+                  disabled={editLocked}
+                />
+                <FieldInput
+                  label="Aliases"
+                  value={scenario.aliases.join(', ')}
+                  onChange={(value) => updateScenario(index, { aliases: commaSeparatedValues(value) })}
+                  disabled={editLocked}
+                />
+                <button
+                  type="button"
+                  onClick={() => updateCompatibility({
+                    scenarios: deployment.compatibility!.scenarios.filter((_, position) => position !== index),
+                  })}
+                  disabled={editLocked}
+                  className="w-full rounded border border-red-800 px-3 py-1 text-xs text-red-200 hover:bg-red-950/40 disabled:opacity-50"
+                >
+                  Remove Scenario
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              onClick={() => updateCompatibility({
+                scenarios: [
+                  ...deployment.compatibility!.scenarios,
+                  { name: '', program: '', description: '', aliases: [] },
+                ],
+              })}
+              disabled={editLocked}
+              className="w-full rounded border border-gray-600 px-3 py-2 text-sm text-gray-200 hover:bg-gray-700 disabled:opacity-50"
+            >
+              Add Scenario
+            </button>
+          </div>
+        )}
       </Section>
 
       <Section title="Launch">

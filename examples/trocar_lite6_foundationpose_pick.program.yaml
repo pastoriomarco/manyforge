@@ -5,7 +5,12 @@ description: Isaac-compatible Lite6 pick-and-place program for the trocar scene.
   deployment latches a FoundationPose Detection3DArray pose source for the `graspable`
   object before planning, then this program plans and executes a top-down pick sequence
   against the updated scene object.
-catalog_version: "0.3.0"
+compatibility:
+  lanes: [isaac-sim]
+  assistant: forbidden
+  requires: [ros2_control, lite_gripper, foundationpose]
+  tags: [pick-and-place, isaac-sim, lite6, foundationpose]
+catalog_version: "0.4.0"
 robot:
   robot_id: lite6
   group_id: lite6

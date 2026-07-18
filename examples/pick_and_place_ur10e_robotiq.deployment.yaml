@@ -1,8 +1,17 @@
 api_version: manyforge.deployment.v0
-schema_version: 0.1.0
+schema_version: 0.2.0
 name: ur10e_robotiq_pick_place_preview
 description: Preview deployment for UR10e + Robotiq 2F-140 native RoboPlan pick-and-place
   demo.
+compatibility:
+  lane: manyforge-only
+  provides: [robotiq_2f_140_gripper]
+  tags: [pick-and-place, ur10e, robotiq]
+  scenarios:
+    - name: ur10e-pick-place
+      program: pick_and_place_ur10e_robotiq.program.yaml
+      description: UR10e + Robotiq 2F-140 self-contained preview
+      aliases: [ur10e]
 program_profile: v0.1
 grasp_risk_policy:
   open_loop_grasp:

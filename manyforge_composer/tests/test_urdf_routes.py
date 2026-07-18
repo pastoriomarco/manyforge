@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
+
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -130,7 +132,7 @@ def test_urdf_manifest_uses_content_model_key_for_mesh_cache(
     monkeypatch.setattr(routes_urdf, "resolve_robot_model", fake_resolve_robot_model)
     monkeypatch.setitem(sys.modules, "yourdfpy", SimpleNamespace(URDF=FakeUrdf))
 
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.deployment_source_path = str(tmp_path / "deployment.yaml")
     robot_config = SimpleNamespace(
         robot_id="ur",
@@ -214,7 +216,7 @@ def test_urdf_manifest_exposes_collision_geometry_separately(
     monkeypatch.setitem(sys.modules, "yourdfpy", SimpleNamespace(URDF=FakeUrdf))
     routes_urdf._urdf_cache.clear()  # type: ignore[attr-defined]
 
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.deployment_source_path = str(tmp_path / "deployment.yaml")
     state.deployment = SimpleNamespace(
         robot_config=SimpleNamespace(
@@ -321,7 +323,7 @@ def test_urdf_manifest_surfaces_robot_model_authority_and_keys_by_fingerprint(
         },
     }
 
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.deployment_source_path = str(tmp_path / "deployment.yaml")
     state.deployment = SimpleNamespace(
         robot_config=SimpleNamespace(
@@ -384,7 +386,7 @@ def _make_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_urdf_cls) 
     )
     monkeypatch.setitem(sys.modules, "yourdfpy", SimpleNamespace(URDF=fake_urdf_cls))
     routes_urdf._urdf_cache.clear()  # type: ignore[attr-defined]
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
     state.deployment_source_path = str(tmp_path / "deployment.yaml")
     state.deployment = SimpleNamespace(
         robot_config=SimpleNamespace(

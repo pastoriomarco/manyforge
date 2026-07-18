@@ -8,7 +8,12 @@ description: >-
   node confirms the selection before planning a pick sequence. The planner
   validates current->approach, approach->pick, and pick->approach; later
   place logic stays outside the planner.
-catalog_version: "0.3.0"
+compatibility:
+  lanes: [manyforge-only]
+  assistant: required
+  requires: [semantic_shape_inference]
+  tags: [semantic-pick, ur5]
+catalog_version: "0.4.0"
 
 robot:
   robot_id: ur5

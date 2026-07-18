@@ -258,8 +258,12 @@ class CatalogEntryResponse(BaseModel):
 
 
 class CatalogResponse(BaseModel):
+    model_config = _ALIAS_CFG
     version: str
     entries: List[CatalogEntryResponse]
+    effective_catalog_hash: str = Field(alias="effectiveCatalogHash")
+    generation: int
+    sources: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # --- Program ---
@@ -300,6 +304,13 @@ class TreeNodeResponse(BaseModel):
     children: List["TreeNodeResponse"] = Field(default_factory=list)
 
 
+class ProgramCompatibilityResponse(BaseModel):
+    lanes: List[Literal["manyforge-only", "isaac-sim"]]
+    assistant: Literal["required", "optional", "forbidden"] = "optional"
+    requires: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+
+
 class ProgramResponse(BaseModel):
     model_config = _ALIAS_CFG
     name: str
@@ -317,6 +328,7 @@ class ProgramResponse(BaseModel):
     source_path: str = Field(alias="sourcePath", default="")
     program_session_generation: int = Field(default=0, alias="programSessionGeneration")
     program_tree_hash: str = Field(default="", alias="programTreeHash")
+    compatibility: Optional[ProgramCompatibilityResponse] = None
 
 
 class ProgramParameterResponse(BaseModel):
@@ -376,6 +388,7 @@ class SaveProgramRequest(BaseModel):
     scene: Optional[List[ProgramSceneResourceResponse]] = None
     parameters: Optional[List[ProgramParameterResponse]] = None
     blackboard: Optional[ProgramBlackboardResponse] = None
+    compatibility: Optional[ProgramCompatibilityResponse] = None
 
 
 class UpdateTreeRequest(BaseModel):
@@ -763,6 +776,26 @@ class DeploymentResponse(BaseModel):
         default_factory=GraspRiskPolicyResponse,
         alias="graspRiskPolicy",
     )
+    compatibility: Optional["DeploymentCompatibilityResponse"] = None
+
+
+class ExternalNodesConfigResponse(BaseModel):
+    enabled: Optional[List[str]] = None
+    strict: bool = False
+
+
+class DeploymentScenarioResponse(BaseModel):
+    name: str
+    program: str
+    description: str
+    aliases: List[str] = Field(default_factory=list)
+
+
+class DeploymentCompatibilityResponse(BaseModel):
+    lane: Literal["manyforge-only", "isaac-sim"]
+    provides: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+    scenarios: List[DeploymentScenarioResponse] = Field(default_factory=list)
 
 
 class AdapterConfigResponse(BaseModel):
@@ -1031,6 +1064,15 @@ class FullDeploymentResponse(BaseModel):
         default=None,
         alias="simulationControl",
     )
+    external_nodes: ExternalNodesConfigResponse = Field(
+        default_factory=ExternalNodesConfigResponse,
+        alias="externalNodes",
+    )
+    runtime_resources: Dict[str, Any] = Field(
+        default_factory=dict,
+        alias="runtimeResources",
+    )
+    compatibility: Optional[DeploymentCompatibilityResponse] = None
     source_path: str = Field(alias="sourcePath", default="")
 
 
@@ -1093,6 +1135,12 @@ class UpdateDeploymentRequest(BaseModel):
         None,
         alias="simulationControl",
     )
+    external_nodes: Optional[Dict[str, Any]] = Field(None, alias="externalNodes")
+    runtime_resources: Optional[Dict[str, Any]] = Field(
+        None,
+        alias="runtimeResources",
+    )
+    compatibility: Optional[DeploymentCompatibilityResponse] = None
 
 
 class SaveDeploymentRequest(BaseModel):
@@ -1109,6 +1157,7 @@ class ApplySessionRequest(BaseModel):
         alias="programParameters",
     )
     blackboard: Optional[ProgramBlackboardResponse] = None
+    compatibility: Optional[ProgramCompatibilityResponse] = None
     deployment: Optional[FullDeploymentResponse] = None
     force_discard_overrides: bool = Field(default=False, alias="forceDiscardOverrides")
 

@@ -1,5 +1,5 @@
 api_version: manyforge.deployment.v0
-schema_version: 0.1.0
+schema_version: 0.2.0
 name: isaac_manipulator_scene_light_ros2_control
 description: 'Isaac Sim preview deployment for the saved light manipulator scene.
   Planning and scene validation stay on RoboPlan; execution is delegated to a ROS
@@ -9,6 +9,15 @@ description: 'Isaac Sim preview deployment for the saved light manipulator scene
   gripper JointState command topic.
 
   '
+compatibility:
+  lane: isaac-sim
+  provides: [ros2_control, robotiq_2f_140_gripper]
+  tags: [pick-and-place, isaac-sim, ur10e, robotiq]
+  scenarios:
+    - name: isaac-ur10e-light-scene
+      program: isaac_manipulator_scene_light.program.yaml
+      description: Isaac commanded simulation with the UR10e light scene
+      aliases: [isaac-light]
 program_profile: v0.1
 grasp_risk_policy:
   open_loop_grasp:

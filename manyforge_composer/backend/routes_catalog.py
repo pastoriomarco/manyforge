@@ -62,10 +62,12 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
     @router.get("", response_model=CatalogResponse, response_model_by_alias=True)
     def get_catalog() -> dict:
         """Get all catalog entries."""
+        environment = state.node_environment
+        catalog = environment.catalog
         entries = []
-        for entry in state.catalog.entries:
+        for entry in catalog.entries:
             params = [
-                _parameter_response(param, catalog=state.catalog)
+                _parameter_response(param, catalog=catalog)
                 for param in entry.parameters
             ]
             entries.append(CatalogEntryResponse(
@@ -86,20 +88,33 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
                 defaultInterruptScope=entry.default_interrupt_scope,
             ).model_dump(by_alias=True))
         return {
-            "version": state.catalog.version,
+            "version": catalog.version,
             "entries": entries,
+            "effectiveCatalogHash": environment.effective_catalog_hash,
+            "generation": environment.generation,
+            "sources": [
+                {
+                    "nodeId": source.node_id,
+                    "kind": source.kind,
+                    "path": source.path,
+                    "contentHash": source.content_hash,
+                    "version": source.version,
+                }
+                for source in environment.sources
+            ],
         }
     
     @router.get("/{entry_id}", response_model=CatalogEntryResponse, response_model_by_alias=True)
     def get_catalog_entry(entry_id: str) -> dict:
         """Get a single catalog entry by ID."""
+        catalog = state.node_environment.catalog
         try:
-            entry = state.catalog.get(entry_id)
+            entry = catalog.get(entry_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Entry '{entry_id}' not found")
         
         params = [
-            _parameter_response(param, catalog=state.catalog)
+            _parameter_response(param, catalog=catalog)
             for param in entry.parameters
         ]
         

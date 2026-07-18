@@ -148,7 +148,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
 
         errors, _warnings = collect_tree_validation_issues(
             tree,
-            state.catalog,
+            state.node_catalog,
             parameter_defaults=(
                 state.program.get_parameter_defaults()
                 if state.program is not None
@@ -161,7 +161,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
             ),
             blackboard_keys=merged_intervention_blackboard_keys(
                 tree,
-                state.catalog,
+                state.node_catalog,
                 base_keys=(
                     state.program.blackboard_keys
                     if state.program is not None
@@ -343,7 +343,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
             )
         errors, _warnings = collect_tree_validation_issues(
             tree,
-            state.catalog,
+            state.node_catalog,
             parameter_defaults=(
                 state.program.get_parameter_defaults()
                 if state.program is not None
@@ -356,7 +356,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
             ),
             blackboard_keys=merged_intervention_blackboard_keys(
                 tree,
-                state.catalog,
+                state.node_catalog,
                 base_keys=(
                     state.program.blackboard_keys
                     if state.program is not None
@@ -497,7 +497,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
             )
         errors, _warnings = collect_tree_validation_issues(
             tree,
-            state.catalog,
+            state.node_catalog,
             parameter_defaults=(
                 state.program.get_parameter_defaults()
                 if state.program is not None
@@ -510,7 +510,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
             ),
             blackboard_keys=merged_intervention_blackboard_keys(
                 tree,
-                state.catalog,
+                state.node_catalog,
                 base_keys=(
                     state.program.blackboard_keys
                     if state.program is not None

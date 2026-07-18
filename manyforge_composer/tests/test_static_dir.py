@@ -1,4 +1,5 @@
 from pathlib import Path
+from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
 
 import pytest
 
@@ -31,7 +32,7 @@ def test_explicit_static_dir_resolves_when_built(tmp_path):
 
 
 def test_create_app_rejects_invalid_explicit_static_dir(tmp_path):
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=MockKernelClient())
 
     with pytest.raises(RuntimeError, match="Explicit frontend static dir"):
         create_app(state, static_dir=str(tmp_path / "missing"))
