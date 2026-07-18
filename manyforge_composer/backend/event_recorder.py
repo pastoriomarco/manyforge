@@ -1348,6 +1348,11 @@ class EventRecorder:
                 ),
             }
 
+    def heartbeat_revision(self) -> int:
+        """Cheap monotonic invalidation token for cached health projections."""
+        with self._lock:
+            return self._event_index
+
     def stop_latency_summary(self) -> dict[str, Any]:
         """p50/p99 stop latency for the heartbeat (current run, falling back
         to the last finished run)."""

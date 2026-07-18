@@ -1,17 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api } from '../api/client';
 import { useEditLocked } from '../store/cycleStore';
 import { useProgramStore } from '../store/programStore';
+import { useSceneStateStore } from '../store/sceneStateStore';
 import type {
   ProgramSceneResource,
   ProgramCompatibility,
-  SceneFrameState,
   SceneObjectState,
-  SceneStateResponse,
 } from '../types/api';
 
 type SceneShapeType = 'box' | 'sphere' | 'cylinder' | 'mesh';
 type SupportContactMode = 'contact_release' | 'contact_process';
+const EMPTY_SCENE_FRAMES: import('../types/api').SceneFrameState[] = [];
 
 interface SupportContactRow {
   rowKey: string;
@@ -1209,12 +1208,35 @@ export function ScenePanel() {
   const setProgramCompatibility = useProgramStore(
     (state) => state.setProgramCompatibility,
   );
+  const viewerSettings = useProgramStore((state) => state.viewerSettings);
+  const setViewerFrameVisibility = useProgramStore(
+    (state) => state.setViewerFrameVisibility,
+  );
+  const setViewerFrameGizmoSize = useProgramStore(
+    (state) => state.setViewerFrameGizmoSize,
+  );
+  const setViewerObjectFrameVisibility = useProgramStore(
+    (state) => state.setViewerObjectFrameVisibility,
+  );
   const editLocked = useEditLocked();
-  const [sceneState, setSceneState] = useState<SceneStateResponse | null>(null);
-  const [frames, setFrames] = useState<SceneFrameState[]>([]);
-  const [viewerAvailable, setViewerAvailable] = useState(false);
-  const [frameGizmoSizeM, setFrameGizmoSizeM] = useState(0.1);
-  const [loading, setLoading] = useState(false);
+  const sceneState = useSceneStateStore((state) => state.scene);
+  const frameState = useSceneStateStore((state) => state.frames);
+  const refreshSceneProjection = useSceneStateStore((state) => state.refresh);
+  const loading = useSceneStateStore((state) => state.refreshInFlight);
+  const sceneProjectionError = useSceneStateStore((state) => state.error);
+  const projectedFrames = frameState?.frames ?? EMPTY_SCENE_FRAMES;
+  const frames = useMemo(
+    () => projectedFrames.map((frame) => ({
+      ...frame,
+      viewerVisible:
+        viewerSettings?.frameVisibility[frame.name] ?? frame.viewerVisible,
+    })),
+    [projectedFrames, viewerSettings?.frameVisibility],
+  );
+  const viewerAvailable = frameState?.viewerAvailable ?? false;
+  const frameGizmoSizeM = viewerSettings?.frameGizmoSizeM
+    ?? frameState?.frameGizmoSizeM
+    ?? 0.1;
   const [error, setError] = useState<string | null>(null);
   const [newObjectId, setNewObjectId] = useState('');
   const [newShapeType, setNewShapeType] = useState<SceneShapeType>('box');
@@ -1243,23 +1265,9 @@ export function ScenePanel() {
   );
 
   const refresh = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [nextState, frameState] = await Promise.all([
-        api.scene.state(),
-        api.scene.frames(),
-      ]);
-      setSceneState(nextState);
-      setFrames(frameState.frames);
-      setViewerAvailable(frameState.viewerAvailable);
-      setFrameGizmoSizeM(frameState.frameGizmoSizeM ?? 0.1);
-      setError(null);
-    } catch (refreshError) {
-      setError((refreshError as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+    setError(null);
+    await refreshSceneProjection();
+  }, [refreshSceneProjection]);
 
   useEffect(() => {
     void refresh();
@@ -1270,9 +1278,18 @@ export function ScenePanel() {
     frames.forEach((frame) => names.add(frame.name));
     return Array.from(names).sort();
   }, [frames]);
+  const liveObjects = useMemo(
+    () => (sceneState?.objects ?? []).map((objectState) => ({
+      ...objectState,
+      viewer_frame_visible:
+        viewerSettings?.objectFrameVisibility[objectState.object_id]
+        ?? objectState.viewer_frame_visible,
+    })),
+    [sceneState?.objects, viewerSettings?.objectFrameVisibility],
+  );
   const liveObjectsById = useMemo(
-    () => new Map((sceneState?.objects ?? []).map((objectState) => [objectState.object_id, objectState])),
-    [sceneState],
+    () => new Map(liveObjects.map((objectState) => [objectState.object_id, objectState])),
+    [liveObjects],
   );
 
   const replaceSceneResource = useCallback(
@@ -1355,46 +1372,30 @@ export function ScenePanel() {
   ]);
 
   const toggleFrameVisibility = useCallback(
-    async (frameName: string, visible: boolean) => {
+    (frameName: string, visible: boolean) => {
+      setViewerFrameVisibility(frameName, visible);
       setError(null);
-      try {
-        await api.scene.setFrameVisibility(frameName, visible);
-        await refresh();
-      } catch (toggleError) {
-        setError((toggleError as Error).message);
-      }
     },
-    [refresh],
+    [setViewerFrameVisibility],
   );
 
   const updateFrameGizmoSize = useCallback(
-    async (axesLengthM: number) => {
+    (axesLengthM: number) => {
       if (!Number.isFinite(axesLengthM) || axesLengthM <= 0) {
         return;
       }
-      setFrameGizmoSizeM(axesLengthM);
+      setViewerFrameGizmoSize(axesLengthM);
       setError(null);
-      try {
-        await api.scene.setFrameGizmoSize(axesLengthM);
-        await refresh();
-      } catch (sizeError) {
-        setError((sizeError as Error).message);
-      }
     },
-    [refresh],
+    [setViewerFrameGizmoSize],
   );
 
   const toggleObjectFrameVisibility = useCallback(
-    async (objectId: string, visible: boolean) => {
+    (objectId: string, visible: boolean) => {
+      setViewerObjectFrameVisibility(objectId, visible);
       setError(null);
-      try {
-        await api.scene.setObjectFrameVisibility(objectId, visible);
-        await refresh();
-      } catch (toggleError) {
-        setError((toggleError as Error).message);
-      }
     },
-    [refresh],
+    [setViewerObjectFrameVisibility],
   );
 
   return (
@@ -1425,8 +1426,10 @@ export function ScenePanel() {
             PROGRAM SCENE EDITING DISABLED WHILE EXECUTION IS ACTIVE
           </div>
         )}
-        {error && (
-          <div className="rounded bg-red-900/60 px-2 py-1 text-red-200">{error}</div>
+        {(error ?? sceneProjectionError) && (
+          <div className="rounded bg-red-900/60 px-2 py-1 text-red-200">
+            {error ?? sceneProjectionError}
+          </div>
         )}
       </div>
 
@@ -1531,7 +1534,7 @@ export function ScenePanel() {
           <NumericInput
             label="Frame gizmo size (m)"
             value={frameGizmoSizeM}
-            onChange={(next) => void updateFrameGizmoSize(next)}
+            onChange={updateFrameGizmoSize}
             step="0.01"
             disabled={!viewerAvailable}
           />
@@ -1550,7 +1553,7 @@ export function ScenePanel() {
               <input
                 type="checkbox"
                 checked={frame.viewerVisible}
-                onChange={(event) => void toggleFrameVisibility(frame.name, event.target.checked)}
+                onChange={(event) => toggleFrameVisibility(frame.name, event.target.checked)}
                 disabled={!viewerAvailable}
                 className="mt-0.5"
               />
@@ -1762,12 +1765,12 @@ export function ScenePanel() {
       </Section>
 
       <Section title="Live Runtime Scene">
-        {(sceneState?.objects ?? []).length === 0 && (
+        {liveObjects.length === 0 && (
           <div className="rounded border border-gray-700 bg-gray-900/40 p-3 text-xs text-gray-500">
             No live scene objects available.
           </div>
         )}
-        {(sceneState?.objects ?? []).map((objectState) => (
+        {liveObjects.map((objectState) => (
           <LiveSceneObjectCard
             key={objectState.object_id}
             objectState={objectState}

@@ -2,10 +2,23 @@
 from __future__ import annotations
 
 from typing import Any, Optional, List, Dict, Literal
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StrictBool,
+    model_validator,
+)
 
 _ALIAS_CFG = ConfigDict(populate_by_name=True)
 _ALIAS_EXTRA_CFG = ConfigDict(populate_by_name=True, extra="allow")
+_VIEWER_WIRE_CFG = ConfigDict(extra="forbid", allow_inf_nan=False)
+_PROGRAM_VIEWER_CFG = ConfigDict(
+    populate_by_name=True,
+    extra="forbid",
+    allow_inf_nan=False,
+)
 
 
 # --- Cycle ---
@@ -311,6 +324,30 @@ class ProgramCompatibilityResponse(BaseModel):
     tags: List[str] = Field(default_factory=list)
 
 
+class ProgramViewerResponse(BaseModel):
+    """Non-authoritative viewer presentation persisted with a program."""
+
+    model_config = _PROGRAM_VIEWER_CFG
+    frame_visibility: Dict[str, StrictBool] = Field(
+        default_factory=dict,
+        alias="frameVisibility",
+    )
+    frame_gizmo_size_m: float = Field(
+        default=0.1,
+        gt=0.0,
+        alias="frameGizmoSizeM",
+    )
+    object_frame_visibility: Dict[str, StrictBool] = Field(
+        default_factory=dict,
+        alias="objectFrameVisibility",
+    )
+    object_axes_gizmo_size_m: float = Field(
+        default=0.1,
+        gt=0.0,
+        alias="objectAxesGizmoSizeM",
+    )
+
+
 class ProgramResponse(BaseModel):
     model_config = _ALIAS_CFG
     name: str
@@ -329,6 +366,7 @@ class ProgramResponse(BaseModel):
     program_session_generation: int = Field(default=0, alias="programSessionGeneration")
     program_tree_hash: str = Field(default="", alias="programTreeHash")
     compatibility: Optional[ProgramCompatibilityResponse] = None
+    viewer: Optional[ProgramViewerResponse] = None
 
 
 class ProgramParameterResponse(BaseModel):
@@ -389,6 +427,7 @@ class SaveProgramRequest(BaseModel):
     parameters: Optional[List[ProgramParameterResponse]] = None
     blackboard: Optional[ProgramBlackboardResponse] = None
     compatibility: Optional[ProgramCompatibilityResponse] = None
+    viewer: Optional[ProgramViewerResponse] = None
 
 
 class UpdateTreeRequest(BaseModel):
@@ -1158,6 +1197,7 @@ class ApplySessionRequest(BaseModel):
     )
     blackboard: Optional[ProgramBlackboardResponse] = None
     compatibility: Optional[ProgramCompatibilityResponse] = None
+    viewer: Optional[ProgramViewerResponse] = None
     deployment: Optional[FullDeploymentResponse] = None
     force_discard_overrides: bool = Field(default=False, alias="forceDiscardOverrides")
 
@@ -1466,7 +1506,7 @@ class VisualStateRouteDiagnosticsResponse(BaseModel):
 
 
 class VisualSceneSnapshotResponse(BaseModel):
-    """Immutable viewer snapshot published outside scene-state request paths.
+    """Immutable low-rate scene debug snapshot built outside request paths.
 
     Observer routes serve the latest snapshot by cheap copy/serialization.
     Potentially blocking reads such as execution snapshots, visual FK,
@@ -1474,7 +1514,7 @@ class VisualSceneSnapshotResponse(BaseModel):
     path, not in HTTP request handling.
     """
 
-    schema_version: str = "visual_scene_snapshot.v0"
+    schema_version: str = "manyforge.scene.debug_snapshot.v1"
     sequence_number: int = 0
     timestamp_ns: int = 0
     source: str = "visual_snapshot"
@@ -1486,6 +1526,322 @@ class VisualSceneSnapshotResponse(BaseModel):
     link_poses: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     grippers: List[SceneGripperStateResponse] = Field(default_factory=list)
     pose_sources: List[PoseSourceStatusResponse] = Field(default_factory=list)
+
+
+class ViewerPoseV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    position_m: List[float] = Field(min_length=3, max_length=3)
+    orientation_xyzw: List[float] = Field(min_length=4, max_length=4)
+
+
+class ViewerShapeV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    type: str
+    box_dimensions_m: Optional[List[float]]
+    sphere_radius_m: Optional[float]
+    cylinder_radius_m: Optional[float]
+    cylinder_height_m: Optional[float]
+    mesh_resource_uri: Optional[str]
+    mesh_scale: Optional[List[float]]
+    mesh_asset_url: Optional[str]
+    mesh_asset_status: Optional[str]
+
+
+class ViewerRobotManifestV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    robot_id: Optional[str]
+    group_id: Optional[str]
+    urdf_model_key: Optional[str]
+    base_frame: str
+    tcp_frame: str
+    base_pose: Dict[str, Any]
+    joint_names: List[str]
+    link_order: List[str]
+
+
+class ViewerEntityManifestV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    object_id: str
+    shape: Optional[ViewerShapeV1]
+    attached: bool
+    attached_to: Optional[str]
+    source: Literal["authored", "runtime", "attached"]
+    persistable: bool
+    viewer_frame_visible: bool
+    support_contacts: List[Dict[str, Any]]
+
+
+class ViewerFrameManifestV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    name: str
+    roles: List[str]
+    viewer_visible: bool
+
+
+class ViewerGripperSubtreeLinkV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    name: str
+    position_m: List[float]
+    orientation_xyzw: List[float]
+
+
+class ViewerGripperVisualizationV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    gripper_root_link: str
+    tcp_to_root_position_m: List[float]
+    tcp_to_root_orientation_xyzw: List[float]
+    subtree_links: List[ViewerGripperSubtreeLinkV1]
+
+
+class ViewerGripperManifestV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    gripper_id: str
+    joint_name: str
+    derived_joints: List[str]
+    actuation_kind: str
+    state_authority: str
+    completion_policy: str
+    grasp_confirmation_policy: str
+    transport_kind: str
+    limit_lower: Optional[float]
+    limit_upper: Optional[float]
+    motion_time_s: float
+    srdf_presets: Dict[str, float]
+    visualization: Optional[ViewerGripperVisualizationV1]
+
+
+class ViewerPoseSourceObjectManifestV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    object_id: str
+    entity: str
+    frame_id: str
+    apply_policy: str
+    scene_admission: Optional[Dict[str, Any]]
+    measured_state_ghost: Optional[Dict[str, Any]]
+
+
+class ViewerPoseSourceManifestV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    pose_source_id: str
+    kind: str
+    enabled: bool
+    max_update_hz: float = Field(ge=0.0)
+    stale_after_s: float = Field(ge=0.0)
+    frame_id: str
+    description: str
+    objects: List[ViewerPoseSourceObjectManifestV1] = Field(max_length=16384)
+
+
+class ViewerGripperFrameV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    gripper_id: str
+    joint_name: str
+    derived_joints: List[str]
+    state: str
+    command_id: int
+    generation: int
+    revision: int
+    current_position: Optional[float]
+    target_position: Optional[float]
+    commanded_position: Optional[float]
+    observed_position: Optional[float]
+    commanded_state: str
+    actuation_kind: str
+    state_authority: str
+    completion_policy: str
+    grasp_confirmation_policy: str
+    transport_kind: str
+    evidence: List[str]
+    evidence_state: str
+    projection_state: str
+    projection_reason: str
+    limit_lower: Optional[float]
+    limit_upper: Optional[float]
+    motion_time_s: float
+    srdf_presets: Dict[str, float]
+    visualization: Optional[ViewerGripperVisualizationV1]
+    error: Optional[str]
+    reason_code: Optional[str]
+
+
+class ViewerOrdersV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    links: List[str]
+    entities: List[str]
+    frames: List[str]
+    grippers: List[str]
+    pose_sources: List[str]
+
+
+class ViewerManifestV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    type: Literal["manifest"]
+    schema_version: Literal["manyforge.viewer.manifest.v1"]
+    producer_epoch: str = Field(min_length=1, max_length=128)
+    manifest_revision: int = Field(ge=1)
+    content_hash: str = Field(min_length=64, max_length=64)
+    world_frame: str = Field(min_length=1)
+    robots: List[ViewerRobotManifestV1] = Field(max_length=64)
+    entities: List[ViewerEntityManifestV1] = Field(max_length=16384)
+    frames: List[ViewerFrameManifestV1] = Field(max_length=65536)
+    grippers: List[ViewerGripperManifestV1] = Field(max_length=256)
+    pose_sources: List[ViewerPoseSourceManifestV1] = Field(max_length=4096)
+    orders: ViewerOrdersV1
+    object_axes_gizmo_size_m: float = Field(gt=0.0)
+    frame_axes_gizmo_size_m: float = Field(gt=0.0)
+    capabilities: Dict[str, bool]
+
+
+class ViewerRobotFrameV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    robot_id: Optional[str]
+    joint_positions: List[Optional[float]]
+    link_transforms: List[Optional[ViewerPoseV1]]
+    tcp_pose_in_base: Optional[Dict[str, Any]]
+    state_source: Optional[str]
+    source_timestamp_ns: Optional[int]
+    source_age_ns: Optional[int] = Field(ge=0)
+
+
+class ViewerPoseSourceObjectFrameV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    object_id: str
+    status: str
+    age_s: Optional[float] = Field(ge=0.0)
+    update: Optional[PoseSourceUpdateResponse]
+    rejection: Optional[PoseSourceRejectionResponse]
+    attached_drift: Optional[PoseSourceAttachedDriftStateResponse]
+
+
+class ViewerPoseSourceFrameV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    pose_source_id: str
+    status: str
+    received_at_ns: Optional[int]
+    measured_tcp: Optional[PoseSourceMeasuredTcpResponse]
+    measured_robot: Optional[PoseSourceMeasuredRobotResponse]
+    objects: List[ViewerPoseSourceObjectFrameV1] = Field(max_length=16384)
+
+
+class ViewerFrameV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    type: Literal["frame"]
+    schema_version: Literal["manyforge.viewer.frame.v1"]
+    producer_epoch: str = Field(min_length=1, max_length=128)
+    manifest_revision: int = Field(ge=1)
+    frame_sequence: int = Field(ge=1)
+    render_revision: int = Field(ge=1)
+    timestamp_ns: int = Field(ge=0)
+    source_sequence: int = Field(ge=0)
+    stale: bool
+    robot_blocks: List[ViewerRobotFrameV1] = Field(max_length=64)
+    entity_transforms: List[Optional[ViewerPoseV1]] = Field(
+        max_length=16384,
+    )
+    frame_transforms: List[Optional[ViewerPoseV1]] = Field(
+        max_length=65536,
+    )
+    gripper_states: List[ViewerGripperFrameV1] = Field(
+        max_length=256,
+    )
+    pose_source_states: List[ViewerPoseSourceFrameV1] = Field(
+        max_length=4096,
+    )
+
+
+class ViewerDiagnosticsV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    type: Literal["diagnostics"]
+    schema_version: Literal["manyforge.viewer.diagnostics.v1"]
+    producer_epoch: str
+    timestamp_ns: int = Field(ge=0)
+    worker_epoch: Optional[str] = None
+    producer_healthy: bool = True
+    producer_health_reason: Optional[str] = None
+    publisher_running: bool = True
+    worker_alive: bool = True
+    last_publication_age_ms: Optional[float] = Field(default=None, ge=0.0)
+    worker_restarts: int = Field(default=0, ge=0)
+    worker_errors: int = Field(default=0, ge=0)
+    demand_client_count: int = Field(default=0, ge=0)
+    active_client_count: int = Field(default=0, ge=0)
+    build_stage_durations_ms: Dict[str, float] = Field(default_factory=dict)
+    input_replacements: int = Field(default=0, ge=0)
+    fanout_replacements: int = Field(default=0, ge=0)
+    fanout_errors: int = Field(default=0, ge=0)
+    unavailable_layers: List[str] = Field(default_factory=list)
+    last_error: Optional[str] = None
+
+
+class ViewerLeaseControlV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    type: Literal["subscribe", "lease", "visibility"]
+    schema_version: Literal["manyforge.viewer.control.v1"]
+    request_id: Optional[str] = Field(default=None, max_length=128)
+    visibility: Literal["focused", "visible", "collapsed", "hidden"]
+    requested_rate_hz: float = Field(ge=0.0)
+    layers: List[str] = Field(default_factory=list, max_length=32)
+
+
+class ViewerResyncControlV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    type: Literal["resync"]
+    schema_version: Literal["manyforge.viewer.control.v1"]
+    request_id: Optional[str] = Field(default=None, max_length=128)
+
+
+class ViewerClientDiagnosticsControlV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    type: Literal["client_diagnostics"]
+    schema_version: Literal["manyforge.viewer.control.v1"]
+    request_id: Optional[str] = Field(default=None, max_length=128)
+    visibility: Literal["focused", "visible", "collapsed", "hidden"]
+    window_duration_ms: float = Field(ge=0.0, le=60_000.0)
+    websocket_messages: int = Field(ge=0, le=9_007_199_254_740_991)
+    websocket_bytes: int = Field(ge=0, le=9_007_199_254_740_991)
+    manifest_messages: int = Field(ge=0, le=9_007_199_254_740_991)
+    frame_messages: int = Field(ge=0, le=9_007_199_254_740_991)
+    dropped_frame_gaps: int = Field(ge=0, le=9_007_199_254_740_991)
+    resync_requests: int = Field(ge=0, le=9_007_199_254_740_991)
+    materializations: int = Field(ge=0, le=9_007_199_254_740_991)
+    materialization_total_ms: float = Field(ge=0.0)
+    materialization_max_ms: float = Field(ge=0.0)
+    react_commits: int = Field(ge=0, le=9_007_199_254_740_991)
+    react_commit_total_ms: float = Field(ge=0.0)
+    react_commit_max_ms: float = Field(ge=0.0)
+    rendered_frames: int = Field(ge=0, le=9_007_199_254_740_991)
+    draw_calls_max: int = Field(ge=0, le=9_007_199_254_740_991)
+    triangles_max: int = Field(ge=0, le=9_007_199_254_740_991)
+    canvas_pixels_max: int = Field(ge=0, le=9_007_199_254_740_991)
+    render_interval_p95_ms: Optional[float] = Field(default=None, ge=0.0)
+    render_interval_max_ms: Optional[float] = Field(default=None, ge=0.0)
+    long_task_supported: bool
+    long_tasks: int = Field(ge=0, le=9_007_199_254_740_991)
+    long_task_total_ms: float = Field(ge=0.0)
+    long_task_max_ms: float = Field(ge=0.0)
+    heap_used_bytes: Optional[int] = Field(default=None, ge=0)
+    topology_rebuilds: int = Field(ge=0, le=9_007_199_254_740_991)
+    transform_applies: int = Field(ge=0, le=9_007_199_254_740_991)
+    renderer_vendor: Optional[str] = Field(default=None, max_length=256)
+    renderer_name: Optional[str] = Field(default=None, max_length=256)
+    renderer_software: bool
+    effective_dpr: float = Field(gt=0.0, le=4.0)
+    requested_rate_hz: float = Field(ge=0.0, le=120.0)
+
+
+class ViewerLeaseAckV1(BaseModel):
+    model_config = _VIEWER_WIRE_CFG
+    type: Literal["lease_ack"]
+    schema_version: Literal["manyforge.viewer.diagnostics.v1"]
+    request_id: Optional[str] = None
+    client_id: str
+    timestamp_ns: int = Field(ge=0)
+    expires_at_ns: int = Field(ge=0)
+    lease_revision: int = Field(ge=0)
+    visibility: Literal["focused", "visible", "collapsed", "hidden"]
+    granted_rate_hz: float = Field(ge=0.0)
+    granted_layers: List[str] = Field(default_factory=list)
+    server_max_rate_hz: float = Field(gt=0.0)
 
 
 class SceneStateResponse(BaseModel):

@@ -8,6 +8,7 @@ import { SceneViewerPanel } from './SceneViewer';
 import { CollapsedRail } from './CollapsedRail';
 import { useProgramStore } from '../store/programStore';
 import { useDeploymentStore } from '../store/deploymentStore';
+import { useViewerDemand } from '../store/sceneStateStore';
 
 interface ViewerErrorBoundaryProps {
   fallback: ReactNode;
@@ -78,6 +79,15 @@ const MIN_VIEWER_WIDTH = 480;
 const MAX_VIEWER_WIDTH = 960;
 const MIN_PROPERTIES_WIDTH = 260;
 const MAX_PROPERTIES_WIDTH = 520;
+
+function CollapsedViewerRail({ onExpand }: { onExpand: () => void }) {
+  // Keep one passive lease so collapse is observable and expansion can resume
+  // without losing manifest identity. Active command-authority subscribers are
+  // counted separately and override this zero-rate lease when they require a
+  // fresh scene snapshot.
+  useViewerDemand(true, 'collapsed');
+  return <CollapsedRail label="Viewer" side="right" onExpand={onExpand} />;
+}
 
 function signature(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -171,11 +181,7 @@ export function Viewport() {
       )}
 
       {viewerCollapsed ? (
-        <CollapsedRail
-          label="Viewer"
-          side="right"
-          onExpand={() => setViewerCollapsed(false)}
-        />
+        <CollapsedViewerRail onExpand={() => setViewerCollapsed(false)} />
       ) : (
         <>
           <div

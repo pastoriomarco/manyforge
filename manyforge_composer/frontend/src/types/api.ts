@@ -213,6 +213,7 @@ export interface ProgramInfo {
   programSessionGeneration: number;
   programTreeHash: string;
   compatibility?: ProgramCompatibility | null;
+  viewer?: ProgramViewerSettings | null;
 }
 
 export interface ProgramCompatibility {
@@ -220,6 +221,13 @@ export interface ProgramCompatibility {
   assistant: 'required' | 'optional' | 'forbidden';
   requires: string[];
   tags: string[];
+}
+
+export interface ProgramViewerSettings {
+  frameVisibility: Record<string, boolean>;
+  frameGizmoSizeM: number;
+  objectFrameVisibility: Record<string, boolean>;
+  objectAxesGizmoSizeM: number;
 }
 
 export interface ProgramSceneResource {

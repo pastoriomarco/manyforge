@@ -280,6 +280,46 @@ class TestProgramLoading:
         assert prog.robot.base_pose == data["robot"]["base_pose"]
         assert prog.to_dict()["robot"]["base_pose"] == data["robot"]["base_pose"]
 
+    def test_viewer_presentation_round_trips_without_runtime_semantics(self, catalog):
+        data = yaml.safe_load(FIXTURE_PATH.read_text())
+        data["viewer"] = {
+            "frame_visibility": {
+                "base_link": True,
+                "left_inner_finger": False,
+            },
+            "frame_gizmo_size_m": 0.14,
+            "object_frame_visibility": {"pick_object": True},
+            "object_axes_gizmo_size_m": 0.09,
+        }
+
+        program = Program.from_dict(data, catalog)
+
+        assert program.viewer is not None
+        assert program.viewer.frame_visibility == data["viewer"]["frame_visibility"]
+        assert program.viewer.object_frame_visibility == {
+            "pick_object": True,
+        }
+        assert program.to_dict()["viewer"] == data["viewer"]
+
+    @pytest.mark.parametrize(
+        "viewer, message",
+        [
+            ({"frame_visibility": {"tool0": 1}}, "must be a boolean"),
+            ({"frame_visibility": {"": True}}, "non-empty strings"),
+            ({"frame_gizmo_size_m": float("nan")}, "finite positive"),
+            ({"object_axes_gizmo_size_m": 0.0}, "finite positive"),
+            ({"unexpected": True}, "unknown fields"),
+        ],
+    )
+    def test_viewer_presentation_rejects_malformed_values(
+        self,
+        catalog,
+        viewer,
+        message,
+    ):
+        with pytest.raises(ProgramValidationError, match=message):
+            Program.from_dict(_minimal_program(viewer=viewer), catalog)
+
     def test_robot_base_pose_requires_orientation(self, catalog):
         data = yaml.safe_load(FIXTURE_PATH.read_text())
         data["robot"]["base_pose"] = {

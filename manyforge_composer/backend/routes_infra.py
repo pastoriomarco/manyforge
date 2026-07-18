@@ -167,6 +167,8 @@ def build_infra_status_payload(state: ComposerState) -> dict[str, Any]:
 
     visual_state, visual_meta = state.visual_state_snapshot()
     visual_meta = visual_meta or {}
+    viewer_status = state.viewer_data_plane_status()
+    viewer_worker = viewer_status.get("worker", {})
     broker = getattr(state, "snapshot_broker", None)
     broker_has_clients = False
     if broker is not None:
@@ -174,13 +176,43 @@ def build_infra_status_payload(state: ComposerState) -> dict[str, Any]:
             broker_has_clients = bool(broker.has_clients())
         except Exception:
             broker_has_clients = False
+    viewer_ready = state.program is not None and state.kernel is not None
+    viewer_demanded = int(viewer_status.get("active_client_count") or 0) > 0
+    worker_policy = viewer_worker.get("worker_policy")
+    worker_policy_failed = (
+        isinstance(worker_policy, dict)
+        and worker_policy.get("policy_ok") is not True
+    )
+    viewer_degraded = viewer_demanded and (
+        not bool(viewer_worker.get("alive"))
+        or bool(viewer_worker.get("last_error"))
+        or worker_policy_failed
+    )
     components["native_viewer"] = {
-        "status": "healthy" if state.program is not None and state.kernel is not None else "waiting",
+        "status": (
+            "degraded"
+            if viewer_degraded
+            else "healthy"
+            if viewer_ready
+            else "waiting"
+        ),
         "visual_state_cached": visual_state is not None,
         "visual_state_publisher_running": bool(visual_meta.get("publisher_running", False)),
         "visual_state_sequence_number": visual_meta.get("sequence_number"),
         "snapshot_bridge_ready": broker is not None,
         "snapshot_bridge_client_connected": broker_has_clients,
+        "active_client_count": viewer_status.get("active_client_count", 0),
+        "worker_alive": viewer_worker.get("alive", False),
+        "worker_epoch": viewer_worker.get("worker_epoch"),
+        "worker_pid": viewer_worker.get("pid"),
+        "worker_restarts": viewer_worker.get("restarts", 0),
+        "worker_last_error": viewer_worker.get("last_error"),
+        "worker_policy": worker_policy,
+        "worker_policy_ok": (
+            worker_policy.get("policy_ok")
+            if isinstance(worker_policy, dict)
+            else None
+        ),
     }
 
     # Deployment
@@ -197,13 +229,14 @@ def build_infra_status_payload(state: ComposerState) -> dict[str, Any]:
         "status": heartbeat["status"],
         "components": components,
         "heartbeat": heartbeat,
+        "heartbeat_cache": state.heartbeat_cache_status(),
         "timestamp": now,
         "timestamp_ns": heartbeat["timestamp_ns"],
         "uptime_s": heartbeat["uptime_s"],
     }
 
 
-def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
+def _build_infra_heartbeat_payload_uncached(state: ComposerState) -> dict[str, Any]:
     """Build a compact heartbeat/status payload for launchers and supervisors."""
     now_ns = time.monotonic_ns()
     started_at_ns = int(getattr(state, "started_at_ns", now_ns))
@@ -395,6 +428,15 @@ def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
             "pose_source_apply": pose_source_apply,
         },
     }
+
+
+def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
+    """Return the shared bounded-cadence immutable heartbeat sample."""
+    return state.cached_heartbeat_sample(
+        lambda: _build_infra_heartbeat_payload_uncached(state),
+        revision=state.heartbeat_revision(),
+        max_age_s=0.5,
+    )
 
 
 def create_infra_router(state: ComposerState) -> APIRouter:

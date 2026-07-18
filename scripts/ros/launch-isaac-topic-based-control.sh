@@ -128,13 +128,22 @@ if [ -z "${isaac_profile}" ]; then
     esac
 fi
 
-manyforge_exec_with_nrt_affinity ros2 launch manyforge_ros_bringup isaac_topic_based_control.launch.py \
-    isaac_profile:="${isaac_profile}" \
-    controller_manager_lock_memory:="${MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY:-false}" \
-    controller_manager_thread_priority:="${MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY:-50}" \
-    controller_manager_cpu_affinity:="${MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY:-}" \
-    composer_url:="${COMPOSER_URL:-http://127.0.0.1:9000}" \
-    program_path:="${PROGRAM_PATH:-/workspace/examples/isaac_manipulator_scene_light.program.yaml}" \
-    deployment_path:="${DEPLOYMENT_PATH:-/workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml}" \
-    supervisor_auto_load:="${SUPERVISOR_AUTO_LOAD:-true}" \
+launch_arguments=(
+    "isaac_profile:=${isaac_profile}"
+    "controller_manager_lock_memory:=${MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY:-false}"
+    "controller_manager_thread_priority:=${MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY:-50}"
+    "composer_url:=${COMPOSER_URL:-http://127.0.0.1:9000}"
+    "program_path:=${PROGRAM_PATH:-/workspace/examples/isaac_manipulator_scene_light.program.yaml}"
+    "deployment_path:=${DEPLOYMENT_PATH:-/workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml}"
+    "supervisor_auto_load:=${SUPERVISOR_AUTO_LOAD:-true}"
+)
+if [ -n "${MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY:-}" ]; then
+    launch_arguments+=(
+        "controller_manager_cpu_affinity:=${MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY}"
+    )
+fi
+
+manyforge_exec_with_nrt_affinity \
+    ros2 launch manyforge_ros_bringup isaac_topic_based_control.launch.py \
+    "${launch_arguments[@]}" \
     "$@"

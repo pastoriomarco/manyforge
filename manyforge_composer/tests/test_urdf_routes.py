@@ -178,6 +178,67 @@ def test_urdf_manifest_uses_content_model_key_for_mesh_cache(
         assert legacy_current.headers["cache-control"] == "no-store"
 
 
+def test_active_model_key_tracks_mesh_and_authority_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urdf_path = tmp_path / "robot.urdf"
+    mesh_path = tmp_path / "mesh.stl"
+    urdf_path.write_text("fixture")
+    mesh_path.write_text("mesh")
+
+    entry = routes_urdf._UrdfCacheEntry(
+        urdf_path=str(urdf_path),
+        package_paths=(),
+        mtime_ns=urdf_path.stat().st_mtime_ns,
+        root_link="base_link",
+        links=(
+            routes_urdf._LinkEntry(
+                name="base_link",
+                visuals=(
+                    routes_urdf._LinkVisual(
+                        link_name="base_link",
+                        visual_index=0,
+                        mesh_resource_uri="mesh.stl",
+                        mesh_path=str(mesh_path),
+                        mesh_scale=(1.0, 1.0, 1.0),
+                        primitive=None,
+                        visual_origin_xyz=(0.0, 0.0, 0.0),
+                        visual_origin_rpy=(0.0, 0.0, 0.0),
+                        visual_origin_xyzw=(0.0, 0.0, 0.0, 1.0),
+                    ),
+                ),
+                collisions=(),
+            ),
+        ),
+        joints=(),
+        link_names_for_fk=("base_link",),
+        mesh_glb_cache={},
+    )
+    authority = {"canonical_fingerprint": "authority-a"}
+    state = SimpleNamespace(
+        deployment=SimpleNamespace(
+            robot_config=SimpleNamespace(robot_id="robot")
+        )
+    )
+    monkeypatch.setattr(routes_urdf, "get_urdf_entry", lambda _state: entry)
+    monkeypatch.setattr(
+        routes_urdf,
+        "robot_model_authority_metadata",
+        lambda _state: dict(authority),
+    )
+    first = routes_urdf.active_urdf_model_key(state)
+    second = routes_urdf.active_urdf_model_key(state)
+    mesh_path.write_text("mesh changed")
+    mesh_changed = routes_urdf.active_urdf_model_key(state)
+    authority["canonical_fingerprint"] = "authority-b"
+    third = routes_urdf.active_urdf_model_key(state)
+
+    assert first == second
+    assert mesh_changed != first
+    assert third != first
+
+
 def test_urdf_manifest_exposes_collision_geometry_separately(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

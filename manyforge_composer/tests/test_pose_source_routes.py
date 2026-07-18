@@ -499,6 +499,9 @@ def test_continuous_snapshot_applies_planning_scene_without_operator_apply(tmp_p
     state.request_visual_state_publish = (
         lambda *, reason="": publish_reasons.append(reason)
     )
+    state.request_visual_state_one_shot = (
+        lambda *, reason="": publish_reasons.append(reason)
+    )
 
     response = _post_fresh_box_snapshot(client)
 
@@ -534,6 +537,58 @@ def test_continuous_snapshot_applies_planning_scene_without_operator_apply(tmp_p
         "pose_source_continuous",
         "scene_state_cache_empty",
     ]
+
+
+def test_stale_continuous_snapshot_is_observed_but_never_queued_for_scene_apply(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(box_policy="continuous")
+    )
+    queued: list[dict[str, Any]] = []
+    state.enqueue_pose_source_apply = lambda **kwargs: queued.append(kwargs) or {
+        "success": True,
+        "queued": True,
+    }
+    payload = {
+        "poseSourceId": "isaac_scene_objects",
+        "status": "stale",
+        "monotonicS": 10.0,
+        "objects": [_pose_source_observation("box")],
+    }
+
+    first = client.post(
+        "/api/scene/pose-sources/isaac_scene_objects/snapshot",
+        json=payload,
+    )
+    second = client.post(
+        "/api/scene/pose-sources/isaac_scene_objects/snapshot",
+        json=payload,
+    )
+
+    assert first.status_code == 200
+    assert first.json()["continuous_apply_suppressed"] == [
+        {
+            "object_id": "box",
+            "policy": "continuous",
+            "reason": "source_not_fresh",
+        }
+    ]
+    assert second.status_code == 200
+    assert queued == []
+    latest = state.pose_source_snapshots()["isaac_scene_objects"]
+    assert latest["status"] == "stale"
+    counters = state.pose_source_apply_status()["counters"]
+    assert counters["ingest_apply_suppressed"] == 2
+    assert counters["ingest_source_not_fresh"] == 2
+    transitions = [
+        event
+        for event in state.event_recorder.get_events_since(0)
+        if event["type"] == "pose_source_ingest_apply_state_changed"
+    ]
+    assert len(transitions) == 1
+    assert transitions[0]["details"]["rejection_reason"] == "source_not_fresh"
 
 
 def test_continuous_duplicate_apply_skips_kernel_scene_edit_and_records_metric(

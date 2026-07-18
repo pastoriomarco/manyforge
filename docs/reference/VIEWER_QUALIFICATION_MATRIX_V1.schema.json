@@ -1,0 +1,313 @@
+{
+  "$defs": {
+    "ViewerQualificationBudgetsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "build_failures_max": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Build Failures Max",
+          "type": "integer"
+        },
+        "client_long_tasks_max": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Client Long Tasks Max"
+        },
+        "client_materialization_max_ms": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Client Materialization Max Ms"
+        },
+        "client_react_commits_per_frame_max": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Client React Commits Per Frame Max"
+        },
+        "client_unmatched_topology_rebuilds_max": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Client Unmatched Topology Rebuilds Max"
+        },
+        "process_cpu_p95_percent": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Process Cpu P95 Percent",
+          "type": "object"
+        },
+        "publication_sink_drops_max": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Publication Sink Drops Max",
+          "type": "integer"
+        },
+        "viewer_route_p95_ms": {
+          "exclusiveMinimum": 0.0,
+          "title": "Viewer Route P95 Ms",
+          "type": "number"
+        }
+      },
+      "required": [
+        "viewer_route_p95_ms"
+      ],
+      "title": "ViewerQualificationBudgetsV1",
+      "type": "object"
+    },
+    "ViewerQualificationCaptureV1": {
+      "additionalProperties": false,
+      "properties": {
+        "duration_s": {
+          "exclusiveMinimum": 0.0,
+          "title": "Duration S",
+          "type": "number"
+        },
+        "hz": {
+          "exclusiveMinimum": 0.0,
+          "title": "Hz",
+          "type": "number"
+        },
+        "timeout_s": {
+          "exclusiveMinimum": 0.0,
+          "title": "Timeout S",
+          "type": "number"
+        },
+        "warmup_s": {
+          "minimum": 0.0,
+          "title": "Warmup S",
+          "type": "number"
+        }
+      },
+      "required": [
+        "duration_s",
+        "warmup_s",
+        "hz",
+        "timeout_s"
+      ],
+      "title": "ViewerQualificationCaptureV1",
+      "type": "object"
+    },
+    "ViewerQualificationRequirementsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "active_client": {
+          "default": false,
+          "title": "Active Client",
+          "type": "boolean"
+        },
+        "active_client_count_min": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Active Client Count Min"
+        },
+        "client_count_max": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Client Count Max"
+        },
+        "client_count_min": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Client Count Min"
+        },
+        "client_total_min": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Client Total Min",
+          "type": "object"
+        },
+        "kernel_counter_delta_min": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Kernel Counter Delta Min",
+          "type": "object"
+        },
+        "kernel_state_sample_min": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Kernel State Sample Min",
+          "type": "object"
+        },
+        "no_client": {
+          "default": false,
+          "title": "No Client",
+          "type": "boolean"
+        },
+        "observer_counter_delta_min": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object"
+          },
+          "title": "Observer Counter Delta Min",
+          "type": "object"
+        },
+        "required_layers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Layers",
+          "type": "array"
+        },
+        "viewer_counter_delta_min": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Viewer Counter Delta Min",
+          "type": "object"
+        },
+        "zero_builds": {
+          "default": false,
+          "title": "Zero Builds",
+          "type": "boolean"
+        }
+      },
+      "title": "ViewerQualificationRequirementsV1",
+      "type": "object"
+    },
+    "ViewerQualificationScenarioV1": {
+      "additionalProperties": false,
+      "properties": {
+        "budgets": {
+          "$ref": "#/$defs/ViewerQualificationBudgetsV1"
+        },
+        "capture": {
+          "$ref": "#/$defs/ViewerQualificationCaptureV1"
+        },
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "observer_paths": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Observer Paths",
+          "type": "object"
+        },
+        "preconditions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Preconditions",
+          "type": "array"
+        },
+        "required_process_labels": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Process Labels",
+          "type": "array"
+        },
+        "requirements": {
+          "$ref": "#/$defs/ViewerQualificationRequirementsV1"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "capture",
+        "requirements",
+        "budgets"
+      ],
+      "title": "ViewerQualificationScenarioV1",
+      "type": "object"
+    }
+  },
+  "$id": "https://manyforge.dev/schemas/viewer-qualification-matrix-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "policy": {
+      "additionalProperties": true,
+      "title": "Policy",
+      "type": "object"
+    },
+    "scenarios": {
+      "items": {
+        "$ref": "#/$defs/ViewerQualificationScenarioV1"
+      },
+      "minItems": 1,
+      "title": "Scenarios",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "manyforge.viewer.qualification_matrix.v1",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "policy",
+    "scenarios"
+  ],
+  "title": "ViewerQualificationMatrixV1",
+  "type": "object"
+}

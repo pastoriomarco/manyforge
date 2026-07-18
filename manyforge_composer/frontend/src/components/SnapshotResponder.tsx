@@ -1,21 +1,32 @@
 import { useEffect, useRef } from 'react';
 import { useStore } from '@react-three/fiber';
-import { Vector2 } from 'three';
+import {
+  PerspectiveCamera,
+  RGBAFormat,
+  SRGBColorSpace,
+  UnsignedByteType,
+  WebGLRenderTarget,
+} from 'three';
+
+import {
+  applyLatestViewerFrame,
+  waitForViewerFrameGeneration,
+} from '../store/viewerFrameStore';
+import { canvasToBlobWithTimeout, flipRgbaRowsInPlace } from '../utils/snapshotCapture';
 
 /**
  * Native R3F visualizer Day 3: round-trips scene-snapshot requests
- * from the backend snapshot broker. Mounted inside the same Canvas
- * the operator sees so we capture the live framebuffer rather than
- * a hidden offscreen renderer (which keeps the bytes consistent with
- * what the operator is looking at).
+ * from the backend snapshot broker. Mounted inside the operator's Canvas so
+ * the offscreen render uses the same scene and camera state without resizing
+ * or preserving the visible framebuffer.
  *
  * Wire:
  *   backend SnapshotBroker -> WS /ws/scene/snapshot -> this component
  *   captureFrame(width, height, mime) -> POST /api/scene/snapshot/upload/{id}
  *
- * The Canvas's `gl` config must include `preserveDrawingBuffer: true`
- * — without it `toDataURL` may return a transparent frame depending
- * on the browser's compositor.
+ * Capture uses a reusable offscreen render target. The visible framebuffer is
+ * never preserved or resized, so snapshot support has no permanent render cost
+ * and cannot perturb the operator camera/canvas.
  */
 export function SnapshotResponder() {
   // R3F's `useThree(selector)` returns the selected value, but every
@@ -28,6 +39,12 @@ export function SnapshotResponder() {
   // `.getState()` inside the effect.
   const store = useStore();
   const wsRef = useRef<WebSocket | null>(null);
+  const targetRef = useRef<WebGLRenderTarget | null>(null);
+  const pixelsRef = useRef<{
+    bytes: Uint8Array<ArrayBuffer>;
+    clamped: Uint8ClampedArray<ArrayBuffer>;
+  } | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -48,40 +65,61 @@ export function SnapshotResponder() {
       height: number,
       mime: string,
     ): Promise<Blob> {
-      const { gl, scene, camera, invalidate } = store.getState();
-      const savedSize = new Vector2();
-      gl.getSize(savedSize);
-      const savedPixelRatio = gl.getPixelRatio();
-      const persp = camera as unknown as {
-        isPerspectiveCamera?: boolean;
-        aspect?: number;
-        updateProjectionMatrix?: () => void;
-      };
-      const savedAspect =
-        persp.isPerspectiveCamera && typeof persp.aspect === 'number' ? persp.aspect : null;
+      if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
+        throw new Error('Snapshot dimensions must be positive integers');
+      }
+      const { gl, scene, camera } = store.getState();
+      let target = targetRef.current;
+      if (target === null) {
+        target = new WebGLRenderTarget(width, height, {
+          format: RGBAFormat,
+          type: UnsignedByteType,
+          depthBuffer: true,
+          stencilBuffer: false,
+        });
+        target.texture.colorSpace = SRGBColorSpace;
+        targetRef.current = target;
+      } else if (target.width !== width || target.height !== height) {
+        target.setSize(width, height);
+      }
+      const requiredBytes = width * height * 4;
+      let pixelViews = pixelsRef.current;
+      if (pixelViews === null || pixelViews.bytes.byteLength !== requiredBytes) {
+        const buffer = new ArrayBuffer(requiredBytes);
+        pixelViews = {
+          bytes: new Uint8Array(buffer),
+          clamped: new Uint8ClampedArray(buffer),
+        };
+        pixelsRef.current = pixelViews;
+      }
+      let outputCanvas = canvasRef.current;
+      if (outputCanvas === null) {
+        outputCanvas = document.createElement('canvas');
+        canvasRef.current = outputCanvas;
+      }
+      outputCanvas.width = width;
+      outputCanvas.height = height;
+      const context = outputCanvas.getContext('2d');
+      if (context === null) throw new Error('2D snapshot encoder is unavailable');
+
+      const captureCamera = camera.clone();
+      if (captureCamera instanceof PerspectiveCamera) {
+        captureCamera.aspect = width / height;
+        captureCamera.updateProjectionMatrix();
+      }
+      const previousTarget = gl.getRenderTarget();
 
       try {
-        gl.setPixelRatio(1);
-        gl.setSize(width, height, false);
-        if (savedAspect !== null && persp.updateProjectionMatrix) {
-          persp.aspect = width / height;
-          persp.updateProjectionMatrix();
-        }
-        gl.render(scene, camera);
-        const dataUrl = gl.domElement.toDataURL(mime, 0.9);
-        const response = await fetch(dataUrl);
-        return await response.blob();
+        gl.setRenderTarget(target);
+        gl.clear(true, true, true);
+        gl.render(scene, captureCamera);
+        gl.readRenderTargetPixels(target, 0, 0, width, height, pixelViews.bytes);
       } finally {
-        gl.setPixelRatio(savedPixelRatio);
-        gl.setSize(savedSize.x, savedSize.y, false);
-        if (savedAspect !== null && persp.updateProjectionMatrix) {
-          persp.aspect = savedAspect;
-          persp.updateProjectionMatrix();
-        }
-        // Force a repaint at the restored size so the visible canvas
-        // doesn't get stuck showing the snapshot resolution.
-        invalidate();
+        gl.setRenderTarget(previousTarget);
       }
+      flipRgbaRowsInPlace(pixelViews.bytes, width, height);
+      context.putImageData(new ImageData(pixelViews.clamped, width, height), 0, 0);
+      return canvasToBlobWithTimeout(outputCanvas, mime, 0.9, 1_000);
     }
 
     async function handleRequest(msg: {
@@ -89,9 +127,28 @@ export function SnapshotResponder() {
       width: number;
       height: number;
       format: string;
+      requiredProducerEpoch?: string;
+      requiredFrameSequence?: number;
+      timeoutMs?: number;
     }): Promise<void> {
       const mime = msg.format === 'png' ? 'image/png' : 'image/jpeg';
       try {
+        if (
+          typeof msg.requiredProducerEpoch === 'string'
+          && Number.isInteger(msg.requiredFrameSequence)
+        ) {
+          const available = await waitForViewerFrameGeneration(
+            msg.requiredProducerEpoch,
+            msg.requiredFrameSequence as number,
+            Number.isFinite(msg.timeoutMs) ? Number(msg.timeoutMs) : 1_000,
+          );
+          if (!available) {
+            throw new Error('Required viewer frame did not arrive before capture');
+          }
+          // Apply refs synchronously so hidden-tab animation throttling cannot
+          // make an offscreen snapshot lag the generation the backend prepared.
+          applyLatestViewerFrame(Date.now(), 0);
+        }
         const blob = await captureFrame(msg.width, msg.height, mime);
         await fetch(
           `/api/scene/snapshot/upload/${encodeURIComponent(msg.requestId)}`,
@@ -174,6 +231,10 @@ export function SnapshotResponder() {
       } catch {
         /* already closed */
       }
+      targetRef.current?.dispose();
+      targetRef.current = null;
+      pixelsRef.current = null;
+      canvasRef.current = null;
     };
   }, [store]);
 

@@ -1,0 +1,150 @@
+{
+  "$defs": {
+    "ViewerQualificationSampleV1": {
+      "additionalProperties": false,
+      "properties": {
+        "errors": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Errors",
+          "type": "array"
+        },
+        "index": {
+          "minimum": 0,
+          "title": "Index",
+          "type": "integer"
+        },
+        "kernel_metrics": {
+          "additionalProperties": true,
+          "title": "Kernel Metrics",
+          "type": "object"
+        },
+        "kernel_route_latency_ms": {
+          "minimum": 0.0,
+          "title": "Kernel Route Latency Ms",
+          "type": "number"
+        },
+        "kernel_snapshot": {
+          "additionalProperties": true,
+          "title": "Kernel Snapshot",
+          "type": "object"
+        },
+        "monotonic_ns": {
+          "minimum": 0,
+          "title": "Monotonic Ns",
+          "type": "integer"
+        },
+        "observers": {
+          "additionalProperties": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Observers",
+          "type": "object"
+        },
+        "processes": {
+          "additionalProperties": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Processes",
+          "type": "object"
+        },
+        "viewer_route_latency_ms": {
+          "minimum": 0.0,
+          "title": "Viewer Route Latency Ms",
+          "type": "number"
+        },
+        "viewer_status": {
+          "additionalProperties": true,
+          "title": "Viewer Status",
+          "type": "object"
+        }
+      },
+      "required": [
+        "index",
+        "monotonic_ns",
+        "viewer_route_latency_ms",
+        "kernel_route_latency_ms",
+        "viewer_status",
+        "kernel_metrics",
+        "processes",
+        "errors"
+      ],
+      "title": "ViewerQualificationSampleV1",
+      "type": "object"
+    }
+  },
+  "$id": "https://manyforge.dev/schemas/viewer-qualification-artifact-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "captured_at": {
+      "title": "Captured At",
+      "type": "string"
+    },
+    "configuration": {
+      "additionalProperties": true,
+      "title": "Configuration",
+      "type": "object"
+    },
+    "environment": {
+      "additionalProperties": true,
+      "title": "Environment",
+      "type": "object"
+    },
+    "failures": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Failures",
+      "type": "array"
+    },
+    "samples": {
+      "items": {
+        "$ref": "#/$defs/ViewerQualificationSampleV1"
+      },
+      "title": "Samples",
+      "type": "array"
+    },
+    "scenario": {
+      "minLength": 1,
+      "title": "Scenario",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "manyforge.viewer.qualification.v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source": {
+      "additionalProperties": true,
+      "title": "Source",
+      "type": "object"
+    },
+    "success": {
+      "title": "Success",
+      "type": "boolean"
+    },
+    "summary": {
+      "additionalProperties": true,
+      "title": "Summary",
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "scenario",
+    "captured_at",
+    "source",
+    "environment",
+    "configuration",
+    "samples",
+    "summary",
+    "failures",
+    "success"
+  ],
+  "title": "ViewerQualificationArtifactV1",
+  "type": "object"
+}

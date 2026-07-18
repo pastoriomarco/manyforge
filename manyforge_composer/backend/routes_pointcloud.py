@@ -1,39 +1,16 @@
-"""Point-cloud / octomap streaming - /ws/scene/pointcloud
-
-Native viewer Day 4: WebSocket fan-out for live point-cloud frames
-from a perception source to all connected viewer clients. The
-protocol is intentionally minimal so a real octomap / depth-sensor
-producer can register as a publisher without further coordination
-with the viewer.
-
-Publisher API (server-side):
-    state.point_cloud_publisher.publish(points, colors=None)
-    state.point_cloud_publisher.clear()
-
-Wire format (server → client, JSON):
-    { "type": "pointcloud_frame",
-      "timestamp_ns": int,
-      "points": [[x, y, z], ...],    # world-frame metres
-      "colors": [[r, g, b], ...] }   # optional, 0-1 floats
-
-Clear (e.g. when scene is reset):
-    { "type": "pointcloud_clear", "timestamp_ns": int }
-
-No frames flow until a publisher registers, which keeps the viewer
-overhead at zero on scenarios that don't use octomap. The renderer
-on the client side reads the latest frame from a small zustand
-store; we deliberately stream individual frames rather than diffs
-in this first pass — diff/delta protocol can come in a Day 7+
-refinement once a real source is wired and the bandwidth profile
-is measurable.
-"""
+"""Bounded binary point-cloud transport for the native scene viewer."""
 from __future__ import annotations
 
 import asyncio
-import logging
+import math
+import os
+import struct
 import threading
 import time
-from typing import Optional, Sequence, TYPE_CHECKING
+import uuid
+from array import array
+from dataclasses import dataclass, field
+from typing import Any, Final, Optional, Sequence, TYPE_CHECKING
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
@@ -42,139 +19,507 @@ from .security import SecurityConfig, check_ws_bearer_token
 if TYPE_CHECKING:
     from .state import ComposerState
 
-logger = logging.getLogger(__name__)
-_POINTCLOUD_SEND_TIMEOUT_S = 0.25
+_POINTCLOUD_MAGIC: Final = b"MFPC"
+_POINTCLOUD_VERSION: Final = 1
+_POINTCLOUD_FLAG_COLORS: Final = 1 << 0
+_POINTCLOUD_FLAG_CLEAR: Final = 1 << 1
+_POINTCLOUD_HEADER: Final = struct.Struct("<4sBBHQQQII")
+_POINTCLOUD_SEND_TIMEOUT_S: Final = 0.25
+_DEFAULT_MAX_POINTS: Final = 200_000
+_PROTOCOL_MAX_POINTS: Final = 200_000
+
+
+def _validated_max_points() -> int:
+    raw = os.getenv("MANYFORGE_POINTCLOUD_MAX_POINTS", str(_DEFAULT_MAX_POINTS))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("MANYFORGE_POINTCLOUD_MAX_POINTS must be an integer") from exc
+    if value <= 0 or value > _PROTOCOL_MAX_POINTS:
+        raise ValueError(
+            f"MANYFORGE_POINTCLOUD_MAX_POINTS must be in [1, {_PROTOCOL_MAX_POINTS}]"
+        )
+    return value
+
+
+def _pack_pointcloud_frame(
+    *,
+    stream_epoch: int,
+    sequence: int,
+    timestamp_ns: int,
+    points: Sequence[Sequence[float]],
+    colors: Optional[Sequence[Sequence[float]]],
+    max_points: int,
+) -> bytes:
+    count = len(points)
+    if count > max_points:
+        raise ValueError(f"point cloud has {count} points; limit is {max_points}")
+    if colors is not None and len(colors) != count:
+        raise ValueError("point cloud colors must match point count")
+
+    positions = array("f")
+    color_bytes = bytearray(count * 3) if colors is not None else None
+    for index, point in enumerate(points):
+        try:
+            x, y, z = float(point[0]), float(point[1]), float(point[2])
+        except (IndexError, TypeError, ValueError) as exc:
+            raise ValueError(f"point {index} is not an xyz triple") from exc
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            raise ValueError(f"point {index} is not finite")
+        positions.extend((x, y, z))
+        if color_bytes is not None and colors is not None:
+            color = colors[index]
+            try:
+                red, green, blue = (
+                    float(color[0]),
+                    float(color[1]),
+                    float(color[2]),
+                )
+            except (IndexError, TypeError, ValueError) as exc:
+                raise ValueError(f"color {index} is not an rgb triple") from exc
+            if not (
+                math.isfinite(red)
+                and math.isfinite(green)
+                and math.isfinite(blue)
+            ):
+                raise ValueError(f"color {index} is not finite")
+            offset = index * 3
+            color_bytes[offset] = round(max(0.0, min(1.0, red)) * 255.0)
+            color_bytes[offset + 1] = round(max(0.0, min(1.0, green)) * 255.0)
+            color_bytes[offset + 2] = round(max(0.0, min(1.0, blue)) * 255.0)
+
+    if positions.itemsize != 4:
+        raise RuntimeError("platform float array is not IEEE-754 float32")
+    if os.sys.byteorder != "little":
+        positions.byteswap()
+    payload = positions.tobytes()
+    flags = 0
+    if color_bytes is not None:
+        flags |= _POINTCLOUD_FLAG_COLORS
+        payload += color_bytes
+    header = _POINTCLOUD_HEADER.pack(
+        _POINTCLOUD_MAGIC,
+        _POINTCLOUD_VERSION,
+        flags,
+        _POINTCLOUD_HEADER.size,
+        int(stream_epoch),
+        int(sequence),
+        int(timestamp_ns),
+        count,
+        len(payload),
+    )
+    return header + payload
+
+
+def _pack_pointcloud_clear(
+    *,
+    stream_epoch: int,
+    sequence: int,
+    timestamp_ns: int,
+) -> bytes:
+    return _POINTCLOUD_HEADER.pack(
+        _POINTCLOUD_MAGIC,
+        _POINTCLOUD_VERSION,
+        _POINTCLOUD_FLAG_CLEAR,
+        _POINTCLOUD_HEADER.size,
+        int(stream_epoch),
+        int(sequence),
+        int(timestamp_ns),
+        0,
+        0,
+    )
+
+
+def decode_pointcloud_packet(packet: bytes) -> dict[str, Any]:
+    """Strict decoder used by tests and non-browser diagnostics."""
+    if len(packet) < _POINTCLOUD_HEADER.size:
+        raise ValueError("point-cloud packet is shorter than its header")
+    (
+        magic,
+        version,
+        flags,
+        header_size,
+        stream_epoch,
+        sequence,
+        timestamp_ns,
+        point_count,
+        payload_bytes,
+    ) = _POINTCLOUD_HEADER.unpack_from(packet)
+    if magic != _POINTCLOUD_MAGIC or version != _POINTCLOUD_VERSION:
+        raise ValueError("unsupported point-cloud protocol")
+    if header_size != _POINTCLOUD_HEADER.size:
+        raise ValueError("invalid point-cloud header size")
+    if flags & ~(_POINTCLOUD_FLAG_COLORS | _POINTCLOUD_FLAG_CLEAR):
+        raise ValueError("unsupported point-cloud flags")
+    expected_payload = point_count * 12
+    if flags & _POINTCLOUD_FLAG_COLORS:
+        expected_payload += point_count * 3
+    if flags & _POINTCLOUD_FLAG_CLEAR:
+        if point_count != 0 or payload_bytes != 0:
+            raise ValueError("clear packet carries point data")
+    elif payload_bytes != expected_payload:
+        raise ValueError("point-cloud payload shape is inconsistent")
+    if len(packet) != header_size + payload_bytes:
+        raise ValueError("point-cloud packet length is inconsistent")
+    return {
+        "stream_epoch": stream_epoch,
+        "sequence": sequence,
+        "timestamp_ns": timestamp_ns,
+        "point_count": point_count,
+        "has_colors": bool(flags & _POINTCLOUD_FLAG_COLORS),
+        "clear": bool(flags & _POINTCLOUD_FLAG_CLEAR),
+        "payload": memoryview(packet)[header_size:],
+    }
+
+
+@dataclass
+class _PointCloudClient:
+    client_id: str
+    websocket: WebSocket
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    pending: bytes | None = None
+    sent: int = 0
+    replaced: int = 0
+    send_timeouts: int = 0
+    send_errors: int = 0
+    closed: bool = False
 
 
 class PointCloudPublisher:
-    """Fan-out hub for live point-cloud frames.
+    """One-encode, capacity-one ingress and capacity-one per-client fanout."""
 
-    Owned by ``ComposerState.point_cloud_publisher``. A perception
-    source calls ``publish()`` from its own thread; this class
-    serialises the frame as JSON and forwards it to every connected
-    viewer WS client via ``asyncio.run_coroutine_threadsafe`` (same
-    pattern as ``SnapshotBroker.render_sync`` in Day 3).
-
-    State semantics:
-    - ``latest_frame`` holds the most recent publish so a newly
-      connected client can be sent a starter frame on attach,
-      mirroring the publisher's behaviour on the next push without
-      forcing the client to wait for the next perception tick.
-    - ``clear()`` resets ``latest_frame`` and broadcasts a clear
-      message so clients drop their current rendering.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._clients: list[WebSocket] = []
+    def __init__(self, *, max_points: int | None = None) -> None:
+        self._max_points = _validated_max_points() if max_points is None else int(max_points)
+        if self._max_points <= 0 or self._max_points > _PROTOCOL_MAX_POINTS:
+            raise ValueError("max_points is outside the supported range")
+        self._stream_epoch = uuid.uuid4().int & ((1 << 64) - 1)
+        self._encode_lock = threading.Lock()
+        self._ingress_lock = threading.Lock()
+        self._clients_lock = asyncio.Lock()
+        self._clients: dict[str, _PointCloudClient] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._latest_frame: Optional[dict] = None
+        self._client_count = 0
+        self._demand_epoch = 0
+        self._sequence = 0
+        self._latest_packet: bytes | None = None
+        self._ingress_pending: tuple[int, bytes] | None = None
+        self._ingress_scheduled = False
+        self._published = 0
+        self._clears = 0
+        self._suppressed_no_clients = 0
+        self._ingress_replacements = 0
+        self._schedule_failures = 0
+        self._superseded_demand = 0
+        self._rejected = 0
+        self._sent_total = 0
+        self._client_replacements_total = 0
+        self._send_timeouts_total = 0
+        self._send_errors_total = 0
 
-    async def attach(self, ws: WebSocket) -> None:
-        await ws.accept()
+    async def attach(self, websocket: WebSocket, *, client_id: str | None = None) -> str:
+        await websocket.accept()
+        identifier = client_id or uuid.uuid4().hex
         loop = asyncio.get_running_loop()
-        starter: Optional[dict]
-        with self._lock:
-            self._clients.append(ws)
-            if self._loop is None:
-                self._loop = loop
-            starter = self._latest_frame
-        if starter is not None:
-            try:
-                await ws.send_json(starter)
-            except Exception:
-                logger.debug("PointCloud starter-frame send failed", exc_info=True)
+        with self._ingress_lock:
+            if self._loop is not None and self._loop is not loop:
+                raise RuntimeError("point-cloud publisher cannot span event loops")
+            self._loop = loop
+        async with self._clients_lock:
+            if identifier in self._clients:
+                raise ValueError(f"point-cloud client already attached: {identifier}")
+            client = _PointCloudClient(identifier, websocket)
+            first_client = not self._clients
+            self._clients[identifier] = client
+            with self._ingress_lock:
+                if first_client:
+                    self._demand_epoch += 1
+                    starter = None
+                else:
+                    starter = self._latest_packet
+                self._client_count = len(self._clients)
+            if starter is not None:
+                client.pending = starter
+                client.event.set()
+        return identifier
 
-    async def detach(self, ws: WebSocket) -> None:
-        with self._lock:
-            if ws in self._clients:
-                self._clients.remove(ws)
+    async def detach(self, client_id: str) -> None:
+        async with self._clients_lock:
+            client = self._clients.pop(client_id, None)
+            if client is not None:
+                client.closed = True
+                client.event.set()
+            with self._ingress_lock:
+                self._client_count = len(self._clients)
+                if self._client_count == 0:
+                    # A future observer must not receive a frame produced for a
+                    # prior demand lifetime. It will receive the next source
+                    # publication after attaching.
+                    self._demand_epoch += 1
+                    self._latest_packet = None
+                    self._ingress_pending = None
 
     def has_clients(self) -> bool:
-        with self._lock:
-            return bool(self._clients)
+        with self._ingress_lock:
+            return self._client_count > 0
 
     def publish(
         self,
         points: Sequence[Sequence[float]],
         colors: Optional[Sequence[Sequence[float]]] = None,
-    ) -> None:
-        """Push a point-cloud frame to every connected viewer.
+    ) -> bool:
+        """Encode and offer one frame, or suppress it when nobody observes."""
+        with self._encode_lock:
+            with self._ingress_lock:
+                if self._client_count == 0 or self._loop is None:
+                    self._suppressed_no_clients += 1
+                    return False
+                demand_epoch = self._demand_epoch
+                sequence = self._sequence + 1
+            try:
+                packet = _pack_pointcloud_frame(
+                    stream_epoch=self._stream_epoch,
+                    sequence=sequence,
+                    timestamp_ns=time.monotonic_ns(),
+                    points=points,
+                    colors=colors,
+                    max_points=self._max_points,
+                )
+            except Exception:
+                with self._ingress_lock:
+                    self._rejected += 1
+                raise
+            with self._ingress_lock:
+                if (
+                    demand_epoch != self._demand_epoch
+                    or self._client_count == 0
+                    or self._loop is None
+                ):
+                    self._superseded_demand += 1
+                    return False
+                self._sequence = sequence
+                self._latest_packet = packet
+                self._published += 1
+            return self._offer_threadsafe(packet, demand_epoch=demand_epoch)
 
-        ``points`` is a sequence of ``[x, y, z]`` triples in world
-        metres. ``colors`` is an optional sequence of ``[r, g, b]``
-        triples (0-1 floats); when omitted, the client renders the
-        cloud with a default material colour.
-        """
-        frame = {
-            "type": "pointcloud_frame",
-            "timestamp_ns": time.monotonic_ns(),
-            "points": [[float(p[0]), float(p[1]), float(p[2])] for p in points],
-        }
-        if colors is not None:
-            frame["colors"] = [
-                [float(c[0]), float(c[1]), float(c[2])] for c in colors
-            ]
-        with self._lock:
-            self._latest_frame = frame
-            clients = list(self._clients)
-            loop = self._loop
-        if not clients or loop is None:
-            return
-        for ws in clients:
-            asyncio.run_coroutine_threadsafe(self._send_safe(ws, frame), loop)
-
-    def clear(self) -> None:
-        message = {"type": "pointcloud_clear", "timestamp_ns": time.monotonic_ns()}
-        with self._lock:
-            self._latest_frame = None
-            clients = list(self._clients)
-            loop = self._loop
-        if not clients or loop is None:
-            return
-        for ws in clients:
-            asyncio.run_coroutine_threadsafe(self._send_safe(ws, message), loop)
-
-    async def _send_safe(self, ws: WebSocket, frame: dict) -> None:
-        try:
-            await asyncio.wait_for(
-                ws.send_json(frame),
-                timeout=_POINTCLOUD_SEND_TIMEOUT_S,
+    def clear(self) -> bool:
+        with self._encode_lock:
+            with self._ingress_lock:
+                has_clients = self._client_count > 0 and self._loop is not None
+                demand_epoch = self._demand_epoch
+                sequence = self._sequence + 1
+                self._clears += 1
+                self._latest_packet = None
+            if not has_clients:
+                return False
+            packet = _pack_pointcloud_clear(
+                stream_epoch=self._stream_epoch,
+                sequence=sequence,
+                timestamp_ns=time.monotonic_ns(),
             )
-        except Exception:
-            logger.debug("PointCloud send failed (client likely disconnected)", exc_info=True)
-            await self.detach(ws)
+            with self._ingress_lock:
+                if (
+                    demand_epoch != self._demand_epoch
+                    or self._client_count == 0
+                    or self._loop is None
+                ):
+                    self._superseded_demand += 1
+                    return False
+                self._sequence = sequence
+            return self._offer_threadsafe(packet, demand_epoch=demand_epoch)
+
+    def _offer_threadsafe(self, packet: bytes, *, demand_epoch: int) -> bool:
+        schedule = False
+        with self._ingress_lock:
+            loop = self._loop
+            if (
+                loop is None
+                or loop.is_closed()
+                or self._client_count == 0
+                or demand_epoch != self._demand_epoch
+            ):
+                self._superseded_demand += 1
+                return False
+            if self._ingress_pending is not None:
+                self._ingress_replacements += 1
+            self._ingress_pending = (demand_epoch, packet)
+            if not self._ingress_scheduled:
+                self._ingress_scheduled = True
+                schedule = True
+        if not schedule:
+            return True
+        try:
+            loop.call_soon_threadsafe(self._start_ingress_drain)
+        except RuntimeError:
+            with self._ingress_lock:
+                self._ingress_pending = None
+                self._ingress_scheduled = False
+                self._schedule_failures += 1
+            return False
+        return True
+
+    def _start_ingress_drain(self) -> None:
+        asyncio.create_task(self._drain_ingress())
+
+    async def _drain_ingress(self) -> None:
+        while True:
+            with self._ingress_lock:
+                pending = self._ingress_pending
+                self._ingress_pending = None
+                if pending is None:
+                    self._ingress_scheduled = False
+                    return
+            demand_epoch, packet = pending
+            async with self._clients_lock:
+                with self._ingress_lock:
+                    if demand_epoch != self._demand_epoch:
+                        self._superseded_demand += 1
+                        continue
+                replacements = 0
+                for client in self._clients.values():
+                    if client.closed:
+                        continue
+                    if client.pending is not None:
+                        client.replaced += 1
+                        replacements += 1
+                    client.pending = packet
+                    client.event.set()
+            if replacements:
+                with self._ingress_lock:
+                    self._client_replacements_total += replacements
+
+    async def send_loop(self, client_id: str) -> None:
+        while True:
+            async with self._clients_lock:
+                client = self._clients.get(client_id)
+                if client is None or client.closed:
+                    return
+                event = client.event
+            await event.wait()
+            async with self._clients_lock:
+                client = self._clients.get(client_id)
+                if client is None or client.closed:
+                    return
+                packet = client.pending
+                client.pending = None
+                client.event.clear()
+            if packet is None:
+                continue
+            try:
+                await asyncio.wait_for(
+                    client.websocket.send_bytes(packet),
+                    timeout=_POINTCLOUD_SEND_TIMEOUT_S,
+                )
+                async with self._clients_lock:
+                    current = self._clients.get(client_id)
+                    if current is not None:
+                        current.sent += 1
+                with self._ingress_lock:
+                    self._sent_total += 1
+            except asyncio.TimeoutError:
+                async with self._clients_lock:
+                    current = self._clients.get(client_id)
+                    if current is not None:
+                        current.send_timeouts += 1
+                with self._ingress_lock:
+                    self._send_timeouts_total += 1
+                await self.detach(client_id)
+                raise
+            except Exception:
+                async with self._clients_lock:
+                    current = self._clients.get(client_id)
+                    if current is not None:
+                        current.send_errors += 1
+                with self._ingress_lock:
+                    self._send_errors_total += 1
+                await self.detach(client_id)
+                raise
+
+    async def status(self) -> dict[str, Any]:
+        async with self._clients_lock:
+            clients = {
+                client_id: {
+                    "pending": client.pending is not None,
+                    "sent": client.sent,
+                    "replaced": client.replaced,
+                    "send_timeouts": client.send_timeouts,
+                    "send_errors": client.send_errors,
+                }
+                for client_id, client in self._clients.items()
+            }
+        with self._ingress_lock:
+            return {
+                "schema_version": "manyforge.viewer.pointcloud_status.v1",
+                "stream_epoch": self._stream_epoch,
+                "demand_epoch": self._demand_epoch,
+                "sequence": self._sequence,
+                "max_points": self._max_points,
+                "client_count": self._client_count,
+                "published": self._published,
+                "clears": self._clears,
+                "suppressed_no_clients": self._suppressed_no_clients,
+                "rejected": self._rejected,
+                "sent_total": self._sent_total,
+                "client_replacements_total": self._client_replacements_total,
+                "send_timeouts_total": self._send_timeouts_total,
+                "send_errors_total": self._send_errors_total,
+                "ingress_pending": self._ingress_pending is not None,
+                "ingress_replacements": self._ingress_replacements,
+                "schedule_failures": self._schedule_failures,
+                "superseded_demand": self._superseded_demand,
+                "clients": clients,
+            }
 
 
 def create_pointcloud_router(
     state: "ComposerState",
     security: SecurityConfig,
 ) -> APIRouter:
-    """Create the point-cloud WS router.
-
-    Mounted at app root because the WS path is absolute
-    (``/ws/scene/pointcloud``). The HTTP-level
-    ``BearerAuthMiddleware`` doesn't run on WS upgrades, so we
-    check the token here when one is configured.
-    """
     router = APIRouter()
     publisher = PointCloudPublisher()
     state.point_cloud_publisher = publisher  # type: ignore[attr-defined]
 
+    @router.get("/api/scene/pointcloud/status")
+    async def pointcloud_status() -> dict[str, Any]:
+        return await publisher.status()
+
     @router.websocket("/ws/scene/pointcloud")
-    async def ws_pointcloud(ws: WebSocket) -> None:
-        if security.api_token and not check_ws_bearer_token(ws, security.api_token):
-            await ws.close(code=4401, reason="Unauthorized")
+    async def ws_pointcloud(websocket: WebSocket) -> None:
+        if security.api_token and not check_ws_bearer_token(
+            websocket,
+            security.api_token,
+        ):
+            await websocket.close(code=4401, reason="Unauthorized")
             return
-        await publisher.attach(ws)
-        try:
+        client_id = await publisher.attach(websocket)
+        send_task = asyncio.create_task(publisher.send_loop(client_id))
+
+        async def receive_until_disconnect() -> None:
             while True:
-                msg = await ws.receive_text()
-                if msg == "ping":
-                    await ws.send_text("pong")
+                await websocket.receive_text()
+
+        receive_task = asyncio.create_task(receive_until_disconnect())
+        try:
+            await asyncio.wait(
+                {send_task, receive_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
         except WebSocketDisconnect:
             pass
         finally:
-            await publisher.detach(ws)
+            await publisher.detach(client_id)
+            for task in (send_task, receive_task):
+                task.cancel()
+            await asyncio.gather(send_task, receive_task, return_exceptions=True)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     return router
+
+
+__all__ = [
+    "PointCloudPublisher",
+    "create_pointcloud_router",
+    "decode_pointcloud_packet",
+]

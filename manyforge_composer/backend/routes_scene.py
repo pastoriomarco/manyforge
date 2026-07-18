@@ -57,6 +57,12 @@ from manyforge_behavior.geometry import (
 )
 from .route_execution import run_route_background
 from .state import ComposerState
+from .viewer_data_plane import (
+    ViewerInputUnchanged,
+    ViewerSnapshotBuild,
+    freeze_viewer_render_signature,
+    freeze_viewer_signature,
+)
 
 
 def augment_pose_orientation_rpy_deg(value: Any) -> Any:
@@ -89,9 +95,7 @@ def augment_pose_orientation_rpy_deg(value: Any) -> Any:
     return value
 from .visual_state import (
     VisualSnapshotUnavailable,
-    build_robot_visual_snapshot,
-    compute_robot_visual_link_poses,
-    relative_pose_from_world,
+    visual_fk_model_descriptor,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,17 +108,76 @@ def _elapsed_ms(start: float) -> float:
     return (time.monotonic() - start) * 1000.0
 
 
+def _continuous_pose_update_rejection(
+    *,
+    source_status: str,
+    source_stale_after_s: float,
+    source_id: str,
+    object_state: dict[str, Any],
+) -> str | None:
+    """Classify whether one observation is usable for automatic scene apply."""
+    if source_status != "fresh":
+        return "source_not_fresh"
+    if str(object_state.get("status") or "") != "fresh":
+        return "object_not_fresh"
+    if isinstance(object_state.get("rejection"), dict):
+        return "object_rejected"
+    age_s = object_state.get("age_s")
+    if age_s is not None:
+        try:
+            parsed_age_s = float(age_s)
+        except (TypeError, ValueError):
+            return "age_invalid"
+        if (
+            not math.isfinite(parsed_age_s)
+            or parsed_age_s < 0.0
+            or parsed_age_s > float(source_stale_after_s)
+        ):
+            return "age_out_of_budget"
+    update = object_state.get("update")
+    if not isinstance(update, dict):
+        return "update_missing"
+    object_id = str(object_state.get("object_id") or "")
+    if (
+        str(update.get("pose_source_id") or "") != source_id
+        or str(update.get("object_id") or "") != object_id
+    ):
+        return "update_identity_mismatch"
+    pose = update.get("pose")
+    if not isinstance(pose, dict):
+        return "pose_missing"
+    position = pose.get("position_xyz")
+    orientation = pose.get("orientation_xyzw")
+    if not isinstance(position, list) or len(position) != 3:
+        return "position_shape_invalid"
+    if not isinstance(orientation, list) or len(orientation) != 4:
+        return "orientation_shape_invalid"
+    try:
+        position_values = [float(value) for value in position]
+        orientation_values = [float(value) for value in orientation]
+    except (TypeError, ValueError):
+        return "pose_not_numeric"
+    if not all(math.isfinite(value) for value in (*position_values, *orientation_values)):
+        return "pose_not_finite"
+    orientation_norm = math.sqrt(
+        sum(value * value for value in orientation_values)
+    )
+    if orientation_norm <= 1e-12:
+        return "orientation_zero_norm"
+    return None
+
+
 def _visual_publish_period_s() -> float:
-    raw_value = os.environ.get("MANYFORGE_VISUAL_STATE_PUBLISH_HZ")
+    raw_value = os.environ.get("MANYFORGE_VIEWER_MAX_FRAME_HZ")
     if raw_value is None:
         return 1.0 / 15.0
     try:
         hz = float(raw_value)
     except ValueError:
         logger.warning(
-            "invalid MANYFORGE_VISUAL_STATE_PUBLISH_HZ=%r; using 15 Hz",
+            "invalid MANYFORGE_VIEWER_MAX_FRAME_HZ=%r; using 15 Hz",
             raw_value,
-            extra={"event": "visual_state_invalid_publish_hz"},
+            extra={"event": "viewer_invalid_max_frame_hz"},
         )
         return 1.0 / 15.0
     hz = max(1.0, min(hz, 60.0))
@@ -122,23 +185,23 @@ def _visual_publish_period_s() -> float:
 
 
 def _visual_snapshot_stale_after_ms() -> float:
-    raw_value = os.environ.get("MANYFORGE_VISUAL_STATE_STALE_AFTER_MS")
+    raw_value = os.environ.get("MANYFORGE_VIEWER_DEBUG_SNAPSHOT_STALE_AFTER_MS")
     if raw_value is not None:
         try:
             configured_ms = float(raw_value)
         except ValueError:
             logger.warning(
-                "invalid MANYFORGE_VISUAL_STATE_STALE_AFTER_MS=%r; using cadence-derived threshold",
+                "invalid MANYFORGE_VIEWER_DEBUG_SNAPSHOT_STALE_AFTER_MS=%r; using cadence-derived threshold",
                 raw_value,
-                extra={"event": "manyforge.visual.invalid_stale_threshold"},
+                extra={"event": "manyforge.viewer.invalid_debug_stale_threshold"},
             )
         else:
             if math.isfinite(configured_ms) and configured_ms > 0.0:
                 return max(50.0, configured_ms)
             logger.warning(
-                "invalid MANYFORGE_VISUAL_STATE_STALE_AFTER_MS=%r; using cadence-derived threshold",
+                "invalid MANYFORGE_VIEWER_DEBUG_SNAPSHOT_STALE_AFTER_MS=%r; using cadence-derived threshold",
                 raw_value,
-                extra={"event": "manyforge.visual.invalid_stale_threshold"},
+                extra={"event": "manyforge.viewer.invalid_debug_stale_threshold"},
             )
     return max(250.0, _visual_publish_period_s() * 3000.0)
 
@@ -280,7 +343,11 @@ def _load_model_frame_names(state: ComposerState) -> list[str]:
         return []
     if entry is None:
         return []
-    return sorted(link.name for link in entry.links)
+    return sorted(
+        str(link.name)
+        for link in getattr(entry, "links", ())
+        if getattr(link, "name", None)
+    )
 
 
 def _scene_frame_roles(state: ComposerState) -> dict[str, set[str]]:
@@ -298,10 +365,10 @@ def _scene_frame_roles(state: ComposerState) -> dict[str, set[str]]:
 
     if state.deployment is not None:
         for gripper_id, config in state.deployment.grippers.items():
-            add_role(config.mount_frame, f"{gripper_id}:mount")
-            add_role(config.attach_frame, f"{gripper_id}:attach")
-            add_role(config.tcp_frame, f"{gripper_id}:tcp")
-            for frame_name in config.auxiliary_frames:
+            add_role(getattr(config, "mount_frame", ""), f"{gripper_id}:mount")
+            add_role(getattr(config, "attach_frame", ""), f"{gripper_id}:attach")
+            add_role(getattr(config, "tcp_frame", ""), f"{gripper_id}:tcp")
+            for frame_name in getattr(config, "auxiliary_frames", ()):
                 add_role(frame_name, f"{gripper_id}:auxiliary")
 
     return roles
@@ -358,7 +425,7 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
             visual_route_mode = "visual_snapshot"
             visual_route_served = True
         else:
-            state.request_visual_state_publish(reason="scene_frames_cache_empty")
+            state.request_visual_state_one_shot(reason="scene_frames_cache_empty")
             visual_route_mode = "visual_snapshot_pending"
             visual_route_fallback = (
                 snapshot_meta.get("last_error") or "visual_snapshot_pending"
@@ -537,7 +604,11 @@ def _scene_object_responses(
     return sorted(objects, key=lambda obj: obj.object_id)
 
 
-def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse]:
+def _pose_sources_payload(
+    state: ComposerState,
+    *,
+    snapshots: dict[str, dict[str, Any]] | None = None,
+) -> list[PoseSourceStatusResponse]:
     """Merge deployment pose-source declarations with latest sidecar snapshots.
 
     This is intentionally observe-only. Runtime sidecars can report freshness
@@ -550,7 +621,8 @@ def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse
     )
     if not pose_sources:
         return []
-    snapshots = state.pose_source_snapshots()
+    if snapshots is None:
+        snapshots = state.pose_source_snapshots()
     drift_states = state.pose_source_drift_states()
     responses: list[PoseSourceStatusResponse] = []
 
@@ -637,63 +709,6 @@ def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse
     return responses
 
 
-def _source_requests_measured_robot_ghost(
-    source: PoseSourceStatusResponse,
-) -> bool:
-    for observed in source.objects:
-        config = observed.measured_state_ghost
-        if not isinstance(config, dict):
-            continue
-        if config.get("enabled") is not True:
-            continue
-        if config.get("robotTcp", True) is False:
-            continue
-        return True
-    return False
-
-
-def _enrich_measured_robot_link_poses(
-    state: ComposerState,
-    *,
-    pose_sources: list[PoseSourceStatusResponse],
-    link_names: list[str],
-    reference_frame: str,
-    base_frame: str,
-    base_pose: dict[str, Any],
-) -> None:
-    """Attach measured-robot visual FK link poses to pose-source status rows."""
-
-    for source in pose_sources:
-        measured_robot = source.measured_robot
-        if measured_robot is None:
-            continue
-        if not _source_requests_measured_robot_ghost(source):
-            continue
-        joint_names = list(measured_robot.joint_names)
-        joint_positions = list(measured_robot.joint_positions_rad)
-        if not joint_names or len(joint_names) != len(joint_positions):
-            continue
-        try:
-            link_poses = compute_robot_visual_link_poses(
-                state,
-                joint_names=joint_names,
-                joint_positions_rad=joint_positions,
-                link_names=link_names,
-                reference_frame=reference_frame,
-                base_frame=base_frame,
-                base_pose=base_pose,
-            )
-        except VisualSnapshotUnavailable:
-            logger.debug(
-                "measured robot visual FK unavailable for pose source %s",
-                source.pose_source_id,
-                exc_info=True,
-                extra={"event": "manyforge.visual.measured_robot_fk_unavailable"},
-            )
-            continue
-        measured_robot.link_poses = dict(link_poses)
-
-
 def _base_robot_route_metadata(
     state: ComposerState,
 ) -> tuple[str | None, str | None, str, str, dict[str, Any]]:
@@ -713,7 +728,10 @@ def _base_robot_route_metadata(
     return robot_id, group_id, base_frame, tcp_frame, base_pose
 
 
-def _execution_authority_metadata(state: ComposerState) -> dict[str, Any]:
+def _execution_authority_metadata(
+    state: ComposerState,
+    snapshot: Any | None = None,
+) -> dict[str, Any]:
     """Return state-authority metadata for scene robot snapshots.
 
     Phase 4-P3 requires `/api/scene/state` consumers (native viewer and
@@ -726,11 +744,12 @@ def _execution_authority_metadata(state: ComposerState) -> dict[str, Any]:
     if state.kernel is None:
         return {}
     try:
-        snapshot = (
-            state.cycle_manager.get_execution_snapshot()
-            if state.cycle_manager is not None
-            else state.kernel.get_execution_snapshot()
-        )
+        if snapshot is None:
+            snapshot = (
+                state.cycle_manager.get_execution_snapshot()
+                if state.cycle_manager is not None
+                else state.kernel.get_execution_snapshot()
+            )
     except Exception:
         logger.debug(
             "execution authority metadata unavailable for scene robot state",
@@ -753,33 +772,64 @@ def _execution_authority_metadata(state: ComposerState) -> dict[str, Any]:
 
 
 def _build_visual_state_snapshot_for_publisher(state: ComposerState):
-    """Build the complete visual scene snapshot on the publisher thread.
-
-    This is the only visual-snapshot path that may call backend observer APIs.
-    HTTP routes must read the latest published snapshot instead of calling this
-    function directly.
-    """
+    """Sample one immutable input generation and build it in the NRT worker."""
     if state.kernel is None:
         raise VisualSnapshotUnavailable("kernel_unavailable")
 
+    sample_started = time.monotonic()
+    stage_started = sample_started
+    sample_stages_ms: dict[str, float] = {}
+
+    def mark_stage(name: str) -> None:
+        nonlocal stage_started
+        now = time.monotonic()
+        sample_stages_ms[f"sample_{name}"] = (now - stage_started) * 1000.0
+        stage_started = now
+
     robot_id, group_id, base_frame, tcp_frame, base_pose = _base_robot_route_metadata(state)
     joint_names = state.get_drivable_joint_names()
-    live_positions = state.get_current_joint_positions(
+    mark_stage("route_metadata")
+    try:
+        execution_snapshot = (
+            state.cycle_manager.get_execution_snapshot()
+            if state.cycle_manager is not None
+            else state.kernel.get_execution_snapshot()
+        )
+    except Exception as exc:
+        raise VisualSnapshotUnavailable(
+            "execution_snapshot_unavailable",
+            str(exc),
+        ) from exc
+    live_positions = state.resolve_current_joint_positions(
+        execution_snapshot,
         joint_names=joint_names,
-        allow_backend_joint_names=False,
     )
+    snapshot_positions = getattr(execution_snapshot, "joint_positions_rad", None)
+    visual_source_stale = not (
+        snapshot_positions is not None
+        and len(snapshot_positions) == len(joint_names)
+        and len(joint_names) > 0
+    )
+    mark_stage("execution_snapshot")
     joint_positions_by_name: dict[str, float] = {}
     if live_positions is not None and len(live_positions) == len(joint_names):
         joint_positions_by_name = {
             name: position for name, position in zip(joint_names, live_positions)
         }
+    source_revisions = state.viewer_source_revisions()
     urdf_model_key = None
     try:
         from .routes_urdf import active_urdf_model_key
 
-        urdf_model_key = active_urdf_model_key(state)
+        urdf_model_key = state.resolve_viewer_model_key(
+            generation=(source_revisions[0], source_revisions[1]),
+            resolver=lambda: active_urdf_model_key(state),
+        )
     except Exception:
         urdf_model_key = None
+    if not urdf_model_key:
+        raise VisualSnapshotUnavailable("visual_model_unavailable")
+    mark_stage("model_key")
 
     robot_info = SceneRobotResponse(
         robot_id=robot_id,
@@ -790,58 +840,66 @@ def _build_visual_state_snapshot_for_publisher(state: ComposerState):
         base_pose=base_pose,
         joint_names=joint_names,
         joint_positions=joint_positions_by_name,
-        **_execution_authority_metadata(state),
+        **_execution_authority_metadata(state, execution_snapshot),
     )
 
-    grippers = _collect_gripper_states(state)
-    pose_sources = _pose_sources_payload(state)
+    gripper_statuses, gripper_status_signature = _collect_gripper_statuses(state)
+    mark_stage("grippers")
+    pose_source_snapshots, _pose_source_revision = (
+        state.pose_source_snapshots_with_revision()
+    )
+    pose_sources = _pose_sources_payload(
+        state,
+        snapshots=pose_source_snapshots,
+    )
+    mark_stage("pose_sources")
+    object_input = state.visual_scene_objects_input_snapshot()
+    mark_stage("scene_objects")
+    demand = state.viewer_demand_summary()
+    demanded_layers = demand.layers or frozenset({"canonical", "diagnostics"})
+    input_signature = freeze_viewer_signature(
+        (
+            source_revisions[0],
+            source_revisions[1],
+            freeze_viewer_render_signature(pose_sources),
+            object_input[2].get("revision", 0),
+            source_revisions[4],
+            urdf_model_key,
+            (
+                robot_info.robot_id,
+                robot_info.group_id,
+                robot_info.base_frame,
+                robot_info.tcp_frame,
+                robot_info.base_pose,
+                robot_info.state_source,
+            ),
+            joint_names,
+            live_positions,
+            gripper_status_signature,
+            sorted(demanded_layers),
+        )
+    )
+    mark_stage("signature")
+    if not state.visual_input_requires_build(input_signature):
+        sample_stages_ms["sample"] = _elapsed_ms(sample_started)
+        raise ViewerInputUnchanged(sample_stages_ms)
 
-    try:
-        from .routes_urdf import visual_link_names_for_fk
-    except Exception as exc:
-        raise VisualSnapshotUnavailable("visual_links_unavailable", str(exc)) from exc
-
-    world_frame = canonical_scene_world_frame(state)
-    link_names = sorted({*visual_link_names_for_fk(state), base_frame, tcp_frame})
+    # Static gripper metadata (limits, mimic presentation, and visualization
+    # subtree) is revision-bound topology. Resolve it only for a generation
+    # that will actually be built; unchanged observer probes need only the
+    # backend-owned revisioned status captured above.
+    grippers = _collect_gripper_states(state, statuses=gripper_statuses)
+    mark_stage("gripper_metadata")
     visual_joint_names, visual_joint_positions = _visual_fk_joint_inputs(
         joint_names=joint_names,
         joint_positions_rad=live_positions,
         grippers=grippers,
     )
-    visual_state = build_robot_visual_snapshot(
-        state,
-        robot=robot_info,
-        joint_names=visual_joint_names,
-        joint_positions_rad=visual_joint_positions,
-        link_names=link_names,
-        reference_frame=world_frame,
-        base_frame=base_frame,
-        base_pose=base_pose,
-        grippers=grippers,
-        pose_sources=pose_sources,
-    )
-    _enrich_measured_robot_link_poses(
-        state,
-        pose_sources=pose_sources,
-        link_names=link_names,
-        reference_frame=world_frame,
-        base_frame=base_frame,
-        base_pose=base_pose,
-    )
-    link_poses = dict(visual_state.link_poses)
-    if base_frame in link_poses and tcp_frame in link_poses:
-        try:
-            robot_info.tcp_pose_in_base = relative_pose_from_world(
-                child_pose=link_poses[tcp_frame],
-                parent_pose=link_poses[base_frame],
-            )
-        except VisualSnapshotUnavailable:
-            logger.debug(
-                "visual-state publisher could not derive tcp_pose_in_base",
-                exc_info=True,
-                extra={"event": "visual_snapshot_tcp_pose_unavailable"},
-            )
-    scene_objects, objects_meta = state.visual_scene_objects_for_link_poses(link_poses)
+    if visual_joint_positions is None:
+        raise VisualSnapshotUnavailable("joint_state_unavailable")
+    mark_stage("visual_joint_inputs")
+
+    scene_objects, attachment_offsets, objects_meta = object_input
     object_refresh_attempt_age_ms = objects_meta.get("refresh_attempt_age_ms")
     object_refresh_retry_due = (
         object_refresh_attempt_age_ms is None
@@ -854,12 +912,130 @@ def _build_visual_state_snapshot_for_publisher(state: ComposerState):
         and object_refresh_retry_due
     ):
         state.request_visual_scene_objects_refresh(reason="visual_state_cache_empty")
-    objects = _scene_object_responses(state, scene_objects)
-    visual_state.robot = robot_info
-    visual_state.objects = objects
-    visual_state.grippers = grippers
-    visual_state.pose_sources = pose_sources
-    return visual_state
+
+    static_input_key = freeze_viewer_signature(
+        (
+            source_revisions[0],
+            source_revisions[1],
+            int(objects_meta.get("revision", 0)),
+            source_revisions[4],
+            urdf_model_key,
+            base_frame,
+            tcp_frame,
+        )
+    )
+
+    def build_static_input() -> dict[str, Any]:
+        try:
+            from .routes_urdf import visual_link_names_for_fk
+        except Exception as exc:
+            raise VisualSnapshotUnavailable(
+                "visual_links_unavailable",
+                str(exc),
+            ) from exc
+
+        object_responses = {
+            item.object_id: item
+            for item in _scene_object_responses(state, scene_objects)
+        }
+        object_rows_base = tuple(
+            {
+                "object_id": item.object_id,
+                "response": object_responses[item.object_id].model_dump(mode="json"),
+                "frame_id": item.frame_id,
+            }
+            for item in sorted(
+                scene_objects,
+                key=lambda candidate: candidate.object_id,
+            )
+        )
+        frame_roles = _scene_frame_roles(state)
+        frame_names = tuple(sorted({*frame_roles, *_load_model_frame_names(state)}))
+        descriptor = visual_fk_model_descriptor(state)
+        return {
+            "descriptor": descriptor,
+            "world_frame": canonical_scene_world_frame(state),
+            "link_names": tuple(
+                sorted({*visual_link_names_for_fk(state), base_frame, tcp_frame})
+            ),
+            "object_rows_base": object_rows_base,
+            "frame_roles": {
+                name: tuple(sorted(roles)) for name, roles in frame_roles.items()
+            },
+            "frame_names": frame_names,
+            "frame_visibility": {
+                name: state.get_frame_visibility(
+                    name,
+                    default=bool(frame_roles.get(name)),
+                )
+                for name in frame_names
+            },
+            "object_axes_gizmo_size_m": state.get_object_axes_gizmo_size(),
+            "frame_axes_gizmo_size_m": state.get_frame_gizmo_size(),
+        }
+
+    static_input = state.resolve_viewer_static_input(
+        key=static_input_key,
+        resolver=build_static_input,
+    )
+    mark_stage("static_input")
+    descriptor = static_input["descriptor"]
+    world_frame = static_input["world_frame"]
+    link_names = static_input["link_names"]
+    object_rows = tuple(
+        {
+            "response": row["response"],
+            "frame_id": row["frame_id"],
+            # Derived attachment offsets are a mutable observer cache within
+            # one object revision. Keep them outside the topology cache so an
+            # attached object follows the robot on the very next frame.
+            "attachment_offset": attachment_offsets.get(row["object_id"]),
+        }
+        for row in static_input["object_rows_base"]
+    )
+    worker_payload = {
+        "model_descriptor": {
+            "model_key": descriptor.model_key,
+            "canonical_urdf_path": descriptor.canonical_urdf_path,
+            "authority_metadata": descriptor.authority_metadata,
+        },
+        "robot": robot_info.model_dump(mode="json"),
+        "visual_joint_names": visual_joint_names,
+        "visual_joint_positions": visual_joint_positions,
+        "link_names": link_names,
+        "world_frame": world_frame,
+        "base_frame": base_frame,
+        "base_pose": base_pose,
+        "grippers": [item.model_dump(mode="json") for item in grippers],
+        "pose_sources": [item.model_dump(mode="json") for item in pose_sources],
+        "stale": visual_source_stale,
+        "objects": object_rows,
+        "object_revision": int(objects_meta.get("revision", 0)),
+        "demanded_layers": sorted(demanded_layers),
+        "frame_roles": static_input["frame_roles"],
+        "frame_names": static_input["frame_names"],
+        "frame_visibility": static_input["frame_visibility"],
+        "object_axes_gizmo_size_m": static_input["object_axes_gizmo_size_m"],
+        "frame_axes_gizmo_size_m": static_input["frame_axes_gizmo_size_m"],
+    }
+    mark_stage("payload_assembly")
+    sample_duration_ms = _elapsed_ms(sample_started)
+    sample_stages_ms["sample"] = sample_duration_ms
+    build = state.build_visual_state_in_worker(
+        worker_payload,
+        input_signature=input_signature,
+        sample_duration_ms=sample_duration_ms,
+        sample_stage_durations_ms=sample_stages_ms,
+    )
+    # A newer source generation may arrive while the worker builds. This result
+    # remains a coherent, timestamped generation and is safe to publish; the
+    # wake counter immediately schedules the coalesced latest input. Only the
+    # derived cache write is generation-fenced.
+    state.commit_visual_attachment_offsets(
+        expected_revision=build.object_revision or 0,
+        offsets=build.derived_attachment_offsets,
+    )
+    return build
 
 
 def _ensure_visual_state_publisher(state: ComposerState, *, reason: str) -> None:
@@ -867,6 +1043,11 @@ def _ensure_visual_state_publisher(state: ComposerState, *, reason: str) -> None
         lambda: _build_visual_state_snapshot_for_publisher(state),
         period_s=_visual_publish_period_s(),
     )
+
+
+def ensure_viewer_state_publisher(state: ComposerState, *, reason: str) -> None:
+    """Public demand-channel entry point; starting it creates no demand."""
+    _ensure_visual_state_publisher(state, reason=reason)
 
 
 def _scene_state_payload_from_visual_cache(
@@ -887,7 +1068,7 @@ def _scene_state_payload_from_visual_cache(
         if duration >= _SCENE_STATE_SUBSTEP_WARN_MS
     }
     if visual_state is None:
-        state.request_visual_state_publish(reason="scene_state_cache_empty")
+        state.request_visual_state_one_shot(reason="scene_state_cache_empty")
         cached_objects, objects_meta = state.visual_scene_objects_snapshot()
         objects = _scene_object_responses(state, cached_objects)
         pose_sources = _pose_sources_payload(state)
@@ -1014,8 +1195,72 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
     )
 
 
+def _collect_gripper_statuses(
+    state: ComposerState,
+) -> tuple[dict[str, Any], tuple[Any, ...]]:
+    """Capture dynamic gripper status once and derive its cheap build key.
+
+    VP-P0 makes status reads pure and gives every status a monotonic revision.
+    The additional fields preserve correctness for test or third-party clients
+    that have not yet supplied a useful revision; static deployment/model
+    metadata is fenced separately by the viewer source generations and model
+    key.
+    """
+
+    deployment = state.deployment
+    kernel = state.kernel
+    if deployment is None or kernel is None:
+        return {}, ()
+    statuses: dict[str, Any] = {}
+    rows: list[tuple[Any, ...]] = []
+    for gripper_id in deployment.grippers:
+        try:
+            status = kernel.get_gripper_status(gripper_id)
+        except Exception as exc:
+            logger.debug(
+                "get_gripper_status failed for %s",
+                gripper_id,
+                exc_info=True,
+            )
+            rows.append((gripper_id, "unavailable", type(exc).__name__))
+            continue
+        statuses[gripper_id] = status
+        raw_state = getattr(status, "state", "")
+        rows.append(
+            (
+                gripper_id,
+                int(getattr(status, "revision", 0) or 0),
+                int(getattr(status, "command_id", 0) or 0),
+                int(getattr(status, "generation", 0) or 0),
+                str(getattr(raw_state, "value", raw_state)),
+                getattr(status, "current_position", None),
+                getattr(status, "target_position", None),
+                getattr(status, "commanded_position", None),
+                getattr(status, "observed_position", None),
+                str(getattr(status, "commanded_state", "") or ""),
+                str(getattr(status, "actuation_kind", "") or ""),
+                str(getattr(status, "state_authority", "") or ""),
+                str(getattr(status, "completion_policy", "") or ""),
+                str(getattr(status, "grasp_confirmation_policy", "") or ""),
+                str(getattr(status, "transport_kind", "") or ""),
+                getattr(status, "evidence", ()),
+                str(getattr(status, "evidence_state", "") or ""),
+                str(
+                    getattr(status, "projection_state", "not_required")
+                    or "not_required"
+                ),
+                str(getattr(status, "projection_reason", "") or ""),
+                getattr(status, "error", None),
+                getattr(status, "reason_code", None),
+            )
+        )
+    return statuses, tuple(rows)
+
+
 def _collect_gripper_states(
     state: ComposerState,
+    *,
+    statuses: dict[str, Any] | None = None,
 ) -> list[SceneGripperStateResponse]:
     """One entry per gripper declared in the active deployment. Surfaces
     enough metadata for the Robot panel's gripper widget to render a
@@ -1064,11 +1309,16 @@ def _collect_gripper_states(
 
     out: list[SceneGripperStateResponse] = []
     for gripper_id, config in deployment.grippers.items():
-        try:
-            status = kernel.get_gripper_status(gripper_id)
-        except Exception:
-            logger.debug("get_gripper_status failed for %s", gripper_id, exc_info=True)
-            continue
+        if statuses is None:
+            try:
+                status = kernel.get_gripper_status(gripper_id)
+            except Exception:
+                logger.debug("get_gripper_status failed for %s", gripper_id, exc_info=True)
+                continue
+        else:
+            status = statuses.get(gripper_id)
+            if status is None:
+                continue
         limit_lower, limit_upper = joint_limits.get(
             config.joint_name,
             (None, None),
@@ -1262,37 +1512,26 @@ def _preview_joint_link_poses_via_visual_fk(
         if not joint_names or len(joint_names) != len(joint_positions) or not link_names:
             return None
 
-        robot_id, group_id, base_frame, tcp_frame, base_pose = _base_robot_route_metadata(state)
-        joint_positions_by_name = {
-            name: position for name, position in zip(joint_names, joint_positions)
-        }
-        urdf_model_key = None
-        try:
-            from .routes_urdf import active_urdf_model_key
-
-            urdf_model_key = active_urdf_model_key(state)
-        except Exception:
-            urdf_model_key = None
-        robot_info = SceneRobotResponse(
-            robot_id=robot_id,
-            group_id=group_id,
-            urdf_model_key=urdf_model_key,
-            base_frame=base_frame,
-            tcp_frame=tcp_frame,
-            base_pose=base_pose,
-            joint_names=joint_names,
-            joint_positions=joint_positions_by_name,
-            **_execution_authority_metadata(state),
+        _robot_id, _group_id, base_frame, _tcp_frame, base_pose = (
+            _base_robot_route_metadata(state)
         )
-        visual_state = build_robot_visual_snapshot(
-            state,
-            robot=robot_info,
-            joint_names=joint_names,
-            joint_positions_rad=joint_positions,
-            link_names=link_names,
-            reference_frame=str(payload.get("base_frame") or canonical_scene_world_frame(state)),
-            base_frame=base_frame,
-            base_pose=base_pose,
+        descriptor = visual_fk_model_descriptor(state)
+        link_poses = state.compute_visual_fk_preview_in_worker(
+            {
+                "model_descriptor": {
+                    "model_key": descriptor.model_key,
+                    "canonical_urdf_path": descriptor.canonical_urdf_path,
+                    "authority_metadata": descriptor.authority_metadata,
+                },
+                "joint_names": joint_names,
+                "joint_positions_rad": joint_positions,
+                "link_names": link_names,
+                "reference_frame": str(
+                    payload.get("base_frame") or canonical_scene_world_frame(state)
+                ),
+                "base_frame": base_frame,
+                "base_pose": base_pose,
+            }
         )
     except (TypeError, ValueError) as exc:
         logger.debug(
@@ -1301,19 +1540,20 @@ def _preview_joint_link_poses_via_visual_fk(
             extra={"event": "preview_link_poses_visual_fk_malformed"},
         )
         return {"reachable": False, "reason": f"malformed_joint_preview: {exc}"}
-    except VisualSnapshotUnavailable as exc:
+    except (VisualSnapshotUnavailable, RuntimeError) as exc:
+        reason = str(getattr(exc, "reason", "") or "visual_fk_unavailable")
         logger.debug(
             "visual FK preview unavailable: %s",
-            exc.reason,
+            reason,
             exc_info=True,
             extra={"event": "preview_link_poses_visual_fk_unavailable"},
         )
-        return {"reachable": False, "reason": exc.reason}
+        return {"reachable": False, "reason": reason}
     return {
         "reachable": True,
         "joint_names": joint_names,
         "joint_positions_rad": joint_positions,
-        "link_poses": dict(visual_state.link_poses),
+        "link_poses": link_poses,
     }
 
 
@@ -1424,12 +1664,35 @@ def create_scene_router(state: ComposerState) -> APIRouter:
         payload["objects"] = sanitized_objects
         state.update_pose_source_snapshot(pose_source_id, payload)
         continuous_apply_results: list[dict[str, Any]] = []
+        continuous_apply_suppressed: list[dict[str, str]] = []
         for continuous_policy in ("continuous", "continuous_unattached"):
-            continuous_object_ids = [
-                str(object_state.get("object_id") or "")
-                for object_state in sanitized_objects
-                if object_state.get("apply_policy") == continuous_policy
-            ]
+            continuous_object_ids: list[str] = []
+            for object_state in sanitized_objects:
+                if object_state.get("apply_policy") != continuous_policy:
+                    continue
+                object_id = str(object_state.get("object_id") or "")
+                rejection_reason = _continuous_pose_update_rejection(
+                    source_status=request.status,
+                    source_stale_after_s=source.stale_after_s,
+                    source_id=pose_source_id,
+                    object_state=object_state,
+                )
+                state.record_pose_source_ingest_apply_decision(
+                    source_id=pose_source_id,
+                    object_id=object_id,
+                    policy=continuous_policy,
+                    rejection_reason=rejection_reason,
+                )
+                if rejection_reason is None:
+                    continuous_object_ids.append(object_id)
+                else:
+                    continuous_apply_suppressed.append(
+                        {
+                            "object_id": object_id,
+                            "policy": continuous_policy,
+                            "reason": rejection_reason,
+                        }
+                    )
             if not continuous_object_ids:
                 continue
             apply_result = state.enqueue_pose_source_apply(
@@ -1458,6 +1721,8 @@ def create_scene_router(state: ComposerState) -> APIRouter:
             response["continuous_apply"] = continuous_apply_results[0]
         elif continuous_apply_results:
             response["continuous_apply_results"] = continuous_apply_results
+        if continuous_apply_suppressed:
+            response["continuous_apply_suppressed"] = continuous_apply_suppressed
         return response
 
     @router.post("/pose-sources/apply", response_model=None)

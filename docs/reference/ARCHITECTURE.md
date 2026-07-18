@@ -14,7 +14,7 @@ single component in depth.
 
 ## Design principles
 
-Five ideas explain most of the decisions below:
+Six ideas explain most of the decisions below:
 
 - **One owner per safety-critical decision.** Terminal outcome, stop behavior,
   and collision validation each have exactly one authoritative owner; other
@@ -29,6 +29,10 @@ Five ideas explain most of the decisions below:
   the programs, or the public API.
 - **Reconstructable execution.** Every event carries correlation identity, so a
   failure can be reconstructed after the fact rather than reproduced live.
+- **Bounded observer planes.** Visualization and diagnostics consume immutable
+  facts through demand-scoped, latest-only channels. An absent, slow, or failed
+  observer cannot create work without demand, build an unbounded backlog, or
+  acquire control or safety authority.
 
 ---
 
@@ -40,7 +44,7 @@ Five ideas explain most of the decisions below:
 | `manyforge_core/python` | pybind11 | Bindings exposing the kernel to Python (poll-based; no C++→Python callbacks). |
 | `manyforge_roboplan` | C++ + pybind11 | Primary motion planner / execution-backend adapter (RRT planning + TOPP-RA time-parameterization) and the native kernel client wrapper. |
 | `manyforge_behavior` | Python | Behavior-tree program runner (py_trees), node catalog, program/deployment loader, cycle orchestration, and the Robot Model Authority (canonical URDF/SRDF interpretation). |
-| `manyforge_composer` | FastAPI + React + MCP | Operator/authoring surface: REST API, program editor UI with a native 3D viewer, and an MCP server for LLM tool access. |
+| `manyforge_composer` | FastAPI + React + MCP | Operator/authoring surface: REST API, program editor UI with a bounded, demand-scoped 3D viewer data plane, and an MCP server for LLM tool access. |
 | `manyforge_ros` / `manyforge_ros_bringup` / ros2_control lane | C++/Python | ROS 2 integration: FollowJointTrajectory execution, gripper-action bridge, controller capability checks, real/sim ROS surfaces. |
 | `manyforge_assistant_bridge` | Python | Optional direct-lane LLM assistant provider (HTTP). |
 
@@ -88,6 +92,75 @@ which ticks the tree and, for motion nodes, issues execute requests to the
 **planner-execution backend**, runs a collision monitor during execution, and
 publishes state snapshots and events. **Composer** observes that stream and
 presents it over REST, a WebSocket status feed, and MCP tools.
+
+### Scene Viewer data plane
+
+The Scene Viewer is a **non-real-time observer**. It does not read planner or
+collision-engine internals directly, advance execution or gripper lifecycles,
+mutate the scene, certify validation, or decide stop/recovery outcomes. It
+consumes immutable facts already published by their authoritative owners.
+
+```text
+authoritative immutable facts
+        |
+        v
+demand/dirty scheduler -> supervised NRT visual worker
+        |                         |
+        |                         v
+        +--------------> bounded latest-only fanout -> browser scene graph
+                                ^
+                                |
+                   lease/rate/layer demand only
+```
+
+The wire protocol separates three publication domains:
+
+- a **manifest** describes static topology, geometry, ordering, and
+  capabilities and changes only when its revision changes;
+- a **frame** carries one self-contained generation of current transforms and
+  dynamic visual state; timestamp passage alone does not create a frame; and
+- **diagnostics** carry low-rate worker, queue, loss, and renderer health
+  without consuming frame sequence numbers or resetting frame freshness.
+
+Clients hold renewable, bounded demand leases and negotiate visibility, rate,
+and layers. With no demand, visual production stops after a short grace period.
+Each producer/IPC/client boundary retains at most the latest replaceable frame;
+replacement and loss are counted, and a client that misses a generation
+resynchronizes from a manifest plus a self-contained latest frame. A slow or
+malformed client therefore cannot delay control routes or another viewer.
+
+The browser builds geometry/material nodes only when the manifest changes and
+applies transform frames to stable Three.js references. Authoring and snapshot
+commands are anchored to the latest authoritative frame, never to an
+interpolated display pose. Visual preparation runs in a supervised NRT process
+on resources outside qualified controller and runtime-safety reservations; its
+crash or saturation may degrade rendering, but cannot affect robot motion,
+collision monitoring, stop, scene authority, or recovery.
+
+Renderer capability changes presentation policy, never data authority. Every
+WebGL path uses the same bounded observer lease, and a software fallback must
+still present complete opaque frames at a readable pixel-density floor; it may
+not trade frame correctness for lower CPU. Hardware-GPU and software-renderer
+measurements remain separate qualification rows because a software browser can
+consume several host cores even when the viewer worker and transport are idle.
+
+Each browser may explicitly override its automatic viewer presentation rate
+within the server's bounded lease limit. This client-local preference controls
+how often the NRT observer pipeline may sample immutable owner publications,
+shape/fan out frames, and render them; it is not program or deployment
+authority. In particular, it is independent of a deployment pose source's
+`max_update_hz`, which controls how often ManyForge acquires new external
+robot/object observations. Raising the viewer rate cannot manufacture fresher
+source observations.
+
+Authored viewer presentation settings follow the program's ordinary
+Draft/Applied/Saved model. The Scene-tab controls, in-view Tools controls, and
+rendered overlays consume one shared frontend draft; `ComposerState`
+materializes only the applied values into the viewer manifest. The ordered
+manifest supplies topology and transform indices, not a competing set of UI
+defaults. Presentation-only Apply republishes the viewer projection without
+rebuilding the runner, kernel, planner, controller, scene authority, or other
+runtime resources.
 
 ---
 
@@ -258,6 +331,8 @@ The exact, versioned wire contracts (auto-generated from the running code):
 - [`MCP_RUNTIME_CONTRACT.md`](MCP_RUNTIME_CONTRACT.md) — MCP tool surface.
 - [`ASSISTANT_PROVIDER_CONTRACT.md`](ASSISTANT_PROVIDER_CONTRACT.md) —
   assistant-provider HTTP contract.
+- [`VIEWER_DATA_PLANE_V1.schema.json`](VIEWER_DATA_PLANE_V1.schema.json) —
+  manifest, transform-frame, diagnostics, and lease/control wire contracts.
 
 For the component/subsystem index and the three deployment modes, see
 [`../../AGENTS.md`](../../AGENTS.md).

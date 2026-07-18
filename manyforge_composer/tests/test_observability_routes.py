@@ -5,7 +5,6 @@ from __future__ import annotations
 from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
 
 from concurrent.futures import ThreadPoolExecutor
-import builtins
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,8 +31,12 @@ from manyforge_behavior.kernel_client import (
     SceneShape,
 )
 from manyforge_composer.backend.app import create_app
-from manyforge_composer.backend import routes_scene, routes_urdf
-from manyforge_composer.backend.models import VisualSceneSnapshotResponse
+from manyforge_composer.backend import routes_infra, routes_runtime, routes_scene, routes_urdf
+from manyforge_composer.backend.models import (
+    ViewerFrameV1,
+    ViewerManifestV1,
+    VisualSceneSnapshotResponse,
+)
 from manyforge_composer.backend.state import ComposerState
 
 
@@ -60,6 +63,369 @@ def _publish_visual_snapshot(state: ComposerState) -> dict:
         lambda: routes_scene._build_visual_state_snapshot_for_publisher(state),
         reason="test",
     )
+
+
+@_REQUIRES_PINOCCHIO_VISUAL_FK
+def test_real_viewer_builder_matches_the_generated_strict_wire_contract() -> None:
+    _client, state, _kernel = make_client()
+    state.load_program(_PROGRAM_PATH, deployment_path=_DEPLOYMENT_PATH)
+
+    result = _publish_visual_snapshot(state)
+    assert result["success"] is True
+    publication = state.last_viewer_publication()
+    assert publication is not None
+
+    manifest = ViewerManifestV1.model_validate(publication.manifest)
+    ViewerFrameV1.model_validate(publication.frame)
+    # The v1 manifest and the low-rate /scene/frames projection share the same
+    # authority: semantic frames are visible by default; structural URDF link
+    # frames are opt-in. The Step-15 migration briefly defaulted the manifest's
+    # incomplete visibility map to True and exposed every gripper link axis.
+    assert any(frame.roles for frame in manifest.frames)
+    assert any(not frame.roles for frame in manifest.frames)
+    assert all(frame.viewer_visible == bool(frame.roles) for frame in manifest.frames)
+
+    structural_frame = next(frame for frame in manifest.frames if not frame.roles)
+    semantic_frame = next(frame for frame in manifest.frames if frame.roles)
+    state.set_frame_visibility(structural_frame.name, True)
+    state.set_frame_visibility(semantic_frame.name, False)
+    override_result = _publish_visual_snapshot(state)
+    assert override_result["success"] is True
+    override_publication = state.last_viewer_publication()
+    assert override_publication is not None
+    overridden = ViewerManifestV1.model_validate(override_publication.manifest)
+    overridden_by_name = {frame.name: frame for frame in overridden.frames}
+    assert overridden_by_name[structural_frame.name].viewer_visible is True
+    assert overridden_by_name[semantic_frame.name].viewer_visible is False
+
+    # Both frontend control surfaces consume /scene/frames while the renderer
+    # consumes the v1 manifest. They must remain two projections of one
+    # ComposerState authority, including explicit overrides and gizmo size.
+    frame_projection = routes_scene.build_scene_frames_payload(state)
+    projected_by_name = {
+        frame["name"]: frame for frame in frame_projection["frames"]
+    }
+    assert set(projected_by_name) == set(overridden_by_name)
+    assert all(
+        projected_by_name[name]["viewerVisible"]
+        == overridden_by_name[name].viewer_visible
+        for name in projected_by_name
+    )
+    assert frame_projection["frameGizmoSizeM"] == overridden.frame_axes_gizmo_size_m
+
+    assert state.viewer_data_plane_status()["render_revision"] == override_publication.frame[
+        "render_revision"
+    ]
+
+
+@_REQUIRES_PINOCCHIO_VISUAL_FK
+def test_viewer_builder_resolves_static_gripper_metadata_only_for_changed_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _client, state, _kernel = make_client()
+    state.load_program(_PROGRAM_PATH, deployment_path=_DEPLOYMENT_PATH)
+
+    real_states = routes_scene._collect_gripper_states
+    synthetic_revision = 0
+    pose_source_revision = 0
+    state_builds = 0
+
+    def statuses_with_test_revision(_state_arg: ComposerState):
+        return {}, (("test_revision", synthetic_revision),)
+
+    def counted_states(*args, **kwargs):
+        nonlocal state_builds
+        state_builds += 1
+        return real_states(*args, **kwargs)
+
+    monkeypatch.setattr(
+        routes_scene,
+        "_collect_gripper_statuses",
+        statuses_with_test_revision,
+    )
+    monkeypatch.setattr(routes_scene, "_collect_gripper_states", counted_states)
+    monkeypatch.setattr(state, "viewer_source_revisions", lambda: (1, 1, 0, 0, 0))
+    monkeypatch.setattr(
+        state,
+        "pose_source_snapshots_with_revision",
+        lambda: ({}, pose_source_revision),
+    )
+    monkeypatch.setattr(
+        state,
+        "visual_scene_objects_input_snapshot",
+        lambda: ([], {}, {"revision": 0, "timestamp_ns": 1}),
+    )
+    monkeypatch.setattr(state, "scene_viewer_revision", lambda: 0)
+
+    first_build = routes_scene._build_visual_state_snapshot_for_publisher(state)
+    state.commit_visual_input_signature(first_build.input_signature)
+    stable_state_builds = state_builds
+
+    with pytest.raises(routes_scene.ViewerInputUnchanged):
+        routes_scene._build_visual_state_snapshot_for_publisher(state)
+    assert state_builds == stable_state_builds
+
+    # A transport-only source revision cannot force FK/encoding when its
+    # render-significant content is unchanged.
+    pose_source_revision = 1
+    with pytest.raises(routes_scene.ViewerInputUnchanged):
+        routes_scene._build_visual_state_snapshot_for_publisher(state)
+    assert state_builds == stable_state_builds
+
+    synthetic_revision = 1
+    routes_scene._build_visual_state_snapshot_for_publisher(state)
+    assert state_builds == stable_state_builds + 1
+
+
+def test_visual_publisher_performs_no_build_without_demand_and_one_shot_is_exact(
+) -> None:
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=MockKernelClient(),
+    )
+    built = threading.Event()
+    build_count = 0
+
+    def builder() -> VisualSceneSnapshotResponse:
+        nonlocal build_count
+        build_count += 1
+        built.set()
+        return VisualSceneSnapshotResponse(
+            sequence_number=build_count,
+            timestamp_ns=time.monotonic_ns(),
+        )
+
+    try:
+        state.ensure_visual_state_publisher(builder, period_s=0.02)
+        state.request_visual_state_publish(reason="no_demand")
+        assert built.wait(timeout=0.05) is False
+
+        generation = state.request_visual_state_one_shot(reason="test_one_shot")
+        assert built.wait(timeout=1.0) is True
+        result = state.wait_for_visual_state_one_shot(
+            generation=generation,
+            timeout_s=1.0,
+        )
+        assert result is not None
+        assert result["success"] is True
+        assert result["sequence_number"] == 1
+        assert build_count == 1
+    finally:
+        state.stop_visual_state_publisher(timeout_s=1.0)
+
+
+def test_unchanged_observer_sample_clears_transient_producer_error() -> None:
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=MockKernelClient(),
+    )
+    state.record_visual_state_publish_error(
+        duration_ms=1.0,
+        error="execution_snapshot_unavailable",
+        reason="test",
+    )
+
+    def unchanged_sample() -> None:
+        raise routes_scene.ViewerInputUnchanged()
+
+    result = state.publish_visual_state_snapshot_sync(
+        unchanged_sample,
+        reason="unchanged_after_recovery",
+    )
+
+    assert result["unchanged"] is True
+    _snapshot, metadata = state.visual_state_snapshot()
+    assert metadata["last_error"] is None
+
+
+def test_visual_publisher_coalesces_dirty_wakes_under_granted_rate() -> None:
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=MockKernelClient(),
+    )
+    built = threading.Event()
+    build_count = 0
+
+    def builder() -> VisualSceneSnapshotResponse:
+        nonlocal build_count
+        build_count += 1
+        built.set()
+        return VisualSceneSnapshotResponse(
+            sequence_number=build_count,
+            timestamp_ns=time.monotonic_ns(),
+        )
+
+    try:
+        state.ensure_visual_state_publisher(builder, period_s=0.02)
+        state.attach_viewer_demand(
+            "rate-limited-client",
+            visibility="focused",
+            requested_rate_hz=1.0,
+            layers=("canonical",),
+        )
+        assert built.wait(timeout=1.0) is True
+        assert build_count == 1
+
+        built.clear()
+        for index in range(10):
+            state.request_visual_state_publish(reason=f"dirty_{index}")
+            time.sleep(0.01)
+
+        assert built.wait(timeout=0.2) is False
+        assert build_count == 1
+        assert built.wait(timeout=1.2) is True
+        assert build_count == 2
+    finally:
+        state.stop_visual_state_publisher(timeout_s=1.0)
+
+
+def test_viewer_model_key_cache_is_generation_fenced_and_bounded() -> None:
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=MockKernelClient(),
+    )
+    calls = 0
+
+    def resolve() -> str:
+        nonlocal calls
+        calls += 1
+        return f"model-{calls}"
+
+    assert state.resolve_viewer_model_key(
+        generation=(1, 1),
+        resolver=resolve,
+    ) == "model-1"
+    assert state.resolve_viewer_model_key(
+        generation=(1, 1),
+        resolver=resolve,
+    ) == "model-1"
+    assert calls == 1
+
+    assert state.resolve_viewer_model_key(
+        generation=(1, 2),
+        resolver=resolve,
+    ) == "model-2"
+    assert state.resolve_viewer_model_key(
+        generation=(1, 2),
+        resolver=resolve,
+        revalidate_after_s=0.0,
+    ) == "model-3"
+
+
+def test_viewer_static_input_cache_reuses_only_the_exact_revision_key() -> None:
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=MockKernelClient(),
+    )
+    calls = 0
+
+    def resolve() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        return {"generation": calls}
+
+    first = state.resolve_viewer_static_input(key=(1, "model"), resolver=resolve)
+    repeated = state.resolve_viewer_static_input(
+        key=(1, "model"),
+        resolver=resolve,
+    )
+    changed = state.resolve_viewer_static_input(key=(2, "model"), resolver=resolve)
+
+    assert repeated is first
+    assert first == {"generation": 1}
+    assert changed == {"generation": 2}
+    assert calls == 2
+
+
+def test_visual_worker_failure_is_contained_and_last_good_snapshot_survives() -> None:
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=MockKernelClient(),
+    )
+    previous = VisualSceneSnapshotResponse(sequence_number=1, timestamp_ns=1)
+    replacement = VisualSceneSnapshotResponse(sequence_number=2, timestamp_ns=2)
+    state.update_visual_state_snapshot(previous, reason="seed")
+
+    def fail_worker():
+        raise routes_scene.VisualSnapshotUnavailable(
+            "viewer_worker_build_failed",
+            "synthetic worker failure",
+        )
+
+    result = state.publish_visual_state_snapshot_sync(
+        fail_worker,
+        reason="worker_failure",
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "viewer_worker_build_failed"
+    snapshot, metadata = state.visual_state_snapshot()
+    assert snapshot is previous
+    assert metadata["last_error"] == "viewer_worker_build_failed"
+
+    recovered = state.publish_visual_state_snapshot_sync(
+        lambda: replacement,
+        reason="worker_recovered",
+    )
+    assert recovered["success"] is True
+    assert state.visual_state_snapshot()[0] is replacement
+
+
+def test_native_viewer_heartbeat_degrades_dead_worker_only_while_demanded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=MockKernelClient(),
+    )
+    monkeypatch.setattr(
+        state._viewer_worker,
+        "status",
+        lambda: {
+            "alive": False,
+            "worker_epoch": "failed-epoch",
+            "pid": None,
+            "restarts": 1,
+            "last_error": "viewer_worker_exited",
+            "worker_policy": {"policy_ok": False},
+        },
+    )
+
+    undemanded = routes_infra.build_infra_status_payload(state)
+    assert undemanded["components"]["native_viewer"]["status"] == "waiting"
+
+    state.attach_viewer_demand(
+        "heartbeat-test",
+        visibility="focused",
+        requested_rate_hz=15.0,
+        layers=["canonical"],
+    )
+    demanded = routes_infra.build_infra_status_payload(state)
+    component = demanded["components"]["native_viewer"]
+    assert component["status"] == "degraded"
+    assert component["worker_last_error"] == "viewer_worker_exited"
+    assert component["worker_policy_ok"] is False
+
+
+def test_runtime_and_infra_projections_share_one_material_heartbeat_sample() -> None:
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=MockKernelClient(),
+    )
+
+    first = routes_infra.build_infra_heartbeat_payload(state)
+    routes_runtime.build_runtime_status_payload(state)
+    initial_cache = state.heartbeat_cache_status()
+
+    assert initial_cache["misses"] == 1
+    assert initial_cache["hits"] >= 1
+    assert routes_infra.build_infra_heartbeat_payload(state) is first
+
+    state.update_external_runtime_status("test-provider", {"status": "ready"})
+    refreshed = routes_infra.build_infra_heartbeat_payload(state)
+    refreshed_cache = state.heartbeat_cache_status()
+    assert refreshed is not first
+    assert refreshed_cache["misses"] == 2
 
 
 def _load_program_for_scene_sync() -> tuple[TestClient, ComposerState, MockKernelClient]:
@@ -340,14 +706,13 @@ def test_scene_state_visual_snapshot_reports_missing_pinocchio(
         grippers={},
     )
 
-    real_import = builtins.__import__
+    def unavailable_worker(*_args, **_kwargs):
+        raise routes_scene.VisualSnapshotUnavailable(
+            "pinocchio_unavailable",
+            "No module named 'pinocchio' in visual worker",
+        )
 
-    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "pinocchio" or name.startswith("pinocchio."):
-            raise ModuleNotFoundError("No module named 'pinocchio'")
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    monkeypatch.setattr(state, "build_visual_state_in_worker", unavailable_worker)
 
     result = _publish_visual_snapshot(state)
     assert result["success"] is False
@@ -752,7 +1117,7 @@ def test_scene_routes_read_cached_visual_snapshot_without_backend_calls(
     )
     publish_reasons: list[str] = []
     state.ensure_visual_state_publisher = lambda builder, period_s: None
-    state.request_visual_state_publish = lambda *, reason="": publish_reasons.append(reason)
+    state.request_visual_state_one_shot = lambda *, reason="": publish_reasons.append(reason)
 
     state_payload = routes_scene.build_scene_state_payload(state)
     frames_payload = routes_scene.build_scene_frames_payload(state)
@@ -819,7 +1184,7 @@ def test_scene_state_deployment_only_uses_cached_visual_snapshot(
 def test_scene_state_marks_stale_visual_snapshot_without_blocking(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setenv("MANYFORGE_VISUAL_STATE_STALE_AFTER_MS", "50")
+    monkeypatch.setenv("MANYFORGE_VIEWER_DEBUG_SNAPSHOT_STALE_AFTER_MS", "50")
     kernel = MockKernelClient(joint_names=["joint_a"])
     state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     state.program = SimpleNamespace(
@@ -953,7 +1318,7 @@ def test_scene_state_empty_visual_object_cache_queues_refresh_without_scene_read
     state.program = SimpleNamespace(scene=[])
     publish_reasons: list[str] = []
     state.ensure_visual_state_publisher = lambda builder, period_s: None
-    state.request_visual_state_publish = lambda *, reason="": publish_reasons.append(reason)
+    state.request_visual_state_one_shot = lambda *, reason="": publish_reasons.append(reason)
 
     payload = routes_scene.build_scene_state_payload(state)
 
@@ -983,7 +1348,7 @@ def test_scene_state_does_not_wait_for_blocked_object_refresh(
     state.program = SimpleNamespace(scene=[])
     publish_reasons: list[str] = []
     state.ensure_visual_state_publisher = lambda builder, period_s: None
-    state.request_visual_state_publish = lambda *, reason="": publish_reasons.append(reason)
+    state.request_visual_state_one_shot = lambda *, reason="": publish_reasons.append(reason)
 
     try:
         refresh_result = state.request_visual_scene_objects_refresh(reason="test_blocked")
@@ -1077,10 +1442,12 @@ def test_attached_visual_object_pose_is_composed_from_link_pose(
             )
         ]
     )
+    revision_before_attach = state.viewer_source_revisions()[3]
 
     visual_update = state.apply_visual_scene_edit_success(
         SceneEditRequest(operation="attach", object_id="part", frame_id="tool0")
     )
+    revision_after_attach = state.viewer_source_revisions()[3]
     objects_at_attach, _meta = state.visual_scene_objects_for_link_poses(
         {
             "tool0": {
@@ -1099,6 +1466,7 @@ def test_attached_visual_object_pose_is_composed_from_link_pose(
     )
 
     assert visual_update == {"updated": True, "needs_refresh": False}
+    assert revision_after_attach == revision_before_attach + 1
     assert objects_at_attach[0].attached is True
     assert objects_at_attach[0].frame_id == "tool0"
     assert objects_at_attach[0].pose_in_universe["position_m"] == pytest.approx(
@@ -1107,6 +1475,52 @@ def test_attached_visual_object_pose_is_composed_from_link_pose(
     assert objects_after_motion[0].pose_in_universe["position_m"] == pytest.approx(
         [2.2, 0.0, 0.0]
     )
+
+
+def test_visual_object_pose_edit_invalidates_worker_static_input():
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=MockKernelClient(),
+    )
+    state.update_visual_scene_objects_snapshot(
+        [
+            SceneObjectSnapshot(
+                object_id="part",
+                shape=SceneShape(type="box", box_dimensions_m=[0.1, 0.1, 0.1]),
+                pose_in_universe={
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+                attached=False,
+                frame_id="universe",
+            )
+        ]
+    )
+    revision_before = state.viewer_source_revisions()[3]
+    first = state.resolve_viewer_static_input(
+        key=(revision_before,),
+        resolver=lambda: "before",
+    )
+
+    result = state.apply_visual_scene_edit_success(
+        SceneEditRequest(
+            operation="update_pose",
+            object_id="part",
+            pose_position_m=[0.4, 0.5, 0.6],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        )
+    )
+    revision_after = state.viewer_source_revisions()[3]
+    second = state.resolve_viewer_static_input(
+        key=(revision_after,),
+        resolver=lambda: "after",
+    )
+
+    assert result == {"updated": True, "needs_refresh": False}
+    assert revision_after == revision_before + 1
+    assert first == "before"
+    assert second == "after"
 
 
 def test_visual_object_refresh_derives_attachment_offset_from_snapshot(

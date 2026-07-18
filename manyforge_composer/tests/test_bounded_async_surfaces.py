@@ -195,10 +195,106 @@ def test_snapshot_broker_rejects_late_response_after_timeout() -> None:
         assert snapshot_client.messages
         late_request_id = snapshot_client.messages[0]["requestId"]
         assert broker.deliver(late_request_id, b"late-image") is False
+        status = broker.status()
+        assert status["client_count"] == 1
+        assert status["pending_count"] == 0
+        assert status["requests_total"] == 1
+        assert status["completed_total"] == 0
+        assert status["failed_total"] == 1
+        assert status["timeouts_total"] == 1
+        assert status["unavailable_total"] == 0
+        assert status["deliveries_rejected_total"] == 1
+        assert status["bytes_total"] == 0
+        assert status["last_completion_ns"] is not None
         with broker._lock:
             assert broker._pending == {}
             assert broker._results == {}
     finally:
+        loop_thread.stop()
+
+
+def test_snapshot_broker_counts_one_completed_round_trip() -> None:
+    loop_thread = _LoopThread()
+    snapshot_client = _SnapshotClient()
+    broker = SnapshotBroker()
+    result: list[bytes | None] = []
+    try:
+        with broker._lock:
+            broker._clients.append(snapshot_client)  # type: ignore[arg-type]
+            broker._loop = loop_thread.loop
+        caller = threading.Thread(
+            target=lambda: result.append(
+                broker.render_sync(320, 240, "jpeg", timeout_s=1.0)
+            )
+        )
+        caller.start()
+        deadline = time.monotonic() + 1.0
+        while not snapshot_client.messages and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert snapshot_client.messages
+        request_id = snapshot_client.messages[0]["requestId"]
+        assert broker.deliver(request_id, b"image") is True
+        caller.join(timeout=1.0)
+        assert not caller.is_alive()
+        assert result == [b"image"]
+        status = broker.status()
+        assert status["requests_total"] == 1
+        assert status["completed_total"] == 1
+        assert status["failed_total"] == 0
+        assert status["bytes_total"] == 5
+    finally:
+        loop_thread.stop()
+
+
+def test_snapshot_broker_prepares_exact_frame_and_rejects_concurrent_capture() -> None:
+    loop_thread = _LoopThread()
+    snapshot_client = _SnapshotClient()
+    prepare_entered = threading.Event()
+    release_prepare = threading.Event()
+
+    def prepare_capture(timeout_s: float) -> tuple[str, int] | None:
+        assert timeout_s > 0.0
+        prepare_entered.set()
+        assert release_prepare.wait(timeout=1.0)
+        return "worker-epoch", 17
+
+    broker = SnapshotBroker(prepare_capture=prepare_capture)
+    result: list[bytes | None] = []
+    try:
+        with broker._lock:
+            broker._clients.append(snapshot_client)  # type: ignore[arg-type]
+            broker._loop = loop_thread.loop
+        caller = threading.Thread(
+            target=lambda: result.append(
+                broker.render_sync(320, 240, "jpeg", timeout_s=1.0)
+            )
+        )
+        caller.start()
+        assert prepare_entered.wait(timeout=1.0)
+
+        assert broker.render_sync(320, 240, "jpeg", timeout_s=0.1) is None
+        release_prepare.set()
+        deadline = time.monotonic() + 1.0
+        while not snapshot_client.messages and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert snapshot_client.messages
+        message = snapshot_client.messages[0]
+        assert message["requiredProducerEpoch"] == "worker-epoch"
+        assert message["requiredFrameSequence"] == 17
+        assert 1 <= message["timeoutMs"] <= 1_000
+        assert broker.deliver(message["requestId"], b"prepared-image") is True
+        caller.join(timeout=1.0)
+        assert not caller.is_alive()
+        assert result == [b"prepared-image"]
+
+        status = broker.status()
+        assert status["requests_total"] == 2
+        assert status["completed_total"] == 1
+        assert status["failed_total"] == 1
+        assert status["busy_rejected_total"] == 1
+        assert status["pending_count"] == 0
+    finally:
+        release_prepare.set()
         loop_thread.stop()
 
 
@@ -213,28 +309,36 @@ def test_snapshot_upload_route_rejects_unknown_or_expired_request_id() -> None:
     assert response.json()["detail"] == "Unknown or expired snapshot request id"
 
 
+def test_snapshot_status_route_exposes_bounded_broker_evidence() -> None:
+    with TestClient(create_app(_state(), security=_TEST_SECURITY)) as client:
+        response = client.get("/api/scene/snapshot/status")
+
+    assert response.status_code == 200
+    assert response.json()["schema_version"] == "manyforge.viewer.snapshot_status.v1"
+    assert response.json()["pending_count"] == 0
+
+
 class _FailingPointCloudClient:
-    async def send_json(self, _message: dict[str, Any]) -> None:
+    async def accept(self) -> None:
+        return
+
+    async def send_bytes(self, _message: bytes) -> None:
         raise RuntimeError("client disconnected")
 
 
 def test_pointcloud_publisher_removes_dead_client_after_send_failure() -> None:
-    loop_thread = _LoopThread()
-    publisher = PointCloudPublisher()
-    dead_client = _FailingPointCloudClient()
-    try:
-        with publisher._lock:
-            publisher._clients.append(dead_client)  # type: ignore[arg-type]
-            publisher._loop = loop_thread.loop
+    async def scenario() -> None:
+        publisher = PointCloudPublisher()
+        dead_client = _FailingPointCloudClient()
+        client_id = await publisher.attach(dead_client)  # type: ignore[arg-type]
+        send_task = asyncio.create_task(publisher.send_loop(client_id))
 
-        publisher.publish([[0.0, 0.0, 0.0]])
-
-        deadline = time.monotonic() + 2.0
-        while publisher.has_clients() and time.monotonic() < deadline:
-            time.sleep(0.001)
+        assert publisher.publish([[0.0, 0.0, 0.0]])
+        with pytest.raises(RuntimeError, match="client disconnected"):
+            await asyncio.wait_for(send_task, timeout=1.0)
         assert not publisher.has_clients()
-    finally:
-        loop_thread.stop()
+
+    asyncio.run(scenario())
 
 
 def test_statehub_broadcast_collection_runs_off_event_loop() -> None:

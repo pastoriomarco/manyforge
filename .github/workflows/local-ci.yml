@@ -39,6 +39,7 @@ jobs:
               ./scripts/ci/check-terminal-commit-boundary.sh
               python3 scripts/ci/check-authority-port-alignment.py
               python3 scripts/ci/check-planner-portability.py
+              python3 scripts/ci/check-viewer-data-plane-boundaries.py
               # Runs inside the dev image already (this whole command executes
               # in manyforge-dev:latest), so take the direct in-container path.
               INSIDE_MANYFORGE_DEV_CONTAINER=1 ./scripts/ci/check-public-contracts-fresh.sh

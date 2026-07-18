@@ -1,6 +1,17 @@
-import { Component, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Component,
+  Profiler,
+  Suspense,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import type { ErrorInfo, MutableRefObject, ReactNode } from 'react';
-import { Canvas } from '@react-three/fiber';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import {
   Grid,
   Html,
@@ -14,16 +25,31 @@ import * as THREE from 'three';
 import type { Group, Mesh } from 'three';
 
 import { api } from '../api/client';
-import { usePointCloudStore, usePointCloudSubscription } from '../store/pointCloudStore';
+import {
+  applyLatestPointCloudFrame,
+  registerPointCloudApplier,
+  subscribePointCloudWake,
+  usePointCloudSubscription,
+} from '../store/pointCloudStore';
 import { useProgramStore } from '../store/programStore';
 import { useRobotControlCandidateStore } from '../store/robotControlCandidateStore';
 import { useRobotCommandAuthority } from '../store/commandAuthority';
-import { useSceneStateStore, useScenePolling } from '../store/sceneStateStore';
+import {
+  getAuthoritativeViewerState,
+  useSceneStateStore,
+  useViewerDemand,
+} from '../store/sceneStateStore';
+import {
+  applyLatestViewerFrame,
+  getLatestViewerSnapshot,
+  registerViewerFrameApplier,
+  subscribeViewerFrameWake,
+  viewerRobotLinkPose,
+} from '../store/viewerFrameStore';
 import { useStatusPolling, useStatusStore } from '../store/statusStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
 import type {
   MeshAssetStatus,
-  PoseSourceStatusState,
   PreviewLinkPosesResponse,
   SceneFrameState,
   SceneGripperState,
@@ -43,10 +69,26 @@ import {
   poseFromRecord,
 } from '../utils/poseTransforms';
 import type { PoseTuple } from '../utils/poseTransforms';
+import type {
+  ViewerFrameV1,
+  ViewerManifestV1,
+  ViewerPoseV1,
+} from '../types/viewerProtocol.generated';
 import { ObjectEditPanel } from './ObjectEditPanel';
 import { RobotControlPanel } from './RobotControlPanel';
 import { SceneControls } from './SceneControls';
 import { SnapshotResponder } from './SnapshotResponder';
+import {
+  inspectViewerRenderer,
+  getViewerRendererProfile,
+  publishViewerRendererProfile,
+  recordViewerEffectiveDpr,
+  recordViewerReactCommit,
+  recordViewerRenderFrame,
+  recordViewerRenderWork,
+  selectViewerPresentationProfile,
+  subscribeViewerRendererProfile,
+} from '../utils/viewerPerformance';
 
 // Module-level stable references for zustand selector fallbacks. Returning
 // a new `[]` or `{}` from a selector each render makes Object.is-based
@@ -55,14 +97,36 @@ import { SnapshotResponder } from './SnapshotResponder';
 // same identity across renders keeps zustand's bailout path working.
 const EMPTY_OBJECTS: SceneObjectState[] = [];
 
-const EMPTY_POSE_SOURCES: PoseSourceStatusState[] = [];
-
-const EMPTY_LINK_POSES: Record<
-  string,
-  { position_m: number[]; orientation_xyzw: number[] }
-> = {};
-
 const EMPTY_GRIPPERS: SceneGripperState[] = [];
+
+function manifestEntityToSceneObject(
+  entity: ViewerManifestV1['entities'][number],
+): SceneObjectState {
+  const shape = entity.shape === null
+    ? null
+    : {
+      type: entity.shape.type,
+      box_dimensions_m: entity.shape.box_dimensions_m ?? undefined,
+      sphere_radius_m: entity.shape.sphere_radius_m ?? undefined,
+      cylinder_radius_m: entity.shape.cylinder_radius_m ?? undefined,
+      cylinder_height_m: entity.shape.cylinder_height_m ?? undefined,
+      mesh_resource_uri: entity.shape.mesh_resource_uri ?? undefined,
+      mesh_scale: entity.shape.mesh_scale ?? undefined,
+      mesh_asset_url: entity.shape.mesh_asset_url,
+      mesh_asset_status: entity.shape.mesh_asset_status,
+    };
+  return {
+    object_id: entity.object_id,
+    shape,
+    pose_in_universe: null,
+    attached: entity.attached,
+    attached_to: entity.attached_to,
+    source: entity.source,
+    persistable: entity.persistable,
+    viewer_frame_visible: entity.viewer_frame_visible,
+    support_contacts: entity.support_contacts,
+  };
+}
 
 interface SceneViewerPanelProps {
   onCollapse: () => void;
@@ -124,9 +188,11 @@ export function SceneViewerPanel({
   resizing = false,
 }: SceneViewerPanelProps) {
   useStatusPolling();
-  useScenePolling();
+  useViewerDemand();
   const runtime = useStatusStore((state) => state.runtime);
-  const scene = useSceneStateStore((state) => state.scene);
+  const manifest = useSceneStateStore((state) => state.manifest);
+  const connectionState = useSceneStateStore((state) => state.connectionState);
+  const frameAvailable = useSceneStateStore((state) => state.frameAvailable);
   const sceneError = useSceneStateStore((state) => state.error);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   // Header panels are mutually exclusive — clicking one closes any
@@ -143,9 +209,9 @@ export function SceneViewerPanel({
 
   let backendAvailable: boolean | null;
   let unavailableDetail: string | null = null;
-  if (scene === null && sceneError === null) {
+  if (manifest === null && sceneError === null && connectionState !== 'disconnected') {
     backendAvailable = null;
-  } else if (scene !== null) {
+  } else if (manifest !== null) {
     backendAvailable = true;
   } else {
     backendAvailable = false;
@@ -155,10 +221,10 @@ export function SceneViewerPanel({
       || 'Load a program/deployment to start the embedded 3D viewer.';
   }
 
-  const handleContextMenu = (objectId: string, x: number, y: number): void => {
+  const handleContextMenu = useCallback((objectId: string, x: number, y: number): void => {
     setContextMenu({ objectId, x, y });
-  };
-  const closeContextMenu = (): void => setContextMenu(null);
+  }, []);
+  const closeContextMenu = useCallback((): void => setContextMenu(null), []);
 
   return (
     <div
@@ -239,7 +305,25 @@ export function SceneViewerPanel({
           </div>
         ) : (
           <>
-            <SceneCanvas resizing={resizing} onContextMenu={handleContextMenu} />
+            <Profiler
+              id="manyforge-scene-viewer"
+              onRender={(_id, _phase, actualDuration) => {
+                recordViewerReactCommit(actualDuration);
+              }}
+            >
+              <SceneCanvas
+                resizing={resizing}
+                frameAvailable={frameAvailable}
+                onContextMenu={handleContextMenu}
+              />
+            </Profiler>
+            {manifest !== null && (!frameAvailable || connectionState === 'stale') && (
+              <div className="pointer-events-none absolute left-3 top-3 z-10 rounded border border-amber-700 bg-gray-950/90 px-2 py-1 text-xs text-amber-200">
+                {connectionState === 'stale'
+                  ? 'Viewer state is stale'
+                  : 'Waiting for current viewer state'}
+              </div>
+            )}
             {activePanel === 'tools' && (
               <SceneControls onClose={() => setActivePanel(null)} />
             )}
@@ -269,7 +353,11 @@ function SceneObjectContextMenu({
   state: ContextMenuState;
   onClose: () => void;
 }) {
-  const objects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
+  const manifest = useSceneStateStore((s) => s.manifest);
+  const objects = useMemo(
+    () => manifest?.entities.map(manifestEntityToSceneObject) ?? EMPTY_OBJECTS,
+    [manifest],
+  );
   const object = useMemo(
     () => objects.find((o) => o.object_id === state.objectId) ?? null,
     [objects, state.objectId],
@@ -305,7 +393,10 @@ function SceneObjectContextMenu({
   function handleDuplicate(): void {
     if (object === null) return;
     const newId = `${object.object_id}_copy_${Date.now().toString(36)}`;
-    const pose = object.pose_in_universe as Record<string, unknown> | null;
+    const authoritativeObject = getAuthoritativeViewerState()?.scene.objects.find(
+      (candidate) => candidate.object_id === object.object_id,
+    );
+    const pose = authoritativeObject?.pose_in_universe as Record<string, unknown> | null;
     const position = Array.isArray(pose?.position_m)
       ? (pose!.position_m as number[]).map((v, i) => (i === 0 ? Number(v) + 0.1 : Number(v)))
       : [0.1, 0, 0];
@@ -400,11 +491,195 @@ function SceneObjectContextMenu({
 type GizmoMode = 'translate' | 'rotate' | 'scale';
 type GizmoSpace = 'world' | 'local';
 
-function SceneCanvas({
+function ViewerRenderMetrics() {
+  const gl = useThree((state) => state.gl);
+  useEffect(() => {
+    const { vendor, renderer, software } = inspectViewerRenderer(gl);
+    const presentation = selectViewerPresentationProfile(
+      software,
+      window.devicePixelRatio,
+    );
+    publishViewerRendererProfile({
+      vendor: vendor || null,
+      renderer: renderer || null,
+      software,
+      ...presentation,
+    });
+  }, [gl]);
+  useFrame(() => {
+    recordViewerEffectiveDpr(gl.getPixelRatio());
+    recordViewerRenderFrame(performance.now());
+    recordViewerRenderWork(
+      gl.info.render.calls,
+      gl.info.render.triangles,
+      gl.domElement.width * gl.domElement.height,
+    );
+  });
+  return null;
+}
+
+const HARDWARE_INTERPOLATION_DURATION_MS = 50;
+const SOFTWARE_INTERPOLATION_DURATION_MS = 0;
+const HARDWARE_INTERPOLATION_RATE_HZ = 60;
+const SOFTWARE_INTERPOLATION_RATE_HZ = 15;
+
+function ViewerFrameDriver({ software }: { software: boolean }) {
+  const invalidate = useThree((state) => state.invalidate);
+  const continuationTimerRef = useRef<number | null>(null);
+  const wake = useCallback(() => {
+    if (continuationTimerRef.current !== null) {
+      window.clearTimeout(continuationTimerRef.current);
+      continuationTimerRef.current = null;
+    }
+    invalidate();
+  }, [invalidate]);
+  useEffect(() => {
+    const unsubscribe = subscribeViewerFrameWake(wake);
+    return () => {
+      unsubscribe();
+      if (continuationTimerRef.current !== null) {
+        window.clearTimeout(continuationTimerRef.current);
+        continuationTimerRef.current = null;
+      }
+    };
+  }, [wake]);
+  useFrame(() => {
+    const result = applyLatestViewerFrame(
+      Date.now(),
+      software
+        ? SOFTWARE_INTERPOLATION_DURATION_MS
+        : HARDWARE_INTERPOLATION_DURATION_MS,
+    );
+    if (!result.interpolationPending || continuationTimerRef.current !== null) {
+      return;
+    }
+    const rateHz = software
+      ? SOFTWARE_INTERPOLATION_RATE_HZ
+      : HARDWARE_INTERPOLATION_RATE_HZ;
+    continuationTimerRef.current = window.setTimeout(() => {
+      continuationTimerRef.current = null;
+      invalidate();
+    }, 1_000 / rateHz);
+  }, -1_000);
+  return null;
+}
+
+function useViewerFrameBinding<T extends THREE.Object3D>(
+  node: T | null,
+  apply: (
+    target: T,
+    manifest: ViewerManifestV1,
+    frame: ViewerFrameV1,
+    previousFrame: ViewerFrameV1 | null,
+    interpolationAlpha: number,
+  ) => number | void,
+): void {
+  const applyRef = useRef(apply);
+  applyRef.current = apply;
+  useEffect(() => {
+    if (node === null) return undefined;
+    return registerViewerFrameApplier((manifest, frame, previousFrame, interpolationAlpha) => (
+      applyRef.current(node, manifest, frame, previousFrame, interpolationAlpha)
+    ));
+  }, [node]);
+}
+
+const MAX_INTERPOLATED_TRANSLATION_M = 0.25;
+const interpolationStartQuaternion = new THREE.Quaternion();
+const interpolationEndQuaternion = new THREE.Quaternion();
+
+function finitePoseComponent(value: number, fallback: number): number {
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function applyPoseComponents(
+  target: THREE.Object3D,
+  position: ArrayLike<number>,
+  quaternion: ArrayLike<number>,
+  previousPosition: ArrayLike<number> | null,
+  previousQuaternion: ArrayLike<number> | null,
+  interpolationAlpha: number,
+): number {
+  const px = finitePoseComponent(Number(position[0]), 0);
+  const py = finitePoseComponent(Number(position[1]), 0);
+  const pz = finitePoseComponent(Number(position[2]), 0);
+  const qx = finitePoseComponent(Number(quaternion[0]), 0);
+  const qy = finitePoseComponent(Number(quaternion[1]), 0);
+  const qz = finitePoseComponent(Number(quaternion[2]), 0);
+  const qw = finitePoseComponent(Number(quaternion[3]), 1);
+  const alpha = Math.min(1, Math.max(0, interpolationAlpha));
+  if (alpha >= 1 || previousPosition === null || previousQuaternion === null) {
+    target.position.set(px, py, pz);
+    target.quaternion.set(qx, qy, qz, qw).normalize();
+    return 1;
+  }
+  const previousPx = Number(previousPosition[0]);
+  const previousPy = Number(previousPosition[1]);
+  const previousPz = Number(previousPosition[2]);
+  const previousQx = Number(previousQuaternion[0]);
+  const previousQy = Number(previousQuaternion[1]);
+  const previousQz = Number(previousQuaternion[2]);
+  const previousQw = Number(previousQuaternion[3]);
+  const dx = px - previousPx;
+  const dy = py - previousPy;
+  const dz = pz - previousPz;
+  if (
+    !Number.isFinite(previousPx)
+    || !Number.isFinite(previousPy)
+    || !Number.isFinite(previousPz)
+    || !Number.isFinite(previousQx)
+    || !Number.isFinite(previousQy)
+    || !Number.isFinite(previousQz)
+    || !Number.isFinite(previousQw)
+    || dx * dx + dy * dy + dz * dz
+      > MAX_INTERPOLATED_TRANSLATION_M * MAX_INTERPOLATED_TRANSLATION_M
+  ) {
+    target.position.set(px, py, pz);
+    target.quaternion.set(qx, qy, qz, qw).normalize();
+    return 1;
+  }
+  target.position.set(
+    previousPx + (px - previousPx) * alpha,
+    previousPy + (py - previousPy) * alpha,
+    previousPz + (pz - previousPz) * alpha,
+  );
+  interpolationStartQuaternion
+    .set(previousQx, previousQy, previousQz, previousQw)
+    .normalize();
+  interpolationEndQuaternion.set(qx, qy, qz, qw).normalize();
+  target.quaternion.slerpQuaternions(
+    interpolationStartQuaternion,
+    interpolationEndQuaternion,
+    alpha,
+  );
+  return 1;
+}
+
+function applyViewerPose(
+  target: THREE.Object3D,
+  pose: ViewerPoseV1 | null,
+  previousPose: ViewerPoseV1 | null = null,
+  interpolationAlpha = 1,
+): number {
+  target.visible = pose !== null;
+  if (pose === null) return 0;
+  return applyPoseComponents(
+    target,
+    pose.position_m,
+    pose.orientation_xyzw,
+    previousPose?.position_m ?? null,
+    previousPose?.orientation_xyzw ?? null,
+    interpolationAlpha,
+  );
+}
+
+const SceneCanvas = memo(function SceneCanvas({
   resizing,
+  frameAvailable,
   onContextMenu,
 }: {
   resizing: boolean;
+  frameAvailable: boolean;
   onContextMenu: (objectId: string, x: number, y: number) => void;
 }) {
   const selectedId = useViewerSelectionStore((s) => s.selectedId);
@@ -416,6 +691,11 @@ function SceneCanvas({
   // keystroke away for axis-aligned moves.
   const [gizmoSpace, setGizmoSpace] = useState<GizmoSpace>('local');
   const [statsVisible, setStatsVisible] = useState(false);
+  const rendererProfile = useSyncExternalStore(
+    subscribeViewerRendererProfile,
+    getViewerRendererProfile,
+    getViewerRendererProfile,
+  );
   // `isDragging` lives in a ref because we read it from an event
   // handler attached to <Canvas> (onPointerMissed) — a `useState` would
   // make the closure stale unless the Canvas re-rendered between
@@ -460,16 +740,29 @@ function SceneCanvas({
 
   return (
     <Canvas
+      // Renderer kind is known only after the first context is inspected. If
+      // that context proves to be software WebGL, remount once into the
+      // bounded fallback profile; hardware contexts keep MSAA for normal
+      // operator-facing visual quality.
+      key={[
+        rendererProfile.software ? 'software' : 'hardware',
+        rendererProfile.antialias ? 'msaa' : 'no-msaa',
+        rendererProfile.preserveDrawingBuffer ? 'preserved' : 'transient',
+      ].join('-')}
       frameloop="demand"
+      dpr={rendererProfile.effectiveDpr}
       gl={{
-        antialias: true,
+        antialias: rendererProfile.antialias,
+        // The viewer is visually opaque. Avoiding a transparent WebGL surface
+        // removes an unnecessary compositor blend and prevents software-canvas
+        // tiles from exposing stale page content during camera motion.
+        alpha: false,
         powerPreference: 'high-performance',
-        // Required for client-side scene-snapshot capture (Day 3): the
-        // backend SnapshotBroker round-trips a render request to this
-        // Canvas and reads pixels back via `toDataURL`, which yields
-        // a transparent frame on browsers that auto-clear the
-        // drawing buffer between paints.
-        preserveDrawingBuffer: true,
+        // SnapshotResponder renders into a reusable offscreen target. Keeping
+        // the visible drawing buffer is disabled on hardware. The software
+        // profile preserves it because Firefox/llvmpipe otherwise presents
+        // incomplete transient frames during demand-driven camera movement.
+        preserveDrawingBuffer: rendererProfile.preserveDrawingBuffer,
       }}
       className={resizing ? 'pointer-events-none' : ''}
       style={{ background: '#0a0f18' }}
@@ -482,6 +775,9 @@ function SceneCanvas({
         setSelected(null);
       }}
     >
+      <ViewerRenderMetrics />
+      <ViewerFrameDriver software={rendererProfile.software} />
+      <color attach="background" args={['#0a0f18']} />
       <PerspectiveCamera
         makeDefault
         up={[0, 0, 1]}
@@ -499,6 +795,10 @@ function SceneCanvas({
       <hemisphereLight args={['#dbe6ff', '#1a2530', 0.7]} />
       <directionalLight position={[5, 5, 10]} intensity={1.6} castShadow={false} />
       <directionalLight position={[-5, -5, 6]} intensity={0.6} castShadow={false} />
+      {/* GridHelper uses clipped WebGL line segments, which Mesa llvmpipe can
+          mis-rasterize as large polygons during camera motion. A finite shader
+          grid is one draw call, has no line primitives, and avoids the old
+          infinite-grid overdraw. */}
       <Grid
         args={[10, 10]}
         cellSize={0.1}
@@ -507,9 +807,9 @@ function SceneCanvas({
         sectionSize={1}
         sectionThickness={0.8}
         sectionColor="#3a4252"
-        fadeDistance={20}
+        fadeDistance={10}
         fadeStrength={1.5}
-        infiniteGrid
+        infiniteGrid={false}
         followCamera={false}
         rotation={[Math.PI / 2, 0, 0]}
       />
@@ -521,29 +821,31 @@ function SceneCanvas({
         dampingFactor={0.12}
         target={initialCameraTarget}
       />
-      <Suspense fallback={null}>
-        <RobotModel />
-      </Suspense>
-      <SceneObjects
-        selectedId={selectedId}
-        onSelect={setSelected}
-        gizmoMode={gizmoMode}
-        gizmoSpace={gizmoSpace}
-        isDraggingRef={isDraggingRef}
-        onContextMenu={onContextMenu}
-      />
-      <MeasuredPoseSourceGhosts />
-      <FrameAxes />
-      <ObjectFrameAxes />
-      <PointCloud />
-      <TcpJogGizmo />
-      <MoveToTargetGhost />
-      <CandidateGhostRobot />
+      <group name="manyforge-authoritative-view" visible={frameAvailable}>
+        <Suspense fallback={null}>
+          <RobotModel />
+        </Suspense>
+        <SceneObjects
+          selectedId={selectedId}
+          onSelect={setSelected}
+          gizmoMode={gizmoMode}
+          gizmoSpace={gizmoSpace}
+          isDraggingRef={isDraggingRef}
+          onContextMenu={onContextMenu}
+        />
+        <MeasuredPoseSourceGhosts />
+        <FrameAxes />
+        <ObjectFrameAxes />
+        <PointCloud />
+        <TcpJogGizmo />
+        <MoveToTargetGhost />
+        <CandidateGhostRobot />
+      </group>
       <SnapshotResponder />
       {statsVisible && <Stats className="!left-2 !top-2" />}
     </Canvas>
   );
-}
+});
 
 function SceneObjects({
   selectedId,
@@ -560,14 +862,19 @@ function SceneObjects({
   isDraggingRef: MutableRefObject<boolean>;
   onContextMenu: (objectId: string, x: number, y: number) => void;
 }) {
-  const objects = useSceneStateStore((state) => state.scene?.objects ?? EMPTY_OBJECTS);
+  const manifest = useSceneStateStore((state) => state.manifest);
+  const objects = useMemo(
+    () => manifest?.entities.map(manifestEntityToSceneObject) ?? EMPTY_OBJECTS,
+    [manifest],
+  );
   const lockedIds = useViewerSelectionStore((s) => s.lockedIds);
   return (
     <group name="manyforge-scene-objects">
-      {objects.map((obj) => (
+      {objects.map((obj, entityIndex) => (
         <SceneObjectMesh
           key={obj.object_id}
           object={obj}
+          entityIndex={entityIndex}
           selected={obj.object_id === selectedId}
           locked={lockedIds.has(obj.object_id)}
           onSelect={() => onSelect(obj.object_id)}
@@ -586,8 +893,8 @@ interface MeasuredGhost {
   markerKind: 'object' | 'tcp';
   objectId: string;
   sourceId: string;
-  position: [number, number, number];
-  quaternion: [number, number, number, number];
+  sourceFrame: string;
+  observedFrame: string | null;
   shape: SceneShapeState | null;
   shapeType: string | null;
 }
@@ -605,10 +912,12 @@ function measuredGhostEnabled(
 
 function MeasuredPoseSourceGhosts() {
   const visible = useViewerSelectionStore((s) => s.measuredStateGhostVisible);
-  const poseSources = useSceneStateStore(
-    (state) => state.scene?.pose_sources ?? EMPTY_POSE_SOURCES,
+  const manifest = useSceneStateStore((state) => state.manifest);
+  const poseSources = manifest?.pose_sources ?? [];
+  const objects = useMemo(
+    () => manifest?.entities.map(manifestEntityToSceneObject) ?? EMPTY_OBJECTS,
+    [manifest],
   );
-  const objects = useSceneStateStore((state) => state.scene?.objects ?? EMPTY_OBJECTS);
 
   const objectById = useMemo(() => {
     const map = new Map<string, SceneObjectState>();
@@ -625,43 +934,20 @@ function MeasuredPoseSourceGhosts() {
       const renderTcp = source.objects.some((observed) => (
         measuredGhostEnabled(observed.measured_state_ghost, 'robotTcp')
       ));
-      if (renderTcp && source.measured_tcp) {
-        const tcpPose = source.measured_tcp.pose;
-        if (isRenderableWorldPoseFrame(tcpPose.frame_id, source.frame_id)) {
-          const position = tuple3(tcpPose.position_xyz);
-          const quaternion = tuple4(tcpPose.orientation_xyzw);
-          if (position !== null && quaternion !== null) {
-            next.push({
-              key: `${source.pose_source_id}:measured_tcp`,
-              markerKind: 'tcp',
-              objectId: source.measured_tcp.tcp_frame_id || 'measured_tcp',
-              sourceId: source.pose_source_id,
-              position,
-              quaternion,
-              shape: null,
-              shapeType: null,
-            });
-          }
-        }
+      if (renderTcp) {
+        next.push({
+          key: `${source.pose_source_id}:measured_tcp`,
+          markerKind: 'tcp',
+          objectId: 'measured_tcp',
+          sourceId: source.pose_source_id,
+          sourceFrame: source.frame_id,
+          observedFrame: null,
+          shape: null,
+          shapeType: null,
+        });
       }
       for (const observed of source.objects) {
-        if (observed.status !== 'fresh' || observed.update === null || observed.update === undefined) {
-          continue;
-        }
         if (!measuredGhostEnabled(observed.measured_state_ghost, 'object', true)) {
-          continue;
-        }
-        const pose = observed.update.pose;
-        // `observed.frame_id` is the configured coordinate frame for the
-        // binding. `pose.frame_id` is provider metadata and may carry the
-        // source entity frame/name (Isaac reports e.g. "mac_n_cheese_centered")
-        // even though the numeric pose is expressed in the source frame.
-        if (!isRenderableWorldPoseFrame(observed.frame_id, source.frame_id)) {
-          continue;
-        }
-        const position = tuple3(pose.position_xyz);
-        const quaternion = tuple4(pose.orientation_xyzw);
-        if (position === null || quaternion === null) {
           continue;
         }
         const object = objectById.get(observed.object_id) ?? null;
@@ -672,8 +958,8 @@ function MeasuredPoseSourceGhosts() {
           markerKind: 'object',
           objectId: observed.object_id,
           sourceId: source.pose_source_id,
-          position,
-          quaternion,
+          sourceFrame: source.frame_id,
+          observedFrame: observed.frame_id,
           shape,
           shapeType,
         });
@@ -689,24 +975,71 @@ function MeasuredPoseSourceGhosts() {
   return (
     <group name="manyforge-measured-state-ghosts" renderOrder={20}>
       {ghosts.map((ghost) => (
-        <group
+        <BoundMeasuredPoseGhost
           key={ghost.key}
           name={`measured-ghost:${ghost.objectId}`}
-          position={ghost.position}
-          quaternion={ghost.quaternion}
+          ghost={ghost}
         >
           <MeasuredGhostBody
             markerKind={ghost.markerKind}
             shape={ghost.shape}
             shapeType={ghost.shapeType}
           />
-        </group>
+        </BoundMeasuredPoseGhost>
       ))}
     </group>
   );
 }
 
-function measuredRobotGhostOpacity(source: PoseSourceStatusState): number | null {
+function BoundMeasuredPoseGhost({
+  name,
+  ghost,
+  children,
+}: {
+  name: string;
+  ghost: MeasuredGhost;
+  children: ReactNode;
+}) {
+  const [node, setNode] = useState<Group | null>(null);
+  useViewerFrameBinding(node, (target, _manifest, frame) => {
+    const source = frame.pose_source_states.find(
+      (item) => item.pose_source_id === ghost.sourceId,
+    );
+    let position: [number, number, number] | null = null;
+    let quaternion: [number, number, number, number] | null = null;
+    if (ghost.markerKind === 'tcp') {
+      const measuredTcp = source?.measured_tcp ?? null;
+      if (
+        measuredTcp !== null
+        && isRenderableWorldPoseFrame(measuredTcp.pose.frame_id, ghost.sourceFrame)
+      ) {
+        position = tuple3(measuredTcp.pose.position_xyz);
+        quaternion = tuple4(measuredTcp.pose.orientation_xyzw);
+      }
+    } else {
+      const observed = source?.objects.find((item) => item.object_id === ghost.objectId);
+      if (
+        observed?.status === 'fresh'
+        && observed.update !== null
+        && ghost.observedFrame !== null
+        && isRenderableWorldPoseFrame(ghost.observedFrame, ghost.sourceFrame)
+      ) {
+        position = tuple3(observed.update.pose.position_xyz);
+        quaternion = tuple4(observed.update.pose.orientation_xyzw);
+      }
+    }
+    target.visible = position !== null && quaternion !== null;
+    if (position === null || quaternion === null) return 0;
+    target.position.set(...position);
+    target.quaternion.set(...quaternion);
+    return 1;
+  });
+  return <group ref={setNode} name={name} visible={false}>{children}</group>;
+}
+
+function measuredRobotGhostOpacity(source: {
+  objects: Array<{ measured_state_ghost?: Record<string, unknown> | null }>;
+}): number | null {
   for (const observed of source.objects) {
     const config = observed.measured_state_ghost;
     if (!measuredGhostEnabled(config, 'robotTcp')) {
@@ -810,6 +1143,7 @@ function MeasuredGhostBody({
 
 function SceneObjectMesh({
   object,
+  entityIndex,
   selected,
   locked,
   onSelect,
@@ -819,6 +1153,7 @@ function SceneObjectMesh({
   isDraggingRef,
 }: {
   object: SceneObjectState;
+  entityIndex: number;
   selected: boolean;
   locked: boolean;
   onSelect: () => void;
@@ -838,19 +1173,32 @@ function SceneObjectMesh({
   // menu) but does NOT surface the drag gizmo, matching the principle
   // that the gizmo is the Object-panel affordance.
   const objectPanelActive = useViewerSelectionStore((s) => s.activePanel === 'object');
-  const pose = useMemo(() => extractPose(object.pose_in_universe), [object.pose_in_universe]);
   const shape = object.shape ?? null;
   const color = selected ? '#f5d24a' : colorForSource(object.source);
   const opacity = object.attached ? 0.85 : 1.0;
   const shapeType = typeof shape?.type === 'string' ? (shape.type as string) : null;
   const editable = object.persistable && !object.attached;
 
+  useViewerFrameBinding(objectNode, (
+    target,
+    _manifest,
+    frame,
+    previousFrame,
+    interpolationAlpha,
+  ) => {
+    if (selected && isDraggingRef.current) return 0;
+    return applyViewerPose(
+      target,
+      frame.entity_transforms[entityIndex] ?? null,
+      previousFrame?.entity_transforms[entityIndex] ?? null,
+      interpolationAlpha,
+    );
+  });
+
   return (
     <>
       <group
         ref={setObjectNode}
-        position={pose.position}
-        quaternion={pose.quaternion}
         onClick={(event) => {
           event.stopPropagation();
           onSelect();
@@ -1134,22 +1482,21 @@ function emitObjectPoseEdit(objectId: string, group: Group | null): void {
 }
 
 function RobotModel() {
-  const [manifest, setManifest] = useState<SceneUrdfManifest | null>(null);
+  const [urdfManifest, setUrdfManifest] = useState<SceneUrdfManifest | null>(null);
   const [manifestError, setManifestError] = useState<string | null>(null);
-  const linkPoses = useSceneStateStore((state) => state.scene?.link_poses ?? EMPTY_LINK_POSES);
-  const robotModelKey = useSceneStateStore(
-    (state) => state.scene?.robot?.urdf_model_key ?? state.scene?.robot?.robot_id ?? null,
-  );
+  const viewerManifest = useSceneStateStore((state) => state.manifest);
+  const robotDescriptor = viewerManifest?.robots[0] ?? null;
+  const robotModelKey = robotDescriptor?.urdf_model_key ?? robotDescriptor?.robot_id ?? null;
   const collisionMeshesVisible = useViewerSelectionStore((s) => s.collisionMeshesVisible);
 
   useEffect(() => {
     let cancelled = false;
-    setManifest(null);
+    setUrdfManifest(null);
     setManifestError(null);
     api.urdf
       .manifest()
       .then((data) => {
-        if (!cancelled) setManifest(data);
+        if (!cancelled) setUrdfManifest(data);
       })
       .catch((err: unknown) => {
         if (!cancelled) {
@@ -1161,7 +1508,7 @@ function RobotModel() {
     };
   }, [robotModelKey]);
 
-  if (manifest === null) {
+  if (urdfManifest === null) {
     // 404 here is the normal state when the deployment has no URDF;
     // the rest of the viewer still works.
     void manifestError;
@@ -1169,27 +1516,28 @@ function RobotModel() {
   }
   if (
     robotModelKey !== null &&
-    manifest.model_key !== undefined &&
-    manifest.model_key !== robotModelKey
+    urdfManifest.model_key !== undefined &&
+    urdfManifest.model_key !== robotModelKey
   ) {
     return null;
   }
 
-  const modelKey = manifest.model_key ?? manifest.robot_id ?? 'unknown';
+  const modelKey = urdfManifest.model_key ?? urdfManifest.robot_id ?? 'unknown';
+  const linkIndices = new Map(
+    (robotDescriptor?.link_order ?? []).map((name, index) => [name, index]),
+  );
 
   return (
     <>
       <group name="manyforge-urdf" key={modelKey}>
-        {manifest.links.map((link) => {
-          const pose = linkPoses[link.name];
-          if (pose === undefined) {
-            return null;
-          }
+        {urdfManifest.links.map((link) => {
+          const linkIndex = linkIndices.get(link.name);
+          if (linkIndex === undefined) return null;
           return (
-            <group
+            <BoundRobotLink
               key={`${modelKey}:${link.name}`}
-              position={pose.position_m as [number, number, number]}
-              quaternion={pose.orientation_xyzw as [number, number, number, number]}
+              robotIndex={0}
+              linkIndex={linkIndex}
             >
               {link.visuals.map((visual) => (
                 <RobotLinkVisual
@@ -1197,55 +1545,48 @@ function RobotModel() {
                   visual={visual}
                 />
               ))}
-            </group>
+              {collisionMeshesVisible && (link.collisions ?? []).map((collision) => (
+                <RobotLinkCollision
+                  key={`${modelKey}:collision:${link.name}:${collision.index}:${collision.mesh_url ?? 'primitive'}`}
+                  collision={collision}
+                />
+              ))}
+            </BoundRobotLink>
           );
         })}
       </group>
-      {collisionMeshesVisible && (
-        <RobotCollisionMeshes manifest={manifest} modelKey={modelKey} linkPoses={linkPoses} />
-      )}
-      <MeasuredRobotGhosts manifest={manifest} modelKey={modelKey} />
+      <MeasuredRobotGhosts manifest={urdfManifest} modelKey={modelKey} />
     </>
   );
 }
 
-function RobotCollisionMeshes({
-  manifest,
-  modelKey,
-  linkPoses,
+function BoundRobotLink({
+  robotIndex,
+  linkIndex,
+  children,
 }: {
-  manifest: SceneUrdfManifest;
-  modelKey: string;
-  linkPoses: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
+  robotIndex: number;
+  linkIndex: number;
+  children: ReactNode;
 }) {
-  const hasCollisions = manifest.links.some((link) => (link.collisions ?? []).length > 0);
-  if (!hasCollisions) {
-    return null;
-  }
-
+  const [node, setNode] = useState<Group | null>(null);
+  useViewerFrameBinding(node, (
+    target,
+    _manifest,
+    frame,
+    previousFrame,
+    interpolationAlpha,
+  ) => (
+    applyViewerPose(
+      target,
+      frame.robot_blocks[robotIndex]?.link_transforms[linkIndex] ?? null,
+      previousFrame?.robot_blocks[robotIndex]?.link_transforms[linkIndex] ?? null,
+      interpolationAlpha,
+    )
+  ));
   return (
-    <group name="manyforge-urdf-collisions" key={`${modelKey}:collisions`} renderOrder={19}>
-      {manifest.links.map((link) => {
-        const pose = linkPoses[link.name];
-        const collisions = link.collisions ?? [];
-        if (pose === undefined || collisions.length === 0) {
-          return null;
-        }
-        return (
-          <group
-            key={`${modelKey}:collision:${link.name}`}
-            position={pose.position_m as [number, number, number]}
-            quaternion={pose.orientation_xyzw as [number, number, number, number]}
-          >
-            {collisions.map((collision) => (
-              <RobotLinkCollision
-                key={`${modelKey}:collision:${link.name}:${collision.index}:${collision.mesh_url ?? 'primitive'}`}
-                collision={collision}
-              />
-            ))}
-          </group>
-        );
-      })}
+    <group ref={setNode} visible={false}>
+      {children}
     </group>
   );
 }
@@ -1258,37 +1599,25 @@ function MeasuredRobotGhosts({
   modelKey: string;
 }) {
   const visible = useViewerSelectionStore((s) => s.measuredStateGhostVisible);
-  const poseSources = useSceneStateStore(
-    (state) => state.scene?.pose_sources ?? EMPTY_POSE_SOURCES,
-  );
+  const viewerManifest = useSceneStateStore((state) => state.manifest);
   const ghosts = useMemo(() => {
     if (!visible) return [];
-    return poseSources
+    return (viewerManifest?.pose_sources ?? [])
       .map((source) => {
         const opacity = measuredRobotGhostOpacity(source);
-        const measuredRobot = source.measured_robot ?? null;
-        const linkPoses = measuredRobot?.link_poses ?? null;
-        const ageS = measuredRobot?.age_s;
-        if (
-          opacity === null ||
-          linkPoses === null ||
-          Object.keys(linkPoses).length === 0 ||
-          (typeof ageS === 'number' && ageS > source.stale_after_s)
-        ) {
-          return null;
-        }
+        if (opacity === null) return null;
         return {
           key: source.pose_source_id,
           opacity,
-          linkPoses,
+          staleAfterS: source.stale_after_s,
         };
       })
       .filter((item): item is {
         key: string;
         opacity: number;
-        linkPoses: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
+        staleAfterS: number;
       } => item !== null);
-  }, [poseSources, visible]);
+  }, [viewerManifest, visible]);
 
   if (!visible || ghosts.length === 0) {
     return null;
@@ -1297,17 +1626,17 @@ function MeasuredRobotGhosts({
   return (
     <group name="manyforge-measured-robot-ghosts" renderOrder={18}>
       {ghosts.map((ghost) => (
-        <group key={`${modelKey}:measured:${ghost.key}`} name={`measured-robot:${ghost.key}`}>
+        <BoundMeasuredRobotGhost
+          key={`${modelKey}:measured:${ghost.key}`}
+          sourceId={ghost.key}
+          staleAfterS={ghost.staleAfterS}
+        >
           {manifest.links.map((link) => {
-            const pose = ghost.linkPoses[link.name];
-            if (pose === undefined) {
-              return null;
-            }
             return (
-              <group
+              <BoundMeasuredRobotLink
                 key={`${modelKey}:measured:${ghost.key}:${link.name}`}
-                position={pose.position_m as [number, number, number]}
-                quaternion={pose.orientation_xyzw as [number, number, number, number]}
+                sourceId={ghost.key}
+                linkName={link.name}
               >
                 {link.visuals.map((visual) => (
                   <GhostVisual
@@ -1317,13 +1646,80 @@ function MeasuredRobotGhosts({
                     color="#22d3ee"
                   />
                 ))}
-              </group>
+              </BoundMeasuredRobotLink>
             );
           })}
-        </group>
+        </BoundMeasuredRobotGhost>
       ))}
     </group>
   );
+}
+
+function BoundMeasuredRobotGhost({
+  sourceId,
+  staleAfterS,
+  children,
+}: {
+  sourceId: string;
+  staleAfterS: number;
+  children: ReactNode;
+}) {
+  const [node, setNode] = useState<Group | null>(null);
+  useViewerFrameBinding(node, (target, _manifest, frame) => {
+    const source = frame.pose_source_states.find((item) => item.pose_source_id === sourceId);
+    const measured = source?.measured_robot ?? null;
+    const ageS = measured?.age_s;
+    target.visible = measured !== null
+      && measured.link_poses !== undefined
+      && Object.keys(measured.link_poses).length > 0
+      && !(typeof ageS === 'number' && ageS > staleAfterS);
+    return 0;
+  });
+  return (
+    <group ref={setNode} name={`measured-robot:${sourceId}`} visible={false}>
+      {children}
+    </group>
+  );
+}
+
+function BoundMeasuredRobotLink({
+  sourceId,
+  linkName,
+  children,
+}: {
+  sourceId: string;
+  linkName: string;
+  children: ReactNode;
+}) {
+  const [node, setNode] = useState<Group | null>(null);
+  useViewerFrameBinding(node, (
+    target,
+    _manifest,
+    frame,
+    previousFrame,
+    interpolationAlpha,
+  ) => {
+    const source = frame.pose_source_states.find((item) => item.pose_source_id === sourceId);
+    const record = source?.measured_robot?.link_poses?.[linkName];
+    const pose = poseFromRecord(record);
+    target.visible = pose !== null;
+    if (pose === null) return 0;
+    const previousSource = previousFrame?.pose_source_states.find(
+      (item) => item.pose_source_id === sourceId,
+    );
+    const previousPose = poseFromRecord(
+      previousSource?.measured_robot?.link_poses?.[linkName],
+    );
+    return applyPoseComponents(
+      target,
+      pose.position,
+      pose.quaternion,
+      previousPose?.position ?? null,
+      previousPose?.quaternion ?? null,
+      interpolationAlpha,
+    );
+  });
+  return <group ref={setNode} visible={false}>{children}</group>;
 }
 
 function RobotLinkCollision({ collision }: { collision: SceneUrdfCollision }) {
@@ -1491,18 +1887,6 @@ function CollisionPrimitiveMesh({
   return null;
 }
 
-interface ExtractedPose {
-  position: [number, number, number];
-  quaternion: [number, number, number, number];
-}
-
-function extractPose(pose: Record<string, unknown> | null | undefined): ExtractedPose {
-  return {
-    position: numberTriple(pose?.position_m, [0, 0, 0]),
-    quaternion: numberQuad(pose?.orientation_xyzw, [0, 0, 0, 1]),
-  };
-}
-
 function numberTriple(
   value: unknown,
   fallback: [number, number, number],
@@ -1512,21 +1896,6 @@ function numberTriple(
       Number(value[0]) || 0,
       Number(value[1]) || 0,
       Number(value[2]) || 0,
-    ];
-  }
-  return fallback;
-}
-
-function numberQuad(
-  value: unknown,
-  fallback: [number, number, number, number],
-): [number, number, number, number] {
-  if (Array.isArray(value) && value.length === 4) {
-    return [
-      Number(value[0]) || 0,
-      Number(value[1]) || 0,
-      Number(value[2]) || 0,
-      Number(value[3]) || 1,
     ];
   }
   return fallback;
@@ -1597,27 +1966,47 @@ function urdfOriginQuaternion(origin: {
 }
 
 function FrameAxes() {
-  // Render an axes triad at every frame the operator has flagged
-  // visible. Pose + size come from /api/scene/frames (Day-4 parity
-  // work moved frame visibility ownership into ComposerState so
-  // this works without an external viewer server attached). Frames
-  // without a kernel-resolved pose are skipped silently.
-  const frames = useSceneStateStore((s) => s.frames?.frames ?? EMPTY_FRAMES);
-  const gizmoSize = useSceneStateStore((s) => s.frames?.frameGizmoSizeM ?? 0.1);
+  // The manifest owns ordered transforms. Presentation previews the shared
+  // program draft used by both controls, then falls back to the applied scene
+  // projection, so neither UI surface nor the canvas can drift.
+  const manifest = useSceneStateStore((s) => s.manifest);
+  const frameProjection = useSceneStateStore((s) => s.frames);
+  const viewerSettings = useProgramStore((s) => s.viewerSettings);
+  const projectedFrames = frameProjection?.frames ?? EMPTY_FRAME_STATES;
+  const frames = manifest?.frames ?? [];
+  const gizmoSize = viewerSettings?.frameGizmoSizeM
+    ?? frameProjection?.frameGizmoSizeM
+    ?? manifest?.frame_axes_gizmo_size_m
+    ?? 0.1;
+  const visibilityByName = useMemo(
+    () => new Map(projectedFrames.map((frame) => [frame.name, frame.viewerVisible])),
+    [projectedFrames],
+  );
   return (
     <group name="manyforge-frame-axes">
-      {frames.map((frame) => {
-        if (!frame.viewerVisible) return null;
-        const pose = frame.poseInWorld;
-        if (!pose) return null;
-        const position = pose.position_m as [number, number, number];
-        const quaternion = pose.orientation_xyzw as [number, number, number, number];
-        return (
-          <group key={frame.name} position={position} quaternion={quaternion}>
-            <axesHelper args={[gizmoSize]} />
-          </group>
-        );
-      })}
+      {frames.map((frame, frameIndex) => (
+        (
+          viewerSettings?.frameVisibility[frame.name]
+          ?? visibilityByName.get(frame.name)
+          ?? frame.viewer_visible
+        )
+          ? <BoundFrameAxes key={frame.name} frameIndex={frameIndex} size={gizmoSize} />
+          : null
+      ))}
+    </group>
+  );
+}
+
+const EMPTY_FRAME_STATES: import('../types/api').SceneFrameState[] = [];
+
+function BoundFrameAxes({ frameIndex, size }: { frameIndex: number; size: number }) {
+  const [node, setNode] = useState<Group | null>(null);
+  useViewerFrameBinding(node, (target, _manifest, frame) => (
+    applyViewerPose(target, frame.frame_transforms[frameIndex] ?? null)
+  ));
+  return (
+    <group ref={setNode} visible={false}>
+      <axesHelper args={[size]} />
     </group>
   );
 }
@@ -1644,19 +2033,30 @@ function TcpJogGizmo() {
   const author = useRobotControlCandidateStore((s) => s.author);
   const rejectDraft = useRobotControlCandidateStore((s) => s.rejectDraft);
   const candidate = useRobotControlCandidateStore((s) => s.candidate);
-  const scene = useSceneStateStore((s) => s.scene ?? null);
-  const tcpPose = scene?.robot?.tcp_pose_in_base ?? null;
-  const tcpFrame = scene?.robot?.tcp_frame ?? null;
-  const baseFrame = scene?.robot?.base_frame ?? null;
-  const baseWorldPose = useMemo(() => {
-    if (scene?.link_poses !== undefined && baseFrame !== null) {
-      const pose = poseFromRecord(scene.link_poses[baseFrame]);
-      if (pose !== null) return pose;
-    }
-    return poseFromBasePoseRecord(scene?.robot?.base_pose);
-  }, [scene?.link_poses, scene?.robot?.base_pose, baseFrame]);
+  const viewerManifest = useSceneStateStore((s) => s.manifest);
+  const robotDescriptor = viewerManifest?.robots[0] ?? null;
+  const tcpFrame = robotDescriptor?.tcp_frame ?? null;
+  const baseFrame = robotDescriptor?.base_frame ?? null;
+  const staticBasePose = useMemo(
+    () => poseFromBasePoseRecord(robotDescriptor?.base_pose),
+    [robotDescriptor?.base_pose],
+  );
   const [anchor, setAnchor] = useState<Mesh | null>(null);
   const draggingRef = useRef(false);
+
+  const currentBaseWorldPose = (): PoseTuple | null => {
+    const snapshot = getLatestViewerSnapshot();
+    if (snapshot !== null && baseFrame !== null) {
+      const pose = viewerRobotLinkPose(snapshot.manifest, snapshot.frame, 0, baseFrame);
+      if (pose !== null) {
+        return {
+          position: tuple3(pose.position_m) ?? [0, 0, 0],
+          quaternion: tuple4(pose.orientation_xyzw) ?? [0, 0, 0, 1],
+        };
+      }
+    }
+    return staticBasePose;
+  };
 
   // Author a Cartesian candidate from the gizmo anchor's current world pose
   // (set by TransformControls during drag), expressed in the robot base frame
@@ -1683,25 +2083,30 @@ function TcpJogGizmo() {
     // frame cannot be resolved (baseWorldPose unknown): authorGizmoRelease then
     // does NOT author and instead makes any prior draft non-approvable via
     // rejectDraft, so a mis-framed pose can never be authored or approved.
-    authorGizmoRelease(anchorWorld, baseWorldPose, tcpFrame, {
+    authorGizmoRelease(anchorWorld, currentBaseWorldPose(), tcpFrame, {
       author,
       rejectDraft,
     });
   };
 
   const initialPose = useMemo(() => {
-    const tcpWorldPose =
-      tcpFrame !== null && scene?.link_poses !== undefined
-        ? poseFromRecord(scene.link_poses[tcpFrame])
-        : null;
-    if (tcpWorldPose !== null) return tcpWorldPose;
-    const tcpInBase = poseFromRecord(tcpPose);
+    const snapshot = getLatestViewerSnapshot();
+    const tcpWorldPose = snapshot !== null && tcpFrame !== null
+      ? viewerRobotLinkPose(snapshot.manifest, snapshot.frame, 0, tcpFrame)
+      : null;
+    if (tcpWorldPose !== null) {
+      const position = tuple3(tcpWorldPose.position_m);
+      const quaternion = tuple4(tcpWorldPose.orientation_xyzw);
+      if (position !== null && quaternion !== null) return { position, quaternion };
+    }
+    const tcpInBase = poseFromRecord(snapshot?.frame.robot_blocks[0]?.tcp_pose_in_base);
     if (tcpInBase === null) return null;
+    const baseWorldPose = currentBaseWorldPose();
     if (baseWorldPose !== null) {
       return composePose(baseWorldPose, tcpInBase);
     }
     return tcpInBase;
-  }, [scene?.link_poses, tcpFrame, tcpPose, baseWorldPose]);
+  }, [tcpFrame, staticBasePose]);
 
   // While a Cartesian draft candidate is active, the gizmo rests at the
   // AUTHORED TARGET (the candidate's pose), not the live TCP — so editing is
@@ -1710,6 +2115,7 @@ function TcpJogGizmo() {
   // active draft (e.g. after Revert), when the candidate is handing off to
   // execution, or for an exotic non-base frame we cannot convert.
   const draftTargetWorld = useMemo(() => {
+    const baseWorldPose = currentBaseWorldPose();
     if (candidate === null || baseWorldPose === null) return null;
     const target = candidate.cartesianTarget;
     if (target == null) return null;
@@ -1730,9 +2136,30 @@ function TcpJogGizmo() {
       position: target.positionM as [number, number, number],
       quaternion: target.orientationXyzw as [number, number, number, number],
     });
-  }, [candidate, baseWorldPose, baseFrame]);
+  }, [candidate, baseFrame, staticBasePose]);
 
   const anchorPose = draftTargetWorld ?? initialPose;
+
+  useViewerFrameBinding(anchor, (target, manifest, frame) => {
+    if (draggingRef.current || draftTargetWorld !== null || tcpFrame === null) return 0;
+    const tcpWorldPose = viewerRobotLinkPose(manifest, frame, 0, tcpFrame);
+    if (tcpWorldPose !== null) return applyViewerPose(target, tcpWorldPose);
+    const tcpInBase = poseFromRecord(frame.robot_blocks[0]?.tcp_pose_in_base);
+    if (tcpInBase === null) return 0;
+    const basePoseRecord = baseFrame === null
+      ? null
+      : viewerRobotLinkPose(manifest, frame, 0, baseFrame);
+    const basePose = basePoseRecord === null
+      ? staticBasePose
+      : {
+        position: tuple3(basePoseRecord.position_m) ?? [0, 0, 0],
+        quaternion: tuple4(basePoseRecord.orientation_xyzw) ?? [0, 0, 0, 1],
+      };
+    const worldPose = basePose === null ? tcpInBase : composePose(basePose, tcpInBase);
+    target.position.set(...worldPose.position);
+    target.quaternion.set(...worldPose.quaternion);
+    return 1;
+  });
 
   useEffect(() => {
     if (anchor === null || anchorPose === null) return;
@@ -1771,7 +2198,12 @@ function TcpJogGizmo() {
     };
   }, []);
 
-  if (!robotPanelActive || robotMode !== 'cartesian' || anchorPose === null || !commandGate.canCommand) {
+  if (
+    !robotPanelActive
+    || robotMode !== 'cartesian'
+    || tcpFrame === null
+    || !commandGate.canCommand
+  ) {
     return null;
   }
 
@@ -1829,29 +2261,8 @@ function MoveToTargetGhost() {
   const robotPanelActive = useViewerSelectionStore((s) => s.activePanel === 'robot');
   const robotMode = useViewerSelectionStore((s) => s.robotMode);
   const moveTo = useViewerSelectionStore((s) => s.moveTo);
-  const objects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
-  const tcpPose = useSceneStateStore((s) => s.scene?.robot?.tcp_pose_in_base ?? null);
+  const manifest = useSceneStateStore((s) => s.manifest);
   const appliedTree = useProgramStore((s) => s.appliedTree);
-  const [frames, setFrames] = useState<SceneFrameState[]>([]);
-
-  // Independent frames fetch so the ghost works even if MoveToBody
-  // isn't mounted (e.g. operator toggles the panel chrome but keeps
-  // the Move-To selection live). Same cleanup-on-unmount pattern.
-  useEffect(() => {
-    if (!robotPanelActive || robotMode !== 'move-to') return;
-    let cancelled = false;
-    void api.scene
-      .frames()
-      .then((data) => {
-        if (!cancelled) setFrames(data.frames.filter((f) => f.poseAvailable));
-      })
-      .catch(() => {
-        if (!cancelled) setFrames([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [robotPanelActive, robotMode]);
 
   const storedPoses = useMemo(() => {
     const out: { nodeName: string; motionType: 'pose' | 'joint'; params: Record<string, unknown> }[] = [];
@@ -1871,14 +2282,21 @@ function MoveToTargetGhost() {
 
   const target = useMemo(() => {
     if (!robotPanelActive || robotMode !== 'move-to') return null;
+    const authoritative = getAuthoritativeViewerState();
+    const objects = authoritative?.scene.objects
+      ?? manifest?.entities.map(manifestEntityToSceneObject)
+      ?? EMPTY_OBJECTS;
+    const frames: SceneFrameState[] = authoritative?.frames.frames.filter(
+      (frame) => frame.poseAvailable,
+    ) ?? [];
     return computeMoveToTarget({
       moveTo,
       objects: objects.filter((o) => !o.attached),
       frames,
       storedPoses,
-      tcpPose,
+      tcpPose: authoritative?.scene.robot?.tcp_pose_in_base ?? null,
     });
-  }, [robotPanelActive, robotMode, moveTo, objects, frames, storedPoses, tcpPose]);
+  }, [robotPanelActive, robotMode, moveTo, storedPoses, manifest]);
 
   if (target === null || target.kind !== 'cartesian') return null;
 
@@ -1918,12 +2336,16 @@ const _CANDIDATE_GHOST_ACTIVE = new Set([
 
 function CandidateGhostRobot() {
   const candidate = useRobotControlCandidateStore((s) => s.candidate);
-  const robot = useSceneStateStore((s) => s.scene?.robot ?? null);
-  const grippers = useSceneStateStore((s) => s.scene?.grippers ?? EMPTY_GRIPPERS);
-  const robotModelKey = useSceneStateStore(
-    (s) => s.scene?.robot?.urdf_model_key ?? s.scene?.robot?.robot_id ?? null,
+  const viewerManifest = useSceneStateStore((s) => s.manifest);
+  const authoritative = useMemo(
+    () => getAuthoritativeViewerState(),
+    [candidate, viewerManifest],
   );
-  const tcpFrame = useSceneStateStore((s) => s.scene?.robot?.tcp_frame ?? null);
+  const robot = authoritative?.scene.robot ?? null;
+  const grippers = authoritative?.scene.grippers ?? EMPTY_GRIPPERS;
+  const robotDescriptor = viewerManifest?.robots[0] ?? null;
+  const robotModelKey = robotDescriptor?.urdf_model_key ?? robotDescriptor?.robot_id ?? null;
+  const tcpFrame = robotDescriptor?.tcp_frame ?? null;
   const [manifest, setManifest] = useState<SceneUrdfManifest | null>(null);
   const [fetchedPreview, setFetchedPreview] = useState<PreviewLinkPosesResponse | null>(
     null,
@@ -2341,80 +2763,138 @@ function GhostPrimitiveMesh({
 }
 
 function PointCloud() {
-  // WS-pushed point-cloud / octomap frames (Day-4 contract). Idle
-  // until a perception source registers; while idle the WS stays
-  // open but no frames arrive and nothing renders.
   usePointCloudSubscription();
-  const frame = usePointCloudStore((s) => s.frame);
   const pointsRef = useRef<THREE.Points>(null);
+  const materialRef = useRef<THREE.PointsMaterial>(null);
+  const invalidate = useThree((state) => state.invalidate);
+  const capacityRef = useRef(0);
+
+  useEffect(() => subscribePointCloudWake(invalidate), [invalidate]);
+  useFrame(() => applyLatestPointCloudFrame(), -999);
 
   useEffect(() => {
     const node = pointsRef.current;
-    if (node === null || frame === null) return;
-    const geom = node.geometry as THREE.BufferGeometry;
-    const positions = new Float32Array(frame.points.length * 3);
-    for (let i = 0; i < frame.points.length; i += 1) {
-      positions[i * 3] = frame.points[i][0];
-      positions[i * 3 + 1] = frame.points[i][1];
-      positions[i * 3 + 2] = frame.points[i][2];
-    }
-    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    if (frame.colors !== undefined && frame.colors.length === frame.points.length) {
-      const colors = new Float32Array(frame.colors.length * 3);
-      for (let i = 0; i < frame.colors.length; i += 1) {
-        colors[i * 3] = frame.colors[i][0];
-        colors[i * 3 + 1] = frame.colors[i][1];
-        colors[i * 3 + 2] = frame.colors[i][2];
+    if (node === null) return undefined;
+    const geometry = node.geometry as THREE.BufferGeometry;
+    return registerPointCloudApplier((frame) => {
+      const material = materialRef.current;
+      if (frame === null || frame.pointCount === 0) {
+        node.visible = false;
+        geometry.setDrawRange(0, 0);
+        return;
       }
-      geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    } else {
-      geom.deleteAttribute('color');
-    }
-    geom.computeBoundingSphere();
-  }, [frame]);
+      node.visible = true;
+      if (frame.pointCount > capacityRef.current) {
+        let capacity = Math.max(256, capacityRef.current);
+        while (capacity < frame.pointCount) capacity *= 2;
+        capacityRef.current = capacity;
+        geometry.setAttribute(
+          'position',
+          new THREE.BufferAttribute(new Float32Array(capacity * 3), 3),
+        );
+        geometry.setAttribute(
+          'color',
+          new THREE.BufferAttribute(new Uint8Array(capacity * 3), 3, true),
+        );
+      }
+      const position = geometry.getAttribute('position') as THREE.BufferAttribute;
+      (position.array as Float32Array).set(frame.positions);
+      position.needsUpdate = true;
+      const color = geometry.getAttribute('color') as THREE.BufferAttribute;
+      const hasColors = frame.colors !== null;
+      if (hasColors) (color.array as Uint8Array).set(frame.colors!);
+      color.needsUpdate = hasColors;
+      if (material !== null && material.vertexColors !== hasColors) {
+        material.vertexColors = hasColors;
+        material.color.set(hasColors ? '#ffffff' : '#8aaaff');
+        material.needsUpdate = true;
+      }
+      geometry.setDrawRange(0, frame.pointCount);
+    });
+  }, []);
 
-  if (frame === null || frame.points.length === 0) {
-    return null;
-  }
   return (
-    <points ref={pointsRef}>
+    <points ref={pointsRef} visible={false} frustumCulled={false}>
       <bufferGeometry />
       <pointsMaterial
+        ref={materialRef}
         size={0.01}
         sizeAttenuation
         color="#8aaaff"
-        vertexColors={frame.colors !== undefined}
+        vertexColors={false}
       />
     </points>
   );
 }
 
 function ObjectFrameAxes() {
-  // Sibling of FrameAxes for per-scene-object frame helpers. Pose
-  // comes from /api/scene/state.objects[].pose_in_universe;
-  // visibility from .viewer_frame_visible (now state-owned). Size
-  // is tracked independently of the named-frame gizmo size so the
-  // operator can dial each axis style separately.
-  const objects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
-  const gizmoSize = useSceneStateStore(
-    (s) => s.scene?.object_axes_gizmo_size_m ?? 0.1,
+  // Ordered transforms stay on the high-rate manifest/frame path. Object-axis
+  // presentation previews the shared program draft, then falls back through
+  // the applied scene projection to the initial manifest value.
+  const manifest = useSceneStateStore((s) => s.manifest);
+  const sceneProjection = useSceneStateStore((s) => s.scene);
+  const viewerSettings = useProgramStore((s) => s.viewerSettings);
+  const objects = manifest?.entities ?? [];
+  const projectedObjects = sceneProjection?.objects ?? EMPTY_OBJECTS;
+  const visibilityById = useMemo(
+    () => new Map(projectedObjects.map((object) => [
+      object.object_id,
+      object.viewer_frame_visible,
+    ])),
+    [projectedObjects],
   );
+  const gizmoSize = viewerSettings?.objectAxesGizmoSizeM
+    ?? sceneProjection?.object_axes_gizmo_size_m
+    ?? manifest?.object_axes_gizmo_size_m
+    ?? 0.1;
   return (
     <group name="manyforge-object-frame-axes">
-      {objects.map((obj) => {
-        if (!obj.viewer_frame_visible) return null;
-        const pose = extractPose(obj.pose_in_universe);
+      {objects.map((obj, entityIndex) => {
+        if (!(
+          viewerSettings?.objectFrameVisibility[obj.object_id]
+          ?? visibilityById.get(obj.object_id)
+          ?? obj.viewer_frame_visible
+        )) return null;
         return (
-          <group key={obj.object_id} position={pose.position} quaternion={pose.quaternion}>
-            <axesHelper args={[gizmoSize]} />
-          </group>
+          <BoundObjectFrameAxes
+            key={obj.object_id}
+            entityIndex={entityIndex}
+            size={gizmoSize}
+          />
         );
       })}
     </group>
   );
 }
 
-const EMPTY_FRAMES: import('../types/api').SceneFrameState[] = [];
+function BoundObjectFrameAxes({
+  entityIndex,
+  size,
+}: {
+  entityIndex: number;
+  size: number;
+}) {
+  const [node, setNode] = useState<Group | null>(null);
+  useViewerFrameBinding(node, (
+    target,
+    _manifest,
+    frame,
+    previousFrame,
+    interpolationAlpha,
+  ) => (
+    applyViewerPose(
+      target,
+      frame.entity_transforms[entityIndex] ?? null,
+      previousFrame?.entity_transforms[entityIndex] ?? null,
+      interpolationAlpha,
+    )
+  ));
+  return (
+    <group ref={setNode} visible={false}>
+      <axesHelper args={[size]} />
+    </group>
+  );
+}
 
 function colorForSource(source: SceneObjectState['source']): string {
   switch (source) {

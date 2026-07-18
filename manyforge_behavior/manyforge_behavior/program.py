@@ -146,6 +146,83 @@ class ProgramCompatibility:
     tags: tuple[str, ...] = ()
 
 
+@dataclass
+class ProgramViewer:
+    """Portable, non-authoritative viewer presentation preferences."""
+
+    frame_visibility: dict[str, bool] = field(default_factory=dict)
+    frame_gizmo_size_m: float = 0.1
+    object_frame_visibility: dict[str, bool] = field(default_factory=dict)
+    object_axes_gizmo_size_m: float = 0.1
+
+
+def _viewer_visibility_map(raw: Any, *, path: str) -> dict[str, bool]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ProgramValidationError(f"{path} must be a mapping")
+    parsed: dict[str, bool] = {}
+    for raw_name, visible in raw.items():
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ProgramValidationError(
+                f"{path} keys must be non-empty strings"
+            )
+        if type(visible) is not bool:
+            raise ProgramValidationError(
+                f"{path}.{raw_name} must be a boolean"
+            )
+        parsed[raw_name.strip()] = visible
+    return parsed
+
+
+def _viewer_gizmo_size(raw: Any, *, path: str) -> float:
+    if isinstance(raw, bool):
+        raise ProgramValidationError(f"{path} must be a finite positive number")
+    try:
+        size = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ProgramValidationError(
+            f"{path} must be a finite positive number"
+        ) from exc
+    if not math.isfinite(size) or size <= 0.0:
+        raise ProgramValidationError(f"{path} must be a finite positive number")
+    return size
+
+
+def _parse_program_viewer(raw: Any) -> ProgramViewer | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ProgramValidationError("viewer must be a mapping")
+    allowed = {
+        "frame_visibility",
+        "frame_gizmo_size_m",
+        "object_frame_visibility",
+        "object_axes_gizmo_size_m",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ProgramValidationError(f"viewer contains unknown fields: {unknown}")
+    return ProgramViewer(
+        frame_visibility=_viewer_visibility_map(
+            raw.get("frame_visibility"),
+            path="viewer.frame_visibility",
+        ),
+        frame_gizmo_size_m=_viewer_gizmo_size(
+            raw.get("frame_gizmo_size_m", 0.1),
+            path="viewer.frame_gizmo_size_m",
+        ),
+        object_frame_visibility=_viewer_visibility_map(
+            raw.get("object_frame_visibility"),
+            path="viewer.object_frame_visibility",
+        ),
+        object_axes_gizmo_size_m=_viewer_gizmo_size(
+            raw.get("object_axes_gizmo_size_m", 0.1),
+            path="viewer.object_axes_gizmo_size_m",
+        ),
+    )
+
+
 def _compatibility_string_list(
     raw: Any,
     *,
@@ -2033,6 +2110,7 @@ class Program:
         self.program_profile: str = ""
         self.catalog_version: str = ""
         self.compatibility: ProgramCompatibility | None = None
+        self.viewer: ProgramViewer | None = None
         self.robot: Optional[RobotProfile] = None
         self.scene: list[SceneResource] = []
         self.parameters: dict[str, ProgramParameter] = {}
@@ -2072,13 +2150,13 @@ class Program:
         self.program_profile = ""
         self.catalog_version = ""
         self.compatibility = None
+        self.viewer = None
         self.robot = None
         self.scene = []
         self.parameters = {}
         self.blackboard_namespaces = {}
         self.blackboard_keys = {}
         self.saved_with_deployment = None
-        self.compatibility = None
         self.tree = None
         self._load_from_data_and_validate(data)
         return self
@@ -2265,6 +2343,7 @@ class Program:
         self.catalog_version = data.get("catalog_version", "")
         self.name = data.get("name", "")
         self.compatibility = _parse_program_compatibility(data.get("compatibility"))
+        self.viewer = _parse_program_viewer(data.get("viewer"))
         # Optional save-time pointer to the deployment this program was paired
         # with. None when absent (legacy programs); validated only as a dict so
         # legacy YAMLs keep loading. The picker uses this to highlight the
@@ -2515,6 +2594,15 @@ class Program:
                 "assistant": self.compatibility.assistant,
                 "requires": list(self.compatibility.requires),
                 "tags": list(self.compatibility.tags),
+            }
+        if self.viewer is not None:
+            d["viewer"] = {
+                "frame_visibility": dict(self.viewer.frame_visibility),
+                "frame_gizmo_size_m": self.viewer.frame_gizmo_size_m,
+                "object_frame_visibility": dict(
+                    self.viewer.object_frame_visibility
+                ),
+                "object_axes_gizmo_size_m": self.viewer.object_axes_gizmo_size_m,
             }
         d["robot"] = {
             "robot_id": self.robot.robot_id,

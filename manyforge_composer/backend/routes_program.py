@@ -695,6 +695,18 @@ def _program_compatibility_payload(program: Program) -> dict | None:
     }
 
 
+def _program_viewer_payload(program: Program) -> dict | None:
+    viewer = program.viewer
+    if viewer is None:
+        return None
+    return {
+        "frameVisibility": dict(viewer.frame_visibility),
+        "frameGizmoSizeM": viewer.frame_gizmo_size_m,
+        "objectFrameVisibility": dict(viewer.object_frame_visibility),
+        "objectAxesGizmoSizeM": viewer.object_axes_gizmo_size_m,
+    }
+
+
 def _deployment_compatibility_payload(deployment: Deployment) -> dict | None:
     compatibility = deployment.compatibility
     if compatibility is None:
@@ -781,6 +793,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             parameters=_program_parameters_to_response(program),
             blackboard=_program_blackboard_to_response(program),
             compatibility=_program_compatibility_payload(program),
+            viewer=_program_viewer_payload(program),
             sourcePath=state.program_source_path,
             programSessionGeneration=state.program_session_generation,
             programTreeHash=state.program_tree_hash,
@@ -811,6 +824,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             parameters=_program_parameters_to_response(program),
             blackboard=_program_blackboard_to_response(program),
             compatibility=_program_compatibility_payload(program),
+            viewer=_program_viewer_payload(program),
             sourcePath=state.program_source_path,
             programSessionGeneration=state.program_session_generation,
             programTreeHash=state.program_tree_hash,
@@ -849,6 +863,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             parameters=_program_parameters_to_response(saved_program),
             blackboard=_program_blackboard_to_response(saved_program),
             compatibility=_program_compatibility_payload(saved_program),
+            viewer=_program_viewer_payload(saved_program),
             sourcePath=state.program_source_path,
             programSessionGeneration=0,
             programTreeHash="",
@@ -1360,6 +1375,11 @@ def create_program_router(state: ComposerState) -> APIRouter:
                     program_data.pop("compatibility", None)
                 else:
                     program_data["compatibility"] = request.compatibility.model_dump()
+            if "viewer" in request.model_fields_set:
+                if request.viewer is None:
+                    program_data.pop("viewer", None)
+                else:
+                    program_data["viewer"] = request.viewer.model_dump()
             Program.from_dict(
                 program_data,
                 state.node_catalog,
@@ -1473,6 +1493,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 or request.program_parameters is not None
                 or request.blackboard is not None
                 or "compatibility" in request.model_fields_set
+                or "viewer" in request.model_fields_set
             ):
                 program_data = state.program.to_dict()
                 if request.tree is not None:
@@ -1496,6 +1517,11 @@ def create_program_router(state: ComposerState) -> APIRouter:
                         program_data["compatibility"] = (
                             request.compatibility.model_dump()
                         )
+                if "viewer" in request.model_fields_set:
+                    if request.viewer is None:
+                        program_data.pop("viewer", None)
+                    else:
+                        program_data["viewer"] = request.viewer.model_dump()
                 program = Program.from_dict(
                     program_data,
                     state.node_catalog,
@@ -1508,11 +1534,25 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 deployment.validate_against_program(program)
                 deployment.validate_capabilities(program)
 
-            state.apply_models(
-                program,
-                deployment,
-                force_discard_overrides=request.force_discard_overrides,
+            runtime_models_changed = (
+                request.tree is not None
+                or request.scene is not None
+                or request.program_parameters is not None
+                or request.blackboard is not None
+                or "compatibility" in request.model_fields_set
+                or request.deployment is not None
             )
+            if runtime_models_changed:
+                state.apply_models(
+                    program,
+                    deployment,
+                    force_discard_overrides=request.force_discard_overrides,
+                )
+            elif "viewer" in request.model_fields_set:
+                # Viewer presentation is non-authoritative. Applying it updates
+                # the loaded artifact baseline and republishes the manifest,
+                # but must not reconstruct motion/runtime resources.
+                state.apply_program_viewer(program.viewer)
 
             # Spec/430 §3.2 cross-validation that requires the URDF to
             # be loaded — runs AFTER apply_models so we have a kernel
@@ -1521,7 +1561,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             # handler below. The state has already accepted the
             # deployment at this point; the operator's next load
             # attempt with a corrected deployment supersedes.
-            if deployment is not None and state.kernel is not None:
+            if runtime_models_changed and deployment is not None and state.kernel is not None:
                 try:
                     drivable_joints = state.kernel.get_joint_names()
                 except Exception:

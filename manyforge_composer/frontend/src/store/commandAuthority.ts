@@ -1,12 +1,13 @@
-import { useEffect, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 
 import { useCycleStore } from './cycleStore';
 import { useDeploymentStore } from './deploymentStore';
 import { useProgramStore } from './programStore';
-import { useScenePolling, useSceneStateStore } from './sceneStateStore';
-
-const ROBOT_COMMAND_SCENE_STALE_AFTER_MS = 2_000;
+import {
+  useSceneStateStore,
+  useViewerDemand,
+  type ViewerConnectionState,
+} from './sceneStateStore';
 
 function signature(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -45,9 +46,8 @@ export interface RobotCommandAuthorityInputs {
   cycleState: string;
   draftAuthority: DraftAuthorityStatus;
   sceneError: string | null;
-  lastUpdatedAtMs: number | null;
-  nowMs: number;
-  sceneStaleAfterMs?: number;
+  sceneConnectionState: ViewerConnectionState;
+  frameAvailable: boolean;
   options?: RobotCommandAuthorityOptions;
 }
 
@@ -116,9 +116,8 @@ export function evaluateRobotCommandAuthority({
   cycleState,
   draftAuthority,
   sceneError,
-  lastUpdatedAtMs,
-  nowMs,
-  sceneStaleAfterMs = ROBOT_COMMAND_SCENE_STALE_AFTER_MS,
+  sceneConnectionState,
+  frameAvailable,
   options = {},
 }: RobotCommandAuthorityInputs): RobotCommandAuthority {
   const {
@@ -144,11 +143,11 @@ export function evaluateRobotCommandAuthority({
     if (sceneError !== null) {
       return blocked(ROBOT_COMMAND_AUTHORITY_REASONS.sceneUnavailable(sceneError));
     }
-    if (lastUpdatedAtMs === null) {
-      return blocked(ROBOT_COMMAND_AUTHORITY_REASONS.waitingForSceneState);
-    }
-    if (nowMs - lastUpdatedAtMs > sceneStaleAfterMs) {
+    if (sceneConnectionState === 'stale' || sceneConnectionState === 'disconnected') {
       return blocked(ROBOT_COMMAND_AUTHORITY_REASONS.sceneStateStale);
+    }
+    if (!frameAvailable) {
+      return blocked(ROBOT_COMMAND_AUTHORITY_REASONS.waitingForSceneState);
     }
   }
 
@@ -179,25 +178,20 @@ export function useRobotCommandAuthority({
   // scene-state subscription. Otherwise a hidden/collapsed viewer could
   // leave global command buttons permanently blocked on "waiting for scene
   // state" even though the backend is healthy.
-  useScenePolling();
+  useViewerDemand(requireFreshScene);
 
   const cycleState = useCycleStore((s) => s.state);
   const sceneError = useSceneStateStore((s) => s.error);
-  const lastUpdatedAtMs = useSceneStateStore((s) => s.lastUpdatedAtMs);
+  const sceneConnectionState = useSceneStateStore((s) => s.connectionState);
+  const frameAvailable = useSceneStateStore((s) => s.frameAvailable);
   const draftAuthority = useDraftAuthorityStatus();
-  const [nowMs, setNowMs] = useState(() => Date.now());
-
-  useEffect(() => {
-    const timer = window.setInterval(() => setNowMs(Date.now()), 500);
-    return () => window.clearInterval(timer);
-  }, []);
 
   return evaluateRobotCommandAuthority({
     cycleState,
     draftAuthority,
     sceneError,
-    lastUpdatedAtMs,
-    nowMs,
+    sceneConnectionState,
+    frameAvailable,
     options: {
       requireFreshScene,
       requireAppliedDrafts,

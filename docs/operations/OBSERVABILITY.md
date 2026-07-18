@@ -132,8 +132,18 @@ operator-facing subset grouped by what you'd query for.
 | Endpoint | Use it when |
 | --- | --- |
 | `GET /api/scene/diagnostics` | Compare backend-authoritative scene truth with native viewer render state. Use when the viewer looks wrong. |
+| `GET /api/scene/viewer/status` | Inspect viewer demand, bounded fanout/worker state, renderer identity, software-renderer detection, effective DPR, and requested frame-data rate. A `renderer_software` client is a diagnostic fallback, not a hardware-GPU qualification result. |
 | `GET /api/scene/snapshot?width&height&format` | Render the active 3D viewport as an image. Returns 503 if no native viewer source is connected. |
+| `GET /api/scene/snapshot/status` | Inspect bounded snapshot-capture admission, pending request, rejection, timeout, and upload counters. |
 | `GET /api/scene/snapshots/{snapshot_id}` | Serve a previously captured snapshot by stable id. |
+
+The in-view **Tools > Viewer rate** selector controls only the current browser's
+bounded NRT frame request (`Auto`, 2, 5, 10, 15, or 30 Hz). `Auto` requests
+15 Hz for both hardware and software renderers. Select a lower explicit rate
+when software rendering or same-host load needs a tighter bound. External object
+freshness is controlled separately by the applied deployment pose source's
+`max_update_hz`; increasing the viewer rate does not increase that source's
+acquisition rate.
 
 ### Diagnostic capture
 
@@ -194,8 +204,8 @@ observability artifacts.
 | `BRIDGE_AUDIT_LOG` | Path to the assistant audit JSONL. Default `$XDG_STATE_HOME/manyforge/assistant-bridge-audit.log`, size-rotated via `BRIDGE_AUDIT_LOG_MAX_BYTES`/`BRIDGE_AUDIT_LOG_KEEP`; launcher pins to `$LOG_DIR/known-good-bridge-audit.jsonl`. |
 | `BRIDGE_LOG`, `SUPERVISOR_LOG` | Per-process stdout/stderr capture paths inside `$LOG_DIR`. |
 | `MANYFORGE_PROGRESS_MODE=plain` | Force plain (no ANSI redraw) launcher progress output for CI logs. |
-| `MANYFORGE_VISUAL_STATE_PUBLISH_HZ` | Visual snapshot publisher cadence (`routes_scene.py:73`). |
-| `MANYFORGE_VISUAL_STATE_STALE_AFTER_MS` | Snapshot staleness budget; affects fallback reason on `/api/scene/state`. |
+| `MANYFORGE_VIEWER_MAX_FRAME_HZ` | Server ceiling for demand-driven viewer transform publication. |
+| `MANYFORGE_VIEWER_DEBUG_SNAPSHOT_STALE_AFTER_MS` | Staleness threshold for the retained low-rate/debug scene snapshot projection. |
 | `MANYFORGE_VALIDATION_COLLISION_WORKERS` | Direct-factory development/CI fallback for trajectory-validation worker count. Production uses the materialized `orchestrator.config.validation_collision_workers` deployment property (default 4); this variable never overrides an explicit deployment. |
 | `MANYFORGE_API_TOKEN` | Bearer token for the Composer REST API. |
 | `MANYFORGE_CORS_ORIGINS` | CORS allowlist. |

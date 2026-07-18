@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { viewerProtocolFixture as viewerFixture } from '../types/viewerProtocol.fixture.generated';
 import type {
   CatalogEntry,
   FullDeployment,
@@ -10,7 +11,16 @@ import { useCatalogStore } from './catalogStore';
 import { useDeploymentStore } from './deploymentStore';
 import { useProgramStore } from './programStore';
 import { useSceneStateStore } from './sceneStateStore';
+import {
+  publishViewerFrame,
+  publishViewerManifest,
+  resetViewerFrameStore,
+} from './viewerFrameStore';
 import { useViewerSelectionStore } from './viewerSelectionStore';
+import type {
+  ViewerFrameV1,
+  ViewerManifestV1,
+} from '../types/viewerProtocol.generated';
 
 function catalogEntry(
   id: string,
@@ -111,6 +121,25 @@ const SCENE = {
   timestamp_ns: 1,
 } satisfies SceneStateResponse;
 
+const VIEWER_MANIFEST = {
+  ...(viewerFixture.manifest as ViewerManifestV1),
+  entities: [
+    {
+      ...(viewerFixture.manifest as ViewerManifestV1).entities[0],
+      object_id: 'part',
+    },
+  ],
+  orders: {
+    ...(viewerFixture.manifest as ViewerManifestV1).orders,
+    entities: ['part'],
+  },
+} satisfies ViewerManifestV1;
+
+const VIEWER_FRAME = {
+  ...(viewerFixture.frame as ViewerFrameV1),
+  entity_transforms: [(viewerFixture.frame as ViewerFrameV1).entity_transforms[0]],
+} satisfies ViewerFrameV1;
+
 function byLabel(label: string) {
   return useProgramStore.getState().nodes.find(
     (node) => (node.data as { label?: string }).label === label,
@@ -121,12 +150,21 @@ describe('Pick Plan Subtree authoring macro', () => {
   beforeEach(() => {
     useCatalogStore.setState({ entries: CATALOG, version: '0.3.0' });
     useDeploymentStore.setState({ deployment: DEPLOYMENT });
-    useSceneStateStore.setState({ scene: SCENE });
+    useSceneStateStore.setState({
+      scene: SCENE,
+      connectionState: 'connected',
+      frameAvailable: true,
+    });
+    publishViewerManifest(VIEWER_MANIFEST);
+    publishViewerFrame(VIEWER_FRAME);
     useViewerSelectionStore.setState({ selectedId: 'part' });
     useProgramStore.setState({
       programInfo: PROGRAM_INFO,
       nodes: [],
       edges: [],
+      viewerSettings: null,
+      appliedViewerSettings: null,
+      savedViewerSettings: null,
       blackboardNamespaces: [],
       selectedNodeId: null,
       isDirty: false,
@@ -140,13 +178,21 @@ describe('Pick Plan Subtree authoring macro', () => {
       programInfo: null,
       nodes: [],
       edges: [],
+      viewerSettings: null,
+      appliedViewerSettings: null,
+      savedViewerSettings: null,
       blackboardNamespaces: [],
       selectedNodeId: null,
       isDirty: false,
       error: null,
     });
     useDeploymentStore.setState({ deployment: null });
-    useSceneStateStore.setState({ scene: null });
+    useSceneStateStore.setState({
+      scene: null,
+      connectionState: 'disconnected',
+      frameAvailable: false,
+    });
+    resetViewerFrameStore();
     useViewerSelectionStore.setState({ selectedId: null });
   });
 
@@ -207,6 +253,32 @@ describe('Pick Plan Subtree authoring macro', () => {
       link_frame: 'tool0',
       gripper_id: 'primary',
     });
+  });
+
+  it('keeps viewer presentation as a draft until apply or save', () => {
+    useProgramStore.getState().setViewerFrameVisibility('tool0', false);
+
+    let state = useProgramStore.getState();
+    expect(state.viewerSettings).toEqual({
+      frameVisibility: { tool0: false },
+      frameGizmoSizeM: 0.1,
+      objectFrameVisibility: {},
+      objectAxesGizmoSizeM: 0.1,
+    });
+    expect(state.appliedViewerSettings).toBeNull();
+    expect(state.savedViewerSettings).toBeNull();
+    expect(state.programInfo?.viewer).toEqual(state.viewerSettings);
+    expect(state.isDirty).toBe(true);
+
+    useProgramStore.getState().setAppliedToDraft();
+    state = useProgramStore.getState();
+    expect(state.appliedViewerSettings).toEqual(state.viewerSettings);
+    expect(state.savedViewerSettings).toBeNull();
+
+    useProgramStore.getState().setViewerFrameVisibility('tool0', true);
+    state = useProgramStore.getState();
+    expect(state.viewerSettings?.frameVisibility.tool0).toBe(true);
+    expect(state.appliedViewerSettings?.frameVisibility.tool0).toBe(false);
   });
 
   it('uses one deterministic suffix across repeated insertions', () => {

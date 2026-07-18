@@ -3004,6 +3004,40 @@ def test_load_program_clears_viewer_frame_overrides(client, state):
     assert state.get_object_frame_visibility("box") is False
 
 
+def test_load_program_installs_persisted_viewer_presentation(
+    client,
+    state,
+    tmp_path,
+):
+    program_data = yaml.safe_load(Path(_PROGRAM_PATH).read_text(encoding="utf-8"))
+    program_data["viewer"] = {
+        "frame_visibility": {"tool0": False, "base_link": True},
+        "frame_gizmo_size_m": 0.17,
+        "object_frame_visibility": {"box": True},
+        "object_axes_gizmo_size_m": 0.08,
+    }
+    program_path = tmp_path / "viewer_presentation.program.yaml"
+    program_path.write_text(
+        yaml.safe_dump(program_data, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    response = client.post("/api/program/load", json={"path": str(program_path)})
+
+    assert response.status_code == 200
+    assert response.json()["viewer"] == {
+        "frameVisibility": {"tool0": False, "base_link": True},
+        "frameGizmoSizeM": 0.17,
+        "objectFrameVisibility": {"box": True},
+        "objectAxesGizmoSizeM": 0.08,
+    }
+    assert state.get_frame_visibility("tool0", default=True) is False
+    assert state.get_frame_visibility("base_link", default=False) is True
+    assert state.get_object_frame_visibility("box") is True
+    assert state.get_frame_gizmo_size() == pytest.approx(0.17)
+    assert state.get_object_axes_gizmo_size() == pytest.approx(0.08)
+
+
 def test_update_tree_rejects_when_overrides_exist(client, tmp_path):
     program_path = _write_program_with_runtime_policy(tmp_path)
     client.post("/api/program/load", json={"path": program_path})
@@ -4718,6 +4752,161 @@ def test_apply_session_updates_scene_without_touching_saved_artifact(client):
     saved_program = client.get("/api/program/saved").json()
     assert current_program["sceneResources"][0]["objectId"] == "runtime_box"
     assert saved_program["sceneResources"][0]["objectId"] == "table"
+
+
+def test_apply_session_updates_viewer_without_rebuilding_runtime_or_saved_artifact(
+    client,
+    state,
+    monkeypatch,
+):
+    client.post(
+        "/api/program/load",
+        json={"path": _PROGRAM_PATH, "deployment_path": _DEPLOYMENT_PATH},
+    )
+    original_kernel = state.kernel
+    original_manager = state.cycle_manager
+    original_generation = state.program_session_generation
+
+    def reject_runtime_rebuild(*_args, **_kwargs):
+        raise AssertionError("viewer-only apply must not rebuild runtime models")
+
+    monkeypatch.setattr(state, "apply_models", reject_runtime_rebuild)
+    viewer = {
+        "frameVisibility": {"tool0": False, "base_link": True},
+        "frameGizmoSizeM": 0.16,
+        "objectFrameVisibility": {"table": True},
+        "objectAxesGizmoSizeM": 0.07,
+    }
+
+    response = client.post("/api/session/apply", json={"viewer": viewer})
+
+    assert response.status_code == 200
+    assert client.get("/api/program").json()["viewer"] == viewer
+    assert client.get("/api/program/saved").json()["viewer"] is None
+    assert state.kernel is original_kernel
+    assert state.cycle_manager is original_manager
+    assert state.program_session_generation == original_generation
+    assert state.get_frame_visibility("tool0", default=True) is False
+    assert state.get_object_frame_visibility("table") is True
+    assert state.get_frame_gizmo_size() == pytest.approx(0.16)
+    assert state.get_object_axes_gizmo_size() == pytest.approx(0.07)
+
+
+def test_apply_session_viewer_preserves_runtime_overrides(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+    override = client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+    assert override.status_code == 200
+    before = client.get("/api/program/runtime-overrides").json()
+    assert before["activeCount"] + before["stagedCount"] > 0
+
+    response = client.post(
+        "/api/session/apply",
+        json={
+            "viewer": {
+                "frameVisibility": {"tool0": False},
+                "frameGizmoSizeM": 0.1,
+                "objectFrameVisibility": {},
+                "objectAxesGizmoSizeM": 0.1,
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    after = client.get("/api/program/runtime-overrides").json()
+    assert after["activeCount"] == before["activeCount"]
+    assert after["stagedCount"] == before["stagedCount"]
+    assert after["staleCount"] == before["staleCount"]
+
+
+def test_failed_runtime_apply_does_not_advance_viewer_presentation(
+    client,
+    state,
+    monkeypatch,
+):
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+    state.set_frame_visibility("tool0", True)
+    original_revision = state.scene_viewer_revision()
+
+    def reject_runtime_rebuild(*_args, **_kwargs):
+        raise RuntimeError("candidate runtime rejected")
+
+    monkeypatch.setattr(state, "_rebuild_runtime", reject_runtime_rebuild)
+    current_tree = client.get("/api/program/tree").json()["tree"]
+    response = client.post(
+        "/api/session/apply",
+        json={
+            "tree": current_tree,
+            "viewer": {
+                "frameVisibility": {"tool0": False},
+                "frameGizmoSizeM": 0.2,
+                "objectFrameVisibility": {},
+                "objectAxesGizmoSizeM": 0.1,
+            },
+        },
+    )
+
+    assert response.status_code == 409
+    assert state.get_frame_visibility("tool0", default=False) is True
+    assert state.get_frame_gizmo_size() == pytest.approx(0.1)
+    assert state.scene_viewer_revision() == original_revision
+
+
+def test_save_program_persists_viewer_without_applying_it(client, state, tmp_path):
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+    original_revision = state.scene_viewer_revision()
+    save_target = tmp_path / "viewer_presentation"
+    viewer = {
+        "frameVisibility": {"tool0": False},
+        "frameGizmoSizeM": 0.13,
+        "objectFrameVisibility": {"table": True},
+        "objectAxesGizmoSizeM": 0.06,
+    }
+
+    response = client.post(
+        "/api/program/save",
+        json={"path": str(save_target), "viewer": viewer},
+    )
+
+    assert response.status_code == 200
+    saved_yaml = yaml.safe_load(
+        Path(response.json()["path"]).read_text(encoding="utf-8")
+    )
+    assert saved_yaml["viewer"] == {
+        "frame_visibility": {"tool0": False},
+        "frame_gizmo_size_m": 0.13,
+        "object_frame_visibility": {"table": True},
+        "object_axes_gizmo_size_m": 0.06,
+    }
+    assert client.get("/api/program").json()["viewer"] is None
+    assert state.scene_viewer_revision() == original_revision
+
+
+@pytest.mark.parametrize(
+    "viewer",
+    [
+        {"frameVisibility": {"tool0": 1}},
+        {"frameVisibility": {}, "unexpected": True},
+        {"frameVisibility": {}, "frameGizmoSizeM": 0.0},
+    ],
+)
+def test_apply_session_rejects_malformed_viewer_presentation(
+    client,
+    viewer,
+):
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+
+    response = client.post("/api/session/apply", json={"viewer": viewer})
+
+    assert response.status_code == 422
 
 
 def test_save_program_persists_updated_parameters(client, tmp_path):

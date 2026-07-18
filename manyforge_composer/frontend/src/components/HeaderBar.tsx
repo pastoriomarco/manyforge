@@ -114,6 +114,9 @@ export function HeaderBar() {
     programCompatibility,
     appliedProgramCompatibility,
     savedProgramCompatibility,
+    viewerSettings,
+    appliedViewerSettings,
+    savedViewerSettings,
     sceneResources,
     appliedSceneResources,
     savedSceneResources,
@@ -207,6 +210,10 @@ export function HeaderBar() {
     signature(programCompatibility) === signature(appliedProgramCompatibility);
   const programCompatibilitySaved =
     signature(programCompatibility) === signature(savedProgramCompatibility);
+  const viewerSettingsApplied =
+    signature(viewerSettings) === signature(appliedViewerSettings);
+  const viewerSettingsSaved =
+    signature(viewerSettings) === signature(savedViewerSettings);
   const blackboardNamespacesApplied =
     signature(blackboardNamespaces) === signature(appliedBlackboardNamespaces);
   const blackboardNamespacesSaved =
@@ -220,12 +227,22 @@ export function HeaderBar() {
     && signature(appliedSceneResources) === signature(savedSceneResources)
     && signature(appliedProgramParameters) === signature(savedProgramParameters)
     && signature(appliedProgramCompatibility) === signature(savedProgramCompatibility)
+    && signature(appliedViewerSettings) === signature(savedViewerSettings)
     && signature(appliedBlackboardNamespaces) === signature(savedBlackboardNamespaces)
     && signature(appliedBlackboardKeys) === signature(savedBlackboardKeys);
   const deploymentApplied = signature(deployment) === signature(appliedDeployment);
   const deploymentSaved = signature(deployment) === signature(savedDeployment);
   const deploymentAppliedMatchesSaved = signature(appliedDeployment) === signature(savedDeployment);
   const hasUnappliedChanges =
+    !programApplied
+    || !sceneApplied
+    || !programParametersApplied
+    || !programCompatibilityApplied
+    || !viewerSettingsApplied
+    || !blackboardNamespacesApplied
+    || !blackboardKeysApplied
+    || !deploymentApplied;
+  const hasRuntimeModelUnappliedChanges =
     !programApplied
     || !sceneApplied
     || !programParametersApplied
@@ -238,10 +255,19 @@ export function HeaderBar() {
     || !sceneSaved
     || !programParametersSaved
     || !programCompatibilitySaved
+    || !viewerSettingsSaved
     || !blackboardNamespacesSaved
     || !blackboardKeysSaved
     || !deploymentSaved;
   const hasAppliedUnsavedChanges = !programAppliedMatchesSaved || !deploymentAppliedMatchesSaved;
+  const hasRuntimeModelAppliedUnsavedChanges =
+    signature(appliedTree) !== signature(savedTree)
+    || signature(appliedSceneResources) !== signature(savedSceneResources)
+    || signature(appliedProgramParameters) !== signature(savedProgramParameters)
+    || signature(appliedProgramCompatibility) !== signature(savedProgramCompatibility)
+    || signature(appliedBlackboardNamespaces) !== signature(savedBlackboardNamespaces)
+    || signature(appliedBlackboardKeys) !== signature(savedBlackboardKeys)
+    || !deploymentAppliedMatchesSaved;
   // Resolve the active error to a uniform { message, errorCode, errorDetails }
   // shape. Precedence:
   //   1. actionError — a fresh cycle-command 409 (highest priority because
@@ -316,6 +342,7 @@ export function HeaderBar() {
       deployment?: FullDeployment;
       programParameters?: typeof programParameters;
       compatibility?: typeof programCompatibility;
+      viewer?: typeof viewerSettings;
       blackboard?: { namespaces: typeof blackboardNamespaces; keys: typeof blackboardKeys };
     } = {};
     const draftGraphError = validateDraftGraph();
@@ -339,13 +366,16 @@ export function HeaderBar() {
     if (!programCompatibilityApplied) {
       payload.compatibility = programCompatibility;
     }
+    if (!viewerSettingsApplied) {
+      payload.viewer = viewerSettings;
+    }
     if (!blackboardNamespacesApplied || !blackboardKeysApplied) {
       payload.blackboard = {
         namespaces: blackboardNamespaces,
         keys: blackboardKeys,
       };
     }
-    if (!payload.tree && !payload.scene && !payload.deployment && !payload.programParameters && !payload.blackboard && payload.compatibility === undefined) {
+    if (!payload.tree && !payload.scene && !payload.deployment && !payload.programParameters && !payload.blackboard && payload.compatibility === undefined && payload.viewer === undefined) {
       return;
     }
 
@@ -367,7 +397,7 @@ export function HeaderBar() {
       ...payload,
       forceDiscardOverrides,
     });
-    if (payload.tree || payload.scene || payload.programParameters || payload.blackboard || payload.compatibility !== undefined) {
+    if (payload.tree || payload.scene || payload.programParameters || payload.blackboard || payload.compatibility !== undefined || payload.viewer !== undefined) {
       setAppliedToDraft();
     }
     if (payload.deployment) {
@@ -384,6 +414,8 @@ export function HeaderBar() {
     programParametersApplied,
     programCompatibility,
     programCompatibilityApplied,
+    viewerSettings,
+    viewerSettingsApplied,
     blackboardNamespaces,
     blackboardNamespacesApplied,
     blackboardKeys,
@@ -401,6 +433,7 @@ export function HeaderBar() {
       && sceneSaved
       && programParametersSaved
       && programCompatibilitySaved
+      && viewerSettingsSaved
       && blackboardNamespacesSaved
       && blackboardKeysSaved;
     if (!programArtifactSaved && programInfo?.sourcePath) {
@@ -420,6 +453,7 @@ export function HeaderBar() {
     sceneSaved,
     programParametersSaved,
     programCompatibilitySaved,
+    viewerSettingsSaved,
     blackboardNamespacesSaved,
     blackboardKeysSaved,
     programInfo?.sourcePath,
@@ -429,11 +463,15 @@ export function HeaderBar() {
   ]);
 
   const handleApply = useCallback(async () => {
-    if (!confirmRuntimeReload('Applying draft changes', cycleState)) {
+    if (
+      hasRuntimeModelUnappliedChanges
+      && !confirmRuntimeReload('Applying draft changes', cycleState)
+    ) {
       return;
     }
     if (
-      hasRuntimeOverrides
+      hasRuntimeModelUnappliedChanges
+      && hasRuntimeOverrides
       && !window.confirm(
         'Applying draft changes will discard active runtime-only patches created by recovery/LLM workflows. Continue?',
       )
@@ -443,13 +481,19 @@ export function HeaderBar() {
     try {
       setBusy(true);
       setActionError(null);
-      await applyDrafts(hasRuntimeOverrides);
+      await applyDrafts(hasRuntimeOverrides && hasRuntimeModelUnappliedChanges);
     } catch (e) {
       setActionError(e);
     } finally {
       setBusy(false);
     }
-  }, [applyDrafts, cycleState, hasRuntimeOverrides, setActionError]);
+  }, [
+    applyDrafts,
+    cycleState,
+    hasRuntimeModelUnappliedChanges,
+    hasRuntimeOverrides,
+    setActionError,
+  ]);
 
   const handleSaveAll = useCallback(async () => {
     try {
@@ -613,6 +657,8 @@ export function HeaderBar() {
       return;
     }
     if (
+      hasRuntimeModelAppliedUnsavedChanges
+      &&
       !window.confirm(
         'Reverting restores the applied session to the last saved program/deployment, ' +
           'reloads the runtime, and can reset the backend-authored simulation/robot ' +
@@ -623,7 +669,8 @@ export function HeaderBar() {
       return;
     }
     if (
-      hasRuntimeOverrides &&
+      hasRuntimeModelAppliedUnsavedChanges
+      && hasRuntimeOverrides &&
       !window.confirm(
         'Reverting to the saved baseline will also discard active runtime-only patches created by recovery/LLM workflows. Continue?',
       )
@@ -636,13 +683,15 @@ export function HeaderBar() {
       deployment?: FullDeployment;
       programParameters?: typeof programParameters;
       compatibility?: typeof savedProgramCompatibility;
+      viewer?: typeof savedViewerSettings;
       blackboard?: {
         namespaces: typeof savedBlackboardNamespaces;
         keys: typeof savedBlackboardKeys;
       };
       forceDiscardOverrides?: boolean;
     } = {
-      forceDiscardOverrides: hasRuntimeOverrides,
+      forceDiscardOverrides:
+        hasRuntimeOverrides && hasRuntimeModelAppliedUnsavedChanges,
     };
     if (!programAppliedMatchesSaved && savedTree) {
       payload.tree = savedTree;
@@ -656,6 +705,9 @@ export function HeaderBar() {
     if (signature(appliedProgramCompatibility) !== signature(savedProgramCompatibility)) {
       payload.compatibility = savedProgramCompatibility;
     }
+    if (signature(appliedViewerSettings) !== signature(savedViewerSettings)) {
+      payload.viewer = savedViewerSettings;
+    }
     if (
       signature(appliedBlackboardNamespaces) !== signature(savedBlackboardNamespaces)
       || signature(appliedBlackboardKeys) !== signature(savedBlackboardKeys)
@@ -668,7 +720,7 @@ export function HeaderBar() {
     if (!deploymentAppliedMatchesSaved && savedDeployment) {
       payload.deployment = savedDeployment;
     }
-    if (!payload.tree && !payload.scene && !payload.deployment && !payload.programParameters && !payload.blackboard && payload.compatibility === undefined) {
+    if (!payload.tree && !payload.scene && !payload.deployment && !payload.programParameters && !payload.blackboard && payload.compatibility === undefined && payload.viewer === undefined) {
       return;
     }
     try {
@@ -680,6 +732,7 @@ export function HeaderBar() {
         payload.deployment ? fetchDeployment() : Promise.resolve(true),
         payload.tree || payload.programParameters || payload.blackboard
           || payload.compatibility !== undefined
+          || payload.viewer !== undefined
           || payload.scene
           ? fetchProgramInfo()
           : Promise.resolve(true),
@@ -695,9 +748,11 @@ export function HeaderBar() {
     fetchProgramInfo,
     fetchTree,
     hasAppliedUnsavedChanges,
+    hasRuntimeModelAppliedUnsavedChanges,
     hasRuntimeOverrides,
     appliedProgramParameters,
     appliedProgramCompatibility,
+    appliedViewerSettings,
     appliedSceneResources,
     appliedBlackboardKeys,
     appliedBlackboardNamespaces,
@@ -708,6 +763,7 @@ export function HeaderBar() {
     savedBlackboardNamespaces,
     savedProgramParameters,
     savedProgramCompatibility,
+    savedViewerSettings,
     savedTree,
     setActionError,
     cycleState,

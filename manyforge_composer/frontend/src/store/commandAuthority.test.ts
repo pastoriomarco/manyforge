@@ -20,8 +20,8 @@ function evaluate(
     cycleState: 'idle',
     draftAuthority: CLEAN_DRAFT,
     sceneError: null,
-    lastUpdatedAtMs: 1_000,
-    nowMs: 1_100,
+    sceneConnectionState: 'connected',
+    frameAvailable: true,
     ...overrides,
   });
 }
@@ -44,15 +44,16 @@ describe('evaluateRobotCommandAuthority', () => {
     expect(result.unappliedDraftDomains).toEqual(['program graph', 'deployment']);
   });
 
-  it('blocks robot commands when scene state is stale', () => {
+  it('blocks robot commands only on explicit stale or disconnected authority', () => {
     const result = evaluate({
-      lastUpdatedAtMs: 1_000,
-      nowMs: 3_001,
-      sceneStaleAfterMs: 2_000,
+      sceneConnectionState: 'stale',
     });
 
     expect(result.canCommand).toBe(false);
     expect(result.reason).toBe(ROBOT_COMMAND_AUTHORITY_REASONS.sceneStateStale);
+    expect(evaluate({ sceneConnectionState: 'disconnected' }).reason).toBe(
+      ROBOT_COMMAND_AUTHORITY_REASONS.sceneStateStale,
+    );
   });
 
   it('blocks robot commands while the cycle owns the robot', () => {
@@ -68,7 +69,7 @@ describe('evaluateRobotCommandAuthority', () => {
   });
 
   it('uses user-facing reason labels for scene readiness failures', () => {
-    expect(evaluate({ lastUpdatedAtMs: null }).reason).toBe('waiting for scene state');
+    expect(evaluate({ frameAvailable: false }).reason).toBe('waiting for scene state');
     expect(evaluate({ sceneError: 'planner offline' }).reason).toBe(
       'scene unavailable: planner offline',
     );

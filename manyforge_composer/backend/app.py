@@ -36,6 +36,7 @@ from .routes_scene import create_scene_router
 from .routes_scene_meshes import create_scene_meshes_router
 from .routes_pointcloud import create_pointcloud_router
 from .routes_snapshot import create_snapshot_router
+from .routes_viewer import create_viewer_router
 from .routes_urdf import create_urdf_router
 from .routes_execution import create_execution_router
 from .routes_debug import create_debug_router
@@ -296,6 +297,7 @@ def create_app(
     # absolute). Sits idle until a perception source registers itself
     # via state.point_cloud_publisher.publish(...).
     app.include_router(create_pointcloud_router(state, security), tags=["scene-pointcloud"])
+    app.include_router(create_viewer_router(state, security), tags=["scene-viewer"])
     app.include_router(create_execution_router(state), prefix="/api/execution", tags=["execution"])
     app.include_router(create_skills_router(state), prefix="/api", tags=["skills"])
     app.include_router(

@@ -1,0 +1,2322 @@
+{
+  "$defs": {
+    "PoseSourceAttachedDriftStateResponse": {
+      "properties": {
+        "action": {
+          "default": "diagnostic_only",
+          "title": "Action",
+          "type": "string"
+        },
+        "baseline_captured": {
+          "default": false,
+          "title": "Baseline Captured",
+          "type": "boolean"
+        },
+        "condition_raised": {
+          "default": false,
+          "title": "Condition Raised",
+          "type": "boolean"
+        },
+        "debounce_s": {
+          "default": 0.0,
+          "title": "Debounce S",
+          "type": "number"
+        },
+        "exceeded_since_ns": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exceeded Since Ns"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "rotation_rad": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rotation Rad"
+        },
+        "rotation_threshold_rad": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rotation Threshold Rad"
+        },
+        "sample_time_delta_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sample Time Delta S"
+        },
+        "signal_id": {
+          "default": "",
+          "title": "Signal Id",
+          "type": "string"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "translation_m": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Translation M"
+        },
+        "translation_threshold_m": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Translation Threshold M"
+        },
+        "unverifiable_reason": {
+          "default": "",
+          "title": "Unverifiable Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "title": "PoseSourceAttachedDriftStateResponse",
+      "type": "object"
+    },
+    "PoseSourceMeasuredRobotResponse": {
+      "properties": {
+        "age_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Age S"
+        },
+        "joint_names": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Joint Names",
+          "type": "array"
+        },
+        "joint_positions_rad": {
+          "items": {
+            "type": "number"
+          },
+          "title": "Joint Positions Rad",
+          "type": "array"
+        },
+        "joint_state_topic": {
+          "title": "Joint State Topic",
+          "type": "string"
+        },
+        "link_poses": {
+          "additionalProperties": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Link Poses",
+          "type": "object"
+        },
+        "monotonic_s": {
+          "title": "Monotonic S",
+          "type": "number"
+        },
+        "stamp_sec": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stamp Sec"
+        }
+      },
+      "required": [
+        "joint_state_topic",
+        "joint_names",
+        "joint_positions_rad",
+        "monotonic_s"
+      ],
+      "title": "PoseSourceMeasuredRobotResponse",
+      "type": "object"
+    },
+    "PoseSourceMeasuredTcpResponse": {
+      "properties": {
+        "age_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Age S"
+        },
+        "frame_id": {
+          "default": "",
+          "title": "Frame Id",
+          "type": "string"
+        },
+        "monotonic_s": {
+          "title": "Monotonic S",
+          "type": "number"
+        },
+        "pose": {
+          "$ref": "#/$defs/PoseSourcePoseResponse"
+        },
+        "tcp_frame_id": {
+          "default": "",
+          "title": "Tcp Frame Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "monotonic_s",
+        "pose"
+      ],
+      "title": "PoseSourceMeasuredTcpResponse",
+      "type": "object"
+    },
+    "PoseSourcePoseResponse": {
+      "properties": {
+        "frame_id": {
+          "title": "Frame Id",
+          "type": "string"
+        },
+        "orientation_xyzw": {
+          "items": {
+            "type": "number"
+          },
+          "title": "Orientation Xyzw",
+          "type": "array"
+        },
+        "position_xyz": {
+          "items": {
+            "type": "number"
+          },
+          "title": "Position Xyz",
+          "type": "array"
+        },
+        "stamp_sec": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stamp Sec"
+        }
+      },
+      "required": [
+        "frame_id",
+        "position_xyz",
+        "orientation_xyzw"
+      ],
+      "title": "PoseSourcePoseResponse",
+      "type": "object"
+    },
+    "PoseSourceRejectionResponse": {
+      "properties": {
+        "detail": {
+          "default": "",
+          "title": "Detail",
+          "type": "string"
+        },
+        "entity": {
+          "default": "",
+          "title": "Entity",
+          "type": "string"
+        },
+        "monotonic_s": {
+          "title": "Monotonic S",
+          "type": "number"
+        },
+        "object_id": {
+          "title": "Object Id",
+          "type": "string"
+        },
+        "pose_source_id": {
+          "title": "Pose Source Id",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pose_source_id",
+        "object_id",
+        "reason",
+        "monotonic_s"
+      ],
+      "title": "PoseSourceRejectionResponse",
+      "type": "object"
+    },
+    "PoseSourceUpdateResponse": {
+      "properties": {
+        "apply_policy": {
+          "default": "observe_only",
+          "title": "Apply Policy",
+          "type": "string"
+        },
+        "entity": {
+          "default": "",
+          "title": "Entity",
+          "type": "string"
+        },
+        "monotonic_s": {
+          "title": "Monotonic S",
+          "type": "number"
+        },
+        "object_id": {
+          "title": "Object Id",
+          "type": "string"
+        },
+        "pose": {
+          "$ref": "#/$defs/PoseSourcePoseResponse"
+        },
+        "pose_source_id": {
+          "title": "Pose Source Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pose_source_id",
+        "object_id",
+        "monotonic_s",
+        "pose"
+      ],
+      "title": "PoseSourceUpdateResponse",
+      "type": "object"
+    },
+    "ViewerClientDiagnosticsControlV1": {
+      "additionalProperties": false,
+      "properties": {
+        "canvas_pixels_max": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Canvas Pixels Max",
+          "type": "integer"
+        },
+        "draw_calls_max": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Draw Calls Max",
+          "type": "integer"
+        },
+        "dropped_frame_gaps": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Dropped Frame Gaps",
+          "type": "integer"
+        },
+        "effective_dpr": {
+          "exclusiveMinimum": 0.0,
+          "maximum": 4.0,
+          "title": "Effective Dpr",
+          "type": "number"
+        },
+        "frame_messages": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Frame Messages",
+          "type": "integer"
+        },
+        "heap_used_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Heap Used Bytes"
+        },
+        "long_task_max_ms": {
+          "minimum": 0.0,
+          "title": "Long Task Max Ms",
+          "type": "number"
+        },
+        "long_task_supported": {
+          "title": "Long Task Supported",
+          "type": "boolean"
+        },
+        "long_task_total_ms": {
+          "minimum": 0.0,
+          "title": "Long Task Total Ms",
+          "type": "number"
+        },
+        "long_tasks": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Long Tasks",
+          "type": "integer"
+        },
+        "manifest_messages": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Manifest Messages",
+          "type": "integer"
+        },
+        "materialization_max_ms": {
+          "minimum": 0.0,
+          "title": "Materialization Max Ms",
+          "type": "number"
+        },
+        "materialization_total_ms": {
+          "minimum": 0.0,
+          "title": "Materialization Total Ms",
+          "type": "number"
+        },
+        "materializations": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Materializations",
+          "type": "integer"
+        },
+        "react_commit_max_ms": {
+          "minimum": 0.0,
+          "title": "React Commit Max Ms",
+          "type": "number"
+        },
+        "react_commit_total_ms": {
+          "minimum": 0.0,
+          "title": "React Commit Total Ms",
+          "type": "number"
+        },
+        "react_commits": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "React Commits",
+          "type": "integer"
+        },
+        "render_interval_max_ms": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Render Interval Max Ms"
+        },
+        "render_interval_p95_ms": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Render Interval P95 Ms"
+        },
+        "rendered_frames": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Rendered Frames",
+          "type": "integer"
+        },
+        "renderer_name": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Renderer Name"
+        },
+        "renderer_software": {
+          "title": "Renderer Software",
+          "type": "boolean"
+        },
+        "renderer_vendor": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Renderer Vendor"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Request Id"
+        },
+        "requested_rate_hz": {
+          "maximum": 120.0,
+          "minimum": 0.0,
+          "title": "Requested Rate Hz",
+          "type": "number"
+        },
+        "resync_requests": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Resync Requests",
+          "type": "integer"
+        },
+        "schema_version": {
+          "const": "manyforge.viewer.control.v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "topology_rebuilds": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Topology Rebuilds",
+          "type": "integer"
+        },
+        "transform_applies": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Transform Applies",
+          "type": "integer"
+        },
+        "triangles_max": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Triangles Max",
+          "type": "integer"
+        },
+        "type": {
+          "const": "client_diagnostics",
+          "title": "Type",
+          "type": "string"
+        },
+        "visibility": {
+          "enum": [
+            "focused",
+            "visible",
+            "collapsed",
+            "hidden"
+          ],
+          "title": "Visibility",
+          "type": "string"
+        },
+        "websocket_bytes": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Websocket Bytes",
+          "type": "integer"
+        },
+        "websocket_messages": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Websocket Messages",
+          "type": "integer"
+        },
+        "window_duration_ms": {
+          "maximum": 60000.0,
+          "minimum": 0.0,
+          "title": "Window Duration Ms",
+          "type": "number"
+        }
+      },
+      "required": [
+        "type",
+        "schema_version",
+        "visibility",
+        "window_duration_ms",
+        "websocket_messages",
+        "websocket_bytes",
+        "manifest_messages",
+        "frame_messages",
+        "dropped_frame_gaps",
+        "resync_requests",
+        "materializations",
+        "materialization_total_ms",
+        "materialization_max_ms",
+        "react_commits",
+        "react_commit_total_ms",
+        "react_commit_max_ms",
+        "rendered_frames",
+        "draw_calls_max",
+        "triangles_max",
+        "canvas_pixels_max",
+        "long_task_supported",
+        "long_tasks",
+        "long_task_total_ms",
+        "long_task_max_ms",
+        "topology_rebuilds",
+        "transform_applies",
+        "renderer_software",
+        "effective_dpr",
+        "requested_rate_hz"
+      ],
+      "title": "ViewerClientDiagnosticsControlV1",
+      "type": "object"
+    },
+    "ViewerDiagnosticsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "active_client_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Active Client Count",
+          "type": "integer"
+        },
+        "build_stage_durations_ms": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Build Stage Durations Ms",
+          "type": "object"
+        },
+        "demand_client_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Demand Client Count",
+          "type": "integer"
+        },
+        "fanout_errors": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Fanout Errors",
+          "type": "integer"
+        },
+        "fanout_replacements": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Fanout Replacements",
+          "type": "integer"
+        },
+        "input_replacements": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Input Replacements",
+          "type": "integer"
+        },
+        "last_error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Error"
+        },
+        "last_publication_age_ms": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Publication Age Ms"
+        },
+        "producer_epoch": {
+          "title": "Producer Epoch",
+          "type": "string"
+        },
+        "producer_health_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Producer Health Reason"
+        },
+        "producer_healthy": {
+          "default": true,
+          "title": "Producer Healthy",
+          "type": "boolean"
+        },
+        "publisher_running": {
+          "default": true,
+          "title": "Publisher Running",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": "manyforge.viewer.diagnostics.v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "timestamp_ns": {
+          "minimum": 0,
+          "title": "Timestamp Ns",
+          "type": "integer"
+        },
+        "type": {
+          "const": "diagnostics",
+          "title": "Type",
+          "type": "string"
+        },
+        "unavailable_layers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Unavailable Layers",
+          "type": "array"
+        },
+        "worker_alive": {
+          "default": true,
+          "title": "Worker Alive",
+          "type": "boolean"
+        },
+        "worker_epoch": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Worker Epoch"
+        },
+        "worker_errors": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Worker Errors",
+          "type": "integer"
+        },
+        "worker_restarts": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Worker Restarts",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "type",
+        "schema_version",
+        "producer_epoch",
+        "timestamp_ns"
+      ],
+      "title": "ViewerDiagnosticsV1",
+      "type": "object"
+    },
+    "ViewerEntityManifestV1": {
+      "additionalProperties": false,
+      "properties": {
+        "attached": {
+          "title": "Attached",
+          "type": "boolean"
+        },
+        "attached_to": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Attached To"
+        },
+        "object_id": {
+          "title": "Object Id",
+          "type": "string"
+        },
+        "persistable": {
+          "title": "Persistable",
+          "type": "boolean"
+        },
+        "shape": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ViewerShapeV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "enum": [
+            "authored",
+            "runtime",
+            "attached"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "support_contacts": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Support Contacts",
+          "type": "array"
+        },
+        "viewer_frame_visible": {
+          "title": "Viewer Frame Visible",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "object_id",
+        "shape",
+        "attached",
+        "attached_to",
+        "source",
+        "persistable",
+        "viewer_frame_visible",
+        "support_contacts"
+      ],
+      "title": "ViewerEntityManifestV1",
+      "type": "object"
+    },
+    "ViewerFrameManifestV1": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "roles": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Roles",
+          "type": "array"
+        },
+        "viewer_visible": {
+          "title": "Viewer Visible",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "roles",
+        "viewer_visible"
+      ],
+      "title": "ViewerFrameManifestV1",
+      "type": "object"
+    },
+    "ViewerFrameV1": {
+      "additionalProperties": false,
+      "properties": {
+        "entity_transforms": {
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ViewerPoseV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxItems": 16384,
+          "title": "Entity Transforms",
+          "type": "array"
+        },
+        "frame_sequence": {
+          "minimum": 1,
+          "title": "Frame Sequence",
+          "type": "integer"
+        },
+        "frame_transforms": {
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ViewerPoseV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxItems": 65536,
+          "title": "Frame Transforms",
+          "type": "array"
+        },
+        "gripper_states": {
+          "items": {
+            "$ref": "#/$defs/ViewerGripperFrameV1"
+          },
+          "maxItems": 256,
+          "title": "Gripper States",
+          "type": "array"
+        },
+        "manifest_revision": {
+          "minimum": 1,
+          "title": "Manifest Revision",
+          "type": "integer"
+        },
+        "pose_source_states": {
+          "items": {
+            "$ref": "#/$defs/ViewerPoseSourceFrameV1"
+          },
+          "maxItems": 4096,
+          "title": "Pose Source States",
+          "type": "array"
+        },
+        "producer_epoch": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Producer Epoch",
+          "type": "string"
+        },
+        "render_revision": {
+          "minimum": 1,
+          "title": "Render Revision",
+          "type": "integer"
+        },
+        "robot_blocks": {
+          "items": {
+            "$ref": "#/$defs/ViewerRobotFrameV1"
+          },
+          "maxItems": 64,
+          "title": "Robot Blocks",
+          "type": "array"
+        },
+        "schema_version": {
+          "const": "manyforge.viewer.frame.v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "source_sequence": {
+          "minimum": 0,
+          "title": "Source Sequence",
+          "type": "integer"
+        },
+        "stale": {
+          "title": "Stale",
+          "type": "boolean"
+        },
+        "timestamp_ns": {
+          "minimum": 0,
+          "title": "Timestamp Ns",
+          "type": "integer"
+        },
+        "type": {
+          "const": "frame",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "schema_version",
+        "producer_epoch",
+        "manifest_revision",
+        "frame_sequence",
+        "render_revision",
+        "timestamp_ns",
+        "source_sequence",
+        "stale",
+        "robot_blocks",
+        "entity_transforms",
+        "frame_transforms",
+        "gripper_states",
+        "pose_source_states"
+      ],
+      "title": "ViewerFrameV1",
+      "type": "object"
+    },
+    "ViewerGripperFrameV1": {
+      "additionalProperties": false,
+      "properties": {
+        "actuation_kind": {
+          "title": "Actuation Kind",
+          "type": "string"
+        },
+        "command_id": {
+          "title": "Command Id",
+          "type": "integer"
+        },
+        "commanded_position": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Commanded Position"
+        },
+        "commanded_state": {
+          "title": "Commanded State",
+          "type": "string"
+        },
+        "completion_policy": {
+          "title": "Completion Policy",
+          "type": "string"
+        },
+        "current_position": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Current Position"
+        },
+        "derived_joints": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Derived Joints",
+          "type": "array"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Error"
+        },
+        "evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "evidence_state": {
+          "title": "Evidence State",
+          "type": "string"
+        },
+        "generation": {
+          "title": "Generation",
+          "type": "integer"
+        },
+        "grasp_confirmation_policy": {
+          "title": "Grasp Confirmation Policy",
+          "type": "string"
+        },
+        "gripper_id": {
+          "title": "Gripper Id",
+          "type": "string"
+        },
+        "joint_name": {
+          "title": "Joint Name",
+          "type": "string"
+        },
+        "limit_lower": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Limit Lower"
+        },
+        "limit_upper": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Limit Upper"
+        },
+        "motion_time_s": {
+          "title": "Motion Time S",
+          "type": "number"
+        },
+        "observed_position": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Observed Position"
+        },
+        "projection_reason": {
+          "title": "Projection Reason",
+          "type": "string"
+        },
+        "projection_state": {
+          "title": "Projection State",
+          "type": "string"
+        },
+        "reason_code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason Code"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "integer"
+        },
+        "srdf_presets": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Srdf Presets",
+          "type": "object"
+        },
+        "state": {
+          "title": "State",
+          "type": "string"
+        },
+        "state_authority": {
+          "title": "State Authority",
+          "type": "string"
+        },
+        "target_position": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Target Position"
+        },
+        "transport_kind": {
+          "title": "Transport Kind",
+          "type": "string"
+        },
+        "visualization": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ViewerGripperVisualizationV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "gripper_id",
+        "joint_name",
+        "derived_joints",
+        "state",
+        "command_id",
+        "generation",
+        "revision",
+        "current_position",
+        "target_position",
+        "commanded_position",
+        "observed_position",
+        "commanded_state",
+        "actuation_kind",
+        "state_authority",
+        "completion_policy",
+        "grasp_confirmation_policy",
+        "transport_kind",
+        "evidence",
+        "evidence_state",
+        "projection_state",
+        "projection_reason",
+        "limit_lower",
+        "limit_upper",
+        "motion_time_s",
+        "srdf_presets",
+        "visualization",
+        "error",
+        "reason_code"
+      ],
+      "title": "ViewerGripperFrameV1",
+      "type": "object"
+    },
+    "ViewerGripperManifestV1": {
+      "additionalProperties": false,
+      "properties": {
+        "actuation_kind": {
+          "title": "Actuation Kind",
+          "type": "string"
+        },
+        "completion_policy": {
+          "title": "Completion Policy",
+          "type": "string"
+        },
+        "derived_joints": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Derived Joints",
+          "type": "array"
+        },
+        "grasp_confirmation_policy": {
+          "title": "Grasp Confirmation Policy",
+          "type": "string"
+        },
+        "gripper_id": {
+          "title": "Gripper Id",
+          "type": "string"
+        },
+        "joint_name": {
+          "title": "Joint Name",
+          "type": "string"
+        },
+        "limit_lower": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Limit Lower"
+        },
+        "limit_upper": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Limit Upper"
+        },
+        "motion_time_s": {
+          "title": "Motion Time S",
+          "type": "number"
+        },
+        "srdf_presets": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Srdf Presets",
+          "type": "object"
+        },
+        "state_authority": {
+          "title": "State Authority",
+          "type": "string"
+        },
+        "transport_kind": {
+          "title": "Transport Kind",
+          "type": "string"
+        },
+        "visualization": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ViewerGripperVisualizationV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "gripper_id",
+        "joint_name",
+        "derived_joints",
+        "actuation_kind",
+        "state_authority",
+        "completion_policy",
+        "grasp_confirmation_policy",
+        "transport_kind",
+        "limit_lower",
+        "limit_upper",
+        "motion_time_s",
+        "srdf_presets",
+        "visualization"
+      ],
+      "title": "ViewerGripperManifestV1",
+      "type": "object"
+    },
+    "ViewerGripperSubtreeLinkV1": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "orientation_xyzw": {
+          "items": {
+            "type": "number"
+          },
+          "title": "Orientation Xyzw",
+          "type": "array"
+        },
+        "position_m": {
+          "items": {
+            "type": "number"
+          },
+          "title": "Position M",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "position_m",
+        "orientation_xyzw"
+      ],
+      "title": "ViewerGripperSubtreeLinkV1",
+      "type": "object"
+    },
+    "ViewerGripperVisualizationV1": {
+      "additionalProperties": false,
+      "properties": {
+        "gripper_root_link": {
+          "title": "Gripper Root Link",
+          "type": "string"
+        },
+        "subtree_links": {
+          "items": {
+            "$ref": "#/$defs/ViewerGripperSubtreeLinkV1"
+          },
+          "title": "Subtree Links",
+          "type": "array"
+        },
+        "tcp_to_root_orientation_xyzw": {
+          "items": {
+            "type": "number"
+          },
+          "title": "Tcp To Root Orientation Xyzw",
+          "type": "array"
+        },
+        "tcp_to_root_position_m": {
+          "items": {
+            "type": "number"
+          },
+          "title": "Tcp To Root Position M",
+          "type": "array"
+        }
+      },
+      "required": [
+        "gripper_root_link",
+        "tcp_to_root_position_m",
+        "tcp_to_root_orientation_xyzw",
+        "subtree_links"
+      ],
+      "title": "ViewerGripperVisualizationV1",
+      "type": "object"
+    },
+    "ViewerLeaseAckV1": {
+      "additionalProperties": false,
+      "properties": {
+        "client_id": {
+          "title": "Client Id",
+          "type": "string"
+        },
+        "expires_at_ns": {
+          "minimum": 0,
+          "title": "Expires At Ns",
+          "type": "integer"
+        },
+        "granted_layers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Granted Layers",
+          "type": "array"
+        },
+        "granted_rate_hz": {
+          "minimum": 0.0,
+          "title": "Granted Rate Hz",
+          "type": "number"
+        },
+        "lease_revision": {
+          "minimum": 0,
+          "title": "Lease Revision",
+          "type": "integer"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Request Id"
+        },
+        "schema_version": {
+          "const": "manyforge.viewer.diagnostics.v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "server_max_rate_hz": {
+          "exclusiveMinimum": 0.0,
+          "title": "Server Max Rate Hz",
+          "type": "number"
+        },
+        "timestamp_ns": {
+          "minimum": 0,
+          "title": "Timestamp Ns",
+          "type": "integer"
+        },
+        "type": {
+          "const": "lease_ack",
+          "title": "Type",
+          "type": "string"
+        },
+        "visibility": {
+          "enum": [
+            "focused",
+            "visible",
+            "collapsed",
+            "hidden"
+          ],
+          "title": "Visibility",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "schema_version",
+        "client_id",
+        "timestamp_ns",
+        "expires_at_ns",
+        "lease_revision",
+        "visibility",
+        "granted_rate_hz",
+        "server_max_rate_hz"
+      ],
+      "title": "ViewerLeaseAckV1",
+      "type": "object"
+    },
+    "ViewerLeaseControlV1": {
+      "additionalProperties": false,
+      "properties": {
+        "layers": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Layers",
+          "type": "array"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Request Id"
+        },
+        "requested_rate_hz": {
+          "minimum": 0.0,
+          "title": "Requested Rate Hz",
+          "type": "number"
+        },
+        "schema_version": {
+          "const": "manyforge.viewer.control.v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "subscribe",
+            "lease",
+            "visibility"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "visibility": {
+          "enum": [
+            "focused",
+            "visible",
+            "collapsed",
+            "hidden"
+          ],
+          "title": "Visibility",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "schema_version",
+        "visibility",
+        "requested_rate_hz"
+      ],
+      "title": "ViewerLeaseControlV1",
+      "type": "object"
+    },
+    "ViewerManifestV1": {
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "additionalProperties": {
+            "type": "boolean"
+          },
+          "title": "Capabilities",
+          "type": "object"
+        },
+        "content_hash": {
+          "maxLength": 64,
+          "minLength": 64,
+          "title": "Content Hash",
+          "type": "string"
+        },
+        "entities": {
+          "items": {
+            "$ref": "#/$defs/ViewerEntityManifestV1"
+          },
+          "maxItems": 16384,
+          "title": "Entities",
+          "type": "array"
+        },
+        "frame_axes_gizmo_size_m": {
+          "exclusiveMinimum": 0.0,
+          "title": "Frame Axes Gizmo Size M",
+          "type": "number"
+        },
+        "frames": {
+          "items": {
+            "$ref": "#/$defs/ViewerFrameManifestV1"
+          },
+          "maxItems": 65536,
+          "title": "Frames",
+          "type": "array"
+        },
+        "grippers": {
+          "items": {
+            "$ref": "#/$defs/ViewerGripperManifestV1"
+          },
+          "maxItems": 256,
+          "title": "Grippers",
+          "type": "array"
+        },
+        "manifest_revision": {
+          "minimum": 1,
+          "title": "Manifest Revision",
+          "type": "integer"
+        },
+        "object_axes_gizmo_size_m": {
+          "exclusiveMinimum": 0.0,
+          "title": "Object Axes Gizmo Size M",
+          "type": "number"
+        },
+        "orders": {
+          "$ref": "#/$defs/ViewerOrdersV1"
+        },
+        "pose_sources": {
+          "items": {
+            "$ref": "#/$defs/ViewerPoseSourceManifestV1"
+          },
+          "maxItems": 4096,
+          "title": "Pose Sources",
+          "type": "array"
+        },
+        "producer_epoch": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Producer Epoch",
+          "type": "string"
+        },
+        "robots": {
+          "items": {
+            "$ref": "#/$defs/ViewerRobotManifestV1"
+          },
+          "maxItems": 64,
+          "title": "Robots",
+          "type": "array"
+        },
+        "schema_version": {
+          "const": "manyforge.viewer.manifest.v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "type": {
+          "const": "manifest",
+          "title": "Type",
+          "type": "string"
+        },
+        "world_frame": {
+          "minLength": 1,
+          "title": "World Frame",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "schema_version",
+        "producer_epoch",
+        "manifest_revision",
+        "content_hash",
+        "world_frame",
+        "robots",
+        "entities",
+        "frames",
+        "grippers",
+        "pose_sources",
+        "orders",
+        "object_axes_gizmo_size_m",
+        "frame_axes_gizmo_size_m",
+        "capabilities"
+      ],
+      "title": "ViewerManifestV1",
+      "type": "object"
+    },
+    "ViewerOrdersV1": {
+      "additionalProperties": false,
+      "properties": {
+        "entities": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Entities",
+          "type": "array"
+        },
+        "frames": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Frames",
+          "type": "array"
+        },
+        "grippers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Grippers",
+          "type": "array"
+        },
+        "links": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Links",
+          "type": "array"
+        },
+        "pose_sources": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Pose Sources",
+          "type": "array"
+        }
+      },
+      "required": [
+        "links",
+        "entities",
+        "frames",
+        "grippers",
+        "pose_sources"
+      ],
+      "title": "ViewerOrdersV1",
+      "type": "object"
+    },
+    "ViewerPoseSourceFrameV1": {
+      "additionalProperties": false,
+      "properties": {
+        "measured_robot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PoseSourceMeasuredRobotResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "measured_tcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PoseSourceMeasuredTcpResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "objects": {
+          "items": {
+            "$ref": "#/$defs/ViewerPoseSourceObjectFrameV1"
+          },
+          "maxItems": 16384,
+          "title": "Objects",
+          "type": "array"
+        },
+        "pose_source_id": {
+          "title": "Pose Source Id",
+          "type": "string"
+        },
+        "received_at_ns": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Received At Ns"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pose_source_id",
+        "status",
+        "received_at_ns",
+        "measured_tcp",
+        "measured_robot",
+        "objects"
+      ],
+      "title": "ViewerPoseSourceFrameV1",
+      "type": "object"
+    },
+    "ViewerPoseSourceManifestV1": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "frame_id": {
+          "title": "Frame Id",
+          "type": "string"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "max_update_hz": {
+          "minimum": 0.0,
+          "title": "Max Update Hz",
+          "type": "number"
+        },
+        "objects": {
+          "items": {
+            "$ref": "#/$defs/ViewerPoseSourceObjectManifestV1"
+          },
+          "maxItems": 16384,
+          "title": "Objects",
+          "type": "array"
+        },
+        "pose_source_id": {
+          "title": "Pose Source Id",
+          "type": "string"
+        },
+        "stale_after_s": {
+          "minimum": 0.0,
+          "title": "Stale After S",
+          "type": "number"
+        }
+      },
+      "required": [
+        "pose_source_id",
+        "kind",
+        "enabled",
+        "max_update_hz",
+        "stale_after_s",
+        "frame_id",
+        "description",
+        "objects"
+      ],
+      "title": "ViewerPoseSourceManifestV1",
+      "type": "object"
+    },
+    "ViewerPoseSourceObjectFrameV1": {
+      "additionalProperties": false,
+      "properties": {
+        "age_s": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Age S"
+        },
+        "attached_drift": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PoseSourceAttachedDriftStateResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "object_id": {
+          "title": "Object Id",
+          "type": "string"
+        },
+        "rejection": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PoseSourceRejectionResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "update": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PoseSourceUpdateResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "object_id",
+        "status",
+        "age_s",
+        "update",
+        "rejection",
+        "attached_drift"
+      ],
+      "title": "ViewerPoseSourceObjectFrameV1",
+      "type": "object"
+    },
+    "ViewerPoseSourceObjectManifestV1": {
+      "additionalProperties": false,
+      "properties": {
+        "apply_policy": {
+          "title": "Apply Policy",
+          "type": "string"
+        },
+        "entity": {
+          "title": "Entity",
+          "type": "string"
+        },
+        "frame_id": {
+          "title": "Frame Id",
+          "type": "string"
+        },
+        "measured_state_ghost": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Measured State Ghost"
+        },
+        "object_id": {
+          "title": "Object Id",
+          "type": "string"
+        },
+        "scene_admission": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Scene Admission"
+        }
+      },
+      "required": [
+        "object_id",
+        "entity",
+        "frame_id",
+        "apply_policy",
+        "scene_admission",
+        "measured_state_ghost"
+      ],
+      "title": "ViewerPoseSourceObjectManifestV1",
+      "type": "object"
+    },
+    "ViewerPoseV1": {
+      "additionalProperties": false,
+      "properties": {
+        "orientation_xyzw": {
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 4,
+          "minItems": 4,
+          "title": "Orientation Xyzw",
+          "type": "array"
+        },
+        "position_m": {
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "title": "Position M",
+          "type": "array"
+        }
+      },
+      "required": [
+        "position_m",
+        "orientation_xyzw"
+      ],
+      "title": "ViewerPoseV1",
+      "type": "object"
+    },
+    "ViewerResyncControlV1": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Request Id"
+        },
+        "schema_version": {
+          "const": "manyforge.viewer.control.v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "type": {
+          "const": "resync",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "schema_version"
+      ],
+      "title": "ViewerResyncControlV1",
+      "type": "object"
+    },
+    "ViewerRobotFrameV1": {
+      "additionalProperties": false,
+      "properties": {
+        "joint_positions": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Joint Positions",
+          "type": "array"
+        },
+        "link_transforms": {
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ViewerPoseV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Link Transforms",
+          "type": "array"
+        },
+        "robot_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Robot Id"
+        },
+        "source_age_ns": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Age Ns"
+        },
+        "source_timestamp_ns": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Timestamp Ns"
+        },
+        "state_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "State Source"
+        },
+        "tcp_pose_in_base": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tcp Pose In Base"
+        }
+      },
+      "required": [
+        "robot_id",
+        "joint_positions",
+        "link_transforms",
+        "tcp_pose_in_base",
+        "state_source",
+        "source_timestamp_ns",
+        "source_age_ns"
+      ],
+      "title": "ViewerRobotFrameV1",
+      "type": "object"
+    },
+    "ViewerRobotManifestV1": {
+      "additionalProperties": false,
+      "properties": {
+        "base_frame": {
+          "title": "Base Frame",
+          "type": "string"
+        },
+        "base_pose": {
+          "additionalProperties": true,
+          "title": "Base Pose",
+          "type": "object"
+        },
+        "group_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Group Id"
+        },
+        "joint_names": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Joint Names",
+          "type": "array"
+        },
+        "link_order": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Link Order",
+          "type": "array"
+        },
+        "robot_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Robot Id"
+        },
+        "tcp_frame": {
+          "title": "Tcp Frame",
+          "type": "string"
+        },
+        "urdf_model_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Urdf Model Key"
+        }
+      },
+      "required": [
+        "robot_id",
+        "group_id",
+        "urdf_model_key",
+        "base_frame",
+        "tcp_frame",
+        "base_pose",
+        "joint_names",
+        "link_order"
+      ],
+      "title": "ViewerRobotManifestV1",
+      "type": "object"
+    },
+    "ViewerShapeV1": {
+      "additionalProperties": false,
+      "properties": {
+        "box_dimensions_m": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Box Dimensions M"
+        },
+        "cylinder_height_m": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cylinder Height M"
+        },
+        "cylinder_radius_m": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cylinder Radius M"
+        },
+        "mesh_asset_status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Mesh Asset Status"
+        },
+        "mesh_asset_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Mesh Asset Url"
+        },
+        "mesh_resource_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Mesh Resource Uri"
+        },
+        "mesh_scale": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Mesh Scale"
+        },
+        "sphere_radius_m": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Sphere Radius M"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "box_dimensions_m",
+        "sphere_radius_m",
+        "cylinder_radius_m",
+        "cylinder_height_m",
+        "mesh_resource_uri",
+        "mesh_scale",
+        "mesh_asset_url",
+        "mesh_asset_status"
+      ],
+      "title": "ViewerShapeV1",
+      "type": "object"
+    }
+  },
+  "$id": "https://manyforge.dev/schemas/viewer-data-plane-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/ViewerManifestV1"
+    },
+    {
+      "$ref": "#/$defs/ViewerFrameV1"
+    },
+    {
+      "$ref": "#/$defs/ViewerDiagnosticsV1"
+    },
+    {
+      "$ref": "#/$defs/ViewerLeaseAckV1"
+    },
+    {
+      "$ref": "#/$defs/ViewerClientDiagnosticsControlV1"
+    },
+    {
+      "$ref": "#/$defs/ViewerLeaseControlV1"
+    },
+    {
+      "$ref": "#/$defs/ViewerResyncControlV1"
+    }
+  ],
+  "description": "Generated viewer manifest, frame, diagnostics, lease acknowledgement, and client control messages. Source of truth: backend Pydantic models.",
+  "title": "ManyForge Viewer Data Plane v1"
+}

@@ -790,10 +790,14 @@ def active_urdf_model_key(state: ComposerState) -> str | None:
     if deployment is not None and deployment.robot_config is not None:
         robot_id = deployment.robot_config.robot_id
     metadata = robot_model_authority_metadata(state)
+    authority_fingerprint = _authority_fingerprint(metadata) or ""
+    # Viewer production wraps this resolver in ComposerState's bounded,
+    # generation-fenced revalidation cache. Recompute here so the low-cadence
+    # revalidation can still detect an in-place mesh asset change.
     return _entry_model_key(
         entry,
         robot_id,
-        authority_fingerprint=_authority_fingerprint(metadata),
+        authority_fingerprint=authority_fingerprint,
     )
 
 

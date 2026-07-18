@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 import weakref
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
@@ -27,6 +27,7 @@ from manyforge_behavior.node_environment import (
 )
 from manyforge_behavior.program import (
     Program,
+    ProgramViewer,
     apply_tree_param_overrides,
     compute_program_tree_hash,
     find_tree_node_by_name,
@@ -50,6 +51,16 @@ from manyforge_behavior.skill_loader import SkillCatalog, load_skill_catalog, de
 from .event_recorder import EventRecorder
 from .log_throttle import ThrottledLog
 from .security import normalize_allowed_roots
+from .viewer_data_plane import (
+    ViewerDemandRegistry,
+    ViewerDemandSummary,
+    ViewerInputUnchanged,
+    ViewerLeaseGrant,
+    ViewerPublication,
+    ViewerSnapshotBuild,
+    viewer_effective_period_s,
+)
+from .viewer_worker import ViewerWorkerSupervisor
 
 logger = logging.getLogger(__name__)
 
@@ -346,6 +357,7 @@ class ComposerState:
         self._visible_object_frames: set[str] = set()
         self._frame_gizmo_size_m: float = 0.1
         self._object_axes_gizmo_size_m: float = 0.1
+        self._scene_viewer_revision = 0
         # Drivable joint metadata + last-known joint vector. The visual
         # publisher runs concurrently with planning/validation and must not
         # poll RoboPlan's mutable scene for stable group metadata on every
@@ -404,9 +416,18 @@ class ComposerState:
         self._assistant_failure_counts: dict[str, int] = {}
         self._external_runtime_status_lock = threading.Lock()
         self._external_runtime_statuses: dict[str, dict[str, Any]] = {}
+        self._external_runtime_status_revision = 0
+        self._heartbeat_cache_lock = threading.Lock()
+        self._heartbeat_build_lock = threading.Lock()
+        self._heartbeat_cache_payload: dict[str, Any] | None = None
+        self._heartbeat_cache_built_ns = 0
+        self._heartbeat_cache_revision: tuple[Any, ...] | None = None
+        self._heartbeat_cache_hits = 0
+        self._heartbeat_cache_misses = 0
         self._simulation_control_lock = threading.Lock()
         self._pose_source_lock = threading.Lock()
         self._pose_source_snapshots: dict[str, dict[str, Any]] = {}
+        self._pose_source_observer_revision = 0
         self._pose_source_drift_lock = threading.Lock()
         self._pose_source_drift_baselines: dict[tuple[str, str], dict[str, Any]] = {}
         self._pose_source_drift_states: dict[tuple[str, str], dict[str, Any]] = {}
@@ -425,6 +446,7 @@ class ComposerState:
             tuple[str, str, str],
             dict[str, tuple[Any, ...]],
         ] = {}
+        self._pose_source_ingest_apply_state: dict[tuple[str, str, str], str] = {}
         self._pose_source_apply_metrics: dict[str, int] = {
             "snapshots_received": 0,
             "apply_coalesced": 0,
@@ -435,6 +457,7 @@ class ComposerState:
             "stale_generation_dropped": 0,
             "stale_result_ignored": 0,
             "errors": 0,
+            "ingest_apply_suppressed": 0,
         }
         self._pose_source_apply_object_metrics: dict[str, dict[str, int]] = {}
         self._visual_scene_objects_lock = threading.Lock()
@@ -444,7 +467,10 @@ class ComposerState:
         self._visual_scene_objects_refresh_attempt_ns = 0
         self._visual_scene_objects_refresh_running = False
         self._visual_scene_objects_refresh_error: str | None = None
+        self._visual_scene_objects_revision = 0
         self._visual_state_lock = threading.Lock()
+        self._visual_state_build_lock = threading.Lock()
+        self._visual_state_cv = threading.Condition(self._visual_state_lock)
         self._visual_state_snapshot: Any | None = None
         self._visual_state_timestamp_ns = 0
         self._visual_state_last_duration_ms: float | None = None
@@ -454,10 +480,34 @@ class ComposerState:
         self._visual_state_next_reason: str = ""
         self._visual_state_publisher_running = False
         self._visual_state_publisher_thread: threading.Thread | None = None
-        self._visual_state_publisher_wake = threading.Event()
         self._visual_state_publisher_stop = threading.Event()
         self._visual_state_publisher_builder: Callable[[], Any] | None = None
+        self._visual_state_publication_sink: (
+            Callable[[ViewerPublication], bool] | None
+        ) = None
+        self._visual_state_last_publication: ViewerPublication | None = None
+        self._visual_state_wake_generation = 0
+        self._visual_state_one_shot_requested_generation = 0
+        self._visual_state_one_shot_completed_generation = 0
+        self._visual_state_one_shot_results: dict[int, dict[str, Any]] = {}
+        self._visual_state_builds_started = 0
+        self._visual_state_builds_completed = 0
+        self._visual_state_build_failures = 0
+        self._visual_state_builds_suppressed_no_demand = 0
+        self._visual_state_builds_suppressed_unchanged = 0
+        self._visual_state_last_input_signature: tuple[Any, ...] | None = None
+        self._visual_state_model_key_generation: tuple[int, int] | None = None
+        self._visual_state_model_key: str | None = None
+        self._visual_state_model_key_revalidate_ns = 0
+        self._visual_state_static_input_key: tuple[Any, ...] | None = None
+        self._visual_state_static_input: Any | None = None
+        self._visual_state_stage_metrics: dict[str, float] = {}
+        self._visual_state_publications_dropped = 0
         self._visual_state_publisher_period_s = 1.0 / 15.0
+        self._viewer_worker = ViewerWorkerSupervisor()
+        self._viewer_demand = ViewerDemandRegistry(
+            on_change=self._notify_visual_state_demand_changed,
+        )
         # Owned NRT kernel-event consumer for RT-8D. It is independent of
         # browser/WebSocket demand and blocks on the native collector with the
         # GIL released, so offer publication does not poll at viewer cadence.
@@ -2293,6 +2343,24 @@ class ComposerState:
             if self.cycle_manager is not None
             else self.kernel.get_execution_snapshot()
         )
+        return self.resolve_current_joint_positions(
+            snapshot,
+            joint_names=joint_names,
+        )
+
+    def resolve_current_joint_positions(
+        self,
+        snapshot: Any,
+        *,
+        joint_names: list[str],
+    ) -> Optional[list[float]]:
+        """Resolve one observer snapshot without performing another RPC.
+
+        Visual production needs positions and source-authority metadata from
+        the same immutable execution observation. Keeping the fallback chain in
+        this helper prevents a second kernel call while preserving jog and
+        idle-state behavior for all existing callers.
+        """
         snapshot_positions = getattr(snapshot, "joint_positions_rad", None)
         if snapshot_positions and len(snapshot_positions) == len(joint_names):
             live = list(snapshot_positions)
@@ -2367,6 +2435,7 @@ class ComposerState:
             self._visual_scene_objects = copied
             self._visual_scene_objects_timestamp_ns = time.monotonic_ns()
             self._visual_scene_objects_refresh_error = error
+            self._visual_scene_objects_revision += 1
 
     def clear_visual_scene_objects_snapshot(self) -> None:
         with self._visual_scene_objects_lock:
@@ -2375,6 +2444,30 @@ class ComposerState:
             self._visual_scene_objects_timestamp_ns = 0
             self._visual_scene_objects_refresh_attempt_ns = 0
             self._visual_scene_objects_refresh_error = None
+            self._visual_scene_objects_revision += 1
+
+    def commit_visual_attachment_offsets(
+        self,
+        *,
+        expected_revision: int,
+        offsets: dict[str, dict[str, Any]],
+    ) -> bool:
+        """Commit worker-derived attachment offsets only to their input generation."""
+        if not offsets:
+            return True
+        with self._visual_scene_objects_lock:
+            if self._visual_scene_objects_revision != expected_revision:
+                return False
+            attached_ids = {
+                item.object_id for item in self._visual_scene_objects if item.attached
+            }
+            for object_id, offset in offsets.items():
+                if object_id not in attached_ids:
+                    continue
+                if object_id in self._visual_scene_object_attachment_offsets:
+                    continue
+                self._visual_scene_object_attachment_offsets[object_id] = copy.deepcopy(offset)
+            return True
 
     def visual_scene_objects_snapshot(
         self,
@@ -2396,6 +2489,7 @@ class ComposerState:
             attempt_ns = self._visual_scene_objects_refresh_attempt_ns
             running = self._visual_scene_objects_refresh_running
             error = self._visual_scene_objects_refresh_error
+            revision = self._visual_scene_objects_revision
         age_ms = None
         if timestamp_ns > 0:
             age_ms = (time.monotonic_ns() - timestamp_ns) / 1_000_000.0
@@ -2409,11 +2503,52 @@ class ComposerState:
             "refresh_attempt_age_ms": refresh_attempt_age_ms,
             "refresh_running": running,
             "refresh_error": error,
+            "revision": revision,
+        }
+
+    def visual_scene_objects_input_snapshot(
+        self,
+    ) -> tuple[
+        list[SceneObjectSnapshot],
+        dict[str, dict[str, Any]],
+        dict[str, Any],
+    ]:
+        """Capture objects, attachment offsets, and revision coherently."""
+        with self._visual_scene_objects_lock:
+            objects = list(self._visual_scene_objects)
+            offsets = dict(self._visual_scene_object_attachment_offsets)
+            timestamp_ns = self._visual_scene_objects_timestamp_ns
+            attempt_ns = self._visual_scene_objects_refresh_attempt_ns
+            running = self._visual_scene_objects_refresh_running
+            error = self._visual_scene_objects_refresh_error
+            revision = self._visual_scene_objects_revision
+        now_ns = time.monotonic_ns()
+        return objects, offsets, {
+            "timestamp_ns": timestamp_ns,
+            "age_ms": (
+                (now_ns - timestamp_ns) / 1_000_000.0
+                if timestamp_ns > 0
+                else None
+            ),
+            "refresh_attempt_ns": attempt_ns,
+            "refresh_attempt_age_ms": (
+                (now_ns - attempt_ns) / 1_000_000.0 if attempt_ns > 0 else None
+            ),
+            "refresh_running": running,
+            "refresh_error": error,
+            "revision": revision,
         }
 
     def visual_scene_objects_for_link_poses(
         self,
         link_poses: dict[str, dict[str, Any]] | None,
+        *,
+        input_snapshot: tuple[
+            list[SceneObjectSnapshot],
+            dict[str, dict[str, Any]],
+            dict[str, Any],
+        ]
+        | None = None,
     ) -> tuple[list[SceneObjectSnapshot], dict[str, Any]]:
         """Return cached visual objects, composing attached poses from link poses.
 
@@ -2423,13 +2558,27 @@ class ComposerState:
         attached object.
         """
 
-        objects, meta = self.visual_scene_objects_snapshot()
+        if input_snapshot is None:
+            objects, meta = self.visual_scene_objects_snapshot()
+            offsets: dict[str, dict[str, Any]] | None = None
+        else:
+            input_objects, input_offsets, input_meta = input_snapshot
+            objects = list(input_objects)
+            offsets = dict(input_offsets)
+            meta = dict(input_meta)
         if not link_poses:
             return objects, meta
-        with self._visual_scene_objects_lock:
+        if offsets is None:
+            offset_lock = self._visual_scene_objects_lock
+        else:
+            # The supplied snapshot is immutable and coherent; do not merge a
+            # newer offset generation into it while a viewer build is running.
+            offset_lock = nullcontext()
+        with offset_lock:
             # Shallow copy: offset pose dicts are read-only downstream
             # (matrix helpers copy their inputs).
-            offsets = dict(self._visual_scene_object_attachment_offsets)
+            if offsets is None:
+                offsets = dict(self._visual_scene_object_attachment_offsets)
             for obj in objects:
                 if (
                     not obj.attached
@@ -2457,7 +2606,8 @@ class ComposerState:
                         },
                     )
                     continue
-                self._visual_scene_object_attachment_offsets[obj.object_id] = offset
+                if input_snapshot is None:
+                    self._visual_scene_object_attachment_offsets[obj.object_id] = offset
                 offsets[obj.object_id] = offset
         composed: list[SceneObjectSnapshot] = []
         for obj in objects:
@@ -2767,6 +2917,12 @@ class ComposerState:
                 self._visual_scene_objects = objects
                 self._visual_scene_objects_timestamp_ns = now_ns
                 self._visual_scene_objects_refresh_error = None
+                # Object pose/attachment state is part of the worker's
+                # revision-keyed static input. Publish the cache replacement
+                # and its generation under the same leaf lock so a viewer
+                # build can never reuse an older object projection after a
+                # successful scene edit.
+                self._visual_scene_objects_revision += 1
 
         if updated and publish:
             self.request_visual_state_publish(reason=f"scene_edit_{request.operation}")
@@ -2890,12 +3046,16 @@ class ComposerState:
         request handling.
         """
         with self._visual_state_lock:
-            self._visual_state_snapshot = copy.deepcopy(snapshot)
+            # Ownership transfers to the cache. Builders must not retain or
+            # mutate a published object; readers receive this shared immutable
+            # generation and copy only when deriving a variant.
+            self._visual_state_snapshot = snapshot
             self._visual_state_timestamp_ns = time.monotonic_ns() if snapshot is not None else 0
             self._visual_state_last_duration_ms = duration_ms
             self._visual_state_last_error = error
             self._visual_state_last_error_detail = error_detail
             self._visual_state_last_reason = reason
+            self._visual_state_cv.notify_all()
 
     def clear_visual_state_snapshot(self) -> None:
         self.update_visual_state_snapshot(
@@ -2904,6 +3064,9 @@ class ComposerState:
             error=None,
             reason="cleared",
         )
+        with self._visual_state_lock:
+            self._visual_state_last_input_signature = None
+            self._visual_state_last_publication = None
 
     def record_visual_state_publish_error(
         self,
@@ -2965,9 +3128,49 @@ class ComposerState:
         reason: str = "manual",
     ) -> dict[str, Any]:
         """Build and publish a visual snapshot outside route request handling."""
+        with self._visual_state_build_lock:
+            return self._publish_visual_state_snapshot_serialized(
+                builder,
+                reason=reason,
+            )
+
+    def _publish_visual_state_snapshot_serialized(
+        self,
+        builder: Callable[[], Any],
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
         started = time.monotonic()
+        with self._visual_state_lock:
+            self._visual_state_builds_started += 1
+            publication_sink = self._visual_state_publication_sink
         try:
-            snapshot = builder()
+            built = builder()
+            if isinstance(built, ViewerSnapshotBuild):
+                snapshot = built.snapshot
+                input_signature = built.input_signature
+                stage_durations_ms = built.stage_durations_ms
+                worker_publication = built.publication
+            else:
+                snapshot = built
+                input_signature = None
+                stage_durations_ms = {}
+                worker_publication = None
+        except ViewerInputUnchanged as exc:
+            with self._visual_state_lock:
+                self._visual_state_stage_metrics = dict(exc.stage_durations_ms)
+                # A complete, unchanged observer sample proves that a transient
+                # source/sampling error has cleared. Preserve the last immutable
+                # frame, but do not leave its producer health stuck degraded.
+                self._visual_state_last_error = None
+                self._visual_state_last_error_detail = None
+            return {
+                "success": True,
+                "published": False,
+                "unchanged": True,
+                "reason": reason,
+                "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
+            }
         except Exception as exc:
             duration_ms = (time.monotonic() - started) * 1000.0
             error_code = str(getattr(exc, "reason", "") or "").strip()
@@ -2982,6 +3185,8 @@ class ComposerState:
                 error_detail=error_detail,
                 reason=reason,
             )
+            with self._visual_state_lock:
+                self._visual_state_build_failures += 1
             return {
                 "success": False,
                 "error": error_code,
@@ -2990,17 +3195,45 @@ class ComposerState:
                 "duration_ms": round(duration_ms, 1),
             }
         duration_ms = (time.monotonic() - started) * 1000.0
+        publication = worker_publication
         self.update_visual_state_snapshot(
             snapshot,
             duration_ms=duration_ms,
             error=None,
             reason=reason,
         )
+        publication_delivered = False
+        if publication is not None:
+            with self._visual_state_lock:
+                self._visual_state_last_publication = publication
+            if publication_sink is not None:
+                try:
+                    publication_delivered = bool(publication_sink(publication))
+                except Exception:
+                    logger.exception(
+                        "visual-state publication sink failed",
+                        extra={"event": "manyforge.visual.publication_sink_failed"},
+                    )
+                    publication_delivered = False
+                if not publication_delivered:
+                    with self._visual_state_lock:
+                        self._visual_state_publications_dropped += 1
+        with self._visual_state_lock:
+            self._visual_state_builds_completed += 1
+            self._visual_state_stage_metrics = dict(stage_durations_ms)
+        if input_signature is not None:
+            self.commit_visual_input_signature(input_signature)
         return {
             "success": True,
+            "published": True,
             "reason": reason,
             "duration_ms": round(duration_ms, 1),
             "sequence_number": getattr(snapshot, "sequence_number", None),
+            "viewer_frame_sequence": (
+                publication.frame_sequence if publication is not None else None
+            ),
+            "viewer_publication_delivered": publication_delivered,
+            "stage_durations_ms": dict(stage_durations_ms),
         }
 
     def ensure_visual_state_publisher(
@@ -3009,8 +3242,14 @@ class ComposerState:
         *,
         period_s: float,
     ) -> None:
-        """Start or update the background visual-state publisher."""
+        """Start the demand-driven visual-state publisher.
+
+        Starting the worker does not create visual demand.  With no active
+        lease or one-shot request it blocks on the generation-aware condition
+        and performs no observer reads, FK, build, or encoding.
+        """
         period = max(0.02, min(float(period_s), 5.0))
+        self._viewer_worker.reopen()
         with self._visual_state_lock:
             self._visual_state_publisher_builder = builder
             self._visual_state_publisher_period_s = period
@@ -3031,13 +3270,338 @@ class ComposerState:
         with self._visual_state_lock:
             if reason:
                 self._visual_state_next_reason = reason
-        self._visual_state_publisher_wake.set()
+            self._visual_state_wake_generation += 1
+            self._visual_state_cv.notify_all()
+
+    def _notify_visual_state_demand_changed(self) -> None:
+        with self._visual_state_lock:
+            self._visual_state_wake_generation += 1
+            self._visual_state_cv.notify_all()
+
+    def configure_visual_state_publication_sink(
+        self,
+        sink: Callable[[ViewerPublication], bool] | None,
+    ) -> None:
+        with self._visual_state_lock:
+            self._visual_state_publication_sink = sink
+            self._visual_state_wake_generation += 1
+            self._visual_state_cv.notify_all()
+
+    def attach_viewer_demand(
+        self,
+        client_id: str,
+        *,
+        visibility: str,
+        requested_rate_hz: float,
+        layers: list[str] | tuple[str, ...],
+    ) -> ViewerDemandSummary:
+        return self._viewer_demand.attach(
+            client_id,
+            visibility=visibility,
+            requested_rate_hz=requested_rate_hz,
+            layers=layers,
+        )
+
+    def update_viewer_demand(
+        self,
+        client_id: str,
+        *,
+        visibility: str,
+        requested_rate_hz: float,
+        layers: list[str] | tuple[str, ...],
+    ) -> ViewerDemandSummary:
+        return self._viewer_demand.update(
+            client_id,
+            visibility=visibility,
+            requested_rate_hz=requested_rate_hz,
+            layers=layers,
+        )
+
+    def detach_viewer_demand(self, client_id: str) -> ViewerDemandSummary:
+        return self._viewer_demand.detach(client_id)
+
+    def viewer_demand_summary(self) -> ViewerDemandSummary:
+        return self._viewer_demand.summary()
+
+    def viewer_demand_grant(self, client_id: str) -> ViewerLeaseGrant:
+        return self._viewer_demand.grant(client_id)
+
+    def viewer_max_rate_hz(self) -> float:
+        return self._viewer_demand.max_rate_hz
+
+    def request_visual_state_one_shot(self, *, reason: str) -> int:
+        """Request one coalesced build and return its completion generation."""
+        with self._visual_state_lock:
+            # Capacity one: callers that arrive before the pending attempt
+            # completes share its result instead of creating an observer
+            # backlog. A request after completion receives a new generation.
+            if (
+                self._visual_state_one_shot_requested_generation
+                <= self._visual_state_one_shot_completed_generation
+            ):
+                self._visual_state_one_shot_requested_generation += 1
+            generation = self._visual_state_one_shot_requested_generation
+            self._visual_state_next_reason = reason
+            self._visual_state_wake_generation += 1
+            self._visual_state_cv.notify_all()
+            return generation
+
+    def wait_for_visual_state_one_shot(
+        self,
+        *,
+        generation: int,
+        timeout_s: float,
+    ) -> dict[str, Any] | None:
+        """Wait boundedly for the exact coalesced one-shot build attempt."""
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._visual_state_cv:
+            while generation > self._visual_state_one_shot_completed_generation:
+                if self._visual_state_publisher_stop.is_set():
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return None
+                self._visual_state_cv.wait(remaining)
+            result = self._visual_state_one_shot_results.get(generation)
+            return dict(result) if result is not None else None
+
+    def wait_for_visual_state_sequence(
+        self,
+        *,
+        after_sequence: int | None,
+        timeout_s: float,
+    ) -> tuple[Any | None, dict[str, Any]]:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._visual_state_cv:
+            while True:
+                snapshot = self._visual_state_snapshot
+                sequence = getattr(snapshot, "sequence_number", None)
+                if snapshot is not None and (
+                    after_sequence is None or sequence != after_sequence
+                ):
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                self._visual_state_cv.wait(remaining)
+        return self.visual_state_snapshot()
+
+    def build_visual_state_in_worker(
+        self,
+        payload: dict[str, Any],
+        *,
+        input_signature: tuple[Any, ...],
+        sample_duration_ms: float,
+        sample_stage_durations_ms: dict[str, float] | None = None,
+    ) -> ViewerSnapshotBuild:
+        return self._viewer_worker.build(
+            payload,
+            input_signature=input_signature,
+            sample_duration_ms=sample_duration_ms,
+            sample_stage_durations_ms=sample_stage_durations_ms,
+        )
+
+    def compute_visual_fk_preview_in_worker(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        return self._viewer_worker.compute_visual_fk_preview(payload)
+
+    def viewer_source_revisions(self) -> tuple[int, int, int, int, int]:
+        """Return cheap observer generations without nesting owner locks."""
+        with self._runtime_generation_lock:
+            program_generation = self._program_session_generation
+            deployment_generation = self._deployment_session_generation
+        pose_source_revision = self.pose_source_observer_revision()
+        with self._visual_scene_objects_lock:
+            scene_objects_revision = self._visual_scene_objects_revision
+        viewer_revision = self.scene_viewer_revision()
+        return (
+            program_generation,
+            deployment_generation,
+            pose_source_revision,
+            scene_objects_revision,
+            viewer_revision,
+        )
+
+    def resolve_viewer_model_key(
+        self,
+        *,
+        generation: tuple[int, int],
+        resolver: Callable[[], str | None],
+        revalidate_after_s: float = 1.0,
+    ) -> str | None:
+        """Resolve model identity without repeating observer filesystem work.
+
+        Program/deployment generation changes invalidate immediately. A short
+        bounded revalidation interval preserves development-time discovery of
+        an in-place URDF or mesh edit without paying deployment/RMA resolution
+        and file metadata costs on every active-viewer probe.
+        """
+
+        now_ns = time.monotonic_ns()
+        interval_s = max(0.0, float(revalidate_after_s))
+        with self._visual_state_lock:
+            if (
+                interval_s > 0.0
+                and self._visual_state_model_key_generation == generation
+                and now_ns < self._visual_state_model_key_revalidate_ns
+            ):
+                return self._visual_state_model_key
+        value = resolver()
+        interval_ns = int(interval_s * 1e9)
+        with self._visual_state_lock:
+            self._visual_state_model_key_generation = generation
+            self._visual_state_model_key = value
+            self._visual_state_model_key_revalidate_ns = now_ns + interval_ns
+        return value
+
+    def resolve_viewer_static_input(
+        self,
+        *,
+        key: tuple[Any, ...],
+        resolver: Callable[[], Any],
+    ) -> Any:
+        """Return revision-fenced immutable topology input for the worker.
+
+        The value is shared read-only in Composer and copied by the bounded IPC
+        transport. Object/model/viewer revisions in ``key`` are the sole
+        invalidation authority; timestamp-only source updates cannot rebuild
+        topology.
+        """
+
+        with self._visual_state_lock:
+            if self._visual_state_static_input_key == key:
+                return self._visual_state_static_input
+        value = resolver()
+        with self._visual_state_lock:
+            self._visual_state_static_input_key = key
+            self._visual_state_static_input = value
+        return value
+
+    def visual_input_requires_build(self, signature: tuple[Any, ...]) -> bool:
+        """Check the last successfully published immutable input generation."""
+        with self._visual_state_lock:
+            changed = signature != self._visual_state_last_input_signature
+            if not changed:
+                self._visual_state_builds_suppressed_unchanged += 1
+            return changed
+
+    def commit_visual_input_signature(self, signature: tuple[Any, ...]) -> None:
+        """Commit only after FK, shaping, encoding, and publication succeed."""
+        with self._visual_state_lock:
+            self._visual_state_last_input_signature = signature
+
+    def last_viewer_publication(self) -> ViewerPublication | None:
+        with self._visual_state_lock:
+            return self._visual_state_last_publication
+
+    def viewer_data_plane_status(self) -> dict[str, Any]:
+        demand = self._viewer_demand.summary()
+        worker_status = self._viewer_worker.status()
+        with self._visual_state_lock:
+            publication = self._visual_state_last_publication
+            publisher_running = self._visual_state_publisher_running
+            producer_error = self._visual_state_last_error
+            worker_alive = bool(worker_status.get("alive"))
+            producer_health_reason = None
+            if not publisher_running:
+                producer_health_reason = "publisher_not_running"
+            elif producer_error:
+                producer_health_reason = str(producer_error)
+            elif demand.active and publication is not None and not worker_alive:
+                producer_health_reason = "worker_not_running"
+            last_publication_age_ms = (
+                max(
+                    0.0,
+                    (time.monotonic_ns() - self._visual_state_timestamp_ns)
+                    / 1_000_000.0,
+                )
+                if publication is not None and self._visual_state_timestamp_ns > 0
+                else None
+            )
+            return {
+                "schema_version": "manyforge.viewer.data_plane_status.v1",
+                "producer_epoch": (
+                    publication.producer_epoch
+                    if publication is not None
+                    else worker_status.get("worker_epoch")
+                ),
+                "publisher_running": publisher_running,
+                "producer_healthy": producer_health_reason is None,
+                "producer_health_reason": producer_health_reason,
+                "producer_error_detail": self._visual_state_last_error_detail,
+                "last_publication_age_ms": last_publication_age_ms,
+                "client_count": demand.client_count,
+                "active_client_count": demand.active_client_count,
+                "requested_rate_hz": demand.requested_rate_hz,
+                "layers": sorted(demand.layers),
+                "lease_revision": demand.lease_revision,
+                "builds_started": self._visual_state_builds_started,
+                "builds_completed": self._visual_state_builds_completed,
+                "build_failures": self._visual_state_build_failures,
+                "builds_suppressed_no_demand": (
+                    self._visual_state_builds_suppressed_no_demand
+                ),
+                "builds_suppressed_unchanged": (
+                    self._visual_state_builds_suppressed_unchanged
+                ),
+                "one_shot_requested_generation": (
+                    self._visual_state_one_shot_requested_generation
+                ),
+                "one_shot_completed_generation": (
+                    self._visual_state_one_shot_completed_generation
+                ),
+                "publication_sink_drops": self._visual_state_publications_dropped,
+                "last_stage_durations_ms": dict(self._visual_state_stage_metrics),
+                "manifest_revision": (
+                    publication.manifest_revision if publication is not None else None
+                ),
+                "frame_sequence": (
+                    publication.frame_sequence if publication is not None else None
+                ),
+                "render_revision": (
+                    publication.frame.get("render_revision")
+                    if publication is not None
+                    else None
+                ),
+                "encoded_bytes": (
+                    publication.encoded_bytes if publication is not None else None
+                ),
+                "encode_duration_ms": (
+                    publication.encode_duration_ms if publication is not None else None
+                ),
+                "worker": worker_status,
+            }
 
     def stop_visual_state_publisher(self, *, timeout_s: float = 1.0) -> None:
         self._visual_state_publisher_stop.set()
-        self._visual_state_publisher_wake.set()
         with self._visual_state_lock:
             thread = self._visual_state_publisher_thread
+            if (
+                self._visual_state_one_shot_requested_generation
+                > self._visual_state_one_shot_completed_generation
+            ):
+                stopped_result = {
+                    "success": False,
+                    "error": "visual_state_publisher_stopped",
+                    "reason": "publisher_stop",
+                }
+                for generation in range(
+                    self._visual_state_one_shot_completed_generation + 1,
+                    self._visual_state_one_shot_requested_generation + 1,
+                ):
+                    self._visual_state_one_shot_results[generation] = dict(
+                        stopped_result
+                    )
+                self._visual_state_one_shot_completed_generation = (
+                    self._visual_state_one_shot_requested_generation
+                )
+            self._visual_state_wake_generation += 1
+            self._visual_state_cv.notify_all()
+        # Retiring the NRT process makes any in-flight bounded worker wait fail
+        # promptly; no control or shutdown path waits for a wedged visual build.
+        self._viewer_worker.stop()
         if (
             thread is not None
             and thread.is_alive()
@@ -3053,17 +3617,77 @@ class ComposerState:
                 self._visual_state_publisher_running = False
 
     def _visual_state_publisher_loop(self) -> None:
+        observed_wake_generation = -1
+        last_demand_build_ns: int | None = None
         while not self._visual_state_publisher_stop.is_set():
+            demand = self._viewer_demand.summary()
+            now_ns = time.monotonic_ns()
             with self._visual_state_lock:
                 builder = self._visual_state_publisher_builder
-                period_s = self._visual_state_publisher_period_s
-                reason = self._visual_state_next_reason or "periodic"
-                self._visual_state_next_reason = ""
-            if builder is not None:
-                result = self.publish_visual_state_snapshot_sync(
-                    builder,
-                    reason=reason,
+                configured_period_s = self._visual_state_publisher_period_s
+                one_shot_generation = (
+                    self._visual_state_one_shot_requested_generation
+                    if self._visual_state_one_shot_requested_generation
+                    > self._visual_state_one_shot_completed_generation
+                    else None
                 )
+                one_shot = one_shot_generation is not None
+                current_wake_generation = self._visual_state_wake_generation
+                period_s = (
+                    viewer_effective_period_s(
+                        fastest_period_s=configured_period_s,
+                        requested_rate_hz=demand.requested_rate_hz,
+                    )
+                    if demand.active and demand.requested_rate_hz > 0.0
+                    else None
+                )
+                if not demand.active:
+                    last_demand_build_ns = None
+                demand_build_due = bool(
+                    period_s is not None
+                    and (
+                        last_demand_build_ns is None
+                        or now_ns - last_demand_build_ns
+                        >= int(period_s * 1e9)
+                    )
+                )
+                should_build = builder is not None and (
+                    one_shot or demand_build_due
+                )
+                reason = ""
+                if should_build:
+                    reason = self._visual_state_next_reason or (
+                        "viewer_demand" if demand.active else "one_shot"
+                    )
+                    self._visual_state_next_reason = ""
+                if builder is not None and not demand.active and not one_shot:
+                    self._visual_state_builds_suppressed_no_demand += 1
+            if builder is not None:
+                result = (
+                    self.publish_visual_state_snapshot_sync(builder, reason=reason)
+                    if should_build
+                    else None
+                )
+            else:
+                result = None
+            if result is not None and one_shot_generation is not None:
+                with self._visual_state_cv:
+                    previous_completed = self._visual_state_one_shot_completed_generation
+                    for generation in range(
+                        previous_completed + 1,
+                        one_shot_generation + 1,
+                    ):
+                        self._visual_state_one_shot_results[generation] = dict(result)
+                    self._visual_state_one_shot_completed_generation = max(
+                        previous_completed,
+                        one_shot_generation,
+                    )
+                    # Results are synchronization evidence, not an archive.
+                    # Keep only a small tail for waiters delayed by scheduling.
+                    for generation in sorted(self._visual_state_one_shot_results)[:-8]:
+                        self._visual_state_one_shot_results.pop(generation, None)
+                    self._visual_state_cv.notify_all()
+            if result is not None:
                 if not result.get("success", False):
                     logger.debug(
                         "visual-state publisher failed: %s",
@@ -3074,7 +3698,7 @@ class ComposerState:
                             "duration_ms": result.get("duration_ms"),
                         },
                     )
-                else:
+                elif result.get("published", True):
                     duration_ms = float(result.get("duration_ms") or 0.0)
                     logger.debug(
                         "visual-state snapshot published: reason=%s sequence=%s duration_ms=%.1f",
@@ -3102,14 +3726,94 @@ class ComposerState:
                                 "sequence_number": result.get("sequence_number"),
                             },
                         )
-            self._visual_state_publisher_wake.wait(period_s)
-            self._visual_state_publisher_wake.clear()
+            if should_build and demand.active:
+                # Dirty notifications are hints, not permission to exceed the
+                # granted viewer rate. Anchor the next admission after the
+                # completed attempt so slow work cannot trigger catch-up bursts.
+                last_demand_build_ns = time.monotonic_ns()
+            now_ns = time.monotonic_ns()
+            deadline_timeout_s = None
+            if demand.next_deadline_ns is not None:
+                deadline_timeout_s = max(
+                    0.0,
+                    (demand.next_deadline_ns - now_ns) / 1e9,
+                )
+            wait_timeout_s = None
+            if period_s is not None:
+                wait_timeout_s = (
+                    period_s
+                    if last_demand_build_ns is None
+                    else max(
+                        0.0,
+                        (
+                            last_demand_build_ns
+                            + int(period_s * 1e9)
+                            - now_ns
+                        )
+                        / 1e9,
+                    )
+                )
+            if deadline_timeout_s is not None:
+                wait_timeout_s = (
+                    deadline_timeout_s
+                    if wait_timeout_s is None
+                    else min(wait_timeout_s, deadline_timeout_s)
+                )
+            observed_wake_generation = current_wake_generation
+            with self._visual_state_cv:
+                self._visual_state_cv.wait_for(
+                    lambda: (
+                        self._visual_state_publisher_stop.is_set()
+                        or self._visual_state_wake_generation
+                        != observed_wake_generation
+                    ),
+                    timeout=wait_timeout_s,
+                )
         with self._visual_state_lock:
             self._visual_state_publisher_running = False
 
     # Viewer-state accessors: frame + object-frame visibility + gizmo size.
     # These are state-owned so the native viewer and observer routes share one
     # source of truth.
+
+    def _install_program_viewer(self, viewer: ProgramViewer | None) -> None:
+        """Replace presentation state from one validated program artifact."""
+
+        frame_visibility = viewer.frame_visibility if viewer is not None else {}
+        object_visibility = (
+            viewer.object_frame_visibility if viewer is not None else {}
+        )
+        with self._scene_viewer_lock:
+            self._hidden_frames = {
+                name for name, visible in frame_visibility.items() if not visible
+            }
+            self._explicit_visible_frames = {
+                name for name, visible in frame_visibility.items() if visible
+            }
+            self._visible_object_frames = {
+                object_id
+                for object_id, visible in object_visibility.items()
+                if visible
+            }
+            self._frame_gizmo_size_m = (
+                viewer.frame_gizmo_size_m if viewer is not None else 0.1
+            )
+            self._object_axes_gizmo_size_m = (
+                viewer.object_axes_gizmo_size_m if viewer is not None else 0.1
+            )
+            self._scene_viewer_revision += 1
+        self.request_visual_state_publish(reason="program_viewer_installed")
+
+    def apply_program_viewer(self, viewer: ProgramViewer | None) -> None:
+        """Apply presentation-only program state without rebuilding runtime."""
+
+        with self._program_edit_lock:
+            if self.program is None:
+                raise RuntimeError("No program loaded")
+            self.program.viewer = copy.deepcopy(viewer)
+            if self._effective_program is not None:
+                self._effective_program.viewer = copy.deepcopy(viewer)
+            self._install_program_viewer(viewer)
 
     def get_frame_visibility(self, frame_name: str, default: bool = True) -> bool:
         with self._scene_viewer_lock:
@@ -3120,24 +3824,44 @@ class ComposerState:
             return default
 
     def set_frame_visibility(self, frame_name: str, visible: bool) -> None:
+        changed = False
         with self._scene_viewer_lock:
             if visible:
+                changed = (
+                    frame_name in self._hidden_frames
+                    or frame_name not in self._explicit_visible_frames
+                )
                 self._hidden_frames.discard(frame_name)
                 self._explicit_visible_frames.add(frame_name)
             else:
+                changed = (
+                    frame_name in self._explicit_visible_frames
+                    or frame_name not in self._hidden_frames
+                )
                 self._explicit_visible_frames.discard(frame_name)
                 self._hidden_frames.add(frame_name)
+            if changed:
+                self._scene_viewer_revision += 1
+        if changed:
+            self.request_visual_state_publish(reason="frame_visibility_changed")
 
     def get_object_frame_visibility(self, object_id: str) -> bool:
         with self._scene_viewer_lock:
             return object_id in self._visible_object_frames
 
     def set_object_frame_visibility(self, object_id: str, visible: bool) -> None:
+        changed = False
         with self._scene_viewer_lock:
             if visible:
+                changed = object_id not in self._visible_object_frames
                 self._visible_object_frames.add(object_id)
             else:
+                changed = object_id in self._visible_object_frames
                 self._visible_object_frames.discard(object_id)
+            if changed:
+                self._scene_viewer_revision += 1
+        if changed:
+            self.request_visual_state_publish(reason="object_frame_visibility_changed")
 
     def get_frame_gizmo_size(self) -> float:
         with self._scene_viewer_lock:
@@ -3147,8 +3871,14 @@ class ComposerState:
         size = float(axes_length_m)
         if size <= 0:
             raise ValueError("frame gizmo size must be positive")
+        changed = False
         with self._scene_viewer_lock:
-            self._frame_gizmo_size_m = size
+            if self._frame_gizmo_size_m != size:
+                self._frame_gizmo_size_m = size
+                self._scene_viewer_revision += 1
+                changed = True
+        if changed:
+            self.request_visual_state_publish(reason="frame_gizmo_size_changed")
 
     def get_object_axes_gizmo_size(self) -> float:
         with self._scene_viewer_lock:
@@ -3158,8 +3888,18 @@ class ComposerState:
         size = float(axes_length_m)
         if size <= 0:
             raise ValueError("object axes gizmo size must be positive")
+        changed = False
         with self._scene_viewer_lock:
-            self._object_axes_gizmo_size_m = size
+            if self._object_axes_gizmo_size_m != size:
+                self._object_axes_gizmo_size_m = size
+                self._scene_viewer_revision += 1
+                changed = True
+        if changed:
+            self.request_visual_state_publish(reason="object_gizmo_size_changed")
+
+    def scene_viewer_revision(self) -> int:
+        with self._scene_viewer_lock:
+            return self._scene_viewer_revision
 
     def _resolve_scene_snapshot_provider(
         self,
@@ -3597,17 +4337,13 @@ class ComposerState:
                     "materialize (promote) or clear them before changing the program, "
                     "or pass force_discard_overrides=True to discard"
                 )
-        # Frame visibility overrides are scoped to a (program, deployment)
-        # pair: switching to a different robot can reuse link names with
-        # entirely different semantics, so stale toggles must not carry
-        # over.
-        with self._scene_viewer_lock:
-            self._hidden_frames.clear()
-            self._explicit_visible_frames.clear()
-            self._visible_object_frames.clear()
         self.clear_visual_scene_objects_snapshot()
         self.clear_visual_state_snapshot()
         self._rebuild_runtime(program, deployment, effective_program=program)
+        # Publish presentation only after the candidate runtime has completed
+        # its transactional cutover. A rejected runtime apply must leave both
+        # runtime authority and the applied viewer projection unchanged.
+        self._install_program_viewer(program.viewer)
 
     def load_program(
         self,
@@ -3756,10 +4492,7 @@ class ComposerState:
             self._program_session_generation += 1
             self._deployment_session_generation += 1
         self._clear_published_scene_snapshots()
-        with self._scene_viewer_lock:
-            self._hidden_frames.clear()
-            self._explicit_visible_frames.clear()
-            self._visible_object_frames.clear()
+        self._install_program_viewer(self.program.viewer)
         self.clear_pose_source_snapshots()
         self.clear_visual_scene_objects_snapshot()
         self.clear_visual_state_snapshot()
@@ -3807,6 +4540,88 @@ class ComposerState:
         record["receivedAtNs"] = time.monotonic_ns()
         with self._external_runtime_status_lock:
             self._external_runtime_statuses[provider] = record
+            self._external_runtime_status_revision += 1
+
+    def heartbeat_revision(self) -> tuple[Any, ...]:
+        """Cheap material-change token; never calls a backend observer API."""
+        with self._runtime_generation_lock:
+            runtime_generations = (
+                self._program_session_generation,
+                self._deployment_session_generation,
+            )
+        with self._external_runtime_status_lock:
+            external_revision = self._external_runtime_status_revision
+        with self._pose_source_apply_lock:
+            pose_apply_generation = self._pose_source_apply_generation
+        recorder_revision = self.event_recorder.heartbeat_revision()
+        cycle_state = self.cycle_manager.state.value if self.cycle_manager else "none"
+        pipeline_revision: tuple[int, int, int] = (0, 0, 0)
+        if self.cycle_manager is not None:
+            try:
+                pipeline = self.cycle_manager.kernel_event_pipeline_status()
+                pipeline_revision = (
+                    int(pipeline.get("collector_dropped_total") or 0),
+                    int(pipeline.get("manager_dropped_total") or 0),
+                    int(pipeline.get("last_sequence_seen") or 0),
+                )
+            except Exception:
+                pipeline_revision = (-1, -1, -1)
+        return (
+            *runtime_generations,
+            external_revision,
+            pose_apply_generation,
+            recorder_revision,
+            cycle_state,
+            pipeline_revision,
+        )
+
+    def cached_heartbeat_sample(
+        self,
+        builder: Callable[[], dict[str, Any]],
+        *,
+        revision: tuple[Any, ...],
+        max_age_s: float = 0.5,
+    ) -> dict[str, Any]:
+        """Return one immutable heartbeat sample shared by all projections."""
+        max_age_ns = max(1, int(float(max_age_s) * 1e9))
+
+        def current() -> dict[str, Any] | None:
+            now_ns = time.monotonic_ns()
+            with self._heartbeat_cache_lock:
+                payload = self._heartbeat_cache_payload
+                if (
+                    payload is not None
+                    and revision == self._heartbeat_cache_revision
+                    and now_ns - self._heartbeat_cache_built_ns <= max_age_ns
+                ):
+                    self._heartbeat_cache_hits += 1
+                    return payload
+            return None
+
+        cached = current()
+        if cached is not None:
+            return cached
+        # Single-flight without holding the cache leaf lock while traversing
+        # kernel, recorder, route-executor, and trace-storage owners.
+        with self._heartbeat_build_lock:
+            cached = current()
+            if cached is not None:
+                return cached
+            payload = builder()
+            with self._heartbeat_cache_lock:
+                self._heartbeat_cache_payload = payload
+                self._heartbeat_cache_built_ns = time.monotonic_ns()
+                self._heartbeat_cache_revision = revision
+                self._heartbeat_cache_misses += 1
+            return payload
+
+    def heartbeat_cache_status(self) -> dict[str, Any]:
+        with self._heartbeat_cache_lock:
+            return {
+                "hits": self._heartbeat_cache_hits,
+                "misses": self._heartbeat_cache_misses,
+                "sample_timestamp_ns": self._heartbeat_cache_built_ns,
+            }
 
     def update_pose_source_snapshot(
         self,
@@ -3829,6 +4644,7 @@ class ComposerState:
         record["received_at_ns"] = time.monotonic_ns()
         with self._pose_source_lock:
             self._pose_source_snapshots[source] = record
+            self._pose_source_observer_revision += 1
         self._record_pose_source_snapshot_metric(source, record)
         self._evaluate_pose_source_grasp_integrity(source, record)
 
@@ -4669,14 +5485,30 @@ class ComposerState:
 
     def pose_source_snapshots(self) -> dict[str, dict[str, Any]]:
         """Return a defensive copy of latest pose-source snapshots."""
+        snapshots, _revision = self.pose_source_snapshots_with_revision()
+        return snapshots
+
+    def pose_source_snapshots_with_revision(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], int]:
+        """Capture the latest source map and its generation atomically."""
         with self._pose_source_lock:
-            return copy.deepcopy(self._pose_source_snapshots)
+            return (
+                copy.deepcopy(self._pose_source_snapshots),
+                self._pose_source_observer_revision,
+            )
+
+    def pose_source_observer_revision(self) -> int:
+        """Return the monotonic revision of observer-visible source samples."""
+        with self._pose_source_lock:
+            return self._pose_source_observer_revision
 
     def clear_pose_source_snapshots(self) -> None:
         """Drop observed source state when the runtime scene changes."""
         self.invalidate_pose_source_applies(reason="clear_pose_source_snapshots")
         with self._pose_source_lock:
             self._pose_source_snapshots.clear()
+            self._pose_source_observer_revision += 1
         with self._pose_source_drift_lock:
             self._pose_source_drift_baselines.clear()
             self._pose_source_drift_states.clear()
@@ -4723,6 +5555,7 @@ class ComposerState:
                 dropped = pending_dropped + in_flight_dropped
                 self._pose_source_apply_pending.clear()
                 self._pose_source_apply_signatures.clear()
+                self._pose_source_ingest_apply_state.clear()
                 self._increment_pose_source_apply_metric_locked(
                     "stale_generation_dropped",
                     amount=pending_dropped,
@@ -4811,6 +5644,50 @@ class ComposerState:
                         source_id=source_id,
                         object_id=object_id,
                     )
+
+    def record_pose_source_ingest_apply_decision(
+        self,
+        *,
+        source_id: str,
+        object_id: str,
+        policy: str,
+        rejection_reason: str | None,
+    ) -> None:
+        """Account high-rate filtering and emit evidence only on transitions."""
+        key = (source_id, object_id, policy)
+        transition: tuple[str | None, str | None] | None = None
+        with self._pose_source_apply_lock:
+            previous = self._pose_source_ingest_apply_state.get(key)
+            if rejection_reason is None:
+                if previous is not None:
+                    self._pose_source_ingest_apply_state.pop(key, None)
+                    transition = (previous, None)
+            else:
+                self._increment_pose_source_apply_metric_locked(
+                    "ingest_apply_suppressed",
+                    source_id=source_id,
+                    object_id=object_id,
+                )
+                self._increment_pose_source_apply_metric_locked(
+                    f"ingest_{rejection_reason}",
+                    source_id=source_id,
+                    object_id=object_id,
+                )
+                if previous != rejection_reason:
+                    self._pose_source_ingest_apply_state[key] = rejection_reason
+                    transition = (previous, rejection_reason)
+        if transition is not None:
+            self.event_recorder.record_pose_source_event(
+                "ingest_apply_state_changed",
+                details={
+                    "source_id": source_id,
+                    "object_id": object_id,
+                    "policy": policy,
+                    "previous_rejection_reason": transition[0],
+                    "rejection_reason": transition[1],
+                    "eligible": rejection_reason is None,
+                },
+            )
 
     @staticmethod
     def _pose_source_scene_request_signatures(

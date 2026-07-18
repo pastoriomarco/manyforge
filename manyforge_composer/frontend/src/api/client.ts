@@ -257,6 +257,7 @@ export const api = {
       parameters?: ProgramInfo['parameters'],
       blackboard?: ProgramBlackboard,
       compatibility?: ProgramCompatibility | null,
+      viewer?: ProgramInfo['viewer'],
     ) =>
       request<unknown>('POST', '/api/program/save', {
         path,
@@ -265,6 +266,7 @@ export const api = {
         parameters,
         blackboard,
         compatibility,
+        viewer,
       }),
   },
   nodes: {
@@ -295,6 +297,7 @@ export const api = {
       programParameters?: ProgramParameter[];
       blackboard?: ProgramBlackboard;
       compatibility?: ProgramCompatibility | null;
+      viewer?: ProgramInfo['viewer'];
       forceDiscardOverrides?: boolean;
     }) =>
       request<ApplySessionResponse>('POST', '/api/session/apply', payload),

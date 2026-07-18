@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { api } from '../api/client';
 import { useCatalogStore } from './catalogStore';
 import { useDeploymentStore } from './deploymentStore';
-import { useSceneStateStore } from './sceneStateStore';
+import { getAuthoritativeViewerState } from './sceneStateStore';
 import { useViewerSelectionStore } from './viewerSelectionStore';
 import type {
   CatalogParameter,
@@ -12,6 +12,7 @@ import type {
   ProgramSceneResource,
   ProgramBlackboard,
   ProgramCompatibility,
+  ProgramViewerSettings,
   BlackboardNamespace,
   BlackboardKey,
   RuntimeOverrideStatus,
@@ -53,6 +54,9 @@ interface ProgramStore {
   programCompatibility: ProgramCompatibility | null;
   appliedProgramCompatibility: ProgramCompatibility | null;
   savedProgramCompatibility: ProgramCompatibility | null;
+  viewerSettings: ProgramViewerSettings | null;
+  appliedViewerSettings: ProgramViewerSettings | null;
+  savedViewerSettings: ProgramViewerSettings | null;
   sceneResources: ProgramSceneResource[];
   appliedSceneResources: ProgramSceneResource[];
   savedSceneResources: ProgramSceneResource[];
@@ -101,6 +105,10 @@ interface ProgramStore {
   deleteProgramParameter: (name: string) => void;
   setSceneResources: (sceneResources: ProgramSceneResource[]) => void;
   setProgramCompatibility: (compatibility: ProgramCompatibility | null) => void;
+  setViewerFrameVisibility: (frameName: string, visible: boolean) => void;
+  setViewerFrameGizmoSize: (sizeM: number) => void;
+  setViewerObjectFrameVisibility: (objectId: string, visible: boolean) => void;
+  setViewerObjectAxesGizmoSize: (sizeM: number) => void;
   updateBlackboardNamespace: (id: string, patch: Partial<BlackboardNamespace>) => void;
   addBlackboardNamespace: (namespace: BlackboardNamespace) => void;
   deleteBlackboardNamespace: (id: string) => void;
@@ -139,6 +147,25 @@ function cloneProgramCompatibility(
   compatibility?: ProgramCompatibility | null,
 ): ProgramCompatibility | null {
   return compatibility == null ? null : structuredClone(compatibility);
+}
+
+const DEFAULT_VIEWER_SETTINGS: ProgramViewerSettings = {
+  frameVisibility: {},
+  frameGizmoSizeM: 0.1,
+  objectFrameVisibility: {},
+  objectAxesGizmoSizeM: 0.1,
+};
+
+function cloneViewerSettings(
+  viewer?: ProgramViewerSettings | null,
+): ProgramViewerSettings | null {
+  return viewer == null ? null : structuredClone(viewer);
+}
+
+function editableViewerSettings(
+  viewer: ProgramViewerSettings | null,
+): ProgramViewerSettings {
+  return structuredClone(viewer ?? DEFAULT_VIEWER_SETTINGS);
 }
 
 function defaultEnumValue(
@@ -357,7 +384,7 @@ function buildPickPlanSubtreeInsertion(
   const program = useProgramStore.getState();
   const deployment = useDeploymentStore.getState().deployment;
   const selectedObjectId = useViewerSelectionStore.getState().selectedId;
-  const scene = useSceneStateStore.getState().scene;
+  const scene = getAuthoritativeViewerState()?.scene ?? null;
   const catalog = useCatalogStore.getState().entries;
 
   const missingCatalogIds = PICK_PLAN_NODE_IDS.filter(
@@ -934,6 +961,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   programCompatibility: null,
   appliedProgramCompatibility: null,
   savedProgramCompatibility: null,
+  viewerSettings: null,
+  appliedViewerSettings: null,
+  savedViewerSettings: null,
   sceneResources: [],
   appliedSceneResources: [],
   savedSceneResources: [],
@@ -967,6 +997,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
         programCompatibility: cloneProgramCompatibility(info.compatibility),
         appliedProgramCompatibility: cloneProgramCompatibility(info.compatibility),
         savedProgramCompatibility: cloneProgramCompatibility(info.compatibility),
+        viewerSettings: cloneViewerSettings(info.viewer),
+        appliedViewerSettings: cloneViewerSettings(info.viewer),
+        savedViewerSettings: cloneViewerSettings(info.viewer),
         blackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
         appliedBlackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
         savedBlackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
@@ -1001,6 +1034,11 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
         appliedProgramCompatibility: cloneProgramCompatibility(info.compatibility),
         savedProgramCompatibility: cloneProgramCompatibility(
           savedInfo ? savedInfo.compatibility : info.compatibility,
+        ),
+        viewerSettings: cloneViewerSettings(info.viewer),
+        appliedViewerSettings: cloneViewerSettings(info.viewer),
+        savedViewerSettings: cloneViewerSettings(
+          savedInfo ? savedInfo.viewer : info.viewer,
         ),
         blackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
         appliedBlackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
@@ -1055,6 +1093,11 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
           savedProgramInfo
             ? savedProgramInfo.compatibility
             : programInfo.compatibility,
+        ),
+        viewerSettings: cloneViewerSettings(programInfo.viewer),
+        appliedViewerSettings: cloneViewerSettings(programInfo.viewer),
+        savedViewerSettings: cloneViewerSettings(
+          savedProgramInfo ? savedProgramInfo.viewer : programInfo.viewer,
         ),
         blackboardNamespaces: cloneBlackboard(programInfo.blackboard).namespaces,
         appliedBlackboardNamespaces: cloneBlackboard(programInfo.blackboard).namespaces,
@@ -1354,6 +1397,72 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
     }));
   },
 
+  setViewerFrameVisibility: (frameName, visible) => {
+    const normalizedName = frameName.trim();
+    if (!normalizedName) return;
+    set((state) => {
+      const viewerSettings = editableViewerSettings(state.viewerSettings);
+      viewerSettings.frameVisibility[normalizedName] = visible;
+      return {
+        viewerSettings,
+        programInfo: state.programInfo
+          ? { ...state.programInfo, viewer: cloneViewerSettings(viewerSettings) }
+          : state.programInfo,
+        error: null,
+        isDirty: true,
+      };
+    });
+  },
+
+  setViewerFrameGizmoSize: (sizeM) => {
+    if (!Number.isFinite(sizeM) || sizeM <= 0) return;
+    set((state) => {
+      const viewerSettings = editableViewerSettings(state.viewerSettings);
+      viewerSettings.frameGizmoSizeM = sizeM;
+      return {
+        viewerSettings,
+        programInfo: state.programInfo
+          ? { ...state.programInfo, viewer: cloneViewerSettings(viewerSettings) }
+          : state.programInfo,
+        error: null,
+        isDirty: true,
+      };
+    });
+  },
+
+  setViewerObjectFrameVisibility: (objectId, visible) => {
+    const normalizedId = objectId.trim();
+    if (!normalizedId) return;
+    set((state) => {
+      const viewerSettings = editableViewerSettings(state.viewerSettings);
+      viewerSettings.objectFrameVisibility[normalizedId] = visible;
+      return {
+        viewerSettings,
+        programInfo: state.programInfo
+          ? { ...state.programInfo, viewer: cloneViewerSettings(viewerSettings) }
+          : state.programInfo,
+        error: null,
+        isDirty: true,
+      };
+    });
+  },
+
+  setViewerObjectAxesGizmoSize: (sizeM) => {
+    if (!Number.isFinite(sizeM) || sizeM <= 0) return;
+    set((state) => {
+      const viewerSettings = editableViewerSettings(state.viewerSettings);
+      viewerSettings.objectAxesGizmoSizeM = sizeM;
+      return {
+        viewerSettings,
+        programInfo: state.programInfo
+          ? { ...state.programInfo, viewer: cloneViewerSettings(viewerSettings) }
+          : state.programInfo,
+        error: null,
+        isDirty: true,
+      };
+    });
+  },
+
   updateBlackboardNamespace: (id, patch) => {
     set((state) => {
       const blackboardNamespaces = state.blackboardNamespaces.map((namespace) =>
@@ -1527,6 +1636,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       programCompatibility: cloneProgramCompatibility(
         get().appliedProgramCompatibility,
       ),
+      viewerSettings: cloneViewerSettings(get().appliedViewerSettings),
       blackboardNamespaces: structuredClone(get().appliedBlackboardNamespaces),
       blackboardKeys: structuredClone(get().appliedBlackboardKeys),
       selectedNodeId: null,
@@ -1539,6 +1649,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
             compatibility: cloneProgramCompatibility(
               get().appliedProgramCompatibility,
             ),
+            viewer: cloneViewerSettings(get().appliedViewerSettings),
           }
         : null,
     });
@@ -1553,6 +1664,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       appliedProgramCompatibility: cloneProgramCompatibility(
         get().programCompatibility,
       ),
+      appliedViewerSettings: cloneViewerSettings(get().viewerSettings),
       appliedBlackboardNamespaces: structuredClone(get().blackboardNamespaces),
       appliedBlackboardKeys: structuredClone(get().blackboardKeys),
       programInfo: state.programInfo
@@ -1563,6 +1675,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
             parameters: structuredClone(state.programParameters),
             parameterCount: state.programParameters.length,
             compatibility: cloneProgramCompatibility(state.programCompatibility),
+            viewer: cloneViewerSettings(state.viewerSettings),
             blackboard: {
               namespaces: structuredClone(state.blackboardNamespaces),
               keys: structuredClone(state.blackboardKeys),
@@ -1581,6 +1694,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       savedProgramCompatibility: cloneProgramCompatibility(
         get().programCompatibility,
       ),
+      savedViewerSettings: cloneViewerSettings(get().viewerSettings),
       savedBlackboardNamespaces: structuredClone(get().blackboardNamespaces),
       savedBlackboardKeys: structuredClone(get().blackboardKeys),
       isDirty: false,
@@ -1606,10 +1720,18 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
     if (!tree) {
       throw new Error('Draft tree is invalid');
     }
-    const result = await api.program.saveTree(path, tree, get().sceneResources, get().programParameters, {
-      namespaces: get().blackboardNamespaces,
-      keys: get().blackboardKeys,
-    }, get().programCompatibility);
+    const result = await api.program.saveTree(
+      path,
+      tree,
+      get().sceneResources,
+      get().programParameters,
+      {
+        namespaces: get().blackboardNamespaces,
+        keys: get().blackboardKeys,
+      },
+      get().programCompatibility,
+      get().viewerSettings,
+    );
     const savedPath =
       typeof result === 'object' && result !== null && 'path' in result && typeof result.path === 'string'
         ? result.path
@@ -1621,6 +1743,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       savedProgramCompatibility: cloneProgramCompatibility(
         state.programCompatibility,
       ),
+      savedViewerSettings: cloneViewerSettings(state.viewerSettings),
       savedBlackboardNamespaces: structuredClone(state.blackboardNamespaces),
       savedBlackboardKeys: structuredClone(state.blackboardKeys),
       isDirty: false,
@@ -1633,6 +1756,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
             parameters: structuredClone(state.programParameters),
             parameterCount: state.programParameters.length,
             compatibility: cloneProgramCompatibility(state.programCompatibility),
+            viewer: cloneViewerSettings(state.viewerSettings),
             blackboard: {
               namespaces: structuredClone(state.blackboardNamespaces),
               keys: structuredClone(state.blackboardKeys),

@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, useSyncExternalStore } from 'react';
 
 import { api } from '../api/client';
+import { useProgramStore } from '../store/programStore';
 import { useSceneStateStore } from '../store/sceneStateStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
 import type {
@@ -8,6 +9,14 @@ import type {
   SceneFrameState,
   SceneObjectState,
 } from '../types/api';
+import {
+  getAutomaticViewerRateHz,
+  getViewerRatePreferenceHz,
+  getViewerRendererProfile,
+  setViewerRatePreferenceHz,
+  subscribeViewerRendererProfile,
+  VIEWER_RATE_OPTIONS_HZ,
+} from '../utils/viewerPerformance';
 
 /**
  * Viewer controls for the native viewer: frame axis
@@ -16,23 +25,52 @@ import type {
  * overlay panel in the top-left of the viewer area, mutually
  * exclusive with the Robot / Object overlay panels.
  *
- * All state lives backend-side (ComposerState owns it as of Day 4
- * parity work) so this panel just reads from the shared scene-state
- * store and posts updates via the existing /api/scene/* routes.
+ * Applied state is projected by ComposerState, while authoring controls in
+ * this panel and the Scene tab edit one shared ProgramStore draft. That keeps
+ * both surfaces and the canvas in lockstep before Apply/Save.
  */
 interface SceneControlsProps {
   onClose: () => void;
 }
 
 export function SceneControls({ onClose }: SceneControlsProps) {
+  const rendererProfile = useSyncExternalStore(
+    subscribeViewerRendererProfile,
+    getViewerRendererProfile,
+    getViewerRendererProfile,
+  );
+  const ratePreferenceHz = getViewerRatePreferenceHz();
   const frames = useSceneStateStore((s) => s.frames);
-  const objects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
+  const projectedObjects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
+  const viewerSettings = useProgramStore((s) => s.viewerSettings);
+  const effectiveFrames = useMemo(
+    () => (frames?.frames ?? EMPTY_FRAMES).map((frame) => ({
+      ...frame,
+      viewerVisible:
+        viewerSettings?.frameVisibility[frame.name] ?? frame.viewerVisible,
+    })),
+    [frames?.frames, viewerSettings?.frameVisibility],
+  );
+  const objects = useMemo(
+    () => projectedObjects.map((object) => ({
+      ...object,
+      viewer_frame_visible:
+        viewerSettings?.objectFrameVisibility[object.object_id]
+        ?? object.viewer_frame_visible,
+    })),
+    [projectedObjects, viewerSettings?.objectFrameVisibility],
+  );
   const poseSources = useSceneStateStore(
     (s) => s.scene?.pose_sources ?? EMPTY_POSE_SOURCES,
   );
   const objectAxesGizmoSize = useSceneStateStore(
     (s) => s.scene?.object_axes_gizmo_size_m ?? 0.1,
   );
+  const effectiveObjectAxesGizmoSize = viewerSettings?.objectAxesGizmoSizeM
+    ?? objectAxesGizmoSize;
+  const effectiveFrameGizmoSize = viewerSettings?.frameGizmoSizeM
+    ?? frames?.frameGizmoSizeM
+    ?? 0.1;
   const robot = useSceneStateStore((s) => s.scene?.robot ?? null);
   const selectedId = useViewerSelectionStore((s) => s.selectedId);
   const setSelected = useViewerSelectionStore((s) => s.setSelected);
@@ -54,6 +92,28 @@ export function SceneControls({ onClose }: SceneControlsProps) {
           ✕
         </button>
       </div>
+      <label className="flex items-center justify-between gap-2 border-b border-gray-800 bg-gray-900/50 px-2 py-1.5 text-[11px]">
+        <span className="text-gray-400">Viewer rate</span>
+        <select
+          value={ratePreferenceHz ?? 'auto'}
+          onChange={(event) => {
+            const value = event.target.value;
+            setViewerRatePreferenceHz(value === 'auto' ? null : Number(value));
+          }}
+          className="rounded border border-gray-700 bg-gray-950 px-1.5 py-0.5 font-mono text-gray-200"
+          title="Requested client frame rate"
+        >
+          <option value="auto">
+            Auto ({getAutomaticViewerRateHz()} Hz)
+          </option>
+          {VIEWER_RATE_OPTIONS_HZ.map((rateHz) => (
+            <option key={rateHz} value={rateHz}>{rateHz} Hz</option>
+          ))}
+        </select>
+        <span className="sr-only">
+          {rendererProfile.software ? 'software renderer' : 'hardware renderer'}
+        </span>
+      </label>
       <div className="flex gap-1 border-b border-gray-800 bg-gray-900/50 px-2 py-1.5">
         <SectionTab id="frames" current={openSection} onClick={setOpenSection}>
           Frames
@@ -71,12 +131,12 @@ export function SceneControls({ onClose }: SceneControlsProps) {
       <div className="flex-1 overflow-y-auto bg-gray-950/50 p-2">
         {openSection === 'frames' && (
           <FramesSection
-            frames={frames?.frames ?? EMPTY_FRAMES}
-            gizmoSize={frames?.frameGizmoSizeM ?? 0.1}
+            frames={effectiveFrames}
+            gizmoSize={effectiveFrameGizmoSize}
           />
         )}
         {openSection === 'objects' && (
-          <ObjectsSection objects={objects} gizmoSize={objectAxesGizmoSize} />
+          <ObjectsSection objects={objects} gizmoSize={effectiveObjectAxesGizmoSize} />
         )}
         {openSection === 'tree' && (
           <RuntimeTree
@@ -133,16 +193,14 @@ function FramesSection({
   frames: SceneFrameState[];
   gizmoSize: number;
 }) {
-  // Local state on the slider so dragging it feels responsive even
-  // while the server-side state hasn't returned the new value yet.
+  // Local state keeps dragging responsive; commit updates the shared program
+  // draft once so the global authoring controls receive one coherent change.
   const [localSize, setLocalSize] = useState<number | null>(null);
   const displaySize = localSize ?? gizmoSize;
 
   function commitSize(value: number): void {
     setLocalSize(null);
-    void api.scene.setFrameGizmoSize(value).catch((err) => {
-      console.warn('gizmo size update failed', err);
-    });
+    useProgramStore.getState().setViewerFrameGizmoSize(value);
   }
 
   return (
@@ -182,9 +240,10 @@ function FrameRow({ frame }: { frame: SceneFrameState }) {
         type="checkbox"
         checked={frame.viewerVisible}
         onChange={(e) => {
-          void api.scene
-            .setFrameVisibility(frame.name, e.target.checked)
-            .catch((err) => console.warn('frame visibility failed', err));
+          useProgramStore.getState().setViewerFrameVisibility(
+            frame.name,
+            e.target.checked,
+          );
         }}
       />
       <span className="flex-1 truncate font-mono">{frame.name}</span>
@@ -212,9 +271,7 @@ function ObjectsSection({
 
   function commitSize(value: number): void {
     setLocalSize(null);
-    void api.scene.setObjectAxesGizmoSize(value).catch((err) => {
-      console.warn('object axes gizmo size update failed', err);
-    });
+    useProgramStore.getState().setViewerObjectAxesGizmoSize(value);
   }
 
   return (
@@ -254,9 +311,10 @@ function ObjectFrameRow({ object }: { object: SceneObjectState }) {
         type="checkbox"
         checked={object.viewer_frame_visible}
         onChange={(e) => {
-          void api.scene
-            .setObjectFrameVisibility(object.object_id, e.target.checked)
-            .catch((err) => console.warn('object frame visibility failed', err));
+          useProgramStore.getState().setViewerObjectFrameVisibility(
+            object.object_id,
+            e.target.checked,
+          );
         }}
       />
       <span className="flex-1 truncate font-mono">{object.object_id}</span>

@@ -278,7 +278,9 @@ Then check these three signals in the browser at
    `universe` (world), `<base_frame>` (robot_base),
    `<gripper.mount_frame>`, `<gripper.attach_frame>`,
    `<gripper.tcp_frame>`, and each `gripper.auxiliary_frames` entry.
-   All structural URDF link frames default off.
+   All structural URDF link frames default off. A program may persist explicit
+   overrides in its optional `viewer.frame_visibility` map; those saved values
+   replace role defaults for the named frames when that program is loaded.
 3. **Scene viewer renders the robot as one connected body.** No
    floating mesh pieces. The home pose should look kinematically
    coherent — base on the ground, joints lined up. If meshes float

@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-07-18 00:37:56 UTC
+  Last regenerated: 2026-07-18 14:53:45 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -119,11 +119,13 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/scene/object-meshes/{asset_hash}.glb` | scene-object-meshes | Get Scene Object Mesh |
 | `POST` | `/api/scene/objects/frame-visibility` | scene | Set Object Frame Visibility |
 | `POST` | `/api/scene/objects/gizmo-size` | scene | Set Object Axes Gizmo Size |
+| `GET` | `/api/scene/pointcloud/status` | scene-pointcloud | Pointcloud Status |
 | `POST` | `/api/scene/pose-sources/apply` | scene | Apply Pose Source Updates |
 | `POST` | `/api/scene/pose-sources/{pose_source_id}/snapshot` | scene | Update Pose Source Snapshot |
 | `POST` | `/api/scene/preview-link-poses` | scene | Preview Link Poses |
 | `POST` | `/api/scene/program-resource/update` | scene | Update Program Scene Resource |
 | `GET` | `/api/scene/snapshot` | scene | Get Scene Snapshot |
+| `GET` | `/api/scene/snapshot/status` | scene-snapshot | Snapshot Status |
 | `POST` | `/api/scene/snapshot/upload/{request_id}` | scene-snapshot | Upload Snapshot |
 | `GET` | `/api/scene/snapshots/{snapshot_id}` | scene | Get Published Scene Snapshot |
 | `GET` | `/api/scene/state` | scene | Get Scene State |
@@ -132,6 +134,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/scene/urdf/meshes/{link_name}/{visual_index}` | scene-urdf | Get Mesh |
 | `GET` | `/api/scene/urdf/models/{model_key}/collision-meshes/{link_name}/{collision_index}` | scene-urdf | Get Model Collision Mesh |
 | `GET` | `/api/scene/urdf/models/{model_key}/meshes/{link_name}/{visual_index}` | scene-urdf | Get Model Mesh |
+| `GET` | `/api/scene/viewer/status` | scene-viewer | Viewer Status |
 | `POST` | `/api/session/apply` | program | Apply Session |
 | `POST` | `/api/simulation/entity-state` | simulation | Set Entity State |
 | `POST` | `/api/simulation/reset` | simulation | Reset Simulation |

@@ -41,7 +41,9 @@ export function TransportControls() {
     setVelocityScale,
   } = useCycleStore();
   const runAuthority = useRobotCommandAuthority({
-    requireFreshScene: true,
+    // Run admission is owned by the backend and kernel. Visual-state freshness
+    // must not keep the viewer producer alive or become a second safety gate.
+    requireFreshScene: false,
   });
   // Subscribe to the shared runtime-status poll loop so the stop-profile
   // inspector + run gate track the backend's advertised stop capability.
