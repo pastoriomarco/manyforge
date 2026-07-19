@@ -39,10 +39,14 @@ alone is not success.
 
 1. Load an immutable Isaac asset release containing the expected full or light
    scene. The Isaac asset repository documents deployment and scene validation.
-2. Start the ManyForge Isaac/ROS lane normally. The UR profile starts the
+2. While simulation is stopped, verify the gripper is already aligned with the
+   wrist. It must not snap or rotate relative to the wrist when Play begins;
+   movement of the complete arm during drive initialization is a separate
+   behavior.
+3. Start the ManyForge Isaac/ROS lane normally. The UR profile starts the
    position-commanded gripper bridge automatically.
-3. Start simulation playback.
-4. Verify readiness before running a program:
+4. Start simulation playback.
+5. Verify readiness before running a program:
 
 ```bash
 docker exec manyforge-isaac-topic-control-1 bash -lc '
@@ -118,6 +122,14 @@ The acceptance test is the complete light-scene pick/place program: the
 gripper must visibly close, the object must leave its support, travel with the
 tool, release at the drop location, and fall after release.
 
+The pre-Play pose correction was requalified on 2026-07-19 with immutable
+release `gripper-preplay-20260719-r2`. The stopped-to-first-step
+wrist-to-gripper relative transform remained within the contract tolerance,
+direct close/open converged all six joints, and multiple normal Composer
+pick/place passes completed. The scene trace independently recorded a
+successful attach, detach at the drop pose, and the released object falling to
+its support. Isaac was returned to the standard `STOPPED` state after testing.
+
 ## Failure Handling
 
 | Symptom | Interpretation | Action |
@@ -127,6 +139,7 @@ tool, release at the drop location, and fall after release.
 | Goal times out while fingers contact an object | Linkage did not reach the full geometric target | Treat as stalled evidence; adjust task/grasp or qualified tolerance, not result semantics |
 | Bridge exits on readiness change | Software defect; severity-changing logging was an earlier cause | Inspect bridge log; do not bypass supervisor readiness |
 | TCP jumps or stays authored/static | Non-rigid USD Xform used as measured source | Restore rigid base entity plus explicit entity-to-TCP transform |
+| Gripper is misplaced before Play or snaps on Play | A consuming scene overrode the strongest reusable robot overlay's `ee_link` pose | Load a qualified immutable release; validate that scenes contain no local `ee_link` transform |
 | Fresh workstation misses gripper geometry | NVIDIA 5.1 asset cannot resolve and is not cached | Restore endpoint access or populate the Isaac resolver cache; readiness must remain false until all six joints exist |
 | Isaac resets with a transient controller warning | Graph reinitialization window | Accept only if readiness recovers and repeated commands pass; otherwise reload/restart Isaac |
 
