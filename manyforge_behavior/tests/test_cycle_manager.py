@@ -1307,6 +1307,33 @@ class TestCycleManagerReset:
         assert manager.error is None
         assert manager._tick_thread is None or not manager._tick_thread.is_alive()
 
+    def test_reset_quiesces_running_intervention_without_false_timeout(self, kernel):
+        """Every tick target must signal the generation reset is waiting on."""
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        runner.load()
+
+        session = manager.execute_intervention(
+            {
+                "id": "timer",
+                "name": "reset_intervention_timer",
+                "params": {"duration_s": 10.0},
+            },
+            session_kind="manual_intervention",
+            authority_source="human",
+            principal_id="human:test-operator",
+            approval_mode="human_approved",
+        )
+        intervention_exit = manager._tick_exit_event
+
+        manager.reset()
+
+        assert session.status == "aborted"
+        assert intervention_exit.is_set()
+        assert manager.state == CycleState.IDLE
+        assert manager.error_code != "tick_thread_quiesce_timeout"
+        assert manager._tick_thread is None or not manager._tick_thread.is_alive()
+
     def test_reset_waits_for_inflight_nrt_tick_before_claiming_idle(self, kernel):
         """A bounded scene/adapter call may outlive 25 ms without being a zombie."""
         runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)

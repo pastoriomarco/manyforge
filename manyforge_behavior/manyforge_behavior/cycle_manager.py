@@ -2150,11 +2150,39 @@ class CycleManager:
         if decorated is not None:
             yield from self._iter_runtime_tree_nodes(decorated)
 
-    def _start_tick_thread(self, target) -> None:
+    def _start_tick_thread(
+        self,
+        target: Callable[[], None],
+        *,
+        name: str = "manyforge_cycle_tick",
+    ) -> None:
         self._tick_stop_event.clear()
-        self._tick_exit_event.clear()
+        # The exit signal belongs to this thread generation. Reusing one Event
+        # lets a retiring generation accidentally release a reset waiting on a
+        # replacement generation (and made intervention targets that forgot to
+        # set the shared Event indistinguishable from a live blocked thread).
+        exit_event = threading.Event()
+        self._tick_exit_event = exit_event
         self._tick_pause_event.set()
-        self._tick_thread = threading.Thread(target=target, daemon=True)
+
+        def run_target() -> None:
+            try:
+                target()
+            finally:
+                current = threading.current_thread()
+                with self._lock:
+                    if self._tick_thread is current:
+                        self._tick_thread = None
+                # Publish quiescence after releasing cycle state ownership. The
+                # captured per-generation Event prevents a later tick thread
+                # from being mistaken for this retiring one.
+                exit_event.set()
+
+        self._tick_thread = threading.Thread(
+            target=run_target,
+            name=name,
+            daemon=True,
+        )
         self._tick_thread.start()
 
     def set_parent_run_id_provider(
@@ -3497,12 +3525,14 @@ class CycleManager:
             )
 
         thread_to_join = None
+        thread_exit_event = None
         with self._lock:
             # Stop tick thread if running
             if self._tick_thread is not None and self._tick_thread.is_alive():
                 self._tick_stop_event.set()
                 self._tick_pause_event.set()
                 thread_to_join = self._tick_thread
+                thread_exit_event = self._tick_exit_event
 
         if thread_to_join is not None:
             tick_join_started = time.monotonic()
@@ -3511,7 +3541,9 @@ class CycleManager:
                 status="started",
                 request_id=request_id,
             )
-            if not self._tick_exit_event.wait(timeout=_TICK_JOIN_DEADLINE_S):
+            if thread_exit_event is None:
+                raise RuntimeError("tick thread exit signal was not initialized")
+            if not thread_exit_event.wait(timeout=_TICK_JOIN_DEADLINE_S):
                 tick_join_duration_s = time.monotonic() - tick_join_started
                 blocked_stack = None
                 if thread_to_join.ident is not None:
@@ -3974,11 +4006,7 @@ class CycleManager:
                 # the remainder of the tick period.
                 self._tick_stop_event.wait(timeout=sleep_time)
 
-        with self._lock:
-            if self._tick_thread is threading.current_thread():
-                self._tick_thread = None
-        self._tick_exit_event.set()
-    
+
     @property
     def intervention(self) -> Optional[InterventionSession]:
         """Current or most recent intervention session, or None."""
@@ -4645,7 +4673,10 @@ class CycleManager:
 
         with self._lock:
             self._tree = tree
-            self._start_tick_thread(lambda: self._intervention_tick_loop(session))
+            self._start_tick_thread(
+                lambda: self._intervention_tick_loop(session),
+                name="manyforge_intervention_tick",
+            )
             self._state = CycleState.DIRECT_CONTROL
         session.record_event("tree_started")
 

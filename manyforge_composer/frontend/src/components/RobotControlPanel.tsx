@@ -256,8 +256,11 @@ export function RobotControlPanel({ onClose }: RobotControlPanelProps) {
   }, [manifest, robot?.group_id]);
 
   return (
-    <div className="pointer-events-auto absolute right-2 top-2 z-20 flex max-h-[calc(100%-5rem)] w-72 flex-col overflow-hidden rounded-md border border-gray-700 bg-gray-900/50 text-xs text-gray-200 shadow-xl">
-      <div className="flex items-center justify-between border-b border-gray-700 bg-gray-800/50 px-2 py-1">
+    <div
+      data-testid="robot-control-panel"
+      className="pointer-events-auto absolute right-2 top-2 z-20 flex min-h-0 max-h-[calc(100%-5rem)] w-72 flex-col overflow-hidden rounded-md border border-gray-700 bg-gray-900/50 text-xs text-gray-200 shadow-xl"
+    >
+      <div className="flex shrink-0 items-center justify-between border-b border-gray-700 bg-gray-800/50 px-2 py-1">
         <div className="text-[11px] font-semibold uppercase tracking-wide text-gray-300">
           Robot Control
         </div>
@@ -270,7 +273,7 @@ export function RobotControlPanel({ onClose }: RobotControlPanelProps) {
           ✕
         </button>
       </div>
-      <div className="flex gap-1 border-b border-gray-800 bg-gray-900/50 px-2 py-1.5">
+      <div className="flex shrink-0 gap-1 border-b border-gray-800 bg-gray-900/50 px-2 py-1.5">
         <ModeTab id="joint" active={robotMode} onClick={setRobotMode}>
           Joint
         </ModeTab>
@@ -364,7 +367,10 @@ function CandidateApprovalBar({ commandGate }: { commandGate: RobotCommandGate }
           : 'text-gray-300';
 
   return (
-    <div className="border-t border-gray-700 bg-gray-800/60 px-2 py-1.5">
+    <div
+      data-testid="robot-control-candidate-footer"
+      className="shrink-0 border-t border-gray-700 bg-gray-800/60 px-2 py-1.5"
+    >
       <div className="mb-1 flex items-center justify-between text-[10px]">
         <span className="uppercase tracking-wide text-gray-400">Candidate</span>
         {status !== null && (
@@ -485,7 +491,7 @@ function JointModeBody({
 
   return (
     <>
-      <div className="flex items-center gap-2 border-b border-gray-800 bg-gray-900/50 px-2 py-1.5">
+      <div className="flex shrink-0 items-center gap-2 border-b border-gray-800 bg-gray-900/50 px-2 py-1.5">
         <StepCapSelect
           label="step (deg)"
           options={ANGULAR_STEP_RAD_OPTIONS}
@@ -504,7 +510,10 @@ function JointModeBody({
           />
         )}
       </div>
-      <div className="flex-1 overflow-y-auto p-2">
+      <div
+        data-testid="robot-control-joint-scroll"
+        className="min-h-0 flex-1 overflow-y-auto p-2"
+      >
         {!commandGate.canCommand && (
           <div className="mb-2 rounded border border-amber-700/60 bg-amber-950/30 px-2 py-1 text-[10px] text-amber-300">
             Direct joint control disabled: {commandGate.reason}
@@ -538,7 +547,7 @@ function JointModeBody({
         <GrippersSection commandGate={commandGate} />
         <PoseEditSnapshotSection mode="joint" commandGate={commandGate} />
       </div>
-      <div className="border-t border-gray-700 bg-gray-800/50 px-2 py-1 text-[10px] text-gray-500">
+      <div className="shrink-0 border-t border-gray-700 bg-gray-800/50 px-2 py-1 text-[10px] text-gray-500">
         Jog · sliders author a draft target only · release does not move the robot · Approve is the only motion path
       </div>
     </>
@@ -712,7 +721,7 @@ function MoveToBody() {
         </SourceChip>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-2">
+      <div className="min-h-0 flex-1 overflow-y-auto p-2">
         {moveTo.source === 'object' && (
           <EntityList
             label="Objects"
@@ -1171,7 +1180,7 @@ function CartesianModeBody({
           disabled={!commandGate.canCommand}
         />
       </div>
-      <div className="flex-1 overflow-y-auto p-2 text-[11px]">
+      <div className="min-h-0 flex-1 overflow-y-auto p-2 text-[11px]">
         {!commandGate.canCommand && (
           <div className="mb-2 rounded border border-amber-700/60 bg-amber-950/30 px-2 py-1 text-[10px] text-amber-300">
             Direct Cartesian control disabled: {commandGate.reason}
