@@ -65,13 +65,60 @@ def _publish_visual_snapshot(state: ComposerState) -> dict:
     )
 
 
+def _make_hermetic_visual_builder_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> ComposerState:
+    """Build a real viewer-worker input without an installed RoboPlan model."""
+    urdf_path = _write_toy_visual_urdf(tmp_path)
+    entry = SimpleNamespace(
+        urdf_path=str(urdf_path),
+        links=tuple(
+            SimpleNamespace(name=name)
+            for name in ("base_link", "link_1", "finger_link")
+        ),
+    )
+    monkeypatch.setattr(routes_urdf, "get_urdf_entry", lambda _state: entry)
+    monkeypatch.setattr(
+        routes_urdf,
+        "active_urdf_model_key",
+        lambda _state: "toy-wire-contract-key",
+    )
+    monkeypatch.setattr(
+        routes_urdf,
+        "visual_link_names_for_fk",
+        lambda _state: ("base_link", "link_1", "finger_link"),
+    )
+
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=MockKernelClient(joint_names=["joint_a"]),
+    )
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(
+            base_frame="base_link",
+            tcp_frame="link_1",
+            base_pose={},
+        ),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+    return state
+
+
 @_REQUIRES_PINOCCHIO_VISUAL_FK
-def test_real_viewer_builder_matches_the_generated_strict_wire_contract() -> None:
-    _client, state, _kernel = make_client()
-    state.load_program(_PROGRAM_PATH, deployment_path=_DEPLOYMENT_PATH)
+def test_real_viewer_builder_matches_the_generated_strict_wire_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = _make_hermetic_visual_builder_state(monkeypatch, tmp_path)
 
     result = _publish_visual_snapshot(state)
-    assert result["success"] is True
+    assert result["success"] is True, result
     publication = state.last_viewer_publication()
     assert publication is not None
 
@@ -90,7 +137,7 @@ def test_real_viewer_builder_matches_the_generated_strict_wire_contract() -> Non
     state.set_frame_visibility(structural_frame.name, True)
     state.set_frame_visibility(semantic_frame.name, False)
     override_result = _publish_visual_snapshot(state)
-    assert override_result["success"] is True
+    assert override_result["success"] is True, override_result
     override_publication = state.last_viewer_publication()
     assert override_publication is not None
     overridden = ViewerManifestV1.model_validate(override_publication.manifest)
@@ -121,9 +168,9 @@ def test_real_viewer_builder_matches_the_generated_strict_wire_contract() -> Non
 @_REQUIRES_PINOCCHIO_VISUAL_FK
 def test_viewer_builder_resolves_static_gripper_metadata_only_for_changed_inputs(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    _client, state, _kernel = make_client()
-    state.load_program(_PROGRAM_PATH, deployment_path=_DEPLOYMENT_PATH)
+    state = _make_hermetic_visual_builder_state(monkeypatch, tmp_path)
 
     real_states = routes_scene._collect_gripper_states
     synthetic_revision = 0
