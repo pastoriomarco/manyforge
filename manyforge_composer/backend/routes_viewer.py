@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import os
 import time
 import uuid
 from typing import Any
@@ -27,6 +29,25 @@ from .viewer_data_plane import BoundedViewerFanout
 
 _DEFAULT_LAYERS = ["canonical", "diagnostics"]
 _VIEWER_CONTROL_MAX_MESSAGE_SIZE = 4096
+
+
+def _qualification_send_delay_s(websocket: WebSocket) -> float:
+    raw = websocket.query_params.get("qualification_send_delay_ms")
+    if raw is None:
+        return 0.0
+    fixtures_enabled = os.getenv(
+        "MANYFORGE_VIEWER_QUALIFICATION_FIXTURES",
+        "",
+    ).strip().lower() in {"1", "on", "true", "yes"}
+    if not fixtures_enabled:
+        raise ValueError("viewer qualification fixtures are disabled")
+    try:
+        delay_ms = float(raw)
+    except ValueError as exc:
+        raise ValueError("qualification send delay is invalid") from exc
+    if not math.isfinite(delay_ms) or delay_ms <= 0.0 or delay_ms >= 2000.0:
+        raise ValueError("qualification send delay must be in (0, 2000) ms")
+    return delay_ms / 1000.0
 
 
 async def _watch_viewer_lease(
@@ -108,9 +129,19 @@ def create_viewer_router(
             await websocket.close(code=4401, reason="Unauthorized")
             return
 
+        try:
+            qualification_send_delay_s = _qualification_send_delay_s(websocket)
+        except ValueError as exc:
+            await websocket.close(code=1008, reason=str(exc))
+            return
+
         client_id = uuid.uuid4().hex
         await websocket.accept()
-        await fanout.attach(websocket, client_id=client_id)
+        await fanout.attach(
+            websocket,
+            client_id=client_id,
+            qualification_send_delay_s=qualification_send_delay_s,
+        )
         ensure_viewer_state_publisher(state, reason="viewer_websocket_attach")
         state.attach_viewer_demand(
             client_id,

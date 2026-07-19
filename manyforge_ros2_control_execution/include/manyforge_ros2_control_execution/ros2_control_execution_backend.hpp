@@ -42,6 +42,14 @@
 
 namespace manyforge::ros2_control_execution {
 
+namespace detail {
+class SceneProjectionWorker;
+struct SceneProjectionCompletion;
+struct SceneProjectionWorkerDeleter {
+  void operator()(SceneProjectionWorker* worker) const noexcept;
+};
+}  // namespace detail
+
 struct Ros2GripperActionConfig {
   std::string action_name = "/robotiq_gripper_controller/gripper_cmd";
   std::string transport_kind = "ros_gripper_command";
@@ -74,6 +82,14 @@ struct Ros2ControlSceneProjectionMetrics {
   std::uint64_t terminal_retries_scheduled_total = 0;
   std::uint64_t terminal_retry_successes_total = 0;
   std::uint64_t terminal_retry_exhausted_total = 0;
+  std::uint64_t active_requests_total = 0;
+  std::uint64_t joint_requests_total = 0;
+  std::uint64_t requests_coalesced_total = 0;
+  std::uint64_t requests_discarded_total = 0;
+  std::uint64_t requests_rejected_while_suspended_total = 0;
+  std::uint64_t completion_callback_exceptions_total = 0;
+  std::uint64_t apply_duration_max_ns = 0;
+  std::uint64_t queue_lag_max_ns = 0;
 };
 
 struct Ros2ControlControllerProgressMetrics {
@@ -94,6 +110,12 @@ struct Ros2ControlControllerProgressMetrics {
   std::uint64_t last_stop_confirmation_latency_ns = 0;
   std::uint64_t max_stop_confirmation_latency_ns = 0;
   std::uint64_t observed_state_reader_retry_exhausted_total = 0;
+  std::uint64_t observed_state_published_total = 0;
+  std::uint64_t observed_state_rejected_total = 0;
+  std::uint64_t observed_state_writer_busy_total = 0;
+  std::uint64_t observed_state_slot_exhausted_total = 0;
+  std::uint64_t authored_active_publications_total = 0;
+  std::uint64_t authored_active_interarrival_max_ns = 0;
   std::uint64_t jtc_cancel_reference_publications_total = 0;
   std::uint64_t jtc_cancel_reference_rejections_total = 0;
   std::vector<core::ObservedRobotStateSourceMetrics> observed_state_sources;
@@ -282,6 +304,7 @@ class Ros2ControlExecutionBackend final
     validate_config();
     initialize_observed_state_publication();
     initialize_execution_progress_publication();
+    initialize_scene_projection_worker();
     snapshot_.timestamp_ns = clock_.now();
     initialize_authored_state();
   }
@@ -375,6 +398,17 @@ class Ros2ControlExecutionBackend final
 
   void testing_complete_execution() {
     complete_execution();
+  }
+
+  void testing_schedule_active_scene_projection(
+      std::vector<double> positions,
+      std::int64_t source_timestamp_ns = 0) {
+    (void)schedule_active_scene_projection(std::move(positions),
+                                           source_timestamp_ns);
+  }
+
+  bool testing_drain_scene_projection_for(std::chrono::nanoseconds timeout) {
+    return drain_scene_projection_for(timeout);
   }
 
   bool testing_publish_snapshot(core::ExecutionState state,
@@ -479,11 +513,6 @@ class Ros2ControlExecutionBackend final
     std::chrono::steady_clock::time_point observed_at;
   };
 
-  struct PendingTerminalSceneProjection {
-    std::vector<double> joint_positions;
-    std::int64_t source_timestamp_ns = 0;
-  };
-
   enum class SceneUpdateMode {
     kBlocking,
     kBestEffort,
@@ -525,6 +554,8 @@ class Ros2ControlExecutionBackend final
         core::GripperProjectionState::kNotRequired;
     std::string projection_reason;
     int projection_retry_count = 0;
+    std::optional<std::size_t> scene_projection_slot;
+    std::uint64_t scene_projection_request_id = 0;
     std::vector<std::string> evidence;
     std::string evidence_state;
     bool externally_failed = false;
@@ -535,6 +566,7 @@ class Ros2ControlExecutionBackend final
   void validate_config() const;
   void initialize_observed_state_publication();
   void initialize_execution_progress_publication();
+  void initialize_scene_projection_worker();
   void initialize_authored_state();
   void publish_observed_robot_state(
       core::ObservedRobotStateSourceKind source,
@@ -644,11 +676,11 @@ class Ros2ControlExecutionBackend final
   void project_terminal_scene_positions(
       const std::vector<double>& joint_positions,
       std::int64_t source_timestamp_ns);
-  void schedule_terminal_scene_projection_retry(
+  bool schedule_active_scene_projection(
       std::vector<double> joint_positions,
       std::int64_t source_timestamp_ns);
-  void terminal_scene_projection_retry_worker(std::stop_token stop_token);
-  void stop_terminal_scene_projection_retry_worker() noexcept;
+  void stop_scene_projection_worker() noexcept;
+  bool drain_scene_projection_for(std::chrono::nanoseconds timeout);
   void record_scene_projection_success(std::int64_t source_timestamp_ns);
   void record_scene_projection_miss();
   void record_command_progress_latency_ns(std::int64_t latency_ns);
@@ -658,15 +690,13 @@ class Ros2ControlExecutionBackend final
   std::optional<double> scene_group_joint_position(
       const std::string& group_id,
       const std::string& joint_name) const;
-  bool update_scene_group_joint_position(
-      const std::string& group_id,
-      const std::string& joint_name,
+  bool schedule_gripper_scene_projection_locked(
+      const std::shared_ptr<GripperRuntime>& runtime,
       double position,
-      SceneUpdateMode mode = SceneUpdateMode::kBlocking);
-  bool project_gripper_position_to_scene(
-      const Ros2GripperActionConfig& config,
-      double position,
-      SceneUpdateMode mode = SceneUpdateMode::kBlocking);
+      bool terminal);
+  void on_gripper_scene_projection_complete(
+      const std::weak_ptr<GripperRuntime>& runtime,
+      const detail::SceneProjectionCompletion& completion) noexcept;
   bool publish_snapshot(
       core::ExecutionState state,
       double progress,
@@ -901,9 +931,6 @@ class Ros2ControlExecutionBackend final
   std::atomic<std::uint64_t> scene_projection_successes_total_{0};
   std::atomic<std::uint64_t> scene_projection_lag_max_ns_{0};
   std::atomic<std::int64_t> scene_projection_last_success_timestamp_ns_{0};
-  std::atomic<std::uint64_t> terminal_scene_projection_retries_scheduled_total_{0};
-  std::atomic<std::uint64_t> terminal_scene_projection_retry_successes_total_{0};
-  std::atomic<std::uint64_t> terminal_scene_projection_retry_exhausted_total_{0};
   std::atomic<std::uint64_t> state_callbacks_total_{0};
   std::atomic<std::uint64_t> action_feedback_callbacks_total_{0};
   std::atomic<std::uint64_t> action_result_callbacks_total_{0};
@@ -920,10 +947,13 @@ class Ros2ControlExecutionBackend final
   std::atomic<std::uint64_t> max_stop_confirmation_latency_ns_{0};
   std::atomic<std::uint64_t> jtc_cancel_reference_publications_total_{0};
   std::atomic<std::uint64_t> jtc_cancel_reference_rejections_total_{0};
-  mutable std::mutex terminal_scene_projection_retry_mutex_;
-  std::condition_variable_any terminal_scene_projection_retry_cv_;
-  std::optional<PendingTerminalSceneProjection> pending_terminal_scene_projection_;
-  std::jthread terminal_scene_projection_retry_thread_;
+  std::atomic<std::uint64_t> authored_active_publications_total_{0};
+  std::atomic<std::uint64_t> authored_active_interarrival_max_ns_{0};
+  std::atomic<std::int64_t> authored_active_last_publication_ns_{0};
+  mutable std::mutex scene_projection_barrier_mutex_;
+  std::unique_ptr<detail::SceneProjectionWorker,
+                  detail::SceneProjectionWorkerDeleter>
+      scene_projection_worker_;
 };
 
 }  // namespace manyforge::ros2_control_execution

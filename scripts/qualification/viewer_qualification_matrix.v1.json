@@ -82,7 +82,7 @@
       "budgets": {"viewer_route_p95_ms": 10.0, "process_cpu_p95_percent": {"composer": 55.0, "viewer_worker": 75.0, "browser": 250.0}, "client_long_tasks_max": 3, "client_materialization_max_ms": 10.0, "client_react_commits_per_frame_max": 0.03, "client_unmatched_topology_rebuilds_max": 0, "build_failures_max": 0, "publication_sink_drops_max": 0},
       "required_process_labels": ["composer", "viewer_worker", "browser", "controller_manager"],
       "observer_paths": {"point_cloud": "/api/scene/pointcloud/status"},
-      "preconditions": ["Publish the bounded representative point-cloud/octomap fixture and enable its viewer layer."]
+      "preconditions": ["Start Composer with MANYFORGE_POINTCLOUD_QUALIFICATION_FIXTURE=ON (optionally set the bounded point count/rate), focus the browser, and verify /api/scene/pointcloud/status reports the fixture enabled and publishing through the real point-cloud channel."]
     },
     {
       "name": "source_flood",
@@ -111,7 +111,7 @@
       "budgets": {"viewer_route_p95_ms": 10.0, "process_cpu_p95_percent": {"composer": 55.0, "viewer_worker": 65.0, "browser": 225.0}, "client_long_tasks_max": 2, "client_materialization_max_ms": 10.0, "client_react_commits_per_frame_max": 0.03, "client_unmatched_topology_rebuilds_max": 0, "build_failures_max": 0, "publication_sink_drops_max": 0},
       "required_process_labels": ["composer", "viewer_worker", "browser", "controller_manager"],
       "observer_paths": {"viewer": "/api/scene/viewer/status"},
-      "preconditions": ["Attach the bounded slow-client fixture and a normal focused browser; verify replacement counters advance only for the slow client."]
+      "preconditions": ["Start Composer with MANYFORGE_VIEWER_QUALIFICATION_FIXTURES=ON, keep a normal focused browser attached, then run scripts/qualification/viewer_client_fixture.py --mode slow for longer than the capture; verify replacement counters advance only for the qualification-throttled client."]
     },
     {
       "name": "multi_client",
@@ -120,7 +120,7 @@
       "requirements": {"active_client": true, "client_count_min": 2, "active_client_count_min": 2, "viewer_counter_delta_min": {"render_revision": 1}, "client_total_min": {"rendered_frames": 1, "transform_applies": 1}},
       "budgets": {"viewer_route_p95_ms": 10.0, "process_cpu_p95_percent": {"composer": 55.0, "viewer_worker": 65.0, "browser": 300.0}, "client_long_tasks_max": 4, "client_materialization_max_ms": 10.0, "client_react_commits_per_frame_max": 0.03, "client_unmatched_topology_rebuilds_max": 0, "build_failures_max": 0, "publication_sink_drops_max": 0},
       "required_process_labels": ["composer", "viewer_worker", "browser", "controller_manager"],
-      "preconditions": ["Open two normal viewer clients against the same scene and run representative motion."]
+      "preconditions": ["Keep a normal focused browser attached, run scripts/qualification/viewer_client_fixture.py --mode normal for longer than the capture, and run representative motion."]
     },
     {
       "name": "snapshot_capture",

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import struct
@@ -28,6 +29,8 @@ _POINTCLOUD_SEND_TIMEOUT_S: Final = 0.25
 _DEFAULT_MAX_POINTS: Final = 200_000
 _PROTOCOL_MAX_POINTS: Final = 200_000
 
+logger = logging.getLogger(__name__)
+
 
 def _validated_max_points() -> int:
     raw = os.getenv("MANYFORGE_POINTCLOUD_MAX_POINTS", str(_DEFAULT_MAX_POINTS))
@@ -40,6 +43,56 @@ def _validated_max_points() -> int:
             f"MANYFORGE_POINTCLOUD_MAX_POINTS must be in [1, {_PROTOCOL_MAX_POINTS}]"
         )
     return value
+
+
+def _qualification_fixture_enabled() -> bool:
+    return os.getenv("MANYFORGE_POINTCLOUD_QUALIFICATION_FIXTURE", "").strip().lower() in {
+        "1",
+        "on",
+        "true",
+        "yes",
+    }
+
+
+def _qualification_fixture_shape() -> tuple[int, float]:
+    try:
+        point_count = int(
+            os.getenv("MANYFORGE_POINTCLOUD_QUALIFICATION_POINTS", "20000")
+        )
+        rate_hz = float(
+            os.getenv("MANYFORGE_POINTCLOUD_QUALIFICATION_RATE_HZ", "10")
+        )
+    except ValueError as exc:
+        raise ValueError("point-cloud qualification fixture settings are invalid") from exc
+    if point_count <= 0 or point_count > _PROTOCOL_MAX_POINTS:
+        raise ValueError(
+            "MANYFORGE_POINTCLOUD_QUALIFICATION_POINTS must be in "
+            f"[1, {_PROTOCOL_MAX_POINTS}]"
+        )
+    if not math.isfinite(rate_hz) or rate_hz <= 0.0 or rate_hz > 30.0:
+        raise ValueError(
+            "MANYFORGE_POINTCLOUD_QUALIFICATION_RATE_HZ must be in (0, 30]"
+        )
+    return point_count, rate_hz
+
+
+def _qualification_fixture_cloud(
+    point_count: int,
+) -> tuple[tuple[tuple[float, float, float], ...], tuple[tuple[float, float, float], ...]]:
+    """Build one immutable, deterministic bounded cloud outside the hot loop."""
+    width = max(1, math.ceil(math.sqrt(point_count)))
+    denominator = max(1, width - 1)
+    points: list[tuple[float, float, float]] = []
+    colors: list[tuple[float, float, float]] = []
+    for index in range(point_count):
+        column = index % width
+        row = index // width
+        x = -0.5 + column / denominator
+        y = -0.5 + row / denominator
+        z = 0.45 + 0.02 * ((column + row) % 5)
+        points.append((x, y, z))
+        colors.append((column / denominator, row / denominator, 0.75))
+    return tuple(points), tuple(colors)
 
 
 def _pack_pointcloud_frame(
@@ -470,17 +523,107 @@ class PointCloudPublisher:
             }
 
 
+class _PointCloudQualificationFixture:
+    """Opt-in NRT source for repeatable browser qualification only."""
+
+    def __init__(
+        self,
+        publisher: PointCloudPublisher,
+        *,
+        point_count: int,
+        rate_hz: float,
+    ) -> None:
+        self._publisher = publisher
+        self._point_count = point_count
+        self._rate_hz = rate_hz
+        self._points, self._colors = _qualification_fixture_cloud(point_count)
+        self._task: asyncio.Task[None] | None = None
+        self._frames_attempted = 0
+        self._frames_published = 0
+        self._failures = 0
+
+    def start_if_needed(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(
+                self._run(),
+                name="manyforge-pointcloud-qualification-fixture",
+            )
+
+    async def _run(self) -> None:
+        period_s = 1.0 / self._rate_hz
+        current = asyncio.current_task()
+        try:
+            while self._publisher.has_clients():
+                started = time.monotonic()
+                self._frames_attempted += 1
+                try:
+                    published = await asyncio.to_thread(
+                        self._publisher.publish,
+                        self._points,
+                        self._colors,
+                    )
+                    if published:
+                        self._frames_published += 1
+                except Exception:
+                    self._failures += 1
+                    logger.exception("Point-cloud qualification fixture publish failed")
+                remaining_s = period_s - (time.monotonic() - started)
+                if remaining_s > 0.0:
+                    await asyncio.sleep(remaining_s)
+        finally:
+            # No await separates the final demand check from this assignment,
+            # so an attach either keeps this task alive or observes None and
+            # starts the next demand lifetime. Cancellation never respawns work.
+            if self._task is current:
+                self._task = None
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "running": self._task is not None and not self._task.done(),
+            "point_count": self._point_count,
+            "rate_hz": self._rate_hz,
+            "frames_attempted": self._frames_attempted,
+            "frames_published": self._frames_published,
+            "failures": self._failures,
+        }
+
+    async def wait_stopped(self, *, timeout_s: float = 1.0) -> None:
+        task = self._task
+        if task is not None:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_s)
+
+
 def create_pointcloud_router(
     state: "ComposerState",
     security: SecurityConfig,
 ) -> APIRouter:
     router = APIRouter()
     publisher = PointCloudPublisher()
+    qualification_fixture: _PointCloudQualificationFixture | None = None
+    if _qualification_fixture_enabled():
+        point_count, rate_hz = _qualification_fixture_shape()
+        qualification_fixture = _PointCloudQualificationFixture(
+            publisher,
+            point_count=point_count,
+            rate_hz=rate_hz,
+        )
+        logger.warning(
+            "Point-cloud qualification fixture enabled: %d points at %.3f Hz",
+            point_count,
+            rate_hz,
+        )
     state.point_cloud_publisher = publisher  # type: ignore[attr-defined]
 
     @router.get("/api/scene/pointcloud/status")
     async def pointcloud_status() -> dict[str, Any]:
-        return await publisher.status()
+        status = await publisher.status()
+        status["qualification_fixture"] = (
+            qualification_fixture.status()
+            if qualification_fixture is not None
+            else {"enabled": False, "running": False}
+        )
+        return status
 
     @router.websocket("/ws/scene/pointcloud")
     async def ws_pointcloud(websocket: WebSocket) -> None:
@@ -491,6 +634,8 @@ def create_pointcloud_router(
             await websocket.close(code=4401, reason="Unauthorized")
             return
         client_id = await publisher.attach(websocket)
+        if qualification_fixture is not None:
+            qualification_fixture.start_if_needed()
         send_task = asyncio.create_task(publisher.send_loop(client_id))
 
         async def receive_until_disconnect() -> None:

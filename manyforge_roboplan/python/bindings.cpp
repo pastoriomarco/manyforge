@@ -3729,6 +3729,22 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               projection_metrics.terminal_retry_successes_total;
           out["scene_projection_terminal_retry_exhausted_total"] =
               projection_metrics.terminal_retry_exhausted_total;
+          out["scene_projection_active_requests_total"] =
+              projection_metrics.active_requests_total;
+          out["scene_projection_joint_requests_total"] =
+              projection_metrics.joint_requests_total;
+          out["scene_projection_requests_coalesced_total"] =
+              projection_metrics.requests_coalesced_total;
+          out["scene_projection_requests_discarded_total"] =
+              projection_metrics.requests_discarded_total;
+          out["scene_projection_requests_rejected_while_suspended_total"] =
+              projection_metrics.requests_rejected_while_suspended_total;
+          out["scene_projection_completion_callback_exceptions_total"] =
+              projection_metrics.completion_callback_exceptions_total;
+          out["scene_projection_apply_duration_max_ns"] =
+              projection_metrics.apply_duration_max_ns;
+          out["scene_projection_queue_lag_max_ns"] =
+              projection_metrics.queue_lag_max_ns;
           const auto progress_metrics = [&]() {
             py::gil_scoped_release release;
             return ros_execution->controller_progress_metrics();
@@ -3767,6 +3783,18 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               progress_metrics.max_stop_confirmation_latency_ns;
           out["controller_observed_state_reader_retry_exhausted_total"] =
               progress_metrics.observed_state_reader_retry_exhausted_total;
+          out["controller_observed_state_published_total"] =
+              progress_metrics.observed_state_published_total;
+          out["controller_observed_state_rejected_total"] =
+              progress_metrics.observed_state_rejected_total;
+          out["controller_observed_state_writer_busy_total"] =
+              progress_metrics.observed_state_writer_busy_total;
+          out["controller_observed_state_slot_exhausted_total"] =
+              progress_metrics.observed_state_slot_exhausted_total;
+          out["controller_authored_active_publications_total"] =
+              progress_metrics.authored_active_publications_total;
+          out["controller_authored_active_interarrival_max_ns"] =
+              progress_metrics.authored_active_interarrival_max_ns;
           out["controller_jtc_cancel_reference_publications_total"] =
               progress_metrics.jtc_cancel_reference_publications_total;
           out["controller_jtc_cancel_reference_rejections_total"] =

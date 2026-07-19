@@ -10,6 +10,8 @@ import pytest
 pytest.importorskip("fastapi")
 
 from manyforge_composer.backend.routes_pointcloud import (
+    _PointCloudQualificationFixture,
+    _qualification_fixture_cloud,
     PointCloudPublisher,
     decode_pointcloud_packet,
 )
@@ -83,6 +85,43 @@ def test_no_observer_suppresses_source_iteration_and_encoding() -> None:
     assert status["suppressed_no_clients"] == 1
     assert status["published"] == 0
     assert status["sequence"] == 0
+
+
+def test_qualification_cloud_is_deterministic_and_bounded() -> None:
+    first = _qualification_fixture_cloud(7)
+    second = _qualification_fixture_cloud(7)
+
+    assert first == second
+    assert len(first[0]) == len(first[1]) == 7
+    assert all(len(point) == 3 for point in first[0])
+
+
+def test_qualification_fixture_is_demand_scoped_and_uses_real_publisher() -> None:
+    async def scenario() -> None:
+        publisher = PointCloudPublisher(max_points=8)
+        socket = _RecordingSocket()
+        client_id = await publisher.attach(socket)  # type: ignore[arg-type]
+        sender = asyncio.create_task(publisher.send_loop(client_id))
+        fixture = _PointCloudQualificationFixture(
+            publisher,
+            point_count=8,
+            rate_hz=30.0,
+        )
+        fixture.start_if_needed()
+        try:
+            await _wait_until(lambda: len(socket.packets) >= 1)
+            status = fixture.status()
+            assert status["running"] is True
+            assert status["frames_published"] >= 1
+            decoded = decode_pointcloud_packet(socket.packets[-1])
+            assert decoded["point_count"] == 8
+        finally:
+            await publisher.detach(client_id)
+            await sender
+        await fixture.wait_stopped()
+        assert fixture.status()["running"] is False
+
+    asyncio.run(scenario())
 
 
 def test_rejected_frame_does_not_advance_sequence_or_replace_last_good_frame() -> None:

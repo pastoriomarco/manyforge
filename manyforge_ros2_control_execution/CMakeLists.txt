@@ -26,6 +26,7 @@ add_library(manyforge_ros2_control_execution
   src/package.cpp
   src/ros2_control_capability.cpp
   src/ros2_control_execution_backend.cpp
+  src/scene_projection_worker.cpp
 )
 
 target_include_directories(manyforge_ros2_control_execution PUBLIC

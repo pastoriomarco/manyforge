@@ -22,6 +22,14 @@ _PRESERVATION_FIXTURE = (
 )
 
 
+async def _wait_until(predicate, *, attempts: int = 100) -> None:
+    for _ in range(attempts):
+        if predicate():
+            return
+        await asyncio.sleep(0.002)
+    raise AssertionError("condition did not become true")
+
+
 def test_generated_preservation_fixture_is_strict_and_order_coherent() -> None:
     payload = json.loads(_PRESERVATION_FIXTURE.read_text(encoding="utf-8"))
     manifest = ViewerManifestV1.model_validate(payload["manifest"])
@@ -338,6 +346,97 @@ def test_fanout_slow_client_keeps_only_latest_generation_and_resyncs_manifest() 
 
         await fanout.detach("slow")
         await sender
+        retired_status = await fanout.status()
+        assert retired_status["replaced_frames_total"] == 2
+
+    asyncio.run(scenario())
+
+
+def test_fanout_qualification_delay_is_per_client_and_replaces_pending_frames() -> None:
+    async def scenario() -> None:
+        fanout = BoundedViewerFanout()
+        delayed_socket = _FakeWebSocket()
+        fast_socket = _FakeWebSocket()
+        delayed_socket.allow_send.set()
+        fast_socket.allow_send.set()
+        await fanout.attach(
+            delayed_socket,  # type: ignore[arg-type]
+            client_id="delayed",
+            qualification_send_delay_s=0.2,
+        )
+        await fanout.attach(fast_socket, client_id="fast")  # type: ignore[arg-type]
+        delayed_sender = asyncio.create_task(fanout.send_loop("delayed"))
+        fast_sender = asyncio.create_task(fanout.send_loop("fast"))
+        encoder = ViewerProtocolEncoder(producer_epoch="epoch")
+        try:
+            await fanout.publish(
+                encoder.encode(
+                    manifest_payload={"objects": ["a"]},
+                    frame_payload={"value": 1},
+                )
+            )
+            await _wait_until(lambda: len(fast_socket.messages) >= 2)
+            for value in (2, 3, 4):
+                await fanout.publish(
+                    encoder.encode(
+                        manifest_payload={"objects": ["a"]},
+                        frame_payload={"value": value},
+                    )
+                )
+                await _wait_until(lambda: len(fast_socket.messages) >= value + 1)
+            await _wait_until(
+                lambda: delayed_socket.messages
+                or len(fast_socket.messages) >= 5
+            )
+            status = await fanout.status()
+            assert status["clients"]["delayed"]["qualification_send_delay_ms"] == 200.0
+            assert status["clients"]["fast"]["qualification_send_delay_ms"] == 0.0
+            assert status["clients"]["delayed"]["replaced_frames"] >= 1
+            assert status["clients"]["fast"]["replaced_frames"] == 0
+        finally:
+            await fanout.detach("delayed")
+            await fanout.detach("fast")
+            await asyncio.gather(delayed_sender, fast_sender)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("delay", [-0.001, 2.0, float("inf"), float("nan")])
+def test_fanout_rejects_invalid_qualification_send_delay(delay: float) -> None:
+    async def scenario() -> None:
+        fanout = BoundedViewerFanout()
+        with pytest.raises(ValueError, match="below send timeout"):
+            await fanout.attach(
+                _FakeWebSocket(),  # type: ignore[arg-type]
+                client_id="invalid",
+                qualification_send_delay_s=delay,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_fanout_does_not_send_delayed_publication_after_detach() -> None:
+    async def scenario() -> None:
+        fanout = BoundedViewerFanout()
+        websocket = _FakeWebSocket()
+        websocket.allow_send.set()
+        await fanout.attach(
+            websocket,  # type: ignore[arg-type]
+            client_id="delayed",
+            qualification_send_delay_s=0.02,
+        )
+        sender = asyncio.create_task(fanout.send_loop("delayed"))
+        encoder = ViewerProtocolEncoder(producer_epoch="epoch")
+        await fanout.publish(
+            encoder.encode(
+                manifest_payload={"objects": ["a"]},
+                frame_payload={"value": 1},
+            )
+        )
+        await asyncio.sleep(0)
+        await fanout.detach("delayed")
+        await sender
+        assert websocket.messages == []
 
     asyncio.run(scenario())
 

@@ -17,13 +17,20 @@
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_core/types/error_code.hpp>
 
+#include "scene_projection_worker.hpp"
+
 namespace manyforge::ros2_control_execution {
+
+void detail::SceneProjectionWorkerDeleter::operator()(
+    detail::SceneProjectionWorker* worker) const noexcept {
+  delete worker;
+}
+
 namespace {
 
 constexpr double kRuntimeScaleSlewPerSecond = 4.0;  // 0→1 in 250 ms.
 constexpr auto kIdleSceneProjectionMinPeriod = std::chrono::milliseconds(100);
-constexpr int kTerminalSceneProjectionRetryAttempts = 10;
-constexpr auto kTerminalSceneProjectionRetryDelay = std::chrono::milliseconds(20);
+constexpr auto kSceneProjectionBarrierTimeout = std::chrono::seconds(1);
 
 core::Duration gripper_duration_ns(double seconds) noexcept {
   constexpr double kNanosecondsPerSecond = 1'000'000'000.0;
@@ -244,6 +251,7 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
   validate_config();
   initialize_observed_state_publication();
   initialize_execution_progress_publication();
+  initialize_scene_projection_worker();
   snapshot_.timestamp_ns = clock_.now();
   initialize_authored_state();
   initialize_ros();
@@ -295,8 +303,8 @@ Ros2ControlExecutionBackend::~Ros2ControlExecutionBackend() {
   if (monitor_thread_.joinable()) {
     monitor_thread_.join();
   }
-  stop_terminal_scene_projection_retry_worker();
   stop_ros();
+  stop_scene_projection_worker();
 }
 
 void Ros2ControlExecutionBackend::validate_config() const {
@@ -469,6 +477,11 @@ void Ros2ControlExecutionBackend::initialize_execution_progress_publication() {
           freshness_budget_ns);
 }
 
+void Ros2ControlExecutionBackend::initialize_scene_projection_worker() {
+  scene_projection_worker_.reset(new detail::SceneProjectionWorker(
+      execution_state_sink_, group_name_, clock_));
+}
+
 void Ros2ControlExecutionBackend::initialize_authored_state() {
   if (!uses_authored_backend_state()) {
     return;
@@ -560,6 +573,17 @@ bool Ros2ControlExecutionBackend::publish_authored_robot_state(
         source, config_.required_joints, positions, velocities, timestamp_ns,
         timestamp_ns);
     if (result.published) {
+      if (expected_running_generation.has_value()) {
+        authored_active_publications_total_.fetch_add(
+            1, std::memory_order_relaxed);
+        const auto previous = authored_active_last_publication_ns_.exchange(
+            timestamp_ns, std::memory_order_acq_rel);
+        if (previous > 0 && timestamp_ns >= previous) {
+          atomic_max(
+              authored_active_interarrival_max_ns_,
+              static_cast<std::uint64_t>(timestamp_ns - previous));
+        }
+      }
       if (invalidate_before_publish) {
         authored_state_authority_epoch_.store(authority_epoch + 1,
                                               std::memory_order_release);
@@ -1168,7 +1192,7 @@ void Ros2ControlExecutionBackend::sync_idle_scene_from_latest_sample() {
   if (running_flag_.load(std::memory_order_acquire)) {
     return;
   }
-  update_scene_positions(positions, SceneUpdateMode::kBestEffort);
+  (void)schedule_active_scene_projection(positions, clock_.now());
   (void)publish_passive_idle_snapshot(positions);
 }
 
@@ -1386,7 +1410,19 @@ core::Result<void> Ros2ControlExecutionBackend::command_sim_initial_state(
     });
   }
 
-  update_scene_positions(config_.initial_joint_positions_rad);
+  try {
+    update_scene_positions(config_.initial_joint_positions_rad);
+  } catch (const std::exception& exc) {
+    set_command_gate(false);
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorExecutionAborted,
+        std::string("commanded_sim reset could not publish the authoritative ") +
+            "scene state: " + exc.what(),
+        {{"phase", std::move(phase)},
+         {"action_name", config_.action_name},
+         {"reason", "reset_scene_projection_failed"}},
+    });
+  }
   publish_snapshot(core::ExecutionState::kIdle, 0.0,
                    config_.initial_joint_positions_rad);
   return core::Result<void>::Ok();
@@ -1433,7 +1469,16 @@ core::Result<void> Ros2ControlExecutionBackend::sync_observed_state_before_plann
     });
   }
 
-  update_scene_positions(positions);
+  try {
+    update_scene_positions(positions);
+  } catch (const std::exception& exc) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorStartStateMismatch,
+        std::string("Could not publish observed state into the planning scene: ") +
+            exc.what(),
+        {{"reason", "pre_plan_scene_projection_failed"}},
+    });
+  }
   publish_snapshot(core::ExecutionState::kIdle, 0.0, positions);
   return core::Result<void>::Ok();
 }
@@ -1597,23 +1642,37 @@ void Ros2ControlExecutionBackend::testing_store_latest_joint_sample_impl(
 Ros2ControlSceneProjectionMetrics
 Ros2ControlExecutionBackend::scene_projection_metrics() const {
   Ros2ControlSceneProjectionMetrics metrics;
+  const auto worker_metrics = scene_projection_worker_ != nullptr
+                                  ? scene_projection_worker_->metrics()
+                                  : detail::SceneProjectionWorkerMetrics{};
   metrics.misses_total =
-      scene_projection_misses_total_.load(std::memory_order_relaxed);
+      scene_projection_misses_total_.load(std::memory_order_relaxed) +
+      worker_metrics.misses_total;
   metrics.successful_updates_total =
-      scene_projection_successes_total_.load(std::memory_order_relaxed);
-  metrics.lag_max_ns =
-      scene_projection_lag_max_ns_.load(std::memory_order_relaxed);
-  metrics.last_success_timestamp_ns =
-      scene_projection_last_success_timestamp_ns_.load(std::memory_order_relaxed);
+      scene_projection_successes_total_.load(std::memory_order_relaxed) +
+      worker_metrics.successful_updates_total;
+  metrics.lag_max_ns = std::max(
+      scene_projection_lag_max_ns_.load(std::memory_order_relaxed),
+      worker_metrics.lag_max_ns);
+  metrics.last_success_timestamp_ns = std::max(
+      scene_projection_last_success_timestamp_ns_.load(std::memory_order_relaxed),
+      worker_metrics.last_success_timestamp_ns);
   metrics.terminal_retries_scheduled_total =
-      terminal_scene_projection_retries_scheduled_total_.load(
-          std::memory_order_relaxed);
+      worker_metrics.terminal_retries_scheduled_total;
   metrics.terminal_retry_successes_total =
-      terminal_scene_projection_retry_successes_total_.load(
-          std::memory_order_relaxed);
+      worker_metrics.terminal_retry_successes_total;
   metrics.terminal_retry_exhausted_total =
-      terminal_scene_projection_retry_exhausted_total_.load(
-          std::memory_order_relaxed);
+      worker_metrics.terminal_retry_exhausted_total;
+  metrics.active_requests_total = worker_metrics.active_requests_total;
+  metrics.joint_requests_total = worker_metrics.joint_requests_total;
+  metrics.requests_coalesced_total = worker_metrics.requests_coalesced_total;
+  metrics.requests_discarded_total = worker_metrics.requests_discarded_total;
+  metrics.requests_rejected_while_suspended_total =
+      worker_metrics.requests_rejected_while_suspended_total;
+  metrics.completion_callback_exceptions_total =
+      worker_metrics.completion_callback_exceptions_total;
+  metrics.apply_duration_max_ns = worker_metrics.apply_duration_max_ns;
+  metrics.queue_lag_max_ns = worker_metrics.queue_lag_max_ns;
   const auto now_ns = clock_.now();
   if (metrics.last_success_timestamp_ns > 0 &&
       now_ns >= metrics.last_success_timestamp_ns) {
@@ -1662,11 +1721,24 @@ Ros2ControlExecutionBackend::controller_progress_metrics() const {
       jtc_cancel_reference_rejections_total_.load(
           std::memory_order_relaxed);
   if (observed_state_publication_ != nullptr) {
+    const auto publication_metrics = observed_state_publication_->metrics();
     metrics.observed_state_reader_retry_exhausted_total =
-        observed_state_publication_->metrics().reader_retry_exhausted_total;
+        publication_metrics.reader_retry_exhausted_total;
+    metrics.observed_state_published_total =
+        publication_metrics.published_total;
+    metrics.observed_state_rejected_total =
+        publication_metrics.rejected_total;
+    metrics.observed_state_writer_busy_total =
+        publication_metrics.writer_busy_total;
+    metrics.observed_state_slot_exhausted_total =
+        publication_metrics.slot_exhausted_total;
     metrics.observed_state_sources =
         observed_state_publication_->source_metrics();
   }
+  metrics.authored_active_publications_total =
+      authored_active_publications_total_.load(std::memory_order_relaxed);
+  metrics.authored_active_interarrival_max_ns =
+      authored_active_interarrival_max_ns_.load(std::memory_order_relaxed);
 
   const auto now = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1736,6 +1808,19 @@ bool Ros2ControlExecutionBackend::update_scene_positions(
   if (joint_positions.empty()) {
     return true;
   }
+  std::unique_lock<std::mutex> barrier_lock;
+  detail::SceneProjectionWorker::Suspension suspension;
+  if (mode == SceneUpdateMode::kBlocking &&
+      scene_projection_worker_ != nullptr) {
+    barrier_lock = std::unique_lock<std::mutex>(scene_projection_barrier_mutex_);
+    suspension = scene_projection_worker_->suspend();
+    if (!scene_projection_worker_->drain_for(
+            kSceneProjectionBarrierTimeout)) {
+      throw std::runtime_error(
+          "timed out draining asynchronous scene projection before a blocking "
+          "scene-state update");
+    }
+  }
   const auto sink_mode =
       mode == SceneUpdateMode::kBestEffort
           ? core::ExecutionStateUpdateMode::kBestEffort
@@ -1758,95 +1843,37 @@ bool Ros2ControlExecutionBackend::update_scene_positions(
 void Ros2ControlExecutionBackend::project_terminal_scene_positions(
     const std::vector<double>& joint_positions,
     std::int64_t source_timestamp_ns) {
-  if (!update_scene_positions(joint_positions,
-                              SceneUpdateMode::kBestEffort,
-                              source_timestamp_ns)) {
-    schedule_terminal_scene_projection_retry(joint_positions,
-                                             source_timestamp_ns);
+  if (scene_projection_worker_ != nullptr && !joint_positions.empty()) {
+    (void)scene_projection_worker_->submit_terminal(joint_positions,
+                                                    source_timestamp_ns);
   }
 }
 
-void Ros2ControlExecutionBackend::schedule_terminal_scene_projection_retry(
+bool Ros2ControlExecutionBackend::schedule_active_scene_projection(
     std::vector<double> joint_positions,
     std::int64_t source_timestamp_ns) {
-  if (joint_positions.empty()) {
-    return;
+  if (scene_projection_worker_ != nullptr && !joint_positions.empty()) {
+    return scene_projection_worker_->submit_active(std::move(joint_positions),
+                                                   source_timestamp_ns);
   }
-  {
-    std::lock_guard<std::mutex> lock(terminal_scene_projection_retry_mutex_);
-    pending_terminal_scene_projection_ =
-        PendingTerminalSceneProjection{std::move(joint_positions),
-                                       source_timestamp_ns};
-    terminal_scene_projection_retries_scheduled_total_.fetch_add(
-        1, std::memory_order_relaxed);
-    if (!terminal_scene_projection_retry_thread_.joinable()) {
-      terminal_scene_projection_retry_thread_ = std::jthread(
-          [this](std::stop_token stop_token) {
-            terminal_scene_projection_retry_worker(stop_token);
-          });
-    }
-  }
-  terminal_scene_projection_retry_cv_.notify_one();
+  return joint_positions.empty();
 }
 
-void Ros2ControlExecutionBackend::terminal_scene_projection_retry_worker(
-    std::stop_token stop_token) {
-  while (!stop_token.stop_requested()) {
-    PendingTerminalSceneProjection pending;
-    {
-      std::unique_lock<std::mutex> lock(
-          terminal_scene_projection_retry_mutex_);
-      // Token-aware wait: a plain condition_variable whose predicate reads
-      // stop_requested() (state that flips outside this mutex) can lose the
-      // stop wakeup between predicate evaluation and enqueue, deadlocking the
-      // destructor join. The (lock, stoken, pred) overload re-checks the stop
-      // state under the lock and cannot lose it.
-      terminal_scene_projection_retry_cv_.wait(
-          lock, stop_token, [this]() {
-            return pending_terminal_scene_projection_.has_value();
-          });
-      if (stop_token.stop_requested()) {
-        return;
-      }
-      pending = std::move(*pending_terminal_scene_projection_);
-      pending_terminal_scene_projection_.reset();
-    }
-
-    bool projected = false;
-    for (int attempt = 0; attempt < kTerminalSceneProjectionRetryAttempts;
-         ++attempt) {
-      if (stop_token.stop_requested()) {
-        return;
-      }
-      if (update_scene_positions(pending.joint_positions,
-                                 SceneUpdateMode::kBestEffort,
-                                 pending.source_timestamp_ns)) {
-        projected = true;
-        terminal_scene_projection_retry_successes_total_.fetch_add(
-            1, std::memory_order_relaxed);
-        break;
-      }
-      if (attempt + 1 < kTerminalSceneProjectionRetryAttempts) {
-        std::this_thread::sleep_for(kTerminalSceneProjectionRetryDelay);
-      }
-    }
-    if (!projected && !stop_token.stop_requested()) {
-      terminal_scene_projection_retry_exhausted_total_.fetch_add(
-          1, std::memory_order_relaxed);
-    }
+void Ros2ControlExecutionBackend::stop_scene_projection_worker() noexcept {
+  if (scene_projection_worker_ != nullptr &&
+      !scene_projection_worker_->stop_and_join_for(std::chrono::seconds(1))) {
+    RCLCPP_FATAL(
+        rclcpp::get_logger("manyforge_ros2_control_execution"),
+        "Timed out draining the NRT scene-projection worker during backend "
+        "destruction");
+    std::terminate();
   }
 }
 
-void Ros2ControlExecutionBackend::stop_terminal_scene_projection_retry_worker()
-    noexcept {
-  if (terminal_scene_projection_retry_thread_.joinable()) {
-    // request_stop() wakes the token-aware wait through the jthread's
-    // internal stop_callback; no manual notify is needed (and a manual
-    // notify without the mutex would be the lost-wakeup pattern this
-    // codebase has already fixed twice).
-    terminal_scene_projection_retry_thread_.request_stop();
-    terminal_scene_projection_retry_thread_.join();
-  }
+bool Ros2ControlExecutionBackend::drain_scene_projection_for(
+    std::chrono::nanoseconds timeout) {
+  return scene_projection_worker_ == nullptr ||
+         scene_projection_worker_->drain_for(timeout);
 }
 
 std::optional<double> Ros2ControlExecutionBackend::scene_group_joint_position(
@@ -1855,39 +1882,101 @@ std::optional<double> Ros2ControlExecutionBackend::scene_group_joint_position(
   return execution_state_sink_->group_joint_position(group_id, joint_name);
 }
 
-bool Ros2ControlExecutionBackend::update_scene_group_joint_position(
-    const std::string& group_id,
-    const std::string& joint_name,
+bool Ros2ControlExecutionBackend::schedule_gripper_scene_projection_locked(
+    const std::shared_ptr<GripperRuntime>& runtime,
     double position,
-    SceneUpdateMode mode) {
-  const auto sink_mode =
-      mode == SceneUpdateMode::kBestEffort
-          ? core::ExecutionStateUpdateMode::kBestEffort
-          : core::ExecutionStateUpdateMode::kBlocking;
-  try {
-    const auto result = execution_state_sink_->apply_group_joint_position(
-        group_id, joint_name, position, sink_mode);
-    return result.applied();
-  } catch (...) {
-    if (mode == SceneUpdateMode::kBestEffort) {
-      return false;
-    }
-    throw;
-  }
-}
-
-bool Ros2ControlExecutionBackend::project_gripper_position_to_scene(
-    const Ros2GripperActionConfig& config,
-    double position,
-    SceneUpdateMode mode) {
-  if (!std::isfinite(position)) {
+    bool terminal) {
+  if (!runtime || !std::isfinite(position)) {
     return false;
   }
-  if (config.group_id.empty() || config.joint_name.empty()) {
+  if (runtime->config.group_id.empty() || runtime->config.joint_name.empty()) {
+    runtime->projection_state = core::GripperProjectionState::kNotRequired;
+    runtime->projection_reason.clear();
     return true;
   }
-  return update_scene_group_joint_position(config.group_id, config.joint_name,
-                                           position, mode);
+  if (scene_projection_worker_ == nullptr ||
+      !runtime->scene_projection_slot.has_value()) {
+    runtime->projection_state = core::GripperProjectionState::kPending;
+    runtime->projection_reason = "scene_projection_worker_unavailable";
+    return false;
+  }
+
+  const detail::SceneProjectionToken token{
+      runtime->command_id,
+      runtime->generation,
+      ++runtime->scene_projection_request_id,
+  };
+  const bool queued = terminal
+                          ? scene_projection_worker_->submit_terminal_joint(
+                                *runtime->scene_projection_slot, position,
+                                clock_.now(), token)
+                          : scene_projection_worker_->submit_active_joint(
+                                *runtime->scene_projection_slot, position,
+                                clock_.now(), token);
+  runtime->projection_state = core::GripperProjectionState::kPending;
+  runtime->projection_reason =
+      queued ? "scene_projection_queued" : "scene_projection_suspended";
+  return queued;
+}
+
+void Ros2ControlExecutionBackend::on_gripper_scene_projection_complete(
+    const std::weak_ptr<GripperRuntime>& weak_runtime,
+    const detail::SceneProjectionCompletion& completion) noexcept {
+  const auto runtime = weak_runtime.lock();
+  if (!runtime) {
+    return;
+  }
+
+  bool retry_superseded_terminal = false;
+  std::uint64_t command_id = 0;
+  std::uint64_t generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    if (runtime->command_id != completion.token.command_id ||
+        runtime->generation != completion.token.generation ||
+        runtime->scene_projection_request_id != completion.token.request_id) {
+      return;
+    }
+    command_id = runtime->command_id;
+    generation = runtime->generation;
+    switch (completion.outcome) {
+      case detail::SceneProjectionOutcome::kApplied:
+        runtime->projection_state = core::GripperProjectionState::kApplied;
+        runtime->projection_reason.clear();
+        runtime->projection_retry_count = 0;
+        break;
+      case detail::SceneProjectionOutcome::kMissed:
+        runtime->projection_state = core::GripperProjectionState::kPending;
+        runtime->projection_reason = "scene_sink_busy";
+        break;
+      case detail::SceneProjectionOutcome::kRetryExhausted:
+        runtime->projection_state = core::GripperProjectionState::kFailed;
+        runtime->projection_reason = "scene_sink_retry_exhausted";
+        runtime->state = "failed";
+        runtime->executing = false;
+        runtime->error =
+            "Timed out publishing the terminal gripper scene position";
+        runtime->reason_code = "gripper_projection_failed";
+        break;
+      case detail::SceneProjectionOutcome::kSuperseded:
+        runtime->projection_state = core::GripperProjectionState::kPending;
+        runtime->projection_reason = "scene_projection_superseded";
+        retry_superseded_terminal =
+            !runtime->executing && runtime->state == "completed";
+        break;
+    }
+    ++runtime->revision;
+  }
+  if (retry_superseded_terminal) {
+    try {
+      (void)schedule_gripper_lifecycle(
+          runtime, command_id, generation, clock_.now() + 20'000'000);
+    } catch (...) {
+      // The generation remains conservatively pending. Reset/replacement can
+      // still invalidate it; a scheduler exception must not escape this NRT
+      // completion callback or terminate the projection worker.
+    }
+  }
 }
 
 bool Ros2ControlExecutionBackend::publish_snapshot(
@@ -2065,8 +2154,7 @@ bool Ros2ControlExecutionBackend::publish_controlled_stop_command_reference_snap
   }
 
   const double progress = end_s <= 1e-9 ? 1.0 : clamp_progress(sample_time_s / end_s);
-  update_scene_positions(reference->sample.positions_rad, SceneUpdateMode::kBestEffort);
-  return publish_snapshot(
+  const bool published = publish_snapshot(
       core::ExecutionState::kStopping, progress,
       reference->sample.positions_rad, std::nullopt,
       is_commanded_sim_mode() ? "commanded_sim_controlled_stop_reference"
@@ -2074,6 +2162,11 @@ bool Ros2ControlExecutionBackend::publish_controlled_stop_command_reference_snap
       expected_running_generation,
       SnapshotPublicationAuthority::kBackendAuthored,
       &reference->sample.velocities_rad_s);
+  if (published) {
+    (void)schedule_active_scene_projection(reference->sample.positions_rad,
+                                           clock_.now());
+  }
+  return published;
 }
 
 bool Ros2ControlExecutionBackend::publish_observed_cancel_stop_snapshot(
@@ -2102,13 +2195,13 @@ bool Ros2ControlExecutionBackend::publish_observed_cancel_stop_snapshot(
     return false;
   }
 
-  update_scene_positions(positions, SceneUpdateMode::kBestEffort);
   if (!publish_snapshot(
           core::ExecutionState::kStopping, progress, positions, std::nullopt,
           "measured_cancel_stop_feedback", expected_running_generation,
           SnapshotPublicationAuthority::kMeasuredDiagnostic)) {
     return false;
   }
+  (void)schedule_active_scene_projection(positions, clock_.now());
   if (!velocities.empty()) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     snapshot_.joint_velocities_rad_s = std::move(velocities);
@@ -2354,7 +2447,17 @@ core::Result<void> Ros2ControlExecutionBackend::resync_after_intervention_if_nee
         snapshot.state));
   }
 
-  update_scene_positions(positions);
+  try {
+    update_scene_positions(positions);
+  } catch (const std::exception& exc) {
+    const auto snapshot = get_execution_snapshot();
+    return core::Result<void>::Err(operator_intervention_error(
+        core::ErrorCode::kResetFailed,
+        std::string("Cannot resync ros2_control backend scene state: ") +
+            exc.what(),
+        "resync_scene_projection_failed",
+        snapshot.state));
+  }
   {
     std::lock_guard<std::mutex> lock(execution_mutex_);
     resync_required_ = false;
@@ -2733,6 +2836,7 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
           [this]() { return get_execution_snapshot(); }};
     } else {
       set_running_locked(true);
+      authored_active_last_publication_ns_.store(0, std::memory_order_release);
       terminal_ = false;
       stop_requested_ = false;
       natural_completion_stop_requested_ = false;
@@ -2824,8 +2928,10 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
             .count();
   }
 
-  update_scene_positions(start_positions, SceneUpdateMode::kBestEffort);
-  publish_snapshot(core::ExecutionState::kExecuting, 0.0, start_positions);
+  if (publish_snapshot(core::ExecutionState::kExecuting, 0.0,
+                       start_positions)) {
+    (void)schedule_active_scene_projection(start_positions, clock_.now());
+  }
 
   if (!wait_for_action_server_until(action_client_,
                                     config_.wait_for_action_server_timeout_s)) {
@@ -3192,10 +3298,6 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
             trajectory.waypoints.size());
       }
     }
-    if (!predicted_positions.empty()) {
-      update_scene_positions(predicted_positions, SceneUpdateMode::kBestEffort);
-    }
-
     std::vector<double> snapshot_positions = predicted_positions;
     std::optional<std::string> tracking_failure;
     std::string tracking_failure_reason_code =
@@ -3366,12 +3468,15 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
                      std::move(tracking_failure_details));
       return;
     }
-    (void)publish_snapshot(
+    const bool snapshot_published = publish_snapshot(
         natural_completion_stop_requested ? core::ExecutionState::kStopping
                                           : core::ExecutionState::kExecuting,
         progress, snapshot_positions, std::nullopt, "", monitor_generation,
         SnapshotPublicationAuthority::kBackendAuthored,
         predicted_positions.empty() ? nullptr : &predicted_sample.velocities_rad_s);
+    if (snapshot_published && !snapshot_positions.empty()) {
+      (void)schedule_active_scene_projection(snapshot_positions, clock_.now());
+    }
     // Audit 6C (finding 2.5): the period still PACES the tick (waking on
     // every 100 Hz sample would burn CPU for nothing), but terminal and
     // stop/pause intent wake the worker immediately instead of waiting out
@@ -5185,6 +5290,23 @@ core::ResetResultDTO Ros2ControlExecutionBackend::reset() {
     }
     return core::ResetResultDTO{true, std::nullopt};
   }
+  std::unique_lock<std::mutex> scene_projection_barrier(
+      scene_projection_barrier_mutex_);
+  auto scene_projection_suspension = scene_projection_worker_->suspend();
+  if (!scene_projection_worker_->drain_for(
+          kSceneProjectionBarrierTimeout)) {
+    const auto snapshot = get_execution_snapshot();
+    const auto error = operator_intervention_error(
+        core::ErrorCode::kResetFailed,
+        "Timed out fencing pre-reset asynchronous scene projection",
+        "reset_scene_projection_drain_timeout",
+        snapshot.state);
+    publish_snapshot(core::ExecutionState::kInterventionRequired,
+                     snapshot.progress,
+                     snapshot.joint_positions_rad,
+                     error);
+    return core::ResetResultDTO{false, error};
+  }
   publish_snapshot(core::ExecutionState::kIdle, 0.0, {});
   return core::ResetResultDTO{true, std::nullopt};
 }
@@ -5303,6 +5425,16 @@ void Ros2ControlExecutionBackend::configure_gripper_action(
   }
   runtime->generation =
       next_gripper_generation_.fetch_add(1, std::memory_order_relaxed);
+  if (!runtime->config.group_id.empty()) {
+    const std::weak_ptr<GripperRuntime> weak_runtime = runtime;
+    runtime->scene_projection_slot =
+        scene_projection_worker_->register_joint_slot(
+            runtime->config.group_id, runtime->config.joint_name,
+            [this, weak_runtime](
+                const detail::SceneProjectionCompletion& completion) {
+              on_gripper_scene_projection_complete(weak_runtime, completion);
+            });
+  }
   std::shared_ptr<GripperRuntime> replaced_runtime;
   {
     std::lock_guard<std::mutex> authority_lock(gripper_authority_mutex_);
@@ -5403,7 +5535,6 @@ void Ros2ControlExecutionBackend::on_gripper_feedback(
   if (!runtime || !feedback) {
     return;
   }
-  Ros2GripperActionConfig runtime_config;
   std::optional<double> feedback_position;
   bool reached_goal = false;
   std::optional<core::ScheduleHandle> lifecycle_handle;
@@ -5437,7 +5568,6 @@ void Ros2ControlExecutionBackend::on_gripper_feedback(
       runtime->projection_state = core::GripperProjectionState::kNotRequired;
       runtime->projection_reason.clear();
     } else {
-      runtime_config = runtime->config;
       runtime->current_position = feedback->position;
       runtime->progress = clamp_progress(
           static_cast<double>(std::max<core::Duration>(
@@ -5480,17 +5610,9 @@ void Ros2ControlExecutionBackend::on_gripper_feedback(
       std::lock_guard<std::mutex> lock(runtime->mutex);
       if (runtime->command_id == command_id &&
           runtime->generation == generation) {
-        // Best-effort sink projection never waits for the scene mutex. Keep the
-        // gripper leaf lock across the external effect so reset/replacement
-        // cannot invalidate this generation between its check and write.
-        const bool projected = project_gripper_position_to_scene(
-            runtime_config, *feedback_position,
-            SceneUpdateMode::kBestEffort);
-        runtime->projection_state =
-            projected ? core::GripperProjectionState::kApplied
-                      : core::GripperProjectionState::kPending;
-        runtime->projection_reason = projected ? "" : "scene_sink_busy";
-        retry_projection = reached_goal && !projected;
+        const bool queued = schedule_gripper_scene_projection_locked(
+            runtime, *feedback_position, reached_goal);
+        retry_projection = reached_goal && !queued;
         ++runtime->revision;
       }
     }
@@ -5594,15 +5716,10 @@ void Ros2ControlExecutionBackend::on_gripper_result(
       std::lock_guard<std::mutex> lock(runtime->mutex);
       if (runtime->command_id == command_id &&
           runtime->generation == generation) {
-        const bool projected = project_gripper_position_to_scene(
-            runtime_config, *result_position,
-            SceneUpdateMode::kBestEffort);
-        runtime->projection_state =
-            projected ? core::GripperProjectionState::kApplied
-                      : core::GripperProjectionState::kPending;
-        runtime->projection_reason = projected ? "" : "scene_sink_busy";
-        retry_projection = !projected &&
-                           runtime->state == "completed";
+        const bool terminal = runtime->state == "completed";
+        const bool queued = schedule_gripper_scene_projection_locked(
+            runtime, *result_position, terminal);
+        retry_projection = terminal && !queued;
         ++runtime->revision;
       }
     }
@@ -6361,28 +6478,21 @@ void Ros2ControlExecutionBackend::advance_gripper_command(
     if (runtime->command_id == command_id &&
         runtime->generation == generation &&
         runtime->lifecycle_schedule_generation == schedule_generation) {
-      const bool projected = project_gripper_position_to_scene(
-          runtime_config, *scene_position, SceneUpdateMode::kBestEffort);
-      if (projected) {
-        runtime->projection_state = core::GripperProjectionState::kApplied;
-        runtime->projection_reason.clear();
-        runtime->projection_retry_count = 0;
-      } else {
-        runtime->projection_state = core::GripperProjectionState::kPending;
-        runtime->projection_reason = "scene_sink_busy";
-        if (!runtime->executing) {
-          ++runtime->projection_retry_count;
-          if (runtime->projection_retry_count >= 10) {
-            runtime->projection_state = core::GripperProjectionState::kFailed;
-            runtime->projection_reason = "scene_sink_retry_exhausted";
-            runtime->state = "failed";
-            runtime->error =
-                "Timed out publishing the terminal gripper scene position";
-            runtime->reason_code = "gripper_projection_failed";
-          } else {
-            schedule_next = true;
-            next_deadline_ns = clock_.now() + 20'000'000;
-          }
+      const bool terminal = !runtime->executing;
+      const bool queued = schedule_gripper_scene_projection_locked(
+          runtime, *scene_position, terminal);
+      if (!queued && terminal) {
+        ++runtime->projection_retry_count;
+        if (runtime->projection_retry_count >= 10) {
+          runtime->projection_state = core::GripperProjectionState::kFailed;
+          runtime->projection_reason = "scene_sink_retry_exhausted";
+          runtime->state = "failed";
+          runtime->error =
+              "Timed out queueing the terminal gripper scene position";
+          runtime->reason_code = "gripper_projection_failed";
+        } else {
+          schedule_next = true;
+          next_deadline_ns = clock_.now() + 20'000'000;
         }
       }
       ++runtime->revision;

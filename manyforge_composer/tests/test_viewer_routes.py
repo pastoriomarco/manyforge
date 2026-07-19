@@ -194,6 +194,38 @@ def test_viewer_websocket_uses_the_existing_bearer_auth_contract(
         assert json.loads(websocket.receive_text())["type"] == "frame"
 
 
+def test_viewer_websocket_rejects_qualification_delay_when_fixture_gate_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MANYFORGE_VIEWER_QUALIFICATION_FIXTURES", raising=False)
+    state = _state_with_publication(monkeypatch)
+    client = TestClient(create_app(state))
+
+    with pytest.raises(WebSocketDisconnect) as denied:
+        with client.websocket_connect(
+            "/ws/scene/viewer?qualification_send_delay_ms=250"
+        ):
+            pass
+    assert denied.value.code == 1008
+
+
+def test_viewer_websocket_exposes_gated_per_client_qualification_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MANYFORGE_VIEWER_QUALIFICATION_FIXTURES", "ON")
+    state = _state_with_publication(monkeypatch)
+    client = TestClient(create_app(state))
+
+    with client.websocket_connect(
+        "/ws/scene/viewer?qualification_send_delay_ms=25"
+    ) as websocket:
+        assert json.loads(websocket.receive_text())["type"] == "manifest"
+        assert json.loads(websocket.receive_text())["type"] == "frame"
+        status = client.get("/api/scene/viewer/status").json()
+        client_status = next(iter(status["fanout"]["clients"].values()))
+        assert client_status["qualification_send_delay_ms"] == 25.0
+
+
 def test_viewer_websocket_records_bounded_client_reported_qualification_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

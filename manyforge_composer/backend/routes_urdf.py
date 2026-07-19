@@ -1091,7 +1091,26 @@ def resolve_gripper_visualization(
     - Subtree enumeration is BFS deterministic; one bad descendant
       FK does not invalidate the whole resolution (drop-on-error).
     """
-    entry = get_urdf_entry(state)
+    return resolve_gripper_visualization_from_entry(
+        get_urdf_entry(state),
+        mount_frame,
+        tcp_frame,
+        srdf_gripper_joint_names=srdf_gripper_joint_names,
+    )
+
+
+def resolve_gripper_visualization_from_entry(
+    entry: _UrdfCacheEntry | None,
+    mount_frame: str,
+    tcp_frame: str,
+    *,
+    srdf_gripper_joint_names: tuple[str, ...] = (),
+) -> GripperVisualizationResolution | None:
+    """Resolve one gripper against an already selected immutable URDF entry.
+
+    Response builders use this form to keep every gripper on one model-cache
+    generation and to avoid repeating deployment and filesystem resolution.
+    """
     if entry is None:
         return None
     mount = (mount_frame or "").strip()

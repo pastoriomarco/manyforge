@@ -5,6 +5,8 @@
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 #undef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
 
+#include "../src/scene_projection_worker.hpp"
+
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <gtest/gtest.h>
 #include <rclcpp/rclcpp.hpp>
@@ -142,8 +144,15 @@ class RecordingExecutionStateSink final : public core::IExecutionStateSink {
       const std::string& group_id,
       const std::vector<double>& positions_rad,
       core::ExecutionStateUpdateMode mode) override {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     group_updates_.push_back({group_id, positions_rad, mode});
+    if (block_group_update_) {
+      group_update_entered_ = true;
+      group_update_cv_.notify_all();
+      group_update_cv_.wait_for(lock, 2s, [this]() {
+        return release_group_update_;
+      });
+    }
     if (fail_group_updates_remaining_ > 0) {
       --fail_group_updates_remaining_;
       return {fail_group_update_status_};
@@ -242,6 +251,13 @@ class RecordingExecutionStateSink final : public core::IExecutionStateSink {
     release_single_update_ = false;
   }
 
+  void block_group_update() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    block_group_update_ = true;
+    group_update_entered_ = false;
+    release_group_update_ = false;
+  }
+
   void block_read() {
     std::lock_guard<std::mutex> lock(mutex_);
     block_read_ = true;
@@ -269,6 +285,12 @@ class RecordingExecutionStateSink final : public core::IExecutionStateSink {
         lock, 2s, [this]() { return single_update_entered_; });
   }
 
+  bool wait_for_group_update() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return group_update_cv_.wait_for(
+        lock, 2s, [this]() { return group_update_entered_; });
+  }
+
   void release_single_update() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -276,6 +298,15 @@ class RecordingExecutionStateSink final : public core::IExecutionStateSink {
       block_single_update_ = false;
     }
     single_update_cv_.notify_all();
+  }
+
+  void release_group_update() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      release_group_update_ = true;
+      block_group_update_ = false;
+    }
+    group_update_cv_.notify_all();
   }
 
  private:
@@ -298,6 +329,10 @@ class RecordingExecutionStateSink final : public core::IExecutionStateSink {
   bool block_single_update_ = false;
   bool single_update_entered_ = false;
   bool release_single_update_ = false;
+  std::condition_variable group_update_cv_;
+  bool block_group_update_ = false;
+  bool group_update_entered_ = false;
+  bool release_group_update_ = false;
   mutable std::condition_variable read_cv_;
   mutable bool block_read_ = false;
   mutable bool read_entered_ = false;
@@ -598,6 +633,7 @@ TEST(Ros2ControlExecutionBackendTest,
       0.7, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
   ASSERT_TRUE(next.accepted) << (next.error ? next.error->message : "");
   scheduler.advance_to(clock.now());
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
   const auto reset = backend.get_gripper_status("tool");
   EXPECT_EQ(reset.state, core::GripperCommandState::kCompleted);
   EXPECT_TRUE(reset.evidence.empty());
@@ -701,6 +737,7 @@ TEST(Ros2ControlExecutionBackendTest,
 
   clock.advance(1'000'000);
   scheduler.advance_to(clock.now());
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
   const auto completed = backend.get_gripper_status("tool");
   EXPECT_EQ(completed.state, core::GripperCommandState::kCompleted);
   EXPECT_DOUBLE_EQ(completed.progress, 1.0);
@@ -750,6 +787,7 @@ TEST(Ros2ControlExecutionBackendTest,
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   sink->fail_next_single_updates(2);
+  sink->block_single_update();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   Ros2ControlExecutionBackend backend(
@@ -763,6 +801,7 @@ TEST(Ros2ControlExecutionBackendTest,
       0.0, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
   ASSERT_TRUE(command.accepted);
   scheduler.advance_to(clock.now());
+  ASSERT_TRUE(sink->wait_for_single_update());
   auto status = backend.get_gripper_status("tool");
   EXPECT_EQ(status.state, core::GripperCommandState::kExecuting);
   EXPECT_EQ(status.projection_state,
@@ -774,28 +813,25 @@ TEST(Ros2ControlExecutionBackendTest,
   EXPECT_EQ(while_pending.error->code,
             ros2_control_fault_reason::kGripperBusy);
 
-  clock.advance(20'000'000);
-  scheduler.advance_to(clock.now());
-  status = backend.get_gripper_status("tool");
-  EXPECT_EQ(status.state, core::GripperCommandState::kExecuting);
-  EXPECT_EQ(status.projection_state,
-            core::GripperProjectionState::kPending);
-
-  clock.advance(20'000'000);
-  scheduler.advance_to(clock.now());
+  sink->release_single_update();
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
   status = backend.get_gripper_status("tool");
   EXPECT_EQ(status.state, core::GripperCommandState::kCompleted);
   EXPECT_EQ(status.projection_state,
             core::GripperProjectionState::kApplied);
   ASSERT_EQ(sink->single_updates().size(), 3u);
   EXPECT_DOUBLE_EQ(sink->single_updates().back().position_rad, 0.0);
+  const auto metrics = backend.scene_projection_metrics();
+  EXPECT_EQ(metrics.terminal_retries_scheduled_total, 1u);
+  EXPECT_EQ(metrics.terminal_retry_successes_total, 1u);
+  EXPECT_EQ(metrics.terminal_retry_exhausted_total, 0u);
   const auto after_projection = backend.command_gripper(make_gripper_request(
       0.7, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
   EXPECT_TRUE(after_projection.accepted);
 }
 
 TEST(Ros2ControlExecutionBackendTest,
-     GripperInvalidationLinearizesAgainstDequeuedProjection) {
+     GripperInvalidationDoesNotWaitForDequeuedNrtProjectionAndFencesCompletion) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   sink->set_joint_position("gripper", "finger_joint", 0.7);
   sink->block_single_update();
@@ -815,23 +851,65 @@ TEST(Ros2ControlExecutionBackendTest,
     scheduler.advance_to(clock.now());
   });
   ASSERT_TRUE(sink->wait_for_single_update());
+  EXPECT_EQ(callback.wait_for(20ms), std::future_status::ready)
+      << "controller-command progression must only enqueue scene projection";
 
   auto invalidate = std::async(std::launch::async, [&]() {
     backend.invalidate_gripper_commands(
         core::GripperInvalidationReason::kReset);
   });
-  EXPECT_EQ(invalidate.wait_for(20ms), std::future_status::timeout)
-      << "invalidation must serialize with an already admitted sink effect";
+  EXPECT_EQ(invalidate.wait_for(20ms), std::future_status::ready)
+      << "stop/reset invalidation must not wait behind NRT scene projection";
 
   sink->release_single_update();
   callback.get();
   invalidate.get();
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
   const auto updates_after_invalidation = sink->single_updates().size();
   clock.advance(1'000'000'000);
   scheduler.advance_to(clock.now());
   EXPECT_EQ(sink->single_updates().size(), updates_after_invalidation);
   EXPECT_EQ(backend.get_gripper_status("tool").state,
             core::GripperCommandState::kIdle);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ResetFencesDequeuedSceneProjectionBeforeReturningIdle) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      base_config());
+
+  sink->block_group_update();
+  backend.testing_schedule_active_scene_projection({0.25}, clock.now());
+  ASSERT_TRUE(sink->wait_for_group_update());
+
+  auto reset = std::async(std::launch::async, [&]() {
+    return backend.reset();
+  });
+  EXPECT_EQ(reset.wait_for(20ms), std::future_status::timeout)
+      << "reset must not return while a pre-reset scene write is still active";
+  backend.testing_schedule_active_scene_projection({0.5}, clock.now());
+
+  sink->release_group_update();
+  const auto result = reset.get();
+  EXPECT_TRUE(result.accepted)
+      << (result.error ? result.error->message : "");
+  EXPECT_EQ(backend.get_execution_snapshot().state,
+            core::ExecutionState::kIdle);
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
+  EXPECT_EQ(sink->group_updates().size(), 1u)
+      << "a frame submitted after reset suspension must not land";
+  EXPECT_EQ(
+      backend.scene_projection_metrics()
+          .requests_rejected_while_suspended_total,
+      1u);
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -1004,6 +1082,7 @@ TEST(Ros2ControlExecutionBackendTest,
 
   const auto result = backend.sync_observed_state_before_planning();
   ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
   const auto updates = sink->group_updates();
   ASSERT_FALSE(updates.empty());
   bool saw_blocking_pre_plan_update = false;
@@ -1177,6 +1256,7 @@ TEST(Ros2ControlExecutionBackendTest,
       make_single_joint_trajectory(0.0, 1.0), started_at));
   ASSERT_TRUE(backend.testing_publish_controlled_stop_command_reference_snapshot(
       started_at + 50ms));
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
 
   const auto updates = sink->group_updates();
   ASSERT_EQ(updates.size(), 1u);
@@ -1216,6 +1296,7 @@ TEST(Ros2ControlExecutionBackendTest,
   const auto t0 = std::chrono::steady_clock::now();
   backend.testing_store_latest_joint_sample({"joint_1"}, {0.1}, t0);
   backend.testing_sync_idle_scene_from_latest_sample();
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
   ASSERT_EQ(sink->group_updates().size(), 1u);
 
   backend.testing_sync_idle_scene_from_latest_sample();
@@ -1231,6 +1312,7 @@ TEST(Ros2ControlExecutionBackendTest,
   backend.testing_store_latest_joint_sample(
       {"joint_1"}, {0.3}, std::chrono::steady_clock::now());
   backend.testing_sync_idle_scene_from_latest_sample();
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
   ASSERT_EQ(sink->group_updates().size(), 2u);
 
   backend.testing_set_running_state(true);
@@ -1244,9 +1326,96 @@ TEST(Ros2ControlExecutionBackendTest,
   backend.testing_store_latest_joint_sample(
       {"joint_1"}, {0.5}, std::chrono::steady_clock::now());
   backend.testing_sync_idle_scene_from_latest_sample();
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
   ASSERT_EQ(sink->group_updates().size(), 3u)
       << "the first sample after an execution generation is not rate limited";
   EXPECT_NEAR(sink->group_updates().back().positions_rad.front(), 0.5, 1e-9);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ActiveSceneProjectionIsAsyncAndCoalescesToLatestState) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      base_config());
+
+  sink->block_group_update();
+  backend.testing_schedule_active_scene_projection({0.1}, 1);
+  ASSERT_TRUE(sink->wait_for_group_update());
+
+  const auto submitted_at = std::chrono::steady_clock::now();
+  backend.testing_schedule_active_scene_projection({0.2}, 2);
+  backend.testing_schedule_active_scene_projection({0.3}, 3);
+  EXPECT_LT(std::chrono::steady_clock::now() - submitted_at, 20ms)
+      << "controller progress must not wait for an in-flight scene projection";
+
+  sink->release_group_update();
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
+
+  const auto updates = sink->group_updates();
+  ASSERT_EQ(updates.size(), 2u);
+  EXPECT_EQ(updates.front().positions_rad, (std::vector<double>{0.1}));
+  EXPECT_EQ(updates.back().positions_rad, (std::vector<double>{0.3}));
+  EXPECT_EQ(updates.back().mode,
+            core::ExecutionStateUpdateMode::kBestEffort);
+
+  const auto metrics = backend.scene_projection_metrics();
+  EXPECT_EQ(metrics.active_requests_total, 3u);
+  EXPECT_EQ(metrics.requests_coalesced_total, 1u);
+  EXPECT_EQ(metrics.successful_updates_total, 2u);
+  EXPECT_GT(metrics.apply_duration_max_ns, 0u);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ArmAndGripperProjectionUseIndependentLatestOnlySlots) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::DeferredRosExecutorStartTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      base_config());
+  backend.configure_gripper_action(
+      "tool", isaac_gripper_config(
+                  "/manyforge_independent_projection_slots_" + unique_suffix()));
+  const auto gripper = backend.command_gripper(make_gripper_request(
+      0.0, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+  ASSERT_TRUE(gripper.accepted);
+
+  sink->block_group_update();
+  backend.testing_schedule_active_scene_projection({0.1}, 1);
+  ASSERT_TRUE(sink->wait_for_group_update());
+  scheduler.advance_to(clock.now());
+  backend.testing_schedule_active_scene_projection({0.2}, 2);
+  backend.testing_schedule_active_scene_projection({0.3}, 3);
+
+  sink->release_group_update();
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
+  const auto group_updates = sink->group_updates();
+  const auto joint_updates = sink->single_updates();
+  ASSERT_EQ(group_updates.size(), 2u);
+  EXPECT_EQ(group_updates.front().positions_rad,
+            (std::vector<double>{0.1}));
+  EXPECT_EQ(group_updates.back().positions_rad,
+            (std::vector<double>{0.3}));
+  ASSERT_EQ(joint_updates.size(), 1u);
+  EXPECT_DOUBLE_EQ(joint_updates.front().position_rad, 0.0);
+  EXPECT_EQ(backend.get_gripper_status("tool").state,
+            core::GripperCommandState::kCompleted);
+
+  const auto metrics = backend.scene_projection_metrics();
+  EXPECT_EQ(metrics.joint_requests_total, 1u);
+  EXPECT_EQ(metrics.requests_coalesced_total, 1u);
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -1282,6 +1451,28 @@ TEST(Ros2ControlExecutionBackendTest,
             first_capacity);
 }
 
+TEST(SceneProjectionWorkerTest,
+     CompletionCallbackExceptionIsContainedAndMetriced) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  detail::SceneProjectionWorker worker(sink, "arm", clock);
+  const auto slot = worker.register_joint_slot(
+      "gripper", "finger_joint",
+      [](const detail::SceneProjectionCompletion&) {
+        throw std::runtime_error("injected completion callback failure");
+      });
+
+  ASSERT_TRUE(worker.submit_active_joint(
+      slot, 0.25, clock.now(), detail::SceneProjectionToken{1, 2, 3}));
+  ASSERT_TRUE(worker.drain_for(1s));
+
+  const auto metrics = worker.metrics();
+  EXPECT_EQ(metrics.successful_updates_total, 1U);
+  EXPECT_EQ(metrics.completion_callback_exceptions_total, 1U);
+  EXPECT_EQ(sink->single_updates().size(), 1U);
+  EXPECT_TRUE(worker.stop_and_join_for(1s));
+}
+
 TEST(Ros2ControlExecutionBackendTest,
      TerminalSceneProjectionMissIsMetricedAndRetriedAfterSnapshot) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
@@ -1309,10 +1500,6 @@ TEST(Ros2ControlExecutionBackendTest,
   EXPECT_NEAR(terminal.joint_positions_rad.front(), 0.42, 1e-9);
 
   auto metrics = backend.scene_projection_metrics();
-  EXPECT_EQ(metrics.misses_total, 1u);
-  EXPECT_EQ(metrics.terminal_retries_scheduled_total, 1u);
-  EXPECT_EQ(metrics.terminal_retry_exhausted_total, 0u);
-
   const auto deadline = std::chrono::steady_clock::now() + 1s;
   while (metrics.terminal_retry_successes_total == 0u &&
          std::chrono::steady_clock::now() < deadline) {
@@ -1320,6 +1507,8 @@ TEST(Ros2ControlExecutionBackendTest,
     metrics = backend.scene_projection_metrics();
   }
 
+  EXPECT_EQ(metrics.misses_total, 1u);
+  EXPECT_EQ(metrics.terminal_retries_scheduled_total, 1u);
   EXPECT_EQ(metrics.terminal_retry_successes_total, 1u);
   EXPECT_EQ(metrics.terminal_retry_exhausted_total, 0u);
   EXPECT_GE(metrics.successful_updates_total, 1u);

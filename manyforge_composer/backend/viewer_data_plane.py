@@ -713,6 +713,7 @@ class _FanoutClient:
     send_timeouts: int = 0
     client_diagnostics: dict[str, Any] | None = None
     client_diagnostics_received_at_ns: int | None = None
+    qualification_send_delay_s: float = 0.0
     closed: bool = False
 
 
@@ -742,8 +743,25 @@ class BoundedViewerFanout:
         self._ingress_drain_scheduled = False
         self._ingress_replacements = 0
         self._ingress_schedule_failures = 0
+        self._retired_replaced_frames = 0
+        self._retired_replaced_controls = 0
+        self._retired_replaced_diagnostics = 0
+        self._retired_send_errors = 0
+        self._retired_send_timeouts = 0
 
-    async def attach(self, websocket: WebSocket, *, client_id: str) -> None:
+    async def attach(
+        self,
+        websocket: WebSocket,
+        *,
+        client_id: str,
+        qualification_send_delay_s: float = 0.0,
+    ) -> None:
+        if (
+            not math.isfinite(qualification_send_delay_s)
+            or qualification_send_delay_s < 0.0
+            or qualification_send_delay_s >= self._send_timeout_s
+        ):
+            raise ValueError("qualification send delay must remain below send timeout")
         loop = asyncio.get_running_loop()
         async with self._lock:
             if self._loop is not None and self._loop is not loop:
@@ -754,12 +772,18 @@ class BoundedViewerFanout:
             self._clients[client_id] = _FanoutClient(
                 client_id=client_id,
                 websocket=websocket,
+                qualification_send_delay_s=qualification_send_delay_s,
             )
 
     async def detach(self, client_id: str) -> None:
         async with self._lock:
             client = self._clients.pop(client_id, None)
             if client is not None:
+                self._retired_replaced_frames += client.replaced_frames
+                self._retired_replaced_controls += client.replaced_controls
+                self._retired_replaced_diagnostics += client.replaced_diagnostics
+                self._retired_send_errors += client.send_errors
+                self._retired_send_timeouts += client.send_timeouts
                 client.closed = True
                 client.event.set()
 
@@ -844,6 +868,7 @@ class BoundedViewerFanout:
                 publication = client.pending
                 control = client.control_pending
                 diagnostics = client.diagnostics_pending
+                qualification_send_delay_s = client.qualification_send_delay_s
                 client.pending = None
                 client.control_pending = None
                 client.diagnostics_pending = None
@@ -864,6 +889,12 @@ class BoundedViewerFanout:
                             timeout=self._send_timeout_s,
                         )
                     continue
+                if qualification_send_delay_s > 0.0:
+                    await asyncio.sleep(qualification_send_delay_s)
+                    async with self._lock:
+                        current = self._clients.get(client_id)
+                        if current is not client or current.closed:
+                            return
                 manifest_identity = (
                     publication.producer_epoch,
                     publication.manifest_revision,
@@ -980,24 +1011,27 @@ class BoundedViewerFanout:
                     "client_diagnostics_received_at_ns": (
                         client.client_diagnostics_received_at_ns
                     ),
+                    "qualification_send_delay_ms": (
+                        client.qualification_send_delay_s * 1000.0
+                    ),
                 }
                 for client_id, client in self._clients.items()
             }
             replaced_frames_total = sum(
                 client.replaced_frames for client in self._clients.values()
-            )
+            ) + self._retired_replaced_frames
             replaced_controls_total = sum(
                 client.replaced_controls for client in self._clients.values()
-            )
+            ) + self._retired_replaced_controls
             replaced_diagnostics_total = sum(
                 client.replaced_diagnostics for client in self._clients.values()
-            )
+            ) + self._retired_replaced_diagnostics
             send_errors_total = sum(
                 client.send_errors for client in self._clients.values()
-            )
+            ) + self._retired_send_errors
             send_timeouts_total = sum(
                 client.send_timeouts for client in self._clients.values()
-            )
+            ) + self._retired_send_timeouts
             with self._ingress_lock:
                 ingress_pending = self._ingress_pending is not None
                 ingress_replacements = self._ingress_replacements

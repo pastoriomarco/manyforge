@@ -276,7 +276,11 @@ def test_gripper_state_soak_resolves_urdf_limits_once_per_response(
         )
 
     monkeypatch.setattr(routes_urdf, "get_urdf_entry", fake_get_urdf_entry)
-    monkeypatch.setattr(routes_urdf, "resolve_gripper_visualization", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        routes_urdf,
+        "resolve_gripper_visualization_from_entry",
+        lambda *args, **kwargs: None,
+    )
     kernel = _SoakKernel()
     state = _SoakState(kernel, gripper_count=24)
 
@@ -369,7 +373,7 @@ def test_glb_cache_soak_enforces_per_model_cap(
         assert routes_urdf._render_visual_glb(entry, visual) == b"glb"
         assert len(entry.mesh_glb_cache) <= 4
 
-    retained_indices = {key[1] for key in entry.mesh_glb_cache.keys()}
+    retained_indices = {key[2] for key in entry.mesh_glb_cache.keys()}
     assert retained_indices == {8, 9, 10, 11}
 
 

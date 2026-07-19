@@ -1270,6 +1270,8 @@ def _collect_gripper_states(
     kernel = state.kernel
     if deployment is None or kernel is None:
         return []
+    entry = None
+    entry_joints: tuple[Any, ...] = ()
     joint_limits: dict[str, tuple[Optional[float], Optional[float]]] = {}
     derived_joints_by_gripper: dict[str, list[str]] = {}
     try:
@@ -1277,10 +1279,15 @@ def _collect_gripper_states(
 
         entry = get_urdf_entry(state)
         if entry is not None:
-            joint_limits = {
-                joint.name: (joint.limit_lower, joint.limit_upper)
-                for joint in entry.joints
-            }
+            entry_joints = tuple(getattr(entry, "joints", ()) or ())
+            for joint in entry_joints:
+                joint_name = str(getattr(joint, "name", "") or "").strip()
+                if not joint_name:
+                    continue
+                joint_limits[joint_name] = (
+                    getattr(joint, "limit_lower", None),
+                    getattr(joint, "limit_upper", None),
+                )
         metadata = robot_model_authority_metadata(state)
         raw_grippers = metadata.get("grippers") if isinstance(metadata, dict) else None
         if isinstance(raw_grippers, dict):
@@ -1302,9 +1309,9 @@ def _collect_gripper_states(
     # gripper silhouette at the unreachable target, regardless of whether
     # tcp_frame is itself a visual link.
     try:
-        from .routes_urdf import resolve_gripper_visualization
+        from .routes_urdf import resolve_gripper_visualization_from_entry
     except Exception:
-        resolve_gripper_visualization = None  # type: ignore[assignment]
+        resolve_gripper_visualization_from_entry = None  # type: ignore[assignment]
         logger.debug("routes_urdf not importable; scene gripper viz disabled", exc_info=True)
 
     out: list[SceneGripperStateResponse] = []
@@ -1325,26 +1332,24 @@ def _collect_gripper_states(
         )
         derived_joints = derived_joints_by_gripper.get(gripper_id)
         if derived_joints is None:
-            try:
-                from .routes_urdf import get_urdf_entry
-
-                entry = get_urdf_entry(state)
-                derived_joints = [
-                    joint.name
-                    for joint in (entry.joints if entry is not None else ())
-                    if joint.mimic is not None and joint.mimic[0] == config.joint_name
-                ]
-            except Exception:
-                derived_joints = []
+            derived_joints = []
+            for joint in entry_joints:
+                mimic = getattr(joint, "mimic", None)
+                if not isinstance(mimic, (list, tuple)) or not mimic:
+                    continue
+                if mimic[0] == config.joint_name:
+                    joint_name = str(getattr(joint, "name", "") or "").strip()
+                    if joint_name:
+                        derived_joints.append(joint_name)
         visualization = None
-        if resolve_gripper_visualization is not None:
+        if resolve_gripper_visualization_from_entry is not None:
             srdf_gripper_joints: tuple[str, ...] = ()
             joint_name = (config.joint_name or "").strip()
             if joint_name:
                 srdf_gripper_joints = (joint_name,)
             try:
-                resolution = resolve_gripper_visualization(
-                    state,
+                resolution = resolve_gripper_visualization_from_entry(
+                    entry,
                     mount_frame=config.mount_frame,
                     tcp_frame=config.tcp_frame,
                     srdf_gripper_joint_names=srdf_gripper_joints,
