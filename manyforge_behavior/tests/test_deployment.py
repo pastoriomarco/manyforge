@@ -3817,6 +3817,30 @@ class TestCrossArtifactValidation:
         assert measured_tcp.entity_to_tcp_position_xyz == (0.0, 0.0, 0.2)
         assert measured_tcp.entity_to_tcp_orientation_xyzw == (0.0, 0.0, 0.0, 1.0)
 
+    @pytest.mark.parametrize(
+        "deployment_path",
+        [
+            ISAAC_LIGHT_ROS2_CONTROL_DEPLOYMENT_PATH,
+            ISAAC_LIGHT_ROS2_CONTROL_COLLISION_DEPLOYMENT_PATH,
+            ISAAC_LIGHT_ASSISTANT_DEPLOYMENT_PATH,
+        ],
+    )
+    def test_isaac_light_measured_robot_uses_complete_gripper_state_stream(
+        self, deployment_path
+    ):
+        deploy = Deployment(deployment_path)
+        measured_robot = deploy.pose_sources["isaac_scene_objects"].measured_robot
+        bridge_config = yaml.safe_load(
+            ISAAC_ROBOTIQ_GRIPPER_BRIDGE_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+        bridge_state_topic = bridge_config[
+            "manyforge_isaac_gripper_action_bridge"
+        ]["ros__parameters"]["state_topic"]
+
+        assert measured_robot is not None
+        assert bridge_state_topic == "/isaac_joint_states"
+        assert measured_robot.joint_state_topic == bridge_state_topic
+
     def test_validate_against_isaac_lite6_ros2_control_program_success(self, catalog):
         """The Isaac Lite6 ROS execution deployment matches its pick-and-place program."""
         deploy = Deployment(ISAAC_LITE6_PICK_PLACE_DEPLOYMENT_PATH)

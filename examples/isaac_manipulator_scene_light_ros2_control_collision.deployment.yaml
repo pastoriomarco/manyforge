@@ -289,7 +289,7 @@ pose_sources:
       position_xyz: [0.0, 0.0, 0.2]
       orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
   measured_robot:
-    joint_state_topic: /joint_states
+    joint_state_topic: /isaac_joint_states
   objects:
     isaac_cheese_box:
       apply_policy: continuous_unattached
