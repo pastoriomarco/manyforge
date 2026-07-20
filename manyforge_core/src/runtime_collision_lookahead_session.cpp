@@ -916,6 +916,22 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
   if (decision.cancelled || !decision.decision.accepted ||
       decision.decision.action == CollisionDecisionAction::kInconclusive) {
     append_collision_failure_diagnostics(result.failure_details, decision);
+    std::size_t entering_contact_pair_count = 0;
+    for (std::size_t index = 0; index < job.contact_state.count; ++index) {
+      const auto state = job.contact_state.entries[index].support_state;
+      if (state == SupportContactEvaluationState::kInitialContact ||
+          state == SupportContactEvaluationState::kContactActive) {
+        ++entering_contact_pair_count;
+      }
+    }
+    if (auto violation = contact_policy_violation_details(
+            decision, *job.bundle->policy, "preempt_trajectory",
+            entering_contact_pair_count)) {
+      violation->emplace("surface", "observed_runtime_lookahead");
+      for (auto& [key, value] : *violation) {
+        result.failure_details[key] = std::move(value);
+      }
+    }
   }
   if (deadline_exceeded()) {
     result.reason = "runtime_lookahead_deadline_exceeded";

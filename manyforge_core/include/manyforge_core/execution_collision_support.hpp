@@ -194,6 +194,15 @@ bool runtime_collision_lookup_order_is_valid(
 void append_collision_failure_diagnostics(
     std::map<std::string, std::string>& details,
     const CollisionValidationDecisionBundle& bundle);
+/// Build the native contact-policy violation payload for the selected failing
+/// support-contact record. Returns nullopt for ordinary collisions and for
+/// contact-grasp failures, which retain their existing event taxonomy.
+std::optional<std::map<std::string, std::string>>
+contact_policy_violation_details(
+    const CollisionValidationDecisionBundle& bundle,
+    const CollisionPolicySnapshot& policy,
+    std::string_view response,
+    std::optional<std::size_t> initial_contact_pair_count = std::nullopt);
 std::string pre_dispatch_collision_validation_message(
     const std::map<std::string, std::string>& details,
     CollisionDecisionAction action);

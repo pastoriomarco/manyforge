@@ -5,6 +5,7 @@
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -56,6 +57,345 @@ uint64_t steady_now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              tp.time_since_epoch())
       .count();
+}
+
+struct ContactPolicyValidationFailure {
+  std::string reason;
+  std::string field;
+  std::string message;
+};
+
+struct IndexedContactPolicyValidationFailure {
+  std::size_t index = 0;
+  std::optional<std::size_t> first_index;
+  core::CollisionPairId canonical_pair;
+  ContactPolicyValidationFailure failure;
+};
+
+core::CollisionPairId canonical_support_contact_pair(
+    core::CollisionPairId pair) {
+  if (pair.body_b < pair.body_a) {
+    std::swap(pair.body_a, pair.body_b);
+  }
+  return pair;
+}
+
+template <typename Contact>
+bool release_metric_fields_match_defaults(const Contact& contact) {
+  return contact.enforce_max_start_penetration &&
+         contact.max_start_penetration_m == 0.0 &&
+         contact.release_tolerance_m == 1e-5 &&
+         contact.min_release_progress_m == 0.0 &&
+         contact.require_separation_by_end &&
+         contact.require_strictly_decreasing_penetration &&
+         !contact.allow_recontact;
+}
+
+template <typename Contact>
+bool release_metric_fields_are_neutral(const Contact& contact) {
+  return !contact.enforce_max_start_penetration &&
+         contact.max_start_penetration_m == 0.0 &&
+         contact.release_tolerance_m == 0.0 &&
+         contact.min_release_progress_m == 0.0 &&
+         !contact.require_separation_by_end &&
+         !contact.require_strictly_decreasing_penetration &&
+         !contact.allow_recontact;
+}
+
+template <typename Contact>
+bool binary_metric_fields_match_typed_defaults(const Contact& contact) {
+  return contact.enforce_max_start_penetration &&
+         contact.max_start_penetration_m == 0.0 &&
+         contact.release_tolerance_m == 1e-5 &&
+         contact.min_release_progress_m == 0.0 &&
+         contact.require_strictly_decreasing_penetration;
+}
+
+template <typename Contact>
+bool binary_metric_fields_are_neutral(const Contact& contact) {
+  return !contact.enforce_max_start_penetration &&
+         contact.max_start_penetration_m == 0.0 &&
+         contact.release_tolerance_m == 0.0 &&
+         contact.min_release_progress_m == 0.0 &&
+         !contact.require_strictly_decreasing_penetration;
+}
+
+template <typename Contact>
+std::string binary_metric_field_different_from_nearest_typed_baseline(
+    const Contact& contact) {
+  struct CandidateField {
+    const char* name;
+    bool differs_from_default;
+    bool differs_from_neutral;
+  };
+  const std::array<CandidateField, 5> fields{{
+      {"enforce_max_start_penetration",
+       !contact.enforce_max_start_penetration,
+       contact.enforce_max_start_penetration},
+      {"max_start_penetration_m",
+       contact.max_start_penetration_m != 0.0,
+       contact.max_start_penetration_m != 0.0},
+      {"release_tolerance_m",
+       contact.release_tolerance_m != 1e-5,
+       contact.release_tolerance_m != 0.0},
+      {"min_release_progress_m",
+       contact.min_release_progress_m != 0.0,
+       contact.min_release_progress_m != 0.0},
+      {"require_strictly_decreasing_penetration",
+       !contact.require_strictly_decreasing_penetration,
+       contact.require_strictly_decreasing_penetration},
+  }};
+  const auto default_mismatches =
+      std::count_if(fields.begin(), fields.end(), [](const auto& field) {
+        return field.differs_from_default;
+      });
+  const auto neutral_mismatches =
+      std::count_if(fields.begin(), fields.end(), [](const auto& field) {
+        return field.differs_from_neutral;
+      });
+  const bool compare_to_default = default_mismatches <= neutral_mismatches;
+  const auto found =
+      std::find_if(fields.begin(), fields.end(), [&](const auto& field) {
+        return compare_to_default ? field.differs_from_default
+                                  : field.differs_from_neutral;
+      });
+  return found == fields.end() ? "metric_fields" : found->name;
+}
+
+template <typename Contact>
+std::string release_metric_field_different_from_nearest_typed_baseline(
+    const Contact& contact) {
+  struct CandidateField {
+    const char* name;
+    bool differs_from_default;
+    bool differs_from_neutral;
+  };
+  const std::array<CandidateField, 7> fields{{
+      {"enforce_max_start_penetration",
+       !contact.enforce_max_start_penetration,
+       contact.enforce_max_start_penetration},
+      {"max_start_penetration_m",
+       contact.max_start_penetration_m != 0.0,
+       contact.max_start_penetration_m != 0.0},
+      {"release_tolerance_m",
+       contact.release_tolerance_m != 1e-5,
+       contact.release_tolerance_m != 0.0},
+      {"min_release_progress_m",
+       contact.min_release_progress_m != 0.0,
+       contact.min_release_progress_m != 0.0},
+      {"require_separation_by_end",
+       !contact.require_separation_by_end,
+       contact.require_separation_by_end},
+      {"require_strictly_decreasing_penetration",
+       !contact.require_strictly_decreasing_penetration,
+       contact.require_strictly_decreasing_penetration},
+      {"allow_recontact", contact.allow_recontact, contact.allow_recontact},
+  }};
+  const auto default_mismatches =
+      std::count_if(fields.begin(), fields.end(), [](const auto& field) {
+        return field.differs_from_default;
+      });
+  const auto neutral_mismatches =
+      std::count_if(fields.begin(), fields.end(), [](const auto& field) {
+        return field.differs_from_neutral;
+      });
+  const bool compare_to_default = default_mismatches <= neutral_mismatches;
+  const auto found =
+      std::find_if(fields.begin(), fields.end(), [&](const auto& field) {
+        return compare_to_default ? field.differs_from_default
+                                  : field.differs_from_neutral;
+      });
+  return found == fields.end() ? "release_fields" : found->name;
+}
+
+template <typename Contact>
+std::optional<ContactPolicyValidationFailure>
+validate_authored_mode_scoped_contact_fields(const Contact& contact) {
+  if (contact.mode != core::CollisionContactPolicyMode::kContactRelease &&
+      contact.mode != core::CollisionContactPolicyMode::kBoundedPenetration &&
+      contact.mode != core::CollisionContactPolicyMode::kContactProcess) {
+    return ContactPolicyValidationFailure{
+        "unknown_contact_policy_mode",
+        "mode",
+        "support-contact mode is unsupported"};
+  }
+  if (contact.release_evidence_mode !=
+          core::ContactReleaseEvidenceMode::kSignedPenetration &&
+      contact.release_evidence_mode !=
+          core::ContactReleaseEvidenceMode::kBinaryContact) {
+    return ContactPolicyValidationFailure{
+        "unknown_release_evidence_mode",
+        "release_evidence_mode",
+        "contact-release evidence mode is unsupported"};
+  }
+
+  const auto nonnegative_finite = [](double value) {
+    return std::isfinite(value) && value >= 0.0;
+  };
+  if (contact.mode == core::CollisionContactPolicyMode::kBoundedPenetration) {
+    if (!nonnegative_finite(contact.max_contact_penetration_m)) {
+      return ContactPolicyValidationFailure{
+          "bounded_penetration_threshold_invalid",
+          "max_contact_penetration_m",
+          "max_contact_penetration_m must be finite and non-negative"};
+    }
+    if (contact.release_evidence_mode !=
+        core::ContactReleaseEvidenceMode::kSignedPenetration) {
+      return ContactPolicyValidationFailure{
+          "release_evidence_mode_not_applicable",
+          "release_evidence_mode",
+          "release_evidence_mode is not applicable to bounded_penetration"};
+    }
+    if (!release_metric_fields_match_defaults(contact) &&
+        !release_metric_fields_are_neutral(contact)) {
+      const auto field =
+          release_metric_field_different_from_nearest_typed_baseline(contact);
+      return ContactPolicyValidationFailure{
+          "release_field_for_bounded_penetration",
+          field,
+          field + " is not applicable to bounded_penetration"};
+    }
+    return std::nullopt;
+  }
+
+  if (contact.max_contact_penetration_m != 0.0) {
+    return ContactPolicyValidationFailure{
+        "bounded_penetration_field_not_applicable",
+        "max_contact_penetration_m",
+        "max_contact_penetration_m is valid only for bounded_penetration"};
+  }
+
+  if (contact.mode == core::CollisionContactPolicyMode::kContactProcess) {
+    if (contact.release_evidence_mode !=
+        core::ContactReleaseEvidenceMode::kSignedPenetration) {
+      return ContactPolicyValidationFailure{
+          "release_evidence_mode_not_applicable",
+          "release_evidence_mode",
+          "release_evidence_mode is not applicable to contact_process"};
+    }
+    if (!release_metric_fields_match_defaults(contact) &&
+        !release_metric_fields_are_neutral(contact)) {
+      const auto field =
+          release_metric_field_different_from_nearest_typed_baseline(contact);
+      return ContactPolicyValidationFailure{
+          "release_field_not_applicable",
+          field,
+          field + " is not applicable to contact_process"};
+    }
+    return std::nullopt;
+  }
+
+  if (contact.release_evidence_mode ==
+      core::ContactReleaseEvidenceMode::kBinaryContact) {
+    if (!binary_metric_fields_match_typed_defaults(contact) &&
+        !binary_metric_fields_are_neutral(contact)) {
+      const auto field =
+          binary_metric_field_different_from_nearest_typed_baseline(contact);
+      return ContactPolicyValidationFailure{
+          "metric_field_for_binary_contact",
+          field,
+          field + " is not valid for binary_contact"};
+    }
+    return std::nullopt;
+  }
+
+  const std::array<std::pair<const char*, double>, 3> metric_fields{{
+      {"max_start_penetration_m", contact.max_start_penetration_m},
+      {"release_tolerance_m", contact.release_tolerance_m},
+      {"min_release_progress_m", contact.min_release_progress_m},
+  }};
+  for (const auto& [field, value] : metric_fields) {
+    if (!nonnegative_finite(value)) {
+      return ContactPolicyValidationFailure{
+          "contact_release_metric_invalid",
+          field,
+          std::string(field) + " must be finite and non-negative"};
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<ContactPolicyValidationFailure> validate_support_contact_policy(
+    const core::SupportContactDTO& contact) {
+  if (contact.support_object_id.empty()) {
+    return ContactPolicyValidationFailure{
+        "invalid_support_contact_reference",
+        "support_object_id",
+        "support_object_id must not be empty"};
+  }
+  return validate_authored_mode_scoped_contact_fields(contact);
+}
+
+std::optional<ContactPolicyValidationFailure> validate_support_contact_policy(
+    const core::SupportContactPolicyEntry& contact) {
+  if (contact.pair.body_a.empty() || contact.pair.body_b.empty() ||
+      contact.pair.body_a == contact.pair.body_b) {
+    return ContactPolicyValidationFailure{
+        "invalid_support_contact_pair",
+        "pair",
+        "support-contact pair must contain two distinct body ids"};
+  }
+  return validate_authored_mode_scoped_contact_fields(contact);
+}
+
+std::optional<IndexedContactPolicyValidationFailure>
+validate_support_contact_policy_entries(
+    const std::vector<core::SupportContactPolicyEntry>& contacts) {
+  std::map<core::CollisionPairId, std::size_t> first_index_by_pair;
+  for (std::size_t index = 0; index < contacts.size(); ++index) {
+    const auto canonical_pair =
+        canonical_support_contact_pair(contacts[index].pair);
+    if (const auto error = validate_support_contact_policy(contacts[index])) {
+      return IndexedContactPolicyValidationFailure{
+          index, std::nullopt, canonical_pair, *error};
+    }
+    const auto [first, inserted] =
+        first_index_by_pair.emplace(canonical_pair, index);
+    if (!inserted) {
+      return IndexedContactPolicyValidationFailure{
+          index,
+          first->second,
+          canonical_pair,
+          ContactPolicyValidationFailure{
+              "duplicate_support_contact_pair",
+              "pair",
+              "support-contact pair is configured more than once"}};
+    }
+  }
+  return std::nullopt;
+}
+
+template <typename Contact>
+void canonicalize_mode_scoped_contact_fields(Contact& contact) {
+  if (contact.mode == core::CollisionContactPolicyMode::kContactRelease) {
+    contact.max_contact_penetration_m = 0.0;
+    if (contact.release_evidence_mode ==
+        core::ContactReleaseEvidenceMode::kBinaryContact) {
+      contact.enforce_max_start_penetration = false;
+      contact.max_start_penetration_m = 0.0;
+      contact.release_tolerance_m = 0.0;
+      contact.min_release_progress_m = 0.0;
+      contact.require_strictly_decreasing_penetration = false;
+    }
+    return;
+  }
+
+  // Typed DTOs do not encode field presence, so their contact-release members
+  // carry contact-release defaults even for another top-level mode.
+  // Presence-aware artifact/dict boundaries reject those fields. Internally,
+  // erase them so ignored defaults cannot affect identity or policy hashes.
+  contact.release_evidence_mode =
+      core::ContactReleaseEvidenceMode::kSignedPenetration;
+  contact.enforce_max_start_penetration = false;
+  contact.max_start_penetration_m = 0.0;
+  contact.release_tolerance_m = 0.0;
+  contact.min_release_progress_m = 0.0;
+  contact.require_separation_by_end = false;
+  contact.require_strictly_decreasing_penetration = false;
+  contact.allow_recontact = false;
+  if (contact.mode == core::CollisionContactPolicyMode::kContactProcess) {
+    contact.max_contact_penetration_m = 0.0;
+  }
 }
 
 Eigen::VectorXd vector_from_std(const std::vector<double>& positions) {
@@ -200,6 +540,18 @@ RoboPlanProjectionBackend::RoboPlanProjectionBackend(
   if (robot_id.empty()) {
     throw std::invalid_argument("RoboPlan projection robot id must not be empty");
   }
+  if (initial_policy_snapshot.has_value()) {
+    if (const auto error = validate_support_contact_policy_entries(
+            initial_policy_snapshot->support_contacts)) {
+      throw std::invalid_argument(
+          "initial collision policy support_contacts[" +
+          std::to_string(error->index) + "]: " + error->failure.message);
+    }
+    for (auto& contact : initial_policy_snapshot->support_contacts) {
+      contact.pair = canonical_support_contact_pair(contact.pair);
+      canonicalize_mode_scoped_contact_fields(contact);
+    }
+  }
   mapper_robot_id_ = std::move(robot_id);
   policy_snapshot_ = std::move(initial_policy_snapshot);
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
@@ -217,6 +569,29 @@ std::string stable_double(double value) {
   std::ostringstream oss;
   oss << std::setprecision(17) << value;
   return oss.str();
+}
+
+std::string support_contact_identity_entry(
+    const core::SupportContactDTO& contact) {
+  std::string entry =
+      contact.support_object_id + ":" +
+      std::to_string(static_cast<int>(contact.mode));
+  if (contact.mode ==
+      core::CollisionContactPolicyMode::kBoundedPenetration) {
+    return entry + ":" + stable_double(contact.max_contact_penetration_m);
+  }
+  if (contact.mode == core::CollisionContactPolicyMode::kContactProcess) {
+    return entry;
+  }
+  return entry + ":" +
+         std::to_string(static_cast<int>(contact.release_evidence_mode)) +
+         ":" + (contact.enforce_max_start_penetration ? "1" : "0") +
+         ":" + stable_double(contact.max_start_penetration_m) + ":" +
+         stable_double(contact.release_tolerance_m) + ":" +
+         stable_double(contact.min_release_progress_m) + ":" +
+         (contact.require_separation_by_end ? "1" : "0") + ":" +
+         (contact.require_strictly_decreasing_penetration ? "1" : "0") +
+         ":" + (contact.allow_recontact ? "1" : "0");
 }
 
 void append_pose_entries(std::vector<std::string>& entries,
@@ -777,11 +1152,46 @@ core::SceneEditResultDTO RoboPlanProjectionBackend::apply_collision_policy(
     result.rollback_proven = true;
     return result;
   }
+  auto canonical_policy = request.policy;
+  if (const auto error = validate_support_contact_policy_entries(
+          canonical_policy.support_contacts)) {
+    std::map<std::string, std::string> details{
+        {"policy_id", canonical_policy.policy_id},
+        {"reason", error->failure.reason},
+        {"support_contact_index", std::to_string(error->index)}};
+    if (error->first_index.has_value()) {
+      details.emplace("first_support_contact_index",
+                      std::to_string(*error->first_index));
+    }
+    if (!error->failure.field.empty()) {
+      details.emplace("field", error->failure.field);
+    }
+    const auto& pair = error->canonical_pair;
+    if (!pair.body_a.empty() && !pair.body_b.empty() &&
+        pair.body_a != pair.body_b) {
+      details.emplace("zone_id",
+                      "support_pair:" + pair.body_a + "<->" + pair.body_b);
+    }
+    auto result = core::SceneEditResultDTO{
+        false,
+        core::ErrorDTO{
+            core::kErrorInvalidContactPolicy,
+            "collision policy support_contacts[" +
+                std::to_string(error->index) + "]: " +
+                error->failure.message,
+            std::move(details)}};
+    result.rollback_proven = true;
+    return result;
+  }
+  for (auto& contact : canonical_policy.support_contacts) {
+    contact.pair = canonical_support_contact_pair(contact.pair);
+    canonicalize_mode_scoped_contact_fields(contact);
+  }
   try {
     std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
     {
       std::scoped_lock lock(evaluator_mutex_);
-      policy_snapshot_ = request.policy;
+      policy_snapshot_ = std::move(canonical_policy);
     }
     publish_collision_world_revision_locked(
         core::CollisionWorldMutationSource::kPolicyUpdate, {},
@@ -1943,6 +2353,11 @@ void RoboPlanProjectionBackend::publish_runtime_body_freshness_locked() {
     next->world = base->world;
     next->policy = base->policy;
     next->policy_index = base->policy_index;
+    next->selected_distance_pairs = base->selected_distance_pairs;
+    next->contact_grasp_selected_distance_pairs =
+        base->contact_grasp_selected_distance_pairs;
+    next->distance_selection_order_valid =
+        base->distance_selection_order_valid;
   }
   next->body_freshness = std::move(freshness);
   next->lookup_order_valid =
@@ -2041,17 +2456,7 @@ std::string RoboPlanProjectionBackend::object_revision_token_locked(
   std::vector<std::string> support_contacts;
   support_contacts.reserve(state.support_contacts.size());
   for (const auto& contact : state.support_contacts) {
-    support_contacts.push_back(
-        contact.support_object_id + ":" +
-        std::to_string(static_cast<int>(contact.mode)) + ":" +
-        (contact.enforce_max_start_penetration ? "1" : "0") + ":" +
-        stable_double(contact.max_start_penetration_m) + ":" +
-        stable_double(contact.release_tolerance_m) + ":" +
-        stable_double(contact.min_release_progress_m) + ":" +
-        stable_double(contact.min_separation_clearance_m) + ":" +
-        (contact.require_separation_by_end ? "1" : "0") + ":" +
-        (contact.require_strictly_decreasing_penetration ? "1" : "0") +
-        ":" + (contact.allow_recontact ? "1" : "0"));
+    support_contacts.push_back(support_contact_identity_entry(contact));
   }
   std::sort(support_contacts.begin(), support_contacts.end());
   for (const auto& contact : support_contacts) {
@@ -2234,15 +2639,15 @@ RoboPlanProjectionBackend::build_collision_policy_snapshot_locked(
         }
         if (configured) {
           entry.mode = configured->mode;
+          entry.release_evidence_mode = configured->release_evidence_mode;
           entry.enforce_max_start_penetration =
               configured->enforce_max_start_penetration;
           entry.max_start_penetration_m =
               configured->max_start_penetration_m;
           entry.release_tolerance_m = configured->release_tolerance_m;
-          entry.min_release_progress_m =
-              configured->min_release_progress_m;
-          entry.min_separation_clearance_m =
-              configured->min_separation_clearance_m;
+          entry.min_release_progress_m = configured->min_release_progress_m;
+          entry.max_contact_penetration_m =
+              configured->max_contact_penetration_m;
           entry.require_separation_by_end =
               configured->require_separation_by_end;
           entry.require_strictly_decreasing_penetration =
@@ -2253,10 +2658,13 @@ RoboPlanProjectionBackend::build_collision_policy_snapshot_locked(
       }
     }
   }
+  for (auto& entry : policy.support_contacts) {
+    canonicalize_mode_scoped_contact_fields(entry);
+  }
   if (!policy.support_contacts.empty()) {
-    // Contact-release is a numeric safety contract. It is never valid to
-    // evaluate support contacts through a degraded body-pair-only policy: the
-    // ManyForge engine must provide signed clearance / penetration diagnostics.
+    // Every support-contact mode requires complete logical-pair diagnostics.
+    // Signed release and bounded penetration additionally request sparse
+    // numeric evidence; binary release never weakens collision enumeration.
     policy.require_full_diagnostics = true;
   }
 
@@ -2270,6 +2678,10 @@ RoboPlanProjectionBackend::build_collision_policy_snapshot_locked(
               }
               if (lhs.mode != rhs.mode) {
                 return static_cast<int>(lhs.mode) < static_cast<int>(rhs.mode);
+              }
+              if (lhs.release_evidence_mode != rhs.release_evidence_mode) {
+                return static_cast<int>(lhs.release_evidence_mode) <
+                       static_cast<int>(rhs.release_evidence_mode);
               }
               if (lhs.enforce_max_start_penetration !=
                   rhs.enforce_max_start_penetration) {
@@ -2289,10 +2701,10 @@ RoboPlanProjectionBackend::build_collision_policy_snapshot_locked(
                 return lhs.min_release_progress_m <
                        rhs.min_release_progress_m;
               }
-              if (lhs.min_separation_clearance_m !=
-                  rhs.min_separation_clearance_m) {
-                return lhs.min_separation_clearance_m <
-                       rhs.min_separation_clearance_m;
+              if (lhs.max_contact_penetration_m !=
+                  rhs.max_contact_penetration_m) {
+                return lhs.max_contact_penetration_m <
+                       rhs.max_contact_penetration_m;
               }
               if (lhs.require_separation_by_end !=
                   rhs.require_separation_by_end) {
@@ -2312,6 +2724,8 @@ RoboPlanProjectionBackend::build_collision_policy_snapshot_locked(
                   [](const auto& lhs, const auto& rhs) {
                     return lhs.pair == rhs.pair &&
                            lhs.mode == rhs.mode &&
+                           lhs.release_evidence_mode ==
+                               rhs.release_evidence_mode &&
                            lhs.enforce_max_start_penetration ==
                                rhs.enforce_max_start_penetration &&
                            lhs.max_start_penetration_m ==
@@ -2320,8 +2734,8 @@ RoboPlanProjectionBackend::build_collision_policy_snapshot_locked(
                                rhs.release_tolerance_m &&
                            lhs.min_release_progress_m ==
                                rhs.min_release_progress_m &&
-                           lhs.min_separation_clearance_m ==
-                               rhs.min_separation_clearance_m &&
+                           lhs.max_contact_penetration_m ==
+                               rhs.max_contact_penetration_m &&
                            lhs.require_separation_by_end ==
                                rhs.require_separation_by_end &&
                            lhs.require_strictly_decreasing_penetration ==
@@ -2346,13 +2760,21 @@ RoboPlanProjectionBackend::build_collision_policy_snapshot_locked(
     h.mix("support")
         .mix(entry.pair.body_a)
         .mix(entry.pair.body_b)
-        .mix(static_cast<std::int64_t>(entry.mode))
+        .mix(static_cast<std::int64_t>(entry.mode));
+    if (entry.mode ==
+        core::CollisionContactPolicyMode::kBoundedPenetration) {
+      h.mix(entry.max_contact_penetration_m);
+      continue;
+    }
+    if (entry.mode == core::CollisionContactPolicyMode::kContactProcess) {
+      continue;
+    }
+    h.mix(static_cast<std::int64_t>(entry.release_evidence_mode))
         .mix(static_cast<std::int64_t>(
             entry.enforce_max_start_penetration ? 1 : 0))
         .mix(entry.max_start_penetration_m)
         .mix(entry.release_tolerance_m)
         .mix(entry.min_release_progress_m)
-        .mix(entry.min_separation_clearance_m)
         .mix(static_cast<std::int64_t>(
             entry.require_separation_by_end ? 1 : 0))
         .mix(static_cast<std::int64_t>(
@@ -2403,17 +2825,7 @@ std::string RoboPlanProjectionBackend::compute_collision_world_content_hash_lock
     std::vector<std::string> support_contacts;
     support_contacts.reserve(tracked.support_contacts.size());
     for (const auto& contact : tracked.support_contacts) {
-      support_contacts.push_back(
-          contact.support_object_id + ":" +
-          std::to_string(static_cast<int>(contact.mode)) + ":" +
-          (contact.enforce_max_start_penetration ? "1" : "0") + ":" +
-          stable_double(contact.max_start_penetration_m) + ":" +
-          stable_double(contact.release_tolerance_m) + ":" +
-          stable_double(contact.min_release_progress_m) + ":" +
-          stable_double(contact.min_separation_clearance_m) + ":" +
-          (contact.require_separation_by_end ? "1" : "0") + ":" +
-          (contact.require_strictly_decreasing_penetration ? "1" : "0") +
-          ":" + (contact.allow_recontact ? "1" : "0"));
+      support_contacts.push_back(support_contact_identity_entry(contact));
     }
     std::sort(support_contacts.begin(), support_contacts.end());
     for (const auto& contact : support_contacts) {
@@ -3150,8 +3562,111 @@ core::SceneEditResultDTO RoboPlanProjectionBackend::add_object(
     const core::AddObjectRequestDTO& request) {
   core::SceneEditResultDTO result;
 
+  for (std::size_t index = 0; index < request.support_contacts.size(); ++index) {
+    if (const auto error =
+            validate_support_contact_policy(request.support_contacts[index])) {
+      std::map<std::string, std::string> details{
+          {"reason", error->reason},
+          {"support_contact_index", std::to_string(index)}};
+      if (!error->field.empty()) {
+        details.emplace("field", error->field);
+      }
+      const auto& support_object_id =
+          request.support_contacts[index].support_object_id;
+      if (!request.object_id.empty() && !support_object_id.empty() &&
+          request.object_id != support_object_id) {
+        const auto& body_a =
+            std::min(request.object_id, support_object_id);
+        const auto& body_b =
+            std::max(request.object_id, support_object_id);
+        details.emplace("zone_id",
+                        "support_pair:" + body_a + "<->" + body_b);
+      }
+      result.error = core::ErrorDTO{
+          core::kErrorInvalidContactPolicy,
+          "support_contacts[" + std::to_string(index) + "]: " +
+              error->message,
+          std::move(details)};
+      result.rollback_proven = true;
+      return result;
+    }
+  }
+
   try {
     std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+
+    struct AuthoredSupportContactLocation {
+      std::string owner_object_id;
+      std::size_t support_contact_index = 0;
+    };
+    std::map<std::pair<std::string, std::string>,
+             AuthoredSupportContactLocation>
+        first_authored_contact_by_pair;
+    const auto reject_duplicate_authored_contact =
+        [&](const std::pair<std::string, std::string>& pair,
+            const AuthoredSupportContactLocation& first,
+            const AuthoredSupportContactLocation& duplicate) {
+          core::SceneEditResultDTO duplicate_result;
+          duplicate_result.error = core::ErrorDTO{
+              core::kErrorInvalidContactPolicy,
+              "support_contacts[" +
+                  std::to_string(duplicate.support_contact_index) +
+                  "]: support-contact pair is configured more than once",
+              {{"reason", "duplicate_support_contact_pair"},
+               {"field", "support_object_id"},
+               {"pair", pair.first + "<->" + pair.second},
+               {"zone_id",
+                "support_pair:" + pair.first + "<->" + pair.second},
+               {"first_owner_object_id", first.owner_object_id},
+               {"first_support_contact_index",
+                std::to_string(first.support_contact_index)},
+               {"duplicate_owner_object_id", duplicate.owner_object_id},
+               {"duplicate_support_contact_index",
+                std::to_string(duplicate.support_contact_index)}}};
+          duplicate_result.rollback_proven = true;
+          return duplicate_result;
+        };
+    const auto record_authored_contact =
+        [&](const std::string& owner_object_id,
+            std::size_t support_contact_index,
+            const std::string& support_object_id)
+        -> std::optional<core::SceneEditResultDTO> {
+      const auto pair =
+          canonical_collision_pair(owner_object_id, support_object_id);
+      const AuthoredSupportContactLocation location{owner_object_id,
+                                                    support_contact_index};
+      const auto [first, inserted] =
+          first_authored_contact_by_pair.emplace(pair, location);
+      if (inserted) {
+        return std::nullopt;
+      }
+      return reject_duplicate_authored_contact(pair, first->second, location);
+    };
+
+    // Validate the complete authored declaration set while holding the scene
+    // mutex and before any RoboPlan geometry or tracked-object state mutates.
+    // This rejects both repeated local declarations and reciprocal A->B/B->A
+    // declarations independently of field or modality differences.
+    for (const auto& [owner_object_id, tracked] : object_states_) {
+      for (std::size_t index = 0; index < tracked.support_contacts.size();
+           ++index) {
+        if (const auto duplicate = record_authored_contact(
+                owner_object_id,
+                index,
+                tracked.support_contacts[index].support_object_id)) {
+          return *duplicate;
+        }
+      }
+    }
+    for (std::size_t index = 0; index < request.support_contacts.size();
+         ++index) {
+      if (const auto duplicate = record_authored_contact(
+              request.object_id,
+              index,
+              request.support_contacts[index].support_object_id)) {
+        return *duplicate;
+      }
+    }
 
     const std::string final_frame_id =
         is_world_frame(request.frame_id) ? "universe" : request.frame_id;
@@ -3163,6 +3678,9 @@ core::SceneEditResultDTO RoboPlanProjectionBackend::add_object(
     new_state.frame_id = final_frame_id;
     new_state.attached = attached;
     new_state.support_contacts = request.support_contacts;
+    for (auto& contact : new_state.support_contacts) {
+      canonicalize_mode_scoped_contact_fields(contact);
+    }
 
     auto add_r = add_geometry_locked(request.object_id, new_state);
     if (!add_r.has_value()) {

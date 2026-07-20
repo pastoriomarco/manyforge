@@ -25,6 +25,8 @@ REQUIRED_FIXTURES = {
     "unsupported_mesh_fail_closed",
     "isaac_like_primitive_cell",
     "support_contact_ordered_summary",
+    "binary_contact_ordered_summary",
+    "bounded_penetration_insertion",
 }
 
 REQUIRED_VALIDATION_WAYPOINT_SWEEP = (8, 16, 32, 64, 96, 192)
@@ -327,6 +329,9 @@ def validate_collision_matrix(
                         "collision matrix reports all fixtures passed", failures))
     checks.append(check(REQUIRED_FIXTURES.issubset(fixtures_by_name.keys()),
                         "collision matrix covers every required fixture", failures))
+    checks.append(check(int(data.get("fixture_count", 0)) == 9 and
+                        len(fixtures) == 9,
+                        "collision matrix contains exactly nine fixtures", failures))
 
     for name in sorted(REQUIRED_FIXTURES):
         fixture = fixtures_by_name.get(name)
@@ -368,6 +373,85 @@ def validate_collision_matrix(
             bool(worker_sweep) and
             all(bool(sample.get("decision_match")) for sample in worker_sweep),
             "support-contact worker sweep preserves serial decisions", failures))
+
+    for name in (
+        "binary_contact_ordered_summary",
+        "bounded_penetration_insertion",
+    ):
+        fixture = fixtures_by_name.get(name)
+        if fixture is None:
+            continue
+        validation = fixture.get("validation", {})
+        checks.append(check(
+            bool(validation.get("decision_match")),
+            f"{name} serial/parallel validation match", failures))
+        checks.append(check(
+            bool(fixture.get("support_contact_ordered_summary_verified")),
+            f"{name} uses the ordered-summary path", failures))
+        worker_sweep = validation.get("worker_sweep", [])
+        checks.append(check(
+            bool(worker_sweep) and all(
+                bool(sample.get("decision_match")) and
+                bool(sample.get("distance_scope_verified"))
+                for sample in worker_sweep
+                if isinstance(sample, dict)
+            ) and all(isinstance(sample, dict) for sample in worker_sweep),
+            f"{name} worker sweep preserves decisions and distance scope",
+            failures))
+
+    binary_fixture = fixtures_by_name.get("binary_contact_ordered_summary")
+    if binary_fixture is not None:
+        policy = binary_fixture.get("contact_policy", {})
+        worker_sweep = binary_fixture.get("validation", {}).get(
+            "worker_sweep", []
+        )
+        checks.append(check(
+            policy.get("mode") == "contact_release" and
+            policy.get("release_evidence_mode") == "binary_contact" and
+            int(policy.get("configured_pair_count", 0)) > 0 and
+            bool(policy.get("mode_scoped_fields_verified")),
+            "binary-contact fixture uses canonical mode-scoped policy fields",
+            failures))
+        checks.append(check(
+            bool(worker_sweep) and all(
+                sample.get("distance_request_mode") == "none" and
+                int(sample.get("distance_api_call_count", -1)) == 0 and
+                int(sample.get("distance_evaluated_logical_pair_count", -1)) == 0
+                for sample in worker_sweep
+                if isinstance(sample, dict)
+            ),
+            "binary-contact fixture performs zero distance work", failures))
+
+    bounded_fixture = fixtures_by_name.get("bounded_penetration_insertion")
+    if bounded_fixture is not None:
+        policy = bounded_fixture.get("contact_policy", {})
+        worker_sweep = bounded_fixture.get("validation", {}).get(
+            "worker_sweep", []
+        )
+        checks.append(check(
+            policy.get("mode") == "bounded_penetration" and
+            policy.get("release_evidence_mode") == "not_applicable" and
+            int(policy.get("configured_pair_count", 0)) > 0 and
+            float(policy.get("max_contact_penetration_m", 0.0)) > 0.0 and
+            bool(policy.get("mode_scoped_fields_verified")),
+            "bounded insertion fixture uses canonical mode-scoped policy fields",
+            failures))
+        checks.append(check(
+            bool(worker_sweep) and all(
+                sample.get("distance_request_mode") ==
+                "selected_colliding_pairs" and
+                int(sample.get("distance_api_call_count", 0)) > 0 and
+                int(sample.get("distance_evaluated_logical_pair_count", 0)) > 0
+                for sample in worker_sweep
+                if isinstance(sample, dict)
+            ),
+            "bounded insertion fixture measures selected colliding pairs",
+            failures))
+        checks.append(check(
+            bool(policy.get("bounded_over_cap_verified")) and
+            float(policy.get("bounded_observed_penetration_m", 0.0)) >
+            float(policy.get("bounded_adversarial_cap_m", 0.0)) >= 0.0,
+            "bounded insertion fixture rejects its over-cap variant", failures))
 
     for name in (
         "isaac_like_primitive_cell",

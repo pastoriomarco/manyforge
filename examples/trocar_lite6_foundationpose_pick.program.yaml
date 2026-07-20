@@ -73,11 +73,11 @@ scene:
   metadata:
     support_contacts:
     - support_object_id: ground
+      release_evidence_mode: signed_penetration
       enforce_max_start_penetration: true
       max_start_penetration_m: 0.03
       release_tolerance_m: 0.001
       min_release_progress_m: 0
-      min_separation_clearance_m: 0
       require_separation_by_end: true
       require_strictly_decreasing_penetration: true
       allow_recontact: false

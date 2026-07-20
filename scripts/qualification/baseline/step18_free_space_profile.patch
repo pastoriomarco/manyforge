@@ -1,0 +1,167 @@
+diff --git a/tests/cpp/perf/perf_collision_engine_qualification.cpp b/tests/cpp/perf/perf_collision_engine_qualification.cpp
+index 45347a6..882e129 100644
+--- a/tests/cpp/perf/perf_collision_engine_qualification.cpp
++++ b/tests/cpp/perf/perf_collision_engine_qualification.cpp
+@@ -493,6 +493,7 @@ std::vector<ValidationWorkerEvidence> measure_validation_worker_sweep(
+     const CollisionPolicySnapshot& policy,
+     const TrajectoryDTO& trajectory,
+     int max_worker_count,
++    int validation_warmup_runs,
+     int validation_runs) {
+   std::optional<manyforge::core::CollisionValidationDecisionBundle>
+       serial_reference;
+@@ -531,6 +532,16 @@ std::vector<ValidationWorkerEvidence> measure_validation_worker_sweep(
+     const auto cold_allocations =
+         g_allocation_count.load(std::memory_order_relaxed);
+ 
++    for (int run = 0; run < validation_warmup_runs; ++run) {
++      (void)measure_validation_ns(pool,
++                                  snapshot_owner,
++                                  engines,
++                                  trajectory,
++                                  worker_cancel,
++                                  pool_config.pass_config,
++                                  &bundle_result);
++    }
++
+     std::vector<std::int64_t> wall_samples;
+     std::vector<std::int64_t> cpu_samples;
+     wall_samples.reserve(validation_runs);
+@@ -601,7 +612,8 @@ struct FixtureConfig {
+   bool validate_trajectory = true;
+   int query_iterations = 120;
+   int validation_waypoints = 96;
+-  int validation_runs = 9;
++  int validation_warmup_runs = 5;
++  int validation_runs = 50;
+   int worker_count = 4;
+   std::vector<int> validation_waypoint_sweep;
+ };
+@@ -900,7 +912,7 @@ void run_validation_probe(
+   noncollision_options.max_tcp_linear_speed_mps = 1000.0;
+   noncollision_options.tcp_frame = "tool0";
+   noncollision_options.base_frame = "base_link";
+-  for (int i = 0; i < 2; ++i) {
++  for (int i = 0; i < evidence.config.validation_warmup_runs; ++i) {
+     if (!bundle.trajectory_validator
+              ->validate_non_collision(trajectory, noncollision_options, cancel)
+              .valid) {
+@@ -945,6 +957,7 @@ void run_validation_probe(
+       policy,
+       trajectory,
+       evidence.config.worker_count,
++      evidence.config.validation_warmup_runs,
+       evidence.config.validation_runs);
+ 
+   evidence.validation_waypoint_sweep.clear();
+@@ -962,6 +975,7 @@ void run_validation_probe(
+           policy,
+           repeated_trajectory(validation_state, waypoint_count),
+           evidence.config.worker_count,
++          evidence.config.validation_warmup_runs,
+           evidence.config.validation_runs);
+     }
+     evidence.validation_waypoint_sweep.push_back(std::move(sample));
+@@ -1430,7 +1444,8 @@ std::string fixture_to_json(const FixtureEvidence& e) {
+   out << "\"validation\":{\"enabled\":"
+       << json_bool(e.config.validate_trajectory)
+       << ",\"waypoints\":" << e.config.validation_waypoints
+-      << ",\"runs\":" << e.config.validation_runs
++      << ",\"warmup_runs\":" << e.config.validation_warmup_runs
++      << ",\"measured_runs\":" << e.config.validation_runs
+       << ",\"serial_p95_us\":" << e.validation_serial_p95_us
+       << ",\"parallel_p95_us\":" << e.validation_parallel_p95_us
+       << ",\"workers\":" << e.validation_workers
+@@ -1492,7 +1507,8 @@ std::string fixture_to_json(const FixtureEvidence& e) {
+   out << "]},";
+   out << "\"noncollision_validation\":{\"enabled\":"
+       << json_bool(e.config.validate_trajectory)
+-      << ",\"runs\":" << e.config.validation_runs
++      << ",\"warmup_runs\":" << e.config.validation_warmup_runs
++      << ",\"measured_runs\":" << e.config.validation_runs
+       << ",\"p50_us\":" << e.noncollision_validation_p50_us
+       << ",\"p95_us\":" << e.noncollision_validation_p95_us
+       << ",\"p99_us\":" << e.noncollision_validation_p99_us
+@@ -1512,8 +1528,51 @@ std::string fixture_to_json(const FixtureEvidence& e) {
+ 
+ }  // namespace
+ 
+-int main() {
+-  const std::vector<FixtureConfig> fixtures = {
++int parse_positive_run_count(const std::string& value,
++                             const std::string& option) {
++  std::size_t consumed = 0;
++  const auto parsed = std::stoll(value, &consumed, 10);
++  if (consumed != value.size() || parsed <= 0 || parsed > 1'000'000) {
++    throw std::invalid_argument(option +
++                                " must be a positive bounded integer");
++  }
++  return static_cast<int>(parsed);
++}
++
++struct QualificationOptions {
++  int warmup_runs = 5;
++  int measured_runs = 50;
++};
++
++QualificationOptions parse_qualification_options(int argc, char** argv) {
++  QualificationOptions options;
++  for (int index = 1; index < argc; ++index) {
++    const std::string option = argv[index];
++    if (index + 1 >= argc) {
++      throw std::invalid_argument(option + " requires a value");
++    }
++    const std::string value = argv[++index];
++    if (option == "--warmup-runs") {
++      options.warmup_runs = parse_positive_run_count(value, option);
++    } else if (option == "--measured-runs") {
++      options.measured_runs = parse_positive_run_count(value, option);
++    } else {
++      throw std::invalid_argument("unknown option: " + option);
++    }
++  }
++  return options;
++}
++
++int main(int argc, char** argv) {
++  QualificationOptions options;
++  try {
++    options = parse_qualification_options(argc, argv);
++  } catch (const std::exception& error) {
++    std::cerr << "invalid qualification options: " << error.what() << "\n";
++    return 2;
++  }
++
++  std::vector<FixtureConfig> fixtures = {
+       FixtureConfig{.name = "primitive_dense_ur5_gripper",
+                     .profile = "primitive_box",
+                     .expect_manyforge_vs_roboplan_match = true,
+@@ -1546,15 +1605,17 @@ int main() {
+                     .profile = "isaac_like_primitive",
+                     .expect_manyforge_vs_roboplan_match = true,
+                     .isaac_scene_fixture = true,
+-                    .validation_runs = 30,
+                     .validation_waypoint_sweep = {8, 16, 32, 64, 96, 192}},
+       FixtureConfig{.name = "support_contact_ordered_summary",
+                     .profile = "support_contact_policy",
+                     .expect_manyforge_vs_roboplan_match = true,
+                     .expect_support_contact_ordered_summary = true,
+-                    .validation_runs = 30,
+                     .validation_waypoint_sweep = {8, 16, 32, 64, 96, 192}},
+   };
++  for (auto& fixture : fixtures) {
++    fixture.validation_warmup_runs = options.warmup_runs;
++    fixture.validation_runs = options.measured_runs;
++  }
+ 
+   std::vector<FixtureEvidence> results;
+   results.reserve(fixtures.size());
+@@ -1579,6 +1640,8 @@ int main() {
+   out << "{";
+   out << "\"phase4_schema\":1,";
+   out << "\"qualification_scope\":\"collision_engine_fixture_matrix\",";
++  out << "\"warmup_runs\":" << options.warmup_runs << ",";
++  out << "\"measured_runs\":" << options.measured_runs << ",";
+   out << "\"fixture_count\":" << results.size() << ",";
+   out << "\"fixtures_passed\":" << passed_count << ",";
+   out << "\"all_passed\":" << json_bool(all_passed) << ",";

@@ -1,0 +1,32 @@
+diff --git a/tests/cpp/CMakeLists.txt b/tests/cpp/CMakeLists.txt
+index 1162dac..a3c44d5 100644
+--- a/tests/cpp/CMakeLists.txt
++++ b/tests/cpp/CMakeLists.txt
+@@ -31,6 +31,27 @@ add_executable(perf_collision_engine_qualification
+ target_link_libraries(perf_collision_engine_qualification PRIVATE
+   manyforge_roboplan manyforge_collision)
+ 
++# Harness-only Step 18 baseline probes. The detached source remains at the
++# pre-change behavior; observation instrumentation is applied in a separate
++# worktree and is never used for timing promotion.
++add_executable(perf_runtime_collision_schedule_baseline_timing
++  perf/perf_runtime_collision_schedule_qualification.cpp)
++target_compile_definitions(perf_runtime_collision_schedule_baseline_timing PRIVATE
++  MANYFORGE_RUNTIME_SCHEDULE_BASELINE=1
++  MANYFORGE_RUNTIME_SCHEDULE_OBSERVATION=0)
++target_link_libraries(perf_runtime_collision_schedule_baseline_timing PRIVATE
++  manyforge_roboplan manyforge_collision)
++
++add_executable(perf_runtime_collision_schedule_baseline_observation
++  perf/perf_runtime_collision_schedule_qualification.cpp)
++target_compile_definitions(perf_runtime_collision_schedule_baseline_observation PRIVATE
++  MANYFORGE_RUNTIME_SCHEDULE_BASELINE=1
++  MANYFORGE_RUNTIME_SCHEDULE_OBSERVATION=1)
++target_compile_options(perf_runtime_collision_schedule_baseline_observation PRIVATE
++  -Wno-mismatched-new-delete)
++target_link_libraries(perf_runtime_collision_schedule_baseline_observation PRIVATE
++  manyforge_roboplan manyforge_collision)
++
+ gtest_discover_tests(test_collision_engine_integration
+   PROPERTIES
+     ENVIRONMENT "LD_LIBRARY_PATH=${MANYFORGE_INTEGRATION_TEST_LIB_PATHS}"

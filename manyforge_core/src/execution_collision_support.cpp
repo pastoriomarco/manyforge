@@ -3,12 +3,20 @@
 #include <manyforge_core/types/reason_codes.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 
 namespace manyforge::core {
 
 namespace {
+
+CollisionPairId canonical_collision_pair(CollisionPairId pair) {
+  if (pair.body_b < pair.body_a) {
+    std::swap(pair.body_a, pair.body_b);
+  }
+  return pair;
+}
 
 std::string collision_engine_status_name(CollisionEngineStatus status) {
   switch (status) {
@@ -107,6 +115,23 @@ const CollisionValidationWaypointRecord* select_collision_failure_record(
     }
   }
   return nullptr;
+}
+
+std::string_view native_contact_grasp_violation_reason(
+    std::string_view raw_reason) noexcept {
+  if (raw_reason == reason_codes::kMissingSignedClearance) {
+    return reason_codes::kMissingGraspContactClearance;
+  }
+  if (raw_reason == reason_codes::kPenetrationExceedsPolicy) {
+    return reason_codes::kGraspContactPenetrationExceeded;
+  }
+  if (raw_reason == reason_codes::kInitialSampleInContact) {
+    return reason_codes::kInitialSampleInContact;
+  }
+  if (raw_reason == reason_codes::kContactBeforeTerminalWindow) {
+    return "grasp_contact_before_terminal_window";
+  }
+  return raw_reason;
 }
 
 }  // namespace
@@ -660,6 +685,7 @@ load_published_runtime_collision_query_bundle(
 RuntimeCollisionQueryBundlePtr build_runtime_collision_query_bundle(
     CollisionWorldPolicySnapshotBundle bundle, std::uint64_t epoch) {
   auto runtime_bundle = std::make_shared<RuntimeCollisionQueryBundle>();
+  runtime_bundle->distance_selection_order_valid = true;
   runtime_bundle->world = std::move(bundle.world);
   runtime_bundle->body_freshness = std::move(bundle.body_freshness);
   std::sort(runtime_bundle->body_freshness.begin(),
@@ -675,14 +701,35 @@ RuntimeCollisionQueryBundlePtr build_runtime_collision_query_bundle(
   if (bundle.policy) {
     auto policy =
         std::make_shared<CollisionPolicySnapshot>(std::move(*bundle.policy));
-    for (auto& entry : policy->support_contacts) {
-      if (entry.mode == CollisionContactPolicyMode::kContactRelease) {
-        // Runtime ticks evaluate one observed state. End-of-trajectory progress
-        // is enforced by the generation-bound release tracker, not by a
-        // one-state trajectory evaluator.
-        entry.require_separation_by_end = false;
-        entry.require_strictly_decreasing_penetration = false;
+    if (runtime_bundle->world) {
+      runtime_bundle->selected_distance_pairs =
+          build_selected_collision_distance_pairs(
+              *policy, *runtime_bundle->world);
+      for (const auto& grasp : policy->contact_grasps) {
+        runtime_bundle->contact_grasp_selected_distance_pairs.emplace(
+            grasp.policy_id,
+            build_selected_collision_distance_pairs(
+                *policy, *runtime_bundle->world, grasp.policy_id));
       }
+      auto selection_valid = [](const std::vector<CollisionPairId>& pairs) {
+        for (std::size_t i = 0; i < pairs.size(); ++i) {
+          const auto& pair = pairs[i];
+          if (pair.body_a.empty() || pair.body_b.empty() ||
+              !(pair.body_a < pair.body_b) ||
+              (i > 0 && !(pairs[i - 1] < pair))) {
+            return false;
+          }
+        }
+        return true;
+      };
+      runtime_bundle->distance_selection_order_valid =
+          selection_valid(runtime_bundle->selected_distance_pairs) &&
+          std::all_of(
+              runtime_bundle->contact_grasp_selected_distance_pairs.begin(),
+              runtime_bundle->contact_grasp_selected_distance_pairs.end(),
+              [&](const auto& entry) {
+                return selection_valid(entry.second);
+              });
     }
     runtime_bundle->policy_index = build_collision_policy_index(*policy);
     runtime_bundle->policy = std::move(policy);
@@ -797,6 +844,273 @@ void append_collision_failure_diagnostics(
   }
 }
 
+std::optional<std::map<std::string, std::string>>
+contact_policy_violation_details(
+    const CollisionValidationDecisionBundle& bundle,
+    const CollisionPolicySnapshot& policy,
+    std::string_view response,
+    std::optional<std::size_t> initial_contact_pair_count) {
+  const auto* selected = select_collision_failure_record(bundle);
+  if (selected == nullptr) {
+    return std::nullopt;
+  }
+  const auto violation =
+      selected->result.raw_diagnostics.find("contact_release_violation");
+  if (violation == selected->result.raw_diagnostics.end()) {
+    const auto grasp_violation =
+        selected->result.raw_diagnostics.find("contact_grasp_violation");
+    const auto grasp_policy_id =
+        selected->result.raw_diagnostics.find("contact_grasp_policy_id");
+    const auto grasp_pair =
+        selected->result.raw_diagnostics.find("contact_grasp_pair");
+    if (grasp_violation == selected->result.raw_diagnostics.end() ||
+        grasp_policy_id == selected->result.raw_diagnostics.end() ||
+        grasp_pair == selected->result.raw_diagnostics.end()) {
+      return std::nullopt;
+    }
+
+    const ContactGraspPolicyEntry* matched_policy = nullptr;
+    for (const auto& entry : policy.contact_grasps) {
+      if (entry.policy_id == grasp_policy_id->second) {
+        matched_policy = &entry;
+        break;
+      }
+    }
+    if (matched_policy == nullptr) {
+      return std::nullopt;
+    }
+
+    std::optional<CollisionPairId> matched_pair;
+    for (const auto& observed : selected->result.normalized_pairs) {
+      const auto canonical = canonical_collision_pair(observed);
+      if (collision_pair_name(canonical) == grasp_pair->second &&
+          contact_grasp_pair_matches(canonical, *matched_policy)) {
+        matched_pair = canonical;
+        break;
+      }
+    }
+    if (!matched_pair.has_value()) {
+      return std::nullopt;
+    }
+
+    std::string classification =
+        selected->result.decision ==
+                CollisionDecisionResult::kInconclusiveFail
+            ? "diagnostic_incomplete"
+            : "blocking_collision";
+    for (const auto& classified :
+         selected->result.normalized_pairs_classified) {
+      if (canonical_collision_pair(classified.pair) == *matched_pair) {
+        classification =
+            collision_pair_classification_name(classified.classification);
+        break;
+      }
+    }
+
+    std::map<std::string, std::string> details{
+        {"contact_policy_violation",
+         std::string(native_contact_grasp_violation_reason(
+             grasp_violation->second))},
+        {"contact_policy_id", matched_policy->policy_id},
+        {"policy_id", matched_policy->policy_id},
+        {"policy_mode", "contact_grasp"},
+        {"zone_id",
+         "contact_grasp_pair:" + matched_pair->body_a + "<->" +
+             matched_pair->body_b},
+        {"contact_body_a", matched_pair->body_a},
+        {"contact_body_b", matched_pair->body_b},
+        {"contact_present", "true"},
+        {"selected_object_id", matched_policy->selected_object_id},
+        {"terminal_window_start_fraction",
+         format_double(matched_policy->terminal_window_start_fraction)},
+        {"max_penetration_m",
+         format_double(matched_policy->max_penetration_m)},
+        {"distance_request_mode",
+         collision_distance_request_mode_name(
+             selected->result.distance_request_mode)},
+        {"evaluated_distance_pair_count",
+         std::to_string(
+             selected->result.evaluated_distance_pair_count)},
+        {"allowed_contact_grasp", "false"},
+        {"response", std::string(response)},
+        {"classification", std::move(classification)}};
+
+    const auto copy_diagnostic = [&](const char* source,
+                                     const char* destination) {
+      const auto it = selected->result.raw_diagnostics.find(source);
+      if (it != selected->result.raw_diagnostics.end()) {
+        details[destination] = it->second;
+      }
+    };
+    copy_diagnostic("contact_grasp_sample_fraction", "sample_fraction");
+    copy_diagnostic("contact_grasp_inside_terminal_window",
+                    "inside_terminal_window");
+
+    std::optional<double> signed_clearance;
+    for (const auto& clearance : selected->result.pair_clearances) {
+      if (canonical_collision_pair(clearance.pair) == *matched_pair &&
+          std::isfinite(clearance.signed_clearance_m) &&
+          clearance.signed_clearance_m <= 0.0) {
+        signed_clearance = clearance.signed_clearance_m;
+        break;
+      }
+    }
+    if (!signed_clearance.has_value() &&
+        selected->result.min_clearance_pair.has_value() &&
+        canonical_collision_pair(
+            *selected->result.min_clearance_pair) == *matched_pair &&
+        selected->result.min_clearance_m.has_value() &&
+        std::isfinite(*selected->result.min_clearance_m) &&
+        *selected->result.min_clearance_m <= 0.0) {
+      signed_clearance = *selected->result.min_clearance_m;
+    }
+    if (signed_clearance.has_value()) {
+      const auto penetration = format_double(-*signed_clearance);
+      details["penetration_depth_m"] = penetration;
+      details["current_penetration_m"] = penetration;
+    }
+    return details;
+  }
+
+  const SupportContactPolicyEntry* matched = nullptr;
+  const auto diagnostic_pair =
+      selected->result.raw_diagnostics.find("contact_release_pair");
+  if (diagnostic_pair != selected->result.raw_diagnostics.end()) {
+    for (const auto& entry : policy.support_contacts) {
+      if (collision_pair_name(canonical_collision_pair(entry.pair)) ==
+          diagnostic_pair->second) {
+        matched = &entry;
+        break;
+      }
+    }
+  }
+  if (matched == nullptr) {
+    return std::nullopt;
+  }
+
+  const auto pair = canonical_collision_pair(matched->pair);
+  const auto pair_is_present = [&](const CollisionValidationWaypointRecord& record) {
+    return std::any_of(
+        record.result.normalized_pairs.begin(),
+        record.result.normalized_pairs.end(),
+        [&](const CollisionPairId& observed) {
+          return canonical_collision_pair(observed) == pair;
+        });
+  };
+  const auto contact_pair_count = [&](const CollisionValidationWaypointRecord& record) {
+    std::size_t count = 0;
+    for (const auto& observed : record.result.normalized_pairs) {
+      const auto canonical_observed = canonical_collision_pair(observed);
+      if (std::any_of(
+              policy.support_contacts.begin(), policy.support_contacts.end(),
+              [&](const SupportContactPolicyEntry& entry) {
+                return canonical_collision_pair(entry.pair) ==
+                       canonical_observed;
+              })) {
+        ++count;
+      }
+    }
+    return count;
+  };
+
+  if (!initial_contact_pair_count.has_value()) {
+    initial_contact_pair_count = bundle.waypoint_records.empty()
+                                     ? std::size_t{0}
+                                     : contact_pair_count(
+                                           bundle.waypoint_records.front());
+  }
+  const bool contact_present = pair_is_present(*selected);
+
+  std::string classification =
+      selected->result.decision == CollisionDecisionResult::kInconclusiveFail
+          ? "diagnostic_incomplete"
+          : "blocking_collision";
+  for (const auto& classified :
+       selected->result.normalized_pairs_classified) {
+    if (canonical_collision_pair(classified.pair) == pair) {
+      classification =
+          collision_pair_classification_name(classified.classification);
+      break;
+    }
+  }
+
+  const auto policy_mode =
+      matched->mode == CollisionContactPolicyMode::kBoundedPenetration
+          ? "bounded_penetration"
+          : matched->mode == CollisionContactPolicyMode::kContactProcess
+                ? "contact_process"
+                : "contact_release";
+  const std::string policy_id =
+      policy.policy_id.empty()
+          ? "support_contacts@" +
+                std::to_string(policy.revision.revision_id)
+          : policy.policy_id;
+  std::map<std::string, std::string> details{
+      {"contact_policy_violation", violation->second},
+      {"contact_policy_id", policy_id},
+      {"policy_id", policy_id},
+      {"policy_mode", policy_mode},
+      {"zone_id", "support_pair:" + pair.body_a + "<->" + pair.body_b},
+      {"contact_body_a", pair.body_a},
+      {"contact_body_b", pair.body_b},
+      {"contact_present", contact_present ? "true" : "false"},
+      {"initial_contact_pair_count",
+       std::to_string(*initial_contact_pair_count)},
+      {"current_contact_pair_count",
+       std::to_string(contact_pair_count(*selected))},
+      {"distance_request_mode",
+       collision_distance_request_mode_name(
+           selected->result.distance_request_mode)},
+      {"evaluated_distance_pair_count",
+       std::to_string(
+           selected->result.evaluated_distance_pair_count)},
+      {"response", std::string(response)},
+      {"classification", std::move(classification)}};
+
+  if (matched->mode == CollisionContactPolicyMode::kContactRelease) {
+    details["release_evidence_mode"] =
+        matched->release_evidence_mode ==
+                ContactReleaseEvidenceMode::kBinaryContact
+            ? "binary_contact"
+            : "signed_penetration";
+    if (violation->second == "initial_penetration_exceeds_policy" &&
+        matched->release_evidence_mode ==
+            ContactReleaseEvidenceMode::kSignedPenetration &&
+        matched->enforce_max_start_penetration) {
+      details["max_penetration_m"] =
+          format_double(matched->max_start_penetration_m);
+    }
+  } else if (matched->mode ==
+             CollisionContactPolicyMode::kBoundedPenetration) {
+    details["max_contact_penetration_m"] =
+        format_double(matched->max_contact_penetration_m);
+    if (violation->second == "contact_penetration_exceeds_policy") {
+      details["within_penetration_bound"] = "false";
+    }
+  }
+
+  // Metric evidence is emitted only for the violating configured pair when it
+  // is actually present and the engine supplied a finite signed clearance.
+  // Binary contact and absent-pair violations deliberately carry no synthetic
+  // penetration value.
+  if (contact_present &&
+      (matched->mode == CollisionContactPolicyMode::kBoundedPenetration ||
+       (matched->mode == CollisionContactPolicyMode::kContactRelease &&
+        matched->release_evidence_mode ==
+            ContactReleaseEvidenceMode::kSignedPenetration))) {
+    for (const auto& clearance : selected->result.pair_clearances) {
+      if (canonical_collision_pair(clearance.pair) == pair &&
+          std::isfinite(clearance.signed_clearance_m) &&
+          clearance.signed_clearance_m <= 0.0) {
+        details["penetration_depth_m"] =
+            format_double(-clearance.signed_clearance_m);
+        break;
+      }
+    }
+  }
+  return details;
+}
+
 std::string pre_dispatch_collision_validation_message(
     const std::map<std::string, std::string>& details,
     CollisionDecisionAction action) {
@@ -838,6 +1152,10 @@ std::string pre_dispatch_collision_validation_message(
   if (contact_release_violation == "penetration_increased") {
     return with_contact_pair(
         "Support-contact penetration increased during release");
+  }
+  if (contact_release_violation == "contact_penetration_exceeds_policy") {
+    return with_contact_pair(
+        "Support-contact penetration exceeds the configured bounded-contact envelope");
   }
   if (contact_release_violation == "insufficient_release_progress") {
     return with_contact_pair(

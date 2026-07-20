@@ -55,6 +55,17 @@ def test_collision_sampling_mode_enum():
         assert getattr(e, name) is not None
 
 
+def test_collision_distance_request_mode_enum():
+    e = manyforge_core_py.CollisionDistanceRequestMode
+    for name in (
+        "kNone",
+        "kSelectedCollidingPairs",
+        "kAllCollidingPairs",
+        "kAllActivePairs",
+    ):
+        assert getattr(e, name) is not None
+
+
 def test_collision_engine_status_enum():
     e = manyforge_core_py.CollisionEngineStatus
     for name in (
@@ -258,25 +269,44 @@ def test_support_contact_policy_entry_round_trip():
         body_b="fixture/table/shape/0",
     )
     e.mode = manyforge_core_py.CollisionContactPolicyMode.kContactRelease
+    e.release_evidence_mode = (
+        manyforge_core_py.ContactReleaseEvidenceMode.kBinaryContact
+    )
     e.enforce_max_start_penetration = False
     e.max_start_penetration_m = 0.001
     e.release_tolerance_m = 0.00001
     e.min_release_progress_m = 0.0005
-    e.min_separation_clearance_m = 0.0002
+    e.max_contact_penetration_m = 0.0
     e.require_separation_by_end = False
     e.require_strictly_decreasing_penetration = True
     e.allow_recontact = True
 
     assert e.pair.body_b == "fixture/table/shape/0"
     assert e.mode == manyforge_core_py.CollisionContactPolicyMode.kContactRelease
+    assert (
+        e.release_evidence_mode
+        == manyforge_core_py.ContactReleaseEvidenceMode.kBinaryContact
+    )
     assert e.enforce_max_start_penetration is False
     assert e.max_start_penetration_m == 0.001
     assert e.release_tolerance_m == 0.00001
     assert e.min_release_progress_m == 0.0005
-    assert e.min_separation_clearance_m == 0.0002
+    assert e.max_contact_penetration_m == 0.0
     assert e.require_separation_by_end is False
     assert e.require_strictly_decreasing_penetration is True
     assert e.allow_recontact is True
+
+
+def test_bounded_penetration_policy_entry_round_trip():
+    e = manyforge_core_py.SupportContactPolicyEntry()
+    e.mode = manyforge_core_py.CollisionContactPolicyMode.kBoundedPenetration
+    e.max_contact_penetration_m = 0.002
+
+    assert (
+        e.mode
+        == manyforge_core_py.CollisionContactPolicyMode.kBoundedPenetration
+    )
+    assert e.max_contact_penetration_m == 0.002
 
 
 def test_collision_pair_clearance_round_trip():
@@ -424,6 +454,11 @@ def test_collision_query_default():
     assert q.sampling_mode == manyforge_core_py.CollisionSamplingMode.kEngineDefault
     assert q.timeout_budget_ns is None
     assert q.required_capabilities == []
+    assert (
+        q.distance_request_mode
+        == manyforge_core_py.CollisionDistanceRequestMode.kNone
+    )
+    assert q.selected_distance_pairs == []
     assert q.max_contacts is None
 
 
@@ -443,6 +478,12 @@ def test_collision_query_round_trip():
     q.sampling_mode = manyforge_core_py.CollisionSamplingMode.kInterpolatedDiscrete
     q.timeout_budget_ns = 25_000_000
     q.required_capabilities = ["distance", "contact_points"]
+    q.distance_request_mode = (
+        manyforge_core_py.CollisionDistanceRequestMode.kSelectedCollidingPairs
+    )
+    q.selected_distance_pairs = [
+        manyforge_core_py.CollisionPairId(body_a="object/a", body_b="robot/b")
+    ]
     q.max_contacts = 16
 
     assert q.query_id == "q-1"
@@ -457,6 +498,11 @@ def test_collision_query_round_trip():
     assert q.sampling_mode == manyforge_core_py.CollisionSamplingMode.kInterpolatedDiscrete
     assert q.timeout_budget_ns == 25_000_000
     assert q.required_capabilities == ["distance", "contact_points"]
+    assert (
+        q.distance_request_mode
+        == manyforge_core_py.CollisionDistanceRequestMode.kSelectedCollidingPairs
+    )
+    assert q.selected_distance_pairs[0].body_a == "object/a"
     assert q.max_contacts == 16
 
 

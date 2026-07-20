@@ -90,6 +90,17 @@ void atomic_max(std::atomic<std::uint64_t>& target, std::uint64_t value) {
   }
 }
 
+void atomic_max_sequentially_consistent(
+    std::atomic<std::uint64_t>& target, std::uint64_t value) {
+  auto current = target.load(std::memory_order_seq_cst);
+  while (current < value &&
+         !target.compare_exchange_weak(current,
+                                       value,
+                                       std::memory_order_seq_cst,
+                                       std::memory_order_seq_cst)) {
+  }
+}
+
 void record_latency_sample(std::atomic<std::uint64_t>& last,
                            std::atomic<std::uint64_t>& maximum,
                            std::atomic<std::uint64_t>& count,
@@ -1692,16 +1703,37 @@ Ros2ControlExecutionBackend::controller_progress_metrics() const {
       action_feedback_callbacks_total_.load(std::memory_order_relaxed);
   metrics.action_result_callbacks_total =
       action_result_callbacks_total_.load(std::memory_order_relaxed);
-  metrics.command_progress_samples_total =
-      command_progress_samples_total_.load(std::memory_order_relaxed);
   metrics.cancel_confirmations_total =
       cancel_confirmations_total_.load(std::memory_order_relaxed);
   metrics.stop_confirmations_total =
       stop_confirmations_total_.load(std::memory_order_relaxed);
-  metrics.last_command_progress_latency_ns =
-      last_command_progress_latency_ns_.load(std::memory_order_relaxed);
-  metrics.max_command_progress_latency_ns =
-      max_command_progress_latency_ns_.load(std::memory_order_relaxed);
+  // Count/last/max form one observable sample publication. Read them under a
+  // sequence counter so an API poll can never associate one command's count
+  // with the next command's latency. These samples occur once per accepted
+  // goal's first feedback, so the sequentially-consistent atomics are far
+  // outside the controller-rate path and allocate no storage.
+  for (;;) {
+    const auto sequence_before =
+        command_progress_metrics_sequence_.load(std::memory_order_seq_cst);
+    if ((sequence_before & 1U) != 0U) {
+      std::this_thread::yield();
+      continue;
+    }
+    const auto samples_total =
+        command_progress_samples_total_.load(std::memory_order_seq_cst);
+    const auto last_latency =
+        last_command_progress_latency_ns_.load(std::memory_order_seq_cst);
+    const auto max_latency =
+        max_command_progress_latency_ns_.load(std::memory_order_seq_cst);
+    const auto sequence_after =
+        command_progress_metrics_sequence_.load(std::memory_order_seq_cst);
+    if (sequence_before == sequence_after) {
+      metrics.command_progress_samples_total = samples_total;
+      metrics.last_command_progress_latency_ns = last_latency;
+      metrics.max_command_progress_latency_ns = max_latency;
+      break;
+    }
+  }
   metrics.last_action_result_latency_ns =
       last_action_result_latency_ns_.load(std::memory_order_relaxed);
   metrics.max_action_result_latency_ns =
@@ -1772,10 +1804,22 @@ void Ros2ControlExecutionBackend::record_scene_projection_miss() {
 
 void Ros2ControlExecutionBackend::record_command_progress_latency_ns(
     std::int64_t latency_ns) {
-  record_latency_sample(last_command_progress_latency_ns_,
-                        max_command_progress_latency_ns_,
-                        command_progress_samples_total_,
-                        latency_ns);
+  begin_command_progress_metrics_publication(latency_ns);
+  finish_command_progress_metrics_publication();
+}
+
+void Ros2ControlExecutionBackend::begin_command_progress_metrics_publication(
+    std::int64_t latency_ns) {
+  command_progress_metrics_sequence_.fetch_add(1, std::memory_order_seq_cst);
+  const auto clamped =
+      static_cast<std::uint64_t>(std::max<std::int64_t>(0, latency_ns));
+  last_command_progress_latency_ns_.store(clamped, std::memory_order_seq_cst);
+  atomic_max_sequentially_consistent(max_command_progress_latency_ns_, clamped);
+  command_progress_samples_total_.fetch_add(1, std::memory_order_seq_cst);
+}
+
+void Ros2ControlExecutionBackend::finish_command_progress_metrics_publication() {
+  command_progress_metrics_sequence_.fetch_add(1, std::memory_order_seq_cst);
 }
 
 void Ros2ControlExecutionBackend::record_action_result_latency_ns(

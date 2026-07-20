@@ -1238,6 +1238,68 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     CommandProgressMetricsPublishCoherentCountLastAndMaximum) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      base_config());
+
+  auto metrics = backend.controller_progress_metrics();
+  EXPECT_EQ(metrics.command_progress_samples_total, 0u);
+  EXPECT_EQ(metrics.last_command_progress_latency_ns, 0u);
+  EXPECT_EQ(metrics.max_command_progress_latency_ns, 0u);
+
+  backend.testing_record_command_progress_latency_ns(25);
+  backend.testing_record_command_progress_latency_ns(10);
+  backend.testing_record_command_progress_latency_ns(-1);
+
+  metrics = backend.controller_progress_metrics();
+  EXPECT_EQ(metrics.command_progress_samples_total, 3u);
+  EXPECT_EQ(metrics.last_command_progress_latency_ns, 0u);
+  EXPECT_EQ(metrics.max_command_progress_latency_ns, 25u);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     CommandProgressMetricsReaderWaitsForCompletePublication) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      base_config());
+
+  backend.testing_record_command_progress_latency_ns(10);
+  backend.testing_begin_command_progress_metrics_publication(20);
+
+  std::promise<void> reader_started;
+  auto reader_started_future = reader_started.get_future();
+  auto reader = std::async(std::launch::async, [&]() {
+    reader_started.set_value();
+    return backend.controller_progress_metrics();
+  });
+  EXPECT_EQ(reader_started_future.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(reader.wait_for(50ms), std::future_status::timeout)
+      << "reader exposed count/latency fields while their sequence was odd";
+
+  backend.testing_finish_command_progress_metrics_publication();
+  ASSERT_EQ(reader.wait_for(1s), std::future_status::ready);
+  const auto metrics = reader.get();
+  EXPECT_EQ(metrics.command_progress_samples_total, 2u);
+  EXPECT_EQ(metrics.last_command_progress_latency_ns, 20u);
+  EXPECT_EQ(metrics.max_command_progress_latency_ns, 20u);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      ControlledStopCommandReferenceValidatesOnceAndPublishesSamples) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;

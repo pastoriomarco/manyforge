@@ -3494,8 +3494,10 @@ def test_get_capabilities_returns_deployment_capability_summary(client):
     assert "context.state.current" in data["context"]
     assert "scene.edit.add" in data["scene"]
     assert "execution.trajectory.execute" in data["execution"]
+    assert "execution.contact.geometric" in data["execution"]
+    assert "execution.contact.geometric_signed_penetration" in data["execution"]
     assert data["sensing"] == []
-    assert data["contactTier"] == "unsupported"
+    assert data["contactTier"] == "geometry_only"
     assert data["adapterIds"]["planning"] == "planning.roboplan"
     assert data["programProfile"] == "v0.0"
     assert data["timestampNs"] > 0

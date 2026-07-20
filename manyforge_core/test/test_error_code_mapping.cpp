@@ -16,6 +16,11 @@ TEST(ErrorCodeMappingTest, MapsPublicErrorDtoCodes) {
             ErrorCode::kValidationLimitsViolation);
   EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorValidationCollision, "", {}}),
             ErrorCode::kValidationCollision);
+  EXPECT_EQ(error_code_from_dto(ErrorDTO{kErrorInvalidContactPolicy, "", {}}),
+            ErrorCode::kInvalidContactPolicy);
+  EXPECT_EQ(
+      error_code_from_dto(ErrorDTO{kErrorContactPolicyViolation, "", {}}),
+      ErrorCode::kContactPolicyViolation);
   EXPECT_EQ(error_code_from_dto(
                 ErrorDTO{kErrorSceneChangedDuringValidation, "", {}}),
             ErrorCode::kSceneChangedDuringValidation);

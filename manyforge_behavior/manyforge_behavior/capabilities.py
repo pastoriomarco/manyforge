@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+GEOMETRIC_CONTACT_CAPABILITY = "execution.contact.geometric"
+SIGNED_PENETRATION_CONTACT_CAPABILITY = (
+    "execution.contact.geometric_signed_penetration"
+)
+
 CAPABILITY_REGISTRY: frozenset[str] = frozenset({
     # Planning
     "planning.motion.joint_goal",
@@ -41,7 +46,8 @@ CAPABILITY_REGISTRY: frozenset[str] = frozenset({
     "execution.pause",
     "execution.resume",
     "execution.reset",
-    "execution.contact.geometric",
+    GEOMETRIC_CONTACT_CAPABILITY,
+    SIGNED_PENETRATION_CONTACT_CAPABILITY,
     "execution.contact.force_torque",
     "execution.contact.controller_reported",
     "execution.control.admittance",
@@ -117,6 +123,8 @@ _ROBOPLAN_CONTEXT_CAPABILITY_KEYS = frozenset({
     "context.validation.trajectory",
     "context.collision.check",
     "context.collision.check.detailed",
+    GEOMETRIC_CONTACT_CAPABILITY,
+    SIGNED_PENETRATION_CONTACT_CAPABILITY,
     "context.kinematics.fk",
     "context.limits.joint",
     "context.pose.resolve_reference",

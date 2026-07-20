@@ -25,6 +25,7 @@ enum class RuntimeCollisionQueryPrepareStatus {
 
 enum class RuntimeCollisionQueryCapabilityStatus {
   kAdmitted,
+  kInvalidDistanceRequestModes,
   kUnsupportedMemoryModel,
   kMissingDimensionBound,
   kMissingWarmWcet,
@@ -35,9 +36,13 @@ enum class RuntimeCollisionQueryCapabilityStatus {
   kSnapshotChangeMissingWcet,
 };
 
-[[nodiscard]] constexpr RuntimeCollisionQueryCapabilityStatus
+[[nodiscard]] inline RuntimeCollisionQueryCapabilityStatus
 runtime_collision_query_capability_status(
     const CollisionEngineCapabilityDescriptor& capability) noexcept {
+  if (!collision_distance_request_modes_valid(capability)) {
+    return RuntimeCollisionQueryCapabilityStatus::
+        kInvalidDistanceRequestModes;
+  }
   if (capability.runtime_query_memory_model ==
       RuntimeCollisionQueryMemoryModel::kUnsupported) {
     return RuntimeCollisionQueryCapabilityStatus::kUnsupportedMemoryModel;
@@ -84,6 +89,8 @@ runtime_collision_query_capability_status_name(
   switch (status) {
     case RuntimeCollisionQueryCapabilityStatus::kAdmitted:
       return "admitted";
+    case RuntimeCollisionQueryCapabilityStatus::kInvalidDistanceRequestModes:
+      return "invalid_distance_request_modes";
     case RuntimeCollisionQueryCapabilityStatus::kUnsupportedMemoryModel:
       return "unsupported_memory_model";
     case RuntimeCollisionQueryCapabilityStatus::kMissingDimensionBound:
@@ -141,7 +148,12 @@ struct RuntimeCollisionQueryRequest {
   std::span<const double> positions_rad;
   std::int64_t state_time_ns = 0;
   std::int64_t timeout_budget_ns = 0;
-  bool require_distance = false;
+  CollisionDistanceRequestMode distance_request_mode =
+      CollisionDistanceRequestMode::kNone;
+  /// Sorted, unique canonical logical pairs prepared before the runtime hot
+  /// loop. Used only with kSelectedCollidingPairs; the span's storage must
+  /// remain valid for the duration of check_runtime().
+  std::span<const CollisionPairId> selected_distance_pairs;
 };
 
 /// Typed, non-owning runtime result. Maps, formatted strings, and owning result

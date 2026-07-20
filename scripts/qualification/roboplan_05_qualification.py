@@ -30,6 +30,10 @@ CAPTURE_SCHEMA = "manyforge.roboplan_transition_capture.v1"
 EVIDENCE_SCHEMA = "manyforge.roboplan_transition_evidence.v1"
 CAPABILITY_SCHEMA = "manyforge.roboplan_capability_inventory.v1"
 WORKAROUND_SCHEMA = "manyforge.roboplan_workaround_inventory.v1"
+MANYFORGE_SOURCE_IDENTITY_SCHEMA = "manyforge.source_identity.v1"
+MANYFORGE_FROZEN_SOURCE_IDENTITY_MODE = (
+    "frozen_source_fingerprint_sha256"
+)
 ROBOPLAN_05_VERSION = "0.5.1"
 ROBOPLAN_05_SCHEMA_VERSIONS = frozenset({"0.5.0", ROBOPLAN_05_VERSION})
 ROBOPLAN_05_PINNED_COMMIT = "e06d1a2f1b749c38742aee9e401bbe97fa967f7b"
@@ -111,6 +115,25 @@ EXCLUDED_PARTS = {
     "node_modules",
     "qualification",
 }
+
+_SUPPORT_CONTACT_RELEASE_FIELDS = frozenset(
+    {
+        "release_evidence_mode",
+        "enforce_max_start_penetration",
+        "max_start_penetration_m",
+        "release_tolerance_m",
+        "min_release_progress_m",
+        "require_separation_by_end",
+        "require_strictly_decreasing_penetration",
+        "allow_recontact",
+    }
+)
+_RESOLVED_SUPPORT_CONTACT_FIELDS = frozenset(
+    {"pair", "mode", "max_contact_penetration_m"}
+) | _SUPPORT_CONTACT_RELEASE_FIELDS
+_AUTHORED_SUPPORT_CONTACT_FIELDS = frozenset(
+    {"support_object_id", "mode", "max_contact_penetration_m"}
+) | _SUPPORT_CONTACT_RELEASE_FIELDS
 
 
 class ValidationError(ValueError):
@@ -217,6 +240,26 @@ def _finite_scalar(value: Any, field: str, *, positive: bool = False) -> float:
     return result
 
 
+def _reject_unknown_fields(
+    value: dict[str, Any], allowed: frozenset[str], field: str
+) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValidationError(
+            f"{field} contains unknown fields: {', '.join(unknown)}"
+        )
+
+
+def _reject_fields_for_mode(
+    value: dict[str, Any], forbidden: frozenset[str], field: str, mode: str
+) -> None:
+    present = sorted(set(value) & forbidden)
+    if present:
+        raise ValidationError(
+            f"{field} fields are not valid for mode {mode}: {', '.join(present)}"
+        )
+
+
 def _validate_pose(value: Any, field: str) -> None:
     if not isinstance(value, dict):
         raise ValidationError(f"{field} must be an object")
@@ -270,14 +313,49 @@ def _validate_collision_policy(value: Any, field: str) -> None:
         item = f"{field}.support_contacts[{index}]"
         if not isinstance(contact, dict):
             raise ValidationError(f"{item} must be an object")
+        _reject_unknown_fields(contact, _RESOLVED_SUPPORT_CONTACT_FIELDS, item)
         _validate_collision_pair(contact.get("pair"), f"{item}.pair")
-        if contact.get("mode") not in {"contact_release", "contact_process"}:
+        mode = contact.get("mode")
+        if mode not in {
+            "contact_release",
+            "contact_process",
+            "bounded_penetration",
+        }:
             raise ValidationError(f"{item}.mode is unsupported")
+
+        if mode == "bounded_penetration":
+            _reject_fields_for_mode(
+                contact, _SUPPORT_CONTACT_RELEASE_FIELDS, item, mode
+            )
+            maximum = _finite_scalar(
+                contact.get("max_contact_penetration_m"),
+                f"{item}.max_contact_penetration_m",
+            )
+            if maximum < 0.0:
+                raise ValidationError(
+                    f"{item}.max_contact_penetration_m must be non-negative"
+                )
+            continue
+
+        _reject_fields_for_mode(
+            contact,
+            frozenset({"max_contact_penetration_m"}),
+            item,
+            mode,
+        )
+        if mode == "contact_process":
+            _reject_fields_for_mode(
+                contact, _SUPPORT_CONTACT_RELEASE_FIELDS, item, mode
+            )
+            continue
+
+        evidence_mode = contact.get("release_evidence_mode")
+        if evidence_mode not in {"signed_penetration", "binary_contact"}:
+            raise ValidationError(f"{item}.release_evidence_mode is unsupported")
         for name in (
             "max_start_penetration_m",
             "release_tolerance_m",
             "min_release_progress_m",
-            "min_separation_clearance_m",
         ):
             numeric = _finite_scalar(contact.get(name), f"{item}.{name}")
             if numeric < 0.0:
@@ -290,6 +368,24 @@ def _validate_collision_policy(value: Any, field: str) -> None:
         ):
             if not isinstance(contact.get(name), bool):
                 raise ValidationError(f"{item}.{name} must be boolean")
+        if evidence_mode == "binary_contact":
+            if contact["enforce_max_start_penetration"]:
+                raise ValidationError(
+                    f"{item}.enforce_max_start_penetration must be false for "
+                    "binary_contact"
+                )
+            for name in (
+                "max_start_penetration_m",
+                "release_tolerance_m",
+                "min_release_progress_m",
+            ):
+                if float(contact[name]) != 0.0:
+                    raise ValidationError(f"{item}.{name} must be 0 for binary_contact")
+            if contact["require_strictly_decreasing_penetration"]:
+                raise ValidationError(
+                    f"{item}.require_strictly_decreasing_penetration must be false "
+                    "for binary_contact"
+                )
     contact_grasps = value.get("contact_grasps")
     if not isinstance(contact_grasps, list):
         raise ValidationError(f"{field}.contact_grasps must be a list")
@@ -488,8 +584,8 @@ def validate_capture(
     if request_velocities != parsed_velocities:
         raise ValidationError("plan_request start velocities do not match capture")
     request_motion = plan_request.get("motion")
-    if not isinstance(request_motion, dict) or request_motion.get("type") != "pose_goal":
-        raise ValidationError("plan_request.motion must be a pose_goal")
+    if not isinstance(request_motion, dict) or request_motion.get("type") != "pose":
+        raise ValidationError("plan_request.motion must be a pose motion")
     _validate_pose(request_motion.get("pose"), "plan_request.motion.pose")
     if request_motion["pose"] != resolved["pose_goal"]:
         raise ValidationError("plan_request pose does not match resolved_motion")
@@ -567,6 +663,89 @@ def validate_capture(
     if planner_contract["rng_seed"] != planner_contract["rng_base_seed"]:
         raise ValidationError("initial planning attempt must use the base RNG seed")
 
+    planning_result = capture.get("planning_result")
+    if not isinstance(planning_result, dict):
+        raise ValidationError("planning_result must be an object")
+    result_revision = planning_result.get("scene_revision")
+    if not isinstance(result_revision, dict) or result_revision != {
+        "revision_id": scene_binding["revision_id"],
+        "content_hash": scene_binding["content_hash"],
+    }:
+        raise ValidationError(
+            "planning_result.scene_revision does not match the retained plan binding"
+        )
+    trajectory = planning_result.get("trajectory")
+    if not isinstance(trajectory, dict):
+        raise ValidationError("planning_result.trajectory must be an object")
+    if trajectory.get("joint_names") != joint_names:
+        raise ValidationError(
+            "planning_result trajectory joint order does not match the exact request"
+        )
+    waypoints = trajectory.get("waypoints")
+    if not isinstance(waypoints, list) or len(waypoints) < 2:
+        raise ValidationError(
+            "planning_result.trajectory.waypoints must contain at least two samples"
+        )
+    previous_time_s = -math.inf
+    for index, waypoint in enumerate(waypoints):
+        field = f"planning_result.trajectory.waypoints[{index}]"
+        if not isinstance(waypoint, dict):
+            raise ValidationError(f"{field} must be an object")
+        time_from_start_s = _finite_scalar(
+            waypoint.get("time_from_start_s"), f"{field}.time_from_start_s"
+        )
+        if time_from_start_s < 0.0 or time_from_start_s <= previous_time_s:
+            raise ValidationError(
+                f"{field}.time_from_start_s must be non-negative and strictly increasing"
+            )
+        previous_time_s = time_from_start_s
+        _finite_vector(
+            waypoint.get("positions_rad"),
+            len(joint_names),
+            f"{field}.positions_rad",
+        )
+        waypoint_velocities = waypoint.get("velocities_rad_s")
+        if not isinstance(waypoint_velocities, list) or len(
+            waypoint_velocities
+        ) not in {0, len(joint_names)}:
+            raise ValidationError(
+                f"{field}.velocities_rad_s must be empty or match joint order"
+            )
+        if waypoint_velocities:
+            _finite_vector(
+                waypoint_velocities,
+                len(joint_names),
+                f"{field}.velocities_rad_s",
+            )
+        waypoint_accelerations = waypoint.get("accelerations_rad_s2", [])
+        if not isinstance(waypoint_accelerations, list) or len(
+            waypoint_accelerations
+        ) not in {0, len(joint_names)}:
+            raise ValidationError(
+                f"{field}.accelerations_rad_s2 must be empty or match joint order"
+            )
+        if waypoint_accelerations:
+            _finite_vector(
+                waypoint_accelerations,
+                len(joint_names),
+                f"{field}.accelerations_rad_s2",
+            )
+    trajectory_sha256 = _require_nonempty_string(
+        planning_result.get("trajectory_sha256"),
+        "planning_result.trajectory_sha256",
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", trajectory_sha256) is None:
+        raise ValidationError(
+            "planning_result.trajectory_sha256 must be a SHA-256 digest"
+        )
+    expected_trajectory_sha256 = hashlib.sha256(
+        json.dumps(trajectory, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if trajectory_sha256 != expected_trajectory_sha256:
+        raise ValidationError(
+            "planning_result.trajectory_sha256 does not match trajectory content"
+        )
+
     scene = capture.get("scene")
     if not isinstance(scene, dict):
         raise ValidationError("scene must be an object")
@@ -605,6 +784,84 @@ def validate_capture(
     if robot["base_frame"] != plan_request["base_frame"]:
         raise ValidationError("scene robot base frame does not match plan request")
     _validate_pose(robot.get("pose_in_world"), "scene.robot.pose_in_world")
+    projection_seed = robot.get("collision_projection_seed")
+    if not isinstance(projection_seed, dict):
+        raise ValidationError(
+            "scene.robot.collision_projection_seed must be an object"
+        )
+    projection_groups = projection_seed.get("groups")
+    if not isinstance(projection_groups, list) or len(projection_groups) < 2:
+        raise ValidationError(
+            "scene.robot.collision_projection_seed.groups must include arm and gripper"
+        )
+    seen_projection_groups: set[str] = set()
+    seen_projection_joints: set[str] = set()
+    for index, group in enumerate(projection_groups):
+        field = f"scene.robot.collision_projection_seed.groups[{index}]"
+        if not isinstance(group, dict):
+            raise ValidationError(f"{field} must be an object")
+        group_id = _require_nonempty_string(group.get("group_id"), f"{field}.group_id")
+        if group_id in seen_projection_groups:
+            raise ValidationError(
+                "collision projection seed contains a duplicate group id"
+            )
+        seen_projection_groups.add(group_id)
+        seed_joint_names = group.get("joint_names")
+        if (
+            not isinstance(seed_joint_names, list)
+            or not seed_joint_names
+            or any(not isinstance(name, str) or not name for name in seed_joint_names)
+            or len(set(seed_joint_names)) != len(seed_joint_names)
+        ):
+            raise ValidationError(f"{field}.joint_names must be unique names")
+        if seen_projection_joints.intersection(seed_joint_names):
+            raise ValidationError(
+                "collision projection seed assigns one joint to multiple groups"
+            )
+        seen_projection_joints.update(seed_joint_names)
+        seed_positions = _finite_vector(
+            group.get("positions_rad"),
+            len(seed_joint_names),
+            f"{field}.positions_rad",
+        )
+        source_kind = group.get("source")
+        if source_kind not in {
+            "exact_plan_request",
+            "fresh_visual_snapshot_gripper",
+        }:
+            raise ValidationError(f"{field}.source is unsupported")
+        if index == 0:
+            if (
+                group_id != plan_request["group_id"]
+                or seed_joint_names != joint_names
+                or seed_positions != [float(value) for value in positions]
+                or source_kind != "exact_plan_request"
+            ):
+                raise ValidationError(
+                    "first collision projection seed group must exactly match the "
+                    "PlanRequestDTO start state"
+                )
+        elif source_kind != "fresh_visual_snapshot_gripper":
+            raise ValidationError(
+                f"{field} must be sourced from fresh gripper feedback"
+            )
+    projection_seed_sha256 = _require_nonempty_string(
+        projection_seed.get("sha256"),
+        "scene.robot.collision_projection_seed.sha256",
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", projection_seed_sha256) is None:
+        raise ValidationError(
+            "scene.robot.collision_projection_seed.sha256 must be a SHA-256 digest"
+        )
+    expected_projection_seed_sha256 = hashlib.sha256(
+        json.dumps(
+            projection_groups, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    if projection_seed_sha256 != expected_projection_seed_sha256:
+        raise ValidationError(
+            "collision projection seed SHA-256 does not match its groups"
+        )
 
     objects = scene.get("objects")
     if not isinstance(objects, list) or not objects:
@@ -653,22 +910,67 @@ def validate_capture(
             contact_field = f"{field}.support_contacts[{contact_index}]"
             if not isinstance(contact, dict):
                 raise ValidationError(f"{contact_field} must be an object")
+            _reject_unknown_fields(
+                contact, _AUTHORED_SUPPORT_CONTACT_FIELDS, contact_field
+            )
             support_object_id = _require_nonempty_string(
                 contact.get("support_object_id"),
                 f"{contact_field}.support_object_id",
             )
             if support_object_id == object_id:
                 raise ValidationError(f"{contact_field} cannot reference itself")
-            if contact.get("mode", "contact_release") not in {
+            mode = contact.get("mode", "contact_release")
+            if mode not in {
                 "contact_release",
                 "contact_process",
+                "bounded_penetration",
             }:
                 raise ValidationError(f"{contact_field}.mode is unsupported")
+
+            if mode == "bounded_penetration":
+                _reject_fields_for_mode(
+                    contact,
+                    _SUPPORT_CONTACT_RELEASE_FIELDS,
+                    contact_field,
+                    mode,
+                )
+                maximum = _finite_scalar(
+                    contact.get("max_contact_penetration_m"),
+                    f"{contact_field}.max_contact_penetration_m",
+                )
+                if maximum < 0.0:
+                    raise ValidationError(
+                        f"{contact_field}.max_contact_penetration_m must be "
+                        "non-negative"
+                    )
+                continue
+
+            _reject_fields_for_mode(
+                contact,
+                frozenset({"max_contact_penetration_m"}),
+                contact_field,
+                mode,
+            )
+            if mode == "contact_process":
+                _reject_fields_for_mode(
+                    contact,
+                    _SUPPORT_CONTACT_RELEASE_FIELDS,
+                    contact_field,
+                    mode,
+                )
+                continue
+
+            evidence_mode = contact.get(
+                "release_evidence_mode", "signed_penetration"
+            )
+            if evidence_mode not in {"signed_penetration", "binary_contact"}:
+                raise ValidationError(
+                    f"{contact_field}.release_evidence_mode is unsupported"
+                )
             for numeric_field in (
                 "max_start_penetration_m",
                 "release_tolerance_m",
                 "min_release_progress_m",
-                "min_separation_clearance_m",
             ):
                 value = contact.get(numeric_field, 0.0)
                 if (
@@ -678,7 +980,8 @@ def validate_capture(
                     or float(value) < 0.0
                 ):
                     raise ValidationError(
-                        f"{contact_field}.{numeric_field} must be finite and non-negative"
+                        f"{contact_field}.{numeric_field} must be finite and "
+                        "non-negative"
                     )
             for boolean_field in (
                 "enforce_max_start_penetration",
@@ -691,6 +994,29 @@ def validate_capture(
                 ):
                     raise ValidationError(
                         f"{contact_field}.{boolean_field} must be boolean"
+                    )
+            if evidence_mode == "binary_contact":
+                if contact.get("enforce_max_start_penetration", False):
+                    raise ValidationError(
+                        f"{contact_field}.enforce_max_start_penetration must be false "
+                        "for binary_contact"
+                    )
+                for numeric_field in (
+                    "max_start_penetration_m",
+                    "release_tolerance_m",
+                    "min_release_progress_m",
+                ):
+                    if float(contact.get(numeric_field, 0.0)) != 0.0:
+                        raise ValidationError(
+                            f"{contact_field}.{numeric_field} must be 0 for "
+                            "binary_contact"
+                        )
+                if contact.get(
+                    "require_strictly_decreasing_penetration", False
+                ):
+                    raise ValidationError(
+                        f"{contact_field}.require_strictly_decreasing_penetration "
+                        "must be false for binary_contact"
                     )
     for index, obj in enumerate(objects):
         for contact in obj.get("support_contacts", []):
@@ -1194,6 +1520,146 @@ def _validate_live_scene_authority(value: Any, field: str) -> None:
     )
 
 
+def _validate_controller_progress_latency(value: Any, field: str) -> None:
+    if not isinstance(value, dict):
+        raise ValidationError(f"{field} must be an object")
+    source = value.get("source")
+    if source not in {
+        "coherent_native_counter_transition",
+        "collector_quiescent_repeated_counter_transition",
+    }:
+        raise ValidationError(f"{field}.source is not an exact counter transition")
+    expected_instrumentation = (
+        "collector_side_unpatched_backend"
+        if source == "collector_quiescent_repeated_counter_transition"
+        else "native_coherent_observer"
+    )
+    if value.get("instrumentation") != expected_instrumentation:
+        raise ValidationError(f"{field}.instrumentation is inconsistent")
+    baseline = _nonnegative_integer(
+        value.get("baseline_counter"), f"{field}.baseline_counter"
+    )
+    final = _positive_integer(value.get("final_counter"), f"{field}.final_counter")
+    delta = _positive_integer(
+        value.get("native_counter_delta"), f"{field}.native_counter_delta"
+    )
+    if final - baseline != delta:
+        raise ValidationError(f"{field} counter delta is inconsistent")
+    native_max = _nonnegative_integer(
+        value.get("native_max_ns"), f"{field}.native_max_ns"
+    )
+    _validate_latency_summary(
+        value.get("latency_ns"), f"{field}.latency_ns", require_p99=True
+    )
+    samples = value.get("samples")
+    if not isinstance(samples, list) or len(samples) != delta:
+        raise ValidationError(f"{field}.samples must retain every native transition")
+    raw: list[int] = []
+    previous_observed = -1
+    for index, sample in enumerate(samples):
+        item = f"{field}.samples[{index}]"
+        if not isinstance(sample, dict):
+            raise ValidationError(f"{item} must be an object")
+        if _positive_integer(
+            sample.get("counter_value"), f"{item}.counter_value"
+        ) != baseline + index + 1:
+            raise ValidationError(f"{item}.counter_value is not contiguous")
+        latency = _nonnegative_integer(sample.get("latency_ns"), f"{item}.latency_ns")
+        sample_max = _nonnegative_integer(
+            sample.get("native_max_ns"), f"{item}.native_max_ns"
+        )
+        observed = _positive_integer(
+            sample.get("observed_monotonic_ns"),
+            f"{item}.observed_monotonic_ns",
+        )
+        if observed <= previous_observed:
+            raise ValidationError(f"{item}.observed_monotonic_ns is not increasing")
+        if sample_max < latency:
+            raise ValidationError(f"{item}.native_max_ns is below its sample")
+        quiescent_reads = _nonnegative_integer(
+            sample.get("quiescent_reads", 0), f"{item}.quiescent_reads"
+        )
+        if source == "collector_quiescent_repeated_counter_transition":
+            if quiescent_reads < 3:
+                raise ValidationError(
+                    f"{item}.quiescent_reads must prove three stable snapshots"
+                )
+        elif quiescent_reads != 0:
+            raise ValidationError(
+                f"{item}.quiescent_reads is invalid for the native observer"
+            )
+        raw.append(latency)
+        previous_observed = observed
+    if max(raw) != native_max:
+        raise ValidationError(f"{field}.native_max_ns disagrees with raw samples")
+    if float(value["latency_ns"]["max"]) != float(native_max):
+        raise ValidationError(f"{field}.latency_ns.max disagrees with native maximum")
+
+
+def _validate_step18_support_contact(value: Any, field: str) -> None:
+    if not isinstance(value, dict):
+        raise ValidationError(f"{field} must be an object")
+    mode = value.get("mode")
+    if mode not in {
+        "current_all_active_distance",
+        "signed_penetration",
+        "binary_contact",
+        "bounded_penetration",
+    }:
+        raise ValidationError(f"{field}.mode is unsupported")
+    for name in ("saved_scene_sha256", "effective_scene_sha256"):
+        digest = _require_nonempty_string(value.get(name), f"{field}.{name}")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValidationError(f"{field}.{name} must be a SHA-256 digest")
+    authored = value.get("authored_contact")
+    resolved = value.get("resolved_contact")
+    if not isinstance(authored, dict) or not isinstance(resolved, dict):
+        raise ValidationError(f"{field} must retain authored and resolved contacts")
+    if authored.get("support_object_id") != "isaac_table_low_327":
+        raise ValidationError(f"{field}.authored_contact identifies the wrong support")
+    pair = resolved.get("pair")
+    if not isinstance(pair, dict) or {
+        pair.get("body_a"),
+        pair.get("body_b"),
+    } != {"isaac_cheese_box", "isaac_table_low_327"}:
+        raise ValidationError(f"{field}.resolved_contact identifies the wrong pair")
+    if mode == "bounded_penetration":
+        threshold = _nonnegative_scalar(
+            value.get("bounded_penetration_m"),
+            f"{field}.bounded_penetration_m",
+        )
+        if authored.get("mode") != mode or resolved.get("mode") != mode:
+            raise ValidationError(f"{field} bounded mode was not retained")
+        if float(authored.get("max_contact_penetration_m", math.nan)) != threshold:
+            raise ValidationError(f"{field} authored bounded threshold changed")
+        if float(resolved.get("max_contact_penetration_m", math.nan)) != threshold:
+            raise ValidationError(f"{field} resolved bounded threshold changed")
+    elif mode == "current_all_active_distance":
+        if value.get("bounded_penetration_m") is not None:
+            raise ValidationError(f"{field}.bounded_penetration_m must be null")
+        if authored.get("mode", "contact_release") != "contact_release":
+            raise ValidationError(f"{field} baseline contact mode changed")
+        if resolved.get("mode") != "contact_release":
+            raise ValidationError(f"{field} resolved baseline contact mode changed")
+        if authored.get("release_evidence_mode") not in {None, "signed_penetration"}:
+            raise ValidationError(f"{field} baseline authored evidence changed")
+        if resolved.get("release_evidence_mode") not in {None, "signed_penetration"}:
+            raise ValidationError(f"{field} baseline resolved evidence changed")
+    else:
+        if value.get("bounded_penetration_m") is not None:
+            raise ValidationError(f"{field}.bounded_penetration_m must be null")
+        if authored.get("mode") != "contact_release" or resolved.get("mode") != "contact_release":
+            raise ValidationError(f"{field} release mode changed")
+        if authored.get("release_evidence_mode") != mode:
+            raise ValidationError(f"{field} authored evidence mode changed")
+        if resolved.get("release_evidence_mode") != mode:
+            raise ValidationError(f"{field} resolved evidence mode changed")
+    _validate_live_scene_authority(
+        value.get("scene_authority_after_apply"),
+        f"{field}.scene_authority_after_apply",
+    )
+
+
 def _validate_source_artifact(value: Any, field: str, *, named: bool) -> None:
     if not isinstance(value, dict):
         raise ValidationError(f"{field} must be an object")
@@ -1203,6 +1669,142 @@ def _validate_source_artifact(value: Any, field: str, *, named: bool) -> None:
     digest = _require_nonempty_string(value.get("sha256"), f"{field}.sha256")
     if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
         raise ValidationError(f"{field}.sha256 must be a lowercase SHA-256")
+
+
+def _validate_manyforge_source_identity(
+    source: dict[str, Any], *, required: bool
+) -> dict[str, Any] | None:
+    """Validate the versioned, commit-bound ManyForge source fingerprint."""
+
+    identity = source.get("manyforge_source_identity")
+    if identity is None:
+        if required:
+            raise ValidationError(
+                "source.manyforge_source_identity is required for a frozen source"
+            )
+        # The explicit v1 fields are not meaningful without the structured
+        # identity that declares their framing/version. Keep accepting older
+        # evidence that only carries manyforge_worktree_sha256.
+        for name in (
+            "manyforge_worktree_delta_sha256",
+            "manyforge_source_fingerprint_sha256",
+            "manyforge_expected_source_fingerprint_sha256",
+        ):
+            if name in source:
+                raise ValidationError(
+                    f"source.{name} requires source.manyforge_source_identity"
+                )
+        return None
+    if not isinstance(identity, dict):
+        raise ValidationError("source.manyforge_source_identity must be an object")
+
+    required_fields = frozenset(
+        {
+            "schema_version",
+            "head_commit",
+            "head_tree",
+            "dirty",
+            "delta_sha256",
+            "fingerprint_sha256",
+        }
+    )
+    missing = sorted(required_fields - set(identity))
+    if missing:
+        raise ValidationError(
+            "source.manyforge_source_identity is missing fields: "
+            + ", ".join(missing)
+        )
+    unknown = sorted(set(identity) - required_fields)
+    if unknown:
+        raise ValidationError(
+            "source.manyforge_source_identity contains unknown fields: "
+            + ", ".join(unknown)
+        )
+    if identity.get("schema_version") != MANYFORGE_SOURCE_IDENTITY_SCHEMA:
+        raise ValidationError(
+            "source.manyforge_source_identity.schema_version must be "
+            f"{MANYFORGE_SOURCE_IDENTITY_SCHEMA!r}"
+        )
+    for name in ("head_commit", "head_tree"):
+        value = _require_nonempty_string(
+            identity.get(name), f"source.manyforge_source_identity.{name}"
+        )
+        if re.fullmatch(r"[0-9a-f]{40}", value) is None:
+            raise ValidationError(
+                f"source.manyforge_source_identity.{name} must be a full Git SHA"
+            )
+    if not isinstance(identity.get("dirty"), bool):
+        raise ValidationError(
+            "source.manyforge_source_identity.dirty must be boolean"
+        )
+    for name in ("delta_sha256", "fingerprint_sha256"):
+        value = _require_nonempty_string(
+            identity.get(name), f"source.manyforge_source_identity.{name}"
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValidationError(
+                f"source.manyforge_source_identity.{name} must be a lowercase SHA-256"
+            )
+
+    calculated = _manyforge_source_fingerprint_sha256(
+        head_commit=str(identity["head_commit"]),
+        head_tree=str(identity["head_tree"]),
+        dirty=bool(identity["dirty"]),
+        delta_sha256=str(identity["delta_sha256"]),
+    )
+    if identity["fingerprint_sha256"] != calculated:
+        raise ValidationError(
+            "source.manyforge_source_identity.fingerprint_sha256 is inconsistent"
+        )
+
+    top_level_bindings = {
+        "manyforge_commit": identity["head_commit"],
+        "manyforge_dirty": identity["dirty"],
+        "manyforge_worktree_delta_sha256": identity["delta_sha256"],
+        "manyforge_source_fingerprint_sha256": identity["fingerprint_sha256"],
+    }
+    if not isinstance(source.get("manyforge_dirty"), bool):
+        raise ValidationError("source.manyforge_dirty must be boolean")
+    for name, expected in top_level_bindings.items():
+        if name not in source:
+            raise ValidationError(
+                f"source.{name} is required with source.manyforge_source_identity"
+            )
+        if source[name] != expected:
+            raise ValidationError(
+                f"source.{name} is inconsistent with source.manyforge_source_identity"
+            )
+    # Preserve and cross-check the historical delta field while callers move
+    # to its unambiguous name.
+    if source.get("manyforge_worktree_sha256") != identity["delta_sha256"]:
+        raise ValidationError(
+            "source.manyforge_worktree_sha256 is inconsistent with "
+            "source.manyforge_source_identity"
+        )
+
+    expected_fingerprint = source.get(
+        "manyforge_expected_source_fingerprint_sha256"
+    )
+    if expected_fingerprint is not None:
+        if (
+            not isinstance(expected_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint) is None
+        ):
+            raise ValidationError(
+                "source.manyforge_expected_source_fingerprint_sha256 must be a "
+                "lowercase SHA-256"
+            )
+        if expected_fingerprint != identity["fingerprint_sha256"]:
+            raise ValidationError(
+                "source.manyforge_expected_source_fingerprint_sha256 does not "
+                "match the observed source fingerprint"
+            )
+    if required and expected_fingerprint is None:
+        raise ValidationError(
+            "source.manyforge_expected_source_fingerprint_sha256 is required "
+            "for a frozen source"
+        )
+    return identity
 
 
 def _validate_rp5_record(
@@ -1362,6 +1964,36 @@ def _validate_rp5_record(
                 details.get("scene_authority_after"),
                 f"{field}.details.scene_authority_after",
             )
+            if "controller_progress_latency" in details:
+                _validate_controller_progress_latency(
+                    details.get("controller_progress_latency"),
+                    f"{field}.details.controller_progress_latency",
+                )
+            if details.get("step18_support_contact") is not None:
+                _validate_step18_support_contact(
+                    details.get("step18_support_contact"),
+                    f"{field}.details.step18_support_contact",
+                )
+                applied_authority = details["step18_support_contact"].get(
+                    "scene_authority_after_apply"
+                )
+                for authority_name in (
+                    "scene_authority_before",
+                    "scene_authority_after",
+                ):
+                    authority = details.get(authority_name)
+                    if authority.get("revision") != applied_authority.get("revision"):
+                        raise ValidationError(
+                            f"{field}.details.{authority_name} changed the applied "
+                            "scene revision"
+                        )
+                    if authority.get("configured_collision_policy") != (
+                        applied_authority.get("configured_collision_policy")
+                    ):
+                        raise ValidationError(
+                            f"{field}.details.{authority_name} changed the applied "
+                            "collision policy"
+                        )
             for index, sample in enumerate(retained_samples):
                 metrics = sample.get("planner_metrics") if isinstance(sample, dict) else None
                 if not isinstance(metrics, dict) or metrics.get("measurement_complete") is not True:
@@ -1398,6 +2030,29 @@ def _validate_rp5_record(
                         f"{field}.details.samples[{index}].request."
                         "contact_policy_resolution is inconsistent"
                     )
+                if details.get("step18_support_contact") is not None:
+                    if contact_policy_id or expected_resolution != "configured_default":
+                        raise ValidationError(
+                            f"{field}.details.samples[{index}] must use the "
+                            "configured-default Step 18 policy"
+                        )
+                    policy_binding = _validate_revision_identity(
+                        request.get("configured_policy_revision"),
+                        f"{field}.details.samples[{index}].request."
+                        "configured_policy_revision",
+                    )
+                    expected_policy = _validate_revision_identity(
+                        details["scene_authority_before"][
+                            "configured_collision_policy"
+                        ]["revision"],
+                        f"{field}.details.scene_authority_before."
+                        "configured_collision_policy.revision",
+                    )
+                    if policy_binding != expected_policy:
+                        raise ValidationError(
+                            f"{field}.details.samples[{index}] changed collision "
+                            "policy revision"
+                        )
                 binding = _validate_revision_identity(
                     request.get("scene_binding"),
                     f"{field}.details.samples[{index}].request.scene_binding",
@@ -1414,6 +2069,18 @@ def _validate_rp5_record(
                 if binding != result_revision:
                     raise ValidationError(
                         f"{field}.details.samples[{index}] changed scene revision"
+                    )
+                if (
+                    details.get("step18_support_contact") is not None
+                    and binding
+                    != _validate_revision_identity(
+                        details["scene_authority_before"]["revision"],
+                        f"{field}.details.scene_authority_before.revision",
+                    )
+                ):
+                    raise ValidationError(
+                        f"{field}.details.samples[{index}] did not consume the "
+                        "applied scene revision"
                     )
         else:
             failures = details.get("failed_or_timeout_observations")
@@ -1439,10 +2106,25 @@ def validate_evidence(path: Path) -> dict[str, Any]:
             raise ValidationError(f"{field} must be an object")
     source = evidence["source"]
     environment = evidence["environment"]
-    # A clean-source RP5-3 or RP5-7 artifact is release evidence just as the
-    # RP5-0 baseline is. Apply the same provenance and sample-size contract to
-    # every formal phase; dirty-source preflights remain explicitly non-formal.
-    formal = source.get("manyforge_dirty") is False
+    identity_mode = source.get("manyforge_source_identity_mode")
+    frozen_dirty = identity_mode == MANYFORGE_FROZEN_SOURCE_IDENTITY_MODE
+    source_identity = _validate_manyforge_source_identity(
+        source, required=frozen_dirty
+    )
+    if frozen_dirty:
+        if source.get("manyforge_dirty") is not True:
+            raise ValidationError(
+                "frozen_source_fingerprint_sha256 requires a dirty ManyForge source"
+            )
+        if source_identity is None or source_identity.get("dirty") is not True:
+            raise ValidationError(
+                "frozen_source_fingerprint_sha256 requires a dirty source identity"
+            )
+    # A dirty source can be formal only when its composite commit/tree/delta
+    # identity was explicitly frozen before the run. It then receives exactly
+    # the same provenance, sample-size, inventory, and artifact checks as clean
+    # formal evidence. Ordinary dirty preflights remain non-formal.
+    formal = source.get("manyforge_dirty") is False or frozen_dirty
     if formal:
         commit = _require_nonempty_string(
             source.get("manyforge_commit"), "source.manyforge_commit"
@@ -1586,7 +2268,7 @@ def require_source_inventory_stable(
         )
 
 
-def _manyforge_worktree_sha256(repo_root: Path) -> str:
+def _manyforge_worktree_delta_sha256(repo_root: Path) -> str:
     """Fingerprint every non-ignored source change relative to HEAD."""
 
     digest = hashlib.sha256()
@@ -1630,8 +2312,10 @@ def _manyforge_worktree_sha256(repo_root: Path) -> str:
         digest.update(encoded_name)
         digest.update(mode.to_bytes(4, "big"))
         if stat.S_ISLNK(metadata.st_mode):
+            digest.update(b"symlink\0")
             payload = os.fsencode(os.readlink(path))
         elif stat.S_ISREG(metadata.st_mode):
+            digest.update(b"regular\0")
             payload = path.read_bytes()
         else:
             raise ValidationError(
@@ -1640,6 +2324,68 @@ def _manyforge_worktree_sha256(repo_root: Path) -> str:
         digest.update(len(payload).to_bytes(8, "big"))
         digest.update(payload)
     return digest.hexdigest()
+
+
+def _manyforge_worktree_sha256(repo_root: Path) -> str:
+    """Return the legacy name for the tracked-and-untracked delta digest."""
+
+    return _manyforge_worktree_delta_sha256(repo_root)
+
+
+def _manyforge_source_fingerprint_sha256(
+    *,
+    head_commit: str,
+    head_tree: str,
+    dirty: bool,
+    delta_sha256: str,
+) -> str:
+    """Frame and hash the complete v1 source identity deterministically."""
+
+    digest = hashlib.sha256()
+    digest.update(b"manyforge.source_identity.v1\0")
+    fields = (
+        (b"head_commit", head_commit.encode("ascii")),
+        (b"head_tree", head_tree.encode("ascii")),
+        (b"dirty", b"true" if dirty else b"false"),
+        (b"delta_sha256", delta_sha256.encode("ascii")),
+    )
+    for name, payload in fields:
+        digest.update(len(name).to_bytes(4, "big"))
+        digest.update(name)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
+
+
+def _manyforge_source_identity(
+    repo_root: Path, *, dirty: bool | None = None
+) -> dict[str, Any]:
+    """Collect a commit-, tree-, and delta-bound ManyForge identity."""
+
+    observed_dirty = (
+        bool(_git(repo_root, "status", "--porcelain"))
+        if dirty is None
+        else dirty
+    )
+    if not isinstance(observed_dirty, bool):
+        raise TypeError("dirty must be boolean")
+    head_commit = _git(repo_root, "rev-parse", "HEAD")
+    head_tree = _git(repo_root, "rev-parse", "HEAD^{tree}")
+    delta_sha256 = _manyforge_worktree_delta_sha256(repo_root)
+    fingerprint_sha256 = _manyforge_source_fingerprint_sha256(
+        head_commit=head_commit,
+        head_tree=head_tree,
+        dirty=observed_dirty,
+        delta_sha256=delta_sha256,
+    )
+    return {
+        "schema_version": MANYFORGE_SOURCE_IDENTITY_SCHEMA,
+        "head_commit": head_commit,
+        "head_tree": head_tree,
+        "dirty": observed_dirty,
+        "delta_sha256": delta_sha256,
+        "fingerprint_sha256": fingerprint_sha256,
+    }
 
 
 def _git(repo_root: Path, *args: str) -> str:
@@ -1850,12 +2596,22 @@ def collect_inventory(repo_root: Path) -> dict[str, Any]:
         except OSError:
             pass
     dirty = bool(_git(repo_root, "status", "--porcelain"))
+    manyforge_identity = _manyforge_source_identity(repo_root, dirty=dirty)
     return {
         "schema_version": "manyforge.roboplan_transition_inventory.v1",
         "source": {
-            "manyforge_commit": _git(repo_root, "rev-parse", "HEAD"),
+            "manyforge_commit": manyforge_identity["head_commit"],
             "manyforge_dirty": dirty,
-            "manyforge_worktree_sha256": _manyforge_worktree_sha256(repo_root),
+            # Keep the historical field for consumers of the v1 transition
+            # inventory, but name the value accurately for new consumers.
+            "manyforge_worktree_sha256": manyforge_identity["delta_sha256"],
+            "manyforge_worktree_delta_sha256": manyforge_identity[
+                "delta_sha256"
+            ],
+            "manyforge_source_fingerprint_sha256": manyforge_identity[
+                "fingerprint_sha256"
+            ],
+            "manyforge_source_identity": manyforge_identity,
             "roboplan_ref": roboplan_ref,
             "roboplan_commit": roboplan_sha,
             "roboplan_source_clean": True,

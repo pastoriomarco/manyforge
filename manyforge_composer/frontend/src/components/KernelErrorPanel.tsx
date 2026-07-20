@@ -168,6 +168,7 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
       // the trajectory dispatchable.
       const engineStatus = stringField(d, 'collision_result_engine_status');
       const reason = stringField(d, 'reason');
+      const contactPolicy = supportContactPolicyText(d);
       if (engineStatus === 'timeout') {
         const timeoutReason = collisionTimeoutReason(d);
         const observedMs = numberFieldAsMs(
@@ -198,7 +199,13 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
           : 'Collision validation hit unsupported scene geometry';
       }
       if (engineStatus === 'diagnostic_incomplete') {
-        const capability = stringField(d, 'collision_result_raw_required_capability');
+        if (contactPolicy) {
+          const pair = stringField(d, 'collision_result_first_failure_pair');
+          const pairText = pair ? ` for ${prettyPair(pair)}` : '';
+          return `Contact-policy diagnostics incomplete${pairText} (${contactPolicy})`;
+        }
+        const capability = stringField(d, 'required_capability')
+          || stringField(d, 'collision_result_raw_required_capability');
         const syncError = stringField(d, 'collision_result_raw_snapshot_sync_error');
         const reason = capability || syncError;
         return reason
@@ -221,7 +228,6 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
       const pair = stringField(d, 'collision_result_first_failure_pair');
       const wp = stringField(d, 'collision_result_waypoint_index');
       const classification = stringField(d, 'collision_result_first_failure_classification');
-      const contactPolicy = supportContactPolicyText(d);
       const suffix = contactPolicy ? ` (${contactPolicy})` : '';
       if (classification === 'support_contact_start' && pair && wp) {
         return `Trajectory rejected: support contact ${prettyPair(pair)} at waypoint ${wp}${suffix}`;
@@ -240,6 +246,7 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
     hint: (d) => {
       const engineStatus = stringField(d, 'collision_result_engine_status');
       const reason = stringField(d, 'reason');
+      const policy = supportContactPolicyText(d);
       if (engineStatus === 'timeout') {
         const timeoutReason = collisionTimeoutReason(d);
         const syncMs = numberFieldAsMs(
@@ -256,6 +263,9 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
         return 'The active collision engine could not ingest one of the scene or robot geometries. Inspect the diagnostic details, simplify or replace the unsupported geometry, then re-plan.';
       }
       if (engineStatus === 'diagnostic_incomplete') {
+        if (policy) {
+          return `${supportContactPolicyHint(d)} The collision engine could not produce the required contact-pair evidence; inspect the missing capability or pair diagnostic before retrying.`;
+        }
         return 'The collision engine could not produce the diagnostics required to prove the trajectory safe. Inspect the missing capability or snapshot diagnostic below before retrying.';
       }
       if (engineStatus === 'cancelled' || reason === 'collision_validation_cancelled') {
@@ -264,9 +274,8 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
       if (engineStatus === 'engine_error') {
         return 'The collision engine threw while validating the trajectory. Inspect the exception and collision-world diagnostics before retrying.';
       }
-      const policy = supportContactPolicyText(d);
       if (policy) {
-        return `The trajectory failed support-contact validation with ${policy}. Verify the active Support contacts row in Scene, adjust the contact policy or re-plan from a less penetrating pose, then retry.`;
+        return supportContactPolicyHint(d);
       }
       const pair = stringField(d, 'collision_result_first_failure_pair');
       if (pair) {
@@ -286,6 +295,12 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
       const body = stringField(d, 'dynamic_body_id');
       const ageMs = numberFieldAsMs(d, 'dynamic_body_age_ns');
       const budgetMs = numberFieldAsMs(d, 'dynamic_body_effective_freshness_budget_ns');
+      if (reason === 'runtime_collision_required_capability_unsupported') {
+        const capability = stringField(d, 'required_capability');
+        return capability
+          ? `Runtime collision monitor missing required capability: ${capability}`
+          : 'Runtime collision monitor missing a required capability';
+      }
       if (reason === 'stale_dynamic_collision_body') {
         const bodyLabel = body ? `: ${prettyBodyId(body)}` : '';
         if (ageMs !== null && budgetMs !== null) {
@@ -313,6 +328,11 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
     },
     hint: (d) => {
       const reason = stringField(d, 'reason');
+      if (reason === 'runtime_collision_required_capability_unsupported') {
+        const capability = stringField(d, 'required_capability');
+        const capabilityText = capability ? ` (${capability})` : '';
+        return `The active contact policy requires collision evidence that this runtime engine does not provide${capabilityText}. The monitor failed closed; select a qualified collision engine or change the policy before retrying.`;
+      }
       if (
         reason === 'stale_dynamic_collision_body' ||
         reason === 'dynamic_body_missing_source_timestamp'
@@ -477,6 +497,12 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
   },
 };
 
+// Configured contact-envelope failures carry their normative ErrorDTO code,
+// while preserving the same pre-dispatch collision/policy diagnostics and
+// operator guidance previously rendered under validation_collision.
+ERROR_CODE_MAPPING.contact_policy_violation =
+  ERROR_CODE_MAPPING.validation_collision;
+
 const GENERIC_BACKEND_ERROR_CODES = new Set([
   'execution_aborted',
   'execution_rejected',
@@ -635,24 +661,204 @@ function numberField(
   return Number.isFinite(raw) ? raw : null;
 }
 
-function supportContactPolicyText(details: Record<string, unknown> | null | undefined): string {
+type SupportContactPresentationMode =
+  | 'signed_penetration'
+  | 'binary_contact'
+  | 'bounded_penetration'
+  | 'legacy_signed';
+
+interface SupportContactPresentation {
+  mode: SupportContactPresentationMode;
+  text: string;
+}
+
+function formatMeters(value: number): string {
+  const absolute = Math.abs(value);
+  const digits = absolute > 0 && absolute < 0.001 ? 6 : 3;
+  return `${value.toFixed(digits)} m`;
+}
+
+function contactCountText(
+  details: Record<string, unknown> | null | undefined,
+): string {
+  const initial = numberField(details, 'initial_contact_pair_count');
+  const current = numberField(details, 'current_contact_pair_count');
+  if (initial !== null && current !== null) {
+    return `contacts ${initial} → ${current}`;
+  }
+  if (current !== null) {
+    return `contacts now ${current}`;
+  }
+  return '';
+}
+
+function distanceEvidenceText(
+  details: Record<string, unknown> | null | undefined,
+  mode: SupportContactPresentationMode,
+): string {
+  const requestMode = stringField(details, 'distance_request_mode');
+  const evaluatedCount = numberField(details, 'evaluated_distance_pair_count');
+  const scope = (() => {
+    switch (requestMode) {
+      case 'none':
+        return 'none';
+      case 'selected_colliding_pairs':
+        return 'selected colliding pairs';
+      case 'all_colliding_pairs':
+        return 'all colliding pairs';
+      case 'all_active_pairs':
+        return 'all active pairs';
+      default:
+        return requestMode || 'unspecified scope';
+    }
+  })();
+  if (mode === 'binary_contact') {
+    if (
+      (requestMode === 'none' || requestMode === '')
+      && (evaluatedCount === 0 || evaluatedCount === null)
+    ) {
+      return requestMode === 'none' || evaluatedCount === 0
+        ? 'no distance measurements'
+        : '';
+    }
+    const count = evaluatedCount === null
+      ? ''
+      : `, ${evaluatedCount} pair${evaluatedCount === 1 ? '' : 's'} evaluated`;
+    return `unexpected distance evidence: ${scope}${count}`;
+  }
+  if (!requestMode && evaluatedCount === null) {
+    return '';
+  }
+  const count = evaluatedCount === null
+    ? ''
+    : `, ${evaluatedCount} pair${evaluatedCount === 1 ? '' : 's'} evaluated`;
+  return `distance ${scope}${count}`;
+}
+
+function supportContactPolicyPresentation(
+  details: Record<string, unknown> | null | undefined,
+): SupportContactPresentation | null {
+  const policyMode = stringField(details, 'policy_mode');
+  const releaseEvidence = stringField(details, 'release_evidence_mode');
+  const hasStep18ContactPolicy =
+    policyMode === 'contact_release'
+    || policyMode === 'bounded_penetration'
+    || releaseEvidence === 'signed_penetration'
+    || releaseEvidence === 'binary_contact';
+
+  if (hasStep18ContactPolicy) {
+    const mode: SupportContactPresentationMode = policyMode === 'bounded_penetration'
+      ? 'bounded_penetration'
+      : releaseEvidence === 'binary_contact'
+        ? 'binary_contact'
+        : 'signed_penetration';
+    const values: string[] = [];
+    if (mode === 'signed_penetration') {
+      values.push('Precise - signed penetration');
+    } else if (mode === 'binary_contact') {
+      values.push('Lightweight - binary contact');
+    } else {
+      values.push('Contact-tolerant - bounded penetration');
+    }
+
+    const contactPresent = stringField(details, 'contact_present');
+    if (contactPresent === 'true') {
+      values.push('contact present');
+    } else if (contactPresent === 'false') {
+      values.push('contact absent');
+    }
+    const counts = contactCountText(details);
+    if (counts) {
+      values.push(counts);
+    }
+
+    // Metric fields are valid only for a configured metric mode while the
+    // pair is reported colliding. In particular, never turn stray binary or
+    // absent-pair fields into an operator-facing penetration claim.
+    const metricIsApplicable =
+      mode !== 'binary_contact' && contactPresent !== 'false';
+    const penetration = metricIsApplicable
+      ? numberField(details, 'penetration_depth_m')
+      : null;
+    if (mode === 'bounded_penetration') {
+      const maximum = numberField(details, 'max_contact_penetration_m');
+      const withinBound = stringField(details, 'within_penetration_bound');
+      if (penetration !== null && maximum !== null && withinBound === 'false') {
+        values.push(
+          `penetration ${formatMeters(penetration)} > max ${formatMeters(maximum)}`,
+        );
+      } else {
+        if (penetration !== null) {
+          values.push(`penetration ${formatMeters(penetration)}`);
+        }
+        if (maximum !== null) {
+          values.push(`max ${formatMeters(maximum)}`);
+        }
+      }
+    } else if (mode === 'signed_penetration') {
+      const maximum = numberField(details, 'max_penetration_m');
+      if (penetration !== null) {
+        values.push(`penetration ${formatMeters(penetration)}`);
+      }
+      if (maximum !== null) {
+        values.push(`max ${formatMeters(maximum)}`);
+      }
+    }
+
+    const distance = distanceEvidenceText(details, mode);
+    if (distance) {
+      values.push(distance);
+    }
+    return { mode, text: values.join('; ') };
+  }
+
+  // General validation records emitted before the mode-aware details were
+  // attached can still carry these signed-release raw diagnostics. Keep this
+  // fallback narrow: it must not infer binary or bounded metric evidence.
   const current = numberField(details, 'collision_result_raw_contact_release_current_penetration_m');
   const initial = numberField(details, 'collision_result_raw_contact_release_initial_penetration_m');
   const maxStart = numberField(details, 'collision_result_raw_contact_release_max_start_penetration_m');
   const enforce = stringField(details, 'collision_result_raw_contact_release_enforce_max_start_penetration');
   const values: string[] = [];
   if (current !== null) {
-    values.push(`current ${current.toFixed(3)} m`);
+    values.push(`current ${formatMeters(current)}`);
   } else if (initial !== null) {
-    values.push(`initial ${initial.toFixed(3)} m`);
+    values.push(`initial ${formatMeters(initial)}`);
   }
   if (maxStart !== null) {
-    values.push(`max ${maxStart.toFixed(3)} m`);
+    values.push(`max ${formatMeters(maxStart)}`);
   }
   if (enforce === 'false') {
     values.push('start cap disabled');
   }
-  return values.join(', ');
+  return values.length > 0
+    ? { mode: 'legacy_signed', text: values.join(', ') }
+    : null;
+}
+
+function supportContactPolicyText(
+  details: Record<string, unknown> | null | undefined,
+): string {
+  return supportContactPolicyPresentation(details)?.text ?? '';
+}
+
+function supportContactPolicyHint(
+  details: Record<string, unknown> | null | undefined,
+): string {
+  const presentation = supportContactPolicyPresentation(details);
+  if (!presentation) {
+    return '';
+  }
+  if (presentation.mode === 'binary_contact') {
+    return `The trajectory failed support-contact validation (${presentation.text}). Lightweight mode uses contact-pair identity and set transitions only; it does not measure penetration. Inspect the new, re-contacting, or final contact pair, then adjust the release policy or re-plan.`;
+  }
+  if (presentation.mode === 'bounded_penetration') {
+    return `The trajectory failed support-contact validation (${presentation.text}). Contact-tolerant mode permits the configured contact only while its measured geometric penetration remains within the authored maximum. Inspect the pair and threshold, then adjust the contact envelope or re-plan.`;
+  }
+  if (presentation.mode === 'signed_penetration') {
+    return `The trajectory failed support-contact validation (${presentation.text}). Precise mode measures signed penetration only while the configured pair is colliding. Inspect the depth/progress evidence, then adjust the release policy or re-plan.`;
+  }
+  return `The trajectory failed support-contact validation with ${presentation.text}. Verify the active Support contacts row in Scene, adjust the contact policy or re-plan from a less penetrating pose, then retry.`;
 }
 
 function mappingForError(

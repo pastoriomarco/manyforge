@@ -189,6 +189,183 @@ def native_kernel_ur10e_robotiq():
     return NativeKernelClient(bundle)
 
 
+def _native_box_add_request(object_id, *, support_contacts=None, x_m=0.0):
+    request = {
+        "operation": "add",
+        "object_id": object_id,
+        "shape_type": "box",
+        "box_dimensions_m": [0.05, 0.05, 0.05],
+        "pose_position_m": [x_m, 0.0, 0.5],
+        "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        "frame_id": "universe",
+    }
+    if support_contacts is not None:
+        request["support_contacts"] = support_contacts
+    return request
+
+
+class TestNativeSupportContactBindings:
+    @pytest.mark.parametrize(
+        ("contact", "message"),
+        [
+            (
+                {
+                    "support_object_id": "support",
+                    "min_separation_clearance_m": 0.0,
+                },
+                "unknown field: min_separation_clearance_m",
+            ),
+            (
+                {
+                    "support_object_id": "support",
+                    "mode": "bounded_penetration",
+                },
+                "requires max_contact_penetration_m",
+            ),
+            (
+                {
+                    "support_object_id": "support",
+                    "mode": "bounded_penetration",
+                    "max_contact_penetration_m": -0.001,
+                },
+                "max_contact_penetration_m must be finite and >= 0",
+            ),
+            (
+                {
+                    "support_object_id": "support",
+                    "mode": "bounded_penetration",
+                    "max_contact_penetration_m": float("nan"),
+                },
+                "max_contact_penetration_m must be finite and >= 0",
+            ),
+            (
+                {
+                    "support_object_id": "support",
+                    "mode": "bounded_penetration",
+                    "max_contact_penetration_m": float("inf"),
+                },
+                "max_contact_penetration_m must be finite and >= 0",
+            ),
+            (
+                {
+                    "support_object_id": "support",
+                    "mode": "bounded_penetration",
+                    "max_contact_penetration_m": True,
+                },
+                "max_contact_penetration_m must be a number, not a boolean",
+            ),
+            (
+                {
+                    "support_object_id": "support",
+                    "mode": "bounded_penetration",
+                    "max_contact_penetration_m": 0.001,
+                    "release_evidence_mode": "binary_contact",
+                },
+                "release_evidence_mode is valid only for contact_release",
+            ),
+            (
+                {
+                    "support_object_id": "support",
+                    "mode": "contact_release",
+                    "max_contact_penetration_m": 0.001,
+                },
+                "max_contact_penetration_m is valid only for bounded_penetration",
+            ),
+            (
+                {
+                    "support_object_id": "support",
+                    "mode": "contact_process",
+                    "release_tolerance_m": 0.001,
+                },
+                "release_tolerance_m is valid only for contact_release",
+            ),
+            (
+                {
+                    "support_object_id": "support",
+                    "mode": "contact_process",
+                    "max_contact_penetration_m": 0.001,
+                },
+                "max_contact_penetration_m is valid only for bounded_penetration",
+            ),
+        ],
+    )
+    def test_support_contact_dict_contract_is_strict(
+        self, native_kernel, contact, message
+    ):
+        with pytest.raises(ValueError, match=message):
+            native_kernel._bundle.scene_edit(
+                _native_box_add_request(
+                    "invalid_support_contact",
+                    support_contacts=[contact],
+                )
+            )
+
+    def test_all_modes_serialize_canonically_and_round_trip(self, native_kernel):
+        bundle = native_kernel._bundle
+        assert bundle.scene_edit(_native_box_add_request("support"))["success"]
+
+        authored = {
+            "signed": {
+                "support_object_id": "support",
+                "mode": "contact_release",
+                "release_evidence_mode": "signed_penetration",
+            },
+            "binary": {
+                "support_object_id": "support",
+                "mode": "contact_release",
+                "release_evidence_mode": "binary_contact",
+            },
+            "bounded": {
+                "support_object_id": "support",
+                "mode": "bounded_penetration",
+                "max_contact_penetration_m": 0.001,
+            },
+            "process": {
+                "support_object_id": "support",
+                "mode": "contact_process",
+            },
+        }
+        for index, (name, contact) in enumerate(authored.items(), start=1):
+            result = bundle.scene_edit(
+                _native_box_add_request(
+                    name,
+                    support_contacts=[contact],
+                    x_m=0.1 * index,
+                )
+            )
+            assert result["success"], result
+
+        objects = {item["object_id"]: item for item in bundle.get_scene_objects()}
+        serialized = {
+            name: objects[name]["support_contacts"][0] for name in authored
+        }
+        assert serialized["bounded"] == authored["bounded"]
+        assert serialized["process"] == authored["process"]
+        assert {
+            serialized["signed"]["release_evidence_mode"],
+            serialized["binary"]["release_evidence_mode"],
+        } == {"signed_penetration", "binary_contact"}
+        assert "max_contact_penetration_m" not in serialized["signed"]
+        assert "max_contact_penetration_m" not in serialized["binary"]
+        assert "release_evidence_mode" not in serialized["bounded"]
+        assert "release_evidence_mode" not in serialized["process"]
+
+        remove = bundle.scene_edit({"operation": "remove", "object_id": "bounded"})
+        assert remove["success"], remove
+        readd = bundle.scene_edit(
+            _native_box_add_request(
+                "bounded",
+                support_contacts=[serialized["bounded"]],
+                x_m=0.3,
+            )
+        )
+        assert readd["success"], readd
+        bounded = next(
+            item for item in bundle.get_scene_objects() if item["object_id"] == "bounded"
+        )
+        assert bounded["support_contacts"] == [authored["bounded"]]
+
+
 def test_create_native_kernel_accepts_and_reports_runtime_collision_budgets():
     if not HAS_NATIVE:
         pytest.skip("manyforge_roboplan_py not available")

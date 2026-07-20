@@ -85,6 +85,7 @@ enum class KernelEventType {
   // once when a controlled-stop monitor window closes; details retain exact
   // attempts/queries/unavailable gaps without creating a new runtime fault.
   kRuntimeCollisionCoverage,
+  kContactPolicyViolation,
 };
 
 /// Kernel event structure (spec §6.1)

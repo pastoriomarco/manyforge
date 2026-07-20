@@ -33,6 +33,8 @@ class DummyEngine final : public ICollisionQueryEngine {
     capability_.engine_id = std::move(id);
     capability_.engine_version = "test";
     capability_.library_lineage = "unit_test";
+    capability_.supported_distance_request_modes = {
+        CollisionDistanceRequestMode::kNone};
     capability_.thread_safety = thread_safety;
     capability_.mutable_context_id = std::move(mutable_context_id);
     capability_.runtime_query_memory_model =

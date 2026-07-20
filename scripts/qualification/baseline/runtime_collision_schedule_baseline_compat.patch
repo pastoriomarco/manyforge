@@ -1,0 +1,19 @@
+diff --git a/tests/cpp/perf/perf_runtime_collision_schedule_qualification.cpp b/tests/cpp/perf/perf_runtime_collision_schedule_qualification.cpp
+--- a/tests/cpp/perf/perf_runtime_collision_schedule_qualification.cpp
++++ b/tests/cpp/perf/perf_runtime_collision_schedule_qualification.cpp
+@@ -666,6 +666,7 @@ CollisionPolicySnapshot make_policy(
+     entry.max_start_penetration_m = bounded_threshold_m;
+     entry.release_tolerance_m = 1e-5;
+     entry.min_release_progress_m = 0.0;
++    entry.min_separation_clearance_m = 0.0;
+     entry.require_separation_by_end = true;
+     entry.require_strictly_decreasing_penetration = true;
+     entry.allow_recontact = false;
+@@ -676,6 +677,7 @@ CollisionPolicySnapshot make_policy(
+         .mix(entry.max_start_penetration_m)
+         .mix(entry.release_tolerance_m)
+         .mix(entry.min_release_progress_m)
++        .mix(entry.min_separation_clearance_m)
+         .mix(static_cast<std::uint64_t>(entry.require_separation_by_end))
+         .mix(static_cast<std::uint64_t>(
+             entry.require_strictly_decreasing_penetration))

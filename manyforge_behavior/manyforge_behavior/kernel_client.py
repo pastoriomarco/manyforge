@@ -819,29 +819,121 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
             for index, contact in enumerate(request.support_contacts):
                 if not isinstance(contact, dict):
                     return f"support_contacts[{index}] must be a mapping"
+                allowed_fields = {
+                    "support_object_id",
+                    "mode",
+                    "release_evidence_mode",
+                    "max_contact_penetration_m",
+                    "enforce_max_start_penetration",
+                    "max_start_penetration_m",
+                    "release_tolerance_m",
+                    "min_release_progress_m",
+                    "require_separation_by_end",
+                    "require_strictly_decreasing_penetration",
+                    "allow_recontact",
+                }
+                unknown_fields = sorted(
+                    str(field) for field in set(contact) - allowed_fields
+                )
+                if unknown_fields:
+                    return (
+                        f"support_contacts[{index}] contains unknown fields: "
+                        f"{', '.join(unknown_fields)}"
+                    )
                 support_object_id = contact.get("support_object_id")
                 if not isinstance(support_object_id, str) or not support_object_id:
                     return f"support_contacts[{index}].support_object_id is required"
+                mode = contact.get("mode", "contact_release")
+                if mode not in {
+                    "contact_release",
+                    "bounded_penetration",
+                    "contact_process",
+                }:
+                    return (
+                        f"support_contacts[{index}].mode must be contact_release, "
+                        "bounded_penetration, or contact_process"
+                    )
+                release_only_fields = {
+                    "release_evidence_mode",
+                    "enforce_max_start_penetration",
+                    "max_start_penetration_m",
+                    "release_tolerance_m",
+                    "min_release_progress_m",
+                    "require_separation_by_end",
+                    "require_strictly_decreasing_penetration",
+                    "allow_recontact",
+                }
+                if mode == "bounded_penetration":
+                    invalid_fields = sorted(set(contact) & release_only_fields)
+                    if invalid_fields:
+                        return (
+                            f"support_contacts[{index}] fields are valid only for "
+                            f"contact_release: {', '.join(invalid_fields)}"
+                        )
+                    max_contact_penetration_m = contact.get(
+                        "max_contact_penetration_m"
+                    )
+                    if (
+                        isinstance(max_contact_penetration_m, bool)
+                        or not isinstance(max_contact_penetration_m, (int, float))
+                        or not math.isfinite(float(max_contact_penetration_m))
+                        or max_contact_penetration_m < 0.0
+                    ):
+                        return (
+                            f"support_contacts[{index}].max_contact_penetration_m "
+                            "is required and must be finite and >= 0"
+                        )
+                    continue
+                if "max_contact_penetration_m" in contact:
+                    return (
+                        f"support_contacts[{index}].max_contact_penetration_m is "
+                        "valid only for bounded_penetration"
+                    )
+                if mode == "contact_process":
+                    invalid_fields = sorted(set(contact) & release_only_fields)
+                    if invalid_fields:
+                        return (
+                            f"support_contacts[{index}] fields are valid only for "
+                            f"contact_release: {', '.join(invalid_fields)}"
+                        )
+                    continue
+                release_evidence_mode = contact.get(
+                    "release_evidence_mode", "signed_penetration"
+                )
+                if release_evidence_mode not in {
+                    "signed_penetration",
+                    "binary_contact",
+                }:
+                    return (
+                        f"support_contacts[{index}].release_evidence_mode must be "
+                        "signed_penetration or binary_contact"
+                    )
                 max_start_penetration_m = contact.get("max_start_penetration_m", 0.0)
                 if (
-                    not isinstance(max_start_penetration_m, (int, float))
+                    isinstance(max_start_penetration_m, bool)
+                    or not isinstance(max_start_penetration_m, (int, float))
+                    or not math.isfinite(float(max_start_penetration_m))
                     or max_start_penetration_m < 0.0
                 ):
-                    return f"support_contacts[{index}].max_start_penetration_m must be >= 0"
-                mode = contact.get("mode", "contact_release")
-                if mode not in {"contact_release", "contact_process"}:
                     return (
-                        f"support_contacts[{index}].mode must be contact_release "
-                        "or contact_process"
+                        f"support_contacts[{index}].max_start_penetration_m must be "
+                        "finite and >= 0"
                     )
                 for field_name in (
                     "release_tolerance_m",
                     "min_release_progress_m",
-                    "min_separation_clearance_m",
                 ):
                     value = contact.get(field_name, 0.0)
-                    if not isinstance(value, (int, float)) or value < 0.0:
-                        return f"support_contacts[{index}].{field_name} must be >= 0"
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        or value < 0.0
+                    ):
+                        return (
+                            f"support_contacts[{index}].{field_name} must be "
+                            "finite and >= 0"
+                        )
                 for field_name in (
                     "enforce_max_start_penetration",
                     "require_separation_by_end",
@@ -850,6 +942,29 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
                 ):
                     if field_name in contact and not isinstance(contact[field_name], bool):
                         return f"support_contacts[{index}].{field_name} must be boolean"
+                if release_evidence_mode == "binary_contact":
+                    if contact.get("enforce_max_start_penetration", False):
+                        return (
+                            f"support_contacts[{index}]."
+                            "enforce_max_start_penetration must be false for "
+                            "binary_contact"
+                        )
+                    for field_name in (
+                        "max_start_penetration_m",
+                        "release_tolerance_m",
+                        "min_release_progress_m",
+                    ):
+                        if float(contact.get(field_name, 0.0)) != 0.0:
+                            return (
+                                f"support_contacts[{index}].{field_name} must be 0 "
+                                "for binary_contact"
+                            )
+                    if contact.get("require_strictly_decreasing_penetration", False):
+                        return (
+                            f"support_contacts[{index}]."
+                            "require_strictly_decreasing_penetration must be false "
+                            "for binary_contact"
+                        )
 
     if request.operation == "update_pose":
         if request.pose_position_m is None:

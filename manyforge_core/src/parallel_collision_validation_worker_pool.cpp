@@ -111,6 +111,48 @@ CollisionValidationDecisionBundle exception_bundle(
   return bundle;
 }
 
+CollisionValidationDecisionBundle run_serial_validation_with_pass_state(
+    const CollisionWorldSnapshot& snapshot,
+    ICollisionQueryEngine& engine,
+    const TrajectoryDTO& trajectory,
+    CollisionCancellationToken& cancel,
+    const CollisionValidationPassConfig& pass_config) {
+  CollisionValidationCoordinator coordinator(pass_config);
+  const auto& policy = pass_config.effective_policy_snapshot();
+  if (policy.support_contacts.empty()) {
+    return coordinator.validate_trajectory(snapshot, engine, trajectory,
+                                           cancel);
+  }
+
+  auto queried = coordinator.query_trajectory_range_unclassified(
+      snapshot, engine, trajectory, 0, trajectory.waypoints.size(), cancel);
+  auto summary = summarize_ordered_contact_chunk(
+      policy, queried.waypoint_records, 0, trajectory.waypoints.size());
+  auto support_state = pass_config.entering_support_contact_state.value_or(
+      initial_support_contact_state(policy));
+  auto finalized = coordinator.finalize_prequeried_range(
+      snapshot, trajectory, std::move(queried), support_state, nullptr);
+
+  std::vector<OrderedContactChunkSummary> summaries;
+  summaries.push_back(std::move(summary));
+  std::string summary_error;
+  const auto release_violations = merge_contact_release_summaries(
+      policy, summaries, trajectory.waypoints.size(), &summary_error,
+      pass_config.entering_contact_release_state
+          ? &*pass_config.entering_contact_release_state
+          : nullptr,
+      pass_config.enforce_contact_release_trajectory_end, nullptr);
+  if (summary_error.empty()) {
+    (void)apply_contact_release_violations(
+        policy, release_violations, finalized, &summary_error);
+  }
+  if (!summary_error.empty()) {
+    return exception_bundle(snapshot, "ordered_contact_summary_invalid",
+                            "summary_error", summary_error.c_str());
+  }
+  return finalized;
+}
+
 CollisionValidationDecisionBundle timeout_bundle(
     const CollisionWorldSnapshot& snapshot,
     std::int64_t timeout_ns,
@@ -237,11 +279,12 @@ class ValidationDeadlineAlarm final {
       return;
     }
     handle_ = scheduler_.schedule(deadline, std::move(expire), SchedulerPriority::Monitoring);
+    armed_ = true;
   }
 
   ~ValidationDeadlineAlarm() {
-    if (handle_) {
-      scheduler_.cancel(*handle_);
+    if (armed_) {
+      scheduler_.cancel(handle_);
     }
   }
 
@@ -250,7 +293,8 @@ class ValidationDeadlineAlarm final {
 
  private:
   IScheduler& scheduler_;
-  std::optional<ScheduleHandle> handle_;
+  ScheduleHandle handle_{0};
+  bool armed_{false};
 };
 
 /// Every queued job must retire its call-state slot even if a future edit lets
@@ -727,36 +771,8 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
     const auto t0 = steady_now_ns();
     auto run_serial = [&]() -> CollisionValidationDecisionBundle {
       try {
-        CollisionValidationCoordinator coord(pass_config);
-        if (!support_contact_present) {
-          return coord.validate_trajectory(snapshot, *engine_ref.ptr, trajectory, *cancel);
-        }
-
-        auto queried = coord.query_trajectory_range_unclassified(
-            snapshot, *engine_ref.ptr, trajectory, 0, trajectory.waypoints.size(), *cancel);
-        auto summary = summarize_ordered_contact_chunk(effective_policy, queried.waypoint_records,
-                                                       0, trajectory.waypoints.size());
-        auto support_state = pass_config.entering_support_contact_state.value_or(
-            initial_support_contact_state(effective_policy));
-        auto finalized = coord.finalize_prequeried_range(snapshot, trajectory, std::move(queried),
-                                                         support_state, nullptr);
-        std::string summary_error;
-        const std::vector<OrderedContactChunkSummary> summaries{std::move(summary)};
-        const auto release_violations = merge_contact_release_summaries(
-            effective_policy, summaries, trajectory.waypoints.size(), &summary_error,
-            pass_config.entering_contact_release_state
-                ? &*pass_config.entering_contact_release_state
-                : nullptr,
-            pass_config.enforce_contact_release_trajectory_end, nullptr);
-        if (summary_error.empty()) {
-          (void)apply_contact_release_violations(effective_policy, release_violations, finalized,
-                                                 &summary_error);
-        }
-        if (!summary_error.empty()) {
-          return exception_bundle(snapshot, "ordered_contact_summary_invalid", "summary_error",
-                                  summary_error.c_str());
-        }
-        return finalized;
+        return run_serial_validation_with_pass_state(
+            snapshot, *engine_ref.ptr, trajectory, *cancel, pass_config);
       } catch (const std::exception& e) {
         return exception_bundle(
             snapshot,
@@ -814,9 +830,9 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
             out.range_begin = 0;
             const auto worker_t0 = steady_now_ns();
             try {
-              CollisionValidationCoordinator coord(*pass_config_copy);
-              out.bundle = coord.validate_trajectory(*snapshot_copy, *engine_ref.ptr,
-                                                     *trajectory_copy, *cancel);
+              out.bundle = run_serial_validation_with_pass_state(
+                  *snapshot_copy, *engine_ref.ptr, *trajectory_copy, *cancel,
+                  *pass_config_copy);
             } catch (const std::exception& e) {
               out.bundle = exception_bundle(
                   *snapshot_copy, reason_codes::kCollisionValidationSerialFallbackException,
@@ -1451,11 +1467,9 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
   if (config_.serial_reference_mode == SerialReferenceMode::kQualification) {
     const auto ref_t0 = steady_now_ns();
     try {
-      CollisionValidationCoordinator ref_coord(pass_config);
-      (void)ref_coord.validate_trajectory(snapshot,
-                                          *available_engines[0].ptr,
-                                          trajectory,
-                                          *cancel);
+      (void)run_serial_validation_with_pass_state(
+          snapshot, *available_engines[0].ptr, trajectory, *cancel,
+          pass_config);
     } catch (const std::exception&) {
       last_telemetry_.serial_reference_wall_ns.reset();
       return merged;

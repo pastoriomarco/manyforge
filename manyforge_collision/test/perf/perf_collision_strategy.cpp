@@ -2,6 +2,7 @@
 
 #include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
+#include <manyforge_core/types/content_hash.hpp>
 #include <manyforge_roboplan/native_kernel_factory.hpp>
 #include <roboplan_example_models/resources.hpp>
 
@@ -101,6 +102,8 @@ namespace {
 using boost::property_tree::ptree;
 using manyforge::collision::ManyForgeCollisionEngine;
 using manyforge::core::CollisionCancellationToken;
+using manyforge::core::CollisionContactPolicyMode;
+using manyforge::core::CollisionDistanceRequestMode;
 using manyforge::core::CollisionEngineStatus;
 using manyforge::core::CollisionGeometryDescriptor;
 using manyforge::core::CollisionGeometryKind;
@@ -113,6 +116,8 @@ using manyforge::core::CollisionSurface;
 using manyforge::core::CollisionWorldBody;
 using manyforge::core::CollisionWorldSnapshot;
 using manyforge::core::CollisionWorldSnapshotBuilder;
+using manyforge::core::ContactReleaseEvidenceMode;
+using manyforge::core::ContentHasher;
 using manyforge::core::FkRequestDTO;
 using manyforge::core::Pose3DTO;
 using manyforge::core::RobotStateDTO;
@@ -160,6 +165,170 @@ struct Fixture {
   bool expected_collision = false;
   bool support_contact_policy = false;
 };
+
+bool is_runtime_query_class(const std::string& query_class) {
+  return query_class.rfind("runtime_", 0) == 0;
+}
+
+bool is_step18_contact_arm(const std::string& query_class) {
+  return query_class == "collision_only" ||
+         query_class == "current_all_active_distance" ||
+         query_class == "signed_penetration_selective" ||
+         query_class == "bounded_penetration" ||
+         query_class == "binary_contact" ||
+         query_class == "runtime_current_all_active_distance" ||
+         query_class == "runtime_signed_penetration_selective" ||
+         query_class == "runtime_bounded_penetration" ||
+         query_class == "runtime_binary_contact";
+}
+
+bool is_collision_only_arm(const std::string& query_class) {
+  return query_class == "collision_only";
+}
+
+bool is_binary_contact_arm(const std::string& query_class) {
+  return query_class == "binary_contact" ||
+         query_class == "runtime_binary_contact";
+}
+
+bool is_bounded_penetration_arm(const std::string& query_class) {
+  return query_class == "bounded_penetration" ||
+         query_class == "runtime_bounded_penetration";
+}
+
+std::string corpus_query_class(const std::string& query_class) {
+  if (query_class == "collision_only") {
+    return "binary_complete";
+  }
+  if (query_class == "current_all_active_distance") {
+    return "exact_distance";
+  }
+  if (query_class == "signed_penetration_selective" ||
+      query_class == "bounded_penetration") {
+    return "exact_distance";
+  }
+  if (query_class == "binary_contact") {
+    return "binary_complete";
+  }
+  if (query_class == "runtime_current_all_active_distance" ||
+      query_class == "runtime_signed_penetration_selective" ||
+      query_class == "runtime_bounded_penetration") {
+    return "runtime_distance";
+  }
+  if (query_class == "runtime_binary_contact") {
+    return "runtime_binary";
+  }
+  return query_class;
+}
+
+CollisionDistanceRequestMode distance_request_mode_for_query_class(
+    const std::string& query_class) {
+  if (query_class == "signed_penetration_selective" ||
+      query_class == "runtime_signed_penetration_selective" ||
+      query_class == "bounded_penetration" ||
+      query_class == "runtime_bounded_penetration") {
+    return CollisionDistanceRequestMode::kSelectedCollidingPairs;
+  }
+  if (query_class == "exact_distance" ||
+      query_class == "runtime_distance" ||
+      query_class == "current_all_active_distance" ||
+      query_class == "runtime_current_all_active_distance") {
+    return CollisionDistanceRequestMode::kAllActivePairs;
+  }
+  return CollisionDistanceRequestMode::kNone;
+}
+
+bool is_explicit_all_active_baseline_query_class(
+    const std::string& query_class) {
+  return query_class == "exact_distance" ||
+         query_class == "runtime_distance" ||
+         query_class == "current_all_active_distance" ||
+         query_class == "runtime_current_all_active_distance";
+}
+
+const char* distance_request_mode_label(
+    CollisionDistanceRequestMode mode) noexcept {
+  switch (mode) {
+    case CollisionDistanceRequestMode::kNone:
+      return "none";
+    case CollisionDistanceRequestMode::kSelectedCollidingPairs:
+      return "selected_colliding_pairs";
+    case CollisionDistanceRequestMode::kAllCollidingPairs:
+      return "all_colliding_pairs";
+    case CollisionDistanceRequestMode::kAllActivePairs:
+      return "all_active_pairs";
+  }
+  return "unknown";
+}
+
+const char* contact_policy_mode_label(
+    CollisionContactPolicyMode mode) noexcept {
+  switch (mode) {
+    case CollisionContactPolicyMode::kContactRelease:
+      return "contact_release";
+    case CollisionContactPolicyMode::kBoundedPenetration:
+      return "bounded_penetration";
+    case CollisionContactPolicyMode::kContactProcess:
+      return "contact_process";
+  }
+  return "unknown";
+}
+
+const char* release_evidence_mode_label(
+    ContactReleaseEvidenceMode mode) noexcept {
+  switch (mode) {
+    case ContactReleaseEvidenceMode::kSignedPenetration:
+      return "signed_penetration";
+    case ContactReleaseEvidenceMode::kBinaryContact:
+      return "binary_contact";
+  }
+  return "unknown";
+}
+
+std::string benchmark_policy_content_hash(
+    const CollisionPolicySnapshot& policy) {
+  ContentHasher hash;
+  hash.mix("manyforge/perf_collision_strategy/policy")
+      .mix(policy.policy_id)
+      .mix(static_cast<std::int64_t>(policy.require_full_diagnostics ? 1 : 0));
+  for (const auto& entry : policy.support_contacts) {
+    hash.mix("support")
+        .mix(entry.pair.body_a)
+        .mix(entry.pair.body_b)
+        .mix(static_cast<std::int64_t>(entry.mode));
+    if (entry.mode == CollisionContactPolicyMode::kBoundedPenetration) {
+      hash.mix(entry.max_contact_penetration_m);
+      continue;
+    }
+    hash.mix(static_cast<std::int64_t>(entry.release_evidence_mode))
+        .mix(static_cast<std::int64_t>(
+            entry.enforce_max_start_penetration ? 1 : 0))
+        .mix(entry.max_start_penetration_m)
+        .mix(entry.release_tolerance_m)
+        .mix(entry.min_release_progress_m)
+        .mix(static_cast<std::int64_t>(
+            entry.require_separation_by_end ? 1 : 0))
+        .mix(static_cast<std::int64_t>(
+            entry.require_strictly_decreasing_penetration ? 1 : 0))
+        .mix(static_cast<std::int64_t>(entry.allow_recontact ? 1 : 0));
+  }
+  return hash.finalize();
+}
+
+std::string physical_output_fingerprint(
+    bool in_collision, std::int64_t engine_status,
+    std::int64_t decision_code,
+    const std::vector<CollisionPairId>& normalized_pairs) {
+  ContentHasher hash;
+  hash.mix("manyforge/perf_collision_strategy/physical_output/v1")
+      .mix(static_cast<std::int64_t>(in_collision ? 1 : 0))
+      .mix(engine_status)
+      .mix(decision_code);
+  for (const auto& pair : normalized_pairs) {
+    hash.mix(pair.body_a).mix(pair.body_b);
+  }
+  return hash.finalize();
+}
 
 template <typename T>
 std::vector<T> array_values(const ptree& tree) {
@@ -263,6 +432,7 @@ Options parse_options(int argc, char** argv) {
 
 Fixture load_fixture(const ptree& root, const std::string& fixture_id,
                      const std::string& query_class) {
+  const auto declared_query_class = corpus_query_class(query_class);
   for (const auto& [key, candidate] : root.get_child("collision_fixtures")) {
     (void)key;
     if (candidate.get<std::string>("id") != fixture_id) {
@@ -270,8 +440,16 @@ Fixture load_fixture(const ptree& root, const std::string& fixture_id,
     }
     const auto query_classes =
         array_values<std::string>(candidate.get_child("query_classes"));
-    if (std::find(query_classes.begin(), query_classes.end(), query_class) ==
-        query_classes.end()) {
+    const auto decision = candidate.get<std::string>("expected.decision");
+    const bool declared =
+        std::find(query_classes.begin(), query_classes.end(),
+                  declared_query_class) != query_classes.end();
+    const bool step18_support_arm =
+        decision == "support_contact_policy" &&
+        is_step18_contact_arm(query_class) &&
+        std::find(query_classes.begin(), query_classes.end(),
+                  "exact_distance") != query_classes.end();
+    if (!declared && !step18_support_arm) {
       throw std::invalid_argument("query class is not declared by fixture");
     }
     Fixture fixture;
@@ -280,7 +458,6 @@ Fixture load_fixture(const ptree& root, const std::string& fixture_id,
     fixture.world_profile = candidate.get<std::string>("world_profile");
     fixture.robot_state =
         array_values<double>(candidate.get_child("robot_state_rad"));
-    const auto decision = candidate.get<std::string>("expected.decision");
     fixture.expected_collision =
         decision == "collision" || decision == "support_contact_policy";
     fixture.support_contact_policy = decision == "support_contact_policy";
@@ -623,9 +800,9 @@ int main(int argc, char** argv) {
     policy.policy_id = "rp5_free_space";
     policy.revision.revision_id = 1;
     policy.revision.content_hash = "rp5_free_space_v1";
-    if (fixture.support_contact_policy) {
+    if (fixture.support_contact_policy &&
+        !is_collision_only_arm(options.query_class)) {
       policy.policy_id = "rp5_support_contact_release";
-      policy.revision.content_hash = "rp5_support_contact_release_v1";
       SupportContactPolicyEntry entry;
       entry.pair = {
           "object/support_fixture/shape/0",
@@ -633,7 +810,26 @@ int main(int argc, char** argv) {
               "/attached/supported_object/shape/0"};
       entry.max_start_penetration_m = 0.03;
       entry.release_tolerance_m = 0.001;
+      if (is_binary_contact_arm(options.query_class)) {
+        entry.release_evidence_mode =
+            ContactReleaseEvidenceMode::kBinaryContact;
+        entry.enforce_max_start_penetration = false;
+        entry.max_start_penetration_m = 0.0;
+        entry.release_tolerance_m = 0.0;
+        entry.min_release_progress_m = 0.0;
+        entry.require_strictly_decreasing_penetration = false;
+      } else if (is_bounded_penetration_arm(options.query_class)) {
+        entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
+        entry.enforce_max_start_penetration = false;
+        entry.max_start_penetration_m = 0.0;
+        entry.release_tolerance_m = 0.0;
+        entry.min_release_progress_m = 0.0;
+        entry.max_contact_penetration_m = 0.03;
+        entry.require_separation_by_end = false;
+        entry.require_strictly_decreasing_penetration = false;
+      }
       policy.support_contacts.push_back(std::move(entry));
+      policy.revision.content_hash = benchmark_policy_content_hash(policy);
     }
     CollisionCancellationToken cancel;
 
@@ -651,23 +847,64 @@ int main(int argc, char** argv) {
       batch_positions.insert(batch_positions.end(), state.positions_rad.begin(),
                              state.positions_rad.end());
     }
+    const CollisionPairId support_pair =
+        !policy.support_contacts.empty() ? policy.support_contacts.front().pair
+                                         : CollisionPairId{};
+    const auto distance_request_mode =
+        distance_request_mode_for_query_class(options.query_class);
+    if (distance_request_mode ==
+            CollisionDistanceRequestMode::kSelectedCollidingPairs &&
+        !fixture.support_contact_policy) {
+      throw std::invalid_argument(
+          "selective penetration evidence requires a support-contact fixture");
+    }
+    std::vector<CollisionPairId> selected_distance_pairs;
+    if (distance_request_mode ==
+        CollisionDistanceRequestMode::kSelectedCollidingPairs) {
+      selected_distance_pairs.push_back(support_pair);
+    }
+    const SupportContactPolicyEntry* effective_support_policy =
+        !policy.support_contacts.empty() ? &policy.support_contacts.front()
+                                         : nullptr;
+    const bool policy_scope_matches =
+        effective_support_policy == nullptr ||
+        (effective_support_policy->mode ==
+             CollisionContactPolicyMode::kBoundedPenetration &&
+         distance_request_mode ==
+             CollisionDistanceRequestMode::kSelectedCollidingPairs) ||
+        (effective_support_policy->mode ==
+             CollisionContactPolicyMode::kContactRelease &&
+         effective_support_policy->release_evidence_mode ==
+             ContactReleaseEvidenceMode::kBinaryContact &&
+         distance_request_mode == CollisionDistanceRequestMode::kNone) ||
+        (effective_support_policy->mode ==
+             CollisionContactPolicyMode::kContactRelease &&
+         effective_support_policy->release_evidence_mode ==
+             ContactReleaseEvidenceMode::kSignedPenetration &&
+         (distance_request_mode ==
+              CollisionDistanceRequestMode::kSelectedCollidingPairs ||
+          (distance_request_mode ==
+               CollisionDistanceRequestMode::kAllActivePairs &&
+           is_explicit_all_active_baseline_query_class(
+               options.query_class))));
     CollisionQuery query;
     query.query_id = options.fixture_id + "_" + options.query_class;
-    query.surface = options.query_class.rfind("runtime_", 0) == 0
+    query.surface = is_runtime_query_class(options.query_class)
                         ? CollisionSurface::kObservedRuntimeMonitor
                         : CollisionSurface::kPreExecutionValidation;
     query.robot_state = state;
     query.collision_world_revision = snapshot.revision;
     query.policy_revision = policy.revision.content_hash;
-    if (options.query_class == "exact_distance" ||
-        options.query_class == "runtime_distance") {
+    query.distance_request_mode = distance_request_mode;
+    query.selected_distance_pairs = selected_distance_pairs;
+    if (distance_request_mode != CollisionDistanceRequestMode::kNone) {
       query.required_capabilities = {"body_pair_only", "distance",
                                      "penetration_depth"};
     } else {
       query.required_capabilities = {"body_pair_only"};
     }
 
-    const bool runtime = options.query_class.rfind("runtime_", 0) == 0;
+    const bool runtime = is_runtime_query_class(options.query_class);
     if (runtime) {
       const auto prepared = engine.prepare_runtime_query(model.joint_names);
       const auto snapshot_prepared = engine.prepare_runtime_snapshot(snapshot);
@@ -677,6 +914,51 @@ int main(int argc, char** argv) {
         throw std::runtime_error("runtime query preparation failed");
       }
     }
+
+    RuntimeCollisionQueryRequest runtime_request;
+    runtime_request.positions_rad = state.positions_rad;
+    runtime_request.state_time_ns = 1;
+    runtime_request.timeout_budget_ns = 1'000'000'000;
+    runtime_request.distance_request_mode = distance_request_mode;
+    runtime_request.selected_distance_pairs = selected_distance_pairs;
+
+    // Bind physical-output parity outside every timing/allocation window.
+    // In particular, collision_only and binary_contact must return the same
+    // complete collision pairs and decision on the identical support scene;
+    // policy identity and metric scope are deliberately excluded.
+    std::vector<CollisionPairId> parity_normalized_pairs;
+    bool parity_in_collision = false;
+    std::int64_t parity_engine_status = 0;
+    std::int64_t parity_decision_code = 0;
+    if (runtime) {
+      const auto parity = engine.check_runtime(snapshot, runtime_request);
+      parity_in_collision =
+          parity.status == RuntimeCollisionQueryStatus::kCollision;
+      parity_engine_status = static_cast<std::int64_t>(parity.engine_status);
+      parity_decision_code = static_cast<std::int64_t>(parity.status);
+      parity_normalized_pairs.reserve(parity.collision_pairs.size());
+      for (const auto& observation : parity.collision_pairs) {
+        if (observation.pair != nullptr) {
+          parity_normalized_pairs.push_back(*observation.pair);
+        }
+      }
+    } else {
+      const auto parity = engine.check(snapshot, query, policy, cancel);
+      parity_in_collision = parity.in_collision;
+      parity_engine_status =
+          static_cast<std::int64_t>(parity.engine_status);
+      parity_decision_code = static_cast<std::int64_t>(parity.decision);
+      parity_normalized_pairs = parity.normalized_pairs;
+    }
+    std::sort(parity_normalized_pairs.begin(),
+              parity_normalized_pairs.end());
+    parity_normalized_pairs.erase(
+        std::unique(parity_normalized_pairs.begin(),
+                    parity_normalized_pairs.end()),
+        parity_normalized_pairs.end());
+    const auto parity_output_fingerprint = physical_output_fingerprint(
+        parity_in_collision, parity_engine_status, parity_decision_code,
+        parity_normalized_pairs);
 
     std::vector<std::uint64_t> wall_ns;
     std::vector<std::uint64_t> cpu_ns;
@@ -688,10 +970,6 @@ int main(int argc, char** argv) {
     std::size_t pair_count = 0;
     std::size_t clearance_count = 0;
     std::optional<double> min_clearance;
-    const CollisionPairId support_pair =
-        fixture.support_contact_policy
-            ? policy.support_contacts.front().pair
-            : CollisionPairId{};
     std::optional<double> support_clearance;
     const int total_queries = options.warmup_queries + options.measured_queries;
     for (int index = 0; index < total_queries; ++index) {
@@ -707,13 +985,9 @@ int main(int argc, char** argv) {
         const std::span<const double> row(
             batch_positions.data() + offset, state.positions_rad.size());
         if (runtime) {
-          RuntimeCollisionQueryRequest request;
-          request.positions_rad = row;
-          request.state_time_ns = batch_index + 1;
-          request.timeout_budget_ns = 1'000'000'000;
-          request.require_distance =
-              options.query_class == "runtime_distance";
-          const auto result = engine.check_runtime(snapshot, request);
+          runtime_request.positions_rad = row;
+          runtime_request.state_time_ns = batch_index + 1;
+          const auto result = engine.check_runtime(snapshot, runtime_request);
           outcome_matches &= fixture.expected_collision
                                  ? result.status ==
                                        RuntimeCollisionQueryStatus::kCollision
@@ -721,6 +995,20 @@ int main(int argc, char** argv) {
                                        RuntimeCollisionQueryStatus::kClear;
           pair_count = result.collision_pairs.size();
           clearance_count = result.clearance_pairs.size();
+          for (const auto& clearance : result.clearance_pairs) {
+            if (!clearance.signed_clearance_m) {
+              continue;
+            }
+            if (!min_clearance ||
+                *clearance.signed_clearance_m < *min_clearance) {
+              min_clearance = *clearance.signed_clearance_m;
+            }
+            if (fixture.support_contact_policy &&
+                clearance.pair != nullptr &&
+                *clearance.pair == support_pair) {
+              support_clearance = *clearance.signed_clearance_m;
+            }
+          }
         } else {
           query.robot_state.positions_rad.assign(row.begin(), row.end());
           query.state_time_ns = batch_index + 1;
@@ -759,11 +1047,58 @@ int main(int argc, char** argv) {
           g_allocation_count.load(std::memory_order_relaxed));
     }
 
-    if (fixture.support_contact_policy) {
+    if (fixture.support_contact_policy &&
+        distance_request_mode != CollisionDistanceRequestMode::kNone) {
       outcome_matches &= support_clearance.has_value() &&
                          *support_clearance < 0.0 &&
                          *support_clearance >= -0.03 - 1e-9;
+    } else if (distance_request_mode ==
+               CollisionDistanceRequestMode::kNone) {
+      outcome_matches &= clearance_count == 0;
     }
+    const auto mechanism_counters =
+        engine.internal_last_query_mechanism_counters();
+    bool mechanism_matches =
+        policy_scope_matches &&
+        mechanism_counters.distance_request_mode == distance_request_mode &&
+        mechanism_counters.collision_api_call_count == 1 &&
+        mechanism_counters.collision_enumeration_completion_ordinal == 1;
+    mechanism_matches &=
+        distance_request_mode != CollisionDistanceRequestMode::kAllActivePairs ||
+        is_explicit_all_active_baseline_query_class(options.query_class);
+    switch (distance_request_mode) {
+      case CollisionDistanceRequestMode::kNone:
+        mechanism_matches &=
+            mechanism_counters.first_distance_evaluation_ordinal == 0 &&
+            mechanism_counters.distance_api_call_count == 0 &&
+            mechanism_counters.distance_evaluated_geometry_pair_count == 0 &&
+            mechanism_counters.distance_evaluated_logical_pair_count == 0;
+        break;
+      case CollisionDistanceRequestMode::kSelectedCollidingPairs:
+        mechanism_matches &=
+            mechanism_counters.first_distance_evaluation_ordinal == 2 &&
+            mechanism_counters.distance_api_call_count > 0 &&
+            mechanism_counters.distance_api_call_count ==
+                mechanism_counters.distance_evaluated_geometry_pair_count &&
+            mechanism_counters.distance_evaluated_logical_pair_count == 1 &&
+            mechanism_counters.distance_evaluated_geometry_pair_count <
+                mechanism_counters.active_collision_pair_count;
+        break;
+      case CollisionDistanceRequestMode::kAllCollidingPairs:
+        mechanism_matches &=
+            mechanism_counters.first_distance_evaluation_ordinal == 2 &&
+            mechanism_counters.distance_evaluated_geometry_pair_count ==
+                mechanism_counters.colliding_geometry_pair_count;
+        break;
+      case CollisionDistanceRequestMode::kAllActivePairs:
+        mechanism_matches &=
+            mechanism_counters.first_distance_evaluation_ordinal == 2 &&
+            mechanism_counters.distance_api_call_count == 1 &&
+            mechanism_counters.distance_evaluated_geometry_pair_count ==
+                mechanism_counters.active_collision_pair_count;
+        break;
+    }
+    outcome_matches &= mechanism_matches;
     const bool passed = outcome_matches;
     std::ostringstream out;
     out << std::setprecision(17)
@@ -775,6 +1110,10 @@ int main(int argc, char** argv) {
         << ",\"query_class\":\"" << json_escape(options.query_class)
         << "\""
         << ",\"passed\":" << (passed ? "true" : "false")
+        << ",\"mechanism_matches\":"
+        << (mechanism_matches ? "true" : "false")
+        << ",\"policy_scope_matches\":"
+        << (policy_scope_matches ? "true" : "false")
         << ",\"sample_count\":" << options.measured_queries
         << ",\"batch_size\":" << options.batch_size
         << ",\"state_query_count\":"
@@ -814,8 +1153,71 @@ int main(int argc, char** argv) {
         << ",\"geometry_count\":" << snapshot.geometry_count
         << ",\"contains_mesh_geometry\":"
         << (snapshot.contains_mesh_geometry ? "true" : "false")
+        << ",\"distance_request_mode\":\""
+        << distance_request_mode_label(distance_request_mode) << "\""
+        << ",\"selected_distance_pair_count\":"
+        << selected_distance_pairs.size()
+        << ",\"effective_policy_content_hash\":\""
+        << json_escape(policy.revision.content_hash) << "\"";
+    if (effective_support_policy != nullptr) {
+      out << ",\"effective_contact_policy_mode\":\""
+          << contact_policy_mode_label(effective_support_policy->mode)
+          << "\"";
+    } else {
+      out << ",\"effective_contact_policy_mode\":null";
+    }
+    if (effective_support_policy != nullptr &&
+        effective_support_policy->mode ==
+        CollisionContactPolicyMode::kContactRelease) {
+      out << ",\"effective_release_evidence_mode\":\""
+          << release_evidence_mode_label(
+                 effective_support_policy->release_evidence_mode)
+          << "\"";
+    } else {
+      out << ",\"effective_release_evidence_mode\":null";
+    }
+    if (effective_support_policy != nullptr &&
+        effective_support_policy->mode ==
+        CollisionContactPolicyMode::kBoundedPenetration) {
+      out << ",\"max_contact_penetration_m\":"
+          << effective_support_policy->max_contact_penetration_m;
+    } else {
+      out << ",\"max_contact_penetration_m\":null";
+    }
+    out
+        << ",\"mechanism_counter_provenance\":\"direct\""
+        << ",\"physical_output_in_collision\":"
+        << (parity_in_collision ? "true" : "false")
+        << ",\"physical_output_engine_status_code\":"
+        << parity_engine_status
+        << ",\"physical_output_decision_code\":"
+        << parity_decision_code
+        << ",\"physical_output_normalized_pair_count\":"
+        << parity_normalized_pairs.size()
+        << ",\"physical_output_normalized_pair_fingerprint\":\""
+        << json_escape(parity_output_fingerprint) << "\""
         << ",\"normalized_pair_count\":" << pair_count
-        << ",\"clearance_pair_count\":" << clearance_count;
+        << ",\"clearance_pair_count\":" << clearance_count
+        << ",\"collision_api_call_count\":"
+        << mechanism_counters.collision_api_call_count
+        << ",\"collision_enumeration_completion_ordinal\":"
+        << mechanism_counters.collision_enumeration_completion_ordinal
+        << ",\"active_collision_pair_count\":"
+        << mechanism_counters.active_collision_pair_count
+        << ",\"colliding_geometry_pair_count\":"
+        << mechanism_counters.colliding_geometry_pair_count
+        << ",\"colliding_logical_pair_count\":"
+        << mechanism_counters.colliding_logical_pair_count
+        << ",\"distance_api_call_count\":"
+        << mechanism_counters.distance_api_call_count
+        << ",\"first_distance_evaluation_ordinal\":"
+        << mechanism_counters.first_distance_evaluation_ordinal
+        << ",\"distance_evaluated_geometry_pair_count\":"
+        << mechanism_counters.distance_evaluated_geometry_pair_count
+        << ",\"distance_evaluated_logical_pair_count\":"
+        << mechanism_counters.distance_evaluated_logical_pair_count
+        << ",\"fk_placement_invocation_count\":"
+        << mechanism_counters.fk_placement_invocation_count;
     if (min_clearance) {
       out << ",\"min_clearance_m\":" << *min_clearance;
     } else {

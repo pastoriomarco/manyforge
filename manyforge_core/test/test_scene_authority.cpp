@@ -345,6 +345,7 @@ class FakeProjection final : public IPlannerSceneProjection,
     runtime->world = world_;
     runtime->policy =
         std::make_shared<CollisionPolicySnapshot>(configured_policy_);
+    runtime->distance_selection_order_valid = true;
     runtime->lookup_order_valid = true;
     runtime->epoch = revision_.revision_id;
     runtime_ = std::move(runtime);

@@ -5,9 +5,11 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <manyforge_core/types/collision.hpp>
+#include <manyforge_core/types/collision_world_snapshot.hpp>
 
 namespace manyforge::core {
 
@@ -57,14 +59,122 @@ using SupportContactEvaluationStateMap =
 struct ContactReleaseEvaluationState {
   bool initialized = false;
   bool started_in_contact = false;
+  /// Contact truth at the most recently accepted sample. This is independent
+  /// of signed-distance evidence and is required by both evidence modes.
+  bool in_contact = false;
   bool separated = false;
   std::optional<double> initial_depth_m;
   double previous_depth_m = 0.0;
   double best_depth_m = 0.0;
+
+  friend bool operator==(const ContactReleaseEvaluationState&,
+                         const ContactReleaseEvaluationState&) = default;
 };
 
 using ContactReleaseEvaluationStateMap =
     std::map<CollisionPairId, ContactReleaseEvaluationState, std::less<>>;
+
+/// Match one canonical logical collision pair against an authored contact-
+/// grasp binding. This is shared by validation, runtime selection, and policy
+/// classification so pattern interpretation cannot drift between surfaces.
+[[nodiscard]] bool contact_grasp_pair_matches(
+    const CollisionPairId& pair,
+    const ContactGraspPolicyEntry& policy) noexcept;
+
+/// Build the complete canonical metric-pair selection for one immutable world.
+/// Signed-release and bounded-penetration pairs are always included; binary
+/// release pairs are excluded. When `active_contact_policy_id` names a contact-
+/// grasp entry, its object/link pattern is resolved to concrete world body
+/// pairs before the query hot path.
+[[nodiscard]] std::vector<CollisionPairId>
+build_selected_collision_distance_pairs(
+    const CollisionPolicySnapshot& policy,
+    const CollisionWorldSnapshot& world,
+    std::string_view active_contact_policy_id = {});
+
+/// One logical support-pair observation for the shared contact-release state
+/// machine. `signed_clearance_m` is required only when `in_contact` is true and
+/// the policy selects signed-penetration release evidence or bounded-
+/// penetration policy mode. Binary release policies ignore it, and absent pairs
+/// must not fabricate a zero clearance.
+struct ContactReleaseSampleEvidence {
+  bool in_contact = false;
+  std::optional<double> signed_clearance_m;
+};
+
+/// Typed failure emitted by the allocation-free per-sample transition helper.
+/// Callers translate this stable category into surface-specific decisions and
+/// diagnostics without reimplementing the state transition.
+enum class ContactReleaseTransitionFailure {
+  kNone,
+  kInvalidPolicy,
+  kContactProcessNotImplemented,
+  kMissingOrInvalidSignedPenetration,
+  kNewContactAfterClearStart,
+  kInitialPenetrationExceedsPolicy,
+  kRecontactAfterRelease,
+  kRecontactPenetrationExceedsPolicy,
+  kPenetrationIncreased,
+  kContactPenetrationExceedsPolicy,
+};
+
+struct ContactReleaseTransitionResult {
+  ContactReleaseTransitionFailure failure =
+      ContactReleaseTransitionFailure::kNone;
+  std::optional<double> penetration_depth_m;
+
+  [[nodiscard]] constexpr bool accepted() const noexcept {
+    return failure == ContactReleaseTransitionFailure::kNone;
+  }
+};
+
+/// Validate the mode-scoped internal policy representation consumed by every
+/// ordered decision surface. Typed DTO defaults are accepted as the
+/// presence-less representation of omitted fields; arbitrary mixtures of
+/// release-only and bounded-only values fail closed.
+[[nodiscard]] bool support_contact_policy_entry_valid(
+    const SupportContactPolicyEntry& policy) noexcept;
+
+/// Advance one contact-release identity by one trajectory-ordered sample.
+///
+/// The first call establishes C_0. Later contact for an initially-clear pair is
+/// rejected; absence marks separation; disallowed recontact is rejected. The
+/// signed release mode additionally validates and updates penetration evidence
+/// while a pair is colliding. Bounded-penetration mode permits arbitrary
+/// contact appearance/disappearance but validates every colliding depth against
+/// its bound. The helper performs no allocation and never infers contact from a
+/// distance tolerance.
+[[nodiscard]] ContactReleaseTransitionResult advance_contact_release_sample(
+    const SupportContactPolicyEntry& policy,
+    const ContactReleaseSampleEvidence& sample,
+    ContactReleaseEvaluationState& state) noexcept;
+
+[[nodiscard]] constexpr const char* contact_release_transition_failure_name(
+    ContactReleaseTransitionFailure failure) noexcept {
+  switch (failure) {
+    case ContactReleaseTransitionFailure::kNone:
+      return "none";
+    case ContactReleaseTransitionFailure::kInvalidPolicy:
+      return "invalid_contact_policy";
+    case ContactReleaseTransitionFailure::kContactProcessNotImplemented:
+      return "contact_process_policy_not_implemented";
+    case ContactReleaseTransitionFailure::kMissingOrInvalidSignedPenetration:
+      return "missing_contact_release_clearance";
+    case ContactReleaseTransitionFailure::kNewContactAfterClearStart:
+      return "new_active_contact_after_clear_start";
+    case ContactReleaseTransitionFailure::kInitialPenetrationExceedsPolicy:
+      return "initial_penetration_exceeds_policy";
+    case ContactReleaseTransitionFailure::kRecontactAfterRelease:
+      return "recontact_after_release";
+    case ContactReleaseTransitionFailure::kRecontactPenetrationExceedsPolicy:
+      return "recontact_penetration_exceeds_policy";
+    case ContactReleaseTransitionFailure::kPenetrationIncreased:
+      return "penetration_increased";
+    case ContactReleaseTransitionFailure::kContactPenetrationExceedsPolicy:
+      return "contact_penetration_exceeds_policy";
+  }
+  return "unknown_contact_release_failure";
+}
 
 std::shared_ptr<const CollisionPolicyIndex> build_collision_policy_index(
     const CollisionPolicySnapshot& snapshot);

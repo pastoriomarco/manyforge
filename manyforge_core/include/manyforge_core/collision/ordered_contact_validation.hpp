@@ -29,6 +29,8 @@ struct SupportContactPairChunkSummary {
 struct ContactReleaseSampleSummary {
   std::int64_t waypoint_index = -1;
   std::optional<std::int64_t> time_from_start_ns;
+  /// Authoritative logical-pair presence from CollisionResult::normalized_pairs.
+  bool in_contact = false;
   bool clearance_valid = false;
   double signed_clearance_m = 0.0;
   double penetration_depth_m = 0.0;
@@ -41,11 +43,14 @@ struct ContactReleaseSegmentSummary {
   std::optional<ContactReleaseSampleSummary> last_sample;
   std::optional<ContactReleaseSampleSummary> first_missing_clearance;
   std::optional<ContactReleaseSampleSummary> first_active_contact;
+  std::optional<ContactReleaseSampleSummary> last_active_contact;
   std::optional<ContactReleaseSampleSummary> first_separation;
   std::optional<ContactReleaseSampleSummary> first_active_contact_after_separation;
   std::optional<ContactReleaseSampleSummary> first_active_contact_exceeding_max_start;
   std::optional<ContactReleaseSampleSummary>
       first_active_contact_exceeding_max_start_after_separation;
+  std::optional<ContactReleaseSampleSummary>
+      first_active_contact_exceeding_contact_bound;
   std::optional<ContactReleaseSampleSummary> first_internal_depth_increase;
   std::optional<double> minimum_effective_depth_m;
   double last_effective_depth_m = 0.0;

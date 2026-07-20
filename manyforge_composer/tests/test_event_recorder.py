@@ -1852,6 +1852,34 @@ class TestKernelEventPipelineLossVisibility:
         # No gap: contiguous sequences must not synthesize gap records.
         assert not [e for e in events if e["type"] == "kernel_event_gap"]
 
+    def test_contact_policy_violation_is_full_fidelity_error(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec.record_native_kernel_events(
+            [
+                self._native(
+                    1,
+                    1,
+                    type_="contact_policy_violation",
+                    contact_policy_id="support/table",
+                    details={
+                        "contact_policy_mode": "bounded_penetration",
+                        "current_penetration_m": "0.006",
+                        "max_contact_penetration_m": "0.004",
+                    },
+                )
+            ]
+        )
+
+        events = _memory_events(rec)
+        assert len(events) == 1
+        event = events[0]
+        assert event["type"] == "kernel_native_contact_policy_violation"
+        assert event["severity"] == "ERROR"
+        assert event["channel"] == "kernel_native"
+        assert event["contact_policy_id"] == "support/table"
+        assert event["details"]["current_penetration_m"] == "0.006"
+        assert _curated_events(rec) == []
+
     def test_sequence_gap_produces_durable_warn_record(self):
         rec = EventRecorder(observe_min_interval_s=0.0)
         rec.record_native_kernel_events([self._native(1, 1)])

@@ -15,6 +15,10 @@ import pytest
 import yaml
 
 from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.capabilities import (
+    get_adapter_capability_manifest,
+    get_required_keys,
+)
 from manyforge_behavior.deployment import (
     DEFAULT_GLOBAL_MAX_TCP_LINEAR_SPEED_MPS,
     Deployment,
@@ -393,6 +397,37 @@ def _minimal_program(**overrides) -> dict:
     }
     program.update(overrides)
     return program
+
+
+def _support_contact_scene(*, release_evidence_mode: str) -> list[dict]:
+    return [
+        {
+            "object_id": "part",
+            "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+            "pose": {
+                "frame_id": "universe",
+                "position_m": [0.0, 0.0, 0.05],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+            "metadata": {
+                "support_contacts": [
+                    {
+                        "support_object_id": "fixture",
+                        "release_evidence_mode": release_evidence_mode,
+                    }
+                ]
+            },
+        },
+        {
+            "object_id": "fixture",
+            "shape": {"type": "box", "box_dimensions_m": [1.0, 1.0, 0.1]},
+            "pose": {
+                "frame_id": "universe",
+                "position_m": [0.0, 0.0, -0.05],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+        },
+    ]
 
 
 def _minimal_deployment(**overrides) -> dict:
@@ -3883,11 +3918,11 @@ class TestCrossArtifactValidation:
         assert graspable_resource.metadata["support_contacts"] == [
             {
                 "support_object_id": "ground",
+                "release_evidence_mode": "signed_penetration",
                 "enforce_max_start_penetration": True,
                 "max_start_penetration_m": 0.03,
                 "release_tolerance_m": 0.001,
                 "min_release_progress_m": 0.0,
-                "min_separation_clearance_m": 0.0,
                 "require_separation_by_end": True,
                 "require_strictly_decreasing_penetration": True,
                 "allow_recontact": False,
@@ -4509,6 +4544,8 @@ class TestAdapterCapabilityKeys:
             "context.validation.trajectory",
             "context.collision.check",
             "context.collision.check.detailed",
+            "execution.contact.geometric",
+            "execution.contact.geometric_signed_penetration",
             "context.kinematics.fk",
             "context.limits.joint",
             "context.pose.resolve_reference",
@@ -4552,6 +4589,38 @@ class TestAdapterCapabilityKeys:
                 Deployment(path)
         finally:
             os.unlink(path)
+
+    def test_all_roboplan_context_declarations_match_published_manifest(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        deployment_paths = sorted(
+            [*(repo_root / "examples").glob("*.deployment.yaml")]
+            + [
+                *(repo_root / "manyforge_behavior" / "tests" / "fixtures").glob(
+                    "*.deployment.yaml"
+                )
+            ]
+            + [
+                *(repo_root / "verification" / "deployments").glob(
+                    "*.deployment.yaml"
+                )
+            ]
+        )
+        manifest = get_adapter_capability_manifest("planning.roboplan_context")
+        assert manifest is not None
+        matched_paths: list[Path] = []
+
+        for path in deployment_paths:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+            for adapter in (raw.get("adapters") or {}).values():
+                if adapter.get("adapter_id") != "planning.roboplan_context":
+                    continue
+                matched_paths.append(path)
+                declared_keys = adapter.get("capability_keys") or []
+                assert len(declared_keys) == len(set(declared_keys)), path
+                assert len(declared_keys) == len(manifest.capability_keys), path
+                assert set(declared_keys) == set(manifest.capability_keys), path
+
+        assert len(matched_paths) == 14
 
     def test_contact_policies_publish_baseline_collision_policy_snapshot(self):
         data = _minimal_deployment(
@@ -4774,3 +4843,114 @@ class TestValidateCapabilities:
         finally:
             os.unlink(deploy_path)
             os.unlink(program_path)
+
+    @pytest.mark.parametrize(
+        ("contact_capabilities", "missing_capability"),
+        [
+            (
+                {"execution.contact.geometric"},
+                "execution.contact.geometric_signed_penetration",
+            ),
+            (
+                {"execution.contact.geometric_signed_penetration"},
+                "execution.contact.geometric",
+            ),
+        ],
+    )
+    def test_contact_grasp_requires_both_geometric_capability_tiers(
+        self,
+        contact_capabilities,
+        missing_capability,
+    ):
+        data = _minimal_deployment(
+            contact_policies=[
+                {
+                    "policy_id": "contact_grasp/part",
+                    "mode": "contact_grasp",
+                    "sensing": "geometry_only",
+                    "selected_object_id": "part",
+                    "allowed_robot_links": ["left_finger", "right_finger"],
+                    "max_penetration_m": 0.002,
+                }
+            ]
+        )
+        data["adapters"]["execution"]["capability_keys"] = sorted(
+            get_required_keys("v0.0") | contact_capabilities
+        )
+        deployment = Deployment.from_dict(data)
+
+        with pytest.raises(DeploymentValidationError, match=missing_capability):
+            deployment.validate_capabilities()
+
+    def test_contact_grasp_admits_with_both_geometric_capability_tiers(self):
+        data = _minimal_deployment(
+            contact_policies=[
+                {
+                    "policy_id": "contact_grasp/part",
+                    "mode": "contact_grasp",
+                    "sensing": "geometry_only",
+                    "selected_object_id": "part",
+                    "allowed_robot_links": ["left_finger", "right_finger"],
+                    "max_penetration_m": 0.002,
+                }
+            ]
+        )
+        data["adapters"]["execution"]["capability_keys"] = sorted(
+            get_required_keys("v0.0")
+            | {
+                "execution.contact.geometric",
+                "execution.contact.geometric_signed_penetration",
+            }
+        )
+        deployment = Deployment.from_dict(data)
+
+        deployment.validate_capabilities()
+
+    def test_program_binary_contact_admits_with_geometric_tier_only(self, catalog):
+        program = Program.from_dict(
+            _minimal_program(
+                scene=_support_contact_scene(
+                    release_evidence_mode="binary_contact"
+                )
+            ),
+            catalog,
+        )
+        data = _minimal_deployment()
+        data["adapters"]["execution"]["capability_keys"] = sorted(
+            get_required_keys("v0.0") | {"execution.contact.geometric"}
+        )
+        deployment = Deployment.from_dict(data)
+
+        deployment.validate_capabilities(program)
+
+    def test_program_signed_contact_rejects_geometric_tier_only(self, catalog):
+        program = Program.from_dict(
+            _minimal_program(
+                scene=_support_contact_scene(
+                    release_evidence_mode="signed_penetration"
+                )
+            ),
+            catalog,
+        )
+        data = _minimal_deployment()
+        data["adapters"]["execution"]["capability_keys"] = sorted(
+            get_required_keys("v0.0") | {"execution.contact.geometric"}
+        )
+        deployment = Deployment.from_dict(data)
+
+        with pytest.raises(
+            DeploymentValidationError,
+            match="execution.contact.geometric_signed_penetration",
+        ):
+            deployment.validate_capabilities(program)
+
+    def test_legacy_baseline_contact_policy_does_not_claim_contact_grasp_tier(self):
+        data = _minimal_deployment(
+            contact_policies=[{"policy_id": "deployment_baseline"}]
+        )
+        data["adapters"]["execution"]["capability_keys"] = sorted(
+            get_required_keys("v0.0")
+        )
+        deployment = Deployment.from_dict(data)
+
+        deployment.validate_capabilities()

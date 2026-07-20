@@ -15,6 +15,7 @@
 #include <manyforge_core/types/reason_codes.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <exception>
@@ -4156,6 +4157,8 @@ void ExecutionKernel::emit_runtime_collision_lookahead_evidence(
     details.try_emplace(key, value);
   }
 
+  emit_contact_policy_violation_event(result.execution_id, details);
+
   KernelEvent event;
   event.type =
       check.in_collision ? KernelEventType::kCollisionDetected : KernelEventType::kErrorRaised;
@@ -4184,6 +4187,55 @@ void ExecutionKernel::emit_runtime_collision_lookahead_evidence(
                 {{"reason", result.authority_rejection_reason},
                  {"surface", "observed_runtime_lookahead"}}});
   }
+}
+
+void ExecutionKernel::emit_contact_policy_violation_event(
+    std::uint64_t execution_id,
+    const std::map<std::string, std::string>& source_details,
+    std::optional<std::string_view> response_override) {
+  const auto violation = source_details.find("contact_policy_violation");
+  if (violation == source_details.end()) {
+    return;
+  }
+
+  static constexpr std::array<const char*, 18> kPayloadKeys{
+      "contact_policy_id",
+      "policy_mode",
+      "zone_id",
+      "release_evidence_mode",
+      "contact_body_a",
+      "contact_body_b",
+      "contact_present",
+      "initial_contact_pair_count",
+      "current_contact_pair_count",
+      "distance_request_mode",
+      "evaluated_distance_pair_count",
+      "penetration_depth_m",
+      "max_penetration_m",
+      "max_contact_penetration_m",
+      "response",
+      "classification",
+      "surface",
+      "within_penetration_bound"};
+  std::map<std::string, std::string> details{
+      {"violation_reason", violation->second}};
+  for (const auto key : kPayloadKeys) {
+    if (const auto found = source_details.find(key);
+        found != source_details.end()) {
+      details.emplace(found->first, found->second);
+    }
+  }
+  if (response_override.has_value()) {
+    details["response"] = std::string(*response_override);
+  }
+
+  emit_event({KernelEventType::kContactPolicyViolation,
+              execution_id,
+              clock_.now(),
+              {},
+              {},
+              std::nullopt,
+              std::move(details)});
 }
 
 void ExecutionKernel::revoke_runtime_collision_lookahead_clear_permits()
@@ -4802,6 +4854,8 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     retry_details["max_attempts"] =
         std::to_string(max_authoritative_validation_attempts);
     retry_details["move_id"] = request.move_id;
+    emit_contact_policy_violation_event(exec_id,
+                                        validation_error.details);
     emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
                 {}, {}, std::nullopt, std::move(retry_details)});
 
@@ -5188,6 +5242,8 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
       return phase_result;
     }
+    emit_contact_policy_violation_event(exec_id,
+                                        val_result.error().details);
     emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
                  {}, {}, std::nullopt, {{"reason", "validation failed"}}});
     emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
@@ -6535,6 +6591,7 @@ void ExecutionKernel::async_execute_worker(
                                         bool count_plan_failure,
                                         bool count_validation_failure) {
             if (count_validation_failure) {
+              emit_contact_policy_violation_event(exec_id, error.details);
               emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
                           {}, {}, std::nullopt,
                           {{"reason", failure_reason},
@@ -8349,7 +8406,8 @@ namespace {
 
 bool is_retryable_failed_validation_error(const ErrorDTO& error) {
   if (error.code == kErrorSceneChangedDuringValidation ||
-      error.code == kErrorValidationCollision) {
+      error.code == kErrorValidationCollision ||
+      error.code == kErrorContactPolicyViolation) {
     return true;
   }
   const auto reason_it = error.details.find("reason");
@@ -9344,6 +9402,12 @@ Result<void> ExecutionKernel::collision_check_tick() {
       revoke_runtime_collision_lookahead_clear_permits();
       record_tick_metric(true);
       details["surface"] = "observed_runtime_monitor";
+      emit_contact_policy_violation_event(
+          sm_.status().execution_id, details,
+          stop_path_active ? std::optional<std::string_view>{
+                                 "signal_active_stop"}
+                           : std::optional<std::string_view>{
+                                 "preempt_trajectory"});
       const auto stop_owner = [&]() -> const char* {
         if (trip_stop_active) {
           return "motion_trip_stop";
@@ -9723,8 +9787,164 @@ Result<void> ExecutionKernel::collision_check_tick() {
         format_double(*outcome.previous_penetration_m);
   }
   if (outcome.current_penetration_m) {
-    monitor_details["contact_release_current_penetration_m"] =
-        format_double(*outcome.current_penetration_m);
+    const auto current = format_double(*outcome.current_penetration_m);
+    if (outcome.max_contact_penetration_m) {
+      monitor_details["contact_policy_mode"] = "bounded_penetration";
+      monitor_details["current_penetration_m"] = current;
+      monitor_details["max_contact_penetration_m"] =
+          format_double(*outcome.max_contact_penetration_m);
+      if (outcome.reason == RuntimeCollisionTickReason::
+                                kBoundedContactPenetrationExceeded &&
+          std::isfinite(*outcome.current_penetration_m)) {
+        monitor_details["within_penetration_bound"] = "false";
+      }
+    } else {
+      monitor_details["contact_release_current_penetration_m"] = current;
+    }
+  }
+  const auto contact_violation_reason = [&]() -> const char* {
+    switch (outcome.reason) {
+      case RuntimeCollisionTickReason::kContactReleaseMissingClearance:
+        return "missing_contact_release_clearance";
+      case RuntimeCollisionTickReason::kContactReleaseNewContact:
+        return "new_active_contact_after_clear_start";
+      case RuntimeCollisionTickReason::kContactReleaseInitialPenetrationExceeded:
+        return "initial_penetration_exceeds_policy";
+      case RuntimeCollisionTickReason::kContactReleaseRecontact:
+        return "recontact_after_release";
+      case RuntimeCollisionTickReason::
+          kContactReleaseRecontactPenetrationExceeded:
+        return "recontact_penetration_exceeds_policy";
+      case RuntimeCollisionTickReason::kContactReleasePenetrationIncreased:
+        return "penetration_increased";
+      case RuntimeCollisionTickReason::kBoundedContactPenetrationExceeded:
+        return "contact_penetration_exceeds_policy";
+      default:
+        return nullptr;
+    }
+  }();
+  if (contact_violation_reason != nullptr && outcome.pair != nullptr &&
+      outcome.contact_policy_mode.has_value()) {
+    const auto& pair = *outcome.pair;
+    monitor_details["contact_policy_violation"] = contact_violation_reason;
+    monitor_details["contact_policy_id"] =
+        policy_snapshot->policy_id.empty()
+            ? "support_contacts@" +
+                  std::to_string(policy_snapshot->revision.revision_id)
+            : policy_snapshot->policy_id;
+    monitor_details["policy_mode"] =
+        *outcome.contact_policy_mode ==
+                CollisionContactPolicyMode::kBoundedPenetration
+            ? "bounded_penetration"
+            : "contact_release";
+    monitor_details["zone_id"] =
+        "support_pair:" + pair.body_a + "<->" + pair.body_b;
+    monitor_details["contact_body_a"] = pair.body_a;
+    monitor_details["contact_body_b"] = pair.body_b;
+    monitor_details["contact_present"] =
+        outcome.contact_present ? "true" : "false";
+    monitor_details["initial_contact_pair_count"] =
+        std::to_string(outcome.initial_contact_pair_count);
+    monitor_details["current_contact_pair_count"] =
+        std::to_string(outcome.current_contact_pair_count);
+    monitor_details["distance_request_mode"] =
+        collision_distance_request_mode_name(outcome.distance_request_mode);
+    monitor_details["evaluated_distance_pair_count"] =
+        std::to_string(outcome.evaluated_distance_pair_count);
+    monitor_details["response"] = "preempt_trajectory";
+    monitor_details["classification"] =
+        outcome.pair_classification ==
+                CollisionPairClassification::kDiagnosticIncomplete
+            ? "diagnostic_incomplete"
+            : "blocking_collision";
+    if (*outcome.contact_policy_mode ==
+            CollisionContactPolicyMode::kContactRelease &&
+        outcome.release_evidence_mode.has_value()) {
+      monitor_details["release_evidence_mode"] =
+          *outcome.release_evidence_mode ==
+                  ContactReleaseEvidenceMode::kBinaryContact
+              ? "binary_contact"
+              : "signed_penetration";
+    }
+    if (outcome.contact_present && outcome.current_penetration_m &&
+        (*outcome.contact_policy_mode ==
+             CollisionContactPolicyMode::kBoundedPenetration ||
+         outcome.release_evidence_mode ==
+             ContactReleaseEvidenceMode::kSignedPenetration)) {
+      monitor_details["penetration_depth_m"] =
+          format_double(*outcome.current_penetration_m);
+    }
+    if (outcome.max_contact_penetration_m) {
+      monitor_details["max_contact_penetration_m"] =
+          format_double(*outcome.max_contact_penetration_m);
+      if (outcome.reason == RuntimeCollisionTickReason::
+                                kBoundedContactPenetrationExceeded &&
+          outcome.current_penetration_m.has_value() &&
+          std::isfinite(*outcome.current_penetration_m)) {
+        monitor_details["within_penetration_bound"] = "false";
+      }
+    }
+    if (outcome.reason == RuntimeCollisionTickReason::
+                              kContactReleaseInitialPenetrationExceeded) {
+      const auto policy_entry =
+          published_bundle->policy_index->support_contact_index.find(pair);
+      if (policy_entry !=
+              published_bundle->policy_index->support_contact_index.end() &&
+          policy_entry->second.enforce_max_start_penetration) {
+        monitor_details["max_penetration_m"] =
+            format_double(policy_entry->second.max_start_penetration_m);
+      }
+    }
+  }
+  if (outcome.contact_grasp_violation !=
+          RuntimeContactGraspViolation::kNone &&
+      outcome.pair != nullptr) {
+    const auto active_policy = std::find_if(
+        policy_snapshot->contact_grasps.begin(),
+        policy_snapshot->contact_grasps.end(),
+        [&](const ContactGraspPolicyEntry& candidate) {
+          return candidate.policy_id ==
+                 query_session->active_contact_policy_id();
+        });
+    if (active_policy != policy_snapshot->contact_grasps.end()) {
+      auto pair = *outcome.pair;
+      if (pair.body_b < pair.body_a) {
+        std::swap(pair.body_a, pair.body_b);
+      }
+      const bool missing_clearance =
+          outcome.contact_grasp_violation ==
+          RuntimeContactGraspViolation::kMissingClearance;
+      monitor_details["contact_policy_violation"] =
+          missing_clearance
+              ? reason_codes::kMissingGraspContactClearance
+              : reason_codes::kGraspContactPenetrationExceeded;
+      monitor_details["contact_policy_id"] = active_policy->policy_id;
+      monitor_details["policy_mode"] = "contact_grasp";
+      monitor_details["zone_id"] =
+          "contact_grasp_pair:" + pair.body_a + "<->" + pair.body_b;
+      monitor_details["contact_body_a"] = pair.body_a;
+      monitor_details["contact_body_b"] = pair.body_b;
+      monitor_details["contact_present"] =
+          outcome.contact_present ? "true" : "false";
+      monitor_details["distance_request_mode"] =
+          collision_distance_request_mode_name(outcome.distance_request_mode);
+      monitor_details["evaluated_distance_pair_count"] =
+          std::to_string(outcome.evaluated_distance_pair_count);
+      monitor_details["max_penetration_m"] =
+          format_double(active_policy->max_penetration_m);
+      monitor_details["response"] = "preempt_trajectory";
+      monitor_details["classification"] =
+          outcome.pair_classification ==
+                  CollisionPairClassification::kDiagnosticIncomplete
+              ? "diagnostic_incomplete"
+              : "blocking_collision";
+      if (!missing_clearance && outcome.signed_clearance_m.has_value() &&
+          std::isfinite(*outcome.signed_clearance_m) &&
+          *outcome.signed_clearance_m <= 0.0) {
+        monitor_details["penetration_depth_m"] =
+            format_double(std::max(0.0, -*outcome.signed_clearance_m));
+      }
+    }
   }
   return publish_runtime_monitor_fault(check, std::move(monitor_details));
 }
@@ -9936,6 +10156,8 @@ ExecutionKernel::validate_trajectory(
   struct AuthoritativeValidationAttempt {
     CollisionValidationDecisionBundle bundle;
     ParallelValidationTelemetry telemetry;
+    std::optional<std::map<std::string, std::string>>
+        contact_policy_violation;
   };
 
   std::optional<SceneSnapshotLease> effective_scene_snapshot_lease =
@@ -10007,6 +10229,8 @@ ExecutionKernel::validate_trajectory(
     attempt.bundle = collision_validation_worker_pool_->validate_trajectory(
         world_snapshot, validation_engines, collision_trajectory, cancel, cfg);
     attempt.telemetry = collision_validation_worker_pool_->last_telemetry();
+    attempt.contact_policy_violation = contact_policy_violation_details(
+        attempt.bundle, *active_policy, "block_dispatch");
     return Result<AuthoritativeValidationAttempt>::Ok(std::move(attempt));
   };
 
@@ -10018,6 +10242,8 @@ ExecutionKernel::validate_trajectory(
   auto attempt = std::move(attempt_result.value());
   auto bundle = std::move(attempt.bundle);
   auto telemetry = attempt.telemetry;
+  auto contact_policy_violation =
+      std::move(attempt.contact_policy_violation);
 
   if (bundle.decision.accepted) {
     return Result<CollisionValidationSuccess>::Ok(
@@ -10060,6 +10286,16 @@ ExecutionKernel::validate_trajectory(
     details["parallel_fallback_reason"] = telemetry.fallback_reason;
   }
   append_collision_failure_diagnostics(details, bundle);
+  if (contact_policy_violation.has_value()) {
+    contact_policy_violation->emplace("surface", "pre_dispatch_validation");
+    for (auto& [key, value] : *contact_policy_violation) {
+      details[key] = std::move(value);
+    }
+  }
+  const char* rejection_error_code =
+      contact_policy_violation.has_value()
+          ? kErrorContactPolicyViolation
+          : kErrorValidationCollision;
   if (bundle.cancelled) {
     if (bundle.cancelled_at_waypoint_index) {
       details["cancelled_at_waypoint_index"] =
@@ -10082,7 +10318,7 @@ ExecutionKernel::validate_trajectory(
   }
   if (bundle.decision.action == CollisionDecisionAction::kInconclusive) {
     return Result<CollisionValidationSuccess>::Err(
-        ErrorDTO{kErrorValidationCollision,
+        ErrorDTO{rejection_error_code,
                  pre_dispatch_collision_validation_message(
                      details, bundle.decision.action),
                  std::move(details)});
@@ -10093,7 +10329,7 @@ ExecutionKernel::validate_trajectory(
         details, bundle, trajectory, *collision_diagnostic_comparator_);
   }
   return Result<CollisionValidationSuccess>::Err(
-      ErrorDTO{kErrorValidationCollision,
+      ErrorDTO{rejection_error_code,
                pre_dispatch_collision_validation_message(
                    details, bundle.decision.action),
                std::move(details)});

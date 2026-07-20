@@ -16,6 +16,8 @@ from types import MappingProxyType
 
 from manyforge_behavior.capabilities import (
     CAPABILITY_REGISTRY,
+    GEOMETRIC_CONTACT_CAPABILITY,
+    SIGNED_PENETRATION_CONTACT_CAPABILITY,
     get_adapter_capability_manifest,
     get_required_keys,
 )
@@ -4167,7 +4169,8 @@ class Deployment:
         - Any adapter declares supported_profiles but doesn't include self.program_profile
         - The union of all adapters' capability_keys doesn't cover all required keys
         - Required keys are missing from the capability union
-        - Program node/skill capability keys are missing from the capability union
+        - Shipped contact-grasp policy capability keys are missing
+        - Program node/skill/contact capability keys are missing from the union
 
         Missing capability declarations fail closed; supported backends must
         declare the capability keys they provide.
@@ -4202,12 +4205,27 @@ class Deployment:
                 f"{sorted(missing)}"
             )
 
+        contact_grasp_configured = any(
+            policy.raw.get("mode") == "contact_grasp"
+            for policy in self.contact_policies
+        )
+        if contact_grasp_configured:
+            missing_contact_policy_keys = {
+                GEOMETRIC_CONTACT_CAPABILITY,
+                SIGNED_PENETRATION_CONTACT_CAPABILITY,
+            } - all_capability_keys
+            if missing_contact_policy_keys:
+                raise DeploymentValidationError(
+                    "Missing capability keys for contact-grasp policies: "
+                    f"{sorted(missing_contact_policy_keys)}"
+                )
+
         if program is not None:
             required_program_keys = set(program.required_capabilities())
             missing_program_keys = required_program_keys - all_capability_keys
             if missing_program_keys:
                 raise DeploymentValidationError(
-                    "Missing capability keys for program nodes: "
+                    "Missing capability keys for program nodes/contact policies: "
                     f"{sorted(missing_program_keys)}"
                 )
 

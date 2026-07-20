@@ -77,6 +77,10 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .value("kCartesianIncomplete", manyforge::core::ErrorCode::kCartesianIncomplete)
         .value("kStartStateMismatch", manyforge::core::ErrorCode::kStartStateMismatch)
         .value("kValidationCollision", manyforge::core::ErrorCode::kValidationCollision)
+        .value("kInvalidContactPolicy",
+               manyforge::core::ErrorCode::kInvalidContactPolicy)
+        .value("kContactPolicyViolation",
+               manyforge::core::ErrorCode::kContactPolicyViolation)
         .value("kValidationLimitsViolation", manyforge::core::ErrorCode::kValidationLimitsViolation)
         .value("kObjectAlreadyExists", manyforge::core::ErrorCode::kObjectAlreadyExists)
         .value("kObjectNotFound", manyforge::core::ErrorCode::kObjectNotFound)
@@ -757,6 +761,20 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .value("kCcd", manyforge::core::CollisionSamplingMode::kCcd)
         .value("kEngineDefault", manyforge::core::CollisionSamplingMode::kEngineDefault);
 
+    py::enum_<manyforge::core::CollisionDistanceRequestMode>(
+        m, "CollisionDistanceRequestMode")
+        .value("kNone",
+               manyforge::core::CollisionDistanceRequestMode::kNone)
+        .value("kSelectedCollidingPairs",
+               manyforge::core::CollisionDistanceRequestMode::
+                   kSelectedCollidingPairs)
+        .value("kAllCollidingPairs",
+               manyforge::core::CollisionDistanceRequestMode::
+                   kAllCollidingPairs)
+        .value("kAllActivePairs",
+               manyforge::core::CollisionDistanceRequestMode::
+                   kAllActivePairs);
+
     py::enum_<manyforge::core::CollisionEngineStatus>(m, "CollisionEngineStatus")
         .value("kOk", manyforge::core::CollisionEngineStatus::kOk)
         .value("kTimeout", manyforge::core::CollisionEngineStatus::kTimeout)
@@ -912,8 +930,19 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         m, "CollisionContactPolicyMode")
         .value("kContactRelease",
                manyforge::core::CollisionContactPolicyMode::kContactRelease)
+        .value("kBoundedPenetration",
+               manyforge::core::CollisionContactPolicyMode::
+                   kBoundedPenetration)
         .value("kContactProcess",
                manyforge::core::CollisionContactPolicyMode::kContactProcess);
+
+    py::enum_<manyforge::core::ContactReleaseEvidenceMode>(
+        m, "ContactReleaseEvidenceMode")
+        .value("kSignedPenetration",
+               manyforge::core::ContactReleaseEvidenceMode::
+                   kSignedPenetration)
+        .value("kBinaryContact",
+               manyforge::core::ContactReleaseEvidenceMode::kBinaryContact);
 
     py::class_<manyforge::core::SupportContactPolicyEntry>(m,
                                                            "SupportContactPolicyEntry")
@@ -922,6 +951,9 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                        &manyforge::core::SupportContactPolicyEntry::pair)
         .def_readwrite("mode",
                        &manyforge::core::SupportContactPolicyEntry::mode)
+        .def_readwrite(
+            "release_evidence_mode",
+            &manyforge::core::SupportContactPolicyEntry::release_evidence_mode)
         .def_readwrite(
             "enforce_max_start_penetration",
             &manyforge::core::SupportContactPolicyEntry::
@@ -936,8 +968,9 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             "min_release_progress_m",
             &manyforge::core::SupportContactPolicyEntry::min_release_progress_m)
         .def_readwrite(
-            "min_separation_clearance_m",
-            &manyforge::core::SupportContactPolicyEntry::min_separation_clearance_m)
+            "max_contact_penetration_m",
+            &manyforge::core::SupportContactPolicyEntry::
+                max_contact_penetration_m)
         .def_readwrite(
             "require_separation_by_end",
             &manyforge::core::SupportContactPolicyEntry::require_separation_by_end)
@@ -1195,6 +1228,12 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                        &manyforge::core::CollisionQuery::timeout_budget_ns)
         .def_readwrite("required_capabilities",
                        &manyforge::core::CollisionQuery::required_capabilities)
+        .def_readwrite(
+            "distance_request_mode",
+            &manyforge::core::CollisionQuery::distance_request_mode)
+        .def_readwrite(
+            "selected_distance_pairs",
+            &manyforge::core::CollisionQuery::selected_distance_pairs)
         .def_readwrite("max_contacts",
                        &manyforge::core::CollisionQuery::max_contacts)
         .def("__repr__", [](const manyforge::core::CollisionQuery& q) {
@@ -1242,6 +1281,12 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                        &manyforge::core::CollisionResult::policy_revision_used)
         .def_readwrite("raw_diagnostics",
                        &manyforge::core::CollisionResult::raw_diagnostics)
+        .def_readwrite(
+            "distance_request_mode",
+            &manyforge::core::CollisionResult::distance_request_mode)
+        .def_readwrite(
+            "evaluated_distance_pair_count",
+            &manyforge::core::CollisionResult::evaluated_distance_pair_count)
         .def("__repr__", [](const manyforge::core::CollisionResult& r) {
             return py::str("CollisionResult(in_collision={}, pairs={})")
                 .format(r.in_collision, r.normalized_pairs.size());

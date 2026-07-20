@@ -498,30 +498,80 @@ std::pair<std::string, std::string> canonical_pair(std::string a,
   return {std::move(a), std::move(b)};
 }
 
-std::vector<std::pair<std::string, std::string>>
-collision_pairs_from_geometry_data(
-    const pinocchio::GeometryModel& collision_model,
-    const pinocchio::GeometryData& collision_data) {
-  std::vector<std::pair<std::string, std::string>> pairs;
-  const auto pair_count = std::min(collision_model.collisionPairs.size(),
-                                   collision_data.collisionResults.size());
-  for (std::size_t k = 0; k < pair_count; ++k) {
-    const auto& result = collision_data.collisionResults[k];
-    if (!result.isCollision()) {
-      continue;
-    }
-    const auto& pair = collision_model.collisionPairs[k];
-    if (pair.first >= collision_model.geometryObjects.size() ||
-        pair.second >= collision_model.geometryObjects.size()) {
-      continue;
-    }
-    pairs.push_back(canonical_pair(
-        collision_model.geometryObjects[pair.first].name,
-        collision_model.geometryObjects[pair.second].name));
+enum class SelectedDistancePairsValidation {
+  kValid,
+  kMissing,
+  kNotCanonical,
+  kModeInconsistent,
+};
+
+SelectedDistancePairsValidation validate_selected_distance_pairs(
+    core::CollisionDistanceRequestMode mode,
+    std::span<const core::CollisionPairId> selected_pairs) noexcept {
+  if (mode != core::CollisionDistanceRequestMode::kSelectedCollidingPairs) {
+    return selected_pairs.empty()
+               ? SelectedDistancePairsValidation::kValid
+               : SelectedDistancePairsValidation::kModeInconsistent;
   }
-  std::sort(pairs.begin(), pairs.end());
-  pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
-  return pairs;
+  if (selected_pairs.empty()) {
+    return SelectedDistancePairsValidation::kMissing;
+  }
+  for (std::size_t i = 0; i < selected_pairs.size(); ++i) {
+    const auto& pair = selected_pairs[i];
+    if (pair.body_a.empty() || pair.body_b.empty() ||
+        !(pair.body_a < pair.body_b)) {
+      return SelectedDistancePairsValidation::kNotCanonical;
+    }
+    if (i > 0 && !(selected_pairs[i - 1] < pair)) {
+      return SelectedDistancePairsValidation::kNotCanonical;
+    }
+  }
+  return SelectedDistancePairsValidation::kValid;
+}
+
+const char* selected_distance_pairs_validation_reason(
+    SelectedDistancePairsValidation validation) noexcept {
+  switch (validation) {
+    case SelectedDistancePairsValidation::kValid:
+      return "none";
+    case SelectedDistancePairsValidation::kMissing:
+      return "selected_distance_pairs_missing";
+    case SelectedDistancePairsValidation::kNotCanonical:
+      return "selected_distance_pairs_not_canonical";
+    case SelectedDistancePairsValidation::kModeInconsistent:
+      return "distance_request_mode_inconsistent";
+  }
+  return "distance_request_mode_inconsistent";
+}
+
+bool pair_is_selected(
+    const core::CollisionPairId& pair,
+    std::span<const core::CollisionPairId> selected_pairs) noexcept {
+  return std::binary_search(selected_pairs.begin(), selected_pairs.end(), pair);
+}
+
+core::CollisionDistanceRequestMode effective_distance_request_mode(
+    const core::CollisionQuery& query) noexcept {
+  return query.distance_request_mode;
+}
+
+void reset_distance_warm_start(coal::DistanceRequest& request) {
+  // Pinocchio enables Coal's mutable per-pair GJK warm start in GeometryData.
+  // Reusing that history makes an identical signed penetration depend on how
+  // many earlier samples one worker processed. Reset both hints before every
+  // policy-visible distance evaluation so independent workers start from the
+  // same deterministic support state.
+  request.cached_gjk_guess = coal::Vec3s(1.0, 0.0, 0.0);
+  request.cached_support_func_guess = coal::support_func_guess_t::Zero();
+}
+
+bool requests_distance_capability(const core::CollisionQuery& query) noexcept {
+  return std::find(query.required_capabilities.begin(),
+                   query.required_capabilities.end(),
+                   "distance") != query.required_capabilities.end() ||
+         std::find(query.required_capabilities.begin(),
+                   query.required_capabilities.end(),
+                   "penetration_depth") != query.required_capabilities.end();
 }
 
 std::map<std::string, core::CollisionBodyId> build_raw_to_body_map(
@@ -698,6 +748,11 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
   capability_.supported_geometry_kinds = {
       "box", "sphere", "cylinder", "triangle_mesh"};
   capability_.supports_distance_query = true;
+  capability_.supported_distance_request_modes = {
+      core::CollisionDistanceRequestMode::kNone,
+      core::CollisionDistanceRequestMode::kSelectedCollidingPairs,
+      core::CollisionDistanceRequestMode::kAllCollidingPairs,
+      core::CollisionDistanceRequestMode::kAllActivePairs};
   capability_.supports_contact_points = false;
   capability_.supports_penetration_depth = true;
   capability_.supports_continuous_collision = false;
@@ -736,6 +791,12 @@ const void* ManyForgeCollisionEngine::internal_prepared_scene_identity() const {
 
 std::uint64_t ManyForgeCollisionEngine::internal_prepared_scene_build_count() const {
   return scene_cache_->build_count.load(std::memory_order_acquire);
+}
+
+ManyForgeCollisionEngine::QueryMechanismCounters
+ManyForgeCollisionEngine::internal_last_query_mechanism_counters() const {
+  std::lock_guard<std::mutex> lock(scene_mutex_);
+  return last_query_mechanism_counters_;
 }
 
 core::RuntimeCollisionQueryPrepareStatus
@@ -853,6 +914,9 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
     }
     runtime_collision_observations_.clear();
     runtime_clearance_observations_.clear();
+    last_query_mechanism_counters_ = {};
+    last_query_mechanism_counters_.distance_request_mode =
+        request.distance_request_mode;
     auto finish = [&](core::RuntimeCollisionQueryStatus status,
                       core::RuntimeCollisionQueryFailureReason reason,
                       core::CollisionEngineStatus engine_status) {
@@ -861,6 +925,14 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
       result.clearance_pairs = runtime_clearance_observations_;
       return result;
     };
+    if (validate_selected_distance_pairs(request.distance_request_mode,
+                                         request.selected_distance_pairs) !=
+        SelectedDistancePairsValidation::kValid) {
+      return finish(
+          core::RuntimeCollisionQueryStatus::kInconclusive,
+          core::RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete,
+          core::CollisionEngineStatus::kDiagnosticIncomplete);
+    }
     if (!runtime_query_prepared_) {
       return finish(core::RuntimeCollisionQueryStatus::kInconclusive,
                     core::RuntimeCollisionQueryFailureReason::kUnsupported,
@@ -892,17 +964,33 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
           core::CollisionEngineStatus::kDiagnosticIncomplete);
     }
     const auto prepared_scene = active_prepared_scene_;
+    const bool distance_requested =
+        request.distance_request_mode !=
+        core::CollisionDistanceRequestMode::kNone;
     if (!prepared_scene || !active_collision_data_ ||
         prepared_scene->runtime_pair_bindings.size() !=
             prepared_scene->collision_model.collisionPairs.size() ||
         active_collision_data_->collisionResults.size() !=
             prepared_scene->collision_model.collisionPairs.size() ||
-        (request.require_distance &&
-         active_collision_data_->distanceResults.size() !=
-             prepared_scene->collision_model.collisionPairs.size())) {
+        (distance_requested &&
+         (active_collision_data_->distanceResults.size() !=
+              prepared_scene->collision_model.collisionPairs.size() ||
+          active_collision_data_->distanceRequests.size() !=
+              prepared_scene->collision_model.collisionPairs.size()))) {
       return finish(
           core::RuntimeCollisionQueryStatus::kInconclusive,
           core::RuntimeCollisionQueryFailureReason::kSnapshotInvalid,
+          core::CollisionEngineStatus::kDiagnosticIncomplete);
+    }
+
+    const auto pair_count =
+        prepared_scene->collision_model.collisionPairs.size();
+    if (runtime_collision_observations_.capacity() < pair_count ||
+        (distance_requested &&
+         runtime_clearance_observations_.capacity() < pair_count)) {
+      return finish(
+          core::RuntimeCollisionQueryStatus::kInconclusive,
+          core::RuntimeCollisionQueryFailureReason::kObservationCapacityExceeded,
           core::CollisionEngineStatus::kDiagnosticIncomplete);
     }
 
@@ -924,52 +1012,219 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
         prepared_scene->collision_model,
         *active_collision_data_, runtime_q_scratch_,
         /*stop_at_first_collision=*/false);
-    if (request.require_distance) {
-      for (auto& distance_request : active_collision_data_->distanceRequests) {
-        distance_request.enable_signed_distance = true;
+    last_query_mechanism_counters_.collision_api_call_count = 1;
+    last_query_mechanism_counters_
+        .collision_enumeration_completion_ordinal = 1;
+    last_query_mechanism_counters_.fk_placement_invocation_count = 1;
+
+    const auto pair_equal = [](const core::CollisionPairId& lhs,
+                               const core::CollisionPairId& rhs) {
+      return lhs == rhs;
+    };
+    const auto observation_less = [](const auto& lhs, const auto& rhs) {
+      return *lhs.pair < *rhs.pair;
+    };
+    auto find_collision_observation = [&](const core::CollisionPairId& pair) {
+      return std::find_if(
+          runtime_collision_observations_.begin(),
+          runtime_collision_observations_.end(), [&](const auto& observation) {
+            return observation.pair != nullptr &&
+                   pair_equal(*observation.pair, pair);
+          });
+    };
+    auto merge_finite_distance = [&](const core::CollisionPairId* pair,
+                                     double distance) {
+      if (pair == nullptr || !std::isfinite(distance)) {
+        return;
+      }
+      auto clearance = std::find_if(
+          runtime_clearance_observations_.begin(),
+          runtime_clearance_observations_.end(), [&](const auto& observation) {
+            return observation.pair != nullptr &&
+                   pair_equal(*observation.pair, *pair);
+          });
+      if (clearance == runtime_clearance_observations_.end()) {
+        runtime_clearance_observations_.push_back({pair, distance});
+      } else if (!clearance->signed_clearance_m ||
+                 distance < *clearance->signed_clearance_m) {
+        clearance->signed_clearance_m = distance;
+      }
+      auto collision = find_collision_observation(*pair);
+      if (collision != runtime_collision_observations_.end() &&
+          (!collision->signed_clearance_m ||
+           distance < *collision->signed_clearance_m)) {
+        collision->signed_clearance_m = distance;
+      }
+    };
+
+    // First materialize the complete colliding logical-pair set. Distance scope
+    // must never alter collision coverage.
+    for (std::size_t i = 0; i < pair_count; ++i) {
+      if (i >= active_collision_data_->activeCollisionPairs.size() ||
+          !active_collision_data_->activeCollisionPairs[i]) {
+        continue;
+      }
+      ++last_query_mechanism_counters_.active_collision_pair_count;
+      if (!active_collision_data_->collisionResults[i].isCollision()) {
+        continue;
+      }
+      ++last_query_mechanism_counters_.colliding_geometry_pair_count;
+      if (i >= prepared_scene->runtime_pair_bindings.size() ||
+          !prepared_scene->runtime_pair_bindings[i].mapped) {
+        return finish(
+            core::RuntimeCollisionQueryStatus::kInconclusive,
+            core::RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete,
+            core::CollisionEngineStatus::kDiagnosticIncomplete);
+      }
+      const auto* pair = &prepared_scene->runtime_pair_bindings[i].pair;
+      if (find_collision_observation(*pair) ==
+          runtime_collision_observations_.end()) {
+        runtime_collision_observations_.push_back({pair, std::nullopt});
+      }
+    }
+    std::sort(runtime_collision_observations_.begin(),
+              runtime_collision_observations_.end(), observation_less);
+    last_query_mechanism_counters_.colliding_logical_pair_count =
+        runtime_collision_observations_.size();
+    if (in_collision && runtime_collision_observations_.empty()) {
+      return finish(
+          core::RuntimeCollisionQueryStatus::kInconclusive,
+          core::RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete,
+          core::CollisionEngineStatus::kDiagnosticIncomplete);
+    }
+
+    if (request.distance_request_mode ==
+        core::CollisionDistanceRequestMode::kAllActivePairs) {
+      last_query_mechanism_counters_.first_distance_evaluation_ordinal = 2;
+      for (std::size_t i = 0; i < pair_count; ++i) {
+        if (i < active_collision_data_->activeCollisionPairs.size() &&
+            active_collision_data_->activeCollisionPairs[i]) {
+          reset_distance_warm_start(
+              active_collision_data_->distanceRequests[i]);
+          active_collision_data_->distanceRequests[i].enable_signed_distance =
+              true;
+        }
       }
       pinocchio::computeDistances(shared_model_->model, *reusable_model_data_,
                                   prepared_scene->collision_model,
                                   *active_collision_data_, runtime_q_scratch_);
-    }
+      last_query_mechanism_counters_.distance_api_call_count = 1;
+      ++last_query_mechanism_counters_.fk_placement_invocation_count;
 
-    const auto pair_count =
-        prepared_scene->collision_model.collisionPairs.size();
-    if (runtime_collision_observations_.capacity() < pair_count ||
-        (request.require_distance &&
-         runtime_clearance_observations_.capacity() < pair_count)) {
-      return finish(
-          core::RuntimeCollisionQueryStatus::kInconclusive,
-          core::RuntimeCollisionQueryFailureReason::kObservationCapacityExceeded,
-          core::CollisionEngineStatus::kDiagnosticIncomplete);
-    }
-    for (std::size_t i = 0; i < pair_count; ++i) {
-      if (i >= prepared_scene->runtime_pair_bindings.size() ||
-          !prepared_scene->runtime_pair_bindings[i].mapped) {
-        if (active_collision_data_->collisionResults[i].isCollision()) {
+      for (std::size_t i = 0; i < pair_count; ++i) {
+        if (i >= active_collision_data_->activeCollisionPairs.size() ||
+            !active_collision_data_->activeCollisionPairs[i]) {
+          continue;
+        }
+        ++last_query_mechanism_counters_
+              .distance_evaluated_geometry_pair_count;
+        if (i >= prepared_scene->runtime_pair_bindings.size() ||
+            !prepared_scene->runtime_pair_bindings[i].mapped) {
+          // Preserve the legacy runtime behavior: an unmapped non-colliding
+          // active distance pair is omitted, while any colliding pair already
+          // failed closed during complete collision materialization above.
+          continue;
+        }
+        const auto* pair = &prepared_scene->runtime_pair_bindings[i].pair;
+        bool first_logical_pair = true;
+        for (std::size_t prior = 0; prior < i; ++prior) {
+          if (prior < active_collision_data_->activeCollisionPairs.size() &&
+              active_collision_data_->activeCollisionPairs[prior] &&
+              prepared_scene->runtime_pair_bindings[prior].mapped &&
+              prepared_scene->runtime_pair_bindings[prior].pair == *pair) {
+            first_logical_pair = false;
+            break;
+          }
+        }
+        if (first_logical_pair) {
+          ++last_query_mechanism_counters_
+                .distance_evaluated_logical_pair_count;
+        }
+        merge_finite_distance(
+            pair, active_collision_data_->distanceResults[i].min_distance);
+      }
+    } else if (request.distance_request_mode ==
+                   core::CollisionDistanceRequestMode::kAllCollidingPairs ||
+               request.distance_request_mode ==
+                   core::CollisionDistanceRequestMode::kSelectedCollidingPairs) {
+      bool selected_distance_evidence_complete = true;
+      for (const auto& collision : runtime_collision_observations_) {
+        if (request.distance_request_mode ==
+                core::CollisionDistanceRequestMode::kAllCollidingPairs ||
+            pair_is_selected(*collision.pair,
+                             request.selected_distance_pairs)) {
+          ++last_query_mechanism_counters_
+                .distance_evaluated_logical_pair_count;
+        }
+      }
+      for (std::size_t i = 0; i < pair_count; ++i) {
+        if (i >= active_collision_data_->activeCollisionPairs.size() ||
+            !active_collision_data_->activeCollisionPairs[i] ||
+            !active_collision_data_->collisionResults[i].isCollision()) {
+          continue;
+        }
+        const auto& binding = prepared_scene->runtime_pair_bindings[i];
+        const bool selected =
+            request.distance_request_mode ==
+                core::CollisionDistanceRequestMode::kAllCollidingPairs ||
+            pair_is_selected(binding.pair, request.selected_distance_pairs);
+        if (!selected) {
+          continue;
+        }
+        if (last_query_mechanism_counters_.distance_api_call_count == 0) {
+          last_query_mechanism_counters_.first_distance_evaluation_ordinal = 2;
+        }
+        reset_distance_warm_start(
+            active_collision_data_->distanceRequests[i]);
+        active_collision_data_->distanceRequests[i].enable_signed_distance =
+            true;
+        auto& distance_result = pinocchio::computeDistance(
+            prepared_scene->collision_model, *active_collision_data_, i);
+        ++last_query_mechanism_counters_.distance_api_call_count;
+        ++last_query_mechanism_counters_
+              .distance_evaluated_geometry_pair_count;
+        detail::SelectedCollidingDistanceEvidence selected_evidence;
+        selected_evidence.observe(distance_result.min_distance);
+        if (!selected_evidence.complete ||
+            !selected_evidence.deepest_finite_m) {
+          selected_distance_evidence_complete = false;
+          continue;
+        }
+        merge_finite_distance(&binding.pair,
+                              *selected_evidence.deepest_finite_m);
+      }
+
+      if (!selected_distance_evidence_complete) {
+        for (auto& observation : runtime_collision_observations_) {
+          observation.signed_clearance_m.reset();
+        }
+        runtime_clearance_observations_.clear();
+        return finish(
+            core::RuntimeCollisionQueryStatus::kInconclusive,
+            core::RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete,
+            core::CollisionEngineStatus::kDiagnosticIncomplete);
+      }
+
+      // Every selected colliding geometry component must have contributed
+      // finite evidence; only then may the deepest logical metric be used.
+      for (const auto& collision : runtime_collision_observations_) {
+        const bool selected =
+            request.distance_request_mode ==
+                core::CollisionDistanceRequestMode::kAllCollidingPairs ||
+            pair_is_selected(*collision.pair,
+                             request.selected_distance_pairs);
+        if (selected &&
+            (!collision.signed_clearance_m ||
+             *collision.signed_clearance_m > 0.0)) {
           return finish(
               core::RuntimeCollisionQueryStatus::kInconclusive,
               core::RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete,
               core::CollisionEngineStatus::kDiagnosticIncomplete);
         }
-        continue;
-      }
-      const auto* pair =
-          &prepared_scene->runtime_pair_bindings[i].pair;
-      std::optional<double> clearance;
-      if (request.require_distance &&
-          i < active_collision_data_->distanceResults.size()) {
-        const double distance =
-            active_collision_data_->distanceResults[i].min_distance;
-        if (std::isfinite(distance)) {
-          clearance = distance;
-          runtime_clearance_observations_.push_back({pair, distance});
-        }
-      }
-      if (active_collision_data_->collisionResults[i].isCollision()) {
-        runtime_collision_observations_.push_back({pair, clearance});
       }
     }
+    std::sort(runtime_clearance_observations_.begin(),
+              runtime_clearance_observations_.end(), observation_less);
 
     const auto elapsed =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1161,6 +1416,11 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
     result.collision_world_revision = query.collision_world_revision;
   }
 
+  const auto distance_request_mode = effective_distance_request_mode(query);
+  last_query_mechanism_counters_ = {};
+  last_query_mechanism_counters_.distance_request_mode =
+      distance_request_mode;
+
   const auto t_start = std::chrono::steady_clock::now();
   auto finish_with_duration = [&]() {
     const auto t_end = std::chrono::steady_clock::now();
@@ -1168,6 +1428,29 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
         std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start)
             .count();
   };
+
+  const auto selected_pair_validation = validate_selected_distance_pairs(
+      distance_request_mode,
+      std::span<const core::CollisionPairId>(query.selected_distance_pairs));
+  if (selected_pair_validation != SelectedDistancePairsValidation::kValid) {
+    finish_with_duration();
+    result.engine_status = core::CollisionEngineStatus::kDiagnosticIncomplete;
+    result.decision = core::CollisionDecisionResult::kInconclusiveFail;
+    result.raw_diagnostics["distance_scope_error"] =
+        selected_distance_pairs_validation_reason(selected_pair_validation);
+    return result;
+  }
+  if (distance_request_mode ==
+          core::CollisionDistanceRequestMode::kNone &&
+      requests_distance_capability(query)) {
+    finish_with_duration();
+    result.engine_status = core::CollisionEngineStatus::kDiagnosticIncomplete;
+    result.decision = core::CollisionDecisionResult::kInconclusiveFail;
+    result.raw_diagnostics["distance_scope_error"] =
+        "distance or penetration_depth capability requires an explicit typed "
+        "distance request scope";
+    return result;
+  }
 
   for (const auto& capability : query.required_capabilities) {
     if (!supported_required_capability(capability, snapshot != nullptr)) {
@@ -1199,14 +1482,6 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
     }
     const Eigen::VectorXd& q = *q_opt;
 
-    const bool needs_distance =
-        std::find(query.required_capabilities.begin(),
-                  query.required_capabilities.end(),
-                  "distance") != query.required_capabilities.end() ||
-        std::find(query.required_capabilities.begin(),
-                  query.required_capabilities.end(),
-                  "penetration_depth") != query.required_capabilities.end();
-
     if (snapshot != nullptr) {
       if (!prepared_scene || !active_collision_data_) {
         finish_with_duration();
@@ -1217,23 +1492,34 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
             "snapshot collision model is not initialized";
         return result;
       }
+      const auto pair_count =
+          prepared_scene->collision_model.collisionPairs.size();
+      if (prepared_scene->runtime_pair_bindings.size() != pair_count ||
+          active_collision_data_->collisionResults.size() != pair_count ||
+          active_collision_data_->activeCollisionPairs.size() != pair_count ||
+          (distance_request_mode !=
+               core::CollisionDistanceRequestMode::kNone &&
+           (active_collision_data_->distanceResults.size() != pair_count ||
+            active_collision_data_->distanceRequests.size() != pair_count))) {
+        finish_with_duration();
+        result.engine_status =
+            core::CollisionEngineStatus::kDiagnosticIncomplete;
+        result.decision = core::CollisionDecisionResult::kInconclusiveFail;
+        result.raw_diagnostics["snapshot_sync_error"] =
+            "snapshot collision data is inconsistent with the prepared model";
+        return result;
+      }
       result.in_collision =
           pinocchio::computeCollisions(shared_model_->model,
                                        *reusable_model_data_,
                                        prepared_scene->collision_model,
                                        *active_collision_data_,
                                        q,
-                                       /* stop_at_first_collision */ !needs_distance);
-      if (needs_distance) {
-        for (auto& request : active_collision_data_->distanceRequests) {
-          request.enable_signed_distance = true;
-        }
-        pinocchio::computeDistances(shared_model_->model,
-                                    *reusable_model_data_,
-                                    prepared_scene->collision_model,
-                                    *active_collision_data_,
-                                    q);
-      }
+                                       /* stop_at_first_collision */ false);
+      last_query_mechanism_counters_.collision_api_call_count = 1;
+      last_query_mechanism_counters_
+          .collision_enumeration_completion_ordinal = 1;
+      last_query_mechanism_counters_.fk_placement_invocation_count = 1;
     } else {
       finish_with_duration();
       result.engine_status = core::CollisionEngineStatus::kDiagnosticIncomplete;
@@ -1249,130 +1535,239 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
       result.raw_diagnostics["cancel_reason"] = cancel->reason();
       return result;
     }
-    const auto& raw_to_body = prepared_scene->raw_to_body_map;
-    if (result.in_collision) {
-      std::vector<std::pair<std::string, std::string>> raw_pairs;
-      if (snapshot != nullptr) {
-        if (!needs_distance) {
-          // Re-run without early-exit to enumerate ALL colliding pairs for
-          // diagnostics — same reusable scratch, no second Data build.
-          pinocchio::computeCollisions(shared_model_->model,
-                                       *reusable_model_data_,
-                                       prepared_scene->collision_model,
-                                       *active_collision_data_,
-                                       q,
-                                       /* stop_at_first_collision */ false);
+
+    const auto pair_count =
+        prepared_scene->collision_model.collisionPairs.size();
+    auto raw_pair_description = [&](std::size_t pair_index) {
+      if (pair_index >= prepared_scene->collision_model.collisionPairs.size()) {
+        return std::string("invalid geometry pair index");
+      }
+      const auto& geometry_pair =
+          prepared_scene->collision_model.collisionPairs[pair_index];
+      if (geometry_pair.first >=
+              prepared_scene->collision_model.geometryObjects.size() ||
+          geometry_pair.second >=
+              prepared_scene->collision_model.geometryObjects.size()) {
+        return std::string("invalid geometry object index");
+      }
+      return prepared_scene->collision_model
+                 .geometryObjects[geometry_pair.first]
+                 .name +
+             " <-> " +
+             prepared_scene->collision_model
+                 .geometryObjects[geometry_pair.second]
+                 .name;
+    };
+
+    bool any_unknown_collision = false;
+    for (std::size_t pair_index = 0; pair_index < pair_count; ++pair_index) {
+      if (!active_collision_data_->activeCollisionPairs[pair_index]) {
+        continue;
+      }
+      ++last_query_mechanism_counters_.active_collision_pair_count;
+      if (!active_collision_data_->collisionResults[pair_index].isCollision()) {
+        continue;
+      }
+      ++last_query_mechanism_counters_.colliding_geometry_pair_count;
+      const auto& binding =
+          prepared_scene->runtime_pair_bindings[pair_index];
+      if (!binding.mapped) {
+        any_unknown_collision = true;
+        result.raw_diagnostics["unknown_collision_pairs"] +=
+            raw_pair_description(pair_index) + ";";
+        continue;
+      }
+      result.normalized_pairs.push_back(binding.pair);
+    }
+    std::sort(result.normalized_pairs.begin(), result.normalized_pairs.end());
+    result.normalized_pairs.erase(
+        std::unique(result.normalized_pairs.begin(),
+                    result.normalized_pairs.end()),
+        result.normalized_pairs.end());
+    last_query_mechanism_counters_.colliding_logical_pair_count =
+        result.normalized_pairs.size();
+    if (result.in_collision &&
+        last_query_mechanism_counters_.colliding_geometry_pair_count == 0) {
+      any_unknown_collision = true;
+      result.raw_diagnostics["collision_diagnostics_available"] = "false";
+    }
+    if (!result.normalized_pairs.empty()) {
+      result.contact_body_a = result.normalized_pairs.front().body_a;
+      result.contact_body_b = result.normalized_pairs.front().body_b;
+    }
+    if (any_unknown_collision) {
+      finish_with_duration();
+      result.engine_status = core::CollisionEngineStatus::kDiagnosticIncomplete;
+      result.decision = core::CollisionDecisionResult::kInconclusiveFail;
+      return result;
+    }
+
+    std::map<core::CollisionPairId, double> min_clearance_by_pair;
+    std::map<core::CollisionPairId,
+             detail::SelectedCollidingDistanceEvidence>
+        selected_distance_evidence_by_pair;
+    bool incomplete_distance_evidence = false;
+    if (distance_request_mode ==
+        core::CollisionDistanceRequestMode::kAllActivePairs) {
+      last_query_mechanism_counters_.first_distance_evaluation_ordinal = 2;
+      for (std::size_t pair_index = 0; pair_index < pair_count; ++pair_index) {
+        if (active_collision_data_->activeCollisionPairs[pair_index]) {
+          reset_distance_warm_start(
+              active_collision_data_->distanceRequests[pair_index]);
+          active_collision_data_->distanceRequests[pair_index]
+              .enable_signed_distance = true;
         }
-        raw_pairs = collision_pairs_from_geometry_data(
-            prepared_scene->collision_model, *active_collision_data_);
-      } else {
-        raw_pairs = {};
       }
-      if (cancel != nullptr && cancel->is_cancel_requested()) {
-        finish_with_duration();
-        result.engine_status = core::CollisionEngineStatus::kCancelled;
-        result.decision = core::CollisionDecisionResult::kInconclusiveFail;
-        result.raw_diagnostics["cancel_reason"] = cancel->reason();
-        return result;
-      }
-      bool any_unknown = raw_pairs.empty();
-      if (raw_pairs.empty()) {
-        result.raw_diagnostics["collision_diagnostics_available"] = "false";
-      }
-      for (const auto& [raw_a, raw_b] : raw_pairs) {
-        auto a = raw_to_body.find(raw_a);
-        auto b = raw_to_body.find(raw_b);
-        if (a == raw_to_body.end() || b == raw_to_body.end()) {
-          any_unknown = true;
-          result.raw_diagnostics["unknown_collision_pairs"] +=
-              raw_a + " <-> " + raw_b + ";";
+      pinocchio::computeDistances(shared_model_->model,
+                                  *reusable_model_data_,
+                                  prepared_scene->collision_model,
+                                  *active_collision_data_, q);
+      last_query_mechanism_counters_.distance_api_call_count = 1;
+      ++last_query_mechanism_counters_.fk_placement_invocation_count;
+      std::set<core::CollisionPairId> evaluated_logical_pairs;
+      for (std::size_t pair_index = 0; pair_index < pair_count; ++pair_index) {
+        if (!active_collision_data_->activeCollisionPairs[pair_index]) {
           continue;
         }
-        core::CollisionPairId pair{a->second, b->second};
-        if (pair.body_b < pair.body_a) {
-          std::swap(pair.body_a, pair.body_b);
+        ++last_query_mechanism_counters_
+              .distance_evaluated_geometry_pair_count;
+        const auto& binding =
+            prepared_scene->runtime_pair_bindings[pair_index];
+        if (!binding.mapped) {
+          incomplete_distance_evidence = true;
+          result.raw_diagnostics["unknown_distance_pairs"] +=
+              raw_pair_description(pair_index) + ";";
+          continue;
         }
-        result.normalized_pairs.push_back(std::move(pair));
+        evaluated_logical_pairs.insert(binding.pair);
+        const double distance =
+            active_collision_data_->distanceResults[pair_index].min_distance;
+        if (!std::isfinite(distance)) {
+          result.raw_diagnostics["nonfinite_distance_pairs"] +=
+              raw_pair_description(pair_index) + ";";
+          continue;
+        }
+        auto [it, inserted] =
+            min_clearance_by_pair.emplace(binding.pair, distance);
+        if (!inserted && distance < it->second) {
+          it->second = distance;
+        }
       }
-      std::sort(result.normalized_pairs.begin(), result.normalized_pairs.end());
-      result.normalized_pairs.erase(
-          std::unique(result.normalized_pairs.begin(),
-                      result.normalized_pairs.end()),
-          result.normalized_pairs.end());
-      if (!result.normalized_pairs.empty()) {
-        result.contact_body_a = result.normalized_pairs.front().body_a;
-        result.contact_body_b = result.normalized_pairs.front().body_b;
+      last_query_mechanism_counters_.distance_evaluated_logical_pair_count =
+          evaluated_logical_pairs.size();
+    } else if (
+        distance_request_mode ==
+            core::CollisionDistanceRequestMode::kAllCollidingPairs ||
+        distance_request_mode ==
+            core::CollisionDistanceRequestMode::kSelectedCollidingPairs) {
+      for (std::size_t pair_index = 0; pair_index < pair_count; ++pair_index) {
+        if (!active_collision_data_->activeCollisionPairs[pair_index] ||
+            !active_collision_data_->collisionResults[pair_index]
+                 .isCollision()) {
+          continue;
+        }
+        const auto& binding =
+            prepared_scene->runtime_pair_bindings[pair_index];
+        const bool selected =
+            distance_request_mode ==
+                core::CollisionDistanceRequestMode::kAllCollidingPairs ||
+            pair_is_selected(
+                binding.pair,
+                std::span<const core::CollisionPairId>(
+                    query.selected_distance_pairs));
+        if (!selected) {
+          continue;
+        }
+        if (cancel != nullptr && cancel->is_cancel_requested()) {
+          finish_with_duration();
+          result.engine_status = core::CollisionEngineStatus::kCancelled;
+          result.decision = core::CollisionDecisionResult::kInconclusiveFail;
+          result.raw_diagnostics["cancel_reason"] = cancel->reason();
+          return result;
+        }
+        if (last_query_mechanism_counters_.distance_api_call_count == 0) {
+          last_query_mechanism_counters_.first_distance_evaluation_ordinal = 2;
+        }
+        reset_distance_warm_start(
+            active_collision_data_->distanceRequests[pair_index]);
+        active_collision_data_->distanceRequests[pair_index]
+            .enable_signed_distance = true;
+        auto& distance_result = pinocchio::computeDistance(
+            prepared_scene->collision_model, *active_collision_data_,
+            pair_index);
+        ++last_query_mechanism_counters_.distance_api_call_count;
+        ++last_query_mechanism_counters_
+              .distance_evaluated_geometry_pair_count;
+        const double distance = distance_result.min_distance;
+        auto& selected_evidence =
+            selected_distance_evidence_by_pair[binding.pair];
+        selected_evidence.observe(distance);
+        if (!std::isfinite(distance)) {
+          incomplete_distance_evidence = true;
+          result.raw_diagnostics["nonfinite_distance_pairs"] +=
+              raw_pair_description(pair_index) + ";";
+          continue;
+        }
       }
-      if (any_unknown) {
-        finish_with_duration();
-        result.engine_status = core::CollisionEngineStatus::kDiagnosticIncomplete;
-        result.decision = core::CollisionDecisionResult::kInconclusiveFail;
-        return result;
+      for (const auto& [pair, evidence] :
+           selected_distance_evidence_by_pair) {
+        if (evidence.complete && evidence.deepest_finite_m) {
+          min_clearance_by_pair.emplace(pair, *evidence.deepest_finite_m);
+        }
+      }
+      for (const auto& pair : result.normalized_pairs) {
+        const bool selected =
+            distance_request_mode ==
+                core::CollisionDistanceRequestMode::kAllCollidingPairs ||
+            pair_is_selected(
+                pair, std::span<const core::CollisionPairId>(
+                          query.selected_distance_pairs));
+        if (!selected) {
+          continue;
+        }
+        ++last_query_mechanism_counters_
+              .distance_evaluated_logical_pair_count;
+        const auto aggregate =
+            selected_distance_evidence_by_pair.find(pair);
+        if (aggregate != selected_distance_evidence_by_pair.end() &&
+            !aggregate->second.complete) {
+          continue;
+        }
+        const auto evidence = min_clearance_by_pair.find(pair);
+        if (evidence == min_clearance_by_pair.end()) {
+          incomplete_distance_evidence = true;
+          result.raw_diagnostics["missing_selected_distance_pairs"] +=
+              pair.body_a + " <-> " + pair.body_b + ";";
+        } else if (evidence->second > 0.0) {
+          incomplete_distance_evidence = true;
+          result.raw_diagnostics["contradictory_selected_distance_pairs"] +=
+              pair.body_a + " <-> " + pair.body_b + ";";
+        }
       }
     }
-    if (needs_distance) {
-      bool any_unknown_distance = false;
-      std::map<core::CollisionPairId, double> min_clearance_by_pair;
-      const auto pair_count = std::min(
-          prepared_scene->collision_model.collisionPairs.size(),
-          active_collision_data_->distanceResults.size());
-      for (std::size_t pair_index = 0; pair_index < pair_count; ++pair_index) {
-        if (pair_index >= active_collision_data_->activeCollisionPairs.size() ||
-            !active_collision_data_->activeCollisionPairs[pair_index]) {
-          continue;
-        }
-        const auto& pair =
-            prepared_scene->collision_model.collisionPairs[pair_index];
-        if (pair.first >=
-                prepared_scene->collision_model.geometryObjects.size() ||
-            pair.second >=
-                prepared_scene->collision_model.geometryObjects.size()) {
-          continue;
-        }
-        const auto raw_a =
-            prepared_scene->collision_model.geometryObjects[pair.first].name;
-        const auto raw_b =
-            prepared_scene->collision_model.geometryObjects[pair.second].name;
-        auto a = raw_to_body.find(raw_a);
-        auto b = raw_to_body.find(raw_b);
-        if (a == raw_to_body.end() || b == raw_to_body.end()) {
-          any_unknown_distance = true;
-          result.raw_diagnostics["unknown_distance_pairs"] +=
-              raw_a + " <-> " + raw_b + ";";
-          continue;
-        }
-        const auto d = active_collision_data_->distanceResults[pair_index]
-                           .min_distance;
-        if (!std::isfinite(d)) {
-          result.raw_diagnostics["nonfinite_distance_pairs"] +=
-              raw_a + " <-> " + raw_b + ";";
-          continue;
-        }
-        core::CollisionPairId body_pair{a->second, b->second};
-        if (body_pair.body_b < body_pair.body_a) {
-          std::swap(body_pair.body_a, body_pair.body_b);
-        }
-        auto it = min_clearance_by_pair.find(body_pair);
-        if (it == min_clearance_by_pair.end() || d < it->second) {
-          min_clearance_by_pair[body_pair] = d;
-        }
+
+    for (const auto& [pair, distance] : min_clearance_by_pair) {
+      result.pair_clearances.push_back(core::CollisionPairClearance{
+          pair,
+          distance,
+      });
+      if (!result.min_clearance_m || distance < *result.min_clearance_m) {
+        result.min_clearance_m = distance;
+        result.min_clearance_pair = pair;
       }
-      for (const auto& [pair, distance] : min_clearance_by_pair) {
-        result.pair_clearances.push_back(core::CollisionPairClearance{
-            pair,
-            distance,
-        });
-        if (!result.min_clearance_m || distance < *result.min_clearance_m) {
-          result.min_clearance_m = distance;
-          result.min_clearance_pair = pair;
-        }
-      }
-      if (any_unknown_distance) {
-        finish_with_duration();
-        result.engine_status = core::CollisionEngineStatus::kDiagnosticIncomplete;
-        result.decision = core::CollisionDecisionResult::kInconclusiveFail;
-        return result;
-      }
+    }
+    if (cancel != nullptr && cancel->is_cancel_requested()) {
+      finish_with_duration();
+      result.engine_status = core::CollisionEngineStatus::kCancelled;
+      result.decision = core::CollisionDecisionResult::kInconclusiveFail;
+      result.raw_diagnostics["cancel_reason"] = cancel->reason();
+      return result;
+    }
+    if (incomplete_distance_evidence) {
+      finish_with_duration();
+      result.engine_status = core::CollisionEngineStatus::kDiagnosticIncomplete;
+      result.decision = core::CollisionDecisionResult::kInconclusiveFail;
+      return result;
     }
   } catch (const std::exception& exc) {
     finish_with_duration();
@@ -1578,12 +1973,10 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
 
   std::size_t index = 0;
   for (const auto& body : snapshot.bodies) {
-    if (body.geometries.size() != 1) {
-      return "manyforge_collision primitive scope requires exactly one geometry per body: " +
+    if (body.geometries.empty()) {
+      return "manyforge_collision requires at least one geometry per body: " +
              body.body_id;
     }
-    const auto& geom = body.geometries.front();
-    const std::string raw_name = sanitized_geometry_name(body.body_id, index++);
     std::string target_frame;
     if (body.owner_kind == core::CollisionOwnerKind::kRobotLink) {
       target_frame = robot_link_from_collision_body_id(body.body_id).value_or("");
@@ -1599,114 +1992,116 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
              body.body_id;
     }
 
-    std::shared_ptr<coal::CollisionGeometry> shape;
-    switch (geom.geometry_kind) {
-      case core::CollisionGeometryKind::kBox: {
-        if (!geom.box_dimensions_m) {
-          return "box geometry missing dimensions: " + body.body_id;
-        }
-        shape = std::make_shared<coal::Box>(geom.box_dimensions_m->x_m,
-                                                geom.box_dimensions_m->y_m,
-                                                geom.box_dimensions_m->z_m);
-        break;
-      }
-      case core::CollisionGeometryKind::kSphere: {
-        if (!geom.sphere_radius_m) {
-          return "sphere geometry missing radius: " + body.body_id;
-        }
-        shape = std::make_shared<coal::Sphere>(*geom.sphere_radius_m);
-        break;
-      }
-      case core::CollisionGeometryKind::kCylinder: {
-        if (!geom.cylinder_radius_m || !geom.cylinder_height_m) {
-          return "cylinder geometry missing dimensions: " + body.body_id;
-        }
-        shape = std::make_shared<coal::Cylinder>(*geom.cylinder_radius_m,
-                                                     *geom.cylinder_height_m);
-        break;
-      }
-      case core::CollisionGeometryKind::kTriangleMesh: {
-        if (!geom.source_uri || geom.source_uri->empty()) {
-          return "triangle mesh geometry missing source_uri: " + body.body_id;
-        }
-        const Eigen::Vector3d scale = effective_mesh_scale(geom.mesh_scale);
-        if (!(scale.array().isFinite()).all() ||
-            !(scale.array() > 0.0).all()) {
-          return "triangle mesh geometry has invalid mesh_scale: " +
-                 body.body_id;
-        }
-        const auto cache_key = mesh_cache_key(*geom.source_uri, scale);
-        {
-          std::lock_guard<std::mutex> cache_lock(
-              scene_cache_->mesh_cache_mutex);
-          auto cached = scene_cache_->mesh_geometry_cache.find(cache_key);
-          if (cached != scene_cache_->mesh_geometry_cache.end()) {
-            shape = cached->second;
-          } else {
-            if (!allow_resource_io) {
-              return "runtime snapshot references an unprepared triangle mesh: " +
-                     body.body_id;
-            }
-            if (scene_cache_->mesh_geometry_cache.size() >=
-                capability_.runtime_query_max_world_bodies) {
-              return "prepared triangle-mesh cache exceeds qualified body bound";
-            }
-            std::string mesh_error;
-            auto mesh_path = resolve_mesh_resource_uri(
-                *geom.source_uri, shared_model_->package_paths, mesh_error);
-            if (!mesh_path) {
-              return "triangle mesh geometry could not resolve source_uri for " +
-                     body.body_id + ": " + mesh_error;
-            }
-            coal::MeshLoader loader;
-            auto mesh = loader.load(mesh_path->string(), scale);
-            if (!mesh) {
-              return "triangle mesh loader returned null for " + body.body_id +
-                     ": " + mesh_path->string();
-            }
-            shape = std::move(mesh);
-            scene_cache_->mesh_geometry_cache[cache_key] = shape;
+    for (const auto& geom : body.geometries) {
+      const std::string raw_name =
+          sanitized_geometry_name(body.body_id, index++);
+      std::shared_ptr<coal::CollisionGeometry> shape;
+      switch (geom.geometry_kind) {
+        case core::CollisionGeometryKind::kBox: {
+          if (!geom.box_dimensions_m) {
+            return "box geometry missing dimensions: " + body.body_id;
           }
+          shape = std::make_shared<coal::Box>(
+              geom.box_dimensions_m->x_m, geom.box_dimensions_m->y_m,
+              geom.box_dimensions_m->z_m);
+          break;
         }
-        break;
+        case core::CollisionGeometryKind::kSphere: {
+          if (!geom.sphere_radius_m) {
+            return "sphere geometry missing radius: " + body.body_id;
+          }
+          shape = std::make_shared<coal::Sphere>(*geom.sphere_radius_m);
+          break;
+        }
+        case core::CollisionGeometryKind::kCylinder: {
+          if (!geom.cylinder_radius_m || !geom.cylinder_height_m) {
+            return "cylinder geometry missing dimensions: " + body.body_id;
+          }
+          shape = std::make_shared<coal::Cylinder>(
+              *geom.cylinder_radius_m, *geom.cylinder_height_m);
+          break;
+        }
+        case core::CollisionGeometryKind::kTriangleMesh: {
+          if (!geom.source_uri || geom.source_uri->empty()) {
+            return "triangle mesh geometry missing source_uri: " +
+                   body.body_id;
+          }
+          const Eigen::Vector3d scale = effective_mesh_scale(geom.mesh_scale);
+          if (!(scale.array().isFinite()).all() ||
+              !(scale.array() > 0.0).all()) {
+            return "triangle mesh geometry has invalid mesh_scale: " +
+                   body.body_id;
+          }
+          const auto cache_key = mesh_cache_key(*geom.source_uri, scale);
+          {
+            std::lock_guard<std::mutex> cache_lock(
+                scene_cache_->mesh_cache_mutex);
+            auto cached = scene_cache_->mesh_geometry_cache.find(cache_key);
+            if (cached != scene_cache_->mesh_geometry_cache.end()) {
+              shape = cached->second;
+            } else {
+              if (!allow_resource_io) {
+                return "runtime snapshot references an unprepared triangle "
+                       "mesh: " +
+                       body.body_id;
+              }
+              if (scene_cache_->mesh_geometry_cache.size() >=
+                  capability_.runtime_query_max_world_bodies) {
+                return "prepared triangle-mesh cache exceeds qualified body "
+                       "bound";
+              }
+              std::string mesh_error;
+              auto mesh_path = resolve_mesh_resource_uri(
+                  *geom.source_uri, shared_model_->package_paths, mesh_error);
+              if (!mesh_path) {
+                return "triangle mesh geometry could not resolve source_uri "
+                       "for " +
+                       body.body_id + ": " + mesh_error;
+              }
+              coal::MeshLoader loader;
+              auto mesh = loader.load(mesh_path->string(), scale);
+              if (!mesh) {
+                return "triangle mesh loader returned null for " +
+                       body.body_id + ": " + mesh_path->string();
+              }
+              shape = std::move(mesh);
+              scene_cache_->mesh_geometry_cache[cache_key] = shape;
+            }
+          }
+          break;
+        }
+        case core::CollisionGeometryKind::kCapsule:
+        case core::CollisionGeometryKind::kConvexMesh:
+        case core::CollisionGeometryKind::kCompound:
+          return "unsupported scene geometry kind for manyforge_collision: " +
+                 body.body_id;
       }
-      case core::CollisionGeometryKind::kCapsule:
-      case core::CollisionGeometryKind::kConvexMesh:
-      case core::CollisionGeometryKind::kCompound:
-        return "unsupported scene geometry kind for manyforge_collision: " +
-               body.body_id;
-    }
 
-    std::optional<pinocchio::GeometryObject> object;
-    if (target_frame != "universe") {
-      if (!shared_model_->model.existFrame(target_frame)) {
-        return "target frame not present in model: " + target_frame +
-               " for body " + body.body_id;
+      std::optional<pinocchio::GeometryObject> object;
+      if (target_frame != "universe") {
+        if (!shared_model_->model.existFrame(target_frame)) {
+          return "target frame not present in model: " + target_frame +
+                 " for body " + body.body_id;
+        }
+        const auto frame_id = shared_model_->model.getFrameId(target_frame);
+        const auto& frame = shared_model_->model.frames[frame_id];
+        const auto frame_relative_placement =
+            body.owner_kind == core::CollisionOwnerKind::kRobotLink
+                ? pose_to_se3(geom.local_pose)
+                : compose_pose_to_se3(body.pose, geom.local_pose);
+        const auto placement = frame.placement * frame_relative_placement;
+        object.emplace(raw_name, frame.parentJoint, frame_id, placement, shape);
+      } else {
+        const pinocchio::SE3 body_geometry_in_model =
+            model_from_world * compose_pose_to_se3(body.pose, geom.local_pose);
+        object.emplace(raw_name, pinocchio::JointIndex(0),
+                       pinocchio::FrameIndex(0), body_geometry_in_model, shape);
       }
-      const auto frame_id = shared_model_->model.getFrameId(target_frame);
-      const auto& frame = shared_model_->model.frames[frame_id];
-      const auto frame_relative_placement =
-          body.owner_kind == core::CollisionOwnerKind::kRobotLink
-              ? pose_to_se3(geom.local_pose)
-              : compose_pose_to_se3(body.pose, geom.local_pose);
-      const auto placement = frame.placement * frame_relative_placement;
-      object.emplace(raw_name,
-                     frame.parentJoint,
-                     frame_id,
-                     placement,
-                     shape);
-    } else {
-      const pinocchio::SE3 body_geometry_in_model =
-          model_from_world * compose_pose_to_se3(body.pose, geom.local_pose);
-      object.emplace(raw_name,
-                     pinocchio::JointIndex(0),
-                     pinocchio::FrameIndex(0),
-                     body_geometry_in_model,
-                     shape);
+      prepared->collision_model.addGeometryObject(*object,
+                                                  shared_model_->model);
+      prepared->scene_geometry_names.push_back(raw_name);
+      prepared->raw_name_to_body_id[raw_name] = body.body_id;
     }
-    prepared->collision_model.addGeometryObject(*object, shared_model_->model);
-    prepared->scene_geometry_names.push_back(raw_name);
-    prepared->raw_name_to_body_id[raw_name] = body.body_id;
   }
 
   std::map<std::string, std::size_t> synced_index_by_name;
@@ -1734,6 +2129,11 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
     for (; it_b != synced_index_by_name.end(); ++it_b) {
       auto body_b = prepared->raw_name_to_body_id.find(it_b->first);
       if (body_b == prepared->raw_name_to_body_id.end()) {
+        continue;
+      }
+      if (body_a->second == body_b->second) {
+        // Geometry elements belonging to one logical collision body are a
+        // compound shape, not a policy-visible self-collision pair.
         continue;
       }
       const bool a_motion_relevant =

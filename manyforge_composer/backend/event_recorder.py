@@ -221,6 +221,7 @@ _KERNEL_NATIVE_CHANNEL_LIMIT = 2000
 _KERNEL_NATIVE_ERROR_TYPES = {
     "error_raised",
     "collision_detected",
+    "contact_policy_violation",
     "motion_trip_failed",
 }
 _KERNEL_NATIVE_WARN_TYPES = {

@@ -45,6 +45,11 @@ void expect_line_valid(const std::string& line) {
   EXPECT_EQ(line.back(), '}');
 }
 
+TEST(KernelFlightRecorderTest, ContactPolicyViolationTypeNameIsStable) {
+  EXPECT_STREQ(kernel_event_type_name(KernelEventType::kContactPolicyViolation),
+               "contact_policy_violation");
+}
+
 TEST(KernelFlightRecorderTest, RingWrapsKeepingNewestRecords) {
   KernelFlightRecorder recorder;
   const auto total = KernelFlightRecorder::kCapacity + 88;

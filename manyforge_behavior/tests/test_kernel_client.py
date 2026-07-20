@@ -386,6 +386,128 @@ class TestMockKernelSceneEdit:
         assert result.success is False
         assert result.error == "support_contacts[0].allow_recontact must be boolean"
 
+    def test_scene_edit_accepts_binary_contact_release_evidence(self, kernel):
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                support_contacts=[
+                    {
+                        "support_object_id": "table",
+                        "release_evidence_mode": "binary_contact",
+                        "require_separation_by_end": True,
+                    }
+                ],
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+        )
+
+        assert result.success
+        assert kernel.scene_edits[0].support_contacts[0][
+            "release_evidence_mode"
+        ] == "binary_contact"
+
+    def test_scene_edit_rejects_removed_support_contact_clearance_field(self, kernel):
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                support_contacts=[
+                    {
+                        "support_object_id": "table",
+                        "min_separation_clearance_m": 0.0,
+                    }
+                ],
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+        )
+
+        assert result.success is False
+        assert "contains unknown fields: min_separation_clearance_m" in result.error
+
+    def test_scene_edit_accepts_bounded_penetration_contact(self, kernel):
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="insert",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                support_contacts=[
+                    {
+                        "support_object_id": "fixture",
+                        "mode": "bounded_penetration",
+                        "max_contact_penetration_m": 0.001,
+                    }
+                ],
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+        )
+
+        assert result.success
+        assert kernel.scene_edits[0].support_contacts[0] == {
+            "support_object_id": "fixture",
+            "mode": "bounded_penetration",
+            "max_contact_penetration_m": 0.001,
+        }
+
+    def test_scene_edit_rejects_release_field_for_bounded_penetration(self, kernel):
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="insert",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                support_contacts=[
+                    {
+                        "support_object_id": "fixture",
+                        "mode": "bounded_penetration",
+                        "max_contact_penetration_m": 0.001,
+                        "allow_recontact": True,
+                    }
+                ],
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+        )
+
+        assert result.success is False
+        assert result.error == (
+            "support_contacts[0] fields are valid only for contact_release: "
+            "allow_recontact"
+        )
+
+    def test_scene_edit_rejects_metric_constraint_for_binary_contact(self, kernel):
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                support_contacts=[
+                    {
+                        "support_object_id": "table",
+                        "release_evidence_mode": "binary_contact",
+                        "require_strictly_decreasing_penetration": True,
+                    }
+                ],
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+        )
+
+        assert result.success is False
+        assert result.error == (
+            "support_contacts[0].require_strictly_decreasing_penetration "
+            "must be false for binary_contact"
+        )
+
     def test_scene_edit_rejects_partial_pose_source_freshness_metadata(self, kernel):
         result = kernel.scene_edit(
             SceneEditRequest(

@@ -250,6 +250,8 @@ class CollisionValidationCoordinator {
       std::optional<std::int64_t> time_from_start_ns,
       const CollisionWorldRevision& borrowed_revision);
 
+  void prepare_distance_selection(const CollisionWorldSnapshot& snapshot);
+
   void apply_contact_release_constraints(
       const TrajectoryDTO& trajectory,
       CollisionValidationDecisionBundle& bundle,
@@ -275,6 +277,9 @@ class CollisionValidationCoordinator {
   ClockNow clock_now_;
   std::string policy_revision_string_;
   std::vector<std::string> required_capabilities_;
+  CollisionDistanceRequestMode distance_request_mode_ =
+      CollisionDistanceRequestMode::kNone;
+  std::vector<CollisionPairId> selected_distance_pairs_;
 };
 
 }  // namespace manyforge::core

@@ -7,13 +7,13 @@ BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build/asan-core}"
 PARALLEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 GTEST_TIMEOUT_SECONDS="${MANYFORGE_ASAN_GTEST_TIMEOUT_SECONDS:-300}"
 
-ASAN_OPTIONS="${ASAN_OPTIONS:-halt_on_error=1 detect_leaks=1}"
+ASAN_OPTIONS="${ASAN_OPTIONS:-halt_on_error=1:detect_leaks=1}"
 if [[ "${ASAN_OPTIONS}" != *"exitcode="* ]]; then
   ASAN_OPTIONS="${ASAN_OPTIONS}:exitcode=66"
 fi
 export ASAN_OPTIONS
 
-UBSAN_OPTIONS="${UBSAN_OPTIONS:-halt_on_error=1 print_stacktrace=1}"
+UBSAN_OPTIONS="${UBSAN_OPTIONS:-halt_on_error=1:print_stacktrace=1}"
 if [[ "${UBSAN_OPTIONS}" != *"exitcode="* ]]; then
   UBSAN_OPTIONS="${UBSAN_OPTIONS}:exitcode=66"
 fi
@@ -30,4 +30,6 @@ cmake \
   -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
 
 cmake --build "${BUILD_DIR}" --parallel "${PARALLEL}"
-ctest --test-dir "${BUILD_DIR}" --output-on-failure
+python3 "${SCRIPT_DIR}/run-ctest-gtest-binaries-grouped.py" \
+  --build-dir "${BUILD_DIR}" \
+  --summary-prefix CORE_ASAN_UBSAN

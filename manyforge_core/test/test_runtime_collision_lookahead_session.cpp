@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -39,6 +40,13 @@ class TestLookaheadEngine final : public ICollisionQueryEngine {
     capability_.engine_id = "lookahead_test";
     capability_.engine_version = "test";
     capability_.library_lineage = "unit_test";
+    capability_.supports_distance_query = true;
+    capability_.supported_distance_request_modes = {
+        CollisionDistanceRequestMode::kNone,
+        CollisionDistanceRequestMode::kSelectedCollidingPairs,
+        CollisionDistanceRequestMode::kAllCollidingPairs,
+        CollisionDistanceRequestMode::kAllActivePairs};
+    capability_.supports_penetration_depth = true;
     capability_.thread_safety = CollisionEngineThreadSafetyClass::kSingleContextExclusive;
     capability_.mutable_context_id = std::move(context_id);
     capability_.deterministic_ordering = true;
@@ -59,8 +67,10 @@ class TestLookaheadEngine final : public ICollisionQueryEngine {
     if (clock_to_advance != nullptr && simulated_query_duration_ns > 0) {
       clock_to_advance->advance(simulated_query_duration_ns);
     }
-    if (forced_result.has_value()) {
-      auto result = *forced_result;
+    auto selected_result =
+        result_for_query ? result_for_query(query) : forced_result;
+    if (selected_result.has_value()) {
+      auto result = *selected_result;
       result.query_id = query.query_id;
       result.surface = query.surface;
       result.state_time_ns = query.state_time_ns;
@@ -114,6 +124,8 @@ class TestLookaheadEngine final : public ICollisionQueryEngine {
   CollisionPairId collision_pair{"robot", "obstacle"};
   double collision_clearance_m = -0.001;
   std::optional<CollisionResult> forced_result;
+  std::function<std::optional<CollisionResult>(const CollisionQuery&)>
+      result_for_query;
   std::function<void()> on_check;
   std::atomic<std::uint64_t> prepare_calls{0};
   std::atomic<std::uint64_t> check_calls{0};
@@ -148,6 +160,98 @@ RuntimeCollisionQueryBundlePtr make_bundle(std::uint64_t epoch, std::uint64_t re
   policy.policy_id = "free";
   policy.revision = {1, "policy"};
   return make_bundle(epoch, revision, std::move(policy));
+}
+
+RuntimeCollisionQueryBundlePtr with_contact_grasp_world_bodies(
+    RuntimeCollisionQueryBundlePtr source) {
+  auto bundle = std::make_shared<RuntimeCollisionQueryBundle>(*source);
+  auto world = std::make_shared<CollisionWorldSnapshot>(*source->world);
+  CollisionWorldBody object;
+  object.body_id = "object/part/shape/0";
+  CollisionWorldBody finger;
+  finger.body_id = "robot/arm/link/finger_left/collision/0";
+  world->bodies = {std::move(object), std::move(finger)};
+  world->body_count = static_cast<std::int64_t>(world->bodies.size());
+  bundle->world = std::move(world);
+  return bundle;
+}
+
+CollisionResult support_contact_result(const CollisionPairId& pair,
+                                       double signed_clearance_m) {
+  CollisionResult result;
+  result.in_collision = true;
+  result.normalized_pairs = {pair};
+  result.pair_clearances = {{pair, signed_clearance_m}};
+  result.min_clearance_m = signed_clearance_m;
+  result.min_clearance_pair = pair;
+  result.engine_status = CollisionEngineStatus::kOk;
+  result.decision = CollisionDecisionResult::kFail;
+  return result;
+}
+
+RuntimeContactReleaseStateSnapshot active_contact_release_state(
+    const RuntimeCollisionQueryBundlePtr& bundle, double depth_m) {
+  RuntimeContactReleaseStateSnapshot snapshot;
+  snapshot.valid = bundle && bundle->policy_index &&
+                   bundle->policy_index->support_contact_index.size() == 1;
+  if (!snapshot.valid) {
+    return snapshot;
+  }
+  snapshot.binding_owner = bundle;
+  snapshot.count = 1;
+  auto& entry = snapshot.entries[0];
+  entry.pair = &bundle->policy_index->support_contact_index.begin()->first;
+  entry.support_state = SupportContactEvaluationState::kContactActive;
+  entry.release_state.initialized = true;
+  entry.release_state.started_in_contact = true;
+  entry.release_state.in_contact = true;
+  entry.release_state.initial_depth_m = depth_m;
+  entry.release_state.previous_depth_m = depth_m;
+  entry.release_state.best_depth_m = depth_m;
+  return snapshot;
+}
+
+RuntimeContactReleaseStateSnapshot clear_contact_release_state(
+    const RuntimeCollisionQueryBundlePtr& bundle) {
+  RuntimeContactReleaseStateSnapshot snapshot;
+  snapshot.valid = bundle && bundle->policy_index &&
+                   bundle->policy_index->support_contact_index.size() == 1;
+  if (!snapshot.valid) {
+    return snapshot;
+  }
+  snapshot.binding_owner = bundle;
+  snapshot.count = 1;
+  auto& entry = snapshot.entries[0];
+  entry.pair = &bundle->policy_index->support_contact_index.begin()->first;
+  entry.support_state = SupportContactEvaluationState::kNotInContact;
+  entry.release_state.initialized = true;
+  entry.release_state.started_in_contact = false;
+  entry.release_state.in_contact = false;
+  return snapshot;
+}
+
+RuntimeContactReleaseStateSnapshot separated_contact_release_state(
+    const RuntimeCollisionQueryBundlePtr& bundle, double initial_depth_m,
+    double previous_depth_m) {
+  RuntimeContactReleaseStateSnapshot snapshot;
+  snapshot.valid = bundle && bundle->policy_index &&
+                   bundle->policy_index->support_contact_index.size() == 1;
+  if (!snapshot.valid) {
+    return snapshot;
+  }
+  snapshot.binding_owner = bundle;
+  snapshot.count = 1;
+  auto& entry = snapshot.entries[0];
+  entry.pair = &bundle->policy_index->support_contact_index.begin()->first;
+  entry.support_state = SupportContactEvaluationState::kSeparated;
+  entry.release_state.initialized = true;
+  entry.release_state.started_in_contact = true;
+  entry.release_state.in_contact = false;
+  entry.release_state.separated = true;
+  entry.release_state.initial_depth_m = initial_depth_m;
+  entry.release_state.previous_depth_m = previous_depth_m;
+  entry.release_state.best_depth_m = 0.0;
+  return snapshot;
 }
 
 RuntimeCollisionQueryBundlePtr make_dynamic_bundle(
@@ -234,8 +338,10 @@ TrajectoryDTO dense_trajectory(std::size_t waypoint_count,
   return value;
 }
 
-bool request_until_started(RuntimeCollisionLookaheadSession& session, FakeClock& clock,
-                           TestPublisher& publisher) {
+bool request_until_started(
+    RuntimeCollisionLookaheadSession& session, FakeClock& clock,
+    TestPublisher& publisher,
+    const RuntimeContactReleaseStateSnapshot& contact_state = {}) {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (std::chrono::steady_clock::now() < deadline) {
     const auto status = session.status();
@@ -243,7 +349,9 @@ bool request_until_started(RuntimeCollisionLookaheadSession& session, FakeClock&
       return true;
     }
     if (!status.permit_pending) {
-      session.request(clock.now(), publisher.published_runtime_collision_query_bundle(), {});
+      session.request(clock.now(),
+                      publisher.published_runtime_collision_query_bundle(),
+                      contact_state);
     }
     // request() is non-blocking by contract. If its try-lock races the worker
     // parking, the next immediate clear tick retries the latest request instead
@@ -251,6 +359,82 @@ bool request_until_started(RuntimeCollisionLookaheadSession& session, FakeClock&
     std::this_thread::yield();
   }
   return false;
+}
+
+RuntimeCollisionLookaheadResult run_bounded_handoff_case(
+    double final_penetration_m) {
+  const CollisionPairId pair{"gripper", "object"};
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  CollisionPolicySnapshot policy;
+  policy.policy_id = "bounded-lookahead-handoff";
+  policy.revision = {10, "bounded-lookahead-handoff"};
+  SupportContactPolicyEntry bounded;
+  bounded.pair = pair;
+  bounded.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  bounded.enforce_max_start_penetration = false;
+  bounded.max_start_penetration_m = 0.0;
+  bounded.release_tolerance_m = 0.0;
+  bounded.min_release_progress_m = 0.0;
+  bounded.max_contact_penetration_m = 0.005;
+  bounded.require_separation_by_end = false;
+  bounded.require_strictly_decreasing_penetration = false;
+  bounded.allow_recontact = false;
+  policy.support_contacts.push_back(bounded);
+  publisher.bundle = make_bundle(1, 10, std::move(policy));
+
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  EXPECT_TRUE(progress.publish(3, 0, clock.now(), clock.now()).published);
+
+  auto engine =
+      std::make_shared<TestLookaheadEngine>("bounded-lookahead-handoff");
+  const std::array<std::optional<double>, 4> penetration_by_waypoint{
+      0.003, std::nullopt, 0.002, final_penetration_m};
+  engine->result_for_query =
+      [pair, penetration_by_waypoint](const CollisionQuery& query)
+      -> std::optional<CollisionResult> {
+    if (!query.waypoint_index.has_value() || *query.waypoint_index < 0 ||
+        static_cast<std::size_t>(*query.waypoint_index) >=
+            penetration_by_waypoint.size()) {
+      return std::nullopt;
+    }
+    const auto depth = penetration_by_waypoint[static_cast<std::size_t>(
+        *query.waypoint_index)];
+    if (!depth.has_value()) {
+      return std::nullopt;
+    }
+    return support_contact_result(pair, -*depth);
+  };
+
+  ResultSink sink;
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  config.horizon_ns = 400'000'000;
+  config.max_samples = 4;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&sink](const RuntimeCollisionLookaheadSession*,
+              RuntimeCollisionLookaheadResult result) {
+        sink.push(std::move(result));
+      },
+      accept_test_authority());
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+
+  // This is the state an immediate RuntimeCollisionQuerySession publishes
+  // after its first clear bounded-contact tick. Any configured allowed pair
+  // may first appear later, disappear, reappear, and remain at the end while
+  // under the cap; bounded mode has no initial-set or recontact restriction.
+  const auto entering_state = clear_contact_release_state(publisher.bundle);
+  EXPECT_TRUE(entering_state.valid);
+  if (!request_until_started(session, clock, publisher, entering_state)) {
+    ADD_FAILURE() << "bounded lookahead handoff request did not start";
+    return {};
+  }
+  return sink.wait();
 }
 
 TEST(RuntimeCollisionLookaheadSelectionTest,
@@ -463,6 +647,187 @@ TEST(RuntimeCollisionLookaheadSessionTest, MapsEarliestFailureBackToOriginalTraj
   ASSERT_TRUE(result.first_failing_pair.has_value());
   EXPECT_EQ(result.first_failing_pair->body_a, "obstacle");
   EXPECT_EQ(result.first_failing_pair->body_b, "robot");
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     EnforcesAuthoredReleaseEndOnlyWhenSelectionReachesTrajectoryEnd) {
+  const CollisionPairId pair{"gripper", "object"};
+  auto run_case = [&](std::int64_t cursor_time_ns,
+                      std::int64_t horizon_ns) {
+    FakeClock clock;
+    clock.set(1'000'000'000);
+    ManualScheduler scheduler;
+    TestPublisher publisher;
+    CollisionPolicySnapshot policy;
+    policy.policy_id = "contact-release";
+    policy.revision = {8, "lookahead-release-end"};
+    SupportContactPolicyEntry release;
+    release.pair = pair;
+    release.max_start_penetration_m = 0.01;
+    release.require_separation_by_end = true;
+    release.require_strictly_decreasing_penetration = false;
+    policy.support_contacts.push_back(release);
+    publisher.bundle = make_bundle(1, 10, std::move(policy));
+
+    ExecutionProgressPublication progress(
+        ExecutionProgressSourceKind::kBackendCommanded,
+        ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+    EXPECT_TRUE(progress.publish(3, cursor_time_ns, clock.now(), clock.now())
+                    .published);
+    auto engine =
+        std::make_shared<TestLookaheadEngine>("lookahead-release-end");
+    engine->forced_result = support_contact_result(pair, -0.004);
+    ResultSink sink;
+    RuntimeCollisionLookaheadSession::Config config;
+    config.workers = 1;
+    config.horizon_ns = horizon_ns;
+    config.max_samples = 2;
+    RuntimeCollisionLookaheadSession session(
+        config, clock, scheduler, publisher, progress, {engine},
+        [&sink](const RuntimeCollisionLookaheadSession*,
+                RuntimeCollisionLookaheadResult result) {
+          sink.push(std::move(result));
+        },
+        accept_test_authority());
+    session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()),
+                "");
+    const auto contact_state =
+        active_contact_release_state(publisher.bundle, 0.004);
+    EXPECT_TRUE(contact_state.valid);
+    if (!request_until_started(session, clock, publisher, contact_state)) {
+      ADD_FAILURE() << "lookahead request did not start";
+      return RuntimeCollisionLookaheadResult{};
+    }
+    return sink.wait();
+  };
+
+  const auto prefix = run_case(/*cursor_time_ns=*/0,
+                               /*horizon_ns=*/150'000'000);
+  EXPECT_EQ(prefix.termination,
+            RuntimeCollisionLookaheadTermination::kTimeHorizon);
+  EXPECT_EQ(prefix.status, RuntimeCollisionLookaheadResultStatus::kClear);
+
+  const auto terminal = run_case(/*cursor_time_ns=*/300'000'000,
+                                 /*horizon_ns=*/150'000'000);
+  EXPECT_EQ(terminal.termination,
+            RuntimeCollisionLookaheadTermination::kTrajectoryEnd);
+  EXPECT_EQ(terminal.status,
+            RuntimeCollisionLookaheadResultStatus::kCollision);
+  EXPECT_EQ(terminal.reason, "runtime_lookahead_collision");
+  const auto terminal_violation = terminal.failure_details.find(
+      "collision_result_contact_release_violation");
+  ASSERT_NE(terminal_violation, terminal.failure_details.end());
+  EXPECT_EQ(terminal_violation->second, "final_sample_not_separated");
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     TransfersEnteringSeparatedStateAndRejectsFutureRecontact) {
+  const CollisionPairId pair{"gripper", "object"};
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  CollisionPolicySnapshot policy;
+  policy.policy_id = "contact-release";
+  policy.revision = {9, "lookahead-entering-release-state"};
+  SupportContactPolicyEntry release;
+  release.pair = pair;
+  release.max_start_penetration_m = 0.01;
+  release.require_separation_by_end = false;
+  release.require_strictly_decreasing_penetration = false;
+  policy.support_contacts.push_back(release);
+  publisher.bundle = make_bundle(1, 10, std::move(policy));
+
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  ASSERT_TRUE(progress.publish(3, 0, clock.now(), clock.now()).published);
+  auto engine =
+      std::make_shared<TestLookaheadEngine>("lookahead-entering-state");
+  engine->forced_result = support_contact_result(pair, -0.001);
+  ResultSink sink;
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  config.horizon_ns = 150'000'000;
+  config.max_samples = 2;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&sink](const RuntimeCollisionLookaheadSession*,
+              RuntimeCollisionLookaheadResult result) {
+        sink.push(std::move(result));
+      },
+      accept_test_authority());
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  const auto contact_state =
+      separated_contact_release_state(publisher.bundle, 0.004, 0.002);
+  ASSERT_TRUE(contact_state.valid);
+  ASSERT_TRUE(request_until_started(session, clock, publisher, contact_state));
+
+  const auto result = sink.wait();
+  EXPECT_EQ(result.termination,
+            RuntimeCollisionLookaheadTermination::kTimeHorizon);
+  EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kCollision);
+  EXPECT_EQ(result.reason, "runtime_lookahead_collision");
+  const auto violation = result.failure_details.find(
+      "collision_result_contact_release_violation");
+  ASSERT_NE(violation, result.failure_details.end());
+  EXPECT_EQ(violation->second, "recontact_after_release");
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     BoundedHandoffAllowsAnyAllowedPairToAppearDisappearReappearAndEndInContact) {
+  const auto result = run_bounded_handoff_case(0.002);
+
+  EXPECT_EQ(result.termination,
+            RuntimeCollisionLookaheadTermination::kTrajectoryEnd);
+  EXPECT_EQ(result.checked_samples, 4u);
+  EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kClear);
+  EXPECT_EQ(result.reason, "runtime_lookahead_clear");
+  EXPECT_FALSE(result.first_failing_waypoint.has_value());
+  EXPECT_TRUE(result.failure_details.empty());
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     BoundedHandoffRejectsAnyLaterContactThatExceedsTheCap) {
+  const auto result = run_bounded_handoff_case(0.006);
+
+  EXPECT_EQ(result.termination,
+            RuntimeCollisionLookaheadTermination::kTrajectoryEnd);
+  EXPECT_EQ(result.checked_samples, 4u);
+  EXPECT_EQ(result.status,
+            RuntimeCollisionLookaheadResultStatus::kCollision);
+  EXPECT_EQ(result.reason, "runtime_lookahead_collision");
+  ASSERT_TRUE(result.first_failing_waypoint.has_value());
+  EXPECT_EQ(*result.first_failing_waypoint, 4);
+  const auto violation = result.failure_details.find(
+      "collision_result_contact_release_violation");
+  ASSERT_NE(violation, result.failure_details.end());
+  EXPECT_EQ(violation->second, "contact_penetration_exceeds_policy");
+  EXPECT_EQ(result.failure_details.at("contact_policy_violation"),
+            "contact_penetration_exceeds_policy");
+  EXPECT_EQ(result.failure_details.at("contact_policy_id"),
+            "bounded-lookahead-handoff");
+  EXPECT_EQ(result.failure_details.at("policy_mode"),
+            "bounded_penetration");
+  EXPECT_EQ(result.failure_details.at("zone_id"),
+            "support_pair:gripper<->object");
+  EXPECT_EQ(result.failure_details.at("contact_present"), "true");
+  EXPECT_EQ(result.failure_details.at("initial_contact_pair_count"), "0");
+  EXPECT_EQ(result.failure_details.at("current_contact_pair_count"), "1");
+  EXPECT_EQ(result.failure_details.at("distance_request_mode"),
+            "selected_colliding_pairs");
+  EXPECT_EQ(result.failure_details.at("evaluated_distance_pair_count"), "1");
+  EXPECT_DOUBLE_EQ(
+      std::stod(result.failure_details.at("penetration_depth_m")), 0.006);
+  EXPECT_DOUBLE_EQ(
+      std::stod(result.failure_details.at("max_contact_penetration_m")),
+      0.005);
+  EXPECT_EQ(result.failure_details.at("within_penetration_bound"), "false");
+  EXPECT_EQ(result.failure_details.at("response"), "preempt_trajectory");
+  EXPECT_EQ(result.failure_details.at("surface"),
+            "observed_runtime_lookahead");
+  EXPECT_EQ(result.failure_details.find("release_evidence_mode"),
+            result.failure_details.end());
 }
 
 TEST(RuntimeCollisionLookaheadSessionTest,
@@ -691,7 +1056,8 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   grasp.max_penetration_m = 0.003;
   grasp.terminal_window_start_fraction = 0.8;
   policy.contact_grasps.push_back(std::move(grasp));
-  publisher.bundle = make_bundle(1, 10, std::move(policy));
+  publisher.bundle = with_contact_grasp_world_bodies(
+      make_bundle(1, 10, std::move(policy)));
   ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
                                         ExecutionProgressAuthorityProfile::kCommandedSimulation,
                                         "isaac", 0);
@@ -716,6 +1082,116 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kCollision);
   ASSERT_TRUE(result.first_failing_waypoint.has_value());
   EXPECT_EQ(*result.first_failing_waypoint, 3);
+  EXPECT_EQ(result.failure_details.at("contact_policy_violation"),
+            "grasp_contact_before_terminal_window");
+  EXPECT_EQ(result.failure_details.at("contact_policy_id"),
+            "contact_grasp/part");
+  EXPECT_EQ(result.failure_details.at("policy_mode"), "contact_grasp");
+  EXPECT_EQ(result.failure_details.at("zone_id"),
+            "contact_grasp_pair:object/part/shape/0<->"
+            "robot/arm/link/finger_left/collision/0");
+  EXPECT_EQ(result.failure_details.at("contact_present"), "true");
+  EXPECT_EQ(result.failure_details.at("distance_request_mode"),
+            "selected_colliding_pairs");
+  EXPECT_EQ(result.failure_details.at("evaluated_distance_pair_count"), "1");
+  EXPECT_DOUBLE_EQ(
+      std::stod(result.failure_details.at("penetration_depth_m")), 0.001);
+  EXPECT_DOUBLE_EQ(
+      std::stod(result.failure_details.at("max_penetration_m")), 0.003);
+  EXPECT_EQ(result.failure_details.at("inside_terminal_window"), "false");
+  EXPECT_EQ(result.failure_details.at("response"), "preempt_trajectory");
+  EXPECT_EQ(result.failure_details.at("surface"),
+            "observed_runtime_lookahead");
+  EXPECT_EQ(result.failure_details.find("initial_contact_pair_count"),
+            result.failure_details.end());
+  EXPECT_EQ(result.failure_details.find("release_evidence_mode"),
+            result.failure_details.end());
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     ContactGraspMissingMetricCarriesNativeViolationWithoutFabricatedDepth) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  CollisionPolicySnapshot policy;
+  policy.policy_id = "grasp";
+  policy.revision = {1, "grasp-policy"};
+  policy.require_full_diagnostics = true;
+  ContactGraspPolicyEntry grasp;
+  grasp.policy_id = "contact_grasp/part";
+  grasp.selected_object_id = "part";
+  grasp.allowed_robot_links = {"finger_left"};
+  grasp.max_penetration_m = 0.003;
+  grasp.terminal_window_start_fraction = 0.8;
+  policy.contact_grasps.push_back(std::move(grasp));
+  publisher.bundle = with_contact_grasp_world_bodies(
+      make_bundle(1, 10, std::move(policy)));
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  ASSERT_TRUE(
+      progress.publish(3, 50'000'000, clock.now(), clock.now()).published);
+  auto engine =
+      std::make_shared<TestLookaheadEngine>("lookahead-grasp-missing-metric");
+  const CollisionPairId pair{
+      "object/part/shape/0",
+      "robot/arm/link/finger_left/collision/0"};
+  CollisionResult incomplete;
+  incomplete.in_collision = true;
+  incomplete.normalized_pairs = {pair};
+  incomplete.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
+  incomplete.decision = CollisionDecisionResult::kInconclusiveFail;
+  incomplete.raw_diagnostics["missing_selected_distance_pairs"] =
+      "object/part/shape/0 <-> robot/arm/link/finger_left/collision/0";
+  engine->forced_result = std::move(incomplete);
+  ResultSink sink;
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  config.horizon_ns = 300'000'000;
+  config.max_samples = 4;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&sink](const RuntimeCollisionLookaheadSession*,
+              RuntimeCollisionLookaheadResult result) {
+        sink.push(std::move(result));
+      },
+      accept_test_authority());
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()),
+              "contact_grasp/part");
+  ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+  const auto result = sink.wait();
+  EXPECT_EQ(result.status,
+            RuntimeCollisionLookaheadResultStatus::kInconclusive);
+  EXPECT_EQ(result.reason, "runtime_lookahead_diagnostic_incomplete");
+  EXPECT_EQ(result.failure_details.at("contact_policy_violation"),
+            "missing_grasp_contact_clearance");
+  EXPECT_EQ(result.failure_details.at("contact_policy_id"),
+            "contact_grasp/part");
+  EXPECT_EQ(result.failure_details.at("policy_mode"), "contact_grasp");
+  EXPECT_EQ(result.failure_details.at("zone_id"),
+            "contact_grasp_pair:object/part/shape/0<->"
+            "robot/arm/link/finger_left/collision/0");
+  EXPECT_EQ(result.failure_details.at("classification"),
+            "diagnostic_incomplete");
+  EXPECT_EQ(result.failure_details.at("contact_present"), "true");
+  EXPECT_EQ(result.failure_details.at("distance_request_mode"),
+            "selected_colliding_pairs");
+  EXPECT_EQ(result.failure_details.at("evaluated_distance_pair_count"), "0");
+  EXPECT_DOUBLE_EQ(
+      std::stod(result.failure_details.at("max_penetration_m")), 0.003);
+  EXPECT_EQ(result.failure_details.at("response"), "preempt_trajectory");
+  EXPECT_EQ(result.failure_details.at("surface"),
+            "observed_runtime_lookahead");
+  EXPECT_EQ(result.failure_details.find("penetration_depth_m"),
+            result.failure_details.end());
+  EXPECT_EQ(result.failure_details.find("current_penetration_m"),
+            result.failure_details.end());
+  EXPECT_EQ(result.failure_details.find("initial_contact_pair_count"),
+            result.failure_details.end());
+  EXPECT_EQ(result.failure_details.find("release_evidence_mode"),
+            result.failure_details.end());
 }
 
 TEST(RuntimeCollisionLookaheadSessionTest, ClearResultCannotCertifyARevisionPublishedDuringTheJob) {
@@ -1216,8 +1692,25 @@ TEST(RuntimeCollisionLookaheadSessionTest,
 
   const auto admitted_at_ns = clock.now();
   clock.advance(7'000'000);
-  session.request(admitted_at_ns,
-                  publisher.published_runtime_collision_query_bundle(), {});
+  const auto request_bundle =
+      publisher.published_runtime_collision_query_bundle();
+  bool request_admitted = false;
+  for (std::size_t attempt = 0; attempt < 100'000; ++attempt) {
+    const auto status = session.status();
+    if (status.jobs_started_total > 0) {
+      request_admitted = true;
+      break;
+    }
+    if (!status.permit_pending) {
+      // request() is deliberately best-effort and may lose a try-lock race
+      // while the worker parks. Preserve the original admission timestamp so
+      // retries do not change the 7 ms start-jitter assertion below.
+      session.request(admitted_at_ns, request_bundle, {});
+    }
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(request_admitted)
+      << "best-effort lookahead request was never admitted";
 
   const auto result = sink.wait();
   EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kClear);

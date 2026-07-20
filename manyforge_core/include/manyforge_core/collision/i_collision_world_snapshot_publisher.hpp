@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -56,6 +57,15 @@ struct RuntimeCollisionQueryBundle {
   CollisionWorldSnapshotPtr world;
   std::shared_ptr<const CollisionPolicySnapshot> policy;
   std::shared_ptr<const CollisionPolicyIndex> policy_index;
+  /// Pre-resolved metric selections prepared on the NRT publication path.
+  /// The default vector contains signed-release and bounded-penetration pairs.
+  /// Each contact-grasp entry contains that same base union plus the concrete
+  /// world body pairs matched by the active grasp binding. Binary release
+  /// pairs are intentionally absent.
+  std::vector<CollisionPairId> selected_distance_pairs;
+  std::map<std::string, std::vector<CollisionPairId>, std::less<>>
+      contact_grasp_selected_distance_pairs;
+  bool distance_selection_order_valid = false;
   std::vector<CollisionWorldBodyFreshness> body_freshness;
   /// Publication-time proof that world bodies and freshness entries are sorted
   /// and unique by body id, enabling a linear allocation-free merge per tick.

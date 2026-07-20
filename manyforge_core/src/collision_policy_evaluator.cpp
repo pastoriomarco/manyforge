@@ -1,6 +1,7 @@
 #include <manyforge_core/collision/collision_policy_evaluator.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <utility>
@@ -18,7 +19,267 @@ CollisionPairId canonicalize(const CollisionPairId& pair) {
   return pair;
 }
 
+bool object_body_matches(const std::string& body,
+                         const std::string& object_id) noexcept {
+  constexpr std::string_view prefix = "object/";
+  if (body.size() <= prefix.size() + object_id.size() ||
+      body.compare(0, prefix.size(), prefix) != 0 ||
+      body.compare(prefix.size(), object_id.size(), object_id) != 0) {
+    return false;
+  }
+  return body[prefix.size() + object_id.size()] == '/';
+}
+
+bool robot_link_body_matches(const std::string& body,
+                             const std::string& link) noexcept {
+  constexpr std::string_view marker = "/link/";
+  const auto begin = body.find(marker);
+  if (begin == std::string::npos) {
+    return false;
+  }
+  const auto name_begin = begin + marker.size();
+  return body.size() > name_begin + link.size() &&
+         body.compare(name_begin, link.size(), link) == 0 &&
+         body[name_begin + link.size()] == '/';
+}
+
 }  // namespace
+
+bool contact_grasp_pair_matches(const CollisionPairId& pair,
+                                const ContactGraspPolicyEntry& policy) noexcept {
+  auto link_matches = [&](const std::string& body) {
+    return std::any_of(policy.allowed_robot_links.begin(),
+                       policy.allowed_robot_links.end(),
+                       [&](const auto& link) {
+                         return robot_link_body_matches(body, link);
+                       });
+  };
+  return (object_body_matches(pair.body_a, policy.selected_object_id) &&
+          link_matches(pair.body_b)) ||
+         (object_body_matches(pair.body_b, policy.selected_object_id) &&
+          link_matches(pair.body_a));
+}
+
+std::vector<CollisionPairId> build_selected_collision_distance_pairs(
+    const CollisionPolicySnapshot& policy,
+    const CollisionWorldSnapshot& world,
+    std::string_view active_contact_policy_id) {
+  std::vector<CollisionPairId> selected;
+  selected.reserve(policy.support_contacts.size());
+  for (const auto& entry : policy.support_contacts) {
+    if (entry.mode == CollisionContactPolicyMode::kBoundedPenetration ||
+        (entry.mode == CollisionContactPolicyMode::kContactRelease &&
+         entry.release_evidence_mode ==
+             ContactReleaseEvidenceMode::kSignedPenetration)) {
+      selected.push_back(canonicalize(entry.pair));
+    }
+  }
+
+  const auto grasp =
+      std::find_if(policy.contact_grasps.begin(), policy.contact_grasps.end(),
+                   [&](const ContactGraspPolicyEntry& entry) {
+                     return entry.policy_id == active_contact_policy_id;
+                   });
+  if (!active_contact_policy_id.empty() && grasp != policy.contact_grasps.end()) {
+    for (std::size_t i = 0; i < world.bodies.size(); ++i) {
+      for (std::size_t j = i + 1; j < world.bodies.size(); ++j) {
+        CollisionPairId pair{world.bodies[i].body_id,
+                             world.bodies[j].body_id};
+        pair = canonicalize(pair);
+        if (contact_grasp_pair_matches(pair, *grasp)) {
+          selected.push_back(std::move(pair));
+        }
+      }
+    }
+  }
+
+  std::sort(selected.begin(), selected.end());
+  selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
+  return selected;
+}
+
+bool support_contact_policy_entry_valid(
+    const SupportContactPolicyEntry& policy) noexcept {
+  const auto nonnegative_finite = [](double value) {
+    return std::isfinite(value) && value >= 0.0;
+  };
+  const bool release_defaults =
+      policy.enforce_max_start_penetration &&
+      policy.max_start_penetration_m == 0.0 &&
+      policy.release_tolerance_m == 1e-5 &&
+      policy.min_release_progress_m == 0.0 &&
+      policy.require_separation_by_end &&
+      policy.require_strictly_decreasing_penetration &&
+      !policy.allow_recontact;
+  const bool release_neutral =
+      !policy.enforce_max_start_penetration &&
+      policy.max_start_penetration_m == 0.0 &&
+      policy.release_tolerance_m == 0.0 &&
+      policy.min_release_progress_m == 0.0 &&
+      !policy.require_separation_by_end &&
+      !policy.require_strictly_decreasing_penetration &&
+      !policy.allow_recontact;
+
+  switch (policy.mode) {
+    case CollisionContactPolicyMode::kBoundedPenetration:
+      return nonnegative_finite(policy.max_contact_penetration_m) &&
+             policy.release_evidence_mode ==
+                 ContactReleaseEvidenceMode::kSignedPenetration &&
+             (release_defaults || release_neutral);
+    case CollisionContactPolicyMode::kContactProcess:
+      return policy.max_contact_penetration_m == 0.0 &&
+             policy.release_evidence_mode ==
+                 ContactReleaseEvidenceMode::kSignedPenetration &&
+             (release_defaults || release_neutral);
+    case CollisionContactPolicyMode::kContactRelease:
+      break;
+    default:
+      return false;
+  }
+
+  if (policy.max_contact_penetration_m != 0.0 ||
+      !nonnegative_finite(policy.max_start_penetration_m) ||
+      !nonnegative_finite(policy.release_tolerance_m) ||
+      !nonnegative_finite(policy.min_release_progress_m)) {
+    return false;
+  }
+  switch (policy.release_evidence_mode) {
+    case ContactReleaseEvidenceMode::kSignedPenetration:
+      return true;
+    case ContactReleaseEvidenceMode::kBinaryContact:
+      return (policy.enforce_max_start_penetration &&
+              policy.max_start_penetration_m == 0.0 &&
+              policy.release_tolerance_m == 1e-5 &&
+              policy.min_release_progress_m == 0.0 &&
+              policy.require_strictly_decreasing_penetration) ||
+             (!policy.enforce_max_start_penetration &&
+              policy.max_start_penetration_m == 0.0 &&
+              policy.release_tolerance_m == 0.0 &&
+              policy.min_release_progress_m == 0.0 &&
+              !policy.require_strictly_decreasing_penetration);
+    default:
+      return false;
+  }
+}
+
+ContactReleaseTransitionResult advance_contact_release_sample(
+    const SupportContactPolicyEntry& policy,
+    const ContactReleaseSampleEvidence& sample,
+    ContactReleaseEvaluationState& state) noexcept {
+  ContactReleaseTransitionResult result;
+  if (policy.mode == CollisionContactPolicyMode::kContactProcess) {
+    result.failure =
+        ContactReleaseTransitionFailure::kContactProcessNotImplemented;
+    return result;
+  }
+
+  if (!support_contact_policy_entry_valid(policy)) {
+    result.failure = ContactReleaseTransitionFailure::kInvalidPolicy;
+    return result;
+  }
+
+  const bool bounded_penetration =
+      policy.mode == CollisionContactPolicyMode::kBoundedPenetration;
+  const bool signed_penetration =
+      bounded_penetration ||
+      policy.release_evidence_mode ==
+          ContactReleaseEvidenceMode::kSignedPenetration;
+  const double tolerance = std::max(0.0, policy.release_tolerance_m);
+  double depth_m = 0.0;
+  if (sample.in_contact && signed_penetration) {
+    if (!sample.signed_clearance_m ||
+        !std::isfinite(*sample.signed_clearance_m) ||
+        *sample.signed_clearance_m > 0.0) {
+      result.failure = ContactReleaseTransitionFailure::
+          kMissingOrInvalidSignedPenetration;
+      return result;
+    }
+    depth_m = std::max(0.0, -*sample.signed_clearance_m);
+    result.penetration_depth_m = depth_m;
+  }
+
+  if (bounded_penetration) {
+    if (!state.initialized) {
+      state.initialized = true;
+      state.started_in_contact = sample.in_contact;
+    }
+    if (!sample.in_contact && state.in_contact) {
+      state.separated = true;
+    }
+    state.in_contact = sample.in_contact;
+    if (sample.in_contact &&
+        depth_m > std::max(0.0, policy.max_contact_penetration_m)) {
+      result.failure = ContactReleaseTransitionFailure::
+          kContactPenetrationExceedsPolicy;
+    }
+    return result;
+  }
+
+  if (!state.initialized) {
+    state.initialized = true;
+    state.started_in_contact = sample.in_contact;
+    state.in_contact = sample.in_contact;
+    state.separated = false;
+    if (!sample.in_contact) {
+      return result;
+    }
+    if (signed_penetration) {
+      state.initial_depth_m = depth_m;
+      state.previous_depth_m = depth_m;
+      state.best_depth_m = depth_m;
+      if (policy.enforce_max_start_penetration &&
+          depth_m > std::max(0.0, policy.max_start_penetration_m) +
+                        tolerance) {
+        result.failure = ContactReleaseTransitionFailure::
+            kInitialPenetrationExceedsPolicy;
+      }
+    }
+    return result;
+  }
+
+  if (!sample.in_contact) {
+    state.in_contact = false;
+    if (state.started_in_contact) {
+      state.separated = true;
+      if (signed_penetration && state.initial_depth_m) {
+        state.best_depth_m = 0.0;
+      }
+    }
+    return result;
+  }
+
+  const bool recontact = !state.in_contact;
+  state.in_contact = true;
+  if (!state.started_in_contact) {
+    result.failure =
+        ContactReleaseTransitionFailure::kNewContactAfterClearStart;
+    return result;
+  }
+  if (recontact && !policy.allow_recontact) {
+    result.failure = ContactReleaseTransitionFailure::kRecontactAfterRelease;
+    return result;
+  }
+
+  if (signed_penetration) {
+    if (recontact && policy.enforce_max_start_penetration &&
+        depth_m > std::max(0.0, policy.max_start_penetration_m) +
+                      tolerance) {
+      result.failure = ContactReleaseTransitionFailure::
+          kRecontactPenetrationExceedsPolicy;
+      return result;
+    }
+    if (state.initial_depth_m &&
+        depth_m > state.previous_depth_m + tolerance) {
+      result.failure =
+          ContactReleaseTransitionFailure::kPenetrationIncreased;
+      return result;
+    }
+    state.previous_depth_m = depth_m;
+    state.best_depth_m =
+        state.initial_depth_m ? std::min(state.best_depth_m, depth_m) : depth_m;
+  }
+  return result;
+}
 
 std::shared_ptr<const CollisionPolicyIndex> build_collision_policy_index(
     const CollisionPolicySnapshot& snapshot) {
@@ -166,7 +427,9 @@ EvaluatedPairs CollisionPolicyEvaluator::classify(
           entry.classification = CollisionPairClassification::kSupportContactContinued;
           break;
         case SupportContactEvaluationState::kSeparated:
-          if (support_it->second.allow_recontact) {
+          if (support_it->second.mode ==
+                  CollisionContactPolicyMode::kBoundedPenetration ||
+              support_it->second.allow_recontact) {
             state = SupportContactEvaluationState::kContactActive;
             entry.classification =
                 CollisionPairClassification::kSupportContactContinued;

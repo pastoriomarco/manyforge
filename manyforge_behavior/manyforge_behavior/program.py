@@ -23,7 +23,11 @@ from manyforge_behavior.blackboard_bindings import (
     resolve_namespace_binding as _resolve_namespace_binding,
     validate_declared_field_ref as _validate_declared_field_ref,
 )
-from manyforge_behavior.capabilities import get_required_keys
+from manyforge_behavior.capabilities import (
+    GEOMETRIC_CONTACT_CAPABILITY,
+    SIGNED_PENETRATION_CONTACT_CAPABILITY,
+    get_required_keys,
+)
 from manyforge_behavior.catalog import NodeCatalog, SEMVER_RE, profile_satisfied
 from manyforge_behavior.catalog_schema import CatalogValueIssue, validate_value
 from manyforge_behavior.parameters import (
@@ -49,6 +53,30 @@ _REMOVED_COOPERATIVE_INTERRUPT_FIELDS = frozenset(
         "interrupt_policies",
     }
 )
+
+
+def _scene_contact_required_capabilities(
+    scene: list["SceneResource"],
+) -> set[str]:
+    """Return deployment tiers required by compact support-contact authoring.
+
+    ``contact_process`` remains reserved and fail-closed at the native policy
+    boundary; this compact program shape does not carry the sensing selector
+    needed to claim one of its future force/controller-backed tiers.
+    """
+
+    required: set[str] = set()
+    for resource in scene:
+        for contact in resource.metadata.get("support_contacts", []) or []:
+            mode = contact.get("mode", "contact_release")
+            if mode == "contact_process":
+                continue
+            required.add(GEOMETRIC_CONTACT_CAPABILITY)
+            if mode == "bounded_penetration" or contact.get(
+                "release_evidence_mode", "signed_penetration"
+            ) == "signed_penetration":
+                required.add(SIGNED_PENETRATION_CONTACT_CAPABILITY)
+    return required
 
 
 @dataclass
@@ -714,34 +742,125 @@ def _validate_scene_resource_value(value: Any) -> str | None:
         for contact_index, contact in enumerate(support_contacts):
             if not isinstance(contact, Mapping):
                 return f"metadata.support_contacts[{contact_index}] must be a mapping"
+            allowed_fields = {
+                "support_object_id",
+                "mode",
+                "release_evidence_mode",
+                "max_contact_penetration_m",
+                "enforce_max_start_penetration",
+                "max_start_penetration_m",
+                "release_tolerance_m",
+                "min_release_progress_m",
+                "require_separation_by_end",
+                "require_strictly_decreasing_penetration",
+                "allow_recontact",
+            }
+            unknown_fields = sorted(
+                str(field) for field in set(contact) - allowed_fields
+            )
+            if unknown_fields:
+                return (
+                    f"metadata.support_contacts[{contact_index}] contains unknown "
+                    f"fields: {', '.join(unknown_fields)}"
+                )
             support_object_id = contact.get("support_object_id")
             if not isinstance(support_object_id, str) or not support_object_id.strip():
                 return (
                     f"metadata.support_contacts[{contact_index}].support_object_id "
                     "is required"
                 )
-            max_start_penetration_m = contact.get("max_start_penetration_m", 0.0)
-            if not _is_numeric(max_start_penetration_m) or float(max_start_penetration_m) < 0.0:
-                return (
-                    f"metadata.support_contacts[{contact_index}]."
-                    "max_start_penetration_m must be >= 0"
-                )
             mode = contact.get("mode", "contact_release")
-            if mode not in {"contact_release", "contact_process"}:
+            if mode not in {
+                "contact_release",
+                "bounded_penetration",
+                "contact_process",
+            }:
                 return (
                     f"metadata.support_contacts[{contact_index}].mode must be "
-                    "contact_release or contact_process"
+                    "contact_release, bounded_penetration, or contact_process"
+                )
+            release_only_fields = {
+                "release_evidence_mode",
+                "enforce_max_start_penetration",
+                "max_start_penetration_m",
+                "release_tolerance_m",
+                "min_release_progress_m",
+                "require_separation_by_end",
+                "require_strictly_decreasing_penetration",
+                "allow_recontact",
+            }
+            if mode == "bounded_penetration":
+                invalid_fields = sorted(set(contact) & release_only_fields)
+                if invalid_fields:
+                    return (
+                        f"metadata.support_contacts[{contact_index}] fields are "
+                        "valid only for contact_release: "
+                        f"{', '.join(invalid_fields)}"
+                    )
+                max_contact_penetration_m = contact.get(
+                    "max_contact_penetration_m"
+                )
+                if (
+                    not _is_numeric(max_contact_penetration_m)
+                    or not math.isfinite(float(max_contact_penetration_m))
+                    or float(max_contact_penetration_m) < 0.0
+                ):
+                    return (
+                        f"metadata.support_contacts[{contact_index}]."
+                        "max_contact_penetration_m is required and must be "
+                        "finite and >= 0"
+                    )
+                continue
+            if "max_contact_penetration_m" in contact:
+                return (
+                    f"metadata.support_contacts[{contact_index}]."
+                    "max_contact_penetration_m is valid only for "
+                    "bounded_penetration"
+                )
+            if mode == "contact_process":
+                invalid_fields = sorted(set(contact) & release_only_fields)
+                if invalid_fields:
+                    return (
+                        f"metadata.support_contacts[{contact_index}] fields are "
+                        "valid only for contact_release: "
+                        f"{', '.join(invalid_fields)}"
+                    )
+                continue
+            release_evidence_mode = contact.get(
+                "release_evidence_mode", "signed_penetration"
+            )
+            if release_evidence_mode not in {
+                "signed_penetration",
+                "binary_contact",
+            }:
+                return (
+                    f"metadata.support_contacts[{contact_index}]."
+                    "release_evidence_mode must be signed_penetration or "
+                    "binary_contact"
+                )
+            max_start_penetration_m = contact.get("max_start_penetration_m", 0.0)
+            if (
+                not _is_numeric(max_start_penetration_m)
+                or not math.isfinite(float(max_start_penetration_m))
+                or float(max_start_penetration_m) < 0.0
+            ):
+                return (
+                    f"metadata.support_contacts[{contact_index}]."
+                    "max_start_penetration_m must be finite and >= 0"
                 )
             for field_name in (
                 "release_tolerance_m",
                 "min_release_progress_m",
-                "min_separation_clearance_m",
             ):
                 value = contact.get(field_name, 0.0)
-                if not _is_numeric(value) or float(value) < 0.0:
+                if (
+                    not _is_numeric(value)
+                    or not math.isfinite(float(value))
+                    or float(value) < 0.0
+                ):
                     return (
                         f"metadata.support_contacts[{contact_index}]."
-                        f"{field_name} must be >= 0"
+                        f"{field_name} must be finite and >= 0"
                     )
             for field_name in (
                 "enforce_max_start_penetration",
@@ -753,6 +872,29 @@ def _validate_scene_resource_value(value: Any) -> str | None:
                     return (
                         f"metadata.support_contacts[{contact_index}]."
                         f"{field_name} must be boolean"
+                    )
+            if release_evidence_mode == "binary_contact":
+                if contact.get("enforce_max_start_penetration", False):
+                    return (
+                        f"metadata.support_contacts[{contact_index}]."
+                        "enforce_max_start_penetration must be false for "
+                        "binary_contact"
+                    )
+                for field_name in (
+                    "max_start_penetration_m",
+                    "release_tolerance_m",
+                    "min_release_progress_m",
+                ):
+                    if float(contact.get(field_name, 0.0)) != 0.0:
+                        return (
+                            f"metadata.support_contacts[{contact_index}]."
+                            f"{field_name} must be 0 for binary_contact"
+                        )
+                if contact.get("require_strictly_decreasing_penetration", False):
+                    return (
+                        f"metadata.support_contacts[{contact_index}]."
+                        "require_strictly_decreasing_penetration must be false "
+                        "for binary_contact"
                     )
 
     return None
@@ -2162,17 +2304,16 @@ class Program:
         return self
 
     def required_capabilities(self) -> set[str]:
-        """Return the union of capability keys required by the current tree."""
+        """Return capability keys required by the tree and compact policies."""
+        required = _scene_contact_required_capabilities(self.scene)
         if self.tree is None:
-            return set()
+            return required
 
         resolver = (
             ParameterResolver(self.get_parameter_defaults())
             if self.parameters
             else None
         )
-        required: set[str] = set()
-
         def visit(current: TreeNode) -> None:
             if self._skill_catalog is not None and self._skill_catalog.contains(current.id):
                 skill = self._skill_catalog.get(current.id)
@@ -2417,8 +2558,13 @@ class Program:
                     metadata=dict(s.get("metadata", {}) or {}),
                 )
             )
-        for resource in self.scene:
-            for contact in resource.metadata.get("support_contacts", []) or []:
+        support_contact_declarations: dict[
+            tuple[str, str], tuple[int, int]
+        ] = {}
+        for resource_index, resource in enumerate(self.scene):
+            for contact_index, contact in enumerate(
+                resource.metadata.get("support_contacts", []) or []
+            ):
                 support_object_id = contact.get("support_object_id")
                 if support_object_id == resource.object_id:
                     raise ProgramValidationError(
@@ -2429,6 +2575,35 @@ class Program:
                         f"scene resource '{resource.object_id}' support_contacts "
                         f"references unknown object_id '{support_object_id}'"
                     )
+                canonical_pair = tuple(
+                    sorted((resource.object_id, support_object_id))
+                )
+                previous = support_contact_declarations.get(canonical_pair)
+                if previous is not None:
+                    previous_resource_index, previous_contact_index = previous
+                    raise ProgramValidationError(
+                        "Duplicate scene support-contact pair "
+                        f"'{canonical_pair[0]}' <-> '{canonical_pair[1]}' at "
+                        f"scene[{resource_index}].metadata.support_contacts"
+                        f"[{contact_index}]; first declared at "
+                        f"scene[{previous_resource_index}].metadata.support_contacts"
+                        f"[{previous_contact_index}]"
+                    )
+                support_contact_declarations[canonical_pair] = (
+                    resource_index,
+                    contact_index,
+                )
+
+        if self._deployment_capability_keys is not None:
+            missing_contact_capabilities = sorted(
+                _scene_contact_required_capabilities(self.scene)
+                - self._deployment_capability_keys
+            )
+            if missing_contact_capabilities:
+                raise ProgramValidationError(
+                    "Scene support contacts require capabilities "
+                    f"{missing_contact_capabilities}"
+                )
 
         # Parameters
         param_names: set[str] = set()

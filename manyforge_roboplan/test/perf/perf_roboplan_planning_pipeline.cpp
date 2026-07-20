@@ -108,6 +108,7 @@ using manyforge::core::AddObjectRequestDTO;
 using manyforge::core::AttachObjectRequestDTO;
 using manyforge::core::BoxShapeDTO;
 using manyforge::core::CollisionContactPolicyMode;
+using manyforge::core::ContactReleaseEvidenceMode;
 using manyforge::core::CollisionPairId;
 using manyforge::core::CollisionPolicySnapshot;
 using manyforge::core::ContactGraspPolicyEntry;
@@ -489,27 +490,72 @@ CollisionPolicySnapshot captured_collision_policy(const ptree& value) {
     const auto mode = contact.get<std::string>("mode", "contact_release");
     if (mode == "contact_release") {
       entry.mode = CollisionContactPolicyMode::kContactRelease;
+    } else if (mode == "bounded_penetration") {
+      entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
+      entry.max_contact_penetration_m =
+          contact.get<double>("max_contact_penetration_m");
+      if (!std::isfinite(entry.max_contact_penetration_m) ||
+          entry.max_contact_penetration_m < 0.0) {
+        throw std::invalid_argument(
+            "captured bounded contact policy has invalid penetration bound");
+      }
+      policy.support_contacts.push_back(std::move(entry));
+      continue;
     } else if (mode == "contact_process") {
       entry.mode = CollisionContactPolicyMode::kContactProcess;
+      policy.support_contacts.push_back(std::move(entry));
+      continue;
     } else {
       throw std::invalid_argument(
           "captured collision policy has unsupported contact mode: " + mode);
     }
+    const auto evidence_mode = contact.get<std::string>(
+        "release_evidence_mode", "signed_penetration");
+    if (evidence_mode == "signed_penetration") {
+      entry.release_evidence_mode =
+          ContactReleaseEvidenceMode::kSignedPenetration;
+    } else if (evidence_mode == "binary_contact") {
+      entry.release_evidence_mode =
+          ContactReleaseEvidenceMode::kBinaryContact;
+    } else {
+      throw std::invalid_argument(
+          "captured collision policy has unsupported release evidence mode: " +
+          evidence_mode);
+    }
     entry.enforce_max_start_penetration =
-        contact.get<bool>("enforce_max_start_penetration", true);
+        contact.get<bool>(
+            "enforce_max_start_penetration",
+            entry.release_evidence_mode ==
+                ContactReleaseEvidenceMode::kSignedPenetration);
     entry.max_start_penetration_m =
         contact.get<double>("max_start_penetration_m", 0.0);
     entry.release_tolerance_m =
-        contact.get<double>("release_tolerance_m", 1e-5);
+        contact.get<double>(
+            "release_tolerance_m",
+            entry.release_evidence_mode ==
+                    ContactReleaseEvidenceMode::kSignedPenetration
+                ? 1e-5
+                : 0.0);
     entry.min_release_progress_m =
         contact.get<double>("min_release_progress_m", 0.0);
-    entry.min_separation_clearance_m =
-        contact.get<double>("min_separation_clearance_m", 0.0);
     entry.require_separation_by_end =
         contact.get<bool>("require_separation_by_end", true);
     entry.require_strictly_decreasing_penetration = contact.get<bool>(
-        "require_strictly_decreasing_penetration", true);
+        "require_strictly_decreasing_penetration",
+        entry.release_evidence_mode ==
+            ContactReleaseEvidenceMode::kSignedPenetration);
     entry.allow_recontact = contact.get<bool>("allow_recontact", false);
+    if (entry.release_evidence_mode ==
+        ContactReleaseEvidenceMode::kBinaryContact) {
+      if (entry.enforce_max_start_penetration ||
+          entry.max_start_penetration_m != 0.0 ||
+          entry.release_tolerance_m != 0.0 ||
+          entry.min_release_progress_m != 0.0 ||
+          entry.require_strictly_decreasing_penetration) {
+        throw std::invalid_argument(
+            "captured binary contact policy contains metric constraints");
+      }
+    }
     policy.support_contacts.push_back(std::move(entry));
   }
   for (const auto& [key, grasp] : value.get_child("contact_grasps")) {
@@ -664,28 +710,73 @@ void configure_captured_world(NativeKernelBundle& bundle,
         if (mode == "contact_release") {
           policy.mode =
               manyforge::core::CollisionContactPolicyMode::kContactRelease;
+        } else if (mode == "bounded_penetration") {
+          policy.mode = manyforge::core::CollisionContactPolicyMode::
+              kBoundedPenetration;
+          policy.max_contact_penetration_m =
+              contact.get<double>("max_contact_penetration_m");
+          if (!std::isfinite(policy.max_contact_penetration_m) ||
+              policy.max_contact_penetration_m < 0.0) {
+            throw std::invalid_argument(
+                "captured bounded support contact has invalid penetration bound");
+          }
+          request.support_contacts.push_back(std::move(policy));
+          continue;
         } else if (mode == "contact_process") {
           policy.mode =
               manyforge::core::CollisionContactPolicyMode::kContactProcess;
+          request.support_contacts.push_back(std::move(policy));
+          continue;
         } else {
           throw std::invalid_argument(
               "captured support contact has unsupported mode: " + mode);
         }
+        const auto evidence_mode = contact.get<std::string>(
+            "release_evidence_mode", "signed_penetration");
+        if (evidence_mode == "signed_penetration") {
+          policy.release_evidence_mode =
+              ContactReleaseEvidenceMode::kSignedPenetration;
+        } else if (evidence_mode == "binary_contact") {
+          policy.release_evidence_mode =
+              ContactReleaseEvidenceMode::kBinaryContact;
+        } else {
+          throw std::invalid_argument(
+              "captured support contact has unsupported evidence mode: " +
+              evidence_mode);
+        }
         policy.enforce_max_start_penetration = contact.get<bool>(
-            "enforce_max_start_penetration", true);
+            "enforce_max_start_penetration",
+            policy.release_evidence_mode ==
+                ContactReleaseEvidenceMode::kSignedPenetration);
         policy.max_start_penetration_m =
             contact.get<double>("max_start_penetration_m", 0.0);
         policy.release_tolerance_m =
-            contact.get<double>("release_tolerance_m", 1e-5);
+            contact.get<double>(
+                "release_tolerance_m",
+                policy.release_evidence_mode ==
+                        ContactReleaseEvidenceMode::kSignedPenetration
+                    ? 1e-5
+                    : 0.0);
         policy.min_release_progress_m =
             contact.get<double>("min_release_progress_m", 0.0);
-        policy.min_separation_clearance_m =
-            contact.get<double>("min_separation_clearance_m", 0.0);
         policy.require_separation_by_end =
             contact.get<bool>("require_separation_by_end", true);
         policy.require_strictly_decreasing_penetration = contact.get<bool>(
-            "require_strictly_decreasing_penetration", true);
+            "require_strictly_decreasing_penetration",
+            policy.release_evidence_mode ==
+                ContactReleaseEvidenceMode::kSignedPenetration);
         policy.allow_recontact = contact.get<bool>("allow_recontact", false);
+        if (policy.release_evidence_mode ==
+            ContactReleaseEvidenceMode::kBinaryContact) {
+          if (policy.enforce_max_start_penetration ||
+              policy.max_start_penetration_m != 0.0 ||
+              policy.release_tolerance_m != 0.0 ||
+              policy.min_release_progress_m != 0.0 ||
+              policy.require_strictly_decreasing_penetration) {
+            throw std::invalid_argument(
+                "captured binary support contact contains metric constraints");
+          }
+        }
         request.support_contacts.push_back(std::move(policy));
       }
     }

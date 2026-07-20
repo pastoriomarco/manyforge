@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,13 +33,19 @@ namespace {
 using manyforge::core::AddObjectRequestDTO;
 using manyforge::core::AttachObjectRequestDTO;
 using manyforge::core::BoxShapeDTO;
+using manyforge::core::CollisionContactPolicyMode;
 using manyforge::core::CollisionGeometryKind;
 using manyforge::core::CollisionOwnerKind;
+using manyforge::core::CollisionPairId;
+using manyforge::core::CollisionPolicySnapshot;
 using manyforge::core::CollisionShapeDTO;
 using manyforge::core::CollisionWorldBody;
 using manyforge::core::CollisionWorldLeaseInventory;
 using manyforge::core::CollisionWorldMutationSource;
+using manyforge::core::ContactReleaseEvidenceMode;
 using manyforge::core::DetachObjectRequestDTO;
+using manyforge::core::ExecutionKernelConfig;
+using manyforge::core::kErrorInvalidContactPolicy;
 using manyforge::core::kErrorInvalidRequest;
 using manyforge::core::MeshShapeDTO;
 using manyforge::core::Pose3DTO;
@@ -50,6 +57,8 @@ using manyforge::core::SceneSnapshotLease;
 using manyforge::core::SceneSnapshotLeaseObject;
 using manyforge::core::SceneSnapshotLeaseRejection;
 using manyforge::core::SceneSnapshotLeaseValidationContext;
+using manyforge::core::SupportContactDTO;
+using manyforge::core::SupportContactPolicyEntry;
 using manyforge::core::UpdateObjectPoseRequestDTO;
 using manyforge::core::Vector3DTO;
 using manyforge::core::ObservedSceneObjectRole;
@@ -277,6 +286,440 @@ TEST_F(CollisionWorldPublisherTest, InitialSnapshotPublishesRobotBodies) {
 }
 
 TEST_F(CollisionWorldPublisherTest,
+       BoundedContactValidationRejectsInvalidCapsAndWrongModeUse) {
+  auto request = make_box_at_origin("bounded_contact_object");
+  SupportContactDTO contact;
+  contact.support_object_id = "support_surface";
+  contact.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  contact.max_contact_penetration_m = -0.001;
+  request.support_contacts = {contact};
+
+  auto result = bundle_->scene_authority->add_object(request);
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidContactPolicy);
+  EXPECT_EQ(result.error->details.at("reason"),
+            "bounded_penetration_threshold_invalid");
+  EXPECT_EQ(result.error->details.at("field"),
+            "max_contact_penetration_m");
+  EXPECT_NE(result.error->message.find("max_contact_penetration_m"),
+            std::string::npos);
+
+  request.support_contacts.front().max_contact_penetration_m =
+      std::numeric_limits<double>::quiet_NaN();
+  result = bundle_->scene_authority->add_object(request);
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidContactPolicy);
+
+  request.support_contacts.front().mode =
+      CollisionContactPolicyMode::kContactRelease;
+  request.support_contacts.front().max_contact_penetration_m = 0.001;
+  result = bundle_->scene_authority->add_object(request);
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_NE(result.error->message.find("valid only for bounded_penetration"),
+            std::string::npos);
+
+  request.support_contacts.front() = SupportContactDTO{};
+  request.support_contacts.front().support_object_id = "support_surface";
+  request.support_contacts.front().mode =
+      CollisionContactPolicyMode::kBoundedPenetration;
+  request.support_contacts.front().max_contact_penetration_m = 0.001;
+  request.support_contacts.front().max_start_penetration_m = 0.7;
+  result = bundle_->scene_authority->add_object(request);
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidContactPolicy);
+  EXPECT_EQ(result.error->details.at("reason"),
+            "release_field_for_bounded_penetration");
+  EXPECT_EQ(result.error->details.at("field"),
+            "max_start_penetration_m");
+
+  request.support_contacts.front() = SupportContactDTO{};
+  request.support_contacts.front().support_object_id = "support_surface";
+  request.support_contacts.front().mode =
+      CollisionContactPolicyMode::kContactProcess;
+  request.support_contacts.front().allow_recontact = true;
+  result = bundle_->scene_authority->add_object(request);
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidContactPolicy);
+  EXPECT_EQ(result.error->details.at("reason"),
+            "release_field_not_applicable");
+  EXPECT_EQ(result.error->details.at("field"), "allow_recontact");
+
+  request.support_contacts.front() = SupportContactDTO{};
+  request.support_contacts.front().support_object_id = "support_surface";
+  request.support_contacts.front().mode =
+      CollisionContactPolicyMode::kContactProcess;
+  request.support_contacts.front().max_contact_penetration_m = 0.001;
+  result = bundle_->scene_authority->add_object(request);
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_NE(result.error->message.find("valid only for bounded_penetration"),
+            std::string::npos);
+
+  auto policy = projection_backend_->configured_collision_policy();
+  policy.policy_id = "invalid_bounded_policy";
+  SupportContactPolicyEntry policy_entry;
+  policy_entry.pair = CollisionPairId{"body/a", "body/b"};
+  policy_entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  policy_entry.max_contact_penetration_m =
+      std::numeric_limits<double>::infinity();
+  policy.support_contacts = {policy_entry};
+  result = set_collision_policy(std::move(policy));
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidContactPolicy);
+  EXPECT_EQ(result.error->details.at("reason"),
+            "bounded_penetration_threshold_invalid");
+  EXPECT_EQ(result.error->details.at("field"),
+            "max_contact_penetration_m");
+  EXPECT_EQ(result.error->details.at("policy_id"),
+            "invalid_bounded_policy");
+  EXPECT_EQ(result.error->details.at("zone_id"),
+            "support_pair:body/a<->body/b");
+  EXPECT_EQ(result.error->details.at("support_contact_index"), "0");
+
+  CollisionPolicySnapshot initial_policy;
+  initial_policy.policy_id = "invalid_initial_bounded_policy";
+  initial_policy.support_contacts = {policy_entry};
+  ExecutionKernelConfig config;
+  config.baseline_collision_policy_snapshot = std::move(initial_policy);
+  EXPECT_THROW(create_native_kernel("ur5_gripper", "arm", config),
+               std::invalid_argument);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       ApplyCollisionPolicyReturnsTypedModeAndFieldSpecificErrors) {
+  auto reject = [&](SupportContactPolicyEntry entry,
+                    const std::string& reason,
+                    const std::string& field) {
+    CollisionPolicySnapshot policy;
+    policy.policy_id = "invalid-contact-policy";
+    policy.support_contacts = {std::move(entry)};
+    const auto result = set_collision_policy(std::move(policy));
+    EXPECT_FALSE(result.success);
+    EXPECT_TRUE(result.error.has_value());
+    if (!result.error.has_value()) {
+      return;
+    }
+    EXPECT_EQ(result.error->code, kErrorInvalidContactPolicy);
+    EXPECT_EQ(result.error->details.at("policy_id"),
+              "invalid-contact-policy");
+    EXPECT_EQ(result.error->details.at("reason"), reason);
+    EXPECT_EQ(result.error->details.at("field"), field);
+    EXPECT_EQ(result.error->details.at("support_contact_index"), "0");
+  };
+
+  SupportContactPolicyEntry entry;
+  entry.pair = {"body/a", "body/b"};
+  entry.mode = static_cast<CollisionContactPolicyMode>(999);
+  reject(entry, "unknown_contact_policy_mode", "mode");
+
+  entry = SupportContactPolicyEntry{};
+  entry.pair = {"body/a", "body/b"};
+  entry.release_evidence_mode =
+      static_cast<ContactReleaseEvidenceMode>(999);
+  reject(entry, "unknown_release_evidence_mode", "release_evidence_mode");
+
+  entry = SupportContactPolicyEntry{};
+  entry.pair = {"body/a", "body/b"};
+  entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  entry.max_contact_penetration_m = -0.001;
+  reject(entry,
+         "bounded_penetration_threshold_invalid",
+         "max_contact_penetration_m");
+
+  entry = SupportContactPolicyEntry{};
+  entry.pair = {"body/a", "body/b"};
+  entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  entry.max_contact_penetration_m = 0.001;
+  entry.max_start_penetration_m = 0.002;
+  reject(entry,
+         "release_field_for_bounded_penetration",
+         "max_start_penetration_m");
+
+  entry = SupportContactPolicyEntry{};
+  entry.pair = {"body/a", "body/b"};
+  entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  entry.max_contact_penetration_m = 0.001;
+  entry.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  reject(entry,
+         "release_evidence_mode_not_applicable",
+         "release_evidence_mode");
+
+  entry = SupportContactPolicyEntry{};
+  entry.pair = {"body/a", "body/b"};
+  entry.max_contact_penetration_m = 0.001;
+  reject(entry,
+         "bounded_penetration_field_not_applicable",
+         "max_contact_penetration_m");
+
+  entry = SupportContactPolicyEntry{};
+  entry.pair = {"body/a", "body/b"};
+  entry.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  entry.max_start_penetration_m = 0.002;
+  reject(entry, "metric_field_for_binary_contact", "max_start_penetration_m");
+
+  entry = SupportContactPolicyEntry{};
+  entry.pair = {"body/a", "body/a"};
+  reject(entry, "invalid_support_contact_pair", "pair");
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       CollisionPolicyAdmissionRejectsReversedDuplicatePairsAcrossModes) {
+  SupportContactPolicyEntry bounded;
+  bounded.pair = {"body/a", "body/b"};
+  bounded.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  bounded.max_contact_penetration_m = 0.001;
+
+  SupportContactPolicyEntry release;
+  release.pair = {"body/b", "body/a"};
+  release.mode = CollisionContactPolicyMode::kContactRelease;
+
+  CollisionPolicySnapshot policy;
+  policy.policy_id = "duplicate-canonical-support-pair";
+  policy.support_contacts = {bounded, release};
+  const auto result = set_collision_policy(policy);
+
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidContactPolicy);
+  EXPECT_EQ(result.error->details.at("reason"),
+            "duplicate_support_contact_pair");
+  EXPECT_EQ(result.error->details.at("field"), "pair");
+  EXPECT_EQ(result.error->details.at("support_contact_index"), "1");
+  EXPECT_EQ(result.error->details.at("first_support_contact_index"), "0");
+  EXPECT_EQ(result.error->details.at("zone_id"),
+            "support_pair:body/a<->body/b");
+
+  ExecutionKernelConfig config;
+  config.baseline_collision_policy_snapshot = std::move(policy);
+  try {
+    (void)create_native_kernel("ur5_gripper", "arm", config);
+    FAIL() << "duplicate initial support-contact pair must be rejected";
+  } catch (const std::invalid_argument& error) {
+    EXPECT_NE(std::string(error.what()).find(
+                  "support-contact pair is configured more than once"),
+              std::string::npos);
+  }
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       AddObjectRejectsLocalAndReciprocalAuthoredSupportPairDuplicatesBeforeMutation) {
+  SupportContactDTO bounded;
+  bounded.support_object_id = "object_b";
+  bounded.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  bounded.max_contact_penetration_m = 0.001;
+  SupportContactDTO release;
+  release.support_object_id = "object_b";
+  release.mode = CollisionContactPolicyMode::kContactRelease;
+
+  auto local_duplicate = make_box_at_origin("object_a");
+  local_duplicate.support_contacts = {bounded, release};
+  const auto before_local =
+      bundle_->scene_authority->published_collision_world_revision();
+  const auto local_result =
+      bundle_->scene_authority->add_object(local_duplicate);
+  ASSERT_FALSE(local_result.success);
+  ASSERT_TRUE(local_result.error.has_value());
+  EXPECT_EQ(local_result.error->code, kErrorInvalidContactPolicy);
+  EXPECT_EQ(local_result.error->details.at("reason"),
+            "duplicate_support_contact_pair");
+  EXPECT_EQ(local_result.error->details.at("pair"), "object_a<->object_b");
+  EXPECT_EQ(local_result.error->details.at("first_owner_object_id"),
+            "object_a");
+  EXPECT_EQ(local_result.error->details.at("first_support_contact_index"),
+            "0");
+  EXPECT_EQ(local_result.error->details.at("duplicate_owner_object_id"),
+            "object_a");
+  EXPECT_EQ(local_result.error->details.at("duplicate_support_contact_index"),
+            "1");
+  const auto after_local =
+      bundle_->scene_authority->published_collision_world_revision();
+  EXPECT_EQ(after_local.revision_id, before_local.revision_id);
+  EXPECT_EQ(after_local.content_hash, before_local.content_hash);
+
+  auto object_a = make_box_at_origin("object_a");
+  object_a.support_contacts = {bounded};
+  ASSERT_TRUE(bundle_->scene_authority->add_object(object_a).success);
+  const auto before_reciprocal =
+      bundle_->scene_authority->published_collision_world_revision();
+  const auto inventory_before =
+      bundle_->scene_authority->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory_before.has_value());
+
+  auto object_b = make_box_at_origin("object_b");
+  release.support_object_id = "object_a";
+  object_b.support_contacts = {release};
+  const auto reciprocal_result =
+      bundle_->scene_authority->add_object(object_b);
+
+  ASSERT_FALSE(reciprocal_result.success);
+  ASSERT_TRUE(reciprocal_result.error.has_value());
+  EXPECT_EQ(reciprocal_result.error->code, kErrorInvalidContactPolicy);
+  EXPECT_EQ(reciprocal_result.error->details.at("reason"),
+            "duplicate_support_contact_pair");
+  EXPECT_EQ(reciprocal_result.error->details.at("zone_id"),
+            "support_pair:object_a<->object_b");
+  EXPECT_EQ(reciprocal_result.error->details.at("first_owner_object_id"),
+            "object_a");
+  EXPECT_EQ(reciprocal_result.error->details.at("first_support_contact_index"),
+            "0");
+  EXPECT_EQ(reciprocal_result.error->details.at("duplicate_owner_object_id"),
+            "object_b");
+  EXPECT_EQ(reciprocal_result.error->details.at(
+                "duplicate_support_contact_index"),
+            "0");
+
+  const auto after_reciprocal =
+      bundle_->scene_authority->published_collision_world_revision();
+  EXPECT_EQ(after_reciprocal.revision_id, before_reciprocal.revision_id);
+  EXPECT_EQ(after_reciprocal.content_hash, before_reciprocal.content_hash);
+  const auto inventory_after =
+      bundle_->scene_authority->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory_after.has_value());
+  ASSERT_NE(inventory_before->bundle.world, nullptr);
+  ASSERT_NE(inventory_after->bundle.world, nullptr);
+  ASSERT_TRUE(inventory_before->bundle.policy.has_value());
+  ASSERT_TRUE(inventory_after->bundle.policy.has_value());
+  EXPECT_EQ(inventory_after->bundle.world->revision.content_hash,
+            inventory_before->bundle.world->revision.content_hash);
+  EXPECT_EQ(inventory_after->bundle.policy->revision.content_hash,
+            inventory_before->bundle.policy->revision.content_hash);
+  EXPECT_EQ(find_live_object(*inventory_after, "object_b"), nullptr);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       ApplyCollisionPolicyCanonicalizesOnlyTypedOmittedDefaults) {
+  CollisionPolicySnapshot policy;
+  policy.policy_id = "typed-default-contact-policy";
+
+  SupportContactPolicyEntry bounded;
+  bounded.pair = {"body/a", "body/b"};
+  bounded.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  bounded.max_contact_penetration_m = 0.001;
+
+  SupportContactPolicyEntry binary;
+  binary.pair = {"body/c", "body/d"};
+  binary.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  policy.support_contacts = {bounded, binary};
+
+  const auto result = set_collision_policy(std::move(policy));
+  ASSERT_TRUE(result.success)
+      << (result.error.has_value() ? result.error->code + ": " +
+                                         result.error->message
+                                   : std::string{"missing error"});
+  const auto configured = projection_backend_->configured_collision_policy();
+  ASSERT_EQ(configured.support_contacts.size(), 2u);
+  const auto& configured_bounded = configured.support_contacts[0];
+  EXPECT_FALSE(configured_bounded.enforce_max_start_penetration);
+  EXPECT_DOUBLE_EQ(configured_bounded.release_tolerance_m, 0.0);
+  EXPECT_FALSE(configured_bounded.require_separation_by_end);
+  EXPECT_FALSE(configured_bounded.require_strictly_decreasing_penetration);
+  const auto& configured_binary = configured.support_contacts[1];
+  EXPECT_FALSE(configured_binary.enforce_max_start_penetration);
+  EXPECT_DOUBLE_EQ(configured_binary.release_tolerance_m, 0.0);
+  EXPECT_TRUE(configured_binary.require_separation_by_end);
+  EXPECT_FALSE(configured_binary.require_strictly_decreasing_penetration);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       BoundedCapScopesIdentityAfterExactTypedDefaultCanonicalization) {
+  auto support = make_box_at_origin("support_surface");
+  support.pose.position_m.x_m = 0.4;
+  ASSERT_TRUE(bundle_->scene_authority->add_object(support).success);
+
+  auto make_bounded_object = [&](double cap_m, bool neutral_release_fields) {
+    auto object = make_box_at_origin("bounded_contact_object");
+    object.frame_id = "tool0";
+    SupportContactDTO bounded;
+    bounded.support_object_id = "support_surface";
+    bounded.mode = CollisionContactPolicyMode::kBoundedPenetration;
+    bounded.max_contact_penetration_m = cap_m;
+    if (neutral_release_fields) {
+      bounded.enforce_max_start_penetration = false;
+      bounded.max_start_penetration_m = 0.0;
+      bounded.release_tolerance_m = 0.0;
+      bounded.min_release_progress_m = 0.0;
+      bounded.require_separation_by_end = false;
+      bounded.require_strictly_decreasing_penetration = false;
+      bounded.allow_recontact = false;
+    }
+    object.support_contacts = {bounded};
+    return object;
+  };
+
+  auto capture_identity = [&]() {
+    const auto inventory =
+        bundle_->scene_authority->current_scene_snapshot_lease_inventory();
+    EXPECT_TRUE(inventory.has_value());
+    if (!inventory.has_value()) {
+      return std::pair<std::string, std::string>{};
+    }
+    const auto* object =
+        find_live_object(*inventory, "bounded_contact_object");
+    EXPECT_NE(object, nullptr);
+    if (object == nullptr || !object->object_revision_token.has_value() ||
+        !inventory->bundle.policy) {
+      return std::pair<std::string, std::string>{};
+    }
+    const auto entry = std::find_if(
+        inventory->bundle.policy->support_contacts.begin(),
+        inventory->bundle.policy->support_contacts.end(),
+        [](const auto& candidate) {
+          return candidate.mode ==
+                     CollisionContactPolicyMode::kBoundedPenetration &&
+                 candidate.max_contact_penetration_m > 0.0;
+        });
+    EXPECT_NE(entry, inventory->bundle.policy->support_contacts.end());
+    if (entry == inventory->bundle.policy->support_contacts.end()) {
+      return std::pair<std::string, std::string>{};
+    }
+    EXPECT_EQ(entry->release_evidence_mode,
+              ContactReleaseEvidenceMode::kSignedPenetration);
+    EXPECT_FALSE(entry->enforce_max_start_penetration);
+    EXPECT_DOUBLE_EQ(entry->max_start_penetration_m, 0.0);
+    EXPECT_DOUBLE_EQ(entry->release_tolerance_m, 0.0);
+    EXPECT_DOUBLE_EQ(entry->min_release_progress_m, 0.0);
+    EXPECT_FALSE(entry->require_separation_by_end);
+    EXPECT_FALSE(entry->require_strictly_decreasing_penetration);
+    EXPECT_FALSE(entry->allow_recontact);
+    return std::pair{*object->object_revision_token,
+                     inventory->bundle.policy->revision.content_hash};
+  };
+
+  ASSERT_TRUE(bundle_->scene_authority
+                  ->add_object(make_bounded_object(0.001, false))
+                  .success);
+  const auto typed_defaults_same_cap = capture_identity();
+
+  ASSERT_TRUE(bundle_->scene_authority
+                  ->remove_object(
+                      RemoveObjectRequestDTO{"bounded_contact_object"})
+                  .success);
+  ASSERT_TRUE(bundle_->scene_authority
+                  ->add_object(make_bounded_object(0.001, true))
+                  .success);
+  const auto canonical_same_cap = capture_identity();
+  EXPECT_EQ(canonical_same_cap, typed_defaults_same_cap)
+      << "unavoidable typed defaults must canonicalize like neutral fields";
+
+  ASSERT_TRUE(bundle_->scene_authority
+                  ->remove_object(
+                      RemoveObjectRequestDTO{"bounded_contact_object"})
+                  .success);
+  ASSERT_TRUE(bundle_->scene_authority
+                  ->add_object(make_bounded_object(0.002, false))
+                  .success);
+  const auto changed_cap = capture_identity();
+  EXPECT_NE(changed_cap.first, canonical_same_cap.first);
+  EXPECT_NE(changed_cap.second, canonical_same_cap.second);
+}
+
+TEST_F(CollisionWorldPublisherTest,
        FocusedProjectionRebuildRestoresExactCommittedScene) {
   ASSERT_TRUE(bundle_->scene_authority
                   ->add_object(make_box_at_origin("rebuild_box"))
@@ -473,6 +916,12 @@ TEST_F(CollisionWorldPublisherTest,
        FreshnessOnlyUpdateRefreshesRuntimeSidecarWithoutRevisionBump) {
   ASSERT_TRUE(bundle_->scene_authority->add_object(make_box_at_origin("box_a")).success);
 
+  auto policy = bundle_->scene_projection->configured_collision_policy();
+  SupportContactPolicyEntry signed_release;
+  signed_release.pair = {"body/support", "object/box_a/shape/0"};
+  policy.support_contacts = {signed_release};
+  ASSERT_TRUE(set_collision_policy(std::move(policy)).success);
+
   UpdateObjectPoseRequestDTO first;
   first.object_id = "box_a";
   first.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
@@ -491,6 +940,8 @@ TEST_F(CollisionWorldPublisherTest,
   ASSERT_TRUE(before_bundle);
   ASSERT_TRUE(before_bundle->world);
   EXPECT_TRUE(before_bundle->lookup_order_valid);
+  EXPECT_TRUE(before_bundle->distance_selection_order_valid);
+  ASSERT_EQ(before_bundle->selected_distance_pairs.size(), 1u);
   ASSERT_EQ(before_bundle->body_freshness.size(), 1u);
   EXPECT_EQ(before_bundle->body_freshness.front().body_id,
             "object/box_a/shape/0");
@@ -519,6 +970,11 @@ TEST_F(CollisionWorldPublisherTest,
   EXPECT_EQ(after_bundle->world, before_bundle->world);
   EXPECT_EQ(after_bundle->policy, before_bundle->policy);
   EXPECT_EQ(after_bundle->policy_index, before_bundle->policy_index);
+  EXPECT_EQ(after_bundle->selected_distance_pairs,
+            before_bundle->selected_distance_pairs);
+  EXPECT_EQ(after_bundle->contact_grasp_selected_distance_pairs,
+            before_bundle->contact_grasp_selected_distance_pairs);
+  EXPECT_TRUE(after_bundle->distance_selection_order_valid);
   EXPECT_GT(after_bundle->epoch, before_bundle->epoch);
   ASSERT_EQ(after_bundle->body_freshness.size(), 1u);
   ASSERT_TRUE(after_bundle->body_freshness.front().source_timestamp_ns);
@@ -666,6 +1122,7 @@ TEST_F(CollisionWorldPublisherTest,
               bundle->policy->revision.revision_id ||
           bundle->policy_index->source_policy_revision.content_hash !=
               bundle->policy->revision.content_hash ||
+          !bundle->distance_selection_order_valid ||
           !bundle->lookup_order_valid || bundle->epoch < previous_epoch ||
           bundle->body_freshness.size() != 1 ||
           !bundle->body_freshness.front().source_timestamp_ns.has_value()) {

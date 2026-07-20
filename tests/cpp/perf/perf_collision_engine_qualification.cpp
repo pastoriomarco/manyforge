@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <ctime>
 #include <cstdlib>
 #include <filesystem>
@@ -99,6 +100,7 @@ using manyforge::core::BoxShapeDTO;
 using manyforge::core::CollisionCancellationToken;
 using manyforge::core::CollisionDecisionAction;
 using manyforge::core::CollisionDecisionSeverity;
+using manyforge::core::CollisionDistanceRequestMode;
 using manyforge::core::CollisionEngineStatus;
 using manyforge::core::CollisionGeometryDescriptor;
 using manyforge::core::CollisionGeometryKind;
@@ -112,7 +114,12 @@ using manyforge::core::CollisionSurface;
 using manyforge::core::CollisionWorldBody;
 using manyforge::core::CollisionWorldSnapshot;
 using manyforge::core::CollisionWorldSnapshotPtr;
+using manyforge::core::CollisionContactPolicyMode;
 using manyforge::core::CollisionValidationPassConfig;
+using manyforge::core::ContactReleaseEvidenceMode;
+using manyforge::core::ContactReleaseEvaluationState;
+using manyforge::core::ContactReleaseSampleEvidence;
+using manyforge::core::ContactReleaseTransitionFailure;
 using manyforge::core::CylinderShapeDTO;
 using manyforge::core::ICollisionQueryEngine;
 using manyforge::core::ParallelCollisionValidationWorkerPool;
@@ -125,6 +132,20 @@ using manyforge::core::Vector3DTO;
 using manyforge::collision::ManyForgeCollisionEngine;
 using manyforge::roboplan_backend::NativeKernelBundle;
 using manyforge::roboplan_backend::create_native_kernel;
+
+std::string distance_request_mode_name(CollisionDistanceRequestMode mode) {
+  switch (mode) {
+    case CollisionDistanceRequestMode::kNone:
+      return "none";
+    case CollisionDistanceRequestMode::kSelectedCollidingPairs:
+      return "selected_colliding_pairs";
+    case CollisionDistanceRequestMode::kAllCollidingPairs:
+      return "all_colliding_pairs";
+    case CollisionDistanceRequestMode::kAllActivePairs:
+      return "all_active_pairs";
+  }
+  return "unknown";
+}
 
 std::shared_ptr<ManyForgeCollisionEngine> make_engine(
     const std::string& model_name = "ur5_gripper",
@@ -425,11 +446,28 @@ bool same_bundle(
     const manyforge::core::CollisionValidationDecisionBundle& a,
     const manyforge::core::CollisionValidationDecisionBundle& b) {
   return same_decision(a.decision, b.decision) &&
-         a.scene_changed_during_validation == b.scene_changed_during_validation &&
+         a.scene_changed_during_validation ==
+             b.scene_changed_during_validation &&
          a.cancelled == b.cancelled &&
          a.cancellation_reason == b.cancellation_reason &&
          a.cancelled_at_waypoint_index == b.cancelled_at_waypoint_index &&
          same_waypoint_records(a.waypoint_records, b.waypoint_records);
+}
+
+CollisionDistanceRequestMode expected_distance_request_mode(
+    const CollisionPolicySnapshot& policy) {
+  const bool needs_selected_distance = std::any_of(
+      policy.support_contacts.begin(), policy.support_contacts.end(),
+      [](const SupportContactPolicyEntry& entry) {
+        return entry.mode ==
+                   CollisionContactPolicyMode::kBoundedPenetration ||
+               (entry.mode == CollisionContactPolicyMode::kContactRelease &&
+                entry.release_evidence_mode ==
+                    ContactReleaseEvidenceMode::kSignedPenetration);
+      });
+  return needs_selected_distance
+             ? CollisionDistanceRequestMode::kSelectedCollidingPairs
+             : CollisionDistanceRequestMode::kNone;
 }
 
 std::int64_t measure_validation_ns(
@@ -468,6 +506,10 @@ struct ValidationWorkerEvidence {
   std::string fallback_reason;
   bool ordered_contact_summary_used = false;
   bool decision_match = false;
+  std::string distance_request_mode = "none";
+  bool distance_scope_verified = false;
+  std::uint64_t distance_api_call_count = 0;
+  std::uint64_t distance_evaluated_logical_pair_count = 0;
   double wall_p50_us = 0.0;
   double wall_p95_us = 0.0;
   double wall_p99_us = 0.0;
@@ -493,7 +535,9 @@ std::vector<ValidationWorkerEvidence> measure_validation_worker_sweep(
     const CollisionPolicySnapshot& policy,
     const TrajectoryDTO& trajectory,
     int max_worker_count,
-    int validation_runs) {
+    int validation_warmup_runs,
+    int validation_runs,
+    bool expect_selected_colliding_distance) {
   std::optional<manyforge::core::CollisionValidationDecisionBundle>
       serial_reference;
   std::vector<ValidationWorkerEvidence> sweep;
@@ -504,9 +548,13 @@ std::vector<ValidationWorkerEvidence> measure_validation_worker_sweep(
   for (int worker_count = 1; worker_count <= max_worker_count;
        ++worker_count) {
     std::vector<std::shared_ptr<ICollisionQueryEngine>> engines;
+    std::vector<std::shared_ptr<ManyForgeCollisionEngine>> concrete_engines;
     engines.reserve(static_cast<std::size_t>(worker_count));
+    concrete_engines.reserve(static_cast<std::size_t>(worker_count));
     for (int i = 0; i < worker_count; ++i) {
-      engines.push_back(make_engine("ur5_gripper", "arm"));
+      auto engine = make_engine("ur5_gripper", "arm");
+      concrete_engines.push_back(engine);
+      engines.push_back(std::move(engine));
     }
 
     ParallelCollisionValidationWorkerPool::Config pool_config;
@@ -530,6 +578,16 @@ std::vector<ValidationWorkerEvidence> measure_validation_worker_sweep(
     g_count_allocations.store(false, std::memory_order_release);
     const auto cold_allocations =
         g_allocation_count.load(std::memory_order_relaxed);
+
+    for (int run = 0; run < validation_warmup_runs; ++run) {
+      (void)measure_validation_ns(pool,
+                                  snapshot_owner,
+                                  engines,
+                                  trajectory,
+                                  worker_cancel,
+                                  pool_config.pass_config,
+                                  &bundle_result);
+    }
 
     std::vector<std::int64_t> wall_samples;
     std::vector<std::int64_t> cpu_samples;
@@ -564,6 +622,42 @@ std::vector<ValidationWorkerEvidence> measure_validation_worker_sweep(
         telemetry.ordered_contact_summary_used;
     sample.decision_match =
         serial_reference && same_bundle(*serial_reference, bundle_result);
+    const auto expected_mode = expected_distance_request_mode(policy);
+    sample.distance_request_mode = distance_request_mode_name(expected_mode);
+    sample.distance_scope_verified = true;
+    int queried_engine_count = 0;
+    for (const auto& engine : concrete_engines) {
+      const auto counters = engine->internal_last_query_mechanism_counters();
+      if (counters.collision_api_call_count == 0) {
+        continue;
+      }
+      ++queried_engine_count;
+      sample.distance_api_call_count += counters.distance_api_call_count;
+      sample.distance_evaluated_logical_pair_count +=
+          counters.distance_evaluated_logical_pair_count;
+      sample.distance_scope_verified =
+          sample.distance_scope_verified &&
+          counters.distance_request_mode == expected_mode;
+      if (expected_mode == CollisionDistanceRequestMode::kNone) {
+        sample.distance_scope_verified =
+            sample.distance_scope_verified &&
+            counters.distance_api_call_count == 0 &&
+            counters.distance_evaluated_logical_pair_count == 0;
+      } else {
+        sample.distance_scope_verified =
+            sample.distance_scope_verified &&
+            counters.distance_evaluated_logical_pair_count <=
+                policy.support_contacts.size();
+        if (expect_selected_colliding_distance) {
+          sample.distance_scope_verified =
+              sample.distance_scope_verified &&
+              counters.distance_api_call_count > 0 &&
+              counters.distance_evaluated_logical_pair_count > 0;
+        }
+      }
+    }
+    sample.distance_scope_verified =
+        sample.distance_scope_verified && queried_engine_count > 0;
     sample.wall_p50_us = percentile_us(wall_samples, 0.50);
     sample.wall_p95_us = percentile_us(wall_samples, 0.95);
     sample.wall_p99_us = percentile_us(wall_samples, 0.99);
@@ -594,14 +688,18 @@ struct FixtureConfig {
   bool expect_manyforge_vs_roboplan_match = true;
   bool expect_unsupported_fail_closed = false;
   bool expect_support_contact_ordered_summary = false;
+  bool binary_contact_fixture = false;
+  bool bounded_penetration_fixture = false;
   bool expect_attached_object = false;
   bool isaac_scene_fixture = false;
   bool query_enabled = true;
   bool runtime_capacity_fixture = false;
   bool validate_trajectory = true;
-  int query_iterations = 120;
+  int query_warmup_runs = 5;
+  int query_iterations = 50;
   int validation_waypoints = 96;
-  int validation_runs = 9;
+  int validation_warmup_runs = 5;
+  int validation_runs = 50;
   int worker_count = 4;
   std::vector<int> validation_waypoint_sweep;
 };
@@ -636,6 +734,15 @@ struct FixtureEvidence {
   int validation_workers = 0;
   std::string validation_fallback_reason;
   bool validation_support_contact_active = false;
+  std::string contact_policy_mode = "none";
+  std::string contact_release_evidence_mode = "none";
+  std::vector<CollisionPairId> configured_contact_pairs;
+  double max_contact_penetration_m = 0.0;
+  bool mode_scoped_fields_verified = true;
+  bool validation_distance_scope_verified = true;
+  bool bounded_over_cap_verified = false;
+  double bounded_observed_penetration_m = 0.0;
+  double bounded_adversarial_cap_m = 0.0;
   double query_p50_us = 0.0;
   double query_p95_us = 0.0;
   double query_p99_us = 0.0;
@@ -805,26 +912,233 @@ bool setup_fixture(NativeKernelBundle& bundle, FixtureEvidence& evidence) {
                                          pose(1.2, 0.0, 0.12)),
                               evidence);
   }
+  if (name == "binary_contact_ordered_summary") {
+    return add_object_checked(
+        bundle,
+        box_object("phase4_binary_contact_probe",
+                   Vector3DTO{10.0, 10.0, 10.0}, pose(0.0, 0.0, 0.5)),
+        evidence);
+  }
+  if (name == "bounded_penetration_insertion") {
+    // A cylindrical insertion envelope around the zero-state arm produces a
+    // deterministic set of robot/envelope contacts without relying on mesh
+    // discretization. The policy is synthesized from that complete set below.
+    return add_object_checked(
+        bundle,
+        cylinder_object("phase4_bounded_insertion_envelope", 1.0, 3.0,
+                        pose(0.0, 0.0, 0.75)),
+        evidence);
+  }
   add_error(evidence, "unknown fixture: " + name);
   return false;
 }
 
-CollisionPolicySnapshot policy_for_fixture(const FixtureConfig& config) {
+std::vector<CollisionPairId> discover_object_contact_pairs(
+    NativeKernelBundle& bundle, const CollisionWorldSnapshot& snapshot,
+    ManyForgeCollisionEngine& engine, const std::string& object_id,
+    FixtureEvidence& evidence) {
+  CollisionQuery query;
+  query.query_id = "phase4_discover_" + object_id;
+  query.surface = CollisionSurface::kPreExecutionValidation;
+  query.robot_state = observed_state(bundle);
+  query.collision_world_revision = snapshot.revision;
+  query.required_capabilities = {"binary_collision", "body_pair_only"};
+  CollisionCancellationToken cancel;
+  CollisionPolicySnapshot discovery_policy;
+  const auto result = engine.check(snapshot, query, discovery_policy, cancel);
+  if (result.engine_status != CollisionEngineStatus::kOk) {
+    evidence.errors.push_back("contact-pair discovery failed for " +
+                              object_id);
+    return {};
+  }
+
+  const std::string body_id = "object/" + object_id + "/shape/0";
+  std::vector<CollisionPairId> pairs;
+  for (const auto& pair : result.normalized_pairs) {
+    if (pair.body_a == body_id || pair.body_b == body_id) {
+      pairs.push_back(canonical_pair(pair.body_a, pair.body_b));
+    }
+  }
+  std::sort(pairs.begin(), pairs.end());
+  pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+  if (pairs.empty()) {
+    evidence.errors.push_back("fixture produced no collision for " + body_id);
+  }
+  return pairs;
+}
+
+CollisionPolicySnapshot policy_for_fixture(
+    const FixtureConfig& config,
+    const std::vector<CollisionPairId>& discovered_contact_pairs) {
   CollisionPolicySnapshot policy;
   policy.policy_id = "phase4_" + config.name;
   policy.revision.revision_id = 1;
   policy.revision.content_hash = "phase4_policy_" + config.name;
   if (config.expect_support_contact_ordered_summary) {
-    SupportContactPolicyEntry entry;
-    entry.pair = canonical_pair(
-                                "robot/ur5_gripper/link/wrist_3_link/collision/0",
-                                "object/phase4_support_object/shape/0");
-    entry.max_start_penetration_m = 0.10;
-    entry.min_release_progress_m = 0.001;
-    entry.require_separation_by_end = true;
-    policy.support_contacts.push_back(std::move(entry));
+    auto contact_pairs = discovered_contact_pairs;
+    if (contact_pairs.empty() && !config.binary_contact_fixture &&
+        !config.bounded_penetration_fixture) {
+      contact_pairs.push_back(canonical_pair(
+          "robot/ur5_gripper/link/wrist_3_link/collision/0",
+          "object/phase4_support_object/shape/0"));
+    }
+    for (const auto& pair : contact_pairs) {
+      SupportContactPolicyEntry entry;
+      entry.pair = pair;
+      if (config.binary_contact_fixture) {
+        entry.release_evidence_mode =
+            ContactReleaseEvidenceMode::kBinaryContact;
+        entry.enforce_max_start_penetration = false;
+        entry.max_start_penetration_m = 0.0;
+        entry.release_tolerance_m = 0.0;
+        entry.min_release_progress_m = 0.0;
+        entry.max_contact_penetration_m = 0.0;
+      } else if (config.bounded_penetration_fixture) {
+        entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
+        entry.enforce_max_start_penetration = false;
+        entry.max_start_penetration_m = 0.0;
+        entry.release_tolerance_m = 0.0;
+        entry.min_release_progress_m = 0.0;
+        entry.max_contact_penetration_m = 2.0;
+        entry.require_separation_by_end = false;
+        entry.require_strictly_decreasing_penetration = false;
+        entry.allow_recontact = false;
+      } else {
+        entry.max_start_penetration_m = 0.10;
+        entry.min_release_progress_m = 0.001;
+        entry.require_separation_by_end = true;
+      }
+      policy.support_contacts.push_back(std::move(entry));
+    }
   }
   return policy;
+}
+
+void record_contact_policy_evidence(const CollisionPolicySnapshot& policy,
+                                    FixtureEvidence& evidence) {
+  evidence.configured_contact_pairs.clear();
+  if (policy.support_contacts.empty()) {
+    return;
+  }
+  evidence.configured_contact_pairs.reserve(policy.support_contacts.size());
+  for (const auto& entry : policy.support_contacts) {
+    evidence.configured_contact_pairs.push_back(entry.pair);
+  }
+  const auto& first = policy.support_contacts.front();
+  evidence.contact_policy_mode =
+      first.mode == CollisionContactPolicyMode::kBoundedPenetration
+          ? "bounded_penetration"
+          : first.mode == CollisionContactPolicyMode::kContactProcess
+                ? "contact_process"
+                : "contact_release";
+  evidence.contact_release_evidence_mode =
+      first.mode == CollisionContactPolicyMode::kContactRelease
+          ? first.release_evidence_mode ==
+                    ContactReleaseEvidenceMode::kBinaryContact
+                ? "binary_contact"
+                : "signed_penetration"
+          : "not_applicable";
+  evidence.max_contact_penetration_m = first.max_contact_penetration_m;
+
+  evidence.mode_scoped_fields_verified = std::all_of(
+      policy.support_contacts.begin(), policy.support_contacts.end(),
+      [&](const SupportContactPolicyEntry& entry) {
+        if (evidence.config.binary_contact_fixture) {
+          return entry.mode == CollisionContactPolicyMode::kContactRelease &&
+                 entry.release_evidence_mode ==
+                     ContactReleaseEvidenceMode::kBinaryContact &&
+                 !entry.enforce_max_start_penetration &&
+                 entry.max_start_penetration_m == 0.0 &&
+                 entry.release_tolerance_m == 0.0 &&
+                 entry.min_release_progress_m == 0.0 &&
+                 entry.max_contact_penetration_m == 0.0;
+        }
+        if (evidence.config.bounded_penetration_fixture) {
+          return entry.mode ==
+                     CollisionContactPolicyMode::kBoundedPenetration &&
+                 !entry.enforce_max_start_penetration &&
+                 entry.max_start_penetration_m == 0.0 &&
+                 entry.release_tolerance_m == 0.0 &&
+                 entry.min_release_progress_m == 0.0 &&
+                 entry.max_contact_penetration_m > 0.0 &&
+                 !entry.require_separation_by_end &&
+                 !entry.require_strictly_decreasing_penetration &&
+                 !entry.allow_recontact;
+        }
+        return true;
+      });
+}
+
+void run_bounded_over_cap_probe(
+    NativeKernelBundle& bundle, const CollisionWorldSnapshot& snapshot,
+    ManyForgeCollisionEngine& engine, const CollisionPolicySnapshot& policy,
+    FixtureEvidence& evidence) {
+  if (!evidence.config.bounded_penetration_fixture ||
+      policy.support_contacts.empty()) {
+    return;
+  }
+
+  CollisionQuery query;
+  query.query_id = "phase4_bounded_over_cap_probe";
+  query.surface = CollisionSurface::kPreExecutionValidation;
+  query.robot_state = observed_state(bundle);
+  query.collision_world_revision = snapshot.revision;
+  query.required_capabilities = {"body_pair_only", "penetration_depth"};
+  query.distance_request_mode =
+      CollisionDistanceRequestMode::kSelectedCollidingPairs;
+  query.selected_distance_pairs = evidence.configured_contact_pairs;
+  std::sort(query.selected_distance_pairs.begin(),
+            query.selected_distance_pairs.end());
+  CollisionCancellationToken cancel;
+  const auto result = engine.check(snapshot, query, policy, cancel);
+  if (result.engine_status != CollisionEngineStatus::kOk) {
+    evidence.errors.push_back("bounded over-cap metric probe failed");
+    return;
+  }
+
+  const auto clearance = std::find_if(
+      result.pair_clearances.begin(), result.pair_clearances.end(),
+      [](const manyforge::core::CollisionPairClearance& sample) {
+        return std::isfinite(sample.signed_clearance_m) &&
+               sample.signed_clearance_m < 0.0;
+      });
+  if (clearance == result.pair_clearances.end()) {
+    evidence.errors.push_back(
+        "bounded insertion fixture produced no penetrating metric sample");
+    return;
+  }
+
+  evidence.bounded_observed_penetration_m =
+      -clearance->signed_clearance_m;
+  evidence.bounded_adversarial_cap_m =
+      evidence.bounded_observed_penetration_m * 0.5;
+  const auto configured = std::find_if(
+      policy.support_contacts.begin(), policy.support_contacts.end(),
+      [&](const SupportContactPolicyEntry& entry) {
+        return entry.pair == clearance->pair;
+      });
+  if (configured == policy.support_contacts.end()) {
+    evidence.errors.push_back(
+        "bounded metric probe returned an unconfigured pair");
+    return;
+  }
+  auto adversarial = *configured;
+  adversarial.max_contact_penetration_m =
+      evidence.bounded_adversarial_cap_m;
+  ContactReleaseEvaluationState state;
+  const auto transition = manyforge::core::advance_contact_release_sample(
+      adversarial,
+      ContactReleaseSampleEvidence{
+          .in_contact = true,
+          .signed_clearance_m = clearance->signed_clearance_m},
+      state);
+  evidence.bounded_over_cap_verified =
+      transition.failure == ContactReleaseTransitionFailure::
+                                kContactPenetrationExceedsPolicy;
+  if (!evidence.bounded_over_cap_verified) {
+    evidence.errors.push_back(
+        "bounded insertion adversarial cap did not reject penetration");
+  }
 }
 
 bool direct_matches_diagnostic(const CollisionResult& direct,
@@ -850,6 +1164,9 @@ void run_query_probe(NativeKernelBundle& bundle,
   std::vector<std::int64_t> query_ns;
   query_ns.reserve(evidence.config.query_iterations);
   CollisionResult direct;
+  for (int i = 0; i < evidence.config.query_warmup_runs; ++i) {
+    direct = engine.check(snapshot, query, policy, cancel);
+  }
   for (int i = 0; i < evidence.config.query_iterations; ++i) {
     const auto start = std::chrono::steady_clock::now();
     direct = engine.check(snapshot, query, policy, cancel);
@@ -900,7 +1217,7 @@ void run_validation_probe(
   noncollision_options.max_tcp_linear_speed_mps = 1000.0;
   noncollision_options.tcp_frame = "tool0";
   noncollision_options.base_frame = "base_link";
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < evidence.config.validation_warmup_runs; ++i) {
     if (!bundle.trajectory_validator
              ->validate_non_collision(trajectory, noncollision_options, cancel)
              .valid) {
@@ -945,7 +1262,9 @@ void run_validation_probe(
       policy,
       trajectory,
       evidence.config.worker_count,
-      evidence.config.validation_runs);
+      evidence.config.validation_warmup_runs,
+      evidence.config.validation_runs,
+      evidence.config.bounded_penetration_fixture);
 
   evidence.validation_waypoint_sweep.clear();
   evidence.validation_waypoint_sweep.reserve(
@@ -962,7 +1281,9 @@ void run_validation_probe(
           policy,
           repeated_trajectory(validation_state, waypoint_count),
           evidence.config.worker_count,
-          evidence.config.validation_runs);
+          evidence.config.validation_warmup_runs,
+          evidence.config.validation_runs,
+          evidence.config.bounded_penetration_fixture);
     }
     evidence.validation_waypoint_sweep.push_back(std::move(sample));
   }
@@ -989,6 +1310,23 @@ void run_validation_probe(
                                [](const ValidationWorkerEvidence& sample) {
                                  return sample.decision_match;
                                });
+                  });
+  evidence.validation_distance_scope_verified = std::all_of(
+      evidence.validation_worker_sweep.begin(),
+      evidence.validation_worker_sweep.end(),
+      [](const ValidationWorkerEvidence& sample) {
+        return sample.distance_scope_verified;
+      });
+  evidence.validation_distance_scope_verified =
+      evidence.validation_distance_scope_verified &&
+      std::all_of(evidence.validation_waypoint_sweep.begin(),
+                  evidence.validation_waypoint_sweep.end(),
+                  [](const ValidationWaypointSweepEvidence& point) {
+                    return std::all_of(
+                        point.workers.begin(), point.workers.end(),
+                        [](const ValidationWorkerEvidence& sample) {
+                          return sample.distance_scope_verified;
+                        });
                   });
   evidence.validation_workers = selected.workers_used;
   evidence.validation_fallback_reason = selected.fallback_reason;
@@ -1101,6 +1439,8 @@ void run_runtime_query_probe(
             manyforge::core::RuntimeCollisionQueryStatus::kInconclusive;
   }
   g_count_allocations.store(false, std::memory_order_release);
+  const auto runtime_clean_allocations =
+      g_allocation_count.load(std::memory_order_relaxed);
 
   auto timeout_request = request;
   timeout_request.timeout_budget_ns = 0;
@@ -1132,8 +1472,7 @@ void run_runtime_query_probe(
 
   evidence.runtime_query_supported =
       all_revision_changes_conclusive && all_conclusive;
-  evidence.runtime_clean_allocations =
-      g_allocation_count.load(std::memory_order_relaxed);
+  evidence.runtime_clean_allocations = runtime_clean_allocations;
   evidence.runtime_allocations_per_query =
       static_cast<double>(evidence.runtime_clean_allocations) /
       static_cast<double>(kIterations);
@@ -1310,10 +1649,23 @@ FixtureEvidence run_fixture(const FixtureConfig& config) {
         "runtime capacity fixture does not match declared body bound");
   }
 
-  const auto policy = policy_for_fixture(config);
+  std::vector<CollisionPairId> discovered_contact_pairs;
+  if (config.binary_contact_fixture) {
+    discovered_contact_pairs = discover_object_contact_pairs(
+        *bundle, probe_snapshot, *engine, "phase4_binary_contact_probe",
+        evidence);
+  } else if (config.bounded_penetration_fixture) {
+    discovered_contact_pairs = discover_object_contact_pairs(
+        *bundle, probe_snapshot, *engine,
+        "phase4_bounded_insertion_envelope", evidence);
+  }
+  const auto policy = policy_for_fixture(config, discovered_contact_pairs);
+  record_contact_policy_evidence(policy, evidence);
   if (config.query_enabled) {
     run_query_probe(*bundle, probe_snapshot, *engine, policy, evidence);
   }
+  run_bounded_over_cap_probe(*bundle, probe_snapshot, *engine, policy,
+                             evidence);
   if (!config.expect_unsupported_fail_closed) {
     run_runtime_query_probe(*bundle, probe_snapshot, *engine, evidence);
     run_validation_probe(*bundle, probe_snapshot, policy, evidence);
@@ -1331,6 +1683,15 @@ FixtureEvidence run_fixture(const FixtureConfig& config) {
       !evidence.support_contact_ordered_summary_verified) {
     evidence.errors.push_back(
         "support-contact ordered-summary parallel path not verified");
+  }
+  if ((config.binary_contact_fixture || config.bounded_penetration_fixture) &&
+      !evidence.mode_scoped_fields_verified) {
+    evidence.errors.push_back("contact-policy mode-scoped fields are invalid");
+  }
+  if ((config.binary_contact_fixture || config.bounded_penetration_fixture) &&
+      !evidence.validation_distance_scope_verified) {
+    evidence.errors.push_back(
+        "contact-policy validation used the wrong distance scope");
   }
   if (config.expect_attached_object && evidence.attached_object_count <= 0) {
     evidence.errors.push_back("attached object missing from snapshot");
@@ -1378,9 +1739,29 @@ std::string fixture_to_json(const FixtureEvidence& e) {
       << json_bool(e.unsupported_fail_closed) << ",";
   out << "\"support_contact_ordered_summary_verified\":"
       << json_bool(e.support_contact_ordered_summary_verified) << ",";
+  out << "\"contact_policy\":{\"mode\":\""
+      << json_escape(e.contact_policy_mode)
+      << "\",\"release_evidence_mode\":\""
+      << json_escape(e.contact_release_evidence_mode)
+      << "\",\"configured_pair_count\":"
+      << e.configured_contact_pairs.size()
+      << ",\"max_contact_penetration_m\":"
+      << e.max_contact_penetration_m
+      << ",\"mode_scoped_fields_verified\":"
+      << json_bool(e.mode_scoped_fields_verified)
+      << ",\"validation_distance_scope_verified\":"
+      << json_bool(e.validation_distance_scope_verified)
+      << ",\"bounded_over_cap_verified\":"
+      << json_bool(e.bounded_over_cap_verified)
+      << ",\"bounded_observed_penetration_m\":"
+      << e.bounded_observed_penetration_m
+      << ",\"bounded_adversarial_cap_m\":"
+      << e.bounded_adversarial_cap_m << "},";
   out << "\"isaac_scene_fixture\":"
       << json_bool(e.config.isaac_scene_fixture) << ",";
   out << "\"query_enabled\":" << json_bool(e.config.query_enabled) << ",";
+  out << "\"query_warmup_runs\":" << e.config.query_warmup_runs << ",";
+  out << "\"query_measured_runs\":" << e.config.query_iterations << ",";
   out << "\"query_us\":{\"p50\":" << e.query_p50_us
       << ",\"p95\":" << e.query_p95_us
       << ",\"p99\":" << e.query_p99_us
@@ -1430,7 +1811,8 @@ std::string fixture_to_json(const FixtureEvidence& e) {
   out << "\"validation\":{\"enabled\":"
       << json_bool(e.config.validate_trajectory)
       << ",\"waypoints\":" << e.config.validation_waypoints
-      << ",\"runs\":" << e.config.validation_runs
+      << ",\"warmup_runs\":" << e.config.validation_warmup_runs
+      << ",\"measured_runs\":" << e.config.validation_runs
       << ",\"serial_p95_us\":" << e.validation_serial_p95_us
       << ",\"parallel_p95_us\":" << e.validation_parallel_p95_us
       << ",\"workers\":" << e.validation_workers
@@ -1449,6 +1831,14 @@ std::string fixture_to_json(const FixtureEvidence& e) {
         << "\",\"ordered_contact_summary_used\":"
         << json_bool(sample.ordered_contact_summary_used)
         << ",\"decision_match\":" << json_bool(sample.decision_match)
+        << ",\"distance_request_mode\":\""
+        << json_escape(sample.distance_request_mode)
+        << "\",\"distance_scope_verified\":"
+        << json_bool(sample.distance_scope_verified)
+        << ",\"distance_api_call_count\":"
+        << sample.distance_api_call_count
+        << ",\"distance_evaluated_logical_pair_count\":"
+        << sample.distance_evaluated_logical_pair_count
         << ",\"wall_us\":{\"p50\":" << sample.wall_p50_us
         << ",\"p95\":" << sample.wall_p95_us
         << ",\"p99\":" << sample.wall_p99_us
@@ -1492,7 +1882,8 @@ std::string fixture_to_json(const FixtureEvidence& e) {
   out << "]},";
   out << "\"noncollision_validation\":{\"enabled\":"
       << json_bool(e.config.validate_trajectory)
-      << ",\"runs\":" << e.config.validation_runs
+      << ",\"warmup_runs\":" << e.config.validation_warmup_runs
+      << ",\"measured_runs\":" << e.config.validation_runs
       << ",\"p50_us\":" << e.noncollision_validation_p50_us
       << ",\"p95_us\":" << e.noncollision_validation_p95_us
       << ",\"p99_us\":" << e.noncollision_validation_p99_us
@@ -1512,8 +1903,51 @@ std::string fixture_to_json(const FixtureEvidence& e) {
 
 }  // namespace
 
-int main() {
-  const std::vector<FixtureConfig> fixtures = {
+int parse_positive_run_count(const std::string& value,
+                             const std::string& option) {
+  std::size_t consumed = 0;
+  const auto parsed = std::stoll(value, &consumed, 10);
+  if (consumed != value.size() || parsed <= 0 || parsed > 1'000'000) {
+    throw std::invalid_argument(option +
+                                " must be a positive bounded integer");
+  }
+  return static_cast<int>(parsed);
+}
+
+struct QualificationOptions {
+  int warmup_runs = 5;
+  int measured_runs = 50;
+};
+
+QualificationOptions parse_qualification_options(int argc, char** argv) {
+  QualificationOptions options;
+  for (int index = 1; index < argc; ++index) {
+    const std::string option = argv[index];
+    if (index + 1 >= argc) {
+      throw std::invalid_argument(option + " requires a value");
+    }
+    const std::string value = argv[++index];
+    if (option == "--warmup-runs") {
+      options.warmup_runs = parse_positive_run_count(value, option);
+    } else if (option == "--measured-runs") {
+      options.measured_runs = parse_positive_run_count(value, option);
+    } else {
+      throw std::invalid_argument("unknown option: " + option);
+    }
+  }
+  return options;
+}
+
+int main(int argc, char** argv) {
+  QualificationOptions options;
+  try {
+    options = parse_qualification_options(argc, argv);
+  } catch (const std::exception& error) {
+    std::cerr << "invalid qualification options: " << error.what() << "\n";
+    return 2;
+  }
+
+  std::vector<FixtureConfig> fixtures = {
       FixtureConfig{.name = "primitive_dense_ur5_gripper",
                     .profile = "primitive_box",
                     .expect_manyforge_vs_roboplan_match = true,
@@ -1546,15 +1980,33 @@ int main() {
                     .profile = "isaac_like_primitive",
                     .expect_manyforge_vs_roboplan_match = true,
                     .isaac_scene_fixture = true,
-                    .validation_runs = 30,
                     .validation_waypoint_sweep = {8, 16, 32, 64, 96, 192}},
       FixtureConfig{.name = "support_contact_ordered_summary",
                     .profile = "support_contact_policy",
                     .expect_manyforge_vs_roboplan_match = true,
                     .expect_support_contact_ordered_summary = true,
-                    .validation_runs = 30,
                     .validation_waypoint_sweep = {8, 16, 32, 64, 96, 192}},
+      FixtureConfig{.name = "binary_contact_ordered_summary",
+                    .profile = "binary_contact_policy",
+                    .expect_manyforge_vs_roboplan_match = false,
+                    .expect_support_contact_ordered_summary = true,
+                    .binary_contact_fixture = true,
+                    .query_enabled = false,
+                    .validation_waypoint_sweep = {}},
+      FixtureConfig{.name = "bounded_penetration_insertion",
+                    .profile = "bounded_penetration_insertion",
+                    .expect_manyforge_vs_roboplan_match = false,
+                    .expect_support_contact_ordered_summary = true,
+                    .bounded_penetration_fixture = true,
+                    .query_enabled = false,
+                    .validation_waypoint_sweep = {}},
   };
+  for (auto& fixture : fixtures) {
+    fixture.query_warmup_runs = options.warmup_runs;
+    fixture.query_iterations = options.measured_runs;
+    fixture.validation_warmup_runs = options.warmup_runs;
+    fixture.validation_runs = options.measured_runs;
+  }
 
   std::vector<FixtureEvidence> results;
   results.reserve(fixtures.size());
@@ -1579,6 +2031,8 @@ int main() {
   out << "{";
   out << "\"phase4_schema\":1,";
   out << "\"qualification_scope\":\"collision_engine_fixture_matrix\",";
+  out << "\"warmup_runs\":" << options.warmup_runs << ",";
+  out << "\"measured_runs\":" << options.measured_runs << ",";
   out << "\"fixture_count\":" << results.size() << ",";
   out << "\"fixtures_passed\":" << passed_count << ",";
   out << "\"all_passed\":" << json_bool(all_passed) << ",";

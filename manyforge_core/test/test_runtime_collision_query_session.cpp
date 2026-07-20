@@ -2,6 +2,7 @@
 
 #include <manyforge_core/runtime_collision_query_session.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -138,6 +139,13 @@ class FixedRuntimeEngine final : public ICollisionQueryEngine {
     capability_.engine_id = "fixed_runtime_test_engine";
     capability_.engine_version = "test";
     capability_.library_lineage = "unit_test";
+    capability_.supports_distance_query = true;
+    capability_.supported_distance_request_modes = {
+        CollisionDistanceRequestMode::kNone,
+        CollisionDistanceRequestMode::kSelectedCollidingPairs,
+        CollisionDistanceRequestMode::kAllCollidingPairs,
+        CollisionDistanceRequestMode::kAllActivePairs};
+    capability_.supports_penetration_depth = true;
     capability_.thread_safety =
         CollisionEngineThreadSafetyClass::kSingleContextExclusive;
     capability_.mutable_context_id = "fixed_runtime_test_context";
@@ -183,6 +191,30 @@ class FixedRuntimeEngine final : public ICollisionQueryEngine {
     last_timeout_budget_ns_ = request.timeout_budget_ns;
     last_positions_[0] = request.positions_rad[0];
     last_positions_[1] = request.positions_rad[1];
+    last_distance_request_mode_ = request.distance_request_mode;
+    last_selected_distance_pair_count_ = request.selected_distance_pairs.size();
+    if (!request.selected_distance_pairs.empty()) {
+      last_selected_distance_pair_ = request.selected_distance_pairs.front();
+    }
+    const bool pair_selected =
+        observations_[0].pair != nullptr &&
+        std::find(request.selected_distance_pairs.begin(),
+                  request.selected_distance_pairs.end(),
+                  *observations_[0].pair) !=
+            request.selected_distance_pairs.end();
+    const bool measure_pair =
+        request.distance_request_mode ==
+            CollisionDistanceRequestMode::kAllActivePairs ||
+        (status_ == RuntimeCollisionQueryStatus::kCollision &&
+         (request.distance_request_mode ==
+              CollisionDistanceRequestMode::kAllCollidingPairs ||
+          (request.distance_request_mode ==
+               CollisionDistanceRequestMode::kSelectedCollidingPairs &&
+           pair_selected)));
+    returned_observations_[0] = observations_[0];
+    if (!measure_pair) {
+      returned_observations_[0].signed_clearance_m.reset();
+    }
     RuntimeCollisionQueryResultView result;
     result.status = status_;
     result.failure_reason = failure_reason_;
@@ -191,12 +223,12 @@ class FixedRuntimeEngine final : public ICollisionQueryEngine {
     if (return_oversized_collision_observations_) {
       result.collision_pairs = oversized_observations_;
     } else if (status_ == RuntimeCollisionQueryStatus::kCollision) {
-      result.collision_pairs = observations_;
+      result.collision_pairs = returned_observations_;
     }
     if (return_oversized_clearance_observations_) {
       result.clearance_pairs = oversized_observations_;
-    } else if (request.require_distance && observations_[0].pair != nullptr) {
-      result.clearance_pairs = observations_;
+    } else if (measure_pair && observations_[0].pair != nullptr) {
+      result.clearance_pairs = returned_observations_;
     }
     return result;
   }
@@ -209,6 +241,13 @@ class FixedRuntimeEngine final : public ICollisionQueryEngine {
   void collide(CollisionPairId pair, double clearance) {
     observe(std::move(pair), clearance, /*collision=*/true);
   }
+
+  void collide_without_clearance(CollisionPairId pair) {
+    observe(std::move(pair), 0.0, /*collision=*/true);
+    observations_[0].signed_clearance_m.reset();
+  }
+
+  void clear() { status_ = RuntimeCollisionQueryStatus::kClear; }
 
   void observe(CollisionPairId pair, double clearance, bool collision) {
     pair_ = std::move(pair);
@@ -227,12 +266,17 @@ class FixedRuntimeEngine final : public ICollisionQueryEngine {
   CollisionEngineStatus engine_status_ = CollisionEngineStatus::kOk;
   CollisionPairId pair_;
   std::array<RuntimeCollisionPairObservation, 1> observations_{};
+  std::array<RuntimeCollisionPairObservation, 1> returned_observations_{};
   std::array<RuntimeCollisionPairObservation, 65> oversized_observations_{};
   std::array<double, 2> last_positions_{};
   std::size_t prepared_joint_count_ = 0;
   std::uint64_t query_count_ = 0;
   std::int64_t last_timeout_budget_ns_ = 0;
   std::int64_t query_duration_ns_ = 1'000;
+  CollisionDistanceRequestMode last_distance_request_mode_ =
+      CollisionDistanceRequestMode::kNone;
+  std::size_t last_selected_distance_pair_count_ = 0;
+  CollisionPairId last_selected_distance_pair_;
   bool return_oversized_collision_observations_ = false;
   bool return_oversized_clearance_observations_ = false;
 };
@@ -242,6 +286,17 @@ RuntimeCollisionQueryBundlePtr make_bundle(CollisionPolicySnapshot policy,
   auto world = std::make_shared<CollisionWorldSnapshot>();
   world->revision = {1, "runtime-world"};
   world->snapshot_format_version = 1;
+  auto make_body = [](std::string body_id) {
+    CollisionWorldBody body;
+    body.body_id = std::move(body_id);
+    return body;
+  };
+  world->bodies = {
+      make_body("object/part/shape/0"),
+      make_body("robot/robot1/link/finger_left/collision/0"),
+      make_body("robot/robot1/link/finger_right/collision/0"),
+  };
+  world->body_count = static_cast<std::int64_t>(world->bodies.size());
   return build_runtime_collision_query_bundle(
       CollisionWorldPolicySnapshotBundle{world, std::move(policy)}, epoch);
 }
@@ -253,6 +308,36 @@ RuntimeCollisionStateProjection make_projection() {
   projection.template_positions_rad = {0.0, 0.0};
   projection.source_to_query_indices = {0, 1};
   return projection;
+}
+
+TEST(RuntimeCollisionQueryBundleTest,
+     PreservesAuthoredContactReleaseTerminalAndProgressFlags) {
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {7, "preserved-release-policy"};
+  SupportContactPolicyEntry release;
+  release.pair = pair;
+  release.require_separation_by_end = true;
+  release.require_strictly_decreasing_penetration = true;
+  release.min_release_progress_m = 0.004;
+  policy.support_contacts.push_back(release);
+
+  const auto bundle = make_bundle(std::move(policy));
+
+  ASSERT_NE(bundle, nullptr);
+  ASSERT_NE(bundle->policy, nullptr);
+  ASSERT_EQ(bundle->policy->support_contacts.size(), 1U);
+  const auto& published = bundle->policy->support_contacts.front();
+  EXPECT_TRUE(published.require_separation_by_end);
+  EXPECT_TRUE(published.require_strictly_decreasing_penetration);
+  EXPECT_DOUBLE_EQ(published.min_release_progress_m, 0.004);
+  ASSERT_NE(bundle->policy_index, nullptr);
+  const auto indexed = bundle->policy_index->support_contact_index.find(pair);
+  ASSERT_NE(indexed, bundle->policy_index->support_contact_index.end());
+  EXPECT_TRUE(indexed->second.require_separation_by_end);
+  EXPECT_TRUE(indexed->second.require_strictly_decreasing_penetration);
+  EXPECT_DOUBLE_EQ(indexed->second.min_release_progress_m, 0.004);
 }
 
 TEST(RuntimeCollisionQuerySessionTest,
@@ -281,6 +366,117 @@ TEST(RuntimeCollisionQuerySessionTest,
   EXPECT_EQ(g_allocation_count.load(std::memory_order_relaxed), 0u);
   EXPECT_DOUBLE_EQ(engine->last_positions_[0], positions[0]);
   EXPECT_DOUBLE_EQ(engine->last_positions_[1], positions[1]);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     WarmSignedReleaseTickHasZeroFrameworkAllocations) {
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {2, "runtime-signed-release-policy"};
+  SupportContactPolicyEntry release;
+  release.pair = pair;
+  release.max_start_penetration_m = 0.01;
+  policy.support_contacts.push_back(release);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  engine->collide(pair, -0.001);
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+  ASSERT_FALSE(session.prepare(publisher.bundle).has_value());
+  const std::array<double, 2> positions{0.25, -0.5};
+  ASSERT_EQ(session.tick(publisher.bundle, positions, 1).status,
+            RuntimeCollisionTickStatus::kClear);
+
+  g_allocation_count.store(0, std::memory_order_relaxed);
+  g_count_allocations.store(true, std::memory_order_release);
+  RuntimeCollisionTickStatus last = RuntimeCollisionTickStatus::kInconclusive;
+  for (int i = 0; i < 10'000; ++i) {
+    last = session.tick(publisher.bundle, positions, i + 2).status;
+  }
+  g_count_allocations.store(false, std::memory_order_release);
+
+  EXPECT_EQ(last, RuntimeCollisionTickStatus::kClear);
+  EXPECT_EQ(g_allocation_count.load(std::memory_order_relaxed), 0u);
+  EXPECT_EQ(engine->last_distance_request_mode_,
+            CollisionDistanceRequestMode::kSelectedCollidingPairs);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     WarmBinaryReleaseTickHasZeroFrameworkAllocations) {
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {3, "runtime-binary-release-policy"};
+  SupportContactPolicyEntry release;
+  release.pair = pair;
+  release.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  release.enforce_max_start_penetration = false;
+  release.max_start_penetration_m = 0.0;
+  release.release_tolerance_m = 0.0;
+  release.min_release_progress_m = 0.0;
+  release.require_strictly_decreasing_penetration = false;
+  policy.support_contacts.push_back(release);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  engine->collide_without_clearance(pair);
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+  ASSERT_FALSE(session.prepare(publisher.bundle).has_value());
+  const std::array<double, 2> positions{0.25, -0.5};
+  ASSERT_EQ(session.tick(publisher.bundle, positions, 1).status,
+            RuntimeCollisionTickStatus::kClear);
+
+  g_allocation_count.store(0, std::memory_order_relaxed);
+  g_count_allocations.store(true, std::memory_order_release);
+  RuntimeCollisionTickStatus last = RuntimeCollisionTickStatus::kInconclusive;
+  for (int i = 0; i < 10'000; ++i) {
+    last = session.tick(publisher.bundle, positions, i + 2).status;
+  }
+  g_count_allocations.store(false, std::memory_order_release);
+
+  EXPECT_EQ(last, RuntimeCollisionTickStatus::kClear);
+  EXPECT_EQ(g_allocation_count.load(std::memory_order_relaxed), 0u);
+  EXPECT_EQ(engine->last_distance_request_mode_,
+            CollisionDistanceRequestMode::kNone);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     WarmBoundedPenetrationTickHasZeroFrameworkAllocations) {
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {4, "runtime-bounded-contact-policy"};
+  SupportContactPolicyEntry contact;
+  contact.pair = pair;
+  contact.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  contact.max_contact_penetration_m = 0.002;
+  policy.support_contacts.push_back(contact);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  engine->collide(pair, -0.001);
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+  ASSERT_FALSE(session.prepare(publisher.bundle).has_value());
+  const std::array<double, 2> positions{0.25, -0.5};
+  ASSERT_EQ(session.tick(publisher.bundle, positions, 1).status,
+            RuntimeCollisionTickStatus::kClear);
+
+  g_allocation_count.store(0, std::memory_order_relaxed);
+  g_count_allocations.store(true, std::memory_order_release);
+  RuntimeCollisionTickStatus last = RuntimeCollisionTickStatus::kInconclusive;
+  for (int i = 0; i < 10'000; ++i) {
+    last = session.tick(publisher.bundle, positions, i + 2).status;
+  }
+  g_count_allocations.store(false, std::memory_order_release);
+
+  EXPECT_EQ(last, RuntimeCollisionTickStatus::kClear);
+  EXPECT_EQ(g_allocation_count.load(std::memory_order_relaxed), 0u);
+  EXPECT_EQ(engine->last_distance_request_mode_,
+            CollisionDistanceRequestMode::kSelectedCollidingPairs);
 }
 
 TEST(RuntimeCollisionQuerySessionTest,
@@ -326,6 +522,169 @@ TEST(RuntimeCollisionQuerySessionTest,
   ASSERT_TRUE(error.has_value());
   EXPECT_EQ(error->details.at("reason"),
             "runtime_collision_query_capability_unsupported");
+  EXPECT_EQ(engine->query_count_, 0u);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     MissingDistanceScopeDeclarationFailsGeneralCapabilityAdmission) {
+  CollisionPolicySnapshot policy;
+  policy.revision = {1, "runtime-policy"};
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  engine->capability_.supported_distance_request_modes.clear();
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+
+  const auto error = session.prepare(publisher.bundle);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_EQ(error->details.at("reason"),
+            "runtime_collision_query_capability_unsupported");
+  EXPECT_EQ(error->details.at("capability_status"),
+            "invalid_distance_request_modes");
+  EXPECT_EQ(engine->prepared_joint_count_, 0u);
+  EXPECT_EQ(engine->query_count_, 0u);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     DistanceScopeCapabilityDeclarationMustBeSortedUniqueAndConsistent) {
+  FixedRuntimeEngine engine;
+  auto capability = engine.capability_;
+
+  capability.supported_distance_request_modes = {
+      CollisionDistanceRequestMode::kSelectedCollidingPairs,
+      CollisionDistanceRequestMode::kNone};
+  EXPECT_FALSE(collision_distance_request_modes_valid(capability));
+  EXPECT_EQ(runtime_collision_query_capability_status(capability),
+            RuntimeCollisionQueryCapabilityStatus::
+                kInvalidDistanceRequestModes);
+
+  capability.supported_distance_request_modes = {
+      CollisionDistanceRequestMode::kNone,
+      CollisionDistanceRequestMode::kNone};
+  EXPECT_FALSE(collision_distance_request_modes_valid(capability));
+
+  capability.supported_distance_request_modes = {
+      CollisionDistanceRequestMode::kNone,
+      CollisionDistanceRequestMode::kSelectedCollidingPairs};
+  capability.supports_distance_query = false;
+  EXPECT_FALSE(collision_distance_request_modes_valid(capability));
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     SignedPolicyRejectsAllActiveOnlyEngineWithoutScopeFallback) {
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {2, "runtime-signed-release-policy"};
+  SupportContactPolicyEntry release;
+  release.pair = pair;
+  release.max_start_penetration_m = 0.01;
+  policy.support_contacts.push_back(release);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  engine->capability_.supported_distance_request_modes = {
+      CollisionDistanceRequestMode::kNone,
+      CollisionDistanceRequestMode::kAllActivePairs};
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+
+  const auto error = session.prepare(publisher.bundle);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_EQ(error->details.at("reason"),
+            "runtime_collision_distance_request_mode_unsupported");
+  EXPECT_EQ(engine->prepared_joint_count_, 0u);
+  EXPECT_EQ(engine->query_count_, 0u);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     SignedPolicyReportsMissingPenetrationCapabilityPrecisely) {
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {3, "runtime-signed-release-missing-depth-policy"};
+  SupportContactPolicyEntry release;
+  release.pair = pair;
+  release.max_start_penetration_m = 0.01;
+  policy.support_contacts.push_back(release);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  engine->capability_.supports_penetration_depth = false;
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+
+  const auto error = session.prepare(publisher.bundle);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_EQ(error->details.at("reason"),
+            "runtime_collision_required_capability_unsupported");
+  EXPECT_EQ(error->details.at("required_capability"),
+            "penetration_depth");
+  EXPECT_EQ(engine->prepared_joint_count_, 0u);
+  EXPECT_EQ(engine->query_count_, 0u);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     BinaryPolicyAdmitsExplicitCollisionOnlyNoneScope) {
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {3, "runtime-binary-release-policy"};
+  SupportContactPolicyEntry release;
+  release.pair = pair;
+  release.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  release.enforce_max_start_penetration = false;
+  release.max_start_penetration_m = 0.0;
+  release.release_tolerance_m = 0.0;
+  release.min_release_progress_m = 0.0;
+  release.require_strictly_decreasing_penetration = false;
+  policy.support_contacts.push_back(release);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  engine->capability_.supports_distance_query = false;
+  engine->capability_.supports_penetration_depth = false;
+  engine->capability_.supported_distance_request_modes = {
+      CollisionDistanceRequestMode::kNone};
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+
+  EXPECT_FALSE(session.prepare(publisher.bundle).has_value());
+  const std::array<double, 2> positions{0.0, 0.0};
+  const auto outcome = session.tick(publisher.bundle, positions, 1);
+  EXPECT_EQ(outcome.status, RuntimeCollisionTickStatus::kClear);
+  EXPECT_EQ(engine->last_distance_request_mode_,
+            CollisionDistanceRequestMode::kNone);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     BoundedPolicyWithReleaseFieldMixtureFailsBeforeMonitorArm) {
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {4, "runtime-invalid-bounded-policy"};
+  SupportContactPolicyEntry bounded;
+  bounded.pair = pair;
+  bounded.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  bounded.max_contact_penetration_m = 0.002;
+  bounded.release_tolerance_m = 0.001;
+  policy.support_contacts.push_back(bounded);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+
+  const auto error = session.prepare(publisher.bundle);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_EQ(error->details.at("reason"),
+            "runtime_contact_release_policy_invalid");
+  EXPECT_EQ(engine->prepared_joint_count_, 0u);
   EXPECT_EQ(engine->query_count_, 0u);
 }
 
@@ -643,6 +1002,51 @@ TEST(RuntimeCollisionQuerySessionTest,
 }
 
 TEST(RuntimeCollisionQuerySessionTest,
+     RuntimeBundlePreselectsMetricPairsAndExcludesBinaryPairs) {
+  const CollisionPairId bounded_pair{"object/fixture/shape/0",
+                                     "object/insert/shape/0"};
+  const CollisionPairId binary_pair{"fixture/table/shape/0",
+                                    "object/binary/shape/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {2, "mixed-runtime-distance-selection"};
+
+  SupportContactPolicyEntry bounded;
+  bounded.pair = bounded_pair;
+  bounded.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  bounded.max_contact_penetration_m = 0.002;
+  policy.support_contacts.push_back(bounded);
+
+  SupportContactPolicyEntry binary;
+  binary.pair = binary_pair;
+  binary.mode = CollisionContactPolicyMode::kContactRelease;
+  binary.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  binary.enforce_max_start_penetration = false;
+  binary.max_start_penetration_m = 0.0;
+  binary.release_tolerance_m = 0.0;
+  binary.min_release_progress_m = 0.0;
+  binary.require_strictly_decreasing_penetration = false;
+  policy.support_contacts.push_back(binary);
+
+  ContactGraspPolicyEntry grasp;
+  grasp.policy_id = "contact_grasp/part";
+  grasp.selected_object_id = "part";
+  grasp.allowed_robot_links = {"finger_left", "finger_right"};
+  grasp.max_penetration_m = 0.003;
+  grasp.terminal_window_start_fraction = 0.75;
+  policy.contact_grasps.push_back(grasp);
+
+  const auto bundle = make_bundle(std::move(policy));
+  ASSERT_TRUE(bundle->distance_selection_order_valid);
+  const auto& selected =
+      bundle->contact_grasp_selected_distance_pairs.at("contact_grasp/part");
+  EXPECT_NE(std::find(selected.begin(), selected.end(), bounded_pair),
+            selected.end());
+  EXPECT_EQ(std::find(selected.begin(), selected.end(), binary_pair),
+            selected.end());
+  EXPECT_EQ(selected.size(), 3u);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
      ActiveContactGraspAllowsOnlyMatchingBoundedContact) {
   const CollisionPairId pair{"object/part/shape/0",
                              "robot/robot1/link/finger_left/collision/0"};
@@ -666,12 +1070,49 @@ TEST(RuntimeCollisionQuerySessionTest,
   engine->collide(pair, -0.001);
   EXPECT_EQ(session.tick(publisher.bundle, positions, 1).status,
             RuntimeCollisionTickStatus::kClear);
+  EXPECT_EQ(engine->last_distance_request_mode_,
+            CollisionDistanceRequestMode::kSelectedCollidingPairs);
+  EXPECT_EQ(engine->last_selected_distance_pair_count_, 2u);
 
   engine->collide(pair, -0.01);
   const auto blocked = session.tick(publisher.bundle, positions, 2);
   EXPECT_EQ(blocked.status, RuntimeCollisionTickStatus::kCollision);
   EXPECT_EQ(blocked.contact_grasp_violation,
             RuntimeContactGraspViolation::kPenetrationExceeded);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     ActiveContactGraspRejectsContradictoryPositiveClearance) {
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {2, "contact-grasp-positive-clearance"};
+  ContactGraspPolicyEntry grasp;
+  grasp.policy_id = "contact_grasp/part";
+  grasp.selected_object_id = "part";
+  grasp.allowed_robot_links = {"finger_left"};
+  grasp.max_penetration_m = 0.003;
+  grasp.terminal_window_start_fraction = 0.75;
+  policy.contact_grasps.push_back(std::move(grasp));
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  RuntimeCollisionQuerySession session(
+      make_projection(), publisher, engine, "contact_grasp/part", 10'000'000);
+  ASSERT_FALSE(session.prepare(publisher.bundle).has_value());
+
+  engine->collide(pair, 0.001);
+  const std::array<double, 2> positions{0.0, 0.0};
+  const auto blocked = session.tick(publisher.bundle, positions, 1);
+
+  EXPECT_EQ(blocked.status, RuntimeCollisionTickStatus::kInconclusive);
+  EXPECT_EQ(blocked.reason, RuntimeCollisionTickReason::kEngineInconclusive);
+  EXPECT_EQ(blocked.engine_failure_reason,
+            RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete);
+  EXPECT_EQ(blocked.engine_status,
+            CollisionEngineStatus::kDiagnosticIncomplete);
+  EXPECT_EQ(blocked.contact_grasp_violation,
+            RuntimeContactGraspViolation::kMissingClearance);
 }
 
 TEST(RuntimeCollisionQuerySessionTest,
@@ -685,16 +1126,15 @@ TEST(RuntimeCollisionQuerySessionTest,
   release.mode = CollisionContactPolicyMode::kContactRelease;
   release.release_tolerance_m = 1e-5;
   release.max_start_penetration_m = 0.01;
-  release.min_separation_clearance_m = 0.0;
   release.require_separation_by_end = true;
   release.require_strictly_decreasing_penetration = true;
   policy.support_contacts.push_back(std::move(release));
   StaticRuntimePublisher publisher;
   publisher.bundle = make_bundle(std::move(policy));
-  ASSERT_FALSE(
+  ASSERT_TRUE(
       publisher.bundle->policy->support_contacts.front().require_separation_by_end);
-  ASSERT_FALSE(publisher.bundle->policy->support_contacts.front()
-                   .require_strictly_decreasing_penetration);
+  ASSERT_TRUE(publisher.bundle->policy->support_contacts.front()
+                  .require_strictly_decreasing_penetration);
   auto engine = std::make_shared<FixedRuntimeEngine>();
   RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
                                        10'000'000);
@@ -704,18 +1144,205 @@ TEST(RuntimeCollisionQuerySessionTest,
   engine->collide(pair, -0.001);
   EXPECT_EQ(session.tick(publisher.bundle, positions, 1).status,
             RuntimeCollisionTickStatus::kClear);
+  EXPECT_EQ(engine->last_distance_request_mode_,
+            CollisionDistanceRequestMode::kSelectedCollidingPairs);
+  ASSERT_EQ(engine->last_selected_distance_pair_count_, 1U);
+  EXPECT_EQ(engine->last_selected_distance_pair_, pair);
   const auto contact_state = session.contact_release_state_snapshot();
   ASSERT_TRUE(contact_state.valid);
   ASSERT_EQ(contact_state.count, 1U);
   EXPECT_EQ(contact_state.binding_owner, publisher.bundle);
   ASSERT_NE(contact_state.entries[0].pair, nullptr);
   EXPECT_EQ(*contact_state.entries[0].pair, pair);
+  // A current-state tick advances release history but is not a trajectory-end
+  // proof, even though the immutable policy retains its terminal requirement.
+  EXPECT_TRUE(contact_state.entries[0].release_state.in_contact);
 
   engine->collide(pair, -0.003);
   const auto blocked = session.tick(publisher.bundle, positions, 2);
   EXPECT_EQ(blocked.status, RuntimeCollisionTickStatus::kCollision);
   EXPECT_EQ(blocked.reason,
             RuntimeCollisionTickReason::kContactReleasePenetrationIncreased);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     SignedReleaseTreatsAbsentPairAsSeparatedWithoutDistance) {
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {4, "signed-release-policy"};
+  SupportContactPolicyEntry release;
+  release.pair = pair;
+  release.max_start_penetration_m = 0.01;
+  policy.support_contacts.push_back(release);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+  ASSERT_FALSE(session.prepare(publisher.bundle).has_value());
+  const std::array<double, 2> positions{0.0, 0.0};
+
+  engine->collide(pair, -0.002);
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 1).status,
+            RuntimeCollisionTickStatus::kClear);
+  engine->clear();
+  const auto separated = session.tick(publisher.bundle, positions, 2);
+
+  EXPECT_EQ(separated.status, RuntimeCollisionTickStatus::kClear);
+  EXPECT_EQ(engine->last_distance_request_mode_,
+            CollisionDistanceRequestMode::kSelectedCollidingPairs);
+  const auto snapshot = session.contact_release_state_snapshot();
+  ASSERT_TRUE(snapshot.valid);
+  ASSERT_EQ(snapshot.count, 1U);
+  EXPECT_FALSE(snapshot.entries[0].release_state.in_contact);
+  EXPECT_TRUE(snapshot.entries[0].release_state.separated);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     BinaryReleaseRequestsNoDistanceAndRejectsRecontact) {
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {5, "binary-release-policy"};
+  SupportContactPolicyEntry release;
+  release.pair = pair;
+  release.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  release.enforce_max_start_penetration = false;
+  release.release_tolerance_m = 0.0;
+  release.require_strictly_decreasing_penetration = false;
+  policy.support_contacts.push_back(release);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+  ASSERT_FALSE(session.prepare(publisher.bundle).has_value());
+  const std::array<double, 2> positions{0.0, 0.0};
+
+  engine->collide(pair, -0.002);
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 1).status,
+            RuntimeCollisionTickStatus::kClear);
+  EXPECT_EQ(engine->last_distance_request_mode_,
+            CollisionDistanceRequestMode::kNone);
+  EXPECT_EQ(engine->last_selected_distance_pair_count_, 0U);
+
+  engine->collide(pair, -0.004);
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 2).status,
+            RuntimeCollisionTickStatus::kClear);
+  engine->clear();
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 3).status,
+            RuntimeCollisionTickStatus::kClear);
+  engine->collide(pair, -0.001);
+  const auto recontact = session.tick(publisher.bundle, positions, 4);
+
+  EXPECT_EQ(recontact.status, RuntimeCollisionTickStatus::kCollision);
+  EXPECT_EQ(recontact.reason,
+            RuntimeCollisionTickReason::kContactReleaseRecontact);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     BinaryReleaseRejectsContactThatWasAbsentAtRuntimeBaseline) {
+  const CollisionPairId pair{"object/part/shape/0",
+                             "robot/robot1/link/finger_left/collision/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {6, "binary-new-contact-policy"};
+  SupportContactPolicyEntry release;
+  release.pair = pair;
+  release.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  release.enforce_max_start_penetration = false;
+  release.release_tolerance_m = 0.0;
+  release.require_strictly_decreasing_penetration = false;
+  policy.support_contacts.push_back(release);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+  ASSERT_FALSE(session.prepare(publisher.bundle).has_value());
+  const std::array<double, 2> positions{0.0, 0.0};
+
+  engine->clear();
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 1).status,
+            RuntimeCollisionTickStatus::kClear);
+  engine->collide(pair, -0.001);
+  const auto new_contact = session.tick(publisher.bundle, positions, 2);
+
+  EXPECT_EQ(new_contact.status, RuntimeCollisionTickStatus::kCollision);
+  EXPECT_EQ(new_contact.reason,
+            RuntimeCollisionTickReason::kContactReleaseNewContact);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
+     BoundedPenetrationAllowsAppearanceRecontactAndFinalContactWithinBound) {
+  const CollisionPairId pair{"object/insert/shape/0",
+                             "object/fixture/shape/0"};
+  CollisionPolicySnapshot policy;
+  policy.revision = {7, "bounded-contact-policy"};
+  SupportContactPolicyEntry contact;
+  contact.pair = pair;
+  contact.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  contact.max_contact_penetration_m = 0.002;
+  policy.support_contacts.push_back(contact);
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
+  ASSERT_FALSE(session.prepare(publisher.bundle).has_value());
+  const std::array<double, 2> positions{0.0, 0.0};
+
+  engine->clear();
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 1).status,
+            RuntimeCollisionTickStatus::kClear);
+  EXPECT_EQ(engine->last_distance_request_mode_,
+            CollisionDistanceRequestMode::kSelectedCollidingPairs);
+
+  engine->collide(pair, -0.002);
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 2).status,
+            RuntimeCollisionTickStatus::kClear);
+  const auto appeared = session.contact_release_state_snapshot();
+  ASSERT_TRUE(appeared.valid);
+  ASSERT_EQ(appeared.count, 1u);
+  EXPECT_EQ(appeared.entries[0].support_state,
+            SupportContactEvaluationState::kContactActive);
+  engine->clear();
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 3).status,
+            RuntimeCollisionTickStatus::kClear);
+  engine->collide(pair, -0.0015);
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 4).status,
+            RuntimeCollisionTickStatus::kClear);
+
+  engine->collide_without_clearance(pair);
+  const auto missing = session.tick(publisher.bundle, positions, 5);
+  EXPECT_EQ(missing.status, RuntimeCollisionTickStatus::kInconclusive);
+  EXPECT_EQ(missing.reason, RuntimeCollisionTickReason::kEngineInconclusive);
+  EXPECT_EQ(missing.engine_failure_reason,
+            RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete);
+  EXPECT_EQ(missing.engine_status,
+            CollisionEngineStatus::kDiagnosticIncomplete);
+
+  engine->collide(pair, -0.003);
+  const auto exceeded = session.tick(publisher.bundle, positions, 6);
+  EXPECT_EQ(exceeded.status, RuntimeCollisionTickStatus::kCollision);
+  EXPECT_EQ(exceeded.reason,
+            RuntimeCollisionTickReason::kBoundedContactPenetrationExceeded);
+  EXPECT_EQ(exceeded.pair_classification,
+            CollisionPairClassification::kBlockingCollision);
+  ASSERT_TRUE(exceeded.max_contact_penetration_m.has_value());
+  EXPECT_DOUBLE_EQ(*exceeded.max_contact_penetration_m, 0.002);
+  ASSERT_TRUE(exceeded.contact_policy_mode.has_value());
+  EXPECT_EQ(*exceeded.contact_policy_mode,
+            CollisionContactPolicyMode::kBoundedPenetration);
+  EXPECT_FALSE(exceeded.release_evidence_mode.has_value());
+  EXPECT_TRUE(exceeded.contact_present);
+  EXPECT_EQ(exceeded.initial_contact_pair_count, 0u);
+  EXPECT_EQ(exceeded.current_contact_pair_count, 1u);
+  EXPECT_EQ(exceeded.distance_request_mode,
+            CollisionDistanceRequestMode::kSelectedCollidingPairs);
+  EXPECT_EQ(exceeded.evaluated_distance_pair_count, 1u);
+  ASSERT_TRUE(exceeded.current_penetration_m.has_value());
+  EXPECT_DOUBLE_EQ(*exceeded.current_penetration_m, 0.003);
 }
 
 }  // namespace

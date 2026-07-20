@@ -29,6 +29,8 @@ enum class RuntimeCollisionTickReason {
   kPolicyUnavailable,
   kPolicyIndexMismatch,
   kPolicyCapacityExceeded,
+  kDistanceRequestModeUnsupported,
+  kRequiredCapabilityUnsupported,
   kActiveContactPolicyUnknown,
   kActiveContactPolicyInvalid,
   kObservedStateShapeMismatch,
@@ -36,11 +38,15 @@ enum class RuntimeCollisionTickReason {
   kObservationCapacityExceeded,
   kEngineInconclusive,
   kBlockingCollision,
+  kContactReleasePolicyInvalid,
   kContactReleaseProcessUnsupported,
   kContactReleaseMissingClearance,
+  kContactReleaseNewContact,
   kContactReleaseInitialPenetrationExceeded,
   kContactReleaseRecontact,
+  kContactReleaseRecontactPenetrationExceeded,
   kContactReleasePenetrationIncreased,
+  kBoundedContactPenetrationExceeded,
 };
 
 enum class RuntimeContactGraspViolation {
@@ -75,6 +81,15 @@ struct RuntimeCollisionTickOutcome {
   std::optional<double> initial_penetration_m;
   std::optional<double> previous_penetration_m;
   std::optional<double> current_penetration_m;
+  std::optional<double> max_contact_penetration_m;
+  std::optional<CollisionContactPolicyMode> contact_policy_mode;
+  std::optional<ContactReleaseEvidenceMode> release_evidence_mode;
+  bool contact_present = false;
+  std::size_t initial_contact_pair_count = 0;
+  std::size_t current_contact_pair_count = 0;
+  CollisionDistanceRequestMode distance_request_mode =
+      CollisionDistanceRequestMode::kNone;
+  std::size_t evaluated_distance_pair_count = 0;
   RuntimeContactGraspViolation contact_grasp_violation =
       RuntimeContactGraspViolation::kNone;
 };
@@ -134,22 +149,22 @@ class RuntimeCollisionQuerySession final {
   struct ContactReleaseState {
     const CollisionPairId* pair = nullptr;
     const SupportContactPolicyEntry* policy = nullptr;
-    double initial_penetration_m = 0.0;
-    double last_penetration_m = 0.0;
-    double best_penetration_m = 0.0;
+    ContactReleaseEvaluationState transition_state;
+    bool observed_in_contact = false;
     std::optional<double> observed_clearance_m;
-    bool initialized = false;
-    bool started_in_contact = false;
-    bool separated = false;
   };
 
   bool bind_policy(const RuntimeCollisionQueryBundlePtr& bundle) noexcept;
+  bool bind_distance_selection(
+      const RuntimeCollisionQueryBundlePtr& bundle) noexcept;
   RuntimeCollisionTickOutcome project_observed_state(
       std::span<const double> observed_positions_rad) noexcept;
   RuntimeCollisionTickOutcome classify(
       const RuntimeCollisionQueryResultView& query_result) noexcept;
   RuntimeCollisionTickOutcome update_contact_release(
       const RuntimeCollisionQueryResultView& query_result) noexcept;
+  std::size_t current_contact_pair_count(
+      const RuntimeCollisionQueryResultView& query_result) const noexcept;
 
   RuntimeCollisionStateProjection projection_;
   ICollisionWorldSnapshotPublisher* publisher_ = nullptr;
@@ -167,9 +182,12 @@ class RuntimeCollisionQuerySession final {
   const ContactGraspPolicyEntry* active_contact_policy_ = nullptr;
   std::array<ContactReleaseState, kMaxSupportContacts> release_states_{};
   std::size_t release_state_count_ = 0;
+  std::size_t initial_contact_pair_count_ = 0;
+  bool initial_contact_pair_count_initialized_ = false;
   bool policy_binding_valid_ = false;
   RuntimeCollisionTickReason policy_binding_error_ =
       RuntimeCollisionTickReason::kPolicyUnavailable;
+  const char* policy_binding_required_capability_ = nullptr;
 };
 
 }  // namespace manyforge::core

@@ -41,18 +41,20 @@ using CollisionShapeDTO = std::variant<BoxShapeDTO, SphereShapeDTO, CylinderShap
 /// Declared support contact for an authored scene object.
 ///
 /// This is a semantic ManyForge policy, not a backend collision-matrix knob:
-/// the object may start a release motion in contact with support_object_id, but
-/// trajectory validation must prove that the pair separates by the end of the
-/// motion and does not re-contact after separation.
+/// kContactRelease governs separation-only motion, while kBoundedPenetration
+/// permits ongoing/reappearing contact whose colliding samples all stay within
+/// max_contact_penetration_m.
 struct SupportContactDTO {
   std::string support_object_id;
   CollisionContactPolicyMode mode =
       CollisionContactPolicyMode::kContactRelease;
+  ContactReleaseEvidenceMode release_evidence_mode =
+      ContactReleaseEvidenceMode::kSignedPenetration;
   bool enforce_max_start_penetration = true;
   double max_start_penetration_m = 0.0;
   double release_tolerance_m = 1e-5;
   double min_release_progress_m = 0.0;
-  double min_separation_clearance_m = 0.0;
+  double max_contact_penetration_m = 0.0;
   bool require_separation_by_end = true;
   bool require_strictly_decreasing_penetration = true;
   bool allow_recontact = false;

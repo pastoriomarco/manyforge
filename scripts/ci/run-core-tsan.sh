@@ -40,4 +40,6 @@ cmake \
   -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"
 
 cmake --build "${BUILD_DIR}" --parallel "${PARALLEL}"
-ctest --test-dir "${BUILD_DIR}" --output-on-failure
+python3 "${SCRIPT_DIR}/run-ctest-gtest-binaries-grouped.py" \
+  --build-dir "${BUILD_DIR}" \
+  --summary-prefix CORE_TSAN

@@ -81,6 +81,218 @@ describe('KernelErrorPanel mapping', () => {
       ).toContain('0.022 m, max 0.020 m');
     });
 
+    it('retains support-contact diagnostics for contact_policy_violation', () => {
+      const details = {
+        collision_result_first_failure_pair:
+          'object/ground/shape/0 <-> robot/robot0/attached/graspable/shape/0',
+        collision_result_first_failure_classification: 'support_contact_start',
+        collision_result_waypoint_index: '0',
+        collision_result_raw_contact_release_current_penetration_m: '0.021667',
+        collision_result_raw_contact_release_max_start_penetration_m: '0.020000',
+        policy_id: 'support-contact-policy',
+      };
+
+      expect(
+        headlineForError(
+          'contact_policy_violation',
+          details,
+          'Contact policy rejected trajectory',
+        ),
+      ).toBe(
+        'Trajectory rejected: support contact ground ↔ attached graspable at waypoint 0 (current 0.022 m, max 0.020 m)',
+      );
+      expect(hintForError('contact_policy_violation', details)).toContain(
+        '0.022 m, max 0.020 m',
+      );
+    });
+
+    it('prefers authoritative Precise evidence over contradictory legacy fields', () => {
+      const details = {
+        collision_result_first_failure_pair:
+          'object/ground/shape/0 <-> robot/robot0/attached/graspable/shape/0',
+        collision_result_waypoint_index: '4',
+        policy_mode: 'contact_release',
+        release_evidence_mode: 'signed_penetration',
+        contact_present: 'true',
+        initial_contact_pair_count: '2',
+        current_contact_pair_count: '1',
+        distance_request_mode: 'selected_colliding_pairs',
+        evaluated_distance_pair_count: '1',
+        penetration_depth_m: '0.021667',
+        max_penetration_m: '0.020000',
+        collision_result_raw_contact_release_current_penetration_m: '0.900000',
+        collision_result_raw_contact_release_max_start_penetration_m: '0.800000',
+      };
+
+      const headline = headlineForError(
+        'contact_policy_violation',
+        details,
+        'Contact policy rejected trajectory',
+      );
+      expect(headline).toContain('Precise - signed penetration');
+      expect(headline).toContain('contacts 2 → 1');
+      expect(headline).toContain('penetration 0.022 m');
+      expect(headline).toContain('max 0.020 m');
+      expect(headline).toContain('distance selected colliding pairs, 1 pair evaluated');
+      expect(headline).not.toContain('0.900');
+      expect(headline).not.toContain('0.800');
+      expect(hintForError('contact_policy_violation', details)).toContain(
+        'measures signed penetration only while the configured pair is colliding',
+      );
+    });
+
+    it('does not present stray Precise metric evidence for an absent pair', () => {
+      const details = {
+        collision_result_first_failure_pair:
+          'object/ground/shape/0 <-> robot/robot0/attached/graspable/shape/0',
+        policy_mode: 'contact_release',
+        release_evidence_mode: 'signed_penetration',
+        contact_present: 'false',
+        initial_contact_pair_count: '1',
+        current_contact_pair_count: '0',
+        distance_request_mode: 'selected_colliding_pairs',
+        evaluated_distance_pair_count: '0',
+        penetration_depth_m: '0.777000',
+      };
+
+      const headline = headlineForError(
+        'contact_policy_violation',
+        details,
+        'Contact policy rejected trajectory',
+      );
+      expect(headline).toContain('Precise - signed penetration');
+      expect(headline).toContain('contact absent');
+      expect(headline).toContain('0 pairs evaluated');
+      expect(headline).not.toContain('penetration 0.777 m');
+      expect(headline).not.toContain('clearance');
+    });
+
+    it('keeps a colliding Precise pair mode-aware when metric evidence is missing', () => {
+      const details = {
+        collision_result_engine_status: 'diagnostic_incomplete',
+        collision_result_first_failure_pair:
+          'object/ground/shape/0 <-> robot/robot0/attached/graspable/shape/0',
+        collision_result_raw_required_capability: 'penetration_depth',
+        policy_mode: 'contact_release',
+        release_evidence_mode: 'signed_penetration',
+        contact_present: 'true',
+        initial_contact_pair_count: '1',
+        current_contact_pair_count: '1',
+        distance_request_mode: 'selected_colliding_pairs',
+        evaluated_distance_pair_count: '0',
+      };
+
+      const headline = headlineForError(
+        'contact_policy_violation',
+        details,
+        'Contact policy diagnostics incomplete',
+      );
+      expect(headline).toContain('Contact-policy diagnostics incomplete for ground ↔ attached graspable');
+      expect(headline).toContain('Precise - signed penetration');
+      expect(headline).toContain('0 pairs evaluated');
+      expect(headline).not.toMatch(/penetration [0-9]/);
+      expect(hintForError('contact_policy_violation', details)).toContain(
+        'could not produce the required contact-pair evidence',
+      );
+    });
+
+    it('renders Lightweight set evidence without fabricating penetration', () => {
+      const details = {
+        collision_result_first_failure_pair:
+          'object/ground/shape/0 <-> robot/robot0/attached/graspable/shape/0',
+        policy_mode: 'contact_release',
+        release_evidence_mode: 'binary_contact',
+        contact_present: 'false',
+        initial_contact_pair_count: '2',
+        current_contact_pair_count: '0',
+        distance_request_mode: 'none',
+        evaluated_distance_pair_count: '0',
+        // Adversarial stale fields must never turn binary evidence into a
+        // penetration claim.
+        penetration_depth_m: '0.250000',
+        max_penetration_m: '0.010000',
+        collision_result_raw_contact_release_current_penetration_m: '0.500000',
+      };
+
+      const headline = headlineForError(
+        'contact_policy_violation',
+        details,
+        'Contact policy rejected trajectory',
+      );
+      expect(headline).toContain('Lightweight - binary contact');
+      expect(headline).toContain('contacts 2 → 0');
+      expect(headline).toContain('no distance measurements');
+      expect(headline).not.toContain('penetration 0.250 m');
+      expect(headline).not.toContain('0.500');
+      expect(headline).not.toContain('max 0.010 m');
+      expect(hintForError('contact_policy_violation', details)).toContain(
+        'does not measure penetration',
+      );
+
+      const inconsistent = headlineForError(
+        'contact_policy_violation',
+        {
+          ...details,
+          distance_request_mode: 'selected_colliding_pairs',
+          evaluated_distance_pair_count: '3',
+        },
+        'Contact policy rejected trajectory',
+      );
+      expect(inconsistent).toContain(
+        'unexpected distance evidence: selected colliding pairs, 3 pairs evaluated',
+      );
+      expect(inconsistent).not.toContain('no distance measurements');
+    });
+
+    it('renders bounded penetration only for a present configured pair', () => {
+      const details = {
+        collision_result_first_failure_pair:
+          'object/sleeve/shape/0 <-> robot/robot0/attached/insert/shape/0',
+        collision_result_waypoint_index: '9',
+        policy_mode: 'bounded_penetration',
+        contact_present: 'true',
+        initial_contact_pair_count: '0',
+        current_contact_pair_count: '1',
+        distance_request_mode: 'selected_colliding_pairs',
+        evaluated_distance_pair_count: '1',
+        penetration_depth_m: '0.006000',
+        max_contact_penetration_m: '0.005000',
+        within_penetration_bound: 'false',
+        // Release-only fields are invalid for bounded mode and must not win.
+        release_evidence_mode: 'signed_penetration',
+        max_penetration_m: '0.900000',
+      };
+
+      const headline = headlineForError(
+        'contact_policy_violation',
+        details,
+        'Contact policy rejected trajectory',
+      );
+      expect(headline).toContain('Contact-tolerant - bounded penetration');
+      expect(headline).toContain('contacts 0 → 1');
+      expect(headline).toContain('penetration 0.006 m > max 0.005 m');
+      expect(headline).not.toContain('0.900');
+      expect(hintForError('contact_policy_violation', details)).toContain(
+        'measured geometric penetration remains within the authored maximum',
+      );
+
+      const absentHeadline = headlineForError(
+        'contact_policy_violation',
+        {
+          ...details,
+          contact_present: 'false',
+          current_contact_pair_count: '0',
+          evaluated_distance_pair_count: '0',
+          penetration_depth_m: '0.999000',
+        },
+        'Contact policy rejected trajectory',
+      );
+      expect(absentHeadline).toContain('contact absent');
+      expect(absentHeadline).toContain('max 0.005 m');
+      expect(absentHeadline).not.toContain('penetration 0.999 m');
+      expect(absentHeadline).not.toContain('> max');
+    });
+
     it('renders runtime_collision distinct from validation_collision', () => {
       // The runtime monitor catches a collision DURING execution; pre-
       // execute validation catches it BEFORE dispatch. Both render with
@@ -97,6 +309,36 @@ describe('KernelErrorPanel mapping', () => {
       expect(headline).toBe(
         'Runtime collision: wall ↔ wrist_1_link at waypoint 0',
       );
+    });
+
+    it('renders a runtime missing-capability fault instead of obstacle guidance', () => {
+      const details = {
+        reason: 'runtime_collision_required_capability_unsupported',
+        reason_code: 'runtime_collision_monitor',
+        required_capability: 'penetration_depth',
+        // Adversarial unrelated details must not make this look like a stale
+        // dynamic obstacle or a geometric collision.
+        dynamic_body_id: 'object/fixture/shape/0',
+        dynamic_body_age_ns: '900000000',
+        dynamic_body_effective_freshness_budget_ns: '100000000',
+        collision_result_first_failure_pair:
+          'object/fixture/shape/0 <-> robot/robot0/link/wrist_1_link/collision/0',
+      };
+
+      expect(
+        headlineForError(
+          'runtime_collision',
+          details,
+          'Motion execution ended in interrupted',
+        ),
+      ).toBe(
+        'Runtime collision monitor missing required capability: penetration_depth',
+      );
+      const hint = hintForError('runtime_collision', details) ?? '';
+      expect(hint).toContain('runtime engine does not provide (penetration_depth)');
+      expect(hint).toContain('monitor failed closed');
+      expect(hint).not.toContain('dynamic body');
+      expect(hint).not.toContain('intersected the trajectory');
     });
 
     it('renders stale runtime dynamic bodies as freshness faults, not contact collisions', () => {
@@ -231,6 +473,20 @@ describe('KernelErrorPanel mapping', () => {
       expect(hintForError('validation_collision', details)).toContain(
         'required to prove',
       );
+
+      expect(
+        headlineForError(
+          'validation_collision',
+          {
+            collision_result_engine_status: 'diagnostic_incomplete',
+            required_capability: 'penetration_depth',
+            // The direct ErrorDTO capability is authoritative when both
+            // shapes are present during a rolling upgrade.
+            collision_result_raw_required_capability: 'contact_points',
+          },
+          'Collision validation inconclusive',
+        ),
+      ).toBe('Collision validation diagnostics incomplete: penetration_depth');
     });
 
     it('renders cancelled validation distinctly', () => {

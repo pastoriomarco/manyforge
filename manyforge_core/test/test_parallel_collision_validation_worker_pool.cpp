@@ -12,6 +12,7 @@
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
 #include <manyforge_core/collision/ordered_contact_validation.hpp>
 #include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
+#include <manyforge_core/execution_collision_support.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_core/types/reason_codes.hpp>
@@ -60,6 +61,13 @@ class MockCollisionQueryEngine : public ICollisionQueryEngine {
     capability_.library_lineage = "unit_test";
     capability_.mutable_context_id = "mock_context_" + std::to_string(next_context_id.fetch_add(1));
     capability_.supported_geometry_kinds = {"box"};
+    capability_.supports_distance_query = true;
+    capability_.supported_distance_request_modes = {
+        CollisionDistanceRequestMode::kNone,
+        CollisionDistanceRequestMode::kSelectedCollidingPairs,
+        CollisionDistanceRequestMode::kAllCollidingPairs,
+        CollisionDistanceRequestMode::kAllActivePairs};
+    capability_.supports_penetration_depth = true;
     capability_.thread_safety =
         CollisionEngineThreadSafetyClass::kSingleContextExclusive;
     capability_.deterministic_ordering = true;
@@ -183,6 +191,13 @@ CollisionResult contact_result(const CollisionPairId& pair, double signed_cleara
   return result;
 }
 
+CollisionResult clear_result() {
+  CollisionResult result;
+  result.engine_status = CollisionEngineStatus::kOk;
+  result.decision = CollisionDecisionResult::kPass;
+  return result;
+}
+
 CollisionPolicySnapshot contact_release_snapshot(const CollisionPairId& pair) {
   CollisionPolicySnapshot policy;
   policy.policy_id = "contact_release";
@@ -193,10 +208,25 @@ CollisionPolicySnapshot contact_release_snapshot(const CollisionPairId& pair) {
   entry.max_start_penetration_m = 0.10;
   entry.release_tolerance_m = 1e-5;
   entry.min_release_progress_m = 0.001;
-  entry.min_separation_clearance_m = 0.0;
   entry.require_separation_by_end = true;
   entry.require_strictly_decreasing_penetration = true;
   policy.support_contacts.push_back(entry);
+  return policy;
+}
+
+CollisionPolicySnapshot bounded_penetration_snapshot(
+    const CollisionPairId& pair, double max_contact_penetration_m) {
+  auto policy = contact_release_snapshot(pair);
+  auto& entry = policy.support_contacts.front();
+  entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  entry.max_contact_penetration_m = max_contact_penetration_m;
+  entry.enforce_max_start_penetration = false;
+  entry.max_start_penetration_m = 0.0;
+  entry.release_tolerance_m = 0.0;
+  entry.min_release_progress_m = 0.0;
+  entry.require_separation_by_end = false;
+  entry.require_strictly_decreasing_penetration = false;
+  entry.allow_recontact = false;
   return policy;
 }
 
@@ -713,6 +743,187 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
 }
 
 TEST(ParallelCollisionValidationWorkerPoolTest,
+     OrderedBoundedPenetrationMatchesSerialAcrossChunkBoundaries) {
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  MockCollisionQueryEngine serial_engine;
+  const CollisionPairId pair{"gripper", "object"};
+  std::vector<CollisionResult> results{
+      clear_result(),
+      contact_result(pair, -0.004),
+      clear_result(),
+      clear_result(),
+      contact_result(pair, -0.003),
+      clear_result(),
+      contact_result(pair, -0.002),
+      contact_result(pair, -0.005),
+  };
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot =
+      bounded_penetration_snapshot(pair, 0.005);
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 1;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+  const auto trajectory = long_trajectory(static_cast<int>(results.size()));
+
+  auto validate_serial_and_parallel = [&]() {
+    assign_parallel_results({&engine_a, &engine_b}, results);
+    serial_engine.result_by_waypoint.clear();
+    for (std::size_t i = 0; i < results.size(); ++i) {
+      serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] =
+          results[i];
+    }
+    CollisionCancellationToken parallel_cancel;
+    auto parallel = pool.validate_trajectory(
+        test_snapshot(),
+        std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b}, trajectory,
+        parallel_cancel);
+    CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+    CollisionCancellationToken serial_cancel;
+    auto serial = serial_coordinator.validate_trajectory(
+        test_snapshot(), serial_engine, trajectory, serial_cancel);
+    expect_policy_equivalent(parallel, serial);
+    return parallel;
+  };
+
+  const auto accepted = validate_serial_and_parallel();
+  EXPECT_TRUE(accepted.decision.accepted);
+  EXPECT_TRUE(pool.last_telemetry().ordered_contact_summary_used);
+  EXPECT_TRUE(pool.last_telemetry().fallback_reason.empty());
+
+  results[6] = contact_result(pair, -0.006);
+  const auto rejected = validate_serial_and_parallel();
+  ASSERT_FALSE(rejected.decision.accepted);
+  ASSERT_TRUE(rejected.decision.first_failing_waypoint);
+  EXPECT_EQ(*rejected.decision.first_failing_waypoint, 6);
+  EXPECT_EQ(rejected.waypoint_records[6]
+                .result.raw_diagnostics.at("contact_release_violation"),
+            "contact_penetration_exceeds_policy");
+  const auto violation = contact_policy_violation_details(
+      rejected, cfg.pass_config.policy_snapshot, "block_dispatch");
+  ASSERT_TRUE(violation.has_value());
+  EXPECT_EQ(violation->at("policy_mode"), "bounded_penetration");
+  EXPECT_EQ(violation->at("initial_contact_pair_count"), "0");
+  EXPECT_EQ(violation->at("current_contact_pair_count"), "1");
+  EXPECT_EQ(violation->at("distance_request_mode"),
+            "selected_colliding_pairs");
+  EXPECT_EQ(violation->at("evaluated_distance_pair_count"), "1");
+  EXPECT_EQ(violation->find("release_evidence_mode"), violation->end());
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     MixedSignedBinaryAndBoundedContactsMatchSerialAcrossChunkBoundary) {
+  const CollisionPairId signed_pair{"object/signed", "robot/tool"};
+  const CollisionPairId binary_pair{"fixture/table", "object/binary"};
+  const CollisionPairId bounded_pair{"fixture/socket", "object/insert"};
+
+  auto policy = contact_release_snapshot(signed_pair);
+  SupportContactPolicyEntry binary;
+  binary.pair = binary_pair;
+  binary.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  binary.enforce_max_start_penetration = false;
+  binary.max_start_penetration_m = 0.0;
+  binary.release_tolerance_m = 0.0;
+  binary.min_release_progress_m = 0.0;
+  binary.require_separation_by_end = true;
+  binary.require_strictly_decreasing_penetration = false;
+  policy.support_contacts.push_back(binary);
+  policy.support_contacts.push_back(
+      bounded_penetration_snapshot(bounded_pair, 0.005)
+          .support_contacts.front());
+
+  auto sample = [](std::vector<CollisionPairId> colliding,
+                   std::vector<CollisionPairClearance> clearances) {
+    std::sort(colliding.begin(), colliding.end());
+    std::sort(clearances.begin(), clearances.end(),
+              [](const auto& lhs, const auto& rhs) {
+                return lhs.pair < rhs.pair;
+              });
+    CollisionResult result;
+    result.in_collision = !colliding.empty();
+    result.normalized_pairs = std::move(colliding);
+    result.pair_clearances = std::move(clearances);
+    result.engine_status = CollisionEngineStatus::kOk;
+    result.decision = result.in_collision ? CollisionDecisionResult::kFail
+                                          : CollisionDecisionResult::kPass;
+    return result;
+  };
+  const std::vector<CollisionResult> results{
+      sample({signed_pair, binary_pair}, {{signed_pair, -0.004}}),
+      sample({signed_pair, binary_pair}, {{signed_pair, -0.002}}),
+      sample({binary_pair, bounded_pair}, {{bounded_pair, -0.003}}),
+      sample({bounded_pair}, {{bounded_pair, -0.004}}),
+  };
+
+  MockCollisionQueryEngine engine_a;
+  MockCollisionQueryEngine engine_b;
+  MockCollisionQueryEngine serial_engine;
+  assign_parallel_results({&engine_a, &engine_b}, results);
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] =
+        results[i];
+  }
+
+  std::mutex queries_mutex;
+  std::vector<std::vector<CollisionPairId>> selected_pairs_by_query;
+  const auto capture_query = [&](const CollisionQuery& query) {
+    std::lock_guard<std::mutex> lock(queries_mutex);
+    selected_pairs_by_query.push_back(query.selected_distance_pairs);
+  };
+  engine_a.on_check = capture_query;
+  engine_b.on_check = capture_query;
+
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = policy;
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 1;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+  const auto trajectory = long_trajectory(static_cast<int>(results.size()));
+  CollisionCancellationToken parallel_cancel;
+  const auto parallel = pool.validate_trajectory(
+      test_snapshot(),
+      std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b}, trajectory,
+      parallel_cancel);
+  CollisionValidationCoordinator serial_coordinator(cfg.pass_config);
+  CollisionCancellationToken serial_cancel;
+  const auto serial = serial_coordinator.validate_trajectory(
+      test_snapshot(), serial_engine, trajectory, serial_cancel);
+
+  expect_policy_equivalent(parallel, serial);
+  ASSERT_TRUE(parallel.decision.accepted);
+  EXPECT_TRUE(pool.last_telemetry().ordered_contact_summary_used);
+  EXPECT_TRUE(pool.last_telemetry().fallback_reason.empty());
+
+  std::vector<CollisionPairId> expected_selected{bounded_pair, signed_pair};
+  std::sort(expected_selected.begin(), expected_selected.end());
+  {
+    std::lock_guard<std::mutex> lock(queries_mutex);
+    ASSERT_EQ(selected_pairs_by_query.size(), results.size());
+    for (const auto& selected : selected_pairs_by_query) {
+      EXPECT_EQ(selected, expected_selected);
+      EXPECT_EQ(std::find(selected.begin(), selected.end(), binary_pair),
+                selected.end());
+    }
+  }
+  for (const auto& record : parallel.waypoint_records) {
+    EXPECT_EQ(std::find_if(record.result.pair_clearances.begin(),
+                           record.result.pair_clearances.end(),
+                           [&](const auto& clearance) {
+                             return clearance.pair == binary_pair;
+                           }),
+              record.result.pair_clearances.end());
+  }
+  ASSERT_TRUE(parallel.waypoint_records.back().result.in_collision);
+  EXPECT_NE(std::find(parallel.waypoint_records.back()
+                          .result.normalized_pairs.begin(),
+                      parallel.waypoint_records.back()
+                          .result.normalized_pairs.end(),
+                      bounded_pair),
+            parallel.waypoint_records.back().result.normalized_pairs.end());
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
      OrderedContactReleaseDetectsContactBeginningAtChunkBoundary) {
   MockCollisionQueryEngine engine_a;
   MockCollisionQueryEngine engine_b;
@@ -831,7 +1042,7 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
 }
 
 TEST(ParallelCollisionValidationWorkerPoolTest,
-     OrderedContactReleaseMissingClearanceAtBoundaryMatchesSerial) {
+     OrderedContactReleaseMissingCollidingMetricAtBoundaryMatchesSerial) {
   MockCollisionQueryEngine engine_a;
   MockCollisionQueryEngine engine_b;
   MockCollisionQueryEngine serial_engine;
@@ -845,7 +1056,9 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
                                        contact_result(pair, 0.001),
                                        contact_result(pair, 0.002)};
   results[4].engine_status = CollisionEngineStatus::kOk;
-  results[4].decision = CollisionDecisionResult::kPass;
+  results[4].in_collision = true;
+  results[4].normalized_pairs = {pair};
+  results[4].decision = CollisionDecisionResult::kFail;
   assign_parallel_results({&engine_a, &engine_b}, results);
   for (std::size_t i = 0; i < results.size(); ++i) {
     serial_engine.result_by_waypoint[static_cast<std::int64_t>(i)] = results[i];
@@ -1347,6 +1560,139 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   EXPECT_GE(status.abandoned_jobs_total, 1u);
 
   engine_a->release_blocked();
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     TimedOneWorkerFallbackHonorsEnteringReleasedState) {
+  const CollisionPairId pair{"gripper", "object"};
+  auto engine = std::make_shared<MockCollisionQueryEngine>();
+  engine->result_by_waypoint[0] = contact_result(pair, -0.01);
+  engine->result_by_waypoint[1] = clear_result();
+
+  FakeClock clock;
+  ManualScheduler scheduler;
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  auto& release = cfg.pass_config.policy_snapshot.support_contacts.front();
+  release.require_separation_by_end = false;
+  release.require_strictly_decreasing_penetration = false;
+  release.min_release_progress_m = 0.0;
+  cfg.pass_config.entering_support_contact_state =
+      SupportContactEvaluationStateMap{
+          {pair, SupportContactEvaluationState::kSeparated}};
+  ContactReleaseEvaluationState entering_release;
+  entering_release.initialized = true;
+  entering_release.started_in_contact = true;
+  entering_release.in_contact = false;
+  entering_release.separated = true;
+  entering_release.initial_depth_m = 0.05;
+  entering_release.previous_depth_m = 0.02;
+  entering_release.best_depth_m = 0.0;
+  cfg.pass_config.entering_contact_release_state =
+      ContactReleaseEvaluationStateMap{{pair, entering_release}};
+  cfg.worker_count = 1;
+  cfg.validation_wall_timeout = std::chrono::milliseconds(100);
+  cfg.clock = &clock;
+  cfg.scheduler = &scheduler;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+
+  auto cancel = std::make_shared<CollisionCancellationToken>();
+  const auto bundle = pool.validate_trajectory(
+      std::make_shared<const CollisionWorldSnapshot>(test_snapshot()),
+      std::vector<std::shared_ptr<ICollisionQueryEngine>>{engine},
+      long_trajectory(2), cancel, cfg.pass_config);
+
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kReject);
+  ASSERT_EQ(bundle.decision.first_failing_waypoint,
+            std::optional<std::int64_t>{0});
+  EXPECT_EQ(bundle.waypoint_records.front()
+                .result.raw_diagnostics.at("contact_release_violation"),
+            "recontact_after_release");
+  EXPECT_EQ(pool.last_telemetry().fallback_reason, "worker_count_one");
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     TimedShortPrefixFallbackHonorsEnteringPenetrationHistory) {
+  const CollisionPairId pair{"gripper", "object"};
+  auto engine_a = std::make_shared<MockCollisionQueryEngine>();
+  auto engine_b = std::make_shared<MockCollisionQueryEngine>();
+  engine_a->result_by_waypoint[0] = contact_result(pair, -0.04);
+  engine_a->result_by_waypoint[1] = contact_result(pair, -0.02);
+
+  FakeClock clock;
+  ManualScheduler scheduler;
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
+  cfg.pass_config.enforce_contact_release_trajectory_end = false;
+  cfg.pass_config.entering_support_contact_state =
+      SupportContactEvaluationStateMap{
+          {pair, SupportContactEvaluationState::kContactActive}};
+  ContactReleaseEvaluationState entering_release;
+  entering_release.initialized = true;
+  entering_release.started_in_contact = true;
+  entering_release.in_contact = true;
+  entering_release.initial_depth_m = 0.05;
+  entering_release.previous_depth_m = 0.03;
+  entering_release.best_depth_m = 0.03;
+  cfg.pass_config.entering_contact_release_state =
+      ContactReleaseEvaluationStateMap{{pair, entering_release}};
+  cfg.worker_count = 2;
+  cfg.min_waypoints_for_parallel = 8;
+  cfg.validation_wall_timeout = std::chrono::milliseconds(100);
+  cfg.clock = &clock;
+  cfg.scheduler = &scheduler;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+
+  auto cancel = std::make_shared<CollisionCancellationToken>();
+  const auto bundle = pool.validate_trajectory(
+      std::make_shared<const CollisionWorldSnapshot>(test_snapshot()),
+      std::vector<std::shared_ptr<ICollisionQueryEngine>>{engine_a, engine_b},
+      long_trajectory(2), cancel, cfg.pass_config);
+
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kReject);
+  ASSERT_EQ(bundle.decision.first_failing_waypoint,
+            std::optional<std::int64_t>{0});
+  EXPECT_EQ(bundle.waypoint_records.front()
+                .result.raw_diagnostics.at("contact_release_violation"),
+            "penetration_increased");
+  EXPECT_EQ(pool.last_telemetry().fallback_reason, "trajectory_too_short");
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest,
+     TimedBoundedFallbackAllowsFirstAppearanceReappearanceAndFinalContact) {
+  const CollisionPairId pair{"gripper", "object"};
+  auto engine = std::make_shared<MockCollisionQueryEngine>();
+  // No entering contact exists. The configured pair first appears after a
+  // clear sample, disappears, reappears, and remains colliding at the final
+  // sample. Bounded mode permits all four transitions while every collision
+  // remains within the authored cap.
+  engine->result_by_waypoint[0] = clear_result();
+  engine->result_by_waypoint[1] = contact_result(pair, -0.004);
+  engine->result_by_waypoint[2] = clear_result();
+  engine->result_by_waypoint[3] = contact_result(pair, -0.003);
+
+  FakeClock clock;
+  ManualScheduler scheduler;
+  ParallelCollisionValidationWorkerPool::Config cfg;
+  cfg.pass_config.policy_snapshot =
+      bounded_penetration_snapshot(pair, 0.005);
+  cfg.worker_count = 1;
+  cfg.validation_wall_timeout = std::chrono::milliseconds(100);
+  cfg.clock = &clock;
+  cfg.scheduler = &scheduler;
+  ParallelCollisionValidationWorkerPool pool(cfg);
+
+  auto cancel = std::make_shared<CollisionCancellationToken>();
+  const auto bundle = pool.validate_trajectory(
+      std::make_shared<const CollisionWorldSnapshot>(test_snapshot()),
+      std::vector<std::shared_ptr<ICollisionQueryEngine>>{engine},
+      long_trajectory(4), cancel, cfg.pass_config);
+
+  EXPECT_TRUE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kDispatch);
+  EXPECT_EQ(pool.last_telemetry().fallback_reason, "worker_count_one");
 }
 
 TEST(ParallelCollisionValidationWorkerPoolTest,

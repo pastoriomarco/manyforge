@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -147,10 +148,11 @@ struct CollisionPairResult {
 ///
 /// Positive values mean separation clearance. Zero means touching within
 /// engine tolerance. Negative values mean penetration depth. Engines populate
-/// this vector only when the query requested `distance` /
-/// `penetration_depth`, or when doing so is already part of their normal query
-/// path. Consumers MUST NOT infer contact-release safety from
-/// `normalized_pairs` alone when a policy requires numeric release proof.
+/// this vector only for pairs in the query's requested distance scope. Sparse
+/// results are intentional: selected-colliding-pair queries omit selected pairs
+/// that are not colliding. Consumers MUST use `normalized_pairs` as contact
+/// truth and require numeric evidence only for a colliding pair whose policy
+/// requests signed release evidence or a bounded-penetration check.
 struct CollisionPairClearance {
   CollisionPairId pair;
   double signed_clearance_m = 0.0;
@@ -226,6 +228,33 @@ enum class CollisionSamplingMode {
   kEngineDefault,
 };
 
+/// Scope of signed-distance work requested from a collision engine.
+///
+/// Collision enumeration is always complete for the active pair graph. This
+/// enum controls only which pairs receive the additional signed-distance
+/// calculation after collision detection.
+enum class CollisionDistanceRequestMode {
+  kNone,
+  kSelectedCollidingPairs,
+  kAllCollidingPairs,
+  kAllActivePairs,
+};
+
+[[nodiscard]] constexpr const char* collision_distance_request_mode_name(
+    CollisionDistanceRequestMode mode) noexcept {
+  switch (mode) {
+    case CollisionDistanceRequestMode::kNone:
+      return "none";
+    case CollisionDistanceRequestMode::kSelectedCollidingPairs:
+      return "selected_colliding_pairs";
+    case CollisionDistanceRequestMode::kAllCollidingPairs:
+      return "all_colliding_pairs";
+    case CollisionDistanceRequestMode::kAllActivePairs:
+      return "all_active_pairs";
+  }
+  return "unknown";
+}
+
 /// Normalized collision query (spec §3.8.1).
 ///
 /// Superset of CollisionCheckRequestDTO. Chunk 1 mirrors the existing
@@ -247,6 +276,15 @@ struct CollisionQuery {
   /// "penetration_depth", "body_pair_only". Engines that cannot supply a
   /// required capability MUST fail the query with kDiagnosticIncomplete.
   std::vector<std::string> required_capabilities;
+  /// Typed signed-distance scope. The selected-pair mode intersects the sorted
+  /// canonical `selected_distance_pairs` list with the complete colliding-pair
+  /// result; a selected pair that is not colliding is intentionally omitted
+  /// from CollisionResult::pair_clearances.
+  CollisionDistanceRequestMode distance_request_mode =
+      CollisionDistanceRequestMode::kNone;
+  /// Sorted, unique canonical logical pairs used only with
+  /// kSelectedCollidingPairs. Other modes require this list to be empty.
+  std::vector<CollisionPairId> selected_distance_pairs;
   std::optional<std::int64_t> max_contacts;
 };
 
@@ -300,20 +338,20 @@ struct CollisionResult {
   std::optional<std::int64_t> query_duration_ns;
   CollisionSamplingMode sampling_mode = CollisionSamplingMode::kEngineDefault;
 
-  /// Minimum signed clearance across the queried body-pair set. Negative
-  /// values denote penetration depth. Null when the engine does not
-  /// support distance queries. Populated in Chunk 4 when distance support
-  /// lands; null in Chunk 1.
+  /// Minimum signed clearance across the evaluated distance scope. Negative
+  /// values denote penetration depth. Null when no pair in the requested
+  /// scope was evaluated.
   std::optional<double> min_clearance_m;
 
   /// Pair corresponding to min_clearance_m. Null when min_clearance_m is
   /// null.
   std::optional<CollisionPairId> min_clearance_pair;
 
-  /// Per-pair signed clearance / penetration diagnostics. Sorted by pair.
-  /// This may include non-colliding pairs when a query requires distance
-  /// proof. Contact-release policies depend on this field for tracked pairs;
-  /// missing entries under such a policy are fail-closed.
+  /// Per-pair signed clearance / penetration diagnostics. Sorted by pair and
+  /// intentionally sparse according to CollisionQuery::distance_request_mode.
+  /// A missing entry is fail-closed only when the pair is colliding and the
+  /// active policy requested signed release evidence or bounded penetration
+  /// for that pair.
   std::vector<CollisionPairClearance> pair_clearances;
 
   /// Per-pair classification produced by the Chunk 3 policy evaluator.
@@ -334,18 +372,42 @@ struct CollisionResult {
   /// backend contact names, or an unsupported snapshot_format_version.
   /// Stable consumers SHOULD treat unknown keys as opaque.
   std::map<std::string, std::string> raw_diagnostics;
+
+  /// Exact signed-distance scope requested for this result and the number of
+  /// logical pairs for which the engine returned distance evidence. These are
+  /// stamped by the coordinator from the typed query/result boundary; they do
+  /// not infer or synthesize a metric for absent or binary-only pairs.
+  CollisionDistanceRequestMode distance_request_mode =
+      CollisionDistanceRequestMode::kNone;
+  std::size_t evaluated_distance_pair_count = 0;
 };
 
 /// Contact-policy mode for entries in CollisionPolicySnapshot::support_contacts.
 ///
-/// kContactRelease is the production mode for moves that start in
-/// bounded contact and must prove decreasing penetration / release.
+/// kContactRelease is the production mode for configured release-set
+/// transitions: initially present pairs must satisfy the authored evidence and
+/// final-separation rules, while an initially absent configured pair may not
+/// become a new active contact later in the trajectory.
+/// kBoundedPenetration has no initial-contact prerequisite: the declared pair
+/// may first collide at any sample, persist, disappear, reappear, or remain at
+/// trajectory end, but every colliding sample must remain within
+/// max_contact_penetration_m.
 /// kContactProcess is reserved for future force/controller-backed contact-rich
 /// applications and intentionally fails closed until sensing envelopes and
 /// adapter freshness gates are implemented.
 enum class CollisionContactPolicyMode {
   kContactRelease,
+  kBoundedPenetration,
   kContactProcess,
+};
+
+/// Evidence used to prove a contact-release policy.
+///
+/// Presentation surfaces may label these values "Precise" and "Lightweight",
+/// but authored and published contracts use the durable semantic names below.
+enum class ContactReleaseEvidenceMode {
+  kSignedPenetration,
+  kBinaryContact,
 };
 
 /// One entry in CollisionPolicySnapshot::support_contacts (spec §3.8.1,
@@ -354,9 +416,11 @@ struct SupportContactPolicyEntry {
   CollisionPairId pair;
   CollisionContactPolicyMode mode =
       CollisionContactPolicyMode::kContactRelease;
-  /// Initial penetration envelope. Enforced only by evaluators/coordinators
-  /// that receive penetration-depth diagnostics; otherwise full-diagnostic
-  /// policies must fail closed.
+  ContactReleaseEvidenceMode release_evidence_mode =
+      ContactReleaseEvidenceMode::kSignedPenetration;
+  /// Initial penetration envelope for kContactRelease with signed evidence.
+  /// Other modes keep these release-only fields neutral after typed-boundary
+  /// canonicalization; arbitrary mode-scoped mixtures fail core admission.
   bool enforce_max_start_penetration = true;
   double max_start_penetration_m = 0.0;
   /// Numeric tolerance for monotonic release checks. A later sample may be
@@ -366,14 +430,14 @@ struct SupportContactPolicyEntry {
   /// require_strictly_decreasing_penetration is true and the pair has not
   /// reached separation. Zero means any reduction beyond tolerance.
   double min_release_progress_m = 0.0;
-  /// Signed clearance required to count as separated for
-  /// require_separation_by_end and re-contact checks.
-  double min_separation_clearance_m = 0.0;
-  /// Requires a trajectory-scoped coordinator to evaluate the final sample.
-  /// Stateless single-sample evaluators must not claim this was proven.
+  /// Maximum penetration permitted at every colliding sample when `mode` is
+  /// kBoundedPenetration. Other policy modes keep this neutral at zero.
+  double max_contact_penetration_m = 0.0;
+  /// kContactRelease trajectory-end obligation. Canonical bounded entries keep
+  /// this false and permit final contact within their cap.
   bool require_separation_by_end = true;
-  /// Require the trajectory to show a net penetration decrease or separation,
-  /// not merely "no worse than start" within tolerance.
+  /// kContactRelease net-progress obligation. Canonical bounded entries keep
+  /// this false.
   bool require_strictly_decreasing_penetration = true;
   bool allow_recontact = false;
 };
@@ -518,6 +582,10 @@ struct CollisionEngineCapabilityDescriptor {
   std::string mutable_context_id;
   std::vector<std::string> supported_geometry_kinds;
   bool supports_distance_query = false;
+  /// Exact, sorted, duplicate-free distance scopes implemented by this
+  /// adapter.  A broader scope never satisfies a narrower request: callers
+  /// must fail capability admission instead of silently doing more work.
+  std::vector<CollisionDistanceRequestMode> supported_distance_request_modes;
   bool supports_contact_points = false;
   bool supports_penetration_depth = false;
   bool supports_continuous_collision = false;
@@ -552,6 +620,52 @@ struct CollisionEngineCapabilityDescriptor {
   /// "support-contact requires policy snapshot attached".
   std::vector<std::string> known_unsupported_cases;
 };
+
+/// Validate the exact distance-scope capability declaration.  Empty,
+/// unordered, duplicate, or internally contradictory declarations are not
+/// admissible.  `kNone` remains a real declared scope: collision-only callers
+/// must not rely on an omitted/legacy interpretation.
+[[nodiscard]] inline bool collision_distance_request_modes_valid(
+    const CollisionEngineCapabilityDescriptor& capability) noexcept {
+  const auto& modes = capability.supported_distance_request_modes;
+  if (modes.empty()) {
+    return false;
+  }
+  for (std::size_t index = 1; index < modes.size(); ++index) {
+    if (static_cast<int>(modes[index - 1]) >=
+        static_cast<int>(modes[index])) {
+      return false;
+    }
+  }
+  if (!capability.supports_distance_query &&
+      std::any_of(modes.begin(), modes.end(), [](const auto mode) {
+        return mode != CollisionDistanceRequestMode::kNone;
+      })) {
+    return false;
+  }
+  return true;
+}
+
+/// Exact-scope admission.  `all_active_pairs` and `all_colliding_pairs` are
+/// deliberately not fallbacks for `selected_colliding_pairs`.
+[[nodiscard]] inline bool collision_engine_supports_distance_request_mode(
+    const CollisionEngineCapabilityDescriptor& capability,
+    CollisionDistanceRequestMode requested_mode) noexcept {
+  if (!collision_distance_request_modes_valid(capability)) {
+    return false;
+  }
+  if (requested_mode != CollisionDistanceRequestMode::kNone &&
+      !capability.supports_distance_query) {
+    return false;
+  }
+  return std::binary_search(capability.supported_distance_request_modes.begin(),
+                            capability.supported_distance_request_modes.end(),
+                            requested_mode,
+                            [](const auto lhs, const auto rhs) {
+                              return static_cast<int>(lhs) <
+                                     static_cast<int>(rhs);
+                            });
+}
 
 /// Compare-mode policy (spec COLLISION_CHECKING_OWNERSHIP_PLAN §"Engine
 /// Capability And Mismatch Policy", added in Chunk 8 groundwork).

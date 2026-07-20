@@ -199,6 +199,43 @@ def _minimal_program(**overrides) -> dict:
     return prog
 
 
+def _program_with_support_contact(contact: dict) -> dict:
+    return _minimal_program(
+        tree={
+            "id": "sequence",
+            "name": "root",
+            "children": [{"id": "reset_trajectories", "name": "reset"}],
+        },
+        scene=[
+            {
+                "object_id": "part",
+                "shape": {
+                    "type": "box",
+                    "box_dimensions_m": [0.1, 0.1, 0.1],
+                },
+                "pose": {
+                    "frame_id": "universe",
+                    "position_m": [0.0, 0.0, 0.05],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+                "metadata": {"support_contacts": [contact]},
+            },
+            {
+                "object_id": "fixture",
+                "shape": {
+                    "type": "box",
+                    "box_dimensions_m": [1.0, 1.0, 0.1],
+                },
+                "pose": {
+                    "frame_id": "universe",
+                    "position_m": [0.0, 0.0, -0.05],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+            },
+        ]
+    )
+
+
 def test_collect_per_move_tcp_speed_caps_resolves_overrides(catalog):
     """The per-move TCP cap walk resolves ${param:...} against program defaults
     and, when given, runtime overrides."""
@@ -726,6 +763,112 @@ class TestProgramValidation:
             "support_object_id"
         ] == "table"
 
+    @pytest.mark.parametrize(
+        ("contact", "expected_capabilities"),
+        [
+            (
+                {"support_object_id": "fixture"},
+                {
+                    "execution.contact.geometric",
+                    "execution.contact.geometric_signed_penetration",
+                },
+            ),
+            (
+                {
+                    "support_object_id": "fixture",
+                    "mode": "contact_release",
+                    "release_evidence_mode": "signed_penetration",
+                },
+                {
+                    "execution.contact.geometric",
+                    "execution.contact.geometric_signed_penetration",
+                },
+            ),
+            (
+                {
+                    "support_object_id": "fixture",
+                    "mode": "contact_release",
+                    "release_evidence_mode": "binary_contact",
+                },
+                {"execution.contact.geometric"},
+            ),
+            (
+                {
+                    "support_object_id": "fixture",
+                    "mode": "bounded_penetration",
+                    "max_contact_penetration_m": 0.001,
+                },
+                {
+                    "execution.contact.geometric",
+                    "execution.contact.geometric_signed_penetration",
+                },
+            ),
+        ],
+    )
+    def test_support_contact_modes_derive_capability_tiers(
+        self,
+        catalog,
+        contact,
+        expected_capabilities,
+    ):
+        program = Program.from_dict(_program_with_support_contact(contact), catalog)
+
+        assert program.required_capabilities() == expected_capabilities
+
+    def test_binary_support_contact_admits_without_signed_penetration_tier(
+        self, catalog
+    ):
+        Program.from_dict(
+            _program_with_support_contact(
+                {
+                    "support_object_id": "fixture",
+                    "release_evidence_mode": "binary_contact",
+                }
+            ),
+            catalog,
+            deployment_capability_keys={"execution.contact.geometric"},
+        )
+
+    @pytest.mark.parametrize(
+        "contact",
+        [
+            {"support_object_id": "fixture"},
+            {
+                "support_object_id": "fixture",
+                "mode": "bounded_penetration",
+                "max_contact_penetration_m": 0.001,
+            },
+        ],
+    )
+    def test_metric_support_contact_rejects_missing_signed_penetration_tier(
+        self, catalog, contact
+    ):
+        with pytest.raises(
+            ProgramValidationError,
+            match="execution.contact.geometric_signed_penetration",
+        ):
+            Program.from_dict(
+                _program_with_support_contact(contact),
+                catalog,
+                deployment_capability_keys={"execution.contact.geometric"},
+            )
+
+    def test_binary_support_contact_rejects_missing_geometric_tier(self, catalog):
+        with pytest.raises(
+            ProgramValidationError,
+            match="execution.contact.geometric",
+        ):
+            Program.from_dict(
+                _program_with_support_contact(
+                    {
+                        "support_object_id": "fixture",
+                        "release_evidence_mode": "binary_contact",
+                    }
+                ),
+                catalog,
+                deployment_capability_keys=set(),
+            )
+
     def test_allows_scene_resource_support_contact_without_start_penetration_limit(
         self, catalog
     ):
@@ -932,6 +1075,242 @@ class TestProgramValidation:
         with pytest.raises(
             ProgramValidationError,
             match=r"metadata\.support_contacts\[0\]\.require_separation_by_end must be boolean",
+        ):
+            Program.from_dict(data, catalog)
+
+    def test_accepts_binary_contact_release_evidence(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "box1",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, 0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                    "metadata": {
+                        "support_contacts": [
+                            {
+                                "support_object_id": "table",
+                                "release_evidence_mode": "binary_contact",
+                                "require_separation_by_end": True,
+                            }
+                        ]
+                    },
+                },
+                {
+                    "object_id": "table",
+                    "shape": {"type": "box", "box_dimensions_m": [1.0, 1.0, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, -0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+            ],
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [{"id": "reset_trajectories", "name": "reset"}],
+            },
+        )
+
+        program = Program.from_dict(data, catalog)
+
+        assert program.scene[0].metadata["support_contacts"][0][
+            "release_evidence_mode"
+        ] == "binary_contact"
+
+    def test_rejects_duplicate_canonical_scene_support_contact_pairs(self, catalog):
+        def box(object_id, support_contacts=None):
+            resource = {
+                "object_id": object_id,
+                "shape": {
+                    "type": "box",
+                    "box_dimensions_m": [0.1, 0.1, 0.1],
+                },
+                "pose": {
+                    "frame_id": "universe",
+                    "position_m": [0.0, 0.0, 0.05],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+            }
+            if support_contacts is not None:
+                resource["metadata"] = {
+                    "support_contacts": support_contacts,
+                }
+            return resource
+
+        duplicate_on_one_object = [
+            box(
+                "insert",
+                [
+                    {"support_object_id": "fixture"},
+                    {
+                        "support_object_id": "fixture",
+                        "mode": "bounded_penetration",
+                        "max_contact_penetration_m": 0.001,
+                    },
+                ],
+            ),
+            box("fixture"),
+        ]
+        reciprocal_declarations = [
+            box("insert", [{"support_object_id": "fixture"}]),
+            box(
+                "fixture",
+                [
+                    {
+                        "support_object_id": "insert",
+                        "mode": "bounded_penetration",
+                        "max_contact_penetration_m": 0.001,
+                    }
+                ],
+            ),
+        ]
+
+        for scene in (duplicate_on_one_object, reciprocal_declarations):
+            with pytest.raises(
+                ProgramValidationError,
+                match=(
+                    r"Duplicate scene support-contact pair "
+                    r"'fixture' <-> 'insert'"
+                ),
+            ):
+                Program.from_dict(_minimal_program(scene=scene), catalog)
+
+    def test_rejects_removed_support_contact_clearance_field(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "box1",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, 0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                    "metadata": {
+                        "support_contacts": [
+                            {
+                                "support_object_id": "table",
+                                "min_separation_clearance_m": 0.0,
+                            }
+                        ]
+                    },
+                }
+            ]
+        )
+
+        with pytest.raises(
+            ProgramValidationError,
+            match=r"contains unknown fields: min_separation_clearance_m",
+        ):
+            Program.from_dict(data, catalog)
+
+    def test_accepts_bounded_penetration_support_contact(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "insert",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, 0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                    "metadata": {
+                        "support_contacts": [
+                            {
+                                "support_object_id": "fixture",
+                                "mode": "bounded_penetration",
+                                "max_contact_penetration_m": 0.001,
+                            }
+                        ]
+                    },
+                },
+                {
+                    "object_id": "fixture",
+                    "shape": {"type": "box", "box_dimensions_m": [1.0, 1.0, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, -0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+            ],
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [{"id": "reset_trajectories", "name": "reset"}],
+            },
+        )
+
+        program = Program.from_dict(data, catalog)
+
+        contact = program.scene[0].metadata["support_contacts"][0]
+        assert contact["mode"] == "bounded_penetration"
+        assert contact["max_contact_penetration_m"] == 0.001
+
+    def test_rejects_release_field_for_bounded_penetration(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "insert",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, 0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                    "metadata": {
+                        "support_contacts": [
+                            {
+                                "support_object_id": "fixture",
+                                "mode": "bounded_penetration",
+                                "max_contact_penetration_m": 0.001,
+                                "require_separation_by_end": True,
+                            }
+                        ]
+                    },
+                }
+            ]
+        )
+
+        with pytest.raises(
+            ProgramValidationError,
+            match=r"fields are valid only for contact_release: require_separation_by_end",
+        ):
+            Program.from_dict(data, catalog)
+
+    def test_rejects_metric_constraint_for_binary_contact(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "box1",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, 0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                    "metadata": {
+                        "support_contacts": [
+                            {
+                                "support_object_id": "table",
+                                "release_evidence_mode": "binary_contact",
+                                "release_tolerance_m": 0.001,
+                            }
+                        ]
+                    },
+                }
+            ]
+        )
+
+        with pytest.raises(
+            ProgramValidationError,
+            match=r"release_tolerance_m must be 0 for binary_contact",
         ):
             Program.from_dict(data, catalog)
 

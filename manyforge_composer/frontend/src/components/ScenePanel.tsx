@@ -9,7 +9,9 @@ import type {
 } from '../types/api';
 
 type SceneShapeType = 'box' | 'sphere' | 'cylinder' | 'mesh';
-type SupportContactMode = 'contact_release' | 'contact_process';
+type SupportContactMode = 'contact_release' | 'bounded_penetration' | 'contact_process';
+type ContactReleaseEvidenceMode = 'signed_penetration' | 'binary_contact';
+type SupportContactModality = ContactReleaseEvidenceMode | 'bounded_penetration' | 'contact_process';
 const EMPTY_SCENE_FRAMES: import('../types/api').SceneFrameState[] = [];
 
 interface SupportContactRow {
@@ -317,13 +319,33 @@ function supportContactRowsFromResources(resources: ProgramSceneResource[]): Sup
   });
 }
 
-function sanitizedSupportContact(
+export function sanitizedSupportContact(
   supportObjectId: string,
   contact: Record<string, unknown>,
 ): Record<string, unknown> {
   const next = structuredClone(contact);
   next.support_object_id = supportObjectId;
-  if (next.enforce_max_start_penetration === false) {
+  const mode = contactMode(next);
+  next.mode = mode;
+  if (mode === 'bounded_penetration') {
+    const maxPenetration = Number(next.max_contact_penetration_m);
+    return {
+      support_object_id: supportObjectId,
+      mode,
+      max_contact_penetration_m: Number.isFinite(maxPenetration) ? maxPenetration : 0,
+    };
+  }
+  if (mode === 'contact_process') {
+    return { support_object_id: supportObjectId, mode };
+  }
+  delete next.max_contact_penetration_m;
+  if (contactReleaseEvidenceMode(next) === 'binary_contact') {
+    delete next.enforce_max_start_penetration;
+    delete next.max_start_penetration_m;
+    delete next.release_tolerance_m;
+    delete next.min_release_progress_m;
+    delete next.require_strictly_decreasing_penetration;
+  } else if (next.enforce_max_start_penetration === false) {
     delete next.max_start_penetration_m;
   }
   return next;
@@ -364,7 +386,25 @@ function duplicateSupportContact(rows: SupportContactRow[]): string | null {
 }
 
 function contactMode(contact: Record<string, unknown>): SupportContactMode {
+  if (contact.mode === 'bounded_penetration') {
+    return 'bounded_penetration';
+  }
   return contact.mode === 'contact_process' ? 'contact_process' : 'contact_release';
+}
+
+export function supportContactModality(
+  contact: Record<string, unknown>,
+): SupportContactModality {
+  const mode = contactMode(contact);
+  return mode === 'contact_release' ? contactReleaseEvidenceMode(contact) : mode;
+}
+
+export function contactReleaseEvidenceMode(
+  contact: Record<string, unknown>,
+): ContactReleaseEvidenceMode {
+  return contact.release_evidence_mode === 'binary_contact'
+    ? 'binary_contact'
+    : 'signed_penetration';
 }
 
 function contactNumber(
@@ -435,24 +475,71 @@ function liveSupportContactSummary(contact: Record<string, unknown>): string {
   const supportObjectId = typeof contact.support_object_id === 'string'
     ? contact.support_object_id
     : 'unknown';
-  const mode = contact.mode === 'contact_process' ? 'process' : 'release';
+  const mode = contactMode(contact);
+  if (mode === 'bounded_penetration') {
+    const maxPenetration = contactNumber(
+      contact,
+      'max_contact_penetration_m',
+      0,
+    );
+    return `${supportObjectId} (contact-tolerant, max ${maxPenetration.toFixed(3)} m)`;
+  }
+  if (mode === 'contact_process') {
+    return `${supportObjectId} (contact process, reserved)`;
+  }
+  const evidence = contactReleaseEvidenceMode(contact) === 'binary_contact'
+    ? 'lightweight binary'
+    : 'precise penetration';
+  if (contactReleaseEvidenceMode(contact) === 'binary_contact') {
+    return `${supportObjectId} (release, ${evidence})`;
+  }
   const enforceMax = contact.enforce_max_start_penetration !== false;
   const maxStart = Number(contact.max_start_penetration_m);
   const maxText = enforceMax && Number.isFinite(maxStart)
     ? `max ${maxStart.toFixed(3)} m`
     : 'start cap off';
-  return `${supportObjectId} (${mode}, ${maxText})`;
+  return `${supportObjectId} (release, ${evidence}, ${maxText})`;
 }
 
-function defaultSupportContact(supportObjectId: string): Record<string, unknown> {
+function contactForModality(
+  supportObjectId: string,
+  contact: Record<string, unknown>,
+  modality: SupportContactModality,
+): Record<string, unknown> {
+  if (modality === 'bounded_penetration') {
+    return sanitizedSupportContact(supportObjectId, {
+      ...contact,
+      mode: 'bounded_penetration',
+      max_contact_penetration_m: contactNumber(
+        contact,
+        'max_contact_penetration_m',
+        0,
+      ),
+    });
+  }
+  if (modality === 'contact_process') {
+    return sanitizedSupportContact(supportObjectId, {
+      ...contact,
+      mode: 'contact_process',
+    });
+  }
+  return sanitizedSupportContact(supportObjectId, {
+    ...defaultSupportContact(supportObjectId),
+    ...contact,
+    mode: 'contact_release',
+    release_evidence_mode: modality,
+  });
+}
+
+export function defaultSupportContact(supportObjectId: string): Record<string, unknown> {
   return {
     support_object_id: supportObjectId,
     mode: 'contact_release',
+    release_evidence_mode: 'signed_penetration',
     enforce_max_start_penetration: true,
     max_start_penetration_m: 0.0,
-    release_tolerance_m: 0.001,
+    release_tolerance_m: 0.00001,
     min_release_progress_m: 0.0,
-    min_separation_clearance_m: 0.0,
     require_separation_by_end: true,
     require_strictly_decreasing_penetration: true,
     allow_recontact: false,
@@ -923,6 +1010,12 @@ function SupportContactEditor({
       )}
       {rows.map((row) => {
         const enforceMax = contactBoolean(row.contact, 'enforce_max_start_penetration', true);
+        const mode = contactMode(row.contact);
+        const modality = supportContactModality(row.contact);
+        const releaseEvidenceMode = contactReleaseEvidenceMode(row.contact);
+        const isRelease = mode === 'contact_release';
+        const isBoundedPenetration = mode === 'bounded_penetration';
+        const usesSignedPenetration = isRelease && releaseEvidenceMode === 'signed_penetration';
         return (
           <div key={row.rowKey} className="rounded border border-gray-700 bg-gray-900/40 p-3">
             <div className="mb-2 flex items-start justify-between gap-2">
@@ -931,7 +1024,7 @@ function SupportContactEditor({
                   {supportContactSummary(row)}
                 </div>
                 <div className="text-[11px] text-gray-500">
-                  Contact-release policy for attached-object extraction.
+                  Geometric support-contact policy for release or bounded contact.
                 </div>
               </div>
               <button
@@ -988,76 +1081,129 @@ function SupportContactEditor({
             </div>
 
             <label className="mt-2 block">
-              <span className="text-[11px] text-gray-400">Mode</span>
+              <span className="text-[11px] text-gray-400">Validation modality</span>
               <select
-                value={contactMode(row.contact)}
-                onChange={(event) => updateContact(row.rowKey, 'mode', event.target.value as SupportContactMode)}
+                value={modality}
+                onChange={(event) => updateRow(row.rowKey, {
+                  contact: contactForModality(
+                    row.supportObjectId,
+                    row.contact,
+                    event.target.value as SupportContactModality,
+                  ),
+                })}
                 disabled={disabled}
                 className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
               >
-                <option value="contact_release">contact release</option>
-                <option value="contact_process">contact process</option>
+                <option value="signed_penetration">Precise - signed penetration</option>
+                <option value="binary_contact">Lightweight - binary contact</option>
+                <option value="bounded_penetration">
+                  Contact-tolerant - bounded penetration
+                </option>
+                <option value="contact_process">Contact process - reserved</option>
               </select>
             </label>
 
-            <label className="mt-3 flex items-start gap-2 text-xs text-gray-300">
-              <input
-                type="checkbox"
-                checked={enforceMax}
-                onChange={(event) => {
-                  const nextContact = { ...row.contact };
-                  nextContact.enforce_max_start_penetration = event.target.checked;
-                  if (event.target.checked) {
-                    nextContact.max_start_penetration_m = contactNumber(row.contact, 'max_start_penetration_m', 0.0);
-                  } else {
-                    delete nextContact.max_start_penetration_m;
-                  }
-                  updateRow(row.rowKey, { contact: nextContact });
-                }}
-                disabled={disabled}
-                className="mt-0.5 h-3 w-3"
-              />
-              <span>Limit start penetration</span>
-            </label>
+            <div className="mt-2 text-[11px] text-gray-500">
+              Collision pairs are enumerated first. Distance is evaluated only
+              for configured pairs that are currently colliding; lightweight
+              mode evaluates no distance.
+            </div>
 
-            {enforceMax && (
-              <div className="mt-2">
-                <NumericInput
-                  label="Max start penetration (m)"
-                  value={contactNumber(row.contact, 'max_start_penetration_m', 0.0)}
-                  onChange={(next) => updateContact(row.rowKey, 'max_start_penetration_m', next)}
-                  disabled={disabled}
-                />
+            {isRelease && (usesSignedPenetration ? (
+              <>
+                <label className="mt-3 flex items-start gap-2 text-xs text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={enforceMax}
+                    onChange={(event) => {
+                      const nextContact = { ...row.contact };
+                      nextContact.enforce_max_start_penetration = event.target.checked;
+                      if (event.target.checked) {
+                        nextContact.max_start_penetration_m = contactNumber(row.contact, 'max_start_penetration_m', 0.0);
+                      } else {
+                        delete nextContact.max_start_penetration_m;
+                      }
+                      updateRow(row.rowKey, { contact: nextContact });
+                    }}
+                    disabled={disabled}
+                    className="mt-0.5 h-3 w-3"
+                  />
+                  <span>Limit start penetration</span>
+                </label>
+
+                {enforceMax && (
+                  <div className="mt-2">
+                    <NumericInput
+                      label="Max start penetration (m)"
+                      value={contactNumber(row.contact, 'max_start_penetration_m', 0.0)}
+                      onChange={(next) => updateContact(row.rowKey, 'max_start_penetration_m', next)}
+                      disabled={disabled}
+                    />
+                  </div>
+                )}
+
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <NumericInput
+                    label="Release tolerance (m)"
+                    value={contactNumber(row.contact, 'release_tolerance_m', 0.00001)}
+                    onChange={(next) => updateContact(row.rowKey, 'release_tolerance_m', next)}
+                    disabled={disabled}
+                  />
+                  <NumericInput
+                    label="Min release progress (m)"
+                    value={contactNumber(row.contact, 'min_release_progress_m', 0.0)}
+                    onChange={(next) => updateContact(row.rowKey, 'min_release_progress_m', next)}
+                    disabled={disabled}
+                  />
+                </div>
+              </>
+            ) : (
+              <div className="mt-2 rounded border border-amber-700/60 bg-amber-950/30 p-2 text-[11px] text-amber-200">
+                Lightweight mode uses contact-pair identity only. It enforces the
+                configured no-new-pair, re-contact, and final-separation rules,
+                but does not prove that penetration improves while a pair remains
+                in contact.
+              </div>
+            ))}
+
+            {isBoundedPenetration && (
+              <>
+                <div className="mt-3">
+                  <NumericInput
+                    label="Max contact penetration (m)"
+                    value={contactNumber(row.contact, 'max_contact_penetration_m', 0.0)}
+                    onChange={(next) => updateContact(
+                      row.rowKey,
+                      'max_contact_penetration_m',
+                      next,
+                    )}
+                    disabled={disabled}
+                  />
+                </div>
+                <div className="mt-2 rounded border border-blue-700/60 bg-blue-950/30 p-2 text-[11px] text-blue-200">
+                  Contact-tolerant mode permits this configured pair to be clear
+                  initially, first appear later, persist, disappear, re-contact,
+                  or remain at the end while its measured penetration stays
+                  within the bound. It is a geometric guard and does not prove
+                  force or insertion-process safety.
+                </div>
+              </>
+            )}
+
+            {mode === 'contact_process' && (
+              <div className="mt-2 rounded border border-red-700/60 bg-red-950/30 p-2 text-[11px] text-red-200">
+                Contact process is reserved for future force/controller-backed
+                policy and currently fails closed.
               </div>
             )}
 
-            <div className="mt-2 grid grid-cols-2 gap-2">
-              <NumericInput
-                label="Release tolerance (m)"
-                value={contactNumber(row.contact, 'release_tolerance_m', 0.001)}
-                onChange={(next) => updateContact(row.rowKey, 'release_tolerance_m', next)}
-                disabled={disabled}
-              />
-              <NumericInput
-                label="Min release progress (m)"
-                value={contactNumber(row.contact, 'min_release_progress_m', 0.0)}
-                onChange={(next) => updateContact(row.rowKey, 'min_release_progress_m', next)}
-                disabled={disabled}
-              />
-            </div>
-            <div className="mt-2">
-              <NumericInput
-                label="Min separation clearance (m)"
-                value={contactNumber(row.contact, 'min_separation_clearance_m', 0.0)}
-                onChange={(next) => updateContact(row.rowKey, 'min_separation_clearance_m', next)}
-                disabled={disabled}
-              />
-            </div>
-
-            <div className="mt-3 space-y-2">
+            {isRelease && (
+              <div className="mt-3 space-y-2">
               {[
                 ['require_separation_by_end', 'Require separation by end', true],
-                ['require_strictly_decreasing_penetration', 'Require decreasing penetration', true],
+                ...(usesSignedPenetration
+                  ? [['require_strictly_decreasing_penetration', 'Require net penetration progress', true]]
+                  : []),
                 ['allow_recontact', 'Allow re-contact', false],
               ].map(([field, label, fallback]) => (
                 <label key={field as string} className="flex items-start gap-2 text-xs text-gray-300">
@@ -1071,7 +1217,8 @@ function SupportContactEditor({
                   <span>{label as string}</span>
                 </label>
               ))}
-            </div>
+              </div>
+            )}
           </div>
         );
       })}

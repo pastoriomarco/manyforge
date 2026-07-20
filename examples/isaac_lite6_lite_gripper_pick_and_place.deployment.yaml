@@ -103,6 +103,8 @@ adapters:
     - context.validation.trajectory
     - context.collision.check
     - context.collision.check.detailed
+    - execution.contact.geometric
+    - execution.contact.geometric_signed_penetration
     - context.kinematics.fk
     - context.limits.joint
     - context.pose.resolve_reference

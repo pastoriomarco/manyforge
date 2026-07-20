@@ -39,6 +39,14 @@ def test_error_code_enum():
     assert manyforge_core_py.ErrorCode.kSuccess == manyforge_core_py.kSuccess
     assert manyforge_core_py.ErrorCode.kInvalidRequest == manyforge_core_py.kInvalidRequest
     assert manyforge_core_py.ErrorCode.kPlanningFailed == manyforge_core_py.kPlanningFailed
+    assert (
+        manyforge_core_py.ErrorCode.kInvalidContactPolicy
+        == manyforge_core_py.kInvalidContactPolicy
+    )
+    assert (
+        manyforge_core_py.ErrorCode.kContactPolicyViolation
+        == manyforge_core_py.kContactPolicyViolation
+    )
 
 
 def test_vector3_dto():

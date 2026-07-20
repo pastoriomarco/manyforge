@@ -411,6 +411,19 @@ class Ros2ControlExecutionBackend final
     return drain_scene_projection_for(timeout);
   }
 
+  void testing_record_command_progress_latency_ns(std::int64_t latency_ns) {
+    record_command_progress_latency_ns(latency_ns);
+  }
+
+  void testing_begin_command_progress_metrics_publication(
+      std::int64_t latency_ns) {
+    begin_command_progress_metrics_publication(latency_ns);
+  }
+
+  void testing_finish_command_progress_metrics_publication() {
+    finish_command_progress_metrics_publication();
+  }
+
   bool testing_publish_snapshot(core::ExecutionState state,
                                 const std::vector<double>& positions) {
     return publish_snapshot(state, 0.0, positions);
@@ -684,6 +697,8 @@ class Ros2ControlExecutionBackend final
   void record_scene_projection_success(std::int64_t source_timestamp_ns);
   void record_scene_projection_miss();
   void record_command_progress_latency_ns(std::int64_t latency_ns);
+  void begin_command_progress_metrics_publication(std::int64_t latency_ns);
+  void finish_command_progress_metrics_publication();
   void record_action_result_latency_ns(std::int64_t latency_ns);
   void record_cancel_latency_ns(std::int64_t latency_ns);
   void record_stop_confirmation_latency_ns(std::int64_t latency_ns);
@@ -934,6 +949,11 @@ class Ros2ControlExecutionBackend final
   std::atomic<std::uint64_t> state_callbacks_total_{0};
   std::atomic<std::uint64_t> action_feedback_callbacks_total_{0};
   std::atomic<std::uint64_t> action_result_callbacks_total_{0};
+  // Even values identify complete command-progress metric snapshots; odd
+  // values fence the brief multi-atomic publication in progress. This lets
+  // qualification pair the monotonic sample count with exactly its last/max
+  // latency values instead of observing a torn change point.
+  std::atomic<std::uint64_t> command_progress_metrics_sequence_{0};
   std::atomic<std::uint64_t> command_progress_samples_total_{0};
   std::atomic<std::uint64_t> cancel_confirmations_total_{0};
   std::atomic<std::uint64_t> stop_confirmations_total_{0};

@@ -866,6 +866,31 @@ std::vector<SupportContactDTO> support_contacts_from_python(const py::dict& requ
       throw std::invalid_argument("support_contacts entries must be dictionaries");
     }
     const py::dict contact_dict = py::reinterpret_borrow<py::dict>(item);
+    static const std::set<std::string, std::less<>> kAllowedFields{
+        "support_object_id",
+        "mode",
+        "release_evidence_mode",
+        "max_contact_penetration_m",
+        "enforce_max_start_penetration",
+        "max_start_penetration_m",
+        "release_tolerance_m",
+        "min_release_progress_m",
+        "require_separation_by_end",
+        "require_strictly_decreasing_penetration",
+        "allow_recontact",
+    };
+    for (const auto [field, value] : contact_dict) {
+      (void)value;
+      if (!py::isinstance<py::str>(field)) {
+        throw std::invalid_argument(
+            "support_contacts entries contain a non-string field name");
+      }
+      const auto field_name = field.cast<std::string>();
+      if (!kAllowedFields.contains(field_name)) {
+        throw std::invalid_argument(
+            "support_contacts entries contain unknown field: " + field_name);
+      }
+    }
     if (!contact_dict.contains("support_object_id")) {
       throw std::invalid_argument(
           "support_contacts entries require support_object_id");
@@ -876,20 +901,90 @@ std::vector<SupportContactDTO> support_contacts_from_python(const py::dict& requ
     if (contact.support_object_id.empty()) {
       throw std::invalid_argument("support_object_id must not be empty");
     }
-    auto nonnegative_finite = [](double value, const char* field) {
-      if (!std::isfinite(value) || value < 0.0) {
-        throw std::invalid_argument(std::string(field) + " must be finite and >= 0");
+    auto nonnegative_finite = [](const py::handle& value,
+                                 const char* field) {
+      if (py::isinstance<py::bool_>(value)) {
+        throw std::invalid_argument(std::string(field) +
+                                    " must be a number, not a boolean");
       }
+      const double parsed = value.cast<double>();
+      if (!std::isfinite(parsed) || parsed < 0.0) {
+        throw std::invalid_argument(std::string(field) +
+                                    " must be finite and >= 0");
+      }
+      return parsed;
     };
     if (contact_dict.contains("mode")) {
       const auto mode = contact_dict["mode"].cast<std::string>();
       if (mode == "contact_release") {
         contact.mode = CollisionContactPolicyMode::kContactRelease;
+      } else if (mode == "bounded_penetration") {
+        contact.mode = CollisionContactPolicyMode::kBoundedPenetration;
       } else if (mode == "contact_process") {
         contact.mode = CollisionContactPolicyMode::kContactProcess;
       } else {
         throw std::invalid_argument(
-            "support_contacts mode must be contact_release or contact_process");
+            "support_contacts mode must be contact_release, "
+            "bounded_penetration, or contact_process");
+      }
+    }
+    constexpr std::array<const char*, 8> kReleaseOnlyFields{
+        "release_evidence_mode",
+        "enforce_max_start_penetration",
+        "max_start_penetration_m",
+        "release_tolerance_m",
+        "min_release_progress_m",
+        "require_separation_by_end",
+        "require_strictly_decreasing_penetration",
+        "allow_recontact",
+    };
+    if (contact.mode == CollisionContactPolicyMode::kBoundedPenetration) {
+      for (const auto* field : kReleaseOnlyFields) {
+        if (contact_dict.contains(field)) {
+          throw std::invalid_argument(
+              std::string(field) + " is valid only for contact_release");
+        }
+      }
+      if (!contact_dict.contains("max_contact_penetration_m")) {
+        throw std::invalid_argument(
+            "bounded_penetration requires max_contact_penetration_m");
+      }
+      contact.max_contact_penetration_m = nonnegative_finite(
+          contact_dict["max_contact_penetration_m"],
+          "max_contact_penetration_m");
+      contacts.push_back(std::move(contact));
+      continue;
+    }
+    if (contact_dict.contains("max_contact_penetration_m")) {
+      throw std::invalid_argument(
+          "max_contact_penetration_m is valid only for bounded_penetration");
+    }
+    if (contact.mode == CollisionContactPolicyMode::kContactProcess) {
+      for (const auto* field : kReleaseOnlyFields) {
+        if (contact_dict.contains(field)) {
+          throw std::invalid_argument(
+              std::string(field) + " is valid only for contact_release");
+        }
+      }
+      contacts.push_back(std::move(contact));
+      continue;
+    }
+    if (contact_dict.contains("release_evidence_mode")) {
+      const auto evidence_mode =
+          contact_dict["release_evidence_mode"].cast<std::string>();
+      if (evidence_mode == "signed_penetration") {
+        contact.release_evidence_mode =
+            ContactReleaseEvidenceMode::kSignedPenetration;
+      } else if (evidence_mode == "binary_contact") {
+        contact.release_evidence_mode =
+            ContactReleaseEvidenceMode::kBinaryContact;
+        contact.enforce_max_start_penetration = false;
+        contact.release_tolerance_m = 0.0;
+        contact.require_strictly_decreasing_penetration = false;
+      } else {
+        throw std::invalid_argument(
+            "release_evidence_mode must be signed_penetration or "
+            "binary_contact");
       }
     }
     if (contact_dict.contains("enforce_max_start_penetration")) {
@@ -897,27 +992,18 @@ std::vector<SupportContactDTO> support_contacts_from_python(const py::dict& requ
           contact_dict["enforce_max_start_penetration"].cast<bool>();
     }
     if (contact_dict.contains("max_start_penetration_m")) {
-      contact.max_start_penetration_m =
-          contact_dict["max_start_penetration_m"].cast<double>();
-      nonnegative_finite(contact.max_start_penetration_m,
-                         "max_start_penetration_m");
+      contact.max_start_penetration_m = nonnegative_finite(
+          contact_dict["max_start_penetration_m"],
+          "max_start_penetration_m");
     }
     if (contact_dict.contains("release_tolerance_m")) {
-      contact.release_tolerance_m =
-          contact_dict["release_tolerance_m"].cast<double>();
-      nonnegative_finite(contact.release_tolerance_m, "release_tolerance_m");
+      contact.release_tolerance_m = nonnegative_finite(
+          contact_dict["release_tolerance_m"], "release_tolerance_m");
     }
     if (contact_dict.contains("min_release_progress_m")) {
-      contact.min_release_progress_m =
-          contact_dict["min_release_progress_m"].cast<double>();
-      nonnegative_finite(contact.min_release_progress_m,
-                         "min_release_progress_m");
-    }
-    if (contact_dict.contains("min_separation_clearance_m")) {
-      contact.min_separation_clearance_m =
-          contact_dict["min_separation_clearance_m"].cast<double>();
-      nonnegative_finite(contact.min_separation_clearance_m,
-                         "min_separation_clearance_m");
+      contact.min_release_progress_m = nonnegative_finite(
+          contact_dict["min_release_progress_m"],
+          "min_release_progress_m");
     }
     if (contact_dict.contains("require_separation_by_end")) {
       contact.require_separation_by_end =
@@ -931,6 +1017,16 @@ std::vector<SupportContactDTO> support_contacts_from_python(const py::dict& requ
       contact.allow_recontact =
           contact_dict["allow_recontact"].cast<bool>();
     }
+    if (contact.release_evidence_mode ==
+            ContactReleaseEvidenceMode::kBinaryContact &&
+        (contact.enforce_max_start_penetration ||
+         contact.max_start_penetration_m != 0.0 ||
+         contact.release_tolerance_m != 0.0 ||
+         contact.min_release_progress_m != 0.0 ||
+         contact.require_strictly_decreasing_penetration)) {
+      throw std::invalid_argument(
+          "binary_contact does not accept penetration metric constraints");
+    }
     contacts.push_back(std::move(contact));
   }
   return contacts;
@@ -939,14 +1035,25 @@ std::vector<SupportContactDTO> support_contacts_from_python(const py::dict& requ
 py::dict support_contact_to_python(const SupportContactDTO& contact) {
   py::dict d;
   d["support_object_id"] = contact.support_object_id;
-  d["mode"] = contact.mode == CollisionContactPolicyMode::kContactProcess
-                  ? "contact_process"
-                  : "contact_release";
+  if (contact.mode == CollisionContactPolicyMode::kBoundedPenetration) {
+    d["mode"] = "bounded_penetration";
+    d["max_contact_penetration_m"] = contact.max_contact_penetration_m;
+    return d;
+  }
+  if (contact.mode == CollisionContactPolicyMode::kContactProcess) {
+    d["mode"] = "contact_process";
+    return d;
+  }
+  d["mode"] = "contact_release";
+  d["release_evidence_mode"] =
+      contact.release_evidence_mode ==
+              ContactReleaseEvidenceMode::kBinaryContact
+          ? "binary_contact"
+          : "signed_penetration";
   d["enforce_max_start_penetration"] = contact.enforce_max_start_penetration;
   d["max_start_penetration_m"] = contact.max_start_penetration_m;
   d["release_tolerance_m"] = contact.release_tolerance_m;
   d["min_release_progress_m"] = contact.min_release_progress_m;
-  d["min_separation_clearance_m"] = contact.min_separation_clearance_m;
   d["require_separation_by_end"] = contact.require_separation_by_end;
   d["require_strictly_decreasing_penetration"] =
       contact.require_strictly_decreasing_penetration;
@@ -1292,6 +1399,8 @@ const char* kernel_event_type_to_string(KernelEventType type) {
       return "recovery_action_rejected";
     case KernelEventType::kRuntimeCollisionCoverage:
       return "runtime_collision_coverage";
+    case KernelEventType::kContactPolicyViolation:
+      return "contact_policy_violation";
     default: return "unknown";
   }
 }
@@ -1777,16 +1886,29 @@ py::dict collision_policy_to_python(const CollisionPolicySnapshot& policy) {
   for (const auto& contact : policy.support_contacts) {
     py::dict value;
     value["pair"] = collision_pair_to_python(contact.pair);
-    value["mode"] = contact.mode == CollisionContactPolicyMode::kContactProcess
-                        ? "contact_process"
-                        : "contact_release";
+    if (contact.mode == CollisionContactPolicyMode::kBoundedPenetration) {
+      value["mode"] = "bounded_penetration";
+      value["max_contact_penetration_m"] =
+          contact.max_contact_penetration_m;
+      support_contacts.append(std::move(value));
+      continue;
+    }
+    if (contact.mode == CollisionContactPolicyMode::kContactProcess) {
+      value["mode"] = "contact_process";
+      support_contacts.append(std::move(value));
+      continue;
+    }
+    value["mode"] = "contact_release";
+    value["release_evidence_mode"] =
+        contact.release_evidence_mode ==
+                ContactReleaseEvidenceMode::kBinaryContact
+            ? "binary_contact"
+            : "signed_penetration";
     value["enforce_max_start_penetration"] =
         contact.enforce_max_start_penetration;
     value["max_start_penetration_m"] = contact.max_start_penetration_m;
     value["release_tolerance_m"] = contact.release_tolerance_m;
     value["min_release_progress_m"] = contact.min_release_progress_m;
-    value["min_separation_clearance_m"] =
-        contact.min_separation_clearance_m;
     value["require_separation_by_end"] = contact.require_separation_by_end;
     value["require_strictly_decreasing_penetration"] =
         contact.require_strictly_decreasing_penetration;

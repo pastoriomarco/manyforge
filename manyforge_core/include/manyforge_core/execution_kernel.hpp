@@ -50,6 +50,7 @@
 #include <span>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -590,6 +591,10 @@ class ExecutionKernel {
       const RuntimeCollisionLookaheadSession* source_session);
   void emit_runtime_collision_lookahead_evidence(
       RuntimeCollisionLookaheadResult result);
+  void emit_contact_policy_violation_event(
+      std::uint64_t execution_id,
+      const std::map<std::string, std::string>& source_details,
+      std::optional<std::string_view> response_override = std::nullopt);
   RuntimeCollisionProtectionSnapshot runtime_collision_protection_snapshot()
       const;
   bool refresh_published_runtime_collision_snapshot(

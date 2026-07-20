@@ -87,6 +87,7 @@ class TestGetRequiredKeys:
         assert "planning.profile.quality_bounded" in CAPABILITY_REGISTRY
         assert "scene.edit.upsert" in CAPABILITY_REGISTRY
         assert "tool.gripper.command" in CAPABILITY_REGISTRY
+        assert "execution.contact.geometric_signed_penetration" in CAPABILITY_REGISTRY
         assert "execution.contact.force_torque" in CAPABILITY_REGISTRY
         assert "simulator.control.reset" in CAPABILITY_REGISTRY
         assert "simulator.control.pause" in CAPABILITY_REGISTRY

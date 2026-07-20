@@ -4,17 +4,20 @@
 // no-scene-lock-contention against the planner projection.
 
 #include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_core/collision/collision_policy_evaluator.hpp>
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <roboplan_example_models/resources.hpp>
 #include <manyforge_roboplan/native_kernel_factory.hpp>
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -29,6 +32,7 @@ using manyforge::core::AttachObjectRequestDTO;
 using manyforge::core::BoxShapeDTO;
 using manyforge::core::CollisionCancellationToken;
 using manyforge::core::CollisionDecisionResult;
+using manyforge::core::CollisionDistanceRequestMode;
 using manyforge::core::CollisionEngineStatus;
 using manyforge::core::CollisionPolicySnapshot;
 using manyforge::core::CollisionQuery;
@@ -413,6 +417,26 @@ TEST(ManyForgeCollisionEngineTest, EngineExposesStableIdAndVersion) {
   EXPECT_FALSE(engine->engine_version().empty());
 }
 
+TEST(ManyForgeCollisionDistanceEvidenceTest,
+     MixedFiniteAndNonFiniteComponentsRemainIncomplete) {
+  manyforge::collision::detail::SelectedCollidingDistanceEvidence evidence;
+
+  evidence.observe(-0.001);
+  evidence.observe(-0.003);
+  evidence.observe(std::numeric_limits<double>::quiet_NaN());
+  evidence.observe(-0.002);
+
+  EXPECT_FALSE(evidence.complete);
+  ASSERT_TRUE(evidence.deepest_finite_m.has_value());
+  EXPECT_DOUBLE_EQ(*evidence.deepest_finite_m, -0.003);
+
+  manyforge::collision::detail::SelectedCollidingDistanceEvidence
+      infinite_only;
+  infinite_only.observe(std::numeric_limits<double>::infinity());
+  EXPECT_FALSE(infinite_only.complete);
+  EXPECT_FALSE(infinite_only.deepest_finite_m.has_value());
+}
+
 TEST(ManyForgeCollisionEngineTest,
      DedicatedRuntimeSurfacePreparesAndTracksPublishedRevisions) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
@@ -423,6 +447,17 @@ TEST(ManyForgeCollisionEngineTest,
   auto engine = make_engine();
 
   const auto& capability = engine->capability();
+  EXPECT_TRUE(
+      manyforge::core::collision_distance_request_modes_valid(capability));
+  EXPECT_EQ(capability.supported_distance_request_modes,
+            (std::vector<manyforge::core::CollisionDistanceRequestMode>{
+                manyforge::core::CollisionDistanceRequestMode::kNone,
+                manyforge::core::CollisionDistanceRequestMode::
+                    kSelectedCollidingPairs,
+                manyforge::core::CollisionDistanceRequestMode::
+                    kAllCollidingPairs,
+                manyforge::core::CollisionDistanceRequestMode::
+                    kAllActivePairs}));
   EXPECT_EQ(capability.runtime_query_memory_model,
             manyforge::core::RuntimeCollisionQueryMemoryModel::kMeasuredBounded);
   EXPECT_GT(capability.runtime_query_clean_allocation_upper_bound, 0u);
@@ -457,6 +492,88 @@ TEST(ManyForgeCollisionEngineTest,
     ASSERT_NE(observation.pair, nullptr);
     EXPECT_LE(observation.pair->body_a, observation.pair->body_b);
   }
+
+  const std::vector<manyforge::core::CollisionPairId> selected_pairs{
+      *collision.collision_pairs.front().pair};
+  request.distance_request_mode =
+      CollisionDistanceRequestMode::kSelectedCollidingPairs;
+  request.selected_distance_pairs = selected_pairs;
+  auto precise = engine->check_runtime(*collision_snapshot, request);
+  ASSERT_EQ(precise.status,
+            manyforge::core::RuntimeCollisionQueryStatus::kCollision);
+  ASSERT_EQ(precise.clearance_pairs.size(), 1u);
+  ASSERT_NE(precise.clearance_pairs.front().pair, nullptr);
+  EXPECT_EQ(*precise.clearance_pairs.front().pair, selected_pairs.front());
+  EXPECT_TRUE(precise.clearance_pairs.front().signed_clearance_m.has_value());
+  auto counters = engine->internal_last_query_mechanism_counters();
+  EXPECT_EQ(counters.collision_api_call_count, 1u);
+  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
+  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 2u);
+  EXPECT_EQ(counters.distance_evaluated_logical_pair_count, 1u);
+  EXPECT_GT(counters.distance_evaluated_geometry_pair_count, 0u);
+  EXPECT_EQ(counters.distance_api_call_count,
+            counters.distance_evaluated_geometry_pair_count);
+  EXPECT_EQ(counters.fk_placement_invocation_count, 1u);
+
+  const std::vector<manyforge::core::CollisionPairId>
+      selected_noncolliding_pairs{{"fixture/not_present/shape/0",
+                                   "object/not_present/shape/0"}};
+  request.selected_distance_pairs = selected_noncolliding_pairs;
+  auto selected_noncolliding =
+      engine->check_runtime(*collision_snapshot, request);
+  ASSERT_EQ(selected_noncolliding.status,
+            manyforge::core::RuntimeCollisionQueryStatus::kCollision);
+  ASSERT_EQ(selected_noncolliding.collision_pairs.size(),
+            collision.collision_pairs.size());
+  for (std::size_t i = 0; i < collision.collision_pairs.size(); ++i) {
+    ASSERT_NE(selected_noncolliding.collision_pairs[i].pair, nullptr);
+    ASSERT_NE(collision.collision_pairs[i].pair, nullptr);
+    EXPECT_EQ(*selected_noncolliding.collision_pairs[i].pair,
+              *collision.collision_pairs[i].pair);
+  }
+  EXPECT_TRUE(selected_noncolliding.clearance_pairs.empty());
+  counters = engine->internal_last_query_mechanism_counters();
+  EXPECT_EQ(counters.distance_request_mode,
+            CollisionDistanceRequestMode::kSelectedCollidingPairs);
+  EXPECT_EQ(counters.collision_api_call_count, 1u);
+  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
+  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 0u);
+  EXPECT_GT(counters.colliding_geometry_pair_count, 0u);
+  EXPECT_EQ(counters.distance_api_call_count, 0u);
+  EXPECT_EQ(counters.distance_evaluated_geometry_pair_count, 0u);
+  EXPECT_EQ(counters.distance_evaluated_logical_pair_count, 0u);
+  EXPECT_EQ(counters.fk_placement_invocation_count, 1u);
+
+  request.distance_request_mode = CollisionDistanceRequestMode::kNone;
+  request.selected_distance_pairs = {};
+  auto lightweight = engine->check_runtime(*collision_snapshot, request);
+  ASSERT_EQ(lightweight.status,
+            manyforge::core::RuntimeCollisionQueryStatus::kCollision);
+  EXPECT_TRUE(lightweight.clearance_pairs.empty());
+  counters = engine->internal_last_query_mechanism_counters();
+  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
+  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 0u);
+  EXPECT_EQ(counters.distance_api_call_count, 0u);
+  EXPECT_EQ(counters.distance_evaluated_geometry_pair_count, 0u);
+  EXPECT_EQ(counters.distance_evaluated_logical_pair_count, 0u);
+  EXPECT_EQ(counters.fk_placement_invocation_count, 1u);
+
+  request.distance_request_mode =
+      CollisionDistanceRequestMode::kSelectedCollidingPairs;
+  request.selected_distance_pairs = {};
+  const auto missing_selection =
+      engine->check_runtime(*collision_snapshot, request);
+  EXPECT_EQ(missing_selection.status,
+            manyforge::core::RuntimeCollisionQueryStatus::kInconclusive);
+  EXPECT_EQ(
+      missing_selection.failure_reason,
+      manyforge::core::RuntimeCollisionQueryFailureReason::
+          kPairDiagnosticsIncomplete);
+  EXPECT_EQ(missing_selection.engine_status,
+            manyforge::core::CollisionEngineStatus::kDiagnosticIncomplete);
+  counters = engine->internal_last_query_mechanism_counters();
+  EXPECT_EQ(counters.collision_api_call_count, 0u);
+  EXPECT_EQ(counters.distance_api_call_count, 0u);
 }
 
 TEST(ManyForgeCollisionEngineTest,
@@ -1037,7 +1154,10 @@ TEST(ManyForgeCollisionEngineTest,
 
   CollisionQuery q;
   q.robot_state = observed_state(*bundle);
+  // The all-active diagnostic/baseline path is explicit. Production contact-
+  // policy queries use selected/all-colliding scopes instead.
   q.required_capabilities = {"distance", "penetration_depth"};
+  q.distance_request_mode = CollisionDistanceRequestMode::kAllActivePairs;
   auto result = check_snapshot(*engine, *snapshot, q);
 
   EXPECT_EQ(result.engine_status,
@@ -1046,6 +1166,373 @@ TEST(ManyForgeCollisionEngineTest,
   ASSERT_TRUE(result.min_clearance_pair.has_value());
   EXPECT_FALSE(result.pair_clearances.empty());
   EXPECT_TRUE(std::isfinite(*result.min_clearance_m));
+
+  const auto counters = engine->internal_last_query_mechanism_counters();
+  EXPECT_EQ(counters.distance_request_mode,
+            CollisionDistanceRequestMode::kAllActivePairs);
+  EXPECT_EQ(counters.distance_api_call_count, 1u);
+  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
+  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 2u);
+  EXPECT_EQ(counters.distance_evaluated_geometry_pair_count,
+            counters.active_collision_pair_count);
+  EXPECT_EQ(counters.fk_placement_invocation_count, 2u);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     RequiredDistanceCapabilityWithoutTypedScopeFailsClosed) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  auto snapshot = bundle->scene_authority->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  auto engine = make_engine("ur5_gripper", "arm");
+
+  CollisionQuery q;
+  q.robot_state = observed_state(*bundle);
+  q.required_capabilities = {"distance", "penetration_depth"};
+  auto result = check_snapshot(*engine, *snapshot, q);
+
+  EXPECT_EQ(result.engine_status,
+            manyforge::core::CollisionEngineStatus::kDiagnosticIncomplete);
+  EXPECT_EQ(result.decision,
+            manyforge::core::CollisionDecisionResult::kInconclusiveFail);
+  EXPECT_EQ(result.raw_diagnostics.at("distance_scope_error"),
+            "distance or penetration_depth capability requires an explicit "
+            "typed distance request scope");
+  const auto counters = engine->internal_last_query_mechanism_counters();
+  EXPECT_EQ(counters.collision_api_call_count, 0u);
+  EXPECT_EQ(counters.distance_api_call_count, 0u);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     SelectedCollidingDistancePreservesFullCollisionCoverage) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  ASSERT_TRUE(bundle->scene_authority
+                  ->add_object(make_large_collision_box("selective_box"))
+                  .success);
+  auto snapshot = bundle->scene_authority->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  auto engine = make_engine("ur5_gripper", "arm");
+
+  CollisionQuery collision_only;
+  collision_only.robot_state = observed_state(*bundle);
+  collision_only.distance_request_mode = CollisionDistanceRequestMode::kNone;
+  const auto complete = check_snapshot(*engine, *snapshot, collision_only);
+  ASSERT_EQ(complete.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(complete.raw_diagnostics);
+  ASSERT_TRUE(complete.in_collision);
+  ASSERT_GT(complete.normalized_pairs.size(), 1u);
+  EXPECT_TRUE(complete.pair_clearances.empty());
+  auto counters = engine->internal_last_query_mechanism_counters();
+  EXPECT_EQ(counters.collision_api_call_count, 1u);
+  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
+  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 0u);
+  EXPECT_EQ(counters.colliding_logical_pair_count,
+            complete.normalized_pairs.size());
+  EXPECT_EQ(counters.distance_api_call_count, 0u);
+  EXPECT_EQ(counters.distance_evaluated_geometry_pair_count, 0u);
+
+  CollisionQuery selective = collision_only;
+  // Signed-release and bounded-penetration policy modes share this engine
+  // scope; the policy evaluator, not the engine, interprets the metric.
+  selective.distance_request_mode =
+      CollisionDistanceRequestMode::kSelectedCollidingPairs;
+  selective.selected_distance_pairs = {complete.normalized_pairs.front()};
+  for (const std::string evidence_mode : {"signed_penetration",
+                                          "bounded_penetration"}) {
+    selective.query_id = evidence_mode;
+    const auto selected = check_snapshot(*engine, *snapshot, selective);
+    ASSERT_EQ(selected.engine_status, CollisionEngineStatus::kOk)
+        << evidence_mode << ": "
+        << diagnostics_text(selected.raw_diagnostics);
+    EXPECT_EQ(selected.normalized_pairs, complete.normalized_pairs);
+    ASSERT_EQ(selected.pair_clearances.size(), 1u);
+    EXPECT_EQ(selected.pair_clearances.front().pair,
+              complete.normalized_pairs.front());
+    EXPECT_TRUE(std::isfinite(
+        selected.pair_clearances.front().signed_clearance_m));
+    counters = engine->internal_last_query_mechanism_counters();
+    EXPECT_EQ(counters.distance_request_mode,
+              CollisionDistanceRequestMode::kSelectedCollidingPairs);
+    EXPECT_EQ(counters.collision_api_call_count, 1u);
+    EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
+    EXPECT_EQ(counters.first_distance_evaluation_ordinal, 2u);
+    EXPECT_EQ(counters.distance_evaluated_logical_pair_count, 1u);
+    EXPECT_GT(counters.distance_evaluated_geometry_pair_count, 0u);
+    EXPECT_LT(counters.distance_evaluated_geometry_pair_count,
+              counters.active_collision_pair_count);
+    EXPECT_EQ(counters.distance_api_call_count,
+              counters.distance_evaluated_geometry_pair_count);
+    EXPECT_EQ(counters.fk_placement_invocation_count, 1u);
+  }
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     SelectedPenetrationIsExactAcrossIndependentWorkerHistories) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  ASSERT_TRUE(bundle->scene_authority
+                  ->add_object(make_large_collision_box("deterministic_box"))
+                  .success);
+  auto snapshot = bundle->scene_authority->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+
+  CollisionQuery collision_only;
+  collision_only.robot_state = observed_state(*bundle);
+  auto discovery_engine = make_engine("ur5_gripper", "arm");
+  const auto complete =
+      check_snapshot(*discovery_engine, *snapshot, collision_only);
+  ASSERT_EQ(complete.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(complete.raw_diagnostics);
+  ASSERT_FALSE(complete.normalized_pairs.empty());
+
+  CollisionQuery selected = collision_only;
+  selected.distance_request_mode =
+      CollisionDistanceRequestMode::kSelectedCollidingPairs;
+  selected.selected_distance_pairs = {complete.normalized_pairs.front()};
+
+  auto fresh_engine = make_engine("ur5_gripper", "arm");
+  const auto fresh = check_snapshot(*fresh_engine, *snapshot, selected);
+  ASSERT_EQ(fresh.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(fresh.raw_diagnostics);
+  ASSERT_EQ(fresh.pair_clearances.size(), 1u);
+
+  auto history_engine = make_engine("ur5_gripper", "arm");
+  CollisionResult after_history;
+  for (int sample = 0; sample < 37; ++sample) {
+    after_history = check_snapshot(*history_engine, *snapshot, selected);
+    ASSERT_EQ(after_history.engine_status, CollisionEngineStatus::kOk)
+        << diagnostics_text(after_history.raw_diagnostics);
+  }
+  ASSERT_EQ(after_history.pair_clearances.size(), 1u);
+  EXPECT_EQ(after_history.pair_clearances.front().pair,
+            fresh.pair_clearances.front().pair);
+  EXPECT_EQ(after_history.pair_clearances.front().signed_clearance_m,
+            fresh.pair_clearances.front().signed_clearance_m);
+
+  const double penetration_m =
+      -fresh.pair_clearances.front().signed_clearance_m;
+  ASSERT_GT(penetration_m, 0.0);
+  manyforge::core::SupportContactPolicyEntry bounded;
+  bounded.pair = fresh.pair_clearances.front().pair;
+  bounded.mode =
+      manyforge::core::CollisionContactPolicyMode::kBoundedPenetration;
+  bounded.max_contact_penetration_m = penetration_m;
+  manyforge::core::ContactReleaseEvaluationState at_boundary_state;
+  const auto at_boundary = manyforge::core::advance_contact_release_sample(
+      bounded,
+      manyforge::core::ContactReleaseSampleEvidence{
+          .in_contact = true,
+          .signed_clearance_m =
+              fresh.pair_clearances.front().signed_clearance_m},
+      at_boundary_state);
+  EXPECT_TRUE(at_boundary.accepted());
+
+  bounded.max_contact_penetration_m = std::nextafter(penetration_m, 0.0);
+  manyforge::core::ContactReleaseEvaluationState over_boundary_state;
+  const auto over_boundary = manyforge::core::advance_contact_release_sample(
+      bounded,
+      manyforge::core::ContactReleaseSampleEvidence{
+          .in_contact = true,
+          .signed_clearance_m =
+              fresh.pair_clearances.front().signed_clearance_m},
+      over_boundary_state);
+  EXPECT_EQ(over_boundary.failure,
+            manyforge::core::ContactReleaseTransitionFailure::
+                kContactPenetrationExceedsPolicy);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     UnrelatedSelectedPairEvaluatesNoDistance) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  ASSERT_TRUE(bundle->scene_authority
+                  ->add_object(make_large_collision_box("unrelated_box"))
+                  .success);
+  auto snapshot = bundle->scene_authority->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  auto engine = make_engine("ur5_gripper", "arm");
+
+  CollisionQuery query;
+  query.robot_state = observed_state(*bundle);
+  query.distance_request_mode =
+      CollisionDistanceRequestMode::kSelectedCollidingPairs;
+  query.selected_distance_pairs = {{"fixture/not_present/shape/0",
+                                    "object/not_present/shape/0"}};
+  std::sort(query.selected_distance_pairs.begin(),
+            query.selected_distance_pairs.end());
+  auto& unrelated_pair = query.selected_distance_pairs.front();
+  if (unrelated_pair.body_b < unrelated_pair.body_a) {
+    std::swap(unrelated_pair.body_a, unrelated_pair.body_b);
+  }
+
+  const auto result = check_snapshot(*engine, *snapshot, query);
+  ASSERT_EQ(result.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(result.raw_diagnostics);
+  ASSERT_TRUE(result.in_collision);
+  EXPECT_FALSE(result.normalized_pairs.empty());
+  EXPECT_TRUE(result.pair_clearances.empty());
+  const auto counters = engine->internal_last_query_mechanism_counters();
+  EXPECT_EQ(counters.collision_api_call_count, 1u);
+  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
+  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 0u);
+  EXPECT_GT(counters.colliding_geometry_pair_count, 0u);
+  EXPECT_EQ(counters.distance_api_call_count, 0u);
+  EXPECT_EQ(counters.distance_evaluated_geometry_pair_count, 0u);
+  EXPECT_EQ(counters.distance_evaluated_logical_pair_count, 0u);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     SelectedCollidingDistanceRequiresANonemptySelection) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  auto snapshot = bundle->scene_authority->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  auto engine = make_engine("ur5_gripper", "arm");
+
+  CollisionQuery query;
+  query.robot_state = observed_state(*bundle);
+  query.distance_request_mode =
+      CollisionDistanceRequestMode::kSelectedCollidingPairs;
+
+  const auto result = check_snapshot(*engine, *snapshot, query);
+  EXPECT_EQ(result.engine_status,
+            manyforge::core::CollisionEngineStatus::kDiagnosticIncomplete);
+  EXPECT_EQ(result.decision,
+            manyforge::core::CollisionDecisionResult::kInconclusiveFail);
+  EXPECT_EQ(
+      result.raw_diagnostics.at("distance_scope_error"),
+      "selected_distance_pairs_missing");
+  const auto counters = engine->internal_last_query_mechanism_counters();
+  EXPECT_EQ(counters.collision_api_call_count, 0u);
+  EXPECT_EQ(counters.distance_api_call_count, 0u);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     AllCollidingDistanceEvaluatesOnlyCollidingGeometryPairs) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  ASSERT_TRUE(bundle->scene_authority
+                  ->add_object(make_large_collision_box("all_colliding_box"))
+                  .success);
+  auto snapshot = bundle->scene_authority->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  auto engine = make_engine("ur5_gripper", "arm");
+
+  CollisionQuery query;
+  query.robot_state = observed_state(*bundle);
+  query.distance_request_mode =
+      CollisionDistanceRequestMode::kAllCollidingPairs;
+  const auto result = check_snapshot(*engine, *snapshot, query);
+  ASSERT_EQ(result.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(result.raw_diagnostics);
+  ASSERT_TRUE(result.in_collision);
+  ASSERT_EQ(result.pair_clearances.size(), result.normalized_pairs.size());
+
+  const auto counters = engine->internal_last_query_mechanism_counters();
+  EXPECT_EQ(counters.distance_request_mode,
+            CollisionDistanceRequestMode::kAllCollidingPairs);
+  EXPECT_EQ(counters.collision_enumeration_completion_ordinal, 1u);
+  EXPECT_EQ(counters.first_distance_evaluation_ordinal, 2u);
+  EXPECT_EQ(counters.distance_evaluated_geometry_pair_count,
+            counters.colliding_geometry_pair_count);
+  EXPECT_EQ(counters.distance_evaluated_logical_pair_count,
+            counters.colliding_logical_pair_count);
+  EXPECT_EQ(counters.distance_api_call_count,
+            counters.colliding_geometry_pair_count);
+  EXPECT_EQ(counters.fk_placement_invocation_count, 1u);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     MultipleGeometryPairsReduceToDeepestLogicalPairDistance) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  ASSERT_TRUE(bundle->scene_authority
+                  ->add_object(make_large_collision_box("multi_geometry_box"))
+                  .success);
+  const auto published = bundle->scene_authority->snapshot();
+  ASSERT_NE(published, nullptr);
+
+  auto make_variant = [&](std::uint64_t revision_offset,
+                          const std::string& hash_suffix,
+                          bool shifted_first,
+                          bool add_second) {
+    auto variant = *published;
+    auto body = std::find_if(
+        variant.bodies.begin(), variant.bodies.end(), [](const auto& candidate) {
+          return candidate.body_id ==
+                 "object/multi_geometry_box/shape/0";
+        });
+    if (body == variant.bodies.end() || body->geometries.empty()) {
+      throw std::runtime_error("multi-geometry fixture body is missing");
+    }
+    auto shifted = body->geometries.front();
+    shifted.local_pose.position_m.x_m = 0.75;
+    if (shifted_first) {
+      body->geometries.front() = shifted;
+    }
+    if (add_second) {
+      body->geometries.push_back(std::move(shifted));
+      ++variant.geometry_count;
+    }
+    variant.revision.revision_id =
+        published->revision.revision_id + revision_offset;
+    variant.revision.content_hash =
+        published->revision.content_hash + hash_suffix;
+    return variant;
+  };
+
+  const auto first_snapshot = make_variant(1, "-first", false, false);
+  const auto second_snapshot = make_variant(2, "-second", true, false);
+  const auto combined_snapshot = make_variant(3, "-combined", false, true);
+  auto engine = make_engine("ur5_gripper", "arm");
+
+  CollisionQuery discover;
+  discover.robot_state = observed_state(*bundle);
+  const auto discovery =
+      check_snapshot(*engine, first_snapshot, discover);
+  ASSERT_EQ(discovery.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(discovery.raw_diagnostics);
+  ASSERT_FALSE(discovery.normalized_pairs.empty());
+  const auto selected_pair = discovery.normalized_pairs.front();
+
+  CollisionQuery query = discover;
+  query.distance_request_mode =
+      CollisionDistanceRequestMode::kSelectedCollidingPairs;
+  query.selected_distance_pairs = {selected_pair};
+  const auto first = check_snapshot(*engine, first_snapshot, query);
+  ASSERT_EQ(first.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(first.raw_diagnostics);
+  ASSERT_EQ(first.pair_clearances.size(), 1u);
+  const auto first_counters =
+      engine->internal_last_query_mechanism_counters();
+
+  const auto second = check_snapshot(*engine, second_snapshot, query);
+  ASSERT_EQ(second.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(second.raw_diagnostics);
+  ASSERT_EQ(second.pair_clearances.size(), 1u);
+  const auto second_counters =
+      engine->internal_last_query_mechanism_counters();
+
+  const auto combined =
+      check_snapshot(*engine, combined_snapshot, query);
+  ASSERT_EQ(combined.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(combined.raw_diagnostics);
+  ASSERT_EQ(combined.pair_clearances.size(), 1u);
+  const auto combined_counters =
+      engine->internal_last_query_mechanism_counters();
+
+  const double expected_deepest =
+      std::min(first.pair_clearances.front().signed_clearance_m,
+               second.pair_clearances.front().signed_clearance_m);
+  EXPECT_NEAR(combined.pair_clearances.front().signed_clearance_m,
+              expected_deepest, 1e-9);
+  EXPECT_EQ(combined.pair_clearances.front().pair, selected_pair);
+  EXPECT_EQ(combined_counters.distance_evaluated_logical_pair_count, 1u);
+  EXPECT_EQ(combined_counters.distance_evaluated_geometry_pair_count,
+            first_counters.distance_evaluated_geometry_pair_count +
+                second_counters.distance_evaluated_geometry_pair_count);
+  EXPECT_GT(combined_counters.distance_evaluated_geometry_pair_count, 1u);
 }
 
 TEST(ManyForgeCollisionEngineTest, ZeroTimeoutFailsClosedWithoutQueryPass) {

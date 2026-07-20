@@ -1,11 +1,14 @@
 #pragma once
 
+#include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -17,6 +20,28 @@
 
 namespace manyforge::collision {
 
+namespace detail {
+
+/// Aggregate selected colliding geometry-pair distance evidence for one
+/// logical pair. One non-finite component permanently makes the aggregate
+/// incomplete; a finite sibling cannot restore a valid deepest-distance proof.
+struct SelectedCollidingDistanceEvidence {
+  bool complete = true;
+  std::optional<double> deepest_finite_m;
+
+  void observe(double signed_distance_m) noexcept {
+    if (!std::isfinite(signed_distance_m)) {
+      complete = false;
+      return;
+    }
+    if (!deepest_finite_m || signed_distance_m < *deepest_finite_m) {
+      deepest_finite_m = signed_distance_m;
+    }
+  }
+};
+
+}  // namespace detail
+
 /// ManyForge-owned scene-aware collision engine.
 ///
 /// The engine consumes immutable CollisionWorldSnapshot values through the
@@ -24,11 +49,33 @@ namespace manyforge::collision {
 /// GeometryModel, GeometryData, and contact buffers; no query touches
 /// RoboPlan planner-context APIs, RoboPlan scene locks, or adapter state.
 ///
-/// Primitive robot proxies plus authored scene triangle meshes are supported
-/// in the current production profile. Compounds and convex meshes still fail
-/// closed until the snapshot contract carries a qualified decomposition.
+/// Primitive robot proxies, multi-primitive bodies, and authored scene triangle
+/// meshes are supported in the current production profile. Undecomposed
+/// compound and convex-mesh geometry kinds still fail closed until the snapshot
+/// contract carries a qualified decomposition.
 class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
  public:
+  /// Direct mechanism counters for the most recent query executed by this
+  /// mutable engine context. These distinguish complete collision enumeration
+  /// from the narrower optional signed-distance work. They are intended for
+  /// focused qualification and regression tests, not policy decisions.
+  struct QueryMechanismCounters {
+    core::CollisionDistanceRequestMode distance_request_mode =
+        core::CollisionDistanceRequestMode::kNone;
+    std::uint64_t collision_api_call_count = 0;
+    /// Phase ordinals are zero when absent. A successful collision pass is 1;
+    /// the first optional distance evaluation must therefore be 2.
+    std::uint64_t collision_enumeration_completion_ordinal = 0;
+    std::uint64_t active_collision_pair_count = 0;
+    std::uint64_t colliding_geometry_pair_count = 0;
+    std::uint64_t colliding_logical_pair_count = 0;
+    std::uint64_t distance_api_call_count = 0;
+    std::uint64_t first_distance_evaluation_ordinal = 0;
+    std::uint64_t distance_evaluated_geometry_pair_count = 0;
+    std::uint64_t distance_evaluated_logical_pair_count = 0;
+    std::uint64_t fk_placement_invocation_count = 0;
+  };
+
   /// Immutable robot-model assets shared by all collision contexts created by
   /// one kernel factory. The concrete type is intentionally opaque: callers
   /// may share ownership but cannot mutate model state.
@@ -97,6 +144,7 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
   const void* internal_scene_cache_identity() const;
   const void* internal_prepared_scene_identity() const;
   std::uint64_t internal_prepared_scene_build_count() const;
+  QueryMechanismCounters internal_last_query_mechanism_counters() const;
 
  private:
   struct PreparedScene;
@@ -125,6 +173,7 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
       runtime_collision_observations_;
   std::vector<core::RuntimeCollisionPairObservation>
       runtime_clearance_observations_;
+  QueryMechanismCounters last_query_mechanism_counters_;
 
   /// Internal mutex serializes concurrent check() calls on the same
   /// instance. Separate instances do not share this mutex.

@@ -55,7 +55,7 @@
     "summary_repository": "manyforge_specs",
     "summary_file": "docs/implementation/rp5-0-roboplan-0.4-baseline-evidence-2026-07-13.md",
     "captured_authority_fixture": "../corpus/captures/isaac-light-drop-approach-v1.json",
-    "captured_authority_fixture_semantic_sha256": "553e54e3d489f5c8ea9028bf3760c0c6438ed4e797f89094267577ecb805f9f0",
+    "captured_authority_fixture_semantic_sha256": "ca0c59e72254bedd322574319d5617af252356b3631221cb7a1ba8aeeb254d64",
     "raw_artifact_location": "build/qualification",
     "raw_artifacts_are_source_fixtures": false,
     "artifacts": [

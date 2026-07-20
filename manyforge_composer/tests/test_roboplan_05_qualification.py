@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
+from jsonschema import Draft202012Validator
 import pytest
 import yaml
 
@@ -173,6 +174,112 @@ def test_dirty_worktree_fingerprint_changes_with_source_content(
         )
 
 
+def test_worktree_delta_distinguishes_regular_file_from_symlink(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("committed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=ManyForge Test",
+            "-c",
+            "user.email=manyforge-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+    )
+
+    entry = tmp_path / "entry"
+    entry.write_text("target", encoding="utf-8")
+    entry.chmod(0o777)
+    regular = _MODULE._manyforge_worktree_delta_sha256(tmp_path)  # noqa: SLF001
+    entry.unlink()
+    entry.symlink_to("target")
+    symlink = _MODULE._manyforge_worktree_delta_sha256(tmp_path)  # noqa: SLF001
+
+    assert regular != symlink
+
+
+def test_source_fingerprint_is_deterministic_and_binds_clean_head(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    source = tmp_path / "source.txt"
+    source.write_text("committed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "source.txt"], check=True)
+
+    commit = [
+        "git",
+        "-C",
+        str(tmp_path),
+        "-c",
+        "user.name=ManyForge Test",
+        "-c",
+        "user.email=manyforge-test@example.invalid",
+        "commit",
+        "-q",
+    ]
+    subprocess.run([*commit, "-m", "fixture"], check=True)
+    first = _MODULE._manyforge_source_identity(tmp_path)  # noqa: SLF001
+    assert first == _MODULE._manyforge_source_identity(tmp_path)  # noqa: SLF001
+    assert first["dirty"] is False
+    assert first["delta_sha256"] == _MODULE._manyforge_worktree_sha256(  # noqa: SLF001
+        tmp_path
+    )
+
+    # An empty commit deliberately retains the same tree and clean delta. The
+    # composite must still change because HEAD itself is part of the identity.
+    subprocess.run([*commit, "--allow-empty", "-m", "same tree, new head"], check=True)
+    second = _MODULE._manyforge_source_identity(tmp_path)  # noqa: SLF001
+    assert second["head_commit"] != first["head_commit"]
+    assert second["head_tree"] == first["head_tree"]
+    assert second["delta_sha256"] == first["delta_sha256"]
+    assert second["fingerprint_sha256"] != first["fingerprint_sha256"]
+
+
+def test_source_fingerprint_binds_dirty_delta(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    source = tmp_path / "source.txt"
+    source.write_text("committed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "source.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=ManyForge Test",
+            "-c",
+            "user.email=manyforge-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+    )
+
+    source.write_text("dirty-one\n", encoding="utf-8")
+    first = _MODULE._manyforge_source_identity(tmp_path)  # noqa: SLF001
+    source.write_text("dirty-two\n", encoding="utf-8")
+    second = _MODULE._manyforge_source_identity(tmp_path)  # noqa: SLF001
+    assert first["dirty"] is True
+    assert second["dirty"] is True
+    assert first["head_commit"] == second["head_commit"]
+    assert first["head_tree"] == second["head_tree"]
+    assert first["delta_sha256"] != second["delta_sha256"]
+    assert first["fingerprint_sha256"] != second["fingerprint_sha256"]
+
+
 def test_checked_in_corpus_has_required_sample_sizes_and_unique_links() -> None:
     corpus = _REPO_ROOT / "benchmarks/roboplan_05/corpus/corpus-v1.json"
     summary = _MODULE.validate_corpus(corpus, allow_pending_capture=True)
@@ -193,6 +300,33 @@ def test_checked_in_corpus_has_required_sample_sizes_and_unique_links() -> None:
         if fixture["id"] == "ur10e_drop_approach_capture"
     )
     assert captured["capture_source_policy"] == "frozen_rp5_0_manifest"
+
+
+def test_checked_in_capture_matches_schema_semantics_and_frozen_manifest() -> None:
+    capture_path = (
+        _REPO_ROOT
+        / "benchmarks/roboplan_05/corpus/captures/isaac-light-drop-approach-v1.json"
+    )
+    schema = json.loads(
+        (
+            _REPO_ROOT / "benchmarks/roboplan_05/schema/capture-v1.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    capture = json.loads(capture_path.read_text(encoding="utf-8"))
+    Draft202012Validator(schema).validate(capture)
+    assert _MODULE.validate_capture(capture_path)["capture_id"] == (
+        "isaac-light-drop-approach-v1"
+    )
+
+    manifest = json.loads(
+        (
+            _REPO_ROOT
+            / "benchmarks/roboplan_05/baselines/roboplan-0.4.0-manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert capture["semantic_sha256"] == manifest["evidence"][
+        "captured_authority_fixture_semantic_sha256"
+    ]
 
 
 def test_isaac_live_baseline_plays_once_and_reset_owns_loop_replay() -> None:
@@ -785,6 +919,131 @@ def _formal_live_evidence() -> dict:
     }
 
 
+def _freeze_formal_evidence_source(evidence: dict) -> dict:
+    source = evidence["source"]
+    delta_sha256 = "e" * 64
+    identity = {
+        "schema_version": _MODULE.MANYFORGE_SOURCE_IDENTITY_SCHEMA,
+        "head_commit": source["manyforge_commit"],
+        "head_tree": "f" * 40,
+        "dirty": True,
+        "delta_sha256": delta_sha256,
+    }
+    identity["fingerprint_sha256"] = (
+        _MODULE._manyforge_source_fingerprint_sha256(  # noqa: SLF001
+            head_commit=identity["head_commit"],
+            head_tree=identity["head_tree"],
+            dirty=identity["dirty"],
+            delta_sha256=identity["delta_sha256"],
+        )
+    )
+    source.update(
+        {
+            "manyforge_dirty": True,
+            "manyforge_worktree_sha256": delta_sha256,
+            "manyforge_worktree_delta_sha256": delta_sha256,
+            "manyforge_source_identity": identity,
+            "manyforge_source_fingerprint_sha256": identity[
+                "fingerprint_sha256"
+            ],
+            "manyforge_source_identity_mode": (
+                _MODULE.MANYFORGE_FROZEN_SOURCE_IDENTITY_MODE
+            ),
+            "manyforge_expected_source_fingerprint_sha256": identity[
+                "fingerprint_sha256"
+            ],
+        }
+    )
+    return evidence
+
+
+def test_frozen_dirty_source_identity_is_formal(tmp_path: Path) -> None:
+    evidence = _freeze_formal_evidence_source(
+        _promote_to_formal_roboplan_05(_formal_live_evidence())
+    )
+    path = tmp_path / "frozen-dirty-formal.json"
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    assert _MODULE.validate_evidence(path)["records"] == 1
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_identity", "manyforge_source_identity is required"),
+        ("missing_expected", "expected_source_fingerprint_sha256 is required"),
+        ("wrong_expected", "does not match the observed source fingerprint"),
+        ("malformed_tree", "head_tree must be a full Git SHA"),
+        ("wrong_internal_fingerprint", "fingerprint_sha256 is inconsistent"),
+        ("wrong_top_delta", "worktree_delta_sha256 is inconsistent"),
+        ("wrong_top_commit", "manyforge_commit is inconsistent"),
+        ("clean_declaration", "manyforge_dirty is inconsistent"),
+    ],
+)
+def test_frozen_dirty_source_rejects_incomplete_or_inconsistent_identity(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    evidence = _freeze_formal_evidence_source(
+        _promote_to_formal_roboplan_05(_formal_live_evidence())
+    )
+    source = evidence["source"]
+    if mutation == "missing_identity":
+        del source["manyforge_source_identity"]
+    elif mutation == "missing_expected":
+        del source["manyforge_expected_source_fingerprint_sha256"]
+    elif mutation == "wrong_expected":
+        source["manyforge_expected_source_fingerprint_sha256"] = "0" * 64
+    elif mutation == "malformed_tree":
+        source["manyforge_source_identity"]["head_tree"] = "short"
+    elif mutation == "wrong_internal_fingerprint":
+        source["manyforge_source_identity"]["fingerprint_sha256"] = "0" * 64
+    elif mutation == "wrong_top_delta":
+        source["manyforge_worktree_delta_sha256"] = "0" * 64
+    elif mutation == "wrong_top_commit":
+        source["manyforge_commit"] = "0" * 40
+    elif mutation == "clean_declaration":
+        source["manyforge_dirty"] = False
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(mutation)
+    path = tmp_path / f"frozen-{mutation}.json"
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    with pytest.raises(_MODULE.ValidationError, match=message):
+        _MODULE.validate_evidence(path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("provenance", "pinocchio_version"),
+        ("inventory", "complete inventory"),
+        ("artifact", "source.program must be an object"),
+        ("sample_size", "at least 30"),
+    ],
+)
+def test_frozen_dirty_source_gets_all_formal_evidence_rules(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    evidence = _freeze_formal_evidence_source(
+        _promote_to_formal_roboplan_05(_formal_live_evidence())
+    )
+    if mutation == "provenance":
+        del evidence["source"]["pinocchio_version"]
+    elif mutation == "inventory":
+        del evidence["inventory"]
+    elif mutation == "artifact":
+        del evidence["source"]["program"]
+    elif mutation == "sample_size":
+        evidence["records"][0]["sample_count"] = 29
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(mutation)
+    path = tmp_path / f"frozen-formal-{mutation}.json"
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    with pytest.raises(_MODULE.ValidationError, match=message):
+        _MODULE.validate_evidence(path)
+
+
 def test_evidence_validator_requires_reproducible_formal_live_provenance(
     tmp_path: Path,
 ) -> None:
@@ -1083,6 +1342,229 @@ def test_live_runtime_metrics_require_fresh_attributable_baseline() -> None:
         _LIVE._require_fresh_kernel_runtime_baseline(baseline)
 
 
+def test_live_controller_progress_tracker_retains_every_exact_transition() -> None:
+    baseline = {
+        "controller_command_progress_samples_total": 0,
+        "controller_last_command_progress_latency_ns": 0,
+        "controller_max_command_progress_latency_ns": 0,
+    }
+    tracker = _LIVE._ControllerProgressSampleTracker(baseline)
+    tracker.observe(baseline, observed_monotonic_ns=10)
+    tracker.observe(
+        {
+            "controller_command_progress_samples_total": 1,
+            "controller_last_command_progress_latency_ns": 70,
+            "controller_max_command_progress_latency_ns": 70,
+        },
+        observed_monotonic_ns=20,
+    )
+    final_metrics = {
+        "controller_command_progress_samples_total": 2,
+        "controller_last_command_progress_latency_ns": 50,
+        "controller_max_command_progress_latency_ns": 70,
+    }
+    result = tracker.finalize(final_metrics)
+
+    assert result["native_counter_delta"] == 2
+    assert result["native_max_ns"] == 70
+    assert result["latency_ns"]["max"] == 70.0
+    assert [sample["latency_ns"] for sample in result["samples"]] == [70, 50]
+    assert [sample["observed_monotonic_ns"] for sample in result["samples"]][0] == 20
+
+
+def test_live_controller_progress_tracker_fails_on_poll_gap() -> None:
+    tracker = _LIVE._ControllerProgressSampleTracker(
+        {
+            "controller_command_progress_samples_total": 0,
+            "controller_last_command_progress_latency_ns": 0,
+            "controller_max_command_progress_latency_ns": 0,
+        }
+    )
+    with pytest.raises(RuntimeError, match="advanced by 2"):
+        tracker.observe(
+            {
+                "controller_command_progress_samples_total": 2,
+                "controller_last_command_progress_latency_ns": 50,
+                "controller_max_command_progress_latency_ns": 70,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (
+            "binary_contact",
+            {
+                "mode": "contact_release",
+                "release_evidence_mode": "binary_contact",
+                "enforce_max_start_penetration": False,
+                "max_start_penetration_m": 0.0,
+                "release_tolerance_m": 0.0,
+                "min_release_progress_m": 0.0,
+                "require_separation_by_end": True,
+                "require_strictly_decreasing_penetration": False,
+                "allow_recontact": False,
+            },
+        ),
+        (
+            "bounded_penetration",
+            {
+                "mode": "bounded_penetration",
+                "max_contact_penetration_m": 0.03,
+            },
+        ),
+    ],
+)
+def test_live_step18_mode_projection_has_only_mode_valid_fields(
+    mode: str, expected: dict[str, object]
+) -> None:
+    precise = {
+        "support_object_id": "isaac_table_low_327",
+        "mode": "contact_release",
+        "release_evidence_mode": "signed_penetration",
+        "enforce_max_start_penetration": True,
+        "max_start_penetration_m": 0.03,
+        "release_tolerance_m": 0.001,
+        "min_release_progress_m": 0.0,
+        "require_separation_by_end": True,
+        "require_strictly_decreasing_penetration": True,
+        "allow_recontact": False,
+    }
+
+    projected = _LIVE._step18_contact_for_mode(precise, mode, 0.03)
+
+    assert projected["support_object_id"] == "isaac_table_low_327"
+    for key, value in expected.items():
+        assert projected[key] == value
+    if mode == "bounded_penetration":
+        assert "release_evidence_mode" not in projected
+        assert "require_separation_by_end" not in projected
+    else:
+        assert "max_contact_penetration_m" not in projected
+
+
+def test_live_step18_mode_apply_captures_authored_and_resolved_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    precise = {
+        "support_object_id": "isaac_table_low_327",
+        "mode": "contact_release",
+        "release_evidence_mode": "signed_penetration",
+        "enforce_max_start_penetration": True,
+        "max_start_penetration_m": 0.03,
+        "release_tolerance_m": 0.001,
+        "min_release_progress_m": 0.0,
+        "require_separation_by_end": True,
+        "require_strictly_decreasing_penetration": True,
+        "allow_recontact": False,
+    }
+    saved = {
+        "sceneResources": [
+            {
+                "objectId": "isaac_cheese_box",
+                "metadata": {"support_contacts": [precise]},
+            },
+            {"objectId": "isaac_table_low_327"},
+        ]
+    }
+    effective: dict[str, object] = {}
+
+    def request_json(
+        _base_url: str,
+        path: str,
+        *,
+        method: str = "GET",
+        payload: dict | None = None,
+        **_kwargs: object,
+    ) -> dict:
+        if path == "/api/program/saved":
+            return saved
+        if path == "/api/session/apply":
+            assert method == "POST" and payload is not None
+            effective["sceneResources"] = payload["scene"]
+            return {"status": "ok"}
+        if path == "/api/program":
+            return effective
+        if path == "/api/debug/qualification/scene-authority-snapshot":
+            return {
+                "revision": {"revision_id": 7, "content_hash": "scene-seven"},
+                "transaction_sequence": 8,
+                "scene_admission_epoch": 9,
+                "topology_epoch": 10,
+                "policy_epoch": 11,
+                "configured_collision_policy": {
+                    "policy_id": "default_free_space",
+                    "revision": {
+                        "revision_id": 12,
+                        "content_hash": "policy-twelve",
+                    },
+                    "support_contacts": [
+                        {
+                            "pair": {
+                                "body_a": "isaac_cheese_box",
+                                "body_b": "isaac_table_low_327",
+                            },
+                            "mode": "contact_release",
+                            "release_evidence_mode": "binary_contact",
+                        }
+                    ],
+                },
+            }
+        raise AssertionError(path)
+
+    monkeypatch.setattr(_LIVE, "_request_json", request_json)
+
+    evidence = _LIVE._apply_step18_support_contact_mode(
+        "http://composer", mode="binary_contact", bounded_penetration_m=0.03
+    )
+
+    assert evidence["mode"] == "binary_contact"
+    assert evidence["bounded_penetration_m"] is None
+    assert evidence["authored_contact"]["release_evidence_mode"] == "binary_contact"
+    assert evidence["resolved_contact"]["release_evidence_mode"] == "binary_contact"
+    assert evidence["saved_scene_sha256"] != evidence["effective_scene_sha256"]
+
+
+def test_live_step18_baseline_mode_preserves_legacy_precise_shape() -> None:
+    legacy = {
+        "support_object_id": "isaac_table_low_327",
+        "mode": "contact_release",
+        "enforce_max_start_penetration": True,
+        "max_start_penetration_m": 0.03,
+        "min_separation_clearance_m": 0.0,
+        "release_tolerance_m": 0.001,
+        "min_release_progress_m": 0.0,
+        "require_separation_by_end": True,
+        "require_strictly_decreasing_penetration": True,
+        "allow_recontact": False,
+    }
+
+    projected = _LIVE._step18_contact_for_mode(
+        legacy, "current_all_active_distance", 0.03
+    )
+    resolved = _LIVE._resolved_step18_contact(
+        {
+            "configured_collision_policy": {
+                "support_contacts": [
+                    {
+                        "pair": {
+                            "body_a": "isaac_cheese_box",
+                            "body_b": "isaac_table_low_327",
+                        },
+                        "mode": "contact_release",
+                        "min_separation_clearance_m": 0.0,
+                    }
+                ]
+            }
+        },
+        "current_all_active_distance",
+    )
+
+    assert projected == legacy
+    assert resolved["min_separation_clearance_m"] == 0.0
+
+
 def test_live_failed_run_retains_cycle_and_kernel_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1204,6 +1686,20 @@ def test_live_sample_reports_true_behavior_node_envelope() -> None:
                 "execution_id": 4,
                 "timestamp_ns": timestamp,
                 "sequence": 50 if event_type == "validation_passed" else 0,
+                **(
+                    {
+                        "details": {
+                            "collision_workers_requested": 4,
+                            "collision_workers_effective": 4,
+                            "collision_workers_used": 4,
+                            "collision_parallel_fallback_reason": "",
+                            "collision_ordered_contact_summary_used": True,
+                            "collision_validation_wall_ns": 190,
+                        }
+                    }
+                    if event_type == "validation_passed"
+                    else {}
+                ),
             }
             for event_type, timestamp in timestamps.items()
         ),
@@ -1285,6 +1781,12 @@ def test_live_sample_reports_true_behavior_node_envelope() -> None:
         "decision": "passed",
         "event_sequence": 50,
         "joint_limit_and_dynamics_compliance": True,
+        "collision_workers_requested": 4,
+        "collision_workers_effective": 4,
+        "collision_workers_used": 4,
+        "collision_parallel_fallback_reason": "",
+        "collision_ordered_contact_summary_used": True,
+        "collision_validation_wall_ns": 190,
     }
 
     planner_record["result"]["scene_revision"]["revision_id"] = 8
@@ -1444,17 +1946,25 @@ def _capture_scene_state() -> dict:
     return {
         "robot": {
             "robot_id": "ur10e",
+            "group_id": "arm",
             "base_frame": "base_link",
             "base_pose": {
                 "position_m": [0.0, 0.0, 0.0],
                 "orientation_rpy_deg": [0.0, 0.0, 90.0],
             },
             "joint_names": ["joint_a", "joint_b"],
-            "joint_positions": {"joint_a": 0.1, "joint_b": -0.2},
+            "joint_positions": {"joint_a": 0.25, "joint_b": -0.5},
             "state_source": "controller_state",
             "source_timestamp_ns": 100,
             "source_age_ns": 1_000_000,
         },
+        "grippers": [
+            {
+                "gripper_id": "gripper",
+                "joint_name": "finger_joint",
+                "current_position": 0.66,
+            }
+        ],
         "objects": [
             {
                 "object_id": "drop_box",
@@ -1504,6 +2014,7 @@ def _capture_program() -> dict:
                         {
                             "support_object_id": "drop_box",
                             "mode": "contact_release",
+                            "release_evidence_mode": "signed_penetration",
                             "max_start_penetration_m": 0.03,
                         }
                     ]
@@ -1605,6 +2116,7 @@ def _capture_authority_snapshot() -> dict:
                     {
                         "support_object_id": "drop_box",
                         "mode": "contact_release",
+                        "release_evidence_mode": "signed_penetration",
                         "max_start_penetration_m": 0.03,
                     }
                 ],
@@ -1628,7 +2140,7 @@ def _capture_planning_record() -> dict:
                 "velocities_rad_s": [0.0, 0.0],
             },
             "motion": {
-                "type": "pose_goal",
+                "type": "pose",
                 "pose": {
                     "position_m": [1.0, 0.0, 0.4],
                     "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
@@ -1655,7 +2167,28 @@ def _capture_planning_record() -> dict:
                 "projection_lease_id": "lease-seven",
             },
         },
-        "result": {"trajectory": None, "error": {"code": "planning_timeout"}},
+        "result": {
+            "scene_revision": {
+                "revision_id": 7,
+                "content_hash": "scene-seven",
+            },
+            "trajectory": {
+                "joint_names": ["joint_a", "joint_b"],
+                "waypoints": [
+                    {
+                        "time_from_start_s": 0.0,
+                        "positions_rad": [0.25, -0.5],
+                        "velocities_rad_s": [0.0, 0.0],
+                    },
+                    {
+                        "time_from_start_s": 1.0,
+                        "positions_rad": [0.5, -0.25],
+                        "velocities_rad_s": [0.0, 0.0],
+                    },
+                ],
+            },
+            "error": None,
+        },
         "metrics": {
             "rng_base_seed": 12345,
             "rng_seed": 12345,
@@ -1665,14 +2198,12 @@ def _capture_planning_record() -> dict:
     }
 
 
-def test_capture_payload_resolves_base_frame_goal_and_validates_semantic_hash(
-    tmp_path: Path,
-) -> None:
+def _generated_capture(tmp_path: Path) -> dict:
     program_path = tmp_path / "example.program.yaml"
     deployment_path = tmp_path / "example.deployment.yaml"
     program_path.write_text("name: test\n", encoding="utf-8")
     deployment_path.write_text("name: test\n", encoding="utf-8")
-    payload = _CAPTURE._capture_payload(
+    return _CAPTURE._capture_payload(
         program=_capture_program(),
         visual_scene_state=_capture_scene_state(),
         authority_snapshot=_capture_authority_snapshot(),
@@ -1690,6 +2221,21 @@ def test_capture_payload_resolves_base_frame_goal_and_validates_semantic_hash(
             }
         },
     )
+
+
+def _write_rehashed_capture(path: Path, payload: dict) -> None:
+    unsigned = dict(payload)
+    unsigned.pop("semantic_sha256", None)
+    payload["semantic_sha256"] = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_capture_payload_resolves_base_frame_goal_and_validates_semantic_hash(
+    tmp_path: Path,
+) -> None:
+    payload = _generated_capture(tmp_path)
     assert payload["resolved_motion"]["pose_goal"]["position_m"] == pytest.approx(
         [1.0, 0.0, 0.4], abs=1e-12
     )
@@ -1709,6 +2255,27 @@ def test_capture_payload_resolves_base_frame_goal_and_validates_semantic_hash(
         "acceleration_scale": 1.0,
         "max_tcp_linear_speed_mps": 0.25,
     }
+    assert payload["planning_result"]["trajectory_sha256"] == hashlib.sha256(
+        json.dumps(
+            payload["planning_result"]["trajectory"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    assert payload["scene"]["robot"]["collision_projection_seed"]["groups"] == [
+        {
+            "group_id": "arm",
+            "joint_names": ["joint_a", "joint_b"],
+            "positions_rad": [0.25, -0.5],
+            "source": "exact_plan_request",
+        },
+        {
+            "group_id": "gripper",
+            "joint_names": ["finger_joint"],
+            "positions_rad": [0.66],
+            "source": "fresh_visual_snapshot_gripper",
+        },
+    ]
     assert payload["scene"]["authority"]["revision"] == {
         "revision_id": 7,
         "content_hash": "scene-seven",
@@ -1722,6 +2289,7 @@ def test_capture_payload_resolves_base_frame_goal_and_validates_semantic_hash(
         {
             "support_object_id": "drop_box",
             "mode": "contact_release",
+            "release_evidence_mode": "signed_penetration",
             "max_start_penetration_m": 0.03,
         }
     ]
@@ -1763,6 +2331,202 @@ def test_capture_payload_resolves_base_frame_goal_and_validates_semantic_hash(
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(_MODULE.ValidationError, match="semantic_sha256"):
         _MODULE.validate_capture(path)
+
+
+def test_capture_support_contact_modes_are_mode_scoped(tmp_path: Path) -> None:
+    schema = json.loads(
+        (
+            _REPO_ROOT / "benchmarks/roboplan_05/schema/capture-v1.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    validator = Draft202012Validator(schema)
+    path = tmp_path / "capture.json"
+
+    def validate_contact(contact: dict) -> None:
+        payload = _generated_capture(tmp_path)
+        cheese = next(
+            item
+            for item in payload["scene"]["objects"]
+            if item["object_id"] == "isaac_cheese_box"
+        )
+        cheese["support_contacts"] = [contact]
+        _write_rehashed_capture(path, payload)
+        validator.validate(payload)
+        _MODULE.validate_capture(path, required_attachment="isaac_cheese_box")
+
+    # Omitted mode/evidence retains the authored Precise default.
+    validate_contact({"support_object_id": "drop_box"})
+    validate_contact(
+        {
+            "support_object_id": "drop_box",
+            "mode": "contact_release",
+            "release_evidence_mode": "binary_contact",
+            "require_separation_by_end": True,
+            "allow_recontact": False,
+        }
+    )
+    validate_contact(
+        {
+            "support_object_id": "drop_box",
+            "mode": "bounded_penetration",
+            "max_contact_penetration_m": 0.004,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("contact", "message"),
+    [
+        (
+            {
+                "support_object_id": "drop_box",
+                "mode": "contact_release",
+                "release_evidence_mode": "binary_contact",
+                "release_tolerance_m": 0.001,
+            },
+            "release_tolerance_m must be 0",
+        ),
+        (
+            {
+                "support_object_id": "drop_box",
+                "mode": "bounded_penetration",
+            },
+            "max_contact_penetration_m must be a number",
+        ),
+        (
+            {
+                "support_object_id": "drop_box",
+                "mode": "bounded_penetration",
+                "max_contact_penetration_m": -0.001,
+            },
+            "max_contact_penetration_m must be non-negative",
+        ),
+        (
+            {
+                "support_object_id": "drop_box",
+                "mode": "bounded_penetration",
+                "max_contact_penetration_m": 0.004,
+                "release_evidence_mode": "signed_penetration",
+            },
+            "fields are not valid for mode bounded_penetration",
+        ),
+        (
+            {
+                "support_object_id": "drop_box",
+                "mode": "contact_release",
+                "max_contact_penetration_m": 0.004,
+            },
+            "fields are not valid for mode contact_release",
+        ),
+        (
+            {
+                "support_object_id": "drop_box",
+                "min_separation_clearance_m": 0.0,
+            },
+            "contains unknown fields",
+        ),
+    ],
+)
+def test_capture_rejects_invalid_support_contact_mode_fields(
+    tmp_path: Path, contact: dict, message: str
+) -> None:
+    payload = _generated_capture(tmp_path)
+    cheese = next(
+        item
+        for item in payload["scene"]["objects"]
+        if item["object_id"] == "isaac_cheese_box"
+    )
+    cheese["support_contacts"] = [contact]
+    path = tmp_path / "capture.json"
+    _write_rehashed_capture(path, payload)
+
+    schema = json.loads(
+        (
+            _REPO_ROOT / "benchmarks/roboplan_05/schema/capture-v1.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert not Draft202012Validator(schema).is_valid(payload)
+    with pytest.raises(_MODULE.ValidationError, match=message):
+        _MODULE.validate_capture(path)
+
+
+def test_resolved_collision_policy_support_modes_are_canonical() -> None:
+    pair = {"body_a": "carried", "body_b": "table"}
+    signed = {
+        "pair": pair,
+        "mode": "contact_release",
+        "release_evidence_mode": "signed_penetration",
+        "enforce_max_start_penetration": True,
+        "max_start_penetration_m": 0.01,
+        "release_tolerance_m": 0.001,
+        "min_release_progress_m": 0.0,
+        "require_separation_by_end": True,
+        "require_strictly_decreasing_penetration": True,
+        "allow_recontact": False,
+    }
+    binary = {
+        **signed,
+        "release_evidence_mode": "binary_contact",
+        "enforce_max_start_penetration": False,
+        "max_start_penetration_m": 0.0,
+        "release_tolerance_m": 0.0,
+        "require_strictly_decreasing_penetration": False,
+    }
+    bounded = {
+        "pair": pair,
+        "mode": "bounded_penetration",
+        "max_contact_penetration_m": 0.004,
+    }
+    contact_process = {"pair": pair, "mode": "contact_process"}
+
+    def policy(contact: dict) -> dict:
+        return {
+            "policy_id": "test",
+            "revision": {"revision_id": 1, "content_hash": "hash"},
+            "allowed_static_static_pairs": [],
+            "allowed_touch_link_pairs": [],
+            "support_contacts": [contact],
+            "contact_grasps": [],
+            "require_full_diagnostics": False,
+        }
+
+    schema = json.loads(
+        (
+            _REPO_ROOT / "benchmarks/roboplan_05/schema/capture-v1.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    validator = Draft202012Validator(schema)
+    checked_capture = json.loads(
+        (
+            _REPO_ROOT
+            / "benchmarks/roboplan_05/corpus/captures/isaac-light-drop-approach-v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    for contact in (signed, binary, bounded, contact_process):
+        _MODULE._validate_collision_policy(policy(contact), "policy")  # noqa: SLF001
+        candidate = json.loads(json.dumps(checked_capture))
+        candidate["scene"]["authority"]["configured_collision_policy"] = policy(
+            contact
+        )
+        validator.validate(candidate)
+
+    with pytest.raises(_MODULE.ValidationError, match="contains unknown fields"):
+        _MODULE._validate_collision_policy(  # noqa: SLF001
+            policy({**signed, "min_separation_clearance_m": 0.0}), "policy"
+        )
+    invalid_unknown = json.loads(json.dumps(checked_capture))
+    invalid_unknown["scene"]["authority"]["configured_collision_policy"] = policy(
+        {**signed, "min_separation_clearance_m": 0.0}
+    )
+    assert not validator.is_valid(invalid_unknown)
+    with pytest.raises(
+        _MODULE.ValidationError,
+        match="fields are not valid for mode bounded_penetration",
+    ):
+        _MODULE._validate_collision_policy(  # noqa: SLF001
+            policy({**bounded, "release_evidence_mode": "signed_penetration"}),
+            "policy",
+        )
 
 
 def test_capture_wait_uses_active_drop_planning_window_and_fresh_snapshot(
@@ -1972,6 +2736,14 @@ def test_capture_requires_loaded_saved_artifacts_to_match(
         "/api/program": {
             "name": "isaac-light",
             "sourcePath": str(program_path),
+            "programSessionGeneration": 7,
+            "programTreeHash": "loaded-tree-hash",
+        },
+        "/api/program/saved": {
+            "name": "isaac-light",
+            "sourcePath": str(program_path),
+            "programSessionGeneration": 0,
+            "programTreeHash": "",
         },
         "/api/program/tree": {"tree": {"id": "sequence"}},
         "/api/program/saved/tree": {"tree": {"id": "sequence"}},
@@ -2001,12 +2773,28 @@ def test_capture_requires_loaded_saved_artifacts_to_match(
             "name": "isaac-light",
             "path": str(program_path),
             "sha256": hashlib.sha256(program_path.read_bytes()).hexdigest(),
+            "loaded_payload_sha256": _CAPTURE.loaded_program_payload_sha256(
+                responses["/api/program/saved"]
+            ),
         },
         "deployment": {
             "name": "isaac-light-ros",
             "path": str(deployment_path),
             "sha256": hashlib.sha256(deployment_path.read_bytes()).hexdigest(),
+            "loaded_payload_sha256": _CAPTURE._canonical_json_sha256(  # noqa: SLF001
+                responses["/api/deployment/saved/full"]
+            ),
         },
+        "matched_input_sha256": _CAPTURE._canonical_json_sha256(  # noqa: SLF001
+            {
+                "program": _CAPTURE._step18_matched_program_payload(  # noqa: SLF001
+                    responses["/api/program/saved"]
+                ),
+                "deployment": _CAPTURE._step18_matched_deployment_payload(  # noqa: SLF001
+                    responses["/api/deployment/saved/full"]
+                ),
+            }
+        ),
     }
 
     responses["/api/program/tree"] = {"tree": {"id": "modified"}}
@@ -2017,6 +2805,62 @@ def test_capture_requires_loaded_saved_artifacts_to_match(
             deployment_path=deployment_path,
             expected_program_name="isaac-light",
         )
+
+    responses["/api/program/tree"] = responses["/api/program/saved/tree"]
+    responses["/api/program"]["description"] = "stale in-memory payload"
+    with pytest.raises(RuntimeError, match="runtime-overridden content"):
+        _CAPTURE.require_loaded_artifacts_match(
+            "http://composer",
+            program_path=program_path,
+            deployment_path=deployment_path,
+            expected_program_name="isaac-light",
+        )
+
+
+def test_live_row_force_reloads_exact_disk_artifacts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    program = (tmp_path / "program.yaml").resolve()
+    deployment = (tmp_path / "deployment.yaml").resolve()
+    calls: list[tuple[str, str, dict, float]] = []
+    response = {
+        "name": "isaac-light",
+        "sourcePath": str(program),
+        "programSessionGeneration": 17,
+        "programTreeHash": "tree-seventeen",
+    }
+
+    def request(
+        _base_url: str,
+        path: str,
+        *,
+        method: str,
+        payload: dict,
+        timeout_s: float,
+    ) -> dict:
+        calls.append((path, method, payload, timeout_s))
+        return response
+
+    monkeypatch.setattr(_LIVE, "_request_json", request)
+    evidence = _LIVE._reload_matched_artifacts(  # noqa: SLF001
+        "http://composer", program_path=program, deployment_path=deployment
+    )
+
+    assert calls == [
+        (
+            "/api/program/load",
+            "POST",
+            {
+                "path": str(program),
+                "deploymentPath": str(deployment),
+                "forceDiscardOverrides": True,
+            },
+            60.0,
+        )
+    ]
+    assert evidence["response_payload_sha256"] == (
+        _CAPTURE.loaded_program_payload_sha256(response)
+    )
 
 
 def test_captured_replay_rejects_changed_source_or_model_view(tmp_path: Path) -> None:

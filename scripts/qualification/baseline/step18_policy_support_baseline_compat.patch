@@ -1,0 +1,18 @@
+diff --git a/tests/cpp/perf/perf_policy_support_contact_qualification.cpp b/tests/cpp/perf/perf_policy_support_contact_qualification.cpp
+--- a/tests/cpp/perf/perf_policy_support_contact_qualification.cpp
++++ b/tests/cpp/perf/perf_policy_support_contact_qualification.cpp
+@@ -606,5 +606,6 @@ CollisionPolicySnapshot make_policy(
+       entry.release_tolerance_m = kReleaseToleranceM;
+       entry.min_release_progress_m = 0.0;
++      entry.min_separation_clearance_m = 0.0;
+       entry.require_separation_by_end = false;
+       entry.require_strictly_decreasing_penetration = false;
+       entry.allow_recontact = true;
+@@ -654,6 +655,7 @@ CollisionPolicySnapshot make_policy(
+     content.mix(entry.max_start_penetration_m);
+     content.mix(entry.release_tolerance_m);
+     content.mix(entry.min_release_progress_m);
++    content.mix(entry.min_separation_clearance_m);
+     content.mix(static_cast<std::uint64_t>(entry.require_separation_by_end));
+     content.mix(static_cast<std::uint64_t>(
+         entry.require_strictly_decreasing_penetration));

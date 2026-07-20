@@ -275,6 +275,8 @@ TEST(ContractsCompile, ErrorCodeConstants) {
   EXPECT_STREQ(kErrorPlanningTimeout, "planning_timeout");
   EXPECT_STREQ(kErrorStartStateMismatch, "start_state_mismatch");
   EXPECT_STREQ(kErrorValidationCollision, "validation_collision");
+  EXPECT_STREQ(kErrorInvalidContactPolicy, "invalid_contact_policy");
+  EXPECT_STREQ(kErrorContactPolicyViolation, "contact_policy_violation");
   EXPECT_STREQ(kErrorObjectAlreadyExists, "object_already_exists");
   EXPECT_STREQ(kErrorExecutionRejected, "execution_rejected");
   EXPECT_STREQ(kErrorExecutionAborted, "execution_aborted");
@@ -283,6 +285,10 @@ TEST(ContractsCompile, ErrorCodeConstants) {
   EXPECT_STREQ(kErrorInvariantViolation, "invariant_violation");
   EXPECT_STREQ(to_string(ErrorCode::kInvalidRequest), kErrorInvalidRequest);
   EXPECT_STREQ(to_string(ErrorCode::kPlanningFailed), kErrorPlanningFailed);
+  EXPECT_STREQ(to_string(ErrorCode::kInvalidContactPolicy),
+               kErrorInvalidContactPolicy);
+  EXPECT_STREQ(to_string(ErrorCode::kContactPolicyViolation),
+               kErrorContactPolicyViolation);
 }
 
 // Test CacheMode enum values

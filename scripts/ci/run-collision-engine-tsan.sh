@@ -13,6 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build/tsan-collision-engine}"
 PARALLEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
+GTEST_TIMEOUT_SECONDS="${MANYFORGE_TSAN_GTEST_TIMEOUT_SECONDS:-300}"
 TSAN_SUPPRESSIONS="${TSAN_SUPPRESSIONS:-${REPO_ROOT}/scripts/ci/tsan.supp}"
 
 if [[ ! -f "${TSAN_SUPPRESSIONS}" ]]; then
@@ -58,11 +59,14 @@ cmake \
   -B "${BUILD_DIR}" \
   -DBUILD_TESTING=ON \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DMANYFORGE_GTEST_TIMEOUT_SECONDS="${GTEST_TIMEOUT_SECONDS}" \
   -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -Wno-error=array-bounds" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
   -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"
 
 cmake --build "${BUILD_DIR}" --parallel "${PARALLEL}" \
   --target test_collision_engine_integration
-ctest --test-dir "${BUILD_DIR}" --output-on-failure \
-  -R "ManyForgeCollisionEngineTest"
+python3 "${SCRIPT_DIR}/run-ctest-gtest-binaries-grouped.py" \
+  --build-dir "${BUILD_DIR}" \
+  --test-regex "ManyForgeCollisionEngineTest" \
+  --summary-prefix COLLISION_TSAN

@@ -22,13 +22,14 @@ bool same_revision(const SceneRevisionDTO& left,
 bool same_support_contact_policy(const SupportContactPolicyEntry& left,
                                  const SupportContactPolicyEntry& right) {
   return left.pair == right.pair && left.mode == right.mode &&
+         left.release_evidence_mode == right.release_evidence_mode &&
          left.enforce_max_start_penetration ==
              right.enforce_max_start_penetration &&
          left.max_start_penetration_m == right.max_start_penetration_m &&
          left.release_tolerance_m == right.release_tolerance_m &&
          left.min_release_progress_m == right.min_release_progress_m &&
-         left.min_separation_clearance_m ==
-             right.min_separation_clearance_m &&
+         left.max_contact_penetration_m ==
+             right.max_contact_penetration_m &&
          left.require_separation_by_end == right.require_separation_by_end &&
          left.require_strictly_decreasing_penetration ==
              right.require_strictly_decreasing_penetration &&
@@ -43,6 +44,42 @@ bool same_contact_grasp_policy(const ContactGraspPolicyEntry& left,
          left.max_penetration_m == right.max_penetration_m &&
          left.terminal_window_start_fraction ==
              right.terminal_window_start_fraction;
+}
+
+void canonicalize_mode_scoped_contact_fields(
+    SupportContactPolicyEntry& contact) {
+  if (contact.mode == CollisionContactPolicyMode::kContactRelease) {
+    contact.max_contact_penetration_m = 0.0;
+    if (contact.release_evidence_mode ==
+        ContactReleaseEvidenceMode::kBinaryContact) {
+      contact.enforce_max_start_penetration = false;
+      contact.max_start_penetration_m = 0.0;
+      contact.release_tolerance_m = 0.0;
+      contact.min_release_progress_m = 0.0;
+      contact.require_strictly_decreasing_penetration = false;
+    }
+    return;
+  }
+
+  contact.release_evidence_mode =
+      ContactReleaseEvidenceMode::kSignedPenetration;
+  contact.enforce_max_start_penetration = false;
+  contact.max_start_penetration_m = 0.0;
+  contact.release_tolerance_m = 0.0;
+  contact.min_release_progress_m = 0.0;
+  contact.require_separation_by_end = false;
+  contact.require_strictly_decreasing_penetration = false;
+  contact.allow_recontact = false;
+  if (contact.mode == CollisionContactPolicyMode::kContactProcess) {
+    contact.max_contact_penetration_m = 0.0;
+  }
+}
+
+void canonicalize_mode_scoped_contact_fields(
+    CollisionPolicySnapshot& policy) {
+  for (auto& contact : policy.support_contacts) {
+    canonicalize_mode_scoped_contact_fields(contact);
+  }
 }
 
 bool same_configured_collision_policy(const CollisionPolicySnapshot& left,
@@ -232,6 +269,12 @@ SceneCommitResultDTO SceneAuthority::commit_locked(
   if (const auto* policy =
           std::get_if<SetCollisionPolicyRequestDTO>(&transaction.operation)) {
     configured_collision_policy = policy->policy;
+    // Presence-aware frontends omit fields that do not apply to the selected
+    // contact mode, while a directly constructed C++ DTO necessarily carries
+    // its member defaults. The projection validates the authored request
+    // before this point; commit the same canonical representation it publishes
+    // so ignored typed defaults cannot change logical policy identity.
+    canonicalize_mode_scoped_contact_fields(configured_collision_policy);
   }
   if (!refresh_committed_publication(
           projection_result.acknowledged_revision,

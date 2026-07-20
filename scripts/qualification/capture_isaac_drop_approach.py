@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -36,6 +37,102 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path}: expected a YAML mapping")
     return value
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _normalized_capture_support_contact(
+    value: dict[str, Any], *, resolved: bool
+) -> dict[str, Any]:
+    """Normalize only the deleted zero-clearance spelling at the v1 boundary.
+
+    The pristine Step 17 baseline necessarily exposes its old zero-valued
+    field.  A nonzero value is not compatible with Step 18 and fails closed;
+    the capture never preserves or silently emulates it.
+    """
+
+    normalized = copy.deepcopy(value)
+    if "min_separation_clearance_m" in normalized:
+        clearance = normalized.pop("min_separation_clearance_m")
+        if (
+            isinstance(clearance, bool)
+            or not isinstance(clearance, (int, float))
+            or not math.isfinite(float(clearance))
+            or float(clearance) != 0.0
+        ):
+            raise RuntimeError(
+                "Step 18 capture rejects nonzero min_separation_clearance_m"
+            )
+    if normalized.get("mode", "contact_release") == "contact_release":
+        normalized.setdefault("release_evidence_mode", "signed_penetration")
+        if resolved:
+            normalized.setdefault("enforce_max_start_penetration", True)
+            normalized.setdefault("max_start_penetration_m", 0.0)
+            normalized.setdefault("release_tolerance_m", 1e-5)
+            normalized.setdefault("min_release_progress_m", 0.0)
+            normalized.setdefault("require_separation_by_end", True)
+            normalized.setdefault(
+                "require_strictly_decreasing_penetration", True
+            )
+            normalized.setdefault("allow_recontact", False)
+    return normalized
+
+
+def _normalized_capture_policy(value: dict[str, Any]) -> dict[str, Any]:
+    normalized = copy.deepcopy(value)
+    contacts = normalized.get("support_contacts")
+    if not isinstance(contacts, list):
+        raise RuntimeError("captured collision policy omitted support_contacts")
+    normalized["support_contacts"] = [
+        _normalized_capture_support_contact(contact, resolved=True)
+        for contact in contacts
+        if isinstance(contact, dict)
+    ]
+    if len(normalized["support_contacts"]) != len(contacts):
+        raise RuntimeError("captured collision policy contains a non-object contact")
+    return normalized
+
+
+def loaded_program_payload_sha256(value: dict[str, Any]) -> str:
+    """Hash disk-authored program content, excluding API session bookkeeping."""
+
+    normalized = copy.deepcopy(value)
+    normalized.pop("programSessionGeneration", None)
+    normalized.pop("programTreeHash", None)
+    return _canonical_json_sha256(normalized)
+
+
+def _step18_matched_program_payload(value: dict[str, Any]) -> dict[str, Any]:
+    """Remove only the predeclared baseline/candidate authoring differences."""
+
+    normalized = copy.deepcopy(value)
+    for field in ("sourcePath", "programSessionGeneration", "programTreeHash"):
+        normalized.pop(field, None)
+    for resource in normalized.get("sceneResources") or []:
+        metadata = resource.get("metadata") if isinstance(resource, dict) else None
+        contacts = metadata.get("support_contacts") if isinstance(metadata, dict) else None
+        if not isinstance(contacts, list):
+            continue
+        for contact in contacts:
+            if not isinstance(contact, dict):
+                continue
+            # The historical baseline spells the deleted zero-clearance field,
+            # while the candidate may spell the default precise evidence mode.
+            # Those are the only saved-program differences permitted by Step 18.
+            contact.pop("min_separation_clearance_m", None)
+            if contact.get("release_evidence_mode") == "signed_penetration":
+                contact.pop("release_evidence_mode", None)
+    return normalized
+
+
+def _step18_matched_deployment_payload(value: dict[str, Any]) -> dict[str, Any]:
+    normalized = copy.deepcopy(value)
+    normalized.pop("sourcePath", None)
+    return normalized
 
 
 def _request_json(
@@ -189,6 +286,7 @@ def _capture_payload(
 ) -> dict[str, Any]:
     request = planning_record.get("request") or {}
     metrics = planning_record.get("metrics") or {}
+    planning_result = planning_record.get("result") or {}
     if request.get("move_id") != "drop_approach":
         raise RuntimeError("qualification record is not the drop-approach request")
     start = request.get("start_state") or {}
@@ -212,8 +310,111 @@ def _capture_payload(
             "commanded-simulation drop capture requires an at-rest command "
             "reference with zero velocity"
         )
+    trajectory = copy.deepcopy(planning_result.get("trajectory"))
+    if not isinstance(trajectory, dict):
+        raise RuntimeError("captured planner result has no retained trajectory")
+    trajectory_joint_names = list(trajectory.get("joint_names") or [])
+    trajectory_waypoints = list(trajectory.get("waypoints") or [])
+    if trajectory_joint_names != joint_names or len(trajectory_waypoints) < 2:
+        raise RuntimeError(
+            "captured planner trajectory does not preserve the PlanRequestDTO "
+            "joint order or has fewer than two waypoints"
+        )
+    previous_time_s = -math.inf
+    for index, waypoint in enumerate(trajectory_waypoints):
+        if not isinstance(waypoint, dict):
+            raise RuntimeError(
+                f"captured planner trajectory waypoint {index} is not an object"
+            )
+        waypoint_positions = list(waypoint.get("positions_rad") or [])
+        waypoint_velocities = list(waypoint.get("velocities_rad_s") or [])
+        waypoint_accelerations = list(
+            waypoint.get("accelerations_rad_s2") or []
+        )
+        time_from_start_s = waypoint.get("time_from_start_s")
+        if (
+            len(waypoint_positions) != len(joint_names)
+            or not all(math.isfinite(float(value)) for value in waypoint_positions)
+            or (
+                waypoint_velocities
+                and (
+                    len(waypoint_velocities) != len(joint_names)
+                    or not all(
+                        math.isfinite(float(value))
+                        for value in waypoint_velocities
+                    )
+                )
+            )
+            or (
+                waypoint_accelerations
+                and (
+                    len(waypoint_accelerations) != len(joint_names)
+                    or not all(
+                        math.isfinite(float(value))
+                        for value in waypoint_accelerations
+                    )
+                )
+            )
+            or isinstance(time_from_start_s, bool)
+            or not isinstance(time_from_start_s, (int, float))
+            or not math.isfinite(float(time_from_start_s))
+            or float(time_from_start_s) < 0.0
+            or float(time_from_start_s) <= previous_time_s
+        ):
+            raise RuntimeError(
+                f"captured planner trajectory waypoint {index} is invalid"
+            )
+        previous_time_s = float(time_from_start_s)
+    trajectory_sha256 = _canonical_json_sha256(trajectory)
+
+    visual_robot = visual_scene_state.get("robot") or {}
+    visual_joint_names = list(visual_robot.get("joint_names") or [])
+    visual_joint_positions = visual_robot.get("joint_positions") or {}
+    if (
+        visual_joint_names != joint_names
+        or not isinstance(visual_joint_positions, dict)
+        or set(visual_joint_positions) != set(visual_joint_names)
+    ):
+        raise RuntimeError(
+            "fresh visual snapshot does not preserve the exact planned arm seed"
+        )
+    visual_arm_positions = [
+        float(visual_joint_positions[name]) for name in visual_joint_names
+    ]
+    if not all(math.isfinite(value) for value in visual_arm_positions):
+        raise RuntimeError("visual arm projection seed contains a non-finite value")
+    projection_groups = [
+        {
+            "group_id": str(visual_robot.get("group_id") or request.get("group_id")),
+            "joint_names": visual_joint_names,
+            "positions_rad": [float(value) for value in planning_positions],
+            "source": "exact_plan_request",
+        }
+    ]
+    for gripper in visual_scene_state.get("grippers") or []:
+        if not isinstance(gripper, dict):
+            continue
+        joint_name = str(gripper.get("joint_name") or "")
+        position = gripper.get("current_position")
+        if not joint_name or isinstance(position, bool) or not isinstance(
+            position, (int, float)
+        ) or not math.isfinite(float(position)):
+            continue
+        projection_groups.append(
+            {
+                "group_id": str(gripper.get("gripper_id") or ""),
+                "joint_names": [joint_name],
+                "positions_rad": [float(position)],
+                "source": "fresh_visual_snapshot_gripper",
+            }
+        )
+    if len(projection_groups) < 2 or not projection_groups[1]["group_id"]:
+        raise RuntimeError(
+            "drop-approach capture has no exact gripper collision-projection seed"
+        )
+    projection_seed_sha256 = _canonical_json_sha256(projection_groups)
     motion = request.get("motion") or {}
-    if motion.get("type") != "pose_goal" or not isinstance(
+    if motion.get("type") != "pose" or not isinstance(
         motion.get("pose"), dict
     ):
         raise RuntimeError("drop-approach PlanRequestDTO is not a pose goal")
@@ -280,7 +481,10 @@ def _capture_payload(
                 "attached": attached,
                 "attached_to": value.get("frame_id") if attached else "",
                 "touch_links": list(value.get("touch_links") or []),
-                "support_contacts": list(value.get("support_contacts") or []),
+                "support_contacts": [
+                    _normalized_capture_support_contact(contact, resolved=False)
+                    for contact in (value.get("support_contacts") or [])
+                ],
                 "observation": {
                     key: value.get(key)
                     for key in (
@@ -349,6 +553,11 @@ def _capture_payload(
             "source": authored_resolution["source"],
         },
         "plan_request": request,
+        "planning_result": {
+            "scene_revision": copy.deepcopy(planning_result.get("scene_revision")),
+            "trajectory": trajectory,
+            "trajectory_sha256": trajectory_sha256,
+        },
         "planner_contract": {
             "rng_base_seed": metrics.get("rng_base_seed"),
             "rng_seed": metrics.get("rng_seed"),
@@ -360,20 +569,28 @@ def _capture_payload(
         "scene": {
             "world_frame": authority_snapshot.get("world_frame"),
             "authority": {
-                key: authority_snapshot.get(key)
-                for key in (
-                    "revision",
-                    "transaction_sequence",
-                    "scene_admission_epoch",
-                    "topology_epoch",
-                    "policy_epoch",
-                    "configured_collision_policy",
-                )
+                **{
+                    key: authority_snapshot.get(key)
+                    for key in (
+                        "revision",
+                        "transaction_sequence",
+                        "scene_admission_epoch",
+                        "topology_epoch",
+                        "policy_epoch",
+                    )
+                },
+                "configured_collision_policy": _normalized_capture_policy(
+                    authority_snapshot.get("configured_collision_policy") or {}
+                ),
             },
             "robot": {
                 "robot_id": robot_id,
                 "base_frame": request.get("base_frame"),
                 "pose_in_world": robot_placement["pose_in_world"],
+                "collision_projection_seed": {
+                    "groups": projection_groups,
+                    "sha256": projection_seed_sha256,
+                },
             },
             "objects": objects,
         },
@@ -483,7 +700,10 @@ def require_loaded_artifacts_match(
     program_path: Path,
     deployment_path: Path,
     expected_program_name: str,
+    allow_runtime_program_override: bool = False,
 ) -> dict[str, Any]:
+    program_sha256_before = hashlib.sha256(program_path.read_bytes()).hexdigest()
+    deployment_sha256_before = hashlib.sha256(deployment_path.read_bytes()).hexdigest()
     current_program = _request_json(base_url, "/api/program")
     if current_program.get("name") != expected_program_name:
         raise RuntimeError(
@@ -496,9 +716,22 @@ def require_loaded_artifacts_match(
         raise RuntimeError(
             "Composer program source does not match the capture source file"
         )
+    saved_program = _request_json(base_url, "/api/program/saved")
+    saved_program_path = Path(str(saved_program.get("sourcePath") or ""))
+    if not saved_program_path.is_absolute() or (
+        saved_program_path.resolve() != program_path.resolve()
+    ):
+        raise RuntimeError("Composer saved program source path changed")
+    if not allow_runtime_program_override and loaded_program_payload_sha256(
+        current_program
+    ) != loaded_program_payload_sha256(saved_program):
+        raise RuntimeError(
+            "Composer program has unsaved or runtime-overridden content"
+        )
+
     current_tree = _request_json(base_url, "/api/program/tree")
     saved_tree = _request_json(base_url, "/api/program/saved/tree")
-    if current_tree != saved_tree:
+    if not allow_runtime_program_override and current_tree != saved_tree:
         raise RuntimeError(
             "Composer program has unsaved or runtime-overridden tree changes"
         )
@@ -516,6 +749,16 @@ def require_loaded_artifacts_match(
     saved_deployment = _request_json(base_url, "/api/deployment/saved/full")
     if current_deployment != saved_deployment:
         raise RuntimeError("Composer deployment has unsaved changes")
+    if hashlib.sha256(program_path.read_bytes()).hexdigest() != program_sha256_before:
+        raise RuntimeError("program artifact changed while its saved payload was read")
+    if (
+        hashlib.sha256(deployment_path.read_bytes()).hexdigest()
+        != deployment_sha256_before
+    ):
+        raise RuntimeError("deployment artifact changed while its saved payload was read")
+
+    saved_program_sha256 = loaded_program_payload_sha256(saved_program)
+    saved_deployment_sha256 = _canonical_json_sha256(saved_deployment)
     return {
         "program": {
             "name": expected_program_name,
@@ -524,7 +767,8 @@ def require_loaded_artifacts_match(
                 if program_path.is_relative_to(REPO_ROOT)
                 else program_path
             ),
-            "sha256": hashlib.sha256(program_path.read_bytes()).hexdigest(),
+            "sha256": program_sha256_before,
+            "loaded_payload_sha256": saved_program_sha256,
         },
         "deployment": {
             "name": str(current_deployment.get("name") or ""),
@@ -533,8 +777,15 @@ def require_loaded_artifacts_match(
                 if deployment_path.is_relative_to(REPO_ROOT)
                 else deployment_path
             ),
-            "sha256": hashlib.sha256(deployment_path.read_bytes()).hexdigest(),
+            "sha256": deployment_sha256_before,
+            "loaded_payload_sha256": saved_deployment_sha256,
         },
+        "matched_input_sha256": _canonical_json_sha256(
+            {
+                "program": _step18_matched_program_payload(saved_program),
+                "deployment": _step18_matched_deployment_payload(saved_deployment),
+            }
+        ),
     }
 
 
