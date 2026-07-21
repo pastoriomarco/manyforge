@@ -1,6 +1,4 @@
-import { useState } from 'react';
-import type { CycleRecoveryOffer } from '../types/api';
-import { RecoveryActionControls } from './RecoveryActionControls';
+import { useEffect, useId, useState } from 'react';
 
 /**
  * KernelErrorPanel — renders kernel/cycle-manager errors with their full
@@ -28,17 +26,12 @@ export interface KernelErrorPanelProps {
   errorDetails?: Record<string, unknown> | null;
   /** Captured event snapshot for the latest fault/stop incident, when known. */
   incidentSnapshot?: Record<string, unknown> | null;
-  /** Exact server-authored recovery offer shared by every operator surface. */
-  recoveryOffer?: CycleRecoveryOffer | null;
-  /** Submit an action bound to the exact rendered offer. */
-  onRecoveryAction?: (
-    offer: CycleRecoveryOffer,
-    actionId: string,
-  ) => void | Promise<void>;
-  recoveryActionBusy?: boolean;
-  onRecoveryActionError?: (error: unknown) => void;
-  /** Optional close handler for a dismissible banner. */
-  onDismiss?: () => void;
+  /** Stable identity used to reset presentation for a genuinely new incident. */
+  presentationKey?: string;
+  /** Acknowledge this browser notification without mutating runtime authority. */
+  onAcknowledge?: () => void;
+  /** Reduce the notification to the persistent header icon. */
+  onMinimize?: () => void;
 }
 
 interface HeadlineMapping {
@@ -908,6 +901,32 @@ export function hintForError(
   return typeof hint === 'function' ? hint(errorDetails ?? null) : hint;
 }
 
+const ERROR_PRESENTATION_IDENTITY_KEYS = [
+  'runtime_fault_id',
+  'latch_id',
+  'execution_id',
+  'action_span_id',
+  'node_attempt_id',
+] as const;
+
+/** Keep one incident collapsed/minimized across incremental diagnostic updates. */
+export function errorPresentationKey(
+  message: string,
+  errorCode: string | null | undefined,
+  errorDetails: Record<string, unknown> | null | undefined,
+): string {
+  const identities = ERROR_PRESENTATION_IDENTITY_KEYS.flatMap((key) => {
+    const value = errorDetails?.[key];
+    return value === null || value === undefined || value === ''
+      ? []
+      : [`${key}=${String(value)}`];
+  });
+  if (identities.length > 0) {
+    return `${errorCode ?? ''}|${identities.join('|')}`;
+  }
+  return `${errorCode ?? ''}|${message}|${JSON.stringify(errorDetails ?? null)}`;
+}
+
 function severityClasses(severity: HeadlineMapping['severity']): {
   border: string;
   chipBg: string;
@@ -915,13 +934,13 @@ function severityClasses(severity: HeadlineMapping['severity']): {
 } {
   switch (severity) {
     case 'fault':
-      return { border: 'border-red-700 bg-red-950/60', chipBg: 'bg-red-800', chipText: 'text-red-100' };
+      return { border: 'border-red-700 bg-red-950/50', chipBg: 'bg-red-800', chipText: 'text-red-100' };
     case 'config':
-      return { border: 'border-yellow-700 bg-yellow-950/60', chipBg: 'bg-yellow-800', chipText: 'text-yellow-100' };
+      return { border: 'border-yellow-700 bg-yellow-950/50', chipBg: 'bg-yellow-800', chipText: 'text-yellow-100' };
     case 'state':
-      return { border: 'border-amber-700 bg-amber-950/60', chipBg: 'bg-amber-800', chipText: 'text-amber-100' };
+      return { border: 'border-amber-700 bg-amber-950/50', chipBg: 'bg-amber-800', chipText: 'text-amber-100' };
     default:
-      return { border: 'border-red-700 bg-red-950/60', chipBg: 'bg-gray-700', chipText: 'text-gray-100' };
+      return { border: 'border-red-700 bg-red-950/50', chipBg: 'bg-gray-700', chipText: 'text-gray-100' };
   }
 }
 
@@ -1051,8 +1070,8 @@ function StopChainSummary({
     return null;
   }
   return (
-    <div className="mt-2 rounded border border-red-800/70 bg-black/25 p-2 text-xs text-red-100/90">
-      <div className="mb-1 font-semibold text-red-100">Stop chain</div>
+    <details className="mt-2 rounded border border-red-800/70 bg-black/25 p-2 text-xs text-red-100/90">
+      <summary className="cursor-pointer font-semibold text-red-100">Stop chain</summary>
       <div className="grid gap-1 sm:grid-cols-[7rem_1fr]">
         {rows.map(([label, value]) => (
           <div key={label} className="contents">
@@ -1061,7 +1080,7 @@ function StopChainSummary({
           </div>
         ))}
       </div>
-    </div>
+    </details>
   );
 }
 
@@ -1257,13 +1276,15 @@ export function KernelErrorPanel({
   errorCode,
   errorDetails,
   incidentSnapshot,
-  recoveryOffer,
-  onRecoveryAction,
-  recoveryActionBusy = false,
-  onRecoveryActionError,
-  onDismiss,
+  presentationKey,
+  onAcknowledge,
+  onMinimize,
 }: KernelErrorPanelProps) {
-  const [showDetails, setShowDetails] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const bodyId = useId();
+  useEffect(() => {
+    setExpanded(false);
+  }, [presentationKey]);
   const mapping = mappingForError(errorCode, errorDetails);
   const severity = mapping?.severity ?? 'unknown';
   const classes = severityClasses(severity);
@@ -1278,10 +1299,55 @@ export function KernelErrorPanel({
     : [];
   const showStopChain = hasStopChain(errorDetails);
   return (
-    <div className={`mb-2 rounded border px-3 py-2 text-sm text-red-200 ${classes.border}`}>
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex-1">
-          <div className="font-semibold text-red-100">{headline}</div>
+    <div
+      role="alert"
+      className={`pointer-events-auto max-h-[70vh] overflow-hidden rounded border text-sm text-red-200 shadow-xl shadow-black/60 backdrop-blur-sm ${classes.border}`}
+    >
+      <div className="flex min-h-10 items-center gap-2 px-3 py-2">
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-controls={bodyId}
+          aria-label={expanded ? 'Collapse error details' : 'Expand error details'}
+          onClick={() => setExpanded((value) => !value)}
+          className="flex min-w-0 flex-1 items-center gap-2 text-left text-red-100 hover:text-white"
+        >
+          <svg
+            viewBox="0 0 16 16"
+            className={`h-3.5 w-3.5 shrink-0 fill-none stroke-current transition-transform ${expanded ? 'rotate-90' : ''}`}
+            strokeWidth="1.8"
+            aria-hidden
+          >
+            <path d="m6 3 5 5-5 5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <span className="truncate font-semibold" title={headline}>{headline}</span>
+        </button>
+        {onAcknowledge && (
+          <button
+            type="button"
+            onClick={onAcknowledge}
+            className="shrink-0 rounded border border-red-400/50 bg-black/25 px-2 py-1 text-xs font-medium text-red-100 hover:bg-red-900/50"
+            title="Acknowledge this notification. Runtime fault and recovery authority are unchanged."
+          >
+            Acknowledge alert
+          </button>
+        )}
+        {onMinimize && (
+          <button
+            type="button"
+            onClick={onMinimize}
+            className="shrink-0 rounded p-1 text-red-200/80 hover:bg-red-900/50 hover:text-red-100"
+            aria-label="Minimize error to header icon"
+            title="Minimize to header icon"
+          >
+            <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.6" aria-hidden>
+              <path d="M3 8h10" strokeLinecap="round" />
+            </svg>
+          </button>
+        )}
+      </div>
+      {expanded && (
+        <div id={bodyId} className="max-h-[calc(70vh-2.75rem)] overflow-y-auto border-t border-red-300/20 px-3 py-2">
           {subline && (
             <div className="mt-0.5 break-words text-xs text-red-300/90">{subline}</div>
           )}
@@ -1302,49 +1368,23 @@ export function KernelErrorPanel({
             <StopChainSummary details={errorDetails} />
           )}
           <IncidentSnapshotSummary snapshot={incidentSnapshot} />
-          {recoveryOffer && onRecoveryAction && (
-            <div className="mt-2 border-t border-red-300/30 pt-2">
-              <RecoveryActionControls
-                offer={recoveryOffer}
-                busy={recoveryActionBusy}
-                onAction={onRecoveryAction}
-                onError={onRecoveryActionError}
-              />
-            </div>
-          )}
           {detailEntries.length > 0 && (
-            <div className="mt-2">
-              <button
-                type="button"
-                onClick={() => setShowDetails((v) => !v)}
-                className="text-xs underline text-red-100/80 hover:text-red-100"
-              >
-                {showDetails ? 'Hide diagnostic details' : `Show diagnostic details (${detailEntries.length})`}
-              </button>
-              {showDetails && (
-                <div className="mt-1 max-h-48 overflow-auto rounded bg-black/40 p-2 font-mono text-[11px] text-red-100/90">
-                  {detailEntries.map(([k, v]) => (
-                    <div key={k} className="flex gap-2">
-                      <span className="text-red-300/80">{k}:</span>
-                      <span className="break-all">{String(v)}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
+            <details className="mt-2 rounded border border-red-800/70 bg-black/25 p-2 text-xs text-red-100/90">
+              <summary className="cursor-pointer font-semibold text-red-100">
+                Diagnostic details ({detailEntries.length})
+              </summary>
+              <div className="mt-2 max-h-48 overflow-auto rounded bg-black/40 p-2 font-mono text-[11px] text-red-100/90">
+                {detailEntries.map(([k, v]) => (
+                  <div key={k} className="flex gap-2">
+                    <span className="text-red-300/80">{k}:</span>
+                    <span className="break-all">{String(v)}</span>
+                  </div>
+                ))}
+              </div>
+            </details>
           )}
         </div>
-        {onDismiss && (
-          <button
-            type="button"
-            onClick={onDismiss}
-            className="text-red-200/80 hover:text-red-100"
-            aria-label="Dismiss error"
-          >
-            ✕
-          </button>
-        )}
-      </div>
+      )}
     </div>
   );
 }

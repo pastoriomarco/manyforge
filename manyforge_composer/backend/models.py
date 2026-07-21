@@ -2127,6 +2127,64 @@ class NodeStatusTransitionResponse(BaseModel):
     to_status: str = Field(alias="to")
 
 
+class OperatorAlertResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    schema_version: Literal["manyforge.operator_alert.v1"] = Field(
+        alias="schemaVersion"
+    )
+    alert_id: str = Field(alias="alertId")
+    recovery_context_id: Optional[str] = Field(
+        default=None, alias="recoveryContextId"
+    )
+    incident_id: str = Field(alias="incidentId")
+    incident_ids: List[str] = Field(default_factory=list, alias="incidentIds")
+    run_id: Optional[str] = Field(default=None, alias="runId")
+    execution_id: int = Field(default=0, alias="executionId")
+    severity: Literal["ERROR", "CRITICAL"]
+    error_code: str = Field(alias="errorCode")
+    message: str
+    error_details: Dict[str, Any] = Field(default_factory=dict, alias="errorDetails")
+    trigger_type: Optional[str] = Field(default=None, alias="triggerType")
+    trigger_channel: Optional[str] = Field(default=None, alias="triggerChannel")
+    first_seen_at_ns: int = Field(alias="firstSeenAtNs")
+    first_seen_at: Optional[str] = Field(default=None, alias="firstSeenAt")
+    last_seen_at_ns: int = Field(alias="lastSeenAtNs")
+    last_seen_at: Optional[str] = Field(default=None, alias="lastSeenAt")
+    occurrence_count: int = Field(alias="occurrenceCount", ge=1)
+    revision: int = Field(ge=1)
+
+
+class OperatorAlertInboxResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    schema_version: Literal["manyforge.operator_alert_inbox.v1"] = Field(
+        alias="schemaVersion"
+    )
+    generation: int = Field(ge=0)
+    blocking_count: int = Field(alias="blockingCount", ge=0)
+    unacknowledged_alert_ids: List[str] = Field(
+        default_factory=list, alias="unacknowledgedAlertIds"
+    )
+    alerts: List[OperatorAlertResponse] = Field(default_factory=list)
+    truncated: bool = False
+    timestamp_ns: int = Field(alias="timestampNs")
+
+
+class OperatorAlertAcknowledgeAllRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    alert_ids: List[str] = Field(alias="alertIds")
+    expected_generation: int = Field(alias="expectedGeneration", ge=0)
+    confirmed: StrictBool
+
+
+class OperatorAlertAcknowledgeResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    acknowledged_alert_ids: List[str] = Field(
+        default_factory=list, alias="acknowledgedAlertIds"
+    )
+    already_acknowledged: bool = Field(default=False, alias="alreadyAcknowledged")
+    inbox: OperatorAlertInboxResponse
+
+
 class ExecutionHistoryResponse(BaseModel):
     model_config = _ALIAS_CFG
     run_id: Optional[str] = Field(default=None, alias="runId")

@@ -165,9 +165,10 @@ When Isaac or a real robot is available, capture evidence for:
 8. Stop history shows requested/executed mode, hard-stop floor, timing, and
    settle evidence.
 9. Stop/fault intervention recovery choices work as labeled:
-   **Acknowledge and continue** clears the error without backend reset and the
-   next Run replans from the current pose; **Reset cycle and run** explicitly
-   uses the reset path and may command the configured initial pose in
+   **Acknowledge fault** clears the operational latch without backend reset,
+   leaves motion stopped, and exposes a separate Resume command that replans
+   from the current pose; **Reset cycle** explicitly uses the reset path and may
+   command the configured initial pose in
    commanded-sim deployments.
 10. For real robots, hardware/pendant scaling behavior is observed and classified
    before claiming timed guarantees.
@@ -180,17 +181,26 @@ scene and deployment, then repeat the same stop matrix on the physical robot.
 Stop/fault `INTERVENTION_REQUIRED` is a recovery boundary. Pressing Run while it
 is latched does not silently acknowledge the fault. Composer presents:
 
-- **Acknowledge and continue**: the kernel verifies the backend state is readable,
+- **Acknowledge fault** (`acknowledge_and_continue`): the kernel verifies the backend state is readable,
   the backend is not still stopping, the pose is finite, the hard-stop floor is
   reportable, and measured velocity is settled when a settle signal exists. It
   then clears the stop/fault latch without calling backend reset. The cycle
-  remains stopped; the next Run replans from the current robot pose.
-- **Reset cycle and run**: Composer explicitly uses the reset path first. In
+  remains stopped; the now-visible Resume command replans from the current
+  robot pose only after a second operator press.
+- **Reset cycle**: Composer explicitly uses the reset path. In
   commanded-sim lanes this can command the declared initial pose and must be
   treated as a reset action, not a resume.
 - **Cancel**: leave the intervention latched.
 
-The error panel also exposes **Acknowledge error** for classified stop/fault
-interventions. Unknown/unclassified interventions, unreadable backend state,
-active direct-control leases, backend still stopping, or non-settled measured
-velocity remain fail-closed until the operator fixes the cause or chooses Reset.
+The floating error stack exposes **Acknowledge alert**, which removes that item
+from the shared operator-attention inbox and leaves the active runtime fault/
+recovery state unchanged. Up to three newest unacknowledged errors are shown;
+older errors remain retained and appear as newer ones are acknowledged.
+**Acknowledge all** requires confirmation. Retry/Resume/Replan remains disabled
+until the inbox is empty, while Stop and explicit Reset remain available.
+Operational fault acknowledgement exists only in the execution controls. The
+Messages/History drawer retains the source events and acknowledgement audit
+records after an alert leaves the active stack.
+Unknown/unclassified interventions, unreadable backend state, active
+direct-control leases, backend still stopping, or non-settled measured velocity
+remain fail-closed until the operator fixes the cause or chooses Reset.

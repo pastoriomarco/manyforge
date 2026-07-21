@@ -5,6 +5,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -575,7 +576,9 @@ function useViewerFrameBinding<T extends THREE.Object3D>(
   ) => number | void,
 ): void {
   const applyRef = useRef(apply);
-  applyRef.current = apply;
+  useLayoutEffect(() => {
+    applyRef.current = apply;
+  }, [apply]);
   useEffect(() => {
     if (node === null) return undefined;
     return registerViewerFrameApplier((manifest, frame, previousFrame, interpolationAlpha) => (
@@ -913,7 +916,7 @@ function measuredGhostEnabled(
 function MeasuredPoseSourceGhosts() {
   const visible = useViewerSelectionStore((s) => s.measuredStateGhostVisible);
   const manifest = useSceneStateStore((state) => state.manifest);
-  const poseSources = manifest?.pose_sources ?? [];
+  const poseSources = manifest?.pose_sources;
   const objects = useMemo(
     () => manifest?.entities.map(manifestEntityToSceneObject) ?? EMPTY_OBJECTS,
     [manifest],
@@ -930,7 +933,7 @@ function MeasuredPoseSourceGhosts() {
   const ghosts = useMemo<MeasuredGhost[]>(() => {
     if (!visible) return [];
     const next: MeasuredGhost[] = [];
-    for (const source of poseSources) {
+    for (const source of poseSources ?? []) {
       const renderTcp = source.objects.some((observed) => (
         measuredGhostEnabled(observed.measured_state_ghost, 'robotTcp')
       ));
@@ -2044,7 +2047,7 @@ function TcpJogGizmo() {
   const [anchor, setAnchor] = useState<Mesh | null>(null);
   const draggingRef = useRef(false);
 
-  const currentBaseWorldPose = (): PoseTuple | null => {
+  const currentBaseWorldPose = useCallback((): PoseTuple | null => {
     const snapshot = getLatestViewerSnapshot();
     if (snapshot !== null && baseFrame !== null) {
       const pose = viewerRobotLinkPose(snapshot.manifest, snapshot.frame, 0, baseFrame);
@@ -2056,7 +2059,7 @@ function TcpJogGizmo() {
       }
     }
     return staticBasePose;
-  };
+  }, [baseFrame, staticBasePose]);
 
   // Author a Cartesian candidate from the gizmo anchor's current world pose
   // (set by TransformControls during drag), expressed in the robot base frame
@@ -2064,8 +2067,7 @@ function TcpJogGizmo() {
   // creates/updates the server-owned candidate and never moves the robot. The
   // anchor then rests at the authored target (it is not snapped back to the
   // live TCP); the validated candidate ghost shows the planned configuration.
-  const authorFromAnchorRef = useRef<() => void>(() => {});
-  authorFromAnchorRef.current = () => {
+  const authorFromAnchor = useCallback(() => {
     if (!commandGate.canCommand) return;
     if (anchor === null) return;
     // Read the anchor's world transform (top-level scene child; its local
@@ -2087,7 +2089,14 @@ function TcpJogGizmo() {
       author,
       rejectDraft,
     });
-  };
+  }, [
+    anchor,
+    author,
+    commandGate.canCommand,
+    currentBaseWorldPose,
+    rejectDraft,
+    tcpFrame,
+  ]);
 
   const initialPose = useMemo(() => {
     const snapshot = getLatestViewerSnapshot();
@@ -2106,7 +2115,7 @@ function TcpJogGizmo() {
       return composePose(baseWorldPose, tcpInBase);
     }
     return tcpInBase;
-  }, [tcpFrame, staticBasePose]);
+  }, [currentBaseWorldPose, tcpFrame]);
 
   // While a Cartesian draft candidate is active, the gizmo rests at the
   // AUTHORED TARGET (the candidate's pose), not the live TCP — so editing is
@@ -2136,7 +2145,7 @@ function TcpJogGizmo() {
       position: target.positionM as [number, number, number],
       quaternion: target.orientationXyzw as [number, number, number, number],
     });
-  }, [candidate, baseFrame, staticBasePose]);
+  }, [baseFrame, candidate, currentBaseWorldPose]);
 
   const anchorPose = draftTargetWorld ?? initialPose;
 
@@ -2176,27 +2185,26 @@ function TcpJogGizmo() {
   // iterative (the new draft candidate's target keeps `anchorPose` there). It
   // returns to the live TCP only when the draft is discarded (Revert / mode
   // change) or hands off to execution. Authoring only; never moves the robot.
-  const finishDragRef = useRef<() => void>(() => {});
-  finishDragRef.current = () => {
+  const finishDrag = useCallback(() => {
     if (!draggingRef.current) return;
     draggingRef.current = false;
     useViewerSelectionStore.getState().setDraggingGizmo(false);
-    authorFromAnchorRef.current();
-  };
+    authorFromAnchor();
+  }, [authorFromAnchor]);
 
   // Window-level safety net: if drei TransformControls drops its mouseUp
   // event, the window pointerup/pointercancel still finishes the drag.
   // Routed through the single-shot finishDrag path so it can never
   // double-author with the inline handler.
   useEffect(() => {
-    const onPointerUp = () => finishDragRef.current();
+    const onPointerUp = () => finishDrag();
     window.addEventListener('pointerup', onPointerUp);
     window.addEventListener('pointercancel', onPointerUp);
     return () => {
       window.removeEventListener('pointerup', onPointerUp);
       window.removeEventListener('pointercancel', onPointerUp);
     };
-  }, []);
+  }, [finishDrag]);
 
   if (
     !robotPanelActive
@@ -2237,7 +2245,7 @@ function TcpJogGizmo() {
           // Single-shot release through finishDrag: authors exactly once and
           // leaves the gizmo at the authored target (no snap-back); never moves
           // the robot.
-          onMouseUp={() => finishDragRef.current()}
+          onMouseUp={() => finishDrag()}
         />
       )}
     </>
@@ -2337,19 +2345,17 @@ const _CANDIDATE_GHOST_ACTIVE = new Set([
 function CandidateGhostRobot() {
   const candidate = useRobotControlCandidateStore((s) => s.candidate);
   const viewerManifest = useSceneStateStore((s) => s.manifest);
-  const authoritative = useMemo(
-    () => getAuthoritativeViewerState(),
-    [candidate, viewerManifest],
-  );
+  const authoritative = getAuthoritativeViewerState();
   const robot = authoritative?.scene.robot ?? null;
   const grippers = authoritative?.scene.grippers ?? EMPTY_GRIPPERS;
   const robotDescriptor = viewerManifest?.robots[0] ?? null;
   const robotModelKey = robotDescriptor?.urdf_model_key ?? robotDescriptor?.robot_id ?? null;
   const tcpFrame = robotDescriptor?.tcp_frame ?? null;
   const [manifest, setManifest] = useState<SceneUrdfManifest | null>(null);
-  const [fetchedPreview, setFetchedPreview] = useState<PreviewLinkPosesResponse | null>(
-    null,
-  );
+  const [fetchedPreview, setFetchedPreview] = useState<{
+    familyKey: string;
+    response: PreviewLinkPosesResponse;
+  } | null>(null);
   const fetchSeqRef = useRef(0);
   // The joint-vector key the current fetchedPreview was computed for. Used to
   // refetch ONLY when the target configuration actually changes, never on a
@@ -2357,7 +2363,6 @@ function CandidateGhostRobot() {
   // produces a new object with the same pose) — that churn was the ghost
   // flicker.
   const lastFetchKeyRef = useRef<string | null>(null);
-  const fetchedPreviewFamilyRef = useRef<string | null>(null);
 
   const status = candidate?.status ?? null;
   const active = status !== null && _CANDIDATE_GHOST_ACTIVE.has(status);
@@ -2386,7 +2391,6 @@ function CandidateGhostRobot() {
   useEffect(() => {
     setFetchedPreview(null);
     lastFetchKeyRef.current = null;
-    fetchedPreviewFamilyRef.current = null;
   }, [previewFamilyKey]);
 
   useEffect(() => {
@@ -2396,7 +2400,6 @@ function CandidateGhostRobot() {
       // candidate fetches fresh.
       setFetchedPreview(null);
       lastFetchKeyRef.current = null;
-      fetchedPreviewFamilyRef.current = null;
       return;
     }
     let cancelled = false;
@@ -2493,8 +2496,7 @@ function CandidateGhostRobot() {
         .then((r) => {
           if (seq === fetchSeqRef.current) {
             lastFetchKeyRef.current = jointKey;
-            fetchedPreviewFamilyRef.current = previewFamilyKey;
-            setFetchedPreview(r);
+            setFetchedPreview({ familyKey: previewFamilyKey, response: r });
           }
         })
         .catch(() => {
@@ -2565,7 +2567,7 @@ function CandidateGhostRobot() {
   }
 
   const fetchedPreviewForFamily =
-    fetchedPreviewFamilyRef.current === previewFamilyKey ? fetchedPreview : null;
+    fetchedPreview?.familyKey === previewFamilyKey ? fetchedPreview.response : null;
   const fetchedLinkPoses =
     fetchedPreviewForFamily !== null && fetchedPreviewForFamily.reachable
       ? fetchedPreviewForFamily.link_poses

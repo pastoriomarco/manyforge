@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from typing import Any, Iterable
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from manyforge_behavior.cycle_manager import preferred_structured_error_code
 from manyforge_behavior.cycle_recovery import (
@@ -13,12 +13,16 @@ from manyforge_behavior.cycle_recovery import (
 )
 from .cycle_diagnostics import manager_cycle_error_fields
 from .event_recorder import _wall_iso_to_ns
+from .operator_alerts import OperatorAlertError
 
 from .models import (
     BlackboardSnapshotResponse,
     ExecutionDigestObjectResponse,
     ExecutionDigestResponse,
     ExecutionHistoryResponse,
+    OperatorAlertAcknowledgeAllRequest,
+    OperatorAlertAcknowledgeResponse,
+    OperatorAlertInboxResponse,
 )
 from .route_execution import run_route_background
 from .routes_scene import build_scene_diagnostics_payload
@@ -102,6 +106,45 @@ def build_execution_channels_payload(
         "incidentSnapshots": state.event_recorder.incident_snapshots(),
         "timestampNs": time.monotonic_ns(),
     }
+
+
+def build_operator_alerts_payload(
+    state: ComposerState,
+    *,
+    limit: int = 3,
+) -> dict[str, Any]:
+    """Observe execution state and return the authoritative alert inbox."""
+    state.event_recorder.observe(state)
+    return OperatorAlertInboxResponse(
+        **state.event_recorder.operator_alerts(limit=limit)
+    ).model_dump(by_alias=True)
+
+
+def _operator_alert_http_error(
+    state: ComposerState,
+    error: OperatorAlertError,
+) -> HTTPException:
+    status_code = (
+        404
+        if error.code == "operator_alert_not_found"
+        else 409
+        if error.code
+        in {
+            "operator_alert_inbox_stale",
+            "operator_alert_inbox_membership_mismatch",
+        }
+        else 400
+    )
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "message": str(error),
+            "errorCode": error.code,
+            "errorDetails": {
+                "operatorAlertInbox": state.event_recorder.operator_alerts(limit=3)
+            },
+        },
+    )
 
 
 def _split_csv_query(value: str | None) -> list[str] | None:
@@ -356,9 +399,9 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
     kernel_state = getattr(getattr(kernel_status, "state", None), "value", "")
     ordinary_resume_available = bool(
         recovery_offer is None
-        and cycle_state == "running"
+        and cycle_state in {"running", "stopped"}
         and motion_stop_state == "held"
-        and kernel_state in {"paused", "stopped"}
+        and kernel_state in {"paused", "stopped", "idle"}
         and error_code is None
         and error_message is None
     )
@@ -448,6 +491,69 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
 def create_execution_router(state: ComposerState) -> APIRouter:
     """Create execution observability routes."""
     router = APIRouter()
+
+    @router.get(
+        "/alerts",
+        response_model=OperatorAlertInboxResponse,
+        response_model_by_alias=True,
+    )
+    async def get_operator_alerts(
+        limit: int = Query(default=3, ge=0, le=100),
+    ) -> dict[str, Any]:
+        """Return newest unacknowledged execution alerts."""
+        return await run_route_background(
+            lambda: build_operator_alerts_payload(state, limit=limit)
+        )
+
+    @router.post(
+        "/alerts/acknowledge-all",
+        response_model=OperatorAlertAcknowledgeResponse,
+        response_model_by_alias=True,
+    )
+    async def acknowledge_all_operator_alerts(
+        payload: OperatorAlertAcknowledgeAllRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Confirm and generation-fence acknowledgement of the exact inbox."""
+        principal_id = getattr(request.state, "principal_id", None) or "operator_ui"
+
+        def command() -> dict[str, Any]:
+            try:
+                result = state.event_recorder.acknowledge_all_operator_alerts(
+                    alert_ids=payload.alert_ids,
+                    expected_generation=payload.expected_generation,
+                    confirmed=payload.confirmed,
+                    principal_id=principal_id,
+                )
+            except OperatorAlertError as exc:
+                raise _operator_alert_http_error(state, exc) from exc
+            return OperatorAlertAcknowledgeResponse(**result).model_dump(by_alias=True)
+
+        return await run_route_background(command)
+
+    @router.post(
+        "/alerts/{alert_id}/acknowledge",
+        response_model=OperatorAlertAcknowledgeResponse,
+        response_model_by_alias=True,
+    )
+    async def acknowledge_operator_alert(
+        alert_id: str,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Acknowledge one alert without changing recovery or motion state."""
+        principal_id = getattr(request.state, "principal_id", None) or "operator_ui"
+
+        def command() -> dict[str, Any]:
+            try:
+                result = state.event_recorder.acknowledge_operator_alert(
+                    alert_id,
+                    principal_id=principal_id,
+                )
+            except OperatorAlertError as exc:
+                raise _operator_alert_http_error(state, exc) from exc
+            return OperatorAlertAcknowledgeResponse(**result).model_dump(by_alias=True)
+
+        return await run_route_background(command)
 
     @router.get("/runs")
     async def list_execution_runs(

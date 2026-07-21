@@ -6,6 +6,10 @@ import type {
   CycleRecoveryOffer,
   VelocityScaleResponse,
   ExecutionChannelsResponse,
+  ExecutionHistoryQuery,
+  ExecutionHistoryResponse,
+  OperatorAlertAcknowledgeResponse,
+  OperatorAlertInbox,
   CatalogResponse,
   CatalogEntry,
   ProgramInfo,
@@ -184,6 +188,37 @@ export const api = {
         'GET',
         `/api/execution/channels?limit=${encodeURIComponent(String(limit))}`,
       ),
+    alerts: (limit = 3) =>
+      request<OperatorAlertInbox>(
+        'GET',
+        `/api/execution/alerts?limit=${encodeURIComponent(String(limit))}`,
+      ),
+    acknowledgeAlert: (alertId: string) =>
+      request<OperatorAlertAcknowledgeResponse>(
+        'POST',
+        `/api/execution/alerts/${encodeURIComponent(alertId)}/acknowledge`,
+      ),
+    acknowledgeAllAlerts: (
+      alertIds: string[],
+      expectedGeneration: number,
+      confirmed: boolean,
+    ) =>
+      request<OperatorAlertAcknowledgeResponse>(
+        'POST',
+        '/api/execution/alerts/acknowledge-all',
+        { alertIds, expectedGeneration, confirmed },
+      ),
+    history: (query: ExecutionHistoryQuery = {}) => {
+      const params = new URLSearchParams();
+      if (query.limit !== undefined) params.set('limit', String(query.limit));
+      if (query.runId) params.set('run_id', query.runId);
+      if (query.minSeverity) params.set('minSeverity', query.minSeverity);
+      if (query.components?.length) params.set('components', query.components.join(','));
+      if (query.eventTypes?.length) params.set('eventTypes', query.eventTypes.join(','));
+      if (query.executionId !== undefined) params.set('executionId', String(query.executionId));
+      const suffix = params.size > 0 ? `?${params.toString()}` : '';
+      return request<ExecutionHistoryResponse>('GET', `/api/execution/history${suffix}`);
+    },
   },
   simulation: {
     reset: () => request<SimulationResetResponse>('POST', '/api/simulation/reset'),

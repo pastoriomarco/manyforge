@@ -112,6 +112,47 @@ def test_execution_digest_reports_held_motion_stop_as_resume_required():
         assert "Operator action required: resume" in data["warnings"]
 
 
+def test_execution_digest_reports_acknowledged_stopped_cycle_as_resume_ready():
+    kernel = MockKernelClient(execute_duration_s=1.0)
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        assert (
+            client.post("/api/program/load", json={"path": _PROGRAM_PATH}).status_code
+            == 200
+        )
+        assert state.cycle_manager is not None
+        state.cycle_manager._state = CycleState.STOPPED  # noqa: SLF001
+        state.cycle_manager._motion_stop_state = "held"  # noqa: SLF001
+        state.cycle_manager._error = None  # noqa: SLF001
+        state.cycle_manager._error_code = None  # noqa: SLF001
+        kernel._state = ExecutionState.IDLE  # noqa: SLF001
+
+        response = client.get("/api/execution/digest")
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["state"] == "stopped"
+        assert data["motionStopState"] == "held"
+        assert data["recoveryOffer"] is None
+        assert data["requiredOperatorAction"] == "resume"
+        assert data["resumeAllowed"] is True
+        assert data["ackRequired"] is False
+
+        # Gate-only acknowledgement lands the kernel in Idle. A completed
+        # execution must not acquire resume authority merely because a stale
+        # cycle projection still reports held motion.
+        kernel._state = ExecutionState.COMPLETED  # noqa: SLF001
+        completed_response = client.get("/api/execution/digest")
+        assert completed_response.status_code == 200
+        completed_data = completed_response.json()
+        assert completed_data["requiredOperatorAction"] == "none"
+        assert completed_data["resumeAllowed"] is False
+
+
 def test_execution_digest_reports_held_intervention_as_explicit_recovery_required():
     kernel = MockKernelClient(execute_duration_s=1.0)
     state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)

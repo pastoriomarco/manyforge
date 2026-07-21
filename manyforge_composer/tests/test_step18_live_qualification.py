@@ -31,6 +31,43 @@ _VERIFY = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_VERIFY)
 
 
+_FROZEN_CANDIDATE_DELTA_SHA256 = _VERIFY._delta_sha256(  # noqa: SLF001
+    b"step18-live-unit-test-candidate"
+)
+
+
+def _frozen_candidate_source_identity(root: Path) -> dict[str, Any]:
+    """Model the qualified pre-commit candidate after Step 18 closure.
+
+    The production verifier intentionally accepts only the dirty candidate
+    rooted at 643fe9c.  Once that candidate was committed, the repository's
+    real HEAD could no longer serve as the unit-test fixture.  Keep the
+    verifier strict and supply its frozen source identity at the test seam.
+    """
+
+    if Path(root).resolve() != _REPO_ROOT.resolve():
+        return _SOURCE_ID.source_identity(root)
+    return _VERIFY._source_identity(  # noqa: SLF001
+        head_commit=_VERIFY.PINNED_BASELINE_COMMIT,
+        head_tree=_VERIFY.PINNED_BASELINE_TREE,
+        dirty=True,
+        delta_sha256=_FROZEN_CANDIDATE_DELTA_SHA256,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _use_frozen_candidate_source_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        _VERIFY, "current_source_identity", _frozen_candidate_source_identity
+    )
+    monkeypatch.setattr(
+        _GEN.live, "current_source_identity", _frozen_candidate_source_identity
+    )
+    monkeypatch.setattr(_GEN, "source_identity", _frozen_candidate_source_identity)
+
+
 def _specs_repository(tmp_path: Path) -> Path:
     """Create the real, dirty Specs checkout bound by one live-test campaign.
 
@@ -694,7 +731,11 @@ def _patch(tmp_path: Path) -> Path:
             "--binary",
             "--full-index",
             "--no-ext-diff",
-            "HEAD",
+            # Step 18 is committed now, so reconstruct the observation-only
+            # baseline delta from the verifier's pinned pre-Step-18 source.
+            # Using HEAD here only worked while the candidate was still an
+            # uncommitted working-tree patch and became empty at closure.
+            _VERIFY.PINNED_BASELINE_COMMIT,
             "--",
             *sorted(_VERIFY._OBSERVATION_PATCH_PATHS),  # noqa: SLF001
         ]
@@ -724,7 +765,7 @@ def _matrix(
     observation_identity = _VERIFY._observation_patch_identity(  # noqa: SLF001
         patch.read_bytes(), _sha256(patch), _sha256(patch)
     )
-    candidate_identity = _SOURCE_ID.source_identity(_REPO_ROOT)
+    candidate_identity = _VERIFY.current_source_identity(_REPO_ROOT)
     baseline_specs = _VERIFY._source_identity(  # noqa: SLF001
         head_commit=_VERIFY.PINNED_SPECS_COMMIT,
         head_tree=_VERIFY.PINNED_SPECS_TREE,

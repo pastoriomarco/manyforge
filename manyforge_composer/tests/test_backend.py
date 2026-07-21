@@ -596,6 +596,22 @@ def make_client(execute_duration_s: float = 0.0) -> TestClient:
     return TestClient(app)
 
 
+def _acknowledge_all_operator_alerts(client: TestClient) -> dict:
+    inbox = client.get("/api/execution/alerts").json()
+    if inbox["blockingCount"] == 0:
+        return inbox
+    response = client.post(
+        "/api/execution/alerts/acknowledge-all",
+        json={
+            "alertIds": inbox["unacknowledgedAlertIds"],
+            "expectedGeneration": inbox["generation"],
+            "confirmed": True,
+        },
+    )
+    assert response.status_code == 200
+    return response.json()["inbox"]
+
+
 class _StopCapabilityBundle:
     def __init__(self, payload: dict) -> None:
         self.payload = payload
@@ -774,6 +790,148 @@ def test_cycle_status_includes_error_fields_for_hmi(client):
     assert data["error"] is None
     assert data["errorCode"] is None
     assert data["errorDetails"] is None
+
+
+def test_operator_alert_routes_retain_latest_three_and_reveal_older(
+    client, state
+):
+    for execution_id in range(1, 5):
+        state.event_recorder._record_event(  # noqa: SLF001 - incident fixture
+            event_type="cycle_error",
+            execution_id=execution_id,
+            details={
+                "error": f"alert failure {execution_id}",
+                "error_code": f"alert_failure_{execution_id}",
+            },
+        )
+
+    response = client.get("/api/execution/alerts", params={"limit": 3})
+    assert response.status_code == 200
+    inbox = response.json()
+    assert inbox["blockingCount"] == 4
+    assert inbox["truncated"] is True
+    assert len(inbox["alerts"]) == 3
+    assert len(inbox["unacknowledgedAlertIds"]) == 4
+
+    acknowledged_id = inbox["alerts"][0]["alertId"]
+    cycle_before = client.get("/api/cycle/status").json()
+    acknowledged = client.post(
+        f"/api/execution/alerts/{acknowledged_id}/acknowledge"
+    )
+    assert acknowledged.status_code == 200
+    updated = acknowledged.json()["inbox"]
+    assert updated["blockingCount"] == 3
+    assert len(updated["alerts"]) == 3
+    assert acknowledged_id not in updated["unacknowledgedAlertIds"]
+    cycle_after = client.get("/api/cycle/status").json()
+    assert cycle_after["state"] == cycle_before["state"]
+    assert cycle_after["error"] == cycle_before["error"]
+    assert cycle_after["recoveryOffer"] == cycle_before["recoveryOffer"]
+
+    audit = client.get(
+        "/api/execution/history",
+        params={"eventTypes": "operator_alert_acknowledged"},
+    )
+    assert audit.status_code == 200
+    assert [event["type"] for event in audit.json()["events"]] == [
+        "operator_alert_acknowledged"
+    ]
+
+    replay = client.post(
+        f"/api/execution/alerts/{acknowledged_id}/acknowledge"
+    )
+    assert replay.status_code == 200
+    assert replay.json()["alreadyAcknowledged"] is True
+
+
+def test_operator_alert_acknowledge_all_rejects_stale_confirmation(client, state):
+    for execution_id in (11, 12):
+        state.event_recorder._record_event(  # noqa: SLF001 - incident fixture
+            event_type="cycle_error",
+            execution_id=execution_id,
+            details={"error": f"bulk alert {execution_id}"},
+        )
+    original = client.get("/api/execution/alerts").json()
+
+    state.event_recorder._record_event(  # noqa: SLF001 - concurrent incident
+        event_type="cycle_error",
+        execution_id=13,
+        details={"error": "new alert during confirmation"},
+    )
+    stale = client.post(
+        "/api/execution/alerts/acknowledge-all",
+        json={
+            "alertIds": original["unacknowledgedAlertIds"],
+            "expectedGeneration": original["generation"],
+            "confirmed": True,
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["errorCode"] == "operator_alert_inbox_stale"
+    current = client.get("/api/execution/alerts").json()
+    assert current["blockingCount"] == 3
+
+    unconfirmed = client.post(
+        "/api/execution/alerts/acknowledge-all",
+        json={
+            "alertIds": current["unacknowledgedAlertIds"],
+            "expectedGeneration": current["generation"],
+            "confirmed": False,
+        },
+    )
+    assert unconfirmed.status_code == 400
+
+    accepted = client.post(
+        "/api/execution/alerts/acknowledge-all",
+        json={
+            "alertIds": current["unacknowledgedAlertIds"],
+            "expectedGeneration": current["generation"],
+            "confirmed": True,
+        },
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["inbox"]["blockingCount"] == 0
+
+    audit = client.get(
+        "/api/execution/history",
+        params={"eventTypes": "operator_alerts_acknowledged"},
+    )
+    assert audit.status_code == 200
+    audit_events = audit.json()["events"]
+    assert [event["type"] for event in audit_events] == [
+        "operator_alerts_acknowledged"
+    ]
+    assert set(audit_events[0]["details"]["alert_ids"]) == set(
+        current["unacknowledgedAlertIds"]
+    )
+    assert set(audit_events[0]["details"]["execution_ids"]) == {11, 12, 13}
+
+
+def test_unacknowledged_operator_alert_blocks_run_but_not_stop_or_reset(
+    client, state
+):
+    assert client.post("/api/program/load", json={"path": _PROGRAM_PATH}).status_code == 200
+    state.event_recorder._record_event(  # noqa: SLF001 - incident fixture
+        event_type="cycle_error",
+        execution_id=41,
+        details={"error": "operator must inspect this fault"},
+    )
+
+    blocked = client.post("/api/cycle/run")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["errorCode"] == (
+        "unacknowledged_operator_alerts"
+    )
+    assert blocked.json()["detail"]["errorDetails"]["blocking_alert_count"] == 1
+    assert client.post("/api/cycle/stop").status_code == 200
+    assert client.post("/api/cycle/reset").status_code == 200
+
+    inbox = client.get("/api/execution/alerts").json()
+    alert_id = inbox["alerts"][0]["alertId"]
+    assert client.post(
+        f"/api/execution/alerts/{alert_id}/acknowledge"
+    ).status_code == 200
+    assert client.post("/api/cycle/run").status_code == 200
 
 
 def test_cycle_status_falls_back_to_kernel_snapshot_fault(state):
@@ -971,6 +1129,13 @@ def test_recovery_action_acknowledge_and_continue_does_not_reset_backend(
     )
     offer = state.cycle_manager.refresh_recovery_offer()
     before_reset_count = kernel.reset_count
+    state.event_recorder._record_event(  # noqa: SLF001 - attention-gate fixture
+        event_type="cycle_error",
+        execution_id=51,
+        details={"error": "operator attention remains required"},
+    )
+    alerts_before = client.get("/api/execution/alerts").json()
+    assert alerts_before["blockingCount"] == 1
 
     payload = {
         "requestId": "composer-ack-intervention",
@@ -982,11 +1147,18 @@ def test_recovery_action_acknowledge_and_continue_does_not_reset_backend(
     response = client.post("/api/cycle/recovery-actions", json=payload)
     assert response.status_code == 200
     assert response.json()["accepted"] is True
-    assert response.json()["cycleResumed"] is True
-    assert kernel.get_status().state in {
-        ExecutionState.IDLE,
-        ExecutionState.EXECUTING,
-    }
+    assert response.json()["cycleResumed"] is False
+    assert response.json()["resultCode"] == "accepted_resume_ready"
+    assert kernel.get_status().state == ExecutionState.IDLE
+    status = client.get("/api/cycle/status")
+    assert status.status_code == 200
+    assert status.json()["state"] == "stopped"
+    assert status.json()["motionStopState"] == "held"
+    assert status.json()["recoveryOffer"] is None
+    alerts_after = client.get("/api/execution/alerts").json()
+    assert alerts_after["unacknowledgedAlertIds"] == (
+        alerts_before["unacknowledgedAlertIds"]
+    )
     assert kernel.reset_count == before_reset_count
     request = kernel.apply_recovery_action_requests[-1]
     assert request["expected_assessment_revision"] == assessment["assessment_revision"]
@@ -997,6 +1169,18 @@ def test_recovery_action_acknowledge_and_continue_does_not_reset_backend(
     assert replay.status_code == 200
     assert replay.json() == response.json()
     assert len(kernel.apply_recovery_action_requests) == 1
+
+    blocked_resume = client.post("/api/cycle/run")
+    assert blocked_resume.status_code == 409
+    assert blocked_resume.json()["detail"]["errorCode"] == (
+        "unacknowledged_operator_alerts"
+    )
+    assert _acknowledge_all_operator_alerts(client)["blockingCount"] == 0
+
+    resume = client.post("/api/cycle/run")
+    assert resume.status_code == 200
+    assert resume.json()["state"] == "running"
+    assert resume.json()["motionStopState"] == "idle"
 
 
 def test_recovery_action_retry_after_scene_repair_does_not_reset_backend(
@@ -1028,15 +1212,25 @@ def test_recovery_action_retry_after_scene_repair_does_not_reset_backend(
     offer = manager.refresh_recovery_offer()
     before_reset_count = kernel.reset_count
 
+    payload = {
+        "requestId": "composer-retry-validation",
+        "offerId": offer["offerId"],
+        "offerRevision": offer["offerRevision"],
+        "actionId": "retry_after_scene_repair",
+    }
+    # This fixture mutates private manager fields instead of emitting the
+    # normal recorder event; force one observer pass through the public inbox.
+    assert client.get("/api/execution/alerts").json()["blockingCount"] == 1
     response = client.post(
         "/api/cycle/recovery-actions",
-        json={
-            "requestId": "composer-retry-validation",
-            "offerId": offer["offerId"],
-            "offerRevision": offer["offerRevision"],
-            "actionId": "retry_after_scene_repair",
-        },
+        json=payload,
     )
+    assert response.status_code == 409
+    assert response.json()["detail"]["errorCode"] == (
+        "unacknowledged_operator_alerts"
+    )
+    assert _acknowledge_all_operator_alerts(client)["blockingCount"] == 0
+    response = client.post("/api/cycle/recovery-actions", json=payload)
     assert response.status_code == 200
     data = response.json()
     assert data["accepted"] is True
@@ -2062,6 +2256,9 @@ def test_run_route_returns_waiting_offer_while_kernel_retains_authority(
         manager._error = "runtime collision"
         manager._error_code = "runtime_collision"
 
+    # This test targets the recovery-offer waiting state, not the independent
+    # operator-attention gate. Observe and acknowledge the incident first.
+    assert _acknowledge_all_operator_alerts(client)["blockingCount"] == 0
     response = client.post("/api/cycle/run")
 
     assert response.status_code == 409

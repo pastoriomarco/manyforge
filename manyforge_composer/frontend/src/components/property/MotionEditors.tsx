@@ -722,7 +722,7 @@ export function MotionReferenceParamEditor({
       inventory,
       { allowEmptyFrameId },
     ));
-  }, [currentValue, inventory.frameOptions, inventory.objectOptions, inventory.robotLinkOptions, allowEmptyFrameId]);
+  }, [allowEmptyFrameId, currentValue, inventory]);
 
   const commit = (nextDraft: MotionReferenceValue) => {
     setDraft(nextDraft);

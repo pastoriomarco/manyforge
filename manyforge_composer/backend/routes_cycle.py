@@ -5,6 +5,7 @@ import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
+from manyforge_behavior.cycle_recovery import RUN_AUTOMATIC_RECOVERY_ACTION_IDS
 from .models import (
     CycleCommandErrorResponse,
     CycleStatusResponse,
@@ -29,6 +30,7 @@ def _structured_command_error(
     message: str,
     *,
     error_code: Optional[str] = None,
+    error_details: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build a structured `detail` payload for a cycle-command 409.
 
@@ -40,18 +42,43 @@ def _structured_command_error(
     doesn't track (e.g. "no program loaded").
     """
     code = error_code
-    details: Optional[dict[str, Any]] = None
+    details: Optional[dict[str, Any]] = error_details
     manager = state.cycle_manager
     if manager is not None:
         _, manager_code, manager_details = active_cycle_error_fields(manager)
         code = code or manager_code
-        details = manager_details
+        if details is None:
+            details = manager_details
     return CycleCommandErrorResponse(
         message=message,
         error_code=code,
         error_details=details,
         recovery_offer=(manager.get_recovery_offer() if manager is not None else None),
     ).model_dump(by_alias=True)
+
+
+def _require_no_blocking_operator_alerts(state: ComposerState) -> None:
+    """Reject motion intent until every server-owned error alert is seen."""
+    inbox = state.event_recorder.operator_alerts(limit=3)
+    blocking_count = int(inbox.get("blockingCount") or 0)
+    if blocking_count == 0:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=_structured_command_error(
+            state,
+            (
+                f"Acknowledge {blocking_count} operator error alert"
+                f"{'s' if blocking_count != 1 else ''} before starting motion"
+            ),
+            error_code="unacknowledged_operator_alerts",
+            error_details={
+                "blocking_alert_count": blocking_count,
+                "operator_alert_generation": inbox.get("generation"),
+                "operator_alert_ids": inbox.get("unacknowledgedAlertIds", []),
+            },
+        ),
+    )
 
 
 def _refresh_visual_scene_after_reset(state: ComposerState) -> None:
@@ -148,6 +175,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                         state, "No program loaded", error_code="no_program_loaded"
                     ),
                 )
+            _require_no_blocking_operator_alerts(state)
             # Fail closed: never arm a program whose configured operator/fault stop
             # profile names a stop mode the execution backend does not advertise.
             # Running it would mean an operator Stop silently degrades to a
@@ -327,6 +355,8 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
             principal_id = (
                 getattr(request.state, "principal_id", None) or "operator_ui"
             )
+            if payload.action_id in RUN_AUTOMATIC_RECOVERY_ACTION_IDS:
+                _require_no_blocking_operator_alerts(state)
             try:
                 return state.cycle_manager.apply_recovery_action(
                     payload.model_dump(),

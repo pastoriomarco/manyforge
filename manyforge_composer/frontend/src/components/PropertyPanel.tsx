@@ -994,6 +994,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     nodeParams.box_dimensions_m,
     nodeParams.frame_id,
     nodeParams.gripper_id,
+    nodeParams.mesh_scale,
     nodeParams.pose,
     nodeParams.shape,
     nodeParams.shape_type,

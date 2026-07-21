@@ -3218,7 +3218,11 @@ class TestCycleManagerRecoveryActions:
         )
 
         assert result["accepted"] is True
-        assert manager.state == CycleState.RUNNING
+        assert result["cycleResumed"] is False
+        assert result["resultCode"] == "accepted_resume_ready"
+        assert manager.state == CycleState.STOPPED
+        assert manager.motion_stop_state == "held"
+        assert not manager._tick_pause_event.is_set()
         assert kernel.get_status().state == ExecutionState.IDLE
         assert kernel.reset_count == 0
         request = kernel.apply_recovery_action_requests[-1]
@@ -3229,6 +3233,12 @@ class TestCycleManagerRecoveryActions:
             request["expected_stop_owner_generation"]
             == assessment["stop_owner_generation"]
         )
+
+        manager.run()
+
+        assert manager.state == CycleState.RUNNING
+        assert manager.motion_stop_state == "idle"
+        assert manager._tick_pause_event.is_set()
 
     def test_acknowledge_and_continue_accepts_held_motion_intervention(self):
         manager, kernel = self._make_manager()
@@ -3263,12 +3273,20 @@ class TestCycleManagerRecoveryActions:
         )
 
         assert result["accepted"] is True
-        assert manager.state == CycleState.RUNNING
-        assert manager.motion_stop_state == "idle"
-        assert manager._tick_pause_event.is_set()
+        assert result["cycleResumed"] is False
+        assert result["resultCode"] == "accepted_resume_ready"
+        assert manager.state == CycleState.STOPPED
+        assert manager.motion_stop_state == "held"
+        assert not manager._tick_pause_event.is_set()
         assert manager.error is None
         assert kernel.get_status().state == ExecutionState.IDLE
         assert kernel.reset_count == before_reset_count
+
+        manager.run()
+
+        assert manager.state == CycleState.RUNNING
+        assert manager.motion_stop_state == "idle"
+        assert manager._tick_pause_event.is_set()
 
     def test_retry_motion_from_current_state_consumes_exact_collision_offer(self):
         manager, kernel = self._make_manager()

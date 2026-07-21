@@ -24,6 +24,7 @@ from .stop_decision_assembler import (
     StopDecisionRecord,
     sequence_ordered,
 )
+from .operator_alerts import OperatorAlertInbox
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,8 @@ _ALLOWED_EVENT_TYPES = {
     "recovery_action_requested",
     "recovery_action_accepted",
     "recovery_action_rejected",
+    "operator_alert_acknowledged",
+    "operator_alerts_acknowledged",
 }
 _ALLOWED_EVENT_PREFIXES = (
     "cycle_reset_",
@@ -83,6 +86,8 @@ _DURABLE_INFO_EVENT_TYPES = frozenset(
         "recovery_offer_published",
         "recovery_action_requested",
         "recovery_action_accepted",
+        "operator_alert_acknowledged",
+        "operator_alerts_acknowledged",
     }
 )
 _RUNS_INDEX_FILENAME = "runs.index.jsonl"
@@ -533,6 +538,8 @@ def _component_for_event(event_type: str) -> str:
         return "manyforge.cycle"
     if event_type.startswith("recovery_"):
         return "manyforge.cycle_recovery"
+    if event_type.startswith("operator_alert"):
+        return "manyforge.operator_attention"
     if event_type.startswith("kernel_") or event_type in {
         "plan_started",
         "plan_completed",
@@ -620,6 +627,7 @@ def _event_channel(event_type: str, details: Optional[dict[str, Any]]) -> str:
         or event_type.startswith("intervention_")
         or event_type == "delegated_recovery_requested"
         or event_type.startswith("cycle_reset_")
+        or event_type.startswith("operator_alert")
     ):
         return "command_runtime"
     return "execution_lifecycle"
@@ -747,6 +755,7 @@ class EventRecorder:
         self._incident_snapshots: deque[dict[str, Any]] = deque(
             maxlen=_DEFAULT_INCIDENT_SNAPSHOT_LIMIT
         )
+        self._operator_alert_inbox = OperatorAlertInbox()
         self._event_index = 0
         self._run_counter = 0
         self._current_run: Optional[_RunInfo] = None
@@ -1289,6 +1298,89 @@ class EventRecorder:
         with self._lock:
             snapshots = [dict(snapshot) for snapshot in self._incident_snapshots]
         return [] if effective_limit == 0 else snapshots[-effective_limit:]
+
+    def operator_alerts(self, *, limit: Optional[int] = None) -> dict[str, Any]:
+        """Return the server-owned operator-attention inbox, newest first."""
+        return self._operator_alert_inbox.snapshot(limit=limit)
+
+    def has_blocking_operator_alerts(self) -> bool:
+        """True while any ERROR/CRITICAL incident still needs attention."""
+        return self._operator_alert_inbox.has_blocking_alerts()
+
+    def acknowledge_operator_alert(
+        self,
+        alert_id: str,
+        *,
+        principal_id: str,
+    ) -> dict[str, Any]:
+        """Acknowledge one alert without changing execution/recovery state."""
+        alert, changed = self._operator_alert_inbox.acknowledge(alert_id)
+        if changed:
+            self._record_event(
+                event_type="operator_alert_acknowledged",
+                execution_id=int(alert.get("executionId") or 0),
+                run_id=(str(alert["runId"]) if alert.get("runId") else None),
+                principal_id=principal_id,
+                details={
+                    "alert_id": alert_id,
+                    "incident_id": alert.get("incidentId"),
+                    "recovery_context_id": alert.get("recoveryContextId"),
+                    "acknowledgement_scope": "single",
+                },
+            )
+        return {
+            "acknowledgedAlertIds": [alert_id],
+            "alreadyAcknowledged": not changed,
+            "inbox": self.operator_alerts(limit=3),
+        }
+
+    def acknowledge_all_operator_alerts(
+        self,
+        *,
+        alert_ids: list[str],
+        expected_generation: int,
+        confirmed: bool,
+        principal_id: str,
+    ) -> dict[str, Any]:
+        """Generation-fenced bulk acknowledgement of the exact current inbox."""
+        alerts = self._operator_alert_inbox.acknowledge_all(
+            alert_ids=alert_ids,
+            expected_generation=expected_generation,
+            confirmed=confirmed,
+        )
+        if alerts:
+            first = alerts[0]
+            self._record_event(
+                event_type="operator_alerts_acknowledged",
+                execution_id=int(first.get("executionId") or 0),
+                run_id=(str(first["runId"]) if first.get("runId") else None),
+                principal_id=principal_id,
+                details={
+                    "alert_ids": [str(alert["alertId"]) for alert in alerts],
+                    "incident_ids": [str(alert["incidentId"]) for alert in alerts],
+                    "recovery_context_ids": [
+                        str(alert["recoveryContextId"])
+                        for alert in alerts
+                        if alert.get("recoveryContextId")
+                    ],
+                    "run_ids": [
+                        str(alert["runId"])
+                        for alert in alerts
+                        if alert.get("runId")
+                    ],
+                    "execution_ids": [
+                        int(alert.get("executionId") or 0) for alert in alerts
+                    ],
+                    "acknowledgement_scope": "all",
+                    "acknowledged_count": len(alerts),
+                    "expected_generation": expected_generation,
+                },
+            )
+        return {
+            "acknowledgedAlertIds": [str(alert["alertId"]) for alert in alerts],
+            "alreadyAcknowledged": not alerts,
+            "inbox": self.operator_alerts(limit=3),
+        }
 
     def _observe_latency_event_locked(
         self, native_type: str, native_event: dict[str, Any]
@@ -3585,9 +3677,9 @@ class EventRecorder:
                 severity,
                 channel,
             ):
-                self._incident_snapshots.append(
-                    self._build_incident_snapshot_locked(event)
-                )
+                incident_snapshot = self._build_incident_snapshot_locked(event)
+                self._incident_snapshots.append(incident_snapshot)
+                self._operator_alert_inbox.ingest_incident(incident_snapshot)
             self._enqueue_jsonl_locked(
                 run_id=run_id,
                 json_text=json_text,

@@ -1,15 +1,72 @@
 /// <reference types="node" />
 
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import {
+  errorPresentationKey,
   headlineForError,
   hintForError,
   incidentEventSummary,
+  KernelErrorPanel,
   prettyBodyId,
   prettyPair,
 } from './KernelErrorPanel';
 
 describe('KernelErrorPanel mapping', () => {
+  describe('errorPresentationKey', () => {
+    it('keeps one runtime incident stable across incremental diagnostics', () => {
+      const first = errorPresentationKey(
+        'Motion execution ended in interrupted',
+        'runtime_collision',
+        {
+          runtime_fault_id: 'runtime-fault-7',
+          execution_id: 42,
+          lookahead_checked_samples: 8,
+        },
+      );
+      const updated = errorPresentationKey(
+        'Motion execution ended in interrupted',
+        'runtime_collision',
+        {
+          runtime_fault_id: 'runtime-fault-7',
+          execution_id: 42,
+          lookahead_checked_samples: 32,
+        },
+      );
+      const next = errorPresentationKey(
+        'Motion execution ended in interrupted',
+        'runtime_collision',
+        {
+          runtime_fault_id: 'runtime-fault-8',
+          execution_id: 43,
+        },
+      );
+
+      expect(updated).toBe(first);
+      expect(next).not.toBe(first);
+    });
+
+    it('renders a new alert collapsed to its title and alert controls', () => {
+      const html = renderToStaticMarkup(
+        createElement(KernelErrorPanel, {
+          message: 'Test runtime alert',
+          errorCode: 'test_runtime_alert',
+          errorDetails: { hidden_detail: 'only visible after expansion' },
+          presentationKey: 'incident-1',
+          onAcknowledge: () => undefined,
+          onMinimize: () => undefined,
+        }),
+      );
+
+      expect(html).toContain('aria-expanded="false"');
+      expect(html).toContain('Test runtime alert');
+      expect(html).toContain('Acknowledge alert');
+      expect(html).toContain('Minimize error to header icon');
+      expect(html).not.toContain('only visible after expansion');
+    });
+  });
+
   describe('prettyPair', () => {
     it('shortens kernel object<->robot token to operator-friendly names', () => {
       expect(

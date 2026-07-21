@@ -665,7 +665,7 @@ function AuthoredSceneCard({
     setFrameId(pose.frameId);
     setPosition(pose.position);
     setRpyDegrees(pose.rpyDegrees);
-  }, [resourceSignature]);
+  }, [resource, resourceSignature]);
 
   const commit = useCallback(() => {
     const shape =

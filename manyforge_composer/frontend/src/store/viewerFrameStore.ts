@@ -193,7 +193,6 @@ export function waitForViewerFrameGeneration(
   if (matches()) return Promise.resolve(true);
   return new Promise((resolve) => {
     let settled = false;
-    let timer: ReturnType<typeof globalThis.setTimeout>;
     const finish = (value: boolean): void => {
       if (settled) return;
       settled = true;
@@ -204,7 +203,7 @@ export function waitForViewerFrameGeneration(
     const unsubscribe = subscribeViewerFrameWake(() => {
       if (matches()) finish(true);
     });
-    timer = globalThis.setTimeout(
+    const timer = globalThis.setTimeout(
       () => finish(false),
       Math.max(1, Math.trunc(timeoutMs)),
     );

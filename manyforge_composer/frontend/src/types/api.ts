@@ -92,6 +92,87 @@ export interface ExecutionChannelsResponse {
   timestampNs: number;
 }
 
+export interface OperatorAlert {
+  schemaVersion: 'manyforge.operator_alert.v1';
+  alertId: string;
+  recoveryContextId?: string | null;
+  incidentId: string;
+  incidentIds: string[];
+  runId?: string | null;
+  executionId: number;
+  severity: 'ERROR' | 'CRITICAL';
+  errorCode: string;
+  message: string;
+  errorDetails: Record<string, unknown>;
+  triggerType?: string | null;
+  triggerChannel?: string | null;
+  firstSeenAtNs: number;
+  firstSeenAt?: string | null;
+  lastSeenAtNs: number;
+  lastSeenAt?: string | null;
+  occurrenceCount: number;
+  revision: number;
+}
+
+export interface OperatorAlertInbox {
+  schemaVersion: 'manyforge.operator_alert_inbox.v1';
+  generation: number;
+  blockingCount: number;
+  unacknowledgedAlertIds: string[];
+  alerts: OperatorAlert[];
+  truncated: boolean;
+  timestampNs: number;
+}
+
+export interface OperatorAlertAcknowledgeResponse {
+  acknowledgedAlertIds: string[];
+  alreadyAcknowledged: boolean;
+  inbox: OperatorAlertInbox;
+}
+
+export interface ExecutionHistoryEvent {
+  event_index: number;
+  sequence: number;
+  timestamp_ns: number;
+  timestamp?: string | null;
+  severity?: string | null;
+  component?: string | null;
+  channel?: string | null;
+  message?: string | null;
+  run_id?: string | null;
+  execution_id: number;
+  type: string;
+  details: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface NodeStatusTransition {
+  timestamp_ns: number;
+  run_id?: string | null;
+  execution_id: number;
+  node: string;
+  from?: string | null;
+  to: string;
+}
+
+export interface ExecutionHistoryResponse {
+  runId?: string | null;
+  runIds: string[];
+  executionId: number;
+  events: ExecutionHistoryEvent[];
+  nodeStatusTransitions: NodeStatusTransition[];
+  timestampNs: number;
+}
+
+export interface ExecutionHistoryQuery {
+  limit?: number;
+  runId?: string;
+  minSeverity?: string;
+  components?: string[];
+  eventTypes?: string[];
+  executionId?: number;
+}
+
 // Catalog
 export interface CatalogEnumOption {
   value: string;

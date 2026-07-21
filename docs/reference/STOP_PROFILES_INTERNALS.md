@@ -83,14 +83,16 @@ Stop/fault intervention recovery has two distinct paths:
   `acknowledge_and_continue` is the no-backend-reset path. It is valid only for
   the exact current assessment after fresh certificate, stop-owner, latch,
   observed-state, and lifecycle admission checks. It records
-  `backend_reset_performed=false`; a later motion still replans and revalidates.
+  `backend_reset_performed=false` and returns the kernel to its ready state
+  without dispatching motion. The cycle remains STOPPED/held until a separate
+  Run/Resume command starts fresh planning and validation.
 - The normal `Reset` lifecycle command is the reset/resync path. It may call
   `execution_backend.reset()` and, on commanded-sim lanes, may restore the
   deployment's initial simulator state.
 
 `CycleManager.run()` must not choose either path implicitly from
 `STOPPED + INTERVENTION_REQUIRED`. Composer renders the exact current cycle
-recovery offer with **Acknowledge and continue**, **Reset cycle**, or no enabled
+recovery offer with **Acknowledge fault**, **Reset cycle**, or no enabled
 action while evidence remains incomplete.
 
 ## 2.1 Lane Matrix

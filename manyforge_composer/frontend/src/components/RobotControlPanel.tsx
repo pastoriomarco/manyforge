@@ -2261,7 +2261,7 @@ function JointRow({
       el.removeEventListener('input', onNativeInput);
       el.removeEventListener('change', onNativeChange);
     };
-  }, []);
+  }, [setDraft]);
 
   function draftFollow(raw: string): void {
     if (disabled) return;

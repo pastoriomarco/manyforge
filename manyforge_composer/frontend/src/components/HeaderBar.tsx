@@ -1,10 +1,19 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api/client';
 import { useCycleStore, useEditLocked } from '../store/cycleStore';
-import { KernelErrorPanel } from './KernelErrorPanel';
+import {
+  errorPresentationKey,
+  headlineForError,
+  KernelErrorPanel,
+} from './KernelErrorPanel';
 import { useProgramStore } from '../store/programStore';
 import { useDeploymentStore } from '../store/deploymentStore';
 import { FileBrowserDialog } from './FileBrowserDialog';
+import { ExecutionHistoryPanel } from './ExecutionHistoryPanel';
+import {
+  useOperatorAlertPolling,
+  useOperatorAlertStore,
+} from '../store/operatorAlertStore';
 import type { FullDeployment, TreeNode } from '../types/api';
 
 function signature(value: unknown): string {
@@ -95,15 +104,36 @@ function StatusDot({
   );
 }
 
+function summarizeValidationErrors(
+  errors: Array<{ path: string; message: string }>,
+): string {
+  const summary = errors
+    .slice(0, 3)
+    .map((issue) => `${issue.path}: ${issue.message}`)
+    .join(' | ');
+  if (errors.length <= 3) {
+    return summary;
+  }
+  return `${summary} | …and ${errors.length - 3} more`;
+}
+
 export function HeaderBar() {
+  useOperatorAlertPolling();
   const {
     state: cycleState,
     error,
     errorCode: cycleErrorCode,
     errorDetails: cycleErrorDetails,
-    recoveryOffer,
-    applyRecoveryAction,
   } = useCycleStore();
+  const {
+    alerts: operatorAlerts,
+    blockingCount: operatorAlertCount,
+    loaded: operatorAlertsLoaded,
+    busy: operatorAlertsBusy,
+    error: operatorAlertsError,
+    acknowledge: acknowledgeOperatorAlert,
+    acknowledgeAll: acknowledgeAllOperatorAlerts,
+  } = useOperatorAlertStore();
   const {
     flowToTree,
     appliedTree,
@@ -268,39 +298,87 @@ export function HeaderBar() {
     || signature(appliedBlackboardNamespaces) !== signature(savedBlackboardNamespaces)
     || signature(appliedBlackboardKeys) !== signature(savedBlackboardKeys)
     || !deploymentAppliedMatchesSaved;
-  // Resolve the active error to a uniform { message, errorCode, errorDetails }
-  // shape. Precedence:
-  //   1. actionError — a fresh cycle-command 409 (highest priority because
-  //      it represents the operator's most recent action).
-  //   2. cycle store error — pushed via WebSocket from the cycle manager,
-  //      carries the runtime-fault structured cause (collision_detected /
-  //      interrupt_latched harvest, motion-soft-fail diagnostics, etc.).
-  //   3. programError / deploymentError — frontend validation/transport
-  //      errors that don't carry kernel diagnostics. Rendered with the
-  //      panel's generic-banner fallback (no errorCode mapping).
-  let activeError: ActionErrorState | null = null;
-  if (actionError) {
-    activeError = actionError;
-  } else if (error) {
-    activeError = {
-      message: error,
-      errorCode: cycleErrorCode ?? null,
-      errorDetails: cycleErrorDetails ?? null,
-    };
-  } else if (programError || deploymentError) {
-    activeError = {
-      message: programError || deploymentError!,
-      errorCode: null,
-      errorDetails: null,
-    };
+  // Runtime incidents come from the server inbox. Keep a single local fallback
+  // only for browser-side program/deployment failures (and for the brief first
+  // render before the inbox has loaded). Once the inbox is loaded, an
+  // acknowledged runtime alert must not be recreated from the still-latched
+  // cycle error.
+  let localError: ActionErrorState | null = null;
+  if (operatorAlertCount === 0) {
+    if (actionError) {
+      localError = actionError;
+    } else if ((!operatorAlertsLoaded || operatorAlertsError) && error) {
+      localError = {
+        message: error,
+        errorCode: cycleErrorCode ?? null,
+        errorDetails: cycleErrorDetails ?? null,
+      };
+    } else if (programError || deploymentError) {
+      localError = {
+        message: programError || deploymentError!,
+        errorCode: null,
+        errorDetails: null,
+      };
+    }
   }
-  const activeErrorFingerprint = activeError
-    ? `${activeError.message}|${activeError.errorCode ?? ''}|${signature(activeError.errorDetails)}`
+  const localErrorFingerprint = localError
+    ? `${localError.message}|${localError.errorCode ?? ''}|${signature(localError.errorDetails)}`
     : '';
-  const [incidentSnapshot, setIncidentSnapshot] = useState<Record<string, unknown> | null>(null);
+  const localErrorPresentationKey = localError
+    ? errorPresentationKey(
+        localError.message,
+        localError.errorCode,
+        localError.errorDetails,
+      )
+    : '';
+  const localErrorHeadline = localError
+    ? headlineForError(
+        localError.errorCode,
+        localError.errorDetails,
+        localError.message,
+      )
+    : '';
+  const [minimizedLocalErrorKey, setMinimizedLocalErrorKey] = useState<string | null>(null);
+  const [acknowledgedLocalErrorKey, setAcknowledgedLocalErrorKey] = useState<string | null>(null);
   useEffect(() => {
-    if (!activeErrorFingerprint) {
-      setIncidentSnapshot(null);
+    if (!localErrorPresentationKey) {
+      setMinimizedLocalErrorKey(null);
+      setAcknowledgedLocalErrorKey(null);
+    }
+  }, [localErrorPresentationKey]);
+  const localErrorIsMinimized = Boolean(
+    localErrorPresentationKey
+    && minimizedLocalErrorKey === localErrorPresentationKey,
+  );
+  const localErrorIsAcknowledged = Boolean(
+    localErrorPresentationKey
+    && acknowledgedLocalErrorKey === localErrorPresentationKey,
+  );
+  const [operatorAlertStackMinimized, setOperatorAlertStackMinimized] = useState(false);
+  const [showAcknowledgeAllConfirm, setShowAcknowledgeAllConfirm] = useState(false);
+  const [showExecutionHistory, setShowExecutionHistory] = useState(false);
+  const previousOperatorAlertIds = useRef<string[]>([]);
+  const operatorAlertIdsKey = operatorAlerts.map((alert) => alert.alertId).join('|');
+  useEffect(() => {
+    const previous = new Set(previousOperatorAlertIds.current);
+    const hasNewAlert = operatorAlerts.some((alert) => !previous.has(alert.alertId));
+    if (hasNewAlert) setOperatorAlertStackMinimized(false);
+    if (operatorAlertCount === 0) {
+      setOperatorAlertStackMinimized(false);
+      setShowAcknowledgeAllConfirm(false);
+    }
+    previousOperatorAlertIds.current = operatorAlerts.map((alert) => alert.alertId);
+  }, [operatorAlertCount, operatorAlertIdsKey, operatorAlerts]);
+
+  const [incidentSnapshotsById, setIncidentSnapshotsById] = useState<
+    Record<string, Record<string, unknown>>
+  >({});
+  const alertIncidentKey = operatorAlerts
+    .map((alert) => `${alert.alertId}:${alert.revision}:${alert.incidentId}`)
+    .join('|');
+  useEffect(() => {
+    if (!alertIncidentKey && !localErrorFingerprint) {
+      setIncidentSnapshotsById({});
       return;
     }
     let cancelled = false;
@@ -309,31 +387,41 @@ export function HeaderBar() {
         if (cancelled) {
           return;
         }
-        const snapshots = payload.incidentSnapshots;
-        const latest = snapshots.length > 0 ? snapshots[snapshots.length - 1] : null;
-        setIncidentSnapshot(latest ?? null);
+        const byId: Record<string, Record<string, unknown>> = {};
+        payload.incidentSnapshots.forEach((snapshot) => {
+          const incidentId = snapshot.incidentId;
+          if (typeof incidentId === 'string') byId[incidentId] = snapshot;
+        });
+        setIncidentSnapshotsById(byId);
       })
       .catch(() => {
-        if (!cancelled) {
-          setIncidentSnapshot(null);
-        }
+        if (!cancelled) setIncidentSnapshotsById({});
       });
     return () => {
       cancelled = true;
     };
-  }, [activeErrorFingerprint]);
-  const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
+  }, [alertIncidentKey, localErrorFingerprint]);
+  const localIncidentSnapshot = Object.values(incidentSnapshotsById).at(-1) ?? null;
 
-  const summarizeValidationErrors = (errors: Array<{ path: string; message: string }>): string => {
-    const summary = errors
-      .slice(0, 3)
-      .map((issue) => `${issue.path}: ${issue.message}`)
-      .join(' | ');
-    if (errors.length <= 3) {
-      return summary;
+  const acknowledgeOneAlert = useCallback(async (alertId: string) => {
+    try {
+      await acknowledgeOperatorAlert(alertId);
+      setActionError(null);
+    } catch (reason) {
+      setActionError(reason);
     }
-    return `${summary} | …and ${errors.length - 3} more`;
-  };
+  }, [acknowledgeOperatorAlert, setActionError]);
+
+  const confirmAcknowledgeAll = useCallback(async () => {
+    setShowAcknowledgeAllConfirm(false);
+    try {
+      await acknowledgeAllOperatorAlerts();
+      setActionError(null);
+    } catch (reason) {
+      setActionError(reason);
+    }
+  }, [acknowledgeAllOperatorAlerts, setActionError]);
+  const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
 
   const applyDrafts = useCallback(async (forceDiscardOverrides: boolean) => {
     const payload: {
@@ -423,7 +511,6 @@ export function HeaderBar() {
     validateDraftGraph,
     setAppliedDeploymentToDraft,
     setAppliedToDraft,
-    summarizeValidationErrors,
   ]);
 
   const saveDrafts = useCallback(async () => {
@@ -774,7 +861,7 @@ export function HeaderBar() {
   const canSaveAs = (!editLocked && !!programInfo) || (!editLocked && !!deployment);
 
   return (
-    <div className="border-b border-gray-700 bg-gray-900">
+    <div className="relative z-40 shrink-0 border-b border-gray-700 bg-gray-900">
       <div className="flex h-11 items-center gap-3 px-3">
         {/* Program identity + passive state indicators */}
         <div className="flex min-w-0 items-center gap-3">
@@ -799,6 +886,56 @@ export function HeaderBar() {
           {programLoading && (
             <span className="text-xs text-gray-400">Loading program…</span>
           )}
+          {operatorAlertCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setOperatorAlertStackMinimized((value) => !value)}
+              className="relative rounded border border-red-500/80 bg-red-950/70 p-1 text-red-100 transition-colors hover:bg-red-900/80"
+              aria-label={`${operatorAlertStackMinimized ? 'Show' : 'Minimize'} ${operatorAlertCount} unacknowledged error alerts`}
+              title={`${operatorAlertCount} unacknowledged error alert${operatorAlertCount === 1 ? '' : 's'}`}
+            >
+              <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.6" aria-hidden>
+                <path d="M8 2.2 14 13H2L8 2.2Z" strokeLinejoin="round" />
+                <path d="M8 5.5v3.8M8 11.6v.2" strokeLinecap="round" />
+              </svg>
+              <span className="absolute -right-2 -top-2 min-w-4 rounded-full bg-red-500 px-1 text-center text-[9px] font-bold leading-4 text-white">
+                {operatorAlertCount > 99 ? '99+' : operatorAlertCount}
+              </span>
+            </button>
+          )}
+          {localError && localErrorIsMinimized && (
+            <button
+              type="button"
+              onClick={() => setMinimizedLocalErrorKey(null)}
+              className={`relative rounded border p-1 transition-colors ${
+                localErrorIsAcknowledged
+                  ? 'border-red-900/70 bg-gray-800 text-red-300 hover:bg-gray-700'
+                  : 'border-red-500/80 bg-red-950/70 text-red-100 hover:bg-red-900/80'
+              }`}
+              aria-label={`Show active error: ${localErrorHeadline}`}
+              title={localErrorHeadline}
+            >
+              <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.6" aria-hidden>
+                <path d="M8 2.2 14 13H2L8 2.2Z" strokeLinejoin="round" />
+                <path d="M8 5.5v3.8M8 11.6v.2" strokeLinecap="round" />
+              </svg>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setShowExecutionHistory((value) => !value)}
+            className="relative rounded border border-gray-600 bg-gray-800 p-1 text-gray-300 transition-colors hover:bg-gray-700 hover:text-white"
+            aria-label="Show messages and execution history"
+            title="Messages and execution history"
+          >
+            <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.5" aria-hidden>
+              <path d="M2.5 3.5h11v8h-7L3 14v-2.5h-.5z" strokeLinejoin="round" />
+              <path d="M5 6h6M5 8.5h4" strokeLinecap="round" />
+            </svg>
+            {(operatorAlertCount > 0 || operatorAlertsError) && (
+              <span className={`absolute -right-1 -top-1 h-2 w-2 rounded-full ${operatorAlertsError ? 'bg-amber-400' : 'bg-red-400'}`} />
+            )}
+          </button>
         </div>
 
         {/* Document group, then runtime group — Apply is the one accent */}
@@ -855,30 +992,115 @@ export function HeaderBar() {
         </div>
       </div>
 
-      {activeError && (
-        <div className="px-3 pb-2">
+      {operatorAlertCount > 0 && !operatorAlertStackMinimized && (
+        <div className="pointer-events-none absolute inset-x-3 top-full z-50 max-h-[calc(100vh-4rem)] overflow-y-auto pt-2">
+          <div className="pointer-events-auto mb-2 flex flex-wrap items-center gap-2 rounded border border-red-800/70 bg-gray-950/90 px-3 py-2 text-xs text-gray-200 shadow-xl shadow-black/50 backdrop-blur-sm">
+            <span className="font-semibold text-red-100">
+              {operatorAlertCount} unacknowledged error alert{operatorAlertCount === 1 ? '' : 's'}
+            </span>
+            <span className="text-gray-400">
+              Showing newest {Math.min(3, operatorAlertCount)}
+            </span>
+            {operatorAlertsError && (
+              <span
+                className="max-w-md truncate text-red-300"
+                title={operatorAlertsError}
+              >
+                {operatorAlertsError}
+              </span>
+            )}
+            <div className="ml-auto flex items-center gap-2">
+              <button
+                type="button"
+                disabled={operatorAlertsBusy}
+                onClick={() => setShowAcknowledgeAllConfirm(true)}
+                className="rounded border border-red-500/60 bg-red-950/50 px-2 py-1 font-medium text-red-100 hover:bg-red-900/60 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Acknowledge all
+              </button>
+              <button
+                type="button"
+                onClick={() => setOperatorAlertStackMinimized(true)}
+                className="rounded p-1 text-gray-400 hover:bg-gray-800 hover:text-white"
+                aria-label="Minimize alerts to header icon"
+                title="Minimize alerts to header icon"
+              >
+                <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.6" aria-hidden>
+                  <path d="M3 8h10" strokeLinecap="round" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          {showAcknowledgeAllConfirm && (
+            <div
+              role="dialog"
+              aria-label="Acknowledge all error alerts confirmation"
+              className="pointer-events-auto mb-2 rounded border border-red-500/70 bg-gray-950 px-3 py-3 text-xs text-red-100 shadow-xl shadow-black/60"
+            >
+              <div className="font-semibold">Acknowledge all {operatorAlertCount} alerts?</div>
+              <div className="mt-1 text-red-200/80">
+                This marks every currently listed error as seen. It does not clear a fault,
+                reset the cycle, resume execution, or move the robot. If a new alert arrives
+                before confirmation, the backend will reject this request.
+              </div>
+              <div className="mt-2 flex gap-2">
+                <button
+                  type="button"
+                  disabled={operatorAlertsBusy}
+                  onClick={() => void confirmAcknowledgeAll()}
+                  className="rounded border border-red-400/70 bg-red-800 px-2.5 py-1 font-semibold text-white hover:bg-red-700 disabled:opacity-50"
+                >
+                  Confirm acknowledge all
+                </button>
+                <button
+                  type="button"
+                  disabled={operatorAlertsBusy}
+                  onClick={() => setShowAcknowledgeAllConfirm(false)}
+                  className="rounded border border-gray-600 bg-gray-800 px-2.5 py-1 font-semibold text-gray-200 hover:bg-gray-700 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+          <div className="grid gap-2">
+            {operatorAlerts.map((alert) => (
+              <KernelErrorPanel
+                key={alert.alertId}
+                message={alert.message}
+                errorCode={alert.errorCode}
+                errorDetails={alert.errorDetails}
+                incidentSnapshot={incidentSnapshotsById[alert.incidentId] ?? null}
+                presentationKey={alert.alertId}
+                onAcknowledge={() => void acknowledgeOneAlert(alert.alertId)}
+                onMinimize={() => setOperatorAlertStackMinimized(true)}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {localError && !localErrorIsMinimized && operatorAlertCount === 0 && (
+        <div className="pointer-events-none absolute inset-x-3 top-full z-50 pt-2">
           <KernelErrorPanel
-            message={activeError.message}
-            errorCode={activeError.errorCode}
-            errorDetails={activeError.errorDetails}
-            incidentSnapshot={incidentSnapshot}
-            recoveryOffer={recoveryOffer}
-            recoveryActionBusy={busy}
-            onRecoveryAction={async (offer, actionId) => {
-              setBusy(true);
-              try {
-                await applyRecoveryAction(offer, actionId);
-                setActionError(null);
-              } catch (e) {
-                setActionError(e);
-              } finally {
-                setBusy(false);
-              }
+            message={localError.message}
+            errorCode={localError.errorCode}
+            errorDetails={localError.errorDetails}
+            incidentSnapshot={localIncidentSnapshot}
+            presentationKey={localErrorPresentationKey}
+            onAcknowledge={() => {
+              setAcknowledgedLocalErrorKey(localErrorPresentationKey);
+              setMinimizedLocalErrorKey(localErrorPresentationKey);
             }}
-            onRecoveryActionError={setActionError}
+            onMinimize={() => setMinimizedLocalErrorKey(localErrorPresentationKey)}
           />
         </div>
       )}
+
+      <ExecutionHistoryPanel
+        open={showExecutionHistory}
+        onClose={() => setShowExecutionHistory(false)}
+      />
 
       {browserSession && (
         <FileBrowserDialog

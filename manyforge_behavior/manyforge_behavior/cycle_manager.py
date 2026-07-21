@@ -2600,6 +2600,99 @@ class CycleManager:
         )
         return True
 
+    def _arm_resume_after_accepted_acknowledgement(
+        self,
+        *,
+        offer: CycleRecoveryOffer,
+        recovery_request_id: str,
+        runtime_participant: Optional[Any] = None,
+    ) -> bool:
+        """Consume the accepted fault generation without waking the tree.
+
+        ``acknowledge_and_continue`` is a two-press operator boundary. The
+        kernel acknowledgement clears the intervention latch and returns the
+        execution plane to Idle; this helper prepares the exact held behavior
+        context for a later Run/Resume command while keeping the cycle and
+        tick loop stopped. It must run under the lifecycle + tree-tick locks so
+        no behavior can observe a partially armed continuation.
+        """
+        fault_ids = tuple(
+            ref[len("runtime_fault:") :]
+            for ref in offer.evidence_refs
+            if ref.startswith("runtime_fault:")
+        )
+        with self._lock:
+            resumable = (
+                self._state == CycleState.STOPPED
+                and self._tree is not None
+                and not self._tree_is_terminal()
+            ) or (
+                self._state == CycleState.RUNNING
+                and (self._motion_stop_state == "held" or bool(fault_ids))
+            )
+            if not resumable:
+                return False
+            if (
+                runtime_participant is not None
+                and not runtime_participant.accept_runtime_recovery(
+                    recovery_request_id=recovery_request_id,
+                    expected_execution_id=int(offer.execution_id or 0),
+                )
+            ):
+                return False
+
+            selected_faults = tuple(
+                fault
+                for fault_id in fault_ids
+                if (fault := self._runtime_pause_registry.get(fault_id)) is not None
+            )
+            if len(selected_faults) != len(fault_ids):
+                return False
+            if fault_ids and not self._runtime_pause_registry.request_resume(
+                fault_ids,
+                recovery_request_id=recovery_request_id,
+            ):
+                return False
+            # The tree remains paused, so consume the exact grants now. Node-
+            # owned RuntimePauseMixin handles observe the missing registry
+            # generation on the first later tick and clear their local handle;
+            # cycle-owned faults have no node consumer and must also be retired
+            # here. No behavior can execute until the separate Run command.
+            for fault in selected_faults:
+                if (
+                    self._runtime_pause_registry.consume_resume(
+                        fault.fault_id,
+                        expected_generation=fault.generation,
+                    )
+                    is None
+                ):
+                    return False
+            if fault_ids:
+                consumed = set(fault_ids)
+                self._cycle_runtime_fault_ids = {
+                    condition_id: fault_id
+                    for condition_id, fault_id in self._cycle_runtime_fault_ids.items()
+                    if fault_id not in consumed
+                }
+
+            self._pending_delegated_recovery = None
+            self._motion_stop_state = "held"
+            self._error = None
+            self._error_code = None
+            self._error_details = None
+            self._tick_pause_event.clear()
+            self._state = CycleState.STOPPED
+
+        self._set_stop_requested_flag(
+            True,
+            client_name="cycle_manager_recovery_resume_ready",
+        )
+        self._set_motion_stop_active_flag(
+            False,
+            client_name="cycle_manager_recovery_resume_ready",
+        )
+        return True
+
     @staticmethod
     def _recovery_request_fingerprint(
         request: dict[str, Any],
@@ -2965,12 +3058,25 @@ class CycleManager:
                             "recoveryOffer": accepted_offer.to_wire(),
                         }
 
-                    cycle_resumed = self._resume_after_accepted_recovery(
-                        offer=accepted_offer,
-                        recovery_request_id=request_id,
-                        runtime_participant=runtime_participant,
-                    )
-                    if not cycle_resumed and not kernel_action_accepted:
+                    resume_ready = False
+                    if action.action_id == "acknowledge_and_continue":
+                        resume_ready = self._arm_resume_after_accepted_acknowledgement(
+                            offer=accepted_offer,
+                            recovery_request_id=request_id,
+                            runtime_participant=runtime_participant,
+                        )
+                        cycle_resumed = False
+                    else:
+                        cycle_resumed = self._resume_after_accepted_recovery(
+                            offer=accepted_offer,
+                            recovery_request_id=request_id,
+                            runtime_participant=runtime_participant,
+                        )
+                    if (
+                        not resume_ready
+                        and not cycle_resumed
+                        and not kernel_action_accepted
+                    ):
                         error = {
                             "code": "recovery_action_rejected",
                             "message": (
@@ -2998,9 +3104,13 @@ class CycleManager:
                     self.refresh_recovery_offer()
                     newest = self._recovery_coordinator.current_offer()
                     result_code = (
-                        "accepted"
-                        if cycle_resumed
-                        else "kernel_accepted_cycle_context_superseded"
+                        "accepted_resume_ready"
+                        if resume_ready
+                        else (
+                            "accepted"
+                            if cycle_resumed
+                            else "kernel_accepted_cycle_context_superseded"
+                        )
                     )
                     self._emit_recovery_action_event(
                         "accepted",
@@ -3009,6 +3119,7 @@ class CycleManager:
                             "performs_backend_reset": False,
                             "kernel_action_result": kernel_result,
                             "cycle_resumed": cycle_resumed,
+                            "cycle_resume_ready": resume_ready,
                             "result_code": result_code,
                         },
                     )

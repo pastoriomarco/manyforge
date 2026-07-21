@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-07-18 14:53:45 UTC
+  Last regenerated: 2026-07-20 22:16:35 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -68,6 +68,9 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/direct/pending-recovery` | direct | Get Pending Delegated Recovery |
 | `POST` | `/api/direct/promote` | direct | Promote Intervention Blackboard |
 | `GET` | `/api/direct/status` | direct | Get Intervention Status |
+| `GET` | `/api/execution/alerts` | execution | Get Operator Alerts |
+| `POST` | `/api/execution/alerts/acknowledge-all` | execution | Acknowledge All Operator Alerts |
+| `POST` | `/api/execution/alerts/{alert_id}/acknowledge` | execution | Acknowledge Operator Alert |
 | `GET` | `/api/execution/blackboard` | execution | Get Blackboard Snapshot |
 | `GET` | `/api/execution/channels` | execution | Get Execution Channels |
 | `GET` | `/api/execution/digest` | execution | Get Execution Digest |

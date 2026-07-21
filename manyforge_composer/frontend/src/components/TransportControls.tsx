@@ -5,6 +5,11 @@ import {
   useRobotCommandAuthority,
 } from '../store/commandAuthority';
 import { useSceneStateStore } from '../store/sceneStateStore';
+import {
+  operatorAttentionBlocksMotion,
+  useOperatorAlertPolling,
+  useOperatorAlertStore,
+} from '../store/operatorAlertStore';
 import { useStatusPolling, useStatusStore } from '../store/statusStore';
 import {
   buildStopExecutionWarning,
@@ -13,8 +18,11 @@ import {
   shouldFreezeVelocitySlider,
 } from '../store/stopProfile';
 import {
-  RecoveryActionControls,
+  recoveryActionConfirmationText,
   recoveryActionLabel,
+  recoveryActionsForTransport,
+  recoveryOfferHeadline,
+  isMotionProducingRecoveryAction,
 } from './RecoveryActionControls';
 
 /**
@@ -27,6 +35,7 @@ import {
  * cycle is actually armable (color = state, not decoration).
  */
 export function TransportControls() {
+  useOperatorAlertPolling();
   const {
     state,
     motionStopState,
@@ -40,6 +49,9 @@ export function TransportControls() {
     applyRecoveryAction,
     setVelocityScale,
   } = useCycleStore();
+  const operatorAlertsLoaded = useOperatorAlertStore((store) => store.loaded);
+  const operatorAlertCount = useOperatorAlertStore((store) => store.blockingCount);
+  const operatorAlertsError = useOperatorAlertStore((store) => store.error);
   const runAuthority = useRobotCommandAuthority({
     // Run admission is owned by the backend and kernel. Visual-state freshness
     // must not keep the viewer producer alive or become a second safety gate.
@@ -52,6 +64,7 @@ export function TransportControls() {
   const [cycleBusy, setCycleBusy] = useState(false);
   const [stopInProgress, setStopInProgress] = useState(false);
   const [showFullStopMenu, setShowFullStopMenu] = useState(false);
+  const [pendingRecoveryActionId, setPendingRecoveryActionId] = useState<string | null>(null);
   const [velocityDraft, setVelocityDraft] = useState(velocityScale);
   const pendingVelocityScaleRef = useRef<number | null>(null);
   const velocityScaleInFlightRef = useRef(false);
@@ -60,12 +73,27 @@ export function TransportControls() {
 
   const stopGate = evaluateStopRunGate(runtime);
   const stopExecutionWarning = buildStopExecutionWarning(errorDetails);
-  const primaryRecoveryAction = recoveryOffer?.actions.find(
-    (action) => action.actionId === recoveryOffer.primaryAction,
+  const {
+    primaryAction: primaryRecoveryAction,
+    resetAction: resetRecoveryAction,
+  } = recoveryActionsForTransport(recoveryOffer);
+  const confirmationAction = recoveryOffer?.actions.find(
+    (action) => action.actionId === pendingRecoveryActionId,
   );
-  const primaryRecoveryReady = Boolean(
-    recoveryOffer?.status === 'retry_ready' && primaryRecoveryAction?.enabled,
+  const primaryIsAcknowledgement =
+    primaryRecoveryAction?.actionId === 'acknowledge_and_continue';
+  const primaryStartsMotion = primaryRecoveryAction
+    ? isMotionProducingRecoveryAction(primaryRecoveryAction.actionId)
+    : recoveryOffer === null;
+  const operatorAttentionBlocksPrimary = operatorAttentionBlocksMotion(
+    primaryStartsMotion,
+    operatorAlertsLoaded,
+    operatorAlertsError,
+    operatorAlertCount,
   );
+  useEffect(() => {
+    setPendingRecoveryActionId(null);
+  }, [recoveryOffer?.offerId, recoveryOffer?.offerRevision]);
   // The velocity slider is frozen only while a stop is in flight; after the
   // robot reaches STOPPED the operator may choose the resume scale.
   const frozen = shouldFreezeVelocitySlider(state, stopInProgress, motionStopState);
@@ -75,7 +103,7 @@ export function TransportControls() {
     frozenRef.current = frozen;
   }, [frozen]);
 
-  const motionHeld = state === 'running' && motionStopState === 'held';
+  const motionHeld = motionStopState === 'held';
   const running = state === 'running' && motionStopState === 'idle';
   const stopping = state === 'stopping' || motionStopState === 'stopping' || stopInProgress;
   const runAuthorityAllowsResume =
@@ -89,8 +117,10 @@ export function TransportControls() {
     !stopping &&
     runAuthorityAllowsResume &&
     !stopGate.blocked;
-  const canRun = canRunWithoutRecovery && (
-    recoveryOffer === null || primaryRecoveryReady
+  const canRun = !operatorAttentionBlocksPrimary && (
+    recoveryOffer !== null
+      ? Boolean(primaryRecoveryAction?.enabled)
+      : canRunWithoutRecovery
   );
   // Stop applies to in-flight motion the operator can see — BT
   // execution (state==='running') or an intervention / direct-jog
@@ -113,6 +143,26 @@ export function TransportControls() {
       }
     },
     [],
+  );
+
+  const requestRecoveryAction = useCallback(
+    (actionId: string, requiresConfirmation: boolean) => {
+      if (!recoveryOffer) {
+        return;
+      }
+      if (requiresConfirmation) {
+        setPendingRecoveryActionId(actionId);
+        return;
+      }
+      if (isMotionProducingRecoveryAction(actionId)) {
+        // Submit current motion intent. The backend resolves the latest offer
+        // atomically, avoiding the stale cached-revision two-click failure.
+        void runCycleCommand(run);
+        return;
+      }
+      void runCycleCommand(() => applyRecoveryAction(recoveryOffer, actionId));
+    },
+    [applyRecoveryAction, recoveryOffer, run, runCycleCommand],
   );
 
   const flushVelocityScale = useCallback(() => {
@@ -212,9 +262,78 @@ export function TransportControls() {
       : resetMeaningful
         ? `Reset the cycle to its initial state (discards the current ${state} state)`
         : 'Reset the cycle to its initial state';
+  const primaryControlLabel = primaryRecoveryAction
+    ? recoveryActionLabel(primaryRecoveryAction)
+    : recoveryOffer
+      ? recoveryOffer.status === 'waiting'
+        ? 'Recovery waiting'
+        : recoveryOffer.status === 'reset_required'
+          ? 'Reset required'
+          : 'Recovery unavailable'
+      : running
+        ? 'Running'
+        : motionHeld
+          ? 'Resume Motion'
+          : 'Run';
+  const primaryControlTitle = operatorAttentionBlocksPrimary
+    ? operatorAlertsError
+      ? 'Operator alert status is unavailable; motion remains disabled'
+      : operatorAlertsLoaded
+      ? `Acknowledge ${operatorAlertCount} error alert${operatorAlertCount === 1 ? '' : 's'} before starting motion`
+      : 'Checking unacknowledged operator alerts before enabling motion'
+    : recoveryOffer
+    ? primaryRecoveryAction
+      ? primaryRecoveryAction.disabledReasonCode
+        ?? (
+          primaryRecoveryAction.requiresConfirmation
+            ? `${recoveryActionLabel(primaryRecoveryAction)} requires confirmation`
+            : recoveryActionLabel(primaryRecoveryAction)
+        )
+      : `${recoveryOfferHeadline(recoveryOffer)}: ${recoveryOffer.reasonCode}`
+    : canRun
+      ? motionHeld
+        ? 'Resume the held motion branch'
+        : 'Start the loaded program'
+      : stopGate.blocked && stopGate.reason !== null
+        ? stopGate.reason
+        : runAuthority.reason !== null && !runAuthorityAllowsResume
+          ? runAuthority.reason
+          : stopping
+            ? 'Robot is stopping'
+            : `Cycle is ${state}`;
+  const resetControlDisabled = cycleBusy || (
+    resetRecoveryAction
+      ? !resetRecoveryAction.enabled
+      : resetBlockedByStop
+  );
+  const resetControlTitle = resetRecoveryAction
+    ? resetRecoveryAction.disabledReasonCode
+      ?? (
+        resetRecoveryAction.requiresConfirmation
+          ? 'Reset cycle requires confirmation'
+          : recoveryActionLabel(resetRecoveryAction)
+      )
+    : resetTitle;
 
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-3 z-30 flex flex-col items-center gap-2">
+      {operatorAlertsLoaded && operatorAlertCount > 0 && (
+        <div
+          role="status"
+          className="pointer-events-auto max-w-md rounded-md border border-red-700/70 bg-red-950/85 px-3 py-1.5 text-xs text-red-200 shadow-lg"
+        >
+          Acknowledge all {operatorAlertCount} error alert{operatorAlertCount === 1 ? '' : 's'}
+          {' '}before resuming, retrying, or replanning motion.
+        </div>
+      )}
+      {operatorAlertsError && (
+        <div
+          role="alert"
+          className="pointer-events-auto max-w-md rounded-md border border-red-700/70 bg-red-950/85 px-3 py-1.5 text-xs text-red-200 shadow-lg"
+        >
+          Operator alert status is unavailable; motion controls remain disabled.
+        </div>
+      )}
       {stopGate.blocked && stopGate.reason !== null && (
         <div
           role="alert"
@@ -235,15 +354,43 @@ export function TransportControls() {
           {stopExecutionWarning}
         </div>
       )}
-      {recoveryOffer && (
-        <div className="pointer-events-auto w-[min(560px,calc(100vw-24px))] rounded border border-amber-500/70 bg-gray-950/95 px-3 py-2 shadow-xl shadow-black/50">
-          <RecoveryActionControls
-            offer={recoveryOffer}
-            busy={cycleBusy}
-            onAction={(offer, actionId) =>
-              runCycleCommand(() => applyRecoveryAction(offer, actionId))
-            }
-          />
+      {confirmationAction && recoveryOffer && (
+        <div
+          role="dialog"
+          aria-label={`${recoveryActionLabel(confirmationAction)} confirmation`}
+          className="pointer-events-auto w-[min(520px,calc(100vw-24px))] rounded border border-amber-500/70 bg-gray-950/95 px-3 py-2 text-xs text-amber-100 shadow-xl shadow-black/50"
+        >
+          <div className="font-semibold">Confirm {recoveryActionLabel(confirmationAction)}</div>
+          <div className="mt-1 leading-5 text-amber-100/85">
+            {recoveryActionConfirmationText(confirmationAction)}
+          </div>
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              disabled={cycleBusy || !confirmationAction.enabled}
+              onClick={() => {
+                setPendingRecoveryActionId(null);
+                if (isMotionProducingRecoveryAction(confirmationAction.actionId)) {
+                  void runCycleCommand(run);
+                } else {
+                  void runCycleCommand(() =>
+                    applyRecoveryAction(recoveryOffer, confirmationAction.actionId),
+                  );
+                }
+              }}
+              className="rounded border border-amber-400/70 bg-amber-800 px-2.5 py-1 font-semibold text-white hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Confirm
+            </button>
+            <button
+              type="button"
+              disabled={cycleBusy}
+              onClick={() => setPendingRecoveryActionId(null)}
+              className="rounded border border-gray-600 bg-gray-800 px-2.5 py-1 font-semibold text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
         </div>
       )}
       <div className="pointer-events-auto flex items-center gap-2 rounded-lg border border-gray-600/80 bg-gray-900/90 px-3 py-2 shadow-xl shadow-black/50 backdrop-blur-sm">
@@ -251,55 +398,40 @@ export function TransportControls() {
           type="button"
           onClick={() => {
             if (recoveryOffer && primaryRecoveryAction) {
-              void runCycleCommand(() =>
-                applyRecoveryAction(recoveryOffer, primaryRecoveryAction.actionId),
+              requestRecoveryAction(
+                primaryRecoveryAction.actionId,
+                primaryRecoveryAction.requiresConfirmation,
               );
             } else {
               void runCycleCommand(run);
             }
           }}
           disabled={cycleBusy || !canRun}
-          title={
-            canRun
-              ? primaryRecoveryAction
-                ? recoveryActionLabel(primaryRecoveryAction)
-                : motionHeld
-                  ? 'Resume the held motion branch'
-                  : 'Start the loaded program'
-              : stopGate.blocked && stopGate.reason !== null
-                ? stopGate.reason
-                : runAuthority.reason !== null && !runAuthorityAllowsResume
-                  ? runAuthority.reason
-                  : stopping
-                    ? 'Robot is stopping'
-                    : `Cycle is ${state}`
-          }
+          title={primaryControlTitle}
           className={`flex items-center gap-1.5 rounded px-3.5 py-1.5 text-sm font-semibold transition-colors ${
             canRun && !cycleBusy
-              ? 'bg-emerald-600 text-white hover:bg-emerald-500'
+              ? primaryIsAcknowledgement
+                ? 'bg-amber-700 text-white hover:bg-amber-600'
+                : 'bg-emerald-600 text-white hover:bg-emerald-500'
               : running
                 ? 'border border-emerald-600/60 bg-emerald-950/60 text-emerald-400'
                 : 'border border-gray-600 bg-gray-800 text-gray-500'
           } disabled:cursor-not-allowed`}
         >
-          <svg
-            viewBox="0 0 16 16"
-            className={`h-3 w-3 fill-current ${running ? 'animate-pulse' : ''}`}
-            aria-hidden
-          >
-            <path d="M4 2.5v11l9-5.5z" />
-          </svg>
-          {/* Stack both labels in one grid cell so the button is always as
-              wide as the widest label — no layout shift on state change,
-              and it adapts to whatever the labels are. */}
-          <span className="grid text-center">
-            <span className={`col-start-1 row-start-1 ${running || motionHeld || primaryRecoveryAction ? 'invisible' : ''}`}>Run</span>
-            <span className={`col-start-1 row-start-1 ${running ? '' : 'invisible'}`}>Running</span>
-            <span className={`col-start-1 row-start-1 ${motionHeld && !primaryRecoveryAction ? '' : 'invisible'}`}>Resume Motion</span>
-            <span className={`col-start-1 row-start-1 ${primaryRecoveryAction ? '' : 'invisible'}`}>
-              {primaryRecoveryAction ? recoveryActionLabel(primaryRecoveryAction) : ''}
-            </span>
-          </span>
+          {primaryIsAcknowledgement ? (
+            <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 fill-none stroke-current" strokeWidth="1.8" aria-hidden>
+              <path d="m3 8 3 3 7-7" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          ) : (
+            <svg
+              viewBox="0 0 16 16"
+              className={`h-3 w-3 fill-current ${running ? 'animate-pulse' : ''}`}
+              aria-hidden
+            >
+              <path d="M4 2.5v11l9-5.5z" />
+            </svg>
+          )}
+          <span className="min-w-[6.5rem] text-center">{primaryControlLabel}</span>
         </button>
         <div className="relative flex">
           <button
@@ -397,10 +529,17 @@ export function TransportControls() {
         <button
           type="button"
           onClick={() => {
-            runCycleCommand(reset);
+            if (resetRecoveryAction) {
+              requestRecoveryAction(
+                resetRecoveryAction.actionId,
+                resetRecoveryAction.requiresConfirmation,
+              );
+            } else {
+              void runCycleCommand(reset);
+            }
           }}
-          disabled={cycleBusy || resetBlockedByStop}
-          title={resetTitle}
+          disabled={resetControlDisabled}
+          title={resetControlTitle}
           className={`flex items-center gap-1.5 rounded border px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:text-gray-500 ${
             resetMeaningful
               ? 'border-amber-600/70 bg-amber-950/40 text-amber-300 hover:bg-amber-900/50'
