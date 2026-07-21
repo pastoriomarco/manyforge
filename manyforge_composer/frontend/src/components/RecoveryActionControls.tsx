@@ -79,7 +79,7 @@ export function recoveryActionsForTransport(offer: CycleRecoveryOffer | null): {
   };
 }
 
-interface RecoveryConfirmation {
+export interface RecoveryConfirmation {
   offerId: string;
   offerRevision: number;
   actionId: string;
@@ -103,4 +103,42 @@ export function recoveryConfirmationAction(
 
 export function recoveryActionLabel(action: CycleRecoveryAction): string {
   return actionLabel(action);
+}
+
+export function recoveryCommandFailureMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  const message = String(error).trim();
+  return message && message !== '[object Object]'
+    ? message
+    : 'The recovery action could not be applied.';
+}
+
+export function RecoveryCommandNotice({
+  message,
+  onDismiss,
+}: {
+  message: string;
+  onDismiss: () => void;
+}) {
+  return (
+    <div
+      role="alert"
+      className="pointer-events-auto flex max-w-md items-start gap-2 rounded-md border border-amber-600/70 bg-amber-950/90 px-3 py-1.5 text-xs text-amber-100 shadow-lg"
+    >
+      <span>
+        <span className="font-semibold">Recovery action did not start.</span>
+        {' '}{message}
+      </span>
+      <button
+        type="button"
+        onClick={onDismiss}
+        className="ml-auto shrink-0 rounded px-1 text-amber-200 hover:bg-amber-900/70 hover:text-white"
+        aria-label="Dismiss recovery action message"
+      >
+        x
+      </button>
+    </div>
+  );
 }

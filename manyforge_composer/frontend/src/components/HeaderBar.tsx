@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../api/client';
 import { useCycleStore, useEditLocked } from '../store/cycleStore';
 import {
@@ -11,9 +11,14 @@ import { useDeploymentStore } from '../store/deploymentStore';
 import { FileBrowserDialog } from './FileBrowserDialog';
 import { ExecutionHistoryPanel } from './ExecutionHistoryPanel';
 import {
-  useOperatorAlertPolling,
-  useOperatorAlertStore,
-} from '../store/operatorAlertStore';
+  acknowledgementFence,
+  acknowledgementFenceMatches,
+  hasNewAlarmActivation,
+  useOperatorAlarmPolling,
+  useOperatorAlarmStore,
+} from '../store/operatorAlarmStore';
+import type { OperatorAlarmAcknowledgementFence } from '../store/operatorAlarmStore';
+import { incidentIdForAlarm, OperatorAlarmPanel } from './OperatorAlarmPanel';
 import type { FullDeployment, TreeNode } from '../types/api';
 
 function signature(value: unknown): string {
@@ -118,7 +123,7 @@ function summarizeValidationErrors(
 }
 
 export function HeaderBar() {
-  useOperatorAlertPolling();
+  useOperatorAlarmPolling();
   const {
     state: cycleState,
     error,
@@ -126,14 +131,18 @@ export function HeaderBar() {
     errorDetails: cycleErrorDetails,
   } = useCycleStore();
   const {
-    alerts: operatorAlerts,
-    blockingCount: operatorAlertCount,
-    loaded: operatorAlertsLoaded,
-    busy: operatorAlertsBusy,
-    error: operatorAlertsError,
-    acknowledge: acknowledgeOperatorAlert,
-    acknowledgeAll: acknowledgeAllOperatorAlerts,
-  } = useOperatorAlertStore();
+    attentionAlarms: operatorAttentionAlarms,
+    standingAlarms: operatorStandingAlarms,
+    unacknowledgedCount: operatorAttentionCount,
+    activeAcknowledgedCount: operatorStandingCount,
+    unacknowledgedMembership: operatorAlarmMembership,
+    generation: operatorAlarmGeneration,
+    loaded: operatorAlarmsLoaded,
+    busy: operatorAlarmsBusy,
+    error: operatorAlarmsError,
+    acknowledge: acknowledgeOperatorAlarm,
+    acknowledgeAll: acknowledgeAllOperatorAlarms,
+  } = useOperatorAlarmStore();
   const {
     flowToTree,
     appliedTree,
@@ -298,28 +307,25 @@ export function HeaderBar() {
     || signature(appliedBlackboardNamespaces) !== signature(savedBlackboardNamespaces)
     || signature(appliedBlackboardKeys) !== signature(savedBlackboardKeys)
     || !deploymentAppliedMatchesSaved;
-  // Runtime incidents come from the server inbox. Keep a single local fallback
-  // only for browser-side program/deployment failures (and for the brief first
-  // render before the inbox has loaded). Once the inbox is loaded, an
-  // acknowledged runtime alert must not be recreated from the still-latched
-  // cycle error.
+  // Runtime incidents come from the server alarm manager. Keep a local panel
+  // only for browser-side command/document failures (and for the brief first
+  // render before alarm state is available). Once v2 state is loaded, never
+  // recreate an acknowledged condition from the still-latched cycle error.
   let localError: ActionErrorState | null = null;
-  if (operatorAlertCount === 0) {
-    if (actionError) {
-      localError = actionError;
-    } else if ((!operatorAlertsLoaded || operatorAlertsError) && error) {
-      localError = {
-        message: error,
-        errorCode: cycleErrorCode ?? null,
-        errorDetails: cycleErrorDetails ?? null,
-      };
-    } else if (programError || deploymentError) {
-      localError = {
-        message: programError || deploymentError!,
-        errorCode: null,
-        errorDetails: null,
-      };
-    }
+  if (actionError) {
+    localError = actionError;
+  } else if ((!operatorAlarmsLoaded || operatorAlarmsError) && error) {
+    localError = {
+      message: error,
+      errorCode: cycleErrorCode ?? null,
+      errorDetails: cycleErrorDetails ?? null,
+    };
+  } else if (programError || deploymentError) {
+    localError = {
+      message: programError || deploymentError!,
+      errorCode: null,
+      errorDetails: null,
+    };
   }
   const localErrorFingerprint = localError
     ? `${localError.message}|${localError.errorCode ?? ''}|${signature(localError.errorDetails)}`
@@ -354,30 +360,43 @@ export function HeaderBar() {
     localErrorPresentationKey
     && acknowledgedLocalErrorKey === localErrorPresentationKey,
   );
-  const [operatorAlertStackMinimized, setOperatorAlertStackMinimized] = useState(false);
-  const [showAcknowledgeAllConfirm, setShowAcknowledgeAllConfirm] = useState(false);
+  const [operatorAlarmStackMinimized, setOperatorAlarmStackMinimized] = useState(false);
+  const [acknowledgeAllFence, setAcknowledgeAllFence] = useState<
+    OperatorAlarmAcknowledgementFence | null
+  >(null);
   const [showExecutionHistory, setShowExecutionHistory] = useState(false);
-  const previousOperatorAlertIds = useRef<string[]>([]);
-  const operatorAlertIdsKey = operatorAlerts.map((alert) => alert.alertId).join('|');
+  const previousOperatorAlarmActivations = useRef<string[]>([]);
+  const operatorAlarmActivationKeys = useMemo(() => (
+    operatorAlarmMembership.map(
+      (member) => `${member.conditionId}:${member.activationId}`,
+    )
+  ), [operatorAlarmMembership]);
+  const operatorAlarmActivationsKey = operatorAlarmActivationKeys.join('|');
   useEffect(() => {
-    const previous = new Set(previousOperatorAlertIds.current);
-    const hasNewAlert = operatorAlerts.some((alert) => !previous.has(alert.alertId));
-    if (hasNewAlert) setOperatorAlertStackMinimized(false);
-    if (operatorAlertCount === 0) {
-      setOperatorAlertStackMinimized(false);
-      setShowAcknowledgeAllConfirm(false);
+    const hasNewActivation = hasNewAlarmActivation(
+      previousOperatorAlarmActivations.current,
+      operatorAlarmActivationKeys,
+    );
+    if (hasNewActivation) setOperatorAlarmStackMinimized(false);
+    if (operatorAttentionCount === 0) {
+      setOperatorAlarmStackMinimized(false);
     }
-    previousOperatorAlertIds.current = operatorAlerts.map((alert) => alert.alertId);
-  }, [operatorAlertCount, operatorAlertIdsKey, operatorAlerts]);
+    if (operatorAttentionCount < 2) {
+      setAcknowledgeAllFence(null);
+    }
+    previousOperatorAlarmActivations.current = operatorAlarmActivationKeys;
+  }, [operatorAlarmActivationKeys, operatorAlarmActivationsKey, operatorAttentionCount]);
 
   const [incidentSnapshotsById, setIncidentSnapshotsById] = useState<
     Record<string, Record<string, unknown>>
   >({});
-  const alertIncidentKey = operatorAlerts
-    .map((alert) => `${alert.alertId}:${alert.revision}:${alert.incidentId}`)
+  const alarmIncidentKey = operatorAttentionAlarms
+    .map((alarm) => (
+      `${alarm.activationId}:${alarm.recordRevision}:${incidentIdForAlarm(alarm) ?? ''}`
+    ))
     .join('|');
   useEffect(() => {
-    if (!alertIncidentKey && !localErrorFingerprint) {
+    if (!alarmIncidentKey && !localErrorFingerprint) {
       setIncidentSnapshotsById({});
       return;
     }
@@ -400,27 +419,39 @@ export function HeaderBar() {
     return () => {
       cancelled = true;
     };
-  }, [alertIncidentKey, localErrorFingerprint]);
+  }, [alarmIncidentKey, localErrorFingerprint]);
   const localIncidentSnapshot = Object.values(incidentSnapshotsById).at(-1) ?? null;
 
-  const acknowledgeOneAlert = useCallback(async (alertId: string) => {
+  const acknowledgeOneAlarm = useCallback(async (
+    conditionId: string,
+    activationId: string,
+    recordRevision: number,
+  ) => {
     try {
-      await acknowledgeOperatorAlert(alertId);
+      await acknowledgeOperatorAlarm(conditionId, activationId, recordRevision);
       setActionError(null);
     } catch (reason) {
       setActionError(reason);
     }
-  }, [acknowledgeOperatorAlert, setActionError]);
+  }, [acknowledgeOperatorAlarm, setActionError]);
 
   const confirmAcknowledgeAll = useCallback(async () => {
-    setShowAcknowledgeAllConfirm(false);
+    const fence = acknowledgeAllFence;
+    if (!fence) return;
+    setAcknowledgeAllFence(null);
     try {
-      await acknowledgeAllOperatorAlerts();
+      await acknowledgeAllOperatorAlarms(fence);
       setActionError(null);
     } catch (reason) {
       setActionError(reason);
     }
-  }, [acknowledgeAllOperatorAlerts, setActionError]);
+  }, [acknowledgeAllFence, acknowledgeAllOperatorAlarms, setActionError]);
+  const acknowledgeAllFenceIsCurrent = acknowledgeAllFence === null
+    || acknowledgementFenceMatches(
+      acknowledgeAllFence,
+      operatorAlarmGeneration,
+      operatorAlarmMembership,
+    );
   const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
 
   const applyDrafts = useCallback(async (forceDiscardOverrides: boolean) => {
@@ -886,22 +917,30 @@ export function HeaderBar() {
           {programLoading && (
             <span className="text-xs text-gray-400">Loading program…</span>
           )}
-          {operatorAlertCount > 0 && (
+          {operatorAttentionCount > 0 && (
             <button
               type="button"
-              onClick={() => setOperatorAlertStackMinimized((value) => !value)}
+              onClick={() => setOperatorAlarmStackMinimized((value) => !value)}
               className="relative rounded border border-red-500/80 bg-red-950/70 p-1 text-red-100 transition-colors hover:bg-red-900/80"
-              aria-label={`${operatorAlertStackMinimized ? 'Show' : 'Minimize'} ${operatorAlertCount} unacknowledged error alerts`}
-              title={`${operatorAlertCount} unacknowledged error alert${operatorAlertCount === 1 ? '' : 's'}`}
+              aria-label={`${operatorAlarmStackMinimized ? 'Show' : 'Minimize'} ${operatorAttentionCount} alarms requiring acknowledgement`}
+              title={`${operatorAttentionCount} alarm${operatorAttentionCount === 1 ? '' : 's'} requiring acknowledgement`}
             >
               <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.6" aria-hidden>
                 <path d="M8 2.2 14 13H2L8 2.2Z" strokeLinejoin="round" />
                 <path d="M8 5.5v3.8M8 11.6v.2" strokeLinecap="round" />
               </svg>
               <span className="absolute -right-2 -top-2 min-w-4 rounded-full bg-red-500 px-1 text-center text-[9px] font-bold leading-4 text-white">
-                {operatorAlertCount > 99 ? '99+' : operatorAlertCount}
+                {operatorAttentionCount > 99 ? '99+' : operatorAttentionCount}
               </span>
             </button>
+          )}
+          {operatorStandingCount > 0 && (
+            <span
+              className="rounded border border-amber-600/70 bg-amber-950/50 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-amber-100"
+              title={`${operatorStandingCount} active condition${operatorStandingCount === 1 ? '' : 's'} acknowledged and awaiting authoritative return to normal`}
+            >
+              {operatorStandingCount} active · acknowledged
+            </span>
           )}
           {localError && localErrorIsMinimized && (
             <button
@@ -932,8 +971,8 @@ export function HeaderBar() {
               <path d="M2.5 3.5h11v8h-7L3 14v-2.5h-.5z" strokeLinejoin="round" />
               <path d="M5 6h6M5 8.5h4" strokeLinecap="round" />
             </svg>
-            {(operatorAlertCount > 0 || operatorAlertsError) && (
-              <span className={`absolute -right-1 -top-1 h-2 w-2 rounded-full ${operatorAlertsError ? 'bg-amber-400' : 'bg-red-400'}`} />
+            {(operatorAttentionCount > 0 || operatorStandingCount > 0 || operatorAlarmsError) && (
+              <span className={`absolute -right-1 -top-1 h-2 w-2 rounded-full ${operatorAlarmsError ? 'bg-amber-400' : operatorAttentionCount > 0 ? 'bg-red-400' : 'bg-amber-400'}`} />
             )}
           </button>
         </div>
@@ -992,70 +1031,120 @@ export function HeaderBar() {
         </div>
       </div>
 
-      {operatorAlertCount > 0 && !operatorAlertStackMinimized && (
+      {operatorStandingCount > 0 && (
+        <div className="pointer-events-none absolute right-3 top-full z-40 mt-2 flex max-w-[min(54rem,calc(100vw-1.5rem))] flex-wrap justify-end gap-1.5">
+          {operatorStandingAlarms.slice(0, 3).map((alarm) => (
+            <span
+              key={alarm.conditionId}
+              className="pointer-events-auto max-w-sm truncate rounded border border-amber-600/70 bg-gray-950/90 px-2 py-1 text-[10px] text-amber-100 shadow-lg shadow-black/40 backdrop-blur-sm"
+              title={`${alarm.title}: ${alarm.message}. ${alarm.operatorResponse}`}
+            >
+              ACTIVE — ACKNOWLEDGED · {alarm.priority.toUpperCase()} · {alarm.title}
+            </span>
+          ))}
+          {operatorStandingCount > operatorStandingAlarms.slice(0, 3).length && (
+            <span className="pointer-events-auto rounded border border-amber-700/60 bg-gray-950/90 px-2 py-1 text-[10px] text-amber-200 shadow-lg">
+              +{operatorStandingCount - operatorStandingAlarms.slice(0, 3).length} active acknowledged
+            </span>
+          )}
+        </div>
+      )}
+
+      {operatorAttentionCount > 0 && !operatorAlarmStackMinimized && (
         <div className="pointer-events-none absolute inset-x-3 top-full z-50 max-h-[calc(100vh-4rem)] overflow-y-auto pt-2">
-          <div className="pointer-events-auto mb-2 flex flex-wrap items-center gap-2 rounded border border-red-800/70 bg-gray-950/90 px-3 py-2 text-xs text-gray-200 shadow-xl shadow-black/50 backdrop-blur-sm">
-            <span className="font-semibold text-red-100">
-              {operatorAlertCount} unacknowledged error alert{operatorAlertCount === 1 ? '' : 's'}
-            </span>
-            <span className="text-gray-400">
-              Showing newest {Math.min(3, operatorAlertCount)}
-            </span>
-            {operatorAlertsError && (
-              <span
-                className="max-w-md truncate text-red-300"
-                title={operatorAlertsError}
-              >
-                {operatorAlertsError}
+          {operatorAttentionCount > 1 && (
+            <div className="pointer-events-auto mb-2 flex flex-wrap items-center gap-2 rounded border border-red-800/70 bg-gray-950/90 px-3 py-2 text-xs text-gray-200 shadow-xl shadow-black/50 backdrop-blur-sm">
+              <span className="font-semibold text-red-100">
+                {operatorAttentionCount} alarms requiring acknowledgement
               </span>
-            )}
-            <div className="ml-auto flex items-center gap-2">
-              <button
-                type="button"
-                disabled={operatorAlertsBusy}
-                onClick={() => setShowAcknowledgeAllConfirm(true)}
-                className="rounded border border-red-500/60 bg-red-950/50 px-2 py-1 font-medium text-red-100 hover:bg-red-900/60 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                Acknowledge all
-              </button>
-              <button
-                type="button"
-                onClick={() => setOperatorAlertStackMinimized(true)}
-                className="rounded p-1 text-gray-400 hover:bg-gray-800 hover:text-white"
-                aria-label="Minimize alerts to header icon"
-                title="Minimize alerts to header icon"
-              >
-                <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.6" aria-hidden>
-                  <path d="M3 8h10" strokeLinecap="round" />
-                </svg>
-              </button>
+              <span className="text-gray-400">
+                Showing newest {Math.min(3, operatorAttentionCount)}
+              </span>
+              {operatorStandingCount > 0 && (
+                <span className="text-amber-200">
+                  {operatorStandingCount} active acknowledged
+                </span>
+              )}
+              {operatorAlarmsError && (
+                <span
+                  className="max-w-md truncate text-red-300"
+                  title={operatorAlarmsError}
+                >
+                  {operatorAlarmsError}
+                </span>
+              )}
+              <div className="ml-auto flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={operatorAlarmsBusy}
+                  onClick={() => setAcknowledgeAllFence(acknowledgementFence(
+                    operatorAlarmGeneration,
+                    operatorAlarmMembership,
+                  ))}
+                  className="rounded border border-red-500/60 bg-red-950/50 px-2 py-1 font-medium text-red-100 hover:bg-red-900/60 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Acknowledge all
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setOperatorAlarmStackMinimized(true)}
+                  className="rounded p-1 text-gray-400 hover:bg-gray-800 hover:text-white"
+                  aria-label="Minimize alarms to header icon"
+                  title="Minimize alarms to header icon"
+                >
+                  <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.6" aria-hidden>
+                    <path d="M3 8h10" strokeLinecap="round" />
+                  </svg>
+                </button>
+              </div>
             </div>
-          </div>
-          {showAcknowledgeAllConfirm && (
+          )}
+          {operatorAttentionCount > 1 && acknowledgeAllFence && (
             <div
               role="dialog"
-              aria-label="Acknowledge all error alerts confirmation"
+              aria-label="Acknowledge all alarms confirmation"
               className="pointer-events-auto mb-2 rounded border border-red-500/70 bg-gray-950 px-3 py-3 text-xs text-red-100 shadow-xl shadow-black/60"
             >
-              <div className="font-semibold">Acknowledge all {operatorAlertCount} alerts?</div>
-              <div className="mt-1 text-red-200/80">
-                This marks every currently listed error as seen. It does not clear a fault,
-                reset the cycle, resume execution, or move the robot. If a new alert arrives
-                before confirmation, the backend will reject this request.
+              <div className="font-semibold">
+                Acknowledge all {acknowledgeAllFence.members.length} alarms?
               </div>
+              <div className="mt-1 text-red-200/80">
+                This marks the exact alarm activations in this confirmation as seen. It does
+                not clear a condition or interlock, reset the cycle, resume execution, or move
+                the robot. If membership changes, the backend rejects the whole request.
+              </div>
+              {!acknowledgeAllFenceIsCurrent && (
+                <div role="alert" className="mt-2 font-semibold text-amber-200">
+                  Alarm membership changed. Review the current list and refresh this
+                  confirmation; no alarm has been acknowledged.
+                </div>
+              )}
               <div className="mt-2 flex gap-2">
                 <button
                   type="button"
-                  disabled={operatorAlertsBusy}
+                  disabled={operatorAlarmsBusy || !acknowledgeAllFenceIsCurrent}
                   onClick={() => void confirmAcknowledgeAll()}
                   className="rounded border border-red-400/70 bg-red-800 px-2.5 py-1 font-semibold text-white hover:bg-red-700 disabled:opacity-50"
                 >
                   Confirm acknowledge all
                 </button>
+                {!acknowledgeAllFenceIsCurrent && (
+                  <button
+                    type="button"
+                    disabled={operatorAlarmsBusy}
+                    onClick={() => setAcknowledgeAllFence(acknowledgementFence(
+                      operatorAlarmGeneration,
+                      operatorAlarmMembership,
+                    ))}
+                    className="rounded border border-amber-500/70 bg-amber-900/60 px-2.5 py-1 font-semibold text-amber-100 hover:bg-amber-800 disabled:opacity-50"
+                  >
+                    Refresh confirmation
+                  </button>
+                )}
                 <button
                   type="button"
-                  disabled={operatorAlertsBusy}
-                  onClick={() => setShowAcknowledgeAllConfirm(false)}
+                  disabled={operatorAlarmsBusy}
+                  onClick={() => setAcknowledgeAllFence(null)}
                   className="rounded border border-gray-600 bg-gray-800 px-2.5 py-1 font-semibold text-gray-200 hover:bg-gray-700 disabled:opacity-50"
                 >
                   Cancel
@@ -1064,23 +1153,27 @@ export function HeaderBar() {
             </div>
           )}
           <div className="grid gap-2">
-            {operatorAlerts.map((alert) => (
-              <KernelErrorPanel
-                key={alert.alertId}
-                message={alert.message}
-                errorCode={alert.errorCode}
-                errorDetails={alert.errorDetails}
-                incidentSnapshot={incidentSnapshotsById[alert.incidentId] ?? null}
-                presentationKey={alert.alertId}
-                onAcknowledge={() => void acknowledgeOneAlert(alert.alertId)}
-                onMinimize={() => setOperatorAlertStackMinimized(true)}
+            {operatorAttentionAlarms.slice(0, 3).map((alarm) => {
+              const incidentId = incidentIdForAlarm(alarm);
+              return (
+              <OperatorAlarmPanel
+                key={alarm.activationId}
+                alarm={alarm}
+                incidentSnapshot={incidentId ? incidentSnapshotsById[incidentId] ?? null : null}
+                onAcknowledge={() => void acknowledgeOneAlarm(
+                  alarm.conditionId,
+                  alarm.activationId,
+                  alarm.recordRevision,
+                )}
+                onMinimize={() => setOperatorAlarmStackMinimized(true)}
               />
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
 
-      {localError && !localErrorIsMinimized && operatorAlertCount === 0 && (
+      {localError && !localErrorIsMinimized && operatorAttentionCount === 0 && (
         <div className="pointer-events-none absolute inset-x-3 top-full z-50 pt-2">
           <KernelErrorPanel
             message={localError.message}

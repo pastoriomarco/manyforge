@@ -7,9 +7,9 @@ import {
 import { useSceneStateStore } from '../store/sceneStateStore';
 import {
   operatorAttentionBlocksMotion,
-  useOperatorAlertPolling,
-  useOperatorAlertStore,
-} from '../store/operatorAlertStore';
+  useOperatorAlarmPolling,
+  useOperatorAlarmStore,
+} from '../store/operatorAlarmStore';
 import { useStatusPolling, useStatusStore } from '../store/statusStore';
 import {
   buildStopExecutionWarning,
@@ -18,9 +18,13 @@ import {
   shouldFreezeVelocitySlider,
 } from '../store/stopProfile';
 import {
+  RecoveryCommandNotice,
+  type RecoveryConfirmation,
   recoveryActionConfirmationText,
   recoveryActionLabel,
   recoveryActionsForTransport,
+  recoveryCommandFailureMessage,
+  recoveryConfirmationAction,
   recoveryOfferHeadline,
   isMotionProducingRecoveryAction,
 } from './RecoveryActionControls';
@@ -35,7 +39,7 @@ import {
  * cycle is actually armable (color = state, not decoration).
  */
 export function TransportControls() {
-  useOperatorAlertPolling();
+  useOperatorAlarmPolling();
   const {
     state,
     motionStopState,
@@ -49,9 +53,13 @@ export function TransportControls() {
     applyRecoveryAction,
     setVelocityScale,
   } = useCycleStore();
-  const operatorAlertsLoaded = useOperatorAlertStore((store) => store.loaded);
-  const operatorAlertCount = useOperatorAlertStore((store) => store.blockingCount);
-  const operatorAlertsError = useOperatorAlertStore((store) => store.error);
+  const operatorAlarmsLoaded = useOperatorAlarmStore((store) => store.loaded);
+  const operatorAlarmAttentionCount = useOperatorAlarmStore(
+    (store) => store.motionAttentionCount,
+  );
+  const operatorAlarmsError = useOperatorAlarmStore((store) => store.error);
+  const operatorAlarmsReconciled = useOperatorAlarmStore((store) => store.reconciled);
+  const operatorAlarmHealth = useOperatorAlarmStore((store) => store.health);
   const runAuthority = useRobotCommandAuthority({
     // Run admission is owned by the backend and kernel. Visual-state freshness
     // must not keep the viewer producer alive or become a second safety gate.
@@ -64,7 +72,9 @@ export function TransportControls() {
   const [cycleBusy, setCycleBusy] = useState(false);
   const [stopInProgress, setStopInProgress] = useState(false);
   const [showFullStopMenu, setShowFullStopMenu] = useState(false);
-  const [pendingRecoveryActionId, setPendingRecoveryActionId] = useState<string | null>(null);
+  const [pendingRecoveryConfirmation, setPendingRecoveryConfirmation] =
+    useState<RecoveryConfirmation | null>(null);
+  const [recoveryCommandNotice, setRecoveryCommandNotice] = useState<string | null>(null);
   const [velocityDraft, setVelocityDraft] = useState(velocityScale);
   const pendingVelocityScaleRef = useRef<number | null>(null);
   const velocityScaleInFlightRef = useRef(false);
@@ -77,9 +87,9 @@ export function TransportControls() {
     primaryAction: primaryRecoveryAction,
     resetAction: resetRecoveryAction,
   } = recoveryActionsForTransport(recoveryOffer);
-  const confirmationAction = recoveryOffer?.actions.find(
-    (action) => action.actionId === pendingRecoveryActionId,
-  );
+  const confirmationAction = recoveryOffer
+    ? recoveryConfirmationAction(recoveryOffer, pendingRecoveryConfirmation)
+    : undefined;
   const primaryIsAcknowledgement =
     primaryRecoveryAction?.actionId === 'acknowledge_and_continue';
   const primaryStartsMotion = primaryRecoveryAction
@@ -87,13 +97,30 @@ export function TransportControls() {
     : recoveryOffer === null;
   const operatorAttentionBlocksPrimary = operatorAttentionBlocksMotion(
     primaryStartsMotion,
-    operatorAlertsLoaded,
-    operatorAlertsError,
-    operatorAlertCount,
+    operatorAlarmsLoaded,
+    operatorAlarmsError,
+    operatorAlarmsReconciled,
+    operatorAlarmHealth.state,
+    operatorAlarmAttentionCount,
   );
   useEffect(() => {
-    setPendingRecoveryActionId(null);
-  }, [recoveryOffer?.offerId, recoveryOffer?.offerRevision]);
+    if (pendingRecoveryConfirmation === null) {
+      return;
+    }
+    if (
+      recoveryOffer !== null
+      && recoveryOffer.offerId === pendingRecoveryConfirmation.offerId
+      && recoveryOffer.offerRevision === pendingRecoveryConfirmation.offerRevision
+    ) {
+      return;
+    }
+    setPendingRecoveryConfirmation(null);
+    setRecoveryCommandNotice(
+      recoveryOffer === null
+        ? 'The recovery action is no longer available.'
+        : 'Recovery state changed. Review and confirm the current action.',
+    );
+  }, [pendingRecoveryConfirmation, recoveryOffer]);
   // The velocity slider is frozen only while a stop is in flight; after the
   // robot reaches STOPPED the operator may choose the resume scale.
   const frozen = shouldFreezeVelocitySlider(state, stopInProgress, motionStopState);
@@ -134,10 +161,13 @@ export function TransportControls() {
   const runCycleCommand = useCallback(
     async (command: () => Promise<unknown>) => {
       setCycleBusy(true);
+      setRecoveryCommandNotice(null);
       try {
         await command();
-      } catch {
-        // The cycle store preserves the authoritative error/offer payload.
+      } catch (error) {
+        // The cycle store preserves the authoritative cycle error and newest
+        // offer. Keep command rejection separate and visible to the operator.
+        setRecoveryCommandNotice(recoveryCommandFailureMessage(error));
       } finally {
         setCycleBusy(false);
       }
@@ -150,8 +180,13 @@ export function TransportControls() {
       if (!recoveryOffer) {
         return;
       }
+      setRecoveryCommandNotice(null);
       if (requiresConfirmation) {
-        setPendingRecoveryActionId(actionId);
+        setPendingRecoveryConfirmation({
+          offerId: recoveryOffer.offerId,
+          offerRevision: recoveryOffer.offerRevision,
+          actionId,
+        });
         return;
       }
       if (isMotionProducingRecoveryAction(actionId)) {
@@ -276,11 +311,15 @@ export function TransportControls() {
           ? 'Resume Motion'
           : 'Run';
   const primaryControlTitle = operatorAttentionBlocksPrimary
-    ? operatorAlertsError
-      ? 'Operator alert status is unavailable; motion remains disabled'
-      : operatorAlertsLoaded
-      ? `Acknowledge ${operatorAlertCount} error alert${operatorAlertCount === 1 ? '' : 's'} before starting motion`
-      : 'Checking unacknowledged operator alerts before enabling motion'
+    ? operatorAlarmsError
+      ? 'Operator-alarm status cannot be read; motion remains disabled'
+      : !operatorAlarmsLoaded
+        ? 'Checking operator-alarm state before enabling motion'
+        : operatorAlarmHealth.state !== 'available'
+          ? 'Operator-alarm manager is unavailable; motion remains disabled'
+          : !operatorAlarmsReconciled
+            ? 'Operator-alarm sources are not reconciled; motion remains disabled'
+            : `Acknowledge ${operatorAlarmAttentionCount} alarm${operatorAlarmAttentionCount === 1 ? '' : 's'} before starting motion`
     : recoveryOffer
     ? primaryRecoveryAction
       ? primaryRecoveryAction.disabledReasonCode
@@ -317,21 +356,24 @@ export function TransportControls() {
 
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-3 z-30 flex flex-col items-center gap-2">
-      {operatorAlertsLoaded && operatorAlertCount > 0 && (
+      {operatorAlarmsLoaded && operatorAlarmAttentionCount > 0 && (
         <div
           role="status"
           className="pointer-events-auto max-w-md rounded-md border border-red-700/70 bg-red-950/85 px-3 py-1.5 text-xs text-red-200 shadow-lg"
         >
-          Acknowledge all {operatorAlertCount} error alert{operatorAlertCount === 1 ? '' : 's'}
+          Acknowledge {operatorAlarmAttentionCount} alarm{operatorAlarmAttentionCount === 1 ? '' : 's'}
           {' '}before resuming, retrying, or replanning motion.
         </div>
       )}
-      {operatorAlertsError && (
+      {(operatorAlarmsError || (
+        operatorAlarmsLoaded
+        && (!operatorAlarmsReconciled || operatorAlarmHealth.state !== 'available')
+      )) && (
         <div
           role="alert"
           className="pointer-events-auto max-w-md rounded-md border border-red-700/70 bg-red-950/85 px-3 py-1.5 text-xs text-red-200 shadow-lg"
         >
-          Operator alert status is unavailable; motion controls remain disabled.
+          Operator-alarm state is unavailable or not reconciled; motion controls remain disabled.
         </div>
       )}
       {stopGate.blocked && stopGate.reason !== null && (
@@ -354,6 +396,12 @@ export function TransportControls() {
           {stopExecutionWarning}
         </div>
       )}
+      {recoveryCommandNotice && (
+        <RecoveryCommandNotice
+          message={recoveryCommandNotice}
+          onDismiss={() => setRecoveryCommandNotice(null)}
+        />
+      )}
       {confirmationAction && recoveryOffer && (
         <div
           role="dialog"
@@ -369,7 +417,7 @@ export function TransportControls() {
               type="button"
               disabled={cycleBusy || !confirmationAction.enabled}
               onClick={() => {
-                setPendingRecoveryActionId(null);
+                setPendingRecoveryConfirmation(null);
                 if (isMotionProducingRecoveryAction(confirmationAction.actionId)) {
                   void runCycleCommand(run);
                 } else {
@@ -385,7 +433,7 @@ export function TransportControls() {
             <button
               type="button"
               disabled={cycleBusy}
-              onClick={() => setPendingRecoveryActionId(null)}
+              onClick={() => setPendingRecoveryConfirmation(null)}
               className="rounded border border-gray-600 bg-gray-800 px-2.5 py-1 font-semibold text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
             >
               Cancel

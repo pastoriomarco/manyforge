@@ -10,6 +10,7 @@ from .models import (
     CycleCommandErrorResponse,
     CycleStatusResponse,
     CycleCommandResponse,
+    CycleResetRequest,
     CycleRecoveryActionRequestDTO,
     CycleRecoveryActionResultDTO,
     VelocityScaleRequest,
@@ -57,26 +58,19 @@ def _structured_command_error(
     ).model_dump(by_alias=True)
 
 
-def _require_no_blocking_operator_alerts(state: ComposerState) -> None:
-    """Reject motion intent until every server-owned error alert is seen."""
-    inbox = state.event_recorder.operator_alerts(limit=3)
-    blocking_count = int(inbox.get("blockingCount") or 0)
-    if blocking_count == 0:
+def _require_no_blocking_operator_alarms(state: ComposerState) -> None:
+    """Apply the fail-closed alarm-attention gate without replacing interlocks."""
+
+    block = state.operator_alarm_manager.attention_block_reason()
+    if block is None:
         return
     raise HTTPException(
         status_code=409,
         detail=_structured_command_error(
             state,
-            (
-                f"Acknowledge {blocking_count} operator error alert"
-                f"{'s' if blocking_count != 1 else ''} before starting motion"
-            ),
-            error_code="unacknowledged_operator_alerts",
-            error_details={
-                "blocking_alert_count": blocking_count,
-                "operator_alert_generation": inbox.get("generation"),
-                "operator_alert_ids": inbox.get("unacknowledgedAlertIds", []),
-            },
+            str(block["message"]),
+            error_code=str(block["errorCode"]),
+            error_details=dict(block.get("details") or {}),
         ),
     )
 
@@ -111,21 +105,41 @@ def _perform_cycle_reset(
     state: ComposerState,
     *,
     request_id: Optional[str],
+    scene_initialization_token: Optional[str] = None,
 ) -> dict[str, Any]:
     if state.cycle_manager is None:
         raise RuntimeError("No program loaded")
-    override_status = state.runtime_override_status()
-    prev = state.cycle_manager.state.value
-    if override_status["has_staged"]:
-        state.activate_staged_runtime_overrides()
-    else:
-        state.clear_pose_source_snapshots()
-        with state.scene_edit_lock:
-            state.cycle_manager.reset(request_id=request_id)
-    state.reset_backend_authoritative_sim_if_needed(reason="cycle_reset")
-    _refresh_visual_scene_after_reset(state)
-    logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
-    return _cycle_command_payload(state.cycle_manager)
+    pending_token = state.prepare_scene_initialization_reset(
+        scene_initialization_token,
+        reason="cycle_reset",
+    )
+    try:
+        override_status = state.runtime_override_status()
+        prev = state.cycle_manager.state.value
+        if override_status["has_staged"]:
+            state.activate_staged_runtime_overrides()
+        else:
+            state.clear_pose_source_snapshots()
+            with state.scene_edit_lock:
+                state.cycle_manager.reset(request_id=request_id)
+        state.reset_backend_authoritative_sim_if_needed(reason="cycle_reset")
+        _refresh_visual_scene_after_reset(state)
+        if pending_token is not None:
+            state.mark_scene_initialization_seeded(pending_token)
+            state.complete_scene_initialization(
+                pending_token,
+                reason="cycle_reset",
+            )
+        logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
+        result = _cycle_command_payload(state.cycle_manager)
+        result["sceneInitialization"] = state.scene_initialization_status()
+        return result
+    except Exception as exc:
+        state.fail_scene_initialization(
+            pending_token,
+            error=str(exc) or type(exc).__name__,
+        )
+        raise
 
 
 def create_cycle_router(state: ComposerState) -> APIRouter:
@@ -175,7 +189,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                         state, "No program loaded", error_code="no_program_loaded"
                     ),
                 )
-            _require_no_blocking_operator_alerts(state)
+            _require_no_blocking_operator_alarms(state)
             # Fail closed: never arm a program whose configured operator/fault stop
             # profile names a stop mode the execution backend does not advertise.
             # Running it would mean an operator Stop silently degrades to a
@@ -190,6 +204,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                         state,
                         stop_block["message"],
                         error_code=stop_block["error_code"],
+                        error_details=stop_block.get("error_details"),
                     ),
                 )
             override_status = state.runtime_override_status()
@@ -308,7 +323,10 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
         return await _run_cycle_control(command)
 
     @router.post("/reset", response_model=CycleCommandResponse, response_model_by_alias=True)
-    async def reset_cycle(request: Request) -> dict:
+    async def reset_cycle(
+        request: Request,
+        payload: Optional[CycleResetRequest] = None,
+    ) -> dict:
         """Reset the cycle (any→IDLE)."""
         request_id = getattr(request.state, "request_id", None)
 
@@ -324,6 +342,11 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                 return _perform_cycle_reset(
                     state,
                     request_id=request_id if isinstance(request_id, str) else None,
+                    scene_initialization_token=(
+                        payload.scene_initialization_token
+                        if payload is not None
+                        else None
+                    ),
                 )
             except RuntimeError as exc:
                 raise HTTPException(
@@ -356,7 +379,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                 getattr(request.state, "principal_id", None) or "operator_ui"
             )
             if payload.action_id in RUN_AUTOMATIC_RECOVERY_ACTION_IDS:
-                _require_no_blocking_operator_alerts(state)
+                _require_no_blocking_operator_alarms(state)
             try:
                 return state.cycle_manager.apply_recovery_action(
                     payload.model_dump(),

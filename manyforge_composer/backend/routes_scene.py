@@ -1705,6 +1705,7 @@ def create_scene_router(state: ComposerState) -> APIRouter:
                 object_ids=continuous_object_ids,
                 require_idle=False,
                 reason=f"snapshot_{continuous_policy}",
+                source_id=pose_source_id,
             )
             continuous_apply_results.append(apply_result)
             if not apply_result.get("success", False):

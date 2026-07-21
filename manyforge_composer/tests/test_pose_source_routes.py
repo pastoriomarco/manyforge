@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
+import pytest
+import yaml
 
 from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.deployment import Deployment, GripperConfig
@@ -21,6 +23,7 @@ from manyforge_behavior.kernel_client import (
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
+from manyforge_composer.__main__ import build_program_loaded_callback
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CATALOG_PATH = str(_REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml")
@@ -828,6 +831,175 @@ def test_initial_generation_in_flight_apply_is_counted_by_invalidation(
     assert result["generation"] == 1
     assert result["dropped_count"] == 1
     assert state.pose_source_apply_status()["last_result"]["skipped_count"] == 1
+
+
+def test_scene_initialization_barrier_buffers_latest_continuous_pose(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(box_policy="continuous")
+    )
+    _add_box(client)
+
+    barrier = state.begin_scene_initialization(deferred=True, reason="test_load")
+    first = _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[1.0, 0.0, 0.0])],
+    )
+    second = _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[2.0, 0.0, 0.0])],
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["continuous_apply"]["buffered_by_initialization"] is True
+    assert second.json()["continuous_apply"]["buffered_by_initialization"] is True
+    assert [
+        edit for edit in state.kernel.scene_edits if edit.operation == "update_pose"
+    ] == []
+    assert state.scene_initialization_status()["state"] == "closed"
+
+    replay = state.complete_scene_initialization(
+        barrier["token"],
+        reason="test_reset_seed_completed",
+    )
+
+    assert replay["state"] == "open"
+    updates = [
+        edit for edit in state.kernel.scene_edits if edit.operation == "update_pose"
+    ]
+    assert len(updates) == 1
+    assert updates[0].pose_position_m == [2.0, 0.0, 0.0]
+    assert state.pose_source_apply_status()["counters"]["barrier_buffered"] == 2
+    assert state.pose_source_apply_status()["counters"]["barrier_replayed"] == 1
+    event_types = {
+        event["type"] for event in state.event_recorder.get_events_since(0)
+    }
+    assert {
+        "scene_initialization_closed",
+        "scene_initialization_replayed",
+        "scene_initialization_opened",
+    }.issubset(event_types)
+    assert "pose_source_apply_failed" not in event_types
+
+
+def test_program_reload_closes_scene_barrier_before_previous_scene_clear(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state._on_program_loaded = build_program_loaded_callback()
+    deployment_data = yaml.safe_load(
+        (
+            _REPO_ROOT
+            / "manyforge_behavior"
+            / "tests"
+            / "fixtures"
+            / "ur5_roboplan.deployment.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    deployment_data["pose_sources"] = _pose_sources(
+        box_policy="continuous_unattached"
+    )
+    state.deployment = Deployment.from_dict(deployment_data)
+    program_data = yaml.safe_load(
+        (
+            _REPO_ROOT
+            / "manyforge_behavior"
+            / "tests"
+            / "fixtures"
+            / "pick_and_place.program.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    program_data["scene"][0]["object_id"] = "box"
+    program_data["tree"]["children"][1]["params"]["object_id"] = "box"
+    program_path = tmp_path / "pose-reload.program.yaml"
+    program_path.write_text(
+        yaml.safe_dump(program_data, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    initial_load = client.post(
+        "/api/program/load",
+        json={"path": str(program_path)},
+    )
+    assert initial_load.status_code == 200, initial_load.json()
+    assert _post_fresh_box_snapshot(client).status_code == 200
+    assert _wait_for_pose_source_apply(state)["success"] is True
+    event_index_before_reload = max(
+        (
+            int(event.get("event_index") or 0)
+            for event in state.event_recorder.get_events_since(0)
+        ),
+        default=0,
+    )
+
+    previous_manager = state.cycle_manager
+    assert previous_manager is not None
+    original_clear = previous_manager._clear_runtime_scene
+    scene_cleared = threading.Event()
+    release_reset = threading.Event()
+
+    def clear_then_pause() -> None:
+        original_clear()
+        scene_cleared.set()
+        assert release_reset.wait(timeout=2.0)
+
+    previous_manager._clear_runtime_scene = clear_then_pause
+    load_errors: list[BaseException] = []
+
+    def reload_program() -> None:
+        try:
+            state.load_program(str(program_path))
+        except BaseException as exc:  # noqa: BLE001 - asserted after join.
+            load_errors.append(exc)
+
+    load_thread = threading.Thread(target=reload_program, daemon=True)
+    load_thread.start()
+    try:
+        assert scene_cleared.wait(timeout=2.0)
+        during_clear = _post_fresh_box_snapshot(client)
+        continuous_apply = during_clear.json()["continuous_apply"]
+        assert continuous_apply["buffered_by_initialization"] is True
+        assert continuous_apply["scene_initialization_state"] == "closed"
+    finally:
+        release_reset.set()
+        load_thread.join(timeout=5.0)
+        previous_manager._clear_runtime_scene = original_clear
+
+    assert not load_thread.is_alive()
+    assert load_errors == []
+    assert state.scene_initialization_status()["state"] == "open"
+    assert state.cycle_manager is not None
+    assert state.cycle_manager._tree is None
+    reload_events = state.event_recorder.get_events_since(
+        event_index_before_reload
+    )
+    assert not any(
+        event.get("type") == "pose_source_apply_failed"
+        for event in reload_events
+    )
+    assert not any(
+        alarm["definitionId"] == "manyforge.scene.pose_apply_fault"
+        for alarm in state.operator_alarm_manager.snapshot()["alarms"]
+    )
+
+
+def test_stale_scene_initialization_token_cannot_open_newer_barrier(
+    tmp_path: Path,
+) -> None:
+    _, state = _client(tmp_path)
+    first = state.begin_scene_initialization(deferred=True, reason="first")
+    second = state.begin_scene_initialization(deferred=True, reason="second")
+
+    with pytest.raises(RuntimeError, match="stale scene initialization token"):
+        state.complete_scene_initialization(first["token"], reason="stale")
+
+    current = state.scene_initialization_status()
+    assert current["token"] == second["token"]
+    assert current["generation"] == second["generation"]
+    assert current["state"] == "closed"
 
 
 def test_generation_aware_visual_refresh_cannot_publish_after_invalidation(

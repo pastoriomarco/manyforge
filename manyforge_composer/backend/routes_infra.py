@@ -400,6 +400,38 @@ def _build_infra_heartbeat_payload_uncached(state: ComposerState) -> dict[str, A
         if top_status == "ok":
             top_status = "degraded"
 
+    try:
+        scene_initialization = state.scene_initialization_status()
+        # This token authorizes one deferred completion and is returned only by
+        # authenticated program/load surfaces, not broad health diagnostics.
+        scene_initialization.pop("token", None)
+        scene_state = str(scene_initialization.get("state") or "")
+        scene_initialization["status"] = (
+            "error" if scene_state == "failed" else "healthy"
+        )
+        if scene_state == "failed" and top_status == "ok":
+            top_status = "degraded"
+    except Exception as exc:  # pragma: no cover - defensive status surface
+        scene_initialization = {"status": "error", "error": str(exc)}
+        if top_status == "ok":
+            top_status = "degraded"
+
+    try:
+        operator_alarm = state.operator_alarm_status()
+        alarm_health = operator_alarm.get("health", {})
+        if alarm_health.get("state") != "available":
+            operator_alarm["status"] = "error"
+            if top_status == "ok":
+                top_status = "degraded"
+        elif not bool(operator_alarm.get("reconciled")):
+            operator_alarm["status"] = "initializing"
+        else:
+            operator_alarm["status"] = "healthy"
+    except Exception as exc:  # pragma: no cover - defensive status surface
+        operator_alarm = {"status": "error", "error": str(exc)}
+        if top_status == "ok":
+            top_status = "degraded"
+
     return {
         "schema_version": "manyforge.infra_heartbeat.v1",
         "status": top_status,
@@ -426,6 +458,8 @@ def _build_infra_heartbeat_payload_uncached(state: ComposerState) -> dict[str, A
             "runtime_safety": runtime_safety,
             "route_executors": route_executors,
             "pose_source_apply": pose_source_apply,
+            "scene_initialization": scene_initialization,
+            "operator_alarm": operator_alarm,
         },
     }
 

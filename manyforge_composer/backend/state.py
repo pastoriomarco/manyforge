@@ -50,6 +50,16 @@ from manyforge_behavior.kernel_client import (
 from manyforge_behavior.skill_loader import SkillCatalog, load_skill_catalog, default_skills_dir
 from .event_recorder import EventRecorder
 from .log_throttle import ThrottledLog
+from .operator_alarm_adapters import OperatorAlarmAdapters
+from .operator_alarm_catalog import (
+    OperatorAlarmCatalogError,
+    load_operator_alarm_catalog,
+)
+from .operator_alarms import OperatorAlarmManager
+from .scene_initialization import (
+    SceneInitializationBarrier,
+    SceneInitializationReplayBatch,
+)
 from .security import normalize_allowed_roots
 from .viewer_data_plane import (
     ViewerDemandRegistry,
@@ -68,6 +78,10 @@ logger = logging.getLogger(__name__)
 _log_throttle = ThrottledLog(min_interval_s=5.0)
 _MAX_ASSISTANT_REQUEST_RECORDS = 200
 _MAX_ASSISTANT_PROPOSAL_RECORDS = 500
+# Recovery authority is projected on the existing non-real-time pump. Kernel
+# events wake it immediately; this bounded fallback also observes Composer and
+# scene-admission tokens that do not have a native event of their own.
+_RECOVERY_CONTEXT_PROJECTION_INTERVAL_S = 0.02
 _COMPOSER_STATE_INSTANCES: weakref.WeakSet[Any] = weakref.WeakSet()
 
 
@@ -300,6 +314,7 @@ class ComposerState:
         trace_max_bytes: int | None = None,
         allowed_fs_roots: list[str] | None = None,
         scenario_roots: list[str] | None = None,
+        operator_alarm_catalog_path: str | None = None,
     ):
         self._node_environment_lock = threading.Lock()
         active_node_report = replace(node_environment.report, activated=True)
@@ -341,6 +356,35 @@ class ComposerState:
             trace_max_age_s=trace_max_age_s,
             trace_max_bytes=trace_max_bytes,
         )
+        self.operator_alarm_manager: OperatorAlarmManager
+        self.operator_alarm_adapters: OperatorAlarmAdapters | None
+        try:
+            alarm_catalog = load_operator_alarm_catalog(
+                operator_alarm_catalog_path
+            )
+        except OperatorAlarmCatalogError as exc:
+            self.operator_alarm_manager = OperatorAlarmManager.unavailable(
+                code=exc.code,
+                message=str(exc),
+            )
+            self.operator_alarm_adapters = None
+            logger.critical(
+                "Operator-alarm catalog unavailable; motion attention is fail-closed: %s",
+                exc,
+            )
+        else:
+            self.operator_alarm_manager = OperatorAlarmManager(alarm_catalog)
+            self.operator_alarm_adapters = OperatorAlarmAdapters(
+                self.operator_alarm_manager,
+                lifecycle_sink=(
+                    self.event_recorder.record_operator_alarm_lifecycle_facts
+                ),
+            )
+            self.operator_alarm_adapters.initialize_empty_runtime()
+        self._operator_alarm_projection_lock = threading.Lock()
+        self._operator_alarm_cycle_manager: CycleManager | None = None
+        self._operator_alarm_native_event_index = 0
+        self._operator_alarm_last_provider_check_ns = 0
         self._initialize_kernel_observability(trace_dir)
         self.scene_edit_lock = threading.Lock()
         # Viewer-side visibility state. ComposerState is the source of truth
@@ -434,6 +478,7 @@ class ComposerState:
         self._pose_source_drift_exceeded_since_ns: dict[tuple[str, str], int] = {}
         self._pose_source_drift_raised: set[tuple[str, str]] = set()
         self._pose_source_apply_lock = threading.Lock()
+        self._scene_initialization = SceneInitializationBarrier()
         self._pose_source_invalidation_intent_lock = threading.Lock()
         self._pose_source_invalidation_intent_count = 0
         self._pose_source_invalidation_requested = threading.Event()
@@ -458,6 +503,9 @@ class ComposerState:
             "stale_result_ignored": 0,
             "errors": 0,
             "ingest_apply_suppressed": 0,
+            "barrier_buffered": 0,
+            "barrier_buffer_replaced": 0,
+            "barrier_replayed": 0,
         }
         self._pose_source_apply_object_metrics: dict[str, dict[str, int]] = {}
         self._visual_scene_objects_lock = threading.Lock()
@@ -1137,6 +1185,267 @@ class ComposerState:
             suppress_errors=False,
         )
 
+    def _operator_alarm_runtime_parameters(
+        self,
+    ) -> tuple[str, str, tuple[dict[str, str], ...], tuple[str, ...]]:
+        deployment = self.deployment
+        program = self.program
+        compatibility = (
+            getattr(deployment, "compatibility", None)
+            if deployment is not None
+            else None
+        )
+        runtime_lane = str(
+            getattr(compatibility, "lane", "")
+            or getattr(deployment, "name", "")
+            or "composer"
+        )
+        robot_resource = str(
+            getattr(getattr(program, "robot", None), "robot_id", "")
+            or getattr(getattr(deployment, "robot_config", None), "robot_id", "")
+            or "unbound-robot"
+        )
+        pose_scopes: list[dict[str, str]] = []
+        if deployment is not None:
+            for source_id, source in sorted(deployment.pose_sources.items()):
+                if not source.enabled:
+                    continue
+                for object_id, binding in sorted(source.objects.items()):
+                    if binding.apply_policy == "observe_only":
+                        continue
+                    pose_scopes.append(
+                        {
+                            "pose_source_id": str(source_id),
+                            "object_id": str(binding.object_id or object_id),
+                            "apply_policy_id": str(binding.apply_policy),
+                        }
+                    )
+        required_providers: list[str] = []
+        if deployment is not None:
+            execution = deployment.adapters.get("execution")
+            execution_config = dict(execution.config or {}) if execution else {}
+            if self._is_commanded_sim_execution_config(execution_config):
+                required_providers.append("isaac_demo_supervisor")
+        return (
+            runtime_lane,
+            robot_resource,
+            tuple(pose_scopes),
+            tuple(required_providers),
+        )
+
+    def _begin_operator_alarm_runtime(
+        self,
+        manager: CycleManager,
+        *,
+        runtime_token: str,
+        scene_already_open: bool,
+    ) -> None:
+        adapters = self.operator_alarm_adapters
+        if adapters is None:
+            return
+        with self._runtime_generation_lock:
+            program_generation = self._program_session_generation
+            deployment_generation = self._deployment_session_generation
+        epoch = (
+            f"{runtime_token}:program-{program_generation}:"
+            f"deployment-{deployment_generation}"
+        )
+        runtime_lane, robot_resource, pose_scopes, required_providers = (
+            self._operator_alarm_runtime_parameters()
+        )
+        try:
+            with self._operator_alarm_projection_lock:
+                self._operator_alarm_cycle_manager = manager
+                self._operator_alarm_native_event_index = 0
+                self._operator_alarm_last_provider_check_ns = 0
+                adapters.begin_runtime_epoch(
+                    epoch=epoch,
+                    runtime_lane=runtime_lane,
+                    robot_resource=robot_resource,
+                    pose_scopes=pose_scopes,
+                    required_providers=required_providers,
+                )
+                if scene_already_open:
+                    adapters.scene_initialization_opened(
+                        initialization_token=runtime_token,
+                    )
+            with self._external_runtime_status_lock:
+                provider_records = {
+                    provider_id: dict(record)
+                    for provider_id, record in self._external_runtime_statuses.items()
+                    if provider_id in required_providers
+                }
+            for provider_id, record in provider_records.items():
+                adapters.observe_provider_status(
+                    provider_id=provider_id,
+                    payload=record,
+                    received_at_ns=int(record.get("receivedAtNs") or 0),
+                )
+            self.operator_alarm_manager.reconcile_health(
+                code="operator_alarm_runtime_configuration_failed"
+            )
+        except Exception as exc:  # noqa: BLE001 - alarm health fails closed.
+            self.operator_alarm_manager.mark_health_unavailable(
+                code="operator_alarm_runtime_configuration_failed",
+                message=f"Operator-alarm runtime configuration failed: {exc}",
+            )
+            logger.exception("Operator-alarm runtime configuration failed")
+
+    def _project_operator_alarm_motion(self, manager: CycleManager) -> None:
+        adapters = self.operator_alarm_adapters
+        if adapters is None:
+            return
+        with self._operator_alarm_projection_lock:
+            if (
+                manager is not self.cycle_manager
+                or manager is not self._operator_alarm_cycle_manager
+            ):
+                return
+            first_offer = manager.get_recovery_offer()
+            _error, error_code, error_details = manager.get_error_snapshot()
+            second_offer = manager.get_recovery_offer()
+            first_identity = (
+                (first_offer or {}).get("offerId"),
+                (first_offer or {}).get("offerRevision"),
+            )
+            second_identity = (
+                (second_offer or {}).get("offerId"),
+                (second_offer or {}).get("offerRevision"),
+            )
+            if first_identity != second_identity:
+                return
+            adapters.motion_recovery_snapshot(
+                offer=second_offer,
+                error_code=error_code,
+                error_details=error_details,
+            )
+            events = manager.get_kernel_events_since(
+                self._operator_alarm_native_event_index
+            )
+            for event in events:
+                event_index = int(event.get("event_index") or 0)
+                self._operator_alarm_native_event_index = max(
+                    self._operator_alarm_native_event_index,
+                    event_index,
+                )
+                if str(event.get("type") or "") != "collision_detected":
+                    continue
+                raw_details = event.get("details")
+                collision_details = (
+                    dict(raw_details) if isinstance(raw_details, dict) else {}
+                )
+                adapters.motion_occurrence(
+                    error_details=collision_details,
+                    evidence_ref=(
+                        f"kernel-native:{int(event.get('sequence') or event_index)}"
+                    ),
+                    correlations={
+                        "native_event_index": event_index,
+                        "execution_id": int(event.get("execution_id") or 0),
+                        "run_id": manager.program_run_id,
+                    },
+                )
+            now_ns = time.monotonic_ns()
+            if (
+                now_ns - self._operator_alarm_last_provider_check_ns
+                >= 500_000_000
+            ):
+                adapters.check_provider_freshness(now_ns=now_ns)
+                self._operator_alarm_last_provider_check_ns = now_ns
+
+    def _project_operator_alarm_motion_best_effort(
+        self,
+        manager: CycleManager,
+    ) -> None:
+        try:
+            self._project_operator_alarm_motion(manager)
+        except Exception as exc:  # noqa: BLE001 - alarm health fails closed.
+            self.operator_alarm_manager.mark_health_unavailable(
+                code="operator_alarm_motion_projection_failed",
+                message=f"Operator-alarm motion projection failed: {exc}",
+            )
+            _log_throttle.warning(
+                logger,
+                "operator_alarm_motion_projection_failed",
+                "Operator-alarm motion projection failed",
+                extra={"event": "manyforge.operator_alarm.motion_projection_failed"},
+            )
+        else:
+            self.operator_alarm_manager.reconcile_health(
+                code="operator_alarm_motion_projection_failed"
+            )
+
+    def _project_operator_alarm_scene_failure(
+        self,
+        *,
+        token: str | None,
+        error: str,
+    ) -> None:
+        adapters = self.operator_alarm_adapters
+        if adapters is None:
+            return
+        try:
+            adapters.scene_initialization_failed(
+                error=error,
+                initialization_token=token,
+            )
+            self.operator_alarm_manager.reconcile_health(
+                code="operator_alarm_scene_projection_failed"
+            )
+        except Exception as exc:  # noqa: BLE001 - scene authority already committed.
+            self.operator_alarm_manager.mark_health_unavailable(
+                code="operator_alarm_scene_projection_failed",
+                message=f"Operator-alarm scene projection failed: {exc}",
+            )
+            logger.exception("Operator-alarm scene failure projection failed")
+
+    def _project_operator_alarm_scene_opened(self, *, token: str) -> None:
+        adapters = self.operator_alarm_adapters
+        if adapters is None:
+            return
+        try:
+            adapters.scene_initialization_opened(initialization_token=token)
+            self.operator_alarm_manager.reconcile_health(
+                code="operator_alarm_scene_projection_failed"
+            )
+        except Exception as exc:  # noqa: BLE001 - scene authority already committed.
+            self.operator_alarm_manager.mark_health_unavailable(
+                code="operator_alarm_scene_projection_failed",
+                message=f"Operator-alarm scene projection failed: {exc}",
+            )
+            logger.exception("Operator-alarm scene-open projection failed")
+
+    def _project_operator_alarm_pose_result(
+        self,
+        result: dict[str, Any],
+    ) -> None:
+        adapters = self.operator_alarm_adapters
+        if adapters is None:
+            return
+        try:
+            adapters.observe_pose_apply(result)
+            self.operator_alarm_manager.reconcile_health(
+                code="operator_alarm_pose_projection_failed"
+            )
+        except Exception as exc:  # noqa: BLE001 - scene apply result already committed.
+            self.operator_alarm_manager.mark_health_unavailable(
+                code="operator_alarm_pose_projection_failed",
+                message=f"Operator-alarm pose projection failed: {exc}",
+            )
+            logger.exception("Operator-alarm pose-result projection failed")
+
+    def persist_operator_alarm_lifecycle_facts(self, facts) -> list[int]:
+        """Persist already-committed lifecycle facts through the one outbox."""
+
+        adapters = self.operator_alarm_adapters
+        if adapters is None:
+            self.operator_alarm_manager.mark_health_unavailable(
+                code="operator_alarm_lifecycle_persistence_unavailable",
+                message="Operator-alarm lifecycle persistence adapter is unavailable",
+            )
+            return []
+        return adapters.deliver_lifecycle_facts(facts)
+
     def start_recovery_offer_pump(self) -> None:
         """Start the browser-independent NRT recovery event consumer."""
         with self._recovery_offer_pump_lock:
@@ -1147,14 +1456,42 @@ class ComposerState:
             self._recovery_offer_pump_wake.clear()
 
             def worker() -> None:
+                observed_manager: CycleManager | None = None
+                next_context_projection_at = 0.0
                 while not self._recovery_offer_pump_stop.is_set():
                     manager = self.cycle_manager
                     if manager is None:
+                        observed_manager = None
+                        next_context_projection_at = 0.0
                         self._recovery_offer_pump_wake.wait(timeout=0.02)
                         self._recovery_offer_pump_wake.clear()
                         continue
                     try:
-                        manager.wait_for_kernel_events_and_project(0.02)
+                        if manager is not observed_manager:
+                            observed_manager = manager
+                            next_context_projection_at = 0.0
+                        now = time.monotonic()
+                        wait_timeout_s = max(
+                            0.0,
+                            min(
+                                _RECOVERY_CONTEXT_PROJECTION_INTERVAL_S,
+                                next_context_projection_at - now,
+                            ),
+                        )
+                        manager.wait_for_kernel_events_and_project(wait_timeout_s)
+                        now = time.monotonic()
+                        if now >= next_context_projection_at:
+                            # Structural scene-admission and Composer-owned
+                            # generation changes do not necessarily emit a
+                            # native kernel event. While recovery is active,
+                            # poll those bounded NRT facts so an obsolete offer
+                            # is replaced before the operator can submit it.
+                            if manager.get_recovery_offer() is not None:
+                                manager.refresh_recovery_offer()
+                            next_context_projection_at = (
+                                now + _RECOVERY_CONTEXT_PROJECTION_INTERVAL_S
+                            )
+                        self._project_operator_alarm_motion_best_effort(manager)
                     except Exception:  # noqa: BLE001 - evidence remains fail-closed.
                         _log_throttle.warning(
                             logger,
@@ -3946,8 +4283,21 @@ class ComposerState:
         )
         previous_manager = self.cycle_manager
         previous_kernel = self._kernel
-        if self.cycle_manager is not None and not preserve_backend_state:
-            self.cycle_manager.reset()
+        scene_initialization_token: str | None = None
+        if previous_manager is not None and not preserve_backend_state:
+            initialization = self.begin_scene_initialization(
+                deferred=False,
+                reason="runtime_rebuild",
+            )
+            scene_initialization_token = str(initialization["token"])
+            try:
+                previous_manager.reset()
+            except Exception as exc:
+                self.fail_scene_initialization(
+                    scene_initialization_token,
+                    error=str(exc) or type(exc).__name__,
+                )
+                raise
 
         kernel = previous_kernel
         kernel_bundle = self.kernel_bundle
@@ -3995,6 +4345,10 @@ class ComposerState:
                     reason="failed runtime-rebuild candidate rollback",
                     suppress_errors=True,
                 )
+            self._restore_scene_initialization_after_candidate_rollback(
+                scene_initialization_token,
+                reason="runtime_rebuild_candidate_rejected",
+            )
             raise
 
         try:
@@ -4023,8 +4377,18 @@ class ComposerState:
                     reason="failed runtime-rebuild cutover staging",
                     suppress_errors=True,
                 )
+            self._restore_scene_initialization_after_candidate_rollback(
+                scene_initialization_token,
+                reason="runtime_rebuild_staging_rejected",
+            )
             raise
 
+        if not preserve_backend_state and scene_initialization_token is None:
+            initialization = self.begin_scene_initialization(
+                deferred=False,
+                reason="runtime_rebuild",
+            )
+            scene_initialization_token = str(initialization["token"])
         self.program = program
         self._effective_program = effective_program or program
         self.deployment = deployment
@@ -4048,6 +4412,16 @@ class ComposerState:
         self.clear_pose_source_snapshots()
         self.clear_visual_state_snapshot()
         self.cycle_manager = next_manager
+        alarm_runtime_token = (
+            scene_initialization_token
+            or f"runtime-cutover-{uuid.uuid4().hex}"
+        )
+        self._begin_operator_alarm_runtime(
+            next_manager,
+            runtime_token=alarm_runtime_token,
+            scene_already_open=preserve_backend_state,
+        )
+        self._project_operator_alarm_motion_best_effort(next_manager)
         self._recovery_offer_pump_wake.set()
         self._retire_replaced_kernel(
             previous_kernel,
@@ -4061,14 +4435,25 @@ class ComposerState:
             )
         if preserve_backend_state:
             return
-        self.reset_backend_authoritative_sim_if_needed(reason="program_load")
-        # Explicit load-time scene seed: populate the live planning scene with
-        # the program's authored objects now, so they are visible at idle before
-        # the first Run. Scene-only (no tree, no robot reset); the first Run/Reset
-        # re-seeds via _prepare_fresh_cycle. Replaces the removed implicit
-        # frontend authored-scene mirror; the live scene is now written only by
-        # the program cycle, explicit Reset, and this explicit load seed.
-        self.cycle_manager.seed_authored_scene()
+        assert scene_initialization_token is not None
+        try:
+            self.prepare_scene_initialization_reset(
+                scene_initialization_token,
+                reason="runtime_rebuild",
+            )
+            self.reset_backend_authoritative_sim_if_needed(reason="program_load")
+            self.cycle_manager.seed_authored_scene()
+            self.mark_scene_initialization_seeded(scene_initialization_token)
+            self.complete_scene_initialization(
+                scene_initialization_token,
+                reason="runtime_rebuild",
+            )
+        except Exception as exc:
+            self.fail_scene_initialization(
+                scene_initialization_token,
+                error=str(exc) or type(exc).__name__,
+            )
+            raise
 
         if self._on_program_loaded:
             try:
@@ -4102,6 +4487,21 @@ class ComposerState:
         arm time (not on runtime-status polls), so dispatch fails closed if
         the backend can no longer report its capability.
         """
+        initialization = self.scene_initialization_status()
+        if initialization["state"] != "open":
+            return {
+                "message": (
+                    "Execution blocked while the planning scene is being "
+                    f"initialized ({initialization['state']})"
+                ),
+                "error_code": "scene_initialization_not_ready",
+                "error_details": {
+                    "scene_initialization_generation": initialization[
+                        "generation"
+                    ],
+                    "scene_initialization_state": initialization["state"],
+                },
+            }
         self._evaluate_stop_capability(reason="motion_arm")
         return self.stop_capability_block_reason()
 
@@ -4359,6 +4759,23 @@ class ComposerState:
         by default.  Pass ``force_discard_overrides=True`` to explicitly discard
         them.
         """
+        with self._program_edit_lock:
+            return self._load_program_locked(
+                program_path,
+                deployment_path,
+                force_discard_overrides=force_discard_overrides,
+                defer_initial_runtime_reset=defer_initial_runtime_reset,
+            )
+
+    def _load_program_locked(
+        self,
+        program_path: str,
+        deployment_path: Optional[str] = None,
+        *,
+        force_discard_overrides: bool = False,
+        defer_initial_runtime_reset: bool = False,
+    ) -> Program:
+        """Load one program while ``_program_edit_lock`` owns the cutover."""
         with self._runtime_override_lock:
             has_runtime_overrides = bool(self._runtime_overrides)
         if has_runtime_overrides:
@@ -4372,9 +4789,24 @@ class ComposerState:
 
         previous_manager = self.cycle_manager
         previous_kernel = self._kernel
-        # Stop existing cycle manager if running
-        if self.cycle_manager is not None:
-            self.cycle_manager.reset()
+        scene_initialization_token: str | None = None
+        # Close the scene barrier before Reset can temporarily remove authored
+        # objects. Continuous observations then buffer across the whole
+        # quiesce/stage/cutover transaction instead of becoming false alarms.
+        if previous_manager is not None:
+            initialization = self.begin_scene_initialization(
+                deferred=defer_initial_runtime_reset,
+                reason="program_load",
+            )
+            scene_initialization_token = str(initialization["token"])
+            try:
+                previous_manager.reset()
+            except Exception as exc:
+                self.fail_scene_initialization(
+                    scene_initialization_token,
+                    error=str(exc) or type(exc).__name__,
+                )
+                raise
 
         # Load deployment first (if provided), but do not publish the new
         # deployment/kernel into session state until every cross-check below
@@ -4382,20 +4814,32 @@ class ComposerState:
         scene_snapshot_provider = self._resolve_scene_snapshot_provider()
         deployment = self.deployment
         deployment_source_path = self.deployment_source_path
-        if deployment_path:
-            deployment = Deployment(deployment_path)
-            deployment.validate_assistant_modes(self.node_catalog, self.skill_catalog)
-            deployment_source_path = deployment_path
-        elif deployment is not None:
-            deployment.validate_assistant_modes(self.node_catalog, self.skill_catalog)
-
         kernel = self._kernel
         kernel_bundle = self.kernel_bundle
         previous_runtime_resources = self._runtime_resources
-        runtime_resources = build_runtime_resource_registry(
-            deployment.runtime_resources if deployment else {},
-            self._runtime_resource_factories,
-        )
+        try:
+            if deployment_path:
+                deployment = Deployment(deployment_path)
+                deployment.validate_assistant_modes(
+                    self.node_catalog,
+                    self.skill_catalog,
+                )
+                deployment_source_path = deployment_path
+            elif deployment is not None:
+                deployment.validate_assistant_modes(
+                    self.node_catalog,
+                    self.skill_catalog,
+                )
+            runtime_resources = build_runtime_resource_registry(
+                deployment.runtime_resources if deployment else {},
+                self._runtime_resource_factories,
+            )
+        except Exception:
+            self._restore_scene_initialization_after_candidate_rollback(
+                scene_initialization_token,
+                reason="program_load_configuration_rejected",
+            )
+            raise
         try:
             if deployment is not None and self._kernel_factory is not None:
                 kernel, kernel_bundle = self._kernel_factory(deployment)
@@ -4442,6 +4886,10 @@ class ComposerState:
                     reason="failed program-load candidate rollback",
                     suppress_errors=True,
                 )
+            self._restore_scene_initialization_after_candidate_rollback(
+                scene_initialization_token,
+                reason="program_load_candidate_rejected",
+            )
             raise
 
         try:
@@ -4469,8 +4917,18 @@ class ComposerState:
                     reason="failed program-load cutover staging",
                     suppress_errors=True,
                 )
+            self._restore_scene_initialization_after_candidate_rollback(
+                scene_initialization_token,
+                reason="program_load_staging_rejected",
+            )
             raise
 
+        if scene_initialization_token is None:
+            initialization = self.begin_scene_initialization(
+                deferred=defer_initial_runtime_reset,
+                reason="program_load",
+            )
+            scene_initialization_token = str(initialization["token"])
         self.program = runner.program
         self._effective_program = runner.program
         self.program_source_path = program_path
@@ -4497,6 +4955,12 @@ class ComposerState:
         self.clear_visual_scene_objects_snapshot()
         self.clear_visual_state_snapshot()
         self.cycle_manager = next_manager
+        self._begin_operator_alarm_runtime(
+            next_manager,
+            runtime_token=scene_initialization_token,
+            scene_already_open=False,
+        )
+        self._project_operator_alarm_motion_best_effort(next_manager)
         self._recovery_offer_pump_wake.set()
         self._retire_replaced_kernel(
             previous_kernel,
@@ -4508,12 +4972,24 @@ class ComposerState:
             reason="successful program-load cutover",
         )
         if not defer_initial_runtime_reset:
-            self.reset_backend_authoritative_sim_if_needed(reason="program_load")
-            # Explicit load-time scene seed (see _rebuild_runtime): populate the
-            # live planning scene with the program's authored objects at load so
-            # they are visible at idle before the first Run. Scene-only; replaces
-            # the removed implicit frontend authored-scene mirror.
-            self.cycle_manager.seed_authored_scene()
+            try:
+                self.prepare_scene_initialization_reset(
+                    scene_initialization_token,
+                    reason="program_load",
+                )
+                self.reset_backend_authoritative_sim_if_needed(reason="program_load")
+                self.cycle_manager.seed_authored_scene()
+                self.mark_scene_initialization_seeded(scene_initialization_token)
+                self.complete_scene_initialization(
+                    scene_initialization_token,
+                    reason="program_load",
+                )
+            except Exception as exc:
+                self.fail_scene_initialization(
+                    scene_initialization_token,
+                    error=str(exc) or type(exc).__name__,
+                )
+                raise
 
         # Notify runtime visual listeners.
         if self._on_program_loaded:
@@ -4541,6 +5017,23 @@ class ComposerState:
         with self._external_runtime_status_lock:
             self._external_runtime_statuses[provider] = record
             self._external_runtime_status_revision += 1
+        adapters = self.operator_alarm_adapters
+        if adapters is not None:
+            try:
+                adapters.observe_provider_status(
+                    provider_id=provider,
+                    payload=record,
+                    received_at_ns=int(record["receivedAtNs"]),
+                )
+                self.operator_alarm_manager.reconcile_health(
+                    code="operator_alarm_provider_projection_failed"
+                )
+            except Exception as exc:  # noqa: BLE001 - status publication committed.
+                self.operator_alarm_manager.mark_health_unavailable(
+                    code="operator_alarm_provider_projection_failed",
+                    message=f"Operator-alarm provider projection failed: {exc}",
+                )
+                logger.exception("Operator-alarm provider-status projection failed")
 
     def heartbeat_revision(self) -> tuple[Any, ...]:
         """Cheap material-change token; never calls a backend observer API."""
@@ -4553,6 +5046,13 @@ class ComposerState:
             external_revision = self._external_runtime_status_revision
         with self._pose_source_apply_lock:
             pose_apply_generation = self._pose_source_apply_generation
+        scene_initialization = self.scene_initialization_status()
+        scene_initialization_revision = (
+            scene_initialization["generation"],
+            scene_initialization["state"],
+            scene_initialization["updatedAtNs"],
+        )
+        operator_alarm_revision = self.operator_alarm_manager.revision_token()
         recorder_revision = self.event_recorder.heartbeat_revision()
         cycle_state = self.cycle_manager.state.value if self.cycle_manager else "none"
         pipeline_revision: tuple[int, int, int] = (0, 0, 0)
@@ -4570,6 +5070,8 @@ class ComposerState:
             *runtime_generations,
             external_revision,
             pose_apply_generation,
+            scene_initialization_revision,
+            operator_alarm_revision,
             recorder_revision,
             cycle_state,
             pipeline_revision,
@@ -4622,6 +5124,309 @@ class ComposerState:
                 "misses": self._heartbeat_cache_misses,
                 "sample_timestamp_ns": self._heartbeat_cache_built_ns,
             }
+
+    def _record_scene_initialization_event(
+        self,
+        action: str,
+        *,
+        details: dict[str, Any],
+    ) -> None:
+        try:
+            self.event_recorder.record_scene_initialization_event(
+                action,
+                details=details,
+            )
+        except Exception:
+            logger.debug(
+                "scene-initialization event recording failed",
+                exc_info=True,
+            )
+
+    def scene_initialization_status(self) -> dict[str, Any]:
+        return self._scene_initialization.snapshot()
+
+    def operator_alarm_status(self) -> dict[str, Any]:
+        """Return bounded current alarm health, metrics, and adapter outbox state."""
+        snapshot = self.operator_alarm_manager.snapshot(limit=0)
+        adapters = self.operator_alarm_adapters
+        persistence = (
+            adapters.persistence_status()
+            if adapters is not None
+            else {
+                "pendingLifecycleFacts": 0,
+                "capacity": 0,
+                "metrics": {},
+                "unavailable": True,
+            }
+        )
+        return {
+            "schemaVersion": "manyforge.operator_alarm_status.v1",
+            "reconciled": snapshot["reconciled"],
+            "health": snapshot["health"],
+            "domains": snapshot["domains"],
+            "counts": {
+                "live": snapshot["liveCount"],
+                "unacknowledged": snapshot["unacknowledgedCount"],
+                "motionAttention": snapshot["motionAttentionCount"],
+                "active": snapshot["activeCount"],
+                "activeAcknowledged": snapshot["activeAcknowledgedCount"],
+                "byState": snapshot["countsByState"],
+                "byPriority": snapshot["countsByPriority"],
+                "byClass": snapshot["countsByClass"],
+            },
+            "metrics": self.operator_alarm_manager.metrics(),
+            "persistence": persistence,
+        }
+
+    def begin_scene_initialization(
+        self,
+        *,
+        deferred: bool,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Close the barrier before invalidating old pose-apply work."""
+        status = self._scene_initialization.close(
+            deferred=deferred,
+            reason=reason,
+        )
+        # The barrier is already visible. A racing observation is therefore
+        # buffered even if this clear removes its live snapshot.
+        self.clear_pose_source_snapshots()
+        self._record_scene_initialization_event(
+            "closed",
+            details={
+                "generation": status["generation"],
+                "token": status["token"],
+                "deferred": status["deferred"],
+                "reason": status["reason"],
+            },
+        )
+        return self.scene_initialization_status()
+
+    def _restore_scene_initialization_after_candidate_rollback(
+        self,
+        token: str | None,
+        *,
+        reason: str,
+    ) -> None:
+        """Reopen the retained runtime after an unpublished candidate fails.
+
+        A program/runtime cutover closes the barrier before resetting the
+        retained manager. If later candidate staging fails, that reset has
+        already restored the retained authored scene; replay the newest
+        observations gathered behind the barrier and make the retained runtime
+        usable again. A rollback replay failure remains an explicit scene-
+        initialization fault instead of silently reopening an uncertain scene.
+        """
+        if token is None:
+            return
+        try:
+            self.mark_scene_initialization_seeded(token)
+            self.complete_scene_initialization(token, reason=reason)
+        except Exception as exc:  # noqa: BLE001 - preserve candidate failure.
+            error = (
+                "retained runtime scene rollback failed: "
+                f"{str(exc) or type(exc).__name__}"
+            )
+            self.fail_scene_initialization(token, error=error)
+            logger.exception(error)
+
+    def prepare_scene_initialization_reset(
+        self,
+        token: str | None,
+        *,
+        reason: str,
+    ) -> str | None:
+        prepared = self._scene_initialization.prepare_reset(
+            token,
+            reason=reason,
+        )
+        if prepared is not None:
+            status = self.scene_initialization_status()
+            self._record_scene_initialization_event(
+                "resetting",
+                details={
+                    "generation": status["generation"],
+                    "token": prepared,
+                    "reason": reason,
+                },
+            )
+        return prepared
+
+    def mark_scene_initialization_seeded(self, token: str) -> None:
+        status = self._scene_initialization.mark_seeded(token)
+        self._record_scene_initialization_event(
+            "seeded",
+            details={"generation": status["generation"], "token": token},
+        )
+
+    def fail_scene_initialization(self, token: str | None, *, error: str) -> None:
+        before = self.scene_initialization_status()
+        status = self._scene_initialization.fail(token, error=error)
+        if status is not None:
+            if before["state"] != "failed":
+                self._record_scene_initialization_event(
+                    "failed",
+                    details={
+                        "generation": status["generation"],
+                        "token": token,
+                        "error": status["error"],
+                    },
+                )
+            self._project_operator_alarm_scene_failure(
+                token=token,
+                error=str(status.get("error") or error),
+            )
+
+    def _buffer_scene_initialization_apply(
+        self,
+        *,
+        source_id: str | None,
+        policy: str,
+        object_ids: list[str],
+        require_idle: bool,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        snapshots, _revision = self.pose_source_snapshots_with_revision()
+        result = self._scene_initialization.buffer_apply(
+            source_id=source_id,
+            policy=policy,
+            object_ids=object_ids,
+            require_idle=require_idle,
+            reason=reason,
+            snapshots=snapshots,
+        )
+        if result is None:
+            return None
+        with self._pose_source_apply_lock:
+            self._increment_pose_source_apply_metric_locked(
+                "barrier_buffered",
+                amount=max(1, int(result["buffered_count"])),
+            )
+            self._increment_pose_source_apply_metric_locked(
+                "barrier_buffer_replaced",
+                amount=int(result["replacement_count"]),
+            )
+        return result
+
+    def _restore_scene_initialization_snapshots(
+        self,
+        batch: SceneInitializationReplayBatch,
+    ) -> None:
+        by_source: dict[str, dict[str, Any]] = {}
+        objects_by_source: dict[str, list[dict[str, Any]]] = {}
+        for (source_id, _object_id), record in batch.objects.items():
+            base = copy.deepcopy(record["base"])
+            current = by_source.get(source_id)
+            if current is None or int(base.get("received_at_ns") or 0) >= int(
+                current.get("received_at_ns") or 0
+            ):
+                by_source[source_id] = base
+            objects_by_source.setdefault(source_id, []).append(
+                copy.deepcopy(record["object"])
+            )
+        if not by_source:
+            return
+        with self._pose_source_lock:
+            for source_id, base in by_source.items():
+                base["objects"] = sorted(
+                    objects_by_source.get(source_id, []),
+                    key=lambda item: str(item.get("object_id") or ""),
+                )
+                self._pose_source_snapshots[source_id] = base
+            self._pose_source_observer_revision += 1
+
+    def complete_scene_initialization(
+        self,
+        token: str,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Replay newest eligible observations, then open this generation."""
+        current = self.scene_initialization_status()
+        if current["state"] == "open" and token == current["token"]:
+            return current
+
+        while True:
+            batch = self._scene_initialization.take_replay_batch(token)
+            if batch.requests:
+                self._restore_scene_initialization_snapshots(batch)
+                generation = self._pose_source_apply_generation_value()
+                replayed = 0
+                try:
+                    for policy in sorted(batch.requests):
+                        request = batch.requests[policy]
+                        result = self.apply_pose_source_updates(
+                            policy=policy,
+                            object_ids=sorted(request.get("object_ids", set())),
+                            require_idle=bool(request.get("require_idle")),
+                            reason="scene_initialization_replay",
+                            expected_generation=generation,
+                        )
+                        if not result.get("success", False):
+                            raise RuntimeError(
+                                str(
+                                    result.get("error")
+                                    or "pose-source replay failed"
+                                )
+                            )
+                        replayed += int(result.get("applied_count") or 0)
+                except Exception as exc:
+                    error = str(exc) or type(exc).__name__
+                    status = self._scene_initialization.restore_failed_batch(
+                        token,
+                        batch,
+                        error=error,
+                    )
+                    if status is not None:
+                        self._record_scene_initialization_event(
+                            "failed",
+                            details={
+                                "generation": status["generation"],
+                                "token": token,
+                                "error": error,
+                            },
+                        )
+                    raise RuntimeError(
+                        f"scene initialization pose replay failed: {error}"
+                    ) from exc
+                self._scene_initialization.record_replay(
+                    token,
+                    applied_count=replayed,
+                )
+                with self._pose_source_apply_lock:
+                    self._increment_pose_source_apply_metric_locked(
+                        "barrier_replayed",
+                        amount=max(1, replayed),
+                    )
+                self._record_scene_initialization_event(
+                    "replayed",
+                    details={
+                        "generation": self.scene_initialization_status()[
+                            "generation"
+                        ],
+                        "token": token,
+                        "applied_count": replayed,
+                        "policies": sorted(batch.requests),
+                    },
+                )
+
+            opened = self._scene_initialization.open_if_no_buffer(
+                token,
+                reason=reason,
+            )
+            if opened is None:
+                continue
+            self._record_scene_initialization_event(
+                "opened",
+                details={
+                    "generation": opened["generation"],
+                    "token": token,
+                    "reason": reason,
+                },
+            )
+            self._project_operator_alarm_scene_opened(token=token)
+            return opened
 
     def update_pose_source_snapshot(
         self,
@@ -5879,6 +6684,23 @@ class ComposerState:
             "between_nodes",
         }:
             raise ValueError(f"unsupported pose-source apply policy: {policy}")
+        initialization = self.scene_initialization_status()
+        if (
+            initialization["state"] != "open"
+            and reason != "scene_initialization_replay"
+        ):
+            return tagged_result({
+                "success": False,
+                "policy": policy,
+                "error": "scene initialization barrier is closed",
+                "error_code": "scene_initialization_not_ready",
+                "scene_initialization_state": initialization["state"],
+                "scene_initialization_generation": initialization["generation"],
+                "applied_count": 0,
+                "skipped_count": 0,
+                "rejected_count": 1,
+                "details": [],
+            })
         if self.kernel is None:
             return tagged_result({
                 "success": False,
@@ -6519,6 +7341,10 @@ class ComposerState:
         if rejected_count:
             self._record_pose_source_apply_metric("errors", amount=rejected_count)
 
+        with self._runtime_generation_lock:
+            program_generation = self._program_session_generation
+            deployment_generation = self._deployment_session_generation
+
         event_details = {
             "generation": result_generation,
             "current_generation": current_generation,
@@ -6534,6 +7360,9 @@ class ComposerState:
             "rejected_count": rejected_count,
             "required_missing": sorted(required_missing),
             "success": success,
+            "error": error,
+            "program_generation": program_generation,
+            "deployment_generation": deployment_generation,
             "details": copy.deepcopy(details),
         }
         event_details.update(self._action_span_event_details(action_span))
@@ -6567,6 +7396,8 @@ class ComposerState:
             except Exception:
                 logger.debug("pose-source event recording failed", exc_info=True)
 
+        self._project_operator_alarm_pose_result(event_details)
+
         return tagged_result({
             "success": success,
             "policy": policy,
@@ -6586,6 +7417,7 @@ class ComposerState:
         object_ids: list[str] | None = None,
         require_idle: bool = False,
         reason: str = "",
+        source_id: str | None = None,
     ) -> dict[str, Any]:
         """Queue a latest-wins continuous pose-source scene apply.
 
@@ -6599,6 +7431,15 @@ class ComposerState:
             raise ValueError(
                 "enqueue_pose_source_apply is only for continuous pose-source policies"
             )
+        buffered = self._buffer_scene_initialization_apply(
+            source_id=source_id,
+            policy=policy,
+            object_ids=list(object_ids or []),
+            require_idle=require_idle,
+            reason=reason,
+        )
+        if buffered is not None:
+            return buffered
         request = {
             "policy": policy,
             "object_ids": list(object_ids or []),

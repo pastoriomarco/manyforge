@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Any
 import pytest
 from pathlib import Path
 
@@ -42,6 +43,7 @@ from manyforge_composer.backend.models import (
     SceneShapeResponse,
     VisualSceneSnapshotResponse,
 )
+from manyforge_composer.backend.operator_alarms import AlarmConditionUpdate
 from manyforge_composer.backend import route_execution, routes_debug, routes_execution
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.ws_state import StateHub
@@ -63,9 +65,9 @@ _ISAAC_LITE6_DEPLOYMENT_PATH = str(
 
 
 @contextmanager
-def _capture_app_logger(caplog, level: int):
-    """Capture request logs without depending on process-wide root handlers."""
-    logger = logging.getLogger("manyforge_composer.backend.app")
+def _capture_named_logger(caplog, logger_name: str, level: int):
+    """Capture one logger without depending on process-wide root handlers."""
+    logger = logging.getLogger(logger_name)
     previous_level = logger.level
     previous_propagate = logger.propagate
     logger.setLevel(level)
@@ -77,6 +79,12 @@ def _capture_app_logger(caplog, level: int):
         logger.removeHandler(caplog.handler)
         logger.propagate = previous_propagate
         logger.setLevel(previous_level)
+
+
+@contextmanager
+def _capture_app_logger(caplog, level: int):
+    with _capture_named_logger(caplog, "manyforge_composer.backend.app", level):
+        yield
 
 
 def _script_ready_recovery(
@@ -567,9 +575,10 @@ def test_replaced_runtime_resource_cleanup_failure_does_not_relabel_cutover(
         {"plc_clients": {"default": handle}}
     )
 
-    with caplog.at_level(
+    with _capture_named_logger(
+        caplog,
+        "manyforge_composer.backend.state",
         logging.ERROR,
-        logger="manyforge_composer.backend.state",
     ):
         retired = state._retire_runtime_resources_after_cutover(
             resources,
@@ -596,20 +605,52 @@ def make_client(execute_duration_s: float = 0.0) -> TestClient:
     return TestClient(app)
 
 
-def _acknowledge_all_operator_alerts(client: TestClient) -> dict:
-    inbox = client.get("/api/execution/alerts").json()
-    if inbox["blockingCount"] == 0:
-        return inbox
+def _acknowledge_all_operator_alarms(client: TestClient) -> dict:
+    snapshot = client.get("/api/execution/alarms").json()
+    if snapshot["unacknowledgedCount"] == 0:
+        return snapshot
     response = client.post(
-        "/api/execution/alerts/acknowledge-all",
+        "/api/execution/alarms/acknowledge-all",
         json={
-            "alertIds": inbox["unacknowledgedAlertIds"],
-            "expectedGeneration": inbox["generation"],
+            "members": snapshot["unacknowledgedMembership"],
+            "expectedGeneration": snapshot["generation"],
             "confirmed": True,
         },
     )
     assert response.status_code == 200
-    return response.json()["inbox"]
+    return response.json()["snapshot"]
+
+
+def _submit_test_pose_alarm(
+    state: ComposerState,
+    *,
+    object_id: str,
+    sequence: int,
+    active: bool = True,
+) -> dict[str, Any]:
+    adapters = state.operator_alarm_adapters
+    assert adapters is not None
+    scene_source = adapters.source_status()["sources"]["scene"]
+    mutation = state.operator_alarm_manager.submit(
+        AlarmConditionUpdate(
+            definition_id="manyforge.scene.pose_apply_fault",
+            scope={
+                "pose_source_id": "route-test-source",
+                "object_id": object_id,
+                "apply_policy_id": "continuous",
+            },
+            active=active,
+            source_id=scene_source["sourceId"],
+            source_epoch=scene_source["epoch"],
+            source_sequence=sequence,
+            observed_at_ns=time.monotonic_ns(),
+            observed_at_wall="2026-07-21T00:00:00Z",
+            details={"reason": "explicit route-test condition"},
+            correlations={"execution_id": sequence},
+        )
+    )
+    state.persist_operator_alarm_lifecycle_facts(mutation.lifecycle_facts)
+    return mutation.records[0].to_dict()
 
 
 class _StopCapabilityBundle:
@@ -774,6 +815,16 @@ def test_legacy_recovery_routes_are_absent(client, legacy_path):
     assert client.post(legacy_path).status_code in {404, 405}
 
 
+def test_legacy_operator_alert_routes_are_absent_from_openapi(client):
+    paths = client.app.openapi()["paths"]
+    assert "/api/execution/alerts" not in paths
+    assert "/api/execution/alerts/acknowledge-all" not in paths
+    assert "/api/execution/alerts/{alert_id}/acknowledge" not in paths
+    assert "/api/execution/alarms" in paths
+    assert "/api/execution/alarms/acknowledge-all" in paths
+    assert "/api/execution/alarms/{condition_id}/acknowledge" in paths
+
+
 def test_cycle_status_includes_error_fields_for_hmi(client):
     """Rich error UX (#1 + #3): `/api/cycle/status` always returns the
     error / errorCode / errorDetails fields so the viewer can poll one
@@ -792,37 +843,65 @@ def test_cycle_status_includes_error_fields_for_hmi(client):
     assert data["errorDetails"] is None
 
 
-def test_operator_alert_routes_retain_latest_three_and_reveal_older(
+def test_operator_alarm_routes_page_attention_and_keep_active_acknowledged_standing(
     client, state
 ):
+    # Operational severity remains history/incident evidence and cannot admit
+    # an alarm without an explicit condition adapter update.
+    state.event_recorder._record_event(  # noqa: SLF001 - history fixture
+        event_type="cycle_error",
+        execution_id=99,
+        details={"error": "raw error is not an alarm definition"},
+    )
+    assert client.get("/api/execution/alarms").json()["liveCount"] == 0
+
     for execution_id in range(1, 5):
-        state.event_recorder._record_event(  # noqa: SLF001 - incident fixture
-            event_type="cycle_error",
-            execution_id=execution_id,
-            details={
-                "error": f"alert failure {execution_id}",
-                "error_code": f"alert_failure_{execution_id}",
-            },
+        _submit_test_pose_alarm(
+            state,
+            object_id=f"box-{execution_id}",
+            sequence=execution_id,
         )
 
-    response = client.get("/api/execution/alerts", params={"limit": 3})
+    response = client.get(
+        "/api/execution/alarms",
+        params={
+            "limit": 3,
+            "states": "active_unacknowledged,returned_unacknowledged",
+        },
+    )
     assert response.status_code == 200
-    inbox = response.json()
-    assert inbox["blockingCount"] == 4
-    assert inbox["truncated"] is True
-    assert len(inbox["alerts"]) == 3
-    assert len(inbox["unacknowledgedAlertIds"]) == 4
+    snapshot = response.json()
+    assert snapshot["unacknowledgedCount"] == 4
+    assert snapshot["motionAttentionCount"] == 4
+    assert snapshot["activeCount"] == 4
+    assert snapshot["truncated"] is True
+    assert len(snapshot["alarms"]) == 3
+    assert len(snapshot["unacknowledgedMembership"]) == 4
 
-    acknowledged_id = inbox["alerts"][0]["alertId"]
+    acknowledged_alarm = snapshot["alarms"][0]
     cycle_before = client.get("/api/cycle/status").json()
     acknowledged = client.post(
-        f"/api/execution/alerts/{acknowledged_id}/acknowledge"
+        (
+            "/api/execution/alarms/"
+            f"{acknowledged_alarm['conditionId']}/acknowledge"
+        ),
+        json={
+            "activationId": acknowledged_alarm["activationId"],
+            "expectedRecordRevision": acknowledged_alarm["recordRevision"],
+            "confirmed": True,
+        },
     )
     assert acknowledged.status_code == 200
-    updated = acknowledged.json()["inbox"]
-    assert updated["blockingCount"] == 3
-    assert len(updated["alerts"]) == 3
-    assert acknowledged_id not in updated["unacknowledgedAlertIds"]
+    updated = acknowledged.json()["snapshot"]
+    assert updated["unacknowledgedCount"] == 3
+    assert updated["activeCount"] == 4
+    assert updated["activeAcknowledgedCount"] == 1
+    standing = next(
+        alarm
+        for alarm in updated["alarms"]
+        if alarm["conditionId"] == acknowledged_alarm["conditionId"]
+    )
+    assert standing["lifecycleState"] == "active_acknowledged"
     cycle_after = client.get("/api/cycle/status").json()
     assert cycle_after["state"] == cycle_before["state"]
     assert cycle_after["error"] == cycle_before["error"]
@@ -830,51 +909,61 @@ def test_operator_alert_routes_retain_latest_three_and_reveal_older(
 
     audit = client.get(
         "/api/execution/history",
-        params={"eventTypes": "operator_alert_acknowledged"},
+        params={"eventTypes": "operator_alarm_acknowledged"},
     )
     assert audit.status_code == 200
     assert [event["type"] for event in audit.json()["events"]] == [
-        "operator_alert_acknowledged"
+        "operator_alarm_acknowledged"
     ]
 
     replay = client.post(
-        f"/api/execution/alerts/{acknowledged_id}/acknowledge"
+        (
+            "/api/execution/alarms/"
+            f"{acknowledged_alarm['conditionId']}/acknowledge"
+        ),
+        json={
+            "activationId": acknowledged_alarm["activationId"],
+            "expectedRecordRevision": acknowledged_alarm["recordRevision"],
+            "confirmed": True,
+        },
     )
     assert replay.status_code == 200
-    assert replay.json()["alreadyAcknowledged"] is True
+    assert replay.json()["changed"] is False
 
 
-def test_operator_alert_acknowledge_all_rejects_stale_confirmation(client, state):
+def test_operator_alarm_acknowledge_all_rejects_stale_confirmation(client, state):
     for execution_id in (11, 12):
-        state.event_recorder._record_event(  # noqa: SLF001 - incident fixture
-            event_type="cycle_error",
-            execution_id=execution_id,
-            details={"error": f"bulk alert {execution_id}"},
+        _submit_test_pose_alarm(
+            state,
+            object_id=f"bulk-{execution_id}",
+            sequence=execution_id,
         )
-    original = client.get("/api/execution/alerts").json()
+    original = client.get("/api/execution/alarms").json()
 
-    state.event_recorder._record_event(  # noqa: SLF001 - concurrent incident
-        event_type="cycle_error",
-        execution_id=13,
-        details={"error": "new alert during confirmation"},
+    _submit_test_pose_alarm(
+        state,
+        object_id="bulk-13",
+        sequence=13,
     )
     stale = client.post(
-        "/api/execution/alerts/acknowledge-all",
+        "/api/execution/alarms/acknowledge-all",
         json={
-            "alertIds": original["unacknowledgedAlertIds"],
+            "members": original["unacknowledgedMembership"],
             "expectedGeneration": original["generation"],
             "confirmed": True,
         },
     )
     assert stale.status_code == 409
-    assert stale.json()["detail"]["errorCode"] == "operator_alert_inbox_stale"
-    current = client.get("/api/execution/alerts").json()
-    assert current["blockingCount"] == 3
+    assert stale.json()["detail"]["errorCode"] == (
+        "operator_alarm_manager_generation_stale"
+    )
+    current = client.get("/api/execution/alarms").json()
+    assert current["unacknowledgedCount"] == 3
 
     unconfirmed = client.post(
-        "/api/execution/alerts/acknowledge-all",
+        "/api/execution/alarms/acknowledge-all",
         json={
-            "alertIds": current["unacknowledgedAlertIds"],
+            "members": current["unacknowledgedMembership"],
             "expectedGeneration": current["generation"],
             "confirmed": False,
         },
@@ -882,54 +971,82 @@ def test_operator_alert_acknowledge_all_rejects_stale_confirmation(client, state
     assert unconfirmed.status_code == 400
 
     accepted = client.post(
-        "/api/execution/alerts/acknowledge-all",
+        "/api/execution/alarms/acknowledge-all",
         json={
-            "alertIds": current["unacknowledgedAlertIds"],
+            "members": current["unacknowledgedMembership"],
             "expectedGeneration": current["generation"],
             "confirmed": True,
         },
     )
     assert accepted.status_code == 200
-    assert accepted.json()["inbox"]["blockingCount"] == 0
+    assert accepted.json()["snapshot"]["unacknowledgedCount"] == 0
+    assert accepted.json()["snapshot"]["activeAcknowledgedCount"] == 3
+    assert len(accepted.json()["auditEventIndices"]) == 4
 
     audit = client.get(
         "/api/execution/history",
-        params={"eventTypes": "operator_alerts_acknowledged"},
+        params={"eventTypes": "operator_alarms_acknowledged"},
     )
     assert audit.status_code == 200
     audit_events = audit.json()["events"]
     assert [event["type"] for event in audit_events] == [
-        "operator_alerts_acknowledged"
+        "operator_alarms_acknowledged"
     ]
-    assert set(audit_events[0]["details"]["alert_ids"]) == set(
-        current["unacknowledgedAlertIds"]
+    assert audit_events[0]["details"]["member_count"] == 3
+
+
+def test_operator_alarm_metrics_are_bounded_in_infrastructure_heartbeat(
+    client, state
+):
+    initial = client.get("/api/infra/heartbeat")
+    assert initial.status_code == 200
+    component = initial.json()["components"]["operator_alarm"]
+    assert component["schemaVersion"] == "manyforge.operator_alarm_status.v1"
+    assert component["status"] == "healthy"
+    assert component["metrics"]["schemaVersion"] == (
+        "manyforge.operator_alarm_metrics.v1"
     )
-    assert set(audit_events[0]["details"]["execution_ids"]) == {11, 12, 13}
+    assert component["metrics"]["retention"]["durationSamples"] == 4096
+
+    _submit_test_pose_alarm(state, object_id="heartbeat-alarm", sequence=71)
+    updated = client.get("/api/infra/heartbeat").json()["components"][
+        "operator_alarm"
+    ]
+    assert updated["counts"]["unacknowledged"] == 1
+    assert updated["counts"]["motionAttention"] == 1
+    assert updated["metrics"]["totals"]["activations"] >= 1
+    assert updated["metrics"]["gauges"]["countsByPriority"]["high"] == 1
+    assert updated["persistence"]["pendingLifecycleFacts"] == 0
 
 
-def test_unacknowledged_operator_alert_blocks_run_but_not_stop_or_reset(
+def test_unacknowledged_operator_alarm_blocks_run_but_not_stop_or_reset(
     client, state
 ):
     assert client.post("/api/program/load", json={"path": _PROGRAM_PATH}).status_code == 200
-    state.event_recorder._record_event(  # noqa: SLF001 - incident fixture
-        event_type="cycle_error",
-        execution_id=41,
-        details={"error": "operator must inspect this fault"},
+    alarm = _submit_test_pose_alarm(
+        state,
+        object_id="motion-gate-object",
+        sequence=41,
     )
 
     blocked = client.post("/api/cycle/run")
     assert blocked.status_code == 409
     assert blocked.json()["detail"]["errorCode"] == (
-        "unacknowledged_operator_alerts"
+        "unacknowledged_operator_alarms"
     )
-    assert blocked.json()["detail"]["errorDetails"]["blocking_alert_count"] == 1
+    assert len(
+        blocked.json()["detail"]["errorDetails"]["unacknowledgedMembership"]
+    ) == 1
     assert client.post("/api/cycle/stop").status_code == 200
     assert client.post("/api/cycle/reset").status_code == 200
 
-    inbox = client.get("/api/execution/alerts").json()
-    alert_id = inbox["alerts"][0]["alertId"]
     assert client.post(
-        f"/api/execution/alerts/{alert_id}/acknowledge"
+        f"/api/execution/alarms/{alarm['conditionId']}/acknowledge",
+        json={
+            "activationId": alarm["activationId"],
+            "expectedRecordRevision": alarm["recordRevision"],
+            "confirmed": True,
+        },
     ).status_code == 200
     assert client.post("/api/cycle/run").status_code == 200
 
@@ -1129,13 +1246,11 @@ def test_recovery_action_acknowledge_and_continue_does_not_reset_backend(
     )
     offer = state.cycle_manager.refresh_recovery_offer()
     before_reset_count = kernel.reset_count
-    state.event_recorder._record_event(  # noqa: SLF001 - attention-gate fixture
-        event_type="cycle_error",
-        execution_id=51,
-        details={"error": "operator attention remains required"},
+    state._project_operator_alarm_motion_best_effort(  # noqa: SLF001
+        state.cycle_manager
     )
-    alerts_before = client.get("/api/execution/alerts").json()
-    assert alerts_before["blockingCount"] == 1
+    alarms_before = client.get("/api/execution/alarms").json()
+    assert alarms_before["unacknowledgedCount"] == 1
 
     payload = {
         "requestId": "composer-ack-intervention",
@@ -1155,9 +1270,21 @@ def test_recovery_action_acknowledge_and_continue_does_not_reset_backend(
     assert status.json()["state"] == "stopped"
     assert status.json()["motionStopState"] == "held"
     assert status.json()["recoveryOffer"] is None
-    alerts_after = client.get("/api/execution/alerts").json()
-    assert alerts_after["unacknowledgedAlertIds"] == (
-        alerts_before["unacknowledgedAlertIds"]
+    state._project_operator_alarm_motion_best_effort(  # noqa: SLF001
+        state.cycle_manager
+    )
+    alarms_after = client.get("/api/execution/alarms").json()
+    assert alarms_after["unacknowledgedMembership"][0]["conditionId"] == (
+        alarms_before["unacknowledgedMembership"][0]["conditionId"]
+    )
+    assert alarms_after["unacknowledgedMembership"][0]["activationId"] == (
+        alarms_before["unacknowledgedMembership"][0]["activationId"]
+    )
+    assert alarms_after["unacknowledgedMembership"][0]["recordRevision"] == (
+        alarms_before["unacknowledgedMembership"][0]["recordRevision"] + 1
+    )
+    assert alarms_after["alarms"][0]["lifecycleState"] == (
+        "returned_unacknowledged"
     )
     assert kernel.reset_count == before_reset_count
     request = kernel.apply_recovery_action_requests[-1]
@@ -1173,9 +1300,9 @@ def test_recovery_action_acknowledge_and_continue_does_not_reset_backend(
     blocked_resume = client.post("/api/cycle/run")
     assert blocked_resume.status_code == 409
     assert blocked_resume.json()["detail"]["errorCode"] == (
-        "unacknowledged_operator_alerts"
+        "unacknowledged_operator_alarms"
     )
-    assert _acknowledge_all_operator_alerts(client)["blockingCount"] == 0
+    assert _acknowledge_all_operator_alarms(client)["unacknowledgedCount"] == 0
 
     resume = client.post("/api/cycle/run")
     assert resume.status_code == 200
@@ -1218,19 +1345,13 @@ def test_recovery_action_retry_after_scene_repair_does_not_reset_backend(
         "offerRevision": offer["offerRevision"],
         "actionId": "retry_after_scene_repair",
     }
-    # This fixture mutates private manager fields instead of emitting the
-    # normal recorder event; force one observer pass through the public inbox.
-    assert client.get("/api/execution/alerts").json()["blockingCount"] == 1
+    # Failed validation is rationalized as history/workflow, not a persistent
+    # operator alarm in the initial catalog.
+    assert client.get("/api/execution/alarms").json()["unacknowledgedCount"] == 0
     response = client.post(
         "/api/cycle/recovery-actions",
         json=payload,
     )
-    assert response.status_code == 409
-    assert response.json()["detail"]["errorCode"] == (
-        "unacknowledged_operator_alerts"
-    )
-    assert _acknowledge_all_operator_alerts(client)["blockingCount"] == 0
-    response = client.post("/api/cycle/recovery-actions", json=payload)
     assert response.status_code == 200
     data = response.json()
     assert data["accepted"] is True
@@ -2255,10 +2376,16 @@ def test_run_route_returns_waiting_offer_while_kernel_retains_authority(
         manager._motion_stop_state = "held"
         manager._error = "runtime collision"
         manager._error_code = "runtime_collision"
+        manager._error_details = {
+            "collision_result_first_failure_pair": (
+                "object/wall <-> robot/robot0/link/wrist_3"
+            )
+        }
 
     # This test targets the recovery-offer waiting state, not the independent
-    # operator-attention gate. Observe and acknowledge the incident first.
-    assert _acknowledge_all_operator_alerts(client)["blockingCount"] == 0
+    # operator-attention gate. Project and acknowledge the condition first.
+    state._project_operator_alarm_motion_best_effort(manager)  # noqa: SLF001
+    assert _acknowledge_all_operator_alarms(client)["unacknowledgedCount"] == 0
     response = client.post("/api/cycle/run")
 
     assert response.status_code == 409
@@ -2463,6 +2590,197 @@ def test_load_program(client, state):
     assert "parameterCount" in data
     assert "parameters" in data
     assert data["parameters"][0]["name"] == "pick_velocity_scale"
+    assert data["sceneInitialization"]["state"] == "open"
+    assert data["sceneInitialization"]["deferred"] is False
+    alarm_snapshot = state.operator_alarm_manager.snapshot()
+    assert alarm_snapshot["reconciled"] is True
+    assert alarm_snapshot["liveCount"] == 0
+
+
+def test_deferred_program_load_requires_matching_scene_initialization_token(
+    client,
+    state,
+):
+    load = client.post(
+        "/api/program/load",
+        json={"path": _PROGRAM_PATH, "deferInitialRuntimeReset": True},
+    )
+
+    assert load.status_code == 200
+    initialization = load.json()["sceneInitialization"]
+    assert initialization["state"] == "closed"
+    assert initialization["deferred"] is True
+    assert initialization["token"]
+    assert state.scene_initialization_status()["state"] == "closed"
+    pending_alarms = state.operator_alarm_manager.snapshot()
+    assert pending_alarms["liveCount"] == 0
+    assert pending_alarms["reconciled"] is False
+    assert pending_alarms["domains"]["motion"]["reconciled"] is True
+    assert pending_alarms["domains"]["scene"]["reconciled"] is False
+
+    run_while_closed = client.post("/api/cycle/run")
+    assert run_while_closed.status_code == 409
+    assert run_while_closed.json()["detail"]["errorCode"] == (
+        "operator_alarm_state_unavailable"
+    )
+    assert run_while_closed.json()["detail"]["errorDetails"]["domains"][
+        "scene"
+    ]["reconciled"] is False
+
+    missing = client.post("/api/cycle/reset")
+    assert missing.status_code == 409
+    assert "scene initialization token" in str(missing.json()["detail"]).lower()
+
+    stale = client.post(
+        "/api/cycle/reset",
+        json={"sceneInitializationToken": "stale-token"},
+    )
+    assert stale.status_code == 409
+    assert "stale scene initialization token" in str(stale.json()["detail"]).lower()
+
+    completed = client.post(
+        "/api/cycle/reset",
+        json={"sceneInitializationToken": initialization["token"]},
+    )
+    assert completed.status_code == 200
+    assert completed.json()["sceneInitialization"]["state"] == "open"
+    assert state.scene_initialization_status()["state"] == "open"
+    assert state.operator_alarm_manager.snapshot()["reconciled"] is True
+
+
+def test_failed_deferred_initialization_keeps_token_for_explicit_retry(
+    client,
+    state,
+):
+    load = client.post(
+        "/api/program/load",
+        json={"path": _PROGRAM_PATH, "deferInitialRuntimeReset": True},
+    )
+    token = load.json()["sceneInitialization"]["token"]
+    original_reset = state.cycle_manager.reset
+
+    def fail_reset(*, request_id=None):
+        del request_id
+        raise RuntimeError("authored scene seed failed")
+
+    state.cycle_manager.reset = fail_reset
+    failed = client.post(
+        "/api/cycle/reset",
+        json={"sceneInitializationToken": token},
+    )
+
+    assert failed.status_code == 409
+    failed_status = state.scene_initialization_status()
+    assert failed_status["state"] == "failed"
+    assert failed_status["token"] == token
+    assert "authored scene seed failed" in failed_status["error"]
+    failed_alarms = state.operator_alarm_manager.snapshot()
+    initialization_alarm = next(
+        alarm
+        for alarm in failed_alarms["alarms"]
+        if alarm["definitionId"]
+        == "manyforge.runtime.scene_initialization_fault"
+    )
+    assert initialization_alarm["lifecycleState"] == "active_unacknowledged"
+
+    state.cycle_manager.reset = original_reset
+    retried = client.post(
+        "/api/cycle/reset",
+        json={"sceneInitializationToken": token},
+    )
+    assert retried.status_code == 200
+    assert retried.json()["sceneInitialization"]["state"] == "open"
+    returned_alarm = next(
+        alarm
+        for alarm in state.operator_alarm_manager.snapshot()["alarms"]
+        if alarm["definitionId"]
+        == "manyforge.runtime.scene_initialization_fault"
+    )
+    assert returned_alarm["lifecycleState"] == "returned_unacknowledged"
+
+
+def test_invalid_operator_alarm_catalog_starts_readable_and_fails_motion_closed(
+    tmp_path: Path,
+):
+    catalog_path = tmp_path / "invalid-operator-alarm-catalog.yaml"
+    catalog_path.write_text("schema_version: invalid\ndefinitions: []\n", encoding="utf-8")
+
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=MockKernelClient(),
+        operator_alarm_catalog_path=str(catalog_path),
+    )
+
+    snapshot = state.operator_alarm_manager.snapshot()
+    assert snapshot["catalogVersion"] == "unavailable"
+    assert snapshot["reconciled"] is False
+    assert snapshot["health"]["state"] == "unavailable"
+    assert state.operator_alarm_adapters is None
+    assert state.operator_alarm_manager.attention_block_reason()["errorCode"] == (
+        "operator_alarm_state_unavailable"
+    )
+
+
+def test_rejected_program_candidate_does_not_replace_current_barrier(
+    client,
+    state,
+):
+    assert client.post(
+        "/api/program/load", json={"path": _PROGRAM_PATH}
+    ).status_code == 200
+    before = state.scene_initialization_status()
+
+    rejected = client.post(
+        "/api/program/load",
+        json={"path": "/does/not/exist.program.yaml"},
+    )
+
+    assert rejected.status_code in {400, 403}
+    after = state.scene_initialization_status()
+    assert after["generation"] == before["generation"]
+    assert after["token"] == before["token"]
+    assert after["state"] == "open"
+
+
+def test_rejected_program_candidate_reopens_retained_runtime_barrier(
+    client,
+    state,
+    tmp_path,
+):
+    assert client.post(
+        "/api/program/load", json={"path": _PROGRAM_PATH}
+    ).status_code == 200
+    previous_manager = state.cycle_manager
+    previous_program = state.program
+    before = state.scene_initialization_status()
+
+    invalid_program = yaml.safe_load(
+        Path(_PROGRAM_PATH).read_text(encoding="utf-8")
+    )
+    del invalid_program["scene"][0]["pose"]["frame_id"]
+    invalid_path = tmp_path / "candidate-invalid.program.yaml"
+    invalid_path.write_text(
+        yaml.safe_dump(invalid_program, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    rejected = client.post(
+        "/api/program/load",
+        json={"path": str(invalid_path)},
+    )
+
+    assert rejected.status_code == 400
+    assert state.cycle_manager is previous_manager
+    assert state.program is previous_program
+    after = state.scene_initialization_status()
+    assert after["generation"] == before["generation"] + 1
+    assert after["state"] == "open"
+    assert after["reason"] == "program_load_candidate_rejected"
+    assert not any(
+        alarm["definitionId"]
+        == "manyforge.runtime.scene_initialization_fault"
+        for alarm in state.operator_alarm_manager.snapshot()["alarms"]
+    )
 
 
 def test_load_program_invalid_path(client, state):
@@ -5221,7 +5539,10 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
 
     assert not any("on_program_loaded callback failed" in rec.message for rec in caplog.records)
     assert state.cycle_manager._on_run_from_idle is not None
-    assert state.cycle_manager._tree is not None
+    # The load transaction seeds the authored scene but deliberately leaves the
+    # behavior tree unbuilt until the first Run. The visual callback must not
+    # introduce a second Reset/scene writer after initialization opens.
+    assert state.cycle_manager._tree is None
 
     bb = py_trees.blackboard.Client(name="test_scene_edit_callback")
     bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.READ)
@@ -5262,7 +5583,7 @@ def test_program_load_callback_installs_native_visuals(caplog):
 
     assert not any("on_program_loaded callback failed" in rec.message for rec in caplog.records)
     assert state.cycle_manager._on_run_from_idle is not None
-    assert state.cycle_manager._tree is not None
+    assert state.cycle_manager._tree is None
 
     bb = py_trees.blackboard.Client(name="test_native_scene_edit_callback")
     bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.READ)
@@ -6474,7 +6795,68 @@ def test_state_hub_records_drop_advance_without_browser_or_events():
             "gap_records_total"
         ]
         hub.stop()
-        assert after == before + 1
+    assert after == before + 1
+
+
+def test_recovery_offer_pump_projects_structural_scene_change_without_request():
+    """A scene-admission change replaces a rendered offer before operator input."""
+    kernel = MockKernelClient()
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=kernel,
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as local_client:
+        # Own the pump lifetime so no setup event can accidentally satisfy the
+        # assertion. The production worker is restarted only after the scene
+        # token has changed and the native event queue is empty.
+        state.stop_recovery_offer_pump()
+        loaded = local_client.post(
+            "/api/program/load",
+            json={"path": _PROGRAM_PATH},
+        )
+        assert loaded.status_code == 200, loaded.json()
+        manager = state.cycle_manager
+        assert manager is not None
+        active_kernel = manager._kernel  # noqa: SLF001 - integration boundary
+        assert isinstance(active_kernel, MockKernelClient)
+
+        manager._state = CycleState.STOPPED  # noqa: SLF001
+        manager._error = "cycle fault"  # noqa: SLF001
+        manager._error_code = "cycle_fault"  # noqa: SLF001
+        first_offer = manager.refresh_recovery_offer()
+        assert first_offer is not None
+        manager.drain_kernel_events_now()
+
+        replacement_published = threading.Event()
+        published: list[dict[str, Any]] = []
+
+        def capture_replacement(offer: dict[str, Any]) -> None:
+            published.append(offer)
+            if offer["offerRevision"] > first_offer["offerRevision"]:
+                replacement_published.set()
+
+        manager.set_on_recovery_offer_published(capture_replacement)
+        scene_result = active_kernel.scene_edit(
+            SceneEditRequest(
+                operation="update_pose",
+                object_id="table",
+                pose_position_m=[0.35, 0.0, 0.4],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+        assert scene_result.success is True
+        changed_at = time.monotonic()
+
+        state.start_recovery_offer_pump()
+        assert replacement_published.wait(timeout=0.25)
+        elapsed_s = time.monotonic() - changed_at
+        latest = published[-1]
+        assert latest["offerRevision"] == first_offer["offerRevision"] + 1
+        assert latest["sceneAdmissionEpoch"] > first_offer["sceneAdmissionEpoch"]
+        assert elapsed_s < 0.05
 
 
 def test_heartbeat_degrades_on_kernel_event_pipeline_drops():

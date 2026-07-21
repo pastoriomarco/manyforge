@@ -92,42 +92,102 @@ export interface ExecutionChannelsResponse {
   timestampNs: number;
 }
 
-export interface OperatorAlert {
-  schemaVersion: 'manyforge.operator_alert.v1';
-  alertId: string;
-  recoveryContextId?: string | null;
-  incidentId: string;
-  incidentIds: string[];
-  runId?: string | null;
-  executionId: number;
-  severity: 'ERROR' | 'CRITICAL';
-  errorCode: string;
+export type OperatorAlarmLifecycleState =
+  | 'active_unacknowledged'
+  | 'active_acknowledged'
+  | 'returned_unacknowledged'
+  | 'returned_acknowledged';
+
+export interface OperatorAlarm {
+  schemaVersion: 'manyforge.operator_alarm.v2';
+  catalogSchemaVersion: string;
+  catalogVersion: string;
+  definitionVersion: number;
+  definitionId: string;
+  conditionId: string;
+  activationId: string;
+  scope: Record<string, string>;
+  alarmClass: 'motion' | 'scene' | 'runtime_health';
+  priority: 'critical' | 'high' | 'medium' | 'low';
+  title: string;
   message: string;
-  errorDetails: Record<string, unknown>;
-  triggerType?: string | null;
-  triggerChannel?: string | null;
-  firstSeenAtNs: number;
-  firstSeenAt?: string | null;
-  lastSeenAtNs: number;
-  lastSeenAt?: string | null;
+  consequence: string;
+  operatorResponse: string;
+  requiresMotionAttention: boolean;
+  lifecycleState: OperatorAlarmLifecycleState;
+  active: boolean;
+  acknowledged: boolean;
+  activationCount: number;
   occurrenceCount: number;
-  revision: number;
+  recordRevision: number;
+  activatedAtNs: number;
+  activatedAt: string;
+  firstSeenAtNs: number;
+  firstSeenAt: string;
+  lastSeenAtNs: number;
+  lastSeenAt: string;
+  returnedAtNs?: number | null;
+  returnedAt?: string | null;
+  acknowledgedAtNs?: number | null;
+  acknowledgedAt?: string | null;
+  acknowledgementPrincipal?: string | null;
+  acknowledgementReason?: string | null;
+  sourceId: string;
+  sourceEpoch: string;
+  sourceSequence: number;
+  sourceQuality: 'good' | 'unknown';
+  displayArgs: Record<string, unknown>;
+  details: Record<string, unknown>;
+  evidenceRefs: string[];
+  correlations: Record<string, unknown>;
 }
 
-export interface OperatorAlertInbox {
-  schemaVersion: 'manyforge.operator_alert_inbox.v1';
+export interface OperatorAlarmAcknowledgementMember {
+  conditionId: string;
+  activationId: string;
+  recordRevision: number;
+}
+
+export interface OperatorAlarmDomainStatus {
+  required: boolean;
+  reconciled: boolean;
+  sourceCount: number;
+  unknownSourceCount: number;
+}
+
+export interface OperatorAlarmHealth {
+  state: 'available' | 'unavailable';
+  details: Record<string, string>;
+}
+
+export interface OperatorAlarmSnapshot {
+  schemaVersion: 'manyforge.operator_alarm_snapshot.v2';
+  catalogVersion: string;
   generation: number;
-  blockingCount: number;
-  unacknowledgedAlertIds: string[];
-  alerts: OperatorAlert[];
+  stateRevision: number;
+  reconciled: boolean;
+  health: OperatorAlarmHealth;
+  domains: Record<string, OperatorAlarmDomainStatus>;
+  liveCount: number;
+  unacknowledgedCount: number;
+  motionAttentionCount: number;
+  activeCount: number;
+  activeAcknowledgedCount: number;
+  unacknowledgedMembership: OperatorAlarmAcknowledgementMember[];
+  countsByState: Record<string, number>;
+  countsByPriority: Record<string, number>;
+  countsByClass: Record<string, number>;
+  alarms: OperatorAlarm[];
   truncated: boolean;
   timestampNs: number;
 }
 
-export interface OperatorAlertAcknowledgeResponse {
-  acknowledgedAlertIds: string[];
-  alreadyAcknowledged: boolean;
-  inbox: OperatorAlertInbox;
+export interface OperatorAlarmAcknowledgeResponse {
+  status: string;
+  changed: boolean;
+  acknowledgedConditionIds: string[];
+  auditEventIndices: number[];
+  snapshot: OperatorAlarmSnapshot;
 }
 
 export interface ExecutionHistoryEvent {

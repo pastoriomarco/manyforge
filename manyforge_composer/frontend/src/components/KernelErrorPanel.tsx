@@ -28,8 +28,16 @@ export interface KernelErrorPanelProps {
   incidentSnapshot?: Record<string, unknown> | null;
   /** Stable identity used to reset presentation for a genuinely new incident. */
   presentationKey?: string;
+  /** Optional operator-facing headline supplied by a typed condition surface. */
+  headlineOverride?: string;
+  /** Optional response guidance supplied by a typed condition definition. */
+  hintOverride?: string;
   /** Acknowledge this browser notification without mutating runtime authority. */
   onAcknowledge?: () => void;
+  /** Terminology for the acknowledgement control. */
+  acknowledgeLabel?: string;
+  /** Exact acknowledgement semantics for the control tooltip. */
+  acknowledgeTitle?: string;
   /** Reduce the notification to the persistent header icon. */
   onMinimize?: () => void;
 }
@@ -1277,7 +1285,11 @@ export function KernelErrorPanel({
   errorDetails,
   incidentSnapshot,
   presentationKey,
+  headlineOverride,
+  hintOverride,
   onAcknowledge,
+  acknowledgeLabel = 'Acknowledge alert',
+  acknowledgeTitle = 'Acknowledge this notification. Runtime fault and recovery authority are unchanged.',
   onMinimize,
 }: KernelErrorPanelProps) {
   const [expanded, setExpanded] = useState(false);
@@ -1288,12 +1300,12 @@ export function KernelErrorPanel({
   const mapping = mappingForError(errorCode, errorDetails);
   const severity = mapping?.severity ?? 'unknown';
   const classes = severityClasses(severity);
-  const headline = mapping
+  const headline = headlineOverride ?? (mapping
     ? mapping.headline(errorDetails ?? null)
-    : message;
-  const hint = hintForError(errorCode, errorDetails);
+    : message);
+  const hint = hintOverride ?? hintForError(errorCode, errorDetails);
   const subline =
-    mapping && headline !== message ? message : undefined;
+    headline !== message ? message : undefined;
   const detailEntries = errorDetails
     ? Object.entries(errorDetails).filter(([, v]) => v !== null && v !== undefined)
     : [];
@@ -1327,9 +1339,9 @@ export function KernelErrorPanel({
             type="button"
             onClick={onAcknowledge}
             className="shrink-0 rounded border border-red-400/50 bg-black/25 px-2 py-1 text-xs font-medium text-red-100 hover:bg-red-900/50"
-            title="Acknowledge this notification. Runtime fault and recovery authority are unchanged."
+            title={acknowledgeTitle}
           >
-            Acknowledge alert
+            {acknowledgeLabel}
           </button>
         )}
         {onMinimize && (

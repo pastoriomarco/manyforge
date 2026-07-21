@@ -29,6 +29,12 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, String
 
+from .scene_initialization_handshake import (
+    deferred_program_load_payload,
+    scene_initialization_reset_payload,
+    scene_initialization_token_from_program_response,
+)
+
 
 @dataclass(frozen=True)
 class _Readiness:
@@ -171,6 +177,7 @@ class IsaacDemoSupervisor(Node):
         self._last_ready = False
         self._not_ready_since_s: float | None = None
         self._home_reset_complete = False
+        self._scene_initialization_token: str | None = None
         self._last_status_key: tuple[bool, tuple[str, ...], bool, bool] | None = None
 
         self._publish_command_gate(False)
@@ -224,6 +231,7 @@ class IsaacDemoSupervisor(Node):
             ):
                 self._load_complete = False
                 self._home_reset_complete = False
+                self._scene_initialization_token = None
             self._last_ready = False
             self._publish_status(readiness)
             return
@@ -286,13 +294,12 @@ class IsaacDemoSupervisor(Node):
             return False
 
     def _load_composer_artifacts(self) -> bool:
+        self._scene_initialization_token = None
         payload = json.dumps(
-            {
-                "path": self._program_path,
-                "deploymentPath": self._deployment_path,
-                "forceDiscardOverrides": True,
-                "deferInitialRuntimeReset": True,
-            }
+            deferred_program_load_payload(
+                program_path=self._program_path,
+                deployment_path=self._deployment_path,
+            )
         ).encode("utf-8")
         request = urllib.request.Request(
             f"{self._composer_url}/api/program/load",
@@ -305,23 +312,44 @@ class IsaacDemoSupervisor(Node):
                 request, timeout=self._load_http_timeout_s
             ) as response:
                 ok = 200 <= response.status < 300
+                response_payload = json.loads(
+                    response.read().decode("utf-8", errors="strict") or "{}"
+                )
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             self.get_logger().warning(
                 f"Composer artifact load failed: HTTP {exc.code} {detail}"
             )
             return False
-        except (OSError, urllib.error.URLError) as exc:
+        except (OSError, UnicodeError, ValueError, urllib.error.URLError) as exc:
+            self.get_logger().warning(f"Composer artifact load failed: {exc}")
+            return False
+        try:
+            token = scene_initialization_token_from_program_response(
+                response_payload
+            )
+        except ValueError as exc:
             self.get_logger().warning(f"Composer artifact load failed: {exc}")
             return False
         if ok:
+            self._scene_initialization_token = token
             self.get_logger().info("Composer Isaac program/deployment loaded")
         return ok
 
     def _reset_composer_cycle(self) -> bool:
+        token = str(self._scene_initialization_token or "").strip()
+        if not token:
+            self.get_logger().warning(
+                "Composer cycle reset skipped: scene initialization token is missing"
+            )
+            return False
+        payload = json.dumps(scene_initialization_reset_payload(token)).encode(
+            "utf-8"
+        )
         request = urllib.request.Request(
             f"{self._composer_url}/api/cycle/reset",
-            data=b"",
+            data=payload,
+            headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
@@ -339,6 +367,7 @@ class IsaacDemoSupervisor(Node):
             self.get_logger().warning(f"Composer cycle reset failed: {exc}")
             return False
         if ok:
+            self._scene_initialization_token = None
             self.get_logger().info("Composer cycle reset completed for Isaac home command")
         return ok
 

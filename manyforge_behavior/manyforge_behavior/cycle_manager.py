@@ -2469,6 +2469,25 @@ class CycleManager:
             "evidence_refs": list(offer.evidence_refs),
         }
 
+    @staticmethod
+    def _requested_recovery_offer_event_details(
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_revision = request.get(
+            "offer_revision",
+            request.get("offerRevision", 0),
+        )
+        try:
+            revision = int(raw_revision or 0)
+        except (TypeError, ValueError):
+            revision = 0
+        return {
+            "requested_offer_id": str(
+                request.get("offer_id") or request.get("offerId") or ""
+            ),
+            "requested_offer_revision": revision,
+        }
+
     def _select_runtime_recovery_participant(
         self,
         *,
@@ -2807,6 +2826,7 @@ class CycleManager:
                 offer = self._recovery_coordinator.current_offer()
                 details = {
                     **self._recovery_offer_event_details(offer),
+                    **self._requested_recovery_offer_event_details(request),
                     "request_id": request_id,
                     "action_id": str(
                         request.get("action_id") or request.get("actionId") or ""
@@ -2887,6 +2907,7 @@ class CycleManager:
                 offer = self._recovery_coordinator.current_offer()
                 requested_details = {
                     **self._recovery_offer_event_details(offer),
+                    **self._requested_recovery_offer_event_details(request),
                     "request_id": request_id,
                     "action_id": action_id,
                     "principal_id": principal_id,

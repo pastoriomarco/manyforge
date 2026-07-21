@@ -217,7 +217,12 @@ def build_program_loaded_callback():
             st.request_visual_state_publish(reason="run_from_idle")
 
         st.cycle_manager._on_run_from_idle = _refresh_runtime_visuals
-        st.cycle_manager.reset()
+        # Program loading has already seeded the authored scene under the
+        # scene-initialization barrier. Do not run a second Reset here: besides
+        # being redundant, it would clear the ready scene after the barrier had
+        # opened and could turn a concurrent pose observation into a false
+        # post-ready apply fault. The first Run builds the behavior tree from
+        # the seeded IDLE state, as CycleManager.seed_authored_scene() intends.
         initial_positions = _get_simulator_initial_joint_positions(st)
         runtime_bundle = getattr(st, "kernel_bundle", None)
         if runtime_bundle is not None and initial_positions:

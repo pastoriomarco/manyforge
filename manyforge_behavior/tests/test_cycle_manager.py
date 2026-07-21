@@ -265,6 +265,10 @@ class TestCycleManagerRun:
             _script_ready_recovery(slow_kernel)
             rendered_offer = manager.refresh_recovery_offer()
             assert rendered_offer is not None
+            action_events: list[tuple[str, dict]] = []
+            manager.set_on_recovery_action_event(
+                lambda action, details: action_events.append((action, details))
+            )
 
             result = slow_kernel.scene_edit(
                 SceneEditRequest(
@@ -296,6 +300,21 @@ class TestCycleManagerRun:
             )
             assert manager.state == CycleState.STOPPED
             assert not getattr(slow_kernel, "apply_recovery_action_requests", [])
+            assert [action for action, _ in action_events] == [
+                "requested",
+                "rejected",
+            ]
+            for _action, details in action_events:
+                assert details["requested_offer_id"] == rendered_offer["offerId"]
+                assert (
+                    details["requested_offer_revision"]
+                    == rendered_offer["offerRevision"]
+                )
+                assert details["offer_id"] == response["recoveryOffer"]["offerId"]
+                assert (
+                    details["offer_revision"]
+                    == response["recoveryOffer"]["offerRevision"]
+                )
         finally:
             manager.reset()
 

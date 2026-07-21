@@ -24,7 +24,7 @@ from .stop_decision_assembler import (
     StopDecisionRecord,
     sequence_ordered,
 )
-from .operator_alerts import OperatorAlertInbox
+from .operator_alarms import AlarmLifecycleFact
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,10 @@ _ALLOWED_EVENT_TYPES = {
     "recovery_action_rejected",
     "operator_alert_acknowledged",
     "operator_alerts_acknowledged",
+    "operator_alarm_activated",
+    "operator_alarm_returned",
+    "operator_alarm_acknowledged",
+    "operator_alarms_acknowledged",
 }
 _ALLOWED_EVENT_PREFIXES = (
     "cycle_reset_",
@@ -71,6 +75,7 @@ _ALLOWED_EVENT_PREFIXES = (
     "model_call_",
     "pose_source_",
     "runtime_override_",
+    "scene_initialization_",
     "simulation_control_",
     "tool_dispatch_",
 )
@@ -88,6 +93,10 @@ _DURABLE_INFO_EVENT_TYPES = frozenset(
         "recovery_action_accepted",
         "operator_alert_acknowledged",
         "operator_alerts_acknowledged",
+        "operator_alarm_activated",
+        "operator_alarm_returned",
+        "operator_alarm_acknowledged",
+        "operator_alarms_acknowledged",
     }
 )
 _RUNS_INDEX_FILENAME = "runs.index.jsonl"
@@ -492,6 +501,10 @@ def _validate_event_type(event_type: str) -> None:
 
 
 def _severity_for_event(event_type: str, details: Optional[dict[str, Any]]) -> str:
+    if event_type.startswith("operator_alarm"):
+        # Alarm priority and lifecycle are independent from operational-log
+        # severity. These are durable transition facts, not duplicate faults.
+        return "INFO"
     if event_type in {
         "cycle_error",
         "kernel_error",
@@ -526,6 +539,8 @@ def _component_for_event(event_type: str) -> str:
         return "manyforge.tool_dispatch"
     if event_type.startswith("pose_source_"):
         return "manyforge.scene"
+    if event_type.startswith("scene_initialization_"):
+        return "manyforge.scene"
     if event_type.startswith("simulation_control_"):
         return "manyforge.simulation"
     if event_type.startswith("runtime_override_"):
@@ -538,6 +553,8 @@ def _component_for_event(event_type: str) -> str:
         return "manyforge.cycle"
     if event_type.startswith("recovery_"):
         return "manyforge.cycle_recovery"
+    if event_type.startswith("operator_alarm"):
+        return "manyforge.operator_alarm"
     if event_type.startswith("operator_alert"):
         return "manyforge.operator_attention"
     if event_type.startswith("kernel_") or event_type in {
@@ -627,7 +644,9 @@ def _event_channel(event_type: str, details: Optional[dict[str, Any]]) -> str:
         or event_type.startswith("intervention_")
         or event_type == "delegated_recovery_requested"
         or event_type.startswith("cycle_reset_")
+        or event_type.startswith("scene_initialization_")
         or event_type.startswith("operator_alert")
+        or event_type.startswith("operator_alarm")
     ):
         return "command_runtime"
     return "execution_lifecycle"
@@ -755,7 +774,6 @@ class EventRecorder:
         self._incident_snapshots: deque[dict[str, Any]] = deque(
             maxlen=_DEFAULT_INCIDENT_SNAPSHOT_LIMIT
         )
-        self._operator_alert_inbox = OperatorAlertInbox()
         self._event_index = 0
         self._run_counter = 0
         self._current_run: Optional[_RunInfo] = None
@@ -1298,89 +1316,6 @@ class EventRecorder:
         with self._lock:
             snapshots = [dict(snapshot) for snapshot in self._incident_snapshots]
         return [] if effective_limit == 0 else snapshots[-effective_limit:]
-
-    def operator_alerts(self, *, limit: Optional[int] = None) -> dict[str, Any]:
-        """Return the server-owned operator-attention inbox, newest first."""
-        return self._operator_alert_inbox.snapshot(limit=limit)
-
-    def has_blocking_operator_alerts(self) -> bool:
-        """True while any ERROR/CRITICAL incident still needs attention."""
-        return self._operator_alert_inbox.has_blocking_alerts()
-
-    def acknowledge_operator_alert(
-        self,
-        alert_id: str,
-        *,
-        principal_id: str,
-    ) -> dict[str, Any]:
-        """Acknowledge one alert without changing execution/recovery state."""
-        alert, changed = self._operator_alert_inbox.acknowledge(alert_id)
-        if changed:
-            self._record_event(
-                event_type="operator_alert_acknowledged",
-                execution_id=int(alert.get("executionId") or 0),
-                run_id=(str(alert["runId"]) if alert.get("runId") else None),
-                principal_id=principal_id,
-                details={
-                    "alert_id": alert_id,
-                    "incident_id": alert.get("incidentId"),
-                    "recovery_context_id": alert.get("recoveryContextId"),
-                    "acknowledgement_scope": "single",
-                },
-            )
-        return {
-            "acknowledgedAlertIds": [alert_id],
-            "alreadyAcknowledged": not changed,
-            "inbox": self.operator_alerts(limit=3),
-        }
-
-    def acknowledge_all_operator_alerts(
-        self,
-        *,
-        alert_ids: list[str],
-        expected_generation: int,
-        confirmed: bool,
-        principal_id: str,
-    ) -> dict[str, Any]:
-        """Generation-fenced bulk acknowledgement of the exact current inbox."""
-        alerts = self._operator_alert_inbox.acknowledge_all(
-            alert_ids=alert_ids,
-            expected_generation=expected_generation,
-            confirmed=confirmed,
-        )
-        if alerts:
-            first = alerts[0]
-            self._record_event(
-                event_type="operator_alerts_acknowledged",
-                execution_id=int(first.get("executionId") or 0),
-                run_id=(str(first["runId"]) if first.get("runId") else None),
-                principal_id=principal_id,
-                details={
-                    "alert_ids": [str(alert["alertId"]) for alert in alerts],
-                    "incident_ids": [str(alert["incidentId"]) for alert in alerts],
-                    "recovery_context_ids": [
-                        str(alert["recoveryContextId"])
-                        for alert in alerts
-                        if alert.get("recoveryContextId")
-                    ],
-                    "run_ids": [
-                        str(alert["runId"])
-                        for alert in alerts
-                        if alert.get("runId")
-                    ],
-                    "execution_ids": [
-                        int(alert.get("executionId") or 0) for alert in alerts
-                    ],
-                    "acknowledgement_scope": "all",
-                    "acknowledged_count": len(alerts),
-                    "expected_generation": expected_generation,
-                },
-            )
-        return {
-            "acknowledgedAlertIds": [str(alert["alertId"]) for alert in alerts],
-            "alreadyAcknowledged": not alerts,
-            "inbox": self.operator_alerts(limit=3),
-        }
 
     def _observe_latency_event_locked(
         self, native_type: str, native_event: dict[str, Any]
@@ -2732,6 +2667,50 @@ class EventRecorder:
             details=details,
         )
 
+    def record_scene_initialization_event(
+        self,
+        action: str,
+        *,
+        details: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Record one low-rate scene-initialization barrier transition."""
+        self._record_event(
+            event_type=f"scene_initialization_{action}",
+            details=details,
+        )
+
+    def record_operator_alarm_lifecycle_facts(
+        self,
+        facts: tuple[AlarmLifecycleFact, ...],
+    ) -> list[int]:
+        """Durably append committed alarm facts without mutating alarm state."""
+
+        event_indices: list[int] = []
+        for fact in facts:
+            correlations = dict(fact.correlations)
+            raw_execution_id = correlations.get("execution_id")
+            try:
+                execution_id = int(raw_execution_id or 0)
+            except (TypeError, ValueError):
+                execution_id = 0
+            raw_run_id = correlations.get("run_id")
+            run_id = (
+                str(raw_run_id)
+                if raw_run_id is not None and str(raw_run_id)
+                else None
+            )
+            event_indices.append(
+                self._record_event(
+                    event_type=fact.event_type,
+                    execution_id=execution_id,
+                    run_id=run_id,
+                    principal_id=fact.principal_id,
+                    details=fact.to_event_details(),
+                    timestamp_ns=fact.occurred_at_ns,
+                )
+            )
+        return event_indices
+
     def record_simulation_control_event(
         self,
         action: str,
@@ -3421,7 +3400,7 @@ class EventRecorder:
         timestamp_ns: Optional[int] = None,
         kernel_timestamp: bool = False,
         system_event: bool = False,
-    ) -> None:
+    ) -> int:
         _validate_event_type(event_type)
         timestamp_ns = timestamp_ns or time.monotonic_ns()
         # Kernel-stamped timestamps convert to wall time through the clock
@@ -3679,7 +3658,6 @@ class EventRecorder:
             ):
                 incident_snapshot = self._build_incident_snapshot_locked(event)
                 self._incident_snapshots.append(incident_snapshot)
-                self._operator_alert_inbox.ingest_incident(incident_snapshot)
             self._enqueue_jsonl_locked(
                 run_id=run_id,
                 json_text=json_text,
@@ -3690,6 +3668,7 @@ class EventRecorder:
                 ),
             )
             self._maybe_write_failure_archive_locked(event)
+            return self._event_index
 
     def _intervention_run_id(self, session) -> str:
         """Return the correlated run_id for an intervention session."""

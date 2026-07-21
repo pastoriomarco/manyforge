@@ -34,5 +34,8 @@ visual = [
 package-dir = { "manyforge_composer" = "." }
 packages = ["manyforge_composer", "manyforge_composer.backend"]
 
+[tool.setuptools.package-data]
+manyforge_composer = ["resources/*.yaml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -7,6 +7,33 @@ import type {
 } from '../types/api';
 
 export type HistorySeverityFilter = 'all' | 'info' | 'warning' | 'error';
+export type HistoryAlarmFilter =
+  | 'all'
+  | 'lifecycle'
+  | 'activation'
+  | 'return'
+  | 'acknowledgement'
+  | 'raw';
+
+const ALARM_LIFECYCLE_TYPES = new Set([
+  'operator_alarm_activated',
+  'operator_alarm_returned',
+  'operator_alarm_acknowledged',
+  'operator_alarms_acknowledged',
+]);
+
+function matchesAlarmView(
+  event: ExecutionHistoryEvent,
+  alarmView: HistoryAlarmFilter,
+): boolean {
+  if (alarmView === 'all') return true;
+  if (alarmView === 'raw') return !ALARM_LIFECYCLE_TYPES.has(event.type);
+  if (alarmView === 'lifecycle') return ALARM_LIFECYCLE_TYPES.has(event.type);
+  if (alarmView === 'activation') return event.type === 'operator_alarm_activated';
+  if (alarmView === 'return') return event.type === 'operator_alarm_returned';
+  return event.type === 'operator_alarm_acknowledged'
+    || event.type === 'operator_alarms_acknowledged';
+}
 
 function severityGroup(severity: string | null | undefined): HistorySeverityFilter {
   const normalized = (severity ?? 'INFO').toUpperCase();
@@ -22,10 +49,13 @@ export function filterExecutionHistoryEvents(
     eventType: string;
     channel: string;
     search: string;
+    alarmView?: HistoryAlarmFilter;
+    conditionIdentity?: string;
     executionId?: number;
   },
 ): ExecutionHistoryEvent[] {
   const needle = options.search.trim().toLowerCase();
+  const conditionNeedle = (options.conditionIdentity ?? '').trim().toLowerCase();
   return events.filter((event) => {
     if (
       options.severity !== 'all'
@@ -33,9 +63,14 @@ export function filterExecutionHistoryEvents(
     ) return false;
     if (options.eventType && event.type !== options.eventType) return false;
     if (options.channel && event.channel !== options.channel) return false;
+    if (!matchesAlarmView(event, options.alarmView ?? 'all')) return false;
     if (
       options.executionId !== undefined
       && event.execution_id !== options.executionId
+    ) return false;
+    if (
+      conditionNeedle
+      && !JSON.stringify(event).toLowerCase().includes(conditionNeedle)
     ) return false;
     if (!needle) return true;
     return JSON.stringify(event).toLowerCase().includes(needle);
@@ -75,6 +110,8 @@ export function ExecutionHistoryPanel({
   const [severity, setSeverity] = useState<HistorySeverityFilter>('all');
   const [eventType, setEventType] = useState('');
   const [channel, setChannel] = useState('');
+  const [alarmView, setAlarmView] = useState<HistoryAlarmFilter>('all');
+  const [conditionIdentity, setConditionIdentity] = useState('');
   const [search, setSearch] = useState('');
   const [currentExecutionOnly, setCurrentExecutionOnly] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -131,12 +168,14 @@ export function ExecutionHistoryPanel({
       eventType,
       channel,
       search,
+      alarmView,
+      conditionIdentity,
       executionId:
         currentExecutionOnly && (history?.executionId ?? 0) > 0
           ? history!.executionId
           : undefined,
     },
-  ), [channel, currentExecutionOnly, eventType, history, search, severity]);
+  ), [alarmView, channel, conditionIdentity, currentExecutionOnly, eventType, history, search, severity]);
 
   if (!open) return null;
 
@@ -202,6 +241,21 @@ export function ExecutionHistoryPanel({
           </select>
         </label>
         <label className="text-[11px] text-gray-400">
+          Alarm records
+          <select
+            value={alarmView}
+            onChange={(event) => setAlarmView(event.target.value as HistoryAlarmFilter)}
+            className="mt-1 w-full rounded border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-gray-100"
+          >
+            <option value="all">All records</option>
+            <option value="lifecycle">All alarm lifecycle</option>
+            <option value="activation">Alarm activations</option>
+            <option value="return">Alarm returns</option>
+            <option value="acknowledgement">Alarm acknowledgements</option>
+            <option value="raw">Raw events / occurrences</option>
+          </select>
+        </label>
+        <label className="text-[11px] text-gray-400">
           Retained rows
           <select
             value={limit}
@@ -212,6 +266,15 @@ export function ExecutionHistoryPanel({
               <option key={value} value={value}>{value}</option>
             ))}
           </select>
+        </label>
+        <label className="sm:col-span-2 text-[11px] text-gray-400">
+          Condition or activation identity
+          <input
+            value={conditionIdentity}
+            onChange={(event) => setConditionIdentity(event.target.value)}
+            className="mt-1 w-full rounded border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-gray-100"
+            placeholder="condition ID, activation ID, scope, or correlation…"
+          />
         </label>
         <label className="sm:col-span-2 text-[11px] text-gray-400">
           Search message or details

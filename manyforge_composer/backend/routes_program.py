@@ -797,6 +797,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             sourcePath=state.program_source_path,
             programSessionGeneration=state.program_session_generation,
             programTreeHash=state.program_tree_hash,
+            sceneInitialization=state.scene_initialization_status(),
         ).model_dump(by_alias=True)
 
     @router.get("/program", response_model=ProgramResponse, response_model_by_alias=True)
@@ -828,6 +829,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             sourcePath=state.program_source_path,
             programSessionGeneration=state.program_session_generation,
             programTreeHash=state.program_tree_hash,
+            sceneInitialization=state.scene_initialization_status(),
         ).model_dump(by_alias=True)
 
     @router.get("/program/saved", response_model=ProgramResponse, response_model_by_alias=True)

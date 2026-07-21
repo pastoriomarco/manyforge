@@ -37,6 +37,28 @@ const EVENTS: ExecutionHistoryEvent[] = [
     type: 'collision_detected',
     details: { object: 'wall' },
   },
+  {
+    event_index: 4,
+    sequence: 4,
+    timestamp_ns: 4,
+    severity: 'INFO',
+    channel: 'command_runtime',
+    message: 'Operator alarm activated',
+    execution_id: 8,
+    type: 'operator_alarm_activated',
+    details: { condition_id: 'condition-wall', activation_id: 'activation-1' },
+  },
+  {
+    event_index: 5,
+    sequence: 5,
+    timestamp_ns: 5,
+    severity: 'INFO',
+    channel: 'command_runtime',
+    message: 'Operator alarm acknowledged',
+    execution_id: 8,
+    type: 'operator_alarm_acknowledged',
+    details: { condition_id: 'condition-wall', activation_id: 'activation-1' },
+  },
 ];
 
 describe('execution history filtering', () => {
@@ -64,5 +86,29 @@ describe('execution history filtering', () => {
       search: 'wall',
       executionId: 7,
     })).toEqual([]);
+  });
+
+  it('filters lifecycle phases and exact condition correlations', () => {
+    expect(filterExecutionHistoryEvents(EVENTS, {
+      severity: 'all', eventType: '', channel: '', search: '', alarmView: 'lifecycle',
+    }).map((event) => event.type)).toEqual([
+      'operator_alarm_activated',
+      'operator_alarm_acknowledged',
+    ]);
+    expect(filterExecutionHistoryEvents(EVENTS, {
+      severity: 'all',
+      eventType: '',
+      channel: '',
+      search: '',
+      alarmView: 'activation',
+      conditionIdentity: 'condition-wall',
+    }).map((event) => event.type)).toEqual(['operator_alarm_activated']);
+    expect(filterExecutionHistoryEvents(EVENTS, {
+      severity: 'all', eventType: '', channel: '', search: '', alarmView: 'raw',
+    }).map((event) => event.type)).toEqual([
+      'execute_started',
+      'recovery_action_rejected',
+      'collision_detected',
+    ]);
   });
 });

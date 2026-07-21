@@ -13,16 +13,20 @@ from manyforge_behavior.cycle_recovery import (
 )
 from .cycle_diagnostics import manager_cycle_error_fields
 from .event_recorder import _wall_iso_to_ns
-from .operator_alerts import OperatorAlertError
+from .operator_alarms import (
+    AlarmAcknowledgementMember,
+    OperatorAlarmError,
+)
 
 from .models import (
     BlackboardSnapshotResponse,
     ExecutionDigestObjectResponse,
     ExecutionDigestResponse,
     ExecutionHistoryResponse,
-    OperatorAlertAcknowledgeAllRequest,
-    OperatorAlertAcknowledgeResponse,
-    OperatorAlertInboxResponse,
+    OperatorAlarmAcknowledgeAllRequest,
+    OperatorAlarmAcknowledgeRequest,
+    OperatorAlarmAcknowledgeResponse,
+    OperatorAlarmSnapshotResponse,
 )
 from .route_execution import run_route_background
 from .routes_scene import build_scene_diagnostics_payload
@@ -108,30 +112,33 @@ def build_execution_channels_payload(
     }
 
 
-def build_operator_alerts_payload(
+def build_operator_alarms_payload(
     state: ComposerState,
     *,
     limit: int = 3,
+    states: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Observe execution state and return the authoritative alert inbox."""
-    state.event_recorder.observe(state)
-    return OperatorAlertInboxResponse(
-        **state.event_recorder.operator_alerts(limit=limit)
+    """Return the backend-driven condition/alarm snapshot without side effects."""
+
+    return OperatorAlarmSnapshotResponse(
+        **state.operator_alarm_manager.snapshot(limit=limit, states=states)
     ).model_dump(by_alias=True)
 
 
-def _operator_alert_http_error(
+def _operator_alarm_http_error(
     state: ComposerState,
-    error: OperatorAlertError,
+    error: OperatorAlarmError,
 ) -> HTTPException:
     status_code = (
         404
-        if error.code == "operator_alert_not_found"
+        if error.code == "operator_alarm_not_found"
         else 409
         if error.code
         in {
-            "operator_alert_inbox_stale",
-            "operator_alert_inbox_membership_mismatch",
+            "operator_alarm_activation_stale",
+            "operator_alarm_record_revision_stale",
+            "operator_alarm_manager_generation_stale",
+            "operator_alarm_membership_mismatch",
         }
         else 400
     )
@@ -141,7 +148,9 @@ def _operator_alert_http_error(
             "message": str(error),
             "errorCode": error.code,
             "errorDetails": {
-                "operatorAlertInbox": state.event_recorder.operator_alerts(limit=3)
+                "operatorAlarmSnapshot": state.operator_alarm_manager.snapshot(
+                    limit=3
+                )
             },
         },
     )
@@ -493,65 +502,118 @@ def create_execution_router(state: ComposerState) -> APIRouter:
     router = APIRouter()
 
     @router.get(
-        "/alerts",
-        response_model=OperatorAlertInboxResponse,
+        "/alarms",
+        response_model=OperatorAlarmSnapshotResponse,
         response_model_by_alias=True,
     )
-    async def get_operator_alerts(
-        limit: int = Query(default=3, ge=0, le=100),
+    async def get_operator_alarms(
+        limit: int = Query(default=100, ge=0, le=1000),
+        states: str | None = Query(default=None),
     ) -> dict[str, Any]:
-        """Return newest unacknowledged execution alerts."""
+        """Return the four-state condition-backed alarm projection."""
+
+        def read_snapshot() -> dict[str, Any]:
+            try:
+                return build_operator_alarms_payload(
+                    state,
+                    limit=limit,
+                    states=_split_csv_query(states),
+                )
+            except OperatorAlarmError as exc:
+                raise _operator_alarm_http_error(state, exc) from exc
+
         return await run_route_background(
-            lambda: build_operator_alerts_payload(state, limit=limit)
+            read_snapshot
         )
 
     @router.post(
-        "/alerts/acknowledge-all",
-        response_model=OperatorAlertAcknowledgeResponse,
+        "/alarms/acknowledge-all",
+        response_model=OperatorAlarmAcknowledgeResponse,
         response_model_by_alias=True,
     )
-    async def acknowledge_all_operator_alerts(
-        payload: OperatorAlertAcknowledgeAllRequest,
+    async def acknowledge_all_operator_alarms(
+        payload: OperatorAlarmAcknowledgeAllRequest,
         request: Request,
     ) -> dict[str, Any]:
-        """Confirm and generation-fence acknowledgement of the exact inbox."""
+        """Acknowledge the exact activation/revision membership atomically."""
         principal_id = getattr(request.state, "principal_id", None) or "operator_ui"
 
         def command() -> dict[str, Any]:
             try:
-                result = state.event_recorder.acknowledge_all_operator_alerts(
-                    alert_ids=payload.alert_ids,
+                result = state.operator_alarm_manager.acknowledge_all(
+                    members=(
+                        AlarmAcknowledgementMember(
+                            condition_id=member.condition_id,
+                            activation_id=member.activation_id,
+                            record_revision=member.record_revision,
+                        )
+                        for member in payload.members
+                    ),
                     expected_generation=payload.expected_generation,
-                    confirmed=payload.confirmed,
                     principal_id=principal_id,
+                    reason=payload.reason,
+                    confirmed=payload.confirmed,
                 )
-            except OperatorAlertError as exc:
-                raise _operator_alert_http_error(state, exc) from exc
-            return OperatorAlertAcknowledgeResponse(**result).model_dump(by_alias=True)
+            except OperatorAlarmError as exc:
+                raise _operator_alarm_http_error(state, exc) from exc
+            audit_indices = state.persist_operator_alarm_lifecycle_facts(
+                result.lifecycle_facts
+            )
+            response = {
+                "status": result.status,
+                "changed": result.changed,
+                "acknowledgedConditionIds": [
+                    record.condition_id for record in result.records
+                ],
+                "auditEventIndices": audit_indices,
+                "snapshot": state.operator_alarm_manager.snapshot(limit=1000),
+            }
+            return OperatorAlarmAcknowledgeResponse(**response).model_dump(
+                by_alias=True
+            )
 
         return await run_route_background(command)
 
     @router.post(
-        "/alerts/{alert_id}/acknowledge",
-        response_model=OperatorAlertAcknowledgeResponse,
+        "/alarms/{condition_id}/acknowledge",
+        response_model=OperatorAlarmAcknowledgeResponse,
         response_model_by_alias=True,
     )
-    async def acknowledge_operator_alert(
-        alert_id: str,
+    async def acknowledge_operator_alarm(
+        condition_id: str,
+        payload: OperatorAlarmAcknowledgeRequest,
         request: Request,
     ) -> dict[str, Any]:
-        """Acknowledge one alert without changing recovery or motion state."""
+        """Acknowledge one exact activation without changing motion authority."""
         principal_id = getattr(request.state, "principal_id", None) or "operator_ui"
 
         def command() -> dict[str, Any]:
             try:
-                result = state.event_recorder.acknowledge_operator_alert(
-                    alert_id,
+                result = state.operator_alarm_manager.acknowledge(
+                    condition_id=condition_id,
+                    activation_id=payload.activation_id,
+                    expected_record_revision=payload.expected_record_revision,
                     principal_id=principal_id,
+                    reason=payload.reason,
+                    confirmed=payload.confirmed,
                 )
-            except OperatorAlertError as exc:
-                raise _operator_alert_http_error(state, exc) from exc
-            return OperatorAlertAcknowledgeResponse(**result).model_dump(by_alias=True)
+            except OperatorAlarmError as exc:
+                raise _operator_alarm_http_error(state, exc) from exc
+            audit_indices = state.persist_operator_alarm_lifecycle_facts(
+                result.lifecycle_facts
+            )
+            response = {
+                "status": result.status,
+                "changed": result.changed,
+                "acknowledgedConditionIds": [
+                    record.condition_id for record in result.records
+                ],
+                "auditEventIndices": audit_indices,
+                "snapshot": state.operator_alarm_manager.snapshot(limit=1000),
+            }
+            return OperatorAlarmAcknowledgeResponse(**response).model_dump(
+                by_alias=True
+            )
 
         return await run_route_background(command)
 

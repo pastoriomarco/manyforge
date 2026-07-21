@@ -16,6 +16,39 @@ import pytest
 from manyforge_behavior.kernel_client import ExecutionState, ExecutionSnapshot, ExecutionStatus
 from manyforge_composer.backend import event_recorder as event_recorder_module
 from manyforge_composer.backend.event_recorder import EventRecorder
+from manyforge_composer.backend.operator_alarms import AlarmLifecycleFact
+
+
+def test_operator_alarm_lifecycle_is_durable_info_history_not_a_second_incident():
+    recorder = EventRecorder()
+    fact = AlarmLifecycleFact(
+        event_type="operator_alarm_activated",
+        definition_id="manyforge.motion.runtime_collision",
+        condition_id="condition-test",
+        activation_id="activation-test",
+        previous_state=None,
+        current_state="active_unacknowledged",
+        record_revision=1,
+        manager_generation=1,
+        occurred_at_ns=123_456,
+        occurred_at_wall="2026-07-21T00:00:00Z",
+        source_id="manyforge.condition.motion",
+        source_epoch="runtime-1",
+        source_sequence=7,
+        correlations={"execution_id": 42, "run_id": "run-42"},
+        details={"error": "raw cause remains in its original event"},
+    )
+
+    recorder.record_operator_alarm_lifecycle_facts((fact,))
+
+    event = recorder.history(limit=1)["events"][0]
+    assert event["type"] == "operator_alarm_activated"
+    assert event["severity"] == "INFO"
+    assert event["component"] == "manyforge.operator_alarm"
+    assert event["channel"] == "command_runtime"
+    assert event["execution_id"] == 42
+    assert event["run_id"] == "run-42"
+    assert recorder.incident_snapshots() == []
 
 
 # ---------------------------------------------------------------------------

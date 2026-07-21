@@ -8,8 +8,10 @@ import type {
   ExecutionChannelsResponse,
   ExecutionHistoryQuery,
   ExecutionHistoryResponse,
-  OperatorAlertAcknowledgeResponse,
-  OperatorAlertInbox,
+  OperatorAlarmAcknowledgeResponse,
+  OperatorAlarmAcknowledgementMember,
+  OperatorAlarmLifecycleState,
+  OperatorAlarmSnapshot,
   CatalogResponse,
   CatalogEntry,
   ProgramInfo,
@@ -188,25 +190,46 @@ export const api = {
         'GET',
         `/api/execution/channels?limit=${encodeURIComponent(String(limit))}`,
       ),
-    alerts: (limit = 3) =>
-      request<OperatorAlertInbox>(
+    alarms: (limit = 1000, states?: OperatorAlarmLifecycleState[]) => {
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (states?.length) params.set('states', states.join(','));
+      return request<OperatorAlarmSnapshot>(
         'GET',
-        `/api/execution/alerts?limit=${encodeURIComponent(String(limit))}`,
-      ),
-    acknowledgeAlert: (alertId: string) =>
-      request<OperatorAlertAcknowledgeResponse>(
+        `/api/execution/alarms?${params.toString()}`,
+      );
+    },
+    acknowledgeAlarm: (
+      conditionId: string,
+      activationId: string,
+      expectedRecordRevision: number,
+      confirmed = true,
+      reason?: string,
+    ) =>
+      request<OperatorAlarmAcknowledgeResponse>(
         'POST',
-        `/api/execution/alerts/${encodeURIComponent(alertId)}/acknowledge`,
+        `/api/execution/alarms/${encodeURIComponent(conditionId)}/acknowledge`,
+        {
+          activationId,
+          expectedRecordRevision,
+          confirmed,
+          ...(reason ? { reason } : {}),
+        },
       ),
-    acknowledgeAllAlerts: (
-      alertIds: string[],
+    acknowledgeAllAlarms: (
+      members: OperatorAlarmAcknowledgementMember[],
       expectedGeneration: number,
       confirmed: boolean,
+      reason?: string,
     ) =>
-      request<OperatorAlertAcknowledgeResponse>(
+      request<OperatorAlarmAcknowledgeResponse>(
         'POST',
-        '/api/execution/alerts/acknowledge-all',
-        { alertIds, expectedGeneration, confirmed },
+        '/api/execution/alarms/acknowledge-all',
+        {
+          members,
+          expectedGeneration,
+          confirmed,
+          ...(reason ? { reason } : {}),
+        },
       ),
     history: (query: ExecutionHistoryQuery = {}) => {
       const params = new URLSearchParams();

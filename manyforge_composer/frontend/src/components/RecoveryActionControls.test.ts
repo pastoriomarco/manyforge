@@ -1,11 +1,15 @@
 /// <reference types="node" />
 
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import type { CycleRecoveryAction, CycleRecoveryOffer } from '../types/api';
 import {
+  RecoveryCommandNotice,
   recoveryActionConfirmationText,
   recoveryActionLabel,
   recoveryActionsForTransport,
+  recoveryCommandFailureMessage,
   recoveryConfirmationAction,
   isMotionProducingRecoveryAction,
   recoveryOfferHeadline,
@@ -135,5 +139,55 @@ describe('recovery action presentation helpers', () => {
         confirmation,
       ),
     ).toBeUndefined();
+  });
+
+  it('keeps a confirmation bound to its exact rendered action', () => {
+    const reset: CycleRecoveryAction = {
+      actionId: 'reset_cycle',
+      labelKey: 'cycle.recovery.reset_cycle',
+      requiresConfirmation: true,
+      performsBackendReset: true,
+      enabled: true,
+    };
+    const first = offer({ actions: [reset] });
+    const confirmation = {
+      offerId: first.offerId,
+      offerRevision: first.offerRevision,
+      actionId: reset.actionId,
+    };
+
+    expect(recoveryConfirmationAction(first, confirmation)).toBe(reset);
+    expect(
+      recoveryConfirmationAction(
+        offer({
+          offerId: first.offerId,
+          offerRevision: first.offerRevision,
+          actions: [],
+        }),
+        confirmation,
+      ),
+    ).toBeUndefined();
+  });
+
+  it('keeps a backend recovery rejection readable at the transport surface', () => {
+    expect(
+      recoveryCommandFailureMessage(
+        new Error('The recovery offer changed; review the current action'),
+      ),
+    ).toBe('The recovery offer changed; review the current action');
+    expect(recoveryCommandFailureMessage({})).toBe(
+      'The recovery action could not be applied.',
+    );
+
+    const html = renderToStaticMarkup(
+      createElement(RecoveryCommandNotice, {
+        message: 'The recovery offer changed; review the current action',
+        onDismiss: () => undefined,
+      }),
+    );
+    expect(html).toContain('role="alert"');
+    expect(html).toContain('Recovery action did not start.');
+    expect(html).toContain('The recovery offer changed; review the current action');
+    expect(html).toContain('Dismiss recovery action message');
   });
 });

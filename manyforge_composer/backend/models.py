@@ -135,6 +135,42 @@ class CycleCommandErrorResponse(BaseModel):
     )
 
 
+class SceneInitializationResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    schema_version: Literal["manyforge.scene_initialization.v1"] = Field(
+        alias="schemaVersion"
+    )
+    generation: int = Field(ge=0)
+    token: Optional[str] = None
+    state: Literal[
+        "closed",
+        "resetting",
+        "seeding",
+        "replaying",
+        "open",
+        "failed",
+        "retired",
+    ]
+    deferred: bool = False
+    reason: str = ""
+    error: Optional[str] = None
+    started_at_ns: int = Field(alias="startedAtNs", ge=0)
+    updated_at_ns: int = Field(alias="updatedAtNs", ge=0)
+    buffered_object_count: int = Field(alias="bufferedObjectCount", ge=0)
+    buffered_policy_count: int = Field(alias="bufferedPolicyCount", ge=0)
+    counters: Dict[str, int] = Field(default_factory=dict)
+
+
+class CycleResetRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    scene_initialization_token: Optional[str] = Field(
+        default=None,
+        alias="sceneInitializationToken",
+        min_length=1,
+        max_length=128,
+    )
+
+
 class VelocityScaleRequest(BaseModel):
     value: float = Field(ge=0.0, le=1.0)
     principal_id: Optional[str] = Field(default=None, alias="principalId")
@@ -156,6 +192,10 @@ class CycleCommandResponse(BaseModel):
     )
     recovery_offer: Optional[CycleRecoveryOfferDTO] = Field(
         default=None, alias="recoveryOffer"
+    )
+    scene_initialization: Optional[SceneInitializationResponse] = Field(
+        default=None,
+        alias="sceneInitialization",
     )
 
 
@@ -367,6 +407,10 @@ class ProgramResponse(BaseModel):
     program_tree_hash: str = Field(default="", alias="programTreeHash")
     compatibility: Optional[ProgramCompatibilityResponse] = None
     viewer: Optional[ProgramViewerResponse] = None
+    scene_initialization: Optional[SceneInitializationResponse] = Field(
+        default=None,
+        alias="sceneInitialization",
+    )
 
 
 class ProgramParameterResponse(BaseModel):
@@ -2127,62 +2171,158 @@ class NodeStatusTransitionResponse(BaseModel):
     to_status: str = Field(alias="to")
 
 
-class OperatorAlertResponse(BaseModel):
+OperatorAlarmLifecycleState = Literal[
+    "active_unacknowledged",
+    "active_acknowledged",
+    "returned_unacknowledged",
+    "returned_acknowledged",
+]
+
+
+class OperatorAlarmResponse(BaseModel):
     model_config = _ALIAS_CFG
-    schema_version: Literal["manyforge.operator_alert.v1"] = Field(
+    schema_version: Literal["manyforge.operator_alarm.v2"] = Field(
         alias="schemaVersion"
     )
-    alert_id: str = Field(alias="alertId")
-    recovery_context_id: Optional[str] = Field(
-        default=None, alias="recoveryContextId"
+    catalog_schema_version: str = Field(alias="catalogSchemaVersion")
+    catalog_version: str = Field(alias="catalogVersion")
+    definition_version: int = Field(alias="definitionVersion", ge=1)
+    definition_id: str = Field(alias="definitionId")
+    condition_id: str = Field(alias="conditionId")
+    activation_id: str = Field(alias="activationId")
+    scope: Dict[str, str]
+    alarm_class: Literal["motion", "scene", "runtime_health"] = Field(
+        alias="alarmClass"
     )
-    incident_id: str = Field(alias="incidentId")
-    incident_ids: List[str] = Field(default_factory=list, alias="incidentIds")
-    run_id: Optional[str] = Field(default=None, alias="runId")
-    execution_id: int = Field(default=0, alias="executionId")
-    severity: Literal["ERROR", "CRITICAL"]
-    error_code: str = Field(alias="errorCode")
+    priority: Literal["critical", "high", "medium", "low"]
+    title: str
     message: str
-    error_details: Dict[str, Any] = Field(default_factory=dict, alias="errorDetails")
-    trigger_type: Optional[str] = Field(default=None, alias="triggerType")
-    trigger_channel: Optional[str] = Field(default=None, alias="triggerChannel")
-    first_seen_at_ns: int = Field(alias="firstSeenAtNs")
-    first_seen_at: Optional[str] = Field(default=None, alias="firstSeenAt")
-    last_seen_at_ns: int = Field(alias="lastSeenAtNs")
-    last_seen_at: Optional[str] = Field(default=None, alias="lastSeenAt")
+    consequence: str
+    operator_response: str = Field(alias="operatorResponse")
+    requires_motion_attention: bool = Field(alias="requiresMotionAttention")
+    lifecycle_state: OperatorAlarmLifecycleState = Field(alias="lifecycleState")
+    active: bool
+    acknowledged: bool
+    activation_count: int = Field(alias="activationCount", ge=1)
     occurrence_count: int = Field(alias="occurrenceCount", ge=1)
-    revision: int = Field(ge=1)
+    record_revision: int = Field(alias="recordRevision", ge=1)
+    activated_at_ns: int = Field(alias="activatedAtNs", ge=0)
+    activated_at: str = Field(alias="activatedAt")
+    first_seen_at_ns: int = Field(alias="firstSeenAtNs", ge=0)
+    first_seen_at: str = Field(alias="firstSeenAt")
+    last_seen_at_ns: int = Field(alias="lastSeenAtNs", ge=0)
+    last_seen_at: str = Field(alias="lastSeenAt")
+    returned_at_ns: Optional[int] = Field(default=None, alias="returnedAtNs")
+    returned_at: Optional[str] = Field(default=None, alias="returnedAt")
+    acknowledged_at_ns: Optional[int] = Field(
+        default=None,
+        alias="acknowledgedAtNs",
+    )
+    acknowledged_at: Optional[str] = Field(default=None, alias="acknowledgedAt")
+    acknowledgement_principal: Optional[str] = Field(
+        default=None,
+        alias="acknowledgementPrincipal",
+    )
+    acknowledgement_reason: Optional[str] = Field(
+        default=None,
+        alias="acknowledgementReason",
+    )
+    source_id: str = Field(alias="sourceId")
+    source_epoch: str = Field(alias="sourceEpoch")
+    source_sequence: int = Field(alias="sourceSequence", ge=0)
+    source_quality: Literal["good", "unknown"] = Field(alias="sourceQuality")
+    display_args: Dict[str, Any] = Field(default_factory=dict, alias="displayArgs")
+    details: Dict[str, Any] = Field(default_factory=dict)
+    evidence_refs: List[str] = Field(default_factory=list, alias="evidenceRefs")
+    correlations: Dict[str, Any] = Field(default_factory=dict)
 
 
-class OperatorAlertInboxResponse(BaseModel):
+class OperatorAlarmAcknowledgementMember(BaseModel):
     model_config = _ALIAS_CFG
-    schema_version: Literal["manyforge.operator_alert_inbox.v1"] = Field(
+    condition_id: str = Field(alias="conditionId")
+    activation_id: str = Field(alias="activationId")
+    record_revision: int = Field(alias="recordRevision", ge=1)
+
+
+class OperatorAlarmDomainStatusResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    required: bool
+    reconciled: bool
+    source_count: int = Field(alias="sourceCount", ge=0)
+    unknown_source_count: int = Field(alias="unknownSourceCount", ge=0)
+
+
+class OperatorAlarmHealthResponse(BaseModel):
+    state: Literal["available", "unavailable"]
+    details: Dict[str, str] = Field(default_factory=dict)
+
+
+class OperatorAlarmSnapshotResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    schema_version: Literal["manyforge.operator_alarm_snapshot.v2"] = Field(
         alias="schemaVersion"
     )
+    catalog_version: str = Field(alias="catalogVersion")
     generation: int = Field(ge=0)
-    blocking_count: int = Field(alias="blockingCount", ge=0)
-    unacknowledged_alert_ids: List[str] = Field(
-        default_factory=list, alias="unacknowledgedAlertIds"
+    state_revision: int = Field(alias="stateRevision", ge=0)
+    reconciled: bool
+    health: OperatorAlarmHealthResponse
+    domains: Dict[str, OperatorAlarmDomainStatusResponse] = Field(default_factory=dict)
+    live_count: int = Field(alias="liveCount", ge=0)
+    unacknowledged_count: int = Field(alias="unacknowledgedCount", ge=0)
+    motion_attention_count: int = Field(alias="motionAttentionCount", ge=0)
+    active_count: int = Field(alias="activeCount", ge=0)
+    active_acknowledged_count: int = Field(
+        alias="activeAcknowledgedCount",
+        ge=0,
     )
-    alerts: List[OperatorAlertResponse] = Field(default_factory=list)
+    unacknowledged_membership: List[OperatorAlarmAcknowledgementMember] = Field(
+        default_factory=list,
+        alias="unacknowledgedMembership",
+    )
+    counts_by_state: Dict[str, int] = Field(default_factory=dict, alias="countsByState")
+    counts_by_priority: Dict[str, int] = Field(
+        default_factory=dict,
+        alias="countsByPriority",
+    )
+    counts_by_class: Dict[str, int] = Field(default_factory=dict, alias="countsByClass")
+    alarms: List[OperatorAlarmResponse] = Field(default_factory=list)
     truncated: bool = False
-    timestamp_ns: int = Field(alias="timestampNs")
+    timestamp_ns: int = Field(alias="timestampNs", ge=0)
 
 
-class OperatorAlertAcknowledgeAllRequest(BaseModel):
-    model_config = _ALIAS_CFG
-    alert_ids: List[str] = Field(alias="alertIds")
-    expected_generation: int = Field(alias="expectedGeneration", ge=0)
+class OperatorAlarmAcknowledgeRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+    activation_id: str = Field(alias="activationId", min_length=1, max_length=256)
+    expected_record_revision: int = Field(
+        alias="expectedRecordRevision",
+        ge=1,
+    )
+    reason: Optional[str] = Field(default=None, max_length=1024)
     confirmed: StrictBool
 
 
-class OperatorAlertAcknowledgeResponse(BaseModel):
+class OperatorAlarmAcknowledgeAllRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+    members: List[OperatorAlarmAcknowledgementMember]
+    expected_generation: int = Field(alias="expectedGeneration", ge=0)
+    reason: Optional[str] = Field(default=None, max_length=1024)
+    confirmed: StrictBool
+
+
+class OperatorAlarmAcknowledgeResponse(BaseModel):
     model_config = _ALIAS_CFG
-    acknowledged_alert_ids: List[str] = Field(
-        default_factory=list, alias="acknowledgedAlertIds"
+    status: str
+    changed: bool
+    acknowledged_condition_ids: List[str] = Field(
+        default_factory=list,
+        alias="acknowledgedConditionIds",
     )
-    already_acknowledged: bool = Field(default=False, alias="alreadyAcknowledged")
-    inbox: OperatorAlertInboxResponse
+    audit_event_indices: List[int] = Field(
+        default_factory=list,
+        alias="auditEventIndices",
+    )
+    snapshot: OperatorAlarmSnapshotResponse
 
 
 class ExecutionHistoryResponse(BaseModel):
