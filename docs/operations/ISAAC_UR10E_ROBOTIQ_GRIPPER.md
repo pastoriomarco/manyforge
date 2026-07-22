@@ -11,6 +11,11 @@ The program-facing command remains the standard
 contained in `manyforge_isaac_gripper_action_bridge`; behavior programs do not
 contain simulator-specific gripper nodes.
 
+The C++ ros2_control execution backend owns the ManyForge gripper lifecycle:
+admission, progress/dwell, timeout, terminal result, and immutable status. The
+Python Isaac bridge is only the simulator transport/action server; it is not a
+second ManyForge lifecycle owner.
+
 ## Authority Model
 
 The qualified path is:
@@ -35,18 +40,26 @@ six joints, every mapped position is within tolerance, and distinct samples
 remain matching for the configured settle window. Reaching the master target
 alone is not success.
 
+The execution adapter's deployment block also binds the gripper `group_id` and
+`joint_name`. It projects accepted gripper command/status into the same
+execution-state sink used for arm FK, including Robot Model Authority mimic
+joints. Composer therefore renders the canonical robot and command ghost from
+backend-owned state. A backend action result is not exposed as completed while
+that required projection is pending or failed; the viewer never advances the
+gripper on its own.
+
 ## Bring-Up
 
 1. Load an immutable Isaac asset release containing the expected full or light
    scene. The Isaac asset repository documents deployment and scene validation.
-2. While simulation is stopped, verify the gripper is already aligned with the
+1. While simulation is stopped, verify the gripper is already aligned with the
    wrist. It must not snap or rotate relative to the wrist when Play begins;
    movement of the complete arm during drive initialization is a separate
    behavior.
-3. Start the ManyForge Isaac/ROS lane normally. The UR profile starts the
+1. Start the ManyForge Isaac/ROS lane normally. The UR profile starts the
    position-commanded gripper bridge automatically.
-4. Start simulation playback.
-5. Verify readiness before running a program:
+1. Start simulation playback.
+1. Verify readiness before running a program:
 
 ```bash
 docker exec manyforge-isaac-topic-control-1 bash -lc '
@@ -132,16 +145,16 @@ its support. Isaac was returned to the standard `STOPPED` state after testing.
 
 ## Failure Handling
 
-| Symptom | Interpretation | Action |
-| --- | --- | --- |
-| Readiness remains false | Missing/stale/non-finite six-joint state or wrong scene topology | Start playback; inspect `/isaac_joint_states`; confirm the immutable scene release |
-| Master moves but followers do not | Legacy asset or missing PhysX mimic model | Reload the qualified asset; never command followers as a workaround |
-| Goal times out while fingers contact an object | Linkage did not reach the full geometric target | Treat as stalled evidence; adjust task/grasp or qualified tolerance, not result semantics |
-| Bridge exits on readiness change | Software defect; severity-changing logging was an earlier cause | Inspect bridge log; do not bypass supervisor readiness |
-| TCP jumps or stays authored/static | Non-rigid USD Xform used as measured source | Restore rigid base entity plus explicit entity-to-TCP transform |
-| Gripper is misplaced before Play or snaps on Play | A consuming scene overrode the strongest reusable robot overlay's `ee_link` pose | Load a qualified immutable release; validate that scenes contain no local `ee_link` transform |
-| Fresh workstation misses gripper geometry | NVIDIA 5.1 asset cannot resolve and is not cached | Restore endpoint access or populate the Isaac resolver cache; readiness must remain false until all six joints exist |
-| Isaac resets with a transient controller warning | Graph reinitialization window | Accept only if readiness recovers and repeated commands pass; otherwise reload/restart Isaac |
+| Symptom                                           | Interpretation                                                                   | Action                                                                                                               |
+| ------------------------------------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Readiness remains false                           | Missing/stale/non-finite six-joint state or wrong scene topology                 | Start playback; inspect `/isaac_joint_states`; confirm the immutable scene release                                   |
+| Master moves but followers do not                 | Legacy asset or missing PhysX mimic model                                        | Reload the qualified asset; never command followers as a workaround                                                  |
+| Goal times out while fingers contact an object    | Linkage did not reach the full geometric target                                  | Treat as stalled evidence; adjust task/grasp or qualified tolerance, not result semantics                            |
+| Bridge exits on readiness change                  | Software defect; severity-changing logging was an earlier cause                  | Inspect bridge log; do not bypass supervisor readiness                                                               |
+| TCP jumps or stays authored/static                | Non-rigid USD Xform used as measured source                                      | Restore rigid base entity plus explicit entity-to-TCP transform                                                      |
+| Gripper is misplaced before Play or snaps on Play | A consuming scene overrode the strongest reusable robot overlay's `ee_link` pose | Load a qualified immutable release; validate that scenes contain no local `ee_link` transform                        |
+| Fresh workstation misses gripper geometry         | NVIDIA 5.1 asset cannot resolve and is not cached                                | Restore endpoint access or populate the Isaac resolver cache; readiness must remain false until all six joints exist |
+| Isaac resets with a transient controller warning  | Graph reinitialization window                                                    | Accept only if readiness recovers and repeated commands pass; otherwise reload/restart Isaac                         |
 
 Reset does not authorize a second command writer and does not weaken readiness.
 If Isaac becomes unresponsive, distinguish stopped simulation from process

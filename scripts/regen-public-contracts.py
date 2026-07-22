@@ -125,10 +125,13 @@ def _build_composer_state():
     from manyforge_behavior.kernel_client import MockKernelClient
     from manyforge_behavior.node_environment import build_node_environment
     from manyforge_composer.backend.state import ComposerState
+
     return ComposerState(
         node_environment=build_node_environment(DEFAULT_CATALOG_PATH),
         kernel=MockKernelClient(),
     )
+
+
 HEADER_TEMPLATE = (
     "<!--\n"
     "  THIS FILE IS GENERATED — do not hand-edit. Source of truth: code.\n"
@@ -167,6 +170,7 @@ def _normalized_generated_content(path: Path, content: str) -> str:
 # ---------------------------------------------------------------------------
 # Viewer data-plane wire contract generator
 # ---------------------------------------------------------------------------
+
 
 def _viewer_wire_models() -> tuple[type[Any], ...]:
     from manyforge_composer.backend.models import (
@@ -541,12 +545,22 @@ def gen_viewer_preservation_fixture() -> str:
                         pose_identity,
                         {
                             "position_m": [0.4, -0.2, 0.7],
-                            "orientation_xyzw": [0.0, 0.0, 0.7071067811865476, 0.7071067811865476],
+                            "orientation_xyzw": [
+                                0.0,
+                                0.0,
+                                0.7071067811865476,
+                                0.7071067811865476,
+                            ],
                         },
                     ],
                     "tcp_pose_in_base": {
                         "position_m": [0.4, -0.2, 0.7],
-                        "orientation_xyzw": [0.0, 0.0, 0.7071067811865476, 0.7071067811865476],
+                        "orientation_xyzw": [
+                            0.0,
+                            0.0,
+                            0.7071067811865476,
+                            0.7071067811865476,
+                        ],
                     },
                     "state_source": "composer_backend",
                     "source_timestamp_ns": 12_345_670_000,
@@ -560,14 +574,24 @@ def gen_viewer_preservation_fixture() -> str:
                 },
                 {
                     "position_m": [0.4, -0.2, 0.8],
-                    "orientation_xyzw": [0.0, 0.0, 0.7071067811865476, 0.7071067811865476],
+                    "orientation_xyzw": [
+                        0.0,
+                        0.0,
+                        0.7071067811865476,
+                        0.7071067811865476,
+                    ],
                 },
             ],
             "frame_transforms": [
                 pose_identity,
                 {
                     "position_m": [0.4, -0.2, 0.7],
-                    "orientation_xyzw": [0.0, 0.0, 0.7071067811865476, 0.7071067811865476],
+                    "orientation_xyzw": [
+                        0.0,
+                        0.0,
+                        0.7071067811865476,
+                        0.7071067811865476,
+                    ],
                 },
             ],
             "gripper_states": [
@@ -678,6 +702,7 @@ def gen_viewer_preservation_fixture() -> str:
         "snapshot_sequence_number": frame["source_sequence"],
         "snapshot_stale": frame["stale"],
     }
+
     def legacy_shape(shape: dict[str, Any] | None) -> dict[str, Any] | None:
         if shape is None:
             return None
@@ -735,16 +760,19 @@ def gen_viewer_preservation_fixture() -> str:
             "timestampNs": frame["timestamp_ns"],
         },
     }
-    return json.dumps(
-        {
-            "schema_version": "manyforge.viewer.preservation_fixture.v1",
-            "manifest": manifest,
-            "frame": frame,
-            "expected_legacy": expected_legacy,
-        },
-        indent=2,
-        sort_keys=True,
-    ) + "\n"
+    return (
+        json.dumps(
+            {
+                "schema_version": "manyforge.viewer.preservation_fixture.v1",
+                "manifest": manifest,
+                "frame": frame,
+                "expected_legacy": expected_legacy,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
 
 
 def gen_viewer_typescript_fixture() -> str:
@@ -757,9 +785,7 @@ def gen_viewer_typescript_fixture() -> str:
         "gen_viewer_typescript_fixture\n\n"
         "import type { ViewerFrameV1, ViewerManifestV1 } from "
         "'./viewerProtocol.generated';\n\n"
-        "export const viewerProtocolFixture = "
-        + encoded
-        + " satisfies {\n"
+        "export const viewerProtocolFixture = " + encoded + " satisfies {\n"
         "  schema_version: 'manyforge.viewer.preservation_fixture.v1';\n"
         "  manifest: ViewerManifestV1;\n"
         "  frame: ViewerFrameV1;\n"
@@ -772,15 +798,20 @@ def gen_viewer_typescript_fixture() -> str:
 # REST API generator
 # ---------------------------------------------------------------------------
 
+
 def gen_rest_api() -> str:
     """Render the Composer REST surface from its FastAPI OpenAPI schema."""
     try:
         from manyforge_composer.backend.app import create_app
+
         state = _build_composer_state()
         app = create_app(state)
         spec = app.openapi()
     except Exception as exc:
-        return _stamp("gen_rest_api") + textwrap.dedent(f"""
+        return (
+            _stamp("gen_rest_api")
+            + textwrap.dedent(
+                f"""
             # Composer REST API
 
             **AUTO-GENERATION FAILED** — could not import the Composer
@@ -807,7 +838,9 @@ def gen_rest_api() -> str:
             `manyforge_composer/backend/app.py:build_app()`
 
             Per-router files under `manyforge_composer/backend/routes_*.py`.
-        """).lstrip()
+        """
+            ).lstrip()
+        )
 
     body: list[str] = [_stamp("gen_rest_api"), "# Composer REST API\n"]
     body.append(
@@ -816,8 +849,10 @@ def gen_rest_api() -> str:
         f"available at `/openapi.json` and `/docs` while Composer is "
         f"running.\n\n"
     )
-    body.append(f"OpenAPI version: `{spec.get('openapi', '?')}`. "
-                f"Title: `{spec.get('info', {}).get('title', '?')}`.\n\n")
+    body.append(
+        f"OpenAPI version: `{spec.get('openapi', '?')}`. "
+        f"Title: `{spec.get('info', {}).get('title', '?')}`.\n\n"
+    )
     body.append("## Routes\n\n")
     paths = spec.get("paths", {})
     rows = []
@@ -839,10 +874,12 @@ def gen_rest_api() -> str:
 # MCP runtime contract generator
 # ---------------------------------------------------------------------------
 
+
 def gen_mcp_contract() -> str:
     """Render the ManyForge MCP tool surface."""
     try:
         from manyforge_composer.backend.mcp_server import create_mcp_server
+
         state = _build_composer_state()
         server = create_mcp_server(state)
         # FastMCP exposes the registered tools through its tool manager.
@@ -858,7 +895,10 @@ def gen_mcp_contract() -> str:
         if not tools:
             raise RuntimeError("MCP server has no registered tools")
     except Exception as exc:
-        return _stamp("gen_mcp_contract") + textwrap.dedent(f"""
+        return (
+            _stamp("gen_mcp_contract")
+            + textwrap.dedent(
+                f"""
             # ManyForge MCP Runtime Contract
 
             **AUTO-GENERATION FAILED** — could not introspect the MCP
@@ -882,7 +922,9 @@ def gen_mcp_contract() -> str:
 
             Tool registrations: `manyforge_composer/backend/mcp_server.py`
             (each `@mcp.tool()` decorator registers one tool).
-        """).lstrip()
+        """
+            ).lstrip()
+        )
 
     body: list[str] = [_stamp("gen_mcp_contract"), "# ManyForge MCP Runtime Contract\n"]
     body.append(
@@ -900,7 +942,9 @@ def gen_mcp_contract() -> str:
         body.append(f"### `{name}`\n\n")
         body.append(f"{first_line}\n\n")
         # Show the input schema if available.
-        schema = getattr(tool, "parameters", None) or getattr(tool, "input_schema", None)
+        schema = getattr(tool, "parameters", None) or getattr(
+            tool, "input_schema", None
+        )
         if schema:
             try:
                 body.append("Input schema:\n```json\n")
@@ -908,12 +952,14 @@ def gen_mcp_contract() -> str:
                 body.append("\n```\n\n")
             except Exception:
                 pass
-    body.append("## Code source\n\n"
-                "All tools are registered with `@mcp.tool()` decorators in "
-                "`manyforge_composer/backend/mcp_server.py`. The decorator "
-                "captures the tool's name, description (from the function's "
-                "docstring), and JSON-Schema input shape from the function's "
-                "type hints.\n")
+    body.append(
+        "## Code source\n\n"
+        "All tools are registered with `@mcp.tool()` decorators in "
+        "`manyforge_composer/backend/mcp_server.py`. The decorator "
+        "captures the tool's name, description (from the function's "
+        "docstring), and JSON-Schema input shape from the function's "
+        "type hints.\n"
+    )
     return "".join(body)
 
 
@@ -921,30 +967,56 @@ def gen_mcp_contract() -> str:
 # Assistant provider contract generator
 # ---------------------------------------------------------------------------
 
+
 def gen_assistant_provider_contract() -> str:
     """Render the assistant-provider HTTP wire format."""
     try:
         from manyforge_assistant_bridge import bridge as bridge_module
+        from manyforge_composer.backend.assistant_provider import LANE_REGISTRY
+
         spec = bridge_module.app.openapi()
     except Exception as exc:
         spec = None
+        LANE_REGISTRY = {}
         err = exc
 
-    out: list[str] = [_stamp("gen_assistant_provider_contract"),
-                      "# Assistant Provider Contract\n"]
+    out: list[str] = [
+        _stamp("gen_assistant_provider_contract"),
+        "# Assistant Provider Contract\n",
+    ]
     out.append(
         "Composer dispatches assistant requests to a *provider* HTTP service "
         "which speaks the `manyforge.assistant.provider_request.v0` envelope. "
-        "Two reference providers ship with manyforge:\n\n"
-        "- `nemoclaw` lane: `manyforge_assistant_bridge` on port 8100 — "
-        "  runs the agent loop in-process; calls the model directly. "
-        "  Same repo as this doc.\n"
-        "- `openclaw` lane: `openclaw_assistant_bridge` on port 8200 — "
-        "  dispatches into a NemoClaw sandbox running OpenClaw. Lives in "
-        "  the platform repo (NemoClaw-Thor) under `manyforge/`.\n\n"
-        "Both speak the same wire envelope; this doc covers the wire format "
-        "the provider must accept.\n\n"
+        "Composer's lane registry is the owner of canonical provider IDs, "
+        "aliases, routing, isolation, and default bridge ports.\n\n"
     )
+    if LANE_REGISTRY:
+        out.append("## Registered engine-backed lanes\n\n")
+        out.append(
+            "| Canonical ID | Aliases | Port | Routing | Declared runtime | Declared isolation |\n"
+            "|---|---|---:|---|---|---|\n"
+        )
+        for lane_id, entry in sorted(LANE_REGISTRY.items()):
+            aliases = ", ".join(f"`{alias}`" for alias in entry.get("aliases", ()))
+            out.append(
+                f"| `{lane_id}` | {aliases or '—'} | "
+                f"`{entry.get('default_bridge_port', '?')}` | "
+                f"`{entry.get('routing', '?')}` | "
+                f"`{entry.get('runtime', '?')}` | "
+                f"`{entry.get('isolation', '?')}` |\n"
+            )
+        out.append(
+            "\nThe in-tree `manyforge_assistant_bridge` implements the direct "
+            "lane. NemoClaw-Thor supplies the OpenClaw and Hermes adapters. "
+            "All registered lanes use the same provider envelope and remain "
+            "subject to Composer's mode/catalog/authority checks. The runtime "
+            "and isolation values are Composer catalog declarations, not live "
+            "process-placement attestation: the standard in-tree launcher "
+            "starts the direct bridge as a host peer, while a platform "
+            "deployment may sandbox the same bridge. Verify the selected "
+            "topology with the lane bring-up runbook and live process/health "
+            "checks.\n\n"
+        )
     if spec:
         out.append("## Bridge HTTP routes (machine-introspected)\n\n")
         out.append("| Method | Path | Summary |\n|---|---|---|\n")
@@ -959,6 +1031,13 @@ def gen_assistant_provider_contract() -> str:
     else:
         out.append(f"_Auto-introspection failed: `{type(err).__name__}: {err}`._\n\n")
 
+    provider_ids = tuple(LANE_REGISTRY) or ("direct", "openclaw", "hermes")
+    provider_aliases = tuple(
+        alias for entry in LANE_REGISTRY.values() for alias in entry.get("aliases", ())
+    )
+    provider_id_shape = " | ".join(
+        f'"{provider_id}"' for provider_id in (*provider_ids, *provider_aliases)
+    )
     out.append(
         "## Envelope wire format\n\n"
         "The request body sent by Composer to the provider on "
@@ -996,7 +1075,7 @@ def gen_assistant_provider_contract() -> str:
         "{\n"
         '  "requestId": "<echo>",\n'
         '  "conversationId": "<echo>",\n'
-        '  "providerId": "nemoclaw" | "openclaw" | "...",\n'
+        f'  "providerId": {provider_id_shape} | "...",\n'
         '  "message": "<final assistant text>",\n'
         '  "proposals": [ ... ],          // draft mutations the operator must accept\n'
         '  "toolCalls": [ ... ],          // executed callbacks (audit trail)\n'
@@ -1007,7 +1086,7 @@ def gen_assistant_provider_contract() -> str:
         "```\n\n"
         "Errors return non-200 with:\n\n"
         "```json\n"
-        "{ \"requestId\": \"<echo>\", \"code\": \"<short_id>\", \"detail\": \"<human-readable>\" }\n"
+        '{ "requestId": "<echo>", "code": "<short_id>", "detail": "<human-readable>" }\n'
         "```\n\n"
         "## Code source\n\n"
         "- `manyforge_assistant_bridge/bridge.py` — direct lane provider (this repo).\n"
@@ -1023,10 +1102,14 @@ def gen_assistant_provider_contract() -> str:
 # Driver
 # ---------------------------------------------------------------------------
 
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    parser.add_argument("--check", action="store_true",
-                        help="Exit 1 if regen would change any file (CI mode).")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit 1 if regen would change any file (CI mode).",
+    )
     args = parser.parse_args()
 
     REF_DIR.mkdir(parents=True, exist_ok=True)

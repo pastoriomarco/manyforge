@@ -23,10 +23,12 @@ The known Thor/laptop topology is:
 
 Set these in every shell that launches a ROS participant: Isaac Sim on the
 laptop, the Isaac ROS 4.4 container on Thor, and the ManyForge launcher shell on
-Thor.
+Thor. Set `MANYFORGE_ROOT` to the checkout visible in that shell; do not copy a
+user-specific absolute path between hosts.
 
 ```bash
-source /home/tndlux/workspaces/dev_ws/src/manyforge/config/ros/isaac_lite6_trocar_foundationpose.env.sh
+export MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
+source "${MANYFORGE_ROOT}/config/ros/isaac_lite6_trocar_foundationpose.env.sh"
 ```
 
 That profile expands to the known-good commissioning environment:
@@ -75,7 +77,8 @@ Open a fresh shell on the laptop and export the DDS variables before launching
 Isaac Sim:
 
 ```bash
-source /home/tndlux/workspaces/dev_ws/src/manyforge/config/ros/isaac_lite6_trocar_foundationpose.env.sh
+export MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
+source "${MANYFORGE_ROOT}/config/ros/isaac_lite6_trocar_foundationpose.env.sh"
 cd ~/isaac-sim
 ./isaac-sim.sh
 ```
@@ -91,6 +94,7 @@ data, set:
   ```
 
 - `queueSize`: `1`
+
 - `frameSkipCount`: start high enough to keep the operator network usable.
   Lower it only after the full pipeline is stable.
 
@@ -107,7 +111,8 @@ Press Play only after the DDS environment and QoS are set.
 On Thor:
 
 ```bash
-cd /home/tndlux/workspaces/isaac_ros-dev
+export ISAAC_ROS_WS="${ISAAC_ROS_WS:-${HOME}/workspaces/isaac_ros-dev}"
+cd "${ISAAC_ROS_WS}"
 isaac-ros activate
 ```
 
@@ -182,7 +187,8 @@ the shell that runs `scripts/launch.sh`; `docker-compose.yaml` passes them into
 the ROS-capable services.
 
 ```bash
-cd /home/tndlux/workspaces/dev_ws/src/manyforge
+export MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
+cd "${MANYFORGE_ROOT}"
 source config/ros/isaac_lite6_trocar_foundationpose.env.sh
 
 ./scripts/launch.sh --lane isaac-sim --assistant off \
@@ -329,14 +335,14 @@ The pick planner's pose-construction order is intentional:
 
 1. Read the selected object's backend-authoritative pose in the planning base
    frame.
-2. Anchor the nominal pick point to the selected object and its top surface.
-3. Compute the candidate pick TCP orientation. With `force_vertical_pick` true,
+1. Anchor the nominal pick point to the selected object and its top surface.
+1. Compute the candidate pick TCP orientation. With `force_vertical_pick` true,
    the TCP local Z axis is forced vertical-down while preserving the object's
    horizontal heading; the object pose itself is not moved or re-oriented.
-4. Apply `pick_offset_envelope` XYZ modifiers in `pick_offset_reference`.
-5. Apply `min_tcp_z_m` if enabled; this happens after the reference-basis
+1. Apply `pick_offset_envelope` XYZ modifiers in `pick_offset_reference`.
+1. Apply `min_tcp_z_m` if enabled; this happens after the reference-basis
    offset and can change the final TCP Z from the pure rotated offset.
-6. Apply `approach_offset_envelope` XYZ modifiers relative to the final pick
+1. Apply `approach_offset_envelope` XYZ modifiers relative to the final pick
    pose in `approach_offset_reference`.
 
 `pick_offset_envelope` and `approach_offset_envelope` XYZ values are expressed
@@ -345,9 +351,7 @@ in their paired reference parameters: `pick_offset_reference` and
 `robot_link: link_tcp`: the pick offset `[-0.015, 0.0, 0.004]` and approach
 offset `[0.0, 0.0, -0.08]` are expressed in the generated pick TCP basis, not
 the robot's current live TCP pose before planning. If an offset should follow
-the detected trocar heading, set the corresponding reference to `object:
-graspable`; if it should stay in the planning base, set it to `frame:
-link_base`. The vertical-pick option rectifies orientation only; it does not
+the detected trocar heading, set the corresponding reference to `object: graspable`; if it should stay in the planning base, set it to `frame: link_base`. The vertical-pick option rectifies orientation only; it does not
 override the selected translation reference.
 
 Robot Control Cartesian candidates preserve explicit frame parity. A manual

@@ -17,32 +17,40 @@ shared across lanes.
 > `scripts/setup-hermes.sh`, or the bridge ports, update this file in the
 > same commit.
 
----
+______________________________________________________________________
 
 ## The three lanes at a glance
 
-| | **direct** (`nemoclaw` alias) | **openclaw** | **hermes** |
-|---|---|---|---|
-| `ASSISTANT_PROVIDER` | `direct` | `openclaw` | `hermes` |
-| Bridge port | `:8100` | `:8200` | `:8300` |
-| Bridge process | in-tree `manyforge_assistant_bridge.bridge` (host venv) | NemoClaw-Thor `start-openclaw-assistant-bridge.sh` (CLI shell-out) | NemoClaw-Thor `lanes/hermes/service.py` (uvicorn) |
-| Tool surface | inline `tools[]` catalog in the bridge prompt | gateway discovery (`tool_search`/`tool_describe`) | native MCP tools (`mcp_manyforge_*`) |
-| Sandbox | none — talks straight to vLLM | OpenClaw gateway in `openshell-my-assistant-*` (`:18789` in-sandbox) | Hermes `/v1/runs` gateway in `openshell-hermes-*` (forwarded to host `:8642`) |
-| Smoke `--self-heal-lane` | `state-only` | `openclaw` | `hermes` |
-| Enable gate | none | none | `HERMES_LANE_PHASE4_ENABLED=true` |
-| First-time provisioning | `scripts/setup-direct.sh` (host venv only — no sandbox, no onboarding) | one-time `nemoclaw onboard` creates the `my-assistant` sandbox (see `NemoClaw-Thor/USER_QUICKSTART_MANUAL.md` — some onboard defaults need the local-provider fixups), then `NemoClaw-Thor/manyforge/setup-manyforge-assistant.sh` applies the merged policy | `scripts/setup-hermes.sh <sandbox>` provisions its own born-with-MCP sandbox — `nemoclaw onboard` is NOT used for this lane |
+|                          | **direct** (`nemoclaw` alias)                                          | **openclaw**                                                                                                                                                                                                                                                 | **hermes**                                                                                                                  |
+| ------------------------ | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `ASSISTANT_PROVIDER`     | `direct`                                                               | `openclaw`                                                                                                                                                                                                                                                   | `hermes`                                                                                                                    |
+| Bridge port              | `:8100`                                                                | `:8200`                                                                                                                                                                                                                                                      | `:8300`                                                                                                                     |
+| Bridge process           | in-tree `manyforge_assistant_bridge.bridge` (host venv)                | NemoClaw-Thor `start-openclaw-assistant-bridge.sh` (CLI shell-out)                                                                                                                                                                                           | NemoClaw-Thor `lanes/hermes/service.py` (uvicorn)                                                                           |
+| Tool surface             | inline `tools[]` catalog in the bridge prompt                          | gateway discovery (`tool_search`/`tool_describe`)                                                                                                                                                                                                            | native MCP tools (`mcp_manyforge_*`)                                                                                        |
+| Sandbox                  | none — talks straight to vLLM                                          | OpenClaw gateway in `openshell-my-assistant-*` (`:18789` in-sandbox)                                                                                                                                                                                         | Hermes `/v1/runs` gateway in `openshell-hermes-*` (forwarded to host `:8642`)                                               |
+| Smoke `--self-heal-lane` | `state-only`                                                           | `openclaw`                                                                                                                                                                                                                                                   | `hermes`                                                                                                                    |
+| Enable gate              | none                                                                   | none                                                                                                                                                                                                                                                         | `HERMES_LANE_PHASE4_ENABLED=true`                                                                                           |
+| First-time provisioning  | `scripts/setup-direct.sh` (host venv only — no sandbox, no onboarding) | one-time `nemoclaw onboard` creates the `my-assistant` sandbox (see `NemoClaw-Thor/USER_QUICKSTART_MANUAL.md` — some onboard defaults need the local-provider fixups), then `NemoClaw-Thor/manyforge/setup-manyforge-assistant.sh` applies the merged policy | `scripts/setup-hermes.sh <sandbox>` provisions its own born-with-MCP sandbox — `nemoclaw onboard` is NOT used for this lane |
 
 > **Lane dev/analysis** (cross-lane numbers, speed, scorer-strictness) lives in
 > the sibling `NemoClaw-Thor` repo: `manyforge/docs/LANE-COMPARISON.md`; the full
 > scorer note is archived alongside it at
 > `manyforge/docs/archive/THREE-LANE-SCORER-NOTE.md`.
 
+Set checkout paths once in each operator shell; override either variable when
+your layout differs:
+
+```bash
+export MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
+export NEMOCLAW_THOR="${NEMOCLAW_THOR:-${HOME}/workspaces/dev_ws/src/NemoClaw-Thor}"
+```
+
 **Shared foundation (all lanes):**
 
-| Component | Port | Notes |
-|---|---|---|
-| vLLM (`manyforge-e2e-vllm`) | `:8050` | `MODEL_PROFILE`, e.g. `gemma4-12b-it-gguf`. Cold load can take 60+ min. |
-| vllm-proxy (`vllm-proxy.py`) | `:8000` | Token/trim mutation; upstream for every bridge. |
+| Component                           | Port    | Notes                                                                                            |
+| ----------------------------------- | ------- | ------------------------------------------------------------------------------------------------ |
+| vLLM (`manyforge-e2e-vllm`)         | `:8050` | `MODEL_PROFILE`, e.g. `gemma4-12b-it-gguf`. Cold load can take 60+ min.                          |
+| vllm-proxy (`vllm-proxy.py`)        | `:8000` | Token/trim mutation; upstream for every bridge.                                                  |
 | Composer (`manyforge-e2e-composer`) | `:9000` | The smoke runner's target. Dispatches each assistant turn to `MANYFORGE_ASSISTANT_ENDPOINT_URL`. |
 
 The Composer reads two env vars **at process start** to decide which bridge
@@ -56,12 +64,11 @@ MANYFORGE_ASSISTANT_ENDPOINT_URL=http://127.0.0.1:<8100|8200|8300>/v1/manyforge/
 Switching lanes therefore means **re-pointing the Composer** (a container
 restart) and **starting the target lane's bridge**.
 
----
+______________________________________________________________________
 
 ## ⚠️ vLLM reload trap — read before switching lanes
 
-`scripts/launch.sh stop` and `restart` both run `docker rm -f
-manyforge-e2e-vllm` (`scripts/lib/assistant.sh:902`). On the next `start`,
+`scripts/launch.sh stop` and `restart` both run `docker rm -f manyforge-e2e-vllm` (`scripts/lib/assistant.sh:902`). On the next `start`,
 `start_model` cold-loads the model again — **60+ minutes** for a fresh
 gemma4-12b QAT load. `start_model` *is* idempotent when the container is
 already up serving the right `MODEL_PROFILE`
@@ -73,16 +80,16 @@ only launcher path to a lane switch is `restart` → which kills vLLM.
 
 1. **Cold boot (first bring-up of the day):** use `launch.sh` — it brings up
    everything including vLLM. See [Canonical launch.sh path](#canonical-launchsh-path-cold-boot).
-2. **Lane switch with vLLM already loaded (the common case):** use the
+1. **Lane switch with vLLM already loaded (the common case):** use the
    **surgical switch** below — it leaves vLLM + proxy untouched and only
    re-points the Composer + swaps the bridge. This is what the smoke matrix
    uses to compare lanes back-to-back on the same loaded model.
 
----
+______________________________________________________________________
 
 ## Surgical lane switch (preserves the loaded vLLM)
 
-Run from the manyforge repo root: `cd ~/workspaces/dev_ws/src/manyforge`.
+Run from the manyforge repo root: `cd "${MANYFORGE_ROOT}"`.
 
 ### Step 0 — sanity: shared foundation is up
 
@@ -116,7 +123,7 @@ Pick exactly one:
 <details><summary><b>direct</b> — bridge on :8100 (host venv, no sandbox)</summary>
 
 ```bash
-cd ~/workspaces/dev_ws/src/manyforge
+cd "${MANYFORGE_ROOT}"
 mkdir -p /tmp/manyforge-assistant-e2e
 env \
   BRIDGE_HOST=127.0.0.1 BRIDGE_PORT=8100 \
@@ -126,7 +133,7 @@ env \
   BRIDGE_MODEL=gemma4-12b-it-gguf \
   BRIDGE_REQUEST_TIMEOUT_S=300 BRIDGE_MAX_WALL_TIME_S=300 BRIDGE_MAX_TURNS=16 \
   BRIDGE_AUDIT_LOG=/tmp/manyforge-assistant-e2e/direct-bridge-audit.jsonl \
-  MANYFORGE_THOR_ROOT=/home/tndlux/workspaces/dev_ws/src/NemoClaw-Thor/manyforge \
+  MANYFORGE_THOR_ROOT="${NEMOCLAW_THOR}/manyforge" \
   MANYFORGE_STATE_CONTEXT=first_then_every_n MANYFORGE_STATE_CONTEXT_EVERY_N=3 \
   BRIDGE_STATE_CONTEXT=first_then_every_n BRIDGE_STATE_CONTEXT_EVERY_N=3 \
   setsid manyforge_assistant_bridge/.venv/bin/python -m manyforge_assistant_bridge.bridge \
@@ -153,7 +160,7 @@ launcher's `start_bridge_openclaw` starts that gateway lazily; to reproduce
 it surgically:
 
 ```bash
-cd ~/workspaces/dev_ws/src/NemoClaw-Thor
+cd "${NEMOCLAW_THOR}"
 
 # 1. ensure the gateway is up in the sandbox
 SB=$(docker ps --format '{{.Names}}' | grep -E '^openshell-my-assistant-' | head -1)
@@ -183,8 +190,7 @@ env \
 - Health: `curl -sf http://127.0.0.1:8200/healthz` → `"provider":"openclaw"`.
   Becomes 200 once the gateway is responsive.
 
-Sandbox provisioning — `NEMOCLAW_THOR/manyforge/setup-manyforge-assistant.sh
-my-assistant` installs the composer skill, egress preset, `manyforge` MCP
+Sandbox provisioning — `NEMOCLAW_THOR/manyforge/setup-manyforge-assistant.sh my-assistant` installs the composer skill, egress preset, `manyforge` MCP
 server, and the `manyforge-composer` agent profile. It is **idempotent** —
 re-run it to repair a degraded sandbox (gateway died, skill/agent lost). Two
 gotchas:
@@ -196,9 +202,9 @@ gotchas:
   block above is what brings the gateway up on `:18789`.
 
 ```bash
-MANYFORGE_ROOT=~/workspaces/dev_ws/src/manyforge \
-NEMOCLAW_THOR=~/workspaces/dev_ws/src/NemoClaw-Thor \
-  ~/workspaces/dev_ws/src/NemoClaw-Thor/manyforge/setup-manyforge-assistant.sh my-assistant
+MANYFORGE_ROOT="${MANYFORGE_ROOT}" \
+NEMOCLAW_THOR="${NEMOCLAW_THOR}" \
+  "${NEMOCLAW_THOR}/manyforge/setup-manyforge-assistant.sh" my-assistant
 ```
 
 </details>
@@ -210,7 +216,7 @@ and a host→sandbox forward so the bridge can reach the gateway at
 `HERMES_BASE_URL`.
 
 ```bash
-cd ~/workspaces/dev_ws/src/NemoClaw-Thor/manyforge
+cd "${NEMOCLAW_THOR}/manyforge"
 
 # 1. forward the sandbox gateway (internal :18642) to host :8650 if not already up
 #    SB=$(docker ps --format '{{.Names}}' | grep -E '^openshell-hermes-' | head -1)
@@ -230,7 +236,7 @@ env \
 ```
 
 - The stream timeouts are pinned **above** the 300 s case budget (= budget +
-  60) so the proxy/case-budget fire first and Hermes's stale-detector does not
+  60\) so the proxy/case-budget fire first and Hermes's stale-detector does not
   trigger a retry storm (`scripts/setup-hermes.sh`).
 - Health: `curl -sf http://127.0.0.1:8300/healthz` → `"provider":"hermes"`.
 
@@ -240,7 +246,7 @@ Create the sandbox once (born-with-MCP):
 HERMES_LANE_PHASE4_ENABLED=true \
   NEMOCLAW_VLLM_ENDPOINT=http://host.openshell.internal:8000/v1 \
   NEMOCLAW_VLLM_MODEL=gemma4-12b-it-gguf \
-  ~/workspaces/dev_ws/src/manyforge/scripts/setup-hermes.sh hermes-smoke
+  "${MANYFORGE_ROOT}/scripts/setup-hermes.sh" hermes-smoke
 ```
 
 </details>
@@ -252,7 +258,7 @@ removing it and recreating it via the tested lib function (an incremental,
 build-cached rebuild — typically 1–3 min, **vLLM is not touched**):
 
 ```bash
-cd ~/workspaces/dev_ws/src/manyforge
+cd "${MANYFORGE_ROOT}"
 docker rm -f manyforge-e2e-composer
 export MANYFORGE_ROOT=$PWD
 export MANYFORGE_ASSISTANT_PROVIDER=<direct|openclaw|hermes>
@@ -290,7 +296,7 @@ tr '\0' '\n' < /proc/$cpid/environ | grep MANYFORGE_ASSISTANT_
 ### Step 4 — run the smoke corpus
 
 ```bash
-cd ~/workspaces/dev_ws/src/NemoClaw-Thor/manyforge/scripts/debug
+cd "${NEMOCLAW_THOR}/manyforge/scripts/debug"
 python3 -u smoke_corpus_runner.py \
   --composer http://127.0.0.1:9000 \
   --self-heal --self-heal-lane <state-only|openclaw|hermes> \
@@ -310,7 +316,7 @@ python3 -u smoke_corpus_runner.py \
   locally by the MCP bridge) are **not** counted — this keeps the lanes
   comparable.
 
----
+______________________________________________________________________
 
 ## Canonical launch.sh path (cold boot)
 
@@ -318,7 +324,7 @@ From a clean machine (nothing running), the launcher brings up vLLM + proxy +
 Composer + the selected bridge in one shot:
 
 ```bash
-cd ~/workspaces/dev_ws/src/manyforge
+cd "${MANYFORGE_ROOT}"
 
 # direct
 ASSISTANT_PROVIDER=direct MODEL_PROFILE=gemma4-12b-it-gguf \
@@ -343,14 +349,14 @@ HERMES_LANE_PHASE4_ENABLED=true ASSISTANT_PROVIDER=hermes \
 - `start_model` reuses an already-loaded vLLM if it serves `MODEL_PROFILE`; a
   cold load is 60+ min.
 - **Do not** use `launch.sh restart`/`stop` to switch lanes if you want to keep
-  a loaded model — see the [reload trap](#️-vllm-reload-trap--read-before-switching-lanes).
+  a loaded model — see the [reload trap](#%EF%B8%8F-vllm-reload-trap--read-before-switching-lanes).
   Use the surgical switch instead.
 
 `scripts/setup-direct.sh` is an idempotent **direct-lane** health/repair helper
 (verifies vLLM/proxy/Composer/venv/shared-core and tells you how to start the
 bridge). `scripts/setup-hermes.sh` provisions the **hermes** sandbox.
 
----
+______________________________________________________________________
 
 ## Quick status / teardown
 

@@ -6,7 +6,7 @@
 > where to find the canonical reference docs. Read referenced docs
 > before editing code or running scripts.
 
----
+______________________________________________________________________
 
 ## What this repo is
 
@@ -20,11 +20,11 @@ when the optional Composer-assistant lane is enabled.
 Three sibling repositories form the full stack; the cross-repo
 authority map is:
 
-| Question | Authoritative repo | Notes |
-|---|---|---|
-| **How do I install / deploy / run ManyForge?** | this repo (`manyforge`) | self-sufficient at runtime — no other repo required for non-AI use |
-| **How do I run the LLM assistant on Jetson Thor?** | `NemoClaw-Thor` | platform glue: vLLM serving, sandbox provisioner, OpenClaw bridge launcher. Required only when using the `openclaw` lane on Thor. |
-| **What is the spec / contract / ADR — what should this code do?** | `manyforge_specs` (private) | dev-only; **not required at runtime**. Specs/ADRs/plans live there for maintainer use. |
+| Question                                                          | Authoritative repo          | Notes                                                                                                                             |
+| ----------------------------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| **How do I install / deploy / run ManyForge?**                    | this repo (`manyforge`)     | self-sufficient at runtime — no other repo required for non-AI use                                                                |
+| **How do I run the LLM assistant on Jetson Thor?**                | `NemoClaw-Thor`             | platform glue: vLLM serving, sandbox provisioner, OpenClaw bridge launcher. Required only when using the `openclaw` lane on Thor. |
+| **What is the spec / contract / ADR — what should this code do?** | `manyforge_specs` (private) | dev-only; **not required at runtime**. Specs/ADRs/plans live there for maintainer use.                                            |
 
 ### Repository locations and fallbacks
 
@@ -32,11 +32,11 @@ Prefer local checkouts under `${HOME}/workspaces/dev_ws/src/`. If a referenced
 repo is missing locally, inspect or clone the matching repository under
 `https://github.com/pastoriomarco/` before treating a local link as stale.
 
-| Repo | Preferred local path | Accepted alternate local path | Remote |
-|---|---|---|---|
-| `manyforge` | `${HOME}/workspaces/dev_ws/src/manyforge` | - | `https://github.com/pastoriomarco/manyforge` |
-| `NemoClaw-Thor` | `${HOME}/workspaces/dev_ws/src/NemoClaw-Thor` | `${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor` | `https://github.com/pastoriomarco/NemoClaw-Thor` |
-| `manyforge_specs` | `${HOME}/workspaces/dev_ws/src/manyforge_specs` | - | `https://github.com/pastoriomarco/manyforge_specs` |
+| Repo                       | Preferred local path                                     | Accepted alternate local path                                   | Remote                                                      |
+| -------------------------- | -------------------------------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------- |
+| `manyforge`                | `${HOME}/workspaces/dev_ws/src/manyforge`                | -                                                               | `https://github.com/pastoriomarco/manyforge`                |
+| `NemoClaw-Thor`            | `${HOME}/workspaces/dev_ws/src/NemoClaw-Thor`            | `${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor`                 | `https://github.com/pastoriomarco/NemoClaw-Thor`            |
+| `manyforge_specs`          | `${HOME}/workspaces/dev_ws/src/manyforge_specs`          | -                                                               | `https://github.com/pastoriomarco/manyforge_specs`          |
 | `isaac_ros_custom_bringup` | `${HOME}/workspaces/dev_ws/src/isaac_ros_custom_bringup` | `${HOME}/workspaces/isaac_ros-dev/src/isaac_ros_custom_bringup` | `https://github.com/pastoriomarco/isaac_ros_custom_bringup` |
 
 **This file covers the runtime/operator side completely.** A brief
@@ -50,7 +50,7 @@ runtime operation is still fully supported, but non-trivial behavior
 development is limited and needs maintainer audit before it should be
 treated as spec-compliant.
 
----
+______________________________________________________________________
 
 ## Install
 
@@ -79,13 +79,23 @@ installer). On Jetson Orin AGX, use
 [`docs/operations/ORIN_STACK_SETUP.md`](docs/operations/ORIN_STACK_SETUP.md)
 instead so the NVMe/eMMC storage contract is handled first.
 
----
+______________________________________________________________________
 
 ## Runtime
 
-ManyForge has **three deployment modes** — pick the one that matches
-your needs. Each mode adds optional surface; the simpler ones are
-self-contained.
+Runtime selection has two independent axes:
+
+- the **robot execution lane** is ManyForge-only native, Isaac commanded
+  simulation, or a physical ROS-backed robot; and
+- the optional **assistant provider** is off, `direct` (`nemoclaw` alias),
+  `openclaw`, or `hermes`.
+
+Changing the assistant provider never changes motion authority or robot-state
+precedence. See
+[`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md#deployment-lanes)
+for execution lanes and
+[`docs/operations/LANE_BRINGUP.md`](docs/operations/LANE_BRINGUP.md) for the
+three engine-backed assistant lanes.
 
 **Operator-facing launcher quickstart:**
 [`docs/operations/LAUNCHER_QUICKSTART.md`](docs/operations/LAUNCHER_QUICKSTART.md)
@@ -105,7 +115,7 @@ commit.**
 for URDF/SRDF requirements, deployment-YAML schema (arm + gripper),
 capability adapter selection, and smoke-test curls.
 
-### Mode 1 — Composer + behavior runtime (no LLM)
+### Assistant off — Composer + behavior runtime
 
 The full ManyForge runtime, no AI. Use for validating behavior trees,
 debugging planning/execution, or any deployment that doesn't need an
@@ -120,12 +130,13 @@ python -m manyforge_composer \
 
 Open `http://localhost:9000/` for the Composer UI and native viewer.
 
-### Mode 2 — Composer + direct LLM endpoint
+### Assistant `direct` — local model endpoint
 
 Adds the **direct-lane assistant**: ManyForge's
 `manyforge_assistant_bridge` (in this repo) runs a bounded multi-turn
-loop against an OpenAI-compatible local LLM (typically vLLM). No
-sandbox, no OpenClaw — fast iteration, sandbox-bypass.
+loop against an OpenAI-compatible local LLM (typically vLLM). The standard
+in-tree launcher starts this bridge as a host peer; a platform deployment may
+instead place the same bridge in a policy-configured sandbox.
 
 ```bash
 # 1. Start an OpenAI-compatible server on :8000 (vLLM, llama.cpp, ...).
@@ -133,11 +144,11 @@ sandbox, no OpenClaw — fast iteration, sandbox-bypass.
 cd manyforge_assistant_bridge
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m manyforge_assistant_bridge.bridge   # listens on :8100
-# 3. Start Composer with --assistant-provider nemoclaw:
+# 3. Start Composer with the canonical direct provider id:
 docker compose run --rm dev bash -c '
   python -m manyforge_composer \
     --catalog-path manyforge_behavior/resources/node_catalog.yaml \
-    --assistant-provider nemoclaw \
+    --assistant-provider direct \
     --assistant-endpoint http://127.0.0.1:8100/v1/manyforge/assistant \
     --host 0.0.0.0 --port 9000'
 ```
@@ -145,7 +156,7 @@ docker compose run --rm dev bash -c '
 Wire contract for the bridge service:
 [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md).
 
-### Mode 3 — Composer + sandboxed assistant lane (OpenClaw)
+### Assistant `openclaw` — sandboxed OpenClaw lane
 
 Production default on Thor. Routes the assistant through a NemoClaw
 sandbox running OpenClaw, which dispatches tool calls back to Composer
@@ -174,22 +185,36 @@ Cosmos reruns. Operator runbook for this lane lives in NemoClaw-Thor at
 `manyforge/docs/COMPOSER-ASSISTANT-RUNBOOK.md`; lane-comparison
 benchmark at `manyforge/docs/LANE-COMPARISON.md`.
 
----
+### Assistant `hermes` — sandboxed Hermes lane
+
+Hermes is the third registered engine-backed provider. It uses the same
+Composer envelope and authority checks through a NemoClaw-Thor adapter on
+port `8300`, while Hermes owns its session/agent loop. It is opt-in and its
+sandbox is provisioned separately from OpenClaw. Select `--provider hermes`
+with the unified launcher and follow
+[`docs/operations/LANE_BRINGUP.md`](docs/operations/LANE_BRINGUP.md) for
+provisioning, live checks, and teardown.
+
+______________________________________________________________________
 
 ## Operator-facing reference docs (this repo)
 
-These three are the canonical runtime contracts. They live in this
-repo so an operator never needs to fetch private specs to operate
-ManyForge:
+These generated contracts are the exact public runtime wire surfaces. They
+live in this repo so an operator never needs private specs to operate or
+integrate ManyForge. Use
+[`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md) for the
+hand-maintained ownership and end-to-end flow map.
 
-| Topic | Doc | Source-of-truth |
-|---|---|---|
-| Composer REST API | [`docs/reference/REST_API.md`](docs/reference/REST_API.md) | FastAPI app's `/openapi.json` (live at `:9000/openapi.json` when Composer is running) |
-| MCP runtime contract | [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md) | `manyforge_composer/backend/mcp_server.py` (`@mcp.tool()` decorators) |
-| Assistant-provider HTTP | [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md) | `manyforge_assistant_bridge/bridge.py` + `protocol.py` |
+| Topic                   | Doc                                                                                                  | Source-of-truth                                                                                                   |
+| ----------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Composer REST API       | [`docs/reference/REST_API.md`](docs/reference/REST_API.md)                                           | FastAPI app's `/openapi.json` (live at `:9000/openapi.json` when Composer is running)                             |
+| MCP runtime contract    | [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md)                   | `manyforge_composer/backend/mcp_server.py` (`@mcp.tool()` decorators)                                             |
+| Assistant-provider HTTP | [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md)     | `manyforge_assistant_bridge/bridge.py` + `protocol.py`                                                            |
+| Viewer data plane       | [`docs/reference/VIEWER_DATA_PLANE_V1.schema.json`](docs/reference/VIEWER_DATA_PLANE_V1.schema.json) | Strict backend Pydantic wire models; the same generator emits frontend TypeScript types and preservation fixtures |
 
-These docs are auto-generated from code (FastAPI's `openapi()` output
-plus the FastMCP tool registry). To regenerate:
+The Markdown contracts, viewer schemas/fixtures, and frontend viewer types are
+generated from their owning FastAPI, FastMCP, protocol, and Pydantic models.
+Do not edit generated outputs by hand. To regenerate:
 
 ```bash
 docker compose run --rm dev python3 scripts/regen-public-contracts.py
@@ -219,26 +244,28 @@ comparison, smoke tests), see
 For all docs in this repo:
 [`docs/INDEX.md`](docs/INDEX.md).
 
----
+______________________________________________________________________
 
 ## Subcomponent map
 
 What lives where in this repo, and what it's for:
 
-| Path | What |
-|---|---|
-| [`manyforge_core/`](manyforge_core/) | C++20 core: planning DTOs, kernel state machine, ports |
-| [`manyforge_behavior/`](manyforge_behavior/) | Behavior-tree runtime (py_trees), node catalog, tests |
-| [`manyforge_roboplan/`](manyforge_roboplan/) | Native motion-planner backend bindings (RRT + TOPPRA) |
-| [`manyforge_composer/`](manyforge_composer/) | FastAPI backend + React frontend + MCP server |
-| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/) | Direct-lane assistant provider HTTP service (port 8100) |
-| [`manyforge_ros/`](manyforge_ros/) | ROS 2 bridge (optional) |
-| [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/) | OpenClaw skill manifest (used by Mode 3) |
-| [`examples/`](examples/) | Reference `*.program.yaml` + `*.deployment.yaml` |
-| [`scripts/`](scripts/) | Operator scripts (`demo-assistant-known-good.sh`, `setup-docker.sh`, etc.) |
-| [`docs/`](docs/) | Operator docs (`operations/`, `guides/`, `reference/`) |
+| Path                                                                     | What                                                                                               |
+| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
+| [`manyforge_core/`](manyforge_core/)                                     | C++20 core: planning DTOs, kernel state machine, ports                                             |
+| [`manyforge_behavior/`](manyforge_behavior/)                             | Behavior-tree runtime (py_trees), node catalog, tests                                              |
+| [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine               |
+| [`manyforge_roboplan/`](manyforge_roboplan/)                             | Native motion-planner backend bindings (RRT + TOPPRA)                                              |
+| [`manyforge_ros2_control_execution/`](manyforge_ros2_control_execution/) | C++ ROS controller execution, feedback/progress, bounded stop/reset, and isolated scene projection |
+| [`manyforge_composer/`](manyforge_composer/)                             | FastAPI backend + React frontend + MCP server                                                      |
+| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Direct-lane assistant provider HTTP service (port 8100)                                            |
+| [`manyforge_ros/`](manyforge_ros/)                                       | ROS 2 bridge (optional)                                                                            |
+| [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | ManyForge assistant skill installed by sandboxed provider deployments                              |
+| [`examples/`](examples/)                                                 | Reference `*.program.yaml` + `*.deployment.yaml`                                                   |
+| [`scripts/`](scripts/)                                                   | Operator scripts (`demo-assistant-known-good.sh`, `setup-docker.sh`, etc.)                         |
+| [`docs/`](docs/)                                                         | Operator docs (`operations/`, `guides/`, `reference/`)                                             |
 
----
+______________________________________________________________________
 
 ## Boundary rules for LLM agents working in this repo
 
@@ -258,34 +285,33 @@ When making changes here, check the boundary you're touching:
    guard has an explicit allowlist for docs that legitimately *describe*
    the boundary (this file, `STACK_SETUP.md`, the dev-only session
    script).
-2. **Operator-facing reference docs are derived from code, not specs.**
+1. **Operator-facing reference docs are derived from code, not specs.**
    See `scripts/regen-public-contracts.py`. Don't hand-copy spec
    content into `docs/reference/`; extend the generator instead.
-3. **Sibling-repo paths use env-var defaults**: `MANYFORGE_ROOT`,
+1. **Sibling-repo paths use env-var defaults**: `MANYFORGE_ROOT`,
    `NEMOCLAW_THOR`, `MANYFORGE_SPECS_ROOT`. Never hard-code another
    user's home directory.
-4. **Builds and tests run in containers, not on the host.** Host
+1. **Builds and tests run in containers, not on the host.** Host
    `cmake`, `pytest`, `npm`, or ROS setup is inspection-only and does
    not count as qualification evidence. Use `docker compose run --rm dev`
    for ROS-free core/RoboPlan/pybind11/Python/Composer checks; use
    `docker compose --profile ros run --rm ros-jazzy ...` for minimal ROS
-   adapter checks; use `docker compose --profile ros-full run --rm
-   ros-jazzy-full ...` or the launcher `isaac-sim` lane for full
+   adapter checks; use `docker compose --profile ros-full run --rm ros-jazzy-full ...` or the launcher `isaac-sim` lane for full
    ROS/Isaac/ros2_control checks.
-5. **Launcher lane matters.** `manyforge-only` / native
+1. **Launcher lane matters.** `manyforge-only` / native
    `manyforge-e2e-composer` containers are ROS-free. They are valid for
    deterministic native tests only. ROS packages require the
    `isaac-sim` lane or the `ros-full` compose profile.
-6. **Tests fall into deterministic + assistant lanes.** Run
+1. **Tests fall into deterministic + assistant lanes.** Run
    `./scripts/test-all.sh` inside the `dev` container for the
    deterministic suite. The assistant bridge has its own pytest suite
    under `manyforge_assistant_bridge/tests/`.
-7. **Schema changes are wire-breaking.** If you touch
+1. **Schema changes are wire-breaking.** If you touch
    `manyforge_assistant_bridge/protocol.py` (the catalog-hash function
    or any shared envelope helper), every running deployment will
    recompute hashes — treat as a wire-version bump.
 
----
+______________________________________________________________________
 
 ## Branch & commit workflow for agents
 
@@ -309,20 +335,20 @@ humans and LLM agents equally:
    a topic branch if the operator explicitly asks). If you are
    running in a contributor's fork, an authorized push goes to the
    fork — never directly to upstream `dev` or `main`.
-2. **`git commit` requires explicit human authorization** — every time.
+1. **`git commit` requires explicit human authorization** — every time.
    Stage the diff, present it, wait for the literal word `commit`. The
    priority memory rule `feedback_commits_explicit_only.md` is operative:
    multi-step instructions like "fix everything" do not transitively
    authorize commits.
-3. **`git push` is a separate authorization** from `git commit`. Wait
+1. **`git push` is a separate authorization** from `git commit`. Wait
    for an explicit `push` reply.
-4. **Never open a PR autonomously.** Do not run `gh pr create` unless
+1. **Never open a PR autonomously.** Do not run `gh pr create` unless
    explicitly asked. The operator opens the PR through the GitHub UI
    when they're ready.
-5. **Before a non-trivial push, run `/codex:review`** (or equivalent
+1. **Before a non-trivial push, run `/codex:review`** (or equivalent
    second-pass review) and iterate to convergence. Reference:
    `feedback_codex_review_convergence.md`.
-6. **Releases are operator-driven.** Do not bump `VERSION`, do not
+1. **Releases are operator-driven.** Do not bump `VERSION`, do not
    write `[X.Y.Z]` sections in `CHANGELOG.md`, do not tag, do not
    squash-merge `dev → main` — those are explicit-ask operations.
 
@@ -334,7 +360,7 @@ CI workflow `version-sync.yml` (driven by
 Full contributor reference, applicable to both humans and LLMs:
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
----
+______________________________________________________________________
 
 ## For maintainers / spec work
 

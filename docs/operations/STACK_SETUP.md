@@ -2,8 +2,8 @@
 
 # ManyForge Stack Setup
 
-Operational runbook for bringing up ManyForge locally, with or without
-NemoClaw/OpenClaw. This file intentionally stays compact. It points to scripts
+Operational runbook for bringing up ManyForge locally, with or without an
+assistant provider. This file intentionally stays compact. It points to scripts
 and live configuration sources instead of embedding their contents.
 
 User-facing product overview belongs in [`../../README.md`](../../README.md).
@@ -14,8 +14,7 @@ This runbook covers:
 
 - ManyForge-only bring-up
 - ManyForge plus ROS 2 controller execution
-- ManyForge plus direct local model endpoint
-- ManyForge plus NemoClaw/OpenClaw integration
+- direct, OpenClaw, and Hermes assistant-provider selection
 - the current recommended commands
 
 It does not cover:
@@ -52,27 +51,27 @@ Node.js, NemoClaw, or OpenShell, and it does **not** create the first
 1. Prepare the host: Docker Engine + Compose v2, NVIDIA Container Toolkit for
    assistant/model serving, `git`, `curl`, enough disk for Docker images and
    model caches, Hugging Face token/licence acceptance for gated models.
-2. Clone the sibling repos under `${HOME}/workspaces/dev_ws/src/`. Use the
+1. Clone the sibling repos under `${HOME}/workspaces/dev_ws/src/`. Use the
    same tested branch/tag across `manyforge` and `NemoClaw-Thor`; do not mix a
    migration branch in one repo with `main` in the other.
-3. Build the ManyForge image:
+1. Build the ManyForge image:
    ```bash
    cd ${HOME}/workspaces/dev_ws/src/manyforge
    ./scripts/setup-docker.sh
    ```
-4. Install the NemoClaw/OpenShell toolchain from `NemoClaw-Thor` and verify
+1. Install the NemoClaw/OpenShell toolchain from `NemoClaw-Thor` and verify
    `nemoclaw`, `openshell`, and Docker work from the operator account.
-5. Start the local model once from `NemoClaw-Thor/serving/` and confirm
+1. Start the local model once from `NemoClaw-Thor/serving/` and confirm
    `curl http://127.0.0.1:8000/v1/models` returns the served model.
-6. Run first-time `nemoclaw onboard` to create the `my-assistant` sandbox.
+1. Run first-time `nemoclaw onboard` to create the `my-assistant` sandbox.
    The onboard wizard probes the model endpoint, so the model must already be
    running.
-7. After `my-assistant` exists, use the launcher for repeatable bring-up:
+1. After `my-assistant` exists, use the launcher for repeatable bring-up:
    ```bash
    cd ${HOME}/workspaces/dev_ws/src/manyforge
    ./scripts/launch.sh restart
    ```
-8. Verify the live stack:
+1. Verify the live stack:
    ```bash
    curl -fsS http://127.0.0.1:9000/api/infra/heartbeat
    curl -fsS http://127.0.0.1:8000/v1/models
@@ -84,9 +83,16 @@ registration, gateway startup, and bridge startup on every run. That is
 intentional and idempotent. The non-idempotent first-time step is creating the
 sandbox itself with `nemoclaw onboard`.
 
-## Current Supported Modes
+## Runtime Selection
 
-### 1. Deterministic ManyForge only
+Robot execution and assistant-provider selection are independent. Select one
+execution lane, then optionally select one assistant provider. An assistant
+choice never changes motion authority, controller binding, or robot-state
+precedence.
+
+### Robot execution lanes
+
+#### ManyForge-only native
 
 No LLM, no NemoClaw/OpenClaw dependency.
 
@@ -96,7 +102,7 @@ Use when:
 - debugging planning/execution
 - avoiding any model/runtime integration variables
 
-### 2. ManyForge plus ROS 2 controller execution
+#### ROS 2 controller execution
 
 ManyForge plans and validates locally, then dispatches robot motion to a
 ROS 2 controller selected by deployment config. Use this for Isaac Sim
@@ -119,12 +125,13 @@ networking so DDS can discover Isaac/robot endpoints. The default
 Composer services remain ROS-free and continue to use native simulated
 execution unless a deployment selects another adapter.
 
-Important current status: the deployment and Composer factory dispatch
-are wired to fail closed when the ROS execution runtime factory is not
-installed. The ROS-side FollowJointTrajectory transport helpers and fake
-controller tests exist, but the in-process `IExecutionBackend` runtime
-adapter is still the next implementation slice before this mode can move
-Isaac from the Composer Run button.
+The shipped `manyforge_ros2_control_execution` C++ adapter owns
+FollowJointTrajectory dispatch, feedback/settling, bounded stop/reset, and the
+lane-selected execution-state projection. Deployment/Composer factory dispatch
+fails closed if that adapter or a required controller/provider is unavailable.
+The Isaac `commanded_sim` profile and physical controller-observed profile have
+different state precedence; see
+[`../reference/ARCHITECTURE.md`](../reference/ARCHITECTURE.md#deployment-lanes).
 
 Use when:
 
@@ -132,17 +139,21 @@ Use when:
 - testing Isaac Sim / ros2_control execution wiring
 - qualifying trajectory execution outside the native simulated backend
 
-### 3. ManyForge plus direct local model endpoint
+### Optional model and assistant surfaces
 
-ManyForge talks directly to a local OpenAI-compatible server such as vLLM.
+#### Runtime model nodes
+
+Runtime nodes such as `query_model` can use a deployment-declared local
+OpenAI-compatible endpoint such as vLLM. This is independent of the Composer
+assistant provider.
 
 Use when:
 
 - testing `query_model`
 - validating bounded model interactions
-- running the semantic selection demo on the current text-only baseline
+- running semantic-selection programs on the current text-only baseline
 
-### 4. ManyForge plus an assistant lane (NemoClaw/OpenClaw, Direct, or Hermes)
+#### Composer assistant provider
 
 Three first-class assistant-provider lanes exist — `direct`, `openclaw`,
 `hermes` — and the live stack runs exactly one per Composer process,
@@ -150,46 +161,22 @@ selected at startup via `ASSISTANT_PROVIDER`. **OpenClaw + Gemma 4 12B GGUF
 (`openclaw` provider, `gemma4-12b-it-gguf`) is the demo default** as
 of 2026-06-11. The canonical per-lane bring-up, switch procedure, and
 provisioning/onboarding matrix is
-[`LANE_BRINGUP.md`](LANE_BRINGUP.md); the two most common lanes are
-summarized below. The Hermes lane (native MCP, opt-in
-`HERMES_LANE_PHASE4_ENABLED=true`, sandbox provisioned by
-`scripts/setup-hermes.sh` — not by `nemoclaw onboard`) is covered in
-`LANE_BRINGUP.md` and in NemoClaw-Thor's `manyforge/lanes/hermes/README.md`.
-The
-launcher [`scripts/demo-assistant-known-good.sh`](../../scripts/demo-assistant-known-good.sh)
+[`LANE_BRINGUP.md`](LANE_BRINGUP.md). The launcher
+[`scripts/demo-assistant-known-good.sh`](../../scripts/demo-assistant-known-good.sh)
 sets `ASSISTANT_PROVIDER=openclaw` and `MODEL_PROFILE=gemma4-12b-it-gguf`
 by default.
 
-- **OpenClaw lane (default — `ASSISTANT_PROVIDER=openclaw`)**: persistent
-  OpenClaw gateway in the NemoClaw `my-assistant` sandbox. Composer's
-  `openclaw` provider talks to an adapter at `:8200` (lives in
-  NemoClaw-Thor at `manyforge/openclaw_assistant_bridge/`) which
-  forwards to `/v1/chat/completions` on the gateway. The gateway runs
-  the agent loop internally; ManyForge enforces every tool call via the
-  mode-scoped MCP wrapper + `/api/assistant/bridge/tools/{toolId}`.
-  Current evidence: Gemma QAT scored 52/66 on the 2026-06-07
-  OpenClaw sweep and 51/66 in the 2026-06-09 three-lane head-to-head
-  (75 total / 66 scored). Recommended whenever sandbox isolation +
-  the bounded-autonomy audit envelope (assistantMode + catalogHash +
-  requestId + principal) matter, which for the production deployment
-  shape is always.
-
-- **Direct model lane (`ASSISTANT_PROVIDER=direct`; `nemoclaw` is accepted as
-  a legacy alias)**: in-tree
-  `manyforge_assistant_bridge` on `:8100` makes chat-completions calls
-  against the local model endpoint directly, runs the agent loop in-process. Sub-2 s warm
-  latency, ~22 s/test p50 — fastest end-to-end, but no sandbox
-  isolation and no per-call audit envelope. Use this for local
-  development, debugging the bridge in isolation, or single-tenant
-  setups where the model is fully trusted.
+| Provider                    | Bridge/agent path                                                                                              | Placement and use                                                                                                                                                                    |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `direct` (`nemoclaw` alias) | In-tree `manyforge_assistant_bridge` on `:8100`; bridge runs the bounded agent loop against the model endpoint | Standard in-tree launcher starts a host peer. A platform deployment may place the same bridge in a policy-configured sandbox. Useful for local iteration and fallback qualification. |
+| `openclaw`                  | NemoClaw-Thor adapter on `:8200`; OpenClaw gateway owns the agent loop                                         | Sandboxed current Thor demo default.                                                                                                                                                 |
+| `hermes`                    | NemoClaw-Thor adapter on `:8300`; Hermes sessions own the agent loop                                           | Sandboxed and opt-in; provision with `scripts/setup-hermes.sh`, not `nemoclaw onboard`.                                                                                              |
 
 All lanes preserve the same bounded-autonomy contract on the ManyForge
-side. Switching between them is a single env var on
-`scripts/demo-assistant-known-good.sh`. The lane-comparison data that
-justified the default flip (`nemoclaw` → `openclaw` on 2026-05-07)
-and the §10 ablation that validated 9/9 reliability live in
-[`LANE-COMPARISON-direct-vs-openclaw.md`](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/manyforge/docs/archive/LANE-COMPARISON-direct-vs-openclaw.md)
-in NemoClaw-Thor.
+side: mode-scoped catalog enforcement, callback validation, review boundaries,
+and audit identity. Provider IDs and catalog metadata are configuration, not
+proof of live process placement; use `LANE_BRINGUP.md` health/process checks.
+Switching providers is a startup choice, not a runtime execution transition.
 
 Setup recipe:
 [`./ASSISTANT_E2E_COOKBOOK.md`](./ASSISTANT_E2E_COOKBOOK.md) →
@@ -200,7 +187,7 @@ in NemoClaw-Thor.
 
 Use when:
 
-- validating sandbox-to-ManyForge agent flows
+- validating provider-to-ManyForge agent flows
 - working on assistant, monitoring, or delegated-recovery integration
 
 ## Prerequisites
@@ -211,7 +198,7 @@ ManyForge runs inside Docker containers, so the host requirement is
 primarily "a machine that runs Docker." Specifics:
 
 - **OS**: Linux (Ubuntu 24.04 LTS is the reference). Docker Desktop on
-  macOS / Windows works for Mode 1 development but is unsupported for
+  macOS / Windows works for native development but is unsupported for
   the assistant and Isaac lanes — Isaac Sim and NVIDIA-runtime workloads
   require a Linux host with NVIDIA drivers.
 - **Architecture**: amd64 (x86_64) is the reference. arm64 is supported
@@ -220,29 +207,30 @@ primarily "a machine that runs Docker." Specifics:
   arm64+CUDA via NemoClaw-Thor. Isaac Sim itself is x86_64-only.
 - **Docker**: Docker Engine with BuildKit, plus the Compose v2 plugin
   (`docker compose ...`, not the legacy `docker-compose`).
-- **GPU / driver**: not required for Mode 1 (deterministic). Required
-  for Mode 2 (direct LLM) and Mode 3 (sandboxed assistant) — both
+- **GPU / driver**: not required for native execution without a local model.
+  Required for the reference local-model assistant deployments, which
   expect an OpenAI-compatible model server reachable from the host;
   on Thor that is the NemoClaw-Thor-managed vLLM container, which
   needs the NVIDIA Container Toolkit (`nvidia-ctk`) configured.
   Required for the Isaac lane (NVIDIA driver + RTX-class GPU).
-- **RAM**: 16 GB minimum for Mode 1 with a comfortable C++ build.
-  32 GB recommended for Mode 2/3 (vLLM warm-up) and for the Isaac lane.
+- **RAM**: 16 GB minimum for native execution with a comfortable C++ build.
+  32 GB recommended for local-model warm-up and for the Isaac lane.
   Jetson Thor 64 GB unified memory is the supported assistant-lane
   deployment target.
 - **Disk**: ~10 GB for the Docker image plus build cache. The vLLM
-  model cache (Mode 2/3) can grow to 30-60 GB depending on which models
+  model cache can grow to 30-60 GB depending on which models
   are pulled — that cache lives outside the manyforge tree, under
   NemoClaw-Thor's volume.
-- **Local model server (Mode 2/3 only)**: an OpenAI-compatible HTTP
+- **Local model server (model-backed assistant only)**: an OpenAI-compatible HTTP
   endpoint such as vLLM, llama.cpp, or any other server that implements
   `/v1/chat/completions`. Default port 8000.
 
 ### Repositories
 
 - `manyforge` (this repo) — required.
-- `NemoClaw-Thor` — required only when using the integrated OpenClaw stack
-  (Jetson Thor inference + sandboxed assistant lane).
+- `NemoClaw-Thor` — required for the reference Thor model-serving stack and
+  the OpenClaw/Hermes adapters; not required for native operation or a direct
+  bridge pointed at another compatible endpoint.
 - `manyforge_specs` — **dev-only**, not required for runtime/operation.
   Cloned alongside `manyforge` only by maintainers working on specs/ADRs.
 
@@ -252,26 +240,26 @@ These are baked into the Docker images by `scripts/setup-docker.sh`
 and the Dockerfiles. Operators do not need to install or manage them
 manually; they are documented here for traceability.
 
-| Dependency | Version / pin | Source | Notes |
-| --- | --- | --- | --- |
-| Base dev image | `python:3.12-slim-bookworm` | Docker Hub | Dockerfile L31; ROS-free dev environment |
-| Frontend builder | `node:22-slim` | Docker Hub | Dockerfile L23; React/Vite build stage |
-| ROS image | `ros:jazzy-ros-base-noble` | Docker Hub | Dockerfile.ros-jazzy L11; Ubuntu Noble + ROS Jazzy |
-| RoboPlan | reviewed `0.5.1` commit `e06d1a2f1b749c38742aee9e401bbe97fa967f7b` | `https://github.com/open-planning/roboplan.git` | Pinned in `scripts/setup-docker.sh` as `ROBOPLAN_PINNED_REF`. The upstream tag is lightweight and unsigned; the exact commit and every checked patch/removal criterion are recorded in `third_party/roboplan/README.md`. The Dockerfiles install RoboPlan's modular C++ and Python packages, including Cartesian planning. |
-| Pinocchio (kinematics / dynamics) | `pin==4.1.0`, `libpinocchio==4.1.0` | PyPI | Both wrapper and C++ library wheels are pinned; the compatible aarch64 graph uses `coal==3.0.3` and `libcoal==3.0.3`. |
-| `pybind11` | `3.0.3` | PyPI | Dockerfile L58 |
-| `nanobind` | `2.12.0` | PyPI | Dockerfile L63 |
-| `topic_based_ros2_control` | commit `7ee291ab13adba52ab5889deb9e520009fe2283d` | `https://github.com/karanchahal-nv/topic_based_ros2_control.git` | Dockerfile.ros-jazzy L17; built into the ROS image; the bridge used by the Isaac lane |
-| Eigen 3 | apt `libeigen3-dev` | Debian Bookworm | Dockerfile L45 |
-| `urdfdom` | apt `liburdfdom-dev` | Debian Bookworm | Dockerfile L45 |
-| `octomap` | apt `liboctomap-dev` | Debian Bookworm | Dockerfile L46 |
-| `boost` (filesystem / serialization / system / python / chrono / thread / date_time) | apt | Debian Bookworm | Dockerfile L43-44 |
-| `trimesh` | `4.11.5` | PyPI | Dockerfile L61; OBJ/mesh parsing |
-| `yourdfpy` | `0.0.60` | PyPI | Dockerfile L62; URDF Python loader |
-| FastAPI | `0.135.3` | PyPI | Dockerfile L67; Composer backend |
-| MCP (Model Context Protocol) | `1.27.0` | PyPI | Dockerfile L71; assistant-lane MCP server |
+| Dependency                                                                           | Version / pin                                                      | Source                                                           | Notes                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------ | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Base dev image                                                                       | `python:3.12-slim-bookworm`                                        | Docker Hub                                                       | Dockerfile L31; ROS-free dev environment                                                                                                                                                                                                                                                                                   |
+| Frontend builder                                                                     | `node:22-slim`                                                     | Docker Hub                                                       | Dockerfile L23; React/Vite build stage                                                                                                                                                                                                                                                                                     |
+| ROS image                                                                            | `ros:jazzy-ros-base-noble`                                         | Docker Hub                                                       | Dockerfile.ros-jazzy L11; Ubuntu Noble + ROS Jazzy                                                                                                                                                                                                                                                                         |
+| RoboPlan                                                                             | reviewed `0.5.1` commit `e06d1a2f1b749c38742aee9e401bbe97fa967f7b` | `https://github.com/open-planning/roboplan.git`                  | Pinned in `scripts/setup-docker.sh` as `ROBOPLAN_PINNED_REF`. The upstream tag is lightweight and unsigned; the exact commit and every checked patch/removal criterion are recorded in `third_party/roboplan/README.md`. The Dockerfiles install RoboPlan's modular C++ and Python packages, including Cartesian planning. |
+| Pinocchio (kinematics / dynamics)                                                    | `pin==4.1.0`, `libpinocchio==4.1.0`                                | PyPI                                                             | Both wrapper and C++ library wheels are pinned; the compatible aarch64 graph uses `coal==3.0.3` and `libcoal==3.0.3`.                                                                                                                                                                                                      |
+| `pybind11`                                                                           | `3.0.3`                                                            | PyPI                                                             | Dockerfile L58                                                                                                                                                                                                                                                                                                             |
+| `nanobind`                                                                           | `2.12.0`                                                           | PyPI                                                             | Dockerfile L63                                                                                                                                                                                                                                                                                                             |
+| `topic_based_ros2_control`                                                           | commit `7ee291ab13adba52ab5889deb9e520009fe2283d`                  | `https://github.com/karanchahal-nv/topic_based_ros2_control.git` | Dockerfile.ros-jazzy L17; built into the ROS image; the bridge used by the Isaac lane                                                                                                                                                                                                                                      |
+| Eigen 3                                                                              | apt `libeigen3-dev`                                                | Debian Bookworm                                                  | Dockerfile L45                                                                                                                                                                                                                                                                                                             |
+| `urdfdom`                                                                            | apt `liburdfdom-dev`                                               | Debian Bookworm                                                  | Dockerfile L45                                                                                                                                                                                                                                                                                                             |
+| `octomap`                                                                            | apt `liboctomap-dev`                                               | Debian Bookworm                                                  | Dockerfile L46                                                                                                                                                                                                                                                                                                             |
+| `boost` (filesystem / serialization / system / python / chrono / thread / date_time) | apt                                                                | Debian Bookworm                                                  | Dockerfile L43-44                                                                                                                                                                                                                                                                                                          |
+| `trimesh`                                                                            | `4.11.5`                                                           | PyPI                                                             | Dockerfile L61; OBJ/mesh parsing                                                                                                                                                                                                                                                                                           |
+| `yourdfpy`                                                                           | `0.0.60`                                                           | PyPI                                                             | Dockerfile L62; URDF Python loader                                                                                                                                                                                                                                                                                         |
+| FastAPI                                                                              | `0.135.3`                                                          | PyPI                                                             | Dockerfile L67; Composer backend                                                                                                                                                                                                                                                                                           |
+| MCP (Model Context Protocol)                                                         | `1.27.0`                                                           | PyPI                                                             | Dockerfile L71; assistant-lane MCP server                                                                                                                                                                                                                                                                                  |
 
-The model endpoints used by Mode 2/3 are configured in
+Reference model endpoints are configured in
 [`examples/model_endpoint_profiles.yaml`](../../examples/model_endpoint_profiles.yaml).
 The runtime model server (vLLM) is provisioned by NemoClaw-Thor — see
 its repo for model pinning.
@@ -437,7 +425,7 @@ process/container contexts and adds DDS/QoS requirements for raw camera streams.
    `Waiting` means rendering/planning may be available while execution is still
    blocked on simulator/controller readiness.
 
-2. If you want to inspect the raw Isaac side manually, confirm these topics:
+1. If you want to inspect the raw Isaac side manually, confirm these topics:
 
    ```bash
    docker compose --profile ros-full run --rm --no-deps ros-jazzy-full \
@@ -449,7 +437,7 @@ process/container contexts and adds DDS/QoS requirements for raw camera streams.
    - `/isaac_joint_states`
    - `/isaac_joint_commands`
 
-3. The `isaac-topic-control` service launches:
+1. The `isaac-topic-control` service launches:
 
    - `topic_based_ros2_control/TopicBasedSystem`
    - `joint_state_broadcaster`
@@ -464,7 +452,7 @@ process/container contexts and adds DDS/QoS requirements for raw camera streams.
    rebuilt with `topic_based_ros2_control` yet, the script can build a temporary
    overlay from `${ISAAC_ROS_WS}/src/topic_based_ros2_control`.
 
-4. If you want to run the services manually instead of using the one-command
+1. If you want to run the services manually instead of using the one-command
    launcher:
 
    ```bash
@@ -474,7 +462,7 @@ process/container contexts and adds DDS/QoS requirements for raw camera streams.
    The supervisor still handles startup-order recovery and program/deployment
    loading. Set `SUPERVISOR_AUTO_LOAD=false` to disable that behavior.
 
-5. If automatic loading is disabled, load the portable program and ROS
+1. If automatic loading is disabled, load the portable program and ROS
    deployment variant in Composer:
 
    - `examples/isaac_manipulator_scene_light.program.yaml`
@@ -522,16 +510,16 @@ ManyForge-authored state. In this profile:
 ### Direct local model testing
 
 1. Start the model server separately.
-2. Point ManyForge deployment/model alias at that endpoint.
-3. Prefer the semantic demo in text-only mode first.
+1. Point ManyForge deployment/model alias at that endpoint.
+1. Prefer the semantic demo in text-only mode first.
 
 ### NemoClaw/OpenClaw integration
 
 1. Bring up the current assistant path with `scripts/launch.sh` or
    `scripts/demo-assistant-known-good.sh`.
-2. Use `scripts/configure-manyforge-provider.sh` only for legacy mux/plugin
+1. Use `scripts/configure-manyforge-provider.sh` only for legacy mux/plugin
    reproduction.
-3. Validate tool discovery and health before testing agent behavior.
+1. Validate tool discovery and health before testing agent behavior.
 
 (Maintainers working on specs/ADRs additionally run
 `scripts/dev-agent-session-start.sh` to seed sandbox dev-context;

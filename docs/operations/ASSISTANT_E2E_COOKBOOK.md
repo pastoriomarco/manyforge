@@ -197,15 +197,16 @@ manually stitching together the model, Composer, native viewer, and bridge. The 
 defaults to `gemma4-12b-it-gguf`, the current preferred lightweight
 single-model candidate for the known-good assistant lane on Thor.
 
-The launcher has two assistant-provider lanes; **OpenClaw (`openclaw`) is the
-default** for the known-good assistant workflow:
+The launcher has three engine-backed assistant-provider lanes; **OpenClaw
+(`openclaw`) is the default** for the known-good assistant workflow:
 
-| Lane | Default? | Bridge | Evidence | Notes |
-|---|---|---|---|---|
-| `openclaw` | default | NemoClaw-Thor `openclaw_assistant_bridge` on `:8200` | Gemma QAT 51/66 in the 2026-06-09 three-lane head-to-head; 52/66 in the 2026-06-07 model sweep | Persistent gateway in NemoClaw `my-assistant` sandbox. Adds bounded-autonomy enforcement (per-tool audit with assistantMode + catalogHash + principal). Use for the known-good assistant lane and shared/multi-tenant deployments. Provisions the OpenClaw sandbox automatically (egress preset, skill, MCP server). |
-| `direct` (`nemoclaw` alias) | backup | in-tree `manyforge_assistant_bridge` on `:8100` | Gemma QAT 47/66 after semantic scorer correction; fastest lane in the 2026-06-09 sweep | Direct local-model endpoint. Bridge runs the tool loop in-process; for compound prompts the bridge inlines a structured `programSnapshot` / `sceneSnapshot` extract into the user message before pinning the action tool. Useful for fast local iteration and explicit fallback validation. |
+| Lane                        | Default? | Bridge                                               | Evidence                                                                                       | Notes                                                                                                                                                                                                                                                                                                                |
+| --------------------------- | -------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `openclaw`                  | default  | NemoClaw-Thor `openclaw_assistant_bridge` on `:8200` | Gemma QAT 51/66 in the 2026-06-09 three-lane head-to-head; 52/66 in the 2026-06-07 model sweep | Persistent gateway in NemoClaw `my-assistant` sandbox. Adds bounded-autonomy enforcement (per-tool audit with assistantMode + catalogHash + principal). Use for the known-good assistant lane and shared/multi-tenant deployments. Provisions the OpenClaw sandbox automatically (egress preset, skill, MCP server). |
+| `direct` (`nemoclaw` alias) | backup   | in-tree `manyforge_assistant_bridge` on `:8100`      | Gemma QAT 47/66 after semantic scorer correction; fastest lane in the 2026-06-09 sweep         | Direct local-model endpoint. Bridge runs the tool loop in-process; for compound prompts the bridge inlines a structured `programSnapshot` / `sceneSnapshot` extract into the user message before pinning the action tool. Useful for fast local iteration and explicit fallback validation.                          |
+| `hermes`                    | opt-in   | NemoClaw-Thor Hermes adapter on `:8300`              | Qualification/bake-off lane; not the current default                                           | Hermes sessions own the agent loop and call the same mode-scoped ManyForge tools. Provision its separate sandbox with `scripts/setup-hermes.sh`; see `LANE_BRINGUP.md`.                                                                                                                                              |
 
-Both lanes preserve the same bounded-autonomy contract on the ManyForge side
+All three lanes preserve the same bounded-autonomy contract on the ManyForge side
 (mode-scoped MCP wrapper + `/api/assistant/bridge/tools/{toolId}` + audit envelope).
 The direct lane is faster, but the known-good assistant demo defaults to
 OpenClaw because it exercises the sandbox, skill, MCP, and bounded-autonomy
@@ -220,6 +221,10 @@ cd ${HOME}/workspaces/dev_ws/src/manyforge
 
 # direct model backup lane:
 ASSISTANT_PROVIDER=direct ./scripts/demo-assistant-known-good.sh start
+
+# opt-in Hermes lane (the interactive launcher also enables its gate):
+HERMES_LANE_PHASE4_ENABLED=true ASSISTANT_PROVIDER=hermes \
+  ./scripts/demo-assistant-known-good.sh start
 ```
 
 The known-good launcher defaults to `ASSISTANT_MAX_TURNS=16`. This is a bridge
@@ -236,11 +241,11 @@ What it does (default — `openclaw` sandboxed lane):
 
 1. stops stale `manyforge-e2e-vllm` state if needed and runs the Thor memory
    protocol before model launch,
-2. starts `gemma4-12b-it-gguf` through NemoClaw-Thor
+1. starts `gemma4-12b-it-gguf` through NemoClaw-Thor
    `serving/start-model.sh`,
-3. runs `setup/configure-local-provider.sh` for the same profile (which also
+1. runs `setup/configure-local-provider.sh` for the same profile (which also
    spawns the OpenClaw gateway in its SSH-session network namespace),
-4. **provisions the OpenClaw sandbox** by running
+1. **provisions the OpenClaw sandbox** by running
    `manyforge/setup-manyforge-assistant.sh` — applies the
    `manyforge-composer` egress preset (with `allowed_ips` covering the
    Docker-bridge subnet so the SSRF guard accepts vLLM resolution),
@@ -248,14 +253,14 @@ What it does (default — `openclaw` sandboxed lane):
    stages the `manyforge-composer` skill, and registers the `manyforge`
    MCP server in the sandbox via `openclaw mcp set`. Skip with
    `PROVISION_OPENCLAW_SANDBOX=false` if the sandbox is already provisioned,
-5. starts Composer on `http://127.0.0.1:9000` with the native Composer viewer,
+1. starts Composer on `http://127.0.0.1:9000` with the native Composer viewer,
    configured to use the `openclaw` provider at
    `http://127.0.0.1:8200/v1/manyforge/assistant`,
-6. starts the OpenClaw assistant bridge (`openclaw_assistant_bridge`) on
+1. starts the OpenClaw assistant bridge (`openclaw_assistant_bridge`) on
    `http://127.0.0.1:8200`. The bridge translates Composer's
    `manyforge.assistant.provider_request.v0` envelope into
    `/v1/chat/completions` calls against the persistent gateway,
-7. loads `pick_and_place_ur10e_robotiq.program.yaml` with
+1. loads `pick_and_place_ur10e_robotiq.program.yaml` with
    `assistant_modes_scene_authoring.deployment.yaml`.
 
 The direct backup lane (`ASSISTANT_PROVIDER=direct`; `nemoclaw` remains a
@@ -284,8 +289,8 @@ You only need to do these once per machine (or after a NemoClaw upgrade):
    `my-assistant`; policy preset `local-inference` (`setup-manyforge-assistant.sh`
    replaces it later with our combined `manyforge-composer` preset).
    Detailed walk-through:
-   [`nemoclaw/src/NemoClaw-Thor/setup/NEMOCLAW-OPENCLAW-WORKFLOW.md`](../../../../../nemoclaw/src/NemoClaw-Thor/setup/NEMOCLAW-OPENCLAW-WORKFLOW.md).
-2. **Verify `nemoclaw`, `openshell`, `docker`, `kubectl` are on PATH.**
+   [NemoClaw/OpenClaw workflow](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/setup/NEMOCLAW-OPENCLAW-WORKFLOW.md).
+1. **Verify `nemoclaw`, `openshell`, `docker`, `kubectl` are on PATH.**
    `manyforge/setup-manyforge-assistant.sh` checks `nemoclaw` and `docker`
    explicitly; `kubectl` is invoked through `docker exec` against the
    OpenShell cluster container.
@@ -293,7 +298,7 @@ You only need to do these once per machine (or after a NemoClaw upgrade):
 After that, every demo cycle is a single
 `./scripts/demo-assistant-known-good.sh start`. The integration design
 and all decisions made in landing it live at
-[`nemoclaw/src/NemoClaw-Thor/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md`](../../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md).
+[NemoClaw-Thor's ManyForge MCP integration guide](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md).
 
 During startup the launcher waits on real readiness endpoints without showing a
 fake percentage or timeout-budget countdown. In an interactive terminal it
@@ -376,17 +381,24 @@ Use this after the base boot and manual bridge start when checking the actual
 operator workflow.
 
 1. Open `http://127.0.0.1:9000`.
-2. Load `/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml`.
-3. Load `/workspace/examples/assistant_modes_scene_authoring.deployment.yaml`.
-4. Confirm the native viewer in the Composer UI shows the robot/scene.
-5. Open the lower-right assistant button.
-6. Confirm the overlay shows:
+
+1. Load `/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml`.
+
+1. Load `/workspace/examples/assistant_modes_scene_authoring.deployment.yaml`.
+
+1. Confirm the native viewer in the Composer UI shows the robot/scene.
+
+1. Open the lower-right assistant button.
+
+1. Confirm the overlay shows:
+
    - configured provider `nemoclaw`,
    - deployment provider if different from the configured provider,
    - endpoint alias and model/profile from the deployment,
    - active mode and allowed-entry state,
    - request status and elapsed time while a request is running.
-7. In `Query` mode, ask:
+
+1. In `Query` mode, ask:
 
    ```text
    Is a program loaded? Read the current program and summarize it.
@@ -396,7 +408,7 @@ operator workflow.
    the side panel with expandable arguments/results, and Composer remains
    unmodified.
 
-8. In `Composer Assistant` mode, ask for a small draft scene edit, for example:
+1. In `Composer Assistant` mode, ask for a small draft scene edit, for example:
 
    ```text
    Add a small blue box named ui_demo_box at x=0.42, y=-0.12, z=0.18.
@@ -451,21 +463,21 @@ Model/profile bake-off:
 
 Available runner profiles:
 
-| Profile | Purpose |
-|---|---|
-| `vllm-generation-config` | Direct model-endpoint probe with no per-request generation overrides |
-| `bridge-default` | Bridge defaults: `temperature=0.0`, `max_tokens=512`, thinking unset |
-| `gemma-bridge-default` | Recommended current Gemma QAT bridge profile: `temperature=0.0`, `max_tokens=8192`, `enable_thinking=false` |
-| `cosmos-bridge-default` | Historical Cosmos bridge comparison profile: `temperature=0.0`, `max_tokens=8192` |
-| `omni-vendor-tool` | NVIDIA tool-call sampling: `temperature=0.6`, `top_p=0.95`, `max_tokens=512`, thinking unset |
-| `omni-vendor-tool-no-think` | Vendor sampling with `enable_thinking=false`, `max_tokens=512` |
-| `omni-vendor-tool-no-think-32768` | Vendor sampling with `enable_thinking=false`, `max_tokens=32768` |
-| `omni-instruct-no-think` | Instruct sampling: `temperature=0.2`, `top_k=1`, `max_tokens=512`, `enable_thinking=false` |
-| `omni-instruct-no-think-128` | Output-budget sweep with `max_tokens=128` |
-| `omni-instruct-no-think-256` | Output-budget sweep with `max_tokens=256` |
-| `omni-instruct-no-think-1024` | Output-budget sweep with `max_tokens=1024` |
-| `omni-instruct-no-think-32768` | Legacy Nemotron Omni realistic assistant profile: `max_tokens=32768`, `enable_thinking=false` |
-| `omni-deterministic-no-think` | Deterministic non-thinking comparison |
+| Profile                           | Purpose                                                                                                     |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `vllm-generation-config`          | Direct model-endpoint probe with no per-request generation overrides                                        |
+| `bridge-default`                  | Bridge defaults: `temperature=0.0`, `max_tokens=512`, thinking unset                                        |
+| `gemma-bridge-default`            | Recommended current Gemma QAT bridge profile: `temperature=0.0`, `max_tokens=8192`, `enable_thinking=false` |
+| `cosmos-bridge-default`           | Historical Cosmos bridge comparison profile: `temperature=0.0`, `max_tokens=8192`                           |
+| `omni-vendor-tool`                | NVIDIA tool-call sampling: `temperature=0.6`, `top_p=0.95`, `max_tokens=512`, thinking unset                |
+| `omni-vendor-tool-no-think`       | Vendor sampling with `enable_thinking=false`, `max_tokens=512`                                              |
+| `omni-vendor-tool-no-think-32768` | Vendor sampling with `enable_thinking=false`, `max_tokens=32768`                                            |
+| `omni-instruct-no-think`          | Instruct sampling: `temperature=0.2`, `top_k=1`, `max_tokens=512`, `enable_thinking=false`                  |
+| `omni-instruct-no-think-128`      | Output-budget sweep with `max_tokens=128`                                                                   |
+| `omni-instruct-no-think-256`      | Output-budget sweep with `max_tokens=256`                                                                   |
+| `omni-instruct-no-think-1024`     | Output-budget sweep with `max_tokens=1024`                                                                  |
+| `omni-instruct-no-think-32768`    | Legacy Nemotron Omni realistic assistant profile: `max_tokens=32768`, `enable_thinking=false`               |
+| `omni-deterministic-no-think`     | Deterministic non-thinking comparison                                                                       |
 
 ## E2E Recipes
 
@@ -663,19 +675,19 @@ Goal: compare candidate models under the same ManyForge workflow.
 For each profile:
 
 1. Stop vLLM and drop caches with the memory protocol.
-2. Start the model with NemoClaw-Thor `./serving/start-model.sh <profile>`.
-3. Run `./setup/configure-local-provider.sh <profile>`.
-4. Run the primary qualification command above.
-5. Record direct tool-call, query, draft-edit, golden-scene, and repair-turn
+1. Start the model with NemoClaw-Thor `./serving/start-model.sh <profile>`.
+1. Run `./setup/configure-local-provider.sh <profile>`.
+1. Run the primary qualification command above.
+1. Record direct tool-call, query, draft-edit, golden-scene, and repair-turn
    behavior.
 
 Current observations from May 1, 2026:
 
-| Model | Result | Timings |
-|---|---|---|
-| `qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge` | Passed direct tool, query, draft edit; strong repair behavior | direct ~5s, query ~6s, draft ~18s |
-| `nemotron3-nano-omni-30b-a3b-nvfp4` | Passed direct tool, query, draft edit at 32K no-thinking | direct ~9s, query ~4-5s, draft ~16-18s |
-| `cosmos-reason2-8b` | Passed direct tool and query; weaker draft-edit repair | direct ~17s, query ~9s, failed draft repair in the 32K run |
+| Model                                    | Result                                                        | Timings                                                    |
+| ---------------------------------------- | ------------------------------------------------------------- | ---------------------------------------------------------- |
+| `qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge` | Passed direct tool, query, draft edit; strong repair behavior | direct ~5s, query ~6s, draft ~18s                          |
+| `nemotron3-nano-omni-30b-a3b-nvfp4`      | Passed direct tool, query, draft edit at 32K no-thinking      | direct ~9s, query ~4-5s, draft ~16-18s                     |
+| `cosmos-reason2-8b`                      | Passed direct tool and query; weaker draft-edit repair        | direct ~17s, query ~9s, failed draft repair in the 32K run |
 
 ## Future Recipes
 

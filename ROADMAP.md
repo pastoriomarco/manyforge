@@ -68,12 +68,16 @@ convergence, gripper action server hang.
   (iter-32 production recipe: 51/66 = 77.3%); needs hardening before
   it's the recommended path for new operators.
 
+The read-only `inspect_isaac_scene` tool is already wired into the
+`isaac-ur10e-light-scene-assistant` deployment and has been exercised through
+the live ROS/Isaac query path. That is a shipped integration baseline, not a
+claim that every current model/profile combination is release-qualified.
+
 **Acceptance criteria.**
 
 - Smoke-corpus regression suite running in CI on every release.
-- `inspect_isaac_scene` tool wired into the Isaac+AI scenario
-  end-to-end (the scenario exists; the wiring needs a live-run
-  validation pass).
+- Retain a current live Isaac + assistant-profile regression for
+  `inspect_isaac_scene` and the proposal/review boundary.
 - Bridge-fired `/compact` cadence tunable per deployment (currently
   pinned at N=2 for OpenClaw).
 
@@ -112,18 +116,16 @@ The bar for calling ManyForge production-ready:
 
 1. All three execution lanes (manyforge-only, isaac-sim, real-robot)
    ship with qualified tolerances and an external-watchdog example.
-2. Smoke-corpus + chaos tests are mandatory CI gates on every release.
-3. The assistant `composer-assistant` mode hits ≥85% on the smoke
+1. Smoke-corpus + chaos tests are mandatory CI gates on every release.
+1. The assistant `composer-assistant` mode hits ≥85% on the smoke
    corpus with the production recipe (currently 77.3%).
-4. Public-facing APIs (kernel state surfaces, deployment YAML schema,
+1. Public-facing APIs (kernel state surfaces, deployment YAML schema,
    assistant-provider contract) are versioned per spec 430 §schema and stable
    enough that breaking changes are explicit major-release decisions, not
    silent patch-level behavior shifts.
-5. Spec ↔ implementation drift is automated-checked (the existing
-   `check-private-spec-boundary.sh` is the boundary check; an
-   additional CI lane verifying the assistant-bridge wire fields
-   match `docs/reference/ASSISTANT_BACKEND_CONTRACT.md` would close
-   this).
+1. Keep generated REST, MCP, assistant-provider, and viewer contracts plus
+   cross-repository architecture documentation under freshness/convergence CI;
+   extend owner-derived checks when a new public wire surface is introduced.
 
 ## Out of scope / explicitly deferred
 

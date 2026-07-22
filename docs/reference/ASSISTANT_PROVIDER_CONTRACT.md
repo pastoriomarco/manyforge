@@ -3,17 +3,22 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-07-16 23:53:24 UTC
+  Last regenerated: 2026-07-21 22:04:29 UTC
   Generator source: scripts/regen-public-contracts.py:gen_assistant_provider_contract
 -->
 
 # Assistant Provider Contract
-Composer dispatches assistant requests to a *provider* HTTP service which speaks the `manyforge.assistant.provider_request.v0` envelope. Two reference providers ship with manyforge:
+Composer dispatches assistant requests to a *provider* HTTP service which speaks the `manyforge.assistant.provider_request.v0` envelope. Composer's lane registry is the owner of canonical provider IDs, aliases, routing, isolation, and default bridge ports.
 
-- `nemoclaw` lane: `manyforge_assistant_bridge` on port 8100 —   runs the agent loop in-process; calls the model directly.   Same repo as this doc.
-- `openclaw` lane: `openclaw_assistant_bridge` on port 8200 —   dispatches into a NemoClaw sandbox running OpenClaw. Lives in   the platform repo (NemoClaw-Thor) under `manyforge/`.
+## Registered engine-backed lanes
 
-Both speak the same wire envelope; this doc covers the wire format the provider must accept.
+| Canonical ID | Aliases | Port | Routing | Declared runtime | Declared isolation |
+|---|---|---:|---|---|---|
+| `direct` | `nemoclaw` | `8100` | `direct-vllm` | `nemoclaw` | `sandbox` |
+| `hermes` | — | `8300` | `hermes-sessions` | `nemoclaw` | `sandbox` |
+| `openclaw` | — | `8200` | `openclaw-gateway` | `nemoclaw` | `sandbox` |
+
+The in-tree `manyforge_assistant_bridge` implements the direct lane. NemoClaw-Thor supplies the OpenClaw and Hermes adapters. All registered lanes use the same provider envelope and remain subject to Composer's mode/catalog/authority checks. The runtime and isolation values are Composer catalog declarations, not live process-placement attestation: the standard in-tree launcher starts the direct bridge as a host peer, while a platform deployment may sandbox the same bridge. Verify the selected topology with the lane bring-up runbook and live process/health checks.
 
 ## Bridge HTTP routes (machine-introspected)
 
@@ -64,7 +69,7 @@ On success, the provider returns:
 {
   "requestId": "<echo>",
   "conversationId": "<echo>",
-  "providerId": "nemoclaw" | "openclaw" | "...",
+  "providerId": "direct" | "openclaw" | "hermes" | "nemoclaw" | "...",
   "message": "<final assistant text>",
   "proposals": [ ... ],          // draft mutations the operator must accept
   "toolCalls": [ ... ],          // executed callbacks (audit trail)

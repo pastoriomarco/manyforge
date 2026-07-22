@@ -6,7 +6,7 @@ the unified launcher (`scripts/launch.sh`). Two flows are covered:
 1. **Interactive wizard** — the primary way to use the launcher. No
    flags needed; a 7-step menu walks you through lane, assistant, and
    scenario selection (mirrors the NemoClaw onboard wizard).
-2. **Non-interactive / scripted** — flag-driven invocation for CI,
+1. **Non-interactive / scripted** — flag-driven invocation for CI,
    reproducible verification, and the smoke-test matrix.
 
 > **Maintenance rule** — if you modify any of the following, update
@@ -15,7 +15,7 @@ the unified launcher (`scripts/launch.sh`). Two flows are covered:
 >
 > - `scripts/launch.sh` (verbs, flags, wizard order, prompts)
 > - `scripts/lib/*.sh` (any helper used by the launcher)
-> - `scripts/lib/scenarios.sh` (the scenario table)
+> - deployment `compatibility.scenarios` metadata or scenario discovery code
 > - `scripts/demo-*.sh` (the seven shims)
 >
 > Companion docs that point operators at this file: [`README.md`](../../README.md)
@@ -65,7 +65,7 @@ pair. Twelve scenarios today (including a 3-step `ur5-simple-pick-place`
 test fixture, the new `--simple` replacement); four of them cover the
 lane × assistant matrix.
 
----
+______________________________________________________________________
 
 ## Startup contract — what `start` blocks on vs what the popup reports
 
@@ -98,7 +98,7 @@ bridge `/healthz`) and fails the run if any one of them doesn't come
 up within its timeout. `smoke` is the heir of the old
 `demo-isaac-ros2-control.sh start` readiness gate.
 
----
+______________________________________________________________________
 
 ## Interactive wizard (primary use)
 
@@ -192,7 +192,7 @@ The launcher accepts verbs anywhere on the command line:
 the same selection, supply the flags from the "To reproduce
 non-interactively" hint the launcher gave you.
 
----
+______________________________________________________________________
 
 ## Non-interactive / scripted use
 
@@ -202,14 +202,14 @@ matching flag.
 
 ### Selection flags
 
-| Flag | Replaces wizard step |
-|---|---|
-| `--lane manyforge-only` / `--lane isaac-sim` | `[1/7]` |
-| `--assistant on` / `--assistant off` | `[2/7]` |
-| `--scenario NAME` | `[3/7]` (use `--list-scenarios` to see all twelve; deprecated aliases — `pick-place`, `ur10e`, `shape-pick`, `vision-pose`, `assistant-authoring`, `isaac-light`, `isaac-assistant` — also resolve with a one-time deprecation warning per launch. Includes `isaac-ur10e-light-scene-collision` for testing runtime collision-fault detection with a popup object and `isaac-lite6-trocar-foundationpose` for the Lite6/FoundationPose trocar workflow.) |
-| `--program PATH --deployment PATH` | Free-form alternative to `--scenario` |
-| `--non-interactive` (env: `MANYFORGE_NON_INTERACTIVE=1`) | Skip all prompts; any unset selection takes its default value |
-| `--yes` / `-y` (env: `MANYFORGE_ASSUME_YES=1`) | Skip the review gate confirmation |
+| Flag                                                     | Replaces wizard step                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--lane manyforge-only` / `--lane isaac-sim`             | `[1/7]`                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `--assistant on` / `--assistant off`                     | `[2/7]`                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `--scenario NAME`                                        | `[3/7]` (use `--list-scenarios` for the artifact-discovered inventory; deprecated aliases — `pick-place`, `ur10e`, `shape-pick`, `vision-pose`, `assistant-authoring`, `isaac-light`, `isaac-assistant` — also resolve with a one-time warning. Includes `isaac-ur10e-light-scene-collision` for runtime collision-fault testing and `isaac-lite6-trocar-foundationpose` for the Lite6/FoundationPose workflow.) |
+| `--program PATH --deployment PATH`                       | Free-form alternative to `--scenario`                                                                                                                                                                                                                                                                                                                                                                            |
+| `--non-interactive` (env: `MANYFORGE_NON_INTERACTIVE=1`) | Skip all prompts; any unset selection takes its default value                                                                                                                                                                                                                                                                                                                                                    |
+| `--yes` / `-y` (env: `MANYFORGE_ASSUME_YES=1`)           | Skip the review gate confirmation                                                                                                                                                                                                                                                                                                                                                                                |
 
 Supplying all three of `--lane / --assistant / --scenario` plus `--yes`
 makes the run fully non-interactive (no prompts, no review gate):
@@ -231,7 +231,7 @@ Same meaning in interactive and non-interactive mode. `preflight` is
 the most useful CI verb because it runs the decision phase + system
 checks but exits before starting anything.
 
----
+______________________________________________________________________
 
 ## Smoke-test matrix (verify all four combinations)
 
@@ -348,7 +348,7 @@ routing through `launch.sh` rather than the old inline code.
 See [`scripts/MIGRATION.md`](../../scripts/MIGRATION.md) for the full
 list of legacy flags / verbs that have been dropped or remapped.
 
----
+______________________________________________________________________
 
 ## Status + recovery commands (useful any time)
 
@@ -388,8 +388,7 @@ For where logs and observability endpoints live, see
   with strict readiness (override budget with `ROS_DISCOVERY_TIMEOUT_S=NN`).
 - **Port 9000 busy** from a stale prior run →
   `./scripts/launch.sh stop` clears the `manyforge-e2e-composer`
-  container; a leftover unmanaged process needs `docker ps` + `docker
-  rm -f` or a process kill. To use different ports, set
+  container; a leftover unmanaged process needs `docker ps` + `docker rm -f` or a process kill. To use different ports, set
   `COMPOSER_PORT=NNNN` (preflight checks the resolved value;
   `expected_port_owner` matches it).
 - **CI/log-capture wants plain output** → live progress redraw uses
@@ -411,8 +410,7 @@ For where logs and observability endpoints live, see
 - **Unified memory not freed after `stop` on Thor** → the launcher
   runs `sync` + `echo 3 > /proc/sys/vm/drop_caches` at the end of
   `stop_assistant_stack`, but this requires passwordless sudo. If
-  you see `drop_caches needs sudo but sudo would prompt for a
-  password` after stop, add a sudoers rule (see
+  you see `drop_caches needs sudo but sudo would prompt for a password` after stop, add a sudoers rule (see
   `docs/operations/ASSISTANT_E2E_COOKBOOK.md` "Stop and free memory"
   for the exact rule) or set `DROP_CACHES=false` to suppress the
   attempt entirely.
@@ -458,14 +456,14 @@ profile (defined in `NemoClaw-Thor/serving/{config,launch}.sh`) points the
 llama.cpp caches at the ~1 TB NVMe so the ~7 GB GGUF + draft stay off the
 small eMMC and persist across `docker run --rm`:
 
-| Host (NVMe) | Container |
-| --- | --- |
-| `/mnt/nova_ssd/hf-cache-orin` | `/data/models/huggingface` and `/root/.cache/huggingface` |
-| `/mnt/nova_ssd/llama-cpp-cache` | `/root/.cache/llama.cpp` |
+| Host (NVMe)                     | Container                                                 |
+| ------------------------------- | --------------------------------------------------------- |
+| `/mnt/nova_ssd/hf-cache-orin`   | `/data/models/huggingface` and `/root/.cache/huggingface` |
+| `/mnt/nova_ssd/llama-cpp-cache` | `/root/.cache/llama.cpp`                                  |
 
 This mirrors the operator's tested standalone `docker run` and the storage
 layout in
-[`isaac_ros_custom_bringup/jetson_orin_storage/README.md`](../../../isaac_ros_custom_bringup/jetson_orin_storage/README.md)
+[`isaac_ros_custom_bringup/jetson_orin_storage/README.md`](https://github.com/pastoriomarco/isaac_ros_custom_bringup/blob/main/jetson_orin_storage/README.md)
 (`/mnt/nova_ssd` is the NVMe, made persistent in `/etc/fstab` and
 `chown`'d to the user). If the sibling checkout is missing, use
 `https://github.com/pastoriomarco/isaac_ros_custom_bringup` or the accepted
@@ -478,7 +476,7 @@ the NVMe cache. As with all assistant profiles, `start` returns once the
 container is live — model readiness is reported into the Composer popup,
 and `smoke` blocks on it strictly.
 
----
+______________________________________________________________________
 
 ## Where to go from here
 
@@ -490,12 +488,12 @@ and `smoke` blocks on it strictly.
   `./scripts/launch-orin-gemma.sh` (see the Jetson Orin section above).
 - **Stack-level operational concerns**:
   [`docs/operations/STACK_SETUP.md`](STACK_SETUP.md).
-- **Add a new scenario**: edit
-  [`scripts/lib/scenarios.sh`](../../scripts/lib/scenarios.sh) (one
-  pipe-delimited row per scenario), then update the "Interactive
-  wizard" sample above (the scenario list it shows) AND the
-  smoke-test matrix in Step 3 of this file to include the new
-  combination.
+- **Add a new scenario**: add a `compatibility.scenarios` entry to the owning
+  deployment artifact; the shared loader validates and exposes it to the
+  launcher, Composer, and assistant. Then update the "Interactive wizard"
+  sample above and the smoke-test matrix in Step 3 when the new combination is
+  part of the maintained operator set. See
+  [`EXAMPLES_CATALOG.md`](EXAMPLES_CATALOG.md#adding-a-new-scenario).
 - **Add a new lane or assistant value**: bigger surgery —
   [`scripts/launch.sh`](../../scripts/launch.sh) wizard steps,
   [`scripts/lib/compose.sh`](../../scripts/lib/compose.sh) profile

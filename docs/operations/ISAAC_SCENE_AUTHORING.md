@@ -21,7 +21,7 @@ For the extractor's wire contract, filename rules, and OBJ format see
   install or the `manyforge-ros-jazzy-full` Docker image).
 
 Throughout this runbook the placeholder `${MANYFORGE_REPO_ROOT}` refers
-to your checkout (e.g. `/home/me/workspaces/dev_ws/src/manyforge`), and
+to your checkout (for example `${HOME}/workspaces/dev_ws/src/manyforge`), and
 `${SCENE_NAME}` is whatever short identifier you're giving the new
 scene (e.g. `isaac_manipulator_scene_light`).
 
@@ -170,12 +170,12 @@ through the UI). Confirm three things:
 
 1. **`/api/scene/state` reports each object** with the right pose and
    non-error `mesh_asset_status`.
-2. **The native viewer renders the actual collider shape** — table,
+1. **The native viewer renders the actual collider shape** — table,
    crates, cheese box — not orange wireframe placeholders. If you see
    placeholders, the visualization plan's error-marker tooltip will
    tell you which status the asset is in (`missing`,
    `parse_failed`, `unsupported_format`, etc.).
-3. **A test plan succeeds** through the loaded scene — the planning
+1. **A test plan succeeds** through the loaded scene — the planning
    context is reading the same OBJ files, so a successful plan
    confirms the geometry is reaching RoboPlan as well as the viewer.
 
@@ -185,8 +185,7 @@ Static OBJ files define object shape. Object pose can also be observed
 from Isaac at runtime through deployment `pose_sources`. In Composer,
 open **Deployment > Object Pose Sources** to edit the source, entity
 binding, and apply policy. The Isaac demo source uses
-`kind: simulation_interfaces`, `service_prefix: auto`, `frame_id:
-universe`, and a bounded `max_update_hz` such as `4.0`.
+`kind: simulation_interfaces`, `service_prefix: auto`, `frame_id: universe`, and a bounded `max_update_hz` such as `4.0`.
 
 For camera/perception scenes such as the Lite6 trocar FoundationPose workflow,
 also configure each Isaac Sim `ROS2CameraHelper` publisher with bounded
@@ -261,11 +260,11 @@ Acceptance for the current migration:
 1. `mode` is `visual_snapshot` for steady-state samples. A short
    `visual_snapshot_pending` window is acceptable immediately after reload or
    reset. `legacy_live` is no longer an accepted scene-state route mode.
-2. p95 `/api/scene/state` latency remains under the configured budget while
+1. p95 `/api/scene/state` latency remains under the configured budget while
    planning, validation, gripper motion, and pose-source polling are active.
-3. `snapshot_publisher_error` remains empty and the stale ratio stays within
+1. `snapshot_publisher_error` remains empty and the stale ratio stays within
    the configured budget.
-4. Object and gripper counts remain plausible for the loaded scene, so a fast
+1. Object and gripper counts remain plausible for the loaded scene, so a fast
    route is not hiding missing observer data.
 
 If the probe fails, keep the JSONL samples and Composer logs. The samples show
@@ -277,14 +276,14 @@ Scene-authoring-specific cases below. For cross-cutting failures
 (collision rejection, kernel interrupts, ros2_control discovery)
 see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| Inventory response missing an object | Object has no collider, or it's hidden and you didn't pass `include_hidden`. | Author a collider in Isaac, or re-run with the right include flags. |
-| Transfer client fails with `sha256 mismatch` | Network instability during the chunked transfer. | Re-run the same command. `request_id` deduplication on the extension side handles overlapping retries safely. |
-| OBJ file present but Composer shows a `missing` marker | Path mismatch between the program YAML's `mesh_resource_uri` and where the file actually lives. | Check both — repo-root relative paths such as `examples/...`, program-directory relative paths, and `file://` paths are accepted. |
-| OBJ file present, Composer shows `parse_failed` | OBJ is malformed (very rare from this extractor). | Re-extract from Isaac. If it keeps happening, file a bug — the extractor contract guarantees parseable output. |
-| Composer shows `outside_allowed_roots` | The `mesh_resource_uri` resolves outside the deployment / program / model allowlist. | Move the OBJ inside an allowed root (the program directory is always allowed). |
-| Planner fails on the loaded scene but the viewer looks right | RoboPlan's collision tolerance flagged the geometry (zero-area triangle, self-intersection). | Inspect the OBJ in MeshLab/Blender; clean the source mesh in Isaac and re-extract. |
+| Symptom                                                      | Likely cause                                                                                    | Fix                                                                                                                               |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Inventory response missing an object                         | Object has no collider, or it's hidden and you didn't pass `include_hidden`.                    | Author a collider in Isaac, or re-run with the right include flags.                                                               |
+| Transfer client fails with `sha256 mismatch`                 | Network instability during the chunked transfer.                                                | Re-run the same command. `request_id` deduplication on the extension side handles overlapping retries safely.                     |
+| OBJ file present but Composer shows a `missing` marker       | Path mismatch between the program YAML's `mesh_resource_uri` and where the file actually lives. | Check both — repo-root relative paths such as `examples/...`, program-directory relative paths, and `file://` paths are accepted. |
+| OBJ file present, Composer shows `parse_failed`              | OBJ is malformed (very rare from this extractor).                                               | Re-extract from Isaac. If it keeps happening, file a bug — the extractor contract guarantees parseable output.                    |
+| Composer shows `outside_allowed_roots`                       | The `mesh_resource_uri` resolves outside the deployment / program / model allowlist.            | Move the OBJ inside an allowed root (the program directory is always allowed).                                                    |
+| Planner fails on the loaded scene but the viewer looks right | RoboPlan's collision tolerance flagged the geometry (zero-area triangle, self-intersection).    | Inspect the OBJ in MeshLab/Blender; clean the source mesh in Isaac and re-extract.                                                |
 
 ## See also
 

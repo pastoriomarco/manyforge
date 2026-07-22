@@ -26,12 +26,12 @@ LLM agents can follow it without re-discovering the conventions.
 1. Drop your URDF + SRDF + mesh files under
    `manyforge_example_models/models/<robot_id>/` (or a separate package
    you reference via `package_paths`).
-2. Author a deployment YAML at `examples/<scenario>.deployment.yaml`
+1. Author a deployment YAML at `examples/<scenario>.deployment.yaml`
    pointing at the URDF/SRDF, declaring the SRDF planning group, and
    (if applicable) the gripper block.
-3. Author a program YAML at `examples/<scenario>.program.yaml`
+1. Author a program YAML at `examples/<scenario>.program.yaml`
    referencing the robot's `base_frame` + `tcp_frame`.
-4. Load the scenario in Composer. The three checks in
+1. Load the scenario in Composer. The three checks in
    [§ Verify the import](#verify-the-import) tell you whether the import
    succeeded.
 
@@ -195,18 +195,18 @@ creating a deployment.
 
 ### Field cheat-sheet
 
-| Field | Source | Notes |
-|---|---|---|
-| `robot_config.group_id` | SRDF `<group name="...">` | Must exist in SRDF. Determines the kernel's commandable joint set. |
-| `robot_config.urdf_path` / `srdf_path` | filesystem | Use `package://` URIs; fall back to absolute paths only as a last resort. |
-| `robot_config.package_paths` | filesystem | Parent directories ROS package URIs resolve against. Relative paths are resolved against the deployment YAML's directory. |
-| `grippers.<id>.command_mode` | enum | See [§ Gripper command modes](#gripper-command-modes). |
-| `grippers.<id>.joint_name` | URDF master joint | The master of the mimic chain (or the single driven joint for parallel grippers without mimics). |
-| `grippers.<id>.mount_frame` | URDF link | Where the gripper attaches on the arm. |
-| `grippers.<id>.attach_frame` | URDF link | Where grasped objects snap to. Often a virtual frame added in URDF. |
-| `grippers.<id>.tcp_frame` | URDF link | Tool centre point. Used by Cartesian commands. |
-| `grippers.<id>.auxiliary_frames` | URDF link list | Operator-facing frames (default visible in the Tools→Frames panel). |
-| `grippers.<id>.touch_links` | URDF link list | Links that may contact the grasped object without triggering a collision. |
+| Field                                  | Source                    | Notes                                                                                                                     |
+| -------------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `robot_config.group_id`                | SRDF `<group name="...">` | Must exist in SRDF. Determines the kernel's commandable joint set.                                                        |
+| `robot_config.urdf_path` / `srdf_path` | filesystem                | Use `package://` URIs; fall back to absolute paths only as a last resort.                                                 |
+| `robot_config.package_paths`           | filesystem                | Parent directories ROS package URIs resolve against. Relative paths are resolved against the deployment YAML's directory. |
+| `grippers.<id>.command_mode`           | enum                      | See [§ Gripper command modes](#gripper-command-modes).                                                                    |
+| `grippers.<id>.joint_name`             | URDF master joint         | The master of the mimic chain (or the single driven joint for parallel grippers without mimics).                          |
+| `grippers.<id>.mount_frame`            | URDF link                 | Where the gripper attaches on the arm.                                                                                    |
+| `grippers.<id>.attach_frame`           | URDF link                 | Where grasped objects snap to. Often a virtual frame added in URDF.                                                       |
+| `grippers.<id>.tcp_frame`              | URDF link                 | Tool centre point. Used by Cartesian commands.                                                                            |
+| `grippers.<id>.auxiliary_frames`       | URDF link list            | Operator-facing frames (default visible in the Tools→Frames panel).                                                       |
+| `grippers.<id>.touch_links`            | URDF link list            | Links that may contact the grasped object without triggering a collision.                                                 |
 
 ### Gripper command modes
 
@@ -214,14 +214,23 @@ Allowed values (enforced at load by
 `manyforge_behavior/manyforge_behavior/deployment.py`):
 
 - `simulated_joint` — RoboPlan sim drives the master joint directly.
-  Use this on the `manyforge-only` lane and for offline demos.
+  Use this on the `manyforge-only` lane and for offline demos. The native
+  gripper backend owns command progress and the status rendered by Composer.
 - `ros_gripper_command` — actions are forwarded to a ROS gripper
   controller (e.g. `GripperActionController`). Use this on the
-  `isaac-sim` lane and on real hardware.
+  `isaac-sim` lane and on real hardware. The selected execution/gripper adapter
+  owns action acceptance, feedback/dwell, timeout, terminal result, and status.
 
-A new gripper hardware family that does not fit either mode needs a
-new adapter in `manyforge_behavior` and a new enum value — that is an
-SDK change, not a config change. Ask before adding one.
+The native viewer never advances gripper state from animation time. It renders
+the authoritative gripper status plus Robot Model Authority mimic laws. If the
+arm ghost moves but its gripper does not, verify that the deployment's gripper
+is bound to the same selected execution backend/status surface and that the
+status includes the declared command/derived joints.
+
+A new gripper hardware family that does not fit either mode needs an explicit
+adapter/transport capability, lifecycle mapping, contract tests, and a new
+schema value. That is an SDK change, not a config-only change. Do not bypass it
+with a viewer-side or raw-topic state writer.
 
 ## Step 3 — Author the program YAML
 
@@ -265,7 +274,7 @@ Launch Composer and load your scenario:
 ```
 
 Then check these three signals in the browser at
-`http://127.0.0.1:9000/?viewer=native`:
+`http://127.0.0.1:9000/` (the native viewer is the only product viewer):
 
 1. **Robot panel shows the expected joint sliders.** Open the Robot
    overlay (top-right). The slider count should match the SRDF
@@ -273,7 +282,7 @@ Then check these three signals in the browser at
    in the gripper controls; mimic followers must not appear as jog sliders. If
    a gripper joint shows up in the arm jog panel, see
    [§ Mimic chains and the jog panel](#mimic-chains-and-the-jog-panel).
-2. **Tools → Frames lists only the named frames as visible.**
+1. **Tools → Frames lists only the named frames as visible.**
    Expected visible-by-default set:
    `universe` (world), `<base_frame>` (robot_base),
    `<gripper.mount_frame>`, `<gripper.attach_frame>`,
@@ -281,7 +290,7 @@ Then check these three signals in the browser at
    All structural URDF link frames default off. A program may persist explicit
    overrides in its optional `viewer.frame_visibility` map; those saved values
    replace role defaults for the named frames when that program is loaded.
-3. **Scene viewer renders the robot as one connected body.** No
+1. **Scene viewer renders the robot as one connected body.** No
    floating mesh pieces. The home pose should look kinematically
    coherent — base on the ground, joints lined up. If meshes float
    independently, see [§ Mesh and transform issues](#mesh-and-transform-issues).
@@ -353,8 +362,7 @@ mesh should render correctly.
 
 **Symptom: 404 on a mesh URL.**
 Either the file is missing on disk, or `trimesh.load(...)` failed
-(e.g. unsupported format). The backend logs `"Mesh file missing for
-link X"` or `"trimesh.load failed for ..."`. The rest of the robot
+(e.g. unsupported format). The backend logs `"Mesh file missing for link X"` or `"trimesh.load failed for ..."`. The rest of the robot
 keeps rendering; the affected visual is silently dropped.
 
 **Symptom: stale mesh after switching scenarios.**
@@ -409,17 +417,17 @@ with `forceDiscardOverrides: true` clears all per-frame overrides.
 
 ## Reference layout (where each piece lives in the code)
 
-| Concern | File / module |
-|---|---|
-| Canonical robot metadata, mimic laws, commandable-vs-derived joints | `manyforge_behavior/manyforge_behavior/robot_model_authority.py` |
-| URDF parsing + manifest | `manyforge_composer/backend/routes_urdf.py` |
-| Mimic-joint detection | `routes_urdf.py` `_extract_mimic` |
-| Frame inventory + default visibility | `manyforge_composer/backend/routes_scene.py` (`_scene_frame_roles`, `_load_model_frame_names`) |
-| Deployment YAML parser | `manyforge_behavior/manyforge_behavior/deployment.py` |
-| Allowed gripper command modes | `deployment.py` `_ALLOWED_GRIPPER_COMMAND_MODES` |
-| Robot Control limits validator | `deployment.py` `validate_robot_control_joint_limits_against` |
-| Composer state owner | `manyforge_composer/backend/state.py` |
-| Launcher entry | `scripts/launch.sh` |
+| Concern                                                             | File / module                                                                                  |
+| ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Canonical robot metadata, mimic laws, commandable-vs-derived joints | `manyforge_behavior/manyforge_behavior/robot_model_authority.py`                               |
+| URDF parsing + manifest                                             | `manyforge_composer/backend/routes_urdf.py`                                                    |
+| Mimic-joint detection                                               | `routes_urdf.py` `_extract_mimic`                                                              |
+| Frame inventory + default visibility                                | `manyforge_composer/backend/routes_scene.py` (`_scene_frame_roles`, `_load_model_frame_names`) |
+| Deployment YAML parser                                              | `manyforge_behavior/manyforge_behavior/deployment.py`                                          |
+| Allowed gripper command modes                                       | `deployment.py` `_ALLOWED_GRIPPER_COMMAND_MODES`                                               |
+| Robot Control limits validator                                      | `deployment.py` `validate_robot_control_joint_limits_against`                                  |
+| Composer state owner                                                | `manyforge_composer/backend/state.py`                                                          |
+| Launcher entry                                                      | `scripts/launch.sh`                                                                            |
 
 ## LLM agent checklist
 

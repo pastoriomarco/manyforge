@@ -6,26 +6,28 @@ qualification surface. It is intentionally code-facing: future maintainers shoul
 be able to verify the stop behavior from the files and symbols named here without
 reconstructing the design history.
 
-This file is the source of truth for the current `manyforge` implementation.
-Historical rationale belongs in development planning artifacts, but runtime and
-operator docs must remain self-contained.
+This is the maintained code-facing reference for the current implementation;
+source and generated contracts win if it drifts. Historical rationale belongs
+in development planning artifacts, while runtime/operator docs remain
+self-contained.
 
 ## 1. Architecture
 
 ManyForge uses the modified Option A architecture:
 
 1. The backend owns the stop profile.
-2. The backend computes a concrete replacement trajectory in non-real-time code.
-3. Stock `joint_trajectory_controller` executes that trajectory through
+1. The backend computes a concrete replacement trajectory in non-real-time code.
+1. Stock `joint_trajectory_controller` executes that trajectory through
    `FollowJointTrajectory` preemption on ros2_control lanes.
-4. The native lane replays the same core trajectory directly, because it has no
+1. The native lane replays the same core trajectory directly, because it has no
    ROS controller.
-5. Stop success is claimed only after a terminal hold and measured/post-stop
+1. Stop success is claimed only after a terminal hold and measured/post-stop
    evidence, not merely because a command was sent.
 
 The current production stop math lives in
 `manyforge_core/src/soft_on_path_stop_planner.cpp`; ros2_control dispatch lives in
-`manyforge_roboplan/src/ros2_control_execution_backend.cpp`; native replay lives
+`manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp`;
+native replay lives
 in `manyforge_roboplan/src/roboplan_execution_backend.cpp`.
 
 The retired controller-native JTC plugin is not the target architecture. It is
@@ -34,13 +36,13 @@ backend-authored replacement goals.
 
 ## 2. Stop Catalog
 
-| Stop role | Mechanism | Intended use |
-| --- | --- | --- |
-| `soft_on_path` | Backend computes an on-path replacement trajectory from the trip state and active accepted path. Stock JTC executes it as a preempting FJT goal; native replays it directly. | Default operator stop. |
-| `spring_back_hold` | Backend computes a two-phase on-path replacement: forward decel over half the requested duration, then rest-to-rest return along the same accepted path to the trip cursor over the remaining half. Stock JTC executes it as a preempting FJT goal; native replays it directly. | Operator-selected visible spring-back behavior. It must not be implemented as cancel-first. |
-| `hard_deceleration` | JTC cancel path when `decelerate_on_cancel` is configured and proven. | Preferred hard-stop floor where available. |
-| `immediate` hard-stop floor | Unprofiled cancel/hold floor: ros2_control uses plain JTC cancel/hold; native freezes the authored replay immediately. | Last-resort physical stop when controlled replacement cannot be trusted. Not operator-selectable as a normal controlled-stop profile. |
-| Natural completion | Let the already accepted trajectory finish when it will reach rest sooner than the requested stop window and policy allows it. | Short-path case only, bounded by the effective stop deadline. Enabled by default; precision-contact lanes must opt out explicitly. |
+| Stop role                   | Mechanism                                                                                                                                                                                                                                                                       | Intended use                                                                                                                          |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `soft_on_path`              | Backend computes an on-path replacement trajectory from the trip state and active accepted path. Stock JTC executes it as a preempting FJT goal; native replays it directly.                                                                                                    | Default operator stop.                                                                                                                |
+| `spring_back_hold`          | Backend computes a two-phase on-path replacement: forward decel over half the requested duration, then rest-to-rest return along the same accepted path to the trip cursor over the remaining half. Stock JTC executes it as a preempting FJT goal; native replays it directly. | Operator-selected visible spring-back behavior. It must not be implemented as cancel-first.                                           |
+| `hard_deceleration`         | JTC cancel path when `decelerate_on_cancel` is configured and proven.                                                                                                                                                                                                           | Preferred hard-stop floor where available.                                                                                            |
+| `immediate` hard-stop floor | Unprofiled cancel/hold floor: ros2_control uses plain JTC cancel/hold; native freezes the authored replay immediately.                                                                                                                                                          | Last-resort physical stop when controlled replacement cannot be trusted. Not operator-selectable as a normal controlled-stop profile. |
+| Natural completion          | Let the already accepted trajectory finish when it will reach rest sooner than the requested stop window and policy allows it.                                                                                                                                                  | Short-path case only, bounded by the effective stop deadline. Enabled by default; precision-contact lanes must opt out explicitly.    |
 
 `soft_on_path` and `spring_back_hold` are replacement/preemption profiles. They
 must be sent before JTC enters cancel hold or `decelerate_on_cancel`, otherwise
@@ -97,15 +99,15 @@ action while evidence remains incomplete.
 
 ## 2.1 Lane Matrix
 
-| Concern | Shared kernel/planner | ros2_control lane | Native lane |
-| --- | --- | --- | --- |
-| Stop policy | Validates profiles, gates unsupported configured modes, decides fallback/escalation, records incidents. | Same kernel policy. | Same kernel policy. |
-| Trajectory math | `manyforge_core` generates `soft_on_path` and two-phase `spring_back_hold`. | Dispatches the authored trajectory through stock JTC `FollowJointTrajectory` preemption. | Replays the same authored waypoints directly. |
-| `soft_on_path` | Exact-time command-frame lead-in + retimer/ALI, limit checked at trip time. | JTC executes the replacement; backend monitors action result, path deviation, and measured settle. | Native backend publishes the authored stop trajectory to the visualizer/replay clock. |
-| `spring_back_hold` | Forward stop for half the duration, then rest-to-rest return on the accepted path to the trip cursor. | Same authored replacement through JTC preemption. Must never be cancel-first. | Same authored replacement through native replay. |
-| `hard_deceleration` | Treated as a hard-stop floor only when capability proves it. | Available only with `decelerate_on_cancel`, velocity state, and per-joint cancel decel limits. | Not available; no JTC cancel profile exists. |
-| Immediate hard-stop floor | Final floor after refusal/unconfirmed/deadline/collision/hard disposition. Diagnostics carry `hard_stop_floor`, `hard_stop_level`, and `hard_stop_floor_command_source`. | Plain JTC cancel/hold, reported as `hard_stop_level=jtc_cancel_unprofiled_hold`. | Deterministic immediate freeze/hold, reported as `hard_stop_level=native_immediate_hold`. |
-| Visualization authority | Stop trajectory is the command authority for commanded/native views. Feedback is evidence/monitoring. | Composer commanded-sim view follows the authored reference; real robot lanes remain measured-only. | Native view follows the authored replay directly. |
+| Concern                   | Shared kernel/planner                                                                                                                                                    | ros2_control lane                                                                                  | Native lane                                                                               |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Stop policy               | Validates profiles, gates unsupported configured modes, decides fallback/escalation, records incidents.                                                                  | Same kernel policy.                                                                                | Same kernel policy.                                                                       |
+| Trajectory math           | `manyforge_core` generates `soft_on_path` and two-phase `spring_back_hold`.                                                                                              | Dispatches the authored trajectory through stock JTC `FollowJointTrajectory` preemption.           | Replays the same authored waypoints directly.                                             |
+| `soft_on_path`            | Exact-time command-frame lead-in + retimer/ALI, limit checked at trip time.                                                                                              | JTC executes the replacement; backend monitors action result, path deviation, and measured settle. | Native backend publishes the authored stop trajectory to the visualizer/replay clock.     |
+| `spring_back_hold`        | Forward stop for half the duration, then rest-to-rest return on the accepted path to the trip cursor.                                                                    | Same authored replacement through JTC preemption. Must never be cancel-first.                      | Same authored replacement through native replay.                                          |
+| `hard_deceleration`       | Treated as a hard-stop floor only when capability proves it.                                                                                                             | Available only with `decelerate_on_cancel`, velocity state, and per-joint cancel decel limits.     | Not available; no JTC cancel profile exists.                                              |
+| Immediate hard-stop floor | Final floor after refusal/unconfirmed/deadline/collision/hard disposition. Diagnostics carry `hard_stop_floor`, `hard_stop_level`, and `hard_stop_floor_command_source`. | Plain JTC cancel/hold, reported as `hard_stop_level=jtc_cancel_unprofiled_hold`.                   | Deterministic immediate freeze/hold, reported as `hard_stop_level=native_immediate_hold`. |
+| Visualization authority   | Stop trajectory is the command authority for commanded/native views. Feedback is evidence/monitoring.                                                                    | Composer commanded-sim view follows the authored reference; real robot lanes remain measured-only. | Native view follows the authored replay directly.                                         |
 
 ## 3. Defaults And Profile Validation
 
@@ -280,35 +282,35 @@ history.
 For `soft_on_path`:
 
 1. Capture a fresh observed state before preemption.
-2. Recover the active accepted trajectory and trajectory time.
-3. Choose measured or model-derived seam velocity according to lane config.
-4. Call `plan_soft_on_path_stop(...)`.
-5. Publish unit runtime scale when JTC speed scaling is enabled, so the stop is
+1. Recover the active accepted trajectory and trajectory time.
+1. Choose measured or model-derived seam velocity according to lane config.
+1. Call `plan_soft_on_path_stop(...)`.
+1. Publish unit runtime scale when JTC speed scaling is enabled, so the stop is
    executed as authored.
-6. Dispatch the replacement trajectory with
+1. Dispatch the replacement trajectory with
    `send_fjt_replacement_trajectory(...)`.
-7. Wait for the managed FJT result within the effective stop deadline.
-8. Wait, bounded by the same stop budget, for measured velocity to settle when
+1. Wait for the managed FJT result within the effective stop deadline.
+1. Wait, bounded by the same stop budget, for measured velocity to settle when
    the backend exposes velocity feedback. Normal controller-feedback lag is not
    classified as failure from a single instantaneous sample.
-9. Read a fresh post-stop sample and publish a stopped snapshot.
-10. Set `backend_stop_confirmed=true` only after command completion and fresh
-    post-stop state are available.
+1. Read a fresh post-stop sample and publish a stopped snapshot.
+1. Set `backend_stop_confirmed=true` only after command completion and fresh
+   post-stop state are available.
 
 For `spring_back_hold`:
 
 1. Capture a fresh observed state before preemption.
-2. Recover the active accepted trajectory and trajectory time.
-3. Call `plan_spring_back_on_path_stop(...)`.
-4. The planner calls `plan_soft_on_path_stop(...)` internally with half of the
+1. Recover the active accepted trajectory and trajectory time.
+1. Call `plan_spring_back_on_path_stop(...)`.
+1. The planner calls `plan_soft_on_path_stop(...)` internally with half of the
    requested duration for the forward decel phase. This reuses the same
    command-frame lead-in, ALI/retimer checks, and dispatch-latency compatibility
    as `soft_on_path`.
-5. Append a reverse on-path, rest-to-rest quintic return from the forward stop
+1. Append a reverse on-path, rest-to-rest quintic return from the forward stop
    point to the trip cursor over the other half of the requested duration.
-6. Dispatch the combined replacement trajectory with
+1. Dispatch the combined replacement trajectory with
    `send_fjt_replacement_trajectory(...)`.
-7. Wait for the managed FJT result and post-stop state. The final command-frame
+1. Wait for the managed FJT result and post-stop state. The final command-frame
    pose is the trip cursor, not the observed off-path feedback sample.
 
 For hard-stop categories:
@@ -348,12 +350,12 @@ claim and must escalate to a hard-stop category.
 
 Fallback decisions are deterministic from the trip-time planner result:
 
-| Planner/backend condition | Disposition |
-| --- | --- |
-| Planner succeeds | execute `soft_on_path`. |
-| Original trajectory naturally reaches rest within policy window | natural completion, enabled by default unless the profile opts out. |
-| Recoverable short-path/deviation failure and `spring_back_hold` is explicitly allowed | execute `spring_back_hold`. |
-| Infeasible stop time, ALI cannot prove a valid trajectory, dispatch timeout, scaling-source change, or stop monitor timeout | hard-stop category. |
+| Planner/backend condition                                                                                                   | Disposition                                                         |
+| --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Planner succeeds                                                                                                            | execute `soft_on_path`.                                             |
+| Original trajectory naturally reaches rest within policy window                                                             | natural completion, enabled by default unless the profile opts out. |
+| Recoverable short-path/deviation failure and `spring_back_hold` is explicitly allowed                                       | execute `spring_back_hold`.                                         |
+| Infeasible stop time, ALI cannot prove a valid trajectory, dispatch timeout, scaling-source change, or stop monitor timeout | hard-stop category.                                                 |
 
 `spring_back_hold` is not the critical fallback after a runtime scaling-source
 change. That case must use hard-stop behavior because the timed replacement

@@ -21,12 +21,12 @@ This index assumes the repos are checked out as siblings under
 `${HOME}/workspaces/dev_ws/src/`. If a local link does not resolve, use the
 matching GitHub repository before assuming the doc is stale:
 
-| Repo | Preferred local path | Accepted alternate local path | Remote |
-|---|---|---|---|
-| `manyforge` | `${HOME}/workspaces/dev_ws/src/manyforge` | - | `https://github.com/pastoriomarco/manyforge` |
-| `NemoClaw-Thor` | `${HOME}/workspaces/dev_ws/src/NemoClaw-Thor` | `${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor` | `https://github.com/pastoriomarco/NemoClaw-Thor` |
+| Repo                       | Preferred local path                                     | Accepted alternate local path                                   | Remote                                                      |
+| -------------------------- | -------------------------------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------- |
+| `manyforge`                | `${HOME}/workspaces/dev_ws/src/manyforge`                | -                                                               | `https://github.com/pastoriomarco/manyforge`                |
+| `NemoClaw-Thor`            | `${HOME}/workspaces/dev_ws/src/NemoClaw-Thor`            | `${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor`                 | `https://github.com/pastoriomarco/NemoClaw-Thor`            |
 | `isaac_ros_custom_bringup` | `${HOME}/workspaces/dev_ws/src/isaac_ros_custom_bringup` | `${HOME}/workspaces/isaac_ros-dev/src/isaac_ros_custom_bringup` | `https://github.com/pastoriomarco/isaac_ros_custom_bringup` |
-| `manyforge_specs` | `${HOME}/workspaces/dev_ws/src/manyforge_specs` | - | `https://github.com/pastoriomarco/manyforge_specs` |
+| `manyforge_specs`          | `${HOME}/workspaces/dev_ws/src/manyforge_specs`          | -                                                               | `https://github.com/pastoriomarco/manyforge_specs`          |
 
 Minimal clone layout:
 
@@ -47,19 +47,19 @@ git -C NemoClaw-Thor checkout main
 [ ! -d manyforge_specs ] || git -C manyforge_specs checkout main
 ```
 
----
+______________________________________________________________________
 
 ## Phase order
 
-| # | Phase | Repo / doc | Key command(s) |
-|---|---|---|---|
-| 0 | **Host storage** — NVMe mount, Docker `data-root`, bind mounts | Canonical recipe: [`isaac_ros_custom_bringup/jetson_orin_storage/README.md`](../../../isaac_ros_custom_bringup/jetson_orin_storage/README.md); NemoClaw contract: [`NemoClaw-Thor/ORIN-SETUP.md`](../../../NemoClaw-Thor/ORIN-SETUP.md#0-host-storage-and-runtime-prerequisites) §0 | (one-time host setup) |
-| 1 | **Serve the model** — `gemma4-12b-it-gguf-orin` (Orin image, NVMe caches, 128k/q8_0/FA, cache-first `--offline`) | [`NemoClaw-Thor/ORIN-SETUP.md`](../../../NemoClaw-Thor/ORIN-SETUP.md) §1 | `./serving/start-model.sh gemma4-12b-it-gguf-orin` |
-| 2 | **Install toolchain** — node + nemoclaw + openshell on NVMe; bridge venvs; `~/.nemoclaw` bind mount | [`NemoClaw-Thor/ORIN-SETUP.md`](../../../NemoClaw-Thor/ORIN-SETUP.md) §2 | (see §2a–2e) |
-| 3 | **Create the sandbox** — start the model, run first-time `nemoclaw onboard` (`provider=custom`), then apply the local-provider config | [`NemoClaw-Thor/ORIN-SETUP.md`](../../../NemoClaw-Thor/ORIN-SETUP.md) §3 | `nemoclaw onboard --non-interactive …` |
-| 4 | **Build the composer image** | this repo (below) | `./scripts/setup-docker.sh` |
-| 5 | **Run the stack** — launcher brings up Composer, model/proxy, provider config, OpenClaw provisioning (`setup-manyforge-assistant`), gateway/bridge, and supervisor | [`LAUNCHER_QUICKSTART.md`](LAUNCHER_QUICKSTART.md) (Jetson Orin section) | `./scripts/launch-orin-gemma.sh` |
-| 6 | **Smoke** | this repo + NemoClaw-Thor (below) | `smoke_corpus_runner.py` |
+| #   | Phase                                                                                                                                                              | Repo / doc                                                                                                                                                                                                                                                                                          | Key command(s)                                     |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| 0   | **Host storage** — NVMe mount, Docker `data-root`, bind mounts                                                                                                     | Canonical recipe: [Isaac ROS custom bringup storage guide](https://github.com/pastoriomarco/isaac_ros_custom_bringup/blob/main/jetson_orin_storage/README.md); NemoClaw contract: [`NemoClaw-Thor/ORIN-SETUP.md`](../../../NemoClaw-Thor/ORIN-SETUP.md#0-host-storage-and-runtime-prerequisites) §0 | (one-time host setup)                              |
+| 1   | **Serve the model** — `gemma4-12b-it-gguf-orin` (Orin image, NVMe caches, 128k/q8_0/FA, cache-first `--offline`)                                                   | [`NemoClaw-Thor/ORIN-SETUP.md`](../../../NemoClaw-Thor/ORIN-SETUP.md) §1                                                                                                                                                                                                                            | `./serving/start-model.sh gemma4-12b-it-gguf-orin` |
+| 2   | **Install toolchain** — node + nemoclaw + openshell on NVMe; bridge venvs; `~/.nemoclaw` bind mount                                                                | [`NemoClaw-Thor/ORIN-SETUP.md`](../../../NemoClaw-Thor/ORIN-SETUP.md) §2                                                                                                                                                                                                                            | (see §2a–2e)                                       |
+| 3   | **Create the sandbox** — start the model, run first-time `nemoclaw onboard` (`provider=custom`), then apply the local-provider config                              | [`NemoClaw-Thor/ORIN-SETUP.md`](../../../NemoClaw-Thor/ORIN-SETUP.md) §3                                                                                                                                                                                                                            | `nemoclaw onboard --non-interactive …`             |
+| 4   | **Build the composer image**                                                                                                                                       | this repo (below)                                                                                                                                                                                                                                                                                   | `./scripts/setup-docker.sh`                        |
+| 5   | **Run the stack** — launcher brings up Composer, model/proxy, provider config, OpenClaw provisioning (`setup-manyforge-assistant`), gateway/bridge, and supervisor | [`LAUNCHER_QUICKSTART.md`](LAUNCHER_QUICKSTART.md) (Jetson Orin section)                                                                                                                                                                                                                            | `./scripts/launch-orin-gemma.sh`                   |
+| 6   | **Smoke**                                                                                                                                                          | this repo + NemoClaw-Thor (below)                                                                                                                                                                                                                                                                   | `smoke_corpus_runner.py`                           |
 
 Phases 0–3 are one-time host setup. Phases 4–6 are the build/run/verify loop.
 The full NVMe procedure stays in `isaac_ros_custom_bringup`; the minimum
@@ -67,14 +67,16 @@ runtime contract is repeated in `NemoClaw-Thor` so agents starting from that rep
 can verify the load-bearing storage assumptions without rediscovering this
 index.
 
----
+______________________________________________________________________
 
 ## Phase 4 — Build the composer image (`manyforge-dev:latest`)
+
 ```bash
 cd manyforge
 ./scripts/setup-docker.sh          # pre-clones RoboPlan, then `docker compose build`
 # or just the dev image:  docker compose build dev
 ```
+
 **Orin gotcha (fixed in `Dockerfile`):** `pin==3.9.0` (pinocchio) links against
 **urdfdom 4.0**, but the transitive `cmeel-urdfdom` was unpinned and pip
 resolved **v6** → the RoboPlan bindings wheel died with
@@ -84,12 +86,15 @@ image. A fresh build now succeeds; verify with
 `docker run --rm --entrypoint bash manyforge-dev:latest -lc 'python3 -c "import roboplan"'`.
 
 ## Phase 5 — Run the stack
+
 The model profile is selected by `MODEL_PROFILE`; on Orin use the turnkey wrapper
 (pins `gemma4-12b-it-gguf-orin` + assistant lane):
+
 ```bash
 ./scripts/launch-orin-gemma.sh                      # direct/openclaw per ASSISTANT_PROVIDER
 ASSISTANT_PROVIDER=openclaw OPENCLAW_ASSISTANT_TOOL_SURFACE=tools ./scripts/launch-orin-gemma.sh
 ```
+
 `launch.sh` starts Composer and the selected deployment first, then brings up
 the assistant runtime pieces: model/proxy → local-provider config →
 OpenClaw provisioning (`setup-manyforge-assistant`) → gateway/bridge →
@@ -99,23 +104,28 @@ supervisor status. See the **Jetson Orin AGX** section of
 the toolchain or onboard.
 
 ## Phase 6 — Smoke (corpus)
+
 The smoke harness is `smoke_corpus_runner.py` (the "60-case corpus") in
 **NemoClaw-Thor**; it drives the composer and is lane-agnostic (the lane = the
 provider the composer is configured with). Short subset:
+
 ```bash
 # from ${HOME}/workspaces/dev_ws/src/manyforge
 python3 ../NemoClaw-Thor/manyforge/scripts/debug/smoke_corpus_runner.py \
   --filter '^(P1|P2|P3|WRAP_root|SCENE_add|TREE_insert)' \
   --report /tmp/gemma-orin-smoke/<lane>-report.json
 ```
+
 Reference cell runners (composer + bridge + corpus + teardown, per lane) are
 archived in
 [`NemoClaw-Thor/manyforge/docs/smoke-evidence/2026-06-05-gemma4-12b-it-gguf/`](../../../NemoClaw-Thor/manyforge/docs/smoke-evidence/2026-06-05-gemma4-12b-it-gguf/).
 
----
+______________________________________________________________________
 
 ## Cross-cutting Orin gotchas (all hit + fixed)
+
 Full table in [`NemoClaw-Thor/ORIN-SETUP.md`](../../../NemoClaw-Thor/ORIN-SETUP.md#orin-gotchas-all-hit--fixed-this-session). Summary:
+
 - **composer build**: pin `cmeel-urdfdom==4.0.1` (done in `Dockerfile`).
 - **model re-download**: cache-first `--offline` (profile default).
 - **`~/.nemoclaw`**: bind-mount to NVMe, never symlink (NemoClaw rejects symlinked config).
@@ -124,6 +134,7 @@ Full table in [`NemoClaw-Thor/ORIN-SETUP.md`](../../../NemoClaw-Thor/ORIN-SETUP.
 - **bridge venvs**: `sudo apt-get install -y python3.12-venv` first.
 
 ## Status (2026-06-05, this Orin)
+
 - Phases 0–4 ✅ verified. Model serves (offline cache, clean `tool_calls`).
 - **Direct lane smoke**: 3/9 on the hard subset (`P1`, `WRAP_root_medium`,
   `SCENE_add_generic` pass; fails = gemma arg-shape quirk + bounded-autonomy +

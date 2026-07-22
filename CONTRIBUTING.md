@@ -11,16 +11,16 @@ machine-readable companion to this doc.
 ## Short version
 
 1. **`dev` is the integration branch; `main` is for released code only.**
-2. **Only the maintainer pushes to upstream `dev`.** External
+1. **Only the maintainer pushes to upstream `dev`.** External
    contributors fork the repo and open a pull request from their fork
    to upstream `dev`.
-3. **Releases**: the maintainer squash-merges `dev → main` when a new
+1. **Releases**: the maintainer squash-merges `dev → main` when a new
    version lands, then tags. (Mirrors the
    [manymove](https://github.com/pastoriomarco/manymove) policy.)
-4. **Normal development is spec-driven.** Maintainer work should use
+1. **Normal development is spec-driven.** Maintainer work should use
    the sibling private `manyforge_specs` repo as the canonical source
    for contracts, ADRs, and development plans.
-5. CI must stay green on `dev`.
+1. CI must stay green on `dev`.
 
 ## Repository structure (for orientation)
 
@@ -90,33 +90,33 @@ Commit with a Conventional-Commits-ish prefix: `feat:`, `fix:`,
 Only the maintainer has push access to upstream `dev`. The flow is:
 
 1. `git checkout dev && git pull` — start from integration head.
-2. Make changes; run the local checks above.
-3. `git commit` and `git push origin dev`.
-4. CI runs automatically on `dev`: Python tests, frontend build, bash
+1. Make changes; run the local checks above.
+1. `git commit` and `git push origin dev`.
+1. CI runs automatically on `dev`: Python tests, frontend build, bash
    syntax, version sync, private-spec boundary, cpp-tsan (when
    `manyforge_core` is touched). Keep `dev` green.
 
 ### External contributor flow (fork + PR)
 
 1. **Fork** the repository on GitHub.
-2. Clone your fork; add upstream as a remote:
+1. Clone your fork; add upstream as a remote:
    ```bash
    git clone https://github.com/<you>/manyforge.git
    cd manyforge
    git remote add upstream https://github.com/pastoriomarco/manyforge.git
    ```
-3. Sync your fork's `dev` with upstream before starting:
+1. Sync your fork's `dev` with upstream before starting:
    ```bash
    git fetch upstream
    git checkout dev && git reset --hard upstream/dev
    ```
-4. Either work on `dev` in your fork, or create a topic branch:
+1. Either work on `dev` in your fork, or create a topic branch:
    `git checkout -b feature/<short-desc>` (also `fix/<x>` or
    `docs/<x>`).
-5. Make changes; run the local checks above; commit.
-6. Push to your fork: `git push origin <branch>` (or `dev`).
-7. Open a pull request from your fork → upstream `dev`.
-8. CI runs on the PR. Address review comments by pushing more
+1. Make changes; run the local checks above; commit.
+1. Push to your fork: `git push origin <branch>` (or `dev`).
+1. Open a pull request from your fork → upstream `dev`.
+1. CI runs on the PR. Address review comments by pushing more
    commits to the same branch on your fork.
 
 ### Cutting a release
@@ -127,12 +127,12 @@ version bump. Maintainer flow:
 1. For the first public release, finalize the existing `0.1.0 - Upcoming`
    section in `CHANGELOG.md`. For later releases, bump `VERSION` (SemVer) and
    add a new changelog section on `dev`.
-2. Confirm CI is green on `dev`.
-3. **Squash-merge `dev → main`** — one commit per release, as
+1. Confirm CI is green on `dev`.
+1. **Squash-merge `dev → main`** — one commit per release, as
    manymove does. The squash message is the release notes.
-4. Tag the merge commit, for example `git tag v0.1.0 && git push --tags`
+1. Tag the merge commit, for example `git tag v0.1.0 && git push --tags`
    for the first public tag.
-5. (Optional) Draft a GitHub release from the tag.
+1. (Optional) Draft a GitHub release from the tag.
 
 If you spot something that should go in the next release, mention it
 in your commit / PR description so the maintainer can pull it into the
@@ -143,8 +143,7 @@ changelog.
 - **C++**: ports-and-adapters architecture; no ROS types in
   `manyforge_core`; bindings stay thin. `set -euo pipefail` style for
   bash. Comments explain *why*, not *what*.
-- **Python**: type hints encouraged on public APIs. `from __future__
-  import annotations` at the top of any file using PEP-604 union
+- **Python**: type hints encouraged on public APIs. `from __future__ import annotations` at the top of any file using PEP-604 union
   syntax.
 - **Frontend**: TypeScript strict mode, prefer Zustand selectors over
   prop drilling, avoid coupling to specific deployment YAMLs.
@@ -168,18 +167,18 @@ the guardrails need to be the same for both.
    fork's `dev` or topic branch — never to upstream. Never push to
    `main` from anywhere; only the maintainer does that, via the
    release squash-merge.
-2. **`git commit` requires explicit human authorization.** This is a
+1. **`git commit` requires explicit human authorization.** This is a
    standing rule, regardless of how clearly the change is requested.
    Stage the diff, present it to the operator, wait for the literal
    word `commit`. Multi-step instructions like "fix everything" do
    not transitively authorize commits. (Reference: priority memory
    rule `feedback_commits_explicit_only.md`.)
-3. **`git push` is a separate authorization** from `git commit`.
+1. **`git push` is a separate authorization** from `git commit`.
    Wait for an explicit `push` reply.
-4. **Never open a pull request automatically.** Use the GitHub UI or
+1. **Never open a pull request automatically.** Use the GitHub UI or
    wait for the operator. Do not run `gh pr create` unless explicitly
    instructed.
-5. **Releases (squash-merge `dev → main` + tag) are operator-driven.**
+1. **Releases (squash-merge `dev → main` + tag) are operator-driven.**
    Do not bump `VERSION` or write `CHANGELOG.md` release sections
    without an explicit ask.
 
@@ -197,8 +196,8 @@ execution safety/stop behavior, assistant authority, or observability
 surface, the expected maintainer workflow is:
 
 1. Read the relevant material in the sibling `manyforge_specs` repo.
-2. Confirm the implementation change matches the spec/ADR/plan.
-3. If the spec is missing, ambiguous, or wrong, stop and ask for
+1. Confirm the implementation change matches the spec/ADR/plan.
+1. If the spec is missing, ambiguous, or wrong, stop and ask for
    maintainer direction before changing code.
 
 If `manyforge_specs` is unavailable, state that limitation in your
@@ -215,6 +214,7 @@ memory rule `feedback_codex_review_convergence.md`.
 ### When you encounter a constraint you can't resolve
 
 Stop and ask the operator. Specifically:
+
 - If specs in `manyforge_specs/` (private) conflict with the change
   you're being asked to make, surface the conflict — do not
   unilaterally rewrite spec text. (Reference:
@@ -236,7 +236,8 @@ Stop and ask the operator. Specifically:
 - AGENTS.md / CONTRIBUTING.md / README updated only when the durable
   workflow changes — never for transient incident notes.
 - **Launcher behavior changed?** If your change touches
-  `scripts/launch.sh`, `scripts/lib/*.sh`, `scripts/lib/scenarios.sh`,
+  `scripts/launch.sh`, `scripts/lib/*.sh`, the artifact-discovery adapter
+  `scripts/lib/scenarios.sh`,
   or any `scripts/demo-*.sh` shim, update
   [`docs/operations/LAUNCHER_QUICKSTART.md`](docs/operations/LAUNCHER_QUICKSTART.md)
   in the same commit and (when relevant)

@@ -2,8 +2,9 @@
 
 Modular robot execution framework: behavior trees, motion planning, scene
 authoring, and an LLM-assisted Composer UI. It currently supports
-Composer-only authoring and Isaac Sim commanded simulation, and is structured
-for qualified real-robot deployments as that lane matures.
+a self-contained ManyForge-only native lane and Isaac Sim commanded
+simulation. ROS-backed physical deployments use the same controller adapter
+but require robot-specific integration and qualification.
 
 > **For LLMs** (Claude, ChatGPT, agentic IDEs): read
 > [`AGENTS.md`](AGENTS.md) before making any change. It tells you what
@@ -11,7 +12,20 @@ for qualified real-robot deployments as that lane matures.
 > workflow that applies to LLM contributors. The full contributor
 > reference is [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-Internal docs entrypoint: [`docs/INDEX.md`](docs/INDEX.md)
+## Documentation map
+
+| You want to…                                        | Start here                                                                                                                                         |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Install or launch a supported scenario              | [`docs/operations/LAUNCHER_QUICKSTART.md`](docs/operations/LAUNCHER_QUICKSTART.md)                                                                 |
+| Operate, diagnose, or recover a running stack       | [`docs/INDEX.md`](docs/INDEX.md) → operator runbooks                                                                                               |
+| Understand architecture and authority boundaries    | [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md)                                                                                 |
+| Integrate through REST, MCP, or the viewer protocol | [`docs/INDEX.md`](docs/INDEX.md) → generated contracts                                                                                             |
+| Add a robot or trusted external node                | [`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md), [`docs/operations/EXTERNAL_NODES.md`](docs/operations/EXTERNAL_NODES.md) |
+| Contribute code or documentation                    | [`CONTRIBUTING.md`](CONTRIBUTING.md); LLM agents also read [`AGENTS.md`](AGENTS.md)                                                                |
+
+The runtime documentation is self-contained in this repository. Private
+maintainer specifications are not required to install, operate, or integrate
+ManyForge.
 
 ## Disclaimer
 
@@ -117,8 +131,10 @@ ctest --output-on-failure
 ```
 manyforge_core/          C++ library: execution kernel, state machine, DTOs, ports
   python/                pybind11 bindings exposing the kernel to Python
+manyforge_collision/     C++ planner-neutral collision query implementation
 manyforge_roboplan/      C++ RoboPlan adapters: planner/projection, focused ports, native execution
   python/                pybind11 bindings + NativeKernelClient wrapper
+manyforge_ros2_control_execution/  C++ ROS controller execution adapter
 manyforge_behavior/      Python behavior tree runner (py_trees), node catalog, program loader
 manyforge_composer/      Composer: FastAPI backend, React frontend, MCP server
   backend/               REST API routes, state management, security middleware
@@ -133,17 +149,22 @@ docs/                    Architecture reference
 ## Architecture
 
 ```
-Program YAML --> Behavior Runner --> ExecutionKernel (C++) --> Planner/Execution backends
-                      |                    |
-                 Node Catalog        State Machine
-                                    Trajectory Cache
-                                    Collision Policy
+Program YAML --> Behavior Runner --> ExecutionKernel (C++) --> Planner / execution adapters
+                      |                    |                         |
+                 Node Catalog       validation + stop       RoboPlan / ros2_control
+                 recovery offer     collision authority              |
+                                            |                  robot / Isaac
+                                   immutable events/facts
+                                            |
+                                     Composer / viewer
 ```
 
-The kernel owns terminal authority, stop semantics, and collision validation;
-the behavior layer owns program orchestration and run-correlation identity;
-Composer observes and presents. For the full component map, authority
-boundaries, deployment lanes, and observability model, see
+The kernel owns terminal and stop authority; ManyForge's collision layer owns
+collision admission; the behavior layer owns orchestration, run identity,
+and the one versioned recovery offer. Composer owns authoring, presentation,
+the non-safety-rated condition-backed alarm manager, and a bounded observer
+data plane—not motion authority. For the full component map, deployment lanes, scene
+initialization, recovery, and observability model, see
 [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md).
 
 - **manyforge_core** is ROS-free, pure C++20. All robot-framework-specific code lives in adapter packages.
@@ -193,6 +214,7 @@ python -m manyforge_composer --mcp --catalog-path /workspace/manyforge_behavior/
 
 The container runs as a non-root user (`manyforge`, uid 1000). The entrypoint
 (`docker-entrypoint.sh`) automatically:
+
 - Sets `PYTHONPATH` for `manyforge_behavior`
 - Builds pybind11 bindings if the C++ core library exists
 - Uses `/tmp/manyforge-build/` for out-of-tree builds (avoids conflicts with host build dirs)
