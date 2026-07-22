@@ -98,8 +98,11 @@ def test_supervisor_retires_worker_on_bounded_timeout() -> None:
 
 
 def test_supervisor_contains_worker_process_crash() -> None:
+    # This case verifies crash classification, not worker startup latency.
+    # Spawn can exceed one second late in a loaded CI process, so retain the
+    # production-default bound as a deadman without racing process startup.
     supervisor = ViewerWorkerSupervisor(
-        timeout_s=1.0,
+        timeout_s=5.0,
         worker_target=_crashing_worker,
     )
     try:
