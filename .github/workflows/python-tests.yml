@@ -30,6 +30,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Step 18 qualification tests verify artifacts against a pinned
+          # historical source commit, so the default one-commit checkout is
+          # insufficient for their source-identity checks.
+          fetch-depth: 0
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
