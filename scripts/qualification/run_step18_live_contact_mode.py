@@ -28,8 +28,8 @@ from scripts.qualification.source_identity import (  # noqa: E402
 
 
 CONTAINER_REPO_ROOT = Path("/workspace")
-PINNED_BASELINE_COMMIT = "643fe9c399182419d38d4478750d7e6f692dc9ad"
-PINNED_SPECS_COMMIT = "5e50a4872bbb9a2167c6bc14b9b5963061f2f09e"
+PINNED_BASELINE_COMMIT = "2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909"
+PINNED_SPECS_COMMIT = "67c24447a117e14c8274b13d05d720766671aa7a"
 ROW_KINDS = (
     "baseline_pristine_timing",
     "baseline_observation",
@@ -338,7 +338,7 @@ def run(args: argparse.Namespace) -> int:
     host_repo_root = args.host_repo_root.resolve()
     observed_source = _manyforge_source_identity(host_repo_root)
     if observed_source["head_commit"] != PINNED_BASELINE_COMMIT:
-        raise RuntimeError("Step 18 source must remain based on pinned 643fe9c")
+        raise RuntimeError("Step 18 source must remain based on pinned 2bfe30e")
     if (
         observed_source["fingerprint_sha256"]
         != args.expected_source_fingerprint_sha256
@@ -353,7 +353,7 @@ def run(args: argparse.Namespace) -> int:
     specs_identity = _manyforge_source_identity(specs_root)
     specs_contract_identity = _specs_contract_identity(specs_root)
     if specs_identity["head_commit"] != PINNED_SPECS_COMMIT:
-        raise RuntimeError("Step 18 Specs source must remain based on pinned 5e50a48")
+        raise RuntimeError("Step 18 Specs source must remain based on pinned 67c2444")
     if args.row_kind in {"candidate_timing", "candidate_observation"} and not specs_identity["dirty"]:
         raise RuntimeError("candidate rows require the frozen Step 18 Specs delta")
     if args.row_kind not in {"candidate_timing", "candidate_observation"} and specs_identity["dirty"]:

@@ -40,7 +40,7 @@ def _frozen_candidate_source_identity(root: Path) -> dict[str, Any]:
     """Model the qualified pre-commit candidate after Step 18 closure.
 
     The production verifier intentionally accepts only the dirty candidate
-    rooted at 643fe9c.  Once that candidate was committed, the repository's
+    rooted at 2bfe30e.  Once that candidate was committed, the repository's
     real HEAD could no longer serve as the unit-test fixture.  Keep the
     verifier strict and supply its frozen source identity at the test seam.
     """
@@ -1348,7 +1348,7 @@ def test_step18_live_verifier_accepts_source_bound_sixteen_row_matrix(
     ]
     assert all(
         comparison["timing_denominator_source"]
-        == "pristine_643fe9c_unpatched"
+        == "pristine_2bfe30e_unpatched"
         for comparison in result["comparisons"]
     )
     assert result["comparisons"][0]["p95_ratio"] == pytest.approx(1.05)
@@ -1700,8 +1700,8 @@ def test_step18_live_verifier_rejects_progress_regression_and_deadline_miss(
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     [
-        ("expected_baseline_commit", "a" * 40, "pinned 643fe9c"),
-        ("expected_specs_commit", "b" * 40, "pinned 5e50a48"),
+        ("expected_baseline_commit", "a" * 40, "pinned 2bfe30e"),
+        ("expected_specs_commit", "b" * 40, "pinned 67c2444"),
     ],
 )
 def test_step18_live_verifier_rejects_manifest_substitution(
@@ -1731,7 +1731,7 @@ def test_step18_live_verifier_rejects_candidate_commit_substitution(
     )
     _rewrite_manifest(manifest_path, manifest)
 
-    with pytest.raises(_VERIFY.ValidationError, match="frozen 643fe9c"):
+    with pytest.raises(_VERIFY.ValidationError, match="frozen 2bfe30e"):
         _VERIFY.verify(manifest_path)
 
 

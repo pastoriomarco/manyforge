@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run one typed record from a prepared detached 643fe9c runtime baseline lane.
+# Run one typed record from a prepared detached 2bfe30e runtime baseline lane.
 
 set -euo pipefail
 

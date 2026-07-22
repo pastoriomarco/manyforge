@@ -446,7 +446,7 @@ class FullTrajectoryObservationEngine final : public ICollisionQueryEngine {
     totals_.distance_evaluated_logical_pair_count +=
         result.pair_clearances.size();
     ++totals_.distance_api_call_count;
-    // Pristine 643fe9c uses the q-overload for both computeCollisions and the
+    // Pristine 2bfe30e uses the q-overload for both computeCollisions and the
     // subsequent all-active computeDistances call: two placement/FK updates
     // per waypoint query (manyforge_collision_engine.cpp:1221,1231 there).
     totals_.fk_placement_invocation_count += 2;
@@ -1040,7 +1040,7 @@ class PreciseReferenceEngine final : public ICollisionQueryEngine {
       result.pair_clearances.push_back(
           {configured, *sample.configured_signed_clearance_m});
     } else if (!configured_colliding) {
-      // Pristine 643fe9c measured every active pair, including absent pairs.
+      // Pristine 2bfe30e measured every active pair, including absent pairs.
       result.pair_clearances.push_back({configured, 0.010});
     }
     if (std::find(sample.colliding_pairs.begin(), sample.colliding_pairs.end(),
@@ -2997,7 +2997,7 @@ int main(int argc, char** argv) {
 #if MANYFORGE_POLICY_SUPPORT_CURRENT_SOURCE
         << "direct_current_full_trajectory_observation"
 #else
-        << "exact_result_and_source_derivation_pristine_643fe9c"
+        << "exact_result_and_source_derivation_pristine_2bfe30e"
 #endif
         << "\",\"distance_request_mode\":\""
         << mechanism_mode_for(options.arm) << "\""
@@ -3036,7 +3036,7 @@ int main(int argc, char** argv) {
     out << "null";
 #else
     out << "\"manyforge_collision/src/manyforge_collision_engine.cpp"
-           "@643fe9c399182419d38d4478750d7e6f692dc9ad:1221,1231\"";
+           "@2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909:1221,1231\"";
 #endif
     out
         << ",\"allocation_count\":null"

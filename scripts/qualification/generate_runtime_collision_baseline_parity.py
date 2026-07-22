@@ -24,8 +24,8 @@ from source_identity import (
 
 SCHEMA = "manyforge.runtime_collision_baseline_decision_parity.v2"
 RECORD_SCHEMA = "manyforge.runtime_collision_schedule_qualification.v2"
-BASELINE_SOURCE = "643fe9c399182419d38d4478750d7e6f692dc9ad"
-BASELINE_SPECS = "5e50a4872bbb9a2167c6bc14b9b5963061f2f09e"
+BASELINE_SOURCE = "2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909"
+BASELINE_SPECS = "67c24447a117e14c8274b13d05d720766671aa7a"
 
 
 def sha256_file(path: Path) -> str:

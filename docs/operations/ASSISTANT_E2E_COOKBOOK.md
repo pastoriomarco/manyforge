@@ -272,7 +272,7 @@ loop in-process against the local model endpoint.
 The preflight refuses to start if ports `8000`, `8080`, `8100`,
 `8200`, or `9000` are already owned by unmanaged processes. This prevents
 accidental duplicate Composer, bridge (either lane), OpenShell, or vLLM
-instances. **As of `c3c492c` the preflight is strict against
+instances. **As of `490f867` the preflight is strict against
 launcher-managed state too** — already-running launcher Composer / vLLM /
 bridge / supervisor containers or PID files are reported as conflicts.
 Use `scripts/launch.sh stop` or `scripts/launch.sh restart` to clear the
@@ -324,7 +324,7 @@ known-good program/deployment:
 
 Note: `restart-bridge` and `reload-composer` were partial-restart verbs in
 the previous version of this script. They are now deprecated and map to a
-full `restart` via `scripts/launch.sh`. **As of `c3c492c`, `start` is
+full `restart` via `scripts/launch.sh`. **As of `490f867`, `start` is
 strict against partial launcher-managed state** — the previously-supported
 "`pkill` the bridge then re-`start` and let preflight reuse the still-
 running vLLM / sandbox" pattern no longer works; preflight reports the

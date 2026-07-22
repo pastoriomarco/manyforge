@@ -24,7 +24,7 @@ import tracemalloc
 from typing import Any, Callable
 
 
-DEFAULT_BASELINE_REF = "f991c085b5b41b14573de913bc2c1929504b04e8"
+DEFAULT_BASELINE_REF = "33ca99a73742718970ea122c34070d6d4d72682a"
 BASELINE_PATH = "manyforge_composer/backend/operator_alerts.py"
 CURRENT_IMPLEMENTATION_PATHS = (
     "manyforge_composer/backend/operator_alarm_catalog.py",

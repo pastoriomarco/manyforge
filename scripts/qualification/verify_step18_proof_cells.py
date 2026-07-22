@@ -72,8 +72,8 @@ PRECISE_REFERENCE_PAYLOAD_KEYS = frozenset(
 )
 SUMMARY_SCHEMA = "manyforge.step18.proof_cell_verification.v2"
 CLEAN_SCHEMA = "manyforge.step18.validation_nonregression_clean_checkout.v2"
-BASELINE_SOURCE = "643fe9c399182419d38d4478750d7e6f692dc9ad"
-BASELINE_SPECS = "5e50a4872bbb9a2167c6bc14b9b5963061f2f09e"
+BASELINE_SOURCE = "2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909"
+BASELINE_SPECS = "67c24447a117e14c8274b13d05d720766671aa7a"
 BASELINE_ROLE = "pristine_baseline_timing"
 CURRENT_ROLE = "current_candidate"
 LIGHTWEIGHT_FIXTURE = "ur5_support_contact_release"
@@ -3228,11 +3228,11 @@ def validate_policy_support(
             and distance_geometry == distance_logical == clearances
             and distance_logical > colliding_logical
             and value.get("mechanism_provenance")
-            == "exact_result_and_source_derivation_pristine_643fe9c"
+            == "exact_result_and_source_derivation_pristine_2bfe30e"
             and value.get("fk_placement_provenance")
             == "exact_pristine_source_derivation_collision_plus_bulk_distance"
             and value.get("fk_placement_derivation_source")
-            == "manyforge_collision/src/manyforge_collision_engine.cpp@643fe9c399182419d38d4478750d7e6f692dc9ad:1221,1231"
+            == "manyforge_collision/src/manyforge_collision_engine.cpp@2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909:1221,1231"
         )
     elif selective_mode:
         mechanism_ok = (

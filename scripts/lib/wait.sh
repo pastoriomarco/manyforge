@@ -19,9 +19,10 @@
 #   LOG_FN:   optional — pass "" to skip log tailing. Otherwise a bash
 #             function that prints recent log lines to stdout.
 #
-# Lifted from scripts/demo-assistant-known-good.sh:wait_json as it
-# existed at commit ab9af95^ (the original is gone — current file is a
-# shim). API adapted from URL/container string-eval to function names
+# Lifted from the former scripts/demo-assistant-known-good.sh:wait_json
+# helper during the unified-launcher migration (the original helper is
+# gone; this file is a shim). API adapted from URL/container string-eval
+# to function names
 # per audit recommendation. TTY detection uses [[ -t 2 ]] (stderr) so
 # shims passing --non-interactive --yes still get the live display
 # when the human operator is at a terminal.

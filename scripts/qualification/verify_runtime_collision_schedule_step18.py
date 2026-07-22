@@ -2,7 +2,7 @@
 """Strict offline verifier for Step 18 scheduled-runtime JSON artifacts.
 
 The default gate requires three pristine-timing and three observation records
-from the genuine 643fe9c baseline plus three timing and three observation
+from the genuine 2bfe30e baseline plus three timing and three observation
 records for every updated arm. ``--allow-missing-baseline`` is a development
 aid: it verifies current-source invariants but never reports the matched
 before/after gate as closed.
@@ -35,8 +35,8 @@ BASELINE_PARITY_SCHEMA = (
     "manyforge.runtime_collision_baseline_decision_parity.v2"
 )
 BASELINE_ARM = "current_all_active_distance"
-BASELINE_SOURCE = "643fe9c399182419d38d4478750d7e6f692dc9ad"
-BASELINE_SPECS = "5e50a4872bbb9a2167c6bc14b9b5963061f2f09e"
+BASELINE_SOURCE = "2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909"
+BASELINE_SPECS = "67c24447a117e14c8274b13d05d720766671aa7a"
 UPDATED_ARMS = (
     "signed_penetration_selective",
     "binary_contact",
@@ -1207,12 +1207,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--baseline-harness-patch",
         type=Path,
-        help="archived harness-only patch applied to clean 643fe9c",
+        help="archived harness-only patch applied to clean 2bfe30e",
     )
     parser.add_argument(
         "--baseline-observation-patch",
         type=Path,
-        help="archived observation-only instrumentation patch for 643fe9c",
+        help="archived observation-only instrumentation patch for 2bfe30e",
     )
     parser.add_argument(
         "--baseline-decision-parity-artifact",

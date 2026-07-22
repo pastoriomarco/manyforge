@@ -32,7 +32,7 @@ target_link_libraries(perf_collision_engine_qualification PRIVATE
   manyforge_roboplan manyforge_collision)
 
 # Step 18 matched contact-grasp validation timing. The same source is copied
-# unchanged into the detached 643fe9c lane; only this compile definition marks
+# unchanged into the detached 2bfe30e lane; only this compile definition marks
 # the current binary as able to read the new direct mechanism counters after
 # (and outside) each timing window.
 add_executable(perf_contact_grasp_validation_nonregression

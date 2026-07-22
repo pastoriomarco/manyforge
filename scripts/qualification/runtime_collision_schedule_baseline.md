@@ -1,5 +1,12 @@
 # Step 18 scheduled-runtime baseline lane
 
+> **History-rewrite provenance (2026-07-22):** The executable pins below
+> use exact-tree rewritten commits. Historical evidence remains attributed
+> to the original identities:
+>
+> - `manyforge` `643fe9c399182419d38d4478750d7e6f692dc9ad` → `2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909` (tree `c900d971cdcbcfb6ec5d7f9b465ff18befa1dd89`);
+> - `manyforge_specs` `5e50a4872bbb9a2167c6bc14b9b5963061f2f09e` → `67c24447a117e14c8274b13d05d720766671aa7a` (tree `7529497b02758c14666f85bc9bf98e85abec075a`);
+
 Status: **implemented; evidence must still be captured on the frozen final
 candidate**. The current-candidate runner cannot manufacture the historical
 `current_all_active_distance` arm.
@@ -8,8 +15,8 @@ candidate**. The current-candidate runner cannot manufacture the historical
 
 `prepare-runtime-collision-schedule-baseline.sh` creates two detached
 ManyForge worktrees at
-`643fe9c399182419d38d4478750d7e6f692dc9ad` and one detached Specs worktree at
-`5e50a4872bbb9a2167c6bc14b9b5963061f2f09e`. It archives exact clean
+`2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909` and one detached Specs worktree at
+`67c24447a117e14c8274b13d05d720766671aa7a`. It archives exact clean
 `manyforge.source_identity.v1` objects before applying any patch, then records
 the distinct timing/observation overlay identities after patching and verifies
 that those identities remain unchanged through compilation.

@@ -1,5 +1,12 @@
 # Step 18 offline proof campaign
 
+> **History-rewrite provenance (2026-07-22):** The executable pins below
+> use exact-tree rewritten commits. Historical evidence remains attributed
+> to the original identities:
+>
+> - `manyforge` `643fe9c399182419d38d4478750d7e6f692dc9ad` → `2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909` (tree `c900d971cdcbcfb6ec5d7f9b465ff18befa1dd89`);
+> - `manyforge_specs` `5e50a4872bbb9a2167c6bc14b9b5963061f2f09e` → `67c24447a117e14c8274b13d05d720766671aa7a` (tree `7529497b02758c14666f85bc9bf98e85abec075a`);
+
 Status: **implemented; formal evidence must be captured from one frozen final
 candidate**. This runbook covers the offline before/after performance and
 semantic-proof subgate only. It does not close Step 18 by itself.
@@ -87,8 +94,8 @@ export MANYFORGE_EXPECTED_SPECS_CONTRACT_FINGERPRINT_SHA256="${CANDIDATE_FINGERP
 ./scripts/prepare-step18-validation-nonregression-baseline.sh
 ```
 
-The prepared lane is a detached clean ManyForge `643fe9c` plus Specs
-`5e50a48` build with a hash-bound qualification-only overlay. Its pristine
+The prepared lane is a detached clean ManyForge `2bfe30e` plus Specs
+`67c2444` build with a hash-bound qualification-only overlay. Its pristine
 binary is the timing authority for `current_all_active_distance`; the current
 binary must never emulate that historical arm.
 

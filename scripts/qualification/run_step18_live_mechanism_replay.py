@@ -349,7 +349,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     except SourceIdentityError as exc:
         raise RuntimeError(f"cannot bind current source identity: {exc}") from exc
     if initial_candidate.get("head_commit") != live.PINNED_BASELINE_COMMIT or not initial_candidate.get("dirty"):
-        raise RuntimeError("candidate must be a frozen delta over pinned 643fe9c")
+        raise RuntimeError("candidate must be a frozen delta over pinned 2bfe30e")
     if initial_specs_contract.get("head_commit") != live.PINNED_SPECS_COMMIT or not initial_specs_contract.get("contract_dirty"):
         raise RuntimeError("candidate Specs contract must be a frozen Step 18 delta")
 

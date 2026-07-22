@@ -1,6 +1,6 @@
 {
   "policy": {
-    "baseline_source_commit": "b5a02da",
+    "baseline_source_commit": "f235536",
     "budget_change_rule": "Budgets are predeclared before VP-6/VP-7. A change requires measured evidence, reviewer rationale, and a plan-record amendment; a failing run alone is not justification.",
     "cpu_unit": "Percent of one logical CPU aggregated over the named PID tree.",
     "failure_semantics": "Historical pre-cut captures may fail target budgets and remain valid characterization. VP-7 current-source captures must pass every applicable budget.",

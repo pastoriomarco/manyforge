@@ -44,9 +44,9 @@ from scripts.qualification.source_identity import (  # noqa: E402
 SCHEMA = "manyforge.step18_live_contact_modes.v3"
 MANIFEST_SCHEMA = "manyforge.step18_live_contact_modes_manifest.v3"
 PARITY_SCHEMA = "manyforge.step18_live_baseline_retained_output_parity.v1"
-PINNED_BASELINE_COMMIT = "643fe9c399182419d38d4478750d7e6f692dc9ad"
+PINNED_BASELINE_COMMIT = "2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909"
 PINNED_BASELINE_TREE = "c900d971cdcbcfb6ec5d7f9b465ff18befa1dd89"
-PINNED_SPECS_COMMIT = "5e50a4872bbb9a2167c6bc14b9b5963061f2f09e"
+PINNED_SPECS_COMMIT = "67c24447a117e14c8274b13d05d720766671aa7a"
 PINNED_SPECS_TREE = "7529497b02758c14666f85bc9bf98e85abec075a"
 BASELINE_MODE = "current_all_active_distance"
 CANDIDATE_MODES = (
@@ -1981,9 +1981,9 @@ def verify(
     if manifest.get("schema_version") != MANIFEST_SCHEMA:
         raise ValidationError(f"manifest schema_version must be {MANIFEST_SCHEMA!r}")
     if manifest.get("expected_baseline_commit") != PINNED_BASELINE_COMMIT:
-        raise ValidationError("expected_baseline_commit is not pinned 643fe9c")
+        raise ValidationError("expected_baseline_commit is not pinned 2bfe30e")
     if manifest.get("expected_specs_commit") != PINNED_SPECS_COMMIT:
-        raise ValidationError("expected_specs_commit is not pinned 5e50a48")
+        raise ValidationError("expected_specs_commit is not pinned 67c2444")
 
     candidate_root_raw = manifest.get("current_candidate_root")
     specs_root_raw = manifest.get("current_specs_root")
@@ -2041,7 +2041,7 @@ def verify(
         or candidate_identity["head_tree"] != PINNED_BASELINE_TREE
         or candidate_identity["dirty"] is not True
     ):
-        raise ValidationError("candidate source is not the frozen 643fe9c-based delta")
+        raise ValidationError("candidate source is not the frozen 2bfe30e-based delta")
     baseline_specs_identity = _validated_source_identity(
         manifest.get("expected_baseline_specs_source_identity"),
         "expected_baseline_specs_source_identity",
@@ -2057,14 +2057,14 @@ def verify(
         delta_sha256=_delta_sha256(b""),
     )
     if baseline_specs_identity != clean_specs_identity:
-        raise ValidationError("baseline Specs identity is not pristine pinned 5e50a48")
+        raise ValidationError("baseline Specs identity is not pristine pinned 67c2444")
     if (
         candidate_specs_identity["head_commit"] != PINNED_SPECS_COMMIT
         or candidate_specs_identity["head_tree"] != PINNED_SPECS_TREE
         or candidate_specs_identity["dirty"] is not True
         or candidate_specs_identity["delta_sha256"] == _delta_sha256(b"")
     ):
-        raise ValidationError("candidate Specs identity is not the frozen 5e50a48 delta")
+        raise ValidationError("candidate Specs identity is not the frozen 67c2444 delta")
     baseline_specs_contract_identity = _validated_specs_contract_identity(
         manifest.get("expected_baseline_specs_contract_identity"),
         "expected_baseline_specs_contract_identity",
@@ -2081,7 +2081,7 @@ def verify(
     )
     if baseline_specs_contract_identity != clean_specs_contract_identity:
         raise ValidationError(
-            "baseline Specs contract identity is not pristine pinned 5e50a48"
+            "baseline Specs contract identity is not pristine pinned 67c2444"
         )
     if (
         candidate_specs_contract_identity["head_commit"] != PINNED_SPECS_COMMIT
@@ -2275,7 +2275,7 @@ def verify(
                     "viewer_stratum": stratum,
                     "mode": mode,
                     "timing_denominator_row_id": baseline["id"],
-                    "timing_denominator_source": "pristine_643fe9c_unpatched",
+                    "timing_denominator_source": "pristine_2bfe30e_unpatched",
                     "p95_ratio": p95_ratio,
                     "max_ratio": max_ratio,
                     "maximum_allowed_ratio": maximum_ratio,

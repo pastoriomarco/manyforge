@@ -42,9 +42,9 @@ RUNTIME_SCHEMA = "manyforge.runtime_collision_schedule_verification.v2"
 LIVE_SCHEMA = "manyforge.step18_live_contact_modes.v3"
 LOADED_SCHEMA = "manyforge.step18.loaded_kernel_verification.v1"
 RELEASE_SCHEMA = "manyforge.step18.release_gate_verification.v1"
-PINNED_BASELINE_COMMIT = "643fe9c399182419d38d4478750d7e6f692dc9ad"
+PINNED_BASELINE_COMMIT = "2bfe30eeb37952f1ddc36bfdbf89d471a9f6b909"
 PINNED_BASELINE_TREE = "c900d971cdcbcfb6ec5d7f9b465ff18befa1dd89"
-PINNED_SPECS_COMMIT = "5e50a4872bbb9a2167c6bc14b9b5963061f2f09e"
+PINNED_SPECS_COMMIT = "67c24447a117e14c8274b13d05d720766671aa7a"
 REQUIRED_LOADED_PREDICATE_TESTS = frozenset(
     {
         "ExecutionKernelTest.Cancel_StopDuringValidationRequestsValidationCancel",

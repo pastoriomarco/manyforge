@@ -5,6 +5,8 @@
   "completed_on": "2026-07-13",
   "source": {
     "manyforge_commit": "295209041a2b0a6277e9120885370bbdcce972d6",
+    "manyforge_rewritten_equivalent_commit": "d426444ee827194c2fe261a521ec8c04d655dbfd",
+    "history_rewrite_note": "manyforge_commit is the immutable pre-rewrite capture identity; the rewritten commit has the same tree and does not represent a rerun",
     "manyforge_dirty": false,
     "roboplan_version": "0.4.0",
     "roboplan_commit": "7bddd403cf679dd976135aff6d9412fae9c4c04d",

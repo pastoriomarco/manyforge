@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run one proof-cell record from the prepared pristine 643fe9c timing lane.
+# Run one proof-cell record from the prepared pristine 2bfe30e timing lane.
 
 set -euo pipefail
 
