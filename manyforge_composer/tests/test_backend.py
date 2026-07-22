@@ -6711,17 +6711,24 @@ def test_kernel_events_route_records_drop_gap_evidence():
     state = ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
     with TestClient(app) as client:
-        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        load_response = client.post(
+            "/api/program/load", json={"path": _PROGRAM_PATH}
+        )
+        assert load_response.status_code == 200
+        manager = state.cycle_manager
+        assert manager is not None
         # This test owns collector overflow deterministically. The recovery
-        # pump is a legitimate concurrent consumer in production, so stop
-        # it here before filling the ring; otherwise the test measures a
-        # scheduler race rather than the collector's drop accounting.
+        # pump and no-client StateHub feed are legitimate concurrent consumers
+        # in production. Stop the former and fence every drain from the latter
+        # while filling the collector ring; otherwise scheduler timing can
+        # move the same loss from the collector counter to the manager counter.
         state.stop_recovery_offer_pump()
         # Overflow the mock collector ring (maxlen 4096) before any drain:
         # the first drained batch starts past the dropped prefix, so the
         # drop counter is the only loss signal.
-        for _ in range(4200):
-            kernel._emit_kernel_event("state_transition")
+        with manager._kernel_event_drain_lock:
+            for _ in range(4200):
+                kernel._emit_kernel_event("state_transition")
         response = client.get("/api/kernel/events?since=0")
         assert response.status_code == 200
 
@@ -6733,7 +6740,7 @@ def test_kernel_events_route_records_drop_gap_evidence():
         "collector drop advance must produce durable gap evidence"
     )
     assert status["last_gap_wall"]
-    pipeline = state.cycle_manager.kernel_event_pipeline_status()
+    pipeline = manager.kernel_event_pipeline_status()
     assert pipeline["collector_dropped_total"] == 4200 - 4096
 
 
