@@ -38,6 +38,11 @@ manyforge_embed_closed_schema(
   control_interface_contract
   resources/closed_schema/catalog/manyforge.control_interface_contract.v1.yaml
   mf_ctrl_schema)
+manyforge_embed_closed_schema(
+  kEmbeddedStopEvidencePolicySchema
+  stop_evidence_policy
+  resources/closed_schema/catalog/manyforge.stop_evidence_policy.v1.yaml
+  mf_stop_schema)
 
 set(
   MANYFORGE_CORE_INCLUDE_DIR
@@ -53,6 +58,7 @@ add_library(manyforge_deployment
   src/closed_schema.cpp
   src/control_interface_contract_codec.cpp
   src/content_identity.cpp
+  src/stop_evidence_policy_codec.cpp
 )
 add_library(manyforge::deployment ALIAS manyforge_deployment)
 
@@ -113,5 +119,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_control_interface_contract_codec PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_control_interface_contract_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_stop_evidence_policy_codec
+    test/test_stop_evidence_policy_codec.cpp)
+  target_link_libraries(test_stop_evidence_policy_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_stop_evidence_policy_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 endif()

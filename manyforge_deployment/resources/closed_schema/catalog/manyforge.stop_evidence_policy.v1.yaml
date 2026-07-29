@@ -1,0 +1,886 @@
+api_version: manyforge.closed_schema.v1
+schema_id: manyforge.stop_evidence_policy.v1
+schema_revision: sha256:e516114453cac5912b204bf17267b66f08a2afa47a72a8dd0c0f0f6b808478f2
+schema_purpose: artifact_document
+root_definition_id: stop_evidence_policy
+definitions:
+  - definition_id: stop_evidence_policy
+    value_schema:
+      kind: tagged_union
+      tag_field: disposition
+      alternatives:
+        - tag_value: stoppable
+          value_schema:
+            kind: local_ref
+            definition_id: stoppable_policy
+        - tag_value: not_stoppable
+          value_schema:
+            kind: local_ref
+            definition_id: not_stoppable_policy
+  - definition_id: stoppable_policy
+    value_schema:
+      kind: object
+      fields:
+        - field_id: api_version
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manyforge.stop_evidence_policy.v1
+              - kind: string_format
+                value: api_version
+        - field_id: stop_evidence_policy_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: stop_evidence_policy_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+        - field_id: disposition
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - stoppable
+        - field_id: containment_granularity
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - resource
+                  - controller_set
+                  - control_domain
+        - field_id: containment_command
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: containment_command
+        - field_id: deadline_budget
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: deadline_budget
+        - field_id: evidence_conjunction
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - all_of
+        - field_id: evidence_requirements
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 64
+            collection:
+              kind: ordered
+            item_schema:
+              kind: local_ref
+              definition_id: evidence_requirement
+  - definition_id: not_stoppable_policy
+    value_schema:
+      kind: object
+      fields:
+        - field_id: api_version
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manyforge.stop_evidence_policy.v1
+              - kind: string_format
+                value: api_version
+        - field_id: stop_evidence_policy_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: stop_evidence_policy_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+        - field_id: disposition
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - not_stoppable
+        - field_id: containment_granularity
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - resource
+                  - controller_set
+                  - control_domain
+  - definition_id: containment_command
+    value_schema:
+      kind: object
+      fields:
+        - field_id: command_phase_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: command
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: containment_command_value
+  - definition_id: containment_command_value
+    value_schema:
+      kind: tagged_union
+      tag_field: command_kind
+      alternatives:
+        - tag_value: controller_goal_cancel
+          value_schema:
+            kind: local_ref
+            definition_id: controller_goal_cancel_command
+        - tag_value: motion_controlled_stop
+          value_schema:
+            kind: local_ref
+            definition_id: motion_controlled_stop_command
+        - tag_value: capability_command_cancel
+          value_schema:
+            kind: local_ref
+            definition_id: capability_command_cancel
+        - tag_value: safe_output_command
+          value_schema:
+            kind: local_ref
+            definition_id: safe_output_command
+        - tag_value: logical_cancel
+          value_schema:
+            kind: local_ref
+            definition_id: logical_cancel_command
+        - tag_value: registered
+          value_schema:
+            kind: local_ref
+            definition_id: registered_command
+  - definition_id: controller_goal_cancel_command
+    value_schema:
+      kind: object
+      fields:
+        - field_id: command_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - controller_goal_cancel
+  - definition_id: capability_command_cancel
+    value_schema:
+      kind: object
+      fields:
+        - field_id: command_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - capability_command_cancel
+  - definition_id: motion_controlled_stop_command
+    value_schema:
+      kind: object
+      fields:
+        - field_id: command_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - motion_controlled_stop
+        - field_id: provider_contract_ref
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: provider_contract_ref
+  - definition_id: safe_output_command
+    value_schema:
+      kind: object
+      fields:
+        - field_id: command_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - safe_output_command
+        - field_id: provider_contract_ref
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: provider_contract_ref
+  - definition_id: logical_cancel_command
+    value_schema:
+      kind: object
+      fields:
+        - field_id: command_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - logical_cancel
+        - field_id: provider_contract_ref
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: provider_contract_ref
+  - definition_id: registered_command
+    value_schema:
+      kind: object
+      fields:
+        - field_id: command_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - registered
+        - field_id: registered_command_kind_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: provider_contract_ref
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: provider_contract_ref
+  - definition_id: provider_contract_ref
+    value_schema:
+      kind: object
+      fields:
+        - field_id: provider_contract_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: contract_schema_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: api_version
+        - field_id: contract_schema_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+  - definition_id: deadline_budget
+    value_schema:
+      kind: object
+      fields:
+        - field_id: outer_duration_ns
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: integer
+            constraints:
+              - kind: minimum
+                value: 1
+              - kind: maximum
+                value: 9007199254740991
+        - field_id: kernel_completion_reserve_ns
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: integer
+            constraints:
+              - kind: minimum
+                value: 1
+              - kind: maximum
+                value: 9007199254740991
+        - field_id: phases
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 64
+            collection:
+              kind: ordered
+            item_schema:
+              kind: local_ref
+              definition_id: budget_phase
+  - definition_id: budget_phase
+    value_schema:
+      kind: object
+      fields:
+        - field_id: phase_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: deadline_offset_ns
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: integer
+            constraints:
+              - kind: minimum
+                value: 1
+              - kind: maximum
+                value: 9007199254740991
+  - definition_id: evidence_requirement
+    value_schema:
+      kind: object
+      fields:
+        - field_id: evidence_item_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: phase_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: evidence
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: evidence_value
+        - field_id: source_requirement
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: source_requirement
+        - field_id: observation_semantics
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: observation_semantics
+  - definition_id: evidence_value
+    value_schema:
+      kind: tagged_union
+      tag_field: evidence_kind
+      alternatives:
+        - tag_value: controller_goal_terminal
+          value_schema:
+            kind: local_ref
+            definition_id: controller_goal_terminal_evidence
+        - tag_value: motion_rest
+          value_schema:
+            kind: local_ref
+            definition_id: motion_rest_evidence
+        - tag_value: discrete_acknowledgement
+          value_schema:
+            kind: local_ref
+            definition_id: discrete_acknowledgement_evidence
+        - tag_value: io_safe_output
+          value_schema:
+            kind: local_ref
+            definition_id: io_safe_output_evidence
+        - tag_value: logical_cancellation_no_continuing_effect
+          value_schema:
+            kind: local_ref
+            definition_id: logical_cancellation_evidence
+        - tag_value: registered
+          value_schema:
+            kind: local_ref
+            definition_id: registered_evidence
+  - definition_id: controller_goal_terminal_evidence
+    value_schema:
+      kind: object
+      fields:
+        - field_id: evidence_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - controller_goal_terminal
+  - definition_id: discrete_acknowledgement_evidence
+    value_schema:
+      kind: object
+      fields:
+        - field_id: evidence_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - discrete_acknowledgement
+  - definition_id: motion_rest_evidence
+    value_schema:
+      kind: object
+      fields:
+        - field_id: evidence_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - motion_rest
+        - field_id: provider_contract_ref
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: provider_contract_ref
+  - definition_id: io_safe_output_evidence
+    value_schema:
+      kind: object
+      fields:
+        - field_id: evidence_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - io_safe_output
+        - field_id: provider_contract_ref
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: provider_contract_ref
+  - definition_id: logical_cancellation_evidence
+    value_schema:
+      kind: object
+      fields:
+        - field_id: evidence_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - logical_cancellation_no_continuing_effect
+        - field_id: provider_contract_ref
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: provider_contract_ref
+  - definition_id: registered_evidence
+    value_schema:
+      kind: object
+      fields:
+        - field_id: evidence_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - registered
+        - field_id: registered_evidence_kind_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: provider_contract_ref
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: provider_contract_ref
+  - definition_id: source_requirement
+    value_schema:
+      kind: tagged_union
+      tag_field: source_kind
+      alternatives:
+        - tag_value: controller_goal_status
+          value_schema:
+            kind: local_ref
+            definition_id: controller_goal_status_source
+        - tag_value: binding_state_authority
+          value_schema:
+            kind: local_ref
+            definition_id: binding_state_authority_source
+        - tag_value: command_target_status
+          value_schema:
+            kind: local_ref
+            definition_id: command_target_status_source
+        - tag_value: provider_evidence
+          value_schema:
+            kind: local_ref
+            definition_id: provider_evidence_source
+  - definition_id: controller_goal_status_source
+    value_schema:
+      kind: object
+      fields:
+        - field_id: source_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - controller_goal_status
+        - field_id: freshness_budget_ns
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: positive_duration
+  - definition_id: command_target_status_source
+    value_schema:
+      kind: object
+      fields:
+        - field_id: source_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - command_target_status
+        - field_id: freshness_budget_ns
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: positive_duration
+  - definition_id: binding_state_authority_source
+    value_schema:
+      kind: object
+      fields:
+        - field_id: source_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - binding_state_authority
+        - field_id: freshness_budget_ns
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: positive_duration
+        - field_id: state_endpoint_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: allowed_authority_classes
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 3
+            collection:
+              kind: scalar_set
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: enum
+                  values:
+                    - measured
+                    - commanded
+                    - predicted
+  - definition_id: provider_evidence_source
+    value_schema:
+      kind: object
+      fields:
+        - field_id: source_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - provider_evidence
+        - field_id: freshness_budget_ns
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: positive_duration
+        - field_id: evidence_endpoint_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+  - definition_id: observation_semantics
+    value_schema:
+      kind: tagged_union
+      tag_field: observation_kind
+      alternatives:
+        - tag_value: command_result
+          value_schema:
+            kind: local_ref
+            definition_id: command_result_observation
+        - tag_value: post_command_sample
+          value_schema:
+            kind: local_ref
+            definition_id: post_command_sample_observation
+        - tag_value: post_command_dwell
+          value_schema:
+            kind: local_ref
+            definition_id: post_command_dwell_observation
+  - definition_id: command_result_observation
+    value_schema:
+      kind: object
+      fields:
+        - field_id: observation_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - command_result
+  - definition_id: post_command_sample_observation
+    value_schema:
+      kind: object
+      fields:
+        - field_id: observation_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - post_command_sample
+  - definition_id: post_command_dwell_observation
+    value_schema:
+      kind: object
+      fields:
+        - field_id: observation_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - post_command_dwell
+        - field_id: minimum_dwell_ns
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: positive_duration
+  - definition_id: positive_duration
+    value_schema:
+      kind: scalar
+      scalar_type: integer
+      constraints:
+        - kind: minimum
+          value: 1
+        - kind: maximum
+          value: 9007199254740991

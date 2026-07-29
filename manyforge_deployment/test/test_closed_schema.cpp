@@ -459,6 +459,17 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
                 &entry);
+    } else if (entry.record_kind() ==
+               core::CatalogRecordKind::kStopEvidencePolicy) {
+      ++qualified_count;
+      EXPECT_EQ(entry.qualification(), CatalogSchemaQualification::kQualified);
+      ASSERT_NE(entry.compiled_schema(), nullptr);
+      EXPECT_EQ(entry.compiled_schema()->schema_revision().value(),
+                "sha256:e516114453cac5912b204bf17267b66f08a2afa47a72a8dd0c0f0f6b808478f2");
+      EXPECT_EQ(registry.find_qualified_catalog_schema(
+                    entry.record_kind(), entry.schema_id(),
+                    entry.compiled_schema()->schema_revision()),
+                &entry);
     } else {
       EXPECT_EQ(entry.qualification(), CatalogSchemaQualification::kUnqualified);
       EXPECT_EQ(entry.compiled_schema(), nullptr);
@@ -469,9 +480,9 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                       "sha256:0000000000000000000000000000000000000000000000000000000000000000")),
               nullptr);
   }
-  EXPECT_EQ(qualified_count, 2U);
+  EXPECT_EQ(qualified_count, 3U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
-            "sha256:c2aefa0ffe06736be0c6a7ba3e93fbb5fa86633474358999840874645a302abf");
+            "sha256:00877672c566fc361199ebc1e0f56717d9fb04a5d02f6f8d386c8c5b0c84bce7");
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),
                 core::SchemaRevision(
@@ -672,6 +683,25 @@ TEST(ClosedSchema,
                CapabilityDefinitionCodecError);
 }
 
+TEST(ClosedSchema, EveryPackagedYamlResourcePassesStrictUniqueKeyIngress) {
+  const auto resource_root =
+      std::filesystem::path(MANYFORGE_CLOSED_SCHEMA_RESOURCE_DIR);
+  std::size_t parsed_count = 0U;
+  for (const auto& entry :
+       std::filesystem::recursive_directory_iterator(resource_root)) {
+    if (!entry.is_regular_file() || entry.path().extension() != ".yaml") {
+      continue;
+    }
+    const auto relative_path =
+        std::filesystem::relative(entry.path(), resource_root).generic_string();
+    EXPECT_NO_THROW((void)parse_strict_json_model_yaml(
+        read_resource(relative_path)))
+        << relative_path;
+    ++parsed_count;
+  }
+  EXPECT_EQ(parsed_count, 7U);
+}
+
 TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjections) {
   const auto bootstrap = parse_strict_json_model_yaml(
       read_resource("manyforge.closed_schema.bootstrap.v1.yaml"));
@@ -804,21 +834,33 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
               built.schema_id().value());
     if (built.record_kind() == core::CatalogRecordKind::kCapabilityDefinition ||
         built.record_kind() ==
-            core::CatalogRecordKind::kControlInterfaceContract) {
+            core::CatalogRecordKind::kControlInterfaceContract ||
+        built.record_kind() ==
+            core::CatalogRecordKind::kStopEvidencePolicy) {
       EXPECT_EQ(projected.as_object().size(), 5U);
       EXPECT_EQ(
           std::get<std::string>(member(projected, "qualification").storage()),
           "qualified");
-      const std::string expected_revision =
-          built.record_kind() ==
-                  core::CatalogRecordKind::kCapabilityDefinition
-              ? "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0"
-              : "sha256:4abdf2c402d8e6e818bc26df59ce1c9cdc911d1e807144bdf525d2f69d0a449d";
-      const std::string expected_path =
-          built.record_kind() ==
-                  core::CatalogRecordKind::kCapabilityDefinition
-              ? "catalog/manyforge.capability_definition.v1.yaml"
-              : "catalog/manyforge.control_interface_contract.v1.yaml";
+      std::string expected_revision;
+      std::string expected_path;
+      if (built.record_kind() ==
+          core::CatalogRecordKind::kCapabilityDefinition) {
+        expected_revision =
+            "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0";
+        expected_path =
+            "catalog/manyforge.capability_definition.v1.yaml";
+      } else if (built.record_kind() ==
+                 core::CatalogRecordKind::kControlInterfaceContract) {
+        expected_revision =
+            "sha256:4abdf2c402d8e6e818bc26df59ce1c9cdc911d1e807144bdf525d2f69d0a449d";
+        expected_path =
+            "catalog/manyforge.control_interface_contract.v1.yaml";
+      } else {
+        expected_revision =
+            "sha256:e516114453cac5912b204bf17267b66f08a2afa47a72a8dd0c0f0f6b808478f2";
+        expected_path =
+            "catalog/manyforge.stop_evidence_policy.v1.yaml";
+      }
       EXPECT_EQ(
           std::get<std::string>(member(projected, "schema_revision").storage()),
           expected_revision);
@@ -851,6 +893,7 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
       "registry.v1.yaml",
       "catalog/manyforge.capability_definition.v1.yaml",
       "catalog/manyforge.control_interface_contract.v1.yaml",
+      "catalog/manyforge.stop_evidence_policy.v1.yaml",
       "examples/manyforge.closed_schema.example_command.v1.yaml",
       "examples/manyforge.closed_schema.example_inventory.v1.yaml",
   };

@@ -47,5 +47,7 @@ catalog_schemas:
     qualification: unqualified
   - record_kind: stop_evidence_policy
     schema_id: manyforge.stop_evidence_policy.v1
-    qualification: unqualified
+    schema_revision: sha256:e516114453cac5912b204bf17267b66f08a2afa47a72a8dd0c0f0f6b808478f2
+    relative_path: catalog/manyforge.stop_evidence_policy.v1.yaml
+    qualification: qualified
 value_schemas: []

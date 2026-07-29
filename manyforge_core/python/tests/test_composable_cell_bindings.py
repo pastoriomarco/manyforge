@@ -57,6 +57,11 @@ STRONG_STRING_TYPES = (
     "StateAuthorityId",
     "StopEvidencePolicyId",
     "StopEvidencePolicyRevision",
+    "StopBudgetPhaseId",
+    "StopEvidenceItemId",
+    "ProviderContractRoleId",
+    "RegisteredStopCommandKindId",
+    "RegisteredStopEvidenceKindId",
     "ContactPolicyId",
     "ContactPolicyRevision",
     "ProviderInstanceId",
@@ -234,6 +239,103 @@ def _control_interface_contract_reference(document: str, contract_id: str):
         ),
         content_addressed_store_key=core.ContentAddressedStoreKey(
             "sha256/control-interface-python"
+        ),
+    )
+
+
+def _stop_evidence_policy_document(
+    *,
+    policy_id: str = "measured_rest",
+    evidence_kind: str = "controller_goal_terminal",
+    source_kind: str = "controller_goal_status",
+    observation_kind: str = "post_command_sample",
+):
+    evidence = {"evidence_kind": evidence_kind}
+    if evidence_kind in {
+        "motion_rest",
+        "io_safe_output",
+        "logical_cancellation_no_continuing_effect",
+        "registered",
+    }:
+        evidence["provider_contract_ref"] = {
+            "provider_contract_role_id": "stop_contract",
+            "contract_schema_id": "manyforge.stop_provider_contract.v1",
+            "contract_schema_revision": ZERO_DIGEST,
+        }
+    if evidence_kind == "registered":
+        evidence["registered_evidence_kind_id"] = "vendor_terminal"
+
+    source = {
+        "source_kind": source_kind,
+        "freshness_budget_ns": 25,
+    }
+    if source_kind == "binding_state_authority":
+        source["state_endpoint_role_id"] = "measured_state"
+        source["allowed_authority_classes"] = ["measured"]
+    elif source_kind == "provider_evidence":
+        source["evidence_endpoint_role_id"] = "stop_evidence"
+
+    observation = {"observation_kind": observation_kind}
+    if observation_kind == "post_command_dwell":
+        observation["minimum_dwell_ns"] = 200
+
+    payload = {
+        "api_version": "manyforge.stop_evidence_policy.v1",
+        "stop_evidence_policy_id": policy_id,
+        "disposition": "stoppable",
+        "containment_granularity": "control_domain",
+        "containment_command": {
+            "command_phase_id": "command",
+            "command": {"command_kind": "controller_goal_cancel"},
+        },
+        "deadline_budget": {
+            "outer_duration_ns": 1000,
+            "kernel_completion_reserve_ns": 100,
+            "phases": [
+                {"phase_id": "command", "deadline_offset_ns": 100},
+                {"phase_id": "terminal", "deadline_offset_ns": 500},
+            ],
+        },
+        "evidence_conjunction": "all_of",
+        "evidence_requirements": [
+            {
+                "evidence_item_id": "terminal",
+                "phase_id": "terminal",
+                "evidence": evidence,
+                "source_requirement": source,
+                "observation_semantics": observation,
+            }
+        ],
+    }
+    canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    preimage = (
+        b"manyforge.content-identity.v1"
+        b"\x00catalog-record-revision/stop_evidence_policy"
+        b"\x00manyforge.stop_evidence_policy.v1\x00"
+        + canonical_payload.encode()
+    )
+    payload["stop_evidence_policy_revision"] = (
+        "sha256:" + hashlib.sha256(preimage).hexdigest()
+    )
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _stop_evidence_policy_reference(document: str, policy_id: str):
+    parsed = json.loads(document)
+    return core.StopEvidencePolicyCatalogRecordRefDTO(
+        record_id=core.StopEvidencePolicyId(policy_id),
+        record_revision=core.StopEvidencePolicyRevision(
+            parsed["stop_evidence_policy_revision"]
+        ),
+        schema_id=core.SchemaId("manyforge.stop_evidence_policy.v1"),
+        schema_revision=core.SchemaRevision(
+            "sha256:e516114453cac5912b204bf17267b66f08a2afa47a72a8dd0c0f0f6b808478f2"
+        ),
+        content_digest=core.ContentDigest(
+            "sha256:" + hashlib.sha256(document.encode()).hexdigest()
+        ),
+        content_addressed_store_key=core.ContentAddressedStoreKey(
+            "sha256/stop-policy-python"
         ),
     )
 
@@ -712,6 +814,131 @@ def test_control_interface_contract_rejects_referent_identity_mismatches():
         )
 
 
+def test_stop_evidence_policy_is_typed_immutable_and_exactly_qualified():
+    assert (
+        core.STOP_EVIDENCE_POLICY_API_VERSION
+        == "manyforge.stop_evidence_policy.v1"
+    )
+    assert core.MAX_STOP_EVIDENCE_POLICY_ITEMS == 64
+    assert core.MAX_STOP_EVIDENCE_POLICY_DURATION_NS == (2**53) - 1
+
+    contract = core.ProviderContractRefDTO(
+        provider_contract_role_id=core.ProviderContractRoleId("stop_contract"),
+        contract_schema_id=core.SchemaId(
+            "manyforge.stop_provider_contract.v1"
+        ),
+        contract_schema_revision=core.SchemaRevision(ZERO_DIGEST),
+    )
+    command = core.StopContainmentCommandDTO(
+        command_phase_id=core.StopBudgetPhaseId("command"),
+        command_kind=core.StopContainmentCommandKind.kMotionControlledStop,
+        provider_contract_ref=contract,
+    )
+    budget = core.StopDeadlineBudgetDTO(
+        outer_duration_ns=1000,
+        kernel_completion_reserve_ns=100,
+        phases=[
+            core.StopBudgetPhaseDTO(core.StopBudgetPhaseId("command"), 100),
+            core.StopBudgetPhaseDTO(core.StopBudgetPhaseId("rest"), 500),
+        ],
+    )
+    evidence = core.StopEvidenceRequirementDTO(
+        evidence_item_id=core.StopEvidenceItemId("rest"),
+        phase_id=core.StopBudgetPhaseId("rest"),
+        evidence_kind=core.StopEvidenceRequirementKind.kMotionRest,
+        provider_contract_ref=contract,
+        source_requirement=core.StopEvidenceSourceRequirementDTO(
+            source_kind=core.StopEvidenceSourceKind.kBindingStateAuthority,
+            freshness_budget_ns=25,
+            endpoint_role_id=core.EndpointRoleId("measured_state"),
+            allowed_authority_classes=[core.StateAuthorityClass.kMeasured],
+        ),
+        observation_semantics=core.StopEvidenceObservationDTO(
+            observation_kind=core.StopEvidenceObservationKind.kPostCommandDwell,
+            minimum_dwell_ns=200,
+        ),
+    )
+    dto = core.StopEvidencePolicyDTO(
+        stop_evidence_policy_id=core.StopEvidencePolicyId("typed_stop"),
+        stop_evidence_policy_revision=core.StopEvidencePolicyRevision(
+            ZERO_DIGEST
+        ),
+        disposition=core.StopEvidenceDisposition.kStoppable,
+        containment_granularity=core.ContainmentGranularity.kControlDomain,
+        containment_command=command,
+        deadline_budget=budget,
+        evidence_conjunction=core.StopEvidenceConjunction.kAllOf,
+        evidence_requirements=[evidence],
+    )
+    assert dto.containment_command == command
+    assert dto.deadline_budget == budget
+    assert dto.evidence_requirements == [evidence]
+    with pytest.raises(AttributeError):
+        dto.evidence_requirements = []
+    with pytest.raises(AttributeError):
+        evidence.evidence_kind = (
+            core.StopEvidenceRequirementKind.kControllerGoalTerminal
+        )
+
+    document = _stop_evidence_policy_document()
+    reference = _stop_evidence_policy_reference(document, "measured_rest")
+    store_key = core.ContentAddressedStoreKey("sha256/stop-policy-python")
+    qualified = core.resolve_and_qualify_stop_evidence_policy(
+        reference, store_key, document
+    )
+    assert isinstance(qualified, core.QualifiedStopEvidencePolicy)
+    assert qualified.value.stop_evidence_policy_id == core.StopEvidencePolicyId(
+        "measured_rest"
+    )
+    assert (
+        qualified.value.evidence_requirements[0].evidence_kind
+        == core.StopEvidenceRequirementKind.kControllerGoalTerminal
+    )
+    assert json.loads(qualified.normalized_canonical_json) == json.loads(
+        document
+    )
+
+
+def test_stop_evidence_policy_rejects_cross_field_and_referent_defects():
+    invalid_document = _stop_evidence_policy_document(
+        policy_id="invalid_matrix",
+        evidence_kind="motion_rest",
+        source_kind="provider_evidence",
+        observation_kind="post_command_dwell",
+    )
+    invalid_reference = _stop_evidence_policy_reference(
+        invalid_document, "invalid_matrix"
+    )
+    store_key = core.ContentAddressedStoreKey("sha256/stop-policy-python")
+    with pytest.raises(core.StopEvidencePolicyCodecError):
+        core.resolve_and_qualify_stop_evidence_policy(
+            invalid_reference, store_key, invalid_document
+        )
+
+    document = _stop_evidence_policy_document()
+    reference = _stop_evidence_policy_reference(document, "measured_rest")
+    with pytest.raises(
+        core.StopEvidencePolicyCodecError, match="different store key"
+    ):
+        core.resolve_and_qualify_stop_evidence_policy(
+            reference,
+            core.ContentAddressedStoreKey("sha256/other"),
+            document,
+        )
+    wrong_digest = core.StopEvidencePolicyCatalogRecordRefDTO(
+        record_id=reference.record_id,
+        record_revision=reference.record_revision,
+        schema_id=reference.schema_id,
+        schema_revision=reference.schema_revision,
+        content_digest=core.ContentDigest(ZERO_DIGEST),
+        content_addressed_store_key=reference.content_addressed_store_key,
+    )
+    with pytest.raises(core.StopEvidencePolicyCodecError):
+        core.resolve_and_qualify_stop_evidence_policy(
+            wrong_digest, store_key, document
+        )
+
+
 def test_json_value_is_explicit_recursive_and_immutable():
     value = core.JsonValueDTO(
         {
@@ -1049,15 +1276,17 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kQualified
     ]
-    assert len(qualified_entries) == 2
+    assert len(qualified_entries) == 3
     assert {entry.record_kind for entry in qualified_entries} == {
         core.CatalogRecordKind.kCapabilityDefinition,
         core.CatalogRecordKind.kControlInterfaceContract,
+        core.CatalogRecordKind.kStopEvidencePolicy,
     }
     assert all(entry.compiled_schema is not None for entry in qualified_entries)
     assert {entry.relative_path for entry in qualified_entries} == {
         "catalog/manyforge.capability_definition.v1.yaml",
         "catalog/manyforge.control_interface_contract.v1.yaml",
+        "catalog/manyforge.stop_evidence_policy.v1.yaml",
     }
     assert all(
         entry.compiled_schema is None and entry.relative_path == ""
@@ -1066,7 +1295,7 @@ target: 0.5
     )
     assert registry.value_schemas == ()
     assert registry.qualification_registry_digest.value == (
-        "sha256:c2aefa0ffe06736be0c6a7ba3e93fbb5fa86633474358999840874645a302abf"
+        "sha256:00877672c566fc361199ebc1e0f56717d9fb04a5d02f6f8d386c8c5b0c84bce7"
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][

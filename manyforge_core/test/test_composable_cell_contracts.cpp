@@ -5,6 +5,7 @@
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
+#include <manyforge_core/types/stop_evidence_policy.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <set>
@@ -305,6 +306,80 @@ TEST(ComposableCellContracts, ContactPolicyRegistryUsesReferentOwnFieldNames) {
   EXPECT_EQ(descriptor.own_id_field, "policy_id");
   EXPECT_EQ(descriptor.own_revision_field, "version");
   EXPECT_TRUE(catalog_record_ref_matches_registry_family(record));
+}
+
+TEST(ComposableCellContracts,
+     StopEvidencePolicyTypesPreserveTheClosedDeclarativeVocabulary) {
+  EXPECT_EQ(kStopEvidencePolicyApiVersion,
+            "manyforge.stop_evidence_policy.v1");
+  EXPECT_EQ(kMaxStopEvidencePolicyItems, 64U);
+  EXPECT_EQ(kMaxStopEvidencePolicyDurationNs, 9007199254740991LL);
+  EXPECT_EQ(to_string(StopEvidenceDisposition::kStoppable), "stoppable");
+  EXPECT_EQ(to_string(StopEvidenceDisposition::kNotStoppable),
+            "not_stoppable");
+  EXPECT_EQ(to_string(StopContainmentCommandKind::kRegistered),
+            "registered");
+  EXPECT_EQ(to_string(StopEvidenceConjunction::kAllOf), "all_of");
+  EXPECT_EQ(
+      to_string(
+          StopEvidenceRequirementKind::
+              kLogicalCancellationNoContinuingEffect),
+      "logical_cancellation_no_continuing_effect");
+  EXPECT_EQ(to_string(StopEvidenceSourceKind::kBindingStateAuthority),
+            "binding_state_authority");
+  EXPECT_EQ(to_string(StopEvidenceObservationKind::kPostCommandDwell),
+            "post_command_dwell");
+
+  const ProviderContractRefDTO contract{
+      ProviderContractRoleId{"stop_contract"},
+      SchemaId{"manyforge.stop_provider_contract.v1"},
+      SchemaRevision{kDigest},
+  };
+  const StopEvidencePolicyDTO policy{
+      StopEvidencePolicyId{"measured_rest"},
+      StopEvidencePolicyRevision{kDigest},
+      StopEvidenceDisposition::kStoppable,
+      ContainmentGranularity::kControlDomain,
+      StopContainmentCommandDTO{
+          StopBudgetPhaseId{"command"},
+          StopContainmentCommandKind::kMotionControlledStop,
+          contract,
+          std::nullopt,
+      },
+      StopDeadlineBudgetDTO{
+          1'000,
+          100,
+          {
+              {StopBudgetPhaseId{"command"}, 100},
+              {StopBudgetPhaseId{"rest"}, 500},
+          },
+      },
+      StopEvidenceConjunction::kAllOf,
+      {
+          {
+              StopEvidenceItemId{"rest"},
+              StopBudgetPhaseId{"rest"},
+              StopEvidenceRequirementKind::kMotionRest,
+              contract,
+              std::nullopt,
+              {
+                  StopEvidenceSourceKind::kBindingStateAuthority,
+                  25,
+                  EndpointRoleId{"measured_state"},
+                  {StateAuthorityClass::kMeasured},
+              },
+              {
+                  StopEvidenceObservationKind::kPostCommandDwell,
+                  200,
+              },
+          },
+      },
+  };
+  ASSERT_TRUE(policy.deadline_budget.has_value());
+  EXPECT_EQ(policy.deadline_budget->phases.size(), 2U);
+  ASSERT_EQ(policy.evidence_requirements.size(), 1U);
+  EXPECT_EQ(policy.evidence_requirements.front().provider_contract_ref,
+            contract);
 }
 
 TEST(ComposableCellContracts,

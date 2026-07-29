@@ -6,6 +6,7 @@
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/control_interface_contract.hpp>
+#include <manyforge_core/types/stop_evidence_policy.hpp>
 #include <optional>
 #include <string>
 #include <utility>
@@ -221,6 +222,262 @@ void register_catalog_record_bindings(py::module_& module) {
       std::string(kControlInterfaceContractApiVersion);
   module.attr("MAX_CONTROL_INTERFACE_CONTRACT_ITEMS") =
       kMaxControlInterfaceContractItems;
+
+  py::enum_<StopEvidenceDisposition>(module, "StopEvidenceDisposition")
+      .value("kStoppable", StopEvidenceDisposition::kStoppable)
+      .value("kNotStoppable", StopEvidenceDisposition::kNotStoppable);
+  py::enum_<StopContainmentCommandKind>(module,
+                                        "StopContainmentCommandKind")
+      .value("kControllerGoalCancel",
+             StopContainmentCommandKind::kControllerGoalCancel)
+      .value("kMotionControlledStop",
+             StopContainmentCommandKind::kMotionControlledStop)
+      .value("kCapabilityCommandCancel",
+             StopContainmentCommandKind::kCapabilityCommandCancel)
+      .value("kSafeOutputCommand",
+             StopContainmentCommandKind::kSafeOutputCommand)
+      .value("kLogicalCancel", StopContainmentCommandKind::kLogicalCancel)
+      .value("kRegistered", StopContainmentCommandKind::kRegistered);
+  py::enum_<StopEvidenceConjunction>(module, "StopEvidenceConjunction")
+      .value("kAllOf", StopEvidenceConjunction::kAllOf);
+  py::enum_<StopEvidenceRequirementKind>(
+      module, "StopEvidenceRequirementKind")
+      .value("kControllerGoalTerminal",
+             StopEvidenceRequirementKind::kControllerGoalTerminal)
+      .value("kMotionRest", StopEvidenceRequirementKind::kMotionRest)
+      .value("kDiscreteAcknowledgement",
+             StopEvidenceRequirementKind::kDiscreteAcknowledgement)
+      .value("kIoSafeOutput", StopEvidenceRequirementKind::kIoSafeOutput)
+      .value(
+          "kLogicalCancellationNoContinuingEffect",
+          StopEvidenceRequirementKind::
+              kLogicalCancellationNoContinuingEffect)
+      .value("kRegistered", StopEvidenceRequirementKind::kRegistered);
+  py::enum_<StopEvidenceSourceKind>(module, "StopEvidenceSourceKind")
+      .value("kControllerGoalStatus",
+             StopEvidenceSourceKind::kControllerGoalStatus)
+      .value("kBindingStateAuthority",
+             StopEvidenceSourceKind::kBindingStateAuthority)
+      .value("kCommandTargetStatus",
+             StopEvidenceSourceKind::kCommandTargetStatus)
+      .value("kProviderEvidence",
+             StopEvidenceSourceKind::kProviderEvidence);
+  py::enum_<StopEvidenceObservationKind>(
+      module, "StopEvidenceObservationKind")
+      .value("kCommandResult",
+             StopEvidenceObservationKind::kCommandResult)
+      .value("kPostCommandSample",
+             StopEvidenceObservationKind::kPostCommandSample)
+      .value("kPostCommandDwell",
+             StopEvidenceObservationKind::kPostCommandDwell);
+
+  py::class_<ProviderContractRefDTO>(module, "ProviderContractRefDTO",
+                                     py::is_final())
+      .def(py::init<ProviderContractRoleId, SchemaId, SchemaRevision>(),
+           py::arg("provider_contract_role_id"),
+           py::arg("contract_schema_id"),
+           py::arg("contract_schema_revision"))
+      .def_readonly("provider_contract_role_id",
+                    &ProviderContractRefDTO::provider_contract_role_id)
+      .def_readonly("contract_schema_id",
+                    &ProviderContractRefDTO::contract_schema_id)
+      .def_readonly("contract_schema_revision",
+                    &ProviderContractRefDTO::contract_schema_revision)
+      .def(
+          "__eq__",
+          [](const ProviderContractRefDTO& lhs,
+             const ProviderContractRefDTO& rhs) { return lhs == rhs; },
+          py::is_operator());
+
+  py::class_<StopContainmentCommandDTO>(
+      module, "StopContainmentCommandDTO", py::is_final())
+      .def(py::init<StopBudgetPhaseId, StopContainmentCommandKind,
+                    std::optional<ProviderContractRefDTO>,
+                    std::optional<RegisteredStopCommandKindId>>(),
+           py::arg("command_phase_id"), py::arg("command_kind"),
+           py::arg("provider_contract_ref") = std::nullopt,
+           py::arg("registered_command_kind_id") = std::nullopt)
+      .def_readonly("command_phase_id",
+                    &StopContainmentCommandDTO::command_phase_id)
+      .def_readonly("command_kind",
+                    &StopContainmentCommandDTO::command_kind)
+      .def_readonly("provider_contract_ref",
+                    &StopContainmentCommandDTO::provider_contract_ref)
+      .def_readonly("registered_command_kind_id",
+                    &StopContainmentCommandDTO::registered_command_kind_id)
+      .def(
+          "__eq__",
+          [](const StopContainmentCommandDTO& lhs,
+             const StopContainmentCommandDTO& rhs) { return lhs == rhs; },
+          py::is_operator());
+
+  py::class_<StopBudgetPhaseDTO>(module, "StopBudgetPhaseDTO",
+                                 py::is_final())
+      .def(py::init<StopBudgetPhaseId, std::int64_t>(),
+           py::arg("phase_id"), py::arg("deadline_offset_ns"))
+      .def_readonly("phase_id", &StopBudgetPhaseDTO::phase_id)
+      .def_readonly("deadline_offset_ns",
+                    &StopBudgetPhaseDTO::deadline_offset_ns)
+      .def(
+          "__eq__",
+          [](const StopBudgetPhaseDTO& lhs, const StopBudgetPhaseDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator());
+
+  py::class_<StopDeadlineBudgetDTO>(module, "StopDeadlineBudgetDTO",
+                                    py::is_final())
+      .def(py::init<std::int64_t, std::int64_t,
+                    std::vector<StopBudgetPhaseDTO>>(),
+           py::arg("outer_duration_ns"),
+           py::arg("kernel_completion_reserve_ns"), py::arg("phases"))
+      .def_readonly("outer_duration_ns",
+                    &StopDeadlineBudgetDTO::outer_duration_ns)
+      .def_readonly("kernel_completion_reserve_ns",
+                    &StopDeadlineBudgetDTO::kernel_completion_reserve_ns)
+      .def_readonly("phases", &StopDeadlineBudgetDTO::phases)
+      .def(
+          "__eq__",
+          [](const StopDeadlineBudgetDTO& lhs,
+             const StopDeadlineBudgetDTO& rhs) { return lhs == rhs; },
+          py::is_operator());
+
+  py::class_<StopEvidenceSourceRequirementDTO>(
+      module, "StopEvidenceSourceRequirementDTO", py::is_final())
+      .def(py::init<StopEvidenceSourceKind, std::int64_t,
+                    std::optional<EndpointRoleId>,
+                    std::vector<StateAuthorityClass>>(),
+           py::arg("source_kind"), py::arg("freshness_budget_ns"),
+           py::arg("endpoint_role_id") = std::nullopt,
+           py::arg("allowed_authority_classes") =
+               std::vector<StateAuthorityClass>{})
+      .def_readonly("source_kind",
+                    &StopEvidenceSourceRequirementDTO::source_kind)
+      .def_readonly("freshness_budget_ns",
+                    &StopEvidenceSourceRequirementDTO::freshness_budget_ns)
+      .def_readonly("endpoint_role_id",
+                    &StopEvidenceSourceRequirementDTO::endpoint_role_id)
+      .def_readonly(
+          "allowed_authority_classes",
+          &StopEvidenceSourceRequirementDTO::allowed_authority_classes)
+      .def(
+          "__eq__",
+          [](const StopEvidenceSourceRequirementDTO& lhs,
+             const StopEvidenceSourceRequirementDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator());
+
+  py::class_<StopEvidenceObservationDTO>(
+      module, "StopEvidenceObservationDTO", py::is_final())
+      .def(py::init<StopEvidenceObservationKind,
+                    std::optional<std::int64_t>>(),
+           py::arg("observation_kind"),
+           py::arg("minimum_dwell_ns") = std::nullopt)
+      .def_readonly("observation_kind",
+                    &StopEvidenceObservationDTO::observation_kind)
+      .def_readonly("minimum_dwell_ns",
+                    &StopEvidenceObservationDTO::minimum_dwell_ns)
+      .def(
+          "__eq__",
+          [](const StopEvidenceObservationDTO& lhs,
+             const StopEvidenceObservationDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator());
+
+  py::class_<StopEvidenceRequirementDTO>(
+      module, "StopEvidenceRequirementDTO", py::is_final())
+      .def(py::init([](
+               StopEvidenceItemId evidence_item_id,
+               StopBudgetPhaseId phase_id,
+               StopEvidenceRequirementKind evidence_kind,
+               StopEvidenceSourceRequirementDTO source_requirement,
+               StopEvidenceObservationDTO observation_semantics,
+               std::optional<ProviderContractRefDTO> provider_contract_ref,
+               std::optional<RegisteredStopEvidenceKindId>
+                   registered_evidence_kind_id) {
+             return StopEvidenceRequirementDTO{
+                 std::move(evidence_item_id),
+                 std::move(phase_id),
+                 evidence_kind,
+                 std::move(provider_contract_ref),
+                 std::move(registered_evidence_kind_id),
+                 std::move(source_requirement),
+                 std::move(observation_semantics)};
+           }),
+           py::arg("evidence_item_id"), py::arg("phase_id"),
+           py::arg("evidence_kind"), py::arg("source_requirement"),
+           py::arg("observation_semantics"),
+           py::arg("provider_contract_ref") = std::nullopt,
+           py::arg("registered_evidence_kind_id") = std::nullopt)
+      .def_readonly("evidence_item_id",
+                    &StopEvidenceRequirementDTO::evidence_item_id)
+      .def_readonly("phase_id", &StopEvidenceRequirementDTO::phase_id)
+      .def_readonly("evidence_kind",
+                    &StopEvidenceRequirementDTO::evidence_kind)
+      .def_readonly("provider_contract_ref",
+                    &StopEvidenceRequirementDTO::provider_contract_ref)
+      .def_readonly("registered_evidence_kind_id",
+                    &StopEvidenceRequirementDTO::
+                        registered_evidence_kind_id)
+      .def_readonly("source_requirement",
+                    &StopEvidenceRequirementDTO::source_requirement)
+      .def_readonly("observation_semantics",
+                    &StopEvidenceRequirementDTO::observation_semantics)
+      .def(
+          "__eq__",
+          [](const StopEvidenceRequirementDTO& lhs,
+             const StopEvidenceRequirementDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator());
+
+  py::class_<StopEvidencePolicyDTO>(module, "StopEvidencePolicyDTO",
+                                    py::is_final())
+      .def(py::init<
+               StopEvidencePolicyId, StopEvidencePolicyRevision,
+               StopEvidenceDisposition, ContainmentGranularity,
+               std::optional<StopContainmentCommandDTO>,
+               std::optional<StopDeadlineBudgetDTO>,
+               std::optional<StopEvidenceConjunction>,
+               std::vector<StopEvidenceRequirementDTO>>(),
+           py::arg("stop_evidence_policy_id"),
+           py::arg("stop_evidence_policy_revision"),
+           py::arg("disposition"), py::arg("containment_granularity"),
+           py::arg("containment_command") = std::nullopt,
+           py::arg("deadline_budget") = std::nullopt,
+           py::arg("evidence_conjunction") = std::nullopt,
+           py::arg("evidence_requirements") =
+               std::vector<StopEvidenceRequirementDTO>{})
+      .def_readonly("stop_evidence_policy_id",
+                    &StopEvidencePolicyDTO::stop_evidence_policy_id)
+      .def_readonly("stop_evidence_policy_revision",
+                    &StopEvidencePolicyDTO::stop_evidence_policy_revision)
+      .def_readonly("disposition",
+                    &StopEvidencePolicyDTO::disposition)
+      .def_readonly("containment_granularity",
+                    &StopEvidencePolicyDTO::containment_granularity)
+      .def_readonly("containment_command",
+                    &StopEvidencePolicyDTO::containment_command)
+      .def_readonly("deadline_budget",
+                    &StopEvidencePolicyDTO::deadline_budget)
+      .def_readonly("evidence_conjunction",
+                    &StopEvidencePolicyDTO::evidence_conjunction)
+      .def_readonly("evidence_requirements",
+                    &StopEvidencePolicyDTO::evidence_requirements)
+      .def(
+          "__eq__",
+          [](const StopEvidencePolicyDTO& lhs,
+             const StopEvidencePolicyDTO& rhs) { return lhs == rhs; },
+          py::is_operator());
+
+  module.attr("STOP_EVIDENCE_POLICY_API_VERSION") =
+      std::string(kStopEvidencePolicyApiVersion);
+  module.attr("MAX_STOP_EVIDENCE_POLICY_ITEMS") =
+      kMaxStopEvidencePolicyItems;
+  module.attr("MAX_STOP_EVIDENCE_POLICY_DURATION_NS") =
+      kMaxStopEvidencePolicyDurationNs;
 
   py::class_<ValueSchemaRefDescriptor>(module, "ValueSchemaRefDescriptor",
                                        py::is_final())

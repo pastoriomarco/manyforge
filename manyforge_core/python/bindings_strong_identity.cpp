@@ -81,6 +81,11 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(StateAuthorityId);
   MANYFORGE_BIND_STRONG_STRING(StopEvidencePolicyId);
   MANYFORGE_BIND_STRONG_STRING(StopEvidencePolicyRevision);
+  MANYFORGE_BIND_STRONG_STRING(StopBudgetPhaseId);
+  MANYFORGE_BIND_STRONG_STRING(StopEvidenceItemId);
+  MANYFORGE_BIND_STRONG_STRING(ProviderContractRoleId);
+  MANYFORGE_BIND_STRONG_STRING(RegisteredStopCommandKindId);
+  MANYFORGE_BIND_STRONG_STRING(RegisteredStopEvidenceKindId);
   MANYFORGE_BIND_STRONG_STRING(ContactPolicyId);
   MANYFORGE_BIND_STRONG_STRING(ContactPolicyRevision);
 
