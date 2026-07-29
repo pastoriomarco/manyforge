@@ -1,0 +1,42 @@
+{
+  "$schema": "manyforge.experimental.composable_cell.i1a.v0",
+  "cases": [
+    {
+      "expected_joints": [
+        "joint1",
+        "joint2",
+        "finger_joint"
+      ],
+      "group": "aggregate",
+      "name": "nested",
+      "srdf": "<robot name=\"nested\"><group name=\"arm\"><joint name=\"joint1\"/><joint name=\"joint2\"/></group><group name=\"tool\"><joint name=\"finger_joint\"/></group><group name=\"aggregate\"><group name=\"arm\"/><group name=\"tool\"/></group></robot>"
+    },
+    {
+      "expected_joints": [
+        "joint1",
+        "joint2"
+      ],
+      "group": "view",
+      "name": "overlapping",
+      "srdf": "<robot name=\"overlap\"><group name=\"arm\"><joint name=\"joint1\"/><joint name=\"joint2\"/></group><group name=\"wrist\"><joint name=\"joint2\"/></group><group name=\"view\"><group name=\"arm\"/><group name=\"wrist\"/></group></robot>"
+    },
+    {
+      "error": "cycle",
+      "group": "a",
+      "name": "cycle",
+      "srdf": "<robot name=\"cycle\"><group name=\"a\"><group name=\"b\"/></group><group name=\"b\"><group name=\"a\"/></group></robot>"
+    },
+    {
+      "error": "unknown subgroup",
+      "group": "aggregate",
+      "name": "missing",
+      "srdf": "<robot name=\"missing\"><group name=\"aggregate\"><group name=\"absent\"/></group></robot>"
+    },
+    {
+      "expected_joints": [],
+      "group": "planning_only",
+      "name": "planning_only",
+      "srdf": "<robot name=\"planning\"><group name=\"planning_only\"><link name=\"world\"/></group></robot>"
+    }
+  ]
+}
