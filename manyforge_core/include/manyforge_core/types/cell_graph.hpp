@@ -1,0 +1,199 @@
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <manyforge_core/types/json_value.hpp>
+#include <manyforge_core/types/strong_id.hpp>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace manyforge::core {
+
+inline constexpr std::string_view kCellGraphApiVersion = "manyforge.cell_graph.v1";
+
+enum class ContainmentGranularity : std::uint8_t {
+  kResource = 0,
+  kControllerSet,
+  kControlDomain,
+};
+
+enum class StateAuthorityClass : std::uint8_t {
+  kMeasured = 0,
+  kCommanded,
+  kPredicted,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(ContainmentGranularity value) noexcept {
+  switch (value) {
+    case ContainmentGranularity::kResource:
+      return "resource";
+    case ContainmentGranularity::kControllerSet:
+      return "controller_set";
+    case ContainmentGranularity::kControlDomain:
+      return "control_domain";
+  }
+  return {};
+}
+
+[[nodiscard]] constexpr std::string_view to_string(StateAuthorityClass value) noexcept {
+  switch (value) {
+    case StateAuthorityClass::kMeasured:
+      return "measured";
+    case StateAuthorityClass::kCommanded:
+      return "commanded";
+    case StateAuthorityClass::kPredicted:
+      return "predicted";
+  }
+  return {};
+}
+
+struct MountPoseDTO {
+  std::array<double, 3> position_m{};
+  std::array<double, 4> orientation_xyzw{0.0, 0.0, 0.0, 1.0};
+
+  friend bool operator==(const MountPoseDTO&, const MountPoseDTO&) = default;
+};
+
+struct ModelRoleBindingDTO {
+  ModelRoleId model_role_id;
+  ModelInstanceId model_instance_id;
+
+  friend bool operator==(const ModelRoleBindingDTO&, const ModelRoleBindingDTO&) = default;
+};
+
+struct ResourceBindingDTO {
+  ResourceRoleId resource_role_id;
+  ResourceId resource_id;
+
+  friend bool operator==(const ResourceBindingDTO&, const ResourceBindingDTO&) = default;
+};
+
+struct RouteEndpointProjectionDTO {
+  ControlRouteId control_route_id;
+  std::vector<EndpointRoleId> command_endpoint_role_ids;
+  std::vector<EndpointRoleId> state_endpoint_role_ids;
+
+  friend bool operator==(const RouteEndpointProjectionDTO&,
+                         const RouteEndpointProjectionDTO&) = default;
+};
+
+struct ComponentAttachmentEndpointDTO {
+  ControllableComponentId controllable_component_id;
+  AttachmentInterfaceId attachment_interface_id;
+
+  friend bool operator==(const ComponentAttachmentEndpointDTO&,
+                         const ComponentAttachmentEndpointDTO&) = default;
+};
+
+/// One of exactly six mutable graph-record kinds.
+struct RuntimeUnitDTO {
+  RuntimeUnitId runtime_unit_id;
+  RuntimeProfileId runtime_profile_id;
+  ContentDigest runtime_profile_digest;
+  std::vector<RuntimeUnitId> dependency_runtime_unit_ids;
+  JsonObjectDTO configuration;
+
+  friend bool operator==(const RuntimeUnitDTO&, const RuntimeUnitDTO&) = default;
+};
+
+/// One of exactly six mutable graph-record kinds.
+struct ModelInstanceDTO {
+  ModelInstanceId model_instance_id;
+  ModelAssetId model_asset_id;
+  ModelRevision model_revision;
+  FrameRoleId mount_parent_frame_role;
+  MountPoseDTO mount_pose;
+  JsonObjectDTO instance_parameters;
+
+  friend bool operator==(const ModelInstanceDTO&, const ModelInstanceDTO&) = default;
+};
+
+/// One of exactly six mutable graph-record kinds.
+struct ControllableComponentDTO {
+  ControllableComponentId controllable_component_id;
+  ComponentTypeId component_type_id;
+  ComponentTypeRevision component_type_revision;
+  ContentDigest component_type_digest;
+  std::vector<ModelRoleBindingDTO> model_role_bindings;
+  std::vector<RuntimeUnitId> runtime_unit_ids;
+
+  friend bool operator==(const ControllableComponentDTO&,
+                         const ControllableComponentDTO&) = default;
+};
+
+/// One of exactly six mutable graph-record kinds.
+struct ControlDomainDTO {
+  ControlDomainId control_domain_id;
+  ControlDomainRevision control_domain_revision;
+  std::vector<RuntimeUnitId> runtime_unit_ids;
+  EndpointRoleId control_coordinator_endpoint_role;
+  ControllerTopologyId controller_topology_id;
+  TopologyRevision topology_revision;
+  ContainmentGranularity containment_granularity;
+
+  friend bool operator==(const ControlDomainDTO&, const ControlDomainDTO&) = default;
+};
+
+/// One of exactly six mutable graph-record kinds.
+struct ControlBindingDTO {
+  ControlBindingId control_binding_id;
+  ControlBindingRevision control_binding_revision;
+  ControllableComponentId controllable_component_id;
+  CommandTargetId command_target_id;
+  CapabilityId capability_id;
+  ControlDomainId control_domain_id;
+  std::vector<ResourceBindingDTO> resource_bindings;
+  ControlInterfaceContractId control_interface_contract_id;
+  ControlInterfaceRevision control_interface_revision;
+  ControllerTopologyId controller_topology_id;
+  TopologyRevision topology_revision;
+  std::vector<ControlRouteId> legal_control_route_ids;
+  std::vector<RouteEndpointProjectionDTO> route_endpoint_projections;
+  ProviderInstanceId provider_instance_id;
+  ProviderManifestRevision provider_manifest_revision;
+  ProviderDigest provider_digest;
+  StateAuthorityId state_authority_id;
+  StateAuthorityClass state_authority_class;
+  StopEvidencePolicyId stop_evidence_policy_id;
+  StopEvidencePolicyRevision stop_evidence_policy_revision;
+  ContentDigest stop_evidence_policy_digest;
+  ContainmentGranularity containment_granularity;
+
+  friend bool operator==(const ControlBindingDTO&, const ControlBindingDTO&) = default;
+};
+
+/// One of exactly six mutable graph-record kinds.
+struct ComponentAttachmentEdgeDTO {
+  ComponentAttachmentId component_attachment_id;
+  ComponentAttachmentRevision component_attachment_revision;
+  ComponentAttachmentEndpointDTO parent;
+  ComponentAttachmentEndpointDTO child;
+  MountPoseDTO mount_pose;
+  AttachmentRoleId role;
+  bool detachable = false;
+  std::vector<FrameRoleId> tcp_effects;
+  std::vector<CollisionBodyRoleId> collision_effects;
+  ContentDigest provenance_digest;
+
+  friend bool operator==(const ComponentAttachmentEdgeDTO&,
+                         const ComponentAttachmentEdgeDTO&) = default;
+};
+
+/// Closed v1 graph envelope. Individual records deliberately do not repeat
+/// graph_revision.
+struct CellGraphDTO {
+  std::string api_version;
+  GraphRevision graph_revision;
+  CellId cell_id;
+  std::vector<RuntimeUnitDTO> runtime_units;
+  std::vector<ModelInstanceDTO> model_instances;
+  std::vector<ControllableComponentDTO> controllable_components;
+  std::vector<ControlDomainDTO> control_domains;
+  std::vector<ControlBindingDTO> control_bindings;
+  std::vector<ComponentAttachmentEdgeDTO> component_attachments;
+
+  friend bool operator==(const CellGraphDTO&, const CellGraphDTO&) = default;
+};
+
+}  // namespace manyforge::core

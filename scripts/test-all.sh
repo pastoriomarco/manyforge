@@ -81,17 +81,41 @@ build_manyforge_core() {
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
 }
 
+build_manyforge_deployment() {
+    local build="$1"
+    local build_testing="$2"
+    mkdir -p "$build"
+    cd "$build"
+    cmake "$WORKSPACE/manyforge_deployment" -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING="$build_testing" \
+        -DMANYFORGE_CORE_INCLUDE_DIR="$WORKSPACE/manyforge_core/include" \
+        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
+    cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
+}
+
 run_cpp_tests() {
     section "C++ manyforge_core tests"
-    local build="$BUILD_DIR/core"
-    build_manyforge_core "$build" ON
-    cd "$build"
+    local core_build="$BUILD_DIR/core"
+    build_manyforge_core "$core_build" ON
+    cd "$core_build"
     # Both layers matter: the per-test TIMEOUT property baked by cmake
     # above (the -D flag re-evaluates on every run, so the env var
     # propagates correctly through the launcher path) AND the ctest
     # CLI flag as a safety net for any ad-hoc `ctest` invocation that
     # bypasses test-all.sh. ctest takes the min of the two.
     if ! require_ctest_tests "manyforge_core"; then
+        FAIL=$((FAIL + 1))
+    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+
+    section "C++ manyforge_deployment tests"
+    local deployment_build="$BUILD_DIR/deployment"
+    build_manyforge_deployment "$deployment_build" ON
+    cd "$deployment_build"
+    if ! require_ctest_tests "manyforge_deployment"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
@@ -171,10 +195,12 @@ PY
 run_pybind_tests() {
     section "pybind11 bindings tests"
     local core_build="$BUILD_DIR/core"
+    local deployment_build="$BUILD_DIR/deployment"
     local pybind_build="$BUILD_DIR/pybind"
-    # Always run the incremental core build. Merely finding an archive does not
-    # prove it was built from the current source tree.
+    # Always run both incremental ROS-free library builds. Merely finding an
+    # archive does not prove it was built from the current source tree.
     build_manyforge_core "$core_build" OFF
+    build_manyforge_deployment "$deployment_build" OFF
 
     local pybind11_dir
     pybind11_dir=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())" 2>/dev/null || echo "")
@@ -184,6 +210,8 @@ run_pybind_tests() {
     cmake "$WORKSPACE/manyforge_core/python" \
         -DMANYFORGE_CORE_DIR="$core_build" \
         -DMANYFORGE_CORE_INCLUDE_DIR="$WORKSPACE/manyforge_core/include" \
+        -DMANYFORGE_DEPLOYMENT_DIR="$deployment_build" \
+        -DMANYFORGE_DEPLOYMENT_INCLUDE_DIR="$WORKSPACE/manyforge_deployment/include" \
         ${pybind11_dir:+-Dpybind11_DIR="$pybind11_dir"} \
         2>&1 | tail -3
     make -j"$BUILD_PARALLEL_LEVEL" 2>&1 | tail -3

@@ -3,6 +3,8 @@
 #include <pybind11/operators.h>
 #include <Python.h>
 
+#include "binding_registrations.hpp"
+
 // Only DTO/enum types are bound — port interfaces and kernel are C++-only.
 // Python interacts with the kernel via NativeKernelClient (manyforge_roboplan_py).
 #include <manyforge_core/types/error_code.hpp>
@@ -29,6 +31,11 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(manyforge_core_py, m) {
     m.doc() = "Python bindings for manyforge_core DTOs and enums";
+
+    manyforge::core::python::register_strong_identity_bindings(m);
+    manyforge::core::python::register_catalog_record_bindings(m);
+    manyforge::core::python::register_cell_graph_bindings(m);
+    manyforge::core::python::register_deployment_candidate_bindings(m);
 
     // ========================================================================
     // Enums

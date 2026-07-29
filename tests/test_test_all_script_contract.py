@@ -130,14 +130,42 @@ def test_native_launcher_build_fails_synchronously_before_detached_start(
     assert completed.returncode == 0, completed.stderr
 
 
-def test_standalone_bindings_always_incrementally_build_current_core() -> None:
+def test_standalone_bindings_build_and_link_current_ros_free_libraries() -> None:
     script = _SCRIPT.read_text(encoding="utf-8")
     bindings_body = script.split("run_pybind_tests() {", maxsplit=1)[1].split(
         "run_python_tests() {", maxsplit=1
     )[0]
+    binding_cmake = (
+        _REPO_ROOT / "manyforge_core" / "python" / "CMakeLists.txt"
+    ).read_text(encoding="utf-8")
 
     assert 'build_manyforge_core "$core_build" OFF' in bindings_body
+    assert (
+        'build_manyforge_deployment "$deployment_build" OFF'
+        in bindings_body
+    )
+    assert (
+        '-DMANYFORGE_DEPLOYMENT_DIR="$deployment_build"'
+        in bindings_body
+    )
+    assert "manyforge_deployment_archive" in binding_cmake
+    assert (
+        '"${MANYFORGE_DEPLOYMENT_DIR}/libmanyforge_deployment.a"'
+        in binding_cmake
+    )
     assert 'if [ ! -f "$core_build/libmanyforge_core.a" ]' not in bindings_body
+    assert (
+        'if [ ! -f "$deployment_build/libmanyforge_deployment.a" ]'
+        not in bindings_body
+    )
+
+
+def test_deployment_package_participates_in_repository_version_guard() -> None:
+    version_guard = (
+        _REPO_ROOT / "scripts" / "ci" / "verify-version-sync.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'check "manyforge_deployment CMakeLists.txt"' in version_guard
 
 
 def test_test_suites_are_never_skipped_from_a_head_only_success_stamp() -> None:

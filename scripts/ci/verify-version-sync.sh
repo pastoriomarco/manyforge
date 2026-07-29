@@ -48,6 +48,7 @@ extract_cmake_version() {
 }
 
 check "manyforge_core CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_core/CMakeLists.txt")"
+check "manyforge_deployment CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_deployment/CMakeLists.txt")"
 check "manyforge_roboplan CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_roboplan/CMakeLists.txt")"
 
 # Python packages — pyproject.toml `version = "X.Y.Z"`
