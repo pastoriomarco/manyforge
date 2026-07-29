@@ -3,6 +3,7 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
+#include <manyforge_deployment/closed_schema.hpp>
 #include <string>
 #include <string_view>
 
@@ -16,11 +17,14 @@ void register_deployment_candidate_bindings(py::module_& module) {
   using deployment::IntrinsicallyValidatedCellGraphCandidate;
   using deployment::ParsedArtifactCandidate;
   using deployment::TypedCellGraphCandidate;
+  using deployment::UnqualifiedSchemaNormalizedArtifactCandidate;
 
   py::register_exception<deployment::ArtifactCodecError>(module, "ArtifactCodecError",
                                                          PyExc_ValueError);
   py::register_exception<deployment::CellGraphCodecError>(module, "CellGraphCodecError",
                                                           PyExc_ValueError);
+  py::register_exception<deployment::ClosedSchemaError>(module, "ClosedSchemaError",
+                                                        PyExc_ValueError);
 
   py::class_<ParsedArtifactCandidate>(module, "ParsedArtifactCandidate", py::is_final())
       .def_property_readonly("canonical_json", [](const ParsedArtifactCandidate& candidate) {
@@ -54,6 +58,106 @@ void register_deployment_candidate_bindings(py::module_& module) {
             return deployment::canonical_json(candidate.structurally_normalized_root());
           });
 
+  py::enum_<deployment::ClosedSchemaPurpose>(module, "ClosedSchemaPurpose")
+      .value("kArtifactDocument", deployment::ClosedSchemaPurpose::kArtifactDocument)
+      .value("kValue", deployment::ClosedSchemaPurpose::kValue);
+
+  py::enum_<deployment::ClosedSchemaRootShape>(module, "ClosedSchemaRootShape")
+      .value("kScalar", deployment::ClosedSchemaRootShape::kScalar)
+      .value("kObject", deployment::ClosedSchemaRootShape::kObject)
+      .value("kArray", deployment::ClosedSchemaRootShape::kArray)
+      .value("kTaggedUnion", deployment::ClosedSchemaRootShape::kTaggedUnion);
+
+  py::enum_<deployment::CatalogSchemaQualification>(module, "CatalogSchemaQualification")
+      .value("kUnqualified", deployment::CatalogSchemaQualification::kUnqualified)
+      .value("kQualified", deployment::CatalogSchemaQualification::kQualified);
+
+  py::class_<deployment::CompiledClosedSchema>(module, "CompiledClosedSchema", py::is_final())
+      .def_property_readonly("schema_id", &deployment::CompiledClosedSchema::schema_id)
+      .def_property_readonly("schema_revision",
+                             &deployment::CompiledClosedSchema::schema_revision)
+      .def_property_readonly("schema_purpose",
+                             &deployment::CompiledClosedSchema::schema_purpose)
+      .def_property_readonly("root_shape", &deployment::CompiledClosedSchema::root_shape)
+      .def_property_readonly(
+          "normalized_descriptor_canonical_json",
+          [](const deployment::CompiledClosedSchema& schema) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(schema.normalized_descriptor());
+          });
+
+  py::class_<UnqualifiedSchemaNormalizedArtifactCandidate>(
+      module, "UnqualifiedSchemaNormalizedArtifactCandidate", py::is_final())
+      .def_property_readonly(
+          "schema_id", &UnqualifiedSchemaNormalizedArtifactCandidate::schema_id)
+      .def_property_readonly(
+          "schema_revision",
+          &UnqualifiedSchemaNormalizedArtifactCandidate::schema_revision)
+      .def_property_readonly(
+          "schema_purpose",
+          &UnqualifiedSchemaNormalizedArtifactCandidate::schema_purpose)
+      .def_property_readonly("normalized_canonical_json",
+                             [](const UnqualifiedSchemaNormalizedArtifactCandidate&
+                                    artifact) {
+                               py::gil_scoped_release release;
+                               return deployment::canonical_json(artifact.normalized_root());
+                             });
+
+  py::class_<deployment::BuildCatalogSchemaEntry>(module, "BuildCatalogSchemaEntry",
+                                                   py::is_final())
+      .def_property_readonly("record_kind",
+                             &deployment::BuildCatalogSchemaEntry::record_kind)
+      .def_property_readonly("schema_id", &deployment::BuildCatalogSchemaEntry::schema_id)
+      .def_property_readonly("qualification",
+                             &deployment::BuildCatalogSchemaEntry::qualification)
+      .def_property_readonly(
+          "compiled_schema",
+          [](const deployment::BuildCatalogSchemaEntry& entry) -> py::object {
+            const auto* schema = entry.compiled_schema();
+            if (schema == nullptr) {
+              return py::none();
+            }
+            return py::cast(schema, py::return_value_policy::reference);
+          });
+
+  py::class_<deployment::BuildQualifiedValueSchemaEntry>(
+      module, "BuildQualifiedValueSchemaEntry", py::is_final())
+      .def_property_readonly("schema_id",
+                             &deployment::BuildQualifiedValueSchemaEntry::schema_id)
+      .def_property_readonly("schema_revision",
+                             &deployment::BuildQualifiedValueSchemaEntry::schema_revision)
+      .def_property_readonly(
+          "compiled_schema",
+          [](const deployment::BuildQualifiedValueSchemaEntry& entry) {
+            return &entry.compiled_schema();
+          },
+          py::return_value_policy::reference);
+
+  py::class_<deployment::BuildQualifiedClosedSchemaRegistry>(
+      module, "BuildQualifiedClosedSchemaRegistry", py::is_final())
+      .def_property_readonly(
+          "catalog_schemas",
+          [](const deployment::BuildQualifiedClosedSchemaRegistry& registry) {
+            const auto entries = registry.catalog_schemas();
+            py::tuple snapshot{entries.size()};
+            for (std::size_t index = 0; index < entries.size(); ++index) {
+              snapshot[index] =
+                  py::cast(&entries[index], py::return_value_policy::reference);
+            }
+            return snapshot;
+          })
+      .def_property_readonly(
+          "value_schemas",
+          [](const deployment::BuildQualifiedClosedSchemaRegistry& registry) {
+            const auto entries = registry.value_schemas();
+            py::tuple snapshot{entries.size()};
+            for (std::size_t index = 0; index < entries.size(); ++index) {
+              snapshot[index] =
+                  py::cast(&entries[index], py::return_value_policy::reference);
+            }
+            return snapshot;
+          });
+
   module.def(
       "parse_strict_json_model_yaml",
       [](const std::string& yaml_bytes) {
@@ -65,6 +169,23 @@ void register_deployment_candidate_bindings(py::module_& module) {
   module.def("validate_intrinsic_cell_graph_candidate",
              &deployment::validate_intrinsic_cell_graph_candidate, py::arg("candidate"),
              py::call_guard<py::gil_scoped_release>());
+  module.def("compile_closed_schema_descriptor",
+             &deployment::compile_closed_schema_descriptor, py::arg("candidate"),
+             py::call_guard<py::gil_scoped_release>());
+  module.def("validate_and_normalize_unqualified_artifact_candidate",
+             &deployment::validate_and_normalize_unqualified_artifact_candidate,
+             py::arg("schema"), py::arg("candidate"),
+             py::call_guard<py::gil_scoped_release>());
+  module.def(
+      "build_qualified_closed_schema_registry",
+      []() -> const deployment::BuildQualifiedClosedSchemaRegistry& {
+        return deployment::build_qualified_closed_schema_registry();
+      },
+      py::return_value_policy::reference);
+  module.attr("CLOSED_SCHEMA_API_VERSION") =
+      py::str(deployment::kClosedSchemaApiVersion);
+  module.attr("CLOSED_SCHEMA_BOOTSTRAP_CONTRACT_DIGEST") =
+      py::str(deployment::kClosedSchemaBootstrapContractDigest);
 }
 
 }  // namespace manyforge::core::python

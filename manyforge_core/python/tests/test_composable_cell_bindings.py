@@ -1,14 +1,19 @@
-"""C0.1 parity tests for the immutable composable-cell core projection."""
+"""C0.2 parity tests for immutable composable-cell deployment boundaries."""
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import typing
 
 import pytest
 
 core = pytest.importorskip("manyforge_core_py")
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+CLOSED_SCHEMA_RESOURCES = (
+    REPOSITORY_ROOT / "manyforge_deployment" / "resources" / "closed_schema"
+)
 
 STRONG_STRING_TYPES = (
     "CellId",
@@ -648,6 +653,116 @@ component_attachments: []
     ) as validation_error:
         core.validate_intrinsic_cell_graph_candidate(dangling_runtime)
     assert type(validation_error.value) is core.CellGraphCodecError
+
+
+def test_closed_schema_trust_phases_and_registry_are_immutable():
+    descriptor_yaml = (
+        CLOSED_SCHEMA_RESOURCES
+        / "examples"
+        / "manyforge.closed_schema.example_command.v1.yaml"
+    ).read_text(encoding="utf-8")
+    schema = core.compile_closed_schema_descriptor(
+        core.parse_strict_json_model_yaml(descriptor_yaml)
+    )
+
+    assert isinstance(schema, core.CompiledClosedSchema)
+    assert schema.schema_id == core.SchemaId(
+        "manyforge.closed_schema.example_command.v1"
+    )
+    assert schema.schema_revision == core.SchemaRevision(
+        "sha256:37985bd40f1c50cca9a82e3952bf407ddecca0d1c32d7787cd903bfffbf5fce7"
+    )
+    assert schema.schema_purpose == core.ClosedSchemaPurpose.kArtifactDocument
+    assert schema.root_shape == core.ClosedSchemaRootShape.kTaggedUnion
+    assert (
+        json.loads(schema.normalized_descriptor_canonical_json)["schema_id"]
+        == schema.schema_id.value
+    )
+
+    artifact = core.validate_and_normalize_unqualified_artifact_candidate(
+        schema,
+        core.parse_strict_json_model_yaml(
+            """\
+api_version: manyforge.closed_schema.example_command.v1
+command_kind: position
+target: 0.5
+"""
+        ),
+    )
+    assert isinstance(
+        artifact, core.UnqualifiedSchemaNormalizedArtifactCandidate
+    )
+    assert artifact.schema_id == schema.schema_id
+    assert artifact.schema_revision == schema.schema_revision
+    assert artifact.schema_purpose == schema.schema_purpose
+    assert json.loads(artifact.normalized_canonical_json) == {
+        "api_version": "manyforge.closed_schema.example_command.v1",
+        "command_kind": "position",
+        "target": 0.5,
+    }
+
+    registry = core.build_qualified_closed_schema_registry()
+    assert isinstance(registry, core.BuildQualifiedClosedSchemaRegistry)
+    assert isinstance(registry.catalog_schemas, tuple)
+    assert len(registry.catalog_schemas) == 11
+    assert all(
+        entry.qualification == core.CatalogSchemaQualification.kUnqualified
+        and entry.compiled_schema is None
+        for entry in registry.catalog_schemas
+    )
+    assert registry.value_schemas == ()
+    assert core.CLOSED_SCHEMA_API_VERSION == "manyforge.closed_schema.v1"
+    assert core.CLOSED_SCHEMA_BOOTSTRAP_CONTRACT_DIGEST == (
+        "sha256:29a2fef8e781ca406eaaad448e46fb6061fe18e99e2c1cd39f303e2e0d815834"
+    )
+
+    for value, field in (
+        (schema, "schema_id"),
+        (artifact, "normalized_canonical_json"),
+        (registry, "catalog_schemas"),
+        (registry.catalog_schemas[0], "qualification"),
+    ):
+        with pytest.raises(AttributeError):
+            setattr(value, field, getattr(value, field))
+        with pytest.raises(AttributeError):
+            value.extra = "not allowed"
+
+    for value_type in (
+        core.CompiledClosedSchema,
+        core.UnqualifiedSchemaNormalizedArtifactCandidate,
+        core.BuildCatalogSchemaEntry,
+        core.BuildQualifiedValueSchemaEntry,
+        core.BuildQualifiedClosedSchemaRegistry,
+    ):
+        with pytest.raises(TypeError):
+            value_type()
+
+
+def test_closed_schema_failures_map_to_value_error():
+    assert issubclass(core.ClosedSchemaError, ValueError)
+
+    descriptor_yaml = (
+        CLOSED_SCHEMA_RESOURCES
+        / "examples"
+        / "manyforge.closed_schema.example_command.v1.yaml"
+    ).read_text(encoding="utf-8")
+    schema = core.compile_closed_schema_descriptor(
+        core.parse_strict_json_model_yaml(descriptor_yaml)
+    )
+    with pytest.raises(
+        core.ClosedSchemaError, match="above maximum"
+    ) as normalization_error:
+        core.validate_and_normalize_unqualified_artifact_candidate(
+            schema,
+            core.parse_strict_json_model_yaml(
+                """\
+api_version: manyforge.closed_schema.example_command.v1
+command_kind: position
+target: 2
+"""
+            ),
+        )
+    assert type(normalization_error.value) is core.ClosedSchemaError
 
 
 def test_python_exposes_no_premature_graph_revision_trust_surface():

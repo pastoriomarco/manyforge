@@ -81,6 +81,10 @@ TEST(ArtifactCodec, RejectsUnsafeOrNonFiniteNumbersAndNegativeZero) {
   EXPECT_THROW(parse_strict_json_model_yaml("value: +.NaN\n"), ArtifactCodecError);
   EXPECT_THROW(parse_strict_json_model_yaml("value: -.nan\n"), ArtifactCodecError);
   EXPECT_THROW(parse_strict_json_model_yaml("value: -0\n"), ArtifactCodecError);
+  EXPECT_THROW(parse_strict_json_model_yaml("value: 1e-999\n"), ArtifactCodecError);
+
+  const auto exact_zero = parse_strict_json_model_yaml("value: 0e-999\n");
+  EXPECT_EQ(std::get<double>(exact_zero.root().find_object_member("value")->storage()), 0.0);
 }
 
 TEST(ArtifactCodec, KeepsYamlOnlyPlainScalarsAsStrings) {

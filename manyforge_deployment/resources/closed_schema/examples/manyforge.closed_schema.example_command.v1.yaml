@@ -1,0 +1,95 @@
+api_version: manyforge.closed_schema.v1
+schema_id: manyforge.closed_schema.example_command.v1
+schema_revision: sha256:37985bd40f1c50cca9a82e3952bf407ddecca0d1c32d7787cd903bfffbf5fce7
+schema_purpose: artifact_document
+root_definition_id: command
+definitions:
+  - definition_id: command
+    value_schema:
+      kind: tagged_union
+      tag_field: command_kind
+      alternatives:
+        - tag_value: discrete
+          value_schema:
+            kind: local_ref
+            definition_id: discrete_command
+        - tag_value: position
+          value_schema:
+            kind: local_ref
+            definition_id: position_command
+  - definition_id: discrete_command
+    value_schema:
+      kind: object
+      fields:
+        - field_id: api_version
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manyforge.closed_schema.example_command.v1
+              - kind: string_format
+                value: api_version
+        - field_id: command_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - discrete
+        - field_id: value
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: boolean
+            constraints: []
+  - definition_id: position_command
+    value_schema:
+      kind: object
+      fields:
+        - field_id: api_version
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manyforge.closed_schema.example_command.v1
+              - kind: string_format
+                value: api_version
+        - field_id: command_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - position
+        - field_id: target
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: maximum
+                value: 1
+              - kind: minimum
+                value: 0

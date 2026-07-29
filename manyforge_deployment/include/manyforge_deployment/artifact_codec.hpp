@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -13,6 +14,7 @@ inline constexpr std::size_t kMaxArtifactEncodedBytes = 16U * 1024U * 1024U;
 inline constexpr std::size_t kMaxArtifactNestingDepth = 64U;
 inline constexpr std::size_t kMaxArtifactNodeCount = 250000U;
 inline constexpr std::size_t kMaxArtifactScalarBytes = 1024U * 1024U;
+inline constexpr std::int64_t kMaxArtifactSafeInteger = 9007199254740991LL;
 
 class ArtifactCodecError : public std::invalid_argument {
  public:

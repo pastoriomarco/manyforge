@@ -4,19 +4,25 @@ on:
   pull_request:
     paths:
       - "manyforge_core/**"
+      - "manyforge_deployment/**"
       - "scripts/ci/run-core-asan.sh"
+      - "scripts/ci/run-deployment-asan.sh"
+      - "scripts/ci/run-ctest-gtest-binaries-grouped.py"
       - ".github/workflows/cpp-asan.yml"
   push:
     branches: [main, dev]
     paths:
       - "manyforge_core/**"
+      - "manyforge_deployment/**"
       - "scripts/ci/run-core-asan.sh"
+      - "scripts/ci/run-deployment-asan.sh"
+      - "scripts/ci/run-ctest-gtest-binaries-grouped.py"
       - ".github/workflows/cpp-asan.yml"
   workflow_dispatch:
 
 jobs:
-  manyforge-core-asan:
-    name: manyforge_core AddressSanitizer
+  manyforge-cpp-asan:
+    name: ROS-free C++ AddressSanitizer
     runs-on: ubuntu-24.04
     env:
       ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:exitcode=66
@@ -27,6 +33,10 @@ jobs:
       - name: Install C++ test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake g++ libgtest-dev
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ libdouble-conversion-dev libgtest-dev libssl-dev \
+            libutf8proc-dev libyaml-dev pkg-config
       - name: Run core C++ tests under AddressSanitizer
         run: bash scripts/ci/run-core-asan.sh
+      - name: Run deployment C++ tests under AddressSanitizer
+        run: bash scripts/ci/run-deployment-asan.sh

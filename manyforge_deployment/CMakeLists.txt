@@ -23,6 +23,7 @@ add_library(manyforge_deployment
   src/artifact_codec.cpp
   src/canonical_value.cpp
   src/cell_graph_codec.cpp
+  src/closed_schema.cpp
   src/content_identity.cpp
 )
 add_library(manyforge::deployment ALIAS manyforge_deployment)
@@ -67,5 +68,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_cell_graph_codec PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_cell_graph_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_closed_schema test/test_closed_schema.cpp)
+  target_compile_definitions(test_closed_schema PRIVATE
+    MANYFORGE_CLOSED_SCHEMA_RESOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/resources/closed_schema")
+  target_link_libraries(test_closed_schema PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_closed_schema
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 endif()

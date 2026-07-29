@@ -21,8 +21,6 @@
 namespace manyforge::deployment {
 namespace {
 
-constexpr std::int64_t kMaxSafeInteger = 9007199254740991LL;
-
 [[nodiscard]] std::string mark_suffix(const yaml_mark_t& mark) {
   return " at line " + std::to_string(mark.line + 1U) + ", column " +
          std::to_string(mark.column + 1U);
@@ -111,8 +109,8 @@ constexpr std::int64_t kMaxSafeInteger = 9007199254740991LL;
   if (is_integer_syntax(value)) {
     std::int64_t integer = 0;
     const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), integer);
-    if (error != std::errc{} || end != value.data() + value.size() || integer < -kMaxSafeInteger ||
-        integer > kMaxSafeInteger) {
+    if (error != std::errc{} || end != value.data() + value.size() ||
+        integer < -kMaxArtifactSafeInteger || integer > kMaxArtifactSafeInteger) {
       fail("integer is outside the lossless I-JSON range", mark);
     }
   }
@@ -126,8 +124,9 @@ constexpr std::int64_t kMaxSafeInteger = 9007199254740991LL;
   if (result == 0.0 && std::signbit(result)) {
     fail("negative zero is forbidden", mark);
   }
-  if (std::trunc(result) == result && (result < -static_cast<double>(kMaxSafeInteger) ||
-                                       result > static_cast<double>(kMaxSafeInteger))) {
+  if (std::trunc(result) == result &&
+      (result < -static_cast<double>(kMaxArtifactSafeInteger) ||
+       result > static_cast<double>(kMaxArtifactSafeInteger))) {
     fail("integer-valued number is outside the lossless I-JSON range", mark);
   }
   return result;

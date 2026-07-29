@@ -1,0 +1,47 @@
+api_version: manyforge.closed_schema_registry.v1
+dialect_api_version: manyforge.closed_schema.v1
+bootstrap_contract_digest: sha256:29a2fef8e781ca406eaaad448e46fb6061fe18e99e2c1cd39f303e2e0d815834
+example_schemas:
+  - schema_id: manyforge.closed_schema.example_command.v1
+    schema_revision: sha256:37985bd40f1c50cca9a82e3952bf407ddecca0d1c32d7787cd903bfffbf5fce7
+    relative_path: examples/manyforge.closed_schema.example_command.v1.yaml
+    qualification: dialect_example_only
+  - schema_id: manyforge.closed_schema.example_inventory.v1
+    schema_revision: sha256:dd5840f1d78b171d86631d73b333625011c81fcae9b54221ab3ea63c65446c55
+    relative_path: examples/manyforge.closed_schema.example_inventory.v1.yaml
+    qualification: dialect_example_only
+catalog_schemas:
+  - record_kind: capability_definition
+    schema_id: manyforge.capability_definition.v1
+    qualification: unqualified
+  - record_kind: command_schema
+    schema_id: manyforge.command_schema.v1
+    qualification: unqualified
+  - record_kind: component_type
+    schema_id: manyforge.component_type.v1
+    qualification: unqualified
+  - record_kind: contact_policy
+    schema_id: manyforge.contact_policy.v1
+    qualification: unqualified
+  - record_kind: control_interface_contract
+    schema_id: manyforge.control_interface_contract.v1
+    qualification: unqualified
+  - record_kind: controller_topology
+    schema_id: manyforge.controller_topology.v1
+    qualification: unqualified
+  - record_kind: model_asset
+    schema_id: manyforge.model_asset.v1
+    qualification: unqualified
+  - record_kind: provider_manifest
+    schema_id: manyforge.provider_manifest.v1
+    qualification: unqualified
+  - record_kind: runtime_policy
+    schema_id: manyforge.runtime_policy.v1
+    qualification: unqualified
+  - record_kind: runtime_profile
+    schema_id: manyforge.runtime_profile.v1
+    qualification: unqualified
+  - record_kind: stop_evidence_policy
+    schema_id: manyforge.stop_evidence_policy.v1
+    qualification: unqualified
+value_schemas: []
