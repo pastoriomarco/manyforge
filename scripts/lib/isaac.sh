@@ -21,9 +21,41 @@ ISAAC_JOINT_STATE_TOPIC="${ISAAC_JOINT_STATE_TOPIC:-/isaac_joint_states}"
 ARM_JOINT_STATE_TOPIC="${ARM_JOINT_STATE_TOPIC:-/joint_states}"
 ARM_CONTROLLER_STATE_TOPIC="${ARM_CONTROLLER_STATE_TOPIC:-/isaac_arm_controller/controller_state}"
 TOPIC_BASED_PKG="${TOPIC_BASED_PKG:-topic_based_ros2_control}"
+ISAAC_RUNTIME_IMAGE_ID=""
+ISAAC_BUILD_CACHE_VOLUME=""
+
+isaac_build_cache_volume_for_image_id() {
+    local image_id="${1:-}"
+    [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+    printf 'manyforge_ros-full-build-cache-%s\n' "${image_id#sha256:}"
+}
+
+pin_isaac_runtime_image() {
+    local image_ref="${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-jazzy-full}"
+    local image_id
+    image_id="$(
+        docker image inspect "${image_ref}" --format '{{.Id}}' 2>/dev/null ||
+            true
+    )"
+    if ! ISAAC_BUILD_CACHE_VOLUME="$(
+        isaac_build_cache_volume_for_image_id "${image_id}"
+    )"; then
+        fail "Could not resolve immutable image identity for ${image_ref}"
+        return 1
+    fi
+    ISAAC_RUNTIME_IMAGE_ID="${image_id}"
+    export MANYFORGE_ROS_FULL_IMAGE="${image_id}"
+    export MANYFORGE_ROS_FULL_BUILD_CACHE_VOLUME="${ISAAC_BUILD_CACHE_VOLUME}"
+}
 
 ros_shell() {
-    "${COMPOSE_CMD[@]}" run --rm --no-deps ros-jazzy-full bash -lc "$*"
+    local -a cache_args=()
+    if [[ -n "${ISAAC_BUILD_CACHE_VOLUME}" ]]; then
+        cache_args=(-v "${ISAAC_BUILD_CACHE_VOLUME}:/tmp/manyforge-build")
+    fi
+    "${COMPOSE_CMD[@]}" run --rm --no-deps \
+        "${cache_args[@]}" \
+        ros-jazzy-full bash -lc "$*"
 }
 
 build_ros2_control_runtime() {
@@ -123,6 +155,7 @@ maybe_build_isaac_image() {
         true)
             step "Building ROS-capable image (REBUILD=true)"
             "${COMPOSE_CMD[@]}" build ros-jazzy-full
+            pin_isaac_runtime_image
             if ! isaac_image_runtime_ready; then
                 fail "Rebuilt canonical ROS image failed its runtime probe"
                 return 2
@@ -134,6 +167,7 @@ maybe_build_isaac_image() {
                 fail "REBUILD=false but the canonical ROS image is unavailable"
                 return 2
             fi
+            pin_isaac_runtime_image
             if ! isaac_image_runtime_ready; then
                 fail "REBUILD=false but the canonical ROS image failed its runtime probe"
                 return 2
@@ -147,6 +181,7 @@ maybe_build_isaac_image() {
             # when every input is unchanged.
             step "Reconciling the canonical ROS image with current Docker inputs"
             "${COMPOSE_CMD[@]}" build ros-jazzy-full
+            pin_isaac_runtime_image
             if ! isaac_image_runtime_ready; then
                 fail "Rebuilt canonical ROS image failed its runtime probe"
                 return 2

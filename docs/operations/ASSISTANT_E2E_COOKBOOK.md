@@ -117,24 +117,18 @@ cd ${HOME}/workspaces/dev_ws/src/manyforge
 
 docker rm -f manyforge-e2e-composer 2>/dev/null || true
 
-docker run -d --rm \
-  --name manyforge-e2e-composer \
-  --network host \
-  -v ${HOME}/workspaces/dev_ws/src/manyforge:/workspace \
-  -v manyforge_build-cache:/tmp/manyforge-build \
-  -w /workspace \
-  -e MANYFORGE_ASSISTANT_PROVIDER=direct \
-  -e MANYFORGE_ASSISTANT_ENDPOINT_URL=http://127.0.0.1:8100/v1/manyforge/assistant \
-  -e MANYFORGE_ASSISTANT_TIMEOUT_S=300 \
-  manyforge-dev:latest \
-  bash -lc 'python -m manyforge_composer \
-    --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \
-    --host 127.0.0.1 \
-    --port 9000 \
-    --assistant-provider nemoclaw \
-    --assistant-endpoint http://127.0.0.1:8100/v1/manyforge/assistant \
-    --assistant-timeout-s 300'
+export MANYFORGE_ROOT="$PWD"
+export MANYFORGE_ASSISTANT_PROVIDER=direct
+export MANYFORGE_ASSISTANT_ENDPOINT_URL=http://127.0.0.1:8100/v1/manyforge/assistant
+export MANYFORGE_ASSISTANT_TIMEOUT_S=300
+source scripts/lib/compose.sh
+start_composer_dev_container
 ```
+
+This uses the same launcher owner as the normal native lane: it resolves
+`manyforge-dev:latest` once, starts that immutable image ID, and retains build
+products only in the cache keyed to that ID. Do not copy the old manual
+`docker run` recipe with a mutable tag and a global build volume.
 
 Verify:
 

@@ -20,7 +20,8 @@ machine-readable companion to this doc.
 1. **Normal development is spec-driven.** Maintainer work should use
    the sibling private `manyforge_specs` repo as the canonical source
    for contracts, ADRs, and development plans.
-1. CI must stay green on `dev`.
+1. CI must stay green on `dev`, except for local, unpushed commits covered by
+   the temporary composable-cell destructive implementation window below.
 
 ## Repository structure (for orientation)
 
@@ -84,6 +85,39 @@ whether you're the maintainer or a forked contributor:
 
 Commit with a Conventional-Commits-ish prefix: `feat:`, `fix:`,
 `docs:`, `refactor:`, `test:`, `chore:`.
+
+### Temporary composable-cell destructive implementation window
+
+> **TEMPORARY — remove when the Composable Cell Runtime Implementation Plan
+> closes.**
+
+This maintainer exception applies exclusively to work explicitly mapped to the
+active `COMPOSABLE_CELL_RUNTIME_IMPLEMENTATION_PLAN.md` in the sibling private
+`manyforge_specs` repository. It applies only to local, unpushed commits on
+`dev`; all unrelated work follows the normal green-`dev` workflow.
+
+During this plan only:
+
+- a local commit may intentionally leave one or all lanes unavailable and need
+  not pass full CI or the complete lane matrix;
+- validation may target the layer and contracts changed by the slice, while
+  expected product failures and their restoration gate are recorded in the
+  demolition ledger and commit handoff;
+- superseded code and its exclusive tests, configuration, and documentation
+  may be removed before an end-to-end replacement exists, without a
+  compatibility shim or backup implementation; and
+- an operator recipe for an intentionally unavailable surface must be marked
+  unavailable or removed, rather than kept apparently valid.
+
+Container-based checks, branch and authorization rules, normative ADR/spec
+approval, safety boundaries, focused tests for changed foundational layers,
+truthful documentation, and adversarial review remain mandatory. Full
+applicable CI and the named product-restoration gates must pass before the
+affected work is pushed or claimed restored.
+
+The I12/M-final plan-closing change must remove this entire section and the
+matching temporary section in `AGENTS.md`. The plan cannot be marked complete
+while either exception remains.
 
 ### Maintainer flow (direct push to upstream `dev`)
 

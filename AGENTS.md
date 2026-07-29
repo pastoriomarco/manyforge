@@ -250,24 +250,24 @@ ______________________________________________________________________
 
 What lives where in this repo, and what it's for:
 
-| Path                                                                     | What                                                                                               |
-| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
-| [`manyforge_core/`](manyforge_core/)                                     | C++20 core: planning DTOs, kernel state machine, ports                                             |
-| [`manyforge_behavior/`](manyforge_behavior/)                             | Behavior-tree runtime (py_trees), node catalog, tests                                              |
-| [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine               |
-| [`manyforge_roboplan/`](manyforge_roboplan/)                             | Native motion-planner backend bindings (RRT + TOPPRA)                                              |
+| Path                                                                     | What                                                                                                                        |
+| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| [`manyforge_core/`](manyforge_core/)                                     | C++20 core: planning DTOs, kernel state machine, ports                                                                      |
+| [`manyforge_behavior/`](manyforge_behavior/)                             | Behavior-tree runtime (py_trees), node catalog, tests                                                                       |
+| [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine                                        |
+| [`manyforge_roboplan/`](manyforge_roboplan/)                             | Native motion-planner backend bindings (RRT + TOPPRA)                                                                       |
 | [`manyforge_ros2_control_execution/`](manyforge_ros2_control_execution/) | C++ ROS controller execution, exact binding/admission, feedback/progress, bounded stop/reset, and isolated scene projection |
-| [`manyforge_robot_lifecycle/`](manyforge_robot_lifecycle/)               | ROS-independent lifecycle supervision, authority sessions, and admission projection                |
-| [`manyforge_robot_lifecycle_msgs/`](manyforge_robot_lifecycle_msgs/)     | Robot-neutral ROS IDL for same-host lifecycle admission transport                                  |
-| [`manyforge_xarm_adapter/`](manyforge_xarm_adapter/)                     | Experimental xArm model generation, endpoint binding, and read-only observation boundary           |
-| [`manyforge_xarm_control/`](manyforge_xarm_control/)                     | Experimental xArm lifecycle coordinator and sole-backend ros2_control boundary                     |
-| [`manyforge_composer/`](manyforge_composer/)                             | FastAPI backend + React frontend + MCP server                                                      |
-| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Direct-lane assistant provider HTTP service (port 8100)                                            |
-| [`manyforge_ros/`](manyforge_ros/)                                       | ROS 2 bridge (optional)                                                                            |
-| [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | ManyForge assistant skill installed by sandboxed provider deployments                              |
-| [`examples/`](examples/)                                                 | Reference `*.program.yaml` + `*.deployment.yaml`                                                   |
-| [`scripts/`](scripts/)                                                   | Operator scripts (`demo-assistant-known-good.sh`, `setup-docker.sh`, etc.)                         |
-| [`docs/`](docs/)                                                         | Operator docs (`operations/`, `guides/`, `reference/`)                                             |
+| [`manyforge_robot_lifecycle/`](manyforge_robot_lifecycle/)               | ROS-independent lifecycle supervision, authority sessions, and admission projection                                         |
+| [`manyforge_robot_lifecycle_msgs/`](manyforge_robot_lifecycle_msgs/)     | Robot-neutral ROS IDL for same-host lifecycle admission transport                                                           |
+| [`manyforge_xarm_adapter/`](manyforge_xarm_adapter/)                     | Experimental xArm model generation, endpoint binding, and read-only observation boundary                                    |
+| [`manyforge_xarm_control/`](manyforge_xarm_control/)                     | Experimental xArm lifecycle coordinator and sole-backend ros2_control boundary                                              |
+| [`manyforge_composer/`](manyforge_composer/)                             | FastAPI backend + React frontend + MCP server                                                                               |
+| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Direct-lane assistant provider HTTP service (port 8100)                                                                     |
+| [`manyforge_ros/`](manyforge_ros/)                                       | ROS 2 bridge (optional)                                                                                                     |
+| [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/)   | ManyForge assistant skill installed by sandboxed provider deployments                                                       |
+| [`examples/`](examples/)                                                 | Reference `*.program.yaml` + `*.deployment.yaml`                                                                            |
+| [`scripts/`](scripts/)                                                   | Operator scripts (`demo-assistant-known-good.sh`, `setup-docker.sh`, etc.)                                                  |
+| [`docs/`](docs/)                                                         | Operator docs (`operations/`, `guides/`, `reference/`)                                                                      |
 
 ______________________________________________________________________
 
@@ -314,6 +314,47 @@ When making changes here, check the boundary you're touching:
    `manyforge_assistant_bridge/protocol.py` (the catalog-hash function
    or any shared envelope helper), every running deployment will
    recompute hashes — treat as a wire-version bump.
+
+______________________________________________________________________
+
+## Temporary composable-cell destructive implementation window
+
+> **TEMPORARY — remove when the Composable Cell Runtime Implementation Plan
+> closes.**
+
+This exception applies only to work explicitly mapped to the active
+`COMPOSABLE_CELL_RUNTIME_IMPLEMENTATION_PLAN.md` in the sibling private
+`manyforge_specs` repository. It applies only to local, unpushed `dev` work
+while that plan remains active; it is not a general ManyForge development
+policy.
+
+For those plan slices only:
+
+1. A local commit may intentionally leave one or all product lanes unavailable
+   and need not pass the complete CI or three-lane qualification matrix.
+1. Pre-commit validation may be limited to the focused layer, contract,
+   syntax, static-analysis, and regression checks selected by the owning
+   slice. Expected product-level failures or absent surfaces must be recorded
+   in the plan's demolition ledger and named in the commit handoff; they must
+   not be hidden with permissive fallbacks or misleading skipped tests.
+1. Superseded implementations and their exclusive tests, configuration, and
+   documentation may be deleted before an end-to-end replacement exists.
+   Do not add a compatibility shim, backup implementation, copied legacy tree,
+   or old/new runtime switch.
+1. Operator documentation must remain truthful. When a documented surface is
+   intentionally unavailable, mark or remove that recipe instead of repairing
+   the implementation solely to preserve the old workflow.
+
+This exception does **not** relax container-based validation, branch rules,
+commit or push authorization, normative ADR/spec approval, private-spec
+boundaries, robot/safety constraints, focused tests for changed foundational
+layers, or adversarial review of substantial chunks. Full applicable CI and
+the named product gates must pass before the affected work is pushed or
+claimed restored.
+
+The I12/M-final plan-closing change must delete this entire section and the
+matching section in `CONTRIBUTING.md`. The plan cannot be marked complete while
+either temporary exception remains.
 
 ______________________________________________________________________
 

@@ -25,6 +25,30 @@ source "$(dirname "${BASH_SOURCE[0]}")/realtime-resources.sh"
 # Result variable for compose_set_lane.
 declare -a COMPOSE_CMD
 declare -a NATIVE_COMPOSER_RT_DOCKER_ARGS
+NATIVE_COMPOSER_IMAGE_REF="manyforge-dev:latest"
+NATIVE_COMPOSER_IMAGE_ID=""
+NATIVE_COMPOSER_BUILD_CACHE_VOLUME=""
+
+native_composer_build_cache_volume_for_image_id() {
+    local image_id="${1:-}"
+    [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+    printf 'manyforge_native-composer-build-cache-%s\n' "${image_id#sha256:}"
+}
+
+resolve_native_composer_image() {
+    local image_id
+    image_id="$(
+        docker image inspect "${NATIVE_COMPOSER_IMAGE_REF}" \
+            --format '{{.Id}}' 2>/dev/null || true
+    )"
+    if ! NATIVE_COMPOSER_BUILD_CACHE_VOLUME="$(
+        native_composer_build_cache_volume_for_image_id "${image_id}"
+    )"; then
+        fail "Could not resolve immutable image identity for ${NATIVE_COMPOSER_IMAGE_REF}"
+        return 1
+    fi
+    NATIVE_COMPOSER_IMAGE_ID="${image_id}"
+}
 
 prepare_native_composer_rt_docker_args() {
     NATIVE_COMPOSER_RT_DOCKER_ARGS=()
@@ -32,7 +56,9 @@ prepare_native_composer_rt_docker_args() {
         return 0
     fi
     export MANYFORGE_RT_CONTROLLER_MANAGER_PRESENT=false
-    manyforge_validate_rt_resource_profile
+    if ! manyforge_validate_rt_resource_profile; then
+        return 1
+    fi
     NATIVE_COMPOSER_RT_DOCKER_ARGS=(
         --cap-add SYS_NICE
         --ulimit rtprio=99:99
@@ -149,9 +175,10 @@ stop_vllm_status_watcher() {
 }
 
 # start_composer_dev_container — for the manyforge-only lane.
-# Detached docker run that builds C++ backends on entry then execs the
-# Composer process. Matches the inline pattern in scripts/demo.sh
-# but in detached form so the launcher can manage it via name.
+# A foreground one-shot container first builds and qualifies source-mounted
+# products. Only a successful build starts the detached Composer process. This
+# keeps build failures synchronous and visible instead of deleting the failed
+# container and waiting for an API that can never become ready.
 #
 # Ports are env-overridable:
 #   COMPOSER_PORT (default 9000) — Composer API + UI
@@ -165,7 +192,10 @@ stop_vllm_status_watcher() {
 start_composer_dev_container() {
     local container_name="${COMPOSER_CONTAINER:-manyforge-e2e-composer}"
     local composer_port="${COMPOSER_PORT:-9000}"
-    prepare_native_composer_rt_docker_args
+    if ! prepare_native_composer_rt_docker_args; then
+        fail "Native Composer real-time resource profile is invalid"
+        return 1
+    fi
     start_vllm_status_watcher  # idempotent; covers both reuse and fresh-start paths
     if container_running "${container_name}"; then
         if manyforge_rt_profile_enabled; then
@@ -180,6 +210,10 @@ start_composer_dev_container() {
         fi
     fi
     docker rm -f "${container_name}" >/dev/null 2>&1 || true
+    if ! resolve_native_composer_image; then
+        stop_vllm_status_watcher
+        return 1
+    fi
     local assistant_env=()
     if [[ -n "${MANYFORGE_ASSISTANT_PROVIDER:-}" ]]; then
         assistant_env+=(-e "MANYFORGE_ASSISTANT_PROVIDER=${MANYFORGE_ASSISTANT_PROVIDER}")
@@ -210,20 +244,16 @@ start_composer_dev_container() {
     fi
     local vllm_status_dir="${MANYFORGE_VLLM_STATUS_DIR:-/tmp/manyforge-assistant-e2e}"
     mkdir -p "${vllm_status_dir}" 2>/dev/null || true
-    info "Starting ${container_name} (detached dev container) on Composer ${composer_port}; native viewer is default"
-    docker run -d --rm \
-        --name "${container_name}" \
+    info "Building and qualifying native Composer products"
+    if ! docker run --rm \
         --network host \
         -v "${MANYFORGE_ROOT:?MANYFORGE_ROOT not set}:/workspace" \
-        -v manyforge_build-cache:/tmp/manyforge-build \
-        -v "${vllm_status_dir}:/tmp/manyforge-assistant-e2e:ro" \
+        -v "${NATIVE_COMPOSER_BUILD_CACHE_VOLUME}:/tmp/manyforge-build" \
         -w /workspace \
-        -e MANYFORGE_COMPOSER_PORT="${composer_port}" \
-        -e MANYFORGE_TRACE_DIR="${MANYFORGE_TRACE_DIR:-/workspace/.manyforge-var/traces}" \
+        -e MANYFORGE_BUILD_DIR=/tmp/manyforge-build \
         -e CTEST_TEST_TIMEOUT_S="${CTEST_TEST_TIMEOUT_S:-60}" \
-        "${NATIVE_COMPOSER_RT_DOCKER_ARGS[@]}" \
         "${assistant_env[@]}" \
-        manyforge-dev:latest \
+        "${NATIVE_COMPOSER_IMAGE_ID}" \
         bash -lc '
             set -euo pipefail
             # Build output streams live to docker logs so the launcher
@@ -233,19 +263,45 @@ start_composer_dev_container() {
             # "Building..." echo. The previous `| tail -3` buffered
             # everything until each invocation exited.
             echo "Building C++ backends..."
-            ./scripts/test-all.sh cpp 2>&1 || echo "  (core build had warnings — continuing)"
+            ./scripts/test-all.sh cpp 2>&1
             echo "Building roboplan..."
-            ./scripts/test-all.sh roboplan 2>&1 || echo "  (roboplan build failed — will use MockKernelClient)"
+            ./scripts/test-all.sh roboplan 2>&1
             source /workspace/scripts/lib/frontend.sh
             manyforge_build_frontend_dist /workspace/manyforge_composer/frontend /tmp/manyforge-build
+        '; then
+        fail "Native Composer product build or qualification failed"
+        stop_vllm_status_watcher
+        return 1
+    fi
+
+    info "Starting ${container_name} (detached dev container) on Composer ${composer_port}; native viewer is default"
+    if ! docker run -d --rm \
+        --name "${container_name}" \
+        --network host \
+        -v "${MANYFORGE_ROOT:?MANYFORGE_ROOT not set}:/workspace" \
+        -v "${NATIVE_COMPOSER_BUILD_CACHE_VOLUME}:/tmp/manyforge-build" \
+        -v "${vllm_status_dir}:/tmp/manyforge-assistant-e2e:ro" \
+        -w /workspace \
+        -e MANYFORGE_BUILD_DIR=/tmp/manyforge-build \
+        -e MANYFORGE_COMPOSER_PORT="${composer_port}" \
+        -e MANYFORGE_TRACE_DIR="${MANYFORGE_TRACE_DIR:-/workspace/.manyforge-var/traces}" \
+        "${NATIVE_COMPOSER_RT_DOCKER_ARGS[@]}" \
+        "${assistant_env[@]}" \
+        "${NATIVE_COMPOSER_IMAGE_ID}" \
+        bash -lc '
+            set -euo pipefail
             export PYTHONPATH="/tmp/manyforge-build/roboplan:/workspace/manyforge_roboplan/python:${PYTHONPATH:-}"
             source /workspace/scripts/lib/realtime-resources.sh
             manyforge_exec_with_nrt_affinity python -m manyforge_composer \
                 --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \
                 --host 0.0.0.0 \
                 --port "${MANYFORGE_COMPOSER_PORT:-9000}" \
-                --static-dir "${MANYFORGE_FRONTEND_STATIC_DIR}"
-        ' >/dev/null
+                --static-dir /tmp/manyforge-build/frontend-cache/workspace/dist
+        ' >/dev/null; then
+        fail "Native Composer container failed to start"
+        stop_vllm_status_watcher
+        return 1
+    fi
 }
 
 stop_composer_dev_container() {

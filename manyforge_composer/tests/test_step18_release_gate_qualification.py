@@ -434,7 +434,7 @@ def test_docker_lane_contracts_are_exact_and_independently_rerunnable() -> None:
             assert description["security_options"] == ["seccomp=unconfined"]
         else:
             assert description["security_options"] == []
-    assert "./scripts/test-all.sh --force all" in _VERIFY.lane_inner_script(
+    assert "./scripts/test-all.sh all" in _VERIFY.lane_inner_script(
         "full_dev_regression"
     )
     ros = _VERIFY.lane_inner_script("full_ros_regression")

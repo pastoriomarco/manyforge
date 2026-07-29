@@ -17,8 +17,6 @@ dist.*-old/
 .vite-temp/
 .vite/
 
-# test-all.sh re-test gate stamp (records last fully-passing commit per filter)
-.manyforge-tested-*.commit
 # Persistent runtime state (execution traces, failure archives) written by
 # the compose lanes via MANYFORGE_TRACE_DIR.
 .manyforge-var/

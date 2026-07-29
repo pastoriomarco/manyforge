@@ -115,9 +115,16 @@ jobs:
           set -euo pipefail
           worktree="${{ steps.checkout.outputs.worktree }}"
           image="${MANYFORGE_LOCAL_CI_IMAGE:-manyforge-dev:latest}"
-          cache_volume="manyforge-local-ci-build-${{ matrix.suite }}"
 
-          docker image inspect "${image}" >/dev/null
+          image_id="$(docker image inspect "${image}" --format '{{.Id}}')"
+          if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve immutable image identity for ${image}" >&2
+            exit 1
+          fi
+          # Do not share CMake products across workflow containers. A
+          # persistent suite-named volume can race between refs and can outlive
+          # the dev image whose ABI produced it. Run the inspected immutable
+          # image so a concurrent retag cannot change the qualified runtime.
           docker run --rm \
             --security-opt seccomp=unconfined \
             -e WORKSPACE=/workspace \
@@ -125,9 +132,8 @@ jobs:
             -e CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL}" \
             -e TSAN_OPTIONS="${TSAN_OPTIONS}" \
             -v "${worktree}:/workspace" \
-            -v "${cache_volume}:/tmp/manyforge-build" \
             -w /workspace \
-            "${image}" \
+            "${image_id}" \
             bash -lc "set -euo pipefail; ${LOCAL_CI_COMMAND}"
 
       - name: Upload qualification evidence

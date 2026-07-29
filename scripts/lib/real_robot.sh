@@ -13,11 +13,19 @@ REAL_ROBOT_OWNER_LABEL="org.manyforge.xarm-transport-owner"
 REAL_ROBOT_OWNER_ID="lite6-a:sole-owner"
 REAL_ROBOT_SUPERVISED_CONTRACT="1"
 REAL_ROBOT_CELL_ID="${MANYFORGE_REAL_ROBOT_CELL_ID:-lite6-a}"
+REAL_ROBOT_IMAGE_ID=""
 REAL_ROBOT_RESOLVED_DEPLOYMENT=""
 REAL_ROBOT_RUNTIME_HOST_ROOT=""
 REAL_ROBOT_SUPERVISOR_CONTROL_ROOT=""
 REAL_ROBOT_SUPERVISOR_PID=""
+REAL_ROBOT_BUILD_CACHE_VOLUME=""
 REAL_ROBOT_ACTIVE_RUN_FILE="${MANYFORGE_ROOT}/.manyforge-var/real-lite6/active-run"
+
+real_robot_build_cache_volume_for_image_id() {
+    local image_id="${1:-}"
+    [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+    printf 'manyforge_real-lite6-build-cache-%s\n' "${image_id#sha256:}"
+}
 
 real_robot_supervisor_pid_matches() {
     local pid="${1:-}" runtime_root="${2:-}" token
@@ -53,15 +61,33 @@ real_robot_preflight() {
         fail "ManyForge must be clean before connecting the physical lane."
         return 1
     fi
-    if [[ "$(docker image inspect "${REAL_ROBOT_IMAGE}" --format '{{index .Config.Labels "org.manyforge.experimental.real-lite6"}}' 2>/dev/null || true)" != "true" ]]; then
+    local image_record image_id image_experimental image_contract
+    image_record="$(
+        docker image inspect "${REAL_ROBOT_IMAGE}" \
+            --format '{{.Id}}|{{index .Config.Labels "org.manyforge.experimental.real-lite6"}}|{{index .Config.Labels "org.manyforge.xarm.supervised-contract"}}' \
+            2>/dev/null || true
+    )"
+    IFS='|' read -r \
+        image_id image_experimental image_contract <<<"${image_record}"
+    if [[ "${image_experimental}" != "true" ]]; then
         fail "Image is not a ManyForge experimental real-Lite6 image: ${REAL_ROBOT_IMAGE}"
         return 1
     fi
-    if [[ "$(docker image inspect "${REAL_ROBOT_IMAGE}" --format '{{index .Config.Labels "org.manyforge.xarm.supervised-contract"}}' 2>/dev/null || true)" != "${REAL_ROBOT_SUPERVISED_CONTRACT}" ]]; then
+    if [[ "${image_contract}" != "${REAL_ROBOT_SUPERVISED_CONTRACT}" ]]; then
         fail "Image does not provide xArm supervised contract v${REAL_ROBOT_SUPERVISED_CONTRACT}: ${REAL_ROBOT_IMAGE}"
         fail "Rebuild it with scripts/xarm/build-real-lite6-image.sh."
         return 1
     fi
+    if ! REAL_ROBOT_BUILD_CACHE_VOLUME="$(
+        real_robot_build_cache_volume_for_image_id "${image_id}"
+    )"; then
+        fail "Could not resolve the immutable image identity for ${REAL_ROBOT_IMAGE}"
+        return 1
+    fi
+    REAL_ROBOT_IMAGE_ID="${image_id}"
+    # A mutable tag may be rebuilt with a different compiler, ROS tree, or
+    # embedded xarm_ros2 checkout. Key the persistent CMake/colcon cache to the
+    # immutable image ID so old binaries can never cross that ABI boundary.
     local container
     for container in \
         "${REAL_ROBOT_OWNER_CONTAINER}" \
@@ -86,6 +112,10 @@ real_robot_preflight() {
 start_real_robot_lane() {
     local provider_uuid session_id container_runtime_root owner_timeout_s
     local supervisor_epoch heartbeat_path supervisor_deadline
+    if [[ -z "${REAL_ROBOT_BUILD_CACHE_VOLUME}" ]]; then
+        fail "Real-robot preflight did not resolve an image-bound build cache."
+        return 1
+    fi
     read -r provider_uuid </proc/sys/kernel/random/uuid
     session_id="$(date -u +%Y%m%dT%H%M%SZ)-${provider_uuid}"
     REAL_ROBOT_RUNTIME_HOST_ROOT="${MANYFORGE_ROOT}/.manyforge-var/real-lite6/runs/${session_id}"
@@ -189,9 +219,9 @@ start_real_robot_lane() {
         -e MANYFORGE_FRONTEND_SOURCE_MODE=git-head \
         -v "${MANYFORGE_ROOT}:/workspace:ro" \
         -v "${REAL_ROBOT_RUNTIME_HOST_ROOT}:${container_runtime_root}:rw" \
-        -v manyforge_build-cache:/tmp/manyforge-build \
+        -v "${REAL_ROBOT_BUILD_CACHE_VOLUME}:/tmp/manyforge-build" \
         -w /workspace \
-        "${REAL_ROBOT_IMAGE}" \
+        "${REAL_ROBOT_IMAGE_ID}" \
         ./scripts/ros/start-lite6-real-robot-owner.sh \
         >/dev/null; then
         stop_real_robot_lane
@@ -228,9 +258,9 @@ start_real_robot_lane() {
         -e MANYFORGE_FRONTEND_SOURCE_MODE=git-head \
         -v "${MANYFORGE_ROOT}:/workspace:ro" \
         -v "${REAL_ROBOT_RUNTIME_HOST_ROOT}:${container_runtime_root}:rw" \
-        -v manyforge_build-cache:/tmp/manyforge-build \
+        -v "${REAL_ROBOT_BUILD_CACHE_VOLUME}:/tmp/manyforge-build" \
         -w /workspace \
-        "${REAL_ROBOT_IMAGE}" \
+        "${REAL_ROBOT_IMAGE_ID}" \
         ./scripts/ros/start-lite6-real-robot-composer.sh \
         >/dev/null; then
         stop_real_robot_lane

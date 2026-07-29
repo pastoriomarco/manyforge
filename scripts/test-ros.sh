@@ -16,11 +16,10 @@ if [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]; then
     set -u
 fi
 
-if [ -f "${WORKSPACE}/install/setup.bash" ]; then
-    # shellcheck disable=SC1091
-    set +u
-    source "${WORKSPACE}/install/setup.bash"
-    set -u
+if env | grep -Fq "${WORKSPACE}/install"; then
+    echo "Canonical ROS tests refuse the source-mounted workspace install overlay." >&2
+    env | grep -F "${WORKSPACE}/install" >&2
+    exit 2
 fi
 
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/manyforge-pycache}"

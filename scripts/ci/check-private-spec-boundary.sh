@@ -82,6 +82,9 @@ for path in "${RUNTIME_PATHS[@]}"; do
             --include='*.py' --include='*.sh' --include='*.md' \
             --include='*.yaml' --include='*.yml' --include='*.json' \
             --include='*.ts' --include='*.tsx' --include='*.js' \
+            --include='*.c' --include='*.cc' --include='*.cpp' \
+            --include='*.h' --include='*.hh' --include='*.hpp' \
+            --include='CMakeLists.txt' --include='*.cmake' \
             --exclude-dir='.git' --exclude-dir='node_modules' \
             --exclude-dir='__pycache__' --exclude-dir='.venv' \
             --exclude-dir='.pytest_cache' --exclude-dir='build' \

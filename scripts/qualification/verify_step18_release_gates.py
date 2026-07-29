@@ -332,12 +332,7 @@ def lane_environment(
             {key: "" for key in ROS_AMBIENT_PASSTHROUGH_VARIABLES}
         )
     if lane == "full_dev_regression":
-        environment.update(
-            {
-                "MANYFORGE_BUILD_DIR": build_root,
-                "MANYFORGE_TEST_STAMP": f"{build_root}/test-all.stamp",
-            }
-        )
+        environment["MANYFORGE_BUILD_DIR"] = build_root
     elif lane == "full_ros_regression":
         environment.update(
             {
@@ -428,7 +423,7 @@ set -u'''
 
 def _lane_body(lane: str) -> str:
     if lane == "full_dev_regression":
-        return "./scripts/test-all.sh --force all"
+        return "./scripts/test-all.sh all"
     if lane == "full_ros_regression":
         return rf'''{_gcc13_probe()}
 {_ros_setup()}
@@ -643,7 +638,7 @@ def _verify_lane_log(lane: str, log_path: Path) -> dict[str, Any]:
             raise ValidationError("full_dev_regression skipped a capability lane")
         if "already passed" in section or "skipping re-test" in section:
             raise ValidationError(
-                "full_dev_regression used the re-test shortcut despite --force"
+                "full_dev_regression used a forbidden re-test shortcut"
             )
         matches = re.findall(
             r"^All ([0-9]+) test suite\(s\) passed\.$",

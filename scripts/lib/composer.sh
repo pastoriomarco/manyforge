@@ -51,7 +51,7 @@ composer_logs() {
 }
 
 wait_for_composer() {
-    local hint="First-run cold-cache builds can take several minutes (C++ + roboplan inside the dev container). Override with COMPOSER_READY_TIMEOUT_S=NN."
+    local hint="Native product qualification has succeeded; this budget covers only Composer API startup. Override with COMPOSER_READY_TIMEOUT_S=NN."
     wait_with_progress \
         "Composer at ${COMPOSER_URL}" \
         "${COMPOSER_READY_TIMEOUT_S}" \

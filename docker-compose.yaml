@@ -19,12 +19,18 @@ services:
       - seccomp=unconfined
     volumes:
       - .:/workspace
-      - build-cache:/tmp/manyforge-build
+      # Deliberately no persistent CMake volume: every canonical
+      # `docker compose run --rm dev` test invocation gets an image-local,
+      # container-local build root and cannot consume products from an older
+      # dev image. Runtime launchers bind their own immutable-image-keyed cache.
     working_dir: /workspace
     stdin_open: true
     tty: true
 
-  # Composer backend (FastAPI on 9000) — production mode serves built frontend
+  # Raw Composer backend debug profile. Product/runtime launches use
+  # scripts/launch.sh, which qualifies native products and binds them to the
+  # immutable image it starts. This profile intentionally has no compiled
+  # build cache and is not a lane-qualification surface.
   composer:
     build:
       context: .
@@ -35,7 +41,6 @@ services:
       - "9000:9000"
     volumes:
       - .:/workspace
-      - build-cache:/tmp/manyforge-build
     environment:
       MANYFORGE_VALIDATION_COLLISION_WORKERS: ${MANYFORGE_VALIDATION_COLLISION_WORKERS:-}
       MANYFORGE_NODE_ROOTS: ${MANYFORGE_NODE_ROOTS:-}
@@ -64,7 +69,8 @@ services:
     profiles:
       - composer
 
-  # Composer dev mode: FastAPI + Vite dev server with hot reload
+  # Composer source/API debug mode: FastAPI + Vite with hot reload. Like the
+  # raw `composer` profile, this is not a qualified execution lane.
   composer-api:
     build:
       context: .
@@ -74,7 +80,6 @@ services:
       - "9000:9000"
     volumes:
       - .:/workspace
-      - build-cache:/tmp/manyforge-build
     environment:
       MANYFORGE_VALIDATION_COLLISION_WORKERS: ${MANYFORGE_VALIDATION_COLLISION_WORKERS:-}
       MANYFORGE_NODE_ROOTS: ${MANYFORGE_NODE_ROOTS:-}
@@ -109,7 +114,6 @@ services:
     ipc: host
     volumes:
       - .:/workspace
-      - ros-build-cache:/tmp/manyforge-build
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
       - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
@@ -138,7 +142,6 @@ services:
     ipc: host
     volumes:
       - .:/workspace
-      - ros-full-build-cache:/tmp/manyforge-build
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
       - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
@@ -235,8 +238,7 @@ services:
       # LOAD_ARTIFACTS is the operator-facing escape hatch inherited from
       # the old demo-isaac-ros2-control.sh. SUPERVISOR_AUTO_LOAD takes
       # precedence when set explicitly (scripts/lib/isaac.sh exports it);
-      # raw `docker compose --profile ros-full up` users can set
-      # LOAD_ARTIFACTS=false directly without going through the launcher.
+      # debug-only raw Compose users can set LOAD_ARTIFACTS=false directly.
       - COMPOSER_URL=${COMPOSER_URL:-http://127.0.0.1:9000}
       - PROGRAM_PATH=${PROGRAM_PATH:-/workspace/examples/isaac_manipulator_scene_light.program.yaml}
       - DEPLOYMENT_PATH=${DEPLOYMENT_PATH:-/workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml}
@@ -248,6 +250,5 @@ services:
       - ros-full
 
 volumes:
-  build-cache:
-  ros-build-cache:
   ros-full-build-cache:
+    name: ${MANYFORGE_ROS_FULL_BUILD_CACHE_VOLUME:-manyforge_ros-full-build-cache}

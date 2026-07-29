@@ -15,11 +15,9 @@ namespace manyforge::core {
 
 // Normalized collision DTOs (spec §3.8.1).
 //
-// These DTOs ship the ManyForge-owned collision contract introduced by the
-// collision-ownership plan. They are populated alongside the existing
-// CollisionCheckRequestDTO / CollisionCheckResultDTO during Chunks 1-4 of
-// that plan. The kernel migrates to consuming them in Chunk 5; see
-// docs/plans/COLLISION_CHECKING_OWNERSHIP_PLAN.md for chunk semantics.
+// These DTOs shipped the ManyForge-owned collision contract. They were
+// populated alongside CollisionCheckRequestDTO / CollisionCheckResultDTO
+// during the rollout, before the kernel migrated to consuming them.
 
 /// Stable, engine-independent collision body id (spec §3.8.1).
 ///

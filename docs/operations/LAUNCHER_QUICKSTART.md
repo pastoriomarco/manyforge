@@ -100,6 +100,12 @@ supervisors, with status `waiting` until the dependency comes online,
 then `ready`. Use the popup as the source of truth after `start`
 returns.
 
+For every lane that builds source-mounted native/ROS products, the launcher
+captures the resolved runtime image ID once, runs that immutable ID, and shares
+only the build cache named for that ID among the lane's cooperating
+containers. Rebuilding a mutable image tag therefore produces a cold,
+separate cache rather than loading binaries from the prior image.
+
 For strict end-to-end verification — CI gate, pre-cell-test sanity —
 use `./scripts/launch.sh smoke`. That **does** block on every external
 probe (Isaac topics, action servers, controller state, vLLM `/models`,
@@ -212,14 +218,14 @@ matching flag.
 
 ### Selection flags
 
-| Flag                                                     | Replaces wizard step                                                                                                                                                                                                                                                                                                                                                                                             |
-| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--lane manyforge-only` / `--lane isaac-sim` / `--lane real-robot` | `[1/7]`                                                                                                                                                                                                                                                                                                                                                                                                |
-| `--assistant on` / `--assistant off`                     | `[2/7]`                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `--scenario NAME`                                        | `[3/7]` (use `--list-scenarios` for the artifact-discovered inventory; deprecated aliases — `pick-place`, `ur10e`, `shape-pick`, `vision-pose`, `assistant-authoring`, `isaac-light`, `isaac-assistant` — also resolve with a one-time warning. Includes `isaac-ur10e-light-scene-collision` for runtime collision-fault testing and `isaac-lite6-trocar-foundationpose` for the Lite6/FoundationPose workflow.) |
-| `--program PATH --deployment PATH`                       | Free-form alternative to `--scenario`                                                                                                                                                                                                                                                                                                                                                                            |
-| `--non-interactive` (env: `MANYFORGE_NON_INTERACTIVE=1`) | Skip all prompts; any unset selection takes its default value                                                                                                                                                                                                                                                                                                                                                    |
-| `--yes` / `-y` (env: `MANYFORGE_ASSUME_YES=1`)           | Skip the review gate confirmation                                                                                                                                                                                                                                                                                                                                                                                |
+| Flag                                                               | Replaces wizard step                                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--lane manyforge-only` / `--lane isaac-sim` / `--lane real-robot` | `[1/7]`                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `--assistant on` / `--assistant off`                               | `[2/7]`                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `--scenario NAME`                                                  | `[3/7]` (use `--list-scenarios` for the artifact-discovered inventory; deprecated aliases — `pick-place`, `ur10e`, `shape-pick`, `vision-pose`, `assistant-authoring`, `isaac-light`, `isaac-assistant` — also resolve with a one-time warning. Includes `isaac-ur10e-light-scene-collision` for runtime collision-fault testing and `isaac-lite6-trocar-foundationpose` for the Lite6/FoundationPose workflow.) |
+| `--program PATH --deployment PATH`                                 | Free-form alternative to `--scenario`                                                                                                                                                                                                                                                                                                                                                                            |
+| `--non-interactive` (env: `MANYFORGE_NON_INTERACTIVE=1`)           | Skip all prompts; any unset selection takes its default value                                                                                                                                                                                                                                                                                                                                                    |
+| `--yes` / `-y` (env: `MANYFORGE_ASSUME_YES=1`)                     | Skip the review gate confirmation                                                                                                                                                                                                                                                                                                                                                                                |
 
 Supplying all three of `--lane / --assistant / --scenario` plus `--yes`
 makes the run fully non-interactive (no prompts, no review gate):
@@ -280,6 +286,11 @@ services plus one host-side supervisor:
   reduced dependency loss performs bounded Composer-before-owner teardown.
   Its arm/shutdown channel is host-only; a terminal loss requires a fresh
   launcher start and never auto-enables or resumes the robot.
+
+The launcher resolves the experimental image tag once, starts both containers
+from that immutable image ID, and uses a build-cache volume named from the same
+ID. A rebuilt tag therefore cannot consume binaries from the previous image or
+split the owner and Composer across two images.
 
 The repository, portable program/template, and cell definition remain
 committed. Each launch instead retains a run-specific resolved deployment and
@@ -530,11 +541,21 @@ For where logs and observability endpoints live, see
 
 - **`manyforge-dev:latest` not built** → preflight fails with a clear
   error. Run `./scripts/setup-docker.sh` first.
-- **Composer takes minutes on first launch** → the dev container does a
-  cold-cache C++ + roboplan build inside on first run; `start` shows
-  live progress with the last few build-log lines. Default budget is
-  600 s (10 min); on a slow host or a fresh image override with
-  `COMPOSER_READY_TIMEOUT_S=1200` (or higher).
+- **Composer takes minutes on first launch** → a foreground one-shot container
+  performs the cold-cache C++ + RoboPlan qualification once per immutable dev
+  image and streams its complete output. A failure returns immediately and
+  prevents the detached Composer from starting. The
+  `COMPOSER_READY_TIMEOUT_S` budget (default 600 s) applies only after that
+  succeeds, while waiting for the Composer API.
+- **Old image-bound build caches use disk** → launcher caches are intentionally
+  not reused across rebuilt images. After stopping all ManyForge lanes, list
+  them with
+  `docker volume ls --format '{{.Name}}' | grep -E '^manyforge_(native-composer|real-lite6|ros-full)-build-cache-'`.
+  Before removing one, verify
+  `docker ps -a --filter volume=<exact-volume-name> --format '{{.Names}}'`
+  prints nothing, then run
+  `docker volume rm <exact-volume-name>`. Cache removal only makes the next
+  launch rebuild; the launcher never prunes volumes automatically.
 - **vLLM model load is slow** (for `--assistant on`) → `start` only
   checks that the vLLM container launched and didn't immediately exit.
   Full model readiness — including FlashInfer JIT compile (~60+ min

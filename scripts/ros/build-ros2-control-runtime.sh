@@ -33,12 +33,6 @@ export CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}"
 
 PYBIND11_DIR=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())")
 
-cache_file="${BUILD_DIR}/CMakeCache.txt"
-if [ -f "${cache_file}" ] && ! grep -q '^MANYFORGE_ENABLE_ROS2_CONTROL:BOOL=ON$' "${cache_file}"; then
-    echo "Rebuilding ${BUILD_DIR}: existing cache was not ROS-enabled." >&2
-    rm -rf "${BUILD_DIR}"
-fi
-
 cmake -S "${WORKSPACE}/manyforge_roboplan" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DMANYFORGE_ENABLE_ROS2_CONTROL=ON \

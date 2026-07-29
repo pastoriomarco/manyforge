@@ -722,9 +722,10 @@ PYBIND11_MODULE(manyforge_core_py, m) {
     // ========================================================================
     // Normalized Collision DTOs (spec §3.8.1)
     //
-    // See docs/plans/COLLISION_CHECKING_OWNERSHIP_PLAN.md. These DTOs ride
-    // alongside the existing CollisionCheckRequestDTO / CollisionCheckResultDTO
-    // through Chunks 1-4 and become the kernel's source of truth in Chunk 5.
+    // During the historical collision-ownership rollout, these DTOs rode
+    // alongside the existing CollisionCheckRequestDTO /
+    // CollisionCheckResultDTO through Chunks 1-4 and became the kernel's
+    // source of truth in Chunk 5.
     // ========================================================================
 
     py::enum_<manyforge::core::CollisionOwnerKind>(m, "CollisionOwnerKind")

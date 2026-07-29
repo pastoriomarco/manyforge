@@ -109,16 +109,21 @@ ROS 2 controller selected by deployment config. Use this for Isaac Sim
 or robot-driver previews where the program stays portable and the
 deployment provides controller topics/actions.
 
-Current activation point:
+Canonical activation goes through the unified launcher so the selected image,
+build products, and cooperating services share one captured identity:
 
 ```bash
-docker compose --profile ros-full up composer-ros
+scripts/launch.sh --lane isaac-sim --assistant off \
+  --scenario isaac-ur10e-light-scene --non-interactive --yes
 ```
 
-Then load:
+By default, the selected scenario's supervisor loads:
 
 - program: `examples/isaac_manipulator_scene_light.program.yaml`
 - deployment: `examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml`
+
+Set `LOAD_ARTIFACTS=false` only when you intentionally want to load them
+manually.
 
 The `composer-ros` service uses the full ROS-capable image with host
 networking so DDS can discover Isaac/robot endpoints. The default
@@ -395,7 +400,8 @@ dev-assist agents only. For deployment / operator bring-up, use
 ### ManyForge only
 
 ```bash
-docker compose up --build
+scripts/launch.sh --lane manyforge-only --assistant off \
+  --scenario lite6-pick-place --non-interactive --yes
 ```
 
 Then use:
@@ -403,7 +409,7 @@ Then use:
 - Composer API on port `9000`
 - native Composer viewer in the Composer UI
 
-This profile does not require ROS, Isaac Sim, or a robot controller. The
+This lane does not require ROS, Isaac Sim, or a robot controller. The
 native execution adapter is in-process: reset and retry only affect ManyForge's
 software state and RoboPlan-backed scene projection. No external robot or
 simulator is commanded.
@@ -464,19 +470,23 @@ process/container contexts and adds DDS/QoS requirements for raw camera streams.
 
    Keep this container running while Composer executes against Isaac. Host IPC
    is required for reliable ROS 2 action/service behavior across containers;
-   the compose service already sets `ipc: host`. If the image has not been
-   rebuilt with `topic_based_ros2_control` yet, the script can build a temporary
-   overlay from `${ISAAC_ROS_WS}/src/topic_based_ros2_control`.
+   the compose service already sets `ipc: host`. Canonical preflight requires
+   the selected image to vendor `topic_based_ros2_control`. A temporary build
+   from `${ISAAC_ROS_WS}/src/topic_based_ros2_control` is a debug-only escape
+   hatch and requires
+   `MANYFORGE_SOURCE_DEVELOPMENT_ROS_OVERLAYS=ON`.
 
-1. If you want to run the services manually instead of using the one-command
-   launcher:
+1. Raw Compose startup is retained only as a debugging surface:
 
    ```bash
    docker compose --profile ros-full up isaac-topic-control composer-ros
    ```
 
-   The supervisor still handles startup-order recovery and program/deployment
-   loading. Set `SUPERVISOR_AUTO_LOAD=false` to disable that behavior.
+   It does not pin a mutable image tag to an immutable ID or derive the cache
+   identity from that ID. Do not use it for qualification or product
+   operation. The supervisor still handles startup-order recovery and
+   program/deployment loading; set `SUPERVISOR_AUTO_LOAD=false` to disable
+   that behavior.
 
 1. If automatic loading is disabled, load the portable program and ROS
    deployment variant in Composer:

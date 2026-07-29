@@ -224,12 +224,15 @@ python -m manyforge_composer --mcp --catalog-path /workspace/manyforge_behavior/
 ## Docker Details
 
 The container runs as a non-root user (`manyforge`, uid 1000). The entrypoint
-(`docker-entrypoint.sh`) automatically:
+(`docker-entrypoint.sh`) only establishes the runtime environment:
 
 - Sets `PYTHONPATH` for `manyforge_behavior`
-- Builds pybind11 bindings if the C++ core library exists
 - Uses `/tmp/manyforge-build/` for out-of-tree builds (avoids conflicts with host build dirs)
-- Detects stale root-owned build cache volumes and asks you to remove them
+- Refuses a non-writable build root; it never builds or deletes cached products
+
+Canonical `docker compose run --rm dev ...` test containers use an ephemeral
+build root. The unified launcher performs its required builds explicitly and
+retains them only in a cache bound to the immutable image ID it actually runs.
 
 To rebuild the image after Dockerfile changes:
 
@@ -244,20 +247,13 @@ rm -rf .docker/roboplan
 ./scripts/setup-docker.sh
 ```
 
-### Upgrading from root-based images
+### Retained launcher caches
 
-Older images ran as root. After rebuilding with the current Dockerfile, the
-`build-cache` Docker volume may still contain root-owned files that the new
-non-root user cannot write to. If you see "Build cache not writable" on
-startup, run:
-
-```bash
-docker compose down -v
-```
-
-This removes the stale volume. The next container start will recreate it with
-the correct ownership. The C++ build cache will be rebuilt automatically (~2
-min).
+Raw Composer frontend/API debug profiles do not mount compiled-product caches.
+Canonical launchers retain native/ROS products only in cache volumes bound to
+the immutable runtime image ID. List and remove an exact unused cache using the
+guarded procedure in
+[`LAUNCHER_QUICKSTART.md`](docs/operations/LAUNCHER_QUICKSTART.md#likely-first-run-gotchas).
 
 ## Versioning, releases, security
 

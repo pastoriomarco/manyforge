@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# compose-dev.sh — Start ManyForge Composer in dev mode
+# compose-dev.sh — Start raw Composer frontend/API debug profiles
+#
+# These profiles do not build or load qualified native execution products.
+# Use scripts/launch.sh for every product/runtime lane.
 #
 # Usage:
 #   ./scripts/compose-dev.sh              # Start API (9000) + Vite HMR (3000)
-#   ./scripts/compose-dev.sh --prod       # Start production mode (API serves built frontend on 9000)
+#   ./scripts/compose-dev.sh --prod       # Start backend/static-UI debug mode
 #   ./scripts/compose-dev.sh --stop       # Stop all composer services
 #
 # Dev mode:   http://localhost:3000  (Vite + hot reload, proxies API to :9000)
-# Prod mode:  http://localhost:9000  (FastAPI serves static dist/)
+# --prod:     http://localhost:9000  (debug backend serves image-baked dist/)
 #
 # Pick-and-place E2E test:
 #   1. Start the composer (this script)
@@ -32,14 +35,16 @@ case "${1:-}" in
     exit 0
     ;;
   --prod)
-    echo "Starting Composer in production mode (port 9000)..."
+    echo "Starting raw Composer backend debug mode (port 9000)."
+    echo "This is not a qualified execution lane; use scripts/launch.sh for runtime work."
     docker compose --profile composer up --build -d
     echo ""
     echo "Composer running at http://localhost:9000"
     echo "Stop with: $0 --stop"
     ;;
   *)
-    echo "Starting Composer in dev mode (API :9000 + Vite :3000)..."
+    echo "Starting raw Composer source/API debug mode (API :9000 + Vite :3000)."
+    echo "This is not a qualified execution lane; use scripts/launch.sh for runtime work."
     docker compose --profile dev-composer up --build -d
     echo ""
     echo "API:      http://localhost:9000"

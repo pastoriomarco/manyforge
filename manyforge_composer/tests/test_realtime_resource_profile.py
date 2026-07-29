@@ -170,6 +170,79 @@ def test_native_composer_strict_profile_forwards_minimum_container_contract():
     assert "manyforge_exec_with_nrt_affinity python -m manyforge_composer" in source
 
 
+def test_native_composer_invalid_strict_profile_fails_without_docker_arguments():
+    environment = _profile_environment()
+    environment["MANYFORGE_NRT_CPU_AFFINITY"] = "not-a-cpu"
+    completed = _run_shell(
+        (
+            f"source {str(_COMPOSE_HELPER)!r}; "
+            "set +e; "
+            "prepare_native_composer_rt_docker_args; "
+            "rc=$?; "
+            "printf '<%s>\\n' \"${NATIVE_COMPOSER_RT_DOCKER_ARGS[@]}\"; "
+            'exit "${rc}"'
+        ),
+        environment,
+    )
+
+    assert completed.returncode != 0
+    assert "<--cap-add>" not in completed.stdout
+    assert "invalid CPU token" in completed.stderr
+
+
+def test_native_composer_build_cache_is_bound_to_immutable_image_id():
+    image_id = "sha256:" + ("a" * 64)
+    completed = _run_shell(
+        (
+            f"source {str(_COMPOSE_HELPER)!r}; "
+            f"native_composer_build_cache_volume_for_image_id {image_id!r}"
+        ),
+        {},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == (
+        "manyforge_native-composer-build-cache-" + ("a" * 64)
+    )
+
+    invalid = _run_shell(
+        (
+            f"source {str(_COMPOSE_HELPER)!r}; "
+            "native_composer_build_cache_volume_for_image_id latest"
+        ),
+        {},
+    )
+    assert invalid.returncode != 0
+
+    source = _COMPOSE_HELPER.read_text(encoding="utf-8")
+    assert '-v "${NATIVE_COMPOSER_BUILD_CACHE_VOLUME}:/tmp/manyforge-build"' in source
+    assert '"${NATIVE_COMPOSER_IMAGE_ID}" \\' in source
+    assert "manyforge_build-cache:/tmp/manyforge-build" not in source
+
+
+def test_native_composer_resolves_tag_once_to_image_and_cache_identity():
+    image_id = "sha256:" + ("c" * 64)
+    completed = _run_shell(
+        (
+            "docker() {\n"
+            "  [[ \"$1 $2 $3\" == \"image inspect manyforge-dev:latest\" ]]\n"
+            f"  printf '%s\\n' {image_id!r}\n"
+            "}\n"
+            f"source {str(_COMPOSE_HELPER)!r}; "
+            "resolve_native_composer_image; "
+            "printf '%s|%s\\n' "
+            '"${NATIVE_COMPOSER_IMAGE_ID}" '
+            '"${NATIVE_COMPOSER_BUILD_CACHE_VOLUME}"'
+        ),
+        {},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == (
+        f"{image_id}|manyforge_native-composer-build-cache-" + ("c" * 64)
+    )
+
+
 def test_native_profile_can_reclaim_absent_controller_manager_cpu_for_nrt():
     environment = _profile_environment()
     environment["MANYFORGE_NRT_CPU_AFFINITY"] = ",".join(

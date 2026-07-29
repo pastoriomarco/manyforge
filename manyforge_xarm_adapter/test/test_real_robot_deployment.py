@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import shlex
+import subprocess
 
 from manyforge_composer.backend.robot_lifecycle import (
     validate_real_robot_runtime_record,
@@ -296,6 +298,14 @@ def test_product_launcher_separates_control_owner_from_composer() -> None:
     assert '--cap-add SYS_NICE' in launcher
     assert '--ulimit rtprio=99:99' in launcher
     assert '--ulimit memlock=-1:-1' in launcher
+    assert 'docker image inspect' in launcher
+    assert 'immutable image identity' in launcher
+    assert launcher.count('"${REAL_ROBOT_IMAGE_ID}"') == 2
+    assert launcher.count(
+        '"${REAL_ROBOT_BUILD_CACHE_VOLUME}:/tmp/manyforge-build"'
+    ) == 2
+    assert 'manyforge_real-lite6-build-cache:/tmp/manyforge-build' not in launcher
+    assert 'manyforge_build-cache:/tmp/manyforge-build' not in launcher
     assert 'REAL_ROBOT_SUPERVISED_CONTRACT="1"' in launcher
     assert 'org.manyforge.xarm.supervised-contract' in launcher
     assert 'MANYFORGE_REAL_ROBOT_SMOKE_TIMEOUT_S' in launch_entrypoint
@@ -308,6 +318,42 @@ def test_product_launcher_separates_control_owner_from_composer() -> None:
     ) in builder
     assert 'XARM_SUPERVISED_CONTRACT_VERSION' in dockerfile
     assert 'org.manyforge.xarm.supervised-contract' in dockerfile
+
+
+def test_real_robot_build_cache_is_bound_to_immutable_image_id() -> None:
+    launcher = REPO_ROOT / 'scripts' / 'lib' / 'real_robot.sh'
+
+    def resolve(image_id: str) -> subprocess.CompletedProcess[str]:
+        command = (
+            f'source {shlex.quote(str(launcher))}; '
+            'real_robot_build_cache_volume_for_image_id '
+            f'{shlex.quote(image_id)}'
+        )
+        return subprocess.run(
+            ['bash', '-c', command],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={'MANYFORGE_ROOT': str(REPO_ROOT), 'PATH': '/usr/bin:/bin'},
+        )
+
+    first_digest = 'a' * 64
+    second_digest = 'b' * 64
+    first = resolve(f'sha256:{first_digest}')
+    second = resolve(f'sha256:{second_digest}')
+    malformed = resolve('not-an-image-id')
+
+    assert first.returncode == 0
+    assert first.stdout.strip() == (
+        f'manyforge_real-lite6-build-cache-{first_digest}'
+    )
+    assert second.returncode == 0
+    assert second.stdout.strip() == (
+        f'manyforge_real-lite6-build-cache-{second_digest}'
+    )
+    assert first.stdout != second.stdout
+    assert malformed.returncode != 0
+    assert malformed.stdout == ''
 
 
 def test_product_capture_retains_bounded_recent_lifecycle_history() -> None:

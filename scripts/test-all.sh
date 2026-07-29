@@ -12,60 +12,30 @@ set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/manyforge-pycache}"
+# The canonical `docker compose run --rm dev ...` lane does not mount a
+# persistent build volume. Its container-local default therefore cannot mix
+# CMake state from different dev images. Runtime launchers that intentionally
+# retain build products pass an explicit image-bound MANYFORGE_BUILD_DIR.
 BUILD_DIR="${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}"
 CTEST_TEST_TIMEOUT_S="${CTEST_TEST_TIMEOUT_S:-60}"
+BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"
+if [[ ! "${BUILD_PARALLEL_LEVEL}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "CMAKE_BUILD_PARALLEL_LEVEL must be a positive integer" >&2
+    exit 2
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-FORCE=0
-FILTER=""
-for _arg in "$@"; do
-    case "${_arg}" in
-        --force|-f) FORCE=1 ;;
-        --) ;;
-        -*) echo "test-all.sh: unknown option '${_arg}'" >&2; exit 2 ;;
-        *)  FILTER="${_arg}" ;;
-    esac
-done
-FILTER="${FILTER:-all}"
+if (( $# > 1 )); then
+    echo "test-all.sh accepts at most one suite name" >&2
+    exit 2
+fi
+FILTER="${1:-all}"
 PASS=0
 FAIL=0
-
-# ── Re-test gate ─────────────────────────────────────────────────────────────
-# A re-run against the same, unmodified workspace HEAD is redundant. Record the
-# commit of the last fully-passing run of this filter and skip an identical
-# re-run. --force overrides. MANYFORGE_GIT_COMMIT may be pre-set (e.g. by the
-# build) so the gate also works when the container workspace is not git-aware.
-# The gate is HEAD-keyed, so it only holds for a clean tree: the interpreted
-# Python suites run straight from the working tree, where an uncommitted edit
-# changes behavior without a rebuild. A dirty tree therefore disables the gate
-# entirely — no skip, no stamp.
-CURRENT_COMMIT="$(git -c safe.directory='*' -C "${WORKSPACE}" rev-parse HEAD 2>/dev/null || true)"
-export MANYFORGE_GIT_COMMIT="${MANYFORGE_GIT_COMMIT:-${CURRENT_COMMIT}}"
-REF_COMMIT="${MANYFORGE_GIT_COMMIT}"
-TEST_STAMP="${MANYFORGE_TEST_STAMP:-${WORKSPACE}/.manyforge-tested-${FILTER}.commit}"
-WORKSPACE_DIRTY=0
-if [[ -n "${CURRENT_COMMIT}" ]] \
-      && [[ -n "$(git -c safe.directory='*' -C "${WORKSPACE}" status --porcelain 2>/dev/null | head -c1)" ]]; then
-    WORKSPACE_DIRTY=1
-fi
-
-if (( FORCE == 0 && WORKSPACE_DIRTY == 0 )) && [[ -n "${REF_COMMIT}" && -f "${TEST_STAMP}" \
-      && "$(cat "${TEST_STAMP}" 2>/dev/null)" == "${REF_COMMIT}" ]]; then
-    echo -e "${GREEN}=== test-all (${FILTER}) ===${NC}"
-    echo "  Workspace HEAD ${REF_COMMIT:0:12} already passed the '${FILTER}' suite;"
-    echo "  code unchanged since (not rebuilt) — skipping re-test. Use --force to run anyway."
-    exit 0
-fi
-if (( WORKSPACE_DIRTY == 1 )); then
-    echo -e "${YELLOW}  (workspace has uncommitted changes — re-test gate disabled: running fully, no stamp will be written)${NC}"
-fi
-if [[ -z "${REF_COMMIT}" ]]; then
-    echo -e "${YELLOW}  (workspace not git-aware and MANYFORGE_GIT_COMMIT unset — running unconditionally; no stamp written)${NC}"
-fi
 
 section() { echo -e "\n${GREEN}=== $1 ===${NC}"; }
 skip()    { echo -e "${YELLOW}  SKIP: $1${NC}"; }
@@ -86,17 +56,6 @@ setup_pythonpath() {
     export PYTHONPATH="$WORKSPACE:$WORKSPACE/manyforge_behavior:${PYTHONPATH:-}"
 }
 
-reset_stale_python_build_dir() {
-    local build_dir="$1"
-    local cache_file="$build_dir/CMakeCache.txt"
-    local current_site
-    current_site=$(python3 -c "import site; print(site.getsitepackages()[0])")
-
-    if [ -f "$cache_file" ] && grep -q "/usr/local/lib/python3\\." "$cache_file" && ! grep -q "$current_site" "$cache_file"; then
-        rm -rf "$build_dir"
-    fi
-}
-
 python_has_modules() {
     python3 - "$@" <<'PY'
 import importlib
@@ -111,15 +70,22 @@ raise SystemExit(0)
 PY
 }
 
+build_manyforge_core() {
+    local build="$1"
+    local build_testing="$2"
+    mkdir -p "$build"
+    cd "$build"
+    cmake "$WORKSPACE/manyforge_core" -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING="$build_testing" \
+        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
+    cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
+}
+
 run_cpp_tests() {
     section "C++ manyforge_core tests"
     local build="$BUILD_DIR/core"
-    reset_stale_python_build_dir "$build"
-    mkdir -p "$build" && cd "$build"
-    cmake "$WORKSPACE/manyforge_core" -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_TESTING=ON \
-        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
-    make -j"$(nproc)" 2>&1 | tail -5
+    build_manyforge_core "$build" ON
+    cd "$build"
     # Both layers matter: the per-test TIMEOUT property baked by cmake
     # above (the -D flag re-evaluates on every run, so the env var
     # propagates correctly through the launcher path) AND the ctest
@@ -146,8 +112,8 @@ run_roboplan_tests() {
         set -u
     fi
     local build="$BUILD_DIR/roboplan"
-    reset_stale_python_build_dir "$build"
-    mkdir -p "$build" && cd "$build"
+    mkdir -p "$build"
+    cd "$build"
 
     PINOCCHIO_CMAKE_DIR=$(
         python3 - <<'PY'
@@ -184,9 +150,10 @@ PY
         BOOST_LIBRARYDIR="${boost_root:+${boost_root}/lib}" \
         cmake "$WORKSPACE/manyforge_roboplan" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=ON \
+        -DMANYFORGE_ENABLE_ROS2_CONTROL=OFF \
         -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" \
         ${pybind11_dir:+-Dpybind11_DIR="$pybind11_dir"} 2>&1 | tail -3
-    make -j"$(nproc)" 2>&1 | tail -5
+    make -j"$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
     if ! require_ctest_tests "manyforge_roboplan"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
@@ -205,23 +172,21 @@ run_pybind_tests() {
     section "pybind11 bindings tests"
     local core_build="$BUILD_DIR/core"
     local pybind_build="$BUILD_DIR/pybind"
-    reset_stale_python_build_dir "$pybind_build"
-
-    if [ ! -f "$core_build/libmanyforge_core.a" ]; then
-        skip "Build manyforge_core first (run with 'all' or 'cpp')"
-        return
-    fi
+    # Always run the incremental core build. Merely finding an archive does not
+    # prove it was built from the current source tree.
+    build_manyforge_core "$core_build" OFF
 
     local pybind11_dir
     pybind11_dir=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())" 2>/dev/null || echo "")
 
-    mkdir -p "$pybind_build" && cd "$pybind_build"
+    mkdir -p "$pybind_build"
+    cd "$pybind_build"
     cmake "$WORKSPACE/manyforge_core/python" \
         -DMANYFORGE_CORE_DIR="$core_build" \
         -DMANYFORGE_CORE_INCLUDE_DIR="$WORKSPACE/manyforge_core/include" \
         ${pybind11_dir:+-Dpybind11_DIR="$pybind11_dir"} \
         2>&1 | tail -3
-    make -j"$(nproc)" 2>&1 | tail -3
+    make -j"$BUILD_PARALLEL_LEVEL" 2>&1 | tail -3
     export PYTHONPATH="$pybind_build:${PYTHONPATH:-}"
     cd "$WORKSPACE"
     if pytest manyforge_core/python/tests/ -v; then
@@ -495,15 +460,6 @@ esac
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo -e "${GREEN}All $PASS test suite(s) passed.${NC}"
-    # Record this commit so an identical re-run (same code, not rebuilt) is
-    # skipped by the gate above. Only stamp on a clean pass, a known commit,
-    # and a clean tree — a dirty tree can pass now and regress after further
-    # edits without the stamp ever noticing.
-    if [[ -n "${REF_COMMIT}" && "${WORKSPACE_DIRTY}" -eq 0 ]]; then
-        if echo "${REF_COMMIT}" > "${TEST_STAMP}" 2>/dev/null; then
-            echo "  Recorded '${FILTER}' pass at ${REF_COMMIT:0:12} → re-test skipped until code changes (--force overrides)."
-        fi
-    fi
 else
     echo -e "${RED}$FAIL test suite(s) FAILED${NC} ($PASS passed)"
     exit 1

@@ -19,7 +19,9 @@ ROS_DISTRO="${ROS_DISTRO:-jazzy}"
 WORKSPACE="${WORKSPACE:-${REPO_ROOT}}"
 ISAAC_ROS_WS="${ISAAC_ROS_WS:-/home/tndlux/workspaces/isaac_ros-dev}"
 BUILD_IF_MISSING="${BUILD_IF_MISSING:-1}"
-MANYFORGE_ROS_OVERLAY="${MANYFORGE_ROS_OVERLAY:-/tmp/manyforge-ros2-control-overlay}"
+MANYFORGE_BUILD_DIR="${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}"
+MANYFORGE_ROS_OVERLAY="${MANYFORGE_ROS_OVERLAY:-${MANYFORGE_BUILD_DIR}/isaac-ros-overlay}"
+MANYFORGE_SOURCE_DEVELOPMENT_ROS_OVERLAYS="${MANYFORGE_SOURCE_DEVELOPMENT_ROS_OVERLAYS:-OFF}"
 
 source_if_exists() {
     local path="$1"
@@ -33,18 +35,39 @@ source_if_exists() {
 
 source_if_exists "/opt/ros/${ROS_DISTRO}/setup.bash"
 source_if_exists "/opt/manyforge/topic_based_ros2_control/install/setup.bash"
-source_if_exists "${ISAAC_ROS_WS}/install/setup.bash"
-source_if_exists "${WORKSPACE}/install/setup.bash"
+source_if_exists "${MANYFORGE_ROS_OVERLAY}/install/setup.bash"
+
+if [ "${MANYFORGE_SOURCE_DEVELOPMENT_ROS_OVERLAYS}" = "ON" ]; then
+    # Debug-only escape hatch. Canonical launch.sh runs never consume
+    # source-mounted or external-workspace compiled products.
+    source_if_exists "${ISAAC_ROS_WS}/install/setup.bash"
+    source_if_exists "${WORKSPACE}/install/setup.bash"
+fi
+
+build_manyforge_ros_bringup() {
+    echo "Building manyforge_ros_bringup in ${MANYFORGE_ROS_OVERLAY}/install ..." >&2
+    mkdir -p "${MANYFORGE_ROS_OVERLAY}"
+    colcon --log-base "${MANYFORGE_ROS_OVERLAY}/log" build \
+        --base-paths "${WORKSPACE}/manyforge_ros_bringup" \
+        --build-base "${MANYFORGE_ROS_OVERLAY}/build" \
+        --install-base "${MANYFORGE_ROS_OVERLAY}/install" \
+        --merge-install \
+        --packages-select manyforge_ros_bringup \
+        --cmake-args -DBUILD_TESTING=OFF
+    source_if_exists "${MANYFORGE_ROS_OVERLAY}/install/setup.bash"
+}
 
 if ! ros2 pkg prefix topic_based_ros2_control >/dev/null 2>&1; then
-    if [ "${BUILD_IF_MISSING}" = "1" ] && [ -d "${ISAAC_ROS_WS}/src/topic_based_ros2_control" ]; then
+    if [ "${BUILD_IF_MISSING}" = "1" ] &&
+       [ "${MANYFORGE_SOURCE_DEVELOPMENT_ROS_OVERLAYS}" = "ON" ] &&
+       [ -d "${ISAAC_ROS_WS}/src/topic_based_ros2_control" ]; then
         echo "Building topic_based_ros2_control and manyforge_ros_bringup in ${MANYFORGE_ROS_OVERLAY}/install ..." >&2
-        rm -rf "${MANYFORGE_ROS_OVERLAY}"
         mkdir -p "${MANYFORGE_ROS_OVERLAY}"
-        colcon build \
+        colcon --log-base "${MANYFORGE_ROS_OVERLAY}/log" build \
             --base-paths "${ISAAC_ROS_WS}/src/topic_based_ros2_control" "${WORKSPACE}/manyforge_ros_bringup" \
             --build-base "${MANYFORGE_ROS_OVERLAY}/build" \
             --install-base "${MANYFORGE_ROS_OVERLAY}/install" \
+            --merge-install \
             --packages-select topic_based_ros2_control manyforge_ros_bringup \
             --cmake-args -DBUILD_TESTING=OFF
         source_if_exists "${MANYFORGE_ROS_OVERLAY}/install/setup.bash"
@@ -56,9 +79,9 @@ if ! ros2 pkg prefix topic_based_ros2_control >/dev/null 2>&1; then
 topic_based_ros2_control is not available.
 
 Either:
-  - set ISAAC_ROS_WS to a workspace whose install/setup.bash contains it, or
-  - rebuild the manyforge-ros-jazzy-full image, which vendors it under /opt/manyforge.
-  - keep BUILD_IF_MISSING=1 and make sure ISAAC_ROS_WS/src/topic_based_ros2_control exists.
+  - rebuild the manyforge-ros-jazzy-full image, which vendors it under /opt/manyforge; or
+  - for debug-only development, set MANYFORGE_SOURCE_DEVELOPMENT_ROS_OVERLAYS=ON,
+    keep BUILD_IF_MISSING=1, and provide ISAAC_ROS_WS/src/topic_based_ros2_control.
 EOF
     exit 2
 fi
@@ -68,12 +91,7 @@ if ! ros2 pkg prefix manyforge_ros_bringup >/dev/null 2>&1; then
         echo "manyforge_ros_bringup is not built. Run: colcon build --packages-select manyforge_ros_bringup" >&2
         exit 2
     fi
-    echo "Building manyforge_ros_bringup in ${WORKSPACE}/install ..." >&2
-    (
-        cd "${WORKSPACE}"
-        colcon build --packages-select manyforge_ros_bringup
-    )
-    source_if_exists "${WORKSPACE}/install/setup.bash"
+    build_manyforge_ros_bringup
 fi
 
 bringup_executables="$(ros2 pkg executables manyforge_ros_bringup 2>/dev/null || true)"
@@ -91,12 +109,7 @@ Rebuild with:
 EOF
         exit 2
     fi
-    echo "Rebuilding stale manyforge_ros_bringup in ${WORKSPACE}/install ..." >&2
-    (
-        cd "${WORKSPACE}"
-        colcon build --packages-select manyforge_ros_bringup
-    )
-    source_if_exists "${WORKSPACE}/install/setup.bash"
+    build_manyforge_ros_bringup
 fi
 
 bringup_prefix="$(ros2 pkg prefix manyforge_ros_bringup 2>/dev/null || true)"
@@ -107,17 +120,11 @@ if [ -n "${bringup_prefix}" ] && [ -f "${bringup_gate_exe}" ] && \
         cat >&2 <<EOF
 manyforge_ros_bringup source is newer than the installed Isaac launch helpers.
 
-Rebuild with:
-  colcon build --packages-select manyforge_ros_bringup
+Rebuild with the canonical launcher, or set BUILD_IF_MISSING=1.
 EOF
         exit 2
     fi
-    echo "Rebuilding updated manyforge_ros_bringup in ${WORKSPACE}/install ..." >&2
-    (
-        cd "${WORKSPACE}"
-        colcon build --packages-select manyforge_ros_bringup
-    )
-    source_if_exists "${WORKSPACE}/install/setup.bash"
+    build_manyforge_ros_bringup
 fi
 
 isaac_profile="${ISAAC_TOPIC_CONTROL_PROFILE:-}"
