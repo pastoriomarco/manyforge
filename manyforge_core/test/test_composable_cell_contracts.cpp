@@ -33,10 +33,21 @@ concept HasCommandTuple = requires(T value) {
   value.command;
 };
 
+template <typename T>
+concept HasCatalogContentDigest = requires(T value) {
+  value.runtime_profile_digest;
+} || requires(T value) {
+  value.component_type_digest;
+} || requires(T value) {
+  value.provider_digest;
+} || requires(T value) {
+  value.stop_evidence_policy_digest;
+};
+
 static_assert(!std::is_same_v<CellId, ModelAssetId>);
 static_assert(!std::is_same_v<ModelAssetId, ModelInstanceId>);
 static_assert(!std::is_same_v<RuntimeProfileRevision, ModelRevision>);
-static_assert(!std::is_same_v<ContentDigest, ProviderDigest>);
+static_assert(!std::is_same_v<ModelRoleId, ModelGroupRoleId>);
 static_assert(!std::is_same_v<EndpointRoleId, StateAuthorityId>);
 static_assert(!std::is_same_v<ControlDomainId, ControlBindingId>);
 static_assert(!std::is_same_v<ComponentAttachmentId, ComponentAttachmentRevision>);
@@ -46,7 +57,8 @@ static_assert(!std::is_convertible_v<std::string, CellId>);
 static_assert(!std::is_convertible_v<CellId, std::string>);
 
 static_assert(std::is_same_v<decltype(RuntimeUnitDTO::runtime_unit_id), RuntimeUnitId>);
-static_assert(std::is_same_v<decltype(RuntimeUnitDTO::runtime_profile_digest), ContentDigest>);
+static_assert(
+    std::is_same_v<decltype(RuntimeUnitDTO::runtime_profile_revision), RuntimeProfileRevision>);
 static_assert(std::is_same_v<decltype(ModelInstanceDTO::model_revision), ModelRevision>);
 static_assert(std::is_same_v<decltype(ControllableComponentDTO::model_role_bindings),
                              std::vector<ModelRoleBindingDTO>>);
@@ -55,6 +67,8 @@ static_assert(
 static_assert(
     std::is_same_v<decltype(ControlBindingDTO::state_authority_class), StateAuthorityClass>);
 static_assert(std::is_same_v<decltype(ControlBindingDTO::state_authority_id), StateAuthorityId>);
+static_assert(std::is_same_v<decltype(ControlBindingDTO::capability_definition_revision),
+                             CapabilityDefinitionRevision>);
 static_assert(
     std::is_same_v<decltype(ComponentAttachmentEdgeDTO::parent), ComponentAttachmentEndpointDTO>);
 static_assert(std::is_same_v<decltype(ComponentAttachmentEdgeDTO::role), AttachmentRoleId>);
@@ -71,6 +85,9 @@ static_assert(!HasGraphRevision<ControlBindingDTO>);
 static_assert(!HasGraphRevision<ComponentAttachmentEdgeDTO>);
 static_assert(!HasDesiredState<RuntimeUnitDTO>);
 static_assert(!HasCommandTuple<RuntimeUnitDTO>);
+static_assert(!HasCatalogContentDigest<RuntimeUnitDTO>);
+static_assert(!HasCatalogContentDigest<ControllableComponentDTO>);
+static_assert(!HasCatalogContentDigest<ControlBindingDTO>);
 
 TEST(ComposableCellContracts, EqualTextRemainsDistinctAcrossStrongTypes) {
   const CellId cell{"same-text"};
@@ -97,7 +114,7 @@ TEST(ComposableCellContracts, SixGraphRecordShapesComposeOneClosedEnvelope) {
   const RuntimeUnitDTO runtime_unit{
       RuntimeUnitId{"runtime.control.a"},
       RuntimeProfileId{"runtime-profile.xarm"},
-      ContentDigest{kDigest},
+      RuntimeProfileRevision{kDigest},
       {},
       {},
   };
@@ -113,7 +130,6 @@ TEST(ComposableCellContracts, SixGraphRecordShapesComposeOneClosedEnvelope) {
       ControllableComponentId{"component.lite6.a"},
       ComponentTypeId{"component-type.arm"},
       ComponentTypeRevision{kDigest},
-      ContentDigest{kDigest},
       {{ModelRoleId{"base"}, model_instance.model_instance_id}},
       {runtime_unit.runtime_unit_id},
   };
@@ -129,6 +145,7 @@ TEST(ComposableCellContracts, SixGraphRecordShapesComposeOneClosedEnvelope) {
       component.controllable_component_id,
       CommandTargetId{"arm"},
       CapabilityId{"execution.trajectory.execute"},
+      CapabilityDefinitionRevision{kDigest},
       domain.control_domain_id,
       {{ResourceRoleId{"arm_joint_1"}, ResourceId{"lite6_a_joint1"}}},
       ControlInterfaceContractId{"interface.arm.position"},
@@ -141,12 +158,10 @@ TEST(ComposableCellContracts, SixGraphRecordShapesComposeOneClosedEnvelope) {
         {EndpointRoleId{"joint_state"}}}},
       ProviderInstanceId{"xarm_hardware.a"},
       ProviderManifestRevision{kDigest},
-      ProviderDigest{kDigest},
       StateAuthorityId{"xarm_measured_state"},
       StateAuthorityClass::kMeasured,
       StopEvidencePolicyId{"arm_measured_rest"},
       StopEvidencePolicyRevision{kDigest},
-      ContentDigest{kDigest},
       ContainmentGranularity::kControllerSet,
   };
   const ComponentAttachmentEdgeDTO attachment{

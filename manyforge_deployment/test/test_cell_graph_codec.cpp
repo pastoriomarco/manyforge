@@ -67,8 +67,6 @@ constexpr std::string_view kZeroDigest =
     component_type_id: articulated_arm
     component_type_revision: )YAML" + std::string(kZeroDigest) +
                                       R"YAML(
-    component_type_digest: )YAML" + std::string(kZeroDigest) +
-                                      R"YAML(
     model_role_bindings:
       - {model_role_id: base, model_instance_id: robot_1_model}
     runtime_unit_ids: []
@@ -78,8 +76,6 @@ constexpr std::string_view kZeroDigest =
     model_role_bindings:
       - model_instance_id: robot_2_model
         model_role_id: base
-    component_type_digest: )YAML" + std::string(kZeroDigest) +
-                                       R"YAML(
     component_type_revision: )YAML" + std::string(kZeroDigest) +
                                        R"YAML(
     component_type_id: articulated_arm
@@ -109,13 +105,13 @@ cell_id: full_cell
 runtime_units:
   - runtime_unit_id: observer
     runtime_profile_id: observer_profile
-    runtime_profile_digest: )YAML" +
+    runtime_profile_revision: )YAML" +
          std::string(kZeroDigest) + R"YAML(
     dependency_runtime_unit_ids: []
     configuration: {}
   - runtime_unit_id: driver
     runtime_profile_id: driver_profile
-    runtime_profile_digest: )YAML" +
+    runtime_profile_revision: )YAML" +
          std::string(kZeroDigest) + R"YAML(
     dependency_runtime_unit_ids: [observer]
     configuration: {robot_ip_ref: site.robot.ip}
@@ -143,16 +139,12 @@ controllable_components:
     component_type_id: arm_type
     component_type_revision: )YAML" +
          std::string(kZeroDigest) + R"YAML(
-    component_type_digest: )YAML" +
-         std::string(kZeroDigest) + R"YAML(
     model_role_bindings:
       - {model_role_id: base, model_instance_id: arm_model}
     runtime_unit_ids: [observer, driver]
   - controllable_component_id: tool
     component_type_id: tool_type
     component_type_revision: )YAML" +
-         std::string(kZeroDigest) + R"YAML(
-    component_type_digest: )YAML" +
          std::string(kZeroDigest) + R"YAML(
     model_role_bindings:
       - {model_role_id: body, model_instance_id: tool_model}
@@ -174,6 +166,8 @@ control_bindings:
     controllable_component_id: arm
     command_target_id: arm
     capability_id: execution.trajectory.execute
+    capability_definition_revision: )YAML" +
+         std::string(kZeroDigest) + R"YAML(
     control_domain_id: arm_motion
     resource_bindings:
       - {resource_role_id: arm_joints, resource_id: joint_2}
@@ -195,14 +189,10 @@ control_bindings:
     provider_instance_id: hardware
     provider_manifest_revision: )YAML" +
          std::string(kZeroDigest) + R"YAML(
-    provider_digest: )YAML" +
-         std::string(kZeroDigest) + R"YAML(
     state_authority_id: measured_joint_state
     state_authority_class: measured
     stop_evidence_policy_id: measured_rest
     stop_evidence_policy_revision: )YAML" +
-         std::string(kZeroDigest) + R"YAML(
-    stop_evidence_policy_digest: )YAML" +
          std::string(kZeroDigest) + R"YAML(
     containment_granularity: controller_set
 component_attachments:
@@ -242,8 +232,9 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
     "\"provenanc"
     "e_digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"rol"
     "e\":\"end_effector\",\"tcp_effects\":[\"tool_tcp\"]}],\"control_bindings\":[{\"capability_"
-    "id\":\"exe"
-    "cution.trajectory.execute\",\"command_target_id\":\"arm\",\"containment_granularity\":"
+    "definition_revision\":\"sha256:000000000000000000000000000000000000000000000000000000000000"
+    "0000\",\"capability_id\":\"execution.trajectory.execute\",\"command_target_id\":\"arm\","
+    "\"containment_granularity\":"
     "\"controll"
     "er_set\",\"control_binding_id\":\"arm_trajectory\",\"control_binding_revision\":\"sha256:"
     "0000000"
@@ -253,8 +244,7 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
     "0000000000000000000000000000000000000000000000000000000000000000\",\"controllable_componen"
     "t_id\":\"arm\",\"controller_topology_id\":\"standard\",\"legal_control_route_ids\":[\"route_"
     "a\",\"ro"
-    "ute_b\"],\"provider_digest\":\"sha256:000000000000000000000000000000000000000000000000000000"
-    "0000000000\",\"provider_instance_id\":\"hardware\",\"provider_manifest_revision\":\"sha256:"
+    "ute_b\"],\"provider_instance_id\":\"hardware\",\"provider_manifest_revision\":\"sha256:"
     "00000"
     "00000000000000000000000000000000000000000000000000000000000\",\"resource_bindings\":[{\"reso"
     "urce_id\":\"joint_2\",\"resource_role_id\":\"arm_joints\"},{\"resource_id\":\"joint_1\","
@@ -267,8 +257,7 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
     "endpoint_"
     "role_ids\":[\"state_a\",\"state_b\"]}],\"state_authority_class\":\"measured\",\"state_"
     "authority_id"
-    "\":\"measured_joint_state\",\"stop_evidence_policy_digest\":\"sha256:0000000000000000000000000"
-    "000000000000000000000000000000000000000\",\"stop_evidence_policy_id\":\"measured_rest\",\"stop"
+    "\":\"measured_joint_state\",\"stop_evidence_policy_id\":\"measured_rest\",\"stop"
     "_evidence_policy_revision\":\"sha256:00000000000000000000000000000000000000000000000000000"
     "00000000000\",\"topology_revision\":\"sha256:00000000000000000000000000000000000000000000000"
     "00000000000000000\"}],\"control_domains\":[{\"containment_granularity\":\"controller_set\","
@@ -279,14 +268,11 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
     "00000000\",\"controller_topology_id\":\"standard\",\"runtime_unit_ids\":[\"driver\"],"
     "\"topology_re"
     "vision\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"}],\"con"
-    "trollable_components\":[{\"component_type_digest\":\"sha256:00000000000000000000000000000000"
-    "00000000000000000000000000000000\",\"component_type_id\":\"arm_type\",\"component_type_revisio"
+    "trollable_components\":[{\"component_type_id\":\"arm_type\",\"component_type_revisio"
     "n\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"controllab"
     "le_component_id\":\"arm\",\"model_role_bindings\":[{\"model_instance_id\":\"arm_model\","
     "\"model_ro"
-    "le_id\":\"base\"}],\"runtime_unit_ids\":[\"driver\",\"observer\"]},{\"component_type_digest\":"
-    "\"sha2"
-    "56:0000000000000000000000000000000000000000000000000000000000000000\",\"component_type_id\""
+    "le_id\":\"base\"}],\"runtime_unit_ids\":[\"driver\",\"observer\"]},{\"component_type_id\""
     ":\"tool_type\",\"component_type_revision\":\"sha256:00000000000000000000000000000000000000000"
     "00000000000000000000000\",\"controllable_component_id\":\"tool\",\"model_role_bindings\":[{"
     "\"mod"
@@ -306,13 +292,13 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
     "\"orientation_xyzw\":[0,0,0,1],\"position_m\":[0,0,0.1]}}],\"runtime_units\":[{"
     "\"configuration\""
     ":{\"robot_ip_ref\":\"site.robot.ip\"},\"dependency_runtime_unit_ids\":[\"observer\"],"
-    "\"runtime_pr"
-    "ofile_digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\","
-    "\"runtime_profile_id\":\"driver_profile\",\"runtime_unit_id\":\"driver\"},{\"configuration\":{"
+    "\"runtime_profile_id\":\"driver_profile\",\"runtime_profile_revision\":\"sha256:"
+    "0000000000000000000000000000000000000000000000000000000000000000\",\"runtime_unit_id\":"
+    "\"driver\"},{\"configuration\":{"
     "},\"d"
-    "ependency_runtime_unit_ids\":[],\"runtime_profile_digest\":\"sha256:000000000000000000000000"
-    "0000000000000000000000000000000000000000\",\"runtime_profile_id\":\"observer_profile\",\"runti"
-    "me_unit_id\":\"observer\"}]}";
+    "ependency_runtime_unit_ids\":[],\"runtime_profile_id\":\"observer_profile\",\"runtime_profile_"
+    "revision\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\","
+    "\"runtime_unit_id\":\"observer\"}]}";
 
 [[nodiscard]] std::string replace_once(std::string text, std::string_view from,
                                        std::string_view to) {
@@ -364,6 +350,39 @@ TEST(CellGraphCodec, RetainedFieldChangeChangesNormalizedCandidate) {
 
   EXPECT_NE(canonical_json(first.structurally_normalized_root()),
             canonical_json(second.structurally_normalized_root()));
+}
+
+TEST(CellGraphCodec, RejectsRemovedCatalogByteDigestCompatibilityFields) {
+  const std::string digest = std::string(kZeroDigest);
+  EXPECT_THROW(
+      {
+        (void)decode(replace_once(
+            full_graph(), "    dependency_runtime_unit_ids: []",
+            "    runtime_profile_digest: " + digest + "\n    dependency_runtime_unit_ids: []"));
+      },
+      CellGraphCodecError);
+  EXPECT_THROW(
+      {
+        (void)decode(replace_once(
+            full_graph(), "    model_role_bindings:",
+            "    component_type_digest: " + digest + "\n    model_role_bindings:"));
+      },
+      CellGraphCodecError);
+  EXPECT_THROW(
+      {
+        (void)decode(replace_once(
+            full_graph(), "    state_authority_id: measured_joint_state",
+            "    provider_digest: " + digest + "\n    state_authority_id: measured_joint_state"));
+      },
+      CellGraphCodecError);
+  EXPECT_THROW(
+      {
+        (void)decode(replace_once(
+            full_graph(), "    containment_granularity: controller_set\ncomponent_attachments:",
+            "    stop_evidence_policy_digest: " + digest +
+                "\n    containment_granularity: controller_set\ncomponent_attachments:"));
+      },
+      CellGraphCodecError);
 }
 
 TEST(CellGraphCodec, TwoSameTypeInstancesAreDistinctAndValid) {

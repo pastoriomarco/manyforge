@@ -22,6 +22,7 @@ namespace {
 
 using core::AttachmentInterfaceId;
 using core::AttachmentRoleId;
+using core::CapabilityDefinitionRevision;
 using core::CapabilityId;
 using core::CellGraphDTO;
 using core::CellId;
@@ -59,7 +60,6 @@ using core::ModelRevision;
 using core::ModelRoleBindingDTO;
 using core::ModelRoleId;
 using core::MountPoseDTO;
-using core::ProviderDigest;
 using core::ProviderInstanceId;
 using core::ProviderManifestRevision;
 using core::ResourceBindingDTO;
@@ -67,6 +67,7 @@ using core::ResourceId;
 using core::ResourceRoleId;
 using core::RouteEndpointProjectionDTO;
 using core::RuntimeProfileId;
+using core::RuntimeProfileRevision;
 using core::RuntimeUnitDTO;
 using core::RuntimeUnitId;
 using core::StateAuthorityClass;
@@ -316,7 +317,7 @@ template <typename StrongType>
                                                 std::string_view path) {
   const auto& object = require_object(value, path);
   require_exact_fields(object,
-                       {"runtime_unit_id", "runtime_profile_id", "runtime_profile_digest",
+                       {"runtime_unit_id", "runtime_profile_id", "runtime_profile_revision",
                         "dependency_runtime_unit_ids", "configuration"},
                        path);
   return RuntimeUnitDTO{
@@ -324,8 +325,9 @@ template <typename StrongType>
                                     child_path(path, "runtime_unit_id")),
       parse_identity<RuntimeProfileId>(require_member(object, "runtime_profile_id", path),
                                        child_path(path, "runtime_profile_id")),
-      parse_digest<ContentDigest>(require_member(object, "runtime_profile_digest", path),
-                                  child_path(path, "runtime_profile_digest")),
+      parse_digest<RuntimeProfileRevision>(
+          require_member(object, "runtime_profile_revision", path),
+          child_path(path, "runtime_profile_revision")),
       parse_identity_set<RuntimeUnitId>(require_member(object, "dependency_runtime_unit_ids", path),
                                         child_path(path, "dependency_runtime_unit_ids")),
       to_json_object(require_member(object, "configuration", path),
@@ -388,7 +390,7 @@ template <typename StrongType>
   const auto& object = require_object(value, path);
   require_exact_fields(object,
                        {"controllable_component_id", "component_type_id", "component_type_revision",
-                        "component_type_digest", "model_role_bindings", "runtime_unit_ids"},
+                        "model_role_bindings", "runtime_unit_ids"},
                        path);
   return ControllableComponentDTO{
       parse_identity<ControllableComponentId>(
@@ -398,8 +400,6 @@ template <typename StrongType>
                                       child_path(path, "component_type_id")),
       parse_digest<ComponentTypeRevision>(require_member(object, "component_type_revision", path),
                                           child_path(path, "component_type_revision")),
-      parse_digest<ContentDigest>(require_member(object, "component_type_digest", path),
-                                  child_path(path, "component_type_digest")),
       parse_model_role_bindings(require_member(object, "model_role_bindings", path),
                                 child_path(path, "model_role_bindings")),
       parse_identity_set<RuntimeUnitId>(require_member(object, "runtime_unit_ids", path),
@@ -498,6 +498,7 @@ template <typename StrongType>
                         "controllable_component_id",
                         "command_target_id",
                         "capability_id",
+                        "capability_definition_revision",
                         "control_domain_id",
                         "resource_bindings",
                         "control_interface_contract_id",
@@ -508,12 +509,10 @@ template <typename StrongType>
                         "route_endpoint_projections",
                         "provider_instance_id",
                         "provider_manifest_revision",
-                        "provider_digest",
                         "state_authority_id",
                         "state_authority_class",
                         "stop_evidence_policy_id",
                         "stop_evidence_policy_revision",
-                        "stop_evidence_policy_digest",
                         "containment_granularity"},
                        path);
 
@@ -549,6 +548,9 @@ template <typename StrongType>
                                       child_path(path, "command_target_id")),
       parse_identity<CapabilityId>(require_member(object, "capability_id", path),
                                    child_path(path, "capability_id")),
+      parse_digest<CapabilityDefinitionRevision>(
+          require_member(object, "capability_definition_revision", path),
+          child_path(path, "capability_definition_revision")),
       parse_identity<ControlDomainId>(require_member(object, "control_domain_id", path),
                                       child_path(path, "control_domain_id")),
       parse_resource_bindings(require_member(object, "resource_bindings", path),
@@ -570,8 +572,6 @@ template <typename StrongType>
       parse_digest<ProviderManifestRevision>(
           require_member(object, "provider_manifest_revision", path),
           child_path(path, "provider_manifest_revision")),
-      parse_digest<ProviderDigest>(require_member(object, "provider_digest", path),
-                                   child_path(path, "provider_digest")),
       parse_identity<StateAuthorityId>(require_member(object, "state_authority_id", path),
                                        child_path(path, "state_authority_id")),
       parse_state_authority_class(require_member(object, "state_authority_class", path),
@@ -581,8 +581,6 @@ template <typename StrongType>
       parse_digest<StopEvidencePolicyRevision>(
           require_member(object, "stop_evidence_policy_revision", path),
           child_path(path, "stop_evidence_policy_revision")),
-      parse_digest<ContentDigest>(require_member(object, "stop_evidence_policy_digest", path),
-                                  child_path(path, "stop_evidence_policy_digest")),
       parse_containment_granularity(require_member(object, "containment_granularity", path),
                                     child_path(path, "containment_granularity"))};
 }
@@ -720,7 +718,7 @@ template <typename StrongType>
   return CanonicalValue(CanonicalValue::Object{
       {"runtime_unit_id", identity_value(record.runtime_unit_id)},
       {"runtime_profile_id", identity_value(record.runtime_profile_id)},
-      {"runtime_profile_digest", identity_value(record.runtime_profile_digest)},
+      {"runtime_profile_revision", identity_value(record.runtime_profile_revision)},
       {"dependency_runtime_unit_ids", identity_array(record.dependency_runtime_unit_ids)},
       {"configuration", json_object_to_canonical(record.configuration)}});
 }
@@ -747,7 +745,6 @@ template <typename StrongType>
       {"controllable_component_id", identity_value(record.controllable_component_id)},
       {"component_type_id", identity_value(record.component_type_id)},
       {"component_type_revision", identity_value(record.component_type_revision)},
-      {"component_type_digest", identity_value(record.component_type_digest)},
       {"model_role_bindings", CanonicalValue(std::move(model_bindings))},
       {"runtime_unit_ids", identity_array(record.runtime_unit_ids)}});
 }
@@ -787,6 +784,8 @@ template <typename StrongType>
       {"controllable_component_id", identity_value(record.controllable_component_id)},
       {"command_target_id", identity_value(record.command_target_id)},
       {"capability_id", identity_value(record.capability_id)},
+      {"capability_definition_revision",
+       identity_value(record.capability_definition_revision)},
       {"control_domain_id", identity_value(record.control_domain_id)},
       {"resource_bindings", CanonicalValue(std::move(resources))},
       {"control_interface_contract_id", identity_value(record.control_interface_contract_id)},
@@ -797,13 +796,11 @@ template <typename StrongType>
       {"route_endpoint_projections", CanonicalValue(std::move(projections))},
       {"provider_instance_id", identity_value(record.provider_instance_id)},
       {"provider_manifest_revision", identity_value(record.provider_manifest_revision)},
-      {"provider_digest", identity_value(record.provider_digest)},
       {"state_authority_id", identity_value(record.state_authority_id)},
       {"state_authority_class",
        CanonicalValue(std::string(core::to_string(record.state_authority_class)))},
       {"stop_evidence_policy_id", identity_value(record.stop_evidence_policy_id)},
       {"stop_evidence_policy_revision", identity_value(record.stop_evidence_policy_revision)},
-      {"stop_evidence_policy_digest", identity_value(record.stop_evidence_policy_digest)},
       {"containment_granularity",
        CanonicalValue(std::string(core::to_string(record.containment_granularity)))}});
 }

@@ -58,6 +58,7 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(ModelInstanceId);
   MANYFORGE_BIND_STRONG_STRING(ModelRevision);
   MANYFORGE_BIND_STRONG_STRING(ModelRoleId);
+  MANYFORGE_BIND_STRONG_STRING(ModelGroupRoleId);
   MANYFORGE_BIND_STRONG_STRING(CommandTargetId);
   MANYFORGE_BIND_STRONG_STRING(CapabilityId);
   MANYFORGE_BIND_STRONG_STRING(CapabilityDefinitionRevision);
@@ -86,7 +87,6 @@ void register_strong_identity_bindings(py::module_& module) {
 
   MANYFORGE_BIND_STRONG_STRING(ProviderInstanceId);
   MANYFORGE_BIND_STRONG_STRING(ProviderManifestRevision);
-  MANYFORGE_BIND_STRONG_STRING(ProviderDigest);
 
   MANYFORGE_BIND_STRONG_STRING(ComponentAttachmentId);
   MANYFORGE_BIND_STRONG_STRING(ComponentAttachmentRevision);

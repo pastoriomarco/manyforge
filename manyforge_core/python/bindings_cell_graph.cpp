@@ -276,21 +276,21 @@ void register_cell_graph_bindings(py::module_& module) {
 
   py::class_<RuntimeUnitDTO>(module, "RuntimeUnitDTO", py::is_final())
       .def(py::init([](RuntimeUnitId runtime_unit_id, RuntimeProfileId runtime_profile_id,
-                       ContentDigest runtime_profile_digest,
+                       RuntimeProfileRevision runtime_profile_revision,
                        std::vector<RuntimeUnitId> dependency_runtime_unit_ids,
                        JsonObjectDTO configuration) {
              return RuntimeUnitDTO{
-                 std::move(runtime_unit_id),        std::move(runtime_profile_id),
-                 std::move(runtime_profile_digest), std::move(dependency_runtime_unit_ids),
-                 std::move(configuration),
+                 std::move(runtime_unit_id), std::move(runtime_profile_id),
+                 std::move(runtime_profile_revision),
+                 std::move(dependency_runtime_unit_ids), std::move(configuration),
              };
            }),
            py::arg("runtime_unit_id"), py::arg("runtime_profile_id"),
-           py::arg("runtime_profile_digest"), py::arg("dependency_runtime_unit_ids"),
+           py::arg("runtime_profile_revision"), py::arg("dependency_runtime_unit_ids"),
            py::arg("configuration"))
       .def_readonly("runtime_unit_id", &RuntimeUnitDTO::runtime_unit_id)
       .def_readonly("runtime_profile_id", &RuntimeUnitDTO::runtime_profile_id)
-      .def_readonly("runtime_profile_digest", &RuntimeUnitDTO::runtime_profile_digest)
+      .def_readonly("runtime_profile_revision", &RuntimeUnitDTO::runtime_profile_revision)
       .def_readonly("dependency_runtime_unit_ids", &RuntimeUnitDTO::dependency_runtime_unit_ids)
       .def_readonly("configuration", &RuntimeUnitDTO::configuration)
       .def(
@@ -332,23 +332,21 @@ void register_cell_graph_bindings(py::module_& module) {
       .def(py::init([](ControllableComponentId controllable_component_id,
                        ComponentTypeId component_type_id,
                        ComponentTypeRevision component_type_revision,
-                       ContentDigest component_type_digest,
                        std::vector<ModelRoleBindingDTO> model_role_bindings,
                        std::vector<RuntimeUnitId> runtime_unit_ids) {
              return ControllableComponentDTO{
                  std::move(controllable_component_id), std::move(component_type_id),
-                 std::move(component_type_revision),   std::move(component_type_digest),
-                 std::move(model_role_bindings),       std::move(runtime_unit_ids),
+                 std::move(component_type_revision), std::move(model_role_bindings),
+                 std::move(runtime_unit_ids),
              };
            }),
            py::arg("controllable_component_id"), py::arg("component_type_id"),
-           py::arg("component_type_revision"), py::arg("component_type_digest"),
-           py::arg("model_role_bindings"), py::arg("runtime_unit_ids"))
+           py::arg("component_type_revision"), py::arg("model_role_bindings"),
+           py::arg("runtime_unit_ids"))
       .def_readonly("controllable_component_id",
                     &ControllableComponentDTO::controllable_component_id)
       .def_readonly("component_type_id", &ControllableComponentDTO::component_type_id)
       .def_readonly("component_type_revision", &ControllableComponentDTO::component_type_revision)
-      .def_readonly("component_type_digest", &ControllableComponentDTO::component_type_digest)
       .def_readonly("model_role_bindings", &ControllableComponentDTO::model_role_bindings)
       .def_readonly("runtime_unit_ids", &ControllableComponentDTO::runtime_unit_ids)
       .def(
@@ -405,6 +403,7 @@ void register_cell_graph_bindings(py::module_& module) {
                        ControlBindingRevision control_binding_revision,
                        ControllableComponentId controllable_component_id,
                        CommandTargetId command_target_id, CapabilityId capability_id,
+                       CapabilityDefinitionRevision capability_definition_revision,
                        ControlDomainId control_domain_id,
                        std::vector<ResourceBindingDTO> resource_bindings,
                        ControlInterfaceContractId control_interface_contract_id,
@@ -415,11 +414,10 @@ void register_cell_graph_bindings(py::module_& module) {
                        std::vector<RouteEndpointProjectionDTO> route_endpoint_projections,
                        ProviderInstanceId provider_instance_id,
                        ProviderManifestRevision provider_manifest_revision,
-                       ProviderDigest provider_digest, StateAuthorityId state_authority_id,
+                       StateAuthorityId state_authority_id,
                        StateAuthorityClass state_authority_class,
                        StopEvidencePolicyId stop_evidence_policy_id,
                        StopEvidencePolicyRevision stop_evidence_policy_revision,
-                       ContentDigest stop_evidence_policy_digest,
                        ContainmentGranularity containment_granularity) {
              return ControlBindingDTO{
                  std::move(control_binding_id),
@@ -427,6 +425,7 @@ void register_cell_graph_bindings(py::module_& module) {
                  std::move(controllable_component_id),
                  std::move(command_target_id),
                  std::move(capability_id),
+                 std::move(capability_definition_revision),
                  std::move(control_domain_id),
                  std::move(resource_bindings),
                  std::move(control_interface_contract_id),
@@ -437,31 +436,31 @@ void register_cell_graph_bindings(py::module_& module) {
                  std::move(route_endpoint_projections),
                  std::move(provider_instance_id),
                  std::move(provider_manifest_revision),
-                 std::move(provider_digest),
                  std::move(state_authority_id),
                  state_authority_class,
                  std::move(stop_evidence_policy_id),
                  std::move(stop_evidence_policy_revision),
-                 std::move(stop_evidence_policy_digest),
                  containment_granularity,
              };
            }),
            py::arg("control_binding_id"), py::arg("control_binding_revision"),
            py::arg("controllable_component_id"), py::arg("command_target_id"),
-           py::arg("capability_id"), py::arg("control_domain_id"), py::arg("resource_bindings"),
+           py::arg("capability_id"), py::arg("capability_definition_revision"),
+           py::arg("control_domain_id"), py::arg("resource_bindings"),
            py::arg("control_interface_contract_id"), py::arg("control_interface_revision"),
            py::arg("controller_topology_id"), py::arg("topology_revision"),
            py::arg("legal_control_route_ids"), py::arg("route_endpoint_projections"),
            py::arg("provider_instance_id"), py::arg("provider_manifest_revision"),
-           py::arg("provider_digest"), py::arg("state_authority_id"),
-           py::arg("state_authority_class"), py::arg("stop_evidence_policy_id"),
-           py::arg("stop_evidence_policy_revision"), py::arg("stop_evidence_policy_digest"),
+           py::arg("state_authority_id"), py::arg("state_authority_class"),
+           py::arg("stop_evidence_policy_id"), py::arg("stop_evidence_policy_revision"),
            py::arg("containment_granularity"))
       .def_readonly("control_binding_id", &ControlBindingDTO::control_binding_id)
       .def_readonly("control_binding_revision", &ControlBindingDTO::control_binding_revision)
       .def_readonly("controllable_component_id", &ControlBindingDTO::controllable_component_id)
       .def_readonly("command_target_id", &ControlBindingDTO::command_target_id)
       .def_readonly("capability_id", &ControlBindingDTO::capability_id)
+      .def_readonly("capability_definition_revision",
+                    &ControlBindingDTO::capability_definition_revision)
       .def_readonly("control_domain_id", &ControlBindingDTO::control_domain_id)
       .def_readonly("resource_bindings", &ControlBindingDTO::resource_bindings)
       .def_readonly("control_interface_contract_id",
@@ -473,13 +472,11 @@ void register_cell_graph_bindings(py::module_& module) {
       .def_readonly("route_endpoint_projections", &ControlBindingDTO::route_endpoint_projections)
       .def_readonly("provider_instance_id", &ControlBindingDTO::provider_instance_id)
       .def_readonly("provider_manifest_revision", &ControlBindingDTO::provider_manifest_revision)
-      .def_readonly("provider_digest", &ControlBindingDTO::provider_digest)
       .def_readonly("state_authority_id", &ControlBindingDTO::state_authority_id)
       .def_readonly("state_authority_class", &ControlBindingDTO::state_authority_class)
       .def_readonly("stop_evidence_policy_id", &ControlBindingDTO::stop_evidence_policy_id)
       .def_readonly("stop_evidence_policy_revision",
                     &ControlBindingDTO::stop_evidence_policy_revision)
-      .def_readonly("stop_evidence_policy_digest", &ControlBindingDTO::stop_evidence_policy_digest)
       .def_readonly("containment_granularity", &ControlBindingDTO::containment_granularity)
       .def(
           "__eq__",

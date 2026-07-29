@@ -29,6 +29,7 @@ STRONG_STRING_TYPES = (
     "ModelInstanceId",
     "ModelRevision",
     "ModelRoleId",
+    "ModelGroupRoleId",
     "CommandTargetId",
     "CapabilityId",
     "CapabilityDefinitionRevision",
@@ -55,7 +56,6 @@ STRONG_STRING_TYPES = (
     "ContactPolicyRevision",
     "ProviderInstanceId",
     "ProviderManifestRevision",
-    "ProviderDigest",
     "ComponentAttachmentId",
     "ComponentAttachmentRevision",
     "CommandSchemaId",
@@ -183,7 +183,9 @@ def _cell_graph():
     runtime_unit = core.RuntimeUnitDTO(
         runtime_unit_id=core.RuntimeUnitId("runtime/arm"),
         runtime_profile_id=core.RuntimeProfileId("runtime-profile/fake"),
-        runtime_profile_digest=core.ContentDigest("sha256:runtime-profile"),
+        runtime_profile_revision=core.RuntimeProfileRevision(
+            "sha256:runtime-profile"
+        ),
         dependency_runtime_unit_ids=[],
         configuration=configuration,
     )
@@ -203,7 +205,6 @@ def _cell_graph():
         controllable_component_id=core.ControllableComponentId("component/arm"),
         component_type_id=core.ComponentTypeId("component-type/lite6"),
         component_type_revision=core.ComponentTypeRevision("sha256:component-type"),
-        component_type_digest=core.ContentDigest("sha256:component-type-bytes"),
         model_role_bindings=[
             core.ModelRoleBindingDTO(
                 model_role_id=core.ModelRoleId("primary"),
@@ -232,6 +233,9 @@ def _cell_graph():
         controllable_component_id=component.controllable_component_id,
         command_target_id=core.CommandTargetId("target/arm"),
         capability_id=core.CapabilityId("execution.trajectory.execute"),
+        capability_definition_revision=core.CapabilityDefinitionRevision(
+            "sha256:capability"
+        ),
         control_domain_id=domain.control_domain_id,
         resource_bindings=[
             core.ResourceBindingDTO(
@@ -253,14 +257,12 @@ def _cell_graph():
         provider_manifest_revision=core.ProviderManifestRevision(
             "sha256:provider-manifest"
         ),
-        provider_digest=core.ProviderDigest("sha256:provider"),
         state_authority_id=core.StateAuthorityId("state/measured"),
         state_authority_class=core.StateAuthorityClass.kMeasured,
         stop_evidence_policy_id=core.StopEvidencePolicyId("stop/measured-rest"),
         stop_evidence_policy_revision=core.StopEvidencePolicyRevision(
             "sha256:stop-policy"
         ),
-        stop_evidence_policy_digest=core.ContentDigest("sha256:stop-policy-bytes"),
         containment_granularity=core.ContainmentGranularity.kControlDomain,
     )
     parent = core.ComponentAttachmentEndpointDTO(
@@ -504,6 +506,13 @@ def test_all_six_graph_records_and_envelope_round_trip_read_only():
     assert graph.control_domains == [values["domain"]]
     assert graph.control_bindings == [values["binding"]]
     assert graph.component_attachments == [values["attachment"]]
+    for value, removed_field in (
+        (values["runtime_unit"], "runtime_profile_digest"),
+        (values["component"], "component_type_digest"),
+        (values["binding"], "provider_digest"),
+        (values["binding"], "stop_evidence_policy_digest"),
+    ):
+        assert not hasattr(value, removed_field)
 
     expected_record_types = {
         "RuntimeUnitDTO",
@@ -547,7 +556,7 @@ def test_graph_dto_constructors_do_not_coerce_raw_strings_to_strong_ids():
         core.RuntimeUnitDTO(
             runtime_unit_id="runtime/arm",
             runtime_profile_id=core.RuntimeProfileId("profile"),
-            runtime_profile_digest=core.ContentDigest("digest"),
+            runtime_profile_revision=core.RuntimeProfileRevision("revision"),
             dependency_runtime_unit_ids=[],
             configuration={},
         )
@@ -623,7 +632,7 @@ cell_id: cell_a
 runtime_units:
   - runtime_unit_id: driver
     runtime_profile_id: fake_driver
-    runtime_profile_digest: {ZERO_DIGEST}
+    runtime_profile_revision: {ZERO_DIGEST}
     dependency_runtime_unit_ids: [missing]
     configuration: {{}}
 model_instances: []

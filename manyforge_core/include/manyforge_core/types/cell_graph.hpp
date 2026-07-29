@@ -86,11 +86,14 @@ struct ComponentAttachmentEndpointDTO {
                          const ComponentAttachmentEndpointDTO&) = default;
 };
 
+// Catalog references in graph records carry only the referent's typed ID and
+// semantic revision. Schema identity, exact-byte content digest, and store key
+// belong exclusively to CatalogRecordRefDTO.
 /// One of exactly six mutable graph-record kinds.
 struct RuntimeUnitDTO {
   RuntimeUnitId runtime_unit_id;
   RuntimeProfileId runtime_profile_id;
-  ContentDigest runtime_profile_digest;
+  RuntimeProfileRevision runtime_profile_revision;
   std::vector<RuntimeUnitId> dependency_runtime_unit_ids;
   JsonObjectDTO configuration;
 
@@ -114,7 +117,6 @@ struct ControllableComponentDTO {
   ControllableComponentId controllable_component_id;
   ComponentTypeId component_type_id;
   ComponentTypeRevision component_type_revision;
-  ContentDigest component_type_digest;
   std::vector<ModelRoleBindingDTO> model_role_bindings;
   std::vector<RuntimeUnitId> runtime_unit_ids;
 
@@ -142,6 +144,7 @@ struct ControlBindingDTO {
   ControllableComponentId controllable_component_id;
   CommandTargetId command_target_id;
   CapabilityId capability_id;
+  CapabilityDefinitionRevision capability_definition_revision;
   ControlDomainId control_domain_id;
   std::vector<ResourceBindingDTO> resource_bindings;
   ControlInterfaceContractId control_interface_contract_id;
@@ -152,12 +155,10 @@ struct ControlBindingDTO {
   std::vector<RouteEndpointProjectionDTO> route_endpoint_projections;
   ProviderInstanceId provider_instance_id;
   ProviderManifestRevision provider_manifest_revision;
-  ProviderDigest provider_digest;
   StateAuthorityId state_authority_id;
   StateAuthorityClass state_authority_class;
   StopEvidencePolicyId stop_evidence_policy_id;
   StopEvidencePolicyRevision stop_evidence_policy_revision;
-  ContentDigest stop_evidence_policy_digest;
   ContainmentGranularity containment_granularity;
 
   friend bool operator==(const ControlBindingDTO&, const ControlBindingDTO&) = default;
