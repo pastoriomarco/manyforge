@@ -429,7 +429,7 @@ definitions:
                        "root definition and every root tagged-union branch must resolve to object");
 }
 
-TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteCapabilityFamily) {
+TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   const auto& registry = build_qualified_closed_schema_registry();
   ASSERT_EQ(registry.catalog_schemas().size(), core::kCatalogRecordTypeRegistry.size());
   EXPECT_TRUE(registry.value_schemas().empty());
@@ -448,6 +448,17 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteCapabilityFamily) {
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
                 &entry);
+    } else if (entry.record_kind() ==
+               core::CatalogRecordKind::kControlInterfaceContract) {
+      ++qualified_count;
+      EXPECT_EQ(entry.qualification(), CatalogSchemaQualification::kQualified);
+      ASSERT_NE(entry.compiled_schema(), nullptr);
+      EXPECT_EQ(entry.compiled_schema()->schema_revision().value(),
+                "sha256:4abdf2c402d8e6e818bc26df59ce1c9cdc911d1e807144bdf525d2f69d0a449d");
+      EXPECT_EQ(registry.find_qualified_catalog_schema(
+                    entry.record_kind(), entry.schema_id(),
+                    entry.compiled_schema()->schema_revision()),
+                &entry);
     } else {
       EXPECT_EQ(entry.qualification(), CatalogSchemaQualification::kUnqualified);
       EXPECT_EQ(entry.compiled_schema(), nullptr);
@@ -458,9 +469,9 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteCapabilityFamily) {
                       "sha256:0000000000000000000000000000000000000000000000000000000000000000")),
               nullptr);
   }
-  EXPECT_EQ(qualified_count, 1U);
+  EXPECT_EQ(qualified_count, 2U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
-            "sha256:0fcb72ac90018caf707dbdf938bfdb7a12bda6f1377e00556e35218ecbc8e11d");
+            "sha256:c2aefa0ffe06736be0c6a7ba3e93fbb5fa86633474358999840874645a302abf");
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),
                 core::SchemaRevision(
@@ -791,19 +802,30 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
               core::to_string(built.record_kind()));
     EXPECT_EQ(std::get<std::string>(member(projected, "schema_id").storage()),
               built.schema_id().value());
-    if (built.record_kind() == core::CatalogRecordKind::kCapabilityDefinition) {
+    if (built.record_kind() == core::CatalogRecordKind::kCapabilityDefinition ||
+        built.record_kind() ==
+            core::CatalogRecordKind::kControlInterfaceContract) {
       EXPECT_EQ(projected.as_object().size(), 5U);
       EXPECT_EQ(
           std::get<std::string>(member(projected, "qualification").storage()),
           "qualified");
+      const std::string expected_revision =
+          built.record_kind() ==
+                  core::CatalogRecordKind::kCapabilityDefinition
+              ? "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0"
+              : "sha256:4abdf2c402d8e6e818bc26df59ce1c9cdc911d1e807144bdf525d2f69d0a449d";
+      const std::string expected_path =
+          built.record_kind() ==
+                  core::CatalogRecordKind::kCapabilityDefinition
+              ? "catalog/manyforge.capability_definition.v1.yaml"
+              : "catalog/manyforge.control_interface_contract.v1.yaml";
       EXPECT_EQ(
           std::get<std::string>(member(projected, "schema_revision").storage()),
-          "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0");
+          expected_revision);
       EXPECT_EQ(std::get<std::string>(
                     member(projected, "relative_path").storage()),
-                "catalog/manyforge.capability_definition.v1.yaml");
-      const auto compiled =
-          compile_resource("catalog/manyforge.capability_definition.v1.yaml");
+                expected_path);
+      const auto compiled = compile_resource(expected_path);
       EXPECT_EQ(compiled.schema_revision(),
                 built.compiled_schema()->schema_revision());
     } else {
@@ -828,6 +850,7 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
       "manyforge.closed_schema.bootstrap.v1.yaml",
       "registry.v1.yaml",
       "catalog/manyforge.capability_definition.v1.yaml",
+      "catalog/manyforge.control_interface_contract.v1.yaml",
       "examples/manyforge.closed_schema.example_command.v1.yaml",
       "examples/manyforge.closed_schema.example_inventory.v1.yaml",
   };

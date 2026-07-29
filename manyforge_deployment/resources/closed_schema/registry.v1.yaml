@@ -27,7 +27,9 @@ catalog_schemas:
     qualification: unqualified
   - record_kind: control_interface_contract
     schema_id: manyforge.control_interface_contract.v1
-    qualification: unqualified
+    schema_revision: sha256:4abdf2c402d8e6e818bc26df59ce1c9cdc911d1e807144bdf525d2f69d0a449d
+    relative_path: catalog/manyforge.control_interface_contract.v1.yaml
+    qualification: qualified
   - record_kind: controller_topology
     schema_id: manyforge.controller_topology.v1
     qualification: unqualified

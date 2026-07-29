@@ -5,6 +5,7 @@
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/closed_schema.hpp>
+#include <manyforge_deployment/control_interface_contract_codec.hpp>
 #include <string>
 #include <string_view>
 
@@ -28,6 +29,8 @@ void register_deployment_candidate_bindings(py::module_& module) {
                                                         PyExc_ValueError);
   py::register_exception<deployment::CapabilityDefinitionCodecError>(
       module, "CapabilityDefinitionCodecError", PyExc_ValueError);
+  py::register_exception<deployment::ControlInterfaceContractCodecError>(
+      module, "ControlInterfaceContractCodecError", PyExc_ValueError);
 
   py::class_<ParsedArtifactCandidate>(module, "ParsedArtifactCandidate", py::is_final())
       .def_property_readonly("canonical_json", [](const ParsedArtifactCandidate& candidate) {
@@ -192,6 +195,17 @@ void register_deployment_candidate_bindings(py::module_& module) {
             return deployment::canonical_json(definition.normalized_root());
           });
 
+  py::class_<deployment::QualifiedControlInterfaceContract>(
+      module, "QualifiedControlInterfaceContract", py::is_final())
+      .def_property_readonly(
+          "value", &deployment::QualifiedControlInterfaceContract::value)
+      .def_property_readonly(
+          "normalized_canonical_json",
+          [](const deployment::QualifiedControlInterfaceContract& contract) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(contract.normalized_root());
+          });
+
   module.def(
       "parse_strict_json_model_yaml",
       [](const std::string& yaml_bytes) {
@@ -212,6 +226,11 @@ void register_deployment_candidate_bindings(py::module_& module) {
              py::call_guard<py::gil_scoped_release>());
   module.def("resolve_and_qualify_capability_definition",
              &deployment::resolve_and_qualify_capability_definition,
+             py::arg("reference"), py::arg("resolved_store_key"),
+             py::arg("stored_bytes"),
+             py::call_guard<py::gil_scoped_release>());
+  module.def("resolve_and_qualify_control_interface_contract",
+             &deployment::resolve_and_qualify_control_interface_contract,
              py::arg("reference"), py::arg("resolved_store_key"),
              py::arg("stored_bytes"),
              py::call_guard<py::gil_scoped_release>());

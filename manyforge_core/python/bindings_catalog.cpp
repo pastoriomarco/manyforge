@@ -5,6 +5,7 @@
 #include <array>
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
+#include <manyforge_core/types/control_interface_contract.hpp>
 #include <optional>
 #include <string>
 #include <utility>
@@ -149,6 +150,77 @@ void register_catalog_record_bindings(py::module_& module) {
           [](const CapabilityDefinitionDTO& lhs,
              const CapabilityDefinitionDTO& rhs) { return lhs != rhs; },
           py::is_operator());
+
+  py::class_<ResourceInterfaceClaimDTO>(module, "ResourceInterfaceClaimDTO",
+                                        py::is_final())
+      .def(py::init([](ResourceRoleId resource_role_id,
+                       std::string interface_name) {
+             return ResourceInterfaceClaimDTO{std::move(resource_role_id),
+                                              std::move(interface_name)};
+           }),
+           py::arg("resource_role_id"), py::arg("interface_name"))
+      .def_readonly("resource_role_id",
+                    &ResourceInterfaceClaimDTO::resource_role_id)
+      .def_readonly("interface_name",
+                    &ResourceInterfaceClaimDTO::interface_name)
+      .def(
+          "__eq__",
+          [](const ResourceInterfaceClaimDTO& lhs,
+             const ResourceInterfaceClaimDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ResourceInterfaceClaimDTO& lhs,
+             const ResourceInterfaceClaimDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  py::class_<ControlInterfaceContractDTO>(
+      module, "ControlInterfaceContractDTO", py::is_final())
+      .def(py::init([](
+               ControlInterfaceContractId control_interface_contract_id,
+               ControlInterfaceRevision control_interface_revision,
+               std::vector<ResourceInterfaceClaimDTO> command_interfaces,
+               std::vector<ResourceInterfaceClaimDTO> state_interfaces,
+               std::vector<ResourceRoleId> ordering) {
+             return ControlInterfaceContractDTO{
+                 std::move(control_interface_contract_id),
+                 std::move(control_interface_revision),
+                 std::move(command_interfaces), std::move(state_interfaces),
+                 std::move(ordering)};
+           }),
+           py::arg("control_interface_contract_id"),
+           py::arg("control_interface_revision"),
+           py::arg("command_interfaces"), py::arg("state_interfaces"),
+           py::arg("ordering"))
+      .def_readonly("control_interface_contract_id",
+                    &ControlInterfaceContractDTO::
+                        control_interface_contract_id)
+      .def_readonly("control_interface_revision",
+                    &ControlInterfaceContractDTO::control_interface_revision)
+      .def_readonly("command_interfaces",
+                    &ControlInterfaceContractDTO::command_interfaces)
+      .def_readonly("state_interfaces",
+                    &ControlInterfaceContractDTO::state_interfaces)
+      .def_readonly("ordering", &ControlInterfaceContractDTO::ordering)
+      .def(
+          "__eq__",
+          [](const ControlInterfaceContractDTO& lhs,
+             const ControlInterfaceContractDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ControlInterfaceContractDTO& lhs,
+             const ControlInterfaceContractDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  module.attr("CONTROL_INTERFACE_CONTRACT_API_VERSION") =
+      std::string(kControlInterfaceContractApiVersion);
+  module.attr("MAX_CONTROL_INTERFACE_CONTRACT_ITEMS") =
+      kMaxControlInterfaceContractItems;
 
   py::class_<ValueSchemaRefDescriptor>(module, "ValueSchemaRefDescriptor",
                                        py::is_final())

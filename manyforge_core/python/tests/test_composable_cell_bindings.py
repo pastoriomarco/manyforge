@@ -178,6 +178,66 @@ def _catalog_ref(case, *, schema_family: str | None = None):
     )
 
 
+def _control_interface_contract_document(
+    *,
+    contract_id: str = "arm_position_trajectory",
+    command_interfaces=None,
+    state_interfaces=None,
+    ordering=None,
+):
+    command_interfaces = (
+        [{"resource_role_id": "arm", "interface_name": "position"}]
+        if command_interfaces is None
+        else command_interfaces
+    )
+    state_interfaces = (
+        [
+            {"resource_role_id": "arm", "interface_name": "position"},
+            {"resource_role_id": "arm", "interface_name": "velocity"},
+        ]
+        if state_interfaces is None
+        else state_interfaces
+    )
+    ordering = ["arm"] if ordering is None else ordering
+    payload = {
+        "api_version": "manyforge.control_interface_contract.v1",
+        "control_interface_contract_id": contract_id,
+        "command_interfaces": command_interfaces,
+        "state_interfaces": state_interfaces,
+        "ordering": ordering,
+    }
+    canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    preimage = (
+        b"manyforge.content-identity.v1"
+        b"\x00catalog-record-revision/control_interface_contract"
+        b"\x00manyforge.control_interface_contract.v1\x00" + canonical_payload.encode()
+    )
+    payload["control_interface_revision"] = (
+        "sha256:" + hashlib.sha256(preimage).hexdigest()
+    )
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _control_interface_contract_reference(document: str, contract_id: str):
+    parsed = json.loads(document)
+    return core.ControlInterfaceContractCatalogRecordRefDTO(
+        record_id=core.ControlInterfaceContractId(contract_id),
+        record_revision=core.ControlInterfaceRevision(
+            parsed["control_interface_revision"]
+        ),
+        schema_id=core.SchemaId("manyforge.control_interface_contract.v1"),
+        schema_revision=core.SchemaRevision(
+            "sha256:4abdf2c402d8e6e818bc26df59ce1c9cdc911d1e807144bdf525d2f69d0a449d"
+        ),
+        content_digest=core.ContentDigest(
+            "sha256:" + hashlib.sha256(document.encode()).hexdigest()
+        ),
+        content_addressed_store_key=core.ContentAddressedStoreKey(
+            "sha256/control-interface-python"
+        ),
+    )
+
+
 def _cell_graph():
     configuration = {
         "driver": core.JsonValueDTO("fake"),
@@ -482,6 +542,173 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
             reference,
             core.ContentAddressedStoreKey("sha256/other"),
             stored_bytes,
+        )
+
+
+def test_control_interface_contract_is_typed_ordered_and_exactly_qualified():
+    assert (
+        core.CONTROL_INTERFACE_CONTRACT_API_VERSION
+        == "manyforge.control_interface_contract.v1"
+    )
+    assert core.MAX_CONTROL_INTERFACE_CONTRACT_ITEMS == 4096
+    command = [
+        core.ResourceInterfaceClaimDTO(core.ResourceRoleId("arm"), "position"),
+        core.ResourceInterfaceClaimDTO(core.ResourceRoleId("arm"), "effort"),
+        core.ResourceInterfaceClaimDTO(core.ResourceRoleId("tool"), "position"),
+    ]
+    state = [
+        core.ResourceInterfaceClaimDTO(core.ResourceRoleId("arm"), "position"),
+        core.ResourceInterfaceClaimDTO(core.ResourceRoleId("tool"), "position"),
+    ]
+    dto = core.ControlInterfaceContractDTO(
+        control_interface_contract_id=core.ControlInterfaceContractId(
+            "application_specific"
+        ),
+        control_interface_revision=core.ControlInterfaceRevision(ZERO_DIGEST),
+        command_interfaces=command,
+        state_interfaces=state,
+        ordering=[
+            core.ResourceRoleId("arm"),
+            core.ResourceRoleId("tool"),
+        ],
+    )
+    assert dto.command_interfaces == command
+    assert dto.state_interfaces == state
+    assert [role.value for role in dto.ordering] == ["arm", "tool"]
+    with pytest.raises(AttributeError):
+        dto.ordering = []
+    with pytest.raises(AttributeError):
+        command[0].interface_name = "changed"
+
+    document = _control_interface_contract_document(
+        contract_id="application_specific",
+        command_interfaces=[
+            {"resource_role_id": "arm", "interface_name": "position"},
+            {"resource_role_id": "arm", "interface_name": "effort"},
+            {"resource_role_id": "tool", "interface_name": "position"},
+        ],
+        state_interfaces=[
+            {"resource_role_id": "arm", "interface_name": "position"},
+            {"resource_role_id": "tool", "interface_name": "position"},
+        ],
+        ordering=["arm", "tool"],
+    )
+    reference = _control_interface_contract_reference(document, "application_specific")
+    store_key = core.ContentAddressedStoreKey("sha256/control-interface-python")
+    qualified = core.resolve_and_qualify_control_interface_contract(
+        reference, store_key, document
+    )
+    assert isinstance(qualified, core.QualifiedControlInterfaceContract)
+    assert qualified.value.control_interface_contract_id.value == "application_specific"
+    assert [
+        (claim.resource_role_id.value, claim.interface_name)
+        for claim in qualified.value.command_interfaces
+    ] == [
+        ("arm", "position"),
+        ("arm", "effort"),
+        ("tool", "position"),
+    ]
+    assert json.loads(qualified.normalized_canonical_json) == json.loads(document)
+
+
+@pytest.mark.parametrize(
+    ("command_interfaces", "state_interfaces", "ordering"),
+    [
+        ([], [], []),
+        (
+            [
+                {"resource_role_id": "arm", "interface_name": "position"},
+                {"resource_role_id": "arm", "interface_name": "position"},
+            ],
+            [],
+            ["arm"],
+        ),
+        (
+            [
+                {"resource_role_id": "arm", "interface_name": "position"},
+                {"resource_role_id": "tool", "interface_name": "position"},
+                {"resource_role_id": "arm", "interface_name": "velocity"},
+            ],
+            [],
+            ["arm", "tool"],
+        ),
+        (
+            [
+                {"resource_role_id": "tool", "interface_name": "position"},
+                {"resource_role_id": "arm", "interface_name": "position"},
+            ],
+            [],
+            ["arm", "tool"],
+        ),
+        (
+            [{"resource_role_id": "arm", "interface_name": "position"}],
+            [],
+            ["arm", "arm"],
+        ),
+        (
+            [{"resource_role_id": "arm", "interface_name": "position"}],
+            [],
+            ["arm", "unused"],
+        ),
+    ],
+)
+def test_control_interface_contract_rejects_cross_field_semantic_defects(
+    command_interfaces, state_interfaces, ordering
+):
+    document = _control_interface_contract_document(
+        contract_id="semantic_negative",
+        command_interfaces=command_interfaces,
+        state_interfaces=state_interfaces,
+        ordering=ordering,
+    )
+    reference = _control_interface_contract_reference(document, "semantic_negative")
+    with pytest.raises(core.ControlInterfaceContractCodecError):
+        core.resolve_and_qualify_control_interface_contract(
+            reference,
+            core.ContentAddressedStoreKey("sha256/control-interface-python"),
+            document,
+        )
+
+
+def test_control_interface_contract_rejects_referent_identity_mismatches():
+    document = _control_interface_contract_document()
+    reference = _control_interface_contract_reference(
+        document, "arm_position_trajectory"
+    )
+    store_key = core.ContentAddressedStoreKey("sha256/control-interface-python")
+    with pytest.raises(
+        core.ControlInterfaceContractCodecError, match="different store key"
+    ):
+        core.resolve_and_qualify_control_interface_contract(
+            reference,
+            core.ContentAddressedStoreKey("sha256/other"),
+            document,
+        )
+
+    wrong_id = core.ControlInterfaceContractCatalogRecordRefDTO(
+        record_id=core.ControlInterfaceContractId("different"),
+        record_revision=reference.record_revision,
+        schema_id=reference.schema_id,
+        schema_revision=reference.schema_revision,
+        content_digest=reference.content_digest,
+        content_addressed_store_key=reference.content_addressed_store_key,
+    )
+    with pytest.raises(core.ControlInterfaceContractCodecError):
+        core.resolve_and_qualify_control_interface_contract(
+            wrong_id, store_key, document
+        )
+
+    wrong_digest = core.ControlInterfaceContractCatalogRecordRefDTO(
+        record_id=reference.record_id,
+        record_revision=reference.record_revision,
+        schema_id=reference.schema_id,
+        schema_revision=reference.schema_revision,
+        content_digest=core.ContentDigest(ZERO_DIGEST),
+        content_addressed_store_key=reference.content_addressed_store_key,
+    )
+    with pytest.raises(core.ControlInterfaceContractCodecError):
+        core.resolve_and_qualify_control_interface_contract(
+            wrong_digest, store_key, document
         )
 
 
@@ -822,15 +1049,16 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kQualified
     ]
-    assert len(qualified_entries) == 1
-    assert (
-        qualified_entries[0].record_kind
-        == core.CatalogRecordKind.kCapabilityDefinition
-    )
-    assert qualified_entries[0].compiled_schema is not None
-    assert qualified_entries[0].relative_path == (
-        "catalog/manyforge.capability_definition.v1.yaml"
-    )
+    assert len(qualified_entries) == 2
+    assert {entry.record_kind for entry in qualified_entries} == {
+        core.CatalogRecordKind.kCapabilityDefinition,
+        core.CatalogRecordKind.kControlInterfaceContract,
+    }
+    assert all(entry.compiled_schema is not None for entry in qualified_entries)
+    assert {entry.relative_path for entry in qualified_entries} == {
+        "catalog/manyforge.capability_definition.v1.yaml",
+        "catalog/manyforge.control_interface_contract.v1.yaml",
+    }
     assert all(
         entry.compiled_schema is None and entry.relative_path == ""
         for entry in registry.catalog_schemas
@@ -838,11 +1066,14 @@ target: 0.5
     )
     assert registry.value_schemas == ()
     assert registry.qualification_registry_digest.value == (
-        "sha256:0fcb72ac90018caf707dbdf938bfdb7a12bda6f1377e00556e35218ecbc8e11d"
+        "sha256:c2aefa0ffe06736be0c6a7ba3e93fbb5fa86633474358999840874645a302abf"
     )
-    assert json.loads(registry.normalized_projection_canonical_json)[
-        "catalog_schemas"
-    ][0]["qualification"] == "qualified"
+    assert (
+        json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][
+            "qualification"
+        ]
+        == "qualified"
+    )
     assert core.CLOSED_SCHEMA_API_VERSION == "manyforge.closed_schema.v1"
     assert core.CLOSED_SCHEMA_BOOTSTRAP_CONTRACT_DIGEST == (
         "sha256:29a2fef8e781ca406eaaad448e46fb6061fe18e99e2c1cd39f303e2e0d815834"

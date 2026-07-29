@@ -13,22 +13,31 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(UTF8PROC REQUIRED IMPORTED_TARGET libutf8proc)
 pkg_check_modules(LIBYAML REQUIRED IMPORTED_TARGET yaml-0.1)
 
-set(
-  MANYFORGE_CAPABILITY_DEFINITION_SCHEMA_PATH
-  "${CMAKE_CURRENT_SOURCE_DIR}/resources/closed_schema/catalog/manyforge.capability_definition.v1.yaml")
-set_property(
-  DIRECTORY
-  APPEND
-  PROPERTY CMAKE_CONFIGURE_DEPENDS
-           "${MANYFORGE_CAPABILITY_DEFINITION_SCHEMA_PATH}")
-file(
-  READ
-  "${MANYFORGE_CAPABILITY_DEFINITION_SCHEMA_PATH}"
-  MANYFORGE_CAPABILITY_DEFINITION_SCHEMA_YAML)
-configure_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_capability_definition_schema.hpp.in"
-  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_capability_definition_schema.hpp"
-  @ONLY)
+function(manyforge_embed_closed_schema symbol stem relative_path delimiter)
+  set(schema_path "${CMAKE_CURRENT_SOURCE_DIR}/${relative_path}")
+  set_property(
+    DIRECTORY
+    APPEND
+    PROPERTY CMAKE_CONFIGURE_DEPENDS "${schema_path}")
+  file(READ "${schema_path}" MANYFORGE_EMBEDDED_SCHEMA_YAML)
+  set(MANYFORGE_EMBEDDED_SCHEMA_SYMBOL "${symbol}")
+  set(MANYFORGE_EMBEDDED_SCHEMA_DELIMITER "${delimiter}")
+  configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_closed_schema.hpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_${stem}_schema.hpp"
+    @ONLY)
+endfunction()
+
+manyforge_embed_closed_schema(
+  kEmbeddedCapabilityDefinitionSchema
+  capability_definition
+  resources/closed_schema/catalog/manyforge.capability_definition.v1.yaml
+  mf_cap_schema)
+manyforge_embed_closed_schema(
+  kEmbeddedControlInterfaceContractSchema
+  control_interface_contract
+  resources/closed_schema/catalog/manyforge.control_interface_contract.v1.yaml
+  mf_ctrl_schema)
 
 set(
   MANYFORGE_CORE_INCLUDE_DIR
@@ -42,6 +51,7 @@ add_library(manyforge_deployment
   src/canonical_value.cpp
   src/cell_graph_codec.cpp
   src/closed_schema.cpp
+  src/control_interface_contract_codec.cpp
   src/content_identity.cpp
 )
 add_library(manyforge::deployment ALIAS manyforge_deployment)
@@ -96,5 +106,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_closed_schema PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_closed_schema
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_control_interface_contract_codec
+    test/test_control_interface_contract_codec.cpp)
+  target_link_libraries(test_control_interface_contract_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_control_interface_contract_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 endif()

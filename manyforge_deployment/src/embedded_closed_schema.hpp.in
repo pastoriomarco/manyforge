@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace manyforge::deployment::detail {
+
+inline constexpr std::string_view @MANYFORGE_EMBEDDED_SCHEMA_SYMBOL@ =
+    R"@MANYFORGE_EMBEDDED_SCHEMA_DELIMITER@(@MANYFORGE_EMBEDDED_SCHEMA_YAML@)@MANYFORGE_EMBEDDED_SCHEMA_DELIMITER@";
+
+}  // namespace manyforge::deployment::detail
