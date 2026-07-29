@@ -441,6 +441,10 @@ def test_execution_channels_and_debug_export_surface_incident_snapshot(tmp_path)
             "reason_code": "controller_cancel_timeout",
         },
     )
+    state.event_recorder.record_robot_lifecycle_event(
+        "observation_baseline",
+        details={"provider_id": "lite6-a:provider:test"},
+    )
 
     with TestClient(app) as client:
         channels_response = client.get("/api/execution/channels")
@@ -453,6 +457,17 @@ def test_execution_channels_and_debug_export_surface_incident_snapshot(tmp_path)
         assert snapshot["triggerType"] == "error_raised"
         assert "allEvents" in snapshot
         assert "eventsByChannel" in snapshot
+
+        lifecycle_response = client.get(
+            "/api/execution/channels",
+            params={"limit": 1, "channels": "robot_lifecycle"},
+        )
+        assert lifecycle_response.status_code == 200
+        lifecycle_channels = lifecycle_response.json()["channels"]
+        assert list(lifecycle_channels) == ["robot_lifecycle"]
+        assert lifecycle_channels["robot_lifecycle"][0]["type"] == (
+            "robot_lifecycle_observation_baseline"
+        )
 
         export_response = client.get("/api/debug/export")
         assert export_response.status_code == 200

@@ -1,10 +1,11 @@
 # ManyForge
 
 Modular robot execution framework: behavior trees, motion planning, scene
-authoring, and an LLM-assisted Composer UI. It currently supports
-a self-contained ManyForge-only native lane and Isaac Sim commanded
-simulation. ROS-backed physical deployments use the same controller adapter
-but require robot-specific integration and qualification.
+authoring, and an LLM-assisted Composer UI. It currently supports a
+self-contained ManyForge-only native lane, Isaac Sim commanded simulation,
+and an experimental supervised `real-robot` lane whose first qualified target
+is Lite6. Physical support remains robot- and cell-specific: the common
+controller/lifecycle contracts do not replace hardware qualification.
 
 > **For LLMs** (Claude, ChatGPT, agentic IDEs): read
 > [`AGENTS.md`](AGENTS.md) before making any change. It tells you what
@@ -64,8 +65,9 @@ and follow the prompts — same shape as the NemoClaw onboard wizard:
 ./scripts/launch.sh
 ```
 
-A 7-step interactive menu walks you through lane (manyforge-only /
-isaac-sim), assistant (on / off), and scenario, then brings up the
+A 7-step interactive menu walks you through lane (`manyforge-only`,
+`isaac-sim`, or the experimental `real-robot` path), assistant (on / off), and
+scenario, then brings up the
 stack. See [`docs/operations/LAUNCHER_QUICKSTART.md`](docs/operations/LAUNCHER_QUICKSTART.md)
 for the full guide — interactive wizard first, then scripted /
 non-interactive use for CI, plus the four-combination smoke-test
@@ -76,6 +78,11 @@ matrix.
 URDF/SRDF requirements, deployment-YAML schema, capability adapter
 selection, and smoke-test curls. All operator docs are catalogued at
 [`docs/INDEX.md`](docs/INDEX.md).
+
+**Qualifying the physical Lite6?** Use the staged, attended procedure in
+[`docs/operations/LITE6_LIVE_QUALIFICATION.md`](docs/operations/LITE6_LIVE_QUALIFICATION.md).
+Launcher startup is observation-only; it never enables drives or dispatches a
+trajectory.
 
 ## Running Tests
 
@@ -134,7 +141,11 @@ manyforge_core/          C++ library: execution kernel, state machine, DTOs, por
 manyforge_collision/     C++ planner-neutral collision query implementation
 manyforge_roboplan/      C++ RoboPlan adapters: planner/projection, focused ports, native execution
   python/                pybind11 bindings + NativeKernelClient wrapper
-manyforge_ros2_control_execution/  C++ ROS controller execution adapter
+manyforge_ros2_control_execution/  C++ ROS controller execution and exact-admission adapter
+manyforge_robot_lifecycle/  ROS-independent real-robot lifecycle supervisor
+manyforge_robot_lifecycle_msgs/  ROS IDL for same-host lifecycle admission transport
+manyforge_xarm_adapter/  Experimental xArm model/binding/observation boundary
+manyforge_xarm_control/  Experimental xArm lifecycle and sole transport-owner boundary
 manyforge_behavior/      Python behavior tree runner (py_trees), node catalog, program loader
 manyforge_composer/      Composer: FastAPI backend, React frontend, MCP server
   backend/               REST API routes, state management, security middleware

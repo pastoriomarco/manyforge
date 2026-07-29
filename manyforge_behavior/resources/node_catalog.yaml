@@ -7,7 +7,7 @@
 # Capability keys: docs/spec/240-supported-backend-capability-profile.md
 
 api_version: manyforge.node_catalog.v1
-catalog_version: "0.4.0"
+catalog_version: "0.5.0"
 
 schema_types:
   orientation_reference:
@@ -237,6 +237,26 @@ schema_types:
       type: float
       constraints:
         min_exclusive: 0.0
+  joint_dynamics_limit:
+    type: object
+    additional_properties: false
+    properties:
+      max_velocity_rad_s:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+      max_acceleration_rad_s2:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+      max_jerk_rad_s3:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+  per_joint_dynamics_limits:
+    type: object
+    additional_properties:
+      schema_ref: "#/schema_types/joint_dynamics_limit"
   template_variable_binding:
     type: object
     additional_properties: false
@@ -726,6 +746,15 @@ entries:
         description: >-
           Per-move TCP linear speed cap (m/s). Effective limit is
           min(global_max, this value). Omit to use global limit only.
+      - name: per_joint_dynamics_limits
+        schema_ref: "#/schema_types/per_joint_dynamics_limits"
+        required: false
+        description: >-
+          Optional absolute per-joint velocity, acceleration, and jerk caps.
+          The catalog rejects unknown cap fields and ordinary numeric values
+          that are not greater than zero. The runtime additionally requires
+          finite values, non-empty cap objects, and at most 128 trimmed
+          canonical joint names of bounded length.
       - name: joint_position_tol_rad
         schema:
           type: float

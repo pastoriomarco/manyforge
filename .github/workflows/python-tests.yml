@@ -5,6 +5,7 @@ on:
     paths:
       - "manyforge_behavior/**"
       - "manyforge_composer/**"
+      - "manyforge_supervision/**"
       - "manyforge_assistant_bridge/**"
       - ".github/workflows/python-tests.yml"
   push:
@@ -12,6 +13,7 @@ on:
     paths:
       - "manyforge_behavior/**"
       - "manyforge_composer/**"
+      - "manyforge_supervision/**"
       - "manyforge_assistant_bridge/**"
   workflow_dispatch:
 

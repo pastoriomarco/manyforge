@@ -2,7 +2,7 @@ api_version: manyforge.program.v0
 program_profile: v0.0
 name: simple_motion_test
 description: Integration test program with motion only (no scene edits).
-catalog_version: "0.4.0"
+catalog_version: "0.5.0"
 
 robot:
   robot_id: robot1

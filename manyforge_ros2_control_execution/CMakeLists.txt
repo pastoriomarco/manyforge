@@ -12,6 +12,8 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(control_msgs REQUIRED)
+find_package(controller_manager_msgs REQUIRED)
+find_package(lifecycle_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
@@ -23,6 +25,7 @@ if(NOT TARGET manyforge_core)
 endif()
 
 add_library(manyforge_ros2_control_execution
+  src/controller_binding.cpp
   src/package.cpp
   src/ros2_control_capability.cpp
   src/ros2_control_execution_backend.cpp
@@ -42,6 +45,8 @@ ament_target_dependencies(manyforge_ros2_control_execution
   rclcpp
   rclcpp_action
   control_msgs
+  controller_manager_msgs
+  lifecycle_msgs
   sensor_msgs
   std_msgs
   trajectory_msgs

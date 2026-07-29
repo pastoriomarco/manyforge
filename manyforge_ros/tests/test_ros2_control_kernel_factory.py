@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
 import sys
+from types import ModuleType, SimpleNamespace
 
+from manyforge_ros.ros2_control_kernel_factory import _kernel_stop_profile
 from manyforge_ros.ros2_control_kernel_factory import create_ros2_control_kernel
+from manyforge_ros.ros2_control_kernel_factory import Ros2ControlRuntimeBundle
+import pytest
 
 
 def _write_one_joint_model(root: Path) -> tuple[Path, Path]:
@@ -38,6 +41,44 @@ def _write_one_joint_model(root: Path) -> tuple[Path, Path]:
         encoding="utf-8",
     )
     return urdf, srdf
+
+
+def test_kernel_stop_profile_derives_same_total_deadline_as_ros_backend():
+    execution_config = {
+        "stop_completion_timeout_ms": 1500,
+        "operator_stop_profile": {
+            "profile_id": "operator-soft",
+            "stop_mode": "soft_on_path",
+            "deceleration_time_s": 1.0,
+        },
+    }
+
+    resolved = _kernel_stop_profile(
+        execution_config,
+        "operator_stop_profile",
+    )
+
+    assert resolved["max_stop_time_s"] == pytest.approx(2.5)
+    assert "max_stop_time_s" not in execution_config["operator_stop_profile"]
+
+
+def test_kernel_stop_profile_preserves_explicit_total_deadline():
+    execution_config = {
+        "stop_completion_timeout_s": 1.5,
+        "operator_stop_profile": {
+            "profile_id": "operator-soft",
+            "stop_mode": "soft_on_path",
+            "deceleration_time_s": 1.0,
+            "max_stop_time_s": 4.0,
+        },
+    }
+
+    resolved = _kernel_stop_profile(
+        execution_config,
+        "operator_stop_profile",
+    )
+
+    assert resolved["max_stop_time_s"] == pytest.approx(4.0)
 
 
 def _write_mimic_gripper_model(root: Path) -> tuple[Path, Path]:
@@ -103,6 +144,30 @@ def _write_mimic_gripper_model(root: Path) -> tuple[Path, Path]:
     return urdf, srdf
 
 
+def test_runtime_bundle_resets_native_backend_when_ingress_shutdown_fails():
+    calls: list[str] = []
+
+    class FailingSubscription:
+        def shutdown(self):
+            calls.append("subscription")
+            raise RuntimeError("subscriber failed")
+
+    class NativeBundle:
+        def reset(self):
+            calls.append("native")
+
+    bundle = Ros2ControlRuntimeBundle(
+        native_bundle=NativeBundle(),
+        group_id="arm",
+        execution_admission_subscription=FailingSubscription(),
+    )
+
+    with pytest.raises(RuntimeError, match="subscriber failed"):
+        bundle.shutdown()
+    assert calls == ["subscription", "native"]
+    assert bundle.execution_admission_subscription is None
+
+
 def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path):
     urdf, srdf = _write_one_joint_model(tmp_path)
     deployment = SimpleNamespace(
@@ -120,6 +185,23 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
                     "required_joints": ["joint1"],
                     "arm_action": "/arm_controller/follow_joint_trajectory",
                     "executor_thread_count": 4,
+                    "controller_binding": {
+                        "schema": (
+                            "manyforge.ros2_control."
+                            "execution_binding.v0.experimental"
+                        ),
+                        "generation_id": "binding-generation",
+                    },
+                    "require_execution_admission_snapshot": True,
+                    "execution_admission": {
+                        "topic": "/manyforge_execution_admission",
+                        "provider_instance_id": "provider-session-1",
+                        "runtime_generation_id": "runtime-1",
+                        "cell_supervisor_component_epoch": (
+                            "supervisor-epoch-1"
+                        ),
+                        "maximum_lease_ms": 250,
+                    },
                 },
             ),
             "planning": SimpleNamespace(
@@ -181,6 +263,29 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
     fake_client_module.NativeKernelClient = FakeNativeKernelClient
     monkeypatch.setitem(sys.modules, "native_kernel_client", fake_client_module)
 
+    fake_admission_module = ModuleType("manyforge_ros.execution_admission")
+
+    class FakeIngressConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeAdmissionSubscription:
+        def __init__(self, **kwargs):
+            recorded["admission_subscription"] = kwargs
+
+        def shutdown(self):
+            recorded["admission_shutdown"] = True
+
+    fake_admission_module.ExecutionAdmissionIngressConfig = FakeIngressConfig
+    fake_admission_module.RosExecutionAdmissionSubscription = (
+        FakeAdmissionSubscription
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "manyforge_ros.execution_admission",
+        fake_admission_module,
+    )
+
     kernel, bundle = create_ros2_control_kernel(deployment=deployment)
 
     assert isinstance(kernel, FakeNativeKernelClient)
@@ -198,6 +303,29 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
         "/arm_controller/follow_joint_trajectory"
     )
     assert recorded["ros_config"]["executor_thread_count"] == 4
+    assert recorded["ros_config"]["controller_binding"] == {
+        "schema": (
+            "manyforge.ros2_control.execution_binding.v0.experimental"
+        ),
+        "generation_id": "binding-generation",
+    }
+    assert (
+        recorded["ros_config"]["require_execution_admission_snapshot"]
+        is True
+    )
+    admission = recorded["admission_subscription"]
+    assert admission["native_bundle"] is fake_native_bundle
+    assert admission["config"].topic == "/manyforge_execution_admission"
+    assert admission["config"].provider_instance_id == "provider-session-1"
+    assert admission["config"].robot_id == "logical_robot"
+    assert admission["config"].binding_contract_generation_id == (
+        "binding-generation"
+    )
+    assert admission["config"].runtime_generation_id == "runtime-1"
+    assert admission["config"].cell_supervisor_component_epoch == (
+        "supervisor-epoch-1"
+    )
+    assert admission["config"].maximum_lease_ns == 250_000_000
     assert recorded["kernel_config"]["rng_seed"] == 12345
     assert kernel.robot_model_authority_metadata["view_changed"] is False
     assert bundle.robot_model_authority_metadata["canonical_urdf_path"] == str(urdf)
@@ -205,6 +333,8 @@ def test_ros2_control_factory_uses_authority_runtime_model(monkeypatch, tmp_path
         kernel.robot_model_authority_metadata
     )
     assert kernel.kwargs["robot_model_authority_temp_dir"] is None
+    bundle.shutdown()
+    assert recorded["admission_shutdown"] is True
 
 
 def test_ros2_control_factory_forwards_validation_collision_timeout(

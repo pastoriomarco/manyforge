@@ -42,12 +42,20 @@ from manyforge_behavior.runtime_resources import (
     build_runtime_resource_registry,
 )
 from manyforge_behavior.kernel_client import (
+    GripperCommandState,
     KernelClient,
     SceneEditRequest,
     SceneObjectSnapshot,
     SceneShape,
 )
 from manyforge_behavior.skill_loader import SkillCatalog, load_skill_catalog, default_skills_dir
+from manyforge_supervision import ComponentHealthReducer
+from manyforge_supervision import ComponentHeartbeat
+from manyforge_supervision import ComponentHealthState
+from manyforge_supervision import ComponentRole
+from manyforge_supervision import ExecutionEnvironmentPin
+from manyforge_supervision import read_cell_supervisor_heartbeat
+from manyforge_supervision import supervision_policy_from_mapping
 from .event_recorder import EventRecorder
 from .log_throttle import ThrottledLog
 from .operator_alarm_adapters import OperatorAlarmAdapters
@@ -56,6 +64,14 @@ from .operator_alarm_catalog import (
     load_operator_alarm_catalog,
 )
 from .operator_alarms import OperatorAlarmManager
+from .robot_lifecycle import (
+    AuthorityHealthEvidence,
+    RobotLifecycleClient,
+    RobotLifecycleConfig,
+    RobotLifecycleTransitionRecorder,
+    UnavailableRobotLifecycleClient,
+    validate_real_robot_runtime_record,
+)
 from .scene_initialization import (
     SceneInitializationBarrier,
     SceneInitializationReplayBatch,
@@ -83,6 +99,53 @@ _MAX_ASSISTANT_PROPOSAL_RECORDS = 500
 # scene-admission tokens that do not have a native event of their own.
 _RECOVERY_CONTEXT_PROJECTION_INTERVAL_S = 0.02
 _COMPOSER_STATE_INSTANCES: weakref.WeakSet[Any] = weakref.WeakSet()
+_DEFAULT_OBSERVED_JOINT_STATE_MAX_AGE_S = 0.25
+_OBSERVED_AUTHORITY_PROFILES = frozenset(
+    {
+        "controller_observed",
+        "observed_robot",
+        "observed_ros2",
+        "real",
+        "real_robot",
+    }
+)
+_BACKEND_AUTHORITY_PROFILES = frozenset(
+    {
+        "authored",
+        "authored_preview",
+        "backend_authored",
+        "commanded_sim",
+        "native",
+    }
+)
+_OBSERVED_SNAPSHOT_SOURCES = frozenset({"observed_robot", "observed_ros2"})
+_ARTIFACT_MUTATION_REQUIRES_IDLE = "artifact_mutation_requires_idle_runtime"
+_ARTIFACT_MUTATION_STATE_UNAVAILABLE = "artifact_mutation_runtime_state_unavailable"
+_RECOVERABLE_TRANSPORT_OWNER_PROGRESS_REASONS = frozenset(
+    {"xarm_owner_publication_stale"}
+)
+
+
+def _transport_owner_component_health_state(
+    lifecycle_status: Mapping[str, Any],
+) -> ComponentHealthState:
+    """Map owner facts without bypassing the declared progress-age policy.
+
+    A fresh provider publication may truthfully report that its last owner
+    heartbeat crossed the shorter delivery budget. That closes motion
+    admission immediately, but it is not yet proof that the owner component
+    epoch died. Keep the heartbeat accepted and let its unchanged critical
+    progress token expire through ComponentHealthReducer. Identity, terminal,
+    and command-deadline failures remain immediately degraded.
+    """
+    if lifecycle_status.get("transportOwnerProgressHealthy") is True:
+        return ComponentHealthState.HEALTHY
+    reason = str(
+        lifecycle_status.get("transportOwnerProgressReason") or ""
+    )
+    if reason in _RECOVERABLE_TRANSPORT_OWNER_PROGRESS_REASONS:
+        return ComponentHealthState.HEALTHY
+    return ComponentHealthState.DEGRADED
 
 
 def stop_all_visual_state_publishers(*, timeout_s: float = 0.5) -> None:
@@ -242,6 +305,51 @@ class PublishedSceneSnapshot:
     format: str
     sha256: str
     created_at_ns: int = field(default_factory=time.monotonic_ns)
+
+
+@dataclass(frozen=True)
+class JointStateAuthorityProfile:
+    """Deployment-derived authority policy for arm joint state.
+
+    This is intentionally independent of the launcher lane. A ROS2-control
+    deployment can be a backend-authored simulator or a measurement-authority
+    physical robot, and the active execution adapter config is the only
+    reliable way to distinguish them.
+    """
+
+    profile_id: str
+    measurement_authoritative: bool
+    max_source_age_ns: int
+
+
+@dataclass(frozen=True)
+class JointPositionResolution:
+    """One coherent joint-position observation and its provenance."""
+
+    positions_rad: tuple[float, ...] | None
+    provenance: str
+    state_source: str | None
+    source_timestamp_ns: int | None
+    source_age_ns: int | None
+    measurement_authoritative: bool
+    stale: bool
+    captured_at_ns: int = field(default_factory=time.monotonic_ns)
+
+    @property
+    def available(self) -> bool:
+        return self.positions_rad is not None
+
+    def positions_list(self) -> list[float] | None:
+        if self.positions_rad is None:
+            return None
+        return list(self.positions_rad)
+
+
+@dataclass(frozen=True)
+class _ObservedJointPositionRecord:
+    resolution: JointPositionResolution
+    joint_names: tuple[str, ...]
+    deployment_token: int
 
 
 @dataclass
@@ -412,6 +520,9 @@ class ComposerState:
         self._joint_state_lock = threading.Lock()
         self._drivable_joint_names: list[str] = []
         self._last_known_joint_positions_rad: list[float] | None = None
+        self._last_observed_joint_position_record: (
+            _ObservedJointPositionRecord | None
+        ) = None
         if kernel is not None:
             self.refresh_drivable_joint_names(kernel=kernel)
         self.allowed_fs_roots = normalize_allowed_roots(allowed_fs_roots)
@@ -429,6 +540,7 @@ class ComposerState:
         # calling the kernel, importing nodes, or rebuilding a runtime.
         self._runtime_admission_lock = threading.Lock()
         self._runtime_admissions_in_flight = 0
+        self._runtime_admissions_by_thread: dict[int, int] = {}
         self._node_environment_reload_in_progress = False
         # Leaf lock for generation tokens only. Recovery projection must not
         # queue behind long program-model edits or assistant draft work.
@@ -461,6 +573,52 @@ class ComposerState:
         self._external_runtime_status_lock = threading.Lock()
         self._external_runtime_statuses: dict[str, dict[str, Any]] = {}
         self._external_runtime_status_revision = 0
+        self._robot_lifecycle_lock = threading.Lock()
+        # Serializes one complete source-token check and its NRT projections
+        # against lifecycle-client cutover. The client/command lock remains
+        # short-lived and is never held across projection work.
+        self._robot_lifecycle_projection_lock = threading.Lock()
+        self._robot_lifecycle_client: (
+            RobotLifecycleClient | UnavailableRobotLifecycleClient | None
+        ) = None
+        self._robot_lifecycle_client_token: object | None = None
+        self._robot_lifecycle_transition_recorder = (
+            RobotLifecycleTransitionRecorder(
+                self.event_recorder.record_robot_lifecycle_event
+            )
+        )
+        self._control_authority_health_lock = threading.Lock()
+        self._control_authority_component_epoch = (
+            f"composer-control:{uuid.uuid4().hex}"
+        )
+        self._execution_backend_component_epoch = (
+            f"composer-execution:{uuid.uuid4().hex}"
+        )
+        self._control_authority_health_sequence = 0
+        self._control_authority_health_active = False
+        self._control_authority_last_state = "unconfigured"
+        self._cell_supervision_lock = threading.Lock()
+        # Serializes one complete reducer evaluation against deployment
+        # replacement. The reducer and progress cursors are mutable NRT domain
+        # state; the leaf lock below protects publication snapshots only.
+        self._cell_supervision_evaluation_lock = threading.Lock()
+        self._cell_supervision_reducer: ComponentHealthReducer | None = None
+        self._cell_supervision_manifest: dict[str, Any] | None = None
+        self._cell_supervision_heartbeat_path: Path | None = None
+        self._cell_supervision_expected_epoch = ""
+        self._cell_supervision_component_ids: dict[ComponentRole, str] = {}
+        self._cell_supervision_progress: dict[
+            str, tuple[str, object, int]
+        ] = {}
+        self._cell_supervision_last_snapshot: dict[str, Any] | None = None
+        self._cycle_environment_lock = threading.Lock()
+        self._active_cycle_environment_pin: (
+            ExecutionEnvironmentPin | None
+        ) = None
+        self._active_cycle_environment_manager: CycleManager | None = None
+        self._cycle_environment_reset_required = False
+        self._cycle_environment_containment_started = False
+        self._cycle_environment_containment_generation = 0
         self._heartbeat_cache_lock = threading.Lock()
         self._heartbeat_build_lock = threading.Lock()
         self._heartbeat_cache_payload: dict[str, Any] | None = None
@@ -897,6 +1055,15 @@ class ComposerState:
         with self._assistant_request_lock:
             return self._assistant_requests.get(request_id)
 
+    def assistant_request_tool_evidence(self, request_id: str) -> tuple[bool, int]:
+        """Return draft-mutation evidence and live tool count for one request."""
+        with self._assistant_request_lock:
+            record = self._assistant_requests.get(request_id)
+            if record is None:
+                return False, 0
+            tool_calls = list(record.tool_calls)
+        return any(call.draft_mutated for call in tool_calls), len(tool_calls)
+
     def stage_assistant_proposals(
         self,
         *,
@@ -1088,6 +1255,14 @@ class ComposerState:
 
     def _configure_cycle_manager_callbacks(self, manager: CycleManager) -> None:
         """Bind callbacks on a manager before it becomes session-visible."""
+        manager.set_on_run_from_idle(
+            lambda: self._arm_cycle_execution_environment(manager)
+        )
+        manager.set_on_reset_completed(
+            lambda: self._retire_cycle_execution_environment_after_reset(
+                manager
+            )
+        )
         manager.set_parent_run_id_provider(
             self._current_or_last_run_id_for_recovery,
         )
@@ -1226,6 +1401,14 @@ class ComposerState:
             execution_config = dict(execution.config or {}) if execution else {}
             if self._is_commanded_sim_execution_config(execution_config):
                 required_providers.append("isaac_demo_supervisor")
+        with self._robot_lifecycle_lock:
+            lifecycle_client = self._robot_lifecycle_client
+        if lifecycle_client is not None:
+            required_providers.append(lifecycle_client.provider_id)
+        if isinstance(lifecycle_client, RobotLifecycleClient):
+            required_providers.append(
+                lifecycle_client.authority_provider_id
+            )
         return (
             runtime_lane,
             robot_resource,
@@ -1612,29 +1795,1265 @@ class ComposerState:
             return self._node_environment
 
     @contextmanager
-    def runtime_admission_guard(self) -> Iterator[None]:
-        """Fence Run admission against node-environment publication.
+    def artifact_read_transaction(self) -> Iterator[None]:
+        """Fence one loaded-program/deployment decision against cutover.
 
-        Concurrent Run calls may still occupy the lifecycle executor. The leaf
-        lock is released before any RPC, while the in-flight count makes reload
-        fail closed. Stop and controller-command paths never acquire it.
+        Callers may atomically read the active artifacts, perform their final
+        content/generation check, and accept a dispatch while this context is
+        held. Program/deployment load and apply already use the same reentrant
+        lock, so they cannot publish a replacement between those operations.
+        The context deliberately adds no new lock or artifact copy; nested use
+        on the same thread is supported. Keep the protected section bounded to
+        final admission/dispatch work.
         """
-        with self._runtime_admission_lock:
-            if self._node_environment_reload_in_progress:
-                raise RuntimeError("node_environment_reload_in_progress")
-            self._runtime_admissions_in_flight += 1
+        with self._program_edit_lock:
+            yield
+
+    @contextmanager
+    def runtime_admission_guard(self) -> Iterator[None]:
+        """Fence Run admission against artifact and node-environment cutover.
+
+        Registration is atomic with artifact cutover under the program-edit ->
+        runtime-admission lock order used by node-environment reload. The
+        in-flight token then protects the caller's final checks and synchronous
+        ``CycleManager.run()`` acceptance without holding an exclusive artifact
+        lock across execution. This preserves concurrent Run and multi-robot
+        admission. Stop and controller-command paths never acquire either lock.
+        """
+        owner_thread_id = threading.get_ident()
+        with self._program_edit_lock:
+            with self._runtime_admission_lock:
+                if self._node_environment_reload_in_progress:
+                    raise RuntimeError("node_environment_reload_in_progress")
+                self._runtime_admissions_in_flight += 1
+                self._runtime_admissions_by_thread[owner_thread_id] = (
+                    self._runtime_admissions_by_thread.get(owner_thread_id, 0)
+                    + 1
+                )
         try:
             yield
         finally:
             with self._runtime_admission_lock:
                 self._runtime_admissions_in_flight -= 1
+                remaining = (
+                    self._runtime_admissions_by_thread.get(owner_thread_id, 0)
+                    - 1
+                )
+                if remaining > 0:
+                    self._runtime_admissions_by_thread[owner_thread_id] = remaining
+                else:
+                    self._runtime_admissions_by_thread.pop(owner_thread_id, None)
 
     def close_runtime_resources(self) -> None:
         """Retire deployment-owned NRT handles exactly once at shutdown."""
+        with self._robot_lifecycle_projection_lock:
+            with self._robot_lifecycle_lock:
+                lifecycle_client = self._robot_lifecycle_client
+                self._robot_lifecycle_client = None
+                self._robot_lifecycle_client_token = None
+        if lifecycle_client is not None:
+            lifecycle_client.close()
         with self._program_edit_lock:
             resources = self._runtime_resources
             self._runtime_resources = RuntimeResourceRegistry.empty()
         resources.close()
+
+    def _robot_lifecycle_config(
+        self,
+        deployment: Deployment | None,
+        *,
+        robot_id: str,
+    ) -> RobotLifecycleConfig | None:
+        if deployment is None:
+            return None
+        execution = deployment.adapters.get("execution")
+        config = dict(execution.config or {}) if execution is not None else {}
+        compatibility = getattr(deployment, "compatibility", None)
+        if (
+            compatibility is not None
+            and compatibility.lane == "real-robot"
+        ):
+            validate_real_robot_runtime_record(
+                deployment_path=deployment.source_path,
+                execution_config=config,
+            )
+        raw_provider = config.get("robot_lifecycle_provider")
+        if raw_provider is None:
+            return None
+        if not isinstance(raw_provider, dict):
+            raise ValueError(
+                "execution.config.robot_lifecycle_provider must be a mapping"
+            )
+        return RobotLifecycleConfig.from_mapping(
+            raw_provider,
+            fallback_robot_id=robot_id,
+        )
+
+    def _configure_cell_supervision(
+        self,
+        deployment: Deployment | None,
+    ) -> None:
+        raw_supervision: object = None
+        if deployment is not None:
+            execution = deployment.adapters.get("execution")
+            execution_config = (
+                dict(execution.config or {})
+                if execution is not None
+                else {}
+            )
+            raw_supervision = execution_config.get("cell_supervision")
+        if raw_supervision is None:
+            with self._cell_supervision_evaluation_lock:
+                with self._cell_supervision_lock:
+                    previous_ids = set(
+                        self._cell_supervision_component_ids.values()
+                    )
+                    self._cell_supervision_reducer = None
+                    self._cell_supervision_manifest = None
+                    self._cell_supervision_heartbeat_path = None
+                    self._cell_supervision_expected_epoch = ""
+                    self._cell_supervision_component_ids = {}
+                    self._cell_supervision_progress = {}
+                    self._cell_supervision_last_snapshot = None
+                with self._cycle_environment_lock:
+                    self._cycle_environment_containment_generation += 1
+                    self._active_cycle_environment_pin = None
+                    self._active_cycle_environment_manager = None
+                    self._cycle_environment_reset_required = False
+                    self._cycle_environment_containment_started = False
+            for component_id in previous_ids:
+                self.remove_external_runtime_status(component_id)
+            return
+        if not isinstance(raw_supervision, dict):
+            raise ValueError(
+                "execution.config.cell_supervision must be a mapping"
+            )
+        policy = supervision_policy_from_mapping(raw_supervision)
+        role_ids: dict[ComponentRole, str] = {}
+        for component in policy.components:
+            if component.component_role in role_ids:
+                raise ValueError(
+                    "cell supervision requires one component per role"
+                )
+            role_ids[component.component_role] = component.component_id
+        required_roles = {
+            ComponentRole.CELL_SUPERVISOR,
+            ComponentRole.TRANSPORT_OWNER,
+            ComponentRole.LIFECYCLE_PROVIDER,
+            ComponentRole.EXECUTION_BACKEND,
+            ComponentRole.CONTROL_AUTHORITY,
+        }
+        if not required_roles.issubset(role_ids):
+            raise ValueError(
+                "cell supervision omits a required execution component"
+            )
+        raw_path = raw_supervision.get("supervisor_heartbeat_path")
+        expected_epoch = raw_supervision.get(
+            "cell_supervisor_component_epoch"
+        )
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path
+            or not isinstance(expected_epoch, str)
+            or not expected_epoch
+        ):
+            raise ValueError(
+                "cell supervision heartbeat identity is malformed"
+            )
+        heartbeat_path = Path(raw_path)
+        if not heartbeat_path.is_absolute():
+            raise ValueError(
+                "cell supervision heartbeat path must be absolute"
+            )
+        reducer = ComponentHealthReducer(
+            policy,
+            clock_ns=time.monotonic_ns,
+        )
+        with self._cell_supervision_evaluation_lock:
+            with self._cell_supervision_lock:
+                self._cell_supervision_reducer = reducer
+                self._cell_supervision_manifest = dict(raw_supervision)
+                self._cell_supervision_heartbeat_path = heartbeat_path
+                self._cell_supervision_expected_epoch = expected_epoch
+                self._cell_supervision_component_ids = role_ids
+                self._cell_supervision_progress = {}
+                self._cell_supervision_last_snapshot = None
+            with self._cycle_environment_lock:
+                self._cycle_environment_containment_generation += 1
+                self._active_cycle_environment_pin = None
+                self._active_cycle_environment_manager = None
+                self._cycle_environment_reset_required = False
+                self._cycle_environment_containment_started = False
+
+    def _cell_progress_sequence(
+        self,
+        *,
+        component_id: str,
+        component_epoch: str,
+        progress_token: object,
+    ) -> int:
+        current = self._cell_supervision_progress.get(component_id)
+        if current is None or current[0] != component_epoch:
+            sequence = 1
+        elif current[1] != progress_token:
+            sequence = current[2] + 1
+        else:
+            sequence = current[2]
+        self._cell_supervision_progress[component_id] = (
+            component_epoch,
+            progress_token,
+            sequence,
+        )
+        return sequence
+
+    @staticmethod
+    def _cell_supervision_snapshot_payload(snapshot: Any) -> dict[str, Any]:
+        return {
+            "generation": snapshot.generation,
+            "evaluatedAtSteadyTimeNs": snapshot.evaluated_at_ns,
+            "cellId": snapshot.cell_id,
+            "robotIds": list(snapshot.robot_ids),
+            "authorityProfile": snapshot.authority_profile,
+            "authorityComponentEpoch": (
+                snapshot.authority_component_epoch
+            ),
+            "dependencyGraphHealthy": snapshot.dependency_graph_healthy,
+            "dispatchAdmitted": snapshot.dispatch_admitted,
+            "activeEnvironmentHealthy": (
+                snapshot.active_environment_healthy
+            ),
+            "reasonCodes": list(snapshot.reason_codes),
+            "requestedContainment": snapshot.requested_containment,
+            "restartDomains": list(snapshot.restart_domains),
+            "components": [
+                {
+                    "role": component.component_role.value,
+                    "id": component.component_id,
+                    "componentEpoch": component.component_epoch,
+                    "sequence": component.sequence,
+                    "heartbeatAgeNs": component.heartbeat_age_ns,
+                    "criticalProgressSequence": (
+                        component.critical_progress_sequence
+                    ),
+                    "criticalProgressAgeNs": (
+                        component.critical_progress_age_ns
+                    ),
+                    "healthState": component.health_state.value,
+                    "healthy": component.healthy,
+                    "reasonCodes": list(component.reason_codes),
+                    "restartDomain": component.restart_domain,
+                    "runtimeGeneration": component.runtime_generation,
+                    "bindingGeneration": component.binding_generation,
+                    "configurationGeneration": (
+                        component.configuration_generation
+                    ),
+                }
+                for component in snapshot.components
+            ],
+        }
+
+    def _publish_cell_supervision_snapshot(self, snapshot: Any) -> None:
+        payload = self._cell_supervision_snapshot_payload(snapshot)
+        with self._cell_supervision_lock:
+            self._cell_supervision_last_snapshot = payload
+            component_ids = dict(self._cell_supervision_component_ids)
+        supervisor_id = component_ids.get(ComponentRole.CELL_SUPERVISOR)
+        if not supervisor_id:
+            return
+        detail = (
+            "Cell execution environment is healthy."
+            if snapshot.dispatch_admitted
+            else (
+                "Cell execution environment is fenced: "
+                + ", ".join(snapshot.reason_codes[:4])
+            )
+        )
+        self.update_external_runtime_status(
+            supervisor_id,
+            {
+                "readiness": (
+                    "ready" if snapshot.dispatch_admitted else "offline"
+                ),
+                "providerHealthy": snapshot.dispatch_admitted,
+                "canExecute": snapshot.dispatch_admitted,
+                "userMessage": detail,
+                "components": [
+                    {
+                        "id": component.component_id,
+                        "label": component.component_id,
+                        "kind": "component_supervision",
+                        "status": (
+                            "ready" if component.healthy else "offline"
+                        ),
+                        "requiredFor": ["execute"],
+                        "detail": ", ".join(component.reason_codes),
+                    }
+                    for component in snapshot.components
+                ],
+                "cellSupervision": payload,
+            },
+        )
+
+    def cell_supervision_status(self) -> dict[str, Any] | None:
+        """Return the latest immutable reduced snapshot for NRT observers."""
+        with self._cell_supervision_lock:
+            snapshot = self._cell_supervision_last_snapshot
+            return copy.deepcopy(snapshot) if snapshot is not None else None
+
+    def _arm_cycle_execution_environment(
+        self,
+        manager: CycleManager,
+    ) -> None:
+        """Mint the upper half of the physical execution-environment pin.
+
+        Composer owns program/deployment/run identity and the cell dependency
+        graph. The ros2_control backend owns the lower controller/JTC,
+        lifecycle-admission, and component-epoch dispatch pin. Both are
+        immutable for one run; either half failing retires the run.
+        """
+        with self._cell_supervision_evaluation_lock:
+            with self._cell_supervision_lock:
+                reducer = self._cell_supervision_reducer
+            if reducer is None:
+                return
+            snapshot = reducer.snapshot()
+            if not snapshot.dispatch_admitted:
+                reason = (
+                    snapshot.reason_codes[0]
+                    if snapshot.reason_codes
+                    else "cell_execution_environment_unhealthy"
+                )
+                raise RuntimeError(reason)
+            with self._robot_lifecycle_lock:
+                lifecycle_client = self._robot_lifecycle_client
+            lifecycle_status = (
+                lifecycle_client.status()
+                if isinstance(lifecycle_client, RobotLifecycleClient)
+                else {}
+            )
+            if (
+                lifecycle_status.get("providerHealthy") is not True
+                or lifecycle_status.get("fresh") is not True
+                or lifecycle_status.get("canExecute") is not True
+            ):
+                raise RuntimeError(
+                    "robot_lifecycle_motion_admission_not_current"
+                )
+            runtime_generation = str(
+                lifecycle_status.get("runtimeGenerationId") or ""
+            )
+            controller_binding_generation = next(
+                (
+                    component.expected_binding_generation
+                    for component in reducer.policy.components
+                    if component.expected_binding_generation
+                ),
+                "",
+            )
+            lifecycle_generation = int(
+                lifecycle_status.get("authoritySessionGeneration") or 0
+            )
+            admission_generation = int(
+                lifecycle_status.get("snapshotGeneration") or 0
+            )
+            if (
+                not runtime_generation
+                or not controller_binding_generation
+                or lifecycle_generation <= 0
+                or admission_generation <= 0
+            ):
+                raise RuntimeError(
+                    "execution_environment_generation_missing"
+                )
+            with self._runtime_generation_lock:
+                program_generation = self._program_session_generation
+                deployment_generation = self._deployment_session_generation
+            program_run_id = manager.program_run_id or ""
+            if not program_run_id:
+                raise RuntimeError("execution_environment_program_run_missing")
+            robot_id = reducer.policy.robot_ids[0]
+            pin = reducer.mint_execution_pin(
+                snapshot=snapshot,
+                execution_id=f"cycle:{program_run_id}",
+                program_run_id=program_run_id,
+                robot_id=robot_id,
+                program_generation=f"program-{program_generation}",
+                deployment_generation=(
+                    f"deployment-{deployment_generation}"
+                ),
+                runtime_generation=runtime_generation,
+                controller_binding_generation=(
+                    controller_binding_generation
+                ),
+                lifecycle_generation=lifecycle_generation,
+                admission_generation=admission_generation,
+            )
+            with self._cycle_environment_lock:
+                if manager is not self.cycle_manager:
+                    raise RuntimeError(
+                        "execution_environment_manager_replaced"
+                    )
+                if self._cycle_environment_reset_required:
+                    raise RuntimeError(
+                        "execution_environment_reset_required"
+                    )
+                self._active_cycle_environment_pin = pin
+                self._active_cycle_environment_manager = manager
+                self._cycle_environment_containment_started = False
+
+    def _retire_cycle_execution_environment_after_reset(
+        self,
+        manager: CycleManager,
+    ) -> None:
+        with self._cycle_environment_lock:
+            if manager is not self.cycle_manager:
+                return
+            self._cycle_environment_containment_generation += 1
+            self._active_cycle_environment_pin = None
+            self._active_cycle_environment_manager = None
+            self._cycle_environment_reset_required = False
+            self._cycle_environment_containment_started = False
+
+    def _request_cycle_environment_containment(
+        self,
+        *,
+        reason_codes: tuple[str, ...],
+    ) -> None:
+        with self._cycle_environment_lock:
+            manager = self._active_cycle_environment_manager
+            if (
+                manager is None
+                or self._active_cycle_environment_pin is None
+                or self._cycle_environment_containment_started
+                or manager is not self.cycle_manager
+            ):
+                return
+            self._active_cycle_environment_pin = None
+            self._cycle_environment_reset_required = True
+            self._cycle_environment_containment_started = True
+            self._cycle_environment_containment_generation += 1
+            containment_generation = (
+                self._cycle_environment_containment_generation
+            )
+
+        reason_code = (
+            reason_codes[0]
+            if reason_codes
+            else "execution_environment_unhealthy"
+        )
+
+        def contain() -> None:
+            try:
+                def is_current() -> bool:
+                    with self._cycle_environment_lock:
+                        return bool(
+                            self._cycle_environment_containment_generation
+                            == containment_generation
+                            and self._cycle_environment_reset_required
+                            and manager is self.cycle_manager
+                        )
+
+                contained = manager.contain_execution_environment_loss(
+                    reason_code=reason_code,
+                    details={
+                        "reason_codes": list(reason_codes),
+                        "program_run_id": manager.program_run_id or "",
+                    },
+                    is_current=is_current,
+                )
+                if not contained:
+                    return
+                self.event_recorder.record_robot_lifecycle_event(
+                    "execution_environment_contained",
+                    details={
+                        "reason_codes": list(reason_codes),
+                        "program_run_id": manager.program_run_id,
+                        "requires_reset": True,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Execution-environment containment failed"
+                )
+
+        threading.Thread(
+            target=contain,
+            name="manyforge-execution-environment-containment",
+            daemon=True,
+        ).start()
+
+    def _validate_active_cycle_execution_environment(
+        self,
+        *,
+        reducer: ComponentHealthReducer,
+        snapshot: Any,
+        lifecycle_status: dict[str, Any],
+    ) -> None:
+        with self._cycle_environment_lock:
+            pin = self._active_cycle_environment_pin
+            manager = self._active_cycle_environment_manager
+        if pin is None or manager is None:
+            return
+        if manager is not self.cycle_manager:
+            self._request_cycle_environment_containment(
+                reason_codes=("execution_environment_manager_replaced",),
+            )
+            return
+        if manager.state.value == "idle":
+            with self._cycle_environment_lock:
+                if self._active_cycle_environment_manager is manager:
+                    self._active_cycle_environment_pin = None
+                    self._active_cycle_environment_manager = None
+            return
+
+        reasons = set(
+            reducer.validate_pin(pin, snapshot=snapshot).reason_codes
+        )
+        with self._runtime_generation_lock:
+            program_generation = self._program_session_generation
+            deployment_generation = self._deployment_session_generation
+        if pin.program_generation != f"program-{program_generation}":
+            reasons.add("execution_environment_program_changed")
+        if (
+            pin.deployment_generation
+            != f"deployment-{deployment_generation}"
+        ):
+            reasons.add("execution_environment_deployment_changed")
+        if (
+            str(lifecycle_status.get("runtimeGenerationId") or "")
+            != pin.runtime_generation
+        ):
+            reasons.add("execution_environment_runtime_changed")
+        if (
+            int(lifecycle_status.get("authoritySessionGeneration") or 0)
+            != pin.lifecycle_generation
+        ):
+            reasons.add("execution_environment_lifecycle_changed")
+        if (
+            lifecycle_status.get("providerHealthy") is not True
+            or lifecycle_status.get("fresh") is not True
+            or lifecycle_status.get("canExecute") is not True
+        ):
+            reasons.add("execution_environment_admission_lost")
+        if reasons:
+            self._request_cycle_environment_containment(
+                reason_codes=tuple(sorted(reasons)),
+            )
+
+    def _reduce_cell_supervision(
+        self,
+        *,
+        heartbeat_sequence: int,
+        critical_probe_healthy: bool,
+        critical_probe_reason: str,
+    ) -> tuple[bool, str]:
+        with self._cell_supervision_evaluation_lock:
+            return self._reduce_cell_supervision_once(
+                heartbeat_sequence=heartbeat_sequence,
+                critical_probe_healthy=critical_probe_healthy,
+                critical_probe_reason=critical_probe_reason,
+            )
+
+    def _reduce_cell_supervision_once(
+        self,
+        *,
+        heartbeat_sequence: int,
+        critical_probe_healthy: bool,
+        critical_probe_reason: str,
+    ) -> tuple[bool, str]:
+        """Evaluate one immutable cell snapshot under the NRT reducer lock."""
+        with self._cell_supervision_lock:
+            reducer = self._cell_supervision_reducer
+            manifest = dict(self._cell_supervision_manifest or {})
+            heartbeat_path = self._cell_supervision_heartbeat_path
+            expected_supervisor_epoch = (
+                self._cell_supervision_expected_epoch
+            )
+            component_ids = dict(self._cell_supervision_component_ids)
+        if reducer is None:
+            return critical_probe_healthy, critical_probe_reason
+        assert heartbeat_path is not None
+        supervisor_id = component_ids[ComponentRole.CELL_SUPERVISOR]
+        try:
+            supervisor_heartbeat = read_cell_supervisor_heartbeat(
+                heartbeat_path,
+                expected_component_id=supervisor_id,
+                expected_component_epoch=expected_supervisor_epoch,
+            )
+            reducer.ingest(supervisor_heartbeat)
+        except Exception:
+            # Retain the prior accepted sample. Its receiver-local age then
+            # expires deterministically; malformed/replayed files never renew.
+            pass
+
+        with self._robot_lifecycle_lock:
+            lifecycle_client = self._robot_lifecycle_client
+        lifecycle_status = (
+            lifecycle_client.status()
+            if isinstance(lifecycle_client, RobotLifecycleClient)
+            else {}
+        )
+        runtime_generation = str(
+            lifecycle_status.get("runtimeGenerationId")
+            or manifest.get("runtime_generation_id")
+            or ""
+        )
+        policy_by_id = {
+            item.component_id: item for item in reducer.policy.components
+        }
+        epochs: dict[str, str] = {
+            supervisor_id: expected_supervisor_epoch,
+            component_ids[ComponentRole.TRANSPORT_OWNER]: str(
+                lifecycle_status.get("transportOwnerComponentEpoch") or ""
+            ),
+            component_ids[ComponentRole.LIFECYCLE_PROVIDER]: str(
+                lifecycle_status.get("providerComponentEpoch") or ""
+            ),
+            component_ids[ComponentRole.EXECUTION_BACKEND]: (
+                self._execution_backend_component_epoch
+            ),
+            component_ids[ComponentRole.CONTROL_AUTHORITY]: (
+                self._control_authority_component_epoch
+            ),
+        }
+
+        def dependencies(component_id: str) -> dict[str, str]:
+            return {
+                dependency_id: epochs[dependency_id]
+                for dependency_id in policy_by_id[
+                    component_id
+                ].dependency_ids
+                if epochs.get(dependency_id)
+            }
+
+        robot_id = reducer.policy.robot_ids[0]
+        cell_id = reducer.policy.cell_id
+        binding_generation = next(
+            (
+                policy.expected_binding_generation
+                for policy in reducer.policy.components
+                if policy.expected_binding_generation
+            ),
+            "",
+        )
+        owner_id = component_ids[ComponentRole.TRANSPORT_OWNER]
+        owner_epoch = epochs[owner_id]
+        if owner_epoch:
+            owner_progress = self._cell_progress_sequence(
+                component_id=owner_id,
+                component_epoch=owner_epoch,
+                progress_token=lifecycle_status.get(
+                    "transportOwnerProgressSequence"
+                ),
+            )
+            reducer.ingest(
+                ComponentHeartbeat(
+                    component_role=ComponentRole.TRANSPORT_OWNER,
+                    component_id=owner_id,
+                    robot_id=robot_id,
+                    cell_id=cell_id,
+                    component_epoch=owner_epoch,
+                    sequence=heartbeat_sequence,
+                    health_state=_transport_owner_component_health_state(
+                        lifecycle_status
+                    ),
+                    critical_progress_sequence=owner_progress,
+                    dependency_epochs=dependencies(owner_id),
+                    runtime_generation=runtime_generation,
+                    binding_generation=binding_generation,
+                )
+            )
+
+        provider_id = component_ids[ComponentRole.LIFECYCLE_PROVIDER]
+        provider_epoch = epochs[provider_id]
+        if provider_epoch:
+            provider_progress = self._cell_progress_sequence(
+                component_id=provider_id,
+                component_epoch=provider_epoch,
+                progress_token=lifecycle_status.get(
+                    "providerDeliverySequence"
+                ),
+            )
+            reducer.ingest(
+                ComponentHeartbeat(
+                    component_role=ComponentRole.LIFECYCLE_PROVIDER,
+                    component_id=provider_id,
+                    robot_id=robot_id,
+                    cell_id=cell_id,
+                    component_epoch=provider_epoch,
+                    sequence=heartbeat_sequence,
+                    health_state=(
+                        ComponentHealthState.HEALTHY
+                        if lifecycle_status.get("providerHealthy") is True
+                        else ComponentHealthState.DEGRADED
+                    ),
+                    critical_progress_sequence=provider_progress,
+                    dependency_epochs=dependencies(provider_id),
+                    runtime_generation=runtime_generation,
+                    binding_generation=binding_generation,
+                )
+            )
+
+        backend_id = component_ids[ComponentRole.EXECUTION_BACKEND]
+        backend_progress = self._cell_progress_sequence(
+            component_id=backend_id,
+            component_epoch=epochs[backend_id],
+            progress_token=(
+                heartbeat_sequence
+                if critical_probe_healthy
+                else "critical-probe-failed"
+            ),
+        )
+        reducer.ingest(
+            ComponentHeartbeat(
+                component_role=ComponentRole.EXECUTION_BACKEND,
+                component_id=backend_id,
+                robot_id=robot_id,
+                cell_id=cell_id,
+                component_epoch=epochs[backend_id],
+                sequence=heartbeat_sequence,
+                health_state=(
+                    ComponentHealthState.HEALTHY
+                    if critical_probe_healthy
+                    else ComponentHealthState.DEGRADED
+                ),
+                critical_progress_sequence=backend_progress,
+                dependency_epochs=dependencies(backend_id),
+                runtime_generation=runtime_generation,
+                binding_generation=binding_generation,
+            )
+        )
+
+        authority_id = component_ids[ComponentRole.CONTROL_AUTHORITY]
+        authority_progress = self._cell_progress_sequence(
+            component_id=authority_id,
+            component_epoch=epochs[authority_id],
+            progress_token=heartbeat_sequence,
+        )
+        reducer.ingest(
+            ComponentHeartbeat(
+                component_role=ComponentRole.CONTROL_AUTHORITY,
+                component_id=authority_id,
+                robot_id=robot_id,
+                cell_id=cell_id,
+                component_epoch=epochs[authority_id],
+                sequence=heartbeat_sequence,
+                health_state=(
+                    ComponentHealthState.HEALTHY
+                    if critical_probe_healthy
+                    else ComponentHealthState.DEGRADED
+                ),
+                critical_progress_sequence=authority_progress,
+                dependency_epochs=dependencies(authority_id),
+                runtime_generation=runtime_generation,
+                binding_generation=binding_generation,
+            )
+        )
+        snapshot = reducer.snapshot()
+        self._publish_cell_supervision_snapshot(snapshot)
+        self._validate_active_cycle_execution_environment(
+            reducer=reducer,
+            snapshot=snapshot,
+            lifecycle_status=dict(lifecycle_status),
+        )
+        if snapshot.dispatch_admitted:
+            return True, ""
+        return False, (
+            snapshot.reason_codes[0]
+            if snapshot.reason_codes
+            else "cell_execution_environment_unhealthy"
+        )
+
+    def start_control_authority_health(self) -> None:
+        """Admit backend-owned health samples after the app event loop starts."""
+        with self._control_authority_health_lock:
+            self._control_authority_health_active = True
+
+    def stop_control_authority_health(self) -> None:
+        """Prevent authority renewal before ordered application quiescence."""
+        with self._control_authority_health_lock:
+            self._control_authority_health_active = False
+
+    def _probe_control_authority_health(self) -> AuthorityHealthEvidence:
+        """Prove the headless control loop and lifecycle authority progressed.
+
+        This runs from the app-owned authority pump, never from a browser
+        request. This probe deliberately checks component liveness, not live
+        robot-state freshness or diagnostic delivery:
+
+        * measured-state freshness is an independent planning/dispatch gate;
+        * controller/provider health is reduced through cell supervision; and
+        * kernel-event loss is reported by the infrastructure heartbeat.
+
+        Mixing those evidence planes here made one transient pose or diagnostic
+        read retire an otherwise healthy, stationary authority session.
+        """
+        with self._control_authority_health_lock:
+            active = self._control_authority_health_active
+        reason = ""
+        if not active:
+            reason = "composer_control_authority_not_running"
+        elif self.kernel is None:
+            reason = "execution_kernel_unavailable"
+        else:
+            try:
+                self.kernel.get_status()
+                manager = self.cycle_manager
+                if manager is not None:
+                    _ = manager.state.value
+            except Exception as exc:
+                reason = (
+                    "composer_critical_progress_probe_failed:"
+                    f"{str(exc) or type(exc).__name__}"
+                )
+        observed_at_ns = time.monotonic_ns()
+        with self._control_authority_health_lock:
+            if not self._control_authority_health_active:
+                reason = "composer_control_authority_not_running"
+            self._control_authority_health_sequence += 1
+            sequence = self._control_authority_health_sequence
+        reduced_healthy, reduced_reason = self._reduce_cell_supervision(
+            heartbeat_sequence=sequence,
+            critical_probe_healthy=not reason,
+            critical_probe_reason=reason,
+        )
+        if not reduced_healthy:
+            # Preserve the originating local probe failure. The reducer's
+            # dependency reason is still published in the cell-supervision
+            # snapshot, but replacing this value previously made the durable
+            # authority trace impossible to diagnose.
+            reason = reason or reduced_reason
+        return AuthorityHealthEvidence(
+            component_epoch=self._control_authority_component_epoch,
+            sequence=sequence,
+            observed_at_ns=observed_at_ns,
+            healthy=not reason,
+            reason=reason,
+        )
+
+    def robot_lifecycle_authority_heartbeat_interval_s(self) -> float:
+        with self._robot_lifecycle_lock:
+            client = self._robot_lifecycle_client
+        if isinstance(client, RobotLifecycleClient):
+            return client.authority_heartbeat_period_s
+        return 1.0
+
+    def robot_lifecycle_authority_heartbeat_tick(self) -> dict[str, Any]:
+        """Drive selected-authority renewal from the headless backend."""
+        with self._robot_lifecycle_lock:
+            client = self._robot_lifecycle_client
+        if not isinstance(client, RobotLifecycleClient):
+            return {"status": "unconfigured", "renewed": False}
+        result = client.authority_heartbeat_tick()
+        raw_state = str(result.get("status") or "unknown")
+        client_status = client.status()
+        health_state = (
+            "healthy"
+            if client_status.get("authorityHealthy") is True
+            else raw_state
+        )
+        with self._control_authority_health_lock:
+            previous_state = self._control_authority_last_state
+            self._control_authority_last_state = health_state
+        if health_state != previous_state:
+            self.event_recorder.record_robot_lifecycle_event(
+                "authority_health_changed",
+                details={
+                    "authority_component_epoch": (
+                        self._control_authority_component_epoch
+                    ),
+                    "authority_provider_id": client.authority_provider_id,
+                    "provider_id": client.provider_id,
+                    "previous_state": previous_state,
+                    "state": health_state,
+                    "session_state": raw_state,
+                    "reason": result.get("reason"),
+                    "renewed": result.get("renewed") is True,
+                },
+            )
+        return result
+
+    def _publish_robot_lifecycle_status(
+        self,
+        status: dict[str, Any],
+        *,
+        source_token: object | None = None,
+    ) -> bool:
+        with self._robot_lifecycle_projection_lock:
+            provider_id = str(status.get("providerId") or "").strip()
+            if not provider_id:
+                return False
+            with self._robot_lifecycle_lock:
+                if (
+                    source_token is not None
+                    and source_token is not self._robot_lifecycle_client_token
+                ):
+                    return False
+            runtime_payload = {
+                "readiness": str(status.get("readiness") or "offline"),
+                "providerHealthy": status.get("providerHealthy") is True,
+                "canExecute": status.get("canExecute") is True,
+                "userMessage": str(status.get("userMessage") or ""),
+                "components": [
+                    {
+                        "id": provider_id,
+                        "label": (
+                            "Robot lifecycle "
+                            f"({status.get('robotId') or 'unbound robot'})"
+                        ),
+                        "kind": "robot_lifecycle",
+                        "status": (
+                            "ready"
+                            if status.get("providerHealthy") is True
+                            and status.get("readiness")
+                            in {"ready", "waiting"}
+                            else str(status.get("readiness") or "offline")
+                        ),
+                        "requiredFor": ["execute"],
+                        "detail": str(status.get("userMessage") or ""),
+                    }
+                ],
+            }
+            self.update_external_runtime_status(provider_id, runtime_payload)
+            authority_provider_id = str(
+                status.get("authorityProviderId") or ""
+            ).strip()
+            authority_health = status.get("authorityHealth")
+            if authority_provider_id and isinstance(authority_health, dict):
+                authority_healthy = status.get("authorityHealthy") is True
+                authority_observed = int(
+                    authority_health.get("sequence") or 0
+                ) > 0
+                authority_payload = {
+                    "readiness": (
+                        "ready"
+                        if authority_healthy
+                        else "offline"
+                        if authority_observed
+                        else "waiting"
+                    ),
+                    "providerHealthy": authority_healthy,
+                    "canExecute": authority_healthy,
+                    "userMessage": (
+                        "Headless local control authority is healthy."
+                        if authority_healthy
+                        else "Waiting for headless control-authority health."
+                        if not authority_observed
+                        else (
+                            "Headless local control authority is unavailable: "
+                            f"{authority_health.get('reason') or 'unknown'}"
+                        )
+                    ),
+                    "components": [
+                        {
+                            "id": authority_provider_id,
+                            "label": "Headless local control authority",
+                            "kind": "control_authority",
+                            "status": (
+                                "ready" if authority_healthy else "offline"
+                            ),
+                            "requiredFor": ["execute"],
+                            "detail": str(
+                                authority_health.get("reason") or ""
+                            ),
+                        }
+                    ],
+                    "authorityHealth": dict(authority_health),
+                }
+                self.update_external_runtime_status(
+                    authority_provider_id,
+                    authority_payload,
+                )
+            adapters = self.operator_alarm_adapters
+            try:
+                if adapters is not None:
+                    adapters.observe_robot_lifecycle(status)
+            finally:
+                try:
+                    self._robot_lifecycle_transition_recorder.observe(status)
+                except Exception:
+                    # History is non-authoritative. Its failure must never
+                    # suppress lifecycle, authority, admission, or alarms.
+                    logger.exception(
+                        "Robot lifecycle history projection failed"
+                    )
+            return True
+
+    def _replace_robot_lifecycle_client(
+        self,
+        deployment: Deployment | None,
+        *,
+        robot_id: str,
+    ) -> None:
+        try:
+            config = self._robot_lifecycle_config(
+                deployment,
+                robot_id=robot_id,
+            )
+            # Install supervision only after the complete lifecycle/runtime
+            # record validates. A rejected deployment must not partially
+            # replace the reducer beneath the still-active client.
+            self._configure_cell_supervision(deployment)
+        except Exception as exc:
+            raise ValueError(
+                "Invalid deployment robot lifecycle provider: "
+                f"{str(exc) or type(exc).__name__}"
+            ) from exc
+        replacement: (
+            RobotLifecycleClient | UnavailableRobotLifecycleClient | None
+        ) = None
+        replacement_token: object | None = (
+            object() if config is not None else None
+        )
+        replacement_recorder = RobotLifecycleTransitionRecorder(
+            self.event_recorder.record_robot_lifecycle_event,
+            material_adapter_status_keys=(
+                config.material_adapter_status_keys if config else ()
+            ),
+        )
+        with self._robot_lifecycle_lock:
+            retained = self._robot_lifecycle_client
+            retained_token = self._robot_lifecycle_client_token
+        if (
+            config is not None
+            and isinstance(retained, RobotLifecycleClient)
+            and retained.config == config
+        ):
+            # A program-only cutover must not replace the startup-bound
+            # authority client. Recreating it would restart its session
+            # generation while the provider retains the higher replay fence
+            # from this same authority component epoch.
+            with self._robot_lifecycle_projection_lock:
+                with self._robot_lifecycle_lock:
+                    if (
+                        self._robot_lifecycle_client is retained
+                        and self._robot_lifecycle_client_token
+                        is retained_token
+                    ):
+                        self._robot_lifecycle_transition_recorder = (
+                            replacement_recorder
+                        )
+                    else:
+                        retained = None
+            if retained is not None:
+                self._publish_robot_lifecycle_status(
+                    retained.status(),
+                    source_token=retained_token,
+                )
+                return
+        if config is not None:
+            try:
+                replacement = RobotLifecycleClient(
+                    config,
+                    authority_component_epoch=(
+                        self._control_authority_component_epoch
+                    ),
+                    authority_health_probe=(
+                        self._probe_control_authority_health
+                    ),
+                    status_sink=lambda status: (
+                        self._publish_robot_lifecycle_status(
+                            status,
+                            source_token=replacement_token,
+                        )
+                    ),
+                )
+            except Exception as exc:
+                logger.exception("Robot lifecycle ROS ingress failed to start")
+                replacement = UnavailableRobotLifecycleClient(
+                    config,
+                    (
+                        "Robot lifecycle ROS ingress is unavailable: "
+                        f"{str(exc) or type(exc).__name__}"
+                    ),
+                )
+        with self._robot_lifecycle_projection_lock:
+            with self._robot_lifecycle_lock:
+                previous = self._robot_lifecycle_client
+                self._robot_lifecycle_client = replacement
+                self._robot_lifecycle_client_token = replacement_token
+                self._robot_lifecycle_transition_recorder = (
+                    replacement_recorder
+                )
+        if previous is not None:
+            previous.close()
+            if replacement is None or replacement.provider_id != previous.provider_id:
+                self.remove_external_runtime_status(previous.provider_id)
+            previous_authority_id = getattr(
+                previous,
+                "authority_provider_id",
+                "",
+            )
+            replacement_authority_id = getattr(
+                replacement,
+                "authority_provider_id",
+                "",
+            )
+            if (
+                previous_authority_id
+                and previous_authority_id != replacement_authority_id
+            ):
+                self.remove_external_runtime_status(previous_authority_id)
+        if replacement is not None:
+            self._publish_robot_lifecycle_status(
+                replacement.status(),
+                source_token=replacement_token,
+            )
+
+    def robot_lifecycle_status(self) -> dict[str, Any]:
+        for _attempt in range(2):
+            with self._robot_lifecycle_lock:
+                client = self._robot_lifecycle_client
+                source_token = self._robot_lifecycle_client_token
+            if client is None:
+                return {
+                    "schemaVersion": "manyforge.robot_lifecycle.ui_status.v1",
+                    "configured": False,
+                    "providerHealthy": False,
+                    "fresh": False,
+                    "readiness": "disabled",
+                    "canExecute": False,
+                    "userMessage": (
+                        "The loaded deployment has no robot lifecycle provider."
+                    ),
+                    "capabilities": [],
+                    "commandInFlight": None,
+                    "lastCompositeResult": None,
+                }
+            status = client.status()
+            # Re-evaluate delivery freshness on every read. ROS callbacks
+            # publish material changes and a bounded heartbeat, but an abruptly
+            # lost provider produces no final "offline" sample. A concurrent
+            # cutover rejects the retired token and retries the new client.
+            if self._publish_robot_lifecycle_status(
+                status,
+                source_token=source_token,
+            ):
+                return status
+        return {
+            "schemaVersion": "manyforge.robot_lifecycle.ui_status.v1",
+            "configured": True,
+            "providerHealthy": False,
+            "fresh": False,
+            "readiness": "waiting",
+            "canExecute": False,
+            "userMessage": (
+                "Robot lifecycle provider changed while status was read; "
+                "waiting for one stable publication."
+            ),
+            "capabilities": [],
+            "commandInFlight": None,
+            "lastCompositeResult": None,
+        }
+
+    def robot_lifecycle_motion_admission_block_reason(
+        self,
+    ) -> dict[str, Any] | None:
+        """Return a pre-arm block for a physical deployment, if any.
+
+        The execution adapter still rechecks its immutable admission lease at
+        final dispatch. This earlier product gate prevents Run or candidate
+        approval from entering a motion lifecycle while the robot is disabled.
+        """
+        deployment = self.deployment
+        compatibility = (
+            deployment.compatibility if deployment is not None else None
+        )
+        if compatibility is None or compatibility.lane != "real-robot":
+            return None
+        status = self.robot_lifecycle_status()
+        if status.get("configured") is not True:
+            return {
+                "error_code": "robot_lifecycle_provider_not_configured",
+                "message": (
+                    "Execution is disabled because this real-robot deployment "
+                    "has no lifecycle provider."
+                ),
+                "error_details": {"robotLifecycle": status},
+            }
+        if (
+            status.get("providerHealthy") is not True
+            or status.get("fresh") is not True
+        ):
+            return {
+                "error_code": "robot_lifecycle_status_unavailable",
+                "message": (
+                    "Execution is disabled until fresh robot lifecycle status "
+                    "is available."
+                ),
+                "error_details": {"robotLifecycle": status},
+            }
+        if status.get("canExecute") is not True:
+            return {
+                "error_code": "robot_lifecycle_motion_not_admitted",
+                "message": str(
+                    status.get("userMessage")
+                    or "Enable the robot before starting motion."
+                ),
+                "error_details": {
+                    "robotLifecycle": status,
+                    "admissionReasonCodes": list(
+                        status.get("admissionReasonCodes") or []
+                    ),
+                },
+            }
+        return None
+
+    def enable_robot_lifecycle(self) -> dict[str, Any]:
+        with self._robot_lifecycle_lock:
+            client = self._robot_lifecycle_client
+        if client is None:
+            raise RuntimeError("robot_lifecycle_provider_not_configured")
+        return client.enable()
+
+    def disable_robot_lifecycle(self, *, timeout_s: float = 8.0) -> dict[str, Any]:
+        """Quiesce the program first, then unwind robot control and drives."""
+        with self._robot_lifecycle_lock:
+            client = self._robot_lifecycle_client
+        if client is None:
+            raise RuntimeError("robot_lifecycle_provider_not_configured")
+        manager = self.cycle_manager
+        cycle_stop: dict[str, Any] = {
+            "requested": False,
+            "state": "none",
+        }
+        if manager is not None:
+            state_value = manager.state.value
+            cycle_stop["state"] = state_value
+            if state_value not in {"idle", "stopped"}:
+                manager.full_stop()
+                cycle_stop["requested"] = True
+                deadline = time.monotonic() + timeout_s
+                while time.monotonic() < deadline:
+                    state_value = manager.state.value
+                    cycle_stop["state"] = state_value
+                    if state_value in {"idle", "stopped"}:
+                        break
+                    time.sleep(0.02)
+                if state_value not in {"idle", "stopped"}:
+                    raise RuntimeError(
+                        "cycle_full_stop_not_proven_before_robot_disable"
+                    )
+        result = client.disable()
+        result["cycleStop"] = cycle_stop
+        return result
+
+    def robot_lifecycle_recovery_action(
+        self,
+        action_id: str,
+    ) -> dict[str, Any]:
+        with self._robot_lifecycle_lock:
+            client = self._robot_lifecycle_client
+        if client is None:
+            raise RuntimeError("robot_lifecycle_provider_not_configured")
+        return client.recovery_action(action_id)
+
+    def reconcile_robot_lifecycle(self) -> dict[str, Any]:
+        with self._robot_lifecycle_lock:
+            client = self._robot_lifecycle_client
+        if client is None:
+            raise RuntimeError("robot_lifecycle_provider_not_configured")
+        return client.reconcile()
 
     @staticmethod
     def _retire_runtime_resources_after_cutover(
@@ -2165,16 +3584,110 @@ class ComposerState:
     def _current_cycle_state(self) -> str:
         return self.cycle_manager.state.value if self.cycle_manager is not None else "idle"
 
+    def _ensure_artifact_mutation_safe_locked(self) -> None:
+        """Fail closed unless the active runtime is quiescent for cutover.
+
+        Callers own ``_program_edit_lock``. Cycle state alone is insufficient:
+        the lightweight gripper bridge can execute a command while the cycle
+        manager remains IDLE, so every configured gripper is checked as part of
+        the same cutover admission decision.
+        """
+
+        with self._runtime_admission_lock:
+            own_admissions = self._runtime_admissions_by_thread.get(
+                threading.get_ident(),
+                0,
+            )
+            foreign_admissions = (
+                self._runtime_admissions_in_flight - own_admissions
+            )
+        if foreign_admissions > 0:
+            raise RuntimeError(
+                f"{_ARTIFACT_MUTATION_REQUIRES_IDLE}: run_admission_in_progress"
+            )
+
+        cycle_state = self._current_cycle_state()
+        if self.cycle_manager is not None and cycle_state != "idle":
+            raise RuntimeError(
+                f"{_ARTIFACT_MUTATION_REQUIRES_IDLE}: cycle_state={cycle_state}"
+            )
+
+        deployment = self.deployment
+        raw_grippers = getattr(deployment, "grippers", None)
+        if raw_grippers is None:
+            return
+        keys = getattr(raw_grippers, "keys", None)
+        if not callable(keys):
+            if raw_grippers:
+                raise RuntimeError(
+                    f"{_ARTIFACT_MUTATION_STATE_UNAVAILABLE}: gripper_configuration"
+                )
+            return
+        gripper_ids = sorted(str(gripper_id) for gripper_id in keys())
+        if not gripper_ids:
+            return
+
+        kernel = self.kernel
+        if kernel is None:
+            # A state with neither manager nor kernel is initial startup. Once a
+            # manager exists, missing kernel status is an unsafe live-runtime
+            # condition rather than evidence that every gripper is idle.
+            if self.cycle_manager is None:
+                return
+            raise RuntimeError(
+                f"{_ARTIFACT_MUTATION_STATE_UNAVAILABLE}: gripper_status"
+            )
+        get_status = getattr(kernel, "get_gripper_status", None)
+        if not callable(get_status):
+            raise RuntimeError(
+                f"{_ARTIFACT_MUTATION_STATE_UNAVAILABLE}: gripper_status"
+            )
+
+        known_states = {state.value for state in GripperCommandState}
+        for gripper_id in gripper_ids:
+            try:
+                status = get_status(gripper_id)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"{_ARTIFACT_MUTATION_STATE_UNAVAILABLE}: "
+                    f"gripper_status={gripper_id}"
+                ) from exc
+            raw_state = getattr(status, "state", None)
+            state_value = str(getattr(raw_state, "value", raw_state) or "").lower()
+            if state_value not in known_states:
+                raise RuntimeError(
+                    f"{_ARTIFACT_MUTATION_STATE_UNAVAILABLE}: "
+                    f"gripper_status={gripper_id}"
+                )
+            if state_value == GripperCommandState.EXECUTING.value:
+                raise RuntimeError(
+                    f"{_ARTIFACT_MUTATION_REQUIRES_IDLE}: "
+                    f"gripper_executing={gripper_id}"
+                )
+
     def promote_runtime_overrides_to_loaded_program(
+        self,
+        *,
+        include_staged: bool,
+    ) -> Program:
+        """Atomically materialize overrides into the loaded program."""
+        with self._program_edit_lock:
+            return self._promote_runtime_overrides_to_loaded_program_locked(
+                include_staged=include_staged,
+            )
+
+    def _promote_runtime_overrides_to_loaded_program_locked(
         self,
         *,
         include_staged: bool,
     ) -> Program:
         """Materialize selected runtime overrides into the loaded in-memory program."""
         cycle_state = self._current_cycle_state()
-        if cycle_state not in {"idle", "stopped"}:
+        if cycle_state != "idle":
             raise RuntimeError(
-                "Runtime overrides may only be promoted into the loaded program in IDLE or STOPPED"
+                "Runtime overrides may only be promoted into the loaded program "
+                "in IDLE; Reset a stopped execution before promotion, then "
+                "include staged overrides or clear them first"
             )
         with self._runtime_override_lock:
             has_staged_overrides = any(
@@ -2252,6 +3765,11 @@ class ComposerState:
         return materialized_program
 
     def activate_staged_runtime_overrides(self) -> None:
+        """Atomically activate staged overrides against current artifacts."""
+        with self._program_edit_lock:
+            self._activate_staged_runtime_overrides_locked()
+
+    def _activate_staged_runtime_overrides_locked(self) -> None:
         """Promote staged overrides into the runtime by rebuilding the effective program."""
         with self._runtime_override_lock:
             has_staged_overrides = any(
@@ -2305,6 +3823,11 @@ class ComposerState:
             )
 
     def remove_runtime_override(self, node_name: str) -> bool:
+        """Atomically remove one override from the current artifact generation."""
+        with self._program_edit_lock:
+            return self._remove_runtime_override_locked(node_name)
+
+    def _remove_runtime_override_locked(self, node_name: str) -> bool:
         """Remove a runtime override and rebuild immediately if it was active."""
         cycle_state = self._ensure_runtime_override_mutation_allowed()
         with self._runtime_override_lock:
@@ -2356,6 +3879,11 @@ class ComposerState:
         return True
 
     def clear_runtime_overrides(self) -> None:
+        """Atomically clear overrides from the current artifact generation."""
+        with self._program_edit_lock:
+            self._clear_runtime_overrides_locked()
+
+    def _clear_runtime_overrides_locked(self) -> None:
         """Drop all runtime overrides and return the runtime to the base program."""
         cycle_state = self._ensure_runtime_override_mutation_allowed()
         with self._runtime_override_lock:
@@ -2400,6 +3928,11 @@ class ComposerState:
             )
 
     def revalidate_stale_overrides(self) -> dict[str, str]:
+        """Atomically revalidate overrides against the current program."""
+        with self._program_edit_lock:
+            return self._revalidate_stale_overrides_locked()
+
+    def _revalidate_stale_overrides_locked(self) -> dict[str, str]:
         """Re-validate stale overrides against the current program.
 
         Returns a mapping of node_name -> outcome where outcome is one of:
@@ -2471,6 +4004,29 @@ class ComposerState:
         return results
 
     def apply_runtime_override(
+        self,
+        *,
+        node_name: str,
+        params: dict[str, Any],
+        authority_source: str,
+        approval_mode: str,
+        reason: str = "",
+        session_id: Optional[str] = None,
+        trigger_node_instance: Optional[str] = None,
+    ) -> RuntimeOverrideRecord:
+        """Atomically apply or stage an override against current artifacts."""
+        with self._program_edit_lock:
+            return self._apply_runtime_override_locked(
+                node_name=node_name,
+                params=params,
+                authority_source=authority_source,
+                approval_mode=approval_mode,
+                reason=reason,
+                session_id=session_id,
+                trigger_node_instance=trigger_node_instance,
+            )
+
+    def _apply_runtime_override_locked(
         self,
         *,
         node_name: str,
@@ -2616,6 +4172,27 @@ class ComposerState:
             self._drivable_joint_names = list(names)
             return list(self._drivable_joint_names)
 
+    def _commit_joint_state_runtime_cutover(
+        self,
+        joint_names: list[str],
+        *,
+        preserve_backend_state: bool,
+    ) -> None:
+        """Publish joint metadata after a successfully staged runtime cutover.
+
+        A replacement kernel/deployment must never inherit a same-DOF pose from
+        the previous runtime.  Clear both authored and observed caches in the
+        same leaf-lock transaction that publishes the replacement joint order.
+        Node-environment reloads deliberately preserve the existing backend and
+        therefore retain its matching position caches.
+        """
+
+        with self._joint_state_lock:
+            self._drivable_joint_names = list(joint_names)
+            if not preserve_backend_state:
+                self._last_known_joint_positions_rad = None
+                self._last_observed_joint_position_record = None
+
     def get_drivable_joint_names(
         self,
         *,
@@ -2635,37 +4212,179 @@ class ComposerState:
         return self.refresh_drivable_joint_names()
 
     def record_current_joint_positions(self, positions: list[float]) -> None:
+        """Record backend-authored position state for authored lanes only.
+
+        Commanded targets are intent, not state, in measurement-authoritative
+        deployments. Keeping this guard at the shared cache boundary prevents a
+        direct-control or candidate path from accidentally making an optimistic
+        command authoritative.
+        """
+        if self.joint_state_authority_profile().measurement_authoritative:
+            return
         with self._joint_state_lock:
             self._last_known_joint_positions_rad = list(positions)
 
-    def get_current_joint_positions(
+    def joint_state_authority_profile(self) -> JointStateAuthorityProfile:
+        """Resolve joint-state authority from the active deployment adapter."""
+        deployment = self.deployment
+        execution_adapter: Any | None = None
+        if deployment is not None:
+            try:
+                execution_adapter = deployment.adapters.get("execution")
+            except (AttributeError, TypeError):
+                execution_adapter = None
+
+        adapter_id = str(
+            getattr(execution_adapter, "adapter_id", "") or ""
+        ).strip().lower()
+        raw_config = getattr(execution_adapter, "config", None)
+        config = dict(raw_config) if isinstance(raw_config, dict) else {}
+        profile_id = str(
+            config.get("execution_state_authority_profile")
+            or config.get("execution_state_source_mode")
+            or ""
+        ).strip().lower()
+
+        if profile_id in _BACKEND_AUTHORITY_PROFILES:
+            measurement_authoritative = False
+        elif profile_id in _OBSERVED_AUTHORITY_PROFILES:
+            measurement_authoritative = True
+        else:
+            # A ROS2-control adapter without an explicit authored/simulator
+            # profile is a real/default controller profile. Fail closed toward
+            # measurement authority rather than treating a command or seed as
+            # the robot's current position.
+            measurement_authoritative = adapter_id.startswith(
+                "execution.ros2_control"
+            )
+
+        max_age_s = _DEFAULT_OBSERVED_JOINT_STATE_MAX_AGE_S
+        raw_max_age: Any = config.get("joint_state_max_age_s")
+        scale = 1.0
+        if raw_max_age is None and "joint_state_max_age_ms" in config:
+            raw_max_age = config.get("joint_state_max_age_ms")
+            scale = 0.001
+        if raw_max_age is not None:
+            try:
+                parsed_max_age_s = float(raw_max_age) * scale
+            except (TypeError, ValueError):
+                parsed_max_age_s = max_age_s
+            if math.isfinite(parsed_max_age_s) and parsed_max_age_s >= 0.0:
+                max_age_s = parsed_max_age_s
+
+        effective_profile_id = profile_id or (
+            "ros2_control_default"
+            if measurement_authoritative
+            else "backend_authored"
+        )
+        return JointStateAuthorityProfile(
+            profile_id=effective_profile_id,
+            measurement_authoritative=measurement_authoritative,
+            max_source_age_ns=int(max_age_s * 1_000_000_000),
+        )
+
+    @staticmethod
+    def _complete_joint_positions(
+        raw_positions: Any,
+        *,
+        expected_count: int,
+    ) -> tuple[float, ...] | None:
+        if (
+            not isinstance(raw_positions, (list, tuple))
+            or len(raw_positions) != expected_count
+            or expected_count <= 0
+        ):
+            return None
+        try:
+            positions = tuple(float(value) for value in raw_positions)
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in positions):
+            return None
+        return positions
+
+    @staticmethod
+    def _snapshot_source_metadata(
+        snapshot: Any,
+    ) -> tuple[str | None, int | None, int | None]:
+        if snapshot is None:
+            return None, None, None
+        source = str(getattr(snapshot, "state_source", "") or "").strip() or None
+        raw_timestamp = getattr(snapshot, "source_timestamp_ns", None)
+        raw_age = getattr(snapshot, "source_age_ns", None)
+        timestamp = (
+            int(raw_timestamp)
+            if isinstance(raw_timestamp, int) and not isinstance(raw_timestamp, bool)
+            else None
+        )
+        age = (
+            int(raw_age)
+            if isinstance(raw_age, int) and not isinstance(raw_age, bool)
+            else None
+        )
+        return source, timestamp, age
+
+    def _remember_observed_joint_positions(
+        self,
+        resolution: JointPositionResolution,
+        *,
+        joint_names: list[str],
+    ) -> JointPositionResolution:
+        record = _ObservedJointPositionRecord(
+            resolution=resolution,
+            joint_names=tuple(joint_names),
+            deployment_token=id(self.deployment),
+        )
+        with self._joint_state_lock:
+            previous = self._last_observed_joint_position_record
+            if (
+                previous is not None
+                and previous.joint_names == record.joint_names
+                and previous.deployment_token == record.deployment_token
+                and previous.resolution.source_timestamp_ns is not None
+                and resolution.source_timestamp_ns is not None
+                and previous.resolution.source_timestamp_ns
+                > resolution.source_timestamp_ns
+            ):
+                return previous.resolution
+            self._last_observed_joint_position_record = record
+        return resolution
+
+    def _retained_observed_joint_positions(
+        self,
+        *,
+        joint_names: list[str],
+    ) -> JointPositionResolution | None:
+        with self._joint_state_lock:
+            record = self._last_observed_joint_position_record
+        if (
+            record is None
+            or record.joint_names != tuple(joint_names)
+            or record.deployment_token != id(self.deployment)
+        ):
+            return None
+        captured = record.resolution
+        if captured.source_age_ns is None:
+            return None
+        now_ns = time.monotonic_ns()
+        effective_age_ns = captured.source_age_ns + max(
+            0, now_ns - captured.captured_at_ns
+        )
+        return replace(
+            captured,
+            provenance="retained_observed_snapshot",
+            source_age_ns=effective_age_ns,
+            stale=True,
+        )
+
+    def get_current_joint_position_resolution(
         self,
         *,
         joint_names: list[str] | None = None,
         allow_backend_joint_names: bool = True,
-    ) -> Optional[list[float]]:
-        """Return the best-known full joint vector, or None if unknown.
-
-        Day-5c.1 lifted this resolution chain into routes_scene for the
-        /api/scene/state payload; routes_direct's joint-jog handler
-        needed the same answer when assembling the full overlay before
-        submitting an intervention. The chain:
-
-        1. Live execution snapshot if it carries non-empty positions.
-        2. The state-cached `_last_known_joint_positions_rad`, refreshed
-           on every read with valid live positions or on the
-           optimistic write that follows a successful jog.
-        3. Deployment's `adapters.execution.config.initial_joint_positions_rad`
-           — the same vector the kernel uses as its initial config on
-           deployment load.
-
-        Without this, joint-jog called outside an active execution
-        would pad the snapshot's `None` to zeros and the planner would
-        receive a goal where every untouched joint should be 0 —
-        the operator's "slider drives the robot to all-zero" report.
-        """
-        if self.kernel is None:
-            return None
+        for_display: bool = False,
+    ) -> JointPositionResolution:
+        """Resolve one current position observation for motion or display."""
         joint_names = list(
             joint_names
             if joint_names is not None
@@ -2673,17 +4392,37 @@ class ComposerState:
                 allow_backend_refresh=allow_backend_joint_names
             )
         )
-        if not joint_names:
-            return None
-        snapshot = (
-            self.cycle_manager.get_execution_snapshot()
-            if self.cycle_manager is not None
-            else self.kernel.get_execution_snapshot()
-        )
-        return self.resolve_current_joint_positions(
+        snapshot: Any | None = None
+        if self.kernel is not None and joint_names:
+            snapshot = (
+                self.cycle_manager.get_execution_snapshot()
+                if self.cycle_manager is not None
+                else self.kernel.get_execution_snapshot()
+            )
+        return self.resolve_joint_position_authority(
             snapshot,
             joint_names=joint_names,
+            for_display=for_display,
         )
+
+    def get_current_joint_positions(
+        self,
+        *,
+        joint_names: list[str] | None = None,
+        allow_backend_joint_names: bool = True,
+    ) -> Optional[list[float]]:
+        """Return the motion-authoritative full joint vector, if available.
+
+        Backend-authored lanes retain the historical snapshot → Composer cache
+        → deployment-initial fallback. Measurement-authoritative lanes accept
+        only a complete fresh observed snapshot; command, cache and initial
+        values are never promoted to physical robot state.
+        """
+        return self.get_current_joint_position_resolution(
+            joint_names=joint_names,
+            allow_backend_joint_names=allow_backend_joint_names,
+            for_display=False,
+        ).positions_list()
 
     def resolve_current_joint_positions(
         self,
@@ -2691,18 +4430,118 @@ class ComposerState:
         *,
         joint_names: list[str],
     ) -> Optional[list[float]]:
-        """Resolve one observer snapshot without performing another RPC.
+        """Resolve one snapshot for motion without performing another RPC.
 
-        Visual production needs positions and source-authority metadata from
-        the same immutable execution observation. Keeping the fallback chain in
-        this helper prevents a second kernel call while preserving jog and
-        idle-state behavior for all existing callers.
+        Visual production should use :meth:`resolve_joint_position_authority`
+        with ``for_display=True`` so retained measured state remains explicitly
+        stale and carries atomic provenance.
         """
-        snapshot_positions = getattr(snapshot, "joint_positions_rad", None)
-        if snapshot_positions and len(snapshot_positions) == len(joint_names):
-            live = list(snapshot_positions)
+        return self.resolve_joint_position_authority(
+            snapshot,
+            joint_names=joint_names,
+            for_display=False,
+        ).positions_list()
+
+    def resolve_joint_position_authority(
+        self,
+        snapshot: Any,
+        *,
+        joint_names: list[str],
+        for_display: bool,
+    ) -> JointPositionResolution:
+        """Resolve positions and provenance atomically from one observation.
+
+        Motion in a measurement-authoritative deployment accepts only the
+        complete, fresh, observed snapshot passed to this call. Display may
+        retain the last complete observed sample, but it stays explicitly stale
+        and retains the source metadata captured with those exact positions.
+        """
+        profile = self.joint_state_authority_profile()
+        positions = self._complete_joint_positions(
+            getattr(snapshot, "joint_positions_rad", None),
+            expected_count=len(joint_names),
+        )
+        source, source_timestamp_ns, source_age_ns = (
+            self._snapshot_source_metadata(snapshot)
+        )
+
+        if profile.measurement_authoritative:
+            observed_metadata_valid = (
+                source in _OBSERVED_SNAPSHOT_SOURCES
+                and source_timestamp_ns is not None
+                and source_timestamp_ns > 0
+                and source_age_ns is not None
+                and source_age_ns >= 0
+            )
+            if positions is not None and observed_metadata_valid:
+                stale = source_age_ns > profile.max_source_age_ns
+                observed = JointPositionResolution(
+                    positions_rad=positions,
+                    provenance="observed_snapshot",
+                    state_source=source,
+                    source_timestamp_ns=source_timestamp_ns,
+                    source_age_ns=source_age_ns,
+                    measurement_authoritative=True,
+                    stale=stale,
+                )
+                retained = self._remember_observed_joint_positions(
+                    observed,
+                    joint_names=joint_names,
+                )
+                if for_display:
+                    if retained is not observed:
+                        current_retained = self._retained_observed_joint_positions(
+                            joint_names=joint_names
+                        )
+                        if current_retained is not None:
+                            return current_retained
+                    return observed
+                if not stale:
+                    return observed
+                return replace(
+                    observed,
+                    positions_rad=None,
+                    provenance="observed_snapshot_stale",
+                )
+
+            if for_display:
+                retained = self._retained_observed_joint_positions(
+                    joint_names=joint_names
+                )
+                if retained is not None:
+                    return retained
+            return JointPositionResolution(
+                positions_rad=None,
+                provenance=(
+                    "observed_snapshot_invalid"
+                    if positions is not None
+                    else "observed_snapshot_unavailable"
+                ),
+                state_source=source if source in _OBSERVED_SNAPSHOT_SOURCES else None,
+                source_timestamp_ns=(
+                    source_timestamp_ns
+                    if source in _OBSERVED_SNAPSHOT_SOURCES
+                    else None
+                ),
+                source_age_ns=(
+                    source_age_ns if source in _OBSERVED_SNAPSHOT_SOURCES else None
+                ),
+                measurement_authoritative=True,
+                stale=True,
+            )
+
+        if positions is not None:
+            live = list(positions)
             self.record_current_joint_positions(live)
-            return live
+            return JointPositionResolution(
+                positions_rad=positions,
+                provenance="backend_snapshot",
+                state_source=source,
+                source_timestamp_ns=source_timestamp_ns,
+                source_age_ns=source_age_ns,
+                measurement_authoritative=False,
+                stale=False,
+            )
         with self._joint_state_lock:
             last_known = (
                 list(self._last_known_joint_positions_rad)
@@ -2710,7 +4549,15 @@ class ComposerState:
                 else None
             )
         if last_known is not None and len(last_known) == len(joint_names):
-            return last_known
+            return JointPositionResolution(
+                positions_rad=tuple(last_known),
+                provenance="backend_cache",
+                state_source=None,
+                source_timestamp_ns=None,
+                source_age_ns=None,
+                measurement_authoritative=False,
+                stale=True,
+            )
         if self.deployment is not None:
             try:
                 execution_adapter = self.deployment.adapters.get("execution")
@@ -2720,9 +4567,30 @@ class ComposerState:
                 initial = execution_adapter.config.get("initial_joint_positions_rad")
                 if isinstance(initial, list) and len(initial) == len(joint_names):
                     seeded = [float(v) for v in initial]
+                    if not all(math.isfinite(value) for value in seeded):
+                        seeded = []
+                else:
+                    seeded = []
+                if seeded:
                     self.record_current_joint_positions(seeded)
-                    return seeded
-        return None
+                    return JointPositionResolution(
+                        positions_rad=tuple(seeded),
+                        provenance="deployment_initial",
+                        state_source=None,
+                        source_timestamp_ns=None,
+                        source_age_ns=None,
+                        measurement_authoritative=False,
+                        stale=True,
+                    )
+        return JointPositionResolution(
+            positions_rad=None,
+            provenance="unavailable",
+            state_source=None,
+            source_timestamp_ns=None,
+            source_age_ns=None,
+            measurement_authoritative=False,
+            stale=True,
+        )
 
     def update_visual_scene_objects_snapshot(
         self,
@@ -3954,9 +5822,15 @@ class ComposerState:
                 self._visual_state_publisher_running = False
 
     def _visual_state_publisher_loop(self) -> None:
-        observed_wake_generation = -1
         last_demand_build_ns: int | None = None
         while not self._visual_state_publisher_stop.is_set():
+            # Capture the generation before reading the independently locked
+            # demand registry. If demand changes after this point, the final
+            # wait predicate remains true and the worker immediately samples
+            # it again. Capturing after summary() can lose a notification and
+            # leave a newly attached viewer waiting indefinitely.
+            with self._visual_state_lock:
+                cycle_wake_generation = self._visual_state_wake_generation
             demand = self._viewer_demand.summary()
             now_ns = time.monotonic_ns()
             with self._visual_state_lock:
@@ -3969,7 +5843,6 @@ class ComposerState:
                     else None
                 )
                 one_shot = one_shot_generation is not None
-                current_wake_generation = self._visual_state_wake_generation
                 period_s = (
                     viewer_effective_period_s(
                         fastest_period_s=configured_period_s,
@@ -4096,13 +5969,12 @@ class ComposerState:
                     if wait_timeout_s is None
                     else min(wait_timeout_s, deadline_timeout_s)
                 )
-            observed_wake_generation = current_wake_generation
             with self._visual_state_cv:
                 self._visual_state_cv.wait_for(
                     lambda: (
                         self._visual_state_publisher_stop.is_set()
                         or self._visual_state_wake_generation
-                        != observed_wake_generation
+                        != cycle_wake_generation
                     ),
                     timeout=wait_timeout_s,
                 )
@@ -4268,6 +6140,28 @@ class ComposerState:
         skill_catalog: SkillCatalog | None = None,
         preserve_backend_state: bool = False,
     ) -> None:
+        """Fence and rebuild a runtime from validated in-memory models."""
+        with self._program_edit_lock:
+            self._ensure_artifact_mutation_safe_locked()
+            self._rebuild_runtime_locked(
+                program,
+                deployment,
+                effective_program=effective_program,
+                node_environment=node_environment,
+                skill_catalog=skill_catalog,
+                preserve_backend_state=preserve_backend_state,
+            )
+
+    def _rebuild_runtime_locked(
+        self,
+        program: Program,
+        deployment: Optional[Deployment],
+        *,
+        effective_program: Optional[Program] = None,
+        node_environment: NodeEnvironment | None = None,
+        skill_catalog: SkillCatalog | None = None,
+        preserve_backend_state: bool = False,
+    ) -> None:
         """Rebuild runner + cycle manager from already-validated in-memory models."""
         scene_snapshot_provider = self._resolve_scene_snapshot_provider()
         environment = node_environment or self.node_environment
@@ -4332,6 +6226,22 @@ class ComposerState:
             if deployment is not None:
                 validate_environment_availability(
                     environment, deployment, runner.program
+                )
+                self._robot_lifecycle_config(
+                    deployment,
+                    robot_id=str(
+                        getattr(
+                            getattr(program, "robot", None),
+                            "robot_id",
+                            "",
+                        )
+                        or getattr(
+                            deployment.robot_config,
+                            "robot_id",
+                            "",
+                        )
+                        or "unbound-robot"
+                    ),
                 )
         except Exception:
             if runtime_resources is not previous_runtime_resources:
@@ -4401,8 +6311,22 @@ class ComposerState:
         self._runtime_resources = runtime_resources
         self._kernel = kernel
         self.kernel_bundle = kernel_bundle
-        with self._joint_state_lock:
-            self._drivable_joint_names = list(drivable_joints)
+        self._replace_robot_lifecycle_client(
+            deployment,
+            robot_id=str(
+                getattr(getattr(program, "robot", None), "robot_id", "")
+                or getattr(
+                    getattr(deployment, "robot_config", None),
+                    "robot_id",
+                    "",
+                )
+                or "unbound-robot"
+            ),
+        )
+        self._commit_joint_state_runtime_cutover(
+            drivable_joints,
+            preserve_backend_state=preserve_backend_state,
+        )
         self._evaluate_stop_capability()
         self._update_program_tree_hash()
         with self._runtime_generation_lock:
@@ -4484,8 +6408,10 @@ class ComposerState:
 
         Every surface that can arm motion through Composer must call this
         immediately before dispatch. It re-queries the backend capability at
-        arm time (not on runtime-status polls), so dispatch fails closed if
-        the backend can no longer report its capability.
+        arm time (not on runtime-status polls), checks physical lifecycle
+        admission, and refuses an execution-environment fault until Reset.
+        Final controller/JTC dispatch repeats the lower-level immutable
+        admission check inside the execution backend.
         """
         initialization = self.scene_initialization_status()
         if initialization["state"] != "open":
@@ -4502,8 +6428,22 @@ class ComposerState:
                     "scene_initialization_state": initialization["state"],
                 },
             }
+        with self._cycle_environment_lock:
+            reset_required = self._cycle_environment_reset_required
+        if reset_required:
+            return {
+                "message": (
+                    "Execution environment changed. Reset the cycle before "
+                    "starting a new Run, Retry, Replan, or direct motion."
+                ),
+                "error_code": "execution_environment_reset_required",
+                "error_details": {"requiresReset": True},
+            }
         self._evaluate_stop_capability(reason="motion_arm")
-        return self.stop_capability_block_reason()
+        stop_block = self.stop_capability_block_reason()
+        if stop_block is not None:
+            return stop_block
+        return self.robot_lifecycle_motion_admission_block_reason()
 
     def stop_capability_block_reason(self) -> Optional[dict]:
         """Shared fail-closed pre-motion gate. Returns a structured
@@ -4707,6 +6647,7 @@ class ComposerState:
         force_discard_overrides: bool = False,
     ) -> None:
         with self._program_edit_lock:
+            self._ensure_artifact_mutation_safe_locked()
             self._apply_models_locked(
                 program,
                 deployment,
@@ -4726,6 +6667,7 @@ class ComposerState:
         Pass ``force_discard_overrides=True`` to explicitly discard them,
         or materialize/clear them before calling this method.
         """
+        self._ensure_artifact_mutation_safe_locked()
         with self._runtime_override_lock:
             has_runtime_overrides = bool(self._runtime_overrides)
         if has_runtime_overrides:
@@ -4739,7 +6681,11 @@ class ComposerState:
                 )
         self.clear_visual_scene_objects_snapshot()
         self.clear_visual_state_snapshot()
-        self._rebuild_runtime(program, deployment, effective_program=program)
+        self._rebuild_runtime_locked(
+            program,
+            deployment,
+            effective_program=program,
+        )
         # Publish presentation only after the candidate runtime has completed
         # its transactional cutover. A rejected runtime apply must leave both
         # runtime authority and the applied viewer projection unchanged.
@@ -4760,6 +6706,7 @@ class ComposerState:
         them.
         """
         with self._program_edit_lock:
+            self._ensure_artifact_mutation_safe_locked()
             return self._load_program_locked(
                 program_path,
                 deployment_path,
@@ -4776,6 +6723,7 @@ class ComposerState:
         defer_initial_runtime_reset: bool = False,
     ) -> Program:
         """Load one program while ``_program_edit_lock`` owns the cutover."""
+        self._ensure_artifact_mutation_safe_locked()
         with self._runtime_override_lock:
             has_runtime_overrides = bool(self._runtime_overrides)
         if has_runtime_overrides:
@@ -4875,6 +6823,22 @@ class ComposerState:
                 validate_environment_availability(
                     self.node_environment, deployment, runner.program
                 )
+                self._robot_lifecycle_config(
+                    deployment,
+                    robot_id=str(
+                        getattr(
+                            getattr(runner.program, "robot", None),
+                            "robot_id",
+                            "",
+                        )
+                        or getattr(
+                            deployment.robot_config,
+                            "robot_id",
+                            "",
+                        )
+                        or "unbound-robot"
+                    ),
+                )
         except Exception:
             self._retire_runtime_resources_after_cutover(
                 runtime_resources,
@@ -4937,14 +6901,28 @@ class ComposerState:
         self._kernel = kernel
         self.kernel_bundle = kernel_bundle
         self._runtime_resources = runtime_resources
+        self._replace_robot_lifecycle_client(
+            deployment,
+            robot_id=str(
+                getattr(getattr(self.program, "robot", None), "robot_id", "")
+                or getattr(
+                    getattr(deployment, "robot_config", None),
+                    "robot_id",
+                    "",
+                )
+                or "unbound-robot"
+            ),
+        )
         self._evaluate_stop_capability()
         joint_names_to_cache = (
             drivable_joints
             if drivable_joints or deployment is not None
             else self.get_drivable_joint_names()
         )
-        with self._joint_state_lock:
-            self._drivable_joint_names = list(joint_names_to_cache)
+        self._commit_joint_state_runtime_cutover(
+            joint_names_to_cache,
+            preserve_backend_state=False,
+        )
         self._update_program_tree_hash()
         with self._runtime_generation_lock:
             self._program_session_generation += 1
@@ -5015,8 +6993,24 @@ class ComposerState:
         record["providerId"] = provider
         record["receivedAtNs"] = time.monotonic_ns()
         with self._external_runtime_status_lock:
+            previous = self._external_runtime_statuses.get(provider)
+            previous_material = (
+                {
+                    key: value
+                    for key, value in previous.items()
+                    if key != "receivedAtNs"
+                }
+                if previous is not None
+                else None
+            )
+            current_material = {
+                key: value
+                for key, value in record.items()
+                if key != "receivedAtNs"
+            }
             self._external_runtime_statuses[provider] = record
-            self._external_runtime_status_revision += 1
+            if previous_material != current_material:
+                self._external_runtime_status_revision += 1
         adapters = self.operator_alarm_adapters
         if adapters is not None:
             try:
@@ -5034,6 +7028,16 @@ class ComposerState:
                     message=f"Operator-alarm provider projection failed: {exc}",
                 )
                 logger.exception("Operator-alarm provider-status projection failed")
+
+    def remove_external_runtime_status(self, provider_id: str) -> None:
+        """Remove one retired deployment provider without touching peers."""
+        provider = provider_id.strip()
+        if not provider:
+            return
+        with self._external_runtime_status_lock:
+            removed = self._external_runtime_statuses.pop(provider, None)
+            if removed is not None:
+                self._external_runtime_status_revision += 1
 
     def heartbeat_revision(self) -> tuple[Any, ...]:
         """Cheap material-change token; never calls a backend observer API."""

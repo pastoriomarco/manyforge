@@ -395,7 +395,7 @@ def _write_minimal_program(directory: Path) -> Path:
                 "api_version: manyforge.program.v0",
                 "program_profile: v0.0",
                 "name: assistant_smoke_minimal",
-                'catalog_version: "0.4.0"',
+                'catalog_version: "0.5.0"',
                 "description: Minimal program for assistant proposal lifecycle smoke.",
                 "robot:",
                 "  robot_id: ur5",

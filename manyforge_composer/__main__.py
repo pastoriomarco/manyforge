@@ -620,6 +620,18 @@ def _make_ros2_control_kernel(
     )
 
     adapter_id = _execution_adapter_id_from_deployment(deployment)
+    compatibility = getattr(deployment, "compatibility", None)
+    declared_lane = getattr(compatibility, "lane", None)
+    expected_ros_lane = (
+        declared_lane
+        if declared_lane in {"isaac-sim", "real-robot"}
+        else "isaac-sim"
+    )
+    suggested_scenario = (
+        "real-lite6-commissioning"
+        if expected_ros_lane == "real-robot"
+        else "isaac-ur10e-light-scene"
+    )
     try:
         from manyforge_ros.ros2_control_kernel_factory import (
             create_ros2_control_kernel,
@@ -634,14 +646,14 @@ def _make_ros2_control_kernel(
                 f"Deployment selected ROS 2 controller execution ({adapter_id}), "
                 "but the ROS runtime kernel factory is not available in this "
                 "Composer image. Start Composer in the ROS-capable lane "
-                "(isaac-sim) before loading this deployment."
+                f"({expected_ros_lane}) before loading this deployment."
             ),
             missing=("ros_adapter",),
-            expected_lane="isaac-sim",
+            expected_lane=expected_ros_lane,
             current_lane=detect_current_lane(),
             suggested_command=(
-                "scripts/launch.sh --lane isaac-sim "
-                "--scenario isaac-ur10e-light-scene restart"
+                f"scripts/launch.sh --lane {expected_ros_lane} "
+                f"--scenario {suggested_scenario} restart"
             ),
             original_error=str(exc),
         ) from exc
@@ -688,11 +700,11 @@ def _make_ros2_control_kernel(
                 "controller config, and ROS endpoint availability."
             ),
             missing=(),
-            expected_lane="isaac-sim",
+            expected_lane=expected_ros_lane,
             current_lane=detect_current_lane(),
             suggested_command=(
-                "scripts/launch.sh --lane isaac-sim "
-                "--scenario isaac-ur10e-light-scene restart"
+                f"scripts/launch.sh --lane {expected_ros_lane} "
+                f"--scenario {suggested_scenario} restart"
             ),
             original_error=str(exc),
         ) from exc

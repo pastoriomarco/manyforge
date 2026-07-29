@@ -2697,6 +2697,91 @@ ros2_exec::Ros2ControlExecutionBackendConfig ros2_control_config_from_python(
     config.command_gate_topic =
         config_dict["command_gate_topic"].cast<std::string>();
   }
+  if (config_dict.contains("controller_binding") &&
+      !config_dict["controller_binding"].is_none()) {
+    const auto binding_dict =
+        config_dict["controller_binding"].cast<py::dict>();
+    if (!binding_dict.contains("schema") ||
+        binding_dict["schema"].is_none() ||
+        binding_dict["schema"].cast<std::string>() !=
+            "manyforge.ros2_control.execution_binding.v0.experimental") {
+      throw std::invalid_argument(
+          "controller_binding.schema is required and unsupported values "
+          "are rejected");
+    }
+    const auto required_string =
+        [&binding_dict](const char* key) -> std::string {
+          if (!binding_dict.contains(key) ||
+              binding_dict[key].is_none()) {
+            throw std::invalid_argument(
+                std::string("controller_binding.") + key +
+                " is required");
+          }
+          return binding_dict[key].cast<std::string>();
+        };
+    ros2_exec::ControllerBindingContract binding;
+    binding.generation_id = required_string("generation_id");
+    binding.controller_manager =
+        required_string("controller_manager");
+    binding.activity_topic = required_string("activity_topic");
+    binding.hardware_component_name =
+        required_string("hardware_component_name");
+    binding.trajectory_controller_manager_name =
+        required_string("trajectory_controller_manager_name");
+    binding.trajectory_controller_ros_name =
+        required_string("trajectory_controller_ros_name");
+    binding.trajectory_controller_type =
+        required_string("trajectory_controller_type");
+    binding.follow_joint_trajectory_action =
+        required_string("follow_joint_trajectory_action");
+    binding.controller_state_topic =
+        required_string("controller_state_topic");
+    binding.joint_state_topic =
+        required_string("joint_state_topic");
+    binding.required_joints =
+        binding_dict["required_joints"]
+            .cast<std::vector<std::string>>();
+    binding.claimed_command_interfaces =
+        binding_dict["claimed_command_interfaces"]
+            .cast<std::vector<std::string>>();
+    binding.required_state_interfaces =
+        binding_dict["required_state_interfaces"]
+            .cast<std::vector<std::string>>();
+    const bool has_max_age_ns =
+        binding_dict.contains("snapshot_max_age_ns");
+    const bool has_max_age_ms =
+        binding_dict.contains("snapshot_max_age_ms");
+    if (has_max_age_ns == has_max_age_ms) {
+      throw std::invalid_argument(
+          "controller_binding requires exactly one of "
+          "snapshot_max_age_ns or snapshot_max_age_ms");
+    }
+    if (has_max_age_ns) {
+      binding.snapshot_max_age_ns =
+          binding_dict["snapshot_max_age_ns"].cast<std::int64_t>();
+    } else {
+      const auto milliseconds =
+          binding_dict["snapshot_max_age_ms"].cast<std::int64_t>();
+      if (milliseconds <= 0 ||
+          milliseconds >
+              std::numeric_limits<std::int64_t>::max() /
+                  1'000'000) {
+        throw std::invalid_argument(
+            "controller_binding.snapshot_max_age_ms is invalid");
+      }
+      binding.snapshot_max_age_ns = milliseconds * 1'000'000;
+    }
+    config.controller_binding = std::move(binding);
+  }
+  if (config_dict.contains(
+          "require_execution_admission_snapshot")) {
+    config.require_execution_admission_snapshot =
+        config_dict["require_execution_admission_snapshot"].cast<bool>();
+  }
+  config.controller_binding_refresh_timeout_s = read_seconds(
+      "controller_binding_refresh_timeout_s",
+      "controller_binding_refresh_timeout_ms",
+      config.controller_binding_refresh_timeout_s);
   if (config_dict.contains("speed_scaling_topic")) {
     config.speed_scaling_topic =
         config_dict["speed_scaling_topic"].cast<std::string>();
@@ -3921,6 +4006,20 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               progress_metrics.jtc_cancel_reference_publications_total;
           out["controller_jtc_cancel_reference_rejections_total"] =
               progress_metrics.jtc_cancel_reference_rejections_total;
+          out["controller_binding_activity_events_total"] =
+              progress_metrics.controller_binding_activity_events_total;
+          out["controller_binding_refresh_attempts_total"] =
+              progress_metrics.controller_binding_refresh_attempts_total;
+          out["controller_binding_refresh_successes_total"] =
+              progress_metrics.controller_binding_refresh_successes_total;
+          out["controller_binding_refresh_failures_total"] =
+              progress_metrics.controller_binding_refresh_failures_total;
+          out["controller_binding_dispatch_rejections_total"] =
+              progress_metrics.controller_binding_dispatch_rejections_total;
+          out["execution_admission_dispatch_rejections_total"] =
+              progress_metrics.execution_admission_dispatch_rejections_total;
+          out["dispatch_authority_losses_total"] =
+              progress_metrics.dispatch_authority_losses_total;
           py::list observed_sources;
           for (const auto& source : progress_metrics.observed_state_sources) {
             py::dict source_metrics;
@@ -4048,6 +4147,129 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         py::gil_scoped_release release;
         return backend.command_gate_configured();
       })
+      .def("publish_ros2_control_execution_admission_snapshot",
+          [](NativeKernelBundle& self, py::dict snapshot_dict) {
+            ros2_exec::ExecutionAdmissionSnapshot snapshot;
+            snapshot.generation =
+                snapshot_dict["generation"].cast<std::uint64_t>();
+            snapshot.lifecycle_generation =
+                snapshot_dict["lifecycle_generation"]
+                    .cast<std::uint64_t>();
+            snapshot.robot_id =
+                snapshot_dict["robot_id"].cast<std::string>();
+            snapshot.binding_contract_generation_id =
+                snapshot_dict["binding_contract_generation_id"]
+                    .cast<std::string>();
+            snapshot.runtime_generation_id =
+                snapshot_dict["runtime_generation_id"]
+                    .cast<std::string>();
+            snapshot.provider_component_epoch =
+                snapshot_dict["provider_component_epoch"]
+                    .cast<std::string>();
+            snapshot.transport_owner_component_epoch =
+                snapshot_dict["transport_owner_component_epoch"]
+                    .cast<std::string>();
+            snapshot.authority_component_epoch =
+                snapshot_dict["authority_component_epoch"]
+                    .cast<std::string>();
+            snapshot.cell_supervisor_component_epoch =
+                snapshot_dict["cell_supervisor_component_epoch"]
+                    .cast<std::string>();
+            snapshot.observed_timestamp_ns =
+                snapshot_dict["observed_timestamp_ns"]
+                    .cast<std::int64_t>();
+            snapshot.received_timestamp_ns =
+                snapshot_dict["received_timestamp_ns"]
+                    .cast<std::int64_t>();
+            snapshot.fresh_until_ns =
+                snapshot_dict["fresh_until_ns"].cast<std::int64_t>();
+            snapshot.controller_ready =
+                snapshot_dict["controller_ready"].cast<bool>();
+            snapshot.motion_admitted =
+                snapshot_dict["motion_admitted"].cast<bool>();
+            if (snapshot_dict.contains("reason_codes")) {
+              snapshot.reason_codes =
+                  snapshot_dict["reason_codes"]
+                      .cast<std::vector<std::string>>();
+            }
+            auto& backend = require_ros2_control_execution(self);
+            py::gil_scoped_release release;
+            return backend.publish_execution_admission_snapshot(
+                std::move(snapshot));
+          },
+          py::arg("snapshot"))
+      .def("get_ros2_control_execution_admission_snapshot",
+          [](NativeKernelBundle& self) -> py::object {
+            auto& backend = require_ros2_control_execution(self);
+            const auto snapshot = [&]() {
+              py::gil_scoped_release release;
+              return backend.execution_admission_snapshot();
+            }();
+            if (!snapshot.has_value()) {
+              return py::none();
+            }
+            py::dict out;
+            out["generation"] = snapshot->generation;
+            out["lifecycle_generation"] =
+                snapshot->lifecycle_generation;
+            out["robot_id"] = snapshot->robot_id;
+            out["binding_contract_generation_id"] =
+                snapshot->binding_contract_generation_id;
+            out["runtime_generation_id"] =
+                snapshot->runtime_generation_id;
+            out["provider_component_epoch"] =
+                snapshot->provider_component_epoch;
+            out["transport_owner_component_epoch"] =
+                snapshot->transport_owner_component_epoch;
+            out["authority_component_epoch"] =
+                snapshot->authority_component_epoch;
+            out["cell_supervisor_component_epoch"] =
+                snapshot->cell_supervisor_component_epoch;
+            out["observed_timestamp_ns"] =
+                snapshot->observed_timestamp_ns;
+            out["received_timestamp_ns"] =
+                snapshot->received_timestamp_ns;
+            out["fresh_until_ns"] = snapshot->fresh_until_ns;
+            out["controller_ready"] = snapshot->controller_ready;
+            out["motion_admitted"] = snapshot->motion_admitted;
+            out["reason_codes"] = snapshot->reason_codes;
+            return out;
+          })
+      .def("get_ros2_control_controller_binding_snapshot",
+          [](NativeKernelBundle& self) -> py::object {
+            auto& backend = require_ros2_control_execution(self);
+            const auto snapshot = [&]() {
+              py::gil_scoped_release release;
+              return backend.controller_binding_snapshot();
+            }();
+            if (!snapshot.has_value()) {
+              return py::none();
+            }
+            py::dict out;
+            out["generation"] = snapshot->generation;
+            out["activity_generation"] =
+                snapshot->activity_generation;
+            out["contract_generation_id"] =
+                snapshot->contract_generation_id;
+            out["observed_timestamp_ns"] =
+                snapshot->observed_timestamp_ns;
+            out["received_timestamp_ns"] =
+                snapshot->received_timestamp_ns;
+            out["fresh_until_ns"] = snapshot->fresh_until_ns;
+            out["controller_active"] = snapshot->controller_active;
+            out["hardware_active"] = snapshot->hardware_active;
+            out["controller_type_matches"] =
+                snapshot->controller_type_matches;
+            out["claimed_interfaces_match"] =
+                snapshot->claimed_interfaces_match;
+            out["state_interfaces_available"] =
+                snapshot->state_interfaces_available;
+            out["conflicting_claims_absent"] =
+                snapshot->conflicting_claims_absent;
+            out["valid"] = snapshot->valid;
+            out["reason_codes"] = snapshot->reason_codes;
+            return out;
+          })
 #endif
       .def("command_gripper",
           [](NativeKernelBundle& self, py::dict request) -> py::dict {

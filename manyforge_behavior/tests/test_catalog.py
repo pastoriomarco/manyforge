@@ -1,6 +1,7 @@
 """Tests for the node catalog loader and validator."""
 
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -21,13 +22,26 @@ class TestCatalogLoading:
     def test_loads_shipped_catalog(self):
         catalog = NodeCatalog(CATALOG_PATH)
         assert len(catalog.entries) > 0
-        assert catalog.version == "0.4.0"
+        assert catalog.version == "0.5.0"
         assert catalog.api_version == "manyforge.node_catalog.v1"
         assert all(
             param.schema is not None
             for entry in catalog.entries
             for param in entry.parameters
         )
+
+    def test_adding_robot_recipe_tracks_shipped_catalog_version(self):
+        catalog = NodeCatalog(CATALOG_PATH)
+        recipe = (
+            CATALOG_PATH.parents[2] / "docs" / "operations" / "ADDING_A_ROBOT.md"
+        ).read_text(encoding="utf-8")
+        match = re.search(
+            r"catalog_version:\s*([0-9]+\.[0-9]+\.[0-9]+)"
+            r"\s+# exact value from manyforge_behavior/resources/node_catalog\.yaml",
+            recipe,
+        )
+        assert match is not None
+        assert match.group(1) == catalog.version
 
     def test_all_entries_have_ids(self):
         catalog = NodeCatalog(CATALOG_PATH)
@@ -91,6 +105,45 @@ class TestCatalogLoading:
         assert target_reference.visible_when is not None
         assert target_reference.visible_when.param == "target_mode"
         assert target_reference.visible_when.equals == "relative"
+
+    def test_move_manipulator_per_joint_dynamics_schema_is_strict(self):
+        catalog = NodeCatalog(CATALOG_PATH)
+        move = catalog.get("move_manipulator_action")
+        parameter = next(
+            p for p in move.parameters if p.name == "per_joint_dynamics_limits"
+        )
+        assert parameter.schema is not None
+
+        valid = validate_value(
+            parameter.schema,
+            {
+                "joint_1": {
+                    "max_velocity_rad_s": 0.4,
+                    "max_acceleration_rad_s2": 1.5,
+                }
+            },
+            registry=catalog.schema_registry,
+            path="params.per_joint_dynamics_limits",
+        )
+        assert valid == []
+
+        invalid = validate_value(
+            parameter.schema,
+            {
+                "joint_1": {
+                    "max_velocity_rad_s": 0.0,
+                    "unknown_cap": 1.0,
+                }
+            },
+            registry=catalog.schema_registry,
+            path="params.per_joint_dynamics_limits",
+        )
+        assert any(
+            issue.path.endswith(".max_velocity_rad_s")
+            and "must be > 0.0" in issue.message
+            for issue in invalid
+        )
+        assert any("must not contain unknown fields" in issue.message for issue in invalid)
 
     def test_blackboard_metadata_loaded_for_shipped_entries(self):
         catalog = NodeCatalog(CATALOG_PATH)

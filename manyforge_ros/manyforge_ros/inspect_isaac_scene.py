@@ -116,8 +116,21 @@ class InspectIsaacSceneClient:
             publisher.publish(message)
 
             deadline = time.monotonic() + self.timeout_s
+            # One mid-window retry is enough to cover a volatile DDS sample
+            # lost during endpoint discovery without piling duplicate
+            # read-only inspections onto a slow Isaac callback.
+            retry_period_s = max(0.25, self.timeout_s / 2.0)
+            next_publish = time.monotonic() + retry_period_s
             while time.monotonic() < deadline and not responses:
                 self._spin_once(deadline)
+                now = time.monotonic()
+                if not responses and now >= next_publish:
+                    # This is a read-only, request-id-correlated topic RPC.
+                    # Re-publishing the same immutable request recovers from
+                    # a volatile DDS sample lost during endpoint discovery
+                    # without creating a new logical operation.
+                    publisher.publish(message)
+                    next_publish = now + retry_period_s
 
             if responses:
                 return validate_inspection_response(responses[0], query.request_id)

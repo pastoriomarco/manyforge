@@ -139,6 +139,22 @@ Use when:
 - testing Isaac Sim / ros2_control execution wiring
 - qualifying trajectory execution outside the native simulated backend
 
+#### Supervised physical robot
+
+The experimental `real-robot` lane uses the same generic ROS 2 execution
+adapter, but adds a robot-lifecycle provider and a strict retained runtime
+record. The physical xArm/ros2_control owner and Composer run as separate
+services; only the owner process talks to the robot. Startup leaves drives,
+hardware, the trajectory controller, the program, and motion admission off.
+
+For the first Lite6 target, use only the attended workflow in
+[`LAUNCHER_QUICKSTART.md`](LAUNCHER_QUICKSTART.md#experimental-real-lite6-commissioning)
+and [`LITE6_LIVE_QUALIFICATION.md`](LITE6_LIVE_QUALIFICATION.md). In
+particular, **Run**, Resume, retry/replan, and Robot Control approval remain
+disabled until a fresh, identity-matched lifecycle snapshot proves the robot
+enabled and the complete motion-admission gate open. Browser state is only an
+operator aid: the backend and execution adapter enforce the same refusal.
+
 ### Optional model and assistant surfaces
 
 #### Runtime model nodes

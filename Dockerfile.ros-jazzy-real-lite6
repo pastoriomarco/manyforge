@@ -1,0 +1,137 @@
+# syntax=docker/dockerfile:1.7
+#
+# Experimental real-Lite6 overlay.
+#
+# Build only through scripts/xarm/build-real-lite6-image.sh. The helper
+# supplies an exact local xarm_ros2 source context and verifies its content
+# digest before this image compiles it.
+
+ARG MANYFORGE_ROS_FULL_BASE_IMAGE=manyforge-ros-jazzy-full
+FROM ${MANYFORGE_ROS_FULL_BASE_IMAGE}
+
+USER root
+
+SHELL ["/bin/bash", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ros-${ROS_DISTRO}-ament-cmake-gtest \
+        ros-${ROS_DISTRO}-backward-ros \
+        ros-${ROS_DISTRO}-diagnostic-msgs \
+        ros-${ROS_DISTRO}-launch-param-builder \
+        ros-${ROS_DISTRO}-moveit-configs-utils \
+        ros-${ROS_DISTRO}-robot-state-publisher \
+        ros-${ROS_DISTRO}-tf2-ros \
+        ros-${ROS_DISTRO}-xacro \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=0755 docker-entrypoint.ros-jazzy-full.sh \
+    /usr/local/bin/docker-entrypoint.ros-jazzy-full.sh
+
+ARG XARM_SOURCE_REPOSITORY=https://github.com/pastoriomarco/xarm_ros2
+ARG XARM_SOURCE_BRANCH
+ARG XARM_SOURCE_COMMIT
+ARG XARM_SOURCE_TREE
+ARG XARM_SOURCE_CONTENT_SHA256
+ARG XARM_SOURCE_DIRTY
+ARG XARM_XC4_BASE_COMMIT=50064477f39ecd69ab006488630c837cdcb8d83e
+ARG XARM_XC4_BASE_TREE=5b7ab25ecf7f5d030b891824f2cd308ea72c3a57
+ARG XARM_SUPERVISED_CONTRACT_VERSION
+ARG MANYFORGE_ROS_FULL_BASE_IMAGE_ID
+
+LABEL org.manyforge.experimental.real-lite6="true" \
+      org.manyforge.xarm.repository="${XARM_SOURCE_REPOSITORY}" \
+      org.manyforge.xarm.commit="${XARM_SOURCE_COMMIT}" \
+      org.manyforge.xarm.tree="${XARM_SOURCE_TREE}" \
+      org.manyforge.xarm.content-sha256="${XARM_SOURCE_CONTENT_SHA256}" \
+      org.manyforge.xarm.xc4-base="${XARM_XC4_BASE_COMMIT}" \
+      org.manyforge.xarm.supervised-contract="${XARM_SUPERVISED_CONTRACT_VERSION}"
+
+COPY --from=xarm_ros2_source / /tmp/xarm_ws/src/xarm_ros2/
+
+RUN set -euo pipefail; \
+    if [[ "${XARM_SOURCE_DIRTY}" != "false" ]]; then \
+      echo "physical-test xarm source must be clean" >&2; \
+      exit 1; \
+    fi; \
+    if [[ "${XARM_SUPERVISED_CONTRACT_VERSION}" != "1" ]]; then \
+      echo "unsupported xArm supervised contract version" >&2; \
+      exit 1; \
+    fi; \
+    case "${XARM_SOURCE_COMMIT}" in \
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;; \
+      *) echo "invalid XARM_SOURCE_COMMIT" >&2; exit 1 ;; \
+    esac; \
+    case "${XARM_SOURCE_TREE}" in \
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;; \
+      *) echo "invalid XARM_SOURCE_TREE" >&2; exit 1 ;; \
+    esac; \
+    case "${XARM_SOURCE_CONTENT_SHA256}" in \
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;; \
+      *) echo "invalid XARM_SOURCE_CONTENT_SHA256" >&2; exit 1 ;; \
+    esac; \
+    actual_content_sha256="$( \
+      cd /tmp/xarm_ws/src/xarm_ros2; \
+      find . \
+        \( -name .git -o -name build -o -name install -o -name log \
+           -o -name __pycache__ -o -name .pytest_cache \) -prune \
+        -o -type f -print0 \
+        | LC_ALL=C sort -z \
+        | xargs -0 sha256sum \
+        | sha256sum \
+        | awk '{print $1}' \
+    )"; \
+    if [[ "${actual_content_sha256}" != "${XARM_SOURCE_CONTENT_SHA256}" ]]; then \
+      echo "xarm source context digest mismatch" >&2; \
+      echo "expected=${XARM_SOURCE_CONTENT_SHA256}" >&2; \
+      echo "actual=${actual_content_sha256}" >&2; \
+      exit 1; \
+    fi; \
+    set +u; \
+    source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
+    set -u; \
+    cd /tmp/xarm_ws; \
+    colcon build \
+      --merge-install \
+      --install-base /opt/manyforge/xarm/install \
+      --packages-select \
+        xarm_msgs \
+        xarm_sdk \
+        xarm_description \
+        xarm_api \
+        xarm_controller \
+        uf_ros_lib \
+        xarm_moveit_config \
+      --cmake-args -DBUILD_TESTING=ON; \
+    set +u; \
+    source /opt/manyforge/xarm/install/setup.bash; \
+    set -u; \
+    ctest \
+      --test-dir /tmp/xarm_ws/build/xarm_api \
+      --output-on-failure \
+      --tests-regex \
+        '^test_driver_(access_policy|lifecycle|injected_transport|supervised_session|supervised_actual_failed_connect)$'; \
+    ctest \
+      --test-dir /tmp/xarm_ws/build/xarm_controller \
+      --output-on-failure \
+      --tests-regex \
+        '^test_supervised_(lifecycle_contract|hardware_boundary)$'; \
+    mkdir -p /opt/manyforge/xarm; \
+    printf '%s\n' \
+      '{' \
+      '  "schema": "manyforge.xarm_ros2_source.v0.experimental",' \
+      "  \"repository\": \"${XARM_SOURCE_REPOSITORY}\"," \
+      "  \"branch\": \"${XARM_SOURCE_BRANCH}\"," \
+      "  \"commit\": \"${XARM_SOURCE_COMMIT}\"," \
+      "  \"tree\": \"${XARM_SOURCE_TREE}\"," \
+      "  \"content_sha256\": \"${XARM_SOURCE_CONTENT_SHA256}\"," \
+      "  \"dirty\": ${XARM_SOURCE_DIRTY}," \
+      "  \"xc4_base_commit\": \"${XARM_XC4_BASE_COMMIT}\"," \
+      "  \"xc4_base_tree\": \"${XARM_XC4_BASE_TREE}\"," \
+      "  \"supervised_contract_version\": \"${XARM_SUPERVISED_CONTRACT_VERSION}\"," \
+      "  \"base_image_id\": \"${MANYFORGE_ROS_FULL_BASE_IMAGE_ID}\"," \
+      '  "qualification": "local_experimental"' \
+      '}' \
+      > /opt/manyforge/xarm/source-manifest.json; \
+    rm -rf /tmp/xarm_ws
+
+USER 1000:1000

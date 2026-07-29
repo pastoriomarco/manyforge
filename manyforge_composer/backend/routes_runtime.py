@@ -158,32 +158,44 @@ def _execution_profile(state: ComposerState) -> tuple[str, str, str, dict[str, A
         config.get("execution_state_authority_profile")
         or config.get("execution_state_source_mode")
         or ""
-    )
-    if source_mode == "commanded_sim":
-        return (
-            "commanded_sim",
-            "Isaac commanded simulation",
-            "backend_authored",
-            config,
-        )
-    if adapter_id.startswith("execution.ros2_control"):
-        if source_mode == "observed_ros2":
+    ).strip().lower()
+    authority_profile = state.joint_state_authority_profile()
+    if not authority_profile.measurement_authoritative:
+        if source_mode == "commanded_sim":
             return (
-                "observed_ros2",
-                "ROS controller observed authority",
-                "controller_observed",
+                "commanded_sim",
+                "Isaac commanded simulation",
+                "backend_authored",
+                config,
+            )
+        if adapter_id.startswith("execution.ros2_control"):
+            return (
+                "composer_only",
+                "ROS authored preview",
+                "backend_authored",
                 config,
             )
         return (
-            "real_robot",
-            "ROS controller / real robot",
+            "composer_only",
+            "Composer/native preview",
+            "backend_authored",
+            config,
+        )
+    if source_mode == "observed_ros2":
+        return (
+            "observed_ros2",
+            "ROS controller observed authority",
             "controller_observed",
             config,
         )
     return (
-        "composer_only",
-        "Composer/native preview",
-        "backend_authored",
+        "real_robot",
+        (
+            "ROS controller / real robot"
+            if adapter_id.startswith("execution.ros2_control")
+            else "Observed robot state"
+        ),
+        "controller_observed",
         config,
     )
 
@@ -341,6 +353,9 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
             )
         )
 
+    # Refresh the local lifecycle projection so an abruptly silent ROS
+    # provider becomes offline even though it cannot publish a final sample.
+    state.robot_lifecycle_status()
     external_statuses = state.external_runtime_statuses(max_age_s=6.0)
     external_ready = True
     external_waiting = False
@@ -391,7 +406,7 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
     can_render = bool(program_loaded and kernel_available)
     can_plan = bool(program_loaded and kernel_available)
     can_execute = bool(program_loaded and kernel_available)
-    if profile_kind == "commanded_sim":
+    if profile_kind in {"commanded_sim", "real_robot"}:
         can_execute = can_execute and external_ready
     if kernel_fault:
         can_execute = False
@@ -432,7 +447,9 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
                 f"Backend advertises: {advertised}. Choose a supported stop profile in "
                 "the Deployment tab."
             )
-    elif external_waiting or (profile_kind == "commanded_sim" and not can_execute):
+    elif external_waiting or (
+        profile_kind in {"commanded_sim", "real_robot"} and not can_execute
+    ):
         readiness = "waiting"
         summary_label = "Waiting"
         user_message = (
@@ -478,6 +495,11 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
         "backendUnsupportedStopReasons": stop_cap.get("unsupported_reasons") or {},
         "stopProfileUnsupported": stop_capability_unsupported,
         "stopCapabilityQueryFailed": stop_capability_query_failed,
+        # A single already-reduced, observer-safe snapshot.  The external
+        # deployment supervisor consumes this field on an NRT host channel;
+        # it never derives robot lifecycle or command decisions from the rest
+        # of this UI-oriented payload.
+        "cellSupervision": state.cell_supervision_status(),
         "timestampNs": now_ns,
     }
 

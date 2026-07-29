@@ -491,18 +491,18 @@ class CycleRecoveryCoordinator:
         elif facts.program_generation <= 0 or facts.deployment_generation <= 0:
             blocking_reason = "runtime_generation_unavailable"
 
-        evidence_expired = False
         valid_until_raw = assessment.get("observed_state_valid_until_ns")
         try:
             valid_until = int(valid_until_raw or 0)
         except (TypeError, ValueError):
             valid_until = 0
-        if (
-            kernel_recovery_active
-            and valid_until > 0
-            and time.monotonic_ns() >= valid_until
-        ):
-            evidence_expired = True
+        # This is the deadline of the observed sample recorded in the
+        # immutable kernel assessment, not a human interaction deadline for
+        # the recovery offer. The kernel owns freshness expiry, publishes a
+        # non-ready assessment when no equivalent newer sample exists, and
+        # rechecks the latest sample atomically when an action is selected.
+        # Expiring the offer here would race that authority and make a valid
+        # Retry/Replan action usable for only one sample period.
 
         if (
             facts.cycle_state == "stopped"
@@ -526,8 +526,6 @@ class CycleRecoveryCoordinator:
                 )
             else:
                 disabled_reason = blocking_reason
-            if not is_reset and disabled_reason is None and evidence_expired:
-                disabled_reason = "recovery_evidence_expired"
             if (
                 disabled_reason is None
                 and not is_reset
@@ -558,9 +556,6 @@ class CycleRecoveryCoordinator:
         if blocking_reason is not None:
             status = "waiting"
             reason_code = blocking_reason
-        elif evidence_expired:
-            status = "waiting"
-            reason_code = "recovery_evidence_expired"
 
         primary_action = next(
             (

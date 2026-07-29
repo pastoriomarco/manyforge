@@ -47,5 +47,39 @@ TEST(TrajectoryProgressProjectionTest, RejectsShapeMismatchAndRetracedPathAmbigu
   EXPECT_EQ(ambiguous.status, TrajectoryProgressProjectionStatus::kProjectionAmbiguous);
 }
 
+TEST(TrajectoryProgressProjectionTest, AcceptsSlowForwardContinuousTrajectoryStart) {
+  TrajectoryDTO trajectory;
+  trajectory.joint_names = {"j1"};
+  trajectory.waypoints = {
+      TrajectoryWaypointDTO{0.0, {0.0}, {}, {}},
+      TrajectoryWaypointDTO{0.060677, {0.00005896}, {}, {}},
+      TrajectoryWaypointDTO{0.121355, {0.0001776}, {}, {}},
+  };
+
+  const auto projected =
+      project_trajectory_progress(trajectory, std::array<double, 1>{0.0}, 0.0);
+
+  EXPECT_EQ(projected.status, TrajectoryProgressProjectionStatus::kProjected);
+  EXPECT_NEAR(projected.trajectory_time_s, 0.0, 1e-12);
+  EXPECT_EQ(projected.segment_index, 0U);
+}
+
+TEST(TrajectoryProgressProjectionTest, SlowStartDoesNotHideLaterDistinctBranch) {
+  TrajectoryDTO trajectory;
+  trajectory.joint_names = {"j1"};
+  trajectory.waypoints = {
+      TrajectoryWaypointDTO{0.0, {0.0}, {}, {}},
+      TrajectoryWaypointDTO{0.060677, {0.00005896}, {}, {}},
+      TrajectoryWaypointDTO{0.121355, {0.0001776}, {}, {}},
+      TrajectoryWaypointDTO{1.0, {1.0}, {}, {}},
+      TrajectoryWaypointDTO{2.0, {0.00008}, {}, {}},
+  };
+
+  const auto ambiguous =
+      project_trajectory_progress(trajectory, std::array<double, 1>{0.0}, 0.0);
+
+  EXPECT_EQ(ambiguous.status, TrajectoryProgressProjectionStatus::kProjectionAmbiguous);
+}
+
 }  // namespace
 }  // namespace manyforge::core

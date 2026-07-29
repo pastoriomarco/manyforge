@@ -129,7 +129,7 @@ class TestRunnerLoading:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.1",
                 "name": "parallel_policy_program",
-                "catalog_version": "0.4.0",
+                "catalog_version": "0.5.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -308,7 +308,7 @@ class TestRunnerExecution:
                     "api_version": "manyforge.program.v0",
                     "program_profile": "v0.0",
                     "name": "skill_program",
-                    "catalog_version": "0.4.0",
+                    "catalog_version": "0.5.0",
                     "description": "skill-authored test program",
                     "robot": {
                         "robot_id": "ur5",
@@ -361,7 +361,7 @@ class TestRunnerChildCardinality:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "invalid_leaf_children",
-                "catalog_version": "0.4.0",
+                "catalog_version": "0.5.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -382,7 +382,7 @@ class TestRunnerChildCardinality:
                     "api_version": "manyforge.program.v0",
                     "program_profile": "v0.0",
                     "name": "single_wait",
-                    "catalog_version": "0.4.0",
+                    "catalog_version": "0.5.0",
                     "robot": {
                         "robot_id": "ur5",
                         "group_id": "arm",
@@ -412,7 +412,7 @@ class TestRunnerChildCardinality:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "invalid_decorator_children",
-                "catalog_version": "0.4.0",
+                "catalog_version": "0.5.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -435,7 +435,7 @@ class TestRunnerChildCardinality:
                     "api_version": "manyforge.program.v0",
                     "program_profile": "v0.0",
                     "name": "second_wait",
-                    "catalog_version": "0.4.0",
+                    "catalog_version": "0.5.0",
                     "robot": {
                         "robot_id": "ur5",
                         "group_id": "arm",
@@ -469,7 +469,7 @@ class TestRelativeTargetValidation:
             "api_version": "manyforge.program.v0",
             "program_profile": "v0.1",
             "name": "relative_target_validation",
-            "catalog_version": "0.4.0",
+            "catalog_version": "0.5.0",
             "robot": {
                 "robot_id": "ur5",
                 "group_id": "arm",
@@ -664,7 +664,7 @@ class TestRunnerDeployment:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "query_model_program",
-                "catalog_version": "0.4.0",
+                "catalog_version": "0.5.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",
@@ -899,7 +899,7 @@ class TestRunnerDeployment:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "vlm_pose_goal_program",
-                "catalog_version": "0.4.0",
+                "catalog_version": "0.5.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",

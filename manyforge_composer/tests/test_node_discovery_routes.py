@@ -270,10 +270,17 @@ def test_scenario_route_exposes_artifact_owned_inventory() -> None:
 
     assert response.status_code == 200
     scenarios = response.json()["scenarios"]
-    assert len(scenarios) == 12
+    assert len(scenarios) == 13
     assert sum(len(item["aliases"]) for item in scenarios) == 7
     isaac = next(
         item for item in scenarios if item["name"] == "isaac-ur10e-light-scene"
     )
     assert isaac["lane"] == "isaac-sim"
     assert isaac["aliases"] == ["isaac-light"]
+    real_robot = next(
+        item for item in scenarios if item["name"] == "real-lite6-commissioning"
+    )
+    assert real_robot["lane"] == "real-robot"
+    assert real_robot["deploymentPath"].endswith(
+        "lite6_fixed_pneumatic_commissioning.deployment.template.yaml"
+    )

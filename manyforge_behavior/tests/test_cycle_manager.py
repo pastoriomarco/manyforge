@@ -166,6 +166,35 @@ class TestCycleManagerRun:
         # Tree should complete quickly, so state may change
         # But we know it started running
 
+    def test_final_run_admission_rejection_never_starts_tick_thread(
+        self,
+        kernel,
+    ):
+        """A changed execution environment cannot escape through Run."""
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        attempted_run_ids = []
+
+        def reject() -> None:
+            attempted_run_ids.append(manager.program_run_id)
+            raise RuntimeError("execution_environment_not_admitted")
+
+        manager.set_on_run_from_idle(reject)
+
+        with pytest.raises(
+            RuntimeError,
+            match="execution_environment_not_admitted",
+        ):
+            manager.run()
+
+        assert attempted_run_ids == [manager.program_run_id]
+        assert manager.program_run_id is not None
+        assert manager.state == CycleState.IDLE
+        assert (
+            manager._tick_thread is None
+            or not manager._tick_thread.is_alive()
+        )
+
     def test_run_from_idle_after_reset_reuses_prepared_tree_and_scene(self, kernel):
         """Idle start after Reset uses the prepared baseline without rebuilding scene/tree again."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
@@ -639,7 +668,7 @@ class TestCycleManagerRun:
 program_profile: v0.0
 name: missing_bb_failure
 description: Motion node fails on missing blackboard key.
-catalog_version: "0.4.0"
+catalog_version: "0.5.0"
 
 robot:
   robot_id: ur5
@@ -707,6 +736,69 @@ class TestCycleManagerStop:
         
         manager.full_stop()
         assert manager.state == CycleState.STOPPED
+
+    def test_execution_environment_loss_is_terminal_until_reset(self):
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(
+            NODE_ENVIRONMENT,
+            FIXTURE_PATH,
+            slow_kernel,
+        )
+        manager = CycleManager(runner, slow_kernel)
+        manager.run()
+        assert manager.state == CycleState.RUNNING
+
+        manager.contain_execution_environment_loss(
+            reason_code="execution_environment_component_epoch_changed:owner",
+            details={"component_id": "owner"},
+        )
+
+        assert manager.state == CycleState.STOPPED
+        assert manager.error_code == "execution_environment_changed"
+        assert manager.error_details == {
+            "component_id": "owner",
+            "reason": (
+                "execution_environment_component_epoch_changed:owner"
+            ),
+            "requires_reset": True,
+        }
+        assert slow_kernel.stop_count == 1
+
+    def test_environment_loss_retires_paused_kernel_from_stopped_cycle(
+        self,
+        kernel,
+    ):
+        """STOPPED is not proof that a retained resumable Kernel is harmless."""
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        with manager._lock:
+            manager._state = CycleState.STOPPED
+        kernel._state = ExecutionState.PAUSED
+
+        manager.contain_execution_environment_loss(
+            reason_code="execution_environment_authority_epoch_changed",
+        )
+
+        assert kernel.stop_count == 1
+        assert manager.state == CycleState.STOPPED
+        assert manager.error_code == "execution_environment_changed"
+
+    def test_retired_containment_generation_cannot_touch_cycle(
+        self,
+        kernel,
+    ):
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        contained = manager.contain_execution_environment_loss(
+            reason_code="retired_environment",
+            is_current=lambda: False,
+        )
+
+        assert contained is False
+        assert manager.state == CycleState.IDLE
+        assert manager.error is None
+        assert kernel.stop_count == 0
 
     def test_stop_exposes_stopping_state_and_run_is_noop_until_settled(self):
         """The HMI must see the controlled-stop window as STOPPING so Run can
@@ -890,7 +982,7 @@ class TestCycleManagerMotionStop:
             "program_profile": "v0.1" if success_policy is not None else "v0.0",
             "name": "motion_stop_parallel_test",
             "description": "Motion stop cooperative ticking test.",
-            "catalog_version": "0.4.0",
+            "catalog_version": "0.5.0",
             "robot": {
                 "robot_id": "ur5",
                 "group_id": "arm",
@@ -1309,6 +1401,27 @@ class TestCycleManagerReset:
         
         manager.reset()
         assert manager.state == CycleState.IDLE
+
+    def test_reset_completion_callback_observes_fresh_idle_cycle(
+        self,
+        kernel,
+    ):
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        observations = []
+        manager.set_on_reset_completed(
+            lambda: observations.append(
+                (
+                    manager.state,
+                    manager.error,
+                    manager._tree is not None,
+                )
+            )
+        )
+
+        manager.reset()
+
+        assert observations == [(CycleState.IDLE, None, True)]
     
     def test_reset_from_stopped(self, kernel):
         """reset() from STOPPED resets to IDLE."""
@@ -3156,6 +3269,8 @@ class TestRos2ControlBackendFaultTaxonomy:
         }
         assert critical == {
             "controller_cancel_timeout",
+            "controller_binding_lost",
+            "execution_admission_lost",
             "monitor_thread_still_shutting_down",
         }
 
@@ -3186,6 +3301,142 @@ class TestCycleManagerRecoveryActions:
         runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         return manager, kernel
+
+    @staticmethod
+    def _assessment_refresh_manager(
+        *,
+        change_stop_certificate: bool = False,
+    ) -> tuple[CycleManager, MockKernelClient, dict]:
+        class AssessmentRefreshKernel(MockKernelClient):
+            def apply_recovery_action(self, request):  # type: ignore[override]
+                self.apply_recovery_action_requests = getattr(
+                    self, "apply_recovery_action_requests", []
+                )
+                self.apply_recovery_action_requests.append(dict(request))
+                current = dict(self.get_recovery_assessment())
+                if len(self.apply_recovery_action_requests) == 1:
+                    refreshed = dict(current)
+                    refreshed.update(
+                        {
+                            "assessment_revision": (
+                                int(current["assessment_revision"]) + 1
+                            ),
+                            "observed_state_sequence": (
+                                int(current["observed_state_sequence"]) + 1
+                            ),
+                            "observed_state_valid_until_ns": (
+                                time.monotonic_ns() + 5_000_000_000
+                            ),
+                        }
+                    )
+                    if change_stop_certificate:
+                        refreshed["stop_certificate_id"] = "replacement-cert"
+                    self.script_recovery_assessment(refreshed)
+                    return {
+                        "request_id": str(request.get("request_id") or ""),
+                        "action": str(request.get("action") or ""),
+                        "accepted": False,
+                        "error": {
+                            "code": "recovery_action_rejected",
+                            "message": "Recovery action rejected",
+                            "details": {"reason": "assessment_stale"},
+                        },
+                        "resulting_assessment": refreshed,
+                    }
+
+                resulting = dict(current)
+                resulting.update(
+                    {
+                        "assessment_revision": (
+                            int(current["assessment_revision"]) + 1
+                        ),
+                        "execution_state": "idle",
+                        "recovery_class": "none",
+                        "status": "unavailable",
+                        "latch_id": "",
+                        "stop_certificate_id": "",
+                        "retry_admissible": False,
+                        "allowed_actions": [],
+                        "reason_code": "no_recovery_active",
+                        "evidence_refs": [],
+                    }
+                )
+                self.script_recovery_assessment(resulting)
+                self._state = ExecutionState.IDLE  # noqa: SLF001
+                return {
+                    "request_id": str(request.get("request_id") or ""),
+                    "action": str(request.get("action") or ""),
+                    "accepted": True,
+                    "error": None,
+                    "resulting_assessment": resulting,
+                }
+
+        kernel = AssessmentRefreshKernel(execute_duration_s=0.5)
+        runner = OrchestratorRunner(NODE_ENVIRONMENT, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager._prepare_fresh_cycle()  # noqa: SLF001 - resumable fixture.
+        with manager._lock:  # noqa: SLF001 - exact held recovery fixture.
+            manager._state = CycleState.RUNNING
+            manager._motion_stop_state = "held"
+        _script_ready_recovery(kernel)
+        offer = manager.refresh_recovery_offer()
+        return manager, kernel, offer
+
+    def test_equivalent_assessment_refresh_retries_one_operator_action_once(
+        self,
+    ):
+        manager, kernel, offer = self._assessment_refresh_manager()
+        request = {
+            "request_id": "replan-after-sample-refresh",
+            "offer_id": offer["offerId"],
+            "offer_revision": offer["offerRevision"],
+            "action_id": "replan_from_stopped_state",
+        }
+        try:
+            result = manager.apply_recovery_action(
+                request,
+                principal_id="operator:test",
+            )
+
+            assert result["accepted"] is True
+            assert result["cycleResumed"] is True
+            calls = kernel.apply_recovery_action_requests
+            assert len(calls) == 2
+            assert calls[0]["request_id"] == calls[1]["request_id"]
+            assert calls[0]["expected_assessment_revision"] == 11
+            assert calls[1]["expected_assessment_revision"] == 12
+
+            replay = manager.apply_recovery_action(
+                request,
+                principal_id="operator:test",
+            )
+            assert replay == result
+            assert len(kernel.apply_recovery_action_requests) == 2
+        finally:
+            manager.reset()
+
+    def test_assessment_refresh_identity_change_is_not_retried(self):
+        manager, kernel, offer = self._assessment_refresh_manager(
+            change_stop_certificate=True
+        )
+
+        result = manager.apply_recovery_action(
+            {
+                "request_id": "replan-after-certificate-change",
+                "offer_id": offer["offerId"],
+                "offer_revision": offer["offerRevision"],
+                "action_id": "replan_from_stopped_state",
+            },
+            principal_id="operator:test",
+        )
+
+        assert result["accepted"] is False
+        assert result["resultCode"] == "kernel_rejected"
+        assert (
+            result["error"]["details"]["reason"]
+            == "assessment_stale"
+        )
+        assert len(kernel.apply_recovery_action_requests) == 1
 
     def test_run_from_stopped_with_kernel_intervention_requires_explicit_recovery(
         self,

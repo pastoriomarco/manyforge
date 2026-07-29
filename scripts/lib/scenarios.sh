@@ -86,7 +86,9 @@ scenario_lookup() {
 
 scenario_field() {
     local row="$1"
-    local idx="$2"   # 1=name, 2=lane, 3=assistant, 4=program, 5=deployment, 6=description
+    # 1=name, 2=lane, 3=assistant, 4=program, 5=deployment,
+    # 6=description, 7=aliases, 8=runtime resolver, 9=cell artifact
+    local idx="$2"
     printf '%s\n' "${row}" | awk -F'|' -v i="${idx}" '{print $i}'
 }
 

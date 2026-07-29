@@ -32,6 +32,7 @@ def test_shipped_scenario_inventory_and_aliases_are_artifact_owned() -> None:
         "isaac-ur10e-light-scene-assistant",
         "isaac-ur10e-light-scene-collision",
         "lite6-pick-place",
+        "real-lite6-commissioning",
         "ur10e-pick-place",
         "ur10e-scene-authoring",
         "ur5-pick-place",
@@ -57,6 +58,12 @@ def test_shipped_scenario_inventory_and_aliases_are_artifact_owned() -> None:
         resolved, deprecated = catalog.resolve(alias)
         assert deprecated is True
         assert resolved.name == canonical
+    real, deprecated = catalog.resolve("real-lite6-commissioning")
+    assert deprecated is False
+    assert real.lane == "real-robot"
+    assert real.runtime_resolver == "xarm.lite6_supervised.v1"
+    assert real.cell_path is not None
+    assert real.cell_path.name.endswith(".real-robot-cell.yaml")
 
 
 def test_missing_scenario_root_is_a_structured_discovery_error(

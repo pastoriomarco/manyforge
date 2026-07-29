@@ -326,6 +326,55 @@ def test_visual_publisher_coalesces_dirty_wakes_under_granted_rate() -> None:
         state.stop_visual_state_publisher(timeout_s=1.0)
 
 
+def test_visual_publisher_cannot_lose_demand_attached_during_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = ComposerState(
+        node_environment=node_environment_for_catalog(_CATALOG_PATH),
+        kernel=MockKernelClient(),
+    )
+    sampled_inactive = threading.Event()
+    release_inactive_sample = threading.Event()
+    built = threading.Event()
+    original_summary = state._viewer_demand.summary
+
+    def gated_summary():
+        result = original_summary()
+        if not result.active and not sampled_inactive.is_set():
+            sampled_inactive.set()
+            assert release_inactive_sample.wait(timeout=1.0)
+        return result
+
+    monkeypatch.setattr(state._viewer_demand, "summary", gated_summary)
+
+    def build_visual_snapshot() -> VisualSceneSnapshotResponse:
+        built.set()
+        return VisualSceneSnapshotResponse(
+            sequence_number=1,
+            timestamp_ns=time.monotonic_ns(),
+        )
+
+    try:
+        state.ensure_visual_state_publisher(
+            build_visual_snapshot,
+            period_s=0.02,
+        )
+        assert sampled_inactive.wait(timeout=0.5) is True
+
+        state.attach_viewer_demand(
+            "lost-wake-client",
+            visibility="focused",
+            requested_rate_hz=1.0,
+            layers=("canonical",),
+        )
+        release_inactive_sample.set()
+
+        assert built.wait(timeout=0.5) is True
+    finally:
+        release_inactive_sample.set()
+        state.stop_visual_state_publisher(timeout_s=1.0)
+
+
 def test_viewer_model_key_cache_is_generation_fenced_and_bounded() -> None:
     state = ComposerState(
         node_environment=node_environment_for_catalog(_CATALOG_PATH),

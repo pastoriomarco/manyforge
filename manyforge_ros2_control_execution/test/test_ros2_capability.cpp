@@ -26,7 +26,221 @@ Ros2ControlExecutionBackendConfig base_config() {
   return cfg;
 }
 
+ControllerBindingContract binding_contract() {
+  ControllerBindingContract contract;
+  contract.generation_id = "binding-sha256";
+  contract.controller_manager = "/cell/controller_manager";
+  contract.activity_topic = "/cell/controller_manager/activity";
+  contract.hardware_component_name = "lite6_system";
+  contract.trajectory_controller_manager_name = "lite6_traj_controller";
+  contract.trajectory_controller_ros_name =
+      "/cell/lite6_traj_controller";
+  contract.trajectory_controller_type =
+      "joint_trajectory_controller/JointTrajectoryController";
+  contract.follow_joint_trajectory_action =
+      "/cell/lite6_traj_controller/follow_joint_trajectory";
+  contract.controller_state_topic =
+      "/cell/lite6_traj_controller/controller_state";
+  contract.joint_state_topic = "/cell/joint_states";
+  contract.required_joints = {"joint1", "joint2"};
+  contract.claimed_command_interfaces = {
+      "joint1/position", "joint1/velocity",
+      "joint2/position", "joint2/velocity"};
+  contract.required_state_interfaces = {
+      "joint1/position", "joint1/velocity",
+      "joint2/position", "joint2/velocity"};
+  contract.snapshot_max_age_ns = 1'000'000'000;
+  return contract;
+}
+
+ControllerBindingSnapshot valid_binding_snapshot() {
+  ControllerBindingSnapshot snapshot;
+  snapshot.generation = 11;
+  snapshot.activity_generation = 7;
+  snapshot.contract_generation_id = "binding-sha256";
+  snapshot.observed_timestamp_ns = 1'000;
+  snapshot.received_timestamp_ns = 1'000;
+  snapshot.fresh_until_ns = 2'000;
+  snapshot.controller_active = true;
+  snapshot.hardware_active = true;
+  snapshot.controller_type_matches = true;
+  snapshot.claimed_interfaces_match = true;
+  snapshot.state_interfaces_available = true;
+  snapshot.conflicting_claims_absent = true;
+  snapshot.valid = true;
+  return snapshot;
+}
+
+ExecutionAdmissionSnapshot valid_admission_snapshot() {
+  ExecutionAdmissionSnapshot snapshot;
+  snapshot.generation = 19;
+  snapshot.lifecycle_generation = 5;
+  snapshot.robot_id = "lite6-a";
+  snapshot.binding_contract_generation_id = "binding-sha256";
+  snapshot.runtime_generation_id = "runtime-1";
+  snapshot.provider_component_epoch = "provider-epoch-1";
+  snapshot.transport_owner_component_epoch = "owner-epoch-1";
+  snapshot.authority_component_epoch = "authority-epoch-1";
+  snapshot.cell_supervisor_component_epoch = "supervisor-epoch-1";
+  snapshot.observed_timestamp_ns = 1'000;
+  snapshot.received_timestamp_ns = 1'000;
+  snapshot.fresh_until_ns = 2'000;
+  snapshot.controller_ready = true;
+  snapshot.motion_admitted = true;
+  return snapshot;
+}
+
 }  // namespace
+
+TEST(Ros2ControllerBindingTest,
+     ExactFreshSnapshotsProduceOneGenerationPin) {
+  const auto contract = binding_contract();
+  const auto binding = valid_binding_snapshot();
+  const auto admission = valid_admission_snapshot();
+  const auto decision = evaluate_dispatch_admission(
+      &contract, &binding, &admission, true, 1'500,
+      contract.follow_joint_trajectory_action,
+      contract.required_joints);
+
+  ASSERT_TRUE(decision.admitted);
+  ASSERT_TRUE(decision.pin.has_value());
+  EXPECT_EQ(decision.pin->binding_contract_generation_id,
+            contract.generation_id);
+  EXPECT_EQ(decision.pin->binding_snapshot_generation,
+            binding.generation);
+  EXPECT_EQ(decision.pin->binding_activity_generation,
+            binding.activity_generation);
+  EXPECT_EQ(decision.pin->admission_snapshot_generation,
+            admission.generation);
+  EXPECT_EQ(decision.pin->lifecycle_generation,
+            admission.lifecycle_generation);
+  EXPECT_EQ(decision.pin->transport_owner_component_epoch,
+            admission.transport_owner_component_epoch);
+  EXPECT_EQ(decision.pin->authority_component_epoch,
+            admission.authority_component_epoch);
+}
+
+TEST(Ros2ControllerBindingTest,
+     DispatchMatrixFailsClosedWithStableReasons) {
+  const auto contract = binding_contract();
+  const auto action = contract.follow_joint_trajectory_action;
+  const auto joints = contract.required_joints;
+
+  auto binding = valid_binding_snapshot();
+  auto admission = valid_admission_snapshot();
+  EXPECT_EQ(evaluate_dispatch_admission(
+                &contract, nullptr, &admission, true, 1'500,
+                action, joints)
+                .reason_code,
+            "controller_binding_unavailable");
+
+  binding.fresh_until_ns = 1'500;
+  EXPECT_EQ(evaluate_dispatch_admission(
+                &contract, &binding, &admission, true, 1'500,
+                action, joints)
+                .reason_code,
+            "controller_binding_stale");
+  binding = valid_binding_snapshot();
+  binding.valid = false;
+  binding.reason_codes = {"trajectory_controller_inactive"};
+  EXPECT_EQ(evaluate_dispatch_admission(
+                &contract, &binding, &admission, true, 1'500,
+                action, joints)
+                .reason_code,
+            "controller_binding_invalid");
+  binding = valid_binding_snapshot();
+  EXPECT_EQ(evaluate_dispatch_admission(
+                &contract, &binding, &admission, true, 1'500,
+                action + "_wrong", joints)
+                .reason_code,
+            "controller_action_binding_mismatch");
+  EXPECT_EQ(evaluate_dispatch_admission(
+                &contract, &binding, &admission, true, 1'500,
+                action, {"joint2", "joint1"})
+                .reason_code,
+            "controller_joint_order_mismatch");
+  EXPECT_EQ(evaluate_dispatch_admission(
+                &contract, &binding, nullptr, true, 1'500,
+                action, joints)
+                .reason_code,
+            "execution_admission_unavailable");
+
+  admission = valid_admission_snapshot();
+  admission.fresh_until_ns = 1'500;
+  EXPECT_EQ(evaluate_dispatch_admission(
+                &contract, &binding, &admission, true, 1'500,
+                action, joints)
+                .reason_code,
+            "execution_admission_stale");
+  admission = valid_admission_snapshot();
+  admission.binding_contract_generation_id = "other-binding";
+  EXPECT_EQ(evaluate_dispatch_admission(
+                &contract, &binding, &admission, true, 1'500,
+                action, joints)
+                .reason_code,
+            "execution_admission_binding_mismatch");
+  admission = valid_admission_snapshot();
+  admission.controller_ready = false;
+  EXPECT_EQ(evaluate_dispatch_admission(
+                &contract, &binding, &admission, true, 1'500,
+                action, joints)
+                .reason_code,
+            "execution_controller_not_ready");
+  admission = valid_admission_snapshot();
+  admission.motion_admitted = false;
+  EXPECT_EQ(evaluate_dispatch_admission(
+                &contract, &binding, &admission, true, 1'500,
+                action, joints)
+                .reason_code,
+            "execution_motion_not_admitted");
+}
+
+TEST(Ros2ControllerBindingTest,
+     RuntimeAllowsLeaseRefreshButRejectsAuthorityChurn) {
+  const auto contract = binding_contract();
+  auto binding = valid_binding_snapshot();
+  auto admission = valid_admission_snapshot();
+  const auto dispatch = evaluate_dispatch_admission(
+      &contract, &binding, &admission, true, 1'500,
+      contract.follow_joint_trajectory_action,
+      contract.required_joints);
+  ASSERT_TRUE(dispatch.pin.has_value());
+
+  // Refresh publications may renew freshness without pretending a lifecycle
+  // transition occurred.
+  binding.generation += 1;
+  binding.fresh_until_ns += 1'000;
+  admission.generation += 1;
+  admission.fresh_until_ns += 1'000;
+  EXPECT_TRUE(evaluate_active_dispatch_authority(
+                  &contract, &binding, &admission, true, 2'000,
+                  *dispatch.pin)
+                  .admitted);
+
+  binding.activity_generation += 1;
+  EXPECT_EQ(evaluate_active_dispatch_authority(
+                &contract, &binding, &admission, true, 2'000,
+                *dispatch.pin)
+                .reason_code,
+            "controller_binding_generation_changed");
+  binding.activity_generation -= 1;
+  admission.lifecycle_generation += 1;
+  EXPECT_EQ(evaluate_active_dispatch_authority(
+                &contract, &binding, &admission, true, 2'000,
+                *dispatch.pin)
+                .reason_code,
+            "execution_admission_generation_changed");
+
+  admission = valid_admission_snapshot();
+  admission.lifecycle_generation += 1;
+  admission.transport_owner_component_epoch = "owner-epoch-2";
+  admission.fresh_until_ns += 1'000;
+  EXPECT_EQ(evaluate_active_dispatch_authority(
+                &contract, &binding, &admission, true, 2'000,
+                *dispatch.pin)
+                .reason_code,
+            "execution_environment_epoch_changed");
+}
 
 TEST(Ros2CapabilityTest,
      SpringBackHoldIsAlwaysSupported) {

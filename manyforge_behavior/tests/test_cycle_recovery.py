@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import time
 
 from manyforge_behavior.cycle_recovery import (
     CycleRecoveryActionId,
@@ -72,6 +73,25 @@ def test_offer_is_immutable_and_live_world_revision_is_diagnostic_only():
     assert second.offer_revision == first.offer_revision
     assert second.live_collision_world_revision == 101
     assert len(published) == 1
+
+
+def test_observed_sample_deadline_is_not_an_operator_click_deadline():
+    coordinator = CycleRecoveryCoordinator()
+    assessment = _ready_assessment(
+        observed_state_valid_until_ns=time.monotonic_ns() - 1,
+    )
+
+    first = coordinator.project(assessment, _facts())
+    second = coordinator.project(assessment, _facts())
+
+    assert first is not None
+    assert second is first
+    assert first.status == "retry_ready"
+    assert first.primary_action == "retry_motion_from_current_state"
+    assert first.actions[0].enabled
+    # The timestamp remains available as evidence. Only a newer non-ready
+    # kernel assessment may revoke the stable operator offer.
+    assert first.valid_until_ns == assessment["observed_state_valid_until_ns"]
 
 
 def test_structural_scene_epoch_publishes_new_offer_and_stales_old_request():

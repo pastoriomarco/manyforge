@@ -66,6 +66,12 @@ def main() -> int:
             _runtime_path(scenario.deployment_path, repo_root),
             scenario.description.replace("|", " ").replace("\n", " "),
             ",".join(scenario.aliases),
+            scenario.runtime_resolver,
+            (
+                _runtime_path(scenario.cell_path, repo_root)
+                if scenario.cell_path is not None
+                else ""
+            ),
         )
         print("|".join(fields))
     return 0

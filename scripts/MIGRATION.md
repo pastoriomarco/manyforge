@@ -159,3 +159,22 @@ REBUILD=true \
   iteration-velocity loss matters in practice, a follow-up can add
   `restart-bridge` / `restart-composer` verbs to the unified launcher
   that key off `ASSISTANT` / `LANE`.
+
+## New physical lane (no legacy-script migration)
+
+The unified launcher now owns the experimental `real-robot` selector. No old
+demo script maps to it. The first artifact-owned scenario is
+`real-lite6-commissioning`:
+
+```bash
+MANYFORGE_LITE6_ROBOT_IP=192.168.1.31 \
+  scripts/launch.sh --lane real-robot --assistant off \
+    --scenario real-lite6-commissioning
+```
+
+This starts a sole-owner robot/control container and a separate non-owner
+Composer container. It resolves address- and process-specific state below the
+ignored `.manyforge-var/` runtime root, but does not enable drives, activate
+the trajectory controller, or run a trajectory. Follow
+[`docs/operations/LITE6_LIVE_QUALIFICATION.md`](../docs/operations/LITE6_LIVE_QUALIFICATION.md)
+for the attended lifecycle and motion gates.

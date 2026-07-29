@@ -1,5 +1,5 @@
 schema_version: manyforge.operator_alarm_catalog.v1
-catalog_version: 1.0.0
+catalog_version: 1.1.0
 definitions:
   - definition_id: manyforge.motion.runtime_collision
     version: 1
@@ -143,3 +143,34 @@ definitions:
     acknowledgement_reason_required: false
     requires_motion_attention: true
     max_evidence_refs: 16
+
+  - definition_id: manyforge.runtime.robot_lifecycle_fault
+    version: 1
+    title: Robot lifecycle fault
+    message_template: "Robot lifecycle fault {fault_code} on {robot_resource}"
+    alarm_class: runtime_health
+    priority: high
+    priority_rationale: >-
+      A current physical-robot fault, warning, recovery latch, or uncertain
+      lifecycle transaction requires operator attention before motion can be
+      admitted.
+    consequence: >-
+      Robot readiness and trajectory dispatch remain fail-closed until the
+      provider publishes a fresh matching clear or reconciliation result.
+    operator_response: >-
+      Inspect robot and lifecycle diagnostics, correct the physical cause,
+      apply only an offered recovery action, and wait for a fresh reconciled
+      provider snapshot.
+    scope_fields:
+      - robot_resource
+      - fault_code
+    set_authority: manyforge.robot_lifecycle.provider_snapshot
+    clear_authority: manyforge.robot_lifecycle.provider_snapshot
+    adapter_id: manyforge.adapter.runtime_health_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: true
+    max_evidence_refs: 32

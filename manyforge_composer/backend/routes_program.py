@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import logging
 import math
+from functools import wraps
 from pathlib import Path
+from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException, Query
 from manyforge_behavior.deployment import Deployment, DeploymentValidationError
@@ -85,6 +87,16 @@ def _deployment_capability_keys(state: ComposerState) -> set[str] | None:
     if state.deployment is None:
         return None
     return state.deployment.capability_keys()
+
+
+def _ensure_deployment_mutation_idle(state: ComposerState) -> None:
+    """Reject deployment cutover unless no execution owner is active."""
+    manager = state.cycle_manager
+    if manager is not None and manager.state.value != "idle":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot apply deployment changes while execution is active",
+        )
 
 
 def _coerce_artifact_save_path(
@@ -730,6 +742,18 @@ def _deployment_compatibility_payload(deployment: Deployment) -> dict | None:
 def create_program_router(state: ComposerState) -> APIRouter:
     """Create the program router with the given state."""
     router = APIRouter()
+
+    def artifact_transactional(
+        handler: Callable[..., Any],
+    ) -> Callable[..., Any]:
+        """Keep source artifacts stable while deriving and applying a mutation."""
+
+        @wraps(handler)
+        def wrapped(*args, **kwargs):
+            with state.artifact_read_transaction():
+                return handler(*args, **kwargs)
+
+        return wrapped
     
     @router.post("/program/load", response_model=ProgramResponse, response_model_by_alias=True)
     def load_program(request: LoadProgramRequest) -> dict:
@@ -1190,11 +1214,21 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 kind_label="Deployment path",
             )
             deployment = Deployment(deployment_path)
-            _validate_deployment_against_catalogs(state, deployment)
-            state.deployment = deployment
-            state.deployment_source_path = deployment_path
+            with state.artifact_read_transaction():
+                _ensure_deployment_mutation_idle(state)
+                _validate_deployment_against_catalogs(state, deployment)
+                program = state.program
+                if program is not None:
+                    deployment.validate_against_program(program)
+                    deployment.validate_capabilities(program)
+                    state.apply_models(program, deployment)
+                else:
+                    state.deployment = deployment
+                state.deployment_source_path = deployment_path
         except HTTPException:
             raise
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
         except DeploymentValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as e:
@@ -1294,6 +1328,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
         )
 
     @router.put("/program/tree")
+    @artifact_transactional
     def update_program_tree(request: UpdateTreeRequest) -> dict:
         if state.program is None:
             raise HTTPException(status_code=404, detail="No program loaded")
@@ -1401,30 +1436,38 @@ def create_program_router(state: ComposerState) -> APIRouter:
 
     @router.put("/deployment")
     def update_deployment(request: UpdateDeploymentRequest) -> dict:
-        if state.deployment is None:
-            raise HTTPException(status_code=404, detail="No deployment loaded")
-        if state.cycle_manager is not None and state.cycle_manager.state.value == "running":
-            raise HTTPException(status_code=409, detail="Cannot apply deployment changes while execution is active")
         try:
-            deployment_dict = state.deployment.to_dict()
-            patch_dict = request.model_dump(exclude_unset=True)
-            patch_dict = _strip_readonly_deployment_response_fields(patch_dict)
-            for key, value in patch_dict.items():
-                deployment_dict[key] = value
-            updated_deployment = Deployment.from_dict(
-                deployment_dict,
-                path=state.deployment_source_path or "<memory>",
-            )
-            _validate_deployment_against_catalogs(state, updated_deployment)
-            if state.program is not None:
-                updated_deployment.validate_against_program(state.program)
-                updated_deployment.validate_capabilities(state.program)
-                state.apply_models(
-                    state.program,
-                    updated_deployment,
+            with state.artifact_read_transaction():
+                if state.deployment is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="No deployment loaded",
+                    )
+                _ensure_deployment_mutation_idle(state)
+                deployment_dict = state.deployment.to_dict()
+                patch_dict = request.model_dump(exclude_unset=True)
+                patch_dict = _strip_readonly_deployment_response_fields(patch_dict)
+                for key, value in patch_dict.items():
+                    deployment_dict[key] = value
+                updated_deployment = Deployment.from_dict(
+                    deployment_dict,
+                    path=state.deployment_source_path or "<memory>",
                 )
-            else:
-                state.deployment = updated_deployment
+                _validate_deployment_against_catalogs(state, updated_deployment)
+                program = state.program
+                if program is not None:
+                    updated_deployment.validate_against_program(program)
+                    updated_deployment.validate_capabilities(program)
+                    state.apply_models(
+                        program,
+                        updated_deployment,
+                    )
+                else:
+                    state.deployment = updated_deployment
+        except HTTPException:
+            raise
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
         except (ProgramValidationError, DeploymentValidationError) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as e:
@@ -1468,6 +1511,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
         return {"status": "ok", "path": target_path}
 
     @router.post("/session/apply", response_model=ApplySessionResponse)
+    @artifact_transactional
     def apply_session(request: ApplySessionRequest) -> dict:
         if state.program is None:
             raise HTTPException(status_code=404, detail="No program loaded")

@@ -44,7 +44,7 @@ ______________________________________________________________________
 | `manyforge_core/python`                   | pybind11              | Bindings exposing the kernel to Python (poll-based; no C++→Python callbacks).                                                                                                                       |
 | `manyforge_collision`                     | C++20                 | Planner-neutral collision-world/query implementation behind ManyForge collision ports.                                                                                                              |
 | `manyforge_roboplan`                      | C++ + pybind11        | Primary planning/projection adapter (RRT + TOPP-RA), native execution, and native kernel composition.                                                                                               |
-| `manyforge_ros2_control_execution`        | C++20/ROS 2           | Controller execution adapter: FollowJointTrajectory, feedback/settling, bounded stop/reset, and isolated ROS scene projection.                                                                      |
+| `manyforge_ros2_control_execution`        | C++20/ROS 2           | Controller execution adapter: FollowJointTrajectory, feedback/settling, bounded stop/reset, isolated ROS scene projection, and optional exact controller/lifecycle dispatch admission.                |
 | `manyforge_behavior`                      | Python                | Behavior-tree runner, node catalog, program/deployment loader, cycle orchestration, one versioned recovery offer, and Robot Model Authority.                                                        |
 | `manyforge_composer`                      | FastAPI + React + MCP | Authoring/operator surface, condition-backed alarm manager, scene-initialization barrier, bounded native viewer, REST, and MCP.                                                                     |
 | `manyforge_ros` / `manyforge_ros_bringup` | C++/Python            | ROS utility and deployment wiring: simulator inspection, standard controller/gripper surfaces, readiness supervision, and real/sim bring-up.                                                        |
@@ -323,6 +323,101 @@ behind the execution backend.
   ros2_control lane, but controller/driver-observed state is authoritative;
   reset resynchronizes software and never implies physical homing. Vendor
   safety functions and explicit physical qualification remain required.
+
+For a physical deployment, the robot adapter resolves vendor-specific
+controller names, namespaces, joints, and interfaces into one immutable
+robot-neutral binding. The generic ros2_control backend observes
+controller-manager activity, verifies that exact binding outside the update
+loop, and requires a fresh lifecycle-admission snapshot at the final bounded
+goal-enqueue boundary. Activity or lifecycle-generation loss invalidates the
+running authority and cancels the known goal. The lifecycle provider and
+production launcher remain robot/deployment adapters; the generic execution
+package does not infer vendor names or own robot activation.
+
+The initial Lite6 product shape runs a sole-owner control service separately
+from the non-owner Composer service. A committed cell and portable deployment
+template resolve into a digest-bound, retained per-run deployment/runtime
+record; Composer refuses missing or drifted provenance. Startup configures the
+hardware and controllers inactive. Composer or PLC/ROXSIE requests one stable
+robot-neutral target intent: `robot.prepare_for_motion` for **Enable robot** or
+`robot.make_noncommandable` for **Disable robot**. The lifecycle provider owns
+the durable transaction, while the selected vendor adapter owns its resumable
+stage plan and proves every stage from fresh observation. Neither client
+sequences vendor calls or controller-manager transitions.
+
+Enablement persists while the selected headless authority and its dependencies
+remain healthy; it is not a browser/user inactivity lease. For the
+`local_operator` profile, an app-lifespan-owned Composer task proves progress
+through bounded Kernel/cycle reads and renews the same authority epoch. The
+browser is only an HMI. Renewal never creates a session, advances lifecycle
+generation, or resets replay identity. Health loss closes admission; a
+recovered/restarted component starts observation-only and requires explicit
+Enable plus a new execution request. Client and provider reject same-generation
+renewal once the prior lease has expired, so a delayed heartbeat/RPC cannot
+reopen admission.
+
+The retained runtime record binds the effective heartbeat/lease policy, while
+the authority component generates its unpredictable startup epoch inside the
+process. Generic admission publication uses a 250 ms lease. The xArm owner's
+internal write gate provisionally follows its 1000 ms producer-observation
+lease and cannot outlive fresh robot state. Supervision is deliberately
+layered:
+
+1. local command, final-dispatch, and active-goal fences close without waiting
+   for process management;
+2. a ROS-free NRT reducer checks receiver-local heartbeat/progress ages,
+   component epochs, generation identities, and the dependency DAG; and
+3. an external host supervisor observes the owner and Composer containers,
+   consumes Composer's already-reduced critical-health snapshot with its own
+   receiver-local freshness/epoch fence, and owns bounded
+   dependency-ordered teardown. Composer fences dispatch on the first
+   unhealthy reduction; external teardown requires continuous reduced-health
+   loss for its recorded persistence budget so a transient cannot destroy a
+   healthy owner. Process exit, identity/epoch mismatch, progress regression,
+   and stale supervision remain independent terminal paths. A container being
+   merely `running` is never sufficient health evidence.
+
+Provider delivery health and robot-observation freshness are deliberately
+separate. Advancing, identity-valid lifecycle samples inside the receiver-local
+delivery budget prove that the provider component is alive. The observation's
+shorter source deadline independently fences Enable, Run, final dispatch, and
+active execution. An expired observation never permits motion, but it does not
+by itself claim that the provider process died or request restart-domain
+teardown. Exact redelivery, stopped progress, delivery timeout, or identity
+failure still makes the provider component unhealthy.
+
+The initial external policy is intentionally one-way: an unexpected service
+exit, stalled reduced-health channel, component-epoch replacement, or
+persistently unhealthy reduced dependency graph is terminal for that launcher
+generation. It never auto-restarts, re-enables, or resumes the lane; a later
+operator launch creates fresh epochs and starts observation-only. Its
+arm/shutdown channel is host-only, while the containers can read the retained
+heartbeat evidence. Health polling and process control remain NRT and outside
+robot command paths.
+
+The execution environment is one logical, composed fence rather than one
+cross-layer lock. Composer's upper pin owns program, deployment, run,
+authority-session, and full component-graph identity. The native
+ros2_control backend's lower pin owns controller activity/binding,
+lifecycle-admission semantics, provider/owner/authority/supervisor epochs, and
+its own backend epoch. The planning/validation span, final enqueue, goal
+response, active monitor, resume, and successful terminal commit all validate
+the applicable immutable pin. Either half changing retires the execution;
+ordinary heartbeat/publication generations are correlation evidence and do
+not themselves become semantic equality fences.
+
+Reducer, heartbeat, alarm, and process-control work is NRT. None runs in the
+controller update, collision, dispatch-linearization, or Kernel stop-critical
+path.
+
+The provider projects lifecycle faults through the ordinary alarm/history
+system. UI Run/Resume and candidate approval mirror its `canExecute` state, the
+backend rejects them while admission is closed, and the execution adapter
+rechecks the immutable admission generation at FJT enqueue. The main Stop
+remains a motion/tree stop; Disable first stops the cycle and proves it
+quiescent, then one provider-owned transaction makes the robot
+non-commandable. Cause-specific recovery and controller shutdown remain
+separate operations.
 
 Program artifacts remain backend-neutral and can run unchanged when the target
 deployment declares the capabilities they require. Validation and

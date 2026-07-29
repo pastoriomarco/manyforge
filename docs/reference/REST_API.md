@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-07-21 10:12:43 UTC
+  Last regenerated: 2026-07-26 09:13:16 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -110,6 +110,11 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/robot-control/candidates/{candidate_id}` | robot-control | Get Candidate |
 | `POST` | `/api/robot-control/candidates/{candidate_id}/execute` | robot-control | Execute Candidate |
 | `POST` | `/api/robot-control/candidates/{candidate_id}/revert` | robot-control | Revert Candidate |
+| `POST` | `/api/robot-lifecycle/disable` | robot-lifecycle | Disable |
+| `POST` | `/api/robot-lifecycle/enable` | robot-lifecycle | Enable |
+| `POST` | `/api/robot-lifecycle/reconcile` | robot-lifecycle | Reconcile |
+| `POST` | `/api/robot-lifecycle/recovery/{action_id}` | robot-lifecycle | Recovery |
+| `GET` | `/api/robot-lifecycle/status` | robot-lifecycle | Status |
 | `POST` | `/api/runtime/external/{provider_id}` | runtime | Update External Runtime Status |
 | `GET` | `/api/runtime/status` | runtime | Runtime Status |
 | `GET` | `/api/scenarios` | scenarios | List Scenarios |

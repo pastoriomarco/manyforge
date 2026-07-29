@@ -19,6 +19,7 @@ branch/commit workflow).
 | Diagnose a runtime symptom                  | [`operations/TROUBLESHOOTING.md`](operations/TROUBLESHOOTING.md), then [`operations/OBSERVABILITY.md`](operations/OBSERVABILITY.md) |
 | Operate stop/recovery controls              | [`operations/STOP_PROFILES.md`](operations/STOP_PROFILES.md)                                                                        |
 | Add a robot or trusted external node        | [`operations/ADDING_A_ROBOT.md`](operations/ADDING_A_ROBOT.md), [`operations/EXTERNAL_NODES.md`](operations/EXTERNAL_NODES.md)      |
+| Qualify an experimental physical Lite6      | [`operations/LITE6_LIVE_QUALIFICATION.md`](operations/LITE6_LIVE_QUALIFICATION.md)                                                  |
 | Understand ownership and data flow          | [`reference/ARCHITECTURE.md`](reference/ARCHITECTURE.md)                                                                            |
 | Integrate an API/client                     | Generated REST/MCP/viewer contracts under [`reference/`](reference/)                                                                |
 
@@ -87,6 +88,12 @@ branch/commit workflow).
   - Multi-machine Lite6 trocar workflow with Isaac Sim, Isaac ROS 4.4
     YOLOv8/FoundationPose perception, ManyForge ROS control, DDS/QoS
     isolation, TF checks, and smoke qualification.
+
+- [`operations/LITE6_LIVE_QUALIFICATION.md`](operations/LITE6_LIVE_QUALIFICATION.md)
+
+  - Staged real-Lite6 qualification: exact production JTC binding, offline
+    fake-hardware HIL, bounded read-only evidence, live lifecycle gates, and
+    the later physical-motion boundary.
 
 - [`../config/ros/isaac_lite6_trocar_foundationpose.env.sh`](../config/ros/isaac_lite6_trocar_foundationpose.env.sh)
 

@@ -11045,6 +11045,27 @@ TEST_F(ExecutionKernelTest, GetExecutionSnapshot_AfterExecute_ContainsIdsAndFina
   EXPECT_GT(snapshot.sequence_number, 0u);
 }
 
+TEST_F(ExecutionKernelTest, GetExecutionSnapshot_WhileIdle_ServesLiveBackendSnapshot) {
+  ASSERT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+  execution.snapshot.state = ExecutionState::kExecuting;
+  execution.snapshot.execution_id = 99u;
+  execution.snapshot.move_id = "backend_identity_is_not_authoritative";
+  execution.snapshot.sequence_number = 41u;
+  execution.snapshot.joint_positions_rad = {0.3, 0.7};
+  execution.snapshot.state_source = "observed_ros2";
+
+  const auto snapshot = kernel.get_execution_snapshot();
+
+  EXPECT_EQ(snapshot.state, ExecutionState::kIdle);
+  EXPECT_EQ(snapshot.execution_id, 0u);
+  EXPECT_TRUE(snapshot.move_id.empty());
+  EXPECT_EQ(snapshot.sequence_number, 41u);
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 2u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad[0], 0.3);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad[1], 0.7);
+  EXPECT_EQ(snapshot.state_source, "observed_ros2");
+}
+
 TEST_F(ExecutionKernelTest, GetExecutionSnapshot_DuringExecuting_ServesLiveBackendSnapshot) {
   // Observer freshness contract: during kExecuting (like kStopping since 1B)
   // get_execution_snapshot() reads the backend's live snapshot instead of the

@@ -527,6 +527,7 @@ def create_mcp_server(state: ComposerState):
                     return json.dumps({
                         "error": stop_block["message"],
                         "error_code": stop_block["error_code"],
+                        "error_details": stop_block.get("error_details"),
                     })
                 override_status = state.runtime_override_status()
                 if (
@@ -785,6 +786,7 @@ def create_mcp_server(state: ComposerState):
                 return json.dumps({
                     "error": stop_block["message"],
                     "error_code": stop_block["error_code"],
+                    "error_details": stop_block.get("error_details"),
                 })
 
             parent_run_id = state.event_recorder.current_run_id

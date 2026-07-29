@@ -29,13 +29,15 @@ Freshness model (Phase 1, Composer-route): the kernel's collision-world
 revision is not plumbed to the Composer Python layer, so the planning snapshot
 fingerprint is built from the stable signals that ARE available here
 (authoritative robot joint positions, execution-state source, and loaded
-program/deployment identity). Scene / collision-world changes are additionally
+program/deployment content). Scene / collision-world changes are additionally
 caught by the MANDATORY re-validation that Approve runs against the current
 state before any dispatch. Promoting candidate ownership into the kernel with a
 real collision-world revision is the documented Phase 2 follow-up.
 """
 from __future__ import annotations
 
+from copy import deepcopy
+import hashlib
 import json
 import logging
 import math
@@ -93,8 +95,10 @@ _STRICT_CFG = ConfigDict(populate_by_name=True, extra="forbid")
 # green indicator can never linger; the UI must re-author to refresh.
 _CANDIDATE_MAX_AGE_NS = 30_000_000_000  # 30 s
 
-# Positions are rounded to this many decimals before they enter the planning
-# snapshot fingerprint so sensor jitter does not spuriously stale a candidate.
+# Backend-authored positions are rounded to this many decimals before they
+# enter the planning snapshot fingerprint. Measurement-authoritative lanes use
+# their explicit deployment start tolerance instead (see
+# `_planning_snapshots_equivalent`); they never inherit an invented tolerance.
 _POSITION_FINGERPRINT_DECIMALS = 5
 
 # Scene-object poses are rounded to this many decimals before they enter the
@@ -117,19 +121,198 @@ _CARTESIAN_PATH_DEFAULTS: dict[str, Any] = {
 
 # --- Per-joint robot_control_joint_limits enforcement (Phase 4-P5.1K) ---
 # `deployment.robot_config.robot_control_joint_limits` carries per-joint Robot
-# Control velocity / acceleration / jerk caps. `_build_execute_request` forwards
-# them on `ExecuteRequest.per_joint_dynamics_limits` for BOTH the preview plan
-# and the approval-time recheck (identical caps for the candidate's planning
-# snapshot). The native kernel resolves the effective per-joint cap as the
-# conservative minimum across model/backend/controller and these deployment
-# caps, enforces velocity/acceleration in RoboPlan TOPP-RA time-parameterization
-# (a tight cap lengthens/smooths the trajectory), and fails closed before
-# dispatch for unknown joints, malformed values, or caps the active path cannot
-# enforce. A jerk cap is carried but the discrete TOPP-RA path cannot enforce
-# jerk, so the native request validation rejects it as
-# `unsupported_joint_dynamics_limit` rather than claiming enforcement. Joint-name
-# validity is enforced at deployment load
-# (`Deployment.validate_robot_control_joint_limits_against`).
+# Control velocity / acceleration / jerk caps. A candidate freezes these caps
+# once, fingerprints the immutable payload, and forwards that exact payload to
+# initial preview, approval recheck, and intervention dispatch. The native
+# kernel resolves the effective per-joint cap as the conservative minimum
+# across model/backend/controller and these deployment caps, enforces
+# velocity/acceleration in RoboPlan TOPP-RA time-parameterization (a tight cap
+# lengthens/smooths the trajectory), and fails closed before dispatch for
+# unknown joints, malformed values, or caps the active path cannot enforce. A
+# jerk cap is carried but the discrete TOPP-RA path cannot enforce jerk, so the
+# native request validation rejects it as `unsupported_joint_dynamics_limit`
+# rather than claiming enforcement. Joint-name validity is enforced at
+# deployment load (`Deployment.validate_robot_control_joint_limits_against`).
+
+
+@dataclass(frozen=True)
+class _ExecutionConstraintPayload:
+    """Immutable candidate-owned dynamics/TCP caps.
+
+    The tuple representation prevents an in-place deployment edit from changing
+    a READY candidate after preview. ``fingerprint`` is deterministic content
+    identity used in tests/evidence and is independent of Python object ids.
+    """
+
+    max_tcp_linear_speed_mps: float | None
+    # (joint_name, velocity, acceleration, jerk), sorted by canonical name.
+    per_joint_dynamics_limits: tuple[
+        tuple[str, float | None, float | None, float | None], ...
+    ]
+
+    @classmethod
+    def from_request(cls, request: ExecuteRequest) -> "_ExecutionConstraintPayload":
+        return cls(
+            max_tcp_linear_speed_mps=(
+                None
+                if request.max_tcp_linear_speed_mps is None
+                else float(request.max_tcp_linear_speed_mps)
+            ),
+            per_joint_dynamics_limits=tuple(
+                sorted(
+                    (
+                        str(joint_name),
+                        (
+                            None
+                            if limit.max_velocity_rad_s is None
+                            else float(limit.max_velocity_rad_s)
+                        ),
+                        (
+                            None
+                            if limit.max_acceleration_rad_s2 is None
+                            else float(limit.max_acceleration_rad_s2)
+                        ),
+                        (
+                            None
+                            if limit.max_jerk_rad_s3 is None
+                            else float(limit.max_jerk_rad_s3)
+                        ),
+                    )
+                    for joint_name, limit in request.per_joint_dynamics_limits.items()
+                )
+            ),
+        )
+
+    @property
+    def fingerprint(self) -> str:
+        canonical = {
+            "max_tcp_linear_speed_mps": self.max_tcp_linear_speed_mps,
+            "per_joint_dynamics_limits": [
+                {
+                    "joint_name": joint_name,
+                    "max_velocity_rad_s": velocity,
+                    "max_acceleration_rad_s2": acceleration,
+                    "max_jerk_rad_s3": jerk,
+                }
+                for joint_name, velocity, acceleration, jerk in (
+                    self.per_joint_dynamics_limits
+                )
+            ],
+        }
+        encoded = json.dumps(
+            canonical,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def to_kernel_limits(self) -> dict[str, JointDynamicsLimit]:
+        return {
+            joint_name: JointDynamicsLimit(
+                max_velocity_rad_s=velocity,
+                max_acceleration_rad_s2=acceleration,
+                max_jerk_rad_s3=jerk,
+            )
+            for joint_name, velocity, acceleration, jerk in (
+                self.per_joint_dynamics_limits
+            )
+        }
+
+    def to_dispatch_params(self) -> dict[str, Any]:
+        """Serialize the frozen caps into intervention-tree parameters."""
+        params: dict[str, Any] = {}
+        if self.max_tcp_linear_speed_mps is not None:
+            params["max_tcp_linear_speed_mps"] = self.max_tcp_linear_speed_mps
+
+        per_joint: dict[str, dict[str, float]] = {}
+        for joint_name, velocity, acceleration, jerk in (
+            self.per_joint_dynamics_limits
+        ):
+            serialized = {
+                field_name: value
+                for field_name, value in (
+                    ("max_velocity_rad_s", velocity),
+                    ("max_acceleration_rad_s2", acceleration),
+                    ("max_jerk_rad_s3", jerk),
+                )
+                if value is not None
+            }
+            if serialized:
+                per_joint[joint_name] = serialized
+        if per_joint:
+            params["per_joint_dynamics_limits"] = per_joint
+        return params
+
+
+def _execution_constraints_from_deployment(
+    state: ComposerState,
+) -> _ExecutionConstraintPayload:
+    """Resolve and freeze the active deployment's candidate execution caps."""
+    deployment = state.deployment
+    robot_config = (
+        getattr(deployment, "robot_config", None) if deployment is not None else None
+    )
+    raw_tcp = (
+        getattr(robot_config, "global_max_tcp_linear_speed_mps", None)
+        if robot_config is not None
+        else None
+    )
+    tcp_cap = (
+        float(raw_tcp)
+        if isinstance(raw_tcp, (int, float))
+        and not isinstance(raw_tcp, bool)
+        and math.isfinite(float(raw_tcp))
+        and float(raw_tcp) > 0.0
+        else None
+    )
+    raw_limits = (
+        getattr(robot_config, "robot_control_joint_limits", None)
+        if robot_config is not None
+        else None
+    )
+    limits: list[tuple[str, float | None, float | None, float | None]] = []
+    if isinstance(raw_limits, dict):
+        for joint_name, limit in raw_limits.items():
+            velocity = getattr(limit, "max_velocity_rad_s", None)
+            acceleration = getattr(limit, "max_acceleration_rad_s2", None)
+            jerk = getattr(limit, "max_jerk_rad_s3", None)
+            limits.append(
+                (
+                    str(joint_name),
+                    None if velocity is None else float(velocity),
+                    None if acceleration is None else float(acceleration),
+                    None if jerk is None else float(jerk),
+                ),
+            )
+    return _ExecutionConstraintPayload(
+        max_tcp_linear_speed_mps=tcp_cap,
+        per_joint_dynamics_limits=tuple(sorted(limits)),
+    )
+
+
+def _stable_model_content_fingerprint(model: Any) -> str:
+    """Hash model content deterministically; serialization failure is fail-closed."""
+    if model is None:
+        return ""
+    payload = model.to_dict()
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        default=str,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _execution_limit_dispatch_params(
+    constraints: _ExecutionConstraintPayload,
+) -> dict[str, Any]:
+    """Compatibility helper for the exact frozen intervention payload."""
+    return constraints.to_dispatch_params()
 
 
 # --- KERNEL-PROMOTION GAP: collision-world revision freshness -----------------
@@ -642,6 +825,11 @@ class _PlanningSnapshot:
     every poll; meaningful robot motion is detected through the rounded joint
     positions instead.
 
+    Backend-authored lanes retain rounded position equality. Physical,
+    measurement-authoritative lanes retain the complete raw joint vector and
+    compare it with the deployment's explicit `start_tolerance_rad`. Missing or
+    invalid tolerance configuration fails closed to rounded strict equality.
+
     `scene_object_count` + `scene_fingerprint` additionally capture
     the SCENE / attached-object state so a candidate goes STALE when objects are
     added/removed/relocated or (de)attached WITHOUT a new user edit. These are
@@ -653,10 +841,13 @@ class _PlanningSnapshot:
     """
 
     state_source: str
-    robot_positions_key: tuple
+    robot_joint_names_key: tuple[str, ...]
+    robot_positions_key: tuple[float, ...]
     robot_state_known: bool
-    program_token: int
-    deployment_token: int
+    measurement_authoritative: bool
+    position_tolerance_rad: float | None
+    program_fingerprint: str
+    deployment_fingerprint: str
     scene_object_count: int
     scene_fingerprint: str
 
@@ -713,6 +904,80 @@ def _compute_scene_fingerprint(state: ComposerState) -> tuple[int, str]:
     return len(descriptors), fingerprint
 
 
+def _configured_start_tolerance_rad(state: ComposerState) -> float | None:
+    """Return the explicit execution start tolerance, or no tolerance.
+
+    Candidate freshness must not invent a physical-robot tolerance. The
+    deployment parser intentionally leaves adapter config extensible, so this
+    boundary validates the value again before granting tolerant equivalence.
+    """
+    deployment = state.deployment
+    if deployment is None:
+        return None
+    try:
+        execution = deployment.adapters.get("execution")
+        config = getattr(execution, "config", None)
+        raw = config.get("start_tolerance_rad") if isinstance(config, dict) else None
+    except (AttributeError, TypeError):
+        return None
+    if (
+        not isinstance(raw, (int, float))
+        or isinstance(raw, bool)
+        or not math.isfinite(float(raw))
+        or float(raw) <= 0.0
+    ):
+        return None
+    return float(raw)
+
+
+def _planning_snapshots_equivalent(
+    planned: _PlanningSnapshot,
+    current: _PlanningSnapshot,
+) -> bool:
+    """Compare candidate facts under the active lane's authority contract.
+
+    All non-position facts remain exact, including joint identity/order,
+    authority mode, explicit tolerance, and full program/deployment content.
+    Only complete measured vectors with the same valid configured tolerance may
+    differ numerically, and then every joint must stay within that tolerance.
+    Backend-authored or unconfigured measured lanes preserve strict rounded
+    equality.
+    """
+    if (
+        planned.state_source != current.state_source
+        or planned.robot_joint_names_key != current.robot_joint_names_key
+        or planned.robot_state_known != current.robot_state_known
+        or planned.measurement_authoritative
+        != current.measurement_authoritative
+        or planned.position_tolerance_rad != current.position_tolerance_rad
+        or planned.program_fingerprint != current.program_fingerprint
+        or planned.deployment_fingerprint != current.deployment_fingerprint
+        or planned.scene_object_count != current.scene_object_count
+        or planned.scene_fingerprint != current.scene_fingerprint
+    ):
+        return False
+
+    tolerance = planned.position_tolerance_rad
+    if (
+        planned.measurement_authoritative
+        and tolerance is not None
+        and planned.robot_state_known
+        and planned.robot_joint_names_key
+        and len(planned.robot_positions_key)
+        == len(planned.robot_joint_names_key)
+        == len(current.robot_positions_key)
+    ):
+        return all(
+            abs(planned_position - current_position) <= tolerance
+            for planned_position, current_position in zip(
+                planned.robot_positions_key,
+                current.robot_positions_key,
+                strict=True,
+            )
+        )
+    return planned.robot_positions_key == current.robot_positions_key
+
+
 def _compute_planning_snapshot(state: ComposerState) -> _PlanningSnapshot:
     kernel = state.kernel
     state_source = ""
@@ -727,21 +992,52 @@ def _compute_planning_snapshot(state: ComposerState) -> _PlanningSnapshot:
         positions = state.get_current_joint_positions()
     except Exception:  # noqa: BLE001
         positions = None
-    if positions is None:
-        positions_key: tuple = ()
+    try:
+        joint_names_key = tuple(state.get_drivable_joint_names())
+    except Exception:  # noqa: BLE001
+        joint_names_key = ()
+    try:
+        measurement_authoritative = bool(
+            state.joint_state_authority_profile().measurement_authoritative
+        )
+    except Exception:  # noqa: BLE001 — authority uncertainty stays strict
+        measurement_authoritative = False
+    position_tolerance_rad = _configured_start_tolerance_rad(state)
+    try:
+        raw_positions = (
+            None
+            if positions is None
+            else tuple(float(position) for position in positions)
+        )
+    except (TypeError, ValueError):
+        raw_positions = None
+    if raw_positions is not None and not all(
+        math.isfinite(position) for position in raw_positions
+    ):
+        raw_positions = None
+    if raw_positions is None:
+        positions_key: tuple[float, ...] = ()
         robot_state_known = False
     else:
-        positions_key = tuple(
-            round(float(p), _POSITION_FINGERPRINT_DECIMALS) for p in positions
+        positions_key = (
+            raw_positions
+            if measurement_authoritative and position_tolerance_rad is not None
+            else tuple(
+                round(position, _POSITION_FINGERPRINT_DECIMALS)
+                for position in raw_positions
+            )
         )
         robot_state_known = True
     scene_object_count, scene_fingerprint = _compute_scene_fingerprint(state)
     return _PlanningSnapshot(
         state_source=state_source,
+        robot_joint_names_key=joint_names_key,
         robot_positions_key=positions_key,
         robot_state_known=robot_state_known,
-        program_token=id(state.program) if state.program is not None else 0,
-        deployment_token=id(state.deployment) if state.deployment is not None else 0,
+        measurement_authoritative=measurement_authoritative,
+        position_tolerance_rad=position_tolerance_rad,
+        program_fingerprint=_stable_model_content_fingerprint(state.program),
+        deployment_fingerprint=_stable_model_content_fingerprint(state.deployment),
         scene_object_count=scene_object_count,
         scene_fingerprint=scene_fingerprint,
     )
@@ -751,10 +1047,13 @@ def _compute_planning_snapshot(state: ComposerState) -> _PlanningSnapshot:
 # staleness (a PLANNING placeholder has no planned-against snapshot yet).
 _EMPTY_PLANNING_SNAPSHOT = _PlanningSnapshot(
     state_source="",
+    robot_joint_names_key=(),
     robot_positions_key=(),
     robot_state_known=False,
-    program_token=0,
-    deployment_token=0,
+    measurement_authoritative=False,
+    position_tolerance_rad=None,
+    program_fingerprint="",
+    deployment_fingerprint="",
     scene_object_count=0,
     scene_fingerprint="",
 )
@@ -771,6 +1070,9 @@ class _StoredCandidate:
     # (b) build the intervention tree for dispatch. None when the candidate is
     # not executable (error/blocked).
     dispatch_params: Optional[dict]
+    # Candidate-owned immutable caps used identically by preview, approval
+    # recheck, and dispatch. None for non-arm or non-executable candidates.
+    execution_constraints: _ExecutionConstraintPayload | None = None
 
 
 # --- Diagnostic classification ---------------------------------------------
@@ -875,39 +1177,6 @@ class _CandidatePlanner:
 
     # -- helpers ----------------------------------------------------------
 
-    def _global_tcp_speed_cap(self) -> Optional[float]:
-        deployment = self._state.deployment
-        if deployment is None or getattr(deployment, "robot_config", None) is None:
-            return None
-        cap = getattr(deployment.robot_config, "global_max_tcp_linear_speed_mps", None)
-        if isinstance(cap, (int, float)) and math.isfinite(cap) and cap > 0:
-            return float(cap)
-        return None
-
-    def _per_joint_dynamics_limits(self) -> dict[str, JointDynamicsLimit]:
-        """Resolve the deployment's per-joint Robot Control dynamics caps into
-        the request channel (Phase 4-P5.1K). The deployment is one source only;
-        the kernel combines these with model/backend/controller limits by
-        conservative minimum and enforces velocity/acceleration in TOPP-RA.
-        Joint-name validity is enforced at deployment load
-        (`validate_robot_control_joint_limits_against`); a jerk cap is carried
-        and rejected by the native path as `unsupported_joint_dynamics_limit`
-        where the discrete planner cannot enforce it."""
-        deployment = self._state.deployment
-        if deployment is None or getattr(deployment, "robot_config", None) is None:
-            return {}
-        raw = getattr(deployment.robot_config, "robot_control_joint_limits", None)
-        if not isinstance(raw, dict):
-            return {}
-        out: dict[str, JointDynamicsLimit] = {}
-        for joint_name, limit in raw.items():
-            out[str(joint_name)] = JointDynamicsLimit(
-                max_velocity_rad_s=getattr(limit, "max_velocity_rad_s", None),
-                max_acceleration_rad_s2=getattr(limit, "max_acceleration_rad_s2", None),
-                max_jerk_rad_s3=getattr(limit, "max_jerk_rad_s3", None),
-            )
-        return out
-
     def _build_execute_request(
         self,
         *,
@@ -919,6 +1188,7 @@ class _CandidatePlanner:
         cartesian_path: Optional[dict] = None,
         base_frame: Optional[str] = None,
         tcp_frame: Optional[str] = None,
+        execution_constraints: _ExecutionConstraintPayload | None = None,
     ) -> ExecuteRequest:
         robot = self._state.program.robot  # type: ignore[union-attr]
         # Honor the candidate's requested cartesian frameId / tcpFrame when set;
@@ -928,11 +1198,14 @@ class _CandidatePlanner:
         # validated.
         resolved_base = base_frame if base_frame else robot.base_frame
         resolved_tcp = tcp_frame if tcp_frame else robot.tcp_frame
-        # Forward both deployment dynamics channels: the Cartesian TCP speed cap
-        # and the per-joint Robot Control dynamics caps (Phase 4-P5.1K). The
-        # SAME caps are built for preview planning and the approval-time recheck
-        # (both call this helper), so the candidate is validated and executed
-        # against identical limits.
+        # Freeze both deployment dynamics channels on initial planning. Approval
+        # passes the candidate-owned immutable payload back into this helper so
+        # recheck cannot silently pick up a different deployment limit set.
+        constraints = (
+            execution_constraints
+            if execution_constraints is not None
+            else _execution_constraints_from_deployment(self._state)
+        )
         return ExecuteRequest(
             robot_id=robot.robot_id,
             group_id=robot.group_id,
@@ -944,8 +1217,8 @@ class _CandidatePlanner:
             joint_goal_positions_rad=list(joint_positions or []),
             pose_goal=pose_goal,
             cartesian_path=cartesian_path,
-            max_tcp_linear_speed_mps=self._global_tcp_speed_cap(),
-            per_joint_dynamics_limits=self._per_joint_dynamics_limits(),
+            max_tcp_linear_speed_mps=constraints.max_tcp_linear_speed_mps,
+            per_joint_dynamics_limits=constraints.to_kernel_limits(),
         )
 
     def _maybe_link_poses(
@@ -1230,10 +1503,12 @@ class _CandidatePlanner:
             joint_names=kernel_joint_names,
             joint_positions=target_positions,
         )
+        execution_constraints = _ExecutionConstraintPayload.from_request(exec_request)
         dispatch_params = {
             "motion_type": "joint",
             "joint_goal_names": kernel_joint_names,
             "joint_goal_positions_rad": target_positions,
+            **_execution_limit_dispatch_params(execution_constraints),
         }
         return self._run_preview(
             req,
@@ -1248,6 +1523,7 @@ class _CandidatePlanner:
             ghost_joint_names=kernel_joint_names,
             ghost_joint_positions=target_positions,
             blocked_target_pose=None,
+            execution_constraints=execution_constraints,
         )
 
     def _plan_cartesian(self, req, start, start_state_model, snapshot, _make):
@@ -1335,11 +1611,13 @@ class _CandidatePlanner:
             base_frame=candidate_base_frame,
             tcp_frame=candidate_tcp_frame,
         )
+        execution_constraints = _ExecutionConstraintPayload.from_request(exec_request)
         dispatch_params = {
             "motion_type": "cartesian",
             "cartesian_path": cartesian_path,
             "base_frame": candidate_base_frame,
             "tcp_frame": candidate_tcp_frame,
+            **_execution_limit_dispatch_params(execution_constraints),
         }
         # The requested TCP pose is always known for a Cartesian target, so a
         # blocked candidate can still render a red ghost at that pose.
@@ -1360,6 +1638,7 @@ class _CandidatePlanner:
             ghost_joint_names=None,
             ghost_joint_positions=None,
             blocked_target_pose=requested_pose,
+            execution_constraints=execution_constraints,
         )
 
     def _plan_gripper(self, req, snapshot, _make):
@@ -1449,6 +1728,7 @@ class _CandidatePlanner:
         ghost_joint_names: Optional[list[str]],
         ghost_joint_positions: Optional[list[float]],
         blocked_target_pose: Optional[CandidatePose],
+        execution_constraints: _ExecutionConstraintPayload,
     ):
         try:
             preview = self._state.kernel.preview_motion(exec_request, start)
@@ -1546,7 +1826,12 @@ class _CandidatePlanner:
                 summary="Candidate planned and validated; ready to approve.",
             ),
         )
-        return response, _StoredCandidate(response, snapshot, dispatch_params)
+        return response, _StoredCandidate(
+            response,
+            snapshot,
+            dispatch_params,
+            execution_constraints=execution_constraints,
+        )
 
 
 # --- Candidate store -------------------------------------------------------
@@ -1727,13 +2012,13 @@ class _CandidateStore:
             response.updated_at_ns = now
             stored.dispatch_params = None
             return
-        if stored.snapshot != current:
+        if not _planning_snapshots_equivalent(stored.snapshot, current):
             response.status = CandidateStatus.STALE
             response.commit_eligible = False
             response.diagnostics = CandidateDiagnostics(
                 reason_code=REASON_STALE,
                 summary=(
-                    "Robot state / loaded program changed since planning; "
+                    "Robot state / loaded program or deployment changed since planning; "
                     "re-author or re-approve to revalidate."
                 ),
             )
@@ -1883,17 +2168,25 @@ class _CandidateStore:
             return response.model_copy(deep=True)
 
     def commit_for_dispatch(
-        self, candidate_id: str
+        self,
+        candidate_id: str,
+        current: _PlanningSnapshot,
     ) -> tuple[bool, Optional[CandidateResponse]]:
         """Atomically confirm the candidate is STILL approving and flip it to
         EXECUTING under the lock, returning (committed, current-view).
 
-        This closes the begin_approval -> revalidate -> dispatch TOCTOU window.
+        This closes the candidate-lifecycle half of the
+        begin_approval -> revalidate -> dispatch TOCTOU window.
         `begin_approval` sets APPROVING and the caller caches dispatch_params,
-        but the mandatory revalidation (a kernel preview) runs WITHOUT the lock;
-        a concurrent `revert` could flip the candidate to REVERTED in that gap
-        while the caller still holds the cached params. Re-checking here, under
-        the lock, immediately before dispatch makes the decision atomic:
+        but the mandatory revalidation (a kernel preview) runs WITHOUT the
+        store lock; a concurrent `revert` could flip the candidate to REVERTED
+        in that gap while the caller still holds the cached params.
+
+        The caller MUST hold ``ComposerState.artifact_read_transaction`` while
+        computing ``current``, calling this method, and accepting dispatch.
+        That state-owned transaction supplies the matching program/deployment
+        cutover boundary; this store lock alone cannot serialize artifact
+        publication. Together they establish:
           - a revert that lands BEFORE this commit wins -> (False, ...), the
             caller must NOT dispatch (fail-closed, no motion);
           - a revert that lands AFTER sees EXECUTING and is refused (see
@@ -1904,6 +2197,19 @@ class _CandidateStore:
             if stored is None:
                 return False, None
             response = stored.response
+            if not _planning_snapshots_equivalent(stored.snapshot, current):
+                response.status = CandidateStatus.STALE
+                response.commit_eligible = False
+                response.diagnostics = CandidateDiagnostics(
+                    reason_code=REASON_STALE,
+                    summary=(
+                        "Robot state / loaded program or deployment changed "
+                        "during approval; re-author and approve again."
+                    ),
+                )
+                response.updated_at_ns = time.monotonic_ns()
+                stored.dispatch_params = None
+                return False, response.model_copy(deep=True)
             if (
                 response.status is not CandidateStatus.APPROVING
                 or stored.dispatch_params is None
@@ -2382,66 +2688,77 @@ def _execute_gripper_candidate(
                 "timestamp_ns": time.monotonic_ns(),
             },
         )
-    # Atomic commit closes the begin_approval -> revalidate -> dispatch TOCTOU:
-    # a concurrent revert that beat us wins (no command).
-    committed, commit_view = store.commit_for_dispatch(candidate_id)
-    if not committed:
-        reason = (
-            commit_view.diagnostics.reason_code
-            if commit_view is not None and commit_view.diagnostics is not None
-            else REASON_NOT_READY
+    # Match arm dispatch: one artifact transaction owns the final content check,
+    # candidate commit, and command acceptance.
+    with state.artifact_read_transaction():
+        committed, commit_view = store.commit_for_dispatch(
+            candidate_id,
+            _compute_planning_snapshot(state),
         )
-        return JSONResponse(
-            status_code=409,
-            content={
-                "reasonCode": reason,
-                "detail": "candidate was reverted or changed during approval; no command",
-                "candidate": (
-                    commit_view.model_dump(by_alias=True)
-                    if commit_view is not None
-                    else None
+        if not committed:
+            reason = (
+                commit_view.diagnostics.reason_code
+                if commit_view is not None
+                and commit_view.diagnostics is not None
+                else REASON_NOT_READY
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "reasonCode": reason,
+                    "detail": (
+                        "candidate was reverted or changed during approval; no command"
+                    ),
+                    "candidate": (
+                        commit_view.model_dump(by_alias=True)
+                        if commit_view is not None
+                        else None
+                    ),
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+        try:
+            result = state.kernel.command_gripper(validation.request)
+        except Exception as exc:  # noqa: BLE001 — dispatch failures are fail-closed
+            failed = store.finish_approval(
+                candidate_id,
+                status=CandidateStatus.ERROR,
+                diagnostics=CandidateDiagnostics(
+                    reason_code=REASON_BACKEND_UNAVAILABLE,
+                    summary=f"gripper command raised: {exc}",
                 ),
-                "timestamp_ns": time.monotonic_ns(),
-            },
-        )
-    try:
-        result = state.kernel.command_gripper(validation.request)
-    except Exception as exc:  # noqa: BLE001 — dispatch failures are fail-closed
-        failed = store.finish_approval(
-            candidate_id,
-            status=CandidateStatus.ERROR,
-            diagnostics=CandidateDiagnostics(
-                reason_code=REASON_BACKEND_UNAVAILABLE,
-                summary=f"gripper command raised: {exc}",
-            ),
-        )
-        return JSONResponse(
-            status_code=409,
-            content={
-                "reasonCode": REASON_BACKEND_UNAVAILABLE,
-                "detail": "gripper command dispatch failed; check kernel",
-                "candidate": failed.model_dump(by_alias=True) if failed else None,
-                "timestamp_ns": time.monotonic_ns(),
-            },
-        )
-    if not getattr(result, "accepted", False):
-        detail = getattr(result, "error", None) or "gripper command rejected"
-        failed = store.finish_approval(
-            candidate_id,
-            status=CandidateStatus.ERROR,
-            diagnostics=CandidateDiagnostics(
-                reason_code=REASON_BACKEND_UNAVAILABLE, summary=detail
-            ),
-        )
-        return JSONResponse(
-            status_code=409,
-            content={
-                "reasonCode": REASON_BACKEND_UNAVAILABLE,
-                "detail": detail,
-                "candidate": failed.model_dump(by_alias=True) if failed else None,
-                "timestamp_ns": time.monotonic_ns(),
-            },
-        )
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "reasonCode": REASON_BACKEND_UNAVAILABLE,
+                    "detail": "gripper command dispatch failed; check kernel",
+                    "candidate": (
+                        failed.model_dump(by_alias=True) if failed else None
+                    ),
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+        if not getattr(result, "accepted", False):
+            detail = getattr(result, "error", None) or "gripper command rejected"
+            failed = store.finish_approval(
+                candidate_id,
+                status=CandidateStatus.ERROR,
+                diagnostics=CandidateDiagnostics(
+                    reason_code=REASON_BACKEND_UNAVAILABLE, summary=detail
+                ),
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "reasonCode": REASON_BACKEND_UNAVAILABLE,
+                    "detail": detail,
+                    "candidate": (
+                        failed.model_dump(by_alias=True) if failed else None
+                    ),
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
     executed = store.finish_approval(
         candidate_id,
         status=CandidateStatus.EXECUTING,
@@ -2566,6 +2883,7 @@ def create_robot_control_candidates_router(state: ComposerState) -> APIRouter:
                 content={
                     "reasonCode": stop_block["error_code"],
                     "detail": stop_block["message"],
+                    "errorDetails": stop_block.get("error_details"),
                     "timestamp_ns": time.monotonic_ns(),
                 },
             )
@@ -2590,7 +2908,11 @@ def create_robot_control_candidates_router(state: ComposerState) -> APIRouter:
                 },
             )
 
-        dispatch_params = stored.dispatch_params
+        dispatch_params = (
+            deepcopy(stored.dispatch_params)
+            if stored.dispatch_params is not None
+            else None
+        )
         if dispatch_params is None:
             failed = store.finish_approval(
                 candidate_id,
@@ -2610,6 +2932,29 @@ def create_robot_control_candidates_router(state: ComposerState) -> APIRouter:
                 },
             )
 
+        execution_constraints = stored.execution_constraints
+        if (
+            dispatch_params.get("motion_type") != "gripper"
+            and execution_constraints is None
+        ):
+            failed = store.finish_approval(
+                candidate_id,
+                status=CandidateStatus.ERROR,
+                diagnostics=CandidateDiagnostics(
+                    reason_code=REASON_NOT_READY,
+                    summary="Candidate has no frozen execution constraints.",
+                ),
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "reasonCode": REASON_NOT_READY,
+                    "detail": "candidate has no frozen execution constraints; no motion",
+                    "candidate": failed.model_dump(by_alias=True) if failed else None,
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+
         # Gripper candidates dispatch through the lightweight gripper bridge (not
         # the arm intervention path): revalidate the same deployment/config/limit
         # facts, atomically commit, then send exactly one gripper command.
@@ -2617,6 +2962,14 @@ def create_robot_control_candidates_router(state: ComposerState) -> APIRouter:
             return _execute_gripper_candidate(
                 state, store, candidate_id, dispatch_params
             )
+        assert execution_constraints is not None
+
+        # Rebuild the mutable intervention dict from the immutable
+        # candidate-owned payload. This prevents either a caller or a later
+        # deployment edit from changing the caps between preview and dispatch.
+        dispatch_params.pop("max_tcp_linear_speed_mps", None)
+        dispatch_params.pop("per_joint_dynamics_limits", None)
+        dispatch_params.update(execution_constraints.to_dispatch_params())
 
         # MANDATORY pre-dispatch revalidation against the CURRENT robot state.
         # This is the freshness gate that also catches scene/collision-world
@@ -2654,6 +3007,7 @@ def create_robot_control_candidates_router(state: ComposerState) -> APIRouter:
             # defaults, so the pre-dispatch gate matches the planned motion.
             base_frame=dispatch_params.get("base_frame"),
             tcp_frame=dispatch_params.get("tcp_frame"),
+            execution_constraints=execution_constraints,
         )
         try:
             recheck = state.kernel.preview_motion(recheck_request, start)
@@ -2678,64 +3032,81 @@ def create_robot_control_candidates_router(state: ComposerState) -> APIRouter:
                 },
             )
 
-        # Close the begin_approval -> revalidate -> dispatch TOCTOU: a concurrent
-        # revert can flip the candidate to REVERTED after begin_approval cached
-        # dispatch_params and while the (lock-free) revalidation ran. Re-commit
-        # atomically under the store lock immediately before dispatch so a revert
-        # that beat us wins (no motion) and a revert that arrives after sees
-        # EXECUTING. Fail closed if the candidate is no longer approving.
-        committed, commit_view = store.commit_for_dispatch(candidate_id)
-        if not committed:
-            reason = (
-                commit_view.diagnostics.reason_code
-                if commit_view is not None and commit_view.diagnostics is not None
-                else REASON_NOT_READY
+        # Close both approval races at one state-owned linearization boundary:
+        # the candidate-store commit resolves concurrent Revert, while the
+        # artifact read transaction prevents a program/deployment cutover from
+        # publishing after the final snapshot but before dispatch acceptance.
+        # A cutover that acquired the transaction first is visible below and
+        # makes the candidate stale; one that arrives later waits until the
+        # intervention has been accepted and then observes execution admission.
+        with state.artifact_read_transaction():
+            committed, commit_view = store.commit_for_dispatch(
+                candidate_id,
+                _compute_planning_snapshot(state),
             )
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "reasonCode": reason,
-                    "detail": (
-                        "candidate was reverted or changed during approval; no motion"
+            if not committed:
+                reason = (
+                    commit_view.diagnostics.reason_code
+                    if commit_view is not None
+                    and commit_view.diagnostics is not None
+                    else REASON_NOT_READY
+                )
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "reasonCode": reason,
+                        "detail": (
+                            "candidate was reverted or changed during approval; "
+                            "no motion"
+                        ),
+                        "candidate": (
+                            commit_view.model_dump(by_alias=True)
+                            if commit_view is not None
+                            else None
+                        ),
+                        "timestamp_ns": time.monotonic_ns(),
+                    },
+                )
+
+            # Freshness proven and dispatch committed: run the normal
+            # intervention path before releasing artifact stability. Approve is
+            # an explicit human action; use the authenticated principal when
+            # present, else a stable operator id so the audit trail always
+            # identifies the Robot Control surface.
+            auth_principal = getattr(http_request.state, "principal_id", None)
+            principal = auth_principal or "robot_control_operator"
+            try:
+                session, move_id = _dispatch_candidate(
+                    state, dispatch_params, principal
+                )
+            except _DispatchError as exc:
+                failed = store.finish_approval(
+                    candidate_id,
+                    status=CandidateStatus.ERROR,
+                    diagnostics=CandidateDiagnostics(
+                        reason_code=exc.reason_code, summary=exc.message
                     ),
+                )
+                content: dict[str, Any] = {
+                    "reasonCode": exc.reason_code,
+                    "detail": exc.message,
                     "candidate": (
-                        commit_view.model_dump(by_alias=True)
-                        if commit_view is not None
-                        else None
+                        failed.model_dump(by_alias=True) if failed else None
                     ),
                     "timestamp_ns": time.monotonic_ns(),
-                },
-            )
+                }
+                if exc.details is not None:
+                    content["details"] = exc.details
+                return JSONResponse(status_code=exc.status_code, content=content)
 
-        # Freshness proven and dispatch committed: run the normal intervention
-        # path. Approve is an explicit human action; use the authenticated
-        # principal when present, else a stable operator id so the intervention
-        # audit trail always identifies the Robot Control surface.
-        auth_principal = getattr(http_request.state, "principal_id", None)
-        principal = auth_principal or "robot_control_operator"
-        try:
-            session, move_id = _dispatch_candidate(state, dispatch_params, principal)
-        except _DispatchError as exc:
-            failed = store.finish_approval(
-                candidate_id,
-                status=CandidateStatus.ERROR,
-                diagnostics=CandidateDiagnostics(
-                    reason_code=exc.reason_code, summary=exc.message
-                ),
-            )
-            content: dict[str, Any] = {
-                "reasonCode": exc.reason_code,
-                "detail": exc.message,
-                "candidate": failed.model_dump(by_alias=True) if failed else None,
-                "timestamp_ns": time.monotonic_ns(),
-            }
-            if exc.details is not None:
-                content["details"] = exc.details
-            return JSONResponse(status_code=exc.status_code, content=content)
-
-        # Optimistic joint cache update for joint goals (mirrors direct-jog) so
-        # the panel does not snap back while the move completes.
-        if dispatch_params["motion_type"] == "joint":
+        # Backend-authored native/sim lanes may optimistically project the
+        # commanded target so the panel does not snap back while motion runs.
+        # In observed_ros2, measured robot state is the sole position authority:
+        # commanded intent must never overwrite that cache.
+        if (
+            dispatch_params["motion_type"] == "joint"
+            and stored.snapshot.state_source != "observed_ros2"
+        ):
             state.record_current_joint_positions(
                 list(dispatch_params["joint_goal_positions_rad"])
             )

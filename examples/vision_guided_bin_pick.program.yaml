@@ -6,7 +6,7 @@ description: >-
   native viewer scene snapshot, asks the configured vision model which of two candidate
   objects should be picked next, and mirrors the validated decision onto the
   blackboard. The tree then routes into one of two fixed pick/place sequences.
-catalog_version: "0.4.0"
+catalog_version: "0.5.0"
 
 robot:
   robot_id: ur5

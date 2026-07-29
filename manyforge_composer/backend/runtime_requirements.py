@@ -33,6 +33,7 @@ class DeploymentRequirementsDTO:
     """What a deployment expects of the composer runtime."""
 
     execution_backend: str  # "native" | "ros2_control" | "observed_ros2" | "unknown"
+    deployment_lane: Optional[str] = None
     ros_adapter_required: bool = False
     isaac_supervisor_required: bool = False
     action_servers: tuple[str, ...] = ()
@@ -41,6 +42,7 @@ class DeploymentRequirementsDTO:
     def to_dict(self) -> dict[str, Any]:
         return {
             "execution_backend": self.execution_backend,
+            "deployment_lane": self.deployment_lane,
             "ros_adapter_required": self.ros_adapter_required,
             "isaac_supervisor_required": self.isaac_supervisor_required,
             "action_servers": list(self.action_servers),
@@ -52,7 +54,7 @@ class DeploymentRequirementsDTO:
 class RuntimeCapabilitiesDTO:
     """What this composer image / running instance can satisfy."""
 
-    lane: str  # "manyforge-only" | "isaac-sim" | "observed-ros2" | "unknown"
+    lane: str  # "manyforge-only" | "isaac-sim" | "real-robot" | "observed-ros2" | "unknown"
     ros_adapter_available: bool
     isaac_supervisor_available: bool
     has_kernel_factory: bool
@@ -149,7 +151,12 @@ def detect_current_lane() -> str:
     can't tell. Pure.
     """
     raw = os.environ.get("MANYFORGE_LANE", "").strip().lower()
-    if raw in {"manyforge-only", "isaac-sim", "observed-ros2"}:
+    if raw in {
+        "manyforge-only",
+        "isaac-sim",
+        "real-robot",
+        "observed-ros2",
+    }:
         return raw
     return "unknown"
 
@@ -163,6 +170,7 @@ def derive_deployment_requirements(deployment: Any) -> DeploymentRequirementsDTO
     YAML schema migration required for existing deployments.
     """
     backend = "unknown"
+    deployment_lane: Optional[str] = None
     ros_required = False
     supervisor_required = False
     action_servers: list[str] = []
@@ -170,6 +178,11 @@ def derive_deployment_requirements(deployment: Any) -> DeploymentRequirementsDTO
 
     if deployment is None:
         return DeploymentRequirementsDTO(execution_backend=backend)
+
+    compatibility = _attr_or_key(deployment, "compatibility", None)
+    raw_lane = _attr_or_key(compatibility, "lane", None)
+    if raw_lane in {"manyforge-only", "isaac-sim", "real-robot"}:
+        deployment_lane = str(raw_lane)
 
     # 1) Explicit `requires:` block wins — declared intent over inference.
     requires = _attr_or_key(deployment, "requires", None)
@@ -181,6 +194,7 @@ def derive_deployment_requirements(deployment: Any) -> DeploymentRequirementsDTO
         topics = list(requires.get("topics", []) or [])
         return DeploymentRequirementsDTO(
             execution_backend=backend,
+            deployment_lane=deployment_lane,
             ros_adapter_required=ros_required,
             isaac_supervisor_required=supervisor_required,
             action_servers=tuple(action_servers),
@@ -227,6 +241,7 @@ def derive_deployment_requirements(deployment: Any) -> DeploymentRequirementsDTO
 
     return DeploymentRequirementsDTO(
         execution_backend=backend,
+        deployment_lane=deployment_lane,
         ros_adapter_required=ros_required,
         isaac_supervisor_required=supervisor_required,
         action_servers=tuple(action_servers),
@@ -275,7 +290,11 @@ def check_compatibility(
     suggested_command: Optional[str] = None
 
     if requirements.execution_backend == "ros2_control":
-        expected_lane = "isaac-sim"
+        expected_lane = (
+            requirements.deployment_lane
+            if requirements.deployment_lane in {"isaac-sim", "real-robot"}
+            else "isaac-sim"
+        )
         if not capabilities.has_kernel_factory or not capabilities.ros_adapter_available:
             # Fundamental lane mismatch — the runtime adapter isn't even
             # present in this image.
@@ -325,5 +344,10 @@ def _suggest_launcher_command(expected_lane: Optional[str]) -> Optional[str]:
         return (
             "scripts/launch.sh --lane isaac-sim "
             "--scenario isaac-ur10e-light-scene restart"
+        )
+    if expected_lane == "real-robot":
+        return (
+            "scripts/launch.sh --lane real-robot "
+            "--scenario real-lite6-commissioning restart"
         )
     return f"scripts/launch.sh --lane {expected_lane} restart"

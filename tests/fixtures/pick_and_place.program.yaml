@@ -4,7 +4,7 @@ name: pick_and_place_integration_test
 description: >-
   Full pick-and-place pipeline exercising scene edits, multiple motions,
   blackboard logic, timers, and cache invalidation via the kernel.
-catalog_version: "0.4.0"
+catalog_version: "0.5.0"
 
 robot:
   robot_id: robot1

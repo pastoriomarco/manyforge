@@ -79,11 +79,17 @@ def test_inspect_isaac_scene_topic_rpc_returns_correlated_report():
         assert response["success"] is True
         assert response["summary"]["collider_count"] == 2
         assert response["objects"][0]["source_root"] == "/World/soup_can"
-        assert received_requests == [query.to_request_payload()]
+        assert received_requests
+        assert all(
+            request == query.to_request_payload()
+            for request in received_requests
+        )
     finally:
+        executor.shutdown(timeout_sec=2.0)
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
         server_node.destroy_subscription(request_subscription)
         server_node.destroy_publisher(response_publisher)
-        executor.shutdown()
         server_node.destroy_node()
         client_node.destroy_node()
         rclpy.shutdown()

@@ -24,16 +24,19 @@ def _write(tmp_path: Path, document: dict) -> Path:
     return path
 
 
-def test_packaged_catalog_loads_five_immutable_definitions() -> None:
+def test_packaged_catalog_loads_six_immutable_definitions() -> None:
     catalog = load_operator_alarm_catalog()
 
     assert catalog.schema_version == OPERATOR_ALARM_CATALOG_SCHEMA_VERSION
-    assert catalog.catalog_version == "1.0.0"
-    assert len(catalog.definitions) == 5
+    assert catalog.catalog_version == "1.1.0"
+    assert len(catalog.definitions) == 6
     assert len(catalog.sha256) == 64
     assert catalog.definition(
         "manyforge.motion.runtime_collision"
     ).priority == "critical"
+    assert catalog.definition(
+        "manyforge.runtime.robot_lifecycle_fault"
+    ).requires_motion_attention
     with pytest.raises(TypeError):
         catalog.definitions["new"] = catalog.definition(
             "manyforge.motion.runtime_collision"

@@ -696,7 +696,9 @@ _ALLOWED_ASSISTANT_REVIEW_POLICIES = {
 }
 _QUERY_ASSISTANT_MODE_ID = "query"
 _COMPOSER_ASSISTANT_MODE_ID = "composer-assistant"
-_COMPATIBILITY_LANES = frozenset({"manyforge-only", "isaac-sim"})
+_COMPATIBILITY_LANES = frozenset(
+    {"manyforge-only", "isaac-sim", "real-robot"}
+)
 _SCENARIO_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
@@ -891,7 +893,8 @@ def _parse_deployment_compatibility(raw: Any) -> DeploymentCompatibility | None:
     lane = raw.get("lane")
     if lane not in _COMPATIBILITY_LANES:
         raise DeploymentValidationError(
-            "compatibility.lane must be manyforge-only or isaac-sim"
+            "compatibility.lane must be manyforge-only, isaac-sim, "
+            "or real-robot"
         )
     raw_scenarios = raw.get("scenarios", [])
     if not isinstance(raw_scenarios, list):

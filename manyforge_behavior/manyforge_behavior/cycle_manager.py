@@ -411,6 +411,7 @@ class CycleManager:
             on_offer_published=self._handle_recovery_offer_published,
         )
         self._on_run_from_idle: Optional[Callable[[], None]] = None
+        self._on_reset_completed: Optional[Callable[[], None]] = None
         self._error: Optional[str] = None
         # Structured cause for the viewer: when the cycle's `_error` is set from
         # a kernel-side fault (collision, intervention, etc.), the kernel's
@@ -2192,6 +2193,25 @@ class CycleManager:
         """Install a callback used to correlate delegated recovery requests to runs."""
         self._parent_run_id_provider = provider
 
+    def set_on_run_from_idle(
+        self,
+        callback: Optional[Callable[[], None]],
+    ) -> None:
+        """Install a final admission callback before a fresh tick thread starts.
+
+        The callback runs after the fresh tree and blackboard are prepared but
+        before RUNNING is published. Raising rejects Run without starting the
+        tree. It must remain bounded and must not call back into CycleManager.
+        """
+        self._on_run_from_idle = callback
+
+    def set_on_reset_completed(
+        self,
+        callback: Optional[Callable[[], None]],
+    ) -> None:
+        """Install a callback after Reset has committed a fresh IDLE cycle."""
+        self._on_reset_completed = callback
+
     def set_on_delegated_recovery_requested(
         self,
         callback: Optional[Callable[[DelegatedRecoveryRequest], None]],
@@ -2731,6 +2751,97 @@ class CycleManager:
             principal_id,
         )
 
+    @staticmethod
+    def _equivalent_assessment_refresh_request(
+        *,
+        kernel_request: dict[str, Any],
+        kernel_result: dict[str, Any],
+        offer: CycleRecoveryOffer,
+        action_id: str,
+        facts: CycleRecoveryFacts,
+    ) -> Optional[dict[str, Any]]:
+        """Rebind one non-mutating assessment refresh to the same user action.
+
+        The Kernel refreshes observation-dependent recovery evidence under its
+        lifecycle lock when an action is admitted. If the human-facing offer
+        outlives the captured sample, the first exact request can therefore be
+        rejected as ``assessment_stale`` even though every stable recovery
+        identity and admission predicate is unchanged.
+
+        Permit one internal retry only when the rejected result proves that
+        exact case. The retry remains bound to the current Kernel assessment;
+        any authority, execution, certificate, recovery semantic, or allowed
+        action change fails closed and requires a new operator choice.
+        """
+        if kernel_result.get("accepted") is not False:
+            return None
+        error = kernel_result.get("error")
+        if not isinstance(error, dict):
+            return None
+        details = error.get("details")
+        if (
+            not isinstance(details, dict)
+            or str(details.get("reason") or "") != "assessment_stale"
+        ):
+            return None
+        assessment = kernel_result.get("resulting_assessment")
+        if not isinstance(assessment, dict):
+            return None
+
+        try:
+            assessment_revision = int(
+                assessment.get("assessment_revision") or 0
+            )
+            control_command_epoch = int(
+                assessment.get("control_command_epoch") or 0
+            )
+            execution_id = int(assessment.get("execution_id") or 0)
+            stop_owner_generation = int(
+                assessment.get("stop_owner_generation") or 0
+            )
+        except (TypeError, ValueError):
+            return None
+        if (
+            assessment_revision <= 0
+            or assessment_revision
+            == int(kernel_request.get("expected_assessment_revision") or 0)
+            or control_command_epoch != offer.control_command_epoch
+            or execution_id != int(offer.execution_id or 0)
+            or stop_owner_generation != offer.stop_owner_generation
+            or str(assessment.get("latch_id") or "")
+            != str(offer.latch_id or "")
+            or str(assessment.get("stop_certificate_id") or "")
+            != str(offer.stop_certificate_id or "")
+            or str(assessment.get("recovery_class") or "")
+            != offer.recovery_class
+            or str(assessment.get("status") or "") != offer.status
+            or str(assessment.get("reason_code") or "") != offer.reason_code
+            or action_id
+            not in {
+                str(candidate)
+                for candidate in assessment.get("allowed_actions") or []
+            }
+            or bool(assessment.get("stop_owner_active"))
+            or bool(assessment.get("stronger_authority_active"))
+            or bool(assessment.get("queued_latch_present"))
+            or facts.cycle_generation != offer.cycle_generation
+            or facts.program_generation != offer.program_generation
+            or facts.deployment_generation != offer.deployment_generation
+            or facts.scene_admission_epoch != offer.scene_admission_epoch
+            or (
+                facts.pose_source_apply_generation
+                != offer.pose_source_apply_generation
+            )
+            or facts.lifecycle_command_pending
+            or facts.direct_control_active
+            or facts.intervention_active
+        ):
+            return None
+
+        refreshed = dict(kernel_request)
+        refreshed["expected_assessment_revision"] = assessment_revision
+        return refreshed
+
     def _begin_recovery_request(
         self,
         request_id: str,
@@ -2985,6 +3096,7 @@ class CycleManager:
                 else:
                     kernel_result: Optional[dict[str, Any]] = None
                     kernel_action_accepted = False
+                    assessment_refresh_retried = False
                     if is_kernel_recovery_action(action.action_id):
                         kernel_request = {
                             "request_id": request_id,
@@ -3007,12 +3119,33 @@ class CycleManager:
                             "reason": reason,
                         }
                         try:
-                            kernel_result = self._kernel_control_command(
-                                "apply_recovery_action",
-                                lambda _epoch: self._kernel.apply_recovery_action(
-                                    kernel_request
-                                ),
+                            def apply_kernel_recovery(
+                                candidate_request: dict[str, Any],
+                            ) -> dict[str, Any]:
+                                return self._kernel_control_command(
+                                    "apply_recovery_action",
+                                    lambda _epoch: (
+                                        self._kernel.apply_recovery_action(
+                                            candidate_request
+                                        )
+                                    ),
+                                )
+
+                            kernel_result = apply_kernel_recovery(kernel_request)
+                            refreshed_request = (
+                                self._equivalent_assessment_refresh_request(
+                                    kernel_request=kernel_request,
+                                    kernel_result=kernel_result,
+                                    offer=accepted_offer,
+                                    action_id=action.action_id,
+                                    facts=self._capture_recovery_facts(),
+                                )
                             )
+                            if refreshed_request is not None:
+                                assessment_refresh_retried = True
+                                kernel_result = apply_kernel_recovery(
+                                    refreshed_request
+                                )
                         except Exception as exc:  # noqa: BLE001 - bounded RPC boundary.
                             error = {
                                 "code": "recovery_action_transport_failed",
@@ -3139,6 +3272,9 @@ class CycleManager:
                             **requested_details,
                             "performs_backend_reset": False,
                             "kernel_action_result": kernel_result,
+                            "assessment_refresh_retried": (
+                                assessment_refresh_retried
+                            ),
                             "cycle_resumed": cycle_resumed,
                             "cycle_resume_ready": resume_ready,
                             "result_code": result_code,
@@ -3802,7 +3938,105 @@ class CycleManager:
             self._error_details = None
             self._state = CycleState.IDLE
             self._pending_delegated_recovery = None
+        reset_completed = self._on_reset_completed
+        if reset_completed is not None:
+            try:
+                reset_completed()
+            except Exception:
+                # Reset is already committed and the callback is supervisory
+                # bookkeeping only. Keep the fresh IDLE state authoritative.
+                logger.exception("Reset-completed callback failed")
         self.refresh_recovery_offer()
+
+    def contain_execution_environment_loss(
+        self,
+        *,
+        reason_code: str,
+        details: Optional[dict[str, Any]] = None,
+        is_current: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        """Quiesce a cycle whose immutable execution environment was lost.
+
+        This is a terminal supervisory containment request, not the operator's
+        resumable Motion Stop. The caller separately retains the reset-required
+        latch so a later healthy heartbeat or robot Enable cannot resume this
+        tree. ``full_stop`` keeps the existing bounded Kernel stop semantics.
+
+        The transition lock linearizes this asynchronous request against Run
+        and Reset. ``is_current`` is evaluated only after that lock is held, so
+        a containment generation queued before a completed Reset cannot act on
+        the replacement cycle.
+        """
+        with self._run_transition_lock:
+            if is_current is not None and not is_current():
+                return False
+            self._contain_execution_environment_loss_impl(
+                reason_code=reason_code,
+                details=details,
+            )
+            return True
+
+    def _contain_execution_environment_loss_impl(
+        self,
+        *,
+        reason_code: str,
+        details: Optional[dict[str, Any]],
+    ) -> None:
+        stop_error = ""
+        try:
+            self.full_stop()
+        except Exception as exc:  # noqa: BLE001 - containment continues.
+            stop_error = str(exc) or type(exc).__name__
+            logger.exception(
+                "Execution-environment containment full stop failed"
+            )
+
+        # Full Stop intentionally does nothing from an already STOPPED cycle.
+        # A retained paused Kernel execution can still exist there, so apply
+        # the direct Kernel fence independently. This is also the fallback if
+        # the normal cycle-layer stop above failed.
+        try:
+            self._quiesce_runtime(
+                client_name="execution_environment_containment",
+                kernel_action="stop_if_active",
+            )
+        except Exception as exc:  # noqa: BLE001 - latch remains terminal.
+            stop_error = stop_error or str(exc) or type(exc).__name__
+            logger.exception(
+                "Execution-environment containment Kernel fence failed"
+            )
+            self._request_kernel_stop_best_effort(
+                "execution_environment_containment_fallback"
+            )
+
+        try:
+            kernel_state = self._kernel_state_with_timeout(
+                "execution_environment_containment_post_status"
+            )
+        except Exception as exc:  # noqa: BLE001 - unknown stays STOPPING.
+            stop_error = stop_error or str(exc) or type(exc).__name__
+            kernel_state = ExecutionState.STOPPING
+
+        bounded_details = (
+            deepcopy(details) if isinstance(details, dict) else {}
+        )
+        bounded_details["reason"] = reason_code
+        bounded_details["requires_reset"] = True
+        if stop_error:
+            bounded_details["stop_error"] = stop_error
+        with self._lock:
+            self._tick_stop_event.set()
+            self._error = (
+                "Execution environment changed; reset the cycle before "
+                "starting a new run"
+            )
+            self._error_code = "execution_environment_changed"
+            self._error_details = bounded_details
+            if self._kernel_stop_terminal(kernel_state):
+                self._state = CycleState.STOPPED
+            else:
+                self._state = CycleState.STOPPING
+                self._start_stop_settle_watcher_locked()
 
     def set_velocity_scale(
         self, scale: float, principal_id: str | None = None
@@ -4916,12 +5150,14 @@ class CycleManager:
                 self._error = "intervention tick thread did not terminate"
 
     def _write_bb_keys(self) -> None:
-        """Write stop_requested=False, velocity_scale, program_run_id to blackboard."""
+        """Publish the cycle-owned runtime values required by behavior nodes."""
         bb = py_trees.blackboard.Client(name="cycle_manager_init")
+        bb.register_key(key="kernel", access=py_trees.common.Access.WRITE)
         bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
         bb.register_key(key="motion_stop_active", access=py_trees.common.Access.WRITE)
         bb.register_key(key="velocity_scale", access=py_trees.common.Access.WRITE)
         bb.register_key(key="program_run_id", access=py_trees.common.Access.WRITE)
+        bb.kernel = self._kernel
         bb.stop_requested = False
         bb.motion_stop_active = False
         bb.velocity_scale = self._velocity_scale

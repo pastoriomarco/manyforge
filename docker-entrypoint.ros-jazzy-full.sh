@@ -24,6 +24,15 @@ if [ -f "/opt/manyforge/topic_based_ros2_control/install/setup.bash" ]; then
     set -u
 fi
 
+if [ -f "/opt/manyforge/xarm/install/setup.bash" ]; then
+    # Optional dedicated real-Lite6 overlay. Simulation/full images do not
+    # carry this path and retain their existing environment unchanged.
+    # shellcheck disable=SC1091
+    set +u
+    source "/opt/manyforge/xarm/install/setup.bash"
+    set -u
+fi
+
 if [ -d "$MANYFORGE_VENV" ]; then
     # shellcheck disable=SC1091
     set +u

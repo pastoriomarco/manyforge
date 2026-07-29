@@ -209,6 +209,12 @@ class TestMoveManipulatorAction:
             velocity_scale=0.5,
             acceleration_scale=0.6,
             max_tcp_linear_speed_mps=0.5,
+            per_joint_dynamics_limits={
+                "j1": {
+                    "max_velocity_rad_s": 0.4,
+                    "max_acceleration_rad_s2": 1.5,
+                }
+            },
             joint_position_tol_rad=0.02,
             translation_tol_m=0.003,
             rotation_tol_rad=0.04,
@@ -220,9 +226,67 @@ class TestMoveManipulatorAction:
         assert kernel.last_execute_request.velocity_scale == pytest.approx(0.5)
         assert kernel.last_execute_request.acceleration_scale == pytest.approx(0.6)
         assert kernel.last_execute_request.max_tcp_linear_speed_mps == pytest.approx(0.25)
+        joint_limit = kernel.last_execute_request.per_joint_dynamics_limits["j1"]
+        assert joint_limit.max_velocity_rad_s == pytest.approx(0.4)
+        assert joint_limit.max_acceleration_rad_s2 == pytest.approx(1.5)
+        assert joint_limit.max_jerk_rad_s3 is None
         assert kernel.last_execute_request.joint_position_tol_rad == pytest.approx(0.02)
         assert kernel.last_execute_request.translation_tol_m == pytest.approx(0.003)
         assert kernel.last_execute_request.rotation_tol_rad == pytest.approx(0.04)
+
+    @pytest.mark.parametrize(
+        ("limits", "message"),
+        [
+            (
+                {"j1": {"max_velocity_rad_s": 0.0}},
+                "must be a finite number greater than zero",
+            ),
+            (
+                {"j1": {"max_velocity_rad_s": float("nan")}},
+                "must be a finite number greater than zero",
+            ),
+            (
+                {"j1": {"unexpected_limit": 1.0}},
+                "contains unknown fields",
+            ),
+            (
+                {"j1": {}},
+                "must contain at least one cap",
+            ),
+        ],
+    )
+    def test_rejects_malformed_per_joint_dynamics_limits(
+        self, kernel, bb_with_kernel, limits, message
+    ):
+        node = MoveManipulatorAction(
+            name="test_move_bad_limits",
+            move_id="m_bad_limits",
+            motion_type="joint",
+            joint_goal_names=["j1"],
+            joint_goal_positions_rad=[1.0],
+            per_joint_dynamics_limits=limits,
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        assert message in node.feedback_message
+        assert kernel.execute_count == 0
+
+    def test_bounds_per_joint_dynamics_limit_count(self, kernel, bb_with_kernel):
+        node = MoveManipulatorAction(
+            name="test_move_too_many_limits",
+            move_id="m_too_many_limits",
+            motion_type="joint",
+            joint_goal_names=["j1"],
+            joint_goal_positions_rad=[1.0],
+            per_joint_dynamics_limits={
+                f"joint_{index}": {"max_velocity_rad_s": 0.5}
+                for index in range(129)
+            },
+        )
+
+        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        assert "must contain at most 128 joints" in node.feedback_message
+        assert kernel.execute_count == 0
 
     def test_runtime_velocity_scale_does_not_modify_dispatched_request(self, bb_with_kernel):
         kernel = MockKernelClient(execute_duration_s=0.05)

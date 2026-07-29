@@ -9082,35 +9082,38 @@ ExecutionStatus ExecutionKernel::get_status() const {
 ExecutionSnapshot ExecutionKernel::get_execution_snapshot() const {
   const auto kernel_status = sm_.status();
   const auto kernel_state = kernel_status.state;
-  // Live backend read during kStopping (1B: the worker may be blocked inside
-  // execute_controlled_stop and cannot pump the cache, yet stop observability
-  // is safety-relevant) AND during kExecuting (visual/observer freshness: the
-  // backend samples the trajectory every kExecutionTick, and serving the
-  // cached copy makes display consumers see joints up to a publish-cycle
-  // stale — the native-viewer flicker). The kernel remains the lifecycle
-  // authority: state and execution identity are stamped from the state
-  // machine, never trusted from the backend's view.
+  // Read the live backend while idle so continuously observed physical state
+  // is available before the first plan, and during kStopping/kExecuting where
+  // serving the published cache would hide safety-relevant or moving state.
+  // The kernel remains the lifecycle authority: state and execution identity
+  // are stamped from the state machine, never trusted from the backend's view.
   if (kernel_state == ExecutionState::kStopping ||
-      kernel_state == ExecutionState::kExecuting) {
+      kernel_state == ExecutionState::kExecuting ||
+      kernel_state == ExecutionState::kIdle) {
     auto backend_snapshot = execution_backend_.get_execution_snapshot();
-    backend_snapshot.state = kernel_state;
-    backend_snapshot.execution_id = kernel_status.execution_id;
-    backend_snapshot.move_id = active_correlation_.move_id();
-    if (backend_snapshot.timestamp_ns == 0) {
-      backend_snapshot.timestamp_ns = clock_.now();
-    }
-    if (backend_snapshot.timestamp_ns > 0) {
-      const auto now_ns = clock_.now();
-      if (now_ns >= backend_snapshot.timestamp_ns) {
-        const auto lag_ns =
-            static_cast<uint64_t>(now_ns - backend_snapshot.timestamp_ns);
-        std::lock_guard<std::mutex> lock(metrics_mutex_);
-        metrics_.observer_lag_max_ns =
-            std::max(metrics_.observer_lag_max_ns, lag_ns);
+    // An idle backend may not have observed its first physical sample yet.
+    // Preserve the kernel's published fallback until it has useful positions.
+    if (kernel_state != ExecutionState::kIdle ||
+        !backend_snapshot.joint_positions_rad.empty()) {
+      backend_snapshot.state = kernel_state;
+      backend_snapshot.execution_id = kernel_status.execution_id;
+      backend_snapshot.move_id = active_correlation_.move_id();
+      if (backend_snapshot.timestamp_ns == 0) {
+        backend_snapshot.timestamp_ns = clock_.now();
       }
+      if (backend_snapshot.timestamp_ns > 0) {
+        const auto now_ns = clock_.now();
+        if (now_ns >= backend_snapshot.timestamp_ns) {
+          const auto lag_ns =
+              static_cast<uint64_t>(now_ns - backend_snapshot.timestamp_ns);
+          std::lock_guard<std::mutex> lock(metrics_mutex_);
+          metrics_.observer_lag_max_ns =
+              std::max(metrics_.observer_lag_max_ns, lag_ns);
+        }
+      }
+      stamp_active_request_correlation(backend_snapshot);
+      return backend_snapshot;
     }
-    stamp_active_request_correlation(backend_snapshot);
-    return backend_snapshot;
   }
 
   ExecutionSnapshot snapshot = snapshot_publisher_.latest();

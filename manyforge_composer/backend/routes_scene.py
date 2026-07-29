@@ -56,7 +56,7 @@ from manyforge_behavior.geometry import (
     xyzw_to_rpy_deg as _xyzw_to_rpy_deg,
 )
 from .route_execution import run_route_background
-from .state import ComposerState
+from .state import ComposerState, JointPositionResolution
 from .viewer_data_plane import (
     ViewerInputUnchanged,
     ViewerSnapshotBuild,
@@ -729,45 +729,24 @@ def _base_robot_route_metadata(
 
 
 def _execution_authority_metadata(
-    state: ComposerState,
-    snapshot: Any | None = None,
+    resolution: JointPositionResolution,
 ) -> dict[str, Any]:
-    """Return state-authority metadata for scene robot snapshots.
+    """Return metadata captured with the exact displayed joint positions.
 
     Phase 4-P3 requires `/api/scene/state` consumers (native viewer and
     Cartesian gizmo included) to be auditable against the same state authority
-    as `/api/kernel/snapshot`. This helper is only called by the visual-state
-    publisher or its cold-cache fallback, never while serving a cached
-    scene-state snapshot.
+    as `/api/kernel/snapshot`. Accepting the atomic resolution rather than a
+    second snapshot prevents cached/initial/commanded positions from being
+    labelled with unrelated observed-state metadata.
     """
 
-    if state.kernel is None:
-        return {}
-    try:
-        if snapshot is None:
-            snapshot = (
-                state.cycle_manager.get_execution_snapshot()
-                if state.cycle_manager is not None
-                else state.kernel.get_execution_snapshot()
-            )
-    except Exception:
-        logger.debug(
-            "execution authority metadata unavailable for scene robot state",
-            exc_info=True,
-            extra={"event": "manyforge.visual.authority_metadata_unavailable"},
-        )
-        return {}
-
     metadata: dict[str, Any] = {}
-    state_source = getattr(snapshot, "state_source", "") or None
-    if state_source is not None:
-        metadata["state_source"] = state_source
-    source_timestamp_ns = getattr(snapshot, "source_timestamp_ns", None)
-    if source_timestamp_ns is not None:
-        metadata["source_timestamp_ns"] = source_timestamp_ns
-    source_age_ns = getattr(snapshot, "source_age_ns", None)
-    if source_age_ns is not None:
-        metadata["source_age_ns"] = source_age_ns
+    if resolution.state_source is not None:
+        metadata["state_source"] = resolution.state_source
+    if resolution.source_timestamp_ns is not None:
+        metadata["source_timestamp_ns"] = resolution.source_timestamp_ns
+    if resolution.source_age_ns is not None:
+        metadata["source_age_ns"] = resolution.source_age_ns
     return metadata
 
 
@@ -800,16 +779,13 @@ def _build_visual_state_snapshot_for_publisher(state: ComposerState):
             "execution_snapshot_unavailable",
             str(exc),
         ) from exc
-    live_positions = state.resolve_current_joint_positions(
+    position_resolution = state.resolve_joint_position_authority(
         execution_snapshot,
         joint_names=joint_names,
+        for_display=True,
     )
-    snapshot_positions = getattr(execution_snapshot, "joint_positions_rad", None)
-    visual_source_stale = not (
-        snapshot_positions is not None
-        and len(snapshot_positions) == len(joint_names)
-        and len(joint_names) > 0
-    )
+    live_positions = position_resolution.positions_list()
+    visual_source_stale = position_resolution.stale
     mark_stage("execution_snapshot")
     joint_positions_by_name: dict[str, float] = {}
     if live_positions is not None and len(live_positions) == len(joint_names):
@@ -840,7 +816,7 @@ def _build_visual_state_snapshot_for_publisher(state: ComposerState):
         base_pose=base_pose,
         joint_names=joint_names,
         joint_positions=joint_positions_by_name,
-        **_execution_authority_metadata(state, execution_snapshot),
+        **_execution_authority_metadata(position_resolution),
     )
 
     gripper_statuses, gripper_status_signature = _collect_gripper_statuses(state)
@@ -872,6 +848,10 @@ def _build_visual_state_snapshot_for_publisher(state: ComposerState):
                 robot_info.tcp_frame,
                 robot_info.base_pose,
                 robot_info.state_source,
+                robot_info.source_timestamp_ns,
+                robot_info.source_age_ns,
+                position_resolution.provenance,
+                visual_source_stale,
             ),
             joint_names,
             live_positions,
@@ -1075,10 +1055,30 @@ def _scene_state_payload_from_visual_cache(
         robot_id, group_id, base_frame, tcp_frame, base_pose = _base_robot_route_metadata(state)
         joint_names = state.get_drivable_joint_names(allow_backend_refresh=False)
         joint_positions: dict[str, float] = {}
-        live_positions = state.get_current_joint_positions(
-            joint_names=joint_names,
-            allow_backend_joint_names=False,
-        )
+        try:
+            position_resolution = state.get_current_joint_position_resolution(
+                joint_names=joint_names,
+                allow_backend_joint_names=False,
+                for_display=True,
+            )
+        except Exception:
+            logger.debug(
+                "execution authority unavailable for pending scene robot state",
+                exc_info=True,
+                extra={"event": "manyforge.visual.authority_metadata_unavailable"},
+            )
+            position_resolution = JointPositionResolution(
+                positions_rad=None,
+                provenance="unavailable",
+                state_source=None,
+                source_timestamp_ns=None,
+                source_age_ns=None,
+                measurement_authoritative=(
+                    state.joint_state_authority_profile().measurement_authoritative
+                ),
+                stale=True,
+            )
+        live_positions = position_resolution.positions_list()
         if live_positions is not None and len(live_positions) == len(joint_names):
             joint_positions = {
                 name: position for name, position in zip(joint_names, live_positions)
@@ -1091,7 +1091,7 @@ def _scene_state_payload_from_visual_cache(
             base_pose=base_pose,
             joint_names=joint_names,
             joint_positions=joint_positions,
-            **_execution_authority_metadata(state),
+            **_execution_authority_metadata(position_resolution),
         )
         diagnostics = _visual_route_diagnostics(
             timings_ms=timings_ms,

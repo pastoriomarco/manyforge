@@ -242,7 +242,7 @@ api_version: manyforge.program.v0
 program_profile: v0.1
 name: my_robot_pick_place_demo
 description: "..."
-catalog_version: 0.1.0
+catalog_version: 0.5.0  # exact value from manyforge_behavior/resources/node_catalog.yaml
 
 robot:
   robot_id: my_robot                    # MUST match deployment.robot_config.robot_id
@@ -262,6 +262,10 @@ tree:
 
 The `robot.robot_id` and `robot.group_id` strings must match the
 deployment exactly — the load step cross-validates them.
+The `catalog_version` must likewise match the shipped node catalog exactly.
+When starting from a cloned current example this value is already correct;
+when authoring from scratch, copy it from
+`manyforge_behavior/resources/node_catalog.yaml`.
 
 ## Step 4 — Verify the import
 

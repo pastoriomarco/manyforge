@@ -34,6 +34,7 @@ _MOTION_DEFINITIONS = frozenset(
 _POSE_DEFINITION = "manyforge.scene.pose_apply_fault"
 _INITIALIZATION_DEFINITION = "manyforge.runtime.scene_initialization_fault"
 _PROVIDER_DEFINITION = "manyforge.runtime.provider_unavailable"
+_ROBOT_LIFECYCLE_DEFINITION = "manyforge.runtime.robot_lifecycle_fault"
 _SOURCE_CONFIG = {
     "motion": (
         "manyforge.condition.motion",
@@ -201,6 +202,7 @@ class OperatorAlarmAdapters:
         self._provider_records: dict[str, dict[str, Any]] = {}
         self._provider_waiting_since_ns: dict[str, int] = {}
         self._provider_expectation_started_ns = self._monotonic_clock()
+        self._robot_lifecycle_fault_scope: dict[str, str] | None = None
         self._scene_ready = True
         self._motion_signature: tuple[Any, ...] | None = None
         self._register_epoch_locked("composer-startup", epoch_order=0)
@@ -233,7 +235,11 @@ class OperatorAlarmAdapters:
             return self._sources["motion"]
         if definition_id == _POSE_DEFINITION:
             return self._sources["scene"]
-        if definition_id in {_INITIALIZATION_DEFINITION, _PROVIDER_DEFINITION}:
+        if definition_id in {
+            _INITIALIZATION_DEFINITION,
+            _PROVIDER_DEFINITION,
+            _ROBOT_LIFECYCLE_DEFINITION,
+        }:
             return self._sources["runtime_health"]
         raise OperatorAlarmError(
             "operator_alarm_adapter_definition_unknown",
@@ -485,6 +491,7 @@ class OperatorAlarmAdapters:
             self._provider_records.clear()
             self._provider_waiting_since_ns.clear()
             self._provider_expectation_started_ns = self._monotonic_clock()
+            self._robot_lifecycle_fault_scope = None
             self._scene_ready = False
             self._motion_signature = None
             mutations.append(
@@ -856,6 +863,101 @@ class OperatorAlarmAdapters:
             mutations.extend(self._evaluate_providers_locked(self._monotonic_clock()))
         self._deliver(mutations)
 
+    def observe_robot_lifecycle(
+        self,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Project one fresh provider snapshot into the generic alarm model."""
+
+        if (
+            payload.get("providerHealthy") is not True
+            or payload.get("fresh") is not True
+        ):
+            # Stale/absent transport is owned by provider_unavailable. Never
+            # clear a last-known physical condition from missing evidence.
+            return
+        adapter_status = payload.get("adapterStatus")
+        adapter_status = (
+            dict(adapter_status)
+            if isinstance(adapter_status, Mapping)
+            else {}
+        )
+        error_code = str(adapter_status.get("error_code") or "unknown")
+        warning_code = str(adapter_status.get("warning_code") or "unknown")
+        fault_code: str | None = None
+        if payload.get("reconciliationRequired") is True:
+            fault_code = "lifecycle_outcome_uncertain"
+        elif payload.get("faultPresent") == "true":
+            fault_code = f"xarm_error_{error_code}"
+        elif payload.get("warningPresent") == "true":
+            fault_code = f"xarm_warning_{warning_code}"
+        elif payload.get("recoveryRequired") == "true":
+            fault_code = "recovery_required"
+
+        next_scope = (
+            {
+                "robot_resource": _bounded_text(
+                    payload.get("robotId"),
+                    fallback=self._robot_resource,
+                ),
+                "fault_code": _bounded_text(
+                    fault_code,
+                    fallback="unknown_lifecycle_fault",
+                ),
+            }
+            if fault_code is not None
+            else None
+        )
+        mutations: list[OperatorAlarmMutation | None] = []
+        with self._lock:
+            previous = self._robot_lifecycle_fault_scope
+            if previous is not None and previous != next_scope:
+                mutations.append(
+                    self._submit_locked(
+                        definition_id=_ROBOT_LIFECYCLE_DEFINITION,
+                        scope=previous,
+                        active=False,
+                        details={
+                            "reason": "fresh_provider_snapshot_cleared_condition",
+                            "snapshot_generation": payload.get(
+                                "snapshotGeneration"
+                            ),
+                        },
+                    )
+                )
+            if next_scope is not None and previous != next_scope:
+                mutations.append(
+                    self._submit_locked(
+                        definition_id=_ROBOT_LIFECYCLE_DEFINITION,
+                        scope=next_scope,
+                        active=True,
+                        details={
+                            "snapshot_generation": payload.get(
+                                "snapshotGeneration"
+                            ),
+                            "reconciliation_required": payload.get(
+                                "reconciliationRequired"
+                            ),
+                            "fault_present": payload.get("faultPresent"),
+                            "warning_present": payload.get("warningPresent"),
+                            "recovery_required": payload.get(
+                                "recoveryRequired"
+                            ),
+                            "adapter_status": _bounded_details(adapter_status),
+                            "last_terminal_transaction": _bounded_detail_value(
+                                payload.get("lastTerminalTransaction")
+                            ),
+                        },
+                        evidence_refs=(
+                            "robot-lifecycle:"
+                            f"{payload.get('providerId') or 'unknown'}:"
+                            f"{payload.get('snapshotGeneration') or 0}",
+                        ),
+                    )
+                )
+            self._robot_lifecycle_fault_scope = next_scope
+        self._deliver(mutations)
+
     def check_provider_freshness(self, *, now_ns: int | None = None) -> None:
         mutations: list[OperatorAlarmMutation | None] = []
         with self._lock:
@@ -889,7 +991,10 @@ class OperatorAlarmAdapters:
             }
         readiness = str(record.get("readiness") or "").lower()
         can_execute = record.get("canExecute")
-        if readiness == "ready" and can_execute is not False:
+        if (
+            record.get("status", {}).get("providerHealthy") is True
+            or readiness == "ready" and can_execute is not False
+        ):
             self._provider_waiting_since_ns.pop(provider_id, None)
             return "ready", {"reason": "provider_ready", "status": record}
         if readiness in _PROVIDER_UNAVAILABLE_STATES:

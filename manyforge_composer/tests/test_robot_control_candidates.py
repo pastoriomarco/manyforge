@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from manyforge_composer.tests.node_environment_support import node_environment_for_catalog
 
+from contextlib import contextmanager
 import threading
 import time
 from pathlib import Path
@@ -54,6 +55,16 @@ _DEPLOYMENT_PATH = str(
 _BASE = "/api/robot-control/candidates"
 
 
+def _declare_mock_authored_authority(state: ComposerState) -> None:
+    """Make the synthetic MockKernel fixture's state-authority intent explicit."""
+    state.deployment.adapters["execution"].config[
+        "execution_state_authority_profile"
+    ] = "authored_preview"
+    state.deployment.adapters["execution"].config[
+        "execution_state_source_mode"
+    ] = "authored_preview"
+
+
 def _client(tmp_path: Path) -> tuple[TestClient, ComposerState, MockKernelClient]:
     """Bare client (no program loaded) — for input-validation tests."""
     kernel = MockKernelClient()
@@ -78,6 +89,7 @@ def _loaded_client(
     execute_duration_s: float = 0.0,
     deployment_path: str = _DEPLOYMENT_PATH,
     kernel_bundle=None,
+    prepare_cycle: bool = True,
 ) -> tuple[TestClient, ComposerState, MockKernelClient]:
     """Client with a program + deployment loaded so candidate planning has a
     robot profile, a cycle manager (for Approve), and a start joint state."""
@@ -104,11 +116,17 @@ def _loaded_client(
     live_kernel = state.kernel  # load reuses the injected mock
     assert isinstance(live_kernel, MockKernelClient)
     assert state.cycle_manager is not None
-    # Prepare a fresh cycle so the intervention blackboard carries the kernel /
-    # motion coordinator (production wires this via the program-loaded callback,
-    # which calls cycle_manager.reset()). Without it, an Approve dispatch would
-    # tick a move node before the kernel is on the blackboard.
-    state.cycle_manager.reset()
+    # This shared fixture exercises the in-process MockKernel's authored state,
+    # not a physical ROS controller. The historical ros2_control adapter id is
+    # retained for deployment-contract coverage, so make the state-authority
+    # profile explicit instead of letting the real/default ROS2 classification
+    # turn synthetic command state into a measured-state requirement.
+    _declare_mock_authored_authority(state)
+    # Most tests use a prepared cycle. Production can intentionally remain cold
+    # and idle after program load, so focused tests may opt out to cover direct
+    # intervention startup before the base tree has ever been built.
+    if prepare_cycle:
+        state.cycle_manager.reset()
     # Seed a current full-joint vector matching the kernel's joints for
     # candidate planning before any execution has happened.
     state.record_current_joint_positions([0.0] * len(live_kernel.get_joint_names()))
@@ -206,6 +224,33 @@ def _set_mock_robot_positions(
     kernel._last_joint_positions_rad = list(positions)  # type: ignore[attr-defined]
 
 
+def _configure_observed_robot_authority(
+    state: ComposerState,
+    kernel: MockKernelClient,
+    *,
+    start_tolerance_rad: float | None,
+) -> None:
+    """Make the mock expose fresh physical observations for candidate tests."""
+    config = state.deployment.adapters["execution"].config
+    config["execution_state_authority_profile"] = "observed_robot"
+    config["execution_state_source_mode"] = "observed_robot"
+    if start_tolerance_rad is None:
+        config.pop("start_tolerance_rad", None)
+    else:
+        config["start_tolerance_rad"] = start_tolerance_rad
+
+    original_snapshot = kernel.get_execution_snapshot
+
+    def observed_snapshot():
+        snapshot = original_snapshot()
+        snapshot.state_source = "observed_ros2"
+        snapshot.source_timestamp_ns = time.monotonic_ns()
+        snapshot.source_age_ns = 0
+        return snapshot
+
+    kernel.get_execution_snapshot = observed_snapshot  # type: ignore[method-assign]
+
+
 # ---------------------------------------------------------------------------
 # P5.1: candidate preview planning + validation (no motion)
 # ---------------------------------------------------------------------------
@@ -279,6 +324,7 @@ def _recording_loaded_client(
     live_kernel = state.kernel
     assert isinstance(live_kernel, _PreviewRecordingKernel)
     assert state.cycle_manager is not None
+    _declare_mock_authored_authority(state)
     state.cycle_manager.reset()
     state.record_current_joint_positions([0.0] * len(live_kernel.get_joint_names()))
     live_kernel.execute_count = 0
@@ -463,6 +509,56 @@ def test_candidate_forwards_per_joint_dynamics_limits_to_execute_request(
     assert fwd.max_jerk_rad_s3 is None
 
 
+def test_execution_constraint_payload_is_immutable_and_order_stable() -> None:
+    from dataclasses import FrozenInstanceError
+
+    from manyforge_behavior.kernel_client import JointDynamicsLimit
+    from manyforge_composer.backend.robot_control_candidates import (
+        _ExecutionConstraintPayload,
+    )
+
+    first = ExecuteRequest(
+        robot_id="robot",
+        group_id="arm",
+        move_id="first",
+        base_frame="base",
+        tcp_frame="tool",
+        motion_type="joint",
+        max_tcp_linear_speed_mps=0.12,
+        per_joint_dynamics_limits={
+            "joint2": JointDynamicsLimit(max_velocity_rad_s=0.3),
+            "joint1": JointDynamicsLimit(
+                max_velocity_rad_s=0.4,
+                max_acceleration_rad_s2=1.5,
+            ),
+        },
+    )
+    second = ExecuteRequest(
+        robot_id="robot",
+        group_id="arm",
+        move_id="second",
+        base_frame="base",
+        tcp_frame="tool",
+        motion_type="joint",
+        max_tcp_linear_speed_mps=0.12,
+        per_joint_dynamics_limits={
+            "joint1": JointDynamicsLimit(
+                max_velocity_rad_s=0.4,
+                max_acceleration_rad_s2=1.5,
+            ),
+            "joint2": JointDynamicsLimit(max_velocity_rad_s=0.3),
+        },
+    )
+
+    first_payload = _ExecutionConstraintPayload.from_request(first)
+    second_payload = _ExecutionConstraintPayload.from_request(second)
+    assert first_payload == second_payload
+    assert first_payload.fingerprint == second_payload.fingerprint
+    assert first_payload.to_dispatch_params() == second_payload.to_dispatch_params()
+    with pytest.raises(FrozenInstanceError):
+        first_payload.max_tcp_linear_speed_mps = 0.2  # type: ignore[misc]
+
+
 def test_candidate_without_per_joint_limits_forwards_empty_map(
     tmp_path: Path,
 ) -> None:
@@ -551,6 +647,7 @@ def _fk_recording_loaded_client(
     live = state.kernel
     assert isinstance(live, _FkRecordingKernel)
     assert state.cycle_manager is not None
+    _declare_mock_authored_authority(state)
     state.cycle_manager.reset()
     state.record_current_joint_positions([0.0] * len(live.get_joint_names()))
     live.execute_count = 0
@@ -859,6 +956,128 @@ def test_candidate_goes_stale_when_robot_moves(tmp_path: Path) -> None:
     assert stale["diagnostics"]["reasonCode"] == "stale_planning_snapshot"
 
 
+def test_measured_candidate_at_start_tolerance_remains_eligible_and_rechecks(
+    tmp_path: Path,
+) -> None:
+    """The explicit real-lane tolerance admits its inclusive boundary only."""
+    client, state, kernel = _loaded_client(tmp_path)
+    tolerance = 0.01
+    _configure_observed_robot_authority(
+        state,
+        kernel,
+        start_tolerance_rad=tolerance,
+    )
+    preview_starts: list[list[float]] = []
+    original_preview = kernel.preview_motion
+
+    def recording_preview(request, start_state=None):
+        if start_state is not None:
+            preview_starts.append(list(start_state.positions_rad))
+        return original_preview(request, start_state)
+
+    kernel.preview_motion = recording_preview  # type: ignore[method-assign]
+    create = client.post(_BASE, json=_joint_body())
+    assert create.status_code == 200, create.text
+    candidate_id = create.json()["candidateId"]
+
+    current = [0.0] * len(kernel.get_joint_names())
+    current[0] = tolerance
+    _set_mock_robot_positions(state, kernel, current)
+
+    ready = client.get(f"{_BASE}/{candidate_id}")
+    assert ready.status_code == 200, ready.text
+    assert ready.json()["status"] == "ready"
+
+    execute = client.post(f"{_BASE}/{candidate_id}/execute")
+    assert execute.status_code == 200, execute.text
+    assert len(preview_starts) == 2
+    assert preview_starts[0][0] == pytest.approx(0.0)
+    assert preview_starts[1][0] == pytest.approx(tolerance)
+
+
+def test_measured_candidate_outside_start_tolerance_goes_stale(
+    tmp_path: Path,
+) -> None:
+    client, state, kernel = _loaded_client(tmp_path)
+    tolerance = 0.01
+    _configure_observed_robot_authority(
+        state,
+        kernel,
+        start_tolerance_rad=tolerance,
+    )
+    candidate_id = client.post(_BASE, json=_joint_body()).json()["candidateId"]
+
+    current = [0.0] * len(kernel.get_joint_names())
+    current[0] = tolerance + 1e-6
+    _set_mock_robot_positions(state, kernel, current)
+
+    stale = client.get(f"{_BASE}/{candidate_id}").json()
+    assert stale["status"] == "stale"
+    assert stale["diagnostics"]["reasonCode"] == "stale_planning_snapshot"
+
+
+def test_authored_candidate_keeps_strict_rounded_position_freshness(
+    tmp_path: Path,
+) -> None:
+    """An execution start tolerance does not weaken backend-authored lanes."""
+    client, state, kernel = _loaded_client(tmp_path)
+    state.deployment.adapters["execution"].config["start_tolerance_rad"] = 0.01
+    candidate_id = client.post(_BASE, json=_joint_body()).json()["candidateId"]
+
+    current = [0.0] * len(kernel.get_joint_names())
+    current[0] = 2e-5
+    _set_mock_robot_positions(state, kernel, current)
+
+    stale = client.get(f"{_BASE}/{candidate_id}").json()
+    assert stale["status"] == "stale"
+    assert stale["diagnostics"]["reasonCode"] == "stale_planning_snapshot"
+
+
+@pytest.mark.parametrize(
+    "configured_tolerance",
+    [None, 0.0, -0.01],
+    ids=["missing", "zero", "negative"],
+)
+def test_measured_candidate_without_valid_tolerance_keeps_strict_fallback(
+    tmp_path: Path,
+    configured_tolerance: float | None,
+) -> None:
+    """Invalid physical-lane configuration never invents a loose tolerance."""
+    client, state, kernel = _loaded_client(tmp_path)
+    _configure_observed_robot_authority(
+        state,
+        kernel,
+        start_tolerance_rad=configured_tolerance,
+    )
+    candidate_id = client.post(_BASE, json=_joint_body()).json()["candidateId"]
+
+    current = [0.0] * len(kernel.get_joint_names())
+    current[0] = 2e-5
+    _set_mock_robot_positions(state, kernel, current)
+
+    stale = client.get(f"{_BASE}/{candidate_id}").json()
+    assert stale["status"] == "stale"
+    assert stale["diagnostics"]["reasonCode"] == "stale_planning_snapshot"
+
+
+def test_measured_candidate_tolerance_configuration_change_goes_stale(
+    tmp_path: Path,
+) -> None:
+    client, state, kernel = _loaded_client(tmp_path)
+    _configure_observed_robot_authority(
+        state,
+        kernel,
+        start_tolerance_rad=0.01,
+    )
+    candidate_id = client.post(_BASE, json=_joint_body()).json()["candidateId"]
+
+    state.deployment.adapters["execution"].config["start_tolerance_rad"] = 0.02
+
+    stale = client.get(f"{_BASE}/{candidate_id}").json()
+    assert stale["status"] == "stale"
+    assert stale["diagnostics"]["reasonCode"] == "stale_planning_snapshot"
+
+
 def test_candidate_goes_stale_when_scene_changes(tmp_path: Path) -> None:
     """A scene/attached-object change must flip a ready candidate to
     stale WITHOUT a new user edit (the GET route recomputes staleness)."""
@@ -953,6 +1172,361 @@ def test_execute_fresh_ready_candidate_dispatches(tmp_path: Path) -> None:
     while kernel.execute_count == 0 and time.time() < deadline:
         time.sleep(0.02)
     assert kernel.execute_count >= 1
+
+
+@pytest.mark.parametrize(
+    "candidate_body",
+    [_joint_body, _cartesian_body],
+    ids=["joint", "cartesian"],
+)
+def test_execute_candidate_preserves_preview_dynamics_and_tcp_caps(
+    tmp_path: Path,
+    candidate_body,
+) -> None:
+    """Both arm modes dispatch with the caps used by both preview passes."""
+    from manyforge_behavior.deployment import RobotControlJointLimit
+
+    client, state, kernel = _loaded_client(tmp_path)
+    target_joint = kernel.get_joint_names()[0]
+    state.deployment.robot_config.global_max_tcp_linear_speed_mps = 0.12
+    state.deployment.robot_config.robot_control_joint_limits = {
+        target_joint: RobotControlJointLimit(
+            max_velocity_rad_s=0.4,
+            max_acceleration_rad_s2=1.5,
+        )
+    }
+
+    create = client.post(_BASE, json=candidate_body())
+    assert create.status_code == 200, create.text
+    cid = create.json()["candidateId"]
+    initial_preview = kernel.preview_requests[-1]
+
+    execute = client.post(f"{_BASE}/{cid}/execute")
+    assert execute.status_code == 200, execute.text
+    deadline = time.time() + 5.0
+    while kernel.execute_count == 0 and time.time() < deadline:
+        time.sleep(0.02)
+    assert kernel.execute_count >= 1
+    assert len(kernel.preview_requests) >= 2
+    approval_preview = kernel.preview_requests[-1]
+    dispatched = kernel.last_execute_request
+    assert dispatched is not None
+
+    for request in (initial_preview, approval_preview, dispatched):
+        assert request.max_tcp_linear_speed_mps == pytest.approx(0.12)
+        limit = request.per_joint_dynamics_limits[target_joint]
+        assert limit.max_velocity_rad_s == pytest.approx(0.4)
+        assert limit.max_acceleration_rad_s2 == pytest.approx(1.5)
+        assert limit.max_jerk_rad_s3 is None
+
+
+def test_execute_linearizes_final_snapshot_commit_and_dispatch_under_artifact_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No cutover can publish in the final snapshot-to-dispatch window."""
+    import manyforge_composer.backend.robot_control_candidates as candidates
+
+    client, state, _kernel = _loaded_client(tmp_path)
+    create = client.post(_BASE, json=_joint_body())
+    assert create.status_code == 200, create.text
+    candidate_id = create.json()["candidateId"]
+
+    transaction_depth = 0
+    snapshot_depths: list[int] = []
+    commit_depths: list[int] = []
+    dispatch_depths: list[int] = []
+    original_transaction = state.artifact_read_transaction
+    original_snapshot = candidates._compute_planning_snapshot
+    original_commit = candidates._CandidateStore.commit_for_dispatch
+    original_dispatch = candidates._dispatch_candidate
+
+    @contextmanager
+    def tracked_transaction():
+        nonlocal transaction_depth
+        with original_transaction():
+            transaction_depth += 1
+            try:
+                yield
+            finally:
+                transaction_depth -= 1
+
+    def tracked_snapshot(current_state):
+        snapshot_depths.append(transaction_depth)
+        return original_snapshot(current_state)
+
+    def tracked_commit(store, *args, **kwargs):
+        commit_depths.append(transaction_depth)
+        return original_commit(store, *args, **kwargs)
+
+    def tracked_dispatch(*args, **kwargs):
+        dispatch_depths.append(transaction_depth)
+        return original_dispatch(*args, **kwargs)
+
+    monkeypatch.setattr(state, "artifact_read_transaction", tracked_transaction)
+    monkeypatch.setattr(candidates, "_compute_planning_snapshot", tracked_snapshot)
+    monkeypatch.setattr(
+        candidates._CandidateStore,
+        "commit_for_dispatch",
+        tracked_commit,
+    )
+    monkeypatch.setattr(candidates, "_dispatch_candidate", tracked_dispatch)
+
+    execute = client.post(f"{_BASE}/{candidate_id}/execute")
+
+    assert execute.status_code == 200, execute.text
+    # The first execute-time snapshot gates begin_approval. The final snapshot,
+    # candidate-store commit, and intervention acceptance share one state-owned
+    # artifact transaction.
+    assert snapshot_depths == [0, 1]
+    assert commit_depths == [1]
+    assert dispatch_depths == [1]
+    assert transaction_depth == 0
+
+
+def test_execute_rejects_concurrent_deployment_cutover_before_final_transaction(
+    tmp_path: Path,
+) -> None:
+    """The production load route winning before final admission prevents motion."""
+    from manyforge_behavior.deployment import RobotControlJointLimit
+
+    client, state, kernel = _loaded_client(tmp_path)
+    target_joint = kernel.get_joint_names()[0]
+    state.deployment.robot_config.robot_control_joint_limits = {
+        target_joint: RobotControlJointLimit(max_velocity_rad_s=0.4)
+    }
+    create = client.post(_BASE, json=_joint_body())
+    assert create.status_code == 200, create.text
+    candidate_id = create.json()["candidateId"]
+
+    approval_preview_complete = threading.Event()
+    allow_approval_to_continue = threading.Event()
+    original_preview = kernel.preview_motion
+
+    def pause_after_approval_preview(request, start_state=None):
+        result = original_preview(request, start_state)
+        approval_preview_complete.set()
+        assert allow_approval_to_continue.wait(timeout=5.0)
+        return result
+
+    kernel.preview_motion = pause_after_approval_preview  # type: ignore[method-assign]
+    responses: list = []
+
+    def approve() -> None:
+        responses.append(client.post(f"{_BASE}/{candidate_id}/execute"))
+
+    approval_thread = threading.Thread(target=approve, daemon=True)
+    approval_thread.start()
+    assert approval_preview_complete.wait(timeout=5.0)
+
+    replacement = Deployment.from_dict(
+        state.deployment.to_dict(),
+        path="<concurrent-deployment-cutover>",
+    )
+    replacement.robot_config.robot_control_joint_limits = {
+        target_joint: RobotControlJointLimit(max_velocity_rad_s=0.2)
+    }
+    replacement_path = tmp_path / "concurrent.deployment.yaml"
+    replacement.save(str(replacement_path))
+    try:
+        # Exercise the production publication route, not a direct state call.
+        # It owns the same artifact transaction as final candidate admission.
+        cutover = client.post(
+            "/api/deployment/load",
+            json={"path": str(replacement_path)},
+        )
+        assert cutover.status_code == 200, cutover.text
+    finally:
+        allow_approval_to_continue.set()
+
+    approval_thread.join(timeout=5.0)
+    assert not approval_thread.is_alive()
+    assert len(responses) == 1
+    execute = responses[0]
+    assert execute.status_code == 409, execute.text
+    assert execute.json()["reasonCode"] == "stale_planning_snapshot"
+    assert (
+        state.deployment.robot_config.robot_control_joint_limits[
+            target_joint
+        ].max_velocity_rad_s
+        == pytest.approx(0.2)
+    )
+    assert kernel.execute_count == 0
+
+
+@pytest.mark.parametrize(
+    ("state_source", "expects_optimistic_write"),
+    [("backend_authored", True), ("commanded_sim", True), ("observed_ros2", False)],
+)
+def test_joint_candidate_respects_lane_position_authority(
+    tmp_path: Path,
+    state_source: str,
+    expects_optimistic_write: bool,
+) -> None:
+    client, state, kernel = _loaded_client(tmp_path)
+    if state_source == "observed_ros2":
+        authority_profile = "observed_robot"
+    elif state_source == "commanded_sim":
+        authority_profile = "commanded_sim"
+    else:
+        authority_profile = "authored_preview"
+    state.deployment.adapters["execution"].config[
+        "execution_state_authority_profile"
+    ] = authority_profile
+    state.deployment.adapters["execution"].config[
+        "execution_state_source_mode"
+    ] = authority_profile
+    original_snapshot = kernel.get_execution_snapshot
+
+    def snapshot_with_source():
+        snapshot = original_snapshot()
+        snapshot.state_source = state_source
+        if state_source == "observed_ros2":
+            snapshot.source_timestamp_ns = time.monotonic_ns()
+            snapshot.source_age_ns = 0
+        return snapshot
+
+    kernel.get_execution_snapshot = snapshot_with_source  # type: ignore[method-assign]
+    create = client.post(_BASE, json=_joint_body())
+    assert create.status_code == 200, create.text
+    cid = create.json()["candidateId"]
+
+    optimistic_writes: list[list[float]] = []
+    state.record_current_joint_positions = (  # type: ignore[method-assign]
+        lambda positions: optimistic_writes.append(list(positions))
+    )
+    execute = client.post(f"{_BASE}/{cid}/execute")
+
+    assert execute.status_code == 200, execute.text
+    expected = [0.0] * len(kernel.get_joint_names())
+    expected[0] = 0.3
+    if expects_optimistic_write:
+        assert expected in optimistic_writes
+    else:
+        assert expected not in optimistic_writes
+
+
+@pytest.mark.parametrize("mutation_kind", ["in_place", "replacement"])
+def test_execute_rejects_limit_change_racing_approval_recheck(
+    tmp_path: Path,
+    mutation_kind: str,
+) -> None:
+    """The dispatch linearization fence catches mutable or replaced config."""
+    from manyforge_behavior.deployment import RobotControlJointLimit
+
+    client, state, kernel = _loaded_client(tmp_path)
+    target_joint = kernel.get_joint_names()[0]
+    state.deployment.robot_config.robot_control_joint_limits = {
+        target_joint: RobotControlJointLimit(
+            max_velocity_rad_s=0.4,
+            max_acceleration_rad_s2=1.5,
+        )
+    }
+    create = client.post(_BASE, json=_joint_body())
+    assert create.status_code == 200, create.text
+    cid = create.json()["candidateId"]
+    initial_preview_count = len(kernel.preview_requests)
+
+    original_preview = kernel.preview_motion
+
+    def preview_then_change_deployment(request, start_state=None):
+        result = original_preview(request, start_state)
+        if mutation_kind == "replacement":
+            replacement = Deployment.from_dict(
+                state.deployment.to_dict(),
+                path="<approval-race-replacement>",
+            )
+            replacement.robot_config.robot_control_joint_limits = {
+                target_joint: RobotControlJointLimit(
+                    max_velocity_rad_s=0.2,
+                    max_acceleration_rad_s2=0.8,
+                )
+            }
+            state.deployment = replacement
+        else:
+            state.deployment.robot_config.robot_control_joint_limits = {
+                target_joint: RobotControlJointLimit(
+                    max_velocity_rad_s=0.2,
+                    max_acceleration_rad_s2=0.8,
+                )
+            }
+        return result
+
+    kernel.preview_motion = preview_then_change_deployment  # type: ignore[method-assign]
+    execute = client.post(f"{_BASE}/{cid}/execute")
+
+    assert execute.status_code == 409, execute.text
+    body = execute.json()
+    assert body["reasonCode"] == "stale_planning_snapshot"
+    assert body["candidate"]["status"] == "stale"
+    assert kernel.execute_count == 0
+    assert len(kernel.preview_requests) == initial_preview_count + 1
+    # The approval preview used the immutable candidate cap; only the
+    # post-preview content fence observed the concurrent deployment change.
+    approval_limit = kernel.preview_requests[-1].per_joint_dynamics_limits[
+        target_joint
+    ]
+    assert approval_limit.max_velocity_rad_s == pytest.approx(0.4)
+    assert approval_limit.max_acceleration_rad_s2 == pytest.approx(1.5)
+
+
+def test_execute_from_idle_without_prior_reset_publishes_kernel(
+    tmp_path: Path,
+) -> None:
+    client, state, kernel = _loaded_client(tmp_path, prepare_cycle=False)
+    assert state.cycle_manager is not None
+    assert state.cycle_manager._tree is None
+    cid = client.post(_BASE, json=_joint_body()).json()["candidateId"]
+
+    resp = client.post(f"{_BASE}/{cid}/execute")
+
+    assert resp.status_code == 200, resp.text
+    deadline = time.time() + 5.0
+    while (
+        (
+            kernel.execute_count == 0
+            or state.cycle_manager.intervention is None
+            or state.cycle_manager.intervention.status == "running"
+        )
+        and time.time() < deadline
+    ):
+        time.sleep(0.02)
+    assert kernel.execute_count >= 1
+    assert state.cycle_manager.intervention is not None
+    assert state.cycle_manager.intervention.status == "completed"
+    assert state.cycle_manager.intervention.error is None
+
+
+def test_execute_ready_candidate_is_rejected_when_robot_is_not_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, state, kernel = _loaded_client(tmp_path)
+    cid = client.post(_BASE, json=_joint_body()).json()["candidateId"]
+    monkeypatch.setattr(
+        state,
+        "robot_lifecycle_motion_admission_block_reason",
+        lambda: {
+            "error_code": "robot_lifecycle_motion_not_admitted",
+            "message": "Enable the robot before starting motion.",
+            "error_details": {
+                "admissionReasonCodes": ["robot_disabled"],
+            },
+        },
+    )
+
+    resp = client.post(f"{_BASE}/{cid}/execute")
+
+    assert resp.status_code == 409
+    assert resp.json()["reasonCode"] == "robot_lifecycle_motion_not_admitted"
+    assert resp.json()["detail"] == "Enable the robot before starting motion."
+    assert resp.json()["errorDetails"] == {
+        "admissionReasonCodes": ["robot_disabled"],
+    }
+    assert kernel.execute_count == 0
+    candidate = client.get(f"{_BASE}/{cid}").json()
+    assert candidate["status"] == "ready"
+    assert candidate["commitEligible"] is True
 
 
 def test_execute_fresh_cartesian_candidate_dispatches_with_pose_frame(
@@ -1222,6 +1796,44 @@ def test_gripper_candidate_approve_dispatches_exactly_one_command(
     assert kernel.last_gripper_command_request.target_position == pytest.approx(0.1)
 
 
+def test_gripper_candidate_acceptance_uses_artifact_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, state, kernel = _gripper_client(tmp_path)
+    candidate_id = client.post(_BASE, json=_gripper_body(0.1)).json()[
+        "candidateId"
+    ]
+
+    transaction_depth = 0
+    command_depths: list[int] = []
+    original_transaction = state.artifact_read_transaction
+    original_command = kernel.command_gripper
+
+    @contextmanager
+    def tracked_transaction():
+        nonlocal transaction_depth
+        with original_transaction():
+            transaction_depth += 1
+            try:
+                yield
+            finally:
+                transaction_depth -= 1
+
+    def tracked_command(request):
+        command_depths.append(transaction_depth)
+        return original_command(request)
+
+    monkeypatch.setattr(state, "artifact_read_transaction", tracked_transaction)
+    monkeypatch.setattr(kernel, "command_gripper", tracked_command)
+
+    response = client.post(f"{_BASE}/{candidate_id}/execute")
+
+    assert response.status_code == 200, response.text
+    assert command_depths == [1]
+    assert transaction_depth == 0
+
+
 def test_gripper_candidate_blocked_does_not_dispatch(tmp_path: Path) -> None:
     client, _state, kernel = _gripper_client(tmp_path)
     cid = client.post(_BASE, json=_gripper_body(999.0)).json()["candidateId"]
@@ -1467,7 +2079,7 @@ def test_commit_for_dispatch_fails_closed_after_concurrent_revert() -> None:
     reverted = store.revert(cid)
     assert reverted is not None and reverted.status is CandidateStatus.REVERTED
     # The atomic pre-dispatch commit must now FAIL CLOSED — no motion.
-    committed, current = store.commit_for_dispatch(cid)
+    committed, current = store.commit_for_dispatch(cid, snapshot)
     assert committed is False
     assert current is not None and current.status is CandidateStatus.REVERTED
 
@@ -1480,7 +2092,7 @@ def test_commit_for_dispatch_commits_then_post_commit_revert_is_noop() -> None:
     store, cid, snapshot = _ready_store_candidate()
     gated, _view = store.begin_approval(cid, snapshot)
     assert gated is not None
-    committed, view = store.commit_for_dispatch(cid)
+    committed, view = store.commit_for_dispatch(cid, snapshot)
     assert committed is True
     assert view is not None and view.status is CandidateStatus.EXECUTING
     # A revert AFTER the dispatch commit is a no-op (status stays EXECUTING).

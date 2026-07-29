@@ -42,7 +42,9 @@ from manyforge_behavior.skill_loader import (
 
 
 EXPECTED_API_VERSION = "manyforge.program.v0"
-_COMPATIBILITY_LANES = frozenset({"manyforge-only", "isaac-sim"})
+_COMPATIBILITY_LANES = frozenset(
+    {"manyforge-only", "isaac-sim", "real-robot"}
+)
 _COMPATIBILITY_ASSISTANT_POLICIES = frozenset(
     {"required", "optional", "forbidden"}
 )

@@ -1,0 +1,19 @@
+string robot_id
+string command_source
+string caller_context_id
+string caller_assurance
+string session_id
+uint64 session_generation
+string request_id
+uint64 request_sequence
+string action_id
+uint64 expected_snapshot_generation
+bool confirmed
+---
+bool accepted
+string disposition
+string reason
+uint64 transaction_generation
+string transaction_phase
+int64 deadline_steady_time_ns
+uint64 snapshot_generation

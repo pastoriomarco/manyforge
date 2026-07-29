@@ -13,7 +13,9 @@ import type { RobotCommandAuthority } from '../store/commandAuthority';
 import { useRobotCommandAuthority } from '../store/commandAuthority';
 import { useProgramStore } from '../store/programStore';
 import { useRobotControlCandidateStore } from '../store/robotControlCandidateStore';
+import { useRobotLifecycleStore } from '../store/robotLifecycleStore';
 import { useSceneStateStore } from '../store/sceneStateStore';
+import { useStatusPolling, useStatusStore } from '../store/statusStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
 import type {
   CartesianFrame,
@@ -36,6 +38,7 @@ import {
   gripperCompletionNotice,
   gripperPositionSourceLabel,
 } from '../utils/gripperSemantics';
+import { RobotLifecycleCard } from './RobotLifecycleCard';
 
 // UI settle thresholds — when to clear the operator's authored value
 // from the displayed input (CartesianAxisInput draft + CartesianModeBody
@@ -182,6 +185,7 @@ const PRISMATIC_STEPS: readonly number[] = [0.001, 0.01, 0.1];
 const DEFAULT_ANGULAR_STEP_RAD = 5 * DEG_TO_RAD;
 
 export function RobotControlPanel({ onClose }: RobotControlPanelProps) {
+  useStatusPolling();
   const [manifest, setManifest] = useState<SceneUrdfManifest | null>(null);
   const [manifestError, setManifestError] = useState<string | null>(null);
   // Step size = the increment applied by the numeric-input arrow
@@ -273,6 +277,7 @@ export function RobotControlPanel({ onClose }: RobotControlPanelProps) {
           ✕
         </button>
       </div>
+      <RobotLifecycleCard />
       <div className="flex shrink-0 gap-1 border-b border-gray-800 bg-gray-900/50 px-2 py-1.5">
         <ModeTab id="joint" active={robotMode} onClick={setRobotMode}>
           Joint
@@ -328,6 +333,8 @@ function CandidateApprovalBar({ commandGate }: { commandGate: RobotCommandGate }
   const error = useRobotControlCandidateStore((s) => s.error);
   const approve = useRobotControlCandidateStore((s) => s.approve);
   const revert = useRobotControlCandidateStore((s) => s.revert);
+  const lifecycleStatus = useRobotLifecycleStore((s) => s.status);
+  const runtime = useStatusStore((s) => s.runtime);
 
   if (candidate === null && rejection === null && error === null) {
     return null;
@@ -339,7 +346,16 @@ function CandidateApprovalBar({ commandGate }: { commandGate: RobotCommandGate }
   // `ready` candidate can never be approved during the debounce/planning
   // window.
   const ready = status === 'ready' && candidate?.commitEligible === true && !busy;
-  const canApprove = ready && !approving && commandGate.canCommand;
+  const lifecycleBlocksMotion =
+    lifecycleStatus?.configured === true
+    && lifecycleStatus.canExecute !== true;
+  const runtimeBlocksMotion = runtime?.canExecute !== true;
+  const canApprove =
+    ready
+    && !approving
+    && commandGate.canCommand
+    && !lifecycleBlocksMotion
+    && !runtimeBlocksMotion;
   // Once dispatched, the candidate is `executing`: Revert must not act on it
   // (execution cancellation belongs to Stop, not Revert).
   const executing = status === 'executing';
@@ -406,6 +422,17 @@ function CandidateApprovalBar({ commandGate }: { commandGate: RobotCommandGate }
       {!commandGate.canCommand && ready && (
         <div className="mb-1 text-[10px] text-amber-300">
           Approve disabled: {commandGate.reason}
+        </div>
+      )}
+      {lifecycleBlocksMotion && ready && (
+        <div className="mb-1 text-[10px] text-amber-300">
+          Approve disabled: {lifecycleStatus.userMessage}
+        </div>
+      )}
+      {!lifecycleBlocksMotion && runtimeBlocksMotion && ready && (
+        <div className="mb-1 text-[10px] text-amber-300">
+          Approve disabled:{' '}
+          {runtime?.userMessage ?? 'waiting for authoritative runtime status'}
         </div>
       )}
       <div className="flex gap-1">

@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -83,6 +84,9 @@ from .routes_scene import (
     canonical_scene_world_frame,
 )
 from .state import ComposerState
+
+
+logger = logging.getLogger(__name__)
 
 
 _ASSISTANT_ORIENTATION_FIELD_KEYS = {
@@ -373,18 +377,48 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             field_policy=provider_context.field_policy,
         )
 
+        def terminalize_unexpected_request(provider_result: Any = None) -> None:
+            record = state.get_assistant_request(request_id)
+            if record is None or record.status not in ("running", "cancel_requested"):
+                return
+            live_draft_mutated, live_tool_call_count = (
+                state.assistant_request_tool_evidence(request_id)
+            )
+            result_draft_mutated = bool(
+                getattr(provider_result, "draft_mutated", False)
+            )
+            result_tool_calls = getattr(provider_result, "tool_calls", ())
+            result_tool_call_count = (
+                len(result_tool_calls) if isinstance(result_tool_calls, list) else 0
+            )
+            detail = "Assistant request failed due to an unexpected server error."
+            state.finish_assistant_request(
+                request_id,
+                status="failed",
+                message=detail,
+                error={"code": "internal_error", "detail": detail},
+                warnings=[detail],
+                draft_mutated=result_draft_mutated or live_draft_mutated,
+                tool_call_count=max(result_tool_call_count, live_tool_call_count),
+            )
+
         try:
             result = provider.run(request, provider_context)
         except AssistantProviderError as exc:
             status_code = _provider_error_status_code(exc)
             status = "cancelled" if exc.code == "cancelled" else "failed"
             error = {"code": exc.code, "detail": exc.detail}
+            recorded_draft_mutated, recorded_tool_call_count = (
+                state.assistant_request_tool_evidence(request_id)
+            )
             state.finish_assistant_request(
                 request_id,
                 status=status,
                 message=str(exc),
                 error=error,
                 warnings=[exc.detail],
+                draft_mutated=recorded_draft_mutated,
+                tool_call_count=recorded_tool_call_count,
             )
             return JSONResponse(
                 status_code=status_code,
@@ -399,7 +433,7 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                     "toolCalls": [],
                     "warnings": [exc.detail],
                     "mutated": False,
-                    "draftMutated": False,
+                    "draftMutated": recorded_draft_mutated,
                     "requiresReview": True,
                     "programLoaded": program_loaded,
                     "cycleState": cycle_state,
@@ -407,51 +441,69 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                     "error": error,
                 },
             )
+        except Exception:
+            logger.exception(
+                "Unexpected assistant provider failure for request %s",
+                request_id,
+            )
+            terminalize_unexpected_request()
+            raise
 
-        # Aggregate the actual draft-mutation flag from the live
-        # tool-call recorder. The OpenClaw bridge envelope hard-codes
-        # draftMutated=False because tool-call accounting happens on
-        # the ManyForge side, not in the bridge response. So we OR
-        # the provider's own claim with the recorded per-call flags
-        # — whichever is true wins. This drives the frontend hot-
-        # reload trigger; without it the canvas would silently miss
-        # successful assistant mutations on the OpenClaw lane.
-        recorded_history = state.get_assistant_tool_history(
-            conversation_id=conversation_id,
-            limit=200,
-        )
-        recorded_draft_mutated = any(
-            entry.get("draft_mutated") for entry in recorded_history
-        )
-        aggregated_draft_mutated = bool(result.draft_mutated) or recorded_draft_mutated
+        try:
+            # Aggregate the actual draft-mutation flag from the live
+            # tool-call recorder. The OpenClaw bridge envelope hard-codes
+            # draftMutated=False because tool-call accounting happens on
+            # the ManyForge side, not in the bridge response. So we OR
+            # the provider's own claim with the recorded per-call flags
+            # — whichever is true wins. This drives the frontend hot-
+            # reload trigger; without it the canvas would silently miss
+            # successful assistant mutations on the OpenClaw lane.
+            recorded_history = state.get_assistant_tool_history(
+                conversation_id=conversation_id,
+                limit=200,
+            )
+            recorded_draft_mutated = any(
+                entry.get("draft_mutated") for entry in recorded_history
+            )
+            aggregated_draft_mutated = (
+                bool(result.draft_mutated) or recorded_draft_mutated
+            )
 
-        state.finish_assistant_request(
-            request_id,
-            status="completed",
-            message=result.message,
-            warnings=result.warnings,
-            draft_mutated=aggregated_draft_mutated,
-            tool_call_count=len(result.tool_calls),
-        )
+            state.finish_assistant_request(
+                request_id,
+                status="completed",
+                message=result.message,
+                warnings=result.warnings,
+                draft_mutated=aggregated_draft_mutated,
+                tool_call_count=len(result.tool_calls),
+            )
 
-        return {
-            "requestId": request_id,
-            "conversationId": conversation_id,
-            "mode": result.mode,
-            "providerId": provider.provider_id,
-            "assistantMode": provider_context.assistant_mode,
-            "message": result.message,
-            "proposals": result.proposals,
-            "toolCalls": result.tool_calls,
-            "warnings": result.warnings,
-            "mutated": result.mutated,
-            "draftMutated": aggregated_draft_mutated,
-            "requiresReview": result.requires_review,
-            "programLoaded": program_loaded,
-            "cycleState": cycle_state,
-            "timestampNs": result.timestamp_ns,
-            "error": None,
-        }
+            response = {
+                "requestId": request_id,
+                "conversationId": conversation_id,
+                "mode": result.mode,
+                "providerId": provider.provider_id,
+                "assistantMode": provider_context.assistant_mode,
+                "message": result.message,
+                "proposals": result.proposals,
+                "toolCalls": result.tool_calls,
+                "warnings": result.warnings,
+                "mutated": result.mutated,
+                "draftMutated": aggregated_draft_mutated,
+                "requiresReview": result.requires_review,
+                "programLoaded": program_loaded,
+                "cycleState": cycle_state,
+                "timestampNs": result.timestamp_ns,
+                "error": None,
+            }
+        except Exception:
+            logger.exception(
+                "Unexpected assistant result processing failure for request %s",
+                request_id,
+            )
+            terminalize_unexpected_request(result)
+            raise
+        return response
 
     @router.get(
         "/tools",

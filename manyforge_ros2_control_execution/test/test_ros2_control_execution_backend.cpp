@@ -8,11 +8,16 @@
 #include "../src/scene_projection_worker.hpp"
 
 #include <control_msgs/action/follow_joint_trajectory.hpp>
+#include <controller_manager_msgs/msg/controller_manager_activity.hpp>
+#include <controller_manager_msgs/srv/list_controllers.hpp>
+#include <controller_manager_msgs/srv/list_hardware_components.hpp>
 #include <gtest/gtest.h>
+#include <lifecycle_msgs/msg/state.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -65,6 +70,58 @@ Ros2ControlExecutionBackendConfig base_config() {
   config.monitor_period_s = 0.01;
   config.enable_jtc_speed_scaling_input = false;
   return config;
+}
+
+ControllerBindingContract binding_contract_for(
+    const Ros2ControlExecutionBackendConfig& config,
+    const std::string& controller_manager) {
+  ControllerBindingContract contract;
+  contract.generation_id = "binding-" + unique_suffix();
+  contract.controller_manager = controller_manager;
+  contract.activity_topic = controller_manager + "/activity";
+  contract.hardware_component_name = "test_hardware";
+  contract.trajectory_controller_manager_name = "test_trajectory_controller";
+  contract.trajectory_controller_ros_name =
+      controller_manager.substr(
+          0, controller_manager.rfind("/controller_manager")) +
+      "/test_trajectory_controller";
+  contract.trajectory_controller_type =
+      "joint_trajectory_controller/JointTrajectoryController";
+  contract.follow_joint_trajectory_action = config.action_name;
+  contract.controller_state_topic = config.controller_state_topic;
+  contract.joint_state_topic = config.joint_state_topic;
+  contract.required_joints = config.required_joints;
+  for (const auto& joint : config.required_joints) {
+    contract.claimed_command_interfaces.push_back(joint + "/position");
+    contract.claimed_command_interfaces.push_back(joint + "/velocity");
+    contract.required_state_interfaces.push_back(joint + "/position");
+    contract.required_state_interfaces.push_back(joint + "/velocity");
+  }
+  contract.snapshot_max_age_ns = 2'000'000'000;
+  return contract;
+}
+
+ExecutionAdmissionSnapshot admitted_snapshot_for(
+    const ControllerBindingContract& contract,
+    std::int64_t now_ns,
+    std::uint64_t generation = 1,
+    std::uint64_t lifecycle_generation = 1) {
+  ExecutionAdmissionSnapshot admission;
+  admission.generation = generation;
+  admission.lifecycle_generation = lifecycle_generation;
+  admission.robot_id = "lite6-a";
+  admission.binding_contract_generation_id = contract.generation_id;
+  admission.runtime_generation_id = "runtime-1";
+  admission.provider_component_epoch = "provider-epoch-1";
+  admission.transport_owner_component_epoch = "owner-epoch-1";
+  admission.authority_component_epoch = "authority-epoch-1";
+  admission.cell_supervisor_component_epoch = "supervisor-epoch-1";
+  admission.observed_timestamp_ns = now_ns;
+  admission.received_timestamp_ns = now_ns;
+  admission.fresh_until_ns = now_ns + 10'000'000'000;
+  admission.controller_ready = true;
+  admission.motion_admitted = true;
+  return admission;
 }
 
 core::TrajectoryDTO make_single_joint_trajectory(double start, double finish) {
@@ -406,17 +463,27 @@ class FakeFjtServer {
     server_ = rclcpp_action::create_server<FollowJointTrajectory>(
         node_,
         action_name,
-        [](const rclcpp_action::GoalUUID&,
-           std::shared_ptr<const FollowJointTrajectory::Goal>) {
+        [this](const rclcpp_action::GoalUUID&,
+               std::shared_ptr<const FollowJointTrajectory::Goal>) {
+          std::unique_lock<std::mutex> lock(goal_response_mutex_);
+          if (block_goal_response_) {
+            goal_response_entered_ = true;
+            goal_response_cv_.notify_all();
+            goal_response_cv_.wait_for(lock, 2s, [this]() {
+              return release_goal_response_;
+            });
+          }
           return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
         },
-        [](const std::shared_ptr<ServerGoalHandleFJT>) {
+        [this](const std::shared_ptr<ServerGoalHandleFJT>) {
+          cancel_requests_.fetch_add(1, std::memory_order_relaxed);
           return rclcpp_action::CancelResponse::ACCEPT;
         },
         [this](const std::shared_ptr<ServerGoalHandleFJT> goal_handle) {
           {
             std::lock_guard<std::mutex> lock(mutex_);
             goal_handle_ = goal_handle;
+            ++goal_count_;
           }
           cv_.notify_all();
         });
@@ -430,6 +497,7 @@ class FakeFjtServer {
   }
 
   ~FakeFjtServer() {
+    release_goal_response();
     server_.reset();
     if (executor_) {
       executor_->cancel();
@@ -449,9 +517,15 @@ class FakeFjtServer {
   }
 
   bool wait_for_goal() const {
+    return wait_for_goal_count(1);
+  }
+
+  bool wait_for_goal_count(std::uint64_t expected) const {
     std::unique_lock<std::mutex> lock(mutex_);
     return cv_.wait_for(lock, 2s,
-                        [this]() { return goal_handle_ != nullptr; });
+                        [this, expected]() {
+                          return goal_count_ >= expected;
+                        });
   }
 
   bool succeed_current_goal() {
@@ -487,6 +561,56 @@ class FakeFjtServer {
     return true;
   }
 
+  bool cancel_current_goal() {
+    std::shared_ptr<ServerGoalHandleFJT> goal_handle;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      goal_handle = goal_handle_;
+    }
+    if (!goal_handle) {
+      return false;
+    }
+    auto result = std::make_shared<FollowJointTrajectory::Result>();
+    goal_handle->canceled(result);
+    return true;
+  }
+
+  std::uint64_t goal_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return goal_count_;
+  }
+
+  std::uint64_t cancel_requests() const {
+    return cancel_requests_.load(std::memory_order_relaxed);
+  }
+
+  bool has_goal() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return goal_handle_ != nullptr;
+  }
+
+  void block_goal_response() {
+    std::lock_guard<std::mutex> lock(goal_response_mutex_);
+    block_goal_response_ = true;
+    goal_response_entered_ = false;
+    release_goal_response_ = false;
+  }
+
+  bool wait_for_goal_response_entry() const {
+    std::unique_lock<std::mutex> lock(goal_response_mutex_);
+    return goal_response_cv_.wait_for(
+        lock, 2s, [this]() { return goal_response_entered_; });
+  }
+
+  void release_goal_response() {
+    {
+      std::lock_guard<std::mutex> lock(goal_response_mutex_);
+      release_goal_response_ = true;
+      block_goal_response_ = false;
+    }
+    goal_response_cv_.notify_all();
+  }
+
  private:
   std::shared_ptr<rclcpp::Context> context_;
   rclcpp::Node::SharedPtr node_;
@@ -496,7 +620,238 @@ class FakeFjtServer {
   mutable std::mutex mutex_;
   mutable std::condition_variable cv_;
   std::shared_ptr<ServerGoalHandleFJT> goal_handle_;
+  std::uint64_t goal_count_ = 0;
+  std::atomic<std::uint64_t> cancel_requests_{0};
+  mutable std::mutex goal_response_mutex_;
+  mutable std::condition_variable goal_response_cv_;
+  bool block_goal_response_ = false;
+  mutable bool goal_response_entered_ = false;
+  bool release_goal_response_ = false;
 };
+
+class FakeControllerManager {
+ public:
+  FakeControllerManager(
+      std::string controller_manager,
+      ControllerBindingContract contract,
+      bool publish_initial_activity = true)
+      : controller_manager_(std::move(controller_manager)),
+        contract_(std::move(contract)) {
+    context_ = std::make_shared<rclcpp::Context>();
+    int argc = 0;
+    char** argv = nullptr;
+    context_->init(argc, argv);
+
+    rclcpp::NodeOptions options;
+    options.context(context_);
+    node_ = std::make_shared<rclcpp::Node>(
+        "manyforge_controller_manager_test_" + unique_suffix(), options);
+    activity_publisher_ = node_->create_publisher<
+        controller_manager_msgs::msg::ControllerManagerActivity>(
+        contract_.activity_topic,
+        rclcpp::QoS(1).reliable().transient_local());
+    list_controllers_service_ = node_->create_service<
+        controller_manager_msgs::srv::ListControllers>(
+        controller_manager_ + "/list_controllers",
+        [this](
+            const std::shared_ptr<
+                controller_manager_msgs::srv::ListControllers::Request>,
+            std::shared_ptr<
+                controller_manager_msgs::srv::ListControllers::Response>
+                response) {
+          fill_controllers(*response);
+        });
+    list_hardware_service_ = node_->create_service<
+        controller_manager_msgs::srv::ListHardwareComponents>(
+        controller_manager_ + "/list_hardware_components",
+        [this](
+            const std::shared_ptr<
+                controller_manager_msgs::srv::ListHardwareComponents::
+                    Request>,
+            std::shared_ptr<
+                controller_manager_msgs::srv::ListHardwareComponents::
+                    Response> response) {
+          fill_hardware(*response);
+        });
+
+    rclcpp::ExecutorOptions executor_options;
+    executor_options.context = context_;
+    executor_ =
+        std::make_shared<rclcpp::executors::SingleThreadedExecutor>(
+            executor_options);
+    executor_->add_node(node_);
+    spin_thread_ = std::thread([this]() { executor_->spin(); });
+    if (publish_initial_activity) {
+      publish_activity();
+    }
+  }
+
+  ~FakeControllerManager() {
+    if (executor_) {
+      executor_->cancel();
+    }
+    if (spin_thread_.joinable()) {
+      spin_thread_.join();
+    }
+    if (executor_ && node_) {
+      executor_->remove_node(node_);
+    }
+    list_controllers_service_.reset();
+    list_hardware_service_.reset();
+    activity_publisher_.reset();
+    node_.reset();
+    executor_.reset();
+    if (context_) {
+      context_->shutdown("test shutdown");
+      context_.reset();
+    }
+  }
+
+  void set_controller_active(bool active) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      controller_active_ = active;
+    }
+    publish_activity();
+  }
+
+  void set_conflicting_claim(bool conflicting) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      conflicting_claim_ = conflicting;
+    }
+    publish_activity();
+  }
+
+  bool wait_for_activity_subscription() const {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (activity_publisher_->get_subscription_count() > 0) {
+        return true;
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    return activity_publisher_->get_subscription_count() > 0;
+  }
+
+  void announce_activity() {
+    publish_activity();
+  }
+
+ private:
+  void fill_controllers(
+      controller_manager_msgs::srv::ListControllers::Response& response) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    controller_manager_msgs::msg::ControllerState selected;
+    selected.name = contract_.trajectory_controller_manager_name;
+    selected.state = controller_active_ ? "active" : "inactive";
+    selected.type = contract_.trajectory_controller_type;
+    selected.claimed_interfaces =
+        contract_.claimed_command_interfaces;
+    response.controller.push_back(std::move(selected));
+    if (conflicting_claim_) {
+      controller_manager_msgs::msg::ControllerState conflict;
+      conflict.name = "conflicting_controller";
+      conflict.state = "active";
+      conflict.type = "test/ConflictingController";
+      conflict.claimed_interfaces = {
+          contract_.claimed_command_interfaces.front()};
+      response.controller.push_back(std::move(conflict));
+    }
+  }
+
+  void fill_hardware(
+      controller_manager_msgs::srv::ListHardwareComponents::Response&
+          response) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    controller_manager_msgs::msg::HardwareComponentState component;
+    component.name = contract_.hardware_component_name;
+    component.type = "system";
+    component.state.id =
+        lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+    component.state.label = "active";
+    for (const auto& name : contract_.claimed_command_interfaces) {
+      controller_manager_msgs::msg::HardwareInterface interface;
+      interface.name = name;
+      interface.is_available = true;
+      interface.is_claimed = true;
+      component.command_interfaces.push_back(std::move(interface));
+    }
+    for (const auto& name : contract_.required_state_interfaces) {
+      controller_manager_msgs::msg::HardwareInterface interface;
+      interface.name = name;
+      interface.is_available = true;
+      component.state_interfaces.push_back(std::move(interface));
+    }
+    response.component.push_back(std::move(component));
+  }
+
+  void publish_activity() {
+    controller_manager_msgs::msg::ControllerManagerActivity activity;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      controller_manager_msgs::msg::NamedLifecycleState controller;
+      controller.name = contract_.trajectory_controller_manager_name;
+      controller.state.id =
+          controller_active_
+              ? lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE
+              : lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
+      controller.state.label =
+          controller_active_ ? "active" : "inactive";
+      activity.controllers.push_back(std::move(controller));
+      controller_manager_msgs::msg::NamedLifecycleState hardware;
+      hardware.name = contract_.hardware_component_name;
+      hardware.state.id =
+          lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+      hardware.state.label = "active";
+      activity.hardware_components.push_back(std::move(hardware));
+    }
+    activity_publisher_->publish(activity);
+  }
+
+  std::string controller_manager_;
+  ControllerBindingContract contract_;
+  std::shared_ptr<rclcpp::Context> context_;
+  rclcpp::Node::SharedPtr node_;
+  rclcpp::Publisher<
+      controller_manager_msgs::msg::ControllerManagerActivity>::SharedPtr
+      activity_publisher_;
+  rclcpp::Service<
+      controller_manager_msgs::srv::ListControllers>::SharedPtr
+      list_controllers_service_;
+  rclcpp::Service<
+      controller_manager_msgs::srv::ListHardwareComponents>::SharedPtr
+      list_hardware_service_;
+  std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
+  std::thread spin_thread_;
+  mutable std::mutex mutex_;
+  bool controller_active_ = true;
+  bool conflicting_claim_ = false;
+};
+
+template <typename Predicate>
+std::optional<ControllerBindingSnapshot> wait_for_binding_snapshot(
+    const Ros2ControlExecutionBackend& backend,
+    Predicate predicate,
+    std::chrono::milliseconds timeout = 4s) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    auto snapshot = backend.controller_binding_snapshot();
+    if (snapshot.has_value() && predicate(*snapshot)) {
+      return snapshot;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  return std::nullopt;
+}
+
+bool has_reason(const ControllerBindingSnapshot& snapshot,
+                const std::string& reason) {
+  return std::find(
+             snapshot.reason_codes.begin(),
+             snapshot.reason_codes.end(), reason) !=
+         snapshot.reason_codes.end();
+}
 
 TEST(Ros2ControlExecutionBackendTest, RejectsNullExecutionStateSink) {
   core::FakeClock clock;
@@ -505,6 +860,962 @@ TEST(Ros2ControlExecutionBackendTest, RejectsNullExecutionStateSink) {
       Ros2ControlExecutionBackend(
           nullptr, "arm", clock, scheduler, base_config()),
       std::invalid_argument);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     MissingControllerManagerPublishesInvalidBinding) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  auto config = base_config();
+  config.controller_state_topic =
+      "/manyforge_missing_manager_controller_state_" + unique_suffix();
+  config.controller_binding = binding_contract_for(
+      config,
+      "/manyforge_missing_manager_" + unique_suffix() +
+          "/controller_manager");
+  config.controller_binding_refresh_timeout_s = 0.05;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+
+  const auto snapshot = wait_for_binding_snapshot(
+      backend, [](const ControllerBindingSnapshot& candidate) {
+        return !candidate.valid &&
+               has_reason(
+                   candidate, "controller_list_service_unavailable");
+      });
+  ASSERT_TRUE(snapshot.has_value());
+  EXPECT_FALSE(snapshot->valid);
+  EXPECT_GT(
+      backend.controller_progress_metrics()
+          .controller_binding_refresh_failures_total,
+      0u);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ControllerManagerServicesCannotBypassInitialActivityFence) {
+  const std::string suffix = unique_suffix();
+  const std::string controller_manager =
+      "/manyforge_binding_activity_fence_" + suffix +
+      "/controller_manager";
+  auto config = base_config();
+  config.action_name =
+      "/manyforge_binding_activity_fence_" + suffix +
+      "/follow_joint_trajectory";
+  config.joint_state_topic =
+      "/manyforge_binding_activity_fence_" + suffix + "/joint_states";
+  config.controller_state_topic =
+      "/manyforge_binding_activity_fence_" + suffix +
+      "/controller_state";
+  config.controller_binding =
+      binding_contract_for(config, controller_manager);
+  config.controller_binding_refresh_timeout_s = 1.0;
+
+  FakeControllerManager manager(
+      controller_manager, *config.controller_binding,
+      /*publish_initial_activity=*/false);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+
+  const auto fenced = wait_for_binding_snapshot(
+      backend, [](const ControllerBindingSnapshot& candidate) {
+        return !candidate.valid &&
+               has_reason(candidate, "controller_activity_unobserved");
+      });
+  ASSERT_TRUE(fenced.has_value());
+
+  manager.announce_activity();
+  const auto admitted = wait_for_binding_snapshot(
+      backend, [](const ControllerBindingSnapshot& candidate) {
+        return candidate.activity_generation > 0 && candidate.valid;
+      });
+  ASSERT_TRUE(admitted.has_value());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ControllerManagerMonitorRejectsConflictAndRestartChurn) {
+  const std::string suffix = unique_suffix();
+  const std::string controller_manager =
+      "/manyforge_binding_matrix_" + suffix + "/controller_manager";
+  auto config = base_config();
+  config.action_name =
+      "/manyforge_binding_matrix_" + suffix + "/follow_joint_trajectory";
+  config.joint_state_topic =
+      "/manyforge_binding_matrix_" + suffix + "/joint_states";
+  config.controller_state_topic =
+      "/manyforge_binding_matrix_" + suffix + "/controller_state";
+  config.controller_binding =
+      binding_contract_for(config, controller_manager);
+  config.controller_binding_refresh_timeout_s = 1.0;
+
+  FakeControllerManager manager(
+      controller_manager, *config.controller_binding);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+
+  const auto initial = wait_for_binding_snapshot(
+      backend, [](const ControllerBindingSnapshot& candidate) {
+        return candidate.valid;
+      });
+  ASSERT_TRUE(initial.has_value());
+
+  manager.set_conflicting_claim(true);
+  const auto conflict = wait_for_binding_snapshot(
+      backend, [initial](const ControllerBindingSnapshot& candidate) {
+        return candidate.activity_generation >
+                   initial->activity_generation &&
+               !candidate.valid &&
+               has_reason(
+                   candidate, "trajectory_controller_claim_conflict");
+      });
+  ASSERT_TRUE(conflict.has_value());
+  EXPECT_FALSE(conflict->conflicting_claims_absent);
+
+  manager.set_conflicting_claim(false);
+  const auto recovered = wait_for_binding_snapshot(
+      backend, [conflict](const ControllerBindingSnapshot& candidate) {
+        return candidate.activity_generation >
+                   conflict->activity_generation &&
+               candidate.valid;
+      });
+  ASSERT_TRUE(recovered.has_value());
+
+  manager.set_controller_active(false);
+  const auto inactive = wait_for_binding_snapshot(
+      backend, [recovered](const ControllerBindingSnapshot& candidate) {
+        return candidate.activity_generation >
+                   recovered->activity_generation &&
+               !candidate.valid &&
+               has_reason(
+                   candidate, "trajectory_controller_inactive");
+      });
+  ASSERT_TRUE(inactive.has_value());
+  EXPECT_FALSE(inactive->controller_active);
+
+  manager.set_controller_active(true);
+  const auto restarted = wait_for_binding_snapshot(
+      backend, [inactive](const ControllerBindingSnapshot& candidate) {
+        return candidate.activity_generation >
+                   inactive->activity_generation &&
+               candidate.valid;
+      });
+  ASSERT_TRUE(restarted.has_value());
+  EXPECT_TRUE(restarted->controller_active);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     AdmissionPublicationIsMonotonicAndIdempotent) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000);
+  auto config = base_config();
+  config.controller_state_topic =
+      "/manyforge_admission_controller_state_" + unique_suffix();
+  config.controller_binding =
+      binding_contract_for(config, "/manyforge_admission/controller_manager");
+  config.require_execution_admission_snapshot = true;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      config);
+
+  ExecutionAdmissionSnapshot admission;
+  admission.generation = 4;
+  admission.lifecycle_generation = 2;
+  admission.robot_id = "lite6-a";
+  admission.binding_contract_generation_id =
+      config.controller_binding->generation_id;
+  admission.runtime_generation_id = "runtime-1";
+  admission.provider_component_epoch = "provider-epoch-1";
+  admission.transport_owner_component_epoch = "owner-epoch-1";
+  admission.authority_component_epoch = "authority-epoch-1";
+  admission.cell_supervisor_component_epoch = "supervisor-epoch-1";
+  admission.observed_timestamp_ns = clock.now();
+  admission.received_timestamp_ns = clock.now();
+  admission.fresh_until_ns = clock.now() + 10'000;
+  admission.controller_ready = true;
+  admission.motion_admitted = true;
+
+  auto malformed = admission;
+  malformed.robot_id.clear();
+  EXPECT_FALSE(backend.publish_execution_admission_snapshot(malformed));
+  malformed = admission;
+  malformed.observed_timestamp_ns =
+      malformed.received_timestamp_ns + 1;
+  EXPECT_FALSE(backend.publish_execution_admission_snapshot(malformed));
+  malformed = admission;
+  malformed.controller_ready = false;
+  EXPECT_FALSE(backend.publish_execution_admission_snapshot(malformed));
+  malformed = admission;
+  malformed.reason_codes = {"duplicate", "duplicate"};
+  EXPECT_FALSE(backend.publish_execution_admission_snapshot(malformed));
+  malformed = admission;
+  malformed.binding_contract_generation_id = "another-robot-binding";
+  EXPECT_FALSE(backend.publish_execution_admission_snapshot(malformed));
+
+  EXPECT_TRUE(backend.publish_execution_admission_snapshot(admission));
+  EXPECT_TRUE(backend.publish_execution_admission_snapshot(admission))
+      << "an exact retry is idempotent";
+
+  auto conflicting = admission;
+  conflicting.motion_admitted = false;
+  EXPECT_FALSE(backend.publish_execution_admission_snapshot(conflicting))
+      << "one generation cannot describe two lifecycle states";
+
+  auto older = admission;
+  older.generation -= 1;
+  EXPECT_FALSE(backend.publish_execution_admission_snapshot(older));
+
+  auto semantic_change_without_lifecycle_generation = admission;
+  semantic_change_without_lifecycle_generation.generation += 1;
+  semantic_change_without_lifecycle_generation.received_timestamp_ns += 1;
+  semantic_change_without_lifecycle_generation.fresh_until_ns += 1;
+  semantic_change_without_lifecycle_generation.motion_admitted = false;
+  semantic_change_without_lifecycle_generation.reason_codes = {
+      "operator_gate_closed"};
+  EXPECT_FALSE(backend.publish_execution_admission_snapshot(
+      semantic_change_without_lifecycle_generation));
+
+  auto refreshed = admission;
+  refreshed.generation += 1;
+  refreshed.observed_timestamp_ns += 1;
+  refreshed.received_timestamp_ns += 1;
+  refreshed.fresh_until_ns += 1;
+  EXPECT_TRUE(backend.publish_execution_admission_snapshot(refreshed))
+      << "one lifecycle generation may renew its observation lease";
+
+  auto regressed_lifecycle = refreshed;
+  regressed_lifecycle.generation += 1;
+  regressed_lifecycle.lifecycle_generation -= 1;
+  regressed_lifecycle.observed_timestamp_ns += 1;
+  regressed_lifecycle.received_timestamp_ns += 1;
+  regressed_lifecycle.fresh_until_ns += 1;
+  EXPECT_FALSE(
+      backend.publish_execution_admission_snapshot(regressed_lifecycle));
+
+  auto newer = refreshed;
+  newer.generation += 1;
+  newer.lifecycle_generation += 1;
+  newer.observed_timestamp_ns += 1;
+  newer.received_timestamp_ns += 1;
+  newer.fresh_until_ns += 1;
+  newer.motion_admitted = false;
+  newer.reason_codes = {"operator_gate_closed"};
+  EXPECT_TRUE(backend.publish_execution_admission_snapshot(newer));
+
+  const auto observed = backend.execution_admission_snapshot();
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->generation, newer.generation);
+  EXPECT_EQ(observed->lifecycle_generation, newer.lifecycle_generation);
+  EXPECT_FALSE(observed->motion_admitted);
+  EXPECT_EQ(observed->reason_codes,
+            (std::vector<std::string>{"operator_gate_closed"}));
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     MissingAdmissionRejectsBeforeFjtDispatch) {
+  const std::string suffix = unique_suffix();
+  const std::string action_name =
+      "/manyforge_binding_reject_fjt_" + suffix;
+  const std::string joint_state_topic =
+      "/manyforge_binding_reject_joint_states_" + suffix;
+  const std::string controller_state_topic =
+      "/manyforge_binding_reject_controller_state_" + suffix;
+  const std::string controller_manager =
+      "/manyforge_binding_reject_" + suffix + "/controller_manager";
+
+  FakeFjtServer server(action_name);
+  FakeControllerManager manager(
+      controller_manager,
+      [&]() {
+        auto provisional = base_config();
+        provisional.action_name = action_name;
+        provisional.joint_state_topic = joint_state_topic;
+        provisional.controller_state_topic = controller_state_topic;
+        return binding_contract_for(provisional, controller_manager);
+      }());
+  JointStatePublisher publisher(joint_state_topic);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  auto config = base_config();
+  config.action_name = action_name;
+  config.joint_state_topic = joint_state_topic;
+  config.controller_state_topic = controller_state_topic;
+  config.wait_for_state_timeout_s = 1.0;
+  config.wait_for_action_server_timeout_s = 2.0;
+  config.joint_state_max_age_s = 5.0;
+  config.controller_binding =
+      binding_contract_for(config, controller_manager);
+  config.require_execution_admission_snapshot = true;
+  config.controller_binding_refresh_timeout_s = 1.0;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+  const auto binding_deadline = std::chrono::steady_clock::now() + 4s;
+  while (std::chrono::steady_clock::now() < binding_deadline) {
+    const auto binding = backend.controller_binding_snapshot();
+    if (binding.has_value() && binding->valid) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  const auto binding = backend.controller_binding_snapshot();
+  ASSERT_TRUE(binding.has_value());
+  ASSERT_TRUE(binding->valid);
+
+  ASSERT_TRUE(publisher.wait_for_subscription());
+  bool preplanning_rejection_observed = false;
+  const auto sample_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < sample_deadline) {
+    publisher.publish({"joint_1"}, {0.0});
+    const auto sync = backend.sync_observed_state_before_planning();
+    if (
+        !sync.ok() &&
+        sync.error().details.contains("reason") &&
+        sync.error().details.at("reason") ==
+            "execution_admission_unavailable") {
+      preplanning_rejection_observed = true;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(preplanning_rejection_observed);
+  EXPECT_FALSE(backend.testing_planning_environment_pin().has_value());
+
+  const auto handle =
+      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000));
+  const auto snapshot = handle.get_snapshot();
+  EXPECT_EQ(snapshot.state, core::ExecutionState::kFailed);
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->details.at("reason_code"),
+            ros2_control_fault_reason::kExecutionAdmissionRejected);
+  EXPECT_EQ(snapshot.error->details.at("admission_failure_reason"),
+            "execution_admission_unavailable");
+  EXPECT_FALSE(server.has_goal());
+  EXPECT_EQ(
+      backend.controller_progress_metrics()
+          .execution_admission_dispatch_rejections_total,
+      1u);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ComponentEpochChangeBetweenPlanningAndDispatchRejectsWithoutFjtGoal) {
+  const std::string suffix = unique_suffix();
+  const std::string action_name =
+      "/manyforge_environment_change_fjt_" + suffix;
+  const std::string joint_state_topic =
+      "/manyforge_environment_change_joint_states_" + suffix;
+  const std::string controller_state_topic =
+      "/manyforge_environment_change_controller_state_" + suffix;
+  const std::string controller_manager =
+      "/manyforge_environment_change_" + suffix + "/controller_manager";
+
+  auto config = base_config();
+  config.action_name = action_name;
+  config.joint_state_topic = joint_state_topic;
+  config.controller_state_topic = controller_state_topic;
+  config.wait_for_state_timeout_s = 1.0;
+  config.wait_for_action_server_timeout_s = 2.0;
+  config.joint_state_max_age_s = 5.0;
+  config.controller_binding =
+      binding_contract_for(config, controller_manager);
+  config.require_execution_admission_snapshot = true;
+  config.controller_binding_refresh_timeout_s = 1.0;
+
+  FakeFjtServer server(action_name);
+  FakeControllerManager manager(
+      controller_manager, *config.controller_binding);
+  JointStatePublisher publisher(joint_state_topic);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+  ASSERT_TRUE(wait_for_binding_snapshot(
+                  backend,
+                  [](const ControllerBindingSnapshot& candidate) {
+                    return candidate.valid;
+                  })
+                  .has_value());
+
+  auto admission =
+      admitted_snapshot_for(*config.controller_binding, clock.now());
+  ASSERT_TRUE(backend.publish_execution_admission_snapshot(admission));
+
+  ASSERT_TRUE(publisher.wait_for_subscription());
+  bool environment_pinned = false;
+  const auto sample_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < sample_deadline) {
+    publisher.publish({"joint_1"}, {0.0});
+    if (backend.sync_observed_state_before_planning().ok()) {
+      environment_pinned = true;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(environment_pinned);
+  ASSERT_TRUE(backend.testing_planning_environment_pin().has_value());
+
+  admission.generation += 1;
+  admission.lifecycle_generation += 1;
+  admission.observed_timestamp_ns += 1;
+  admission.received_timestamp_ns += 1;
+  admission.fresh_until_ns += 1;
+  admission.transport_owner_component_epoch = "owner-epoch-2";
+  ASSERT_TRUE(backend.publish_execution_admission_snapshot(admission));
+
+  const auto handle =
+      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000));
+  const auto terminal = handle.get_snapshot();
+  EXPECT_EQ(terminal.state, core::ExecutionState::kFailed);
+  ASSERT_TRUE(terminal.error.has_value());
+  EXPECT_EQ(terminal.error->details.at("reason_code"),
+            ros2_control_fault_reason::kExecutionAdmissionRejected);
+  EXPECT_EQ(terminal.error->details.at("phase"),
+            "planning_to_dispatch_environment_pin");
+  EXPECT_EQ(terminal.error->details.at("reason"),
+            "execution_environment_epoch_changed");
+  EXPECT_EQ(server.goal_count(), 0u);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ActivityChangeCancelsActiveFjtAndFailsClosed) {
+  const std::string suffix = unique_suffix();
+  const std::string action_name =
+      "/manyforge_binding_loss_fjt_" + suffix;
+  const std::string joint_state_topic =
+      "/manyforge_binding_loss_joint_states_" + suffix;
+  const std::string controller_state_topic =
+      "/manyforge_binding_loss_controller_state_" + suffix;
+  const std::string controller_manager =
+      "/manyforge_binding_loss_" + suffix + "/controller_manager";
+
+  auto config = base_config();
+  config.action_name = action_name;
+  config.joint_state_topic = joint_state_topic;
+  config.controller_state_topic = controller_state_topic;
+  config.wait_for_state_timeout_s = 1.0;
+  config.wait_for_action_server_timeout_s = 2.0;
+  config.joint_state_max_age_s = 5.0;
+  config.tracking_error_tolerance_rad = 10.0;
+  config.tracking_error_timeout_s = 10.0;
+  config.controller_binding =
+      binding_contract_for(config, controller_manager);
+  config.require_execution_admission_snapshot = true;
+  config.controller_binding_refresh_timeout_s = 1.0;
+
+  FakeFjtServer server(action_name);
+  FakeControllerManager manager(
+      controller_manager, *config.controller_binding);
+  JointStatePublisher publisher(joint_state_topic);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+  const auto binding_deadline = std::chrono::steady_clock::now() + 4s;
+  while (std::chrono::steady_clock::now() < binding_deadline) {
+    const auto binding = backend.controller_binding_snapshot();
+    if (binding.has_value() && binding->valid) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  const auto binding = backend.controller_binding_snapshot();
+  ASSERT_TRUE(binding.has_value());
+  ASSERT_TRUE(binding->valid);
+
+  auto admission =
+      admitted_snapshot_for(*config.controller_binding, clock.now());
+  ASSERT_TRUE(backend.publish_execution_admission_snapshot(admission));
+
+  ASSERT_TRUE(publisher.wait_for_subscription());
+  bool initial_sample_observed = false;
+  const auto sample_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < sample_deadline) {
+    publisher.publish({"joint_1"}, {0.0});
+    if (backend.sync_observed_state_before_planning().ok()) {
+      initial_sample_observed = true;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(initial_sample_observed);
+
+  const auto handle =
+      backend.execute_trajectory(make_single_joint_trajectory(0.0, 1.0));
+  ASSERT_NE(handle.execution_generation, 0u);
+  ASSERT_TRUE(server.wait_for_goal());
+  ASSERT_TRUE(server.publish_feedback(0.0));
+
+  manager.set_controller_active(false);
+  std::optional<core::ExecutionSnapshot> terminal;
+  const auto terminal_deadline = std::chrono::steady_clock::now() + 3s;
+  while (std::chrono::steady_clock::now() < terminal_deadline) {
+    const auto snapshot = handle.get_snapshot();
+    if (snapshot.state == core::ExecutionState::kFailed) {
+      terminal = snapshot;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(terminal.has_value());
+  ASSERT_TRUE(terminal->error.has_value());
+  EXPECT_EQ(terminal->error->details.at("reason_code"),
+            ros2_control_fault_reason::kControllerBindingLost);
+  EXPECT_EQ(terminal->error->details.at("admission_failure_reason"),
+            "controller_binding_invalid");
+  const auto cancellation_deadline =
+      std::chrono::steady_clock::now() + 2s;
+  while (server.cancel_requests() == 0 &&
+         std::chrono::steady_clock::now() < cancellation_deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  EXPECT_GT(server.cancel_requests(), 0u);
+  EXPECT_EQ(
+      backend.controller_progress_metrics()
+          .dispatch_authority_losses_total,
+      1u);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     LifecycleAdmissionLossCancelsActiveFjtAndFailsClosed) {
+  const std::string suffix = unique_suffix();
+  const std::string action_name =
+      "/manyforge_admission_loss_fjt_" + suffix;
+  const std::string joint_state_topic =
+      "/manyforge_admission_loss_joint_states_" + suffix;
+  const std::string controller_state_topic =
+      "/manyforge_admission_loss_controller_state_" + suffix;
+  const std::string controller_manager =
+      "/manyforge_admission_loss_" + suffix + "/controller_manager";
+
+  auto config = base_config();
+  config.action_name = action_name;
+  config.joint_state_topic = joint_state_topic;
+  config.controller_state_topic = controller_state_topic;
+  config.wait_for_state_timeout_s = 1.0;
+  config.wait_for_action_server_timeout_s = 2.0;
+  config.joint_state_max_age_s = 5.0;
+  config.tracking_error_tolerance_rad = 10.0;
+  config.tracking_error_timeout_s = 10.0;
+  config.controller_binding =
+      binding_contract_for(config, controller_manager);
+  config.require_execution_admission_snapshot = true;
+  config.controller_binding_refresh_timeout_s = 1.0;
+
+  FakeFjtServer server(action_name);
+  FakeControllerManager manager(
+      controller_manager, *config.controller_binding);
+  JointStatePublisher publisher(joint_state_topic);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+  ASSERT_TRUE(wait_for_binding_snapshot(
+                  backend,
+                  [](const ControllerBindingSnapshot& candidate) {
+                    return candidate.valid;
+                  })
+                  .has_value());
+  ASSERT_TRUE(backend.publish_execution_admission_snapshot(
+      admitted_snapshot_for(*config.controller_binding, clock.now())));
+
+  ASSERT_TRUE(publisher.wait_for_subscription());
+  bool initial_sample_observed = false;
+  const auto sample_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < sample_deadline) {
+    publisher.publish({"joint_1"}, {0.0});
+    if (backend.sync_observed_state_before_planning().ok()) {
+      initial_sample_observed = true;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(initial_sample_observed);
+
+  const auto handle =
+      backend.execute_trajectory(make_single_joint_trajectory(0.0, 1.0));
+  ASSERT_NE(handle.execution_generation, 0u);
+  ASSERT_TRUE(server.wait_for_goal());
+  ASSERT_TRUE(server.publish_feedback(0.0));
+
+  auto revoked = admitted_snapshot_for(
+      *config.controller_binding, clock.now(),
+      /*generation=*/2, /*lifecycle_generation=*/2);
+  revoked.controller_ready = false;
+  revoked.motion_admitted = false;
+  revoked.reason_codes = {"operator_gate_closed"};
+  ASSERT_TRUE(backend.publish_execution_admission_snapshot(revoked));
+
+  std::optional<core::ExecutionSnapshot> terminal;
+  const auto terminal_deadline = std::chrono::steady_clock::now() + 3s;
+  while (std::chrono::steady_clock::now() < terminal_deadline) {
+    const auto snapshot = handle.get_snapshot();
+    if (snapshot.state == core::ExecutionState::kFailed) {
+      terminal = snapshot;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(terminal.has_value());
+  ASSERT_TRUE(terminal->error.has_value());
+  EXPECT_EQ(terminal->error->details.at("reason_code"),
+            ros2_control_fault_reason::kExecutionAdmissionLost);
+  EXPECT_EQ(terminal->error->details.at("admission_failure_reason"),
+            "execution_controller_not_ready");
+  const auto cancellation_deadline =
+      std::chrono::steady_clock::now() + 2s;
+  while (server.cancel_requests() == 0 &&
+         std::chrono::steady_clock::now() < cancellation_deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  EXPECT_GT(server.cancel_requests(), 0u);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     LifecycleGenerationChangeCannotCommitSuccessfulTerminalResult) {
+  const std::string suffix = unique_suffix();
+  const std::string action_name =
+      "/manyforge_terminal_authority_fjt_" + suffix;
+  const std::string joint_state_topic =
+      "/manyforge_terminal_authority_joint_states_" + suffix;
+  const std::string controller_state_topic =
+      "/manyforge_terminal_authority_controller_state_" + suffix;
+  const std::string controller_manager =
+      "/manyforge_terminal_authority_" + suffix + "/controller_manager";
+
+  auto config = base_config();
+  config.action_name = action_name;
+  config.joint_state_topic = joint_state_topic;
+  config.controller_state_topic = controller_state_topic;
+  config.wait_for_state_timeout_s = 1.0;
+  config.wait_for_action_server_timeout_s = 2.0;
+  config.joint_state_max_age_s = 5.0;
+  config.tracking_error_tolerance_rad = 10.0;
+  config.tracking_error_timeout_s = 10.0;
+  // Keep the periodic monitor asleep so this case exercises the terminal
+  // result boundary itself rather than relying on the next monitor tick.
+  config.monitor_period_s = 5.0;
+  config.controller_binding =
+      binding_contract_for(config, controller_manager);
+  config.require_execution_admission_snapshot = true;
+  config.controller_binding_refresh_timeout_s = 1.0;
+
+  FakeFjtServer server(action_name);
+  FakeControllerManager manager(
+      controller_manager, *config.controller_binding);
+  JointStatePublisher publisher(joint_state_topic);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+  ASSERT_TRUE(wait_for_binding_snapshot(
+                  backend,
+                  [](const ControllerBindingSnapshot& candidate) {
+                    return candidate.valid;
+                  })
+                  .has_value());
+  ASSERT_TRUE(backend.publish_execution_admission_snapshot(
+      admitted_snapshot_for(*config.controller_binding, clock.now())));
+
+  ASSERT_TRUE(publisher.wait_for_subscription());
+  bool initial_sample_observed = false;
+  const auto sample_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < sample_deadline) {
+    publisher.publish({"joint_1"}, {0.0});
+    if (backend.sync_observed_state_before_planning().ok()) {
+      initial_sample_observed = true;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(initial_sample_observed);
+
+  const auto handle =
+      backend.execute_trajectory(make_single_joint_trajectory(0.0, 1.0));
+  ASSERT_NE(handle.execution_generation, 0u);
+  ASSERT_TRUE(server.wait_for_goal());
+  ASSERT_TRUE(server.publish_feedback(0.0));
+
+  auto changed = admitted_snapshot_for(
+      *config.controller_binding, clock.now(),
+      /*generation=*/2, /*lifecycle_generation=*/2);
+  ASSERT_TRUE(backend.publish_execution_admission_snapshot(changed));
+  ASSERT_TRUE(server.succeed_current_goal());
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000));
+
+  const auto terminal = handle.get_snapshot();
+  EXPECT_EQ(terminal.state, core::ExecutionState::kFailed);
+  ASSERT_TRUE(terminal.error.has_value());
+  EXPECT_EQ(terminal.error->details.at("reason_code"),
+            ros2_control_fault_reason::kExecutionAdmissionLost);
+  EXPECT_EQ(terminal.error->details.at("admission_failure_reason"),
+            "execution_admission_generation_changed");
+  ASSERT_TRUE(terminal.error->details.contains("phase"));
+  const auto& phase = terminal.error->details.at("phase");
+  EXPECT_TRUE(phase == "active_goal_authority" ||
+              phase == "terminal_result_authority");
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ResumeCannotInheritPausedExecutionAcrossComponentEpochChange) {
+  const std::string suffix = unique_suffix();
+  const std::string action_name =
+      "/manyforge_resume_environment_fjt_" + suffix;
+  const std::string joint_state_topic =
+      "/manyforge_resume_environment_joint_states_" + suffix;
+  const std::string controller_state_topic =
+      "/manyforge_resume_environment_controller_state_" + suffix;
+  const std::string controller_manager =
+      "/manyforge_resume_environment_" + suffix + "/controller_manager";
+
+  auto config = base_config();
+  config.action_name = action_name;
+  config.joint_state_topic = joint_state_topic;
+  config.controller_state_topic = controller_state_topic;
+  config.wait_for_state_timeout_s = 1.0;
+  config.wait_for_action_server_timeout_s = 2.0;
+  config.joint_state_max_age_s = 5.0;
+  config.tracking_error_tolerance_rad = 10.0;
+  config.tracking_error_timeout_s = 10.0;
+  config.controller_binding =
+      binding_contract_for(config, controller_manager);
+  config.require_execution_admission_snapshot = true;
+  config.controller_binding_refresh_timeout_s = 1.0;
+
+  FakeFjtServer server(action_name);
+  FakeControllerManager manager(
+      controller_manager, *config.controller_binding);
+  JointStatePublisher publisher(joint_state_topic);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+  ASSERT_TRUE(wait_for_binding_snapshot(
+                  backend,
+                  [](const ControllerBindingSnapshot& candidate) {
+                    return candidate.valid;
+                  })
+                  .has_value());
+
+  auto admission =
+      admitted_snapshot_for(*config.controller_binding, clock.now());
+  ASSERT_TRUE(backend.publish_execution_admission_snapshot(admission));
+  ASSERT_TRUE(publisher.wait_for_subscription());
+  bool initial_environment_pinned = false;
+  const auto initial_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < initial_deadline) {
+    publisher.publish({"joint_1"}, {0.0});
+    if (backend.sync_observed_state_before_planning().ok()) {
+      initial_environment_pinned = true;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(initial_environment_pinned);
+
+  const auto initial_handle =
+      backend.execute_trajectory(make_single_joint_trajectory(0.0, 1.0));
+  ASSERT_TRUE(server.wait_for_goal_count(1));
+  ASSERT_TRUE(server.publish_feedback(0.0));
+  const auto pause = backend.pause();
+  ASSERT_TRUE(pause.accepted)
+      << (pause.error.has_value() ? pause.error->message : "");
+  const auto cancel_deadline = std::chrono::steady_clock::now() + 2s;
+  while (server.cancel_requests() == 0 &&
+         std::chrono::steady_clock::now() < cancel_deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_GT(server.cancel_requests(), 0u);
+  ASSERT_TRUE(server.cancel_current_goal());
+  ASSERT_TRUE(initial_handle.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(initial_handle.get_snapshot().state,
+            core::ExecutionState::kPaused);
+  const auto paused_pin = backend.testing_resumable_environment_pin();
+  ASSERT_TRUE(paused_pin.has_value());
+  EXPECT_EQ(paused_pin->transport_owner_component_epoch,
+            "owner-epoch-1");
+
+  admission.generation += 1;
+  admission.lifecycle_generation += 1;
+  admission.observed_timestamp_ns += 1;
+  admission.received_timestamp_ns += 1;
+  admission.fresh_until_ns += 1;
+  admission.transport_owner_component_epoch = "owner-epoch-2";
+  ASSERT_TRUE(backend.publish_execution_admission_snapshot(admission));
+
+  bool replacement_environment_pinned = false;
+  const auto replacement_deadline =
+      std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < replacement_deadline) {
+    publisher.publish({"joint_1"}, {0.0});
+    if (backend.sync_observed_state_before_planning().ok()) {
+      replacement_environment_pinned = true;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(replacement_environment_pinned);
+  const auto provisional_pin =
+      backend.testing_planning_environment_pin();
+  ASSERT_TRUE(provisional_pin.has_value());
+  EXPECT_EQ(provisional_pin->transport_owner_component_epoch,
+            "owner-epoch-2");
+
+  const auto resumed_handle =
+      backend.resume(make_single_joint_trajectory(0.0, 0.1));
+  ASSERT_TRUE(resumed_handle.wait_for_completion(2'000'000'000));
+  const auto terminal = resumed_handle.get_snapshot();
+  EXPECT_EQ(terminal.state, core::ExecutionState::kFailed);
+  ASSERT_TRUE(terminal.error.has_value());
+  EXPECT_EQ(terminal.error->details.at("reason_code"),
+            ros2_control_fault_reason::kExecutionAdmissionRejected);
+  EXPECT_EQ(terminal.error->details.at("reason"),
+            "execution_environment_epoch_changed");
+  EXPECT_EQ(server.goal_count(), 1u);
+  EXPECT_FALSE(backend.testing_resumable_environment_pin().has_value());
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ActivityChangeDuringGoalResponseCannotEscapeGenerationFence) {
+  const std::string suffix = unique_suffix();
+  const std::string action_name =
+      "/manyforge_binding_goal_race_fjt_" + suffix;
+  const std::string joint_state_topic =
+      "/manyforge_binding_goal_race_joint_states_" + suffix;
+  const std::string controller_state_topic =
+      "/manyforge_binding_goal_race_controller_state_" + suffix;
+  const std::string controller_manager =
+      "/manyforge_binding_goal_race_" + suffix +
+      "/controller_manager";
+
+  auto config = base_config();
+  config.action_name = action_name;
+  config.joint_state_topic = joint_state_topic;
+  config.controller_state_topic = controller_state_topic;
+  config.wait_for_state_timeout_s = 1.0;
+  config.wait_for_action_server_timeout_s = 2.0;
+  config.joint_state_max_age_s = 5.0;
+  config.tracking_error_tolerance_rad = 10.0;
+  config.tracking_error_timeout_s = 10.0;
+  config.controller_binding =
+      binding_contract_for(config, controller_manager);
+  config.require_execution_admission_snapshot = true;
+  config.controller_binding_refresh_timeout_s = 1.0;
+
+  FakeFjtServer server(action_name);
+  server.block_goal_response();
+  FakeControllerManager manager(
+      controller_manager, *config.controller_binding);
+  JointStatePublisher publisher(joint_state_topic);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  clock.set(1'000'000'000);
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+
+  ASSERT_TRUE(manager.wait_for_activity_subscription());
+  ASSERT_TRUE(wait_for_binding_snapshot(
+                  backend,
+                  [](const ControllerBindingSnapshot& candidate) {
+                    return candidate.valid;
+                  })
+                  .has_value());
+
+  auto admission =
+      admitted_snapshot_for(*config.controller_binding, clock.now());
+  ASSERT_TRUE(backend.publish_execution_admission_snapshot(admission));
+
+  ASSERT_TRUE(publisher.wait_for_subscription());
+  bool initial_sample_observed = false;
+  const auto sample_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < sample_deadline) {
+    publisher.publish({"joint_1"}, {0.0});
+    if (backend.sync_observed_state_before_planning().ok()) {
+      initial_sample_observed = true;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(initial_sample_observed);
+
+  auto dispatch = std::async(std::launch::async, [&backend]() {
+    return backend.execute_trajectory(
+        make_single_joint_trajectory(0.0, 1.0));
+  });
+  ASSERT_TRUE(server.wait_for_goal_response_entry());
+  manager.set_controller_active(false);
+  ASSERT_TRUE(wait_for_binding_snapshot(
+                  backend,
+                  [](const ControllerBindingSnapshot& candidate) {
+                    return !candidate.valid &&
+                           (has_reason(
+                                candidate,
+                                "controller_activity_changed") ||
+                            has_reason(
+                                candidate,
+                                "trajectory_controller_inactive"));
+                  })
+                  .has_value());
+  server.release_goal_response();
+
+  ASSERT_EQ(dispatch.wait_for(3s), std::future_status::ready);
+  const auto handle = dispatch.get();
+  ASSERT_TRUE(handle.wait_for_completion(3'000'000'000));
+  const auto terminal = handle.get_snapshot();
+  EXPECT_EQ(terminal.state, core::ExecutionState::kFailed);
+  ASSERT_TRUE(terminal.error.has_value());
+  EXPECT_EQ(terminal.error->details.at("reason_code"),
+            ros2_control_fault_reason::kControllerBindingLost);
+  EXPECT_EQ(terminal.error->details.at("phase"),
+            "goal_response_authority");
+  const auto cancellation_deadline =
+      std::chrono::steady_clock::now() + 2s;
+  while (server.cancel_requests() == 0 &&
+         std::chrono::steady_clock::now() < cancellation_deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  EXPECT_GT(server.cancel_requests(), 0u);
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -523,6 +1834,25 @@ TEST(Ros2ControlExecutionBackendTest,
           clock,
           scheduler,
           config),
+      std::invalid_argument);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ObservedModeRequiresPassivePostResultStateSource) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "observed_ros2";
+  config.observed_state_source_precedence = {"action_feedback"};
+  EXPECT_THROW(
+      (Ros2ControlExecutionBackend(
+          Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+          sink,
+          "arm",
+          clock,
+          scheduler,
+          config)),
       std::invalid_argument);
 }
 
@@ -1160,6 +2490,7 @@ TEST(Ros2ControlExecutionBackendTest,
       feedback_observed = true;
       break;
     }
+    ASSERT_TRUE(server.publish_feedback(0.0));
     std::this_thread::sleep_for(5ms);
   }
   ASSERT_TRUE(feedback_observed)
@@ -1181,22 +2512,24 @@ TEST(Ros2ControlExecutionBackendTest,
             core::ExecutionProgressSourceKind::kMeasuredProjection);
 
   ASSERT_TRUE(server.succeed_current_goal());
-  bool observed_terminal_flag = false;
-  const auto result_delivery_deadline = std::chrono::steady_clock::now() + 5s;
-  while (std::chrono::steady_clock::now() < result_delivery_deadline) {
-    if (handle.wait_for_completion(1'000'000)) {
-      observed_terminal_flag = true;
-      break;
-    }
+  const auto gate_deadline = std::chrono::steady_clock::now() + 250ms;
+  while (!backend.testing_completion_gate_pending() &&
+         std::chrono::steady_clock::now() < gate_deadline) {
+    std::this_thread::sleep_for(1ms);
   }
-  ASSERT_TRUE(observed_terminal_flag)
-      << "backend did not observe the action result";
+  ASSERT_TRUE(backend.testing_completion_gate_pending())
+      << "the action result callback did not return and hand completion to "
+         "the NRT gate promptly";
+  EXPECT_EQ(
+      backend.get_execution_snapshot().state,
+      core::ExecutionState::kExecuting);
+  EXPECT_FALSE(handle.wait_for_completion(1'000'000));
 
   const auto completion_wait_started = std::chrono::steady_clock::now();
   std::optional<core::ExecutionSnapshot> terminal_snapshot;
   const auto deadline = completion_wait_started + 2s;
   while (std::chrono::steady_clock::now() < deadline) {
-    publisher.publish({"joint_1"}, {0.42});
+    publisher.publish({"joint_1"}, {0.1});
     auto snapshot = backend.get_execution_snapshot();
     if (snapshot.state == core::ExecutionState::kCompleted ||
         snapshot.state == core::ExecutionState::kFailed ||
@@ -1225,7 +2558,7 @@ TEST(Ros2ControlExecutionBackendTest,
   backend.retire_execution_progress_generation(handle.execution_generation);
   EXPECT_FALSE(execution_progress->acquire().valid);
   ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
-  EXPECT_NEAR(snapshot.joint_positions_rad.front(), 0.42, 1e-9);
+  EXPECT_NEAR(snapshot.joint_positions_rad.front(), 0.1, 1e-9);
 
   const auto metrics = backend.controller_progress_metrics();
   EXPECT_EQ(metrics.executor_thread_count, 3u);
@@ -1235,6 +2568,311 @@ TEST(Ros2ControlExecutionBackendTest,
   // Explicit feedback must count as command progress before terminal delivery.
   EXPECT_GT(metrics.command_progress_samples_total, 0u);
   EXPECT_GT(metrics.last_action_result_latency_ns, 0u);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     NaturalCompletionRejectsFreshMeasuredStateOutsideFinalTolerance) {
+  const std::string suffix = unique_suffix();
+  const std::string action_name =
+      "/manyforge_final_state_gate_fjt_" + suffix;
+  const std::string joint_state_topic =
+      "/manyforge_final_state_gate_joint_states_" + suffix;
+
+  FakeFjtServer server(action_name);
+  JointStatePublisher publisher(joint_state_topic);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.action_name = action_name;
+  config.joint_state_topic = joint_state_topic;
+  config.wait_for_state_timeout_s = 1.0;
+  config.wait_for_action_server_timeout_s = 2.0;
+  config.joint_state_max_age_s = 5.0;
+  config.final_tolerance_rad = 0.01;
+  config.tracking_error_tolerance_rad = 10.0;
+  config.tracking_error_timeout_s = 10.0;
+  config.executor_thread_count = 3;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+
+  ASSERT_TRUE(publisher.wait_for_subscription());
+  bool initial_sample_observed = false;
+  const auto initial_sample_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < initial_sample_deadline) {
+    publisher.publish({"joint_1"}, {0.0});
+    if (backend.sync_observed_state_before_planning().ok()) {
+      initial_sample_observed = true;
+      break;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  ASSERT_TRUE(initial_sample_observed);
+
+  auto handle =
+      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
+  ASSERT_NE(handle.execution_generation, 0u);
+  ASSERT_TRUE(server.wait_for_goal());
+  ASSERT_TRUE(server.publish_feedback(0.0));
+
+  const auto feedback_deadline = std::chrono::steady_clock::now() + 2s;
+  while (backend.controller_progress_metrics().action_feedback_callbacks_total ==
+             0u &&
+         std::chrono::steady_clock::now() < feedback_deadline) {
+    ASSERT_TRUE(server.publish_feedback(0.0));
+    std::this_thread::sleep_for(5ms);
+  }
+  ASSERT_GT(
+      backend.controller_progress_metrics().action_feedback_callbacks_total,
+      0u);
+
+  ASSERT_TRUE(server.succeed_current_goal());
+  std::optional<core::ExecutionSnapshot> terminal_snapshot;
+  const auto terminal_deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < terminal_deadline) {
+    publisher.publish({"joint_1"}, {0.2});
+    auto snapshot = backend.get_execution_snapshot();
+    if (snapshot.state == core::ExecutionState::kCompleted ||
+        snapshot.state == core::ExecutionState::kFailed ||
+        snapshot.state == core::ExecutionState::kInterventionRequired) {
+      terminal_snapshot = std::move(snapshot);
+      break;
+    }
+    std::this_thread::sleep_for(5ms);
+  }
+
+  ASSERT_TRUE(terminal_snapshot.has_value());
+  EXPECT_EQ(terminal_snapshot->state, core::ExecutionState::kFailed);
+  ASSERT_TRUE(terminal_snapshot->error.has_value());
+  EXPECT_EQ(
+      terminal_snapshot->error->details.at("reason_code"),
+      ros2_control_fault_reason::kTrackingErrorExceeded);
+  EXPECT_EQ(
+      terminal_snapshot->error->details.at("phase"),
+      "terminal_result_state_gate");
+  EXPECT_EQ(
+      terminal_snapshot->error->details.at("final_tolerance_rad"),
+      "0.01");
+  EXPECT_NE(
+      terminal_snapshot->error->message.find("Final state mismatch"),
+      std::string::npos);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     StopAndPauseIntentWinWhileMeasuredCompletionGateIsPending) {
+  const auto run_case = [](bool pause) {
+    const std::string suffix = unique_suffix();
+    const std::string action_name =
+        "/manyforge_terminal_intent_fjt_" + suffix;
+    const std::string joint_state_topic =
+        "/manyforge_terminal_intent_joint_states_" + suffix;
+
+    FakeFjtServer server(action_name);
+    JointStatePublisher publisher(joint_state_topic);
+    auto sink = std::make_shared<RecordingExecutionStateSink>();
+    core::FakeClock clock;
+    core::ManualScheduler scheduler;
+    auto config = base_config();
+    config.action_name = action_name;
+    config.joint_state_topic = joint_state_topic;
+    config.wait_for_state_timeout_s = 1.0;
+    config.wait_for_action_server_timeout_s = 2.0;
+    config.joint_state_max_age_s = 5.0;
+    config.tracking_error_tolerance_rad = 10.0;
+    config.tracking_error_timeout_s = 10.0;
+    Ros2ControlExecutionBackend backend(
+        sink, "arm", clock, scheduler, config);
+
+    ASSERT_TRUE(publisher.wait_for_subscription());
+    bool synced = false;
+    const auto sync_deadline = std::chrono::steady_clock::now() + 2s;
+    while (!synced && std::chrono::steady_clock::now() < sync_deadline) {
+      publisher.publish({"joint_1"}, {0.0});
+      synced = backend.sync_observed_state_before_planning().ok();
+      if (!synced) {
+        std::this_thread::sleep_for(10ms);
+      }
+    }
+    ASSERT_TRUE(synced);
+
+    auto handle =
+        backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
+    ASSERT_TRUE(server.wait_for_goal());
+    ASSERT_TRUE(server.publish_feedback(0.0));
+    const auto feedback_deadline =
+        std::chrono::steady_clock::now() + 1s;
+    while (backend.controller_progress_metrics()
+                   .action_feedback_callbacks_total == 0u &&
+           std::chrono::steady_clock::now() < feedback_deadline) {
+      ASSERT_TRUE(server.publish_feedback(0.0));
+      std::this_thread::sleep_for(2ms);
+    }
+    ASSERT_TRUE(server.succeed_current_goal());
+    const auto gate_deadline = std::chrono::steady_clock::now() + 250ms;
+    while (!backend.testing_completion_gate_pending() &&
+           std::chrono::steady_clock::now() < gate_deadline) {
+      std::this_thread::sleep_for(1ms);
+    }
+    ASSERT_TRUE(backend.testing_completion_gate_pending());
+
+    if (pause) {
+      EXPECT_TRUE(backend.pause().accepted);
+    } else {
+      EXPECT_TRUE(backend.stop().accepted);
+    }
+    ASSERT_TRUE(handle.wait_for_completion(500'000'000));
+    EXPECT_EQ(
+        backend.get_execution_snapshot().state,
+        pause ? core::ExecutionState::kPaused
+              : core::ExecutionState::kStopped);
+  };
+
+  run_case(false);
+  run_case(true);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ResetFencesPendingCompletionBeforeReplacementExecution) {
+  const std::string suffix = unique_suffix();
+  const std::string action_name =
+      "/manyforge_completion_replacement_fjt_" + suffix;
+  const std::string joint_state_topic =
+      "/manyforge_completion_replacement_joint_states_" + suffix;
+
+  FakeFjtServer server(action_name);
+  JointStatePublisher publisher(joint_state_topic);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.action_name = action_name;
+  config.joint_state_topic = joint_state_topic;
+  config.wait_for_state_timeout_s = 0.2;
+  config.wait_for_action_server_timeout_s = 2.0;
+  config.stop_completion_timeout_s = 1.0;
+  config.joint_state_max_age_s = 5.0;
+  config.tracking_error_tolerance_rad = 10.0;
+  config.tracking_error_timeout_s = 10.0;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+
+  ASSERT_TRUE(publisher.wait_for_subscription());
+  const auto sync_state = [&]() {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      publisher.publish({"joint_1"}, {0.0});
+      if (backend.sync_observed_state_before_planning().ok()) {
+        return true;
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    return false;
+  };
+  ASSERT_TRUE(sync_state());
+
+  auto first =
+      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.1));
+  ASSERT_TRUE(server.wait_for_goal_count(1));
+  ASSERT_TRUE(server.publish_feedback(0.0));
+  ASSERT_TRUE(server.succeed_current_goal());
+  const auto gate_deadline = std::chrono::steady_clock::now() + 250ms;
+  while (!backend.testing_completion_gate_pending() &&
+         std::chrono::steady_clock::now() < gate_deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_TRUE(backend.testing_completion_gate_pending());
+  ASSERT_TRUE(backend.reset().accepted);
+  EXPECT_FALSE(backend.testing_completion_gate_pending());
+
+  ASSERT_TRUE(sync_state());
+  auto second =
+      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.2));
+  ASSERT_GT(second.execution_generation, first.execution_generation);
+  ASSERT_TRUE(server.wait_for_goal_count(2));
+  ASSERT_TRUE(server.publish_feedback(0.0));
+  ASSERT_TRUE(server.succeed_current_goal());
+  const auto terminal_deadline = std::chrono::steady_clock::now() + 1s;
+  while (!second.wait_for_completion(1'000'000) &&
+         std::chrono::steady_clock::now() < terminal_deadline) {
+    publisher.publish({"joint_1"}, {0.2});
+  }
+  ASSERT_TRUE(second.wait_for_completion(0));
+  auto snapshot = backend.get_execution_snapshot();
+  ASSERT_EQ(snapshot.state, core::ExecutionState::kCompleted);
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.2);
+
+  std::this_thread::sleep_for(250ms);
+  snapshot = backend.get_execution_snapshot();
+  EXPECT_EQ(snapshot.state, core::ExecutionState::kCompleted);
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.2);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ObservedMonitorNeverProjectsPredictionWhenMeasurementBecomesStale) {
+  const std::string suffix = unique_suffix();
+  const std::string action_name =
+      "/manyforge_observed_no_prediction_fjt_" + suffix;
+  const std::string joint_state_topic =
+      "/manyforge_observed_no_prediction_joint_states_" + suffix;
+
+  FakeFjtServer server(action_name);
+  JointStatePublisher publisher(joint_state_topic);
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.action_name = action_name;
+  config.joint_state_topic = joint_state_topic;
+  config.wait_for_state_timeout_s = 0.5;
+  config.wait_for_action_server_timeout_s = 2.0;
+  config.joint_state_max_age_s = 0.02;
+  config.tracking_error_tolerance_rad = 10.0;
+  config.tracking_error_timeout_s = 10.0;
+  Ros2ControlExecutionBackend backend(
+      sink, "arm", clock, scheduler, config);
+
+  ASSERT_TRUE(publisher.wait_for_subscription());
+  bool synced = false;
+  const auto sync_deadline = std::chrono::steady_clock::now() + 2s;
+  while (!synced && std::chrono::steady_clock::now() < sync_deadline) {
+    publisher.publish({"joint_1"}, {0.0});
+    synced = backend.sync_observed_state_before_planning().ok();
+    if (!synced) {
+      std::this_thread::sleep_for(5ms);
+    }
+  }
+  ASSERT_TRUE(synced);
+
+  auto handle =
+      backend.execute_trajectory(make_single_joint_trajectory(0.0, 0.5));
+  ASSERT_NE(handle.execution_generation, 0u);
+  ASSERT_TRUE(server.wait_for_goal());
+  ASSERT_TRUE(server.publish_feedback(0.0));
+  const auto feedback_deadline = std::chrono::steady_clock::now() + 1s;
+  while (backend.controller_progress_metrics()
+                 .action_feedback_callbacks_total == 0u &&
+         std::chrono::steady_clock::now() < feedback_deadline) {
+    ASSERT_TRUE(server.publish_feedback(0.0));
+    std::this_thread::sleep_for(2ms);
+  }
+  ASSERT_GT(
+      backend.controller_progress_metrics().action_feedback_callbacks_total,
+      0u);
+
+  // Both the joint-state sample and the one action-feedback sample are now
+  // stale while the controller goal remains active. The trajectory sampler
+  // reaches 0.5 rad, but that value is intent only on an observed lane.
+  std::this_thread::sleep_for(150ms);
+  const auto snapshot = backend.get_execution_snapshot();
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.0);
+  EXPECT_EQ(snapshot.state_source, "observed_ros2");
+  for (const auto& update : sink->group_updates()) {
+    ASSERT_EQ(update.positions_rad.size(), 1u);
+    EXPECT_DOUBLE_EQ(update.positions_rad.front(), 0.0);
+  }
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -1305,6 +2943,8 @@ TEST(Ros2ControlExecutionBackendTest,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
   Ros2ControlExecutionBackend backend(
       Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
       sink,
@@ -1338,6 +2978,47 @@ TEST(Ros2ControlExecutionBackendTest,
       invalid.waypoints.front().time_from_start_s;
   EXPECT_FALSE(backend.testing_install_controlled_stop_command_reference(
       invalid, started_at));
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ObservedControlledStopCommandReferenceNeverBecomesRobotPose) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "observed_ros2";
+  config.joint_state_max_age_s = 10.0;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      config);
+
+  const auto measured_at = std::chrono::steady_clock::now();
+  backend.testing_store_latest_joint_sample(
+      {"joint_1"}, {0.2}, measured_at, {0.0}, 100);
+  backend.testing_sync_idle_scene_from_latest_sample();
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
+  ASSERT_EQ(sink->group_updates().size(), 1u);
+
+  const auto started_at = measured_at;
+  ASSERT_TRUE(backend.testing_install_controlled_stop_command_reference(
+      make_single_joint_trajectory(0.0, 1.0), started_at));
+  EXPECT_FALSE(
+      backend.testing_publish_controlled_stop_command_reference_snapshot(
+          started_at + 50ms));
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
+
+  const auto snapshot = backend.get_execution_snapshot();
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.2);
+  EXPECT_EQ(snapshot.source_timestamp_ns, 100);
+  EXPECT_EQ(snapshot.state_source, "observed_ros2");
+  ASSERT_EQ(sink->group_updates().size(), 1u);
+  EXPECT_DOUBLE_EQ(
+      sink->group_updates().front().positions_rad.front(), 0.2);
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -1392,6 +3073,96 @@ TEST(Ros2ControlExecutionBackendTest,
   ASSERT_EQ(sink->group_updates().size(), 3u)
       << "the first sample after an execution generation is not rate limited";
   EXPECT_NEAR(sink->group_updates().back().positions_rad.front(), 0.5, 1e-9);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     TerminalObservedStateRefreshPreservesLifecycleMetadataAndAges) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "observed_ros2";
+  config.joint_state_max_age_s = 10.0;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      config);
+
+  backend.testing_set_running_state(true);
+  backend.testing_set_running_state(false);
+  clock.set(1'000'000);
+  const core::ErrorDTO terminal_error{
+      "test_terminal_failure",
+      "terminal metadata must survive measured-state refresh",
+      {{"reason", "test"}}};
+  ASSERT_TRUE(backend.testing_publish_snapshot(
+      core::ExecutionState::kFailed, 0.75, {0.1}, terminal_error));
+  const auto terminal = backend.get_execution_snapshot();
+
+  const auto now = std::chrono::steady_clock::now();
+  clock.set(1'500'000);
+  backend.testing_store_action_feedback_sample(
+      {"joint_1"}, {9.0}, {0.0}, now - 1ms);
+  clock.set(2'000'000);
+  backend.testing_store_latest_joint_sample(
+      {"joint_1"}, {0.42}, now, {-0.03}, 2'000'000);
+  backend.testing_sync_idle_scene_from_latest_sample();
+  ASSERT_TRUE(backend.testing_drain_scene_projection_for(1s));
+
+  const auto refreshed = backend.get_execution_snapshot();
+  EXPECT_EQ(refreshed.state, core::ExecutionState::kFailed);
+  EXPECT_DOUBLE_EQ(refreshed.progress, 0.75);
+  ASSERT_TRUE(refreshed.error.has_value());
+  EXPECT_EQ(refreshed.error->code, terminal_error.code);
+  EXPECT_EQ(refreshed.error->message, terminal_error.message);
+  EXPECT_EQ(refreshed.error->details, terminal_error.details);
+  EXPECT_GT(refreshed.sequence_number, terminal.sequence_number);
+  ASSERT_EQ(refreshed.joint_positions_rad.size(), 1u);
+  EXPECT_DOUBLE_EQ(refreshed.joint_positions_rad[0], 0.42);
+  ASSERT_EQ(refreshed.joint_velocities_rad_s.size(), 1u);
+  EXPECT_DOUBLE_EQ(refreshed.joint_velocities_rad_s[0], -0.03);
+  EXPECT_EQ(refreshed.state_source, "observed_ros2");
+  EXPECT_EQ(refreshed.source_timestamp_ns, 2'000'000);
+  EXPECT_EQ(refreshed.source_age_ns, 0);
+  ASSERT_EQ(sink->group_updates().size(), 1u);
+  EXPECT_DOUBLE_EQ(sink->group_updates().front().positions_rad.front(), 0.42);
+
+  clock.advance(250'000);
+  const auto aged = backend.get_execution_snapshot();
+  EXPECT_EQ(aged.source_timestamp_ns, refreshed.source_timestamp_ns);
+  EXPECT_EQ(aged.source_age_ns, 250'000);
+  EXPECT_EQ(aged.state, core::ExecutionState::kFailed);
+  EXPECT_DOUBLE_EQ(aged.progress, 0.75);
+  ASSERT_TRUE(aged.error.has_value());
+  EXPECT_EQ(aged.error->code, terminal_error.code);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     AuthoredSimulationSnapshotRetainsNonExpiringAuthoritySemantics) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "commanded_sim";
+  config.initial_joint_positions_rad = {0.0};
+  clock.set(1'000'000);
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      config);
+
+  const auto initial = backend.get_execution_snapshot();
+  ASSERT_EQ(initial.state_source, "commanded_sim_predicted");
+  clock.advance(250'000);
+  const auto later = backend.get_execution_snapshot();
+  EXPECT_EQ(later.source_timestamp_ns, initial.source_timestamp_ns);
+  EXPECT_EQ(later.source_age_ns, 0);
 }
 
 TEST(Ros2ControlExecutionBackendTest,
@@ -1550,8 +3321,8 @@ TEST(Ros2ControlExecutionBackendTest,
       base_config());
 
   const auto t0 = std::chrono::steady_clock::now();
-  backend.testing_store_action_feedback_sample(
-      {"joint_1"}, {0.42}, {}, t0);
+  backend.testing_store_latest_joint_sample(
+      {"joint_1"}, {0.42}, t0);
   sink->fail_next_group_updates(1);
 
   backend.testing_complete_execution();
@@ -1664,6 +3435,45 @@ TEST(Ros2ControlExecutionBackendTest,
 }
 
 TEST(Ros2ControlExecutionBackendTest,
+     FreshPassiveSampleWaitWakesOnStateNotificationBeforeDeadline) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.joint_state_max_age_s = 5.0;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      config);
+
+  const auto not_before = std::chrono::steady_clock::now();
+  std::promise<void> waiter_started;
+  auto waiter_started_future = waiter_started.get_future();
+  auto sample_future = std::async(std::launch::async, [&]() {
+    waiter_started.set_value();
+    return backend.testing_wait_for_fresh_passive_sample_after(
+        not_before, 5s);
+  });
+  ASSERT_EQ(waiter_started_future.wait_for(500ms),
+            std::future_status::ready);
+  std::this_thread::sleep_for(20ms);
+  ASSERT_EQ(sample_future.wait_for(0ms), std::future_status::timeout);
+
+  backend.testing_store_latest_controller_sample(
+      {"joint_1"}, {0.42}, std::chrono::steady_clock::now(), {0.0});
+
+  ASSERT_EQ(sample_future.wait_for(500ms), std::future_status::ready)
+      << "a fresh post-result sample notification must not wait for the "
+         "controlled-stop deadline";
+  const auto source = sample_future.get();
+  ASSERT_TRUE(source.has_value());
+  EXPECT_EQ(*source, "controller_state");
+}
+
+TEST(Ros2ControlExecutionBackendTest,
      ObservedStatePublicationFallsBackWhenActionFeedbackStops) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   core::FakeClock clock;
@@ -1737,6 +3547,186 @@ TEST(Ros2ControlExecutionBackendTest,
   EXPECT_EQ(selected.source_kind(),
             core::ObservedRobotStateSourceKind::kJointState);
   EXPECT_DOUBLE_EQ(selected.positions_rad()[0], 0.75);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     PassivePoseSelectionUsesDeclaredPrecedenceAndExcludesRetiredFeedback) {
+  const auto verify = [](
+                          std::vector<std::string> precedence,
+                          double expected_position) {
+    auto sink = std::make_shared<RecordingExecutionStateSink>();
+    core::FakeClock clock;
+    core::ManualScheduler scheduler;
+    auto config = base_config();
+    config.observed_state_source_precedence = std::move(precedence);
+    config.joint_state_max_age_s = 10.0;
+    Ros2ControlExecutionBackend backend(
+        Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+        sink,
+        "arm",
+        clock,
+        scheduler,
+        config);
+
+    const auto now = std::chrono::steady_clock::now();
+    backend.testing_store_action_feedback_sample(
+        {"joint_1"}, {9.0}, {0.0}, now);
+    backend.testing_store_latest_controller_sample(
+        {"joint_1"}, {0.4}, now, {0.0}, 400);
+    backend.testing_store_latest_joint_sample(
+        {"joint_1"}, {0.7}, now, {0.0}, 700);
+    backend.testing_sync_idle_scene_from_latest_sample();
+
+    const auto snapshot = backend.get_execution_snapshot();
+    ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
+    EXPECT_DOUBLE_EQ(
+        snapshot.joint_positions_rad.front(), expected_position);
+    EXPECT_NE(snapshot.joint_positions_rad.front(), 9.0);
+  };
+
+  verify(
+      {"controller_state", "joint_state", "action_feedback"}, 0.4);
+  verify(
+      {"joint_state", "controller_state", "action_feedback"}, 0.7);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     MalformedHigherPrecedenceSampleFallsBackToCompletePhysicalSource) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "observed_ros2";
+  config.observed_state_source_precedence = {
+      "controller_state", "joint_state", "action_feedback"};
+  config.joint_state_max_age_s = 10.0;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      config);
+
+  const auto now = std::chrono::steady_clock::now();
+  backend.testing_store_latest_controller_sample(
+      {"joint_1"},
+      {std::numeric_limits<double>::quiet_NaN()},
+      now,
+      {0.0},
+      100);
+  backend.testing_store_latest_joint_sample(
+      {"joint_1"}, {0.75}, now, {0.01}, 200);
+  backend.testing_sync_idle_scene_from_latest_sample();
+
+  const auto snapshot = backend.get_execution_snapshot();
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.75);
+  ASSERT_EQ(snapshot.joint_velocities_rad_s.size(), 1u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_velocities_rad_s.front(), 0.01);
+  EXPECT_EQ(snapshot.source_timestamp_ns, 200);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     PrePlanningStateGateNeverUsesActionFeedbackFromRetiredGoal) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "observed_ros2";
+  config.observed_state_source_precedence = {
+      "action_feedback", "controller_state", "joint_state"};
+  config.wait_for_state_timeout_s = 0.001;
+  config.joint_state_max_age_s = 10.0;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      config);
+
+  const auto now = std::chrono::steady_clock::now();
+  backend.testing_store_action_feedback_sample(
+      {"joint_1"}, {9.0}, {0.0}, now);
+  const auto action_only =
+      backend.sync_observed_state_before_planning();
+  EXPECT_FALSE(action_only.ok());
+
+  backend.testing_store_latest_joint_sample(
+      {"joint_1"}, {0.25}, std::chrono::steady_clock::now(),
+      {0.0}, 250);
+  const auto passive =
+      backend.sync_observed_state_before_planning();
+  ASSERT_TRUE(passive.ok()) << passive.error().message;
+  const auto snapshot = backend.get_execution_snapshot();
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.25);
+  EXPECT_EQ(snapshot.source_timestamp_ns, 250);
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     ManagedStopRetiresOriginalGoalActionFeedbackAuthority) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.observed_state_source_precedence = {
+      "action_feedback", "joint_state"};
+  config.joint_state_max_age_s = 10.0;
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      config);
+
+  const auto now = std::chrono::steady_clock::now();
+  backend.testing_set_action_feedback_authority(true);
+  backend.testing_store_action_feedback_sample(
+      {"joint_1"}, {9.0}, {0.0}, now);
+  backend.testing_store_latest_joint_sample(
+      {"joint_1"}, {0.5}, now, {0.0}, 500);
+  ASSERT_EQ(
+      backend.testing_selected_sample_source(now),
+      std::optional<std::string>("action_feedback"));
+
+  // Mirrors the managed-stop preemption callback: the execution remains
+  // running, but the original FJT goal has terminalized.
+  backend.testing_set_action_feedback_authority(false);
+  EXPECT_EQ(
+      backend.testing_selected_sample_source(now),
+      std::optional<std::string>("joint_state"));
+}
+
+TEST(Ros2ControlExecutionBackendTest,
+     PassiveObservedRefreshCannotRegressPhysicalSampleTimestamp) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto config = base_config();
+  config.execution_state_source_mode = "observed_ros2";
+  Ros2ControlExecutionBackend backend(
+      Ros2ControlExecutionBackend::TestingNoRosStartupTag{},
+      sink,
+      "arm",
+      clock,
+      scheduler,
+      config);
+  const auto generation = backend.testing_running_generation();
+
+  ASSERT_TRUE(backend.testing_publish_passive_observed_snapshot(
+      {0.6}, {0.01}, 600, generation));
+  EXPECT_FALSE(backend.testing_publish_passive_observed_snapshot(
+      {0.2}, {-0.01}, 200, generation));
+
+  const auto snapshot = backend.get_execution_snapshot();
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 1u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad.front(), 0.6);
+  ASSERT_EQ(snapshot.joint_velocities_rad_s.size(), 1u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_velocities_rad_s.front(), 0.01);
+  EXPECT_EQ(snapshot.source_timestamp_ns, 600);
 }
 
 TEST(Ros2ControlExecutionBackendTest,

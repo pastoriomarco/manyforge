@@ -10,6 +10,7 @@
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_ros2_control_execution/controller_binding.hpp>
 
 namespace manyforge::ros2_control_execution {
 
@@ -55,6 +56,12 @@ struct Ros2ControlExecutionBackendConfig {
   std::string execution_state_source_mode = "observed_robot";
   std::vector<double> initial_joint_positions_rad;
   std::string command_gate_topic;
+  // Phase 2.7A physical-controller admission. No contract means the existing
+  // non-physical/static action binding remains in use. A present contract
+  // enables event-invalidated, NRT controller-manager verification.
+  std::optional<ControllerBindingContract> controller_binding;
+  bool require_execution_admission_snapshot = false;
+  double controller_binding_refresh_timeout_s = 0.25;
   // JTC Jazzy+ on-controller speed-scaling input. If empty, derived from
   // action_name by replacing `/follow_joint_trajectory` with
   // `/speed_scaling_input`.
@@ -145,6 +152,14 @@ inline constexpr const char* kControllerGoalRejected =
     "controller_goal_rejected";
 inline constexpr const char* kControllerGoalResponseTimeout =
     "controller_goal_response_timeout";
+inline constexpr const char* kControllerBindingRejected =
+    "controller_binding_rejected";
+inline constexpr const char* kControllerBindingLost =
+    "controller_binding_lost";
+inline constexpr const char* kExecutionAdmissionRejected =
+    "execution_admission_rejected";
+inline constexpr const char* kExecutionAdmissionLost =
+    "execution_admission_lost";
 inline constexpr const char* kControllerResultFailed =
     "controller_result_failed";
 inline constexpr const char* kEmptyTrajectory = "empty_trajectory";

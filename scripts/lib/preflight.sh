@@ -51,7 +51,7 @@ preflight_managed_components() {
     # `random-composer-ros-suffix` are NOT claimed as ours: the trailing
     # `-test` / `-suffix` would have to match `-[0-9]+`, which they don't.
     names="$(docker ps --format '{{.Names}}' 2>/dev/null \
-        | grep -E '^(manyforge-e2e-composer|manyforge-e2e-vllm)$|^(.*-)?(composer-ros|isaac-topic-control)(-[0-9]+)?$' \
+        | grep -E '^(manyforge-e2e-composer|manyforge-e2e-vllm|manyforge-real-robot-owner|manyforge-real-robot-composer)$|^(.*-)?(composer-ros|isaac-topic-control)(-[0-9]+)?$' \
         || true)"
     if [[ -n "${names}" ]]; then
         warn "Launcher-managed Docker components are already running:"
@@ -108,6 +108,10 @@ expected_port_owner() {
                 # match composer-ros or isaac-topic-control by suffix.
                 docker ps --format '{{.Names}}' 2>/dev/null \
                     | grep -qE '(composer-ros|isaac-topic-control)'
+                return $?
+                ;;
+            real-robot)
+                container_running "${MANYFORGE_REAL_ROBOT_CONTAINER:-manyforge-real-robot-composer}"
                 return $?
                 ;;
             *) return 1 ;;

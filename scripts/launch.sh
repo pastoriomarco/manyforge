@@ -2,7 +2,7 @@
 # scripts/launch.sh — ManyForge unified launcher.
 #
 # Replaces the seven scripts/demo-*.sh launchers with one NemoClaw-style
-# wizard. Selects: lane (manyforge-only | isaac-sim) × assistant (on | off)
+# wizard. Selects: lane (manyforge-only | isaac-sim | real-robot) × assistant (on | off)
 # × scenario (named bundle of program + deployment YAML).
 #
 # Operator-facing test recipe + smoke sequence:
@@ -27,7 +27,7 @@
 #   preflight         Run port/docker/image preflight only
 #
 # CLI flags:
-#   --lane {manyforge-only|isaac-sim}
+#   --lane {manyforge-only|isaac-sim|real-robot}
 #   --assistant {on|off}
 #   --scenario NAME            (or --program PATH --deployment PATH)
 #   --program PATH
@@ -66,6 +66,8 @@ source "${SCRIPT_DIR}/lib/compose.sh"
 source "${SCRIPT_DIR}/lib/composer.sh"
 # shellcheck source=lib/isaac.sh
 source "${SCRIPT_DIR}/lib/isaac.sh"
+# shellcheck source=lib/real_robot.sh
+source "${SCRIPT_DIR}/lib/real_robot.sh"
 # shellcheck source=lib/assistant.sh
 source "${SCRIPT_DIR}/lib/assistant.sh"
 
@@ -82,6 +84,10 @@ SCENARIO="${SCENARIO:-}"
 PLATFORM="${PLATFORM:-}"
 PROGRAM_PATH=""
 DEPLOYMENT_PATH=""
+REAL_ROBOT_RESOLVER=""
+REAL_ROBOT_CELL_PATH=""
+REAL_ROBOT_PROGRAM_PATH=""
+REAL_ROBOT_DEPLOYMENT_TEMPLATE=""
 VERB="start"
 STOP_KNOWN_CONFLICTS="${STOP_KNOWN_CONFLICTS:-false}"
 
@@ -100,7 +106,7 @@ Verbs:
   preflight                   Run port/docker/image preflight only
 
 Selection (skip prompts when supplied):
-  --lane {manyforge-only|isaac-sim}
+  --lane {manyforge-only|isaac-sim|real-robot}
   --assistant {on|off}
   --provider {direct|openclaw|hermes}
                               Assistant only: which lane/bridge to run.
@@ -149,11 +155,16 @@ Common overrides (read by lib modules):
               OPENCLAW_ASSISTANT_TOOL_SURFACE   (tools|code; default tools — see LANE-COMPARISON)
   Isaac:      ARM_ACTION  GRIPPER_ACTION
               ISAAC_JOINT_STATE_TOPIC  ARM_CONTROLLER_STATE_TOPIC
+  Real robot: MANYFORGE_LITE6_ROBOT_IP
+              MANYFORGE_LITE6_ROS_DOMAIN_ID  MANYFORGE_REAL_LITE6_IMAGE
+              MANYFORGE_REAL_ROBOT_OWNER_READY_TIMEOUT_S  (default 600)
 
 Examples:
   scripts/launch.sh                                  # Interactive wizard
   scripts/launch.sh --lane manyforge-only --scenario ur5-pick-place
   scripts/launch.sh --lane isaac-sim --scenario isaac-ur10e-light-scene start
+  MANYFORGE_LITE6_ROBOT_IP=192.168.1.31 scripts/launch.sh \\
+    --lane real-robot --assistant off --scenario real-lite6-commissioning
   scripts/launch.sh --lane manyforge-only --assistant on --scenario ur10e-scene-authoring
   scripts/launch.sh stop
 EOF
@@ -221,10 +232,10 @@ step_choose_lane() {
     if [[ -n "${LANE}" ]]; then
         info "Lane preset via flag: ${LANE}"
     else
-        LANE="$(pick_from_list "Execution lane" 1 manyforge-only isaac-sim)"
+        LANE="$(pick_from_list "Execution lane" 1 manyforge-only isaac-sim real-robot)"
     fi
     case "${LANE}" in
-        manyforge-only|isaac-sim) ;;
+        manyforge-only|isaac-sim|real-robot) ;;
         *) fail "Invalid lane: ${LANE}"; exit 2 ;;
     esac
     pass "Lane: ${LANE}"
@@ -419,6 +430,8 @@ step_choose_scenario() {
         fi
         PROGRAM_PATH="$(scenario_field "${row}" 4)"
         DEPLOYMENT_PATH="$(scenario_field "${row}" 5)"
+        REAL_ROBOT_RESOLVER="$(scenario_field "${row}" 8)"
+        REAL_ROBOT_CELL_PATH="$(scenario_field "${row}" 9)"
         info "Scenario preset via flag: ${SCENARIO}"
     else
         local candidates=()
@@ -439,6 +452,8 @@ step_choose_scenario() {
         SCENARIO="$(scenario_field "${row}" 1)"
         PROGRAM_PATH="$(scenario_field "${row}" 4)"
         DEPLOYMENT_PATH="$(scenario_field "${row}" 5)"
+        REAL_ROBOT_RESOLVER="$(scenario_field "${row}" 8)"
+        REAL_ROBOT_CELL_PATH="$(scenario_field "${row}" 9)"
     fi
 
     # Cross-check: deployment YAML must agree with --assistant choice.
@@ -466,6 +481,14 @@ step_choose_scenario() {
             export REQUIRE_GRIPPER_ACTION="${REQUIRE_GRIPPER_ACTION:-false}"
             ;;
     esac
+    if [[ "${LANE}" == "real-robot" ]]; then
+        if [[ -z "${REAL_ROBOT_RESOLVER}" || -z "${REAL_ROBOT_CELL_PATH}" ]]; then
+            fail "real-robot startup requires an artifact-owned cell scenario; free-form unresolved templates are not accepted."
+            exit 2
+        fi
+        REAL_ROBOT_PROGRAM_PATH="${PROGRAM_PATH}"
+        REAL_ROBOT_DEPLOYMENT_TEMPLATE="${DEPLOYMENT_PATH}"
+    fi
     pass "Scenario: ${SCENARIO}"
 }
 
@@ -488,6 +511,11 @@ EOF
     if [[ "${LANE}" == "isaac-sim" ]]; then
         printf '  Compose:     profile=ros-full, services=composer-ros isaac-topic-control\n' >&2
         printf '  Supervisors: isaac_demo_supervisor (auto)' >&2
+    elif [[ "${LANE}" == "real-robot" ]]; then
+        printf '  Runtime:     sole-owner control service + non-owner Composer service\n' >&2
+        printf '  Startup:     observation-only; drives and trajectory controller inactive\n' >&2
+        printf '  Cell:        %s\n' "${REAL_ROBOT_CELL_PATH}" >&2
+        printf '  Supervisors: robot lifecycle/admission provider\n' >&2
     else
         printf '  Compose:     dev container (detached), no profile\n' >&2
         printf '  Supervisors: (none required for lane)' >&2
@@ -559,6 +587,9 @@ step_preflight() {
             compose_set_lane "${LANE}"
             maybe_build_isaac_image
             ;;
+        real-robot)
+            real_robot_preflight
+            ;;
     esac
 }
 
@@ -594,6 +625,9 @@ step_bring_up_lane() {
             build_ros2_control_runtime
             start_isaac_services
             ;;
+        real-robot)
+            start_real_robot_lane
+            ;;
     esac
     # Early supervisor start (assistant lane only). The supervisor probes
     # the assistant stack components and POSTs status rows to
@@ -628,6 +662,9 @@ step_wait_and_load() {
             ;;
         manyforge-only)
             load_program "${PROGRAM_PATH}" "${DEPLOYMENT_PATH}"
+            ;;
+        real-robot)
+            load_program "${REAL_ROBOT_PROGRAM_PATH}" "${DEPLOYMENT_PATH}"
             ;;
         *)
             fail "Unknown lane for load step: ${LANE}"
@@ -700,6 +737,7 @@ verb_stop() {
     compose_set_lane isaac-sim 2>/dev/null || true
     stop_isaac_services
     stop_composer_dev_container
+    stop_real_robot_lane
     pass "Stop complete."
 }
 
@@ -707,7 +745,7 @@ verb_status() {
     step "Service status"
     echo "  Containers:" >&2
     docker ps --format '    {{.Names}}\t{{.Image}}\t{{.Ports}}' \
-        | grep -E "(manyforge-e2e-|composer-ros|isaac-topic-control|openshell)" >&2 || true
+        | grep -E "(manyforge-e2e-|manyforge-real-robot-(owner|composer)|composer-ros|isaac-topic-control|openshell)" >&2 || true
     echo >&2
     local status_ports=("${COMPOSER_PORT:-9000}" 8000)
     if [[ "${START_VLLM_PROXY:-true}" == "true" ]]; then
@@ -783,6 +821,13 @@ verb_smoke() {
             else
                 info "No smoke test wired for manyforge-only without assistant; skipping."
             fi
+            ;;
+        real-robot)
+            python3 \
+                "${MANYFORGE_ROOT}/scripts/xarm/validate-lite6-product-lane-smoke.py" \
+                --composer-url "${COMPOSER_URL}" \
+                --expected-cell-id "${REAL_ROBOT_CELL_ID}" \
+                --timeout-s "${MANYFORGE_REAL_ROBOT_SMOKE_TIMEOUT_S:-10}"
             ;;
     esac
 }

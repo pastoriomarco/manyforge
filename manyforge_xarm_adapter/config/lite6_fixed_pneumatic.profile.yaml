@@ -1,0 +1,26 @@
+schema: manyforge.xarm_adapter.lite6_profile.v1
+profile_id: lite6_fixed_pneumatic_v1
+robot:
+  robot_type: lite
+  dof: 6
+  limited: true
+  report_type: rich
+  ros_namespace: ""
+  prefix: ""
+  hardware_namespace: ufactory
+  controller_name: lite6_traj_controller
+tool:
+  profile_id: fixed_pneumatic_lite_v1
+  geometry_mesh_filename: pneumatic_lite.stl
+  geometry_mesh_sha256: 6ec37b0104b946e08515f6f4c5707fdefe1e4f74448f4e1ed60b2719898afa4e
+  geometry_mass_kg: 0.3
+  geometry_mesh_origin_xyz: "0 0 0"
+  geometry_mesh_origin_rpy: "0 0 0"
+  geometry_mesh_tcp_xyz: "0.03075 0 0.11885"
+  geometry_mesh_tcp_rpy: "0 0.52 0"
+network:
+  address_source_env: MANYFORGE_LITE6_ROBOT_IP
+source:
+  repository: https://github.com/pastoriomarco/xarm_ros2
+  xc4_base_commit: 50064477f39ecd69ab006488630c837cdcb8d83e
+  xc4_base_tree: 5b7ab25ecf7f5d030b891824f2cd308ea72c3a57

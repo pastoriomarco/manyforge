@@ -60,6 +60,13 @@ ROS2_CONTROL_BACKEND_FAULT_CLASSES: dict[str, BackendFaultClass] = {
         _fault_class("controller_goal_dispatch_failed", "ERROR"),
         _fault_class("controller_goal_rejected", "ERROR"),
         _fault_class("controller_goal_response_timeout", "ERROR"),
+        # Rejected before dispatch: no controller goal was admitted.
+        _fault_class("controller_binding_rejected", "ERROR"),
+        _fault_class("execution_admission_rejected", "ERROR"),
+        # Lost after dispatch: cancellation is requested, but this fault
+        # itself does not prove that the controller confirmed the stop.
+        _fault_class("controller_binding_lost", "CRITICAL"),
+        _fault_class("execution_admission_lost", "CRITICAL"),
         _fault_class("controller_result_failed", "ERROR"),
         _fault_class("empty_trajectory", "ERROR"),
         # Reset/resync blocked behind a monitor thread that will not quiesce:

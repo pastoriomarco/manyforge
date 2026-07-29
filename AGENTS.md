@@ -256,7 +256,11 @@ What lives where in this repo, and what it's for:
 | [`manyforge_behavior/`](manyforge_behavior/)                             | Behavior-tree runtime (py_trees), node catalog, tests                                              |
 | [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine               |
 | [`manyforge_roboplan/`](manyforge_roboplan/)                             | Native motion-planner backend bindings (RRT + TOPPRA)                                              |
-| [`manyforge_ros2_control_execution/`](manyforge_ros2_control_execution/) | C++ ROS controller execution, feedback/progress, bounded stop/reset, and isolated scene projection |
+| [`manyforge_ros2_control_execution/`](manyforge_ros2_control_execution/) | C++ ROS controller execution, exact binding/admission, feedback/progress, bounded stop/reset, and isolated scene projection |
+| [`manyforge_robot_lifecycle/`](manyforge_robot_lifecycle/)               | ROS-independent lifecycle supervision, authority sessions, and admission projection                |
+| [`manyforge_robot_lifecycle_msgs/`](manyforge_robot_lifecycle_msgs/)     | Robot-neutral ROS IDL for same-host lifecycle admission transport                                  |
+| [`manyforge_xarm_adapter/`](manyforge_xarm_adapter/)                     | Experimental xArm model generation, endpoint binding, and read-only observation boundary           |
+| [`manyforge_xarm_control/`](manyforge_xarm_control/)                     | Experimental xArm lifecycle coordinator and sole-backend ros2_control boundary                     |
 | [`manyforge_composer/`](manyforge_composer/)                             | FastAPI backend + React frontend + MCP server                                                      |
 | [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/)             | Direct-lane assistant provider HTTP service (port 8100)                                            |
 | [`manyforge_ros/`](manyforge_ros/)                                       | ROS 2 bridge (optional)                                                                            |

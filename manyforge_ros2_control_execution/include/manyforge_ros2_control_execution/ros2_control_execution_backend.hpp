@@ -20,6 +20,9 @@
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <control_msgs/action/gripper_command.hpp>
 #include <control_msgs/msg/joint_trajectory_controller_state.hpp>
+#include <controller_manager_msgs/msg/controller_manager_activity.hpp>
+#include <controller_manager_msgs/srv/list_controllers.hpp>
+#include <controller_manager_msgs/srv/list_hardware_components.hpp>
 #if __has_include(<control_msgs/msg/speed_scaling_factor.hpp>)
 #include <control_msgs/msg/speed_scaling_factor.hpp>
 #define MANYFORGE_HAS_SPEED_SCALING_FACTOR_MSG 1
@@ -118,6 +121,13 @@ struct Ros2ControlControllerProgressMetrics {
   std::uint64_t authored_active_interarrival_max_ns = 0;
   std::uint64_t jtc_cancel_reference_publications_total = 0;
   std::uint64_t jtc_cancel_reference_rejections_total = 0;
+  std::uint64_t controller_binding_activity_events_total = 0;
+  std::uint64_t controller_binding_refresh_attempts_total = 0;
+  std::uint64_t controller_binding_refresh_successes_total = 0;
+  std::uint64_t controller_binding_refresh_failures_total = 0;
+  std::uint64_t controller_binding_dispatch_rejections_total = 0;
+  std::uint64_t execution_admission_dispatch_rejections_total = 0;
+  std::uint64_t dispatch_authority_losses_total = 0;
   std::vector<core::ObservedRobotStateSourceMetrics> observed_state_sources;
 };
 
@@ -130,6 +140,9 @@ struct Ros2ControlControllerProgressMetrics {
 ///
 /// Lock-order contract:
 /// - Do not hold state_mutex_ while taking execution_mutex_.
+/// - dispatch_admission_mutex_ may be taken before execution_mutex_ only at
+///   the bounded pre-dispatch linearization point. No path may take
+///   dispatch_admission_mutex_ while holding execution_mutex_.
 /// - The scoped JTC cancel-reference writer may take execution_mutex_ then the
 ///   authored-state publication leaf lock; the leaf lock never takes
 ///   execution_mutex_.
@@ -279,6 +292,16 @@ class Ros2ControlExecutionBackend final
   Ros2ControlSceneProjectionMetrics scene_projection_metrics() const;
   Ros2ControlControllerProgressMetrics controller_progress_metrics() const;
 
+  /// Publish the latest robot-family-neutral lifecycle admission. The
+  /// lifecycle owner calls this from NRT work; dispatch and runtime monitoring
+  /// only acquire an immutable snapshot.
+  bool publish_execution_admission_snapshot(
+      ExecutionAdmissionSnapshot snapshot);
+  std::optional<ExecutionAdmissionSnapshot>
+  execution_admission_snapshot() const;
+  std::optional<ControllerBindingSnapshot>
+  controller_binding_snapshot() const;
+
 #ifdef MANYFORGE_ROS2_CONTROL_EXECUTION_TESTING
   using TestingFollowJointTrajectory =
       control_msgs::action::FollowJointTrajectory;
@@ -305,6 +328,7 @@ class Ros2ControlExecutionBackend final
     initialize_observed_state_publication();
     initialize_execution_progress_publication();
     initialize_scene_projection_worker();
+    initialize_dispatch_admission();
     snapshot_.timestamp_ns = clock_.now();
     initialize_authored_state();
   }
@@ -317,6 +341,7 @@ class Ros2ControlExecutionBackend final
     managed_fjt_terminal_goal_id_ = std::move(goal_id);
     managed_fjt_terminal_result_received_ = false;
     managed_fjt_terminal_result_success_ = false;
+    managed_fjt_terminal_result_received_at_.reset();
     managed_fjt_terminal_error_.reset();
   }
 
@@ -350,9 +375,23 @@ class Ros2ControlExecutionBackend final
   void testing_store_latest_joint_sample(
       std::vector<std::string> joint_names,
       std::vector<double> positions,
-      std::chrono::steady_clock::time_point received_at) {
+      std::chrono::steady_clock::time_point received_at,
+      std::vector<double> velocities = {},
+      std::optional<std::int64_t> received_timestamp_ns = std::nullopt) {
     testing_store_latest_joint_sample_impl(
-        std::move(joint_names), std::move(positions), received_at);
+        std::move(joint_names), std::move(positions), received_at,
+        std::move(velocities), received_timestamp_ns);
+  }
+
+  void testing_store_latest_controller_sample(
+      std::vector<std::string> joint_names,
+      std::vector<double> positions,
+      std::chrono::steady_clock::time_point received_at,
+      std::vector<double> velocities = {},
+      std::optional<std::int64_t> received_timestamp_ns = std::nullopt) {
+    testing_store_latest_controller_sample_impl(
+        std::move(joint_names), std::move(positions), received_at,
+        std::move(velocities), received_timestamp_ns);
   }
 
   void testing_sync_idle_scene_from_latest_sample() {
@@ -385,8 +424,37 @@ class Ros2ControlExecutionBackend final
                         positions,
                         velocities,
                         received_at,
+                        clock_.now(),
                         "action_feedback",
                         config_.action_name);
+    const auto authority_generation =
+        active_action_feedback_authority_generation_.load(
+            std::memory_order_acquire);
+    if (authority_generation != 0) {
+      latest_action_feedback_->execution_generation =
+          authority_generation;
+      latest_action_feedback_->goal_id = rclcpp_action::GoalUUID{};
+    }
+  }
+
+  void testing_set_action_feedback_authority(bool active) {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    if (active && !running_) {
+      set_running_locked(true);
+      terminal_ = false;
+    }
+    active_action_feedback_authority_generation_.store(
+        active ? running_generation_.load(std::memory_order_acquire) : 0,
+        std::memory_order_release);
+  }
+
+  std::optional<std::string> testing_selected_sample_source(
+      std::chrono::steady_clock::time_point now) const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    const auto* sample = select_latest_sample_ptr_locked(now);
+    return sample != nullptr
+               ? std::optional<std::string>(sample->source)
+               : std::nullopt;
   }
 
   std::size_t testing_latest_action_feedback_position_capacity() const {
@@ -397,7 +465,7 @@ class Ros2ControlExecutionBackend final
   }
 
   void testing_complete_execution() {
-    complete_execution();
+    testing_complete_execution_impl();
   }
 
   void testing_schedule_active_scene_projection(
@@ -429,8 +497,31 @@ class Ros2ControlExecutionBackend final
     return publish_snapshot(state, 0.0, positions);
   }
 
+  bool testing_publish_snapshot(
+      core::ExecutionState state,
+      double progress,
+      const std::vector<double>& positions,
+      std::optional<core::ErrorDTO> error) {
+    return publish_snapshot(state, progress, positions, std::move(error));
+  }
+
   std::uint64_t testing_running_generation() const {
     return running_generation_.load(std::memory_order_acquire);
+  }
+
+  bool testing_completion_gate_pending() const {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    return completion_gate_request_.has_value();
+  }
+
+  bool testing_publish_passive_observed_snapshot(
+      const std::vector<double>& positions,
+      const std::vector<double>& velocities,
+      std::int64_t source_timestamp_ns,
+      std::uint64_t expected_running_generation) {
+    return publish_passive_observed_snapshot(
+        positions, velocities, source_timestamp_ns,
+        expected_running_generation);
   }
 
   bool testing_publish_snapshot_for_generation(
@@ -451,9 +542,22 @@ class Ros2ControlExecutionBackend final
       std::chrono::nanoseconds timeout) {
     std::unique_lock<std::mutex> lock(managed_fjt_mutex_);
     managed_fjt_terminal_result_received_ = false;
+    managed_fjt_terminal_result_received_at_.reset();
     return managed_fjt_cv_.wait_for(
         lock, stop_token, timeout,
         [this]() { return managed_fjt_terminal_result_received_; });
+  }
+
+  std::optional<std::string>
+  testing_wait_for_fresh_passive_sample_after(
+      std::chrono::steady_clock::time_point not_before,
+      std::chrono::nanoseconds timeout,
+      std::stop_token stop_token = {}) {
+    const auto sample = wait_for_fresh_passive_sample_after(
+        not_before, std::chrono::steady_clock::now() + timeout, stop_token);
+    return sample.has_value()
+               ? std::optional<std::string>(sample->source)
+               : std::nullopt;
   }
 
   std::uint64_t testing_begin_jtc_cancel_reference_authority() {
@@ -475,6 +579,30 @@ class Ros2ControlExecutionBackend final
         joint_names, positions, velocities, received_timestamp_ns,
         expected_token);
   }
+
+  void testing_publish_controller_binding_snapshot(
+      ControllerBindingSnapshot snapshot) {
+    publish_controller_binding_snapshot(std::move(snapshot));
+  }
+
+  std::optional<DispatchAuthorityPin> testing_dispatch_authority_pin() const {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    return active_dispatch_authority_;
+  }
+
+  std::optional<DispatchAuthorityPin> testing_planning_environment_pin() const {
+    std::lock_guard<std::mutex> lock(dispatch_admission_mutex_);
+    return planning_environment_authority_;
+  }
+
+  std::optional<DispatchAuthorityPin> testing_resumable_environment_pin() const {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    return resumable_dispatch_authority_;
+  }
+
+  const std::string& execution_backend_component_epoch() const noexcept {
+    return execution_backend_component_epoch_;
+  }
 #endif
 
  private:
@@ -493,8 +621,21 @@ class Ros2ControlExecutionBackend final
     std::vector<double> positions;
     std::vector<double> velocities;
     std::chrono::steady_clock::time_point received_at;
+    std::int64_t received_timestamp_ns = 0;
     std::string source;
     std::string topic;
+    // Only action feedback is goal-scoped. Passive controller/joint samples
+    // deliberately leave these empty. A feedback sample may be selected only
+    // while both values still identify the active execution.
+    std::optional<std::uint64_t> execution_generation;
+    std::optional<rclcpp_action::GoalUUID> goal_id;
+  };
+
+  struct CompletionGateRequest {
+    std::uint64_t execution_generation = 0;
+    rclcpp_action::GoalUUID goal_id{};
+    std::chrono::steady_clock::time_point result_received_at;
+    std::shared_ptr<const core::TrajectoryDTO> trajectory;
   };
 
   struct TrackingErrorPeak {
@@ -520,6 +661,8 @@ class Ros2ControlExecutionBackend final
     std::vector<double> positions;
     std::vector<double> velocities;
     std::string source;
+    std::string topic;
+    std::int64_t received_timestamp_ns = 0;
     double max_abs_velocity_rad_s = 0.0;
     bool velocity_available = false;
     bool at_rest = false;
@@ -580,6 +723,7 @@ class Ros2ControlExecutionBackend final
   void initialize_observed_state_publication();
   void initialize_execution_progress_publication();
   void initialize_scene_projection_worker();
+  void initialize_dispatch_admission();
   void initialize_authored_state();
   void publish_observed_robot_state(
       core::ObservedRobotStateSourceKind source,
@@ -603,6 +747,26 @@ class Ros2ControlExecutionBackend final
       Ros2ControlExecutionBackendConfig config);
   void initialize_ros();
   void stop_ros();
+  void start_controller_binding_monitor();
+  void stop_controller_binding_monitor() noexcept;
+  void controller_binding_monitor_worker(std::stop_token stop_token);
+  void request_controller_binding_refresh();
+  void on_controller_manager_activity(
+      const controller_manager_msgs::msg::ControllerManagerActivity::SharedPtr
+          msg);
+  void publish_controller_binding_snapshot(
+      ControllerBindingSnapshot snapshot);
+  void invalidate_controller_binding(std::string reason_code);
+  DispatchAdmissionDecision current_dispatch_admission(
+      const std::vector<std::string>& trajectory_joint_names) const;
+  DispatchAdmissionDecision current_active_dispatch_authority(
+      const DispatchAuthorityPin& pin) const;
+  core::Result<void> capture_planning_environment_authority();
+  bool install_dispatch_authority_pin(
+      const DispatchAuthorityPin& pin,
+      std::uint64_t dispatch_generation);
+  void fail_active_dispatch_authority(
+      DispatchAdmissionDecision decision);
 
   void on_joint_state(const sensor_msgs::msg::JointState::SharedPtr msg);
   void on_controller_state(
@@ -618,19 +782,32 @@ class Ros2ControlExecutionBackend final
   void on_action_feedback(
       GoalHandleFJT::SharedPtr,
       const std::shared_ptr<const FollowJointTrajectory::Feedback> feedback);
-  void on_action_result(const GoalHandleFJT::WrappedResult& result);
+  void on_action_result(const GoalHandleFJT::WrappedResult& result,
+                        std::uint64_t execution_generation);
 
   std::optional<JointSample> select_latest_sample_locked(
       std::chrono::steady_clock::time_point now) const;
   const JointSample* select_latest_sample_ptr_locked(
       std::chrono::steady_clock::time_point now) const;
-  std::optional<JointSample> select_latest_sample_after_locked(
+  const JointSample* select_latest_passive_sample_ptr_locked(
+      std::chrono::steady_clock::time_point now) const;
+  std::optional<JointSample> select_latest_passive_sample_after_locked(
       std::chrono::steady_clock::time_point now,
       std::chrono::steady_clock::time_point not_before) const;
-  std::optional<JointSample> wait_for_fresh_sample(double timeout_s);
-  std::optional<JointSample> wait_for_fresh_sample_after(
-      double timeout_s,
-      std::chrono::steady_clock::time_point not_before);
+  bool joint_sample_is_complete_and_finite(
+      const JointSample& sample) const noexcept;
+  bool joint_sample_is_fresh_and_valid(
+      const JointSample& sample,
+      std::chrono::steady_clock::time_point now,
+      std::optional<std::chrono::steady_clock::time_point> not_before =
+          std::nullopt) const noexcept;
+  bool action_sample_matches_active_execution_locked(
+      const JointSample& sample) const noexcept;
+  std::optional<JointSample> wait_for_fresh_passive_sample(double timeout_s);
+  std::optional<JointSample> wait_for_fresh_passive_sample_after(
+      std::chrono::steady_clock::time_point not_before,
+      std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop_token = {});
   std::vector<double> velocities_for_joints(
       const JointSample& sample,
       const std::vector<std::string>& joints) const;
@@ -641,6 +818,7 @@ class Ros2ControlExecutionBackend final
                                   const std::vector<double>& positions,
                                   const std::vector<double>& velocities,
                                   std::chrono::steady_clock::time_point received_at,
+                                  std::int64_t received_timestamp_ns,
                                   const std::string& source,
                                   const std::string& topic);
   void sync_idle_scene_from_latest_sample();
@@ -648,14 +826,29 @@ class Ros2ControlExecutionBackend final
     kRetireImmediately,
     kPreserveTerminalHandoff,
   };
+  enum class ResumeAuthorityRetention {
+    kDiscard,
+    kPreserve,
+  };
   void set_running_locked(
       bool running,
       ProgressRetirement progress_retirement =
-          ProgressRetirement::kRetireImmediately) noexcept;
+          ProgressRetirement::kRetireImmediately,
+      ResumeAuthorityRetention resume_authority_retention =
+          ResumeAuthorityRetention::kDiscard) noexcept;
   void testing_store_latest_joint_sample_impl(
       std::vector<std::string> joint_names,
       std::vector<double> positions,
-      std::chrono::steady_clock::time_point received_at);
+      std::chrono::steady_clock::time_point received_at,
+      std::vector<double> velocities,
+      std::optional<std::int64_t> received_timestamp_ns);
+  void testing_store_latest_controller_sample_impl(
+      std::vector<std::string> joint_names,
+      std::vector<double> positions,
+      std::chrono::steady_clock::time_point received_at,
+      std::vector<double> velocities,
+      std::optional<std::int64_t> received_timestamp_ns);
+  void testing_complete_execution_impl();
   bool is_commanded_sim_mode() const;
   bool uses_authored_backend_state() const;
   void set_command_gate(bool enabled);
@@ -678,9 +871,10 @@ class Ros2ControlExecutionBackend final
   std::optional<PostStopObservation> wait_for_post_stop_observation(
       const std::vector<std::string>& joint_names,
       double settle_velocity_threshold_rad_s,
+      std::chrono::steady_clock::time_point not_before,
       std::chrono::steady_clock::time_point deadline,
       std::stop_token stop_token = {});
-  void complete_managed_controlled_stop_execution();
+  std::uint64_t complete_managed_controlled_stop_execution();
   core::Result<void> command_sim_initial_state(std::string phase);
   bool update_scene_positions(
       const std::vector<double>& joint_positions,
@@ -722,7 +916,24 @@ class Ros2ControlExecutionBackend final
       SnapshotPublicationAuthority authority =
           SnapshotPublicationAuthority::kBackendAuthored,
       const std::vector<double>* authored_velocities = nullptr);
-  bool publish_passive_idle_snapshot(const std::vector<double>& joint_positions);
+  bool publish_passive_observed_snapshot(
+      const std::vector<double>& joint_positions,
+      const std::vector<double>& joint_velocities,
+      std::int64_t source_timestamp_ns,
+      std::uint64_t expected_running_generation);
+  bool publish_observed_snapshot(
+      core::ExecutionState state,
+      double progress,
+      const std::vector<double>& joint_positions,
+      const std::vector<double>& joint_velocities,
+      std::int64_t source_timestamp_ns,
+      std::optional<core::ErrorDTO> error,
+      std::uint64_t expected_running_generation);
+  bool publish_observed_metadata(
+      core::ExecutionState state,
+      double progress,
+      std::optional<core::ErrorDTO> error,
+      std::uint64_t expected_running_generation);
   core::ErrorDTO operator_intervention_error(
       core::ErrorCode code,
       std::string message,
@@ -746,13 +957,28 @@ class Ros2ControlExecutionBackend final
                       core::ErrorCode code,
                       std::string reason_code,
                       std::map<std::string, std::string> details);
+  void commit_action_result_terminal(
+      const rclcpp_action::GoalUUID& goal_id,
+      std::uint64_t execution_generation,
+      bool canceled,
+      std::optional<core::ErrorDTO> failure,
+      std::chrono::steady_clock::time_point result_received_at);
+  DispatchAdmissionDecision current_active_dispatch_authority_locked(
+      const DispatchAuthorityPin& pin) const;
   void require_operator_intervention(std::string message,
                                      core::ErrorCode code = core::ErrorCode::kStopFailed);
   void require_operator_intervention(std::string message,
                                      core::ErrorCode code,
                                      std::string reason_code,
                                      std::map<std::string, std::string> details);
-  void complete_execution();
+  void complete_execution(const JointSample* verified_observed_sample);
+  bool completion_gate_matches_locked(
+      const CompletionGateRequest& request) const;
+  void process_completion_gate(const CompletionGateRequest& request);
+  void commit_completion_gate_terminal(
+      const CompletionGateRequest& request,
+      std::optional<JointSample> verified_observed_sample,
+      std::optional<core::ErrorDTO> failure);
   void monitor_worker(core::TrajectoryDTO trajectory);
   bool start_state_matches(const core::TrajectoryDTO& trajectory,
                            const JointSample& sample,
@@ -792,6 +1018,7 @@ class Ros2ControlExecutionBackend final
   core::IClock& clock_;
   core::IScheduler& scheduler_;
   Ros2ControlExecutionBackendConfig config_;
+  const std::string execution_backend_component_epoch_;
   std::unique_ptr<core::ObservedRobotStatePublication>
       observed_state_publication_;
   std::unique_ptr<core::ExecutionProgressPublication>
@@ -815,9 +1042,18 @@ class Ros2ControlExecutionBackend final
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr action_client_;
   rclcpp::CallbackGroup::SharedPtr action_callback_group_;
   rclcpp::CallbackGroup::SharedPtr state_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr binding_callback_group_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
       controller_state_sub_;
+  rclcpp::Subscription<
+      controller_manager_msgs::msg::ControllerManagerActivity>::SharedPtr
+      controller_manager_activity_sub_;
+  rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedPtr
+      list_controllers_client_;
+  rclcpp::Client<
+      controller_manager_msgs::srv::ListHardwareComponents>::SharedPtr
+      list_hardware_components_client_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr command_gate_pub_;
   // Last value published on the command-gate topic. Read by goal-rejection
   // diagnostics so a closed gate is named as the rejection cause instead of
@@ -850,6 +1086,7 @@ class Ros2ControlExecutionBackend final
   bool goal_accepted_ = false;
   bool first_feedback_seen_ = false;
   bool result_received_ = false;
+  std::optional<CompletionGateRequest> completion_gate_request_;
   bool controlled_stop_preempt_in_progress_ = false;
   // While JTC owns a qualified `decelerate_on_cancel`, commanded-simulation
   // authority follows JointTrajectoryControllerState.reference. The scoped
@@ -863,6 +1100,11 @@ class Ros2ControlExecutionBackend final
   bool resync_in_progress_ = false;
   GoalHandleFJT::SharedPtr active_goal_handle_;
   std::optional<rclcpp_action::GoalUUID> active_goal_id_;
+  // Exact active-goal feedback authority. Zero is retired. The value is the
+  // owning execution generation, so state-only selectors can fence a retired
+  // goal without reading active_goal_id_ outside execution_mutex_.
+  std::atomic<std::uint64_t>
+      active_action_feedback_authority_generation_{0};
   // The raw rclcpp_action result code from the last
   // discrete-trajectory goal terminal callback. Persisted so the
   // hard_deceleration controlled-stop path can distinguish a true
@@ -876,6 +1118,29 @@ class Ros2ControlExecutionBackend final
   std::optional<std::chrono::steady_clock::time_point> stop_requested_at_;
   std::optional<std::chrono::steady_clock::time_point> tracking_error_since_;
   std::optional<TrackingErrorPeak> peak_tracking_error_;
+  std::optional<DispatchAuthorityPin> active_dispatch_authority_;
+  // The original dispatch environment survives only a successful Pause. A
+  // resumed trajectory is freshly planned, but it may not cross a component
+  // replacement boundary and silently inherit the prior execution.
+  std::optional<DispatchAuthorityPin> resumable_dispatch_authority_;
+
+  // Phase 2.7A binding/admission publications. Publishers serialize with the
+  // bounded dispatch enqueue through this NRT mutex; runtime readers acquire
+  // immutable shared snapshots without controller-manager calls.
+  mutable std::mutex dispatch_admission_mutex_;
+  std::atomic<std::shared_ptr<const ControllerBindingSnapshot>>
+      controller_binding_snapshot_{nullptr};
+  std::atomic<std::shared_ptr<const ExecutionAdmissionSnapshot>>
+      execution_admission_snapshot_{nullptr};
+  // Captured only after the measured pre-planning state barrier succeeds.
+  // Final dispatch must observe the same semantic component epochs.
+  std::optional<DispatchAuthorityPin> planning_environment_authority_;
+  std::atomic<std::uint64_t> next_controller_binding_snapshot_generation_{1};
+  std::atomic<std::uint64_t> controller_binding_activity_generation_{0};
+  mutable std::mutex controller_binding_monitor_mutex_;
+  std::condition_variable_any controller_binding_monitor_cv_;
+  bool controller_binding_refresh_requested_ = false;
+  std::jthread controller_binding_monitor_thread_;
 
   // Authority serializes admission/dispatch against reset, stop, and runtime
   // replacement without holding lifecycle or scene locks across ROS waits.
@@ -935,6 +1200,8 @@ class Ros2ControlExecutionBackend final
   std::chrono::steady_clock::time_point managed_fjt_goal_accepted_at_{};
   bool managed_fjt_terminal_result_received_ = true;
   bool managed_fjt_terminal_result_success_ = true;
+  std::optional<std::chrono::steady_clock::time_point>
+      managed_fjt_terminal_result_received_at_;
   std::optional<core::ErrorDTO> managed_fjt_terminal_error_;
   std::shared_ptr<const core::TrajectoryDTO>
       controlled_stop_path_deviation_reference_;
@@ -967,6 +1234,14 @@ class Ros2ControlExecutionBackend final
   std::atomic<std::uint64_t> max_stop_confirmation_latency_ns_{0};
   std::atomic<std::uint64_t> jtc_cancel_reference_publications_total_{0};
   std::atomic<std::uint64_t> jtc_cancel_reference_rejections_total_{0};
+  std::atomic<std::uint64_t> controller_binding_activity_events_total_{0};
+  std::atomic<std::uint64_t> controller_binding_refresh_attempts_total_{0};
+  std::atomic<std::uint64_t> controller_binding_refresh_successes_total_{0};
+  std::atomic<std::uint64_t> controller_binding_refresh_failures_total_{0};
+  std::atomic<std::uint64_t> controller_binding_dispatch_rejections_total_{0};
+  std::atomic<std::uint64_t>
+      execution_admission_dispatch_rejections_total_{0};
+  std::atomic<std::uint64_t> dispatch_authority_losses_total_{0};
   std::atomic<std::uint64_t> authored_active_publications_total_{0};
   std::atomic<std::uint64_t> authored_active_interarrival_max_ns_{0};
   std::atomic<std::int64_t> authored_active_last_publication_ns_{0};

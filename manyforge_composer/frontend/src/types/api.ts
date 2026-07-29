@@ -358,7 +358,7 @@ export interface ProgramInfo {
 }
 
 export interface ProgramCompatibility {
-  lanes: Array<'manyforge-only' | 'isaac-sim'>;
+  lanes: Array<'manyforge-only' | 'isaac-sim' | 'real-robot'>;
   assistant: 'required' | 'optional' | 'forbidden';
   requires: string[];
   tags: string[];
@@ -927,7 +927,7 @@ export interface DeploymentScenario {
 }
 
 export interface DeploymentCompatibility {
-  lane: 'manyforge-only' | 'isaac-sim';
+  lane: 'manyforge-only' | 'isaac-sim' | 'real-robot';
   provides: string[];
   tags: string[];
   scenarios: DeploymentScenario[];
@@ -994,7 +994,7 @@ export interface NodeDiscoveryReport {
 
 export interface ScenarioDescriptor {
   name: string;
-  lane: 'manyforge-only' | 'isaac-sim';
+  lane: 'manyforge-only' | 'isaac-sim' | 'real-robot';
   assistant: 'on' | 'off';
   programPath: string;
   deploymentPath: string;
@@ -1077,6 +1077,96 @@ export interface RuntimeStatus {
   stopProfileUnsupported?: boolean;
   stopCapabilityQueryFailed?: boolean;
   timestampNs: number;
+}
+
+export type RobotLifecycleFact = 'true' | 'false' | 'unknown';
+
+export interface RobotLifecycleCapability {
+  actionId: string;
+  label: string;
+  supported: boolean;
+  available: boolean;
+  availabilityReason: string;
+  confirmationClass: string;
+  sideEffectSummary: string;
+  expectedPostcondition: string;
+  timeoutNs: number;
+}
+
+export interface RobotLifecycleTransaction {
+  generation: number;
+  requestId: string;
+  requestSequence: number;
+  actionId: string;
+  commandSource: string;
+  authoritySessionGeneration: number;
+  phase: string;
+  acceptedAtSteadyTimeNs: number;
+  deadlineSteadyTimeNs: number;
+  terminalAtSteadyTimeNs: number;
+  resultReason: string;
+}
+
+export interface RobotLifecycleCompositeResult {
+  operation: string;
+  success: boolean;
+  startedAtNs: number;
+  completedAtNs: number;
+  targetActionId?: string;
+  reason?: string;
+  stages: Array<{
+    actionId: string;
+    requestId: string;
+    transaction: RobotLifecycleTransaction;
+  }>;
+  cycleStop?: {
+    requested: boolean;
+    state: string;
+  };
+}
+
+export interface RobotLifecycleStatus {
+  schemaVersion: string;
+  configured: boolean;
+  providerId?: string;
+  providerInstanceId?: string;
+  providerHealthy: boolean;
+  robotId?: string;
+  supervisorInstanceId?: string;
+  authorityProfile?: string;
+  fresh: boolean;
+  readiness: RuntimeReadiness | 'disabled' | string;
+  canExecute: boolean;
+  userMessage: string;
+  snapshotGeneration?: number;
+  transportConnected?: RobotLifecycleFact;
+  identityVerified?: RobotLifecycleFact;
+  positionValid?: RobotLifecycleFact;
+  robotEnabled?: RobotLifecycleFact;
+  vendorControlReady?: RobotLifecycleFact;
+  hardwareComponentActive?: RobotLifecycleFact;
+  trajectoryControllerActive?: RobotLifecycleFact;
+  faultPresent?: RobotLifecycleFact;
+  warningPresent?: RobotLifecycleFact;
+  recoveryRequired?: RobotLifecycleFact;
+  stationary?: RobotLifecycleFact;
+  observationFresh?: boolean;
+  authorityFresh?: boolean;
+  observeReady?: boolean;
+  controllerReady?: boolean;
+  motionAdmitted?: boolean;
+  reconciliationRequired?: boolean;
+  admissionReasonCodes?: string[];
+  adapterStatus?: Record<string, string>;
+  capabilities: RobotLifecycleCapability[];
+  pendingTransaction?: RobotLifecycleTransaction | null;
+  lastTerminalTransaction?: RobotLifecycleTransaction | null;
+  commandInFlight?: {
+    operation: string;
+    startedAtNs: number;
+    stage: string;
+  } | null;
+  lastCompositeResult?: RobotLifecycleCompositeResult | null;
 }
 
 export interface SceneRobotState {

@@ -77,6 +77,7 @@ _ALLOWED_EVENT_PREFIXES = (
     "runtime_override_",
     "scene_initialization_",
     "simulation_control_",
+    "robot_lifecycle_",
     "tool_dispatch_",
 )
 # INFO-severity events whose loss would break restart continuity or violate
@@ -104,6 +105,10 @@ _RUNS_INDEX_FILENAME = "runs.index.jsonl"
 # startup prune evidence) land here instead of vanishing: no run file can
 # receive them yet, but their loss would break restart forensics.
 _NO_RUN_FILENAME = "_norun.events.jsonl"
+_ROBOT_LIFECYCLE_NO_RUN_FILENAME = "_robot_lifecycle.events.jsonl"
+# Lifecycle transitions commonly occur while no program run exists. Their
+# dedicated operational stream is atomically compacted by the NRT writer.
+_ROBOT_LIFECYCLE_NO_RUN_MAX_BYTES = 16 * 1024 * 1024
 _RUNS_INDEX_REHYDRATE_LINES = 4000
 _DEFAULT_TRACE_MAX_AGE_S = 30 * 24 * 3600.0
 _DEFAULT_TRACE_MAX_BYTES = 2 * 1024 * 1024 * 1024
@@ -334,6 +339,7 @@ _EVENT_CHANNEL_LIMITS = {
     _KERNEL_NATIVE_CHANNEL: _KERNEL_NATIVE_CHANNEL_LIMIT,
     "fault_safety_stop": 1000,
     "command_runtime": 800,
+    "robot_lifecycle": 512,
     "execution_lifecycle": 1000,
     "pose_source": 300,
     "telemetry_debug": 500,
@@ -543,6 +549,8 @@ def _component_for_event(event_type: str) -> str:
         return "manyforge.scene"
     if event_type.startswith("simulation_control_"):
         return "manyforge.simulation"
+    if event_type.startswith("robot_lifecycle_"):
+        return "manyforge.robot_lifecycle"
     if event_type.startswith("runtime_override_"):
         return "manyforge.runtime_override"
     if event_type.startswith("intervention_"):
@@ -604,6 +612,8 @@ def _message_for_event(
 def _event_channel(event_type: str, details: Optional[dict[str, Any]]) -> str:
     """Classify an event into an independently retained diagnostic stream."""
     details = details or {}
+    if event_type.startswith("robot_lifecycle_"):
+        return "robot_lifecycle"
     if event_type.startswith("kernel_native_") or event_type == "kernel_event_gap":
         return _KERNEL_NATIVE_CHANNEL
     if event_type == "stop_decision_chain":
@@ -711,6 +721,7 @@ class EventRecorder:
         observe_min_interval_s: float | None = None,
         trace_max_age_s: float | None = None,
         trace_max_bytes: int | None = None,
+        robot_lifecycle_stream_max_bytes: int | None = None,
     ) -> None:
         self._trace_dir = Path(trace_dir) if trace_dir is not None else None
         if self._trace_dir is not None:
@@ -753,6 +764,28 @@ class EventRecorder:
             if trace_max_bytes is not None
             else (_DEFAULT_TRACE_MAX_BYTES if self._trace_dir is not None else None)
         )
+        lifecycle_stream_max_bytes = (
+            robot_lifecycle_stream_max_bytes
+            if robot_lifecycle_stream_max_bytes is not None
+            else max(
+                256,
+                min(
+                    _ROBOT_LIFECYCLE_NO_RUN_MAX_BYTES,
+                    self._trace_max_bytes
+                    if self._trace_max_bytes is not None
+                    else _ROBOT_LIFECYCLE_NO_RUN_MAX_BYTES,
+                ),
+            )
+        )
+        if (
+            isinstance(lifecycle_stream_max_bytes, bool)
+            or not isinstance(lifecycle_stream_max_bytes, int)
+            or lifecycle_stream_max_bytes < 256
+        ):
+            raise ValueError(
+                "robot lifecycle stream maximum must be at least 256 bytes"
+            )
+        self._robot_lifecycle_stream_max_bytes = lifecycle_stream_max_bytes
         self._last_trace_prune: dict[str, Any] = {}
         self._run_index_severities: dict[str, str] = {}
         self._current_run_event_count = 0
@@ -2121,7 +2154,10 @@ class EventRecorder:
             effective_limit = _DEFAULT_HISTORY_LIMIT
         else:
             effective_limit = max(0, min(int(limit), _MAX_HISTORY_LIMIT))
-        events = self._load_events_for_run(selected_run_id, limit=effective_limit)
+        events = self._load_events_for_run(
+            selected_run_id,
+            limit=effective_limit,
+        )
         events = self._filter_events(
             events,
             start_ns=start_ns,
@@ -2729,6 +2765,23 @@ class EventRecorder:
             authority_source=authority_source,
             trigger_node_instance=trigger_node_instance,
             execution_mode=execution_mode,
+        )
+
+    def record_robot_lifecycle_event(
+        self,
+        action: str,
+        *,
+        details: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Record one low-rate provider or command lifecycle transition."""
+        self._record_event(
+            event_type=f"robot_lifecycle_{action}",
+            details=details,
+            # Lifecycle observations made while no program is running are
+            # cell/runtime facts, not evidence from the previously finished
+            # run. An active run is still correlated by _record_event.
+            system_event=True,
+            no_run_stream=_ROBOT_LIFECYCLE_NO_RUN_FILENAME,
         )
 
     def record_cycle_reset_phase(self, phase_event: dict[str, Any]) -> None:
@@ -3400,6 +3453,7 @@ class EventRecorder:
         timestamp_ns: Optional[int] = None,
         kernel_timestamp: bool = False,
         system_event: bool = False,
+        no_run_stream: str | None = None,
     ) -> int:
         _validate_event_type(event_type)
         timestamp_ns = timestamp_ns or time.monotonic_ns()
@@ -3665,7 +3719,9 @@ class EventRecorder:
                     _SEVERITY_ORDER.get(str(severity).upper(), 0)
                     >= _SEVERITY_ORDER["WARN"]
                     or event_type in _DURABLE_INFO_EVENT_TYPES
+                    or event_type.startswith("robot_lifecycle_")
                 ),
+                no_run_stream=no_run_stream,
             )
             self._maybe_write_failure_archive_locked(event)
             return self._event_index
@@ -4161,6 +4217,7 @@ class EventRecorder:
         run_id: Optional[str],
         json_text: str,
         durable: bool = False,
+        no_run_stream: str | None = None,
     ) -> None:
         """Hand the serialized event to the JSONL writer thread (audit 6B).
 
@@ -4179,7 +4236,9 @@ class EventRecorder:
             # Durable events must still reach disk; non-durable steady-state
             # events keep their memory-only behavior.
             if durable and self._trace_dir is not None:
-                file_path = self._trace_dir / _NO_RUN_FILENAME
+                file_path = self._trace_dir / (
+                    no_run_stream or _NO_RUN_FILENAME
+                )
             else:
                 return
         try:
@@ -4199,7 +4258,24 @@ class EventRecorder:
                     return
                 file_path, json_text, durable = job
                 try:
-                    self._write_jsonl_line(file_path, json_text, durable=durable)
+                    if (
+                        file_path.name
+                        == _ROBOT_LIFECYCLE_NO_RUN_FILENAME
+                    ):
+                        self._write_jsonl_line(
+                            file_path,
+                            json_text,
+                            durable=durable,
+                            robot_lifecycle_max_bytes=(
+                                self._robot_lifecycle_stream_max_bytes
+                            ),
+                        )
+                    else:
+                        self._write_jsonl_line(
+                            file_path,
+                            json_text,
+                            durable=durable,
+                        )
                 except Exception as exc:  # pragma: no cover - disk failure surface
                     with self._lock:
                         self._last_jsonl_error = str(exc)
@@ -4208,8 +4284,31 @@ class EventRecorder:
 
     @staticmethod
     def _write_jsonl_line(
-        file_path: Path, json_text: str, *, durable: bool = False
+        file_path: Path,
+        json_text: str,
+        *,
+        durable: bool = False,
+        robot_lifecycle_max_bytes: int = (
+            _ROBOT_LIFECYCLE_NO_RUN_MAX_BYTES
+        ),
     ) -> None:
+        if file_path.name == _ROBOT_LIFECYCLE_NO_RUN_FILENAME:
+            try:
+                current_bytes = file_path.stat().st_size
+            except FileNotFoundError:
+                current_bytes = 0
+            incoming_bytes = len(json_text.encode("utf-8")) + 1
+            if current_bytes and (
+                current_bytes + incoming_bytes
+                > robot_lifecycle_max_bytes
+            ):
+                EventRecorder._compact_robot_lifecycle_stream(
+                    file_path,
+                    json_text,
+                    durable=durable,
+                    maximum_bytes=robot_lifecycle_max_bytes,
+                )
+                return
         with file_path.open("a", encoding="utf-8") as handle:
             handle.write(json_text)
             handle.write("\n")
@@ -4218,6 +4317,111 @@ class EventRecorder:
                 # steady-state events may stay in the page cache.
                 handle.flush()
                 os.fsync(handle.fileno())
+
+    @staticmethod
+    def _compact_robot_lifecycle_stream(
+        file_path: Path,
+        json_text: str,
+        *,
+        durable: bool,
+        maximum_bytes: int,
+    ) -> None:
+        """Atomically retain a recent lifecycle tail plus prune evidence."""
+        try:
+            lines = [
+                line
+                for line in file_path.read_text(encoding="utf-8").splitlines()
+                if line
+            ]
+        except FileNotFoundError:
+            lines = []
+        previous_dropped_total = 0
+        for line in lines:
+            try:
+                prior = json.loads(line)
+            except ValueError:
+                continue
+            prior_details = prior.get("details")
+            prior_retention = (
+                prior_details.get("durable_stream_retention")
+                if isinstance(prior_details, dict)
+                else None
+            )
+            if isinstance(prior_retention, dict):
+                previous_dropped_total = max(
+                    previous_dropped_total,
+                    int(prior_retention.get("dropped_records_total") or 0),
+                )
+        payload = json.loads(json_text)
+        details = payload.get("details")
+        if not isinstance(details, dict):
+            details = {}
+            payload["details"] = details
+
+        def encode_with_retention(dropped: int) -> str:
+            details["durable_stream_retention"] = {
+                "stream": "robot_lifecycle",
+                "compacted": True,
+                "dropped_records": dropped,
+                "dropped_records_total": (
+                    previous_dropped_total + dropped
+                ),
+                "maximum_bytes": maximum_bytes,
+            }
+            return json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        # Size the tail against a worst-case marker first. The final marker
+        # can only be equal or shorter because its dropped count is <= this.
+        encoded = encode_with_retention(len(lines))
+        encoded_bytes = len(encoded.encode("utf-8")) + 1
+        if encoded_bytes > maximum_bytes:
+            raise ValueError(
+                "robot lifecycle record exceeds durable stream maximum"
+            )
+        retain_budget = maximum_bytes - encoded_bytes
+        retained_reversed: list[str] = []
+        retained_bytes = 0
+        for line in reversed(lines):
+            line_bytes = len(line.encode("utf-8")) + 1
+            if retained_bytes + line_bytes > retain_budget:
+                break
+            retained_reversed.append(line)
+            retained_bytes += line_bytes
+        retained = list(reversed(retained_reversed))
+        dropped = max(0, len(lines) - len(retained))
+        encoded = encode_with_retention(dropped)
+        while retained and (
+            retained_bytes + len(encoded.encode("utf-8")) + 1
+            > maximum_bytes
+        ):
+            removed = retained.pop(0)
+            retained_bytes -= len(removed.encode("utf-8")) + 1
+            dropped += 1
+            encoded = encode_with_retention(dropped)
+        temporary = file_path.with_suffix(f"{file_path.suffix}.tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            for line in retained:
+                handle.write(line)
+                handle.write("\n")
+            handle.write(encoded)
+            handle.write("\n")
+            if durable:
+                handle.flush()
+                os.fsync(handle.fileno())
+        os.replace(temporary, file_path)
+        if durable:
+            directory_fd = os.open(
+                file_path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
 
     def wait_for_jsonl_idle(self, timeout_s: float = 5.0) -> bool:
         """Wait until queued JSONL appends have hit disk.
@@ -4363,6 +4567,8 @@ class EventRecorder:
                 if current_path is not None and path == current_path:
                     continue
                 if path.name == _NO_RUN_FILENAME:
+                    continue
+                if path.name == _ROBOT_LIFECYCLE_NO_RUN_FILENAME:
                     continue
                 try:
                     stat = path.stat()

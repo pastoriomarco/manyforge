@@ -28,6 +28,8 @@ import type {
   FileBrowserResponse,
   InfraStatus,
   RuntimeStatus,
+  RobotLifecycleCompositeResult,
+  RobotLifecycleStatus,
   ModelEndpointCatalog,
   SceneStateResponse,
   SceneEditRequest,
@@ -155,11 +157,17 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
+    signal,
   });
   if (!res.ok) {
     const payload = await res.json().catch(() => null);
@@ -376,6 +384,36 @@ export const api = {
   runtime: {
     status: () => request<RuntimeStatus>('GET', '/api/runtime/status'),
   },
+  robotLifecycle: {
+    status: () =>
+      request<RobotLifecycleStatus>('GET', '/api/robot-lifecycle/status'),
+    enable: () =>
+      request<RobotLifecycleCompositeResult>(
+        'POST',
+        '/api/robot-lifecycle/enable',
+        { confirmed: true },
+      ),
+    disable: () =>
+      request<RobotLifecycleCompositeResult>(
+        'POST',
+        '/api/robot-lifecycle/disable',
+        { confirmed: true },
+      ),
+    recovery: (
+      action: 'clear-fault' | 'clear-warning' | 'shutdown-controller',
+    ) =>
+      request<Record<string, unknown>>(
+        'POST',
+        `/api/robot-lifecycle/recovery/${action}`,
+        { confirmed: true },
+      ),
+    reconcile: () =>
+      request<Record<string, unknown>>(
+        'POST',
+        '/api/robot-lifecycle/reconcile',
+        { confirmed: true },
+      ),
+  },
   urdf: {
     manifest: () => request<SceneUrdfManifest>('GET', '/api/scene/urdf/manifest'),
     meshUrl: (modelKey: string, linkName: string, visualIndex = 0) =>
@@ -481,10 +519,12 @@ export const api = {
       request<AssistantProviderCatalog>('GET', '/api/assistant/providers'),
     chat: (payload: AssistantChatRequest) =>
       request<AssistantChatResponse>('POST', '/api/assistant/chat', payload),
-    status: (requestId: string) =>
+    status: (requestId: string, signal?: AbortSignal) =>
       request<AssistantRequestStatus>(
         'GET',
         `/api/assistant/requests/${encodeURIComponent(requestId)}`,
+        undefined,
+        signal,
       ),
     cancel: (requestId: string) =>
       request<AssistantCancelResponse>(

@@ -41,6 +41,9 @@ composer_logs() {
                 "${COMPOSE_CMD[@]}" logs --tail 20 composer-ros 2>&1 || true
             fi
             ;;
+        real-robot)
+            real_robot_logs
+            ;;
         *)
             docker logs --tail 20 "${COMPOSER_CONTAINER:-manyforge-e2e-composer}" 2>&1 || true
             ;;

@@ -38,6 +38,16 @@ import {
  * the only red control on the screen; Run carries green only while the
  * cycle is actually armable (color = state, not decoration).
  */
+export function runtimeAllowsMotion(
+  runtime: { canExecute: boolean } | null,
+): boolean {
+  // Unknown runtime state is not permission to arm motion. This briefly
+  // disables Run during the first status fetch on every lane and, critically,
+  // prevents a real-robot control from appearing eligible before its disabled
+  // lifecycle snapshot arrives.
+  return runtime?.canExecute === true;
+}
+
 export function TransportControls() {
   useOperatorAlarmPolling();
   const {
@@ -82,6 +92,7 @@ export function TransportControls() {
   const lastVelocityScaleSentAtRef = useRef(0);
 
   const stopGate = evaluateStopRunGate(runtime);
+  const runtimeBlocksMotion = !runtimeAllowsMotion(runtime);
   const stopExecutionWarning = buildStopExecutionWarning(errorDetails);
   const {
     primaryAction: primaryRecoveryAction,
@@ -143,10 +154,18 @@ export function TransportControls() {
     (state === 'idle' || state === 'stopped' || motionHeld) &&
     !stopping &&
     runAuthorityAllowsResume &&
-    !stopGate.blocked;
+    !stopGate.blocked &&
+    !runtimeBlocksMotion;
   const canRun = !operatorAttentionBlocksPrimary && (
     recoveryOffer !== null
-      ? Boolean(primaryRecoveryAction?.enabled)
+      ? Boolean(
+          primaryRecoveryAction?.enabled
+          && (
+            !primaryRecoveryAction
+            || !isMotionProducingRecoveryAction(primaryRecoveryAction.actionId)
+            || !runtimeBlocksMotion
+          )
+        )
       : canRunWithoutRecovery
   );
   // Stop applies to in-flight motion the operator can see — BT
@@ -335,11 +354,13 @@ export function TransportControls() {
         : 'Start the loaded program'
       : stopGate.blocked && stopGate.reason !== null
         ? stopGate.reason
-        : runAuthority.reason !== null && !runAuthorityAllowsResume
-          ? runAuthority.reason
-          : stopping
-            ? 'Robot is stopping'
-            : `Cycle is ${state}`;
+        : runtimeBlocksMotion
+          ? runtime?.userMessage ?? 'Execution admission is closed'
+          : runAuthority.reason !== null && !runAuthorityAllowsResume
+            ? runAuthority.reason
+            : stopping
+              ? 'Robot is stopping'
+              : `Cycle is ${state}`;
   const resetControlDisabled = cycleBusy || (
     resetRecoveryAction
       ? !resetRecoveryAction.enabled
@@ -415,7 +436,14 @@ export function TransportControls() {
           <div className="mt-2 flex gap-2">
             <button
               type="button"
-              disabled={cycleBusy || !confirmationAction.enabled}
+              disabled={
+                cycleBusy
+                || !confirmationAction.enabled
+                || (
+                  isMotionProducingRecoveryAction(confirmationAction.actionId)
+                  && runtimeBlocksMotion
+                )
+              }
               onClick={() => {
                 setPendingRecoveryConfirmation(null);
                 if (isMotionProducingRecoveryAction(confirmationAction.actionId)) {

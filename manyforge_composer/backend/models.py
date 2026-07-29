@@ -358,7 +358,7 @@ class TreeNodeResponse(BaseModel):
 
 
 class ProgramCompatibilityResponse(BaseModel):
-    lanes: List[Literal["manyforge-only", "isaac-sim"]]
+    lanes: List[Literal["manyforge-only", "isaac-sim", "real-robot"]]
     assistant: Literal["required", "optional", "forbidden"] = "optional"
     requires: List[str] = Field(default_factory=list)
     tags: List[str] = Field(default_factory=list)
@@ -875,7 +875,7 @@ class DeploymentScenarioResponse(BaseModel):
 
 
 class DeploymentCompatibilityResponse(BaseModel):
-    lane: Literal["manyforge-only", "isaac-sim"]
+    lane: Literal["manyforge-only", "isaac-sim", "real-robot"]
     provides: List[str] = Field(default_factory=list)
     tags: List[str] = Field(default_factory=list)
     scenarios: List[DeploymentScenarioResponse] = Field(default_factory=list)

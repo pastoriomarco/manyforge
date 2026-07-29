@@ -73,15 +73,24 @@ extract_rospkg_version() {
     grep -oE '<version>[0-9]+\.[0-9]+\.[0-9]+</version>' "${file}" \
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
 }
-check "manyforge_ros_bringup package.xml" "$(extract_rospkg_version "${REPO_ROOT}/manyforge_ros_bringup/package.xml")"
+for pkg in \
+    manyforge_ros_bringup \
+    manyforge_robot_lifecycle \
+    manyforge_robot_lifecycle_msgs \
+    manyforge_xarm_control \
+    manyforge_xarm_adapter; do
+    check "${pkg} package.xml" "$(extract_rospkg_version "${REPO_ROOT}/${pkg}/package.xml")"
+done
 
-# ROS package — setup.py version="X.Y.Z"
+# ROS package — setup.py version="X.Y.Z" or version='X.Y.Z'
 extract_setup_py_version() {
     local file="$1"
-    grep -oE 'version="[0-9]+\.[0-9]+\.[0-9]+"' "${file}" \
+    grep -oE "version=['\"][0-9]+\\.[0-9]+\\.[0-9]+['\"]" "${file}" \
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
 }
-check "manyforge_ros_bringup setup.py" "$(extract_setup_py_version "${REPO_ROOT}/manyforge_ros_bringup/setup.py")"
+for pkg in manyforge_ros_bringup manyforge_xarm_adapter; do
+    check "${pkg} setup.py" "$(extract_setup_py_version "${REPO_ROOT}/${pkg}/setup.py")"
+done
 
 # Frontend — package.json "version": "X.Y.Z"
 extract_packagejson_version() {

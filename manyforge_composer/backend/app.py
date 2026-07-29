@@ -5,7 +5,7 @@ import logging
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 import asyncio
 from pathlib import Path
 
@@ -48,6 +48,7 @@ from .routes_infra import create_infra_router
 from .routes_runtime import create_runtime_router
 from .routes_assistant import create_assistant_router
 from .routes_simulation import create_simulation_router
+from .routes_robot_lifecycle import create_robot_lifecycle_router
 from .route_execution import shutdown_route_executors
 
 logger = logging.getLogger(__name__)
@@ -66,14 +67,43 @@ def create_app(
 
     hub = StateHub()
 
+    async def control_authority_health_loop() -> None:
+        """Renew headless authority only while critical backend work responds."""
+        while True:
+            try:
+                await asyncio.to_thread(
+                    state.robot_lifecycle_authority_heartbeat_tick
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Control-authority health iteration failed")
+            interval_s = (
+                state.robot_lifecycle_authority_heartbeat_interval_s()
+            )
+            await asyncio.sleep(max(0.05, min(interval_s, 5.0)))
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info("ManyForge Composer starting up")
+        state.start_control_authority_health()
         state.start_recovery_offer_pump()
         hub.start(state)
         hub._task = asyncio.create_task(hub._broadcast_loop())
+        authority_health_task = asyncio.create_task(
+            control_authority_health_loop(),
+            name="manyforge-control-authority-health",
+        )
         yield
         logger.info("ManyForge Composer shutting down")
+        # Stop renewal before quiescing execution. This task is backend-owned
+        # and browser-independent; cancellation cannot re-arm or close a
+        # lifecycle session. The ordered motion stop below remains the
+        # authoritative physical quiesce path.
+        state.stop_control_authority_health()
+        authority_health_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await authority_health_task
         # Ordered quiesce, each step independently guarded. Motion first —
         # a graceful shutdown must never leave the kernel executing on the
         # chance that interpreter-exit GC runs the native teardown. The
@@ -268,6 +298,11 @@ def create_app(
         }
 
     app.include_router(create_cycle_router(state), prefix="/api/cycle", tags=["cycle"])
+    app.include_router(
+        create_robot_lifecycle_router(state),
+        prefix="/api/robot-lifecycle",
+        tags=["robot-lifecycle"],
+    )
     app.include_router(create_catalog_router(state), prefix="/api/catalog", tags=["catalog"])
     app.include_router(create_nodes_router(state), prefix="/api/nodes", tags=["nodes"])
     app.include_router(

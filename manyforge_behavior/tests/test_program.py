@@ -182,7 +182,7 @@ def _minimal_program(**overrides) -> dict:
         "api_version": "manyforge.program.v0",
         "program_profile": "v0.0",
         "name": "test",
-        "catalog_version": "0.4.0",
+        "catalog_version": "0.5.0",
         "robot": {
             "robot_id": "ur5",
             "group_id": "arm",
@@ -243,7 +243,7 @@ def test_collect_per_move_tcp_speed_caps_resolves_overrides(catalog):
         "api_version": "manyforge.program.v0",
         "program_profile": "v0.0",
         "name": "tcp_override_test",
-        "catalog_version": "0.4.0",
+        "catalog_version": "0.5.0",
         "robot": {
             "robot_id": "ur5",
             "group_id": "arm",

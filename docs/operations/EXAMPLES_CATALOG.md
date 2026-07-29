@@ -1,22 +1,26 @@
 # Examples Catalog — Program × Deployment Pairs
 
-This doc catalogues every `examples/*.program.yaml` and
-`examples/*.deployment.yaml` file and maps them to the scenarios the
+This doc catalogues every `examples/*.program.yaml`,
+`examples/*.deployment.yaml`, and physical
+`examples/*.real-robot-cell.yaml` artifact and maps them to the scenarios the
 unified launcher (`scripts/launch.sh`) exposes. Use it to pick the right
 combination for a given test or demo.
 
 For the launcher itself, see
 [`LAUNCHER_QUICKSTART.md`](LAUNCHER_QUICKSTART.md). For the live source
-of truth on each scenario, see `compatibility.scenarios` in its deployment
-artifact. `scripts/lib/scenarios.sh` only loads and presents those discovered
-definitions.
+of truth on ordinary scenarios, see `compatibility.scenarios` in its
+deployment artifact. A physical scenario instead comes from its strict
+cell/template/program bundle. `scripts/lib/scenarios.sh` only loads and
+presents those discovered definitions.
 
 ## How to pick a combination
 
 The launcher takes three axes: **lane**, **assistant**, and **scenario**.
-A scenario is a fixed pairing of a program YAML and a deployment YAML
-plus a lane/assistant default. To use an ad hoc combination not in the table,
-pass both `--program PATH` and `--deployment PATH`. To publish a reusable named
+An ordinary scenario is a fixed pairing of a program YAML and a deployment
+YAML plus a lane/assistant default. A `real-robot` scenario is a portable
+cell/template/program bundle that resolves to a retained per-run deployment.
+To use an ad hoc non-physical combination not in the table, pass both
+`--program PATH` and `--deployment PATH`. To publish a reusable ordinary named
 scenario, add `compatibility.scenarios` metadata to the deployment artifact.
 
 The compatibility rule is simple: a program and deployment must agree on
@@ -36,7 +40,9 @@ Three operator-facing axes determine which scenario to pick:
   manipulator-with-gripper target and the Isaac lane's robot. UFACTORY
   Lite6 + lite gripper (`lite6_lite_gripper_pick_and_place.*`,
   `isaac_lite6_lite_gripper_pick_and_place.*`) is the compact-arm
-  bring-up target for the Robot Model Authority pipeline.
+  bring-up target for the Robot Model Authority pipeline. The first physical
+  target is Lite6 with the fixed custom pneumatic tool and uses the dedicated
+  commissioning bundle below.
 - **Execution backend.** `execution.roboplan_native` for native
   simulated execution; `execution.ros2_control_follow_joint_trajectory`
   for the Isaac lane (commanded-sim, FJT action server,
@@ -65,6 +71,7 @@ Three operator-facing axes determine which scenario to pick:
 | `isaac-lite6-pick-place`            | isaac-sim      | off | [`isaac_lite6_lite_gripper_pick_and_place.program.yaml`](../../examples/isaac_lite6_lite_gripper_pick_and_place.program.yaml) | [`isaac_lite6_lite_gripper_pick_and_place.deployment.yaml`](../../examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml)                           | Isaac commanded-sim with UFACTORY Lite6 + lite gripper pick-and-place. Uses the Lite6 topic-control profile, lite gripper action bridge, and the same compact pick/drop scene as the native Lite6 example.                                                                 |
 | `isaac-lite6-trocar-foundationpose` | isaac-sim      | off | [`trocar_lite6_foundationpose_pick.program.yaml`](../../examples/trocar_lite6_foundationpose_pick.program.yaml)               | [`trocar_lite6_foundationpose_pick.deployment.yaml`](../../examples/trocar_lite6_foundationpose_pick.deployment.yaml)                                         | Isaac commanded-sim with UFACTORY Lite6 + lite gripper using an Isaac ROS FoundationPose `Detection3DArray` pose source on `/output`. See [`ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md`](ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md) for DDS, QoS, perception, TF, and smoke workflow. |
 | `isaac-ur10e-light-scene-assistant` | isaac-sim      | on  | [`isaac_manipulator_scene_light.program.yaml`](../../examples/isaac_manipulator_scene_light.program.yaml)                     | [`isaac_manipulator_scene_light_assistant.deployment.yaml`](../../examples/isaac_manipulator_scene_light_assistant.deployment.yaml)                           | Isaac commanded-sim with the full Cosmos assistant overlay. `apply_policy: before_planning` (instead of `continuous_unattached`) because commanded_sim makes assistant edits authoritative for what Isaac sees.                                                            |
+| `real-lite6-commissioning`          | real-robot     | off | [`lite6_fixed_pneumatic_commissioning.program.yaml`](../../examples/lite6_fixed_pneumatic_commissioning.program.yaml)         | [`lite6_fixed_pneumatic_commissioning.deployment.template.yaml`](../../examples/lite6_fixed_pneumatic_commissioning.deployment.template.yaml) + [cell](../../examples/lite6_fixed_pneumatic_commissioning.real-robot-cell.yaml) | Experimental supervised physical Lite6 commissioning. Startup and the program are non-moving; the cell resolves exact runtime/controller/lifecycle identity. The operator must explicitly enable the robot before Run or candidate approval becomes eligible.          |
 
 Deprecated scenario aliases (still work, emit a one-time warning):
 `pick-place`, `ur10e`, `shape-pick`, `vision-pose`, `assistant-authoring`,
@@ -73,8 +80,8 @@ scenario definitions in deployment metadata.
 
 ## Other files in `examples/` (not in any scenario)
 
-These exist for purposes outside the launcher's scenario flow — they
-are not orphans, just not bound to a launcher entry:
+These exist for purposes outside the launcher's scenario flow — they are not
+orphans, just not bound to a launcher entry:
 
 - [`examples/empty_pick_and_place_ur10e_robotiq.program.yaml`](../../examples/empty_pick_and_place_ur10e_robotiq.program.yaml)
   - Empty program scaffold for the `smoke_corpus.yaml` PnP build chain.
@@ -117,7 +124,7 @@ may appear in logs:
 
 ## Adding a new scenario
 
-To wire a new program/deployment pair into the launcher:
+To wire a new ordinary program/deployment pair into the launcher:
 
 1. Drop both YAMLs under `examples/`. Confirm `robot_id` and
    `group_id` match between them.
@@ -131,3 +138,9 @@ To wire a new program/deployment pair into the launcher:
 If the deployment uses the assistant lane, also reference
 `model_endpoint_profiles.yaml` for any vLLM endpoints — do not inline
 endpoint URLs in the deployment when an existing profile fits.
+
+Physical scenarios use the stricter `*.real-robot-cell.yaml` contract instead.
+Follow
+[`LAUNCHER_QUICKSTART.md`](LAUNCHER_QUICKSTART.md#experimental-real-lite6-commissioning)
+and the adapter-owned resolver; do not put robot addresses or generated
+provider/session identities in a committed deployment.

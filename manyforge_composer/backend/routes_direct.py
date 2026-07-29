@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import time
+from functools import wraps
+from typing import Any, Callable
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -79,6 +81,7 @@ def _motion_arm_admission_error(state: ComposerState) -> JSONResponse | None:
         content={
             "error": stop_block["message"],
             "error_code": stop_block["error_code"],
+            "error_details": stop_block.get("error_details"),
             "timestamp_ns": time.monotonic_ns(),
         },
     )
@@ -111,7 +114,20 @@ def create_direct_router(state: ComposerState) -> APIRouter:
     """Create the direct-control router with the given state."""
     router = APIRouter()
 
+    def artifact_transactional(
+        handler: Callable[..., Any],
+    ) -> Callable[..., Any]:
+        """Keep active artifacts stable through synchronous dispatch acceptance."""
+
+        @wraps(handler)
+        def wrapped(*args, **kwargs):
+            with state.artifact_read_transaction():
+                return handler(*args, **kwargs)
+
+        return wrapped
+
     @router.post("/execute")
+    @artifact_transactional
     def execute_intervention(request: InterventionExecuteRequest, http_request: Request):
         """Execute a temporary subtree as a direct-control intervention.
 
@@ -217,6 +233,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
         return _session_response(session)
 
     @router.post("/joint-jog")
+    @artifact_transactional
     def joint_jog(request: JointJogRequest, http_request: Request):
         """Drive one or more joints to a target position from the viewer's
         robot-control overlay panel (Day 5b).
@@ -261,14 +278,12 @@ def create_direct_router(state: ComposerState) -> APIRouter:
                 },
             )
 
-        # Read current joint vector. We need a full goal across every
-        # joint the kernel exposes, not just the ones the operator
-        # touched, otherwise the planner produces a trajectory that
-        # tries to zero out the unspecified joints. The kernel's
-        # execution-snapshot `joint_positions_rad` is None outside an
-        # active execution, so we route through ComposerState's
-        # full fallback chain (cached last-known → deployment's
-        # initial config) instead of consuming None directly.
+        # Read current joint vector. We need a full goal across every joint the
+        # kernel exposes, not just the ones the operator touched, otherwise the
+        # planner produces a trajectory that tries to zero out unspecified
+        # joints. ComposerState applies the deployment's authority profile:
+        # authored lanes may use their backend cache/seed, while physical
+        # observed lanes require a complete fresh measured snapshot.
         kernel_joint_names = list(state.kernel.get_joint_names())
         if not kernel_joint_names:
             return JSONResponse(
@@ -278,16 +293,45 @@ def create_direct_router(state: ComposerState) -> APIRouter:
                     "timestamp_ns": time.monotonic_ns(),
                 },
             )
+        unknown_joint = next(
+            (name for name in request.joint_names if name not in kernel_joint_names),
+            None,
+        )
+        if unknown_joint is not None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"Unknown joint '{unknown_joint}'",
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
 
-        current_positions = state.get_current_joint_positions()
+        # Surface lifecycle/stop-capability interlocks before position
+        # availability. They are the stronger operator action required and stay
+        # stable even when the observed joint stream is unavailable.
+        admission_error = _motion_arm_admission_error(state)
+        if admission_error is not None:
+            return admission_error
+
+        joint_state_authority = state.joint_state_authority_profile()
+        current_positions = state.get_current_joint_positions(
+            joint_names=kernel_joint_names
+        )
         if current_positions is None:
+            if joint_state_authority.measurement_authoritative:
+                detail = (
+                    "No complete fresh measured robot joint state is available; "
+                    "cannot jog from a cached, initial, or commanded pose"
+                )
+            else:
+                detail = (
+                    "Kernel has no joint state yet — load a deployment so the "
+                    "initial joint configuration is available"
+                )
             return JSONResponse(
                 status_code=409,
                 content={
-                    "error": (
-                        "Kernel has no joint state yet — load a deployment so the "
-                        "initial joint configuration is available"
-                    ),
+                    "error": detail,
                     "timestamp_ns": time.monotonic_ns(),
                 },
             )
@@ -296,16 +340,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
         # current-positions vector.
         target_positions = list(current_positions)
         for name, pos in zip(request.joint_names, request.joint_positions_rad):
-            try:
-                idx = kernel_joint_names.index(name)
-            except ValueError:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": f"Unknown joint '{name}'",
-                        "timestamp_ns": time.monotonic_ns(),
-                    },
-                )
+            idx = kernel_joint_names.index(name)
             target_positions[idx] = float(pos)
 
         auth_principal = getattr(http_request.state, "principal_id", None)
@@ -384,10 +419,6 @@ def create_direct_router(state: ComposerState) -> APIRouter:
                 },
             )
 
-        admission_error = _motion_arm_admission_error(state)
-        if admission_error is not None:
-            return admission_error
-
         try:
             session = state.cycle_manager.execute_intervention(
                 tree_dict,
@@ -417,20 +448,16 @@ def create_direct_router(state: ComposerState) -> APIRouter:
                 },
             )
 
-        # Day 5c.1: optimistic cache update. The kernel's snapshot
-        # returns joint_positions_rad=None when not executing, so
-        # absent this update the panel slider snaps back to the
-        # last *during-execution* value once the trajectory
-        # completes. Setting the cache to the commanded target
-        # right after the intervention is submitted keeps the
-        # slider at the operator's requested position; any
-        # divergence (planner caps, collision halts) overrides this
-        # on the next scene-state poll during execution.
-        state.record_current_joint_positions(list(target_positions))
+        # Authored lanes may optimistically project command intent while their
+        # backend executes it. On a physical/observed lane the measured robot is
+        # the only position authority, so never overwrite its observer cache.
+        if not joint_state_authority.measurement_authoritative:
+            state.record_current_joint_positions(list(target_positions))
 
         return _session_response(session)
 
     @router.post("/cartesian-jog")
+    @artifact_transactional
     def cartesian_jog(request: CartesianJogRequest, http_request: Request):
         """Drive the TCP to a target pose from the viewer's Cartesian
         jog gizmo (Day 5c.2).

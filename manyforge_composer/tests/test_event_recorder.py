@@ -51,6 +51,78 @@ def test_operator_alarm_lifecycle_is_durable_info_history_not_a_second_incident(
     assert recorder.incident_snapshots() == []
 
 
+def test_robot_lifecycle_terminal_is_durable_history_not_a_second_incident(
+    monkeypatch,
+):
+    recorder = EventRecorder()
+    durable_writes: list[bool] = []
+    monkeypatch.setattr(
+        recorder,
+        "_enqueue_jsonl_locked",
+        lambda **kwargs: durable_writes.append(kwargs["durable"]),
+    )
+
+    recorder.record_robot_lifecycle_event(
+        "transaction_terminal",
+        details={
+            "provider_id": "lite6-a:provider:test",
+            "robot_id": "lite6-a",
+            "transaction": {
+                "requestId": "request-1",
+                "generation": 1,
+                "phase": "succeeded",
+            },
+        },
+    )
+
+    event = recorder.history(limit=1)["events"][0]
+    assert event["type"] == "robot_lifecycle_transaction_terminal"
+    assert event["severity"] == "INFO"
+    assert event["component"] == "manyforge.robot_lifecycle"
+    assert event["channel"] == "robot_lifecycle"
+    assert durable_writes == [True]
+    assert recorder.incident_snapshots() == []
+
+
+def test_robot_lifecycle_channel_is_not_evicted_by_execution_traffic() -> None:
+    recorder = EventRecorder(max_events=5)
+    recorder.record_robot_lifecycle_event(
+        "observation_baseline",
+        details={"provider_id": "lite6-a:provider:test"},
+    )
+    for index in range(600):
+        recorder._record_event(
+            event_type="plan_started",
+            details={"index": index},
+        )
+
+    lifecycle_events = recorder.channel_histories(limit=1)[
+        "robot_lifecycle"
+    ]
+
+    assert [event["type"] for event in lifecycle_events] == [
+        "robot_lifecycle_observation_baseline"
+    ]
+
+
+def test_idle_robot_lifecycle_event_does_not_inherit_finished_run() -> None:
+    recorder = EventRecorder(observe_min_interval_s=0.0)
+    recorder.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
+    recorder.observe(_StubState(cycle_manager=_StubCycleManager("running")))
+    finished_run_id = recorder.current_run_id
+    recorder.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
+    assert recorder.last_run_id == finished_run_id
+
+    recorder.record_robot_lifecycle_event(
+        "observed_transition",
+        details={"provider_id": "lite6-a:provider:test"},
+    )
+
+    event = _memory_events(recorder)[-1]
+    assert event["type"] == "robot_lifecycle_observed_transition"
+    assert event["run_id"] is None
+
+
 # ---------------------------------------------------------------------------
 # Minimal stubs that quack like ComposerState / CycleManager / Intervention
 # ---------------------------------------------------------------------------
@@ -2200,6 +2272,57 @@ class TestOW5DurabilityAndShutdown:
         norun = tmp_path / "_norun.events.jsonl"
         assert norun.exists()
         assert "clock_anchor" in norun.read_text()
+
+    def test_idle_lifecycle_history_uses_its_own_durable_stream(
+        self,
+        tmp_path,
+    ):
+        rec = EventRecorder(trace_dir=tmp_path, observe_min_interval_s=0.0)
+        rec.record_robot_lifecycle_event(
+            "observation_baseline",
+            details={"runtime_generation_id": "runtime-1"},
+        )
+        rec.set_clock_anchor(monotonic_ns=11, wall_time_ns=22)
+        assert rec.close(timeout_s=10.0)
+
+        lifecycle = tmp_path / "_robot_lifecycle.events.jsonl"
+        norun = tmp_path / "_norun.events.jsonl"
+        assert "robot_lifecycle_observation_baseline" in lifecycle.read_text()
+        assert "robot_lifecycle" not in norun.read_text()
+        assert "clock_anchor" in norun.read_text()
+
+    def test_idle_lifecycle_trace_compacts_with_retention_evidence(
+        self,
+        tmp_path,
+    ):
+        path = tmp_path / "_robot_lifecycle.events.jsonl"
+        for index in range(8):
+            EventRecorder._write_jsonl_line(
+                path,
+                json.dumps(
+                    {
+                        "event": index,
+                        "details": {"padding": "x" * 96},
+                    }
+                ),
+                robot_lifecycle_max_bytes=512,
+            )
+
+        assert path.exists()
+        records = [
+            json.loads(line)
+            for line in path.read_text().splitlines()
+            if line
+        ]
+        assert path.stat().st_size <= 512
+        assert records[-1]["event"] == 7
+        retention = records[-1]["details"]["durable_stream_retention"]
+        assert retention["stream"] == "robot_lifecycle"
+        assert retention["compacted"] is True
+        assert retention["dropped_records"] > 0
+        assert retention["dropped_records_total"] >= (
+            retention["dropped_records"]
+        )
 
 
 class TestStopDecisionChains:

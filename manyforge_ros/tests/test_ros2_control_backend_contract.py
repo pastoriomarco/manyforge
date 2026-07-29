@@ -590,6 +590,15 @@ def test_ros2_control_backend_preserves_monitor_failure_after_late_result():
             controller_state_topic=controller_state_topic,
             wait_s=5.0,
             config_overrides={
+                # This contract deliberately injects the tracking fault through
+                # action feedback. Select that source explicitly so the test
+                # does not depend on the deployment default, where authoritative
+                # controller state correctly has higher precedence.
+                "observed_state_source_precedence": [
+                    "action_feedback",
+                    "controller_state",
+                    "joint_state",
+                ],
                 "tracking_error_tolerance_rad": 0.01,
                 "tracking_error_timeout_s": 0.05,
             },
@@ -1274,6 +1283,123 @@ def test_ros2_control_backend_documents_lock_order_contract():
     assert "Lock-order contract:" in header
     assert "Do not hold state_mutex_ while taking execution_mutex_" in header
     assert "best-effort execution-state sink updates" in header
+
+
+def test_ros2_control_admission_surface_accepts_exact_generic_binding():
+    suffix = uuid.uuid4().hex
+    action_name = (
+        f"/manyforge_contract_admission_{suffix}/"
+        "follow_joint_trajectory"
+    )
+    joint_state_topic = (
+        f"/manyforge_contract_admission_{suffix}/joint_states"
+    )
+    controller_state_topic = (
+        f"/manyforge_contract_admission_{suffix}/controller_state"
+    )
+    controller_manager = (
+        f"/manyforge_contract_admission_{suffix}/controller_manager"
+    )
+    contract_generation = f"binding-{suffix}"
+    binding = {
+        "schema": "manyforge.ros2_control.execution_binding.v0.experimental",
+        "generation_id": contract_generation,
+        "controller_manager": controller_manager,
+        "activity_topic": f"{controller_manager}/activity",
+        "hardware_component_name": "test_system",
+        "trajectory_controller_manager_name": "test_controller",
+        "trajectory_controller_ros_name": (
+            f"/manyforge_contract_admission_{suffix}/test_controller"
+        ),
+        "trajectory_controller_type": (
+            "joint_trajectory_controller/JointTrajectoryController"
+        ),
+        "follow_joint_trajectory_action": action_name,
+        "controller_state_topic": controller_state_topic,
+        "joint_state_topic": joint_state_topic,
+        "required_joints": JOINTS,
+        "claimed_command_interfaces": [
+            f"{joint}/{interface}"
+            for joint in JOINTS
+            for interface in ("position", "velocity")
+        ],
+        "required_state_interfaces": [
+            f"{joint}/{interface}"
+            for joint in JOINTS
+            for interface in ("position", "velocity")
+        ],
+        "snapshot_max_age_ms": 1_000,
+    }
+    missing_schema = dict(binding)
+    missing_schema.pop("schema")
+    with pytest.raises(ValueError, match="controller_binding.schema"):
+        _create_bundle(
+            action_name=action_name,
+            joint_state_topic=joint_state_topic,
+            controller_state_topic=controller_state_topic,
+            wait_s=0.0,
+            config_overrides={
+                "controller_binding": missing_schema,
+                "require_execution_admission_snapshot": True,
+            },
+            defer_ros_executor_start=True,
+        )
+    bundle = _create_bundle(
+        action_name=action_name,
+        joint_state_topic=joint_state_topic,
+        controller_state_topic=controller_state_topic,
+        wait_s=0.0,
+        config_overrides={
+            "controller_binding": binding,
+            "require_execution_admission_snapshot": True,
+        },
+        defer_ros_executor_start=True,
+    )
+    now_ns = time.monotonic_ns()
+    admission = {
+        "generation": 1,
+        "lifecycle_generation": 7,
+        "robot_id": "lite6-a",
+        "binding_contract_generation_id": contract_generation,
+        "runtime_generation_id": "runtime-generation-1",
+        "provider_component_epoch": "provider-epoch-1",
+        "transport_owner_component_epoch": "owner-epoch-1",
+        "authority_component_epoch": "authority-epoch-1",
+        "cell_supervisor_component_epoch": "supervisor-epoch-1",
+        "observed_timestamp_ns": now_ns,
+        "received_timestamp_ns": now_ns,
+        "fresh_until_ns": now_ns + 250_000_000,
+        "controller_ready": True,
+        "motion_admitted": True,
+        "reason_codes": [],
+    }
+    try:
+        assert bundle.get_ros2_control_controller_binding_snapshot() is None
+        assert (
+            bundle.publish_ros2_control_execution_admission_snapshot(
+                admission
+            )
+            is True
+        )
+        assert (
+            bundle.publish_ros2_control_execution_admission_snapshot(
+                admission
+            )
+            is True
+        )
+        assert (
+            bundle.get_ros2_control_execution_admission_snapshot()
+            == admission
+        )
+        conflicting = dict(admission, motion_admitted=False)
+        assert (
+            bundle.publish_ros2_control_execution_admission_snapshot(
+                conflicting
+            )
+            is False
+        )
+    finally:
+        bundle.close()
 
 
 def test_ros2_control_monitor_exits_promptly_after_stop_confirmation():

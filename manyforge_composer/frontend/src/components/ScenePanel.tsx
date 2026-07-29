@@ -1615,7 +1615,7 @@ export function ScenePanel() {
         {programCompatibility && (
           <div className="rounded border border-gray-700 bg-gray-900/40 p-3 space-y-2">
             <div className="grid grid-cols-2 gap-2">
-              {(['manyforge-only', 'isaac-sim'] as const).map((lane) => (
+              {(['manyforge-only', 'isaac-sim', 'real-robot'] as const).map((lane) => (
                 <label key={lane} className="flex items-center gap-2 text-xs text-gray-300">
                   <input
                     type="checkbox"

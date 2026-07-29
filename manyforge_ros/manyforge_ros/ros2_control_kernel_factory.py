@@ -9,6 +9,7 @@ divergence checks, and gripper JointState publisher live in C++ inside
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,13 +30,78 @@ class Ros2ControlRuntimeBundle:
 
     native_bundle: Any
     group_id: str
+    execution_admission_subscription: Any | None = None
 
     def shutdown(self) -> None:
-        if hasattr(self.native_bundle, "reset"):
-            self.native_bundle.reset()
+        try:
+            if self.execution_admission_subscription is not None:
+                self.execution_admission_subscription.shutdown()
+        finally:
+            self.execution_admission_subscription = None
+            if hasattr(self.native_bundle, "reset"):
+                self.native_bundle.reset()
 
     def set_joint_positions(self, positions: list[float]) -> None:
         self.native_bundle.set_group_joint_positions(self.group_id, positions)
+
+
+def _kernel_stop_profile(
+    execution_config: dict[str, Any],
+    profile_key: str,
+) -> Any:
+    """Give the Kernel the same derived stop deadline as the ROS backend.
+
+    ``stop_completion_timeout_{s,ms}`` is the lane's controller-confirmation
+    margin.  The ROS backend adds it to the requested deceleration window when
+    a profile omits ``max_stop_time_s``.  Materialize that same total in the
+    profile sent to the Kernel so its outer watchdog cannot expire while the
+    backend is still inside its declared confirmation window.
+    """
+
+    profile = execution_config.get(profile_key)
+    if not isinstance(profile, dict):
+        return profile
+    resolved = dict(profile)
+    if resolved.get("max_stop_time_s") is not None:
+        return resolved
+    if resolved.get("deceleration_time_s") is None:
+        return resolved
+
+    tolerance_value: Any | None = None
+    tolerance_scale = 1.0
+    if "stop_completion_timeout_s" in execution_config:
+        tolerance_value = execution_config["stop_completion_timeout_s"]
+    elif "stop_completion_timeout_ms" in execution_config:
+        tolerance_value = execution_config["stop_completion_timeout_ms"]
+        tolerance_scale = 0.001
+    if tolerance_value is None:
+        return resolved
+    if (
+        isinstance(tolerance_value, bool)
+        or not isinstance(tolerance_value, (int, float))
+        or not math.isfinite(float(tolerance_value))
+        or float(tolerance_value) < 0.0
+    ):
+        raise RuntimeError(
+            "execution.config.stop_completion_timeout must be a finite "
+            "non-negative duration"
+        )
+
+    deceleration_value = resolved["deceleration_time_s"]
+    if (
+        isinstance(deceleration_value, bool)
+        or not isinstance(deceleration_value, (int, float))
+        or not math.isfinite(float(deceleration_value))
+        or float(deceleration_value) <= 0.0
+    ):
+        # Leave validation and its profile-specific diagnostic to the owning
+        # deployment/C++ DTO parser rather than inventing a different default.
+        return resolved
+
+    resolved["max_stop_time_s"] = (
+        float(deceleration_value) + float(tolerance_value) * tolerance_scale
+    )
+    return resolved
 
 
 def create_ros2_control_kernel(
@@ -132,14 +198,12 @@ def create_ros2_control_kernel(
         kernel_config["runtime_collision_lookahead_workers"] = (
             runtime_collision_lookahead_workers
         )
-    for key in (
-        "single_shot_ik_timeout_s",
-        "single_shot_ik_timeout_ms",
-        "default_fault_stop_profile",
-        "operator_stop_profile",
-    ):
+    for key in ("single_shot_ik_timeout_s", "single_shot_ik_timeout_ms"):
         if key in config:
             kernel_config[key] = config[key]
+    for key in ("default_fault_stop_profile", "operator_stop_profile"):
+        if key in config:
+            kernel_config[key] = _kernel_stop_profile(config, key)
     for key in (
         "planner_max_planning_time_s",
         "planner_max_planning_time_ms",
@@ -188,9 +252,67 @@ def create_ros2_control_kernel(
         )
     native_bundle.complete_ros2_control_configuration()
 
+    admission_subscription = None
+    admission_config = config.get("execution_admission")
+    if admission_config is not None:
+        if not config.get("require_execution_admission_snapshot", False):
+            raise RuntimeError(
+                "execution_admission transport requires "
+                "require_execution_admission_snapshot=true"
+            )
+        if not isinstance(admission_config, dict):
+            raise RuntimeError(
+                "execution.config.execution_admission must be a mapping"
+            )
+        from manyforge_ros.execution_admission import (
+            ExecutionAdmissionIngressConfig,
+        )
+        from manyforge_ros.execution_admission import (
+            RosExecutionAdmissionSubscription,
+        )
+
+        maximum_lease_ms = admission_config.get('maximum_lease_ms', 250)
+        if (
+            isinstance(maximum_lease_ms, bool)
+            or not isinstance(maximum_lease_ms, int)
+            or maximum_lease_ms <= 0
+            or maximum_lease_ms > 10_000
+        ):
+            raise RuntimeError(
+                'execution.config.execution_admission.maximum_lease_ms '
+                'must be an integer in 1..10000'
+            )
+        try:
+            admission_subscription = RosExecutionAdmissionSubscription(
+                native_bundle=native_bundle,
+                config=ExecutionAdmissionIngressConfig(
+                    topic=admission_config.get("topic"),
+                    provider_instance_id=admission_config.get(
+                        "provider_instance_id"
+                    ),
+                    robot_id=robot_config.robot_id,
+                    binding_contract_generation_id=(
+                        config.get("controller_binding") or {}
+                    ).get(
+                        "generation_id"
+                    ),
+                    runtime_generation_id=admission_config.get(
+                        "runtime_generation_id"
+                    ),
+                    cell_supervisor_component_epoch=admission_config.get(
+                        "cell_supervisor_component_epoch"
+                    ),
+                    maximum_lease_ns=maximum_lease_ms * 1_000_000,
+                ),
+            )
+        except BaseException:
+            if hasattr(native_bundle, "reset"):
+                native_bundle.reset()
+            raise
     bundle = Ros2ControlRuntimeBundle(
         native_bundle=native_bundle,
         group_id=robot_config.group_id or "arm",
+        execution_admission_subscription=admission_subscription,
     )
     kernel = NativeKernelClient(
         native_bundle,

@@ -2962,6 +2962,7 @@ export function DeploymentPanel() {
               >
                 <option value="manyforge-only">manyforge-only</option>
                 <option value="isaac-sim">isaac-sim</option>
+                <option value="real-robot">real-robot</option>
               </select>
             </label>
             <FieldInput

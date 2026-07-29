@@ -10,7 +10,7 @@ compatibility:
   assistant: forbidden
   requires: [ros2_control, lite_gripper, foundationpose]
   tags: [pick-and-place, isaac-sim, lite6, foundationpose]
-catalog_version: "0.4.0"
+catalog_version: "0.5.0"
 robot:
   robot_id: lite6
   group_id: lite6

@@ -13,7 +13,7 @@ compatibility:
   assistant: required
   requires: [semantic_shape_inference]
   tags: [semantic-pick, ur5]
-catalog_version: "0.4.0"
+catalog_version: "0.5.0"
 
 robot:
   robot_id: ur5

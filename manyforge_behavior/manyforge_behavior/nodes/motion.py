@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import Any
 
 import py_trees
@@ -13,6 +14,7 @@ from manyforge_behavior.action_span import (
 )
 from manyforge_behavior.kernel_client import (
     ExecuteRequest,
+    JointDynamicsLimit,
     KernelClient,
 )
 from manyforge_behavior.motion_runtime import MotionExecutionCoordinator
@@ -27,6 +29,90 @@ from manyforge_behavior.runtime_pause import (
 # Canonical conversion is defined once in manyforge_behavior.geometry; re-exported
 # here under the historical private name for existing in-module callers.
 from manyforge_behavior.geometry import rpy_deg_to_xyzw as _rpy_deg_to_xyzw
+
+
+_MAX_PER_JOINT_DYNAMICS_LIMITS = 128
+_MAX_JOINT_NAME_LENGTH = 256
+_JOINT_DYNAMICS_FIELDS = (
+    "max_velocity_rad_s",
+    "max_acceleration_rad_s2",
+    "max_jerk_rad_s3",
+)
+
+
+def _normalize_per_joint_dynamics_limits(
+    raw_limits: Any,
+) -> dict[str, JointDynamicsLimit]:
+    """Validate and convert the tree parameter into the kernel DTO mapping.
+
+    The catalog validates the object shape, known fields, numeric types, and
+    ordinary positive values it can express. This bounded conversion also
+    enforces runtime-only finite-value, non-empty-map, name, and count limits,
+    and protects generated intervention trees/direct node construction that can
+    bypass authoring-time validation.
+    """
+    if raw_limits is None:
+        return {}
+    if not isinstance(raw_limits, Mapping):
+        raise ValueError("per_joint_dynamics_limits must resolve to a mapping")
+    if len(raw_limits) > _MAX_PER_JOINT_DYNAMICS_LIMITS:
+        raise ValueError(
+            "per_joint_dynamics_limits must contain at most "
+            f"{_MAX_PER_JOINT_DYNAMICS_LIMITS} joints"
+        )
+
+    normalized: dict[str, JointDynamicsLimit] = {}
+    allowed_fields = set(_JOINT_DYNAMICS_FIELDS)
+    for joint_name, raw_limit in raw_limits.items():
+        if (
+            not isinstance(joint_name, str)
+            or not joint_name
+            or joint_name != joint_name.strip()
+            or len(joint_name) > _MAX_JOINT_NAME_LENGTH
+        ):
+            raise ValueError(
+                "per_joint_dynamics_limits joint names must be non-empty, "
+                f"trimmed strings no longer than {_MAX_JOINT_NAME_LENGTH} characters"
+            )
+        if not isinstance(raw_limit, Mapping):
+            raise ValueError(
+                f"per_joint_dynamics_limits.{joint_name} must be a mapping"
+            )
+        supplied_fields = set(raw_limit)
+        unknown_fields = supplied_fields - allowed_fields
+        if unknown_fields:
+            raise ValueError(
+                f"per_joint_dynamics_limits.{joint_name} contains unknown fields: "
+                f"{', '.join(sorted(str(field) for field in unknown_fields))}"
+            )
+        if not supplied_fields:
+            raise ValueError(
+                f"per_joint_dynamics_limits.{joint_name} must contain at least one cap"
+            )
+
+        values: dict[str, float | None] = dict.fromkeys(
+            _JOINT_DYNAMICS_FIELDS, None
+        )
+        for field_name in supplied_fields:
+            raw_value = raw_limit[field_name]
+            if (
+                not isinstance(raw_value, (int, float))
+                or isinstance(raw_value, bool)
+                or not math.isfinite(float(raw_value))
+                or float(raw_value) <= 0.0
+            ):
+                raise ValueError(
+                    f"per_joint_dynamics_limits.{joint_name}.{field_name} "
+                    "must be a finite number greater than zero"
+                )
+            values[field_name] = float(raw_value)
+
+        normalized[joint_name] = JointDynamicsLimit(
+            max_velocity_rad_s=values["max_velocity_rad_s"],
+            max_acceleration_rad_s2=values["max_acceleration_rad_s2"],
+            max_jerk_rad_s3=values["max_jerk_rad_s3"],
+        )
+    return normalized
 
 
 def _normalize_pose_dict(pose: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -379,6 +465,14 @@ class MoveManipulatorAction(
                         details={"phase": label},
                     )
 
+            try:
+                per_joint_dynamics_limits = _normalize_per_joint_dynamics_limits(
+                    self._params.get("per_joint_dynamics_limits")
+                )
+            except ValueError as exc:
+                self.feedback_message = str(exc)
+                return py_trees.common.Status.FAILURE
+
             request = ExecuteRequest(
                 robot_id=self._params.get("robot_id", ""),
                 group_id=self._params.get("group_id", ""),
@@ -407,6 +501,7 @@ class MoveManipulatorAction(
                     if self._params.get("max_tcp_linear_speed_mps") is None
                     else float(self._params.get("max_tcp_linear_speed_mps"))
                 ),
+                per_joint_dynamics_limits=per_joint_dynamics_limits,
                 joint_position_tol_rad=float(
                     self._params.get("joint_position_tol_rad", 0.05)
                 ),

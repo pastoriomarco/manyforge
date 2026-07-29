@@ -5,6 +5,10 @@ import { useCycleStore } from '../store/cycleStore';
 import { useDeploymentStore } from '../store/deploymentStore';
 import { useProgramStore } from '../store/programStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
+import {
+  reconcileAssistantRequest,
+  shouldReconcileAssistantRequest,
+} from './assistantRequestRecovery';
 import type {
   AssistantChatResponse,
   AssistantModeDefinition,
@@ -30,7 +34,12 @@ type TranscriptItem =
       error?: string;
     };
 
-type AssistantRunState = 'idle' | 'running' | 'cancel_requested';
+type AssistantRunState =
+  | 'idle'
+  | 'running'
+  | 'cancel_requested'
+  | 'reconciling'
+  | 'outcome_unknown';
 
 const EMPTY_ASSISTANT_MODES: Record<string, AssistantModeDefinition> = {};
 const EMPTY_TOOL_CATALOG: AssistantToolDefinition[] = [];
@@ -239,6 +248,12 @@ function assistantErrorMessage(error?: { code: string; detail: string } | null, 
 }
 
 function requestStatusLabel(status: AssistantRequestStatus | null, runState: AssistantRunState): string {
+  if (runState === 'reconciling') {
+    return 'checking server result';
+  }
+  if (runState === 'outcome_unknown') {
+    return 'outcome unknown';
+  }
   if (status?.status) {
     if (status.status === 'completed' && status.draftMutated) {
       return 'completed · draft changed';
@@ -499,6 +514,7 @@ export function AssistantOverlay() {
     DEFAULT_ASSISTANT_ORIENTATION_FIELDS,
   );
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const recoveryAbortRef = useRef<AbortController | null>(null);
 
   const assistant = deployment?.assistant ?? null;
   const assistantModes = deployment?.assistantModes ?? EMPTY_ASSISTANT_MODES;
@@ -691,7 +707,16 @@ export function AssistantOverlay() {
   }, [transcript, open]);
 
   useEffect(() => {
-    if (!activeRequestId || runState === 'idle') {
+    return () => {
+      recoveryAbortRef.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (
+      !activeRequestId
+      || (runState !== 'running' && runState !== 'cancel_requested')
+    ) {
       return;
     }
     let cancelled = false;
@@ -725,6 +750,176 @@ export function AssistantOverlay() {
     }, 250);
     return () => window.clearInterval(interval);
   }, [runState]);
+
+  const finishActiveRequest = () => {
+    setRunState('idle');
+    setActiveRequestId(null);
+    setActiveRequestStartedMs(null);
+  };
+
+  const refreshMutatedDraft = async () => {
+    setAssistantEditedDraft(true);
+    try {
+      await hydrateLoadedProgram({ retries: 0 });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'draft refresh failed';
+      setNotice(
+        `The assistant changed the draft, but the UI could not refresh it: ${detail}. Reload the program before continuing.`,
+      );
+    }
+  };
+
+  const finishDefinitiveRequestFailure = (
+    requestId: string,
+    error: unknown,
+    startedAtNs: number,
+  ) => {
+    const rawDetail = error instanceof Error ? error.message : 'Assistant request failed';
+    const code = (
+      (error instanceof ApiError && error.status === 504)
+      || rawDetail.toLowerCase().includes('timeout')
+    )
+      ? 'timeout'
+      : 'request_failed';
+    const detail = assistantErrorMessage({ code, detail: rawDetail }, rawDetail);
+    const finishedAtNs = Date.now() * NS_PER_MS;
+    setActiveStatus({
+      requestId,
+      conversationId: conversationId ?? '',
+      providerId,
+      assistantMode: selectedModeId,
+      status: 'failed',
+      message: '',
+      error: { code, detail: rawDetail },
+      warnings: [],
+      draftMutated: false,
+      toolCallCount: 0,
+      startedAtNs,
+      updatedAtNs: finishedAtNs,
+      finishedAtNs,
+    });
+    setNotice(null);
+    setLastError(detail);
+    setTranscript((items) => items.some((item) => item.id === `${requestId}-error`)
+      ? items
+      : [
+          ...items,
+          { kind: 'assistant', id: `${requestId}-error`, text: '', error: detail },
+        ]);
+    finishActiveRequest();
+  };
+
+  const finishRecoveredStatus = async (status: AssistantRequestStatus) => {
+    setConversationId(status.conversationId);
+    setActiveStatus(status);
+
+    if (status.status === 'completed') {
+      const message = status.message || 'Assistant request completed.';
+      setLastError(null);
+      setNotice(`Connection restored; server result recovered for ${status.requestId}.`);
+      setTranscript((items) => items.some(
+        (item) => item.id === `${status.requestId}-assistant`,
+      )
+        ? items
+        : [
+            ...items,
+            {
+              kind: 'assistant',
+              id: `${status.requestId}-assistant`,
+              text: message,
+            },
+          ]);
+      if (status.draftMutated) {
+        await refreshMutatedDraft();
+      }
+    } else {
+      const fallback = status.message
+        || (status.status === 'cancelled' ? 'Request cancelled' : 'Assistant request failed');
+      const error = status.error ?? {
+        code: status.status,
+        detail: fallback,
+      };
+      const detail = assistantErrorMessage(error, fallback);
+      setNotice(`Connection restored; server result recovered for ${status.requestId}.`);
+      setLastError(detail);
+      setTranscript((items) => items.some(
+        (item) => item.id === `${status.requestId}-error`,
+      )
+        ? items
+        : [
+            ...items,
+            {
+              kind: 'assistant',
+              id: `${status.requestId}-error`,
+              text: status.message,
+              error: detail,
+            },
+          ]);
+      if (status.draftMutated) {
+        await refreshMutatedDraft();
+      }
+    }
+
+    finishActiveRequest();
+  };
+
+  const recoverAssistantRequest = async (
+    requestId: string,
+    originalError?: unknown,
+    startedAtNs?: number,
+  ) => {
+    recoveryAbortRef.current?.abort();
+    const controller = new AbortController();
+    recoveryAbortRef.current = controller;
+    setLastError(null);
+    setNotice(`Connection interrupted; checking the server result for ${requestId}.`);
+    setRunState('reconciling');
+
+    const result = await reconcileAssistantRequest({
+      readStatus: (signal) => api.assistant.status(requestId, signal),
+      signal: controller.signal,
+      maxNotFoundAttempts: originalError instanceof ApiError ? 1 : undefined,
+    });
+    if (recoveryAbortRef.current !== controller || result.kind === 'aborted') {
+      return;
+    }
+    recoveryAbortRef.current = null;
+
+    if (result.kind === 'terminal') {
+      await finishRecoveredStatus(result.status);
+      return;
+    }
+
+    if (
+      result.kind === 'not_found'
+      && !result.requestObserved
+      && originalError instanceof ApiError
+    ) {
+      finishDefinitiveRequestFailure(
+        requestId,
+        originalError,
+        startedAtNs ?? Date.now() * NS_PER_MS,
+      );
+      return;
+    }
+
+    setRunState('outcome_unknown');
+    if (result.kind === 'not_found') {
+      setNotice(
+        `No server record could be found for ${requestId}. The outcome is unknown; use Recheck before resetting or sending the request again.`,
+      );
+      return;
+    }
+    if (result.kind === 'exhausted') {
+      setNotice(
+        `The server did not report a final result for ${requestId} within five minutes. The outcome is unknown; use Recheck, or Reset to cancel and clear it.`,
+      );
+      return;
+    }
+    setNotice(
+      `The server result for ${requestId} could not be reached: ${result.detail} The outcome is unknown; use Recheck before resetting.`,
+    );
+  };
 
   const send = async () => {
     const message = input.trim();
@@ -760,8 +955,9 @@ export function AssistantOverlay() {
       { kind: 'user', id: `${requestId}-user`, text: message, modeId: selectedModeId },
     ]);
 
+    let response: AssistantChatResponse;
     try {
-      const response = await api.assistant.chat({
+      response = await api.assistant.chat({
         requestId,
         conversationId,
         message,
@@ -770,55 +966,24 @@ export function AssistantOverlay() {
         assistantMode: selectedModeId,
         fieldPolicy: assistantFieldPolicy,
       });
-      setConversationId(response.conversationId);
-      const finishedAtNs = Date.now() * NS_PER_MS;
-      setActiveStatus({
-        requestId: response.requestId,
-        conversationId: response.conversationId,
-        providerId: response.providerId,
-        assistantMode: response.assistantMode ?? selectedModeId,
-        status: response.error ? 'failed' : 'completed',
-        message: response.message,
-        error: response.error ?? null,
-        warnings: response.warnings,
-        draftMutated: response.draftMutated,
-        toolCallCount: response.toolCalls.length,
-        startedAtNs,
-        updatedAtNs: finishedAtNs,
-        finishedAtNs,
-      });
-      setTranscript((items) => [
-        ...items,
-        {
-          kind: 'assistant',
-          id: `${requestId}-assistant`,
-          text: response.message,
-          response,
-          error: response.error?.detail,
-        },
-      ]);
-      if (response.draftMutated) {
-        setAssistantEditedDraft(true);
-        await hydrateLoadedProgram({ retries: 0 });
-      }
     } catch (error) {
       if (error instanceof ApiError && isAssistantChatResponse(error.payload)) {
-        const response = error.payload;
-        const detail = assistantErrorMessage(response.error, error.message);
+        const errorResponse = error.payload;
+        const detail = assistantErrorMessage(errorResponse.error, error.message);
         const finishedAtNs = Date.now() * NS_PER_MS;
-        const terminalStatus = response.error?.code === 'cancelled' ? 'cancelled' : 'failed';
-        setConversationId(response.conversationId);
+        const terminalStatus = errorResponse.error?.code === 'cancelled' ? 'cancelled' : 'failed';
+        setConversationId(errorResponse.conversationId);
         setActiveStatus({
-          requestId: response.requestId,
-          conversationId: response.conversationId,
-          providerId: response.providerId,
-          assistantMode: response.assistantMode ?? selectedModeId,
+          requestId: errorResponse.requestId,
+          conversationId: errorResponse.conversationId,
+          providerId: errorResponse.providerId,
+          assistantMode: errorResponse.assistantMode ?? selectedModeId,
           status: terminalStatus,
-          message: response.message,
-          error: response.error ?? { code: 'request_failed', detail },
-          warnings: response.warnings,
-          draftMutated: response.draftMutated,
-          toolCallCount: response.toolCalls.length,
+          message: errorResponse.message,
+          error: errorResponse.error ?? { code: 'request_failed', detail },
+          warnings: errorResponse.warnings,
+          draftMutated: errorResponse.draftMutated,
+          toolCallCount: errorResponse.toolCalls.length,
           startedAtNs,
           updatedAtNs: finishedAtNs,
           finishedAtNs,
@@ -829,52 +994,64 @@ export function AssistantOverlay() {
           {
             kind: 'assistant',
             id: `${requestId}-error`,
-            text: response.message,
-            response,
+            text: errorResponse.message,
+            response: errorResponse,
             error: detail,
           },
         ]);
-        if (response.draftMutated) {
-          setAssistantEditedDraft(true);
-          await hydrateLoadedProgram({ retries: 0 });
+        if (errorResponse.draftMutated) {
+          await refreshMutatedDraft();
         }
+        finishActiveRequest();
         return;
       }
 
-      const rawDetail = error instanceof Error ? error.message : 'Assistant request failed';
-      const detail = assistantErrorMessage(
-        {
-          code: rawDetail.toLowerCase().includes('timeout') ? 'timeout' : 'request_failed',
-          detail: rawDetail,
-        },
-        rawDetail,
-      );
-      const finishedAtNs = Date.now() * NS_PER_MS;
-      setActiveStatus({
-        requestId,
-        conversationId: conversationId ?? '',
-        providerId,
-        assistantMode: selectedModeId,
-        status: 'failed',
-        message: '',
-        error: { code: 'request_failed', detail },
-        warnings: [],
-        draftMutated: false,
-        toolCallCount: 0,
-        startedAtNs,
-        updatedAtNs: finishedAtNs,
-        finishedAtNs,
-      });
-      setLastError(detail);
-      setTranscript((items) => [
-        ...items,
-        { kind: 'assistant', id: `${requestId}-error`, text: '', error: detail },
-      ]);
-    } finally {
-      setRunState('idle');
-      setActiveRequestId(null);
-      setActiveRequestStartedMs(null);
+      if (!shouldReconcileAssistantRequest(error)) {
+        finishDefinitiveRequestFailure(requestId, error, startedAtNs);
+        return;
+      }
+      await recoverAssistantRequest(requestId, error, startedAtNs);
+      return;
     }
+
+    setConversationId(response.conversationId);
+    const finishedAtNs = Date.now() * NS_PER_MS;
+    setActiveStatus({
+      requestId: response.requestId,
+      conversationId: response.conversationId,
+      providerId: response.providerId,
+      assistantMode: response.assistantMode ?? selectedModeId,
+      status: response.error ? 'failed' : 'completed',
+      message: response.message,
+      error: response.error ?? null,
+      warnings: response.warnings,
+      draftMutated: response.draftMutated,
+      toolCallCount: response.toolCalls.length,
+      startedAtNs,
+      updatedAtNs: finishedAtNs,
+      finishedAtNs,
+    });
+    setTranscript((items) => [
+      ...items,
+      {
+        kind: 'assistant',
+        id: `${requestId}-assistant`,
+        text: response.message,
+        response,
+        error: response.error?.detail,
+      },
+    ]);
+    if (response.draftMutated) {
+      await refreshMutatedDraft();
+    }
+    finishActiveRequest();
+  };
+
+  const recheck = async () => {
+    if (!activeRequestId || runState !== 'outcome_unknown') {
+      return;
+    }
+    await recoverAssistantRequest(activeRequestId);
   };
 
   const cancel = async () => {
@@ -906,6 +1083,9 @@ export function AssistantOverlay() {
   // gateway session (no summary ported), and clear the transcript. Signals the
   // user via a notice banner.
   const resetConversation = async () => {
+    const outcomeWasUnknown = runState === 'outcome_unknown';
+    recoveryAbortRef.current?.abort();
+    recoveryAbortRef.current = null;
     if (runState !== 'idle' && activeRequestId) {
       setRunState('cancel_requested');
       try {
@@ -921,7 +1101,11 @@ export function AssistantOverlay() {
     setRunState('idle');
     setTranscript([]);
     setLastError(null);
-    setNotice('Conversation reset — context cleared; any in-flight request was cancelled.');
+    setNotice(
+      outcomeWasUnknown
+        ? 'Conversation reset — context cleared; the previous request outcome was not confirmed.'
+        : 'Conversation reset — context cleared; any in-flight request was cancelled.',
+    );
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -957,7 +1141,11 @@ export function AssistantOverlay() {
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <h2 className="truncate text-sm font-semibold text-gray-100">Assistant</h2>
-                  <span className={`h-2 w-2 rounded-full ${statusTone(activeStatus?.status ?? runState)}`} />
+                  <span className={`h-2 w-2 rounded-full ${statusTone(
+                    runState === 'outcome_unknown'
+                      ? runState
+                      : (activeStatus?.status ?? runState),
+                  )}`} />
                   <span className="text-xs text-gray-400">
                     {requestStatusLabel(activeStatus, runState)}
                   </span>
@@ -1144,6 +1332,14 @@ export function AssistantOverlay() {
                           className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-400"
                         >
                           Send
+                        </button>
+                      ) : runState === 'outcome_unknown' ? (
+                        <button
+                          type="button"
+                          onClick={() => void recheck()}
+                          className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500"
+                        >
+                          Recheck
                         </button>
                       ) : (
                         <button

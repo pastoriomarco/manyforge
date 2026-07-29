@@ -2319,6 +2319,151 @@ def test_assistant_chat_records_success_status(
     assert status["error"] is None
 
 
+def test_assistant_chat_records_unexpected_provider_failure_status(
+    state: ComposerState,
+) -> None:
+    class CrashingProvider:
+        provider_id = "crashing-provider"
+
+        def run(self, request, context):
+            del request
+            state.record_assistant_request_tool_call(
+                conversation_id=context.conversation_id,
+                tool_id="tree.draft.insert_node",
+                status="completed",
+                draft_mutated=True,
+            )
+            raise RuntimeError("unexpected provider crash")
+
+    state.assistant_provider = CrashingProvider()
+
+    with TestClient(
+        create_app(state, security=_TEST_SECURITY),
+        raise_server_exceptions=False,
+    ) as local_client:
+        response = local_client.post(
+            "/api/assistant/chat",
+            json={
+                "requestId": "req-unexpected-provider-failure",
+                "message": "Trigger an unexpected provider failure",
+                "mode": "provider",
+                "providerId": "crashing-provider",
+            },
+        )
+        assert response.status_code == 500
+
+        status_response = local_client.get(
+            "/api/assistant/requests/req-unexpected-provider-failure"
+        )
+
+    assert status_response.status_code == 200
+    status = status_response.json()
+    assert status["status"] == "failed"
+    assert status["error"] == {
+        "code": "internal_error",
+        "detail": "Assistant request failed due to an unexpected server error.",
+    }
+    assert status["draftMutated"] is True
+    assert status["toolCallCount"] == 1
+    assert status["recentToolCalls"][0]["draftMutated"] is True
+    assert status["finishedAtNs"] is not None
+
+
+def test_assistant_chat_preserves_mutation_evidence_on_provider_error(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    class FailingAfterMutationProvider:
+        provider_id = "failing-after-mutation"
+
+        def run(self, request, context):
+            del request
+            state.record_assistant_request_tool_call(
+                conversation_id=context.conversation_id,
+                tool_id="tree.draft.insert_node",
+                status="completed",
+                draft_mutated=True,
+            )
+            raise AssistantProviderError(
+                "provider failed after applying a draft edit",
+                code="upstream_call_error",
+            )
+
+    state.assistant_provider = FailingAfterMutationProvider()
+
+    response = client.post(
+        "/api/assistant/chat",
+        json={
+            "requestId": "req-provider-failure-after-mutation",
+            "message": "Apply a draft edit and then fail",
+            "mode": "provider",
+            "providerId": "failing-after-mutation",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["draftMutated"] is True
+    status_response = client.get(
+        "/api/assistant/requests/req-provider-failure-after-mutation"
+    )
+    assert status_response.status_code == 200
+    status = status_response.json()
+    assert status["status"] == "failed"
+    assert status["draftMutated"] is True
+    assert status["toolCallCount"] == 1
+
+
+def test_assistant_chat_records_unexpected_result_processing_failure(
+    state: ComposerState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MutatingResultProvider:
+        provider_id = "mutating-result-provider"
+
+        def run(self, request, context):
+            del request, context
+            return AssistantProviderResult(
+                mode="provider",
+                message="Draft changed before result processing failed.",
+                tool_calls=[{"name": "tree.draft.insert_node", "status": "completed"}],
+                draft_mutated=True,
+            )
+
+    def fail_history_read(**kwargs):
+        del kwargs
+        raise RuntimeError("unexpected result processing crash")
+
+    state.assistant_provider = MutatingResultProvider()
+    monkeypatch.setattr(state, "get_assistant_tool_history", fail_history_read)
+
+    with TestClient(
+        create_app(state, security=_TEST_SECURITY),
+        raise_server_exceptions=False,
+    ) as local_client:
+        response = local_client.post(
+            "/api/assistant/chat",
+            json={
+                "requestId": "req-unexpected-result-processing-failure",
+                "message": "Trigger an unexpected result processing failure",
+                "mode": "provider",
+                "providerId": "mutating-result-provider",
+            },
+        )
+        assert response.status_code == 500
+
+        status_response = local_client.get(
+            "/api/assistant/requests/req-unexpected-result-processing-failure"
+        )
+
+    assert status_response.status_code == 200
+    status = status_response.json()
+    assert status["status"] == "failed"
+    assert status["error"]["code"] == "internal_error"
+    assert status["draftMutated"] is True
+    assert status["toolCallCount"] == 1
+    assert status["finishedAtNs"] is not None
+
+
 def test_assistant_chat_records_draft_mutation_status(
     client: TestClient,
     state: ComposerState,
@@ -3661,7 +3806,7 @@ def _write_minimal_program(tmp_path: Path) -> Path:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "minimal",
-                "catalog_version": "0.4.0",
+                "catalog_version": "0.5.0",
                 "description": "minimal program",
                 "robot": {
                     "robot_id": "ur5",
@@ -3700,7 +3845,7 @@ def _write_pose_target_program(tmp_path: Path) -> Path:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.1",
                 "name": "pose_target",
-                "catalog_version": "0.4.0",
+                "catalog_version": "0.5.0",
                 "robot": {
                     "robot_id": "ur5",
                     "group_id": "arm",

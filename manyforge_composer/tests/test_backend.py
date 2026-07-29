@@ -37,6 +37,8 @@ from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.runtime_resources import RuntimeResourceRegistry
 from manyforge_composer.backend.state import ComposerState, RuntimeOverrideRecord
+from manyforge_composer.backend.robot_lifecycle import RobotLifecycleConfig
+import manyforge_composer.backend.state as state_module
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.models import (
     SceneObjectResponse,
@@ -558,6 +560,367 @@ def state():
     return ComposerState(node_environment=node_environment_for_catalog(_CATALOG_PATH), kernel=kernel)
 
 
+def test_robot_lifecycle_history_failure_cannot_block_alarm_projection(
+    state: ComposerState,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    observed: list[dict[str, Any]] = []
+
+    class AlarmAdapter:
+        def observe_provider_status(self, **_kwargs: Any) -> None:
+            pass
+
+        def observe_robot_lifecycle(self, status: dict[str, Any]) -> None:
+            observed.append(status)
+
+    class FailingHistory:
+        def observe(self, status: dict[str, Any]) -> None:
+            del status
+            raise RuntimeError("history_failed")
+
+    state.operator_alarm_adapters = AlarmAdapter()  # type: ignore[assignment]
+    state._robot_lifecycle_transition_recorder = FailingHistory()
+    status = {
+        "providerId": "lite6-a:provider:test",
+        "robotId": "lite6-a",
+        "readiness": "waiting",
+    }
+
+    with _capture_named_logger(
+        caplog,
+        "manyforge_composer.backend.state",
+        logging.ERROR,
+    ):
+        state._publish_robot_lifecycle_status(status)
+
+    assert observed == [status]
+    assert "Robot lifecycle history projection failed" in caplog.text
+
+
+def test_robot_lifecycle_status_rejects_retired_client_callback(
+    state: ComposerState,
+) -> None:
+    observed: list[dict[str, Any]] = []
+    recorded: list[dict[str, Any]] = []
+
+    class AlarmAdapter:
+        def observe_provider_status(self, **_kwargs: Any) -> None:
+            pass
+
+        def observe_robot_lifecycle(self, status: dict[str, Any]) -> None:
+            observed.append(status)
+
+    class History:
+        def observe(self, status: dict[str, Any]) -> None:
+            recorded.append(status)
+
+    active_token = object()
+    retired_token = object()
+    state.operator_alarm_adapters = AlarmAdapter()  # type: ignore[assignment]
+    state._robot_lifecycle_transition_recorder = History()
+    state._robot_lifecycle_client_token = active_token
+    status = {
+        "providerId": "lite6-a:provider:test",
+        "robotId": "lite6-a",
+        "readiness": "waiting",
+    }
+
+    state._publish_robot_lifecycle_status(
+        status,
+        source_token=retired_token,
+    )
+    assert observed == []
+    assert recorded == []
+
+    state._publish_robot_lifecycle_status(
+        status,
+        source_token=active_token,
+    )
+    assert observed == [status]
+    assert recorded == [status]
+
+
+def test_robot_lifecycle_projection_serializes_client_cutover(
+    state: ComposerState,
+) -> None:
+    old_projection_started = threading.Event()
+    release_old_projection = threading.Event()
+    cutover_finished = threading.Event()
+    recorded: list[str] = []
+    alarmed: list[str] = []
+
+    class AlarmAdapter:
+        def observe_provider_status(self, **_kwargs: Any) -> None:
+            pass
+
+        def observe_robot_lifecycle(self, status: dict[str, Any]) -> None:
+            alarmed.append(str(status["robotId"]))
+
+    class BlockingHistory:
+        def observe(self, status: dict[str, Any]) -> None:
+            robot_id = str(status["robotId"])
+            if robot_id == "old":
+                old_projection_started.set()
+                assert release_old_projection.wait(timeout=1.0)
+            recorded.append(robot_id)
+
+    old_token = object()
+    new_token = object()
+    state.operator_alarm_adapters = AlarmAdapter()  # type: ignore[assignment]
+    state._robot_lifecycle_transition_recorder = BlockingHistory()
+    state._robot_lifecycle_client_token = old_token
+
+    old_thread = threading.Thread(
+        target=state._publish_robot_lifecycle_status,
+        kwargs={
+            "status": {
+                "providerId": "provider-old",
+                "robotId": "old",
+                "readiness": "waiting",
+            },
+            "source_token": old_token,
+        },
+    )
+    old_thread.start()
+    assert old_projection_started.wait(timeout=1.0)
+
+    def cut_over() -> None:
+        with state._robot_lifecycle_projection_lock:
+            with state._robot_lifecycle_lock:
+                state._robot_lifecycle_client_token = new_token
+        cutover_finished.set()
+
+    cutover_thread = threading.Thread(target=cut_over)
+    cutover_thread.start()
+    assert cutover_finished.wait(timeout=0.05) is False
+    release_old_projection.set()
+    old_thread.join(timeout=1.0)
+    cutover_thread.join(timeout=1.0)
+    assert old_thread.is_alive() is False
+    assert cutover_thread.is_alive() is False
+
+    assert state._publish_robot_lifecycle_status(
+        {
+            "providerId": "provider-new",
+            "robotId": "new",
+            "readiness": "waiting",
+        },
+        source_token=new_token,
+    )
+    assert recorded == ["old", "new"]
+    assert alarmed == ["old", "new"]
+
+
+def test_robot_lifecycle_status_retries_client_changed_during_read(
+    state: ComposerState,
+) -> None:
+    old_read_started = threading.Event()
+    release_old_read = threading.Event()
+    recorded: list[str] = []
+
+    class BlockingClient:
+        def status(self) -> dict[str, Any]:
+            old_read_started.set()
+            assert release_old_read.wait(timeout=1.0)
+            return {
+                "providerId": "provider-old",
+                "robotId": "old",
+                "readiness": "waiting",
+            }
+
+        def close(self) -> None:
+            pass
+
+    class NewClient:
+        def status(self) -> dict[str, Any]:
+            return {
+                "providerId": "provider-new",
+                "robotId": "new",
+                "readiness": "waiting",
+            }
+
+        def close(self) -> None:
+            pass
+
+    class History:
+        def observe(self, status: dict[str, Any]) -> None:
+            recorded.append(str(status["robotId"]))
+
+    old_token = object()
+    new_token = object()
+    state._robot_lifecycle_transition_recorder = History()
+    with state._robot_lifecycle_lock:
+        state._robot_lifecycle_client = BlockingClient()  # type: ignore[assignment]
+        state._robot_lifecycle_client_token = old_token
+
+    result: dict[str, Any] = {}
+
+    def read_status() -> None:
+        result.update(state.robot_lifecycle_status())
+
+    reader = threading.Thread(target=read_status)
+    reader.start()
+    assert old_read_started.wait(timeout=1.0)
+    with state._robot_lifecycle_projection_lock:
+        with state._robot_lifecycle_lock:
+            state._robot_lifecycle_client = NewClient()  # type: ignore[assignment]
+            state._robot_lifecycle_client_token = new_token
+    release_old_read.set()
+    reader.join(timeout=1.0)
+
+    assert reader.is_alive() is False
+    assert result["providerId"] == "provider-new"
+    assert recorded == ["new"]
+
+
+def test_lifecycle_client_cutover_installs_provider_material_history(
+    state: ComposerState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = RobotLifecycleConfig(
+        robot_id="lite6-a",
+        provider_instance_id="provider-1",
+        runtime_generation_id="runtime-1",
+        cell_supervisor_component_epoch="cell-1",
+        status_topic="/status",
+        open_session_service="/open",
+        close_session_service="/close",
+        submit_command_service="/submit",
+        reconcile_command_service="/reconcile",
+        material_adapter_status_keys=("vendor_state",),
+    )
+    baseline = {
+        "providerId": "provider-1",
+        "providerInstanceId": "provider-1",
+        "robotId": "lite6-a",
+        "authorityProfile": "local_operator",
+        "runtimeGenerationId": "runtime-1",
+        "providerComponentEpoch": "provider-epoch-1",
+        "transportOwnerComponentEpoch": "owner-epoch-1",
+        "cellSupervisorComponentEpoch": "cell-1",
+        "providerPublicationSequence": 1,
+        "observationGeneration": 1,
+        "readiness": "waiting",
+        "adapterStatus": {"vendor_state": "2"},
+    }
+
+    class FakeClient:
+        def __init__(
+            self,
+            client_config: RobotLifecycleConfig,
+            **_kwargs: Any,
+        ) -> None:
+            self.provider_id = client_config.provider_instance_id
+            self.authority_provider_id = ""
+
+        def status(self) -> dict[str, Any]:
+            return copy.deepcopy(baseline)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(state_module, "RobotLifecycleClient", FakeClient)
+    monkeypatch.setattr(
+        state,
+        "_robot_lifecycle_config",
+        lambda _deployment, *, robot_id: config,
+    )
+    monkeypatch.setattr(
+        state,
+        "_configure_cell_supervision",
+        lambda _deployment: None,
+    )
+
+    state._replace_robot_lifecycle_client(None, robot_id="lite6-a")
+    with state._robot_lifecycle_lock:
+        token = state._robot_lifecycle_client_token
+    changed = copy.deepcopy(baseline)
+    changed["providerPublicationSequence"] = 2
+    changed["observationGeneration"] = 2
+    changed["adapterStatus"]["vendor_state"] = "4"
+
+    assert state._publish_robot_lifecycle_status(
+        changed,
+        source_token=token,
+    )
+    events = state.event_recorder.channel_histories()[
+        "robot_lifecycle"
+    ]
+    assert [event["type"] for event in events] == [
+        "robot_lifecycle_observation_baseline",
+        "robot_lifecycle_observed_transition",
+    ]
+    assert events[-1]["details"]["changes"]["adapter.vendor_state"] == {
+        "previous": "2",
+        "current": "4",
+    }
+
+
+def test_lifecycle_client_cutover_retains_identical_provider(
+    state: ComposerState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = RobotLifecycleConfig(
+        robot_id="lite6-a",
+        provider_instance_id="provider-1",
+        runtime_generation_id="runtime-1",
+        cell_supervisor_component_epoch="cell-1",
+        status_topic="/status",
+        open_session_service="/open",
+        close_session_service="/close",
+        submit_command_service="/submit",
+        reconcile_command_service="/reconcile",
+    )
+    created: list[Any] = []
+
+    class FakeClient:
+        def __init__(
+            self,
+            client_config: RobotLifecycleConfig,
+            **_kwargs: Any,
+        ) -> None:
+            self.config = client_config
+            self.provider_id = client_config.provider_instance_id
+            self.authority_provider_id = ""
+            self.closed = False
+            created.append(self)
+
+        def status(self) -> dict[str, Any]:
+            return {
+                "providerId": self.provider_id,
+                "robotId": self.config.robot_id,
+                "readiness": "waiting",
+            }
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(state_module, "RobotLifecycleClient", FakeClient)
+    monkeypatch.setattr(
+        state,
+        "_robot_lifecycle_config",
+        lambda _deployment, *, robot_id: config,
+    )
+    monkeypatch.setattr(
+        state,
+        "_configure_cell_supervision",
+        lambda _deployment: None,
+    )
+
+    state._replace_robot_lifecycle_client(None, robot_id="lite6-a")
+    with state._robot_lifecycle_lock:
+        first = state._robot_lifecycle_client
+        first_token = state._robot_lifecycle_client_token
+
+    state._replace_robot_lifecycle_client(None, robot_id="lite6-a")
+
+    with state._robot_lifecycle_lock:
+        assert state._robot_lifecycle_client is first
+        assert state._robot_lifecycle_client_token is first_token
+    assert len(created) == 1
+    assert created[0].closed is False
+
+
 def test_replaced_runtime_resource_cleanup_failure_does_not_relabel_cutover(
     state: ComposerState,
     caplog: pytest.LogCaptureFixture,
@@ -595,6 +958,120 @@ def client(state):
     """Create a TestClient for the app."""
     app = create_app(state, security=_TEST_SECURITY)
     return TestClient(app)
+
+
+def test_control_authority_health_pump_is_headless_and_lifespan_owned(
+    state: ComposerState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticked = threading.Event()
+    started: list[bool] = []
+    stopped: list[bool] = []
+
+    monkeypatch.setattr(
+        state,
+        "start_control_authority_health",
+        lambda: started.append(True),
+    )
+    monkeypatch.setattr(
+        state,
+        "stop_control_authority_health",
+        lambda: stopped.append(True),
+    )
+    monkeypatch.setattr(
+        state,
+        "robot_lifecycle_authority_heartbeat_interval_s",
+        lambda: 0.05,
+    )
+    monkeypatch.setattr(
+        state,
+        "robot_lifecycle_authority_heartbeat_tick",
+        lambda: ticked.set() or {"status": "unconfigured"},
+    )
+
+    # No HTTP/WebSocket/browser request drives this tick.
+    with TestClient(create_app(state, security=_TEST_SECURITY)):
+        assert ticked.wait(timeout=1.0)
+        assert started == [True]
+
+    assert stopped == [True]
+
+
+def test_authority_liveness_does_not_depend_on_pose_or_diagnostic_reads(
+    state: ComposerState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient evidence-plane failures must not impersonate process death."""
+
+    assert state.kernel is not None
+    state.start_control_authority_health()
+    monkeypatch.setattr(
+        state.kernel,
+        "get_execution_snapshot",
+        lambda: (_ for _ in ()).throw(RuntimeError("pose delivery gap")),
+    )
+    manager = state.cycle_manager
+    if manager is not None:
+        monkeypatch.setattr(
+            manager,
+            "kernel_event_pipeline_status",
+            lambda: (_ for _ in ()).throw(RuntimeError("diagnostic gap")),
+        )
+
+    evidence = state._probe_control_authority_health()  # noqa: SLF001
+
+    assert evidence.healthy is True
+    assert evidence.reason == ""
+
+
+def test_authority_liveness_preserves_exact_kernel_probe_failure(
+    state: ComposerState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The durable trace must retain the source failure, not only dependency."""
+
+    assert state.kernel is not None
+    state.start_control_authority_health()
+    monkeypatch.setattr(
+        state.kernel,
+        "get_status",
+        lambda: (_ for _ in ()).throw(RuntimeError("kernel status unavailable")),
+    )
+    monkeypatch.setattr(
+        state,
+        "_reduce_cell_supervision",
+        lambda **_kwargs: (
+            False,
+            "control-authority:component_dependency_unhealthy:execution-backend",
+        ),
+    )
+
+    evidence = state._probe_control_authority_health()  # noqa: SLF001
+
+    assert evidence.healthy is False
+    assert evidence.reason == (
+        "composer_critical_progress_probe_failed:kernel status unavailable"
+    )
+
+
+def test_owner_delivery_stale_uses_outer_progress_policy() -> None:
+    status = {
+        "transportOwnerProgressHealthy": False,
+        "transportOwnerProgressReason": "xarm_owner_publication_stale",
+    }
+    terminal = dict(
+        status,
+        transportOwnerProgressReason="xarm_owner_process_restart_required",
+    )
+
+    assert (
+        state_module._transport_owner_component_health_state(status)  # noqa: SLF001
+        == state_module.ComponentHealthState.HEALTHY
+    )
+    assert (
+        state_module._transport_owner_component_health_state(terminal)  # noqa: SLF001
+        == state_module.ComponentHealthState.DEGRADED
+    )
 
 
 def make_client(execute_duration_s: float = 0.0) -> TestClient:
@@ -773,6 +1250,60 @@ def test_run_no_program_409_payload_is_structured(client):
     # errorDetails is None when the cycle manager has no kernel diagnostics
     # to attach (this case never reaches the kernel).
     assert detail.get("errorDetails") in (None,)
+
+
+def test_run_is_rejected_before_cycle_start_when_robot_is_not_enabled(
+    client,
+    state,
+    monkeypatch,
+):
+    assert client.post(
+        "/api/program/load",
+        json={"path": _PROGRAM_PATH},
+    ).status_code == 200
+    monkeypatch.setattr(
+        state,
+        "robot_lifecycle_motion_admission_block_reason",
+        lambda: {
+            "error_code": "robot_lifecycle_motion_not_admitted",
+            "message": "Enable the robot before starting motion.",
+            "error_details": {
+                "admissionReasonCodes": ["robot_disabled"],
+            },
+        },
+    )
+
+    response = client.post("/api/cycle/run")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["message"] == "Enable the robot before starting motion."
+    assert detail["errorCode"] == "robot_lifecycle_motion_not_admitted"
+    assert detail["errorDetails"] == {
+        "admissionReasonCodes": ["robot_disabled"],
+    }
+    assert detail["recoveryOffer"] is None
+    assert state.cycle_manager.state == CycleState.IDLE
+
+
+def test_robot_lifecycle_command_requires_strict_explicit_confirmation(
+    client,
+):
+    refused = client.post(
+        "/api/robot-lifecycle/enable",
+        json={"confirmed": False},
+    )
+    assert refused.status_code == 409
+    assert (
+        refused.json()["detail"]["errorCode"]
+        == "robot_lifecycle_confirmation_required"
+    )
+
+    malformed = client.post(
+        "/api/robot-lifecycle/enable",
+        json={"confirmed": True, "principal": "caller-selected"},
+    )
+    assert malformed.status_code == 422
 
 
 def test_stop_no_program_409(client):
@@ -3957,6 +4488,116 @@ def test_load_deployment(client, state):
     assert "robotConfig" in data
 
 
+def test_load_deployment_without_program_publishes_inside_artifact_transaction(
+    client,
+    state,
+    monkeypatch,
+):
+    """The deployment and its source path become visible in one transaction."""
+    original_transaction = state.artifact_read_transaction
+    published_at_exit: list[tuple[Deployment | None, str | None]] = []
+
+    @contextmanager
+    def tracked_transaction():
+        with original_transaction():
+            yield
+            published_at_exit.append(
+                (state.deployment, state.deployment_source_path)
+            )
+
+    monkeypatch.setattr(
+        state,
+        "artifact_read_transaction",
+        tracked_transaction,
+    )
+
+    response = client.post(
+        "/api/deployment/load",
+        json={"path": _DEPLOYMENT_PATH},
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(published_at_exit) == 1
+    published_deployment, published_path = published_at_exit[0]
+    assert published_deployment is state.deployment
+    assert published_path == _DEPLOYMENT_PATH
+
+
+def test_load_deployment_with_program_rebuilds_coherent_runtime(client, state):
+    """A deployment load updates presentation and runner in one cutover."""
+    loaded = client.post(
+        "/api/program/load",
+        json={
+            "path": _PROGRAM_PATH,
+            "deploymentPath": _DEPLOYMENT_PATH,
+        },
+    )
+    assert loaded.status_code == 200, loaded.text
+    previous_manager = state.cycle_manager
+    previous_generation = state._deployment_session_generation  # noqa: SLF001
+
+    response = client.post(
+        "/api/deployment/load",
+        json={"path": _DEPLOYMENT_PATH},
+    )
+
+    assert response.status_code == 200, response.text
+    assert state.cycle_manager is not previous_manager
+    assert state._deployment_session_generation == previous_generation + 1  # noqa: SLF001
+    assert state.cycle_manager is not None
+    assert state.cycle_manager._runner._deployment is state.deployment  # noqa: SLF001
+    assert state.deployment_source_path == _DEPLOYMENT_PATH
+
+
+@pytest.mark.parametrize(
+    "cycle_state",
+    [
+        CycleState.RUNNING,
+        CycleState.STOPPING,
+        CycleState.STOPPED,
+        CycleState.DIRECT_CONTROL,
+    ],
+)
+@pytest.mark.parametrize("mutation", ["load", "update"])
+def test_deployment_mutation_requires_idle_cycle(
+    client,
+    state,
+    cycle_state,
+    mutation,
+):
+    loaded = client.post(
+        "/api/program/load",
+        json={
+            "path": _PROGRAM_PATH,
+            "deploymentPath": _DEPLOYMENT_PATH,
+        },
+    )
+    assert loaded.status_code == 200, loaded.text
+    assert state.cycle_manager is not None
+    original_deployment = state.deployment
+    original_manager = state.cycle_manager
+    state.cycle_manager._state = cycle_state  # noqa: SLF001
+
+    if mutation == "load":
+        response = client.post(
+            "/api/deployment/load",
+            json={"path": _DEPLOYMENT_PATH},
+        )
+    else:
+        response = client.put(
+            "/api/deployment",
+            json={"description": "must not publish"},
+        )
+
+    assert response.status_code == 409, response.text
+    assert (
+        response.json()["detail"]
+        == "Cannot apply deployment changes while execution is active"
+    )
+    assert state.deployment is original_deployment
+    assert state.cycle_manager is original_manager
+
+
 def test_get_deployment_surfaces_per_joint_max_jerk(client, state):
     """Phase 4-P5.1K — a loaded deployment's per-joint max_jerk_rad_s3 must be
     surfaced through the Composer deployment API, not hidden or dropped."""
@@ -4122,8 +4763,43 @@ def test_runtime_status_reports_composer_only_before_program_load(client):
     assert data["canRender"] is False
     assert data["canPlan"] is False
     assert data["canExecute"] is False
+    assert data["cellSupervision"] is None
     component_ids = {component["id"] for component in data["components"]}
     assert {"composer", "program", "native_viewer", "planner", "execution_backend"} <= component_ids
+
+
+def test_runtime_status_exposes_nonempty_cell_supervision_as_copy(
+    client,
+    state: ComposerState,
+):
+    """Runtime observers cannot mutate the retained supervision snapshot."""
+    retained = {
+        "generation": 7,
+        "evaluatedAtSteadyTimeNs": 123_456,
+        "cellId": "lite6-a",
+        "dependencyGraphHealthy": True,
+        "dispatchAdmitted": True,
+        "components": [
+            {
+                "role": "cell_supervisor",
+                "id": "lite6-a:cell-supervisor",
+                "componentEpoch": "cell-supervisor-epoch-1",
+                "healthy": True,
+            }
+        ],
+    }
+    with state._cell_supervision_lock:
+        state._cell_supervision_last_snapshot = retained
+
+    response = client.get("/api/runtime/status")
+
+    assert response.status_code == 200
+    published = response.json()["cellSupervision"]
+    assert published == retained
+    observed = state.cell_supervision_status()
+    assert observed is not None
+    observed["components"][0]["healthy"] = False
+    assert state.cell_supervision_status() == retained
 
 
 def test_runtime_status_treats_native_viewer_as_render_ready_without_hmi(client):
@@ -5356,7 +6032,7 @@ def test_failed_runtime_apply_does_not_advance_viewer_presentation(
     def reject_runtime_rebuild(*_args, **_kwargs):
         raise RuntimeError("candidate runtime rejected")
 
-    monkeypatch.setattr(state, "_rebuild_runtime", reject_runtime_rebuild)
+    monkeypatch.setattr(state, "_rebuild_runtime_locked", reject_runtime_rebuild)
     current_tree = client.get("/api/program/tree").json()["tree"]
     response = client.post(
         "/api/session/apply",

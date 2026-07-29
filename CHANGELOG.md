@@ -150,6 +150,36 @@ hardening done before the first tag was granted.
 
 ### Changed
 
+- **Real-robot candidate and observed-state authority**: approved Robot Control
+  candidates now carry the same TCP and per-joint dynamics caps through
+  preview, approval recheck, and execution. ROS-backed physical execution
+  requires a fresh measured endpoint before accepting controller success, and
+  terminal/idle scene projection continues following measured robot state with
+  truthful source age while preserving execution metadata. The catalog is
+  `0.5.0`; in-tree programs were migrated to that exact version.
+- **Real-Lite6 lifecycle progress remains observable during bounded vendor
+  operations**: lifecycle primitives and command-gate renewals now run on
+  separate serialized NRT workers, provider status/authority/mutation
+  callbacks use independent groups, and Composer status reads no longer wait
+  behind authority-session transport I/O. Late or post-deadline primitive
+  completions are audited without mutating a replaced transaction.
+- **Real-Lite6 owner liveness is independent from robot telemetry
+  freshness**: a transient stale robot report still fences motion immediately
+  but no longer misclassifies an advancing, identity-valid ROS owner as dead
+  or revokes its authority session. Owner-publication delivery uses the
+  generated cell heartbeat budget. Robot-observation delivery separately uses
+  the generated critical-progress budget, capped by the producer's 1000 ms
+  observation lease, so ordinary 400 ms xArm report gaps do not become false
+  re-arm events. Generic admission publication retains its independent 250 ms
+  lease, while the internal xArm write gate now follows the producer's 1000 ms
+  observation lease; neither can outlive fresh robot state. Stalled owner
+  publication, genuinely stale robot observations, and expired
+  lifecycle-command deadlines remain fail-closed.
+- **Real-Lite6 supervised transport loss is terminal and fail-closed**:
+  generated deployments retain the 250 ms command-admission lease and add a
+  2000 ms report/control-loss timeout. Prolonged stale reports or failed
+  control reads require a fresh controller-manager process; reconnecting a
+  cable cannot silently reuse or re-arm the stale SDK session.
 - **Composer editor chrome restructured (industrial-HMI pass)**: the
   full-width bottom bar is replaced by a slim top header (program name,
   passive applied/saved status dots, Save/Save As/Load as uniform icon

@@ -36,10 +36,13 @@ class IExecutionBackend {
     /// Synchronize the backend-owned planning scene from the authoritative
     /// observed execution state before planning.
     ///
-    /// Native/offline execution backends may treat this as a no-op. Controller
-    /// backed adapters use it as the hard gate between live robot/simulator
-    /// state and planning: if a fresh complete observed state cannot be
-    /// obtained, planning must not proceed from stale authored state.
+    /// Native/offline execution backends may treat this as a no-op.
+    /// Real/observed controller-backed adapters use it as the hard gate between
+    /// measured robot state and planning: if a fresh complete observed state
+    /// cannot be obtained, planning must not proceed from stale authored or
+    /// commanded state. Command-authoritative simulation profiles instead
+    /// synchronize their backend-authored state under their deployment
+    /// contract; controller feedback remains conformance evidence there.
     virtual Result<void> sync_observed_state_before_planning() = 0;
 
     /// Stop the current execution (spec 220 §4)
