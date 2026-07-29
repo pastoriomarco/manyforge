@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import typing
@@ -385,6 +386,105 @@ def test_catalog_record_ref_runtime_union_and_registry_are_closed():
         )
 
 
+def test_capability_definition_registry_and_qualified_referent_are_exact():
+    assert (
+        core.CAPABILITY_DEFINITION_API_VERSION
+        == "manyforge.capability_definition.v1"
+    )
+    registry = core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY
+    assert isinstance(registry, tuple)
+    assert len(registry) == 67
+    assert len({row.capability_id for row in registry}) == 67
+    assert sum(
+        row.scope == core.CapabilityScope.kTargetBinding for row in registry
+    ) == 33
+    assert sum(
+        row.scope == core.CapabilityScope.kCellGlobal for row in registry
+    ) == 26
+    assert sum(
+        row.scope == core.CapabilityScope.kControlDomain for row in registry
+    ) == 8
+    assert sum(
+        row.provider_binding_kind
+        == core.CapabilityProviderBindingKind.kCapabilityProviderBinding
+        for row in registry
+    ) == 45
+    assert sum(
+        row.provider_binding_kind
+        == core.CapabilityProviderBindingKind.kControlBinding
+        for row in registry
+    ) == 22
+    assert all(row.requirement_parameters_schema_ref is None for row in registry)
+    assert core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY_DIGEST == (
+        "sha256:8f61f8285d72110c040aa2bd7095545e9d3369ca6f4ba5b5e44e18afe363b9e2"
+    )
+    assert core.find_builtin_capability_definition("context.state.current") is None
+
+    descriptor = core.find_builtin_capability_definition(
+        "planning.motion.joint_goal"
+    )
+    assert descriptor is not None
+    value = core.materialize_capability_definition(descriptor)
+    assert isinstance(value, core.CapabilityDefinitionDTO)
+    assert value.capability_id.value == descriptor.capability_id
+    assert (
+        value.capability_definition_revision.value
+        == descriptor.capability_definition_revision
+    )
+    stored_bytes = json.dumps(
+        {
+            "api_version": "manyforge.capability_definition.v1",
+            "capability_id": descriptor.capability_id,
+            "capability_definition_revision": (
+                descriptor.capability_definition_revision
+            ),
+            "scope": core.capability_scope_to_string(descriptor.scope),
+            "provider_binding_kind": (
+                core.capability_provider_binding_kind_to_string(
+                    descriptor.provider_binding_kind
+                )
+            ),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    store_key = core.ContentAddressedStoreKey(
+        "sha256/capability-definition-planning-motion-joint-goal"
+    )
+    reference = core.CapabilityDefinitionCatalogRecordRefDTO(
+        core.CapabilityId(descriptor.capability_id),
+        core.CapabilityDefinitionRevision(
+            descriptor.capability_definition_revision
+        ),
+        core.SchemaId("manyforge.capability_definition.v1"),
+        core.SchemaRevision(
+            "sha256:"
+            "2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0"
+        ),
+        core.ContentDigest(
+            f"sha256:{hashlib.sha256(stored_bytes.encode()).hexdigest()}"
+        ),
+        store_key,
+    )
+    qualified = core.resolve_and_qualify_capability_definition(
+        reference, store_key, stored_bytes
+    )
+    assert isinstance(qualified, core.QualifiedCapabilityDefinition)
+    assert qualified.value == value
+    assert json.loads(qualified.normalized_canonical_json) == json.loads(
+        stored_bytes
+    )
+
+    with pytest.raises(
+        core.CapabilityDefinitionCodecError, match="different store key"
+    ):
+        core.resolve_and_qualify_capability_definition(
+            reference,
+            core.ContentAddressedStoreKey("sha256/other"),
+            stored_bytes,
+        )
+
+
 def test_json_value_is_explicit_recursive_and_immutable():
     value = core.JsonValueDTO(
         {
@@ -717,12 +817,32 @@ target: 0.5
     assert isinstance(registry, core.BuildQualifiedClosedSchemaRegistry)
     assert isinstance(registry.catalog_schemas, tuple)
     assert len(registry.catalog_schemas) == 11
-    assert all(
-        entry.qualification == core.CatalogSchemaQualification.kUnqualified
-        and entry.compiled_schema is None
+    qualified_entries = [
+        entry
         for entry in registry.catalog_schemas
+        if entry.qualification == core.CatalogSchemaQualification.kQualified
+    ]
+    assert len(qualified_entries) == 1
+    assert (
+        qualified_entries[0].record_kind
+        == core.CatalogRecordKind.kCapabilityDefinition
+    )
+    assert qualified_entries[0].compiled_schema is not None
+    assert qualified_entries[0].relative_path == (
+        "catalog/manyforge.capability_definition.v1.yaml"
+    )
+    assert all(
+        entry.compiled_schema is None and entry.relative_path == ""
+        for entry in registry.catalog_schemas
+        if entry.qualification == core.CatalogSchemaQualification.kUnqualified
     )
     assert registry.value_schemas == ()
+    assert registry.qualification_registry_digest.value == (
+        "sha256:0fcb72ac90018caf707dbdf938bfdb7a12bda6f1377e00556e35218ecbc8e11d"
+    )
+    assert json.loads(registry.normalized_projection_canonical_json)[
+        "catalog_schemas"
+    ][0]["qualification"] == "qualified"
     assert core.CLOSED_SCHEMA_API_VERSION == "manyforge.closed_schema.v1"
     assert core.CLOSED_SCHEMA_BOOTSTRAP_CONTRACT_DIGEST == (
         "sha256:29a2fef8e781ca406eaaad448e46fb6061fe18e99e2c1cd39f303e2e0d815834"

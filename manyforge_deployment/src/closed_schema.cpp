@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "content_identity_internal.hpp"
+#include "embedded_capability_definition_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 
 namespace manyforge::deployment {
@@ -1680,21 +1681,136 @@ validate_and_normalize_unqualified_artifact_candidate(
 struct BuildQualifiedClosedSchemaRegistry::Storage final {
   std::vector<BuildCatalogSchemaEntry> catalog_schemas;
   std::vector<BuildQualifiedValueSchemaEntry> value_schemas;
+  CanonicalValue normalized_projection;
+  core::ContentDigest qualification_registry_digest{
+      "sha256:0000000000000000000000000000000000000000000000000000000000000000"};
 };
 
 BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
+  struct QualifiedCatalogSchemaSource final {
+    core::CatalogRecordKind record_kind;
+    std::string_view relative_path;
+    std::string_view descriptor_yaml;
+  };
+  struct QualifiedValueSchemaSource final {
+    std::string_view relative_path;
+    std::string_view descriptor_yaml;
+  };
+  const std::array<QualifiedCatalogSchemaSource, 1U> qualified_sources{{
+      {core::CatalogRecordKind::kCapabilityDefinition,
+       "catalog/manyforge.capability_definition.v1.yaml",
+       detail::kEmbeddedCapabilityDefinitionSchema},
+  }};
+  const std::array<QualifiedValueSchemaSource, 0U> qualified_value_sources{};
+
   auto storage = std::make_shared<Storage>();
   storage->catalog_schemas.reserve(core::kCatalogRecordTypeRegistry.size());
   for (const auto& descriptor : core::kCatalogRecordTypeRegistry) {
+    const auto source =
+        std::find_if(qualified_sources.begin(), qualified_sources.end(),
+                     [&](const QualifiedCatalogSchemaSource& candidate) {
+                       return candidate.record_kind == descriptor.record_kind;
+                     });
+    std::shared_ptr<const CompiledClosedSchema> compiled_schema;
+    std::string relative_path;
+    if (source != qualified_sources.end()) {
+      compiled_schema = std::make_shared<const CompiledClosedSchema>(
+          compile_closed_schema_descriptor(
+              parse_strict_json_model_yaml(source->descriptor_yaml)));
+      relative_path = source->relative_path;
+    }
     storage->catalog_schemas.push_back(BuildCatalogSchemaEntry(
         descriptor.record_kind, core::SchemaId(std::string(descriptor.schema_family)),
-        CatalogSchemaQualification::kUnqualified, nullptr));
+        compiled_schema == nullptr ? CatalogSchemaQualification::kUnqualified
+                                   : CatalogSchemaQualification::kQualified,
+        std::move(compiled_schema), std::move(relative_path)));
   }
   std::sort(storage->catalog_schemas.begin(), storage->catalog_schemas.end(),
             [](const BuildCatalogSchemaEntry& left, const BuildCatalogSchemaEntry& right) {
               return core::to_string(left.record_kind()) <
                      core::to_string(right.record_kind());
             });
+
+  storage->value_schemas.reserve(qualified_value_sources.size());
+  for (const auto& source : qualified_value_sources) {
+    auto compiled_schema = std::make_shared<const CompiledClosedSchema>(
+        compile_closed_schema_descriptor(
+            parse_strict_json_model_yaml(source.descriptor_yaml)));
+    storage->value_schemas.push_back(BuildQualifiedValueSchemaEntry(
+        compiled_schema->schema_id(), compiled_schema->schema_revision(),
+        std::move(compiled_schema), std::string(source.relative_path)));
+  }
+  std::sort(
+      storage->value_schemas.begin(), storage->value_schemas.end(),
+      [](const BuildQualifiedValueSchemaEntry& left,
+         const BuildQualifiedValueSchemaEntry& right) {
+        return std::tie(left.schema_id().value(), left.schema_revision().value()) <
+               std::tie(right.schema_id().value(), right.schema_revision().value());
+      });
+
+  CanonicalValue::Array examples;
+  examples.push_back(object(
+      {{"schema_id",
+        CanonicalValue("manyforge.closed_schema.example_command.v1")},
+       {"schema_revision",
+        CanonicalValue(
+            "sha256:37985bd40f1c50cca9a82e3952bf407ddecca0d1c32d7787cd903bfffbf5fce7")},
+       {"relative_path",
+        CanonicalValue(
+            "examples/manyforge.closed_schema.example_command.v1.yaml")},
+       {"qualification", CanonicalValue("dialect_example_only")}}));
+  examples.push_back(object(
+      {{"schema_id",
+        CanonicalValue("manyforge.closed_schema.example_inventory.v1")},
+       {"schema_revision",
+        CanonicalValue(
+            "sha256:dd5840f1d78b171d86631d73b333625011c81fcae9b54221ab3ea63c65446c55")},
+       {"relative_path",
+        CanonicalValue(
+            "examples/manyforge.closed_schema.example_inventory.v1.yaml")},
+       {"qualification", CanonicalValue("dialect_example_only")}}));
+
+  CanonicalValue::Array catalog_schemas;
+  catalog_schemas.reserve(storage->catalog_schemas.size());
+  for (const auto& entry : storage->catalog_schemas) {
+    if (entry.qualification() == CatalogSchemaQualification::kQualified) {
+      catalog_schemas.push_back(object(
+          {{"record_kind",
+            CanonicalValue(std::string(core::to_string(entry.record_kind())))},
+           {"schema_id", CanonicalValue(entry.schema_id().value())},
+           {"schema_revision",
+            CanonicalValue(entry.compiled_schema()->schema_revision().value())},
+           {"relative_path", CanonicalValue(std::string(entry.relative_path()))},
+           {"qualification", CanonicalValue("qualified")}}));
+      continue;
+    }
+    catalog_schemas.push_back(object(
+        {{"record_kind",
+          CanonicalValue(std::string(core::to_string(entry.record_kind())))},
+         {"schema_id", CanonicalValue(entry.schema_id().value())},
+         {"qualification", CanonicalValue("unqualified")}}));
+  }
+  CanonicalValue::Array value_schemas;
+  value_schemas.reserve(storage->value_schemas.size());
+  for (const auto& entry : storage->value_schemas) {
+    value_schemas.push_back(object(
+        {{"schema_id", CanonicalValue(entry.schema_id().value())},
+         {"schema_revision", CanonicalValue(entry.schema_revision().value())},
+         {"relative_path", CanonicalValue(std::string(entry.relative_path()))},
+         {"qualification", CanonicalValue("qualified")}}));
+  }
+  storage->normalized_projection = object(
+      {{"api_version",
+        CanonicalValue("manyforge.closed_schema_registry.v1")},
+       {"dialect_api_version",
+        CanonicalValue(std::string(kClosedSchemaApiVersion))},
+       {"bootstrap_contract_digest",
+        CanonicalValue(std::string(kClosedSchemaBootstrapContractDigest))},
+       {"example_schemas", CanonicalValue(std::move(examples))},
+       {"catalog_schemas", CanonicalValue(std::move(catalog_schemas))},
+       {"value_schemas", CanonicalValue(std::move(value_schemas))}});
+  storage->qualification_registry_digest =
+      core::ContentDigest(sha256_digest(canonical_json(storage->normalized_projection)));
   storage_ = std::move(storage);
 }
 
@@ -1744,6 +1860,16 @@ BuildQualifiedClosedSchemaRegistry::find_qualified_value_schema(
                             entry.schema_revision() == schema_revision;
                    });
   return found == storage_->value_schemas.end() ? nullptr : &*found;
+}
+
+const CanonicalValue&
+BuildQualifiedClosedSchemaRegistry::normalized_projection() const noexcept {
+  return storage_->normalized_projection;
+}
+
+const core::ContentDigest&
+BuildQualifiedClosedSchemaRegistry::qualification_registry_digest() const noexcept {
+  return storage_->qualification_registry_digest;
 }
 
 const BuildQualifiedClosedSchemaRegistry& build_qualified_closed_schema_registry() {

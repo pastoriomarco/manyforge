@@ -14,6 +14,23 @@ pkg_check_modules(UTF8PROC REQUIRED IMPORTED_TARGET libutf8proc)
 pkg_check_modules(LIBYAML REQUIRED IMPORTED_TARGET yaml-0.1)
 
 set(
+  MANYFORGE_CAPABILITY_DEFINITION_SCHEMA_PATH
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/closed_schema/catalog/manyforge.capability_definition.v1.yaml")
+set_property(
+  DIRECTORY
+  APPEND
+  PROPERTY CMAKE_CONFIGURE_DEPENDS
+           "${MANYFORGE_CAPABILITY_DEFINITION_SCHEMA_PATH}")
+file(
+  READ
+  "${MANYFORGE_CAPABILITY_DEFINITION_SCHEMA_PATH}"
+  MANYFORGE_CAPABILITY_DEFINITION_SCHEMA_YAML)
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_capability_definition_schema.hpp.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_capability_definition_schema.hpp"
+  @ONLY)
+
+set(
   MANYFORGE_CORE_INCLUDE_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_core/include"
   CACHE PATH
@@ -21,6 +38,7 @@ set(
 
 add_library(manyforge_deployment
   src/artifact_codec.cpp
+  src/capability_definition_codec.cpp
   src/canonical_value.cpp
   src/cell_graph_codec.cpp
   src/closed_schema.cpp
@@ -33,6 +51,8 @@ target_include_directories(manyforge_deployment PUBLIC
   $<BUILD_INTERFACE:${MANYFORGE_CORE_INCLUDE_DIR}>
   $<INSTALL_INTERFACE:include>
 )
+target_include_directories(manyforge_deployment PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(manyforge_deployment PUBLIC
   OpenSSL::Crypto
   PkgConfig::LIBYAML

@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/capability_definition_codec.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/closed_schema.hpp>
@@ -25,6 +26,8 @@ void register_deployment_candidate_bindings(py::module_& module) {
                                                           PyExc_ValueError);
   py::register_exception<deployment::ClosedSchemaError>(module, "ClosedSchemaError",
                                                         PyExc_ValueError);
+  py::register_exception<deployment::CapabilityDefinitionCodecError>(
+      module, "CapabilityDefinitionCodecError", PyExc_ValueError);
 
   py::class_<ParsedArtifactCandidate>(module, "ParsedArtifactCandidate", py::is_final())
       .def_property_readonly("canonical_json", [](const ParsedArtifactCandidate& candidate) {
@@ -111,6 +114,11 @@ void register_deployment_candidate_bindings(py::module_& module) {
       .def_property_readonly("qualification",
                              &deployment::BuildCatalogSchemaEntry::qualification)
       .def_property_readonly(
+          "relative_path",
+          [](const deployment::BuildCatalogSchemaEntry& entry) {
+            return std::string(entry.relative_path());
+          })
+      .def_property_readonly(
           "compiled_schema",
           [](const deployment::BuildCatalogSchemaEntry& entry) -> py::object {
             const auto* schema = entry.compiled_schema();
@@ -126,6 +134,11 @@ void register_deployment_candidate_bindings(py::module_& module) {
                              &deployment::BuildQualifiedValueSchemaEntry::schema_id)
       .def_property_readonly("schema_revision",
                              &deployment::BuildQualifiedValueSchemaEntry::schema_revision)
+      .def_property_readonly(
+          "relative_path",
+          [](const deployment::BuildQualifiedValueSchemaEntry& entry) {
+            return std::string(entry.relative_path());
+          })
       .def_property_readonly(
           "compiled_schema",
           [](const deployment::BuildQualifiedValueSchemaEntry& entry) {
@@ -156,6 +169,27 @@ void register_deployment_candidate_bindings(py::module_& module) {
                   py::cast(&entries[index], py::return_value_policy::reference);
             }
             return snapshot;
+          })
+      .def_property_readonly(
+          "normalized_projection_canonical_json",
+          [](const deployment::BuildQualifiedClosedSchemaRegistry& registry) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(registry.normalized_projection());
+          })
+      .def_property_readonly(
+          "qualification_registry_digest",
+          &deployment::BuildQualifiedClosedSchemaRegistry::
+              qualification_registry_digest);
+
+  py::class_<deployment::QualifiedCapabilityDefinition>(
+      module, "QualifiedCapabilityDefinition", py::is_final())
+      .def_property_readonly(
+          "value", &deployment::QualifiedCapabilityDefinition::value)
+      .def_property_readonly(
+          "normalized_canonical_json",
+          [](const deployment::QualifiedCapabilityDefinition& definition) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(definition.normalized_root());
           });
 
   module.def(
@@ -175,6 +209,11 @@ void register_deployment_candidate_bindings(py::module_& module) {
   module.def("validate_and_normalize_unqualified_artifact_candidate",
              &deployment::validate_and_normalize_unqualified_artifact_candidate,
              py::arg("schema"), py::arg("candidate"),
+             py::call_guard<py::gil_scoped_release>());
+  module.def("resolve_and_qualify_capability_definition",
+             &deployment::resolve_and_qualify_capability_definition,
+             py::arg("reference"), py::arg("resolved_store_key"),
+             py::arg("stored_bytes"),
              py::call_guard<py::gil_scoped_release>());
   module.def(
       "build_qualified_closed_schema_registry",

@@ -3,12 +3,15 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <manyforge_core/types/capability_definition.hpp>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <type_traits>
 
 #include "manyforge_deployment/artifact_codec.hpp"
+#include "manyforge_deployment/capability_definition_codec.hpp"
 #include "manyforge_deployment/canonical_value.hpp"
 #include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
@@ -23,6 +26,8 @@ static_assert(
     !std::is_default_constructible_v<UnqualifiedSchemaNormalizedArtifactCandidate>);
 static_assert(!std::is_aggregate_v<BuildCatalogSchemaEntry>);
 static_assert(!std::is_aggregate_v<BuildQualifiedValueSchemaEntry>);
+static_assert(!std::is_aggregate_v<QualifiedCapabilityDefinition>);
+static_assert(!std::is_default_constructible_v<QualifiedCapabilityDefinition>);
 static_assert(kMaxClosedSchemaEnumValues == 1024U);
 static_assert(kMaxClosedSchemaKeyPaths == 16U);
 static_assert(kMaxClosedSchemaKeyPathSegments == 16U);
@@ -61,6 +66,63 @@ void expect_compile_error(std::string yaml, std::string_view expected_message) {
     throw std::runtime_error("missing test projection member: " + std::string(name));
   }
   return *found;
+}
+
+[[nodiscard]] CanonicalValue value_object(
+    std::initializer_list<std::pair<std::string, CanonicalValue>> members) {
+  return CanonicalValue(CanonicalValue::Object(members));
+}
+
+[[nodiscard]] std::string capability_definition_document(
+    std::string_view capability_id, core::CapabilityScope scope,
+    core::CapabilityProviderBindingKind provider_binding_kind,
+    std::optional<core::ValueSchemaRefDescriptor> schema_ref = std::nullopt) {
+  CanonicalValue::Object identity_fields{
+      {"api_version",
+       CanonicalValue(std::string(core::kCapabilityDefinitionApiVersion))},
+      {"capability_id", CanonicalValue(std::string(capability_id))},
+      {"scope", CanonicalValue(std::string(core::to_string(scope)))},
+      {"provider_binding_kind",
+       CanonicalValue(std::string(core::to_string(provider_binding_kind)))},
+  };
+  if (schema_ref.has_value()) {
+    identity_fields.emplace_back(
+        "requirement_parameters_schema_ref",
+        value_object(
+            {{"schema_id", CanonicalValue(std::string(schema_ref->schema_id))},
+             {"schema_revision",
+              CanonicalValue(std::string(schema_ref->schema_revision))}}));
+  }
+  const auto identity_value = CanonicalValue(std::move(identity_fields));
+  std::string preimage{"manyforge.content-identity.v1"};
+  preimage.push_back('\0');
+  preimage.append("catalog-record-revision/capability_definition");
+  preimage.push_back('\0');
+  preimage.append(core::kCapabilityDefinitionApiVersion);
+  preimage.push_back('\0');
+  preimage.append(canonical_json(identity_value));
+  const auto revision = sha256_digest(preimage);
+
+  auto root = identity_value.as_object();
+  root.emplace_back("capability_definition_revision",
+                    CanonicalValue(revision));
+  return canonical_json(CanonicalValue(std::move(root)));
+}
+
+[[nodiscard]] core::CapabilityDefinitionCatalogRecordRefDTO
+capability_definition_reference(
+    std::string_view capability_id, std::string_view record_revision,
+    std::string_view stored_bytes,
+    const core::ContentAddressedStoreKey& store_key) {
+  return {
+      core::CapabilityId(std::string(capability_id)),
+      core::CapabilityDefinitionRevision(std::string(record_revision)),
+      core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
+      core::SchemaRevision(
+          "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0"),
+      core::ContentDigest(sha256_digest(stored_bytes)),
+      store_key,
+  };
 }
 
 [[nodiscard]] std::string enum_limit_schema(std::size_t enum_count) {
@@ -367,27 +429,236 @@ definitions:
                        "root definition and every root tagged-union branch must resolve to object");
 }
 
-TEST(ClosedSchema, BuildRegistryCannotBePopulatedFromInput) {
+TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteCapabilityFamily) {
   const auto& registry = build_qualified_closed_schema_registry();
   ASSERT_EQ(registry.catalog_schemas().size(), core::kCatalogRecordTypeRegistry.size());
   EXPECT_TRUE(registry.value_schemas().empty());
+  std::size_t qualified_count = 0U;
   for (const auto& entry : registry.catalog_schemas()) {
-    EXPECT_EQ(entry.qualification(), CatalogSchemaQualification::kUnqualified);
-    EXPECT_EQ(entry.compiled_schema(), nullptr);
     ASSERT_NE(registry.find_catalog_schema_family(entry.record_kind()), nullptr);
+    EXPECT_EQ(entry.schema_id().value(),
+              core::catalog_record_type_descriptor(entry.record_kind())->schema_family);
+    if (entry.record_kind() == core::CatalogRecordKind::kCapabilityDefinition) {
+      ++qualified_count;
+      EXPECT_EQ(entry.qualification(), CatalogSchemaQualification::kQualified);
+      ASSERT_NE(entry.compiled_schema(), nullptr);
+      EXPECT_EQ(entry.compiled_schema()->schema_revision().value(),
+                "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0");
+      EXPECT_EQ(registry.find_qualified_catalog_schema(
+                    entry.record_kind(), entry.schema_id(),
+                    entry.compiled_schema()->schema_revision()),
+                &entry);
+    } else {
+      EXPECT_EQ(entry.qualification(), CatalogSchemaQualification::kUnqualified);
+      EXPECT_EQ(entry.compiled_schema(), nullptr);
+    }
     EXPECT_EQ(registry.find_qualified_catalog_schema(
                   entry.record_kind(), entry.schema_id(),
                   core::SchemaRevision(
                       "sha256:0000000000000000000000000000000000000000000000000000000000000000")),
               nullptr);
-    EXPECT_EQ(entry.schema_id().value(),
-              core::catalog_record_type_descriptor(entry.record_kind())->schema_family);
   }
+  EXPECT_EQ(qualified_count, 1U);
+  EXPECT_EQ(registry.qualification_registry_digest().value(),
+            "sha256:0fcb72ac90018caf707dbdf938bfdb7a12bda6f1377e00556e35218ecbc8e11d");
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),
                 core::SchemaRevision(
                     "sha256:0000000000000000000000000000000000000000000000000000000000000000")),
             nullptr);
+}
+
+TEST(ClosedSchema,
+     QualifiesEveryAndOnlyTheExactBuiltinCapabilityDefinition) {
+  ASSERT_EQ(core::kBuiltinCapabilityDefinitionRegistry.size(), 67U);
+  CanonicalValue::Array registry_projection;
+  registry_projection.reserve(
+      core::kBuiltinCapabilityDefinitionRegistry.size());
+  const core::ContentAddressedStoreKey store_key{
+      "sha256/capability-definition-fixture"};
+  for (const auto& expected :
+       core::kBuiltinCapabilityDefinitionRegistry) {
+    const auto document = capability_definition_document(
+        expected.capability_id, expected.scope,
+        expected.provider_binding_kind,
+        expected.requirement_parameters_schema_ref);
+    const auto parsed = parse_strict_json_model_yaml(document);
+    const auto& computed_revision = std::get<std::string>(
+        member(parsed.root(), "capability_definition_revision").storage());
+    ASSERT_EQ(computed_revision,
+              expected.capability_definition_revision)
+        << expected.capability_id;
+
+    const auto reference = capability_definition_reference(
+        expected.capability_id, expected.capability_definition_revision,
+        document, store_key);
+    const auto qualified = resolve_and_qualify_capability_definition(
+        reference, store_key, document);
+    EXPECT_EQ(qualified.value(),
+              core::materialize_capability_definition(expected));
+    EXPECT_EQ(qualified.normalized_root(), parsed.root());
+    registry_projection.push_back(qualified.normalized_root());
+  }
+  EXPECT_EQ(
+      sha256_digest(
+          canonical_json(CanonicalValue(std::move(registry_projection)))),
+      core::kBuiltinCapabilityDefinitionRegistryDigest);
+
+  const auto unknown = capability_definition_document(
+      "unknown.capability", core::CapabilityScope::kCellGlobal,
+      core::CapabilityProviderBindingKind::kCapabilityProviderBinding);
+  const auto unknown_parsed = parse_strict_json_model_yaml(unknown);
+  const auto& unknown_revision = std::get<std::string>(
+      member(unknown_parsed.root(), "capability_definition_revision").storage());
+  const auto unknown_reference = capability_definition_reference(
+      "unknown.capability", unknown_revision, unknown, store_key);
+  EXPECT_THROW(
+      resolve_and_qualify_capability_definition(
+          unknown_reference, store_key, unknown),
+      CapabilityDefinitionCodecError);
+
+  const auto altered_scope = capability_definition_document(
+      "planning.motion.joint_goal", core::CapabilityScope::kCellGlobal,
+      core::CapabilityProviderBindingKind::kCapabilityProviderBinding);
+  const auto altered_scope_parsed =
+      parse_strict_json_model_yaml(altered_scope);
+  const auto& altered_scope_revision = std::get<std::string>(
+      member(altered_scope_parsed.root(), "capability_definition_revision")
+          .storage());
+  const auto altered_scope_reference = capability_definition_reference(
+      "planning.motion.joint_goal", altered_scope_revision, altered_scope,
+      store_key);
+  EXPECT_THROW(
+      resolve_and_qualify_capability_definition(
+          altered_scope_reference, store_key, altered_scope),
+      CapabilityDefinitionCodecError);
+
+  const auto added_schema_ref = capability_definition_document(
+      "planning.motion.joint_goal", core::CapabilityScope::kTargetBinding,
+      core::CapabilityProviderBindingKind::kCapabilityProviderBinding,
+      core::ValueSchemaRefDescriptor{
+          "manyforge.capability_parameters.example.v1",
+          "sha256:0000000000000000000000000000000000000000000000000000000000000000"});
+  const auto added_schema_ref_parsed =
+      parse_strict_json_model_yaml(added_schema_ref);
+  const auto& added_schema_ref_revision = std::get<std::string>(
+      member(added_schema_ref_parsed.root(),
+             "capability_definition_revision")
+          .storage());
+  const auto added_schema_ref_reference = capability_definition_reference(
+      "planning.motion.joint_goal", added_schema_ref_revision,
+      added_schema_ref, store_key);
+  EXPECT_THROW(
+      resolve_and_qualify_capability_definition(
+          added_schema_ref_reference, store_key, added_schema_ref),
+      CapabilityDefinitionCodecError);
+}
+
+TEST(ClosedSchema,
+     CapabilityDefinitionRejectsStaleIdentityAndOpenShape) {
+  const auto& expected =
+      core::kBuiltinCapabilityDefinitionRegistry.front();
+  auto stale = capability_definition_document(
+      expected.capability_id, expected.scope,
+      expected.provider_binding_kind);
+  const auto digest_offset = stale.find("sha256:");
+  ASSERT_NE(digest_offset, std::string::npos);
+  stale[digest_offset + 7U] =
+      stale[digest_offset + 7U] == '0' ? '1' : '0';
+  const core::ContentAddressedStoreKey store_key{
+      "sha256/capability-definition-negative"};
+  const auto stale_reference = capability_definition_reference(
+      expected.capability_id, expected.capability_definition_revision, stale,
+      store_key);
+  EXPECT_THROW(
+      resolve_and_qualify_capability_definition(stale_reference, store_key,
+                                                stale),
+      CapabilityDefinitionCodecError);
+
+  const std::string open_shape =
+      "{\"api_version\":\"manyforge.capability_definition.v1\","
+      "\"capability_id\":\"planning.motion.joint_goal\","
+      "\"capability_definition_revision\":\"" +
+      std::string(expected.capability_definition_revision) +
+      "\",\"scope\":\"target_binding\","
+      "\"provider_binding_kind\":\"capability_provider_binding\","
+      "\"unexpected\":true}";
+  const auto open_reference = capability_definition_reference(
+      expected.capability_id, expected.capability_definition_revision,
+      open_shape, store_key);
+  EXPECT_THROW(
+      resolve_and_qualify_capability_definition(open_reference, store_key,
+                                                open_shape),
+      ClosedSchemaError);
+}
+
+TEST(ClosedSchema,
+     CapabilityDefinitionCatalogReferenceQualifiesAllSevenFields) {
+  const auto& expected =
+      core::kBuiltinCapabilityDefinitionRegistry.front();
+  const auto stored_bytes = capability_definition_document(
+      expected.capability_id, expected.scope,
+      expected.provider_binding_kind);
+  const core::ContentAddressedStoreKey store_key{
+      "sha256/capability-definition-planning-motion-joint-goal"};
+  auto reference = capability_definition_reference(
+      expected.capability_id, expected.capability_definition_revision,
+      stored_bytes, store_key);
+
+  const auto qualified = resolve_and_qualify_capability_definition(
+      reference, store_key, stored_bytes);
+  EXPECT_EQ(qualified.value(),
+            core::materialize_capability_definition(expected));
+
+  auto wrong_id = reference;
+  wrong_id.record_id = core::CapabilityId("planning.motion.pose_goal");
+  EXPECT_THROW(resolve_and_qualify_capability_definition(
+                   wrong_id, store_key, stored_bytes),
+               CapabilityDefinitionCodecError);
+
+  auto wrong_revision = reference;
+  wrong_revision.record_revision =
+      core::CapabilityDefinitionRevision(
+          "sha256:0000000000000000000000000000000000000000000000000000000000000000");
+  EXPECT_THROW(resolve_and_qualify_capability_definition(
+                   wrong_revision, store_key, stored_bytes),
+               CapabilityDefinitionCodecError);
+
+  auto wrong_schema_id = reference;
+  wrong_schema_id.schema_id = core::SchemaId("manyforge.command_schema.v1");
+  EXPECT_THROW(resolve_and_qualify_capability_definition(
+                   wrong_schema_id, store_key, stored_bytes),
+               CapabilityDefinitionCodecError);
+
+  auto wrong_schema_revision = reference;
+  wrong_schema_revision.schema_revision = core::SchemaRevision(
+      "sha256:0000000000000000000000000000000000000000000000000000000000000000");
+  EXPECT_THROW(resolve_and_qualify_capability_definition(
+                   wrong_schema_revision, store_key, stored_bytes),
+               CapabilityDefinitionCodecError);
+
+  auto wrong_digest = reference;
+  wrong_digest.content_digest = core::ContentDigest(
+      "sha256:0000000000000000000000000000000000000000000000000000000000000000");
+  EXPECT_THROW(resolve_and_qualify_capability_definition(
+                   wrong_digest, store_key, stored_bytes),
+               CapabilityDefinitionCodecError);
+
+  EXPECT_THROW(
+      resolve_and_qualify_capability_definition(
+          reference, core::ContentAddressedStoreKey("sha256/other"),
+          stored_bytes),
+      CapabilityDefinitionCodecError);
+
+  EXPECT_THROW(
+      resolve_and_qualify_capability_definition(
+          reference, core::ContentAddressedStoreKey(""), stored_bytes),
+      CapabilityDefinitionCodecError);
+
+  const std::string oversized(kMaxArtifactEncodedBytes + 1U, ' ');
+  EXPECT_THROW(resolve_and_qualify_capability_definition(
+                   reference, store_key, oversized),
+               CapabilityDefinitionCodecError);
 }
 
 TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjections) {
@@ -443,6 +714,13 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
 
   const auto registry_projection =
       parse_strict_json_model_yaml(read_resource("registry.v1.yaml"));
+  EXPECT_EQ(registry_projection.root(),
+            build_qualified_closed_schema_registry().normalized_projection());
+  EXPECT_EQ(
+      sha256_digest(canonical_json(registry_projection.root())),
+      build_qualified_closed_schema_registry()
+          .qualification_registry_digest()
+          .value());
   EXPECT_EQ(registry_projection.root().as_object().size(), 6U);
   EXPECT_EQ(std::get<std::string>(
                 member(registry_projection.root(), "api_version").storage()),
@@ -486,23 +764,54 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
     EXPECT_EQ(compiled.schema_id().value(), expected.schema_id);
     EXPECT_EQ(compiled.schema_revision().value(), expected.schema_revision);
   }
-  EXPECT_TRUE(std::get<CanonicalValue::Array>(
-                  member(registry_projection.root(), "value_schemas").storage())
-                  .empty());
+  const auto& projected_values = std::get<CanonicalValue::Array>(
+      member(registry_projection.root(), "value_schemas").storage());
   const auto& projected_catalog = std::get<CanonicalValue::Array>(
       member(registry_projection.root(), "catalog_schemas").storage());
   const auto& registry = build_qualified_closed_schema_registry();
+  ASSERT_EQ(projected_values.size(), registry.value_schemas().size());
+  for (std::size_t index = 0U; index < projected_values.size(); ++index) {
+    const auto& projected = projected_values[index];
+    const auto& built = registry.value_schemas()[index];
+    EXPECT_EQ(std::get<std::string>(member(projected, "schema_id").storage()),
+              built.schema_id().value());
+    EXPECT_EQ(
+        std::get<std::string>(member(projected, "schema_revision").storage()),
+        built.schema_revision().value());
+    EXPECT_EQ(std::get<std::string>(member(projected, "relative_path").storage()),
+              built.relative_path());
+    EXPECT_EQ(std::get<std::string>(member(projected, "qualification").storage()),
+              "qualified");
+  }
   ASSERT_EQ(projected_catalog.size(), registry.catalog_schemas().size());
   for (std::size_t index = 0U; index < projected_catalog.size(); ++index) {
     const auto& projected = projected_catalog[index];
     const auto& built = registry.catalog_schemas()[index];
-    EXPECT_EQ(projected.as_object().size(), 3U);
     EXPECT_EQ(std::get<std::string>(member(projected, "record_kind").storage()),
               core::to_string(built.record_kind()));
     EXPECT_EQ(std::get<std::string>(member(projected, "schema_id").storage()),
               built.schema_id().value());
-    EXPECT_EQ(std::get<std::string>(member(projected, "qualification").storage()),
-              "unqualified");
+    if (built.record_kind() == core::CatalogRecordKind::kCapabilityDefinition) {
+      EXPECT_EQ(projected.as_object().size(), 5U);
+      EXPECT_EQ(
+          std::get<std::string>(member(projected, "qualification").storage()),
+          "qualified");
+      EXPECT_EQ(
+          std::get<std::string>(member(projected, "schema_revision").storage()),
+          "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0");
+      EXPECT_EQ(std::get<std::string>(
+                    member(projected, "relative_path").storage()),
+                "catalog/manyforge.capability_definition.v1.yaml");
+      const auto compiled =
+          compile_resource("catalog/manyforge.capability_definition.v1.yaml");
+      EXPECT_EQ(compiled.schema_revision(),
+                built.compiled_schema()->schema_revision());
+    } else {
+      EXPECT_EQ(projected.as_object().size(), 3U);
+      EXPECT_EQ(
+          std::get<std::string>(member(projected, "qualification").storage()),
+          "unqualified");
+    }
   }
 
   std::set<std::string> source_tree_yaml;
@@ -518,6 +827,7 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
   const std::set<std::string> expected_source_tree_yaml{
       "manyforge.closed_schema.bootstrap.v1.yaml",
       "registry.v1.yaml",
+      "catalog/manyforge.capability_definition.v1.yaml",
       "examples/manyforge.closed_schema.example_command.v1.yaml",
       "examples/manyforge.closed_schema.example_inventory.v1.yaml",
   };

@@ -4,6 +4,8 @@
 
 #include <array>
 #include <manyforge_core/types/catalog.hpp>
+#include <manyforge_core/types/capability_definition.hpp>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -81,6 +83,139 @@ void bind_catalog_record_ref_helpers(py::module_& module) {
 }  // namespace
 
 void register_catalog_record_bindings(py::module_& module) {
+  py::enum_<CapabilityScope>(module, "CapabilityScope")
+      .value("kCellGlobal", CapabilityScope::kCellGlobal)
+      .value("kControlDomain", CapabilityScope::kControlDomain)
+      .value("kTargetBinding", CapabilityScope::kTargetBinding);
+
+  py::enum_<CapabilityProviderBindingKind>(module,
+                                           "CapabilityProviderBindingKind")
+      .value("kCapabilityProviderBinding",
+             CapabilityProviderBindingKind::kCapabilityProviderBinding)
+      .value("kControlBinding",
+             CapabilityProviderBindingKind::kControlBinding);
+
+  py::class_<ValueSchemaRefDTO>(module, "ValueSchemaRefDTO", py::is_final())
+      .def(py::init([](SchemaId schema_id, SchemaRevision schema_revision) {
+             return ValueSchemaRefDTO{std::move(schema_id),
+                                      std::move(schema_revision)};
+           }),
+           py::arg("schema_id"), py::arg("schema_revision"))
+      .def_readonly("schema_id", &ValueSchemaRefDTO::schema_id)
+      .def_readonly("schema_revision", &ValueSchemaRefDTO::schema_revision)
+      .def(
+          "__eq__",
+          [](const ValueSchemaRefDTO& lhs, const ValueSchemaRefDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ValueSchemaRefDTO& lhs, const ValueSchemaRefDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<CapabilityDefinitionDTO>(module, "CapabilityDefinitionDTO",
+                                      py::is_final())
+      .def(py::init([](CapabilityId capability_id,
+                       CapabilityDefinitionRevision revision,
+                       CapabilityScope scope,
+                       CapabilityProviderBindingKind provider_binding_kind,
+                       std::optional<ValueSchemaRefDTO> schema_ref) {
+             return CapabilityDefinitionDTO{
+                 std::move(capability_id), std::move(revision), scope,
+                 provider_binding_kind, std::move(schema_ref)};
+           }),
+           py::arg("capability_id"),
+           py::arg("capability_definition_revision"), py::arg("scope"),
+           py::arg("provider_binding_kind"),
+           py::arg("requirement_parameters_schema_ref") = std::nullopt)
+      .def_readonly("capability_id", &CapabilityDefinitionDTO::capability_id)
+      .def_readonly("capability_definition_revision",
+                    &CapabilityDefinitionDTO::capability_definition_revision)
+      .def_readonly("scope", &CapabilityDefinitionDTO::scope)
+      .def_readonly("provider_binding_kind",
+                    &CapabilityDefinitionDTO::provider_binding_kind)
+      .def_readonly("requirement_parameters_schema_ref",
+                    &CapabilityDefinitionDTO::requirement_parameters_schema_ref)
+      .def(
+          "__eq__",
+          [](const CapabilityDefinitionDTO& lhs,
+             const CapabilityDefinitionDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const CapabilityDefinitionDTO& lhs,
+             const CapabilityDefinitionDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  py::class_<ValueSchemaRefDescriptor>(module, "ValueSchemaRefDescriptor",
+                                       py::is_final())
+      .def_property_readonly(
+          "schema_id", [](const ValueSchemaRefDescriptor& value) {
+            return std::string(value.schema_id);
+          })
+      .def_property_readonly(
+          "schema_revision", [](const ValueSchemaRefDescriptor& value) {
+            return std::string(value.schema_revision);
+          });
+
+  py::class_<CapabilityDefinitionDescriptor>(
+      module, "CapabilityDefinitionDescriptor", py::is_final())
+      .def_property_readonly(
+          "capability_id", [](const CapabilityDefinitionDescriptor& value) {
+            return std::string(value.capability_id);
+          })
+      .def_property_readonly(
+          "capability_definition_revision",
+          [](const CapabilityDefinitionDescriptor& value) {
+            return std::string(value.capability_definition_revision);
+          })
+      .def_readonly("scope", &CapabilityDefinitionDescriptor::scope)
+      .def_readonly("provider_binding_kind",
+                    &CapabilityDefinitionDescriptor::provider_binding_kind)
+      .def_readonly(
+          "requirement_parameters_schema_ref",
+          &CapabilityDefinitionDescriptor::requirement_parameters_schema_ref);
+
+  module.attr("CAPABILITY_DEFINITION_API_VERSION") =
+      std::string(kCapabilityDefinitionApiVersion);
+  module.attr("BUILTIN_CAPABILITY_DEFINITION_REGISTRY_DIGEST") =
+      std::string(kBuiltinCapabilityDefinitionRegistryDigest);
+  py::tuple capability_registry{kBuiltinCapabilityDefinitionRegistry.size()};
+  for (std::size_t index = 0U;
+       index < kBuiltinCapabilityDefinitionRegistry.size(); ++index) {
+    capability_registry[index] =
+        py::cast(kBuiltinCapabilityDefinitionRegistry[index]);
+  }
+  module.attr("BUILTIN_CAPABILITY_DEFINITION_REGISTRY") =
+      capability_registry;
+  module.def(
+      "find_builtin_capability_definition",
+      [](std::string_view capability_id)
+          -> std::optional<CapabilityDefinitionDescriptor> {
+        const auto* found =
+            manyforge::core::find_builtin_capability_definition(capability_id);
+        return found == nullptr
+                   ? std::nullopt
+                   : std::optional<CapabilityDefinitionDescriptor>(*found);
+      },
+      py::arg("capability_id"));
+  module.def("materialize_capability_definition",
+             &manyforge::core::materialize_capability_definition,
+             py::arg("descriptor"));
+  module.def(
+      "capability_scope_to_string",
+      [](CapabilityScope scope) { return std::string(to_string(scope)); },
+      py::arg("scope"));
+  module.def(
+      "capability_provider_binding_kind_to_string",
+      [](CapabilityProviderBindingKind kind) {
+        return std::string(to_string(kind));
+      },
+      py::arg("kind"));
+
   py::enum_<CatalogRecordKind>(module, "CatalogRecordKind")
       .value("kModelAsset", CatalogRecordKind::kModelAsset)
       .value("kRuntimeProfile", CatalogRecordKind::kRuntimeProfile)

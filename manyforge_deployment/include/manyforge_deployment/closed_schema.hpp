@@ -135,28 +135,33 @@ class BuildCatalogSchemaEntry final {
   [[nodiscard]] const CompiledClosedSchema* compiled_schema() const noexcept {
     return compiled_schema_.get();
   }
+  [[nodiscard]] std::string_view relative_path() const noexcept {
+    return relative_path_;
+  }
 
  private:
   BuildCatalogSchemaEntry(core::CatalogRecordKind record_kind, core::SchemaId schema_id,
                           CatalogSchemaQualification qualification,
-                          std::shared_ptr<const CompiledClosedSchema> compiled_schema)
+                          std::shared_ptr<const CompiledClosedSchema> compiled_schema,
+                          std::string relative_path)
       : record_kind_(record_kind),
         schema_id_(std::move(schema_id)),
         qualification_(qualification),
-        compiled_schema_(std::move(compiled_schema)) {
+        compiled_schema_(std::move(compiled_schema)),
+        relative_path_(std::move(relative_path)) {
     const auto* family = core::catalog_record_type_descriptor(record_kind_);
     if (family == nullptr || family->schema_family != schema_id_.value()) {
       throw std::logic_error(
           "catalog schema entry does not match the closed record-kind family");
     }
     if (qualification_ == CatalogSchemaQualification::kUnqualified) {
-      if (compiled_schema_ != nullptr) {
+      if (compiled_schema_ != nullptr || !relative_path_.empty()) {
         throw std::logic_error(
-            "unqualified catalog schema entry cannot own a compiled schema");
+            "unqualified catalog schema entry cannot own a compiled schema or path");
       }
       return;
     }
-    if (compiled_schema_ == nullptr ||
+    if (compiled_schema_ == nullptr || relative_path_.empty() ||
         compiled_schema_->schema_purpose() !=
             ClosedSchemaPurpose::kArtifactDocument ||
         compiled_schema_->schema_id() != schema_id_) {
@@ -169,6 +174,7 @@ class BuildCatalogSchemaEntry final {
   core::SchemaId schema_id_;
   CatalogSchemaQualification qualification_;
   std::shared_ptr<const CompiledClosedSchema> compiled_schema_;
+  std::string relative_path_;
 
   friend class BuildQualifiedClosedSchemaRegistry;
 };
@@ -182,26 +188,33 @@ class BuildQualifiedValueSchemaEntry final {
   [[nodiscard]] const CompiledClosedSchema& compiled_schema() const noexcept {
     return *compiled_schema_;
   }
+  [[nodiscard]] std::string_view relative_path() const noexcept {
+    return relative_path_;
+  }
 
  private:
   BuildQualifiedValueSchemaEntry(core::SchemaId schema_id,
                                  core::SchemaRevision schema_revision,
-                                 std::shared_ptr<const CompiledClosedSchema> compiled_schema)
+                                 std::shared_ptr<const CompiledClosedSchema> compiled_schema,
+                                 std::string relative_path)
       : schema_id_(std::move(schema_id)),
         schema_revision_(std::move(schema_revision)),
-        compiled_schema_(std::move(compiled_schema)) {
+        compiled_schema_(std::move(compiled_schema)),
+        relative_path_(std::move(relative_path)) {
     if (compiled_schema_ == nullptr ||
         compiled_schema_->schema_purpose() != ClosedSchemaPurpose::kValue ||
         compiled_schema_->schema_id() != schema_id_ ||
-        compiled_schema_->schema_revision() != schema_revision_) {
+        compiled_schema_->schema_revision() != schema_revision_ ||
+        relative_path_.empty()) {
       throw std::logic_error(
-          "qualified value-schema entry requires an exact value descriptor");
+          "qualified value-schema entry requires an exact value descriptor and path");
     }
   }
 
   core::SchemaId schema_id_;
   core::SchemaRevision schema_revision_;
   std::shared_ptr<const CompiledClosedSchema> compiled_schema_;
+  std::string relative_path_;
 
   friend class BuildQualifiedClosedSchemaRegistry;
 };
@@ -210,7 +223,9 @@ class BuildQualifiedValueSchemaEntry final {
 ///
 /// There is deliberately no public constructor or registry-document loader:
 /// catalog qualification is a build decision, never a runtime assertion from
-/// untrusted input. At this checkpoint all catalog families are unqualified.
+/// untrusted input. Each catalog-family entry records its immutable
+/// build-qualified or unqualified status; qualified entries own their exact
+/// compiled artifact-document descriptor.
 class BuildQualifiedClosedSchemaRegistry final {
  public:
   [[nodiscard]] std::span<const BuildCatalogSchemaEntry> catalog_schemas() const noexcept;
@@ -223,6 +238,8 @@ class BuildQualifiedClosedSchemaRegistry final {
   [[nodiscard]] const BuildQualifiedValueSchemaEntry* find_qualified_value_schema(
       const core::SchemaId& schema_id,
       const core::SchemaRevision& schema_revision) const noexcept;
+  [[nodiscard]] const CanonicalValue& normalized_projection() const noexcept;
+  [[nodiscard]] const core::ContentDigest& qualification_registry_digest() const noexcept;
 
  private:
   BuildQualifiedClosedSchemaRegistry();

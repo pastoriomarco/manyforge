@@ -13,7 +13,9 @@ example_schemas:
 catalog_schemas:
   - record_kind: capability_definition
     schema_id: manyforge.capability_definition.v1
-    qualification: unqualified
+    schema_revision: sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0
+    relative_path: catalog/manyforge.capability_definition.v1.yaml
+    qualification: qualified
   - record_kind: command_schema
     schema_id: manyforge.command_schema.v1
     qualification: unqualified
