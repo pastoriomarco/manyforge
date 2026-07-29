@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <manyforge_core/types/json_value.hpp>
 #include <manyforge_core/types/strong_id.hpp>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -48,11 +49,11 @@ enum class StateAuthorityClass : std::uint8_t {
   return {};
 }
 
-struct MountPoseDTO {
+struct PlacementPoseDTO {
   std::array<double, 3> position_m{};
   std::array<double, 4> orientation_xyzw{0.0, 0.0, 0.0, 1.0};
 
-  friend bool operator==(const MountPoseDTO&, const MountPoseDTO&) = default;
+  friend bool operator==(const PlacementPoseDTO&, const PlacementPoseDTO&) = default;
 };
 
 struct ModelRoleBindingDTO {
@@ -105,9 +106,8 @@ struct ModelInstanceDTO {
   ModelInstanceId model_instance_id;
   ModelAssetId model_asset_id;
   ModelRevision model_revision;
-  FrameRoleId mount_parent_frame_role;
-  MountPoseDTO mount_pose;
   JsonObjectDTO instance_parameters;
+  std::optional<PlacementPoseDTO> root_pose_in_cell;
 
   friend bool operator==(const ModelInstanceDTO&, const ModelInstanceDTO&) = default;
 };
@@ -119,6 +119,7 @@ struct ControllableComponentDTO {
   ComponentTypeRevision component_type_revision;
   std::vector<ModelRoleBindingDTO> model_role_bindings;
   std::vector<RuntimeUnitId> runtime_unit_ids;
+  std::optional<PlacementPoseDTO> root_pose_in_cell;
 
   friend bool operator==(const ControllableComponentDTO&,
                          const ControllableComponentDTO&) = default;
@@ -170,12 +171,7 @@ struct ComponentAttachmentEdgeDTO {
   ComponentAttachmentRevision component_attachment_revision;
   ComponentAttachmentEndpointDTO parent;
   ComponentAttachmentEndpointDTO child;
-  MountPoseDTO mount_pose;
-  AttachmentRoleId role;
-  bool detachable = false;
-  std::vector<FrameRoleId> tcp_effects;
-  std::vector<CollisionBodyRoleId> collision_effects;
-  ContentDigest provenance_digest;
+  PlacementPoseDTO child_interface_pose_in_parent_interface;
 
   friend bool operator==(const ComponentAttachmentEdgeDTO&,
                          const ComponentAttachmentEdgeDTO&) = default;

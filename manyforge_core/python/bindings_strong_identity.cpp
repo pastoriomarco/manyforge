@@ -67,7 +67,6 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(ResourceId);
   MANYFORGE_BIND_STRONG_STRING(ResourceRoleId);
   MANYFORGE_BIND_STRONG_STRING(AttachmentInterfaceId);
-  MANYFORGE_BIND_STRONG_STRING(AttachmentRoleId);
 
   MANYFORGE_BIND_STRONG_STRING(ControlInterfaceContractId);
   MANYFORGE_BIND_STRONG_STRING(ControlInterfaceRevision);

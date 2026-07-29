@@ -6,10 +6,10 @@
 #include <cstddef>
 #include <initializer_list>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -21,12 +21,10 @@ namespace manyforge::deployment {
 namespace {
 
 using core::AttachmentInterfaceId;
-using core::AttachmentRoleId;
 using core::CapabilityDefinitionRevision;
 using core::CapabilityId;
 using core::CellGraphDTO;
 using core::CellId;
-using core::CollisionBodyRoleId;
 using core::CommandTargetId;
 using core::ComponentAttachmentEdgeDTO;
 using core::ComponentAttachmentEndpointDTO;
@@ -35,7 +33,6 @@ using core::ComponentAttachmentRevision;
 using core::ComponentTypeId;
 using core::ComponentTypeRevision;
 using core::ContainmentGranularity;
-using core::ContentDigest;
 using core::ControlBindingDTO;
 using core::ControlBindingId;
 using core::ControlBindingRevision;
@@ -49,7 +46,6 @@ using core::ControllableComponentId;
 using core::ControllerTopologyId;
 using core::ControlRouteId;
 using core::EndpointRoleId;
-using core::FrameRoleId;
 using core::GraphRevision;
 using core::JsonObjectDTO;
 using core::JsonValueDTO;
@@ -59,7 +55,7 @@ using core::ModelInstanceId;
 using core::ModelRevision;
 using core::ModelRoleBindingDTO;
 using core::ModelRoleId;
-using core::MountPoseDTO;
+using core::PlacementPoseDTO;
 using core::ProviderInstanceId;
 using core::ProviderManifestRevision;
 using core::ResourceBindingDTO;
@@ -138,14 +134,6 @@ constexpr std::size_t kMaximumIdentityLength = 128U;
   return *number;
 }
 
-[[nodiscard]] bool require_bool(const CanonicalValue& value, std::string_view path) {
-  const auto* boolean = std::get_if<bool>(&value.storage());
-  if (boolean == nullptr) {
-    fail(path, "expected boolean");
-  }
-  return *boolean;
-}
-
 [[nodiscard]] const CanonicalValue& require_member(const CanonicalValue::Object& object,
                                                    std::string_view name, std::string_view path) {
   const auto iterator = std::find_if(object.begin(), object.end(),
@@ -156,20 +144,31 @@ constexpr std::size_t kMaximumIdentityLength = 128U;
   return iterator->second;
 }
 
-void require_exact_fields(const CanonicalValue::Object& object,
-                          std::initializer_list<std::string_view> expected, std::string_view path) {
-  if (object.size() != expected.size()) {
-    for (const auto& [name, unused] : object) {
-      (void)unused;
-      if (std::find(expected.begin(), expected.end(), name) == expected.end()) {
-        fail(path, "unknown field '" + name + "'");
-      }
+[[nodiscard]] const CanonicalValue* find_member(const CanonicalValue::Object& object,
+                                                std::string_view name) noexcept {
+  const auto iterator = std::find_if(object.begin(), object.end(),
+                                     [name](const auto& member) { return member.first == name; });
+  return iterator == object.end() ? nullptr : &iterator->second;
+}
+
+void require_fields(const CanonicalValue::Object& object,
+                    std::initializer_list<std::string_view> required,
+                    std::initializer_list<std::string_view> optional, std::string_view path) {
+  for (const auto& [name, unused] : object) {
+    (void)unused;
+    if (std::find(required.begin(), required.end(), name) == required.end() &&
+        std::find(optional.begin(), optional.end(), name) == optional.end()) {
+      fail(path, "unknown field '" + name + "'");
     }
-    fail(path, "wrong number of fields");
   }
-  for (const std::string_view name : expected) {
+  for (const std::string_view name : required) {
     (void)require_member(object, name, path);
   }
+}
+
+void require_exact_fields(const CanonicalValue::Object& object,
+                          std::initializer_list<std::string_view> expected, std::string_view path) {
+  require_fields(object, expected, {}, path);
 }
 
 [[nodiscard]] std::string child_path(std::string_view parent, std::string_view name) {
@@ -249,7 +248,8 @@ template <typename StrongType>
       value.storage());
 }
 
-[[nodiscard]] MountPoseDTO parse_mount_pose(const CanonicalValue& value, std::string_view path) {
+[[nodiscard]] PlacementPoseDTO parse_placement_pose(const CanonicalValue& value,
+                                                    std::string_view path) {
   const auto& object = require_object(value, path);
   require_exact_fields(object, {"position_m", "orientation_xyzw"}, path);
 
@@ -266,7 +266,7 @@ template <typename StrongType>
     fail(orientation_path, "expected exactly four quaternion coordinates");
   }
 
-  MountPoseDTO pose;
+  PlacementPoseDTO pose;
   for (std::size_t index = 0; index < pose.position_m.size(); ++index) {
     pose.position_m[index] = require_number(position[index], index_path(position_path, index));
   }
@@ -337,10 +337,10 @@ template <typename StrongType>
 [[nodiscard]] ModelInstanceDTO parse_model_instance(const CanonicalValue& value,
                                                     std::string_view path) {
   const auto& object = require_object(value, path);
-  require_exact_fields(object,
-                       {"model_instance_id", "model_asset_id", "model_revision",
-                        "mount_parent_frame_role", "mount_pose", "instance_parameters"},
-                       path);
+  require_fields(
+      object, {"model_instance_id", "model_asset_id", "model_revision", "instance_parameters"},
+      {"root_pose_in_cell"}, path);
+  const CanonicalValue* root_pose = find_member(object, "root_pose_in_cell");
   return ModelInstanceDTO{
       parse_identity<ModelInstanceId>(require_member(object, "model_instance_id", path),
                                       child_path(path, "model_instance_id")),
@@ -348,11 +348,12 @@ template <typename StrongType>
                                    child_path(path, "model_asset_id")),
       parse_digest<ModelRevision>(require_member(object, "model_revision", path),
                                   child_path(path, "model_revision")),
-      parse_identity<FrameRoleId>(require_member(object, "mount_parent_frame_role", path),
-                                  child_path(path, "mount_parent_frame_role")),
-      parse_mount_pose(require_member(object, "mount_pose", path), child_path(path, "mount_pose")),
       to_json_object(require_member(object, "instance_parameters", path),
-                     child_path(path, "instance_parameters"))};
+                     child_path(path, "instance_parameters")),
+      root_pose == nullptr
+          ? std::nullopt
+          : std::optional<PlacementPoseDTO>{
+                parse_placement_pose(*root_pose, child_path(path, "root_pose_in_cell"))}};
 }
 
 [[nodiscard]] std::vector<ModelRoleBindingDTO> parse_model_role_bindings(
@@ -360,38 +361,39 @@ template <typename StrongType>
   const auto& array = require_array(value, path);
   std::vector<ModelRoleBindingDTO> result;
   result.reserve(array.size());
+  std::set<std::string, std::less<>> model_roles;
+  std::set<std::string, std::less<>> model_instances;
   for (std::size_t index = 0; index < array.size(); ++index) {
     const std::string item_path = index_path(path, index);
     const auto& object = require_object(array[index], item_path);
     require_exact_fields(object, {"model_role_id", "model_instance_id"}, item_path);
-    result.push_back(ModelRoleBindingDTO{
+    ModelRoleBindingDTO binding{
         parse_identity<ModelRoleId>(require_member(object, "model_role_id", item_path),
                                     child_path(item_path, "model_role_id")),
         parse_identity<ModelInstanceId>(require_member(object, "model_instance_id", item_path),
-                                        child_path(item_path, "model_instance_id"))});
+                                        child_path(item_path, "model_instance_id"))};
+    if (!model_roles.emplace(binding.model_role_id.value()).second) {
+      fail(path, "one model role is bound more than once");
+    }
+    if (!model_instances.emplace(binding.model_instance_id.value()).second) {
+      fail(path, "one model instance is bound more than once");
+    }
+    result.push_back(std::move(binding));
   }
   std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
-    return std::tie(left.model_role_id, left.model_instance_id) <
-           std::tie(right.model_role_id, right.model_instance_id);
+    return left.model_role_id < right.model_role_id;
   });
-  const auto duplicate =
-      std::adjacent_find(result.begin(), result.end(), [](const auto& left, const auto& right) {
-        return left.model_role_id == right.model_role_id &&
-               left.model_instance_id == right.model_instance_id;
-      });
-  if (duplicate != result.end()) {
-    fail(path, "duplicate model-role binding");
-  }
   return result;
 }
 
 [[nodiscard]] ControllableComponentDTO parse_controllable_component(const CanonicalValue& value,
                                                                     std::string_view path) {
   const auto& object = require_object(value, path);
-  require_exact_fields(object,
-                       {"controllable_component_id", "component_type_id", "component_type_revision",
-                        "model_role_bindings", "runtime_unit_ids"},
-                       path);
+  require_fields(object,
+                 {"controllable_component_id", "component_type_id", "component_type_revision",
+                  "model_role_bindings", "runtime_unit_ids"},
+                 {"root_pose_in_cell"}, path);
+  const CanonicalValue* root_pose = find_member(object, "root_pose_in_cell");
   return ControllableComponentDTO{
       parse_identity<ControllableComponentId>(
           require_member(object, "controllable_component_id", path),
@@ -403,7 +405,11 @@ template <typename StrongType>
       parse_model_role_bindings(require_member(object, "model_role_bindings", path),
                                 child_path(path, "model_role_bindings")),
       parse_identity_set<RuntimeUnitId>(require_member(object, "runtime_unit_ids", path),
-                                        child_path(path, "runtime_unit_ids"))};
+                                        child_path(path, "runtime_unit_ids")),
+      root_pose == nullptr
+          ? std::nullopt
+          : std::optional<PlacementPoseDTO>{
+                parse_placement_pose(*root_pose, child_path(path, "root_pose_in_cell"))}};
 }
 
 [[nodiscard]] ControlDomainDTO parse_control_domain(const CanonicalValue& value,
@@ -600,11 +606,10 @@ template <typename StrongType>
 [[nodiscard]] ComponentAttachmentEdgeDTO parse_component_attachment(const CanonicalValue& value,
                                                                     std::string_view path) {
   const auto& object = require_object(value, path);
-  require_exact_fields(
-      object,
-      {"component_attachment_id", "component_attachment_revision", "parent", "child", "mount_pose",
-       "role", "detachable", "tcp_effects", "collision_effects", "provenance_digest"},
-      path);
+  require_exact_fields(object,
+                       {"component_attachment_id", "component_attachment_revision", "parent",
+                        "child", "child_interface_pose_in_parent_interface"},
+                       path);
   return ComponentAttachmentEdgeDTO{
       parse_identity<ComponentAttachmentId>(require_member(object, "component_attachment_id", path),
                                             child_path(path, "component_attachment_id")),
@@ -613,16 +618,8 @@ template <typename StrongType>
           child_path(path, "component_attachment_revision")),
       parse_attachment_endpoint(require_member(object, "parent", path), child_path(path, "parent")),
       parse_attachment_endpoint(require_member(object, "child", path), child_path(path, "child")),
-      parse_mount_pose(require_member(object, "mount_pose", path), child_path(path, "mount_pose")),
-      parse_identity<AttachmentRoleId>(require_member(object, "role", path),
-                                       child_path(path, "role")),
-      require_bool(require_member(object, "detachable", path), child_path(path, "detachable")),
-      parse_identity_set<FrameRoleId>(require_member(object, "tcp_effects", path),
-                                      child_path(path, "tcp_effects")),
-      parse_identity_set<CollisionBodyRoleId>(require_member(object, "collision_effects", path),
-                                              child_path(path, "collision_effects")),
-      parse_digest<ContentDigest>(require_member(object, "provenance_digest", path),
-                                  child_path(path, "provenance_digest"))};
+      parse_placement_pose(require_member(object, "child_interface_pose_in_parent_interface", path),
+                           child_path(path, "child_interface_pose_in_parent_interface"))};
 }
 
 template <typename Record, typename Parser, typename Key>
@@ -698,7 +695,7 @@ template <typename StrongType>
   return CanonicalValue(std::move(array));
 }
 
-[[nodiscard]] CanonicalValue mount_pose_value(const MountPoseDTO& pose) {
+[[nodiscard]] CanonicalValue placement_pose_value(const PlacementPoseDTO& pose) {
   CanonicalValue::Array position;
   position.reserve(pose.position_m.size());
   for (const double coordinate : pose.position_m) {
@@ -724,13 +721,16 @@ template <typename StrongType>
 }
 
 [[nodiscard]] CanonicalValue model_instance_value(const ModelInstanceDTO& record) {
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object object{
       {"model_instance_id", identity_value(record.model_instance_id)},
       {"model_asset_id", identity_value(record.model_asset_id)},
       {"model_revision", identity_value(record.model_revision)},
-      {"mount_parent_frame_role", identity_value(record.mount_parent_frame_role)},
-      {"mount_pose", mount_pose_value(record.mount_pose)},
-      {"instance_parameters", json_object_to_canonical(record.instance_parameters)}});
+      {"instance_parameters", json_object_to_canonical(record.instance_parameters)}};
+  if (record.root_pose_in_cell.has_value()) {
+    object.emplace_back("root_pose_in_cell",
+                        placement_pose_value(*record.root_pose_in_cell));
+  }
+  return CanonicalValue(std::move(object));
 }
 
 [[nodiscard]] CanonicalValue controllable_component_value(const ControllableComponentDTO& record) {
@@ -741,12 +741,17 @@ template <typename StrongType>
         CanonicalValue::Object{{"model_role_id", identity_value(binding.model_role_id)},
                                {"model_instance_id", identity_value(binding.model_instance_id)}});
   }
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object object{
       {"controllable_component_id", identity_value(record.controllable_component_id)},
       {"component_type_id", identity_value(record.component_type_id)},
       {"component_type_revision", identity_value(record.component_type_revision)},
       {"model_role_bindings", CanonicalValue(std::move(model_bindings))},
-      {"runtime_unit_ids", identity_array(record.runtime_unit_ids)}});
+      {"runtime_unit_ids", identity_array(record.runtime_unit_ids)}};
+  if (record.root_pose_in_cell.has_value()) {
+    object.emplace_back("root_pose_in_cell",
+                        placement_pose_value(*record.root_pose_in_cell));
+  }
+  return CanonicalValue(std::move(object));
 }
 
 [[nodiscard]] CanonicalValue control_domain_value(const ControlDomainDTO& record) {
@@ -818,12 +823,8 @@ template <typename StrongType>
       {"component_attachment_revision", identity_value(record.component_attachment_revision)},
       {"parent", attachment_endpoint_value(record.parent)},
       {"child", attachment_endpoint_value(record.child)},
-      {"mount_pose", mount_pose_value(record.mount_pose)},
-      {"role", CanonicalValue(record.role.value())},
-      {"detachable", CanonicalValue(record.detachable)},
-      {"tcp_effects", identity_array(record.tcp_effects)},
-      {"collision_effects", identity_array(record.collision_effects)},
-      {"provenance_digest", identity_value(record.provenance_digest)}});
+      {"child_interface_pose_in_parent_interface",
+       placement_pose_value(record.child_interface_pose_in_parent_interface)}});
 }
 
 template <typename Record, typename Converter>
@@ -946,11 +947,23 @@ void validate_intrinsic(const CellGraphDTO& graph) {
                         "controllable_components.model_role_bindings");
       const auto [iterator, inserted] = model_owners.emplace(
           binding.model_instance_id.value(), component.controllable_component_id.value());
-      if (!inserted && iterator->second != component.controllable_component_id.value()) {
+      if (!inserted) {
         fail("controllable_components.model_role_bindings",
-             "model instance '" + binding.model_instance_id.value() + "' is owned by both '" +
-                 iterator->second + "' and '" + component.controllable_component_id.value() + "'");
+             "model instance '" + binding.model_instance_id.value() +
+                 "' is bound more than once; first owner is '" + iterator->second + "'");
       }
+    }
+  }
+  for (const auto& model : graph.model_instances) {
+    const bool owned = model_owners.contains(model.model_instance_id.value());
+    if (owned && model.root_pose_in_cell.has_value()) {
+      fail("model_instances.root_pose_in_cell",
+           "owned model instance '" + model.model_instance_id.value() + "' must omit root pose");
+    }
+    if (!owned && !model.root_pose_in_cell.has_value()) {
+      fail("model_instances.root_pose_in_cell",
+           "passive model instance '" + model.model_instance_id.value() +
+               "' requires a root pose");
     }
   }
 
@@ -977,7 +990,7 @@ void validate_intrinsic(const CellGraphDTO& graph) {
   using Endpoint = std::pair<std::string, std::string>;
   using Edge = std::pair<Endpoint, Endpoint>;
   std::set<Edge> attachment_edges;
-  std::set<Endpoint> child_endpoints;
+  std::set<std::string, std::less<>> child_components;
   std::map<std::string, std::vector<std::string>, std::less<>> attachment_dependencies;
   for (const auto& attachment : graph.component_attachments) {
     require_reference(component_ids, attachment.parent.controllable_component_id.value(),
@@ -988,15 +1001,38 @@ void validate_intrinsic(const CellGraphDTO& graph) {
                           attachment.parent.attachment_interface_id.value()};
     const Endpoint child{attachment.child.controllable_component_id.value(),
                          attachment.child.attachment_interface_id.value()};
+    if (parent.first == child.first) {
+      fail("component_attachments", "a component cannot attach to itself");
+    }
     if (!attachment_edges.emplace(parent, child).second) {
       fail("component_attachments", "duplicate attachment edge");
     }
-    if (!child_endpoints.insert(child).second) {
-      fail("component_attachments", "one child attachment interface has multiple parents");
+    if (!child_components.insert(child.first).second) {
+      fail("component_attachments", "one child component has multiple incoming attachments");
     }
     attachment_dependencies[parent.first].push_back(child.first);
   }
   require_acyclic(attachment_dependencies, "component_attachments");
+
+  for (const auto& component : graph.controllable_components) {
+    const bool has_model = !component.model_role_bindings.empty();
+    const bool is_child = child_components.contains(component.controllable_component_id.value());
+    if (!has_model && component.root_pose_in_cell.has_value()) {
+      fail("controllable_components.root_pose_in_cell",
+           "component '" + component.controllable_component_id.value() +
+               "' has no model binding and must omit root pose");
+    }
+    if (has_model && is_child && component.root_pose_in_cell.has_value()) {
+      fail("controllable_components.root_pose_in_cell",
+           "attached child component '" + component.controllable_component_id.value() +
+               "' must omit root pose");
+    }
+    if (has_model && !is_child && !component.root_pose_in_cell.has_value()) {
+      fail("controllable_components.root_pose_in_cell",
+           "unattached spatial component '" + component.controllable_component_id.value() +
+               "' requires a root pose");
+    }
+  }
 }
 
 }  // namespace

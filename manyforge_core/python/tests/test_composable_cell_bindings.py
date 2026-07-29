@@ -43,7 +43,6 @@ STRONG_STRING_TYPES = (
     "ResourceId",
     "ResourceRoleId",
     "AttachmentInterfaceId",
-    "AttachmentRoleId",
     "ControlInterfaceContractId",
     "ControlInterfaceRevision",
     "ControllerTopologyId",
@@ -194,7 +193,7 @@ def _cell_graph():
         dependency_runtime_unit_ids=[],
         configuration=configuration,
     )
-    mount_pose = core.MountPoseDTO(
+    placement_pose = core.PlacementPoseDTO(
         position_m=[0.0, 0.0, 0.0],
         orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
     )
@@ -202,8 +201,6 @@ def _cell_graph():
         model_instance_id=core.ModelInstanceId("model/arm"),
         model_asset_id=core.ModelAssetId("asset/lite6"),
         model_revision=core.ModelRevision("sha256:model"),
-        mount_parent_frame_role=core.FrameRoleId("world"),
-        mount_pose=mount_pose,
         instance_parameters={"prefix": core.JsonValueDTO("arm_")},
     )
     component = core.ControllableComponentDTO(
@@ -217,6 +214,7 @@ def _cell_graph():
             )
         ],
         runtime_unit_ids=[runtime_unit.runtime_unit_id],
+        root_pose_in_cell=placement_pose,
     )
     domain = core.ControlDomainDTO(
         control_domain_id=core.ControlDomainId("domain/arm"),
@@ -285,12 +283,7 @@ def _cell_graph():
         ),
         parent=parent,
         child=child,
-        mount_pose=mount_pose,
-        role=core.AttachmentRoleId("tool"),
-        detachable=True,
-        tcp_effects=[core.FrameRoleId("tool_tcp")],
-        collision_effects=[core.CollisionBodyRoleId("tool_body")],
-        provenance_digest=core.ContentDigest("sha256:attachment-provenance"),
+        child_interface_pose_in_parent_interface=placement_pose,
     )
     graph = core.CellGraphDTO(
         api_version=core.CELL_GRAPH_API_VERSION,
@@ -511,13 +504,32 @@ def test_all_six_graph_records_and_envelope_round_trip_read_only():
     assert graph.control_domains == [values["domain"]]
     assert graph.control_bindings == [values["binding"]]
     assert graph.component_attachments == [values["attachment"]]
+    assert values["model_instance"].root_pose_in_cell is None
+    assert values["component"].root_pose_in_cell == core.PlacementPoseDTO(
+        position_m=[0.0, 0.0, 0.0],
+        orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+    )
+    assert (
+        values["attachment"].child_interface_pose_in_parent_interface
+        == values["component"].root_pose_in_cell
+    )
     for value, removed_field in (
         (values["runtime_unit"], "runtime_profile_digest"),
+        (values["model_instance"], "mount_parent_frame_role"),
+        (values["model_instance"], "mount_pose"),
         (values["component"], "component_type_digest"),
         (values["binding"], "provider_digest"),
         (values["binding"], "stop_evidence_policy_digest"),
+        (values["attachment"], "mount_pose"),
+        (values["attachment"], "role"),
+        (values["attachment"], "detachable"),
+        (values["attachment"], "tcp_effects"),
+        (values["attachment"], "collision_effects"),
+        (values["attachment"], "provenance_digest"),
     ):
         assert not hasattr(value, removed_field)
+    assert not hasattr(core, "MountPoseDTO")
+    assert not hasattr(core, "AttachmentRoleId")
 
     expected_record_types = {
         "RuntimeUnitDTO",
@@ -623,7 +635,7 @@ def test_deployment_trust_phase_failures_map_to_value_error():
         "api_version: manyforge.cell_graph.v1\n"
     )
     with pytest.raises(
-        core.CellGraphCodecError, match="wrong number of fields"
+        core.CellGraphCodecError, match="missing required field"
     ) as decode_error:
         core.decode_cell_graph_candidate(incomplete)
     assert type(decode_error.value) is core.CellGraphCodecError

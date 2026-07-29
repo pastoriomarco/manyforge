@@ -81,12 +81,18 @@ class IntrinsicallyValidatedCellGraphCandidate final {
 /// candidate data and preserve every nested array exactly; C0.2 must
 /// schema-classify, validate, normalize, and materialize defaults before
 /// GraphRevision is computed. Quaternion norm-squared must be within 1e-6 of
-/// one; accepted values are never silently renormalized.
+/// one; accepted values are never silently renormalized. Optional
+/// root_pose_in_cell fields are represented only by key absence; explicit null
+/// is rejected.
 [[nodiscard]] TypedCellGraphCandidate decode_cell_graph_candidate(
     const ParsedArtifactCandidate& parsed);
 
 /// Verifies every graph invariant that can be decided without resolving
-/// catalog payloads.
+/// catalog payloads. This includes per-component model-binding injectivity,
+/// global model ownership, owned/passive model placement, root/attached
+/// component placement, and an acyclic single-parent component-attachment
+/// forest. Declared component model-role bijection and attachment-interface
+/// compatibility/capacity remain catalog-resolved compiler checks.
 ///
 /// This does not compute or verify GraphRevision: true graph identity requires
 /// the exact catalog-constrained schemas, validation, and default

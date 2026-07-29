@@ -8,6 +8,7 @@
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/json_value.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -172,18 +173,20 @@ void register_cell_graph_bindings(py::module_& module) {
         return py::str("JsonValueDTO({})").format(py::repr(py::cast(value.value)));
       });
 
-  py::class_<MountPoseDTO>(module, "MountPoseDTO", py::is_final())
+  py::class_<PlacementPoseDTO>(module, "PlacementPoseDTO", py::is_final())
       .def(py::init([](std::array<double, 3> position_m, std::array<double, 4> orientation_xyzw) {
-             return MountPoseDTO{position_m, orientation_xyzw};
+             return PlacementPoseDTO{position_m, orientation_xyzw};
            }),
            py::arg("position_m"), py::arg("orientation_xyzw"))
-      .def_readonly("position_m", &MountPoseDTO::position_m)
-      .def_readonly("orientation_xyzw", &MountPoseDTO::orientation_xyzw)
+      .def_readonly("position_m", &PlacementPoseDTO::position_m)
+      .def_readonly("orientation_xyzw", &PlacementPoseDTO::orientation_xyzw)
       .def(
-          "__eq__", [](const MountPoseDTO& lhs, const MountPoseDTO& rhs) { return lhs == rhs; },
+          "__eq__",
+          [](const PlacementPoseDTO& lhs, const PlacementPoseDTO& rhs) { return lhs == rhs; },
           py::is_operator())
       .def(
-          "__ne__", [](const MountPoseDTO& lhs, const MountPoseDTO& rhs) { return lhs != rhs; },
+          "__ne__",
+          [](const PlacementPoseDTO& lhs, const PlacementPoseDTO& rhs) { return lhs != rhs; },
           py::is_operator());
 
   py::class_<ModelRoleBindingDTO>(module, "ModelRoleBindingDTO", py::is_final())
@@ -302,23 +305,21 @@ void register_cell_graph_bindings(py::module_& module) {
 
   py::class_<ModelInstanceDTO>(module, "ModelInstanceDTO", py::is_final())
       .def(py::init([](ModelInstanceId model_instance_id, ModelAssetId model_asset_id,
-                       ModelRevision model_revision, FrameRoleId mount_parent_frame_role,
-                       MountPoseDTO mount_pose, JsonObjectDTO instance_parameters) {
+                       ModelRevision model_revision, JsonObjectDTO instance_parameters,
+                       std::optional<PlacementPoseDTO> root_pose_in_cell) {
              return ModelInstanceDTO{
                  std::move(model_instance_id), std::move(model_asset_id),
-                 std::move(model_revision),    std::move(mount_parent_frame_role),
-                 std::move(mount_pose),        std::move(instance_parameters),
+                 std::move(model_revision), std::move(instance_parameters),
+                 std::move(root_pose_in_cell),
              };
            }),
            py::arg("model_instance_id"), py::arg("model_asset_id"), py::arg("model_revision"),
-           py::arg("mount_parent_frame_role"), py::arg("mount_pose"),
-           py::arg("instance_parameters"))
+           py::arg("instance_parameters"), py::arg("root_pose_in_cell") = std::nullopt)
       .def_readonly("model_instance_id", &ModelInstanceDTO::model_instance_id)
       .def_readonly("model_asset_id", &ModelInstanceDTO::model_asset_id)
       .def_readonly("model_revision", &ModelInstanceDTO::model_revision)
-      .def_readonly("mount_parent_frame_role", &ModelInstanceDTO::mount_parent_frame_role)
-      .def_readonly("mount_pose", &ModelInstanceDTO::mount_pose)
       .def_readonly("instance_parameters", &ModelInstanceDTO::instance_parameters)
+      .def_readonly("root_pose_in_cell", &ModelInstanceDTO::root_pose_in_cell)
       .def(
           "__eq__",
           [](const ModelInstanceDTO& lhs, const ModelInstanceDTO& rhs) { return lhs == rhs; },
@@ -333,22 +334,24 @@ void register_cell_graph_bindings(py::module_& module) {
                        ComponentTypeId component_type_id,
                        ComponentTypeRevision component_type_revision,
                        std::vector<ModelRoleBindingDTO> model_role_bindings,
-                       std::vector<RuntimeUnitId> runtime_unit_ids) {
+                       std::vector<RuntimeUnitId> runtime_unit_ids,
+                       std::optional<PlacementPoseDTO> root_pose_in_cell) {
              return ControllableComponentDTO{
                  std::move(controllable_component_id), std::move(component_type_id),
                  std::move(component_type_revision), std::move(model_role_bindings),
-                 std::move(runtime_unit_ids),
+                 std::move(runtime_unit_ids), std::move(root_pose_in_cell),
              };
            }),
            py::arg("controllable_component_id"), py::arg("component_type_id"),
            py::arg("component_type_revision"), py::arg("model_role_bindings"),
-           py::arg("runtime_unit_ids"))
+           py::arg("runtime_unit_ids"), py::arg("root_pose_in_cell") = std::nullopt)
       .def_readonly("controllable_component_id",
                     &ControllableComponentDTO::controllable_component_id)
       .def_readonly("component_type_id", &ControllableComponentDTO::component_type_id)
       .def_readonly("component_type_revision", &ControllableComponentDTO::component_type_revision)
       .def_readonly("model_role_bindings", &ControllableComponentDTO::model_role_bindings)
       .def_readonly("runtime_unit_ids", &ControllableComponentDTO::runtime_unit_ids)
+      .def_readonly("root_pose_in_cell", &ControllableComponentDTO::root_pose_in_cell)
       .def(
           "__eq__",
           [](const ControllableComponentDTO& lhs, const ControllableComponentDTO& rhs) {
@@ -491,38 +494,25 @@ void register_cell_graph_bindings(py::module_& module) {
       .def(py::init([](ComponentAttachmentId component_attachment_id,
                        ComponentAttachmentRevision component_attachment_revision,
                        ComponentAttachmentEndpointDTO parent, ComponentAttachmentEndpointDTO child,
-                       MountPoseDTO mount_pose, AttachmentRoleId role, bool detachable,
-                       std::vector<FrameRoleId> tcp_effects,
-                       std::vector<CollisionBodyRoleId> collision_effects,
-                       ContentDigest provenance_digest) {
+                       PlacementPoseDTO child_interface_pose_in_parent_interface) {
              return ComponentAttachmentEdgeDTO{
                  std::move(component_attachment_id),
                  std::move(component_attachment_revision),
                  std::move(parent),
                  std::move(child),
-                 std::move(mount_pose),
-                 std::move(role),
-                 detachable,
-                 std::move(tcp_effects),
-                 std::move(collision_effects),
-                 std::move(provenance_digest),
+                 std::move(child_interface_pose_in_parent_interface),
              };
            }),
            py::arg("component_attachment_id"), py::arg("component_attachment_revision"),
-           py::arg("parent"), py::arg("child"), py::arg("mount_pose"), py::arg("role"),
-           py::arg("detachable"), py::arg("tcp_effects"), py::arg("collision_effects"),
-           py::arg("provenance_digest"))
+           py::arg("parent"), py::arg("child"),
+           py::arg("child_interface_pose_in_parent_interface"))
       .def_readonly("component_attachment_id", &ComponentAttachmentEdgeDTO::component_attachment_id)
       .def_readonly("component_attachment_revision",
                     &ComponentAttachmentEdgeDTO::component_attachment_revision)
       .def_readonly("parent", &ComponentAttachmentEdgeDTO::parent)
       .def_readonly("child", &ComponentAttachmentEdgeDTO::child)
-      .def_readonly("mount_pose", &ComponentAttachmentEdgeDTO::mount_pose)
-      .def_readonly("role", &ComponentAttachmentEdgeDTO::role)
-      .def_readonly("detachable", &ComponentAttachmentEdgeDTO::detachable)
-      .def_readonly("tcp_effects", &ComponentAttachmentEdgeDTO::tcp_effects)
-      .def_readonly("collision_effects", &ComponentAttachmentEdgeDTO::collision_effects)
-      .def_readonly("provenance_digest", &ComponentAttachmentEdgeDTO::provenance_digest)
+      .def_readonly("child_interface_pose_in_parent_interface",
+                    &ComponentAttachmentEdgeDTO::child_interface_pose_in_parent_interface)
       .def(
           "__eq__",
           [](const ComponentAttachmentEdgeDTO& lhs, const ComponentAttachmentEdgeDTO& rhs) {

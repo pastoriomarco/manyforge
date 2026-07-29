@@ -44,19 +44,11 @@ constexpr std::string_view kZeroDigest =
     model_asset_id: lite6_model
     model_revision: )YAML" + std::string(kZeroDigest) +
                                   R"YAML(
-    mount_parent_frame_role: cell_world
-    mount_pose:
-      position_m: [0.0, 0.0, 0.0]
-      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
     instance_parameters: {symbol_prefix: robot_1_}
 )YAML";
   const std::string second_model = R"YAML(
   - instance_parameters:
       symbol_prefix: robot_2_
-    mount_pose:
-      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
-      position_m: [1.0, 0.0, 0.0]
-    mount_parent_frame_role: cell_world
     model_revision: )YAML" + std::string(kZeroDigest) +
                                    R"YAML(
     model_asset_id: lite6_model
@@ -70,9 +62,15 @@ constexpr std::string_view kZeroDigest =
     model_role_bindings:
       - {model_role_id: base, model_instance_id: robot_1_model}
     runtime_unit_ids: []
+    root_pose_in_cell:
+      position_m: [0.0, 0.0, 0.0]
+      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
 )YAML";
   const std::string second_component = R"YAML(
-  - runtime_unit_ids: []
+  - root_pose_in_cell:
+      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+      position_m: [1.0, 0.0, 0.0]
+    runtime_unit_ids: []
     model_role_bindings:
       - model_instance_id: robot_2_model
         model_role_id: base
@@ -120,19 +118,11 @@ model_instances:
     model_asset_id: arm_asset
     model_revision: )YAML" +
          std::string(kZeroDigest) + R"YAML(
-    mount_parent_frame_role: cell_world
-    mount_pose:
-      position_m: [0.0, 0.0, 0.0]
-      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
     instance_parameters: {}
   - model_instance_id: tool_model
     model_asset_id: tool_asset
     model_revision: )YAML" +
          std::string(kZeroDigest) + R"YAML(
-    mount_parent_frame_role: cell_world
-    mount_pose:
-      position_m: [0.0, 0.0, 0.1]
-      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
     instance_parameters: {}
 controllable_components:
   - controllable_component_id: arm
@@ -142,6 +132,9 @@ controllable_components:
     model_role_bindings:
       - {model_role_id: base, model_instance_id: arm_model}
     runtime_unit_ids: [observer, driver]
+    root_pose_in_cell:
+      position_m: [0.0, 0.0, 0.0]
+      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
   - controllable_component_id: tool
     component_type_id: tool_type
     component_type_revision: )YAML" +
@@ -205,15 +198,10 @@ component_attachments:
     child:
       controllable_component_id: tool
       attachment_interface_id: mount
-    mount_pose:
+    child_interface_pose_in_parent_interface:
       position_m: [0.0, 0.0, 0.1]
       orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
-    role: end_effector
-    detachable: true
-    tcp_effects: [tool_tcp]
-    collision_effects: [tool_collision]
-    provenance_digest: )YAML" +
-         std::string(kZeroDigest) + "\n";
+)YAML";
 }
 
 // Independently authored from the closed graph schema, not emitted by the
@@ -222,16 +210,11 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
     "{\"api_version\":\"manyforge.cell_graph.v1\",\"cell_id\":\"full_cell\",\"component_"
     "attachments\":["
     "{\"child\":{\"attachment_interface_id\":\"mount\",\"controllable_component_id\":\"tool\"},"
-    "\"collisi"
-    "on_effects\":[\"tool_collision\"],\"component_attachment_id\":\"tool_on_arm\",\"component_"
-    "attach"
-    "ment_revision\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\""
-    ",\"detachable\":true,\"mount_pose\":{\"orientation_xyzw\":[0,0,0,1],\"position_m\":[0,0,0.1]},"
-    "\"p"
-    "arent\":{\"attachment_interface_id\":\"flange\",\"controllable_component_id\":\"arm\"},"
-    "\"provenanc"
-    "e_digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"rol"
-    "e\":\"end_effector\",\"tcp_effects\":[\"tool_tcp\"]}],\"control_bindings\":[{\"capability_"
+    "\"child_interface_pose_in_parent_interface\":{\"orientation_xyzw\":[0,0,0,1],\"position_m\":"
+    "[0,0,0.1]},\"component_attachment_id\":\"tool_on_arm\",\"component_attachment_revision\":"
+    "\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"parent\":{"
+    "\"attachment_interface_id\":\"flange\",\"controllable_component_id\":\"arm\"}}],\"control_"
+    "bindings\":[{\"capability_"
     "definition_revision\":\"sha256:000000000000000000000000000000000000000000000000000000000000"
     "0000\",\"capability_id\":\"execution.trajectory.execute\",\"command_target_id\":\"arm\","
     "\"containment_granularity\":"
@@ -272,7 +255,8 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
     "n\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"controllab"
     "le_component_id\":\"arm\",\"model_role_bindings\":[{\"model_instance_id\":\"arm_model\","
     "\"model_ro"
-    "le_id\":\"base\"}],\"runtime_unit_ids\":[\"driver\",\"observer\"]},{\"component_type_id\""
+    "le_id\":\"base\"}],\"root_pose_in_cell\":{\"orientation_xyzw\":[0,0,0,1],\"position_m\":[0,0,"
+    "0]},\"runtime_unit_ids\":[\"driver\",\"observer\"]},{\"component_type_id\""
     ":\"tool_type\",\"component_type_revision\":\"sha256:00000000000000000000000000000000000000000"
     "00000000000000000000000\",\"controllable_component_id\":\"tool\",\"model_role_bindings\":[{"
     "\"mod"
@@ -282,14 +266,10 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
     "instances\":[{\"instance_parameters\":{},\"model_asset_id\":\"arm_asset\",\"model_instance_"
     "id\":\""
     "arm_model\",\"model_revision\":\"sha256:0000000000000000000000000000000000000000000000000000"
-    "000000000000\",\"mount_parent_frame_role\":\"cell_world\",\"mount_pose\":{\"orientation_"
-    "xyzw\":[0"
-    ",0,0,1],\"position_m\":[0,0,0]}},{\"instance_parameters\":{},\"model_asset_id\":\"tool_"
+    "000000000000\"},{\"instance_parameters\":{},\"model_asset_id\":\"tool_"
     "asset\",\""
     "model_instance_id\":\"tool_model\",\"model_revision\":\"sha256:0000000000000000000000000000000"
-    "000000000000000000000000000000000\",\"mount_parent_frame_role\":\"cell_world\",\"mount_pose\":"
-    "{"
-    "\"orientation_xyzw\":[0,0,0,1],\"position_m\":[0,0,0.1]}}],\"runtime_units\":[{"
+    "000000000000000000000000000000000\"}],\"runtime_units\":[{"
     "\"configuration\""
     ":{\"robot_ip_ref\":\"site.robot.ip\"},\"dependency_runtime_unit_ids\":[\"observer\"],"
     "\"runtime_profile_id\":\"driver_profile\",\"runtime_profile_revision\":\"sha256:"
@@ -329,10 +309,17 @@ TEST(CellGraphCodec, EnforcesBoundedAsciiIdentityGrammar) {
   EXPECT_THROW({ (void)decode(empty_graph("_leading_separator")); }, CellGraphCodecError);
   EXPECT_THROW({ (void)decode(empty_graph("contains/slash")); }, CellGraphCodecError);
   EXPECT_THROW({ (void)decode(empty_graph("ròbot")); }, CellGraphCodecError);
-  EXPECT_THROW({ (void)decode(replace_once(full_graph(), "role: end_effector", "role: \"\"")); },
-               CellGraphCodecError);
   EXPECT_THROW(
-      { (void)decode(replace_once(full_graph(), "role: end_effector", "role: contains/slash")); },
+      {
+        (void)decode(replace_once(full_graph(), "attachment_interface_id: flange",
+                                  "attachment_interface_id: \"\""));
+      },
+      CellGraphCodecError);
+  EXPECT_THROW(
+      {
+        (void)decode(replace_once(full_graph(), "attachment_interface_id: flange",
+                                  "attachment_interface_id: contains/slash"));
+      },
       CellGraphCodecError);
 }
 
@@ -385,7 +372,7 @@ TEST(CellGraphCodec, RejectsRemovedCatalogByteDigestCompatibilityFields) {
       CellGraphCodecError);
 }
 
-TEST(CellGraphCodec, TwoSameTypeInstancesAreDistinctAndValid) {
+TEST(CellGraphCodec, TwoSameTypeInstancesAreDistinctAndIntrinsicallyValid) {
   const auto validated = validate(two_instance_graph(true));
 
   ASSERT_EQ(validated.graph().model_instances.size(), 2U);
@@ -395,7 +382,7 @@ TEST(CellGraphCodec, TwoSameTypeInstancesAreDistinctAndValid) {
             "articulated_arm");
 }
 
-TEST(CellGraphCodec, OneModelMayFulfillMultipleRolesInOneComponent) {
+TEST(CellGraphCodec, RejectsOneModelBoundToMultipleRolesInOneComponent) {
   std::string graph = two_instance_graph(false);
   graph = replace_once(std::move(graph),
                        "      - {model_role_id: base, model_instance_id: robot_1_model}\n"
@@ -404,11 +391,57 @@ TEST(CellGraphCodec, OneModelMayFulfillMultipleRolesInOneComponent) {
                        "      - {model_role_id: base, model_instance_id: robot_1_model}\n"
                        "    runtime_unit_ids: []");
 
+  EXPECT_THROW({ (void)decode(std::move(graph)); }, CellGraphCodecError);
+}
+
+TEST(CellGraphCodec, RejectsOneModelRoleBoundToMultipleModels) {
+  std::string graph = two_instance_graph(false);
+  graph = replace_once(std::move(graph),
+                       "      - {model_role_id: base, model_instance_id: robot_1_model}\n"
+                       "    runtime_unit_ids: []",
+                       "      - {model_role_id: base, model_instance_id: robot_1_model}\n"
+                       "      - {model_role_id: base, model_instance_id: robot_2_model}\n"
+                       "    runtime_unit_ids: []");
+
+  EXPECT_THROW({ (void)decode(std::move(graph)); }, CellGraphCodecError);
+}
+
+TEST(CellGraphCodec, AllowsInjectiveMultiModelBindingPendingCatalogBijection) {
+  std::string graph = empty_graph();
+  graph = replace_once(
+      std::move(graph), "model_instances: []",
+      "model_instances:\n"
+      "  - model_instance_id: base_model\n"
+      "    model_asset_id: base_asset\n"
+      "    model_revision: " +
+          std::string(kZeroDigest) +
+          "\n"
+          "    instance_parameters: {}\n"
+          "  - model_instance_id: tool_model\n"
+          "    model_asset_id: tool_asset\n"
+          "    model_revision: " +
+          std::string(kZeroDigest) +
+          "\n"
+          "    instance_parameters: {}");
+  graph = replace_once(
+      std::move(graph), "controllable_components: []",
+      "controllable_components:\n"
+      "  - controllable_component_id: aggregate\n"
+      "    component_type_id: aggregate_type\n"
+      "    component_type_revision: " +
+          std::string(kZeroDigest) +
+          "\n"
+          "    model_role_bindings:\n"
+          "      - {model_role_id: base, model_instance_id: base_model}\n"
+          "      - {model_role_id: tool, model_instance_id: tool_model}\n"
+          "    runtime_unit_ids: []\n"
+          "    root_pose_in_cell:\n"
+          "      position_m: [0.0, 0.0, 0.0]\n"
+          "      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]");
+
   const auto validated = validate(std::move(graph));
-  ASSERT_EQ(validated.graph().controllable_components[0].model_role_bindings.size(), 2U);
-  EXPECT_EQ(
-      validated.graph().controllable_components[0].model_role_bindings[0].model_role_id.value(),
-      "base");
+  ASSERT_EQ(validated.graph().controllable_components.size(), 1U);
+  EXPECT_EQ(validated.graph().controllable_components[0].model_role_bindings.size(), 2U);
 }
 
 TEST(CellGraphCodec, NormalizesSetsButPreservesResourceBindingOrder) {
@@ -454,6 +487,42 @@ TEST(CellGraphCodec, RejectsUnknownAndDuplicateFields) {
       CellGraphCodecError);
 }
 
+TEST(CellGraphCodec, OptionalPlacementUsesAbsenceAndRejectsNullOrLegacyFields) {
+  EXPECT_NO_THROW({ (void)decode(two_instance_graph(false)); });
+
+  const std::string root_pose =
+      "    root_pose_in_cell:\n"
+      "      position_m: [0.0, 0.0, 0.0]\n"
+      "      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]\n";
+  EXPECT_THROW(
+      {
+        (void)decode(replace_once(two_instance_graph(false), root_pose,
+                                  "    root_pose_in_cell: null\n"));
+      },
+      CellGraphCodecError);
+  EXPECT_THROW(
+      {
+        (void)decode(replace_once(full_graph(), "    instance_parameters: {}",
+                                  "    instance_parameters: {}\n"
+                                  "    root_pose_in_cell: null"));
+      },
+      CellGraphCodecError);
+  EXPECT_THROW(
+      {
+        (void)decode(replace_once(full_graph(), "    instance_parameters: {}",
+                                  "    mount_parent_frame_role: cell_world\n"
+                                  "    instance_parameters: {}"));
+      },
+      CellGraphCodecError);
+  EXPECT_THROW(
+      {
+        (void)decode(replace_once(full_graph(),
+                                  "    child_interface_pose_in_parent_interface:",
+                                  "    mount_pose:"));
+      },
+      CellGraphCodecError);
+}
+
 TEST(CellGraphCodec, RejectsMalformedDigestAndQuaternion) {
   EXPECT_THROW(
       { (void)decode(replace_once(empty_graph(), std::string(kZeroDigest), "sha256:ABC")); },
@@ -465,6 +534,13 @@ TEST(CellGraphCodec, RejectsMalformedDigestAndQuaternion) {
                                   "orientation_xyzw: [0.0, 0.0, 0.0, 2.0]"));
       },
       CellGraphCodecError);
+  EXPECT_THROW(
+      {
+        (void)decode(replace_once(two_instance_graph(false),
+                                  "position_m: [0.0, 0.0, 0.0]",
+                                  "position_m: [0.0, 0.0, 1e309]"));
+      },
+      ArtifactCodecError);
 }
 
 TEST(CellGraphCodec, UsesPracticalQuaternionToleranceWithoutRenormalizing) {
@@ -472,14 +548,19 @@ TEST(CellGraphCodec, UsesPracticalQuaternionToleranceWithoutRenormalizing) {
       replace_once(two_instance_graph(false), "orientation_xyzw: [0.0, 0.0, 0.0, 1.0]",
                    "orientation_xyzw: [0.0, 0.0, 0.70710678, 0.70710678]");
   const TypedCellGraphCandidate candidate = decode(std::move(rounded));
-  EXPECT_DOUBLE_EQ(candidate.graph().model_instances[0].mount_pose.orientation_xyzw[2], 0.70710678);
+  ASSERT_TRUE(candidate.graph().controllable_components[0].root_pose_in_cell.has_value());
+  EXPECT_DOUBLE_EQ(
+      candidate.graph().controllable_components[0].root_pose_in_cell->orientation_xyzw[2],
+      0.70710678);
 
   std::string near_boundary =
       replace_once(two_instance_graph(false), "orientation_xyzw: [0.0, 0.0, 0.0, 1.0]",
                    "orientation_xyzw: [0.0, 0.0, 0.0, 1.0000004]");
   const TypedCellGraphCandidate near_candidate = decode(std::move(near_boundary));
-  EXPECT_DOUBLE_EQ(near_candidate.graph().model_instances[0].mount_pose.orientation_xyzw[3],
-                   1.0000004);
+  ASSERT_TRUE(near_candidate.graph().controllable_components[0].root_pose_in_cell.has_value());
+  EXPECT_DOUBLE_EQ(
+      near_candidate.graph().controllable_components[0].root_pose_in_cell->orientation_xyzw[3],
+      1.0000004);
 
   std::string outside =
       replace_once(two_instance_graph(false), "orientation_xyzw: [0.0, 0.0, 0.0, 1.0]",
@@ -493,8 +574,16 @@ TEST(CellGraphCodec, PreservesQuaternionSignRepresentation) {
       decode(replace_once(two_instance_graph(false), "orientation_xyzw: [0.0, 0.0, 0.0, 1.0]",
                           "orientation_xyzw: [0.0, 0.0, 0.0, -1.0]"));
 
-  EXPECT_EQ(positive.graph().model_instances[0].mount_pose.orientation_xyzw[3], 1.0);
-  EXPECT_EQ(negative.graph().model_instances[0].mount_pose.orientation_xyzw[3], -1.0);
+  ASSERT_TRUE(positive.graph().controllable_components[0].root_pose_in_cell.has_value());
+  ASSERT_TRUE(negative.graph().controllable_components[0].root_pose_in_cell.has_value());
+  EXPECT_EQ(positive.graph()
+                .controllable_components[0]
+                .root_pose_in_cell->orientation_xyzw[3],
+            1.0);
+  EXPECT_EQ(negative.graph()
+                .controllable_components[0]
+                .root_pose_in_cell->orientation_xyzw[3],
+            -1.0);
   EXPECT_NE(canonical_json(positive.structurally_normalized_root()),
             canonical_json(negative.structurally_normalized_root()));
 }
@@ -545,6 +634,75 @@ TEST(CellGraphCodec, RejectsMultipleModelOwnersAndTopologyMismatch) {
   EXPECT_THROW({ (void)validate(std::move(mismatch)); }, CellGraphCodecError);
 }
 
+TEST(CellGraphCodec, EnforcesOwnedPassiveAndComponentRootPlacement) {
+  std::string owned_model_with_root = full_graph();
+  owned_model_with_root =
+      replace_once(std::move(owned_model_with_root), "    instance_parameters: {}",
+                   "    instance_parameters: {}\n"
+                   "    root_pose_in_cell:\n"
+                   "      position_m: [0.0, 0.0, 0.0]\n"
+                   "      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]");
+  EXPECT_THROW({ (void)validate(std::move(owned_model_with_root)); }, CellGraphCodecError);
+
+  std::string passive_missing = empty_graph();
+  passive_missing = replace_once(
+      std::move(passive_missing), "model_instances: []",
+      "model_instances:\n"
+      "  - model_instance_id: passive_model\n"
+      "    model_asset_id: fixture_asset\n"
+      "    model_revision: " +
+          std::string(kZeroDigest) +
+          "\n"
+          "    instance_parameters: {}");
+  EXPECT_THROW({ (void)validate(passive_missing); }, CellGraphCodecError);
+
+  std::string passive_placed =
+      replace_once(std::move(passive_missing), "    instance_parameters: {}",
+                   "    instance_parameters: {}\n"
+                   "    root_pose_in_cell:\n"
+                   "      position_m: [0.0, 0.0, 0.0]\n"
+                   "      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]");
+  EXPECT_NO_THROW({ (void)validate(std::move(passive_placed)); });
+
+  const std::string component_root =
+      "    root_pose_in_cell:\n"
+      "      position_m: [0.0, 0.0, 0.0]\n"
+      "      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]\n";
+  EXPECT_THROW(
+      { (void)validate(replace_once(two_instance_graph(false), component_root, "")); },
+      CellGraphCodecError);
+
+  std::string attached_with_root = full_graph();
+  attached_with_root =
+      replace_once(std::move(attached_with_root),
+                   "    model_role_bindings:\n"
+                   "      - {model_role_id: body, model_instance_id: tool_model}\n"
+                   "    runtime_unit_ids: []",
+                   "    model_role_bindings:\n"
+                   "      - {model_role_id: body, model_instance_id: tool_model}\n"
+                   "    runtime_unit_ids: []\n"
+                   "    root_pose_in_cell:\n"
+                   "      position_m: [0.0, 0.0, 0.0]\n"
+                   "      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]");
+  EXPECT_THROW({ (void)validate(std::move(attached_with_root)); }, CellGraphCodecError);
+
+  std::string model_free_with_root = empty_graph();
+  model_free_with_root = replace_once(
+      std::move(model_free_with_root), "controllable_components: []",
+      "controllable_components:\n"
+      "  - controllable_component_id: io\n"
+      "    component_type_id: io_type\n"
+      "    component_type_revision: " +
+          std::string(kZeroDigest) +
+          "\n"
+          "    model_role_bindings: []\n"
+          "    runtime_unit_ids: []\n"
+          "    root_pose_in_cell:\n"
+          "      position_m: [0.0, 0.0, 0.0]\n"
+          "      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]");
+  EXPECT_THROW({ (void)validate(std::move(model_free_with_root)); }, CellGraphCodecError);
+}
+
 TEST(CellGraphCodec, RejectsInvalidBindingRouteAndResourceDuplicates) {
   EXPECT_THROW(
       {
@@ -580,11 +738,29 @@ TEST(CellGraphCodec, RejectsAttachmentCyclesAndMultipleParents) {
   cycle.append(reverse_edge);
   EXPECT_THROW({ (void)validate(std::move(cycle)); }, CellGraphCodecError);
 
+  std::string self = original;
+  const std::size_t attachments = self.find(edge_marker);
+  ASSERT_NE(attachments, std::string::npos);
+  const std::size_t child_component =
+      self.find("controllable_component_id: tool", attachments);
+  ASSERT_NE(child_component, std::string::npos);
+  self.replace(child_component, std::string("controllable_component_id: tool").size(),
+               "controllable_component_id: arm");
+  EXPECT_THROW({ (void)validate(std::move(self)); }, CellGraphCodecError);
+
+  std::string duplicate = original;
+  std::string duplicate_edge = edge;
+  duplicate_edge = replace_once(std::move(duplicate_edge), "tool_on_arm", "tool_on_arm_duplicate");
+  duplicate.append(duplicate_edge);
+  EXPECT_THROW({ (void)validate(std::move(duplicate)); }, CellGraphCodecError);
+
   std::string multiple_parent = original;
   std::string second_edge = edge;
   second_edge = replace_once(std::move(second_edge), "tool_on_arm", "tool_on_arm_2");
   second_edge = replace_once(std::move(second_edge), "attachment_interface_id: flange",
                              "attachment_interface_id: flange_2");
+  second_edge = replace_once(std::move(second_edge), "attachment_interface_id: mount",
+                             "attachment_interface_id: mount_2");
   multiple_parent.append(second_edge);
   EXPECT_THROW({ (void)validate(std::move(multiple_parent)); }, CellGraphCodecError);
 }

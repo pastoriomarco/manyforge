@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <manyforge_core/types/catalog.hpp>
+#include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/strong_id.hpp>
+#include <optional>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -60,8 +62,12 @@ static_assert(std::is_same_v<decltype(RuntimeUnitDTO::runtime_unit_id), RuntimeU
 static_assert(
     std::is_same_v<decltype(RuntimeUnitDTO::runtime_profile_revision), RuntimeProfileRevision>);
 static_assert(std::is_same_v<decltype(ModelInstanceDTO::model_revision), ModelRevision>);
+static_assert(std::is_same_v<decltype(ModelInstanceDTO::root_pose_in_cell),
+                             std::optional<PlacementPoseDTO>>);
 static_assert(std::is_same_v<decltype(ControllableComponentDTO::model_role_bindings),
                              std::vector<ModelRoleBindingDTO>>);
+static_assert(std::is_same_v<decltype(ControllableComponentDTO::root_pose_in_cell),
+                             std::optional<PlacementPoseDTO>>);
 static_assert(
     std::is_same_v<decltype(ControlDomainDTO::containment_granularity), ContainmentGranularity>);
 static_assert(
@@ -71,11 +77,9 @@ static_assert(std::is_same_v<decltype(ControlBindingDTO::capability_definition_r
                              CapabilityDefinitionRevision>);
 static_assert(
     std::is_same_v<decltype(ComponentAttachmentEdgeDTO::parent), ComponentAttachmentEndpointDTO>);
-static_assert(std::is_same_v<decltype(ComponentAttachmentEdgeDTO::role), AttachmentRoleId>);
-static_assert(
-    std::is_same_v<decltype(ComponentAttachmentEdgeDTO::tcp_effects), std::vector<FrameRoleId>>);
-static_assert(std::is_same_v<decltype(ComponentAttachmentEdgeDTO::collision_effects),
-                             std::vector<CollisionBodyRoleId>>);
+static_assert(std::is_same_v<
+              decltype(ComponentAttachmentEdgeDTO::child_interface_pose_in_parent_interface),
+              PlacementPoseDTO>);
 
 static_assert(!HasGraphRevision<RuntimeUnitDTO>);
 static_assert(!HasGraphRevision<ModelInstanceDTO>);
@@ -122,9 +126,8 @@ TEST(ComposableCellContracts, SixGraphRecordShapesComposeOneClosedEnvelope) {
       ModelInstanceId{"model.lite6.a"},
       ModelAssetId{"asset.lite6"},
       ModelRevision{kDigest},
-      FrameRoleId{"cell_world"},
-      MountPoseDTO{},
       {},
+      std::nullopt,
   };
   const ControllableComponentDTO component{
       ControllableComponentId{"component.lite6.a"},
@@ -132,6 +135,7 @@ TEST(ComposableCellContracts, SixGraphRecordShapesComposeOneClosedEnvelope) {
       ComponentTypeRevision{kDigest},
       {{ModelRoleId{"base"}, model_instance.model_instance_id}},
       {runtime_unit.runtime_unit_id},
+      PlacementPoseDTO{},
   };
   const ControlDomainDTO domain{
       ControlDomainId{"domain.lite6.a"},      ControlDomainRevision{kDigest},
@@ -169,12 +173,7 @@ TEST(ComposableCellContracts, SixGraphRecordShapesComposeOneClosedEnvelope) {
       ComponentAttachmentRevision{kDigest},
       {component.controllable_component_id, AttachmentInterfaceId{"flange"}},
       {ControllableComponentId{"component.tool.a"}, AttachmentInterfaceId{"tool_mount"}},
-      MountPoseDTO{},
-      AttachmentRoleId{"end_effector"},
-      true,
-      {FrameRoleId{"tool_tcp"}},
-      {CollisionBodyRoleId{"tool_collision"}},
-      ContentDigest{kDigest},
+      PlacementPoseDTO{},
   };
 
   const CellGraphDTO graph{
@@ -306,6 +305,94 @@ TEST(ComposableCellContracts, ContactPolicyRegistryUsesReferentOwnFieldNames) {
   EXPECT_EQ(descriptor.own_id_field, "policy_id");
   EXPECT_EQ(descriptor.own_revision_field, "version");
   EXPECT_TRUE(catalog_record_ref_matches_registry_family(record));
+}
+
+TEST(ComposableCellContracts,
+     CapabilityDefinitionRegistryIsExactTypedAndCodeOwned) {
+  EXPECT_EQ(kCapabilityDefinitionApiVersion,
+            "manyforge.capability_definition.v1");
+  ASSERT_EQ(kBuiltinCapabilityDefinitionRegistry.size(), 67U);
+
+  std::set<std::string_view> capability_ids;
+  std::size_t target_binding_count = 0U;
+  std::size_t cell_global_count = 0U;
+  std::size_t control_domain_count = 0U;
+  std::size_t control_binding_count = 0U;
+  std::size_t capability_provider_binding_count = 0U;
+  for (const auto& descriptor : kBuiltinCapabilityDefinitionRegistry) {
+    EXPECT_TRUE(capability_ids.insert(descriptor.capability_id).second);
+    EXPECT_EQ(find_builtin_capability_definition(descriptor.capability_id),
+              &descriptor);
+    EXPECT_TRUE(descriptor.capability_definition_revision.starts_with(
+        "sha256:"));
+    EXPECT_EQ(descriptor.capability_definition_revision.size(), 71U);
+    EXPECT_FALSE(descriptor.requirement_parameters_schema_ref.has_value());
+
+    target_binding_count +=
+        descriptor.scope == CapabilityScope::kTargetBinding ? 1U : 0U;
+    cell_global_count +=
+        descriptor.scope == CapabilityScope::kCellGlobal ? 1U : 0U;
+    control_domain_count +=
+        descriptor.scope == CapabilityScope::kControlDomain ? 1U : 0U;
+    control_binding_count +=
+        descriptor.provider_binding_kind ==
+                CapabilityProviderBindingKind::kControlBinding
+            ? 1U
+            : 0U;
+    capability_provider_binding_count +=
+        descriptor.provider_binding_kind ==
+                CapabilityProviderBindingKind::kCapabilityProviderBinding
+            ? 1U
+            : 0U;
+
+    const auto materialized =
+        materialize_capability_definition(descriptor);
+    EXPECT_EQ(materialized.capability_id.value(),
+              descriptor.capability_id);
+    EXPECT_EQ(materialized.capability_definition_revision.value(),
+              descriptor.capability_definition_revision);
+    EXPECT_EQ(materialized.scope, descriptor.scope);
+    EXPECT_EQ(materialized.provider_binding_kind,
+              descriptor.provider_binding_kind);
+    EXPECT_FALSE(
+        materialized.requirement_parameters_schema_ref.has_value());
+  }
+  EXPECT_EQ(target_binding_count, 33U);
+  EXPECT_EQ(cell_global_count, 26U);
+  EXPECT_EQ(control_domain_count, 8U);
+  EXPECT_EQ(control_binding_count, 22U);
+  EXPECT_EQ(capability_provider_binding_count, 45U);
+  EXPECT_EQ(find_builtin_capability_definition("context.state.current"),
+            nullptr);
+  EXPECT_EQ(find_builtin_capability_definition("unknown.capability"), nullptr);
+}
+
+TEST(ComposableCellContracts,
+     CapabilityDefinitionRegistryPinsRepresentativeSemantics) {
+  const auto* observed =
+      find_builtin_capability_definition("state.observed.current");
+  ASSERT_NE(observed, nullptr);
+  EXPECT_EQ(observed->scope, CapabilityScope::kTargetBinding);
+  EXPECT_EQ(observed->provider_binding_kind,
+            CapabilityProviderBindingKind::kControlBinding);
+  EXPECT_EQ(
+      observed->capability_definition_revision,
+      "sha256:c1ec4dacead10e33176830d634e9b2287e4b96322a54700c1c3910bcba461c02");
+
+  const auto* lifecycle =
+      find_builtin_capability_definition("component.lifecycle.enable");
+  ASSERT_NE(lifecycle, nullptr);
+  EXPECT_EQ(lifecycle->scope, CapabilityScope::kControlDomain);
+  EXPECT_EQ(lifecycle->provider_binding_kind,
+            CapabilityProviderBindingKind::kCapabilityProviderBinding);
+
+  const auto* scene =
+      find_builtin_capability_definition("scene.object.query");
+  ASSERT_NE(scene, nullptr);
+  EXPECT_EQ(scene->scope, CapabilityScope::kCellGlobal);
+  EXPECT_EQ(to_string(scene->scope), "cell_global");
+  EXPECT_EQ(to_string(scene->provider_binding_kind),
+            "capability_provider_binding");
 }
 
 }  // namespace
