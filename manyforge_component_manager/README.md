@@ -7,6 +7,25 @@ Composable Cell Component Manager. It currently owns two bounded mechanisms:
 - durable immutable operation identities, append-only journal replay, and an
   internal compare-and-swap persistence fixture.
 
+The adjacent ROS-free contracts in `manyforge_core` additionally define the
+bounded owner-to-owner substrate that this package will consume:
+
+- strongly separated Apply, bootstrap, stage, publication, runtime-epoch, and
+  configuration-fence identities/generations;
+- focused Manager-to-scene-owner Apply and canonical-empty bootstrap ports;
+- separate active-bundle publish and read-only receipt-verification
+  capabilities; and
+- an Apply-only Kernel fence acquire/rehydrate capability that exposes neither
+  generic Stop nor an unfrozen release operation.
+
+Those DTOs reject contradictory phase evidence, non-canonical transition
+rows, mismatched predecessor/candidate expectations, inconsistent native
+binding sets, invalid publication provenance, and fence reconciliation that
+would reopen admission without complete local evidence. Persisted required-set
+completeness and the final logical-scene snapshot contract remain owning-layer
+checks; the current contract substrate deliberately does not pretend to prove
+them.
+
 The observation reducer keeps process-observer evidence, runtime-source
 evidence, and Manager-derived freshness/dependency facts distinct. Adapters
 must serialize every call into one reducer instance. The reducer intentionally
@@ -34,13 +53,15 @@ suffix is not detectable by this foundation alone.
 
 ## Deliberate non-claims
 
-This checkpoint has no ROS types or callbacks and performs no process, scene,
-Kernel, controller, robot, command, lifecycle, or motion effect. Opaque
+These checkpoints have no ROS types or callbacks and perform no process,
+scene, Kernel, controller, robot, command, lifecycle, or motion effect. Opaque
 product/configuration/bundle/graph spellings are not I3 qualification. An
 operation row named `apply` records only immutable fixture identity; it is not
 the I4 Apply state machine. Likewise, `FoundationHead` is not
 `IActiveBundlePublicationStore`, an active-bundle pointer, staged readiness, or
-a publication receipt.
+a publication receipt. The new port/DTO substrate defines those focused
+interfaces but provides no implementation, durable store, scene owner, Apply
+coordinator, fence release, process convergence, or M0 behavior.
 
 These raw bounded spellings exist only for pre-I3 cross-language parity. Final
 retained-bundle integration must replace them at its boundary with the exact

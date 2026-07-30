@@ -107,6 +107,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_composable_cell_contracts
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_component_manager_ports
+    test/test_component_manager_ports.cpp)
+  target_link_libraries(test_component_manager_ports PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_component_manager_ports
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_execution_state_sink test/test_execution_state_sink.cpp)
   target_link_libraries(test_execution_state_sink PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_execution_state_sink

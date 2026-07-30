@@ -1,6 +1,7 @@
 #pragma once
 
 #include <compare>
+#include <cstdint>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -33,9 +34,44 @@ std::ostream& operator<<(std::ostream& stream, const StrongString<Tag>& value) {
   return stream << value.value();
 }
 
+/// Unsigned revision/generation value with compile-time separation between
+/// semantic domains.
+///
+/// Zero is representable because absence and initialization rules belong to
+/// the enclosing DTO state machine. DTOs that require an accepted/minted
+/// generation validate `nonzero()` at their trust boundary.
+template <typename Tag>
+class StrongCounter {
+ public:
+  explicit constexpr StrongCounter(std::uint64_t value) noexcept
+      : value_(value) {}
+
+  [[nodiscard]] constexpr std::uint64_t value() const noexcept {
+    return value_;
+  }
+  [[nodiscard]] constexpr bool nonzero() const noexcept { return value_ != 0U; }
+
+  friend constexpr bool operator==(const StrongCounter&,
+                                   const StrongCounter&) = default;
+  friend constexpr auto operator<=>(const StrongCounter&,
+                                    const StrongCounter&) = default;
+
+ private:
+  std::uint64_t value_;
+};
+
+template <typename Tag>
+std::ostream& operator<<(std::ostream& stream, const StrongCounter<Tag>& value) {
+  return stream << value.value();
+}
+
 #define MANYFORGE_DECLARE_STRONG_STRING(Name) \
   struct Name##Tag final {};                  \
   using Name = StrongString<Name##Tag>
+
+#define MANYFORGE_DECLARE_STRONG_COUNTER(Name) \
+  struct Name##Tag final {};                   \
+  using Name = StrongCounter<Name##Tag>
 
 MANYFORGE_DECLARE_STRONG_STRING(CellId);
 MANYFORGE_DECLARE_STRONG_STRING(GraphRevision);
@@ -48,6 +84,7 @@ MANYFORGE_DECLARE_STRONG_STRING(RuntimeProfileId);
 MANYFORGE_DECLARE_STRONG_STRING(RuntimeProfileRevision);
 MANYFORGE_DECLARE_STRONG_STRING(RuntimeRoleId);
 MANYFORGE_DECLARE_STRONG_STRING(RuntimeUnitId);
+MANYFORGE_DECLARE_STRONG_STRING(RuntimeEpoch);
 MANYFORGE_DECLARE_STRONG_STRING(RuntimePolicyId);
 MANYFORGE_DECLARE_STRONG_STRING(RuntimePolicyRevision);
 
@@ -79,6 +116,7 @@ MANYFORGE_DECLARE_STRONG_STRING(ControlDomainId);
 MANYFORGE_DECLARE_STRONG_STRING(ControlDomainRevision);
 MANYFORGE_DECLARE_STRONG_STRING(ControlBindingId);
 MANYFORGE_DECLARE_STRONG_STRING(ControlBindingRevision);
+MANYFORGE_DECLARE_STRONG_STRING(ActiveControlConfigurationId);
 MANYFORGE_DECLARE_STRONG_STRING(EndpointRoleId);
 MANYFORGE_DECLARE_STRONG_STRING(StateAuthorityId);
 MANYFORGE_DECLARE_STRONG_STRING(StopEvidencePolicyId);
@@ -108,9 +146,27 @@ MANYFORGE_DECLARE_STRONG_STRING(SiteOverlayValueRef);
 MANYFORGE_DECLARE_STRONG_STRING(ComponentAttachmentId);
 MANYFORGE_DECLARE_STRONG_STRING(ComponentAttachmentRevision);
 
+MANYFORGE_DECLARE_STRONG_STRING(RetainedBundleId);
+MANYFORGE_DECLARE_STRONG_STRING(SceneId);
+MANYFORGE_DECLARE_STRONG_STRING(ProjectionLeaseId);
+
+MANYFORGE_DECLARE_STRONG_STRING(RequestOwnerEpoch);
+MANYFORGE_DECLARE_STRONG_STRING(RequestId);
+MANYFORGE_DECLARE_STRONG_STRING(BootstrapId);
+MANYFORGE_DECLARE_STRONG_STRING(ApplyId);
+MANYFORGE_DECLARE_STRONG_STRING(ConfigurationFenceId);
+
 MANYFORGE_DECLARE_STRONG_STRING(CommandSchemaId);
 MANYFORGE_DECLARE_STRONG_STRING(CommandSchemaRevision);
 
+MANYFORGE_DECLARE_STRONG_COUNTER(ProjectionStageGeneration);
+MANYFORGE_DECLARE_STRONG_COUNTER(ActiveBundlePublicationGeneration);
+MANYFORGE_DECLARE_STRONG_COUNTER(BootstrapGeneration);
+MANYFORGE_DECLARE_STRONG_COUNTER(ApplyGeneration);
+MANYFORGE_DECLARE_STRONG_COUNTER(ConfigurationFenceGeneration);
+MANYFORGE_DECLARE_STRONG_COUNTER(ActiveControlConfigurationGeneration);
+
+#undef MANYFORGE_DECLARE_STRONG_COUNTER
 #undef MANYFORGE_DECLARE_STRONG_STRING
 
 }  // namespace manyforge::core

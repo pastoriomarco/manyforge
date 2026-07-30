@@ -23,9 +23,6 @@ using DeploymentArtifactId = StrongString<DeploymentArtifactIdTag>;
 struct DeploymentRevisionTag final {};
 using DeploymentRevision = StrongString<DeploymentRevisionTag>;
 
-struct RetainedBundleIdTag final {};
-using RetainedBundleId = StrongString<RetainedBundleIdTag>;
-
 struct ProductIdTag final {};
 using ProductId = StrongString<ProductIdTag>;
 
