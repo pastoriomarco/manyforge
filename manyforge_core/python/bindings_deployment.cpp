@@ -7,6 +7,7 @@
 #include <manyforge_deployment/closed_schema.hpp>
 #include <manyforge_deployment/control_interface_contract_codec.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
+#include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
 #include <string>
 #include <string_view>
@@ -35,6 +36,8 @@ void register_deployment_candidate_bindings(py::module_& module) {
       module, "ControlInterfaceContractCodecError", PyExc_ValueError);
   py::register_exception<deployment::ModelAssetCodecError>(
       module, "ModelAssetCodecError", PyExc_ValueError);
+  py::register_exception<deployment::RuntimeProfileCodecError>(
+      module, "RuntimeProfileCodecError", PyExc_ValueError);
   py::register_exception<deployment::StopEvidencePolicyCodecError>(
       module, "StopEvidencePolicyCodecError", PyExc_ValueError);
 
@@ -223,6 +226,17 @@ void register_deployment_candidate_bindings(py::module_& module) {
             return deployment::canonical_json(asset.normalized_root());
           });
 
+  py::class_<deployment::QualifiedRuntimeProfile>(
+      module, "QualifiedRuntimeProfile", py::is_final())
+      .def_property_readonly(
+          "value", &deployment::QualifiedRuntimeProfile::value)
+      .def_property_readonly(
+          "normalized_canonical_json",
+          [](const deployment::QualifiedRuntimeProfile& profile) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(profile.normalized_root());
+          });
+
   py::class_<deployment::QualifiedStopEvidencePolicy>(
       module, "QualifiedStopEvidencePolicy", py::is_final())
       .def_property_readonly(
@@ -264,6 +278,11 @@ void register_deployment_candidate_bindings(py::module_& module) {
              py::call_guard<py::gil_scoped_release>());
   module.def("resolve_and_qualify_model_asset",
              &deployment::resolve_and_qualify_model_asset,
+             py::arg("reference"), py::arg("resolved_store_key"),
+             py::arg("stored_bytes"),
+             py::call_guard<py::gil_scoped_release>());
+  module.def("resolve_and_qualify_runtime_profile",
+             &deployment::resolve_and_qualify_runtime_profile,
              py::arg("reference"), py::arg("resolved_store_key"),
              py::arg("stored_bytes"),
              py::call_guard<py::gil_scoped_release>());

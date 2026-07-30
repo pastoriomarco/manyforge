@@ -5,6 +5,7 @@
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
+#include <manyforge_core/types/runtime_profile.hpp>
 #include <manyforge_core/types/stop_evidence_policy.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
@@ -50,6 +51,7 @@ concept HasCatalogContentDigest = requires(T value) {
 static_assert(!std::is_same_v<CellId, ModelAssetId>);
 static_assert(!std::is_same_v<ModelAssetId, ModelInstanceId>);
 static_assert(!std::is_same_v<RuntimeProfileRevision, ModelRevision>);
+static_assert(!std::is_same_v<RuntimeRoleId, EndpointRoleId>);
 static_assert(!std::is_same_v<ModelRoleId, ModelGroupRoleId>);
 static_assert(!std::is_same_v<EndpointRoleId, StateAuthorityId>);
 static_assert(!std::is_same_v<ControlDomainId, ControlBindingId>);
@@ -113,6 +115,31 @@ TEST(ComposableCellContracts, ClosedEnumsExposeExactWireSpellings) {
   EXPECT_EQ(to_string(StateAuthorityClass::kCommanded), "commanded");
   EXPECT_EQ(to_string(StateAuthorityClass::kPredicted), "predicted");
   EXPECT_EQ(to_string(CatalogRecordKind::kControlInterfaceContract), "control_interface_contract");
+  EXPECT_EQ(to_string(RuntimeLifecycleControl::kManagerManaged),
+            "manager_managed");
+  EXPECT_EQ(to_string(RuntimeLifecycleControl::kExternallyManaged),
+            "externally_managed");
+}
+
+TEST(ComposableCellContracts,
+     RuntimeProfileSeparatesCatalogTruthFromRuntimeUnitConfiguration) {
+  const RuntimeProfileDTO profile{
+      RuntimeProfileId{"runtime-profile.xarm"},
+      RuntimeProfileRevision{kDigest},
+      ValueSchemaRefDTO{SchemaId{"manyforge.value_schema.runtime.empty.v1"},
+                        SchemaRevision{kDigest}},
+      RuntimeProcessContractDTO{
+          RuntimeLifecycleControl::kManagerManaged},
+      RuntimeSupervisionContractDTO{EndpointRoleId{"runtime_status"}},
+      {RuntimeRoleId{"driver"}},
+      {EndpointRoleId{"runtime_status"}},
+  };
+  EXPECT_EQ(profile.process_contract.lifecycle_control,
+            RuntimeLifecycleControl::kManagerManaged);
+  EXPECT_EQ(profile.offered_runtime_role_ids.front(),
+            RuntimeRoleId{"driver"});
+  EXPECT_EQ(profile.source_endpoint_role_ids.front(),
+            profile.supervision_contract.status_endpoint_role_id);
 }
 
 TEST(ComposableCellContracts, SixGraphRecordShapesComposeOneClosedEnvelope) {

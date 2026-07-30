@@ -25,6 +25,7 @@ STRONG_STRING_TYPES = (
     "ContentAddressedStoreKey",
     "RuntimeProfileId",
     "RuntimeProfileRevision",
+    "RuntimeRoleId",
     "RuntimeUnitId",
     "RuntimePolicyId",
     "RuntimePolicyRevision",
@@ -1286,11 +1287,12 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kQualified
     ]
-    assert len(qualified_entries) == 4
+    assert len(qualified_entries) == 5
     assert {entry.record_kind for entry in qualified_entries} == {
         core.CatalogRecordKind.kCapabilityDefinition,
         core.CatalogRecordKind.kControlInterfaceContract,
         core.CatalogRecordKind.kModelAsset,
+        core.CatalogRecordKind.kRuntimeProfile,
         core.CatalogRecordKind.kStopEvidencePolicy,
     }
     assert all(entry.compiled_schema is not None for entry in qualified_entries)
@@ -1298,6 +1300,7 @@ target: 0.5
         "catalog/manyforge.capability_definition.v1.yaml",
         "catalog/manyforge.control_interface_contract.v1.yaml",
         "catalog/manyforge.model_asset.v1.yaml",
+        "catalog/manyforge.runtime_profile.v1.yaml",
         "catalog/manyforge.stop_evidence_policy.v1.yaml",
     }
     assert all(
@@ -1305,9 +1308,15 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kUnqualified
     )
-    assert registry.value_schemas == ()
+    assert len(registry.value_schemas) == 1
+    assert registry.value_schemas[0].schema_id == core.SchemaId(
+        "manyforge.value_schema.runtime.empty.v1"
+    )
+    assert registry.value_schemas[0].schema_revision == core.SchemaRevision(
+        "sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785"
+    )
     assert registry.qualification_registry_digest.value == (
-        "sha256:f1e038cc6895c8939e946dcab4d9923a9487957e421a60f6af632d6f5c4b71d7"
+        "sha256:178e82147dea213e70f686690238a61b6f7b87885108933cc135d3a0bd4a9027"
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][

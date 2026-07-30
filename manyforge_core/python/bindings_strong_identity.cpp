@@ -47,6 +47,7 @@ void register_strong_identity_bindings(py::module_& module) {
 
   MANYFORGE_BIND_STRONG_STRING(RuntimeProfileId);
   MANYFORGE_BIND_STRONG_STRING(RuntimeProfileRevision);
+  MANYFORGE_BIND_STRONG_STRING(RuntimeRoleId);
   MANYFORGE_BIND_STRONG_STRING(RuntimeUnitId);
   MANYFORGE_BIND_STRONG_STRING(RuntimePolicyId);
   MANYFORGE_BIND_STRONG_STRING(RuntimePolicyRevision);

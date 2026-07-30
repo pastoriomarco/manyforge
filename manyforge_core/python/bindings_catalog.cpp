@@ -7,6 +7,7 @@
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/control_interface_contract.hpp>
 #include <manyforge_core/types/model_asset.hpp>
+#include <manyforge_core/types/runtime_profile.hpp>
 #include <manyforge_core/types/stop_evidence_policy.hpp>
 #include <optional>
 #include <string>
@@ -355,6 +356,111 @@ void register_catalog_record_bindings(py::module_& module) {
             return lhs != rhs;
           },
           py::is_operator());
+
+  py::enum_<RuntimeLifecycleControl>(module, "RuntimeLifecycleControl")
+      .value("kManagerManaged",
+             RuntimeLifecycleControl::kManagerManaged)
+      .value("kExternallyManaged",
+             RuntimeLifecycleControl::kExternallyManaged);
+
+  py::class_<RuntimeProcessContractDTO>(
+      module, "RuntimeProcessContractDTO", py::is_final())
+      .def(py::init([](RuntimeLifecycleControl lifecycle_control) {
+             return RuntimeProcessContractDTO{lifecycle_control};
+           }),
+           py::arg("lifecycle_control"))
+      .def_readonly("lifecycle_control",
+                    &RuntimeProcessContractDTO::lifecycle_control)
+      .def(
+          "__eq__",
+          [](const RuntimeProcessContractDTO& lhs,
+             const RuntimeProcessContractDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const RuntimeProcessContractDTO& lhs,
+             const RuntimeProcessContractDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  py::class_<RuntimeSupervisionContractDTO>(
+      module, "RuntimeSupervisionContractDTO", py::is_final())
+      .def(py::init([](EndpointRoleId status_endpoint_role_id) {
+             return RuntimeSupervisionContractDTO{
+                 std::move(status_endpoint_role_id)};
+           }),
+           py::arg("status_endpoint_role_id"))
+      .def_readonly(
+          "status_endpoint_role_id",
+          &RuntimeSupervisionContractDTO::status_endpoint_role_id)
+      .def(
+          "__eq__",
+          [](const RuntimeSupervisionContractDTO& lhs,
+             const RuntimeSupervisionContractDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const RuntimeSupervisionContractDTO& lhs,
+             const RuntimeSupervisionContractDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<RuntimeProfileDTO>(module, "RuntimeProfileDTO", py::is_final())
+      .def(py::init([](
+               RuntimeProfileId runtime_profile_id,
+               RuntimeProfileRevision runtime_profile_revision,
+               ValueSchemaRefDTO configuration_schema_ref,
+               RuntimeProcessContractDTO process_contract,
+               RuntimeSupervisionContractDTO supervision_contract,
+               std::vector<RuntimeRoleId> offered_runtime_role_ids,
+               std::vector<EndpointRoleId> source_endpoint_role_ids) {
+             return RuntimeProfileDTO{
+                 std::move(runtime_profile_id),
+                 std::move(runtime_profile_revision),
+                 std::move(configuration_schema_ref),
+                 std::move(process_contract),
+                 std::move(supervision_contract),
+                 std::move(offered_runtime_role_ids),
+                 std::move(source_endpoint_role_ids)};
+           }),
+           py::arg("runtime_profile_id"),
+           py::arg("runtime_profile_revision"),
+           py::arg("configuration_schema_ref"),
+           py::arg("process_contract"),
+           py::arg("supervision_contract"),
+           py::arg("offered_runtime_role_ids"),
+           py::arg("source_endpoint_role_ids"))
+      .def_readonly("runtime_profile_id",
+                    &RuntimeProfileDTO::runtime_profile_id)
+      .def_readonly("runtime_profile_revision",
+                    &RuntimeProfileDTO::runtime_profile_revision)
+      .def_readonly("configuration_schema_ref",
+                    &RuntimeProfileDTO::configuration_schema_ref)
+      .def_readonly("process_contract",
+                    &RuntimeProfileDTO::process_contract)
+      .def_readonly("supervision_contract",
+                    &RuntimeProfileDTO::supervision_contract)
+      .def_readonly("offered_runtime_role_ids",
+                    &RuntimeProfileDTO::offered_runtime_role_ids)
+      .def_readonly("source_endpoint_role_ids",
+                    &RuntimeProfileDTO::source_endpoint_role_ids)
+      .def(
+          "__eq__",
+          [](const RuntimeProfileDTO& lhs,
+             const RuntimeProfileDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const RuntimeProfileDTO& lhs,
+             const RuntimeProfileDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  module.attr("RUNTIME_PROFILE_API_VERSION") =
+      std::string(kRuntimeProfileApiVersion);
+  module.attr("MAX_RUNTIME_PROFILE_ROLE_IDS") =
+      kMaxRuntimeProfileRoleIds;
 
   py::class_<CapabilityDefinitionDTO>(module, "CapabilityDefinitionDTO",
                                       py::is_final())

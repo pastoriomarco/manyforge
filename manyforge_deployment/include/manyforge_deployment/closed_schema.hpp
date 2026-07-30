@@ -56,6 +56,8 @@ class CompiledClosedSchema final {
   [[nodiscard]] const core::SchemaId& schema_id() const noexcept;
   [[nodiscard]] const core::SchemaRevision& schema_revision() const noexcept;
   [[nodiscard]] ClosedSchemaPurpose schema_purpose() const noexcept;
+  /// `kTaggedUnion` implies every alternative resolves to a closed object;
+  /// schema compilation rejects scalar, array, or nested-union branches.
   [[nodiscard]] ClosedSchemaRootShape root_shape() const noexcept;
   [[nodiscard]] const CanonicalValue& normalized_descriptor() const noexcept;
 
