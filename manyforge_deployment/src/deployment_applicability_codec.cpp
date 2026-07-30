@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "content_identity_internal.hpp"
+#include "compiler_semantic_limits_internal.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 
 namespace manyforge::deployment {
@@ -57,8 +58,6 @@ using core::TargetBindingCapabilityProviderTargetDTO;
 using core::TopologyRevision;
 
 constexpr std::string_view kDeploymentApiVersion = "manyforge.deployment.v1";
-constexpr std::size_t kMaximumPortableTokenLength = 128U;
-
 const detail::ContentIdentitySpec kCapabilityProviderBindingIdentitySpec{
     "capability-provider-binding-revision",
     std::string(kDeploymentApiVersion),
@@ -150,7 +149,8 @@ void require_exact_fields(
 }
 
 [[nodiscard]] bool is_portable_token(std::string_view value) noexcept {
-  if (value.empty() || value.size() > kMaximumPortableTokenLength ||
+  if (value.empty() ||
+      value.size() > detail::kMaximumPortableIdentityBytes ||
       !is_ascii_alphanumeric(static_cast<unsigned char>(value.front()))) {
     return false;
   }

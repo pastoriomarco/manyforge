@@ -15,6 +15,7 @@
 #include <utf8proc.h>
 
 #include "content_identity_internal.hpp"
+#include "compiler_semantic_limits_internal.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/canonical_value.hpp"
 #include "manyforge_deployment/content_identity.hpp"
@@ -24,8 +25,6 @@ namespace {
 
 constexpr std::string_view kSiteOverlayApiVersion =
     "manyforge.site_overlay.v1";
-constexpr std::size_t kMaximumPortableTokenLength = 128U;
-
 const detail::ContentIdentitySpec kSiteOverlayIdentitySpec{
     "site-overlay-revision",
     std::string(kSiteOverlayApiVersion),
@@ -115,7 +114,8 @@ void require_exact_fields(
 }
 
 [[nodiscard]] bool is_portable_token(std::string_view value) noexcept {
-  if (value.empty() || value.size() > kMaximumPortableTokenLength ||
+  if (value.empty() ||
+      value.size() > detail::kMaximumPortableIdentityBytes ||
       !is_ascii_alphanumeric(static_cast<unsigned char>(value.front()))) {
     return false;
   }

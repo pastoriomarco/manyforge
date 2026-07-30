@@ -4,12 +4,12 @@
 the composable-cell runtime. It depends on the passive identities and DTOs in
 `manyforge_core`; the execution Kernel does not depend on this library.
 
-The implemented foundation owns:
+The implemented offline boundary owns:
 
 - strict one-document YAML decoding into a closed I-JSON value model;
 - Unicode/NFC and number-model validation;
 - RFC 8785 canonical JSON plus an internal domain-separated SHA-256 identity
-  primitive; and
+  primitive;
 - immutable `manyforge.closed_schema.v1` descriptor compilation, declared
   `SchemaRevision` verification, bounded default materialization, and
   schema-directed instance normalization;
@@ -17,55 +17,59 @@ The implemented foundation owns:
   (`capability_definition`, `component_type`, `control_interface_contract`,
   `controller_topology`, `model_asset`, `provider_manifest`,
   `runtime_profile`, and `stop_evidence_policy`), two exact qualified value
-  schemas, and explicit rejection of every remaining unqualified family; and
+  schemas, and explicit rejection of every remaining unqualified family;
 - intrinsic `CellGraphDTO` decoding and validation, exact runtime-profile
   closure, schema-normalized runtime configuration, whole-graph output
   budgets, and staged nested/outer graph content identity;
-- exact caller-resolved model-source closure verification, including
-  one compiler-owned immutable retrieval plan, digest-derived store keys, size
-  and SHA-256 checks, resource-bounded non-resolving URDF/SRDF parsing,
-  structural/source-role proof, and a canonical typed structural index that
-  retains no raw model blobs; and
-- exact model-asset/component-type dependency closure plus immutable graph
-  structural qualification: owned and passive model occurrences, single
-  placement derivation, model-role/root/mount/target resolution, and
-  bidirectional attachment compatibility/capacity with child endpoints fixed
-  to the child component root.
+- exact caller-resolved source closure, complete typed/re-emittable URDF/SRDF
+  IR, bounded self-contained COLLADA support, structural/source-role proof,
+  and immutable source qualification;
+- deterministic `mf1` occurrence composition, flattened URDF/SRDF, complete
+  rewrite proof, portable frame/path projection, resource-coordinate maps,
+  target projections, and checked cell-wide bounds;
+- exact occurrence-specific control/provider/capability/route/Stop
+  applicability and deterministic logical templates;
+- a private-constructor `CompilerQualifiedCellIr`, complete current-subset
+  deployment-envelope producer/verifier, and exact envelope/IR retention proof;
+  and
+- code-owned product-contract/raw-CAS foundations plus closed retained-bundle
+  projection/verifier and bounded semantic repository mechanics.
 
 The bootstrap, registry, and dialect examples under `resources/` are hermetic
 source-tree projections and cross-language test goldens. They are not installed
 or loaded as runtime policy, never override the code-owned grammar, and never
-qualify runtime input. The admitted catalog resolvers enforce exact typed
-reference, retrieval key, stored-byte digest, schema, semantic identity, and
-referent boundaries. Source retrieval/storage, complete re-emittable model IR,
-SRDF expansion, generated naming, control compatibility, retained compiler
-products, Apply, process ownership, and runtime/lane behavior remain later
-checkpoints.
-A successfully parsed artifact is therefore only a candidate. Arbitrary
-revision-verified descriptors can only produce explicitly unqualified
-normalized candidates. Production interpretation must select an exact schema
-ID, revision, and purpose from the immutable build-qualified registry, then
-validate and normalize through that pinned descriptor before later intrinsic,
-catalog, and compiler validation. The eight catalog families and two value
-schemas above are the only production-qualified schema families at this
-checkpoint. `GraphRevision` compute/verify accepts only an intrinsically
-validated graph whose runtime configuration has been normalized through the
-exact qualified runtime-profile closure. It computes or verifies
-control-domain, control-binding, and component-attachment revisions before the
-outer graph revision; verification never repairs stale input. The resulting
-wrapper proves normalized graph content identity, not model/source/control
-compatibility, compiler products, runtime readiness, admission, or a lane.
-Topology qualification proves only its immutable logical controller,
-contract, chain, activation-set, and route declaration. It does not select
-plugins or configuration, generate names or endpoints, observe controller
-state, switch a route, or qualify a runtime lane.
-Component-type declaration qualification similarly proves only its immutable
-model-role tree, target-local aliases, capability selectors, tags, and attachment
-interfaces. It does not select model assets, control contracts/topologies,
-providers, generated names, graph instances, runtime state, or a product lane.
-The later structural qualifier described above selects exact graph occurrences
-and source/type closures, but still makes none of the deferred naming,
-control-product, runtime, or lane claims.
+qualify runtime input. Admitted resolvers enforce exact typed references,
+retrieval keys, stored-byte digests, schemas, semantic identities, and complete
+referent closure.
+
+The trust stages are deliberately non-forgeable and non-repairing. A parsed
+artifact is only a candidate; each later wrapper is privately constructed by
+the exact qualifying operation. The final C++ compiler value is the only C++
+semantic input accepted by retention qualification. Unsupported optional
+deployment blocks and unqualified catalog families fail before raw storage.
+
+Current limits are explicit:
+
+- the production Python compiler binding still awaits the separately approved
+  atomic binding cutover, so I2 is not complete;
+- C1.0 build-qualified retention authority is implemented: the closed v2
+  node-environment, compiler-contract, and non-circular compiler-build
+  manifests are produced by one non-caller-constructible authority, and the
+  production canonical-empty path persists and independently reloads that exact
+  closure before any raw-artifact write; compiler-build evidence covers the
+  exact compiler sources, configured core headers, build recipes/templates,
+  and node-environment freshness checker under stable logical IDs;
+- qualified compiler-build evidence currently requires a single-configuration
+  CMake generator; multi-config generators reject at configure time rather
+  than sharing one ambiguous manifest across several binary configurations;
+- manifest durability does not complete I3 storage: the raw CAS and semantic
+  retained-bundle repository are still in-memory, and production
+  materialization returns rather than durably stores/reloads the bundle;
+- remaining products, consumer equivalence, runtime-shadow behavior, and the
+  Manager-facing compile/store/verify port remain later I3 work; and
+- Apply, active publication, process ownership, runtime convergence,
+  simulation, controllers, execution, and lane restoration belong to later
+  packages and plan checkpoints.
 
 Build and run the focused tests through the repository container:
 

@@ -33,6 +33,14 @@ cmake \
   -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
 
 cmake --build "${BUILD_DIR}" --parallel "${PARALLEL}"
+
+non_gtest_regex="^BuildManifestAuthorityRejectsMultiConfigGenerator$"
+ctest \
+  --test-dir "${BUILD_DIR}" \
+  --output-on-failure \
+  --no-tests=error \
+  -R "${non_gtest_regex}"
 python3 "${SCRIPT_DIR}/run-ctest-gtest-binaries-grouped.py" \
   --build-dir "${BUILD_DIR}" \
+  --exclude-test-regex "${non_gtest_regex}" \
   --summary-prefix DEPLOYMENT_ASAN_UBSAN

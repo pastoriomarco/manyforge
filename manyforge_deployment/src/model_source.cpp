@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "manyforge_deployment/content_identity.hpp"
+#include "model_source_contract_internal.hpp"
 #include "manyforge_deployment/canonical_value.hpp"
 
 namespace manyforge::deployment {
@@ -2858,19 +2859,12 @@ void emit_joint(std::string& output, const UrdfJointIr& joint) {
 
 [[nodiscard]] std::optional<ModelSourceArtifactKind>
 opaque_artifact_kind(std::string_view media_type) {
-  if (media_type == "model/stl") {
-    return ModelSourceArtifactKind::kStlMesh;
-  }
-  if (media_type == "model/vnd.collada+xml") {
-    return ModelSourceArtifactKind::kColladaMesh;
-  }
-  if (media_type == "image/png") {
-    return ModelSourceArtifactKind::kPngTexture;
-  }
-  if (media_type == "image/jpeg") {
-    return ModelSourceArtifactKind::kJpegTexture;
-  }
-  return std::nullopt;
+  const auto* contract =
+      detail::find_model_source_dependency_media_contract(media_type);
+  return contract == nullptr
+             ? std::nullopt
+             : std::optional<ModelSourceArtifactKind>(
+                   contract->artifact_kind);
 }
 
 }  // namespace
@@ -2909,7 +2903,10 @@ ModelSourceRetrievalPlan preflight_model_source_declaration(
         artifact_kind == ModelSourceArtifactKind::kUrdfXmlEntrypoint ||
         artifact_kind == ModelSourceArtifactKind::kSrdfXmlEntrypoint;
     if (entrypoint) {
-      if (artifact.media_type != "application/xml" ||
+      const auto* contract =
+          detail::find_model_source_media_contract(artifact_kind);
+      if (contract == nullptr ||
+          artifact.media_type != contract->media_type ||
           artifact.byte_size > kMaxModelSourceXmlEntrypointBytes) {
         fail("model source XML entrypoint has an unsupported type or size");
       }

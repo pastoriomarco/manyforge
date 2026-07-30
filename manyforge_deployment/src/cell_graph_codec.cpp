@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "closed_schema_internal.hpp"
+#include "compiler_semantic_limits_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
@@ -80,16 +81,14 @@ using RuntimeProfileKey = std::pair<std::string, std::string>;
 
 // Accept ordinary decimal serialization error while still rejecting poses
 // that require semantic renormalization. The codec never changes the value.
-constexpr double kQuaternionNormSquaredTolerance = 1.0e-6;
-constexpr std::size_t kMaximumIdentityLength = 128U;
-
 [[nodiscard]] constexpr bool is_ascii_alphanumeric(unsigned char byte) noexcept {
   return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
          (byte >= '0' && byte <= '9');
 }
 
 [[nodiscard]] bool is_bounded_ascii_identity(std::string_view spelling) noexcept {
-  if (spelling.empty() || spelling.size() > kMaximumIdentityLength ||
+  if (spelling.empty() ||
+      spelling.size() > detail::kMaximumPortableIdentityBytes ||
       !is_ascii_alphanumeric(static_cast<unsigned char>(spelling.front()))) {
     return false;
   }
@@ -283,7 +282,8 @@ template <typename StrongType>
     norm_squared += pose.orientation_xyzw[index] * pose.orientation_xyzw[index];
   }
   if (!std::isfinite(norm_squared) ||
-      std::abs(norm_squared - 1.0) > kQuaternionNormSquaredTolerance) {
+      std::abs(norm_squared - 1.0) >
+          detail::kQuaternionNormSquaredTolerance) {
     fail(orientation_path, "quaternion norm squared must be within 1e-6 of one");
   }
   return pose;

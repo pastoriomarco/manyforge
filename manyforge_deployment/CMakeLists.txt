@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.14)
 project(manyforge_deployment VERSION 0.1.0 LANGUAGES CXX)
 
+if(CMAKE_CONFIGURATION_TYPES)
+  message(FATAL_ERROR
+    "build-qualified compiler provenance requires a single-configuration "
+    "generator; one configure tree cannot represent several binary "
+    "configurations with one compiler-build manifest")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -10,9 +17,298 @@ add_compile_options(-Wall -Wextra -Werror -pedantic)
 find_package(OpenSSL REQUIRED)
 find_package(EXPAT REQUIRED)
 find_package(double-conversion CONFIG REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(UTF8PROC REQUIRED IMPORTED_TARGET libutf8proc)
 pkg_check_modules(LIBYAML REQUIRED IMPORTED_TARGET yaml-0.1)
+
+set(
+  MANYFORGE_NODE_ENVIRONMENT_MANIFEST
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_environment_manifest.yaml")
+set(
+  MANYFORGE_NODE_ENVIRONMENT_CHECK
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/scripts/generate_node_environment_manifest.py")
+if(NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}" OR
+   NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_CHECK}")
+  message(FATAL_ERROR
+    "manyforge_deployment production retention requires the sole "
+    "manyforge_behavior node-environment manifest and its freshness checker")
+endif()
+execute_process(
+  COMMAND
+    "${CMAKE_COMMAND}" -E env
+    "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior"
+    "${Python3_EXECUTABLE}" "${MANYFORGE_NODE_ENVIRONMENT_CHECK}" --check
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+  RESULT_VARIABLE MANYFORGE_NODE_ENVIRONMENT_CHECK_RESULT
+  OUTPUT_VARIABLE MANYFORGE_NODE_ENVIRONMENT_CHECK_OUTPUT
+  ERROR_VARIABLE MANYFORGE_NODE_ENVIRONMENT_CHECK_ERROR)
+if(NOT MANYFORGE_NODE_ENVIRONMENT_CHECK_RESULT EQUAL 0)
+  message(FATAL_ERROR
+    "the build-owned node-environment manifest is absent, invalid, or stale:\n"
+    "${MANYFORGE_NODE_ENVIRONMENT_CHECK_OUTPUT}"
+    "${MANYFORGE_NODE_ENVIRONMENT_CHECK_ERROR}")
+endif()
+set_property(
+  DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}"
+  "${MANYFORGE_NODE_ENVIRONMENT_CHECK}")
+
+file(READ
+  "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}"
+  MANYFORGE_EMBEDDED_NODE_ENVIRONMENT_MANIFEST)
+string(
+  FIND
+  "${MANYFORGE_EMBEDDED_NODE_ENVIRONMENT_MANIFEST}"
+  ")mf_node_env\""
+  MANYFORGE_NODE_ENVIRONMENT_DELIMITER_COLLISION)
+if(NOT MANYFORGE_NODE_ENVIRONMENT_DELIMITER_COLLISION EQUAL -1)
+  message(FATAL_ERROR
+    "node-environment manifest collides with the fixed generated-header "
+    "raw-string delimiter")
+endif()
+
+set(
+  MANYFORGE_CORE_INCLUDE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_core/include"
+  CACHE PATH
+  "Path to the ROS-free manyforge_core public headers")
+get_filename_component(
+  MANYFORGE_CORE_INCLUDE_DIR
+  "${MANYFORGE_CORE_INCLUDE_DIR}"
+  ABSOLUTE)
+if(NOT IS_DIRECTORY "${MANYFORGE_CORE_INCLUDE_DIR}")
+  message(FATAL_ERROR
+    "the configured manyforge_core include root does not exist: "
+    "${MANYFORGE_CORE_INCLUDE_DIR}")
+endif()
+
+file(
+  GLOB_RECURSE
+  MANYFORGE_COMPILER_SOURCE_INPUTS
+  CONFIGURE_DEPENDS
+  LIST_DIRECTORIES false
+  "${CMAKE_CURRENT_SOURCE_DIR}/include/*"
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/*"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hpp"
+  "${MANYFORGE_CORE_INCLUDE_DIR}/*")
+list(
+  REMOVE_ITEM
+  MANYFORGE_COMPILER_SOURCE_INPUTS
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_build_evidence.hpp.in"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_closed_schema.hpp.in")
+list(SORT MANYFORGE_COMPILER_SOURCE_INPUTS)
+
+set(
+  MANYFORGE_COMPILER_RECIPE_INPUTS
+  "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
+  "${MANYFORGE_NODE_ENVIRONMENT_CHECK}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_build_evidence.hpp.in"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_closed_schema.hpp.in")
+list(SORT MANYFORGE_COMPILER_RECIPE_INPUTS)
+
+function(
+  manyforge_build_input_id
+  output_id
+  relative_path
+  input_class)
+  if(input_class STREQUAL "source")
+    if(relative_path MATCHES
+       "^manyforge_deployment/include/(.+)\\.(h|hpp)$")
+      set(logical_id "cpp-public-header:${CMAKE_MATCH_1}")
+    elseif(relative_path MATCHES
+           "^manyforge_core/include/(.+)\\.(h|hpp)$")
+      set(logical_id "cpp-public-header:${CMAKE_MATCH_1}")
+    elseif(relative_path MATCHES
+           "^manyforge_deployment/src/(.+)\\.cpp$")
+      set(logical_id "cpp-translation-unit:${CMAKE_MATCH_1}")
+    elseif(relative_path MATCHES
+           "^manyforge_deployment/src/(.+)\\.(h|hpp)$")
+      set(logical_id "cpp-internal-header:${CMAKE_MATCH_1}")
+    elseif(relative_path MATCHES
+           "^manyforge_deployment/resources/(.+)$")
+      set(logical_id "compiler-resource:${CMAKE_MATCH_1}")
+    else()
+      message(FATAL_ERROR
+        "compiler source input has no closed logical-ID mapping: "
+        "${relative_path}")
+    endif()
+  elseif(input_class STREQUAL "recipe")
+    if(relative_path STREQUAL
+       "manyforge_deployment/CMakeLists.txt")
+      set(logical_id "build-recipe:manyforge_deployment")
+    elseif(relative_path STREQUAL
+           "manyforge_behavior/scripts/generate_node_environment_manifest.py")
+      set(
+        logical_id
+        "build-recipe:node-environment-manifest-freshness-check")
+    elseif(relative_path MATCHES
+           "^manyforge_deployment/src/(.+)\\.hpp\\.in$")
+      set(logical_id "build-template:${CMAKE_MATCH_1}")
+    else()
+      message(FATAL_ERROR
+        "compiler recipe input has no closed logical-ID mapping: "
+        "${relative_path}")
+    endif()
+  else()
+    message(FATAL_ERROR
+      "unknown compiler build-evidence input class: ${input_class}")
+  endif()
+  string(REPLACE "/" "." logical_id "${logical_id}")
+  string(TOLOWER "${logical_id}" logical_id)
+  set(${output_id} "${logical_id}" PARENT_SCOPE)
+endfunction()
+
+function(
+  manyforge_build_evidence_rows
+  output_rows
+  output_count
+  input_paths
+  input_class)
+  set(indexed_rows "")
+  foreach(input_path IN LISTS ${input_paths})
+    if(NOT EXISTS "${input_path}")
+      message(FATAL_ERROR
+        "compiler build-evidence input disappeared: ${input_path}")
+    endif()
+    file(
+      RELATIVE_PATH core_relative_path
+      "${MANYFORGE_CORE_INCLUDE_DIR}"
+      "${input_path}")
+    if(input_class STREQUAL "source" AND
+       NOT IS_ABSOLUTE "${core_relative_path}" AND
+       NOT core_relative_path MATCHES "^\\.\\./")
+      set(
+        relative_path
+        "manyforge_core/include/${core_relative_path}")
+    else()
+      file(
+        RELATIVE_PATH relative_path
+        "${CMAKE_CURRENT_SOURCE_DIR}/.."
+        "${input_path}")
+    endif()
+    manyforge_build_input_id(
+      logical_id "${relative_path}" "${input_class}")
+    file(SHA256 "${input_path}" content_digest)
+    list(APPEND indexed_rows
+      "${logical_id}!sha256:${content_digest}")
+    set_property(
+      DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input_path}")
+  endforeach()
+  list(SORT indexed_rows)
+  list(LENGTH indexed_rows count)
+  set(previous_id "")
+  set(rows "")
+  foreach(indexed_row IN LISTS indexed_rows)
+    string(FIND "${indexed_row}" "!" separator)
+    string(SUBSTRING "${indexed_row}" 0 ${separator} logical_id)
+    math(EXPR digest_offset "${separator} + 1")
+    string(SUBSTRING "${indexed_row}" ${digest_offset} -1 content_digest)
+    if("${previous_id}" STREQUAL "${logical_id}")
+      message(FATAL_ERROR
+        "compiler build-evidence logical ID collision: ${logical_id}")
+    endif()
+    set(previous_id "${logical_id}")
+    string(APPEND rows
+      "    BuildEvidenceRow{\"${logical_id}\", "
+      "\"${content_digest}\"},\n")
+  endforeach()
+  set(${output_rows} "${rows}" PARENT_SCOPE)
+  set(${output_count} "${count}" PARENT_SCOPE)
+endfunction()
+
+manyforge_build_evidence_rows(
+  MANYFORGE_COMPILER_SOURCE_ROWS
+  MANYFORGE_COMPILER_SOURCE_COUNT
+  MANYFORGE_COMPILER_SOURCE_INPUTS
+  source)
+manyforge_build_evidence_rows(
+  MANYFORGE_COMPILER_RECIPE_ROWS
+  MANYFORGE_COMPILER_RECIPE_COUNT
+  MANYFORGE_COMPILER_RECIPE_INPUTS
+  recipe)
+
+if(CMAKE_BUILD_TYPE)
+  set(MANYFORGE_COMPILER_BUILD_PROFILE "${CMAKE_BUILD_TYPE}")
+else()
+  set(MANYFORGE_COMPILER_BUILD_PROFILE "unspecified")
+endif()
+set(
+  MANYFORGE_COMPILER_BUILD_TARGET
+  "${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}")
+set(MANYFORGE_COMPILER_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(MANYFORGE_COMPILER_CXX_STANDARD "${CMAKE_CXX_STANDARD}")
+set(MANYFORGE_COMPILER_ID "${CMAKE_CXX_COMPILER_ID}")
+set(MANYFORGE_COMPILER_VERSION "${CMAKE_CXX_COMPILER_VERSION}")
+set(MANYFORGE_CMAKE_VERSION "${CMAKE_VERSION}")
+set(MANYFORGE_OPENSSL_VERSION "${OPENSSL_VERSION}")
+set(MANYFORGE_EXPAT_VERSION "${EXPAT_VERSION_STRING}")
+set(MANYFORGE_UTF8PROC_VERSION "${UTF8PROC_VERSION}")
+set(MANYFORGE_LIBYAML_VERSION "${LIBYAML_VERSION}")
+set(
+  MANYFORGE_DOUBLE_CONVERSION_VERSION
+  "${double-conversion_VERSION}")
+if(NOT MANYFORGE_DOUBLE_CONVERSION_VERSION)
+  message(FATAL_ERROR
+    "the selected double-conversion CMake package does not expose "
+    "double-conversion_VERSION; build-qualified compiler provenance "
+    "requires a versioned package config")
+endif()
+
+# Hash every caller/toolchain-mutable C++ and linker flag input without
+# embedding paths, secrets, or command strings in the semantic manifest.
+# Fixed target options/definitions are covered by the CMake recipe digest;
+# compiler defaults are bound by compiler ID/version, target, and profile.
+string(TOUPPER "${CMAKE_BUILD_TYPE}" MANYFORGE_BUILD_TYPE_UPPER)
+set(MANYFORGE_EFFECTIVE_BUILD_CONFIGURATION "")
+function(manyforge_append_build_configuration key value)
+  string(LENGTH "${value}" value_length)
+  string(APPEND MANYFORGE_EFFECTIVE_BUILD_CONFIGURATION
+    "${key}:${value_length}:${value}\n")
+  set(
+    MANYFORGE_EFFECTIVE_BUILD_CONFIGURATION
+    "${MANYFORGE_EFFECTIVE_BUILD_CONFIGURATION}"
+    PARENT_SCOPE)
+endfunction()
+manyforge_append_build_configuration(
+  "cmake_cxx_flags" "${CMAKE_CXX_FLAGS}")
+manyforge_append_build_configuration(
+  "cmake_cxx_flags_profile"
+  "${CMAKE_CXX_FLAGS_${MANYFORGE_BUILD_TYPE_UPPER}}")
+manyforge_append_build_configuration(
+  "cmake_exe_linker_flags" "${CMAKE_EXE_LINKER_FLAGS}")
+manyforge_append_build_configuration(
+  "cmake_exe_linker_flags_profile"
+  "${CMAKE_EXE_LINKER_FLAGS_${MANYFORGE_BUILD_TYPE_UPPER}}")
+manyforge_append_build_configuration(
+  "cmake_shared_linker_flags" "${CMAKE_SHARED_LINKER_FLAGS}")
+manyforge_append_build_configuration(
+  "cmake_shared_linker_flags_profile"
+  "${CMAKE_SHARED_LINKER_FLAGS_${MANYFORGE_BUILD_TYPE_UPPER}}")
+manyforge_append_build_configuration(
+  "cmake_static_linker_flags" "${CMAKE_STATIC_LINKER_FLAGS}")
+manyforge_append_build_configuration(
+  "cmake_static_linker_flags_profile"
+  "${CMAKE_STATIC_LINKER_FLAGS_${MANYFORGE_BUILD_TYPE_UPPER}}")
+manyforge_append_build_configuration(
+  "cmake_interprocedural_optimization"
+  "${CMAKE_INTERPROCEDURAL_OPTIMIZATION}")
+manyforge_append_build_configuration(
+  "cmake_interprocedural_optimization_profile"
+  "${CMAKE_INTERPROCEDURAL_OPTIMIZATION_${MANYFORGE_BUILD_TYPE_UPPER}}")
+string(
+  SHA256
+  MANYFORGE_BUILD_CONFIGURATION_SHA256
+  "${MANYFORGE_EFFECTIVE_BUILD_CONFIGURATION}")
+set(
+  MANYFORGE_BUILD_CONFIGURATION_DIGEST
+  "sha256:${MANYFORGE_BUILD_CONFIGURATION_SHA256}")
+
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_build_evidence.hpp.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_build_evidence.hpp"
+  @ONLY)
 
 function(manyforge_embed_closed_schema symbol stem relative_path delimiter)
   set(schema_path "${CMAKE_CURRENT_SOURCE_DIR}/${relative_path}")
@@ -80,14 +376,10 @@ manyforge_embed_closed_schema(
   resources/closed_schema/value/manyforge.value_schema.provider_contract.empty.v1.yaml
   mf_pempty)
 
-set(
-  MANYFORGE_CORE_INCLUDE_DIR
-  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_core/include"
-  CACHE PATH
-  "Path to the ROS-free manyforge_core public headers")
-
 add_library(manyforge_deployment
   src/artifact_codec.cpp
+  src/build_manifest.cpp
+  src/build_manifest_repository.cpp
   src/capability_definition_codec.cpp
   src/canonical_value.cpp
   src/cell_applicability.cpp
@@ -138,6 +430,14 @@ if(BUILD_TESTING)
   include(GoogleTest)
   set(MANYFORGE_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
       "Per-test timeout for manyforge_deployment gtest cases")
+  add_test(
+    NAME BuildManifestAuthorityRejectsMultiConfigGenerator
+    COMMAND
+      "${CMAKE_COMMAND}"
+      "-DMANYFORGE_TEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+      "-DMANYFORGE_TEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/multi_config_rejection"
+      -P
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/reject_multi_config.cmake")
 
   function(manyforge_try_public_header result_variable source_file)
     unset(${result_variable} CACHE)
@@ -374,6 +674,16 @@ if(BUILD_TESTING)
   target_link_libraries(test_retained_bundle_materializer PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_retained_bundle_materializer
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_build_manifest
+    test/test_build_manifest.cpp)
+  target_include_directories(test_build_manifest PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  target_link_libraries(test_build_manifest PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_build_manifest
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_retention_qualified_deployment

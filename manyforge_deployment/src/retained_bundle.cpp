@@ -11,6 +11,8 @@
 #include <utility>
 
 #include "content_identity_internal.hpp"
+#include "compiler_semantic_limits_internal.hpp"
+#include "build_manifest_internal.hpp"
 #include "deployment_catalog_codec_internal.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/cell_graph_codec.hpp"
@@ -32,9 +34,6 @@ constexpr std::string_view kRetainedProductOutputDomain =
     "retained-product-output";
 constexpr std::string_view kRetainedProductSchemaTag =
     "manyforge.retained_bundle.v1#retained_product";
-constexpr std::uint64_t kMaximumIJsonInteger = 9007199254740991ULL;
-constexpr std::size_t kMaximumPortableIdentityBytes = 128U;
-
 [[noreturn]] void fail(std::string_view message) {
   throw RetainedBundleError(std::string(message));
 }
@@ -46,7 +45,8 @@ is_ascii_alphanumeric(unsigned char byte) noexcept {
 }
 
 [[nodiscard]] bool is_portable_identity(std::string_view value) noexcept {
-  if (value.empty() || value.size() > kMaximumPortableIdentityBytes ||
+  if (value.empty() ||
+      value.size() > detail::kMaximumPortableIdentityBytes ||
       !is_ascii_alphanumeric(static_cast<unsigned char>(value.front()))) {
     return false;
   }
@@ -147,7 +147,8 @@ void require_null(const CanonicalValue& value, std::string_view field) {
   const auto* number = std::get_if<double>(&value.storage());
   if (number == nullptr || !std::isfinite(*number) || *number < 0.0 ||
       std::trunc(*number) != *number ||
-      *number > static_cast<double>(kMaximumIJsonInteger)) {
+      *number >
+          static_cast<double>(detail::kMaximumIJsonInteger)) {
     fail(std::string(field) +
          " must be a non-negative I-JSON safe integer");
   }
@@ -391,7 +392,7 @@ require_product_contract_conformance(
         store_key_for_digest(artifact.content_digest.value())) {
       fail("retained artifact store key is not digest-derived");
     }
-    if (artifact.byte_size > kMaximumIJsonInteger) {
+    if (artifact.byte_size > detail::kMaximumIJsonInteger) {
       fail("retained artifact byte size exceeds the I-JSON safe integer");
     }
     present_roles.insert(artifact.artifact_role_id.value());
@@ -629,7 +630,8 @@ core::RetainedProductDTO build_and_retain_product(
       fail("product artifact media type does not match its contract");
     }
     if (found != supplied.end() &&
-        found->second->bytes.size() > kMaximumIJsonInteger) {
+        found->second->bytes.size() >
+            detail::kMaximumIJsonInteger) {
       fail("product artifact byte size exceeds the I-JSON safe integer");
     }
   }
@@ -954,6 +956,26 @@ void require_current_subset_before_store(
   }
 }
 
+struct PreparedCanonicalEmptyProduct final {
+  std::string urdf;
+  std::string srdf;
+  const BuildQualifiedProductContract* contract;
+};
+
+[[nodiscard]] PreparedCanonicalEmptyProduct
+prepare_canonical_empty_product_before_store(
+    const RetentionQualifiedDeployment& qualified) {
+  require_current_subset_before_store(qualified);
+  const auto& composition =
+      qualified.compiler_ir().applicability().composition();
+  std::string urdf =
+      emit_canonical_urdf_document(composition.flattened_urdf());
+  std::string srdf =
+      emit_canonical_srdf_document(composition.flattened_srdf());
+  const auto& contract = require_flattened_model_contract();
+  return {std::move(urdf), std::move(srdf), &contract};
+}
+
 [[nodiscard]] GraphRevisionVerifiedCellGraph
 verify_canonical_empty_graph_projection(const CanonicalValue& graph_value) {
   const auto typed = decode_cell_graph_candidate(
@@ -1253,40 +1275,59 @@ detail::BuildQualifiedRetentionContext::BuildQualifiedRetentionContext(
   require_digest(compiler_build_digest_.value(), "compiler_build_digest");
 }
 
+detail::BuildQualifiedRetentionContext::BuildQualifiedRetentionContext(
+    core::RetainedNodeEnvironmentDTO node_environment,
+    core::ContentDigest compiler_contract_digest,
+    core::ContentDigest compiler_build_digest,
+    std::vector<std::shared_ptr<const BuildQualifiedManifest>> manifests)
+    : BuildQualifiedRetentionContext(
+          std::move(node_environment), std::move(compiler_contract_digest),
+          std::move(compiler_build_digest)) {
+  if (manifests.size() != 3U || manifests[0] == nullptr ||
+      manifests[1] == nullptr || manifests[2] == nullptr ||
+      manifests[0]->key().manifest_kind !=
+          BuildManifestKind::kNodeEnvironment ||
+      manifests[1]->key().manifest_kind !=
+          BuildManifestKind::kCompilerContract ||
+      manifests[2]->key().manifest_kind !=
+          BuildManifestKind::kCompilerBuild ||
+      manifests[0]->key().content_digest !=
+          node_environment_.environment_digest ||
+      manifests[1]->key().content_digest != compiler_contract_digest_ ||
+      manifests[2]->key().content_digest != compiler_build_digest_) {
+    throw std::logic_error(
+        "production retention context manifest closure is incoherent");
+  }
+  manifests_ = std::move(manifests);
+}
+
 std::shared_ptr<const RetainedBundle>
-detail::RetainedBundleMaterializer::materialize(
+detail::RetainedBundleMaterializer::materialize_prepared(
     const RetentionQualifiedDeployment& qualified,
     const BuildQualifiedRetentionContext& context,
+    std::string_view urdf, std::string_view srdf,
+    const BuildQualifiedProductContract& contract,
     IRawArtifactStore& artifact_store) {
-  // All semantic/current-subset checks happen before the first raw-CAS write.
-  require_current_subset_before_store(qualified);
-
-  const auto& composition =
-      qualified.compiler_ir().applicability().composition();
-  const std::string urdf =
-      emit_canonical_urdf_document(composition.flattened_urdf());
-  const std::string srdf =
-      emit_canonical_srdf_document(composition.flattened_srdf());
-  // Select this producer's exact contract rather than constraining the whole
-  // code-owned registry to one row. Viewer/control/runtime product contracts
-  // may be qualified later without invalidating canonical-empty retention.
-  const auto& contract = require_flattened_model_contract();
-  const std::vector<RetainedArtifactInput> artifacts{
-      {core::ArtifactRoleId("srdf"), "application/xml", srdf},
-      {core::ArtifactRoleId("urdf"), "application/xml", urdf},
+  const std::vector<detail::RetainedArtifactInput> artifacts{
+      {core::ArtifactRoleId("srdf"), "application/xml",
+       std::string(srdf)},
+      {core::ArtifactRoleId("urdf"), "application/xml",
+       std::string(urdf)},
   };
-  const core::RetainedProductDTO planning = build_and_retain_product(
-      core::ProductId("cell_planning_collision_model"),
-      core::RetainedProductKind::kPlanningCollisionModel,
-      ProductPlacement::kCellPlanningCollisionModel,
-      contract.product_contract_id(), contract.product_contract_revision(),
-      artifacts, artifact_store);
+  const core::RetainedProductDTO planning =
+      detail::build_and_retain_product(
+          core::ProductId("cell_planning_collision_model"),
+          core::RetainedProductKind::kPlanningCollisionModel,
+          ProductPlacement::kCellPlanningCollisionModel,
+          contract.product_contract_id(),
+          contract.product_contract_revision(), artifacts,
+          artifact_store);
 
   const CanonicalValue placeholder = retained_bundle_projection(
       kZeroDigest, qualified, context, planning);
-  const std::string retained_bundle_id = compute_content_identity(
+  const std::string retained_bundle_id = detail::compute_content_identity(
       placeholder,
-      ContentIdentitySpec{
+      detail::ContentIdentitySpec{
           .identity_domain = "retained-bundle-id",
           .api_version = std::string(core::kRetainedBundleApiVersion),
           .own_field = "retained_bundle_id",
@@ -1304,6 +1345,35 @@ detail::RetainedBundleMaterializer::materialize(
         "I3 materializer produced an invalid retained-bundle projection");
   }
   return bundle;
+}
+
+std::shared_ptr<const RetainedBundle>
+detail::RetainedBundleMaterializer::materialize_production(
+    const RetentionQualifiedDeployment& qualified,
+    IBuildManifestRepository& manifest_repository,
+    IRawArtifactStore& artifact_store) {
+  // Complete semantic/subset preparation and build-authority qualification
+  // precede the first repository or CAS effect.
+  const PreparedCanonicalEmptyProduct prepared =
+      prepare_canonical_empty_product_before_store(qualified);
+  const BuildQualifiedRetentionContext context =
+      BuildQualifiedRetentionAuthority::qualify_persisted(
+          manifest_repository);
+  return materialize_prepared(
+      qualified, context, prepared.urdf, prepared.srdf,
+      *prepared.contract, artifact_store);
+}
+
+std::shared_ptr<const RetainedBundle>
+detail::RetainedBundleMaterializer::materialize(
+    const RetentionQualifiedDeployment& qualified,
+    const BuildQualifiedRetentionContext& context,
+    IRawArtifactStore& artifact_store) {
+  const PreparedCanonicalEmptyProduct prepared =
+      prepare_canonical_empty_product_before_store(qualified);
+  return materialize_prepared(
+      qualified, context, prepared.urdf, prepared.srdf,
+      *prepared.contract, artifact_store);
 }
 
 bool verify_retained_bundle_identity(const RetainedBundle &bundle) {

@@ -14,16 +14,10 @@
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "closed_schema_internal.hpp"
+#include "compiler_semantic_limits_internal.hpp"
 
 namespace manyforge::deployment::detail {
 namespace {
-
-constexpr std::size_t kMaximumPortableTokenLength = 128U;
-constexpr std::size_t kNodesPerCatalogRecord = 15U;
-constexpr std::size_t kCatalogContainerNodes = 3U;
-constexpr std::size_t kMaximumCatalogRecords =
-    (kMaxArtifactNodeCount - kCatalogContainerNodes) /
-    kNodesPerCatalogRecord;
 
 [[noreturn]] void fail(std::string_view path, std::string_view reason) {
   throw DeploymentCatalogCodecError(std::string(path) + ": " +
@@ -111,7 +105,8 @@ void require_exact_fields(
 }
 
 [[nodiscard]] bool is_portable_token(std::string_view value) noexcept {
-  if (value.empty() || value.size() > kMaximumPortableTokenLength ||
+  if (value.empty() ||
+      value.size() > kMaximumPortableIdentityBytes ||
       !is_ascii_alphanumeric(static_cast<unsigned char>(value.front()))) {
     return false;
   }

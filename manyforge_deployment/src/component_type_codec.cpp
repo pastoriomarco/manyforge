@@ -15,6 +15,7 @@
 
 #include "catalog_record_referent_internal.hpp"
 #include "content_identity_internal.hpp"
+#include "compiler_semantic_limits_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -23,8 +24,6 @@ using CapabilityKey = std::pair<std::string, std::string>;
 using ModelSourceKey = std::pair<std::string, std::string>;
 using CapabilityIndex =
     std::map<CapabilityKey, const QualifiedCapabilityDefinition*>;
-
-constexpr double kQuaternionNormSquaredTolerance = 1.0e-6;
 
 [[noreturn]] void fail(std::string message) {
   throw ComponentTypeCodecError(std::move(message));
@@ -128,7 +127,8 @@ constexpr double kQuaternionNormSquaredTolerance = 1.0e-6;
         result.orientation_xyzw[index] * result.orientation_xyzw[index];
   }
   if (!std::isfinite(norm_squared) ||
-      std::abs(norm_squared - 1.0) > kQuaternionNormSquaredTolerance) {
+      std::abs(norm_squared - 1.0) >
+          detail::kQuaternionNormSquaredTolerance) {
     fail("component-type placement quaternion norm squared must be within "
          "1e-6 of one");
   }

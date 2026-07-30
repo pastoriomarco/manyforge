@@ -11,6 +11,7 @@
 
 #include "content_identity_internal.hpp"
 #include "closed_schema_internal.hpp"
+#include "compiler_semantic_limits_internal.hpp"
 #include "deployment_catalog_codec_internal.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 
@@ -21,8 +22,6 @@ constexpr std::string_view kDeploymentApiVersion =
     "manyforge.deployment.v1";
 constexpr std::string_view kPlaceholderDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-constexpr std::size_t kMaximumPortableTokenLength = 128U;
-
 const detail::ContentIdentitySpec kDeploymentIdentitySpec{
     "deployment-revision",
     std::string(kDeploymentApiVersion),
@@ -133,7 +132,8 @@ void require_exact_graph_fields(const CanonicalValue::Object& graph) {
 }
 
 [[nodiscard]] bool is_portable_token(std::string_view value) noexcept {
-  if (value.empty() || value.size() > kMaximumPortableTokenLength ||
+  if (value.empty() ||
+      value.size() > detail::kMaximumPortableIdentityBytes ||
       !is_ascii_alphanumeric(static_cast<unsigned char>(value.front()))) {
     return false;
   }

@@ -1,0 +1,55 @@
+#pragma once
+
+#include <array>
+#include <string_view>
+
+namespace manyforge::deployment::detail::build_evidence {
+
+struct BuildEvidenceRow final {
+  std::string_view id;
+  std::string_view content_digest;
+};
+
+inline constexpr std::string_view kNodeEnvironmentManifest =
+    R"mf_node_env(@MANYFORGE_EMBEDDED_NODE_ENVIRONMENT_MANIFEST@)mf_node_env";
+
+inline constexpr std::array<BuildEvidenceRow,
+                            @MANYFORGE_COMPILER_SOURCE_COUNT@>
+    kCompilerSourceInputs{{
+@MANYFORGE_COMPILER_SOURCE_ROWS@}};
+
+inline constexpr std::array<BuildEvidenceRow,
+                            @MANYFORGE_COMPILER_RECIPE_COUNT@>
+    kCompilerRecipeInputs{{
+@MANYFORGE_COMPILER_RECIPE_ROWS@}};
+
+inline constexpr std::string_view kCompilerPackageId =
+    "manyforge_deployment";
+inline constexpr std::string_view kCompilerPackageVersion =
+    "@MANYFORGE_COMPILER_PACKAGE_VERSION@";
+inline constexpr std::string_view kBuildProfile =
+    "@MANYFORGE_COMPILER_BUILD_PROFILE@";
+inline constexpr std::string_view kBuildTarget =
+    "@MANYFORGE_COMPILER_BUILD_TARGET@";
+inline constexpr std::string_view kBuildConfigurationDigest =
+    "@MANYFORGE_BUILD_CONFIGURATION_DIGEST@";
+inline constexpr std::string_view kCompilerId =
+    "@MANYFORGE_COMPILER_ID@";
+inline constexpr std::string_view kCompilerVersion =
+    "@MANYFORGE_COMPILER_VERSION@";
+inline constexpr std::string_view kCxxStandard =
+    "@MANYFORGE_COMPILER_CXX_STANDARD@";
+inline constexpr std::string_view kCMakeVersion =
+    "@MANYFORGE_CMAKE_VERSION@";
+inline constexpr std::string_view kOpenSslVersion =
+    "@MANYFORGE_OPENSSL_VERSION@";
+inline constexpr std::string_view kExpatVersion =
+    "@MANYFORGE_EXPAT_VERSION@";
+inline constexpr std::string_view kUtf8ProcVersion =
+    "@MANYFORGE_UTF8PROC_VERSION@";
+inline constexpr std::string_view kLibYamlVersion =
+    "@MANYFORGE_LIBYAML_VERSION@";
+inline constexpr std::string_view kDoubleConversionVersion =
+    "@MANYFORGE_DOUBLE_CONVERSION_VERSION@";
+
+}  // namespace manyforge::deployment::detail::build_evidence

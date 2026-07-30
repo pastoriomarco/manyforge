@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--build-dir", required=True)
     parser.add_argument("--test-regex")
+    parser.add_argument("--exclude-test-regex")
     parser.add_argument("--summary-prefix", default="GROUPED_GTEST")
     parser.add_argument(
         "--timeout-seconds",
@@ -55,7 +56,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_registry(build_dir: Path, test_regex: str | None) -> list[dict[str, Any]]:
+def load_registry(
+    build_dir: Path,
+    test_regex: str | None,
+    exclude_test_regex: str | None,
+) -> list[dict[str, Any]]:
     command = [
         "ctest",
         "--test-dir",
@@ -64,6 +69,8 @@ def load_registry(build_dir: Path, test_regex: str | None) -> list[dict[str, Any
     ]
     if test_regex:
         command.extend(["-R", test_regex])
+    if exclude_test_regex:
+        command.extend(["-E", exclude_test_regex])
     completed = subprocess.run(
         command,
         check=True,
@@ -268,7 +275,9 @@ def run_group(index: int, group: BinaryGroup) -> tuple[int, int, int, bool]:
 def main() -> int:
     args = parse_args()
     build_dir = Path(args.build_dir).resolve()
-    tests = load_registry(build_dir, args.test_regex)
+    tests = load_registry(
+        build_dir, args.test_regex, args.exclude_test_regex
+    )
     groups = group_registry(tests, args.timeout_seconds)
     disabled = sum(group.disabled_count for group in groups.values())
     enabled = sum(len(group.enabled_filters) for group in groups.values())
