@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <barrier>
+#include <cstddef>
 #include <concepts>
+#include <exception>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
@@ -9,6 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -132,6 +136,23 @@ private:
   mutable std::size_t get_calls_{0U};
 };
 
+void expect_no_thread_failures(
+    std::span<const std::exception_ptr> failures) {
+  for (std::size_t index = 0U; index < failures.size(); ++index) {
+    if (failures[index] == nullptr) {
+      continue;
+    }
+    try {
+      std::rethrow_exception(failures[index]);
+    } catch (const std::exception &error) {
+      ADD_FAILURE() << "worker " << index << " failed: " << error.what();
+    } catch (...) {
+      ADD_FAILURE() << "worker " << index
+                    << " failed with a non-standard exception";
+    }
+  }
+}
+
 } // namespace
 
 TEST(ProductContractRegistryTest, QualifiesOnlyExactFlattenedModelContract) {
@@ -220,6 +241,113 @@ TEST(RawArtifactStoreTest, AppliesEntryAndByteBoundsWithoutEviction) {
   EXPECT_EQ(single_bound.size(), 0U);
 }
 
+TEST(RawArtifactStoreTest,
+     ConcurrentSameBytesAreIdempotentWithExactAccounting) {
+  constexpr std::size_t kThreadCount = 16U;
+  const std::string bytes = "one immutable concurrent artifact";
+  InMemoryRawArtifactStore store(1U, bytes.size(), bytes.size());
+  std::barrier<> start(static_cast<std::ptrdiff_t>(kThreadCount + 1U));
+  std::vector<std::optional<StoredRawArtifact>> results(kThreadCount);
+  std::vector<std::exception_ptr> failures(kThreadCount);
+  std::vector<std::thread> workers;
+  workers.reserve(kThreadCount);
+
+  for (std::size_t index = 0U; index < kThreadCount; ++index) {
+    workers.emplace_back([&, index] {
+      start.arrive_and_wait();
+      try {
+        results[index] = store.put_if_absent(bytes);
+      } catch (...) {
+        failures[index] = std::current_exception();
+      }
+    });
+  }
+  start.arrive_and_wait();
+  for (auto &worker : workers) {
+    worker.join();
+  }
+
+  expect_no_thread_failures(failures);
+  ASSERT_TRUE(std::all_of(results.begin(), results.end(),
+                          [](const auto &result) {
+                            return result.has_value();
+                          }));
+  EXPECT_EQ(std::count_if(results.begin(), results.end(),
+                          [](const auto &result) {
+                            return result->inserted;
+                          }),
+            1);
+  const StoredRawArtifact &identity = *results.front();
+  for (const auto &result : results) {
+    EXPECT_EQ(result->content_digest, identity.content_digest);
+    EXPECT_EQ(result->content_addressed_store_key,
+              identity.content_addressed_store_key);
+    EXPECT_EQ(result->byte_size, bytes.size());
+  }
+  EXPECT_EQ(store.size(), 1U);
+  EXPECT_EQ(store.retained_bytes(), bytes.size());
+  EXPECT_EQ(store.get_verified(identity.content_addressed_store_key,
+                               identity.content_digest, identity.byte_size),
+            bytes);
+}
+
+TEST(RawArtifactStoreTest,
+     ConcurrentDistinctBytesHaveExactCountAndByteAccounting) {
+  constexpr std::size_t kThreadCount = 16U;
+  std::vector<std::string> inputs;
+  inputs.reserve(kThreadCount);
+  std::uint64_t expected_total_bytes = 0U;
+  std::size_t maximum_single_bytes = 0U;
+  for (std::size_t index = 0U; index < kThreadCount; ++index) {
+    inputs.push_back("distinct-artifact-" + std::to_string(index) + "-" +
+                     std::string(index + 1U, 'x'));
+    expected_total_bytes +=
+        static_cast<std::uint64_t>(inputs.back().size());
+    maximum_single_bytes =
+        std::max(maximum_single_bytes, inputs.back().size());
+  }
+
+  InMemoryRawArtifactStore store(
+      kThreadCount, expected_total_bytes,
+      static_cast<std::uint64_t>(maximum_single_bytes));
+  std::barrier<> start(static_cast<std::ptrdiff_t>(kThreadCount + 1U));
+  std::vector<std::optional<StoredRawArtifact>> results(kThreadCount);
+  std::vector<std::exception_ptr> failures(kThreadCount);
+  std::vector<std::thread> workers;
+  workers.reserve(kThreadCount);
+
+  for (std::size_t index = 0U; index < kThreadCount; ++index) {
+    workers.emplace_back([&, index] {
+      start.arrive_and_wait();
+      try {
+        results[index] = store.put_if_absent(inputs[index]);
+      } catch (...) {
+        failures[index] = std::current_exception();
+      }
+    });
+  }
+  start.arrive_and_wait();
+  for (auto &worker : workers) {
+    worker.join();
+  }
+
+  expect_no_thread_failures(failures);
+  ASSERT_TRUE(std::all_of(results.begin(), results.end(),
+                          [](const auto &result) {
+                            return result.has_value();
+                          }));
+  for (std::size_t index = 0U; index < kThreadCount; ++index) {
+    EXPECT_TRUE(results[index]->inserted);
+    EXPECT_EQ(results[index]->byte_size, inputs[index].size());
+    EXPECT_EQ(store.get_verified(results[index]->content_addressed_store_key,
+                                 results[index]->content_digest,
+                                 results[index]->byte_size),
+              inputs[index]);
+  }
+  EXPECT_EQ(store.size(), kThreadCount);
+  EXPECT_EQ(store.retained_bytes(), expected_total_bytes);
+}
+
 TEST(RetainedProductTest, UsesContractBeforeRetainingCanonicalArtifacts) {
   InMemoryRawArtifactStore store;
   auto reversed = product_contract_fixture_artifacts();
@@ -248,6 +376,80 @@ TEST(RetainedProductTest, UsesContractBeforeRetainingCanonicalArtifacts) {
   const core::RetainedProductDTO same = retain_fixture_product(second_store);
   EXPECT_EQ(product, same);
   EXPECT_EQ(output_digest, retained_product_output_digest(same));
+}
+
+TEST(RetainedProductTest,
+     OutputDigestCoversEveryContractValidSemanticField) {
+  InMemoryRawArtifactStore store;
+  const core::RetainedProductDTO original = retain_fixture_product(store);
+  const core::ContentDigest original_digest =
+      retained_product_output_digest(original);
+
+  core::RetainedProductDTO changed = original;
+  changed.product_id = core::ProductId("another_planning_collision_model");
+  EXPECT_NE(retained_product_output_digest(changed), original_digest);
+
+  changed = original;
+  ++changed.artifact_refs.front().byte_size;
+  EXPECT_NE(retained_product_output_digest(changed), original_digest);
+
+  // A content digest and its digest-derived key form one indivisible valid
+  // semantic change. Changing either alone is rejected below.
+  changed = original;
+  const std::string replacement_digest =
+      sha256_digest("same-length-replacement-artifact");
+  changed.artifact_refs.front().content_digest =
+      core::ContentDigest(replacement_digest);
+  changed.artifact_refs.front().content_addressed_store_key =
+      core::ContentAddressedStoreKey("sha256/" +
+                                     replacement_digest.substr(7U));
+  EXPECT_NE(retained_product_output_digest(changed), original_digest);
+}
+
+TEST(RetainedProductTest,
+     ContractOwnedOrIncoherentSemanticFieldMutationsFailClosed) {
+  InMemoryRawArtifactStore store;
+  const core::RetainedProductDTO original = retain_fixture_product(store);
+
+  core::RetainedProductDTO changed = original;
+  changed.product_kind = core::RetainedProductKind::kViewerModel;
+  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
+               RetainedBundleError);
+
+  changed = original;
+  changed.product_contract_id =
+      core::ProductContractId("manyforge.unqualified");
+  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
+               RetainedBundleError);
+
+  changed = original;
+  changed.product_contract_revision =
+      core::ProductContractRevision(std::string(kZeroDigest));
+  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
+               RetainedBundleError);
+
+  changed = original;
+  changed.artifact_refs.front().artifact_role_id =
+      core::ArtifactRoleId("unqualified_role");
+  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
+               RetainedBundleError);
+
+  changed = original;
+  changed.artifact_refs.front().media_type = "text/xml";
+  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
+               RetainedBundleError);
+
+  changed = original;
+  changed.artifact_refs.front().content_digest =
+      core::ContentDigest(std::string(kZeroDigest));
+  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
+               RetainedBundleError);
+
+  changed = original;
+  changed.artifact_refs.front().content_addressed_store_key =
+      core::ContentAddressedStoreKey("sha256/" + std::string(64U, '0'));
+  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
+               RetainedBundleError);
 }
 
 TEST(RetainedProductTest, RejectsContractDefectsBeforeStoreEffects) {
