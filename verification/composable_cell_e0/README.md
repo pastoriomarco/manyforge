@@ -264,6 +264,6 @@ ledger output itself:
 ```bash
 python3 verification/composable_cell_e0/hash_evidence.py \
   --evidence-root /tmp/manyforge-e0-evidence \
-  --exclude raw-evidence-ledger.json \
-  >/tmp/manyforge-e0-evidence/raw-evidence-ledger.json
+  --exclude evidence-ledger.json \
+  >/tmp/manyforge-e0-evidence/evidence-ledger.json
 ```
