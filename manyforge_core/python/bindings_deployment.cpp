@@ -6,6 +6,7 @@
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/closed_schema.hpp>
+#include <manyforge_deployment/component_type_codec.hpp>
 #include <manyforge_deployment/control_interface_contract_codec.hpp>
 #include <manyforge_deployment/controller_topology_codec.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
@@ -41,6 +42,8 @@ void register_deployment_candidate_bindings(py::module_& module) {
       module, "ControlInterfaceContractCodecError", PyExc_ValueError);
   py::register_exception<deployment::ControllerTopologyCodecError>(
       module, "ControllerTopologyCodecError", PyExc_ValueError);
+  py::register_exception<deployment::ComponentTypeCodecError>(
+      module, "ComponentTypeCodecError", PyExc_ValueError);
   py::register_exception<deployment::ModelAssetCodecError>(
       module, "ModelAssetCodecError", PyExc_ValueError);
   py::register_exception<deployment::ProviderManifestCodecError>(
@@ -235,6 +238,17 @@ void register_deployment_candidate_bindings(py::module_& module) {
             return deployment::canonical_json(topology.normalized_root());
           });
 
+  py::class_<deployment::QualifiedComponentType>(
+      module, "QualifiedComponentType", py::is_final())
+      .def_property_readonly(
+          "value", &deployment::QualifiedComponentType::value)
+      .def_property_readonly(
+          "normalized_canonical_json",
+          [](const deployment::QualifiedComponentType& type) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(type.normalized_root());
+          });
+
   py::class_<deployment::QualifiedModelAsset>(
       module, "QualifiedModelAsset", py::is_final())
       .def_property_readonly("value",
@@ -322,6 +336,42 @@ void register_deployment_candidate_bindings(py::module_& module) {
       py::arg("reference"), py::arg("resolved_store_key"),
       py::arg("stored_bytes"), py::arg("qualified_contracts"),
       py::call_guard<py::gil_scoped_release>());
+  module.def(
+      "resolve_and_qualify_component_type",
+      [](const core::ComponentTypeCatalogRecordRefDTO& reference,
+         const core::ContentAddressedStoreKey& resolved_store_key,
+         const std::string& stored_bytes,
+         const py::iterable& qualified_capabilities) {
+        std::vector<deployment::QualifiedCapabilityDefinition>
+            bounded_capabilities;
+        bounded_capabilities.reserve(
+            core::kMaxComponentTypeCapabilityDependencies);
+        for (const auto& capability : qualified_capabilities) {
+          if (bounded_capabilities.size() ==
+              core::kMaxComponentTypeCapabilityDependencies) {
+            throw py::value_error(
+                "qualified_capabilities exceeds the ComponentType v1 "
+                "dependency bound");
+          }
+          if (!py::isinstance<
+                  deployment::QualifiedCapabilityDefinition>(
+                  capability)) {
+            throw py::type_error(
+                "qualified_capabilities must contain only "
+                "QualifiedCapabilityDefinition values");
+          }
+          bounded_capabilities.push_back(
+              capability.cast<
+                  deployment::QualifiedCapabilityDefinition>());
+        }
+        py::gil_scoped_release release;
+        return deployment::resolve_and_qualify_component_type(
+            reference, resolved_store_key, stored_bytes,
+            std::span<const deployment::QualifiedCapabilityDefinition>{
+                bounded_capabilities});
+      },
+      py::arg("reference"), py::arg("resolved_store_key"),
+      py::arg("stored_bytes"), py::arg("qualified_capabilities"));
   module.def("resolve_and_qualify_model_asset",
              &deployment::resolve_and_qualify_model_asset,
              py::arg("reference"), py::arg("resolved_store_key"),

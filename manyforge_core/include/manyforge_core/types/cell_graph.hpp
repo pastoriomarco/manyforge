@@ -1,8 +1,8 @@
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <manyforge_core/types/json_value.hpp>
+#include <manyforge_core/types/placement_pose.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
@@ -48,13 +48,6 @@ enum class StateAuthorityClass : std::uint8_t {
   }
   return {};
 }
-
-struct PlacementPoseDTO {
-  std::array<double, 3> position_m{};
-  std::array<double, 4> orientation_xyzw{0.0, 0.0, 0.0, 1.0};
-
-  friend bool operator==(const PlacementPoseDTO&, const PlacementPoseDTO&) = default;
-};
 
 struct ModelRoleBindingDTO {
   ModelRoleId model_role_id;

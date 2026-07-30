@@ -21,7 +21,9 @@ catalog_schemas:
     qualification: unqualified
   - record_kind: component_type
     schema_id: manyforge.component_type.v1
-    qualification: unqualified
+    schema_revision: sha256:fdd03c397fb792d387002df453055d9ccd7d1826ae41d3b0706e5f7c27480d87
+    relative_path: catalog/manyforge.component_type.v1.yaml
+    qualification: qualified
   - record_kind: contact_policy
     schema_id: manyforge.contact_policy.v1
     qualification: unqualified

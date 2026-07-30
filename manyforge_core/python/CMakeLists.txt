@@ -55,6 +55,7 @@ pybind11_add_module(manyforge_core_py
   bindings.cpp
   bindings_catalog.cpp
   bindings_cell_graph.cpp
+  bindings_component_type.cpp
   bindings_deployment.cpp
   bindings_strong_identity.cpp
 )

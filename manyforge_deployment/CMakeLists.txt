@@ -34,6 +34,11 @@ manyforge_embed_closed_schema(
   resources/closed_schema/catalog/manyforge.capability_definition.v1.yaml
   mf_cap_schema)
 manyforge_embed_closed_schema(
+  kEmbeddedComponentTypeSchema
+  component_type
+  resources/closed_schema/catalog/manyforge.component_type.v1.yaml
+  mf_component)
+manyforge_embed_closed_schema(
   kEmbeddedControlInterfaceContractSchema
   control_interface_contract
   resources/closed_schema/catalog/manyforge.control_interface_contract.v1.yaml
@@ -86,6 +91,7 @@ add_library(manyforge_deployment
   src/canonical_value.cpp
   src/cell_graph_codec.cpp
   src/closed_schema.cpp
+  src/component_type_codec.cpp
   src/control_interface_contract_codec.cpp
   src/controller_topology_codec.cpp
   src/content_identity.cpp
@@ -132,6 +138,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_content_identity PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_content_identity
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_component_type_codec
+    test/test_component_type_codec.cpp)
+  target_link_libraries(test_component_type_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_component_type_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_cell_graph_codec test/test_cell_graph_codec.cpp)

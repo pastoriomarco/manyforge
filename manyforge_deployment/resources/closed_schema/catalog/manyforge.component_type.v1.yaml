@@ -1,0 +1,622 @@
+api_version: manyforge.closed_schema.v1
+schema_id: manyforge.component_type.v1
+schema_revision: sha256:fdd03c397fb792d387002df453055d9ccd7d1826ae41d3b0706e5f7c27480d87
+schema_purpose: artifact_document
+root_definition_id: component_type
+definitions:
+  - definition_id: component_type
+    value_schema:
+      kind: object
+      fields:
+        - field_id: api_version
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manyforge.component_type.v1
+              - kind: string_format
+                value: api_version
+        - field_id: component_type_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: component_type_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+        - field_id: tags
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 256
+            collection:
+              kind: scalar_set
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: string_format
+                  value: portable_id
+        - field_id: model_roles
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - model_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: model_role
+        - field_id: component_root
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: component_root
+        - field_id: model_mounts
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 255
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - child
+                  - model_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: model_mount
+        - field_id: command_targets
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - command_target_id
+            item_schema:
+              kind: local_ref
+              definition_id: command_target
+        - field_id: attachment_interfaces
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - attachment_interface_id
+            item_schema:
+              kind: local_ref
+              definition_id: attachment_interface
+  - definition_id: model_role
+    value_schema:
+      kind: object
+      fields:
+        - field_id: model_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: cardinality
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - exactly_one
+              - kind: string_format
+                value: portable_id
+  - definition_id: component_root
+    value_schema:
+      kind: object
+      fields:
+        - field_id: model_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: frame_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+  - definition_id: model_mount
+    value_schema:
+      kind: object
+      fields:
+        - field_id: parent
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: mount_endpoint
+        - field_id: child
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: mount_endpoint
+        - field_id: child_frame_pose_in_parent_frame
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: placement_pose
+  - definition_id: mount_endpoint
+    value_schema:
+      kind: object
+      fields:
+        - field_id: model_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: frame_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+  - definition_id: placement_pose
+    value_schema:
+      kind: object
+      fields:
+        - field_id: position_m
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 3
+            max_items: 3
+            collection:
+              kind: ordered
+            item_schema:
+              kind: scalar
+              scalar_type: number
+              constraints: []
+        - field_id: orientation_xyzw
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 4
+            max_items: 4
+            collection:
+              kind: ordered
+            item_schema:
+              kind: scalar
+              scalar_type: number
+              constraints: []
+  - definition_id: command_target
+    value_schema:
+      kind: object
+      fields:
+        - field_id: command_target_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: model_group_roles
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - model_group_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: command_target_model_group_role
+        - field_id: resource_roles
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: ordered
+            item_schema:
+              kind: local_ref
+              definition_id: command_target_resource_role
+        - field_id: frame_roles
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - frame_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: command_target_frame_role
+        - field_id: collision_body_roles
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - collision_body_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: command_target_collision_body_role
+        - field_id: capabilities
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - capability_id
+            item_schema:
+              kind: local_ref
+              definition_id: command_target_capability
+  - definition_id: command_target_model_group_role
+    value_schema:
+      kind: object
+      fields:
+        - field_id: model_group_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: model_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: asset_model_group_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+  - definition_id: command_target_resource_role
+    value_schema:
+      kind: tagged_union
+      tag_field: source_kind
+      alternatives:
+        - tag_value: model_role
+          value_schema:
+            kind: local_ref
+            definition_id: command_target_model_resource_role
+        - tag_value: component_local
+          value_schema:
+            kind: local_ref
+            definition_id: command_target_local_resource_role
+  - definition_id: command_target_model_resource_role
+    value_schema:
+      kind: object
+      fields:
+        - field_id: resource_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: source_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - model_role
+              - kind: string_format
+                value: portable_id
+        - field_id: model_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: asset_resource_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+  - definition_id: command_target_local_resource_role
+    value_schema:
+      kind: object
+      fields:
+        - field_id: resource_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: source_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - component_local
+              - kind: string_format
+                value: portable_id
+  - definition_id: command_target_frame_role
+    value_schema:
+      kind: object
+      fields:
+        - field_id: frame_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: model_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: asset_frame_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+  - definition_id: command_target_collision_body_role
+    value_schema:
+      kind: object
+      fields:
+        - field_id: collision_body_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: model_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: asset_collision_body_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+  - definition_id: command_target_capability
+    value_schema:
+      kind: object
+      fields:
+        - field_id: capability_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: capability_definition_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+  - definition_id: attachment_interface
+    value_schema:
+      kind: object
+      fields:
+        - field_id: attachment_interface_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: model_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: frame_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: accepts_tags
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: scalar_set
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: string_format
+                  value: portable_id
+        - field_id: max_attachments
+          presence: optional
+          default:
+            kind: materialized
+            value: 1
+          value_schema:
+            kind: scalar
+            scalar_type: integer
+            constraints:
+              - kind: minimum
+                value: 1
+              - kind: maximum
+                value: 4096

@@ -1348,9 +1348,10 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kQualified
     ]
-    assert len(qualified_entries) == 7
+    assert len(qualified_entries) == 8
     assert {entry.record_kind for entry in qualified_entries} == {
         core.CatalogRecordKind.kCapabilityDefinition,
+        core.CatalogRecordKind.kComponentType,
         core.CatalogRecordKind.kControlInterfaceContract,
         core.CatalogRecordKind.kControllerTopology,
         core.CatalogRecordKind.kModelAsset,
@@ -1361,6 +1362,7 @@ target: 0.5
     assert all(entry.compiled_schema is not None for entry in qualified_entries)
     assert {entry.relative_path for entry in qualified_entries} == {
         "catalog/manyforge.capability_definition.v1.yaml",
+        "catalog/manyforge.component_type.v1.yaml",
         "catalog/manyforge.control_interface_contract.v1.yaml",
         "catalog/manyforge.controller_topology.v1.yaml",
         "catalog/manyforge.model_asset.v1.yaml",
@@ -1388,7 +1390,7 @@ target: 0.5
         ),
     }
     assert registry.qualification_registry_digest.value == (
-        "sha256:814b39453a34ca4c0017e6ee11234da7b1a55f673dcd0d3eaa29ee457f24be34"
+        "sha256:35e15d92f29c8e8173d73cf211586a8deb1ff5a945207f5476ea84d4c773d8f1"
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][
