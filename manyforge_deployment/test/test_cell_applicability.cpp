@@ -2348,6 +2348,10 @@ TEST(CellApplicability,
             emit_canonical_srdf_document(value.flattened_srdf()),
             value.model_occurrences().size(), value.targets().size()};
       });
+  test::expect_immutable_shared_copy_storage(
+      fixture.composition,
+      [](const CompositionQualifiedCellIr& value)
+          -> const UrdfDocumentIr& { return value.flattened_urdf(); });
   test::expect_source_preserving_rvalue_transfers(
       fixture.inputs,
       [](const RevisionVerifiedDeploymentApplicabilityInputs& value) {
@@ -2359,6 +2363,12 @@ TEST(CellApplicability,
             value.normalized_site_overlay_ref(),
             value.external_resources_was_present()};
       });
+  test::expect_immutable_shared_copy_storage(
+      fixture.inputs,
+      [](const RevisionVerifiedDeploymentApplicabilityInputs& value)
+          -> const core::DeploymentApplicabilityInputsDTO& {
+        return value.value();
+      });
 
   ASSERT_FALSE(fixture.runtime_profiles.empty());
   test::expect_source_preserving_rvalue_transfers(
@@ -2367,6 +2377,10 @@ TEST(CellApplicability,
         return std::tuple{value.reference(), value.value(),
                           value.normalized_root()};
       });
+  test::expect_immutable_shared_copy_storage(
+      fixture.runtime_profiles.front(),
+      [](const QualifiedRuntimeProfile& value)
+          -> const CanonicalValue& { return value.normalized_root(); });
   ASSERT_FALSE(fixture.capabilities.empty());
   test::expect_source_preserving_rvalue_transfers(
       fixture.capabilities.front(),
@@ -2374,6 +2388,10 @@ TEST(CellApplicability,
         return std::tuple{value.reference(), value.value(),
                           value.normalized_root()};
       });
+  test::expect_immutable_shared_copy_storage(
+      fixture.capabilities.front(),
+      [](const QualifiedCapabilityDefinition& value)
+          -> const CanonicalValue& { return value.normalized_root(); });
   ASSERT_FALSE(fixture.contracts.empty());
   test::expect_source_preserving_rvalue_transfers(
       fixture.contracts.front(),
@@ -2381,6 +2399,10 @@ TEST(CellApplicability,
         return std::tuple{value.reference(), value.value(),
                           value.normalized_root()};
       });
+  test::expect_immutable_shared_copy_storage(
+      fixture.contracts.front(),
+      [](const QualifiedControlInterfaceContract& value)
+          -> const CanonicalValue& { return value.normalized_root(); });
   ASSERT_FALSE(fixture.topologies.empty());
   test::expect_source_preserving_rvalue_transfers(
       fixture.topologies.front(),
@@ -2388,6 +2410,10 @@ TEST(CellApplicability,
         return std::tuple{value.reference(), value.value(),
                           value.normalized_root()};
       });
+  test::expect_immutable_shared_copy_storage(
+      fixture.topologies.front(),
+      [](const QualifiedControllerTopology& value)
+          -> const CanonicalValue& { return value.normalized_root(); });
   ASSERT_FALSE(fixture.manifests.empty());
   test::expect_source_preserving_rvalue_transfers(
       fixture.manifests.front(),
@@ -2395,6 +2421,10 @@ TEST(CellApplicability,
         return std::tuple{value.reference(), value.value(),
                           value.normalized_root()};
       });
+  test::expect_immutable_shared_copy_storage(
+      fixture.manifests.front(),
+      [](const QualifiedProviderManifest& value)
+          -> const CanonicalValue& { return value.normalized_root(); });
   ASSERT_FALSE(fixture.stop_policies.empty());
   test::expect_source_preserving_rvalue_transfers(
       fixture.stop_policies.front(),
@@ -2402,6 +2432,10 @@ TEST(CellApplicability,
         return std::tuple{value.reference(), value.value(),
                           value.normalized_root()};
       });
+  test::expect_immutable_shared_copy_storage(
+      fixture.stop_policies.front(),
+      [](const QualifiedStopEvidencePolicy& value)
+          -> const CanonicalValue& { return value.normalized_root(); });
 
   ASSERT_TRUE(fixture.selected_overlay.has_selection());
   const auto overlay_projection =
@@ -2429,6 +2463,12 @@ TEST(CellApplicability,
             value.provider_endpoints().size(),
             value.external_resources().size(),
             value.stop_applicability().size()};
+      });
+  test::expect_immutable_shared_copy_storage(
+      applicability_source,
+      [](const ApplicabilityQualifiedCellIr& value)
+          -> const CompositionQualifiedCellIr& {
+        return value.composition();
       });
 
   const auto applicability_destination = std::move(applicability_source);

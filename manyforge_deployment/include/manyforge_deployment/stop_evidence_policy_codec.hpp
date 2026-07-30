@@ -2,6 +2,7 @@
 
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/stop_evidence_policy.hpp>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -25,32 +26,43 @@ class StopEvidencePolicyCodecError : public std::invalid_argument {
 /// the selected command/provider, or authorize/execute Stop.
 class QualifiedStopEvidencePolicy final {
  public:
-  QualifiedStopEvidencePolicy(const QualifiedStopEvidencePolicy&) = default;
+  QualifiedStopEvidencePolicy(const QualifiedStopEvidencePolicy&) noexcept =
+      default;
   QualifiedStopEvidencePolicy& operator=(
-      const QualifiedStopEvidencePolicy&) = default;
+      const QualifiedStopEvidencePolicy&) noexcept = default;
 
   [[nodiscard]] const core::StopEvidencePolicyCatalogRecordRefDTO& reference()
       const noexcept {
-    return reference_;
+    return data_->reference;
   }
   [[nodiscard]] const core::StopEvidencePolicyDTO& value() const noexcept {
-    return value_;
+    return data_->value;
   }
   [[nodiscard]] const CanonicalValue& normalized_root() const noexcept {
-    return normalized_root_;
+    return data_->normalized_root;
   }
 
  private:
+  struct Data final {
+    Data(const core::StopEvidencePolicyCatalogRecordRefDTO& reference_in,
+         core::StopEvidencePolicyDTO value_in,
+         CanonicalValue normalized_root_in)
+        : reference(reference_in),
+          value(std::move(value_in)),
+          normalized_root(std::move(normalized_root_in)) {}
+
+    core::StopEvidencePolicyCatalogRecordRefDTO reference;
+    core::StopEvidencePolicyDTO value;
+    CanonicalValue normalized_root;
+  };
+
   QualifiedStopEvidencePolicy(
       const core::StopEvidencePolicyCatalogRecordRefDTO& reference,
       core::StopEvidencePolicyDTO value, CanonicalValue normalized_root)
-      : reference_(reference),
-        value_(std::move(value)),
-        normalized_root_(std::move(normalized_root)) {}
+      : data_(std::make_shared<const Data>(
+            reference, std::move(value), std::move(normalized_root))) {}
 
-  core::StopEvidencePolicyCatalogRecordRefDTO reference_;
-  core::StopEvidencePolicyDTO value_;
-  CanonicalValue normalized_root_;
+  std::shared_ptr<const Data> data_;
 
   friend QualifiedStopEvidencePolicy resolve_and_qualify_stop_evidence_policy(
       const core::StopEvidencePolicyCatalogRecordRefDTO&,

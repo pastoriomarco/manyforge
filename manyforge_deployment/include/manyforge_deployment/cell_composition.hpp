@@ -7,6 +7,7 @@
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/component_type_codec.hpp>
 #include <manyforge_deployment/model_source.hpp>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -365,76 +366,134 @@ struct CompositionFramePath final {
 /// runtime readiness, or any execution lane.
 class CompositionQualifiedCellIr final {
  public:
-  CompositionQualifiedCellIr(const CompositionQualifiedCellIr&) = default;
-  CompositionQualifiedCellIr& operator=(const CompositionQualifiedCellIr&) =
+  CompositionQualifiedCellIr(const CompositionQualifiedCellIr&) noexcept =
       default;
+  CompositionQualifiedCellIr& operator=(
+      const CompositionQualifiedCellIr&) noexcept = default;
 
   [[nodiscard]] const GraphRevisionVerifiedCellGraph& verified_graph()
       const noexcept {
-    return verified_graph_;
+    return data_->verified_graph;
   }
   [[nodiscard]] const core::CellGraphDTO& graph() const noexcept {
-    return verified_graph_.graph();
+    return data_->verified_graph.graph();
   }
   [[nodiscard]] const std::vector<SourceVerifiedModelAsset>& model_assets()
       const noexcept {
-    return model_assets_;
+    return data_->model_assets;
   }
   [[nodiscard]] const std::vector<QualifiedComponentType>& component_types()
       const noexcept {
-    return component_types_;
+    return data_->component_types;
   }
   [[nodiscard]] const CompositionCellFrame& cell_frame() const noexcept {
-    return cell_frame_;
+    return data_->cell_frame;
   }
   [[nodiscard]] const UrdfDocumentIr& flattened_urdf() const noexcept {
-    return flattened_urdf_;
+    return data_->flattened_urdf;
   }
   [[nodiscard]] const SrdfDocumentIr& flattened_srdf() const noexcept {
-    return flattened_srdf_;
+    return data_->flattened_srdf;
   }
   [[nodiscard]] const std::vector<CompositionModelOccurrence>&
   model_occurrences() const noexcept {
-    return model_occurrences_;
+    return data_->model_occurrences;
   }
   [[nodiscard]] const std::vector<OccurrenceSymbolRewrite>& symbol_rewrites()
       const noexcept {
-    return symbol_rewrites_;
+    return data_->symbol_rewrites;
   }
   [[nodiscard]] const std::vector<OccurrenceReverseSymbolRewrite>&
   reverse_symbol_rewrites() const noexcept {
-    return reverse_symbol_rewrites_;
+    return data_->reverse_symbol_rewrites;
   }
   [[nodiscard]] const std::vector<OccurrenceReferenceRewrite>&
   reference_rewrites() const noexcept {
-    return reference_rewrites_;
+    return data_->reference_rewrites;
   }
   [[nodiscard]] const std::vector<CompositionFrameResolution>& frames()
       const noexcept {
-    return frames_;
+    return data_->frames;
   }
   [[nodiscard]] const std::vector<CompositionFixedConnection>&
   fixed_connections() const noexcept {
-    return fixed_connections_;
+    return data_->fixed_connections;
   }
   [[nodiscard]] const std::vector<CompositionFramePath>& frame_paths()
       const noexcept {
-    return frame_paths_;
+    return data_->frame_paths;
   }
   [[nodiscard]] const std::vector<CompositionModelCoordinate>& coordinates()
       const noexcept {
-    return coordinates_;
+    return data_->coordinates;
   }
   [[nodiscard]] const std::vector<CompositionControlBindingCoordinateMap>&
   control_binding_coordinate_maps() const noexcept {
-    return control_binding_coordinate_maps_;
+    return data_->control_binding_coordinate_maps;
   }
   [[nodiscard]] const std::vector<CompositionTargetResolution>& targets()
       const noexcept {
-    return targets_;
+    return data_->targets;
   }
 
  private:
+  struct Data final {
+    Data(
+        const GraphRevisionVerifiedCellGraph& verified_graph_in,
+        std::vector<SourceVerifiedModelAsset> model_assets_in,
+        std::vector<QualifiedComponentType> component_types_in,
+        CompositionCellFrame cell_frame_in,
+        UrdfDocumentIr flattened_urdf_in,
+        SrdfDocumentIr flattened_srdf_in,
+        std::vector<CompositionModelOccurrence> model_occurrences_in,
+        std::vector<OccurrenceSymbolRewrite> symbol_rewrites_in,
+        std::vector<OccurrenceReverseSymbolRewrite>
+            reverse_symbol_rewrites_in,
+        std::vector<OccurrenceReferenceRewrite> reference_rewrites_in,
+        std::vector<CompositionFrameResolution> frames_in,
+        std::vector<CompositionFixedConnection> fixed_connections_in,
+        std::vector<CompositionFramePath> frame_paths_in,
+        std::vector<CompositionModelCoordinate> coordinates_in,
+        std::vector<CompositionControlBindingCoordinateMap>
+            control_binding_coordinate_maps_in,
+        std::vector<CompositionTargetResolution> targets_in)
+        : verified_graph(verified_graph_in),
+          model_assets(std::move(model_assets_in)),
+          component_types(std::move(component_types_in)),
+          cell_frame(std::move(cell_frame_in)),
+          flattened_urdf(std::move(flattened_urdf_in)),
+          flattened_srdf(std::move(flattened_srdf_in)),
+          model_occurrences(std::move(model_occurrences_in)),
+          symbol_rewrites(std::move(symbol_rewrites_in)),
+          reverse_symbol_rewrites(std::move(reverse_symbol_rewrites_in)),
+          reference_rewrites(std::move(reference_rewrites_in)),
+          frames(std::move(frames_in)),
+          fixed_connections(std::move(fixed_connections_in)),
+          frame_paths(std::move(frame_paths_in)),
+          coordinates(std::move(coordinates_in)),
+          control_binding_coordinate_maps(
+              std::move(control_binding_coordinate_maps_in)),
+          targets(std::move(targets_in)) {}
+
+    GraphRevisionVerifiedCellGraph verified_graph;
+    std::vector<SourceVerifiedModelAsset> model_assets;
+    std::vector<QualifiedComponentType> component_types;
+    CompositionCellFrame cell_frame;
+    UrdfDocumentIr flattened_urdf;
+    SrdfDocumentIr flattened_srdf;
+    std::vector<CompositionModelOccurrence> model_occurrences;
+    std::vector<OccurrenceSymbolRewrite> symbol_rewrites;
+    std::vector<OccurrenceReverseSymbolRewrite> reverse_symbol_rewrites;
+    std::vector<OccurrenceReferenceRewrite> reference_rewrites;
+    std::vector<CompositionFrameResolution> frames;
+    std::vector<CompositionFixedConnection> fixed_connections;
+    std::vector<CompositionFramePath> frame_paths;
+    std::vector<CompositionModelCoordinate> coordinates;
+    std::vector<CompositionControlBindingCoordinateMap>
+        control_binding_coordinate_maps;
+    std::vector<CompositionTargetResolution> targets;
+  };
+
   CompositionQualifiedCellIr(
       const GraphRevisionVerifiedCellGraph& verified_graph,
       std::vector<SourceVerifiedModelAsset> model_assets,
@@ -452,41 +511,19 @@ class CompositionQualifiedCellIr final {
       std::vector<CompositionControlBindingCoordinateMap>
           control_binding_coordinate_maps,
       std::vector<CompositionTargetResolution> targets)
-      : verified_graph_(verified_graph),
-        model_assets_(std::move(model_assets)),
-        component_types_(std::move(component_types)),
-        cell_frame_(std::move(cell_frame)),
-        flattened_urdf_(std::move(flattened_urdf)),
-        flattened_srdf_(std::move(flattened_srdf)),
-        model_occurrences_(std::move(model_occurrences)),
-        symbol_rewrites_(std::move(symbol_rewrites)),
-        reverse_symbol_rewrites_(std::move(reverse_symbol_rewrites)),
-        reference_rewrites_(std::move(reference_rewrites)),
-        frames_(std::move(frames)),
-        fixed_connections_(std::move(fixed_connections)),
-        frame_paths_(std::move(frame_paths)),
-        coordinates_(std::move(coordinates)),
-        control_binding_coordinate_maps_(
-            std::move(control_binding_coordinate_maps)),
-        targets_(std::move(targets)) {}
+      : data_(std::make_shared<const Data>(
+            verified_graph, std::move(model_assets),
+            std::move(component_types), std::move(cell_frame),
+            std::move(flattened_urdf), std::move(flattened_srdf),
+            std::move(model_occurrences), std::move(symbol_rewrites),
+            std::move(reverse_symbol_rewrites),
+            std::move(reference_rewrites), std::move(frames),
+            std::move(fixed_connections), std::move(frame_paths),
+            std::move(coordinates),
+            std::move(control_binding_coordinate_maps),
+            std::move(targets))) {}
 
-  GraphRevisionVerifiedCellGraph verified_graph_;
-  std::vector<SourceVerifiedModelAsset> model_assets_;
-  std::vector<QualifiedComponentType> component_types_;
-  CompositionCellFrame cell_frame_;
-  UrdfDocumentIr flattened_urdf_;
-  SrdfDocumentIr flattened_srdf_;
-  std::vector<CompositionModelOccurrence> model_occurrences_;
-  std::vector<OccurrenceSymbolRewrite> symbol_rewrites_;
-  std::vector<OccurrenceReverseSymbolRewrite> reverse_symbol_rewrites_;
-  std::vector<OccurrenceReferenceRewrite> reference_rewrites_;
-  std::vector<CompositionFrameResolution> frames_;
-  std::vector<CompositionFixedConnection> fixed_connections_;
-  std::vector<CompositionFramePath> frame_paths_;
-  std::vector<CompositionModelCoordinate> coordinates_;
-  std::vector<CompositionControlBindingCoordinateMap>
-      control_binding_coordinate_maps_;
-  std::vector<CompositionTargetResolution> targets_;
+  std::shared_ptr<const Data> data_;
 
   friend CompositionQualifiedCellIr compose_cell_occurrences(
       const GraphRevisionVerifiedCellGraph&,

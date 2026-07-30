@@ -14,6 +14,7 @@
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
 
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -340,77 +341,141 @@ using LogicalStopApplicabilityTemplate =
 /// configuration, command, Stop effect, or runtime observation.
 class ApplicabilityQualifiedCellIr final {
  public:
-  ApplicabilityQualifiedCellIr(const ApplicabilityQualifiedCellIr&) = default;
+  ApplicabilityQualifiedCellIr(
+      const ApplicabilityQualifiedCellIr&) noexcept = default;
   ApplicabilityQualifiedCellIr& operator=(
-      const ApplicabilityQualifiedCellIr&) = default;
+      const ApplicabilityQualifiedCellIr&) noexcept = default;
 
   [[nodiscard]] const CompositionQualifiedCellIr& composition()
       const noexcept {
-    return composition_;
+    return data_->composition;
   }
   [[nodiscard]] const RevisionVerifiedDeploymentApplicabilityInputs&
   deployment_inputs() const noexcept {
-    return deployment_inputs_;
+    return data_->deployment_inputs;
   }
   [[nodiscard]] const std::optional<core::SiteOverlayRefDTO>&
   selected_site_overlay_ref() const noexcept {
-    return selected_site_overlay_ref_;
+    return data_->selected_site_overlay_ref;
   }
   [[nodiscard]] const std::vector<QualifiedRuntimeProfile>& runtime_profiles()
       const noexcept {
-    return runtime_profiles_;
+    return data_->runtime_profiles;
   }
   [[nodiscard]] const std::vector<QualifiedCapabilityDefinition>&
   capability_definitions() const noexcept {
-    return capability_definitions_;
+    return data_->capability_definitions;
   }
   [[nodiscard]] const std::vector<QualifiedControlInterfaceContract>&
   control_interface_contracts() const noexcept {
-    return control_interface_contracts_;
+    return data_->control_interface_contracts;
   }
   [[nodiscard]] const std::vector<QualifiedControllerTopology>&
   controller_topologies() const noexcept {
-    return controller_topologies_;
+    return data_->controller_topologies;
   }
   [[nodiscard]] const std::vector<QualifiedProviderManifest>&
   provider_manifests() const noexcept {
-    return provider_manifests_;
+    return data_->provider_manifests;
   }
   [[nodiscard]] const std::vector<QualifiedStopEvidencePolicy>&
   stop_evidence_policies() const noexcept {
-    return stop_evidence_policies_;
+    return data_->stop_evidence_policies;
   }
   [[nodiscard]] const std::vector<LogicalBindingInterfaceTemplate>&
   binding_interfaces() const noexcept {
-    return binding_interfaces_;
+    return data_->binding_interfaces;
   }
   [[nodiscard]] const std::vector<LogicalControllerTemplate>& controllers()
       const noexcept {
-    return controllers_;
+    return data_->controllers;
   }
   [[nodiscard]] const std::vector<LogicalControlRouteTemplate>& routes()
       const noexcept {
-    return routes_;
+    return data_->routes;
   }
   [[nodiscard]] const std::vector<LogicalCapabilityTemplate>& capabilities()
       const noexcept {
-    return capabilities_;
+    return data_->capabilities;
   }
   [[nodiscard]] const
       std::vector<LogicalProviderEndpointTemplate>&
       provider_endpoints() const noexcept {
-    return provider_endpoints_;
+    return data_->provider_endpoints;
   }
   [[nodiscard]] const std::vector<LogicalExternalResourceTemplate>&
   external_resources() const noexcept {
-    return external_resources_;
+    return data_->external_resources;
   }
   [[nodiscard]] const std::vector<LogicalStopApplicabilityTemplate>&
   stop_applicability() const noexcept {
-    return stop_applicability_;
+    return data_->stop_applicability;
   }
 
  private:
+  struct Data final {
+    Data(
+        const CompositionQualifiedCellIr& composition_in,
+        const RevisionVerifiedDeploymentApplicabilityInputs&
+            deployment_inputs_in,
+        std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref_in,
+        std::vector<QualifiedRuntimeProfile> runtime_profiles_in,
+        std::vector<QualifiedCapabilityDefinition>
+            capability_definitions_in,
+        std::vector<QualifiedControlInterfaceContract>
+            control_interface_contracts_in,
+        std::vector<QualifiedControllerTopology> controller_topologies_in,
+        std::vector<QualifiedProviderManifest> provider_manifests_in,
+        std::vector<QualifiedStopEvidencePolicy> stop_evidence_policies_in,
+        std::vector<LogicalBindingInterfaceTemplate>
+            binding_interfaces_in,
+        std::vector<LogicalControllerTemplate> controllers_in,
+        std::vector<LogicalControlRouteTemplate> routes_in,
+        std::vector<LogicalCapabilityTemplate> capabilities_in,
+        std::vector<LogicalProviderEndpointTemplate>
+            provider_endpoints_in,
+        std::vector<LogicalExternalResourceTemplate>
+            external_resources_in,
+        std::vector<LogicalStopApplicabilityTemplate>
+            stop_applicability_in)
+        : composition(composition_in),
+          deployment_inputs(deployment_inputs_in),
+          selected_site_overlay_ref(
+              std::move(selected_site_overlay_ref_in)),
+          runtime_profiles(std::move(runtime_profiles_in)),
+          capability_definitions(std::move(capability_definitions_in)),
+          control_interface_contracts(
+              std::move(control_interface_contracts_in)),
+          controller_topologies(std::move(controller_topologies_in)),
+          provider_manifests(std::move(provider_manifests_in)),
+          stop_evidence_policies(std::move(stop_evidence_policies_in)),
+          binding_interfaces(std::move(binding_interfaces_in)),
+          controllers(std::move(controllers_in)),
+          routes(std::move(routes_in)),
+          capabilities(std::move(capabilities_in)),
+          provider_endpoints(std::move(provider_endpoints_in)),
+          external_resources(std::move(external_resources_in)),
+          stop_applicability(std::move(stop_applicability_in)) {}
+
+    CompositionQualifiedCellIr composition;
+    RevisionVerifiedDeploymentApplicabilityInputs deployment_inputs;
+    std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref;
+    std::vector<QualifiedRuntimeProfile> runtime_profiles;
+    std::vector<QualifiedCapabilityDefinition> capability_definitions;
+    std::vector<QualifiedControlInterfaceContract>
+        control_interface_contracts;
+    std::vector<QualifiedControllerTopology> controller_topologies;
+    std::vector<QualifiedProviderManifest> provider_manifests;
+    std::vector<QualifiedStopEvidencePolicy> stop_evidence_policies;
+    std::vector<LogicalBindingInterfaceTemplate> binding_interfaces;
+    std::vector<LogicalControllerTemplate> controllers;
+    std::vector<LogicalControlRouteTemplate> routes;
+    std::vector<LogicalCapabilityTemplate> capabilities;
+    std::vector<LogicalProviderEndpointTemplate> provider_endpoints;
+    std::vector<LogicalExternalResourceTemplate> external_resources;
+    std::vector<LogicalStopApplicabilityTemplate> stop_applicability;
+  };
+
   ApplicabilityQualifiedCellIr(
       const CompositionQualifiedCellIr& composition,
       const RevisionVerifiedDeploymentApplicabilityInputs& deployment_inputs,
@@ -429,40 +494,22 @@ class ApplicabilityQualifiedCellIr final {
       std::vector<LogicalProviderEndpointTemplate> provider_endpoints,
       std::vector<LogicalExternalResourceTemplate> external_resources,
       std::vector<LogicalStopApplicabilityTemplate> stop_applicability)
-      : composition_(composition),
-        deployment_inputs_(deployment_inputs),
-        selected_site_overlay_ref_(std::move(selected_site_overlay_ref)),
-        runtime_profiles_(std::move(runtime_profiles)),
-        capability_definitions_(std::move(capability_definitions)),
-        control_interface_contracts_(std::move(control_interface_contracts)),
-        controller_topologies_(std::move(controller_topologies)),
-        provider_manifests_(std::move(provider_manifests)),
-        stop_evidence_policies_(std::move(stop_evidence_policies)),
-        binding_interfaces_(std::move(binding_interfaces)),
-        controllers_(std::move(controllers)),
-        routes_(std::move(routes)),
-        capabilities_(std::move(capabilities)),
-        provider_endpoints_(std::move(provider_endpoints)),
-        external_resources_(std::move(external_resources)),
-        stop_applicability_(std::move(stop_applicability)) {}
+      : data_(std::make_shared<const Data>(
+            composition, deployment_inputs,
+            std::move(selected_site_overlay_ref),
+            std::move(runtime_profiles),
+            std::move(capability_definitions),
+            std::move(control_interface_contracts),
+            std::move(controller_topologies),
+            std::move(provider_manifests),
+            std::move(stop_evidence_policies),
+            std::move(binding_interfaces), std::move(controllers),
+            std::move(routes), std::move(capabilities),
+            std::move(provider_endpoints),
+            std::move(external_resources),
+            std::move(stop_applicability))) {}
 
-  CompositionQualifiedCellIr composition_;
-  RevisionVerifiedDeploymentApplicabilityInputs deployment_inputs_;
-  std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref_;
-  std::vector<QualifiedRuntimeProfile> runtime_profiles_;
-  std::vector<QualifiedCapabilityDefinition> capability_definitions_;
-  std::vector<QualifiedControlInterfaceContract>
-      control_interface_contracts_;
-  std::vector<QualifiedControllerTopology> controller_topologies_;
-  std::vector<QualifiedProviderManifest> provider_manifests_;
-  std::vector<QualifiedStopEvidencePolicy> stop_evidence_policies_;
-  std::vector<LogicalBindingInterfaceTemplate> binding_interfaces_;
-  std::vector<LogicalControllerTemplate> controllers_;
-  std::vector<LogicalControlRouteTemplate> routes_;
-  std::vector<LogicalCapabilityTemplate> capabilities_;
-  std::vector<LogicalProviderEndpointTemplate> provider_endpoints_;
-  std::vector<LogicalExternalResourceTemplate> external_resources_;
-  std::vector<LogicalStopApplicabilityTemplate> stop_applicability_;
+  std::shared_ptr<const Data> data_;
 
   friend ApplicabilityQualifiedCellIr qualify_cell_applicability(
       const CompositionQualifiedCellIr&,

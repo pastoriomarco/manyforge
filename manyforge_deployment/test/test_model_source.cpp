@@ -482,7 +482,7 @@ TEST(ModelSource,
   assert_exact_plan(producer_verified);
 
   const auto copied = consumer_verified;
-  EXPECT_NE(&copied.retrieval_plan(),
+  EXPECT_EQ(&copied.retrieval_plan(),
             &consumer_verified.retrieval_plan());
   assert_exact_plan(copied);
 
@@ -493,6 +493,12 @@ TEST(ModelSource,
   };
   test::expect_source_preserving_rvalue_transfers(expected_plan,
                                                    plan_projection);
+  test::expect_immutable_shared_copy_storage(
+      expected_plan,
+      [](const ModelSourceRetrievalPlan& plan)
+          -> const std::vector<ModelSourceRetrievalPlanRow>& {
+        return plan.artifacts();
+      });
 
   auto rvalue_plan = expected_plan;
   const auto rvalue_verified = verify_model_source_closure(
@@ -513,6 +519,29 @@ TEST(ModelSource,
       };
   test::expect_source_preserving_rvalue_transfers(producer_verified,
                                                    verified_projection);
+  test::expect_immutable_shared_copy_storage(
+      producer_verified,
+      [](const SourceVerifiedModelAsset& verified)
+          -> const ModelSourceIr& { return verified.source_ir(); });
+  test::expect_immutable_shared_copy_storage(
+      producer_verified.source_ir(),
+      [](const ModelSourceIr& source)
+          -> const UrdfDocumentIr& { return source.urdf(); });
+
+  // A repeated-cell composition may retain many occurrences of one source.
+  // This benchmark-style pressure check proves that every copy is a constant-
+  // size immutable handle to the same qualified source IR rather than a deep
+  // copy of the potentially hundreds-of-mebibytes source closure.
+  const std::vector<SourceVerifiedModelAsset> repeated_occurrences(
+      32768U, producer_verified);
+  ASSERT_EQ(repeated_occurrences.size(), 32768U);
+  for (std::size_t index = 0U; index < repeated_occurrences.size();
+       index += 1024U) {
+    EXPECT_EQ(&repeated_occurrences[index].source_ir(),
+              &producer_verified.source_ir());
+    EXPECT_EQ(&repeated_occurrences[index].retrieval_plan(),
+              &producer_verified.retrieval_plan());
+  }
 
   auto move_source = producer_verified;
   const auto moved = std::move(move_source);

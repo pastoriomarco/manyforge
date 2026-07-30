@@ -2,6 +2,7 @@
 
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/component_type.hpp>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -27,31 +28,41 @@ class ComponentTypeCodecError : public std::invalid_argument {
 /// to the later graph compiler and retained deployment product.
 class QualifiedComponentType final {
  public:
-  QualifiedComponentType(const QualifiedComponentType&) = default;
-  QualifiedComponentType& operator=(const QualifiedComponentType&) = default;
+  QualifiedComponentType(const QualifiedComponentType&) noexcept = default;
+  QualifiedComponentType& operator=(const QualifiedComponentType&) noexcept =
+      default;
 
   [[nodiscard]] const core::ComponentTypeCatalogRecordRefDTO& reference()
       const noexcept {
-    return reference_;
+    return data_->reference;
   }
   [[nodiscard]] const core::ComponentTypeDTO& value() const noexcept {
-    return value_;
+    return data_->value;
   }
   [[nodiscard]] const CanonicalValue& normalized_root() const noexcept {
-    return normalized_root_;
+    return data_->normalized_root;
   }
 
  private:
+  struct Data final {
+    Data(const core::ComponentTypeCatalogRecordRefDTO& reference_in,
+         core::ComponentTypeDTO value_in, CanonicalValue normalized_root_in)
+        : reference(reference_in),
+          value(std::move(value_in)),
+          normalized_root(std::move(normalized_root_in)) {}
+
+    core::ComponentTypeCatalogRecordRefDTO reference;
+    core::ComponentTypeDTO value;
+    CanonicalValue normalized_root;
+  };
+
   QualifiedComponentType(
       const core::ComponentTypeCatalogRecordRefDTO& reference,
       core::ComponentTypeDTO value, CanonicalValue normalized_root)
-      : reference_(reference),
-        value_(std::move(value)),
-        normalized_root_(std::move(normalized_root)) {}
+      : data_(std::make_shared<const Data>(
+            reference, std::move(value), std::move(normalized_root))) {}
 
-  core::ComponentTypeCatalogRecordRefDTO reference_;
-  core::ComponentTypeDTO value_;
-  CanonicalValue normalized_root_;
+  std::shared_ptr<const Data> data_;
 
   friend QualifiedComponentType resolve_and_qualify_component_type(
       const core::ComponentTypeCatalogRecordRefDTO&,

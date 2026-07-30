@@ -101,10 +101,13 @@ add_library(manyforge_deployment
   src/controller_topology_codec.cpp
   src/content_identity.cpp
   src/deployment_applicability_codec.cpp
+  src/deployment_artifact_codec.cpp
+  src/deployment_catalog_codec.cpp
   src/model_asset_codec.cpp
   src/model_source.cpp
   src/provider_manifest_codec.cpp
   src/retained_bundle.cpp
+  src/retention_qualified_deployment.cpp
   src/runtime_profile_codec.cpp
   src/site_overlay_resolution.cpp
   src/stop_evidence_policy_codec.cpp
@@ -193,6 +196,22 @@ if(BUILD_TESTING)
   if(MANYFORGE_RETAINED_PRODUCT_OUTPUT_DIGEST_IS_PUBLIC)
     message(FATAL_ERROR
       "retained_product_output_digest remains callable from the public header")
+  endif()
+
+  manyforge_try_public_header(
+    MANYFORGE_BUILD_QUALIFIED_RETENTION_CONTEXT_IS_PUBLIC
+    build_qualified_retention_context_is_private.cpp)
+  if(MANYFORGE_BUILD_QUALIFIED_RETENTION_CONTEXT_IS_PUBLIC)
+    message(FATAL_ERROR
+      "BuildQualifiedRetentionContext remains nameable from the public header")
+  endif()
+
+  manyforge_try_public_header(
+    MANYFORGE_RETAINED_BUNDLE_MATERIALIZER_IS_PUBLIC
+    retained_bundle_materializer_is_private.cpp)
+  if(MANYFORGE_RETAINED_BUNDLE_MATERIALIZER_IS_PUBLIC)
+    message(FATAL_ERROR
+      "RetainedBundleMaterializer remains callable from the public header")
   endif()
 
   add_executable(test_artifact_codec test/test_artifact_codec.cpp)
@@ -284,6 +303,24 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_deployment_applicability_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_deployment_artifact_codec
+    test/test_deployment_artifact_codec.cpp)
+  target_include_directories(test_deployment_artifact_codec PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_deployment_artifact_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_deployment_artifact_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_deployment_catalog_codec
+    test/test_deployment_catalog_codec.cpp)
+  target_include_directories(test_deployment_catalog_codec PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_deployment_catalog_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_deployment_catalog_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_site_overlay_resolution
     test/test_site_overlay_resolution.cpp)
   target_link_libraries(test_site_overlay_resolution PRIVATE
@@ -328,6 +365,22 @@ if(BUILD_TESTING)
   target_link_libraries(test_retained_bundle PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_retained_bundle
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_retained_bundle_materializer
+    test/test_retained_bundle_materializer.cpp)
+  target_include_directories(test_retained_bundle_materializer PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_retained_bundle_materializer PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_retained_bundle_materializer
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_retention_qualified_deployment
+    test/test_retention_qualified_deployment.cpp)
+  target_link_libraries(test_retention_qualified_deployment PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_retention_qualified_deployment
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_stop_evidence_policy_codec

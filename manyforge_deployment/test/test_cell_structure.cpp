@@ -859,6 +859,10 @@ TEST(CellStructure,
         return std::tuple{value.reference(), value.value(),
                           value.normalized_root()};
       });
+  test::expect_immutable_shared_copy_storage(
+      arm_type.value,
+      [](const QualifiedComponentType& value)
+          -> const CanonicalValue& { return value.normalized_root(); });
   test::expect_source_preserving_rvalue_transfers(
       qualified, [](const CompositionQualifiedCellIr& value) {
         return std::tuple{
@@ -868,6 +872,10 @@ TEST(CellStructure,
             value.model_occurrences(), value.fixed_connections(),
             value.targets()};
       });
+  test::expect_immutable_shared_copy_storage(
+      qualified,
+      [](const CompositionQualifiedCellIr& value)
+          -> const UrdfDocumentIr& { return value.flattened_urdf(); });
 
   auto graph_source = graph;
   const auto graph_destination = std::move(graph_source);

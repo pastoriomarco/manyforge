@@ -1221,8 +1221,7 @@ TypedCellGraphCandidate decode_cell_graph_candidate(const ParsedArtifactCandidat
 IntrinsicallyValidatedCellGraphCandidate validate_intrinsic_cell_graph_candidate(
     const TypedCellGraphCandidate& candidate) {
   validate_intrinsic(candidate.graph());
-  return IntrinsicallyValidatedCellGraphCandidate(candidate.graph(),
-                                                  candidate.structurally_normalized_root());
+  return IntrinsicallyValidatedCellGraphCandidate(candidate);
 }
 
 GraphIdentityReadyCellGraphCandidate prepare_cell_graph_identity(
@@ -1315,8 +1314,9 @@ GraphRevisionVerifiedCellGraph compute_graph_revision(
       detail::compute_content_identity(normalized_root,
                                        graph_identity_spec()));
   normalized_root = graph_value(graph);
-  return GraphRevisionVerifiedCellGraph(std::move(graph),
-                                        std::move(normalized_root));
+  return GraphRevisionVerifiedCellGraph(
+      GraphIdentityReadyCellGraphCandidate(
+          std::move(graph), std::move(normalized_root)));
 }
 
 GraphRevisionVerifiedCellGraph verify_graph_revision(
@@ -1327,8 +1327,7 @@ GraphRevisionVerifiedCellGraph verify_graph_revision(
     fail("$.graph_revision",
          "graph_revision does not match normalized graph content");
   }
-  return GraphRevisionVerifiedCellGraph(candidate.graph(),
-                                        candidate.normalized_root());
+  return GraphRevisionVerifiedCellGraph(candidate);
 }
 
 }  // namespace manyforge::deployment

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <manyforge_core/types/deployment_applicability.hpp>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -39,41 +40,71 @@ class RevisionVerifiedDeploymentApplicabilityInputs;
 class TypedDeploymentApplicabilityInputsCandidate final {
  public:
   TypedDeploymentApplicabilityInputsCandidate(
-      const TypedDeploymentApplicabilityInputsCandidate&) = default;
+      const TypedDeploymentApplicabilityInputsCandidate&) noexcept = default;
   TypedDeploymentApplicabilityInputsCandidate& operator=(
-      const TypedDeploymentApplicabilityInputsCandidate&) = default;
+      const TypedDeploymentApplicabilityInputsCandidate&) noexcept = default;
 
   [[nodiscard]] const core::DeploymentApplicabilityInputsDTO& value()
       const noexcept {
-    return value_;
+    return data_->value;
   }
   [[nodiscard]] const CanonicalValue&
   normalized_desired_control_configurations() const noexcept {
-    return normalized_desired_control_configurations_;
+    return data_->normalized_desired_control_configurations;
   }
   [[nodiscard]] const CanonicalValue&
   normalized_capability_provider_bindings() const noexcept {
-    return normalized_capability_provider_bindings_;
+    return data_->normalized_capability_provider_bindings;
   }
   [[nodiscard]] const CanonicalValue& normalized_external_resources()
       const noexcept {
-    return normalized_external_resources_;
+    return data_->normalized_external_resources;
   }
   [[nodiscard]] SiteOverlayRefSourcePresence site_overlay_ref_presence()
       const noexcept {
-    return site_overlay_ref_presence_;
+    return data_->site_overlay_ref_presence;
   }
   /// Nullopt means the source member was absent. A present CanonicalValue is
   /// either JSON null or the normalized exact reference object.
   [[nodiscard]] const std::optional<CanonicalValue>&
   normalized_site_overlay_ref() const noexcept {
-    return normalized_site_overlay_ref_;
+    return data_->normalized_site_overlay_ref;
   }
   [[nodiscard]] bool external_resources_was_present() const noexcept {
-    return external_resources_was_present_;
+    return data_->external_resources_was_present;
   }
 
  private:
+  struct Data final {
+    Data(core::DeploymentApplicabilityInputsDTO value_in,
+         CanonicalValue normalized_desired_control_configurations_in,
+         CanonicalValue normalized_capability_provider_bindings_in,
+         CanonicalValue normalized_external_resources_in,
+         SiteOverlayRefSourcePresence site_overlay_ref_presence_in,
+         std::optional<CanonicalValue> normalized_site_overlay_ref_in,
+         bool external_resources_was_present_in)
+        : value(std::move(value_in)),
+          normalized_desired_control_configurations(
+              std::move(normalized_desired_control_configurations_in)),
+          normalized_capability_provider_bindings(
+              std::move(normalized_capability_provider_bindings_in)),
+          normalized_external_resources(
+              std::move(normalized_external_resources_in)),
+          site_overlay_ref_presence(site_overlay_ref_presence_in),
+          normalized_site_overlay_ref(
+              std::move(normalized_site_overlay_ref_in)),
+          external_resources_was_present(external_resources_was_present_in) {}
+
+    core::DeploymentApplicabilityInputsDTO value;
+    CanonicalValue normalized_desired_control_configurations;
+    CanonicalValue normalized_capability_provider_bindings;
+    CanonicalValue normalized_external_resources;
+    SiteOverlayRefSourcePresence site_overlay_ref_presence{
+        SiteOverlayRefSourcePresence::kAbsent};
+    std::optional<CanonicalValue> normalized_site_overlay_ref;
+    bool external_resources_was_present{false};
+  };
+
   TypedDeploymentApplicabilityInputsCandidate(
       core::DeploymentApplicabilityInputsDTO value,
       CanonicalValue normalized_desired_control_configurations,
@@ -82,25 +113,16 @@ class TypedDeploymentApplicabilityInputsCandidate final {
       SiteOverlayRefSourcePresence site_overlay_ref_presence,
       std::optional<CanonicalValue> normalized_site_overlay_ref,
       bool external_resources_was_present)
-      : value_(std::move(value)),
-        normalized_desired_control_configurations_(
-            std::move(normalized_desired_control_configurations)),
-        normalized_capability_provider_bindings_(
-            std::move(normalized_capability_provider_bindings)),
-        normalized_external_resources_(
-            std::move(normalized_external_resources)),
-        site_overlay_ref_presence_(site_overlay_ref_presence),
-        normalized_site_overlay_ref_(std::move(normalized_site_overlay_ref)),
-        external_resources_was_present_(external_resources_was_present) {}
+      : data_(std::make_shared<const Data>(
+            std::move(value),
+            std::move(normalized_desired_control_configurations),
+            std::move(normalized_capability_provider_bindings),
+            std::move(normalized_external_resources),
+            site_overlay_ref_presence,
+            std::move(normalized_site_overlay_ref),
+            external_resources_was_present)) {}
 
-  core::DeploymentApplicabilityInputsDTO value_;
-  CanonicalValue normalized_desired_control_configurations_;
-  CanonicalValue normalized_capability_provider_bindings_;
-  CanonicalValue normalized_external_resources_;
-  SiteOverlayRefSourcePresence site_overlay_ref_presence_{
-      SiteOverlayRefSourcePresence::kAbsent};
-  std::optional<CanonicalValue> normalized_site_overlay_ref_;
-  bool external_resources_was_present_{false};
+  std::shared_ptr<const Data> data_;
 
   friend TypedDeploymentApplicabilityInputsCandidate
   decode_deployment_applicability_inputs_candidate(
@@ -125,68 +147,56 @@ class TypedDeploymentApplicabilityInputsCandidate final {
 class RevisionVerifiedDeploymentApplicabilityInputs final {
  public:
   RevisionVerifiedDeploymentApplicabilityInputs(
-      const RevisionVerifiedDeploymentApplicabilityInputs&) = default;
+      const RevisionVerifiedDeploymentApplicabilityInputs&) noexcept =
+      default;
   RevisionVerifiedDeploymentApplicabilityInputs& operator=(
-      const RevisionVerifiedDeploymentApplicabilityInputs&) = default;
+      const RevisionVerifiedDeploymentApplicabilityInputs&) noexcept =
+      default;
 
   [[nodiscard]] const core::DeploymentApplicabilityInputsDTO& value()
       const noexcept {
-    return value_;
+    return data_->candidate.value();
   }
   [[nodiscard]] const CanonicalValue&
   normalized_desired_control_configurations() const noexcept {
-    return normalized_desired_control_configurations_;
+    return data_->candidate.normalized_desired_control_configurations();
   }
   [[nodiscard]] const CanonicalValue&
   normalized_capability_provider_bindings() const noexcept {
-    return normalized_capability_provider_bindings_;
+    return data_->candidate.normalized_capability_provider_bindings();
   }
   [[nodiscard]] const CanonicalValue& normalized_external_resources()
       const noexcept {
-    return normalized_external_resources_;
+    return data_->candidate.normalized_external_resources();
   }
   [[nodiscard]] SiteOverlayRefSourcePresence site_overlay_ref_presence()
       const noexcept {
-    return site_overlay_ref_presence_;
+    return data_->candidate.site_overlay_ref_presence();
   }
   /// Nullopt means the source member was absent. A present CanonicalValue is
   /// either JSON null or the normalized exact reference object.
   [[nodiscard]] const std::optional<CanonicalValue>&
   normalized_site_overlay_ref() const noexcept {
-    return normalized_site_overlay_ref_;
+    return data_->candidate.normalized_site_overlay_ref();
   }
   [[nodiscard]] bool external_resources_was_present() const noexcept {
-    return external_resources_was_present_;
+    return data_->candidate.external_resources_was_present();
   }
 
  private:
-  RevisionVerifiedDeploymentApplicabilityInputs(
-      core::DeploymentApplicabilityInputsDTO value,
-      CanonicalValue normalized_desired_control_configurations,
-      CanonicalValue normalized_capability_provider_bindings,
-      CanonicalValue normalized_external_resources,
-      SiteOverlayRefSourcePresence site_overlay_ref_presence,
-      std::optional<CanonicalValue> normalized_site_overlay_ref,
-      bool external_resources_was_present)
-      : value_(std::move(value)),
-        normalized_desired_control_configurations_(
-            std::move(normalized_desired_control_configurations)),
-        normalized_capability_provider_bindings_(
-            std::move(normalized_capability_provider_bindings)),
-        normalized_external_resources_(
-            std::move(normalized_external_resources)),
-        site_overlay_ref_presence_(site_overlay_ref_presence),
-        normalized_site_overlay_ref_(std::move(normalized_site_overlay_ref)),
-        external_resources_was_present_(external_resources_was_present) {}
+  struct Data final {
+    explicit Data(
+        const TypedDeploymentApplicabilityInputsCandidate& candidate_in)
+        : candidate(candidate_in) {}
 
-  core::DeploymentApplicabilityInputsDTO value_;
-  CanonicalValue normalized_desired_control_configurations_;
-  CanonicalValue normalized_capability_provider_bindings_;
-  CanonicalValue normalized_external_resources_;
-  SiteOverlayRefSourcePresence site_overlay_ref_presence_{
-      SiteOverlayRefSourcePresence::kAbsent};
-  std::optional<CanonicalValue> normalized_site_overlay_ref_;
-  bool external_resources_was_present_{false};
+    TypedDeploymentApplicabilityInputsCandidate candidate;
+  };
+
+  explicit RevisionVerifiedDeploymentApplicabilityInputs(
+      const TypedDeploymentApplicabilityInputsCandidate& candidate)
+      : data_(std::make_shared<const Data>(candidate)) {}
+
+  std::shared_ptr<const Data> data_;
 
   friend RevisionVerifiedDeploymentApplicabilityInputs
   compute_capability_provider_binding_revisions(

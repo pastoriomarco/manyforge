@@ -309,6 +309,11 @@ TEST(ModelAssetCodec, RvalueTransfersPreserveQualifiedAssetSourceAndResult) {
         return std::tuple{value.reference(), value.value(),
                           value.normalized_root()};
       });
+  test::expect_immutable_shared_copy_storage(
+      qualified, [](const QualifiedModelAsset& value)
+                     -> const CanonicalValue& {
+        return value.normalized_root();
+      });
 }
 
 TEST(ModelAssetCodec, QualifiesFixedPneumaticAndPassiveUrdfOnlyAssets) {

@@ -329,6 +329,12 @@ TEST(DeploymentApplicabilityCodec,
         value.external_resources_was_present()};
   };
   test::expect_source_preserving_rvalue_transfers(typed, projection);
+  test::expect_immutable_shared_copy_storage(
+      typed,
+      [](const TypedDeploymentApplicabilityInputsCandidate& value)
+          -> const core::DeploymentApplicabilityInputsDTO& {
+        return value.value();
+      });
 
   const auto typed_destination = std::move(typed);
   const auto first_verified =
@@ -340,6 +346,20 @@ TEST(DeploymentApplicabilityCodec,
 
   test::expect_source_preserving_rvalue_transfers(first_verified,
                                                    projection);
+  test::expect_immutable_shared_copy_storage(
+      first_verified,
+      [](const RevisionVerifiedDeploymentApplicabilityInputs& value)
+          -> const core::DeploymentApplicabilityInputsDTO& {
+        return value.value();
+      });
+
+  const auto consumer_candidate =
+      decode(document_from_verified(first_verified));
+  const auto consumer_verified =
+      verify_capability_provider_binding_revisions(consumer_candidate);
+  EXPECT_EQ(&consumer_verified.value(), &consumer_candidate.value());
+  EXPECT_EQ(&consumer_verified.normalized_capability_provider_bindings(),
+            &consumer_candidate.normalized_capability_provider_bindings());
 }
 
 TEST(DeploymentApplicabilityCodec,

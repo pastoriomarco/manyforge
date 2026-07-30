@@ -1045,12 +1045,26 @@ TEST(CellGraphCodec,
         return std::tuple{value.graph(),
                           value.structurally_normalized_root()};
       });
+  test::expect_immutable_shared_copy_storage(
+      typed, [](const TypedCellGraphCandidate& value)
+                 -> const CanonicalValue& {
+        return value.structurally_normalized_root();
+      });
 
   const auto intrinsic = validate_intrinsic_cell_graph_candidate(typed);
+  EXPECT_EQ(&intrinsic.graph(), &typed.graph());
+  EXPECT_EQ(&intrinsic.structurally_normalized_root(),
+            &typed.structurally_normalized_root());
   test::expect_source_preserving_rvalue_transfers(
       intrinsic, [](const IntrinsicallyValidatedCellGraphCandidate& value) {
         return std::tuple{value.graph(),
                           value.structurally_normalized_root()};
+      });
+  test::expect_immutable_shared_copy_storage(
+      intrinsic,
+      [](const IntrinsicallyValidatedCellGraphCandidate& value)
+          -> const CanonicalValue& {
+        return value.structurally_normalized_root();
       });
 
   auto identity_source = prepare_cell_graph_identity(intrinsic, {});
@@ -1058,6 +1072,10 @@ TEST(CellGraphCodec,
       identity_source, [](const GraphIdentityReadyCellGraphCandidate& value) {
         return std::tuple{value.graph(), value.normalized_root()};
       });
+  test::expect_immutable_shared_copy_storage(
+      identity_source,
+      [](const GraphIdentityReadyCellGraphCandidate& value)
+          -> const CanonicalValue& { return value.normalized_root(); });
   const auto identity_destination = std::move(identity_source);
   const auto first_verified = compute_graph_revision(identity_source);
   const auto second_verified = compute_graph_revision(identity_destination);
@@ -1065,10 +1083,25 @@ TEST(CellGraphCodec,
   EXPECT_EQ(first_verified.normalized_root(),
             second_verified.normalized_root());
 
+  const auto consumer_typed =
+      decode(canonical_json(first_verified.normalized_root()));
+  const auto consumer_intrinsic =
+      validate_intrinsic_cell_graph_candidate(consumer_typed);
+  const auto consumer_ready =
+      prepare_cell_graph_identity(consumer_intrinsic, {});
+  const auto consumer_verified = verify_graph_revision(consumer_ready);
+  EXPECT_EQ(&consumer_verified.graph(), &consumer_ready.graph());
+  EXPECT_EQ(&consumer_verified.normalized_root(),
+            &consumer_ready.normalized_root());
+
   test::expect_source_preserving_rvalue_transfers(
       first_verified, [](const GraphRevisionVerifiedCellGraph& value) {
         return std::tuple{value.graph(), value.normalized_root()};
       });
+  test::expect_immutable_shared_copy_storage(
+      first_verified,
+      [](const GraphRevisionVerifiedCellGraph& value)
+          -> const CanonicalValue& { return value.normalized_root(); });
 }
 
 TEST(CellGraphCodec,

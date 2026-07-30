@@ -8,6 +8,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -585,20 +586,49 @@ StructurallyQualifiedCellGraph qualify_cell_structure(
          attachment.child_interface_pose_in_parent_interface});
   }
 
-  std::vector<SourceVerifiedModelAsset> owned_assets(
-      qualified_assets.begin(), qualified_assets.end());
-  std::sort(owned_assets.begin(), owned_assets.end(),
-            [](const SourceVerifiedModelAsset& left,
-               const SourceVerifiedModelAsset& right) {
-              return asset_key(left) < asset_key(right);
-            });
-  std::vector<QualifiedComponentType> owned_types(
-      qualified_types.begin(), qualified_types.end());
-  std::sort(owned_types.begin(), owned_types.end(),
-            [](const QualifiedComponentType& left,
-               const QualifiedComponentType& right) {
-              return type_key(left) < type_key(right);
-            });
+  std::vector<const SourceVerifiedModelAsset*> ordered_assets;
+  ordered_assets.reserve(qualified_assets.size());
+  for (const auto& asset : qualified_assets) {
+    ordered_assets.push_back(&asset);
+  }
+  std::sort(
+      ordered_assets.begin(), ordered_assets.end(),
+      [](const SourceVerifiedModelAsset* left,
+         const SourceVerifiedModelAsset* right) {
+        const auto& left_value = left->value();
+        const auto& right_value = right->value();
+        return std::tie(left_value.model_asset_id,
+                        left_value.model_revision) <
+               std::tie(right_value.model_asset_id,
+                        right_value.model_revision);
+      });
+  std::vector<SourceVerifiedModelAsset> owned_assets;
+  owned_assets.reserve(ordered_assets.size());
+  for (const auto* asset : ordered_assets) {
+    owned_assets.push_back(*asset);
+  }
+
+  std::vector<const QualifiedComponentType*> ordered_types;
+  ordered_types.reserve(qualified_types.size());
+  for (const auto& type : qualified_types) {
+    ordered_types.push_back(&type);
+  }
+  std::sort(
+      ordered_types.begin(), ordered_types.end(),
+      [](const QualifiedComponentType* left,
+         const QualifiedComponentType* right) {
+        const auto& left_value = left->value();
+        const auto& right_value = right->value();
+        return std::tie(left_value.component_type_id,
+                        left_value.component_type_revision) <
+               std::tie(right_value.component_type_id,
+                        right_value.component_type_revision);
+      });
+  std::vector<QualifiedComponentType> owned_types;
+  owned_types.reserve(ordered_types.size());
+  for (const auto* type : ordered_types) {
+    owned_types.push_back(*type);
+  }
 
   return StructurallyQualifiedCellGraph(
       verified_graph, std::move(owned_assets), std::move(owned_types),

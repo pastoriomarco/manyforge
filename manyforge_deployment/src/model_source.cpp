@@ -3075,14 +3075,14 @@ SourceVerifiedModelAsset verify_model_source_closure(
 }
 
 bool operator==(const ModelSourceIr& left, const ModelSourceIr& right) {
-  return emit_urdf_document(left.urdf_) ==
-             emit_urdf_document(right.urdf_) &&
-         ((!left.srdf_.has_value() && !right.srdf_.has_value()) ||
-          (left.srdf_.has_value() && right.srdf_.has_value() &&
-           emit_srdf_document(*left.srdf_) ==
-               emit_srdf_document(*right.srdf_))) &&
-         left.semantic_index_ == right.semantic_index_ &&
-         left.artifact_references_ == right.artifact_references_;
+  return emit_urdf_document(left.urdf()) ==
+             emit_urdf_document(right.urdf()) &&
+         ((!left.srdf().has_value() && !right.srdf().has_value()) ||
+          (left.srdf().has_value() && right.srdf().has_value() &&
+           emit_srdf_document(*left.srdf()) ==
+               emit_srdf_document(*right.srdf()))) &&
+         left.semantic_index() == right.semantic_index() &&
+         left.artifact_references() == right.artifact_references();
 }
 
 std::string emit_canonical_urdf(const ModelSourceIr& source_ir) {

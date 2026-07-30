@@ -15,6 +15,10 @@
 
 namespace manyforge::deployment {
 
+namespace detail {
+class RetainedBundleMaterializer;
+}
+
 inline constexpr std::size_t kMaxInMemoryRetainedBlobCount = 4096U;
 inline constexpr std::uint64_t kMaxInMemoryRetainedBlobBytes =
     512ULL * 1024ULL * 1024ULL;
@@ -200,13 +204,12 @@ private:
   std::unique_ptr<Storage> storage_;
 };
 
-/// Reserved immutable repository value for a future fully qualified bundle.
+/// Immutable semantic retained-bundle value.
 ///
-/// Construction is deliberately sealed in this foundation. Completed I2 must
-/// first provide one code-owned, non-forgeable compiler result that binds every
-/// typed DTO to the exact canonical projection. Only that real boundary may add
-/// a private producer; identity-only graphs and caller-built canonical trees
-/// have no retention path here.
+/// Construction remains private to the I3 materializer. That producer accepts
+/// only RetentionQualifiedDeployment plus separately build-qualified offline
+/// environment/provenance evidence; identity-only graphs and caller-built
+/// canonical trees have no retention path.
 class RetainedBundle final {
 public:
   ~RetainedBundle() = default;
@@ -219,6 +222,9 @@ public:
   retained_bundle_id() const noexcept {
     return retained_bundle_id_;
   }
+  [[nodiscard]] const core::RetainedBundleDTO& value() const noexcept {
+    return value_;
+  }
   [[nodiscard]] const CanonicalValue &normalized_root() const noexcept {
     return normalized_root_;
   }
@@ -228,14 +234,19 @@ public:
 
 private:
   RetainedBundle(core::RetainedBundleId retained_bundle_id,
+                 core::RetainedBundleDTO value,
                  CanonicalValue normalized_root, std::string canonical_bytes)
       : retained_bundle_id_(std::move(retained_bundle_id)),
+        value_(std::move(value)),
         normalized_root_(std::move(normalized_root)),
         canonical_bytes_(std::move(canonical_bytes)) {}
 
   core::RetainedBundleId retained_bundle_id_;
+  core::RetainedBundleDTO value_;
   CanonicalValue normalized_root_;
   std::string canonical_bytes_;
+
+  friend class detail::RetainedBundleMaterializer;
 };
 
 [[nodiscard]] bool

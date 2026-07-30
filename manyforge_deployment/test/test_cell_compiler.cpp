@@ -118,11 +118,11 @@ TEST(CellCompiler,
   EXPECT_TRUE(compiled.catalog_record_refs().empty());
 }
 
-TEST(CellCompiler, CopyPreservesAnIndependentOwnedQualifiedPredecessor) {
+TEST(CellCompiler, CopySharesTheSameImmutableQualifiedPredecessor) {
   const auto compiled = compile_canonical_empty_cell();
   const auto copied = compiled;
 
-  EXPECT_NE(&copied.applicability(), &compiled.applicability());
+  EXPECT_EQ(&copied.applicability(), &compiled.applicability());
   EXPECT_EQ(copied.applicability().composition().graph(),
             compiled.applicability().composition().graph());
   EXPECT_EQ(copied.catalog_record_refs(), compiled.catalog_record_refs());

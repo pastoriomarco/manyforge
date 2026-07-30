@@ -2,6 +2,7 @@
 
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/model_asset.hpp>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -24,31 +25,41 @@ class ModelAssetCodecError : public std::invalid_argument {
 /// claim compatibility with a runtime lane.
 class QualifiedModelAsset final {
  public:
-  QualifiedModelAsset(const QualifiedModelAsset&) = default;
-  QualifiedModelAsset& operator=(const QualifiedModelAsset&) = default;
+  QualifiedModelAsset(const QualifiedModelAsset&) noexcept = default;
+  QualifiedModelAsset& operator=(const QualifiedModelAsset&) noexcept =
+      default;
 
   [[nodiscard]] const core::ModelAssetCatalogRecordRefDTO& reference()
       const noexcept {
-    return reference_;
+    return data_->reference;
   }
   [[nodiscard]] const core::ModelAssetDTO& value() const noexcept {
-    return value_;
+    return data_->value;
   }
   [[nodiscard]] const CanonicalValue& normalized_root() const noexcept {
-    return normalized_root_;
+    return data_->normalized_root;
   }
 
  private:
+  struct Data final {
+    Data(const core::ModelAssetCatalogRecordRefDTO& reference_in,
+         core::ModelAssetDTO value_in, CanonicalValue normalized_root_in)
+        : reference(reference_in),
+          value(std::move(value_in)),
+          normalized_root(std::move(normalized_root_in)) {}
+
+    core::ModelAssetCatalogRecordRefDTO reference;
+    core::ModelAssetDTO value;
+    CanonicalValue normalized_root;
+  };
+
   QualifiedModelAsset(const core::ModelAssetCatalogRecordRefDTO& reference,
                       core::ModelAssetDTO value,
                       CanonicalValue normalized_root)
-      : reference_(reference),
-        value_(std::move(value)),
-        normalized_root_(std::move(normalized_root)) {}
+      : data_(std::make_shared<const Data>(
+            reference, std::move(value), std::move(normalized_root))) {}
 
-  core::ModelAssetCatalogRecordRefDTO reference_;
-  core::ModelAssetDTO value_;
-  CanonicalValue normalized_root_;
+  std::shared_ptr<const Data> data_;
 
   friend QualifiedModelAsset resolve_and_qualify_model_asset(
       const core::ModelAssetCatalogRecordRefDTO&,

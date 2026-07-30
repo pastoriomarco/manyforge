@@ -2,6 +2,7 @@
 
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/runtime_profile.hpp>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -24,32 +25,41 @@ class RuntimeProfileCodecError : public std::invalid_argument {
 /// live health/readiness.
 class QualifiedRuntimeProfile final {
  public:
-  QualifiedRuntimeProfile(const QualifiedRuntimeProfile&) = default;
-  QualifiedRuntimeProfile& operator=(const QualifiedRuntimeProfile&) =
-      default;
+  QualifiedRuntimeProfile(const QualifiedRuntimeProfile&) noexcept = default;
+  QualifiedRuntimeProfile& operator=(
+      const QualifiedRuntimeProfile&) noexcept = default;
 
   [[nodiscard]] const core::RuntimeProfileCatalogRecordRefDTO& reference()
       const noexcept {
-    return reference_;
+    return data_->reference;
   }
   [[nodiscard]] const core::RuntimeProfileDTO& value() const noexcept {
-    return value_;
+    return data_->value;
   }
   [[nodiscard]] const CanonicalValue& normalized_root() const noexcept {
-    return normalized_root_;
+    return data_->normalized_root;
   }
 
  private:
+  struct Data final {
+    Data(const core::RuntimeProfileCatalogRecordRefDTO& reference_in,
+         core::RuntimeProfileDTO value_in, CanonicalValue normalized_root_in)
+        : reference(reference_in),
+          value(std::move(value_in)),
+          normalized_root(std::move(normalized_root_in)) {}
+
+    core::RuntimeProfileCatalogRecordRefDTO reference;
+    core::RuntimeProfileDTO value;
+    CanonicalValue normalized_root;
+  };
+
   QualifiedRuntimeProfile(
       const core::RuntimeProfileCatalogRecordRefDTO& reference,
       core::RuntimeProfileDTO value, CanonicalValue normalized_root)
-      : reference_(reference),
-        value_(std::move(value)),
-        normalized_root_(std::move(normalized_root)) {}
+      : data_(std::make_shared<const Data>(
+            reference, std::move(value), std::move(normalized_root))) {}
 
-  core::RuntimeProfileCatalogRecordRefDTO reference_;
-  core::RuntimeProfileDTO value_;
-  CanonicalValue normalized_root_;
+  std::shared_ptr<const Data> data_;
 
   friend QualifiedRuntimeProfile resolve_and_qualify_runtime_profile(
       const core::RuntimeProfileCatalogRecordRefDTO&,

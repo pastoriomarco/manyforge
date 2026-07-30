@@ -3,6 +3,7 @@
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/catalog.hpp>
 
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -13,7 +14,7 @@
 namespace manyforge::deployment {
 
 class CapabilityDefinitionCodecError : public std::invalid_argument {
-public:
+ public:
   using std::invalid_argument::invalid_argument;
 };
 
@@ -21,33 +22,43 @@ public:
 /// built-in-registry row have all been verified by this build.
 class QualifiedCapabilityDefinition final {
  public:
-  QualifiedCapabilityDefinition(const QualifiedCapabilityDefinition&) =
-      default;
+  QualifiedCapabilityDefinition(
+      const QualifiedCapabilityDefinition&) noexcept = default;
   QualifiedCapabilityDefinition& operator=(
-      const QualifiedCapabilityDefinition&) = default;
+      const QualifiedCapabilityDefinition&) noexcept = default;
 
   [[nodiscard]] const core::CapabilityDefinitionCatalogRecordRefDTO&
   reference() const noexcept {
-    return reference_;
+    return data_->reference;
   }
   [[nodiscard]] const core::CapabilityDefinitionDTO& value() const noexcept {
-    return value_;
+    return data_->value;
   }
   [[nodiscard]] const CanonicalValue& normalized_root() const noexcept {
-    return normalized_root_;
+    return data_->normalized_root;
   }
 
  private:
+  struct Data final {
+    Data(const core::CapabilityDefinitionCatalogRecordRefDTO& reference_in,
+         core::CapabilityDefinitionDTO value_in,
+         CanonicalValue normalized_root_in)
+        : reference(reference_in),
+          value(std::move(value_in)),
+          normalized_root(std::move(normalized_root_in)) {}
+
+    core::CapabilityDefinitionCatalogRecordRefDTO reference;
+    core::CapabilityDefinitionDTO value;
+    CanonicalValue normalized_root;
+  };
+
   QualifiedCapabilityDefinition(
       const core::CapabilityDefinitionCatalogRecordRefDTO& reference,
       core::CapabilityDefinitionDTO value, CanonicalValue normalized_root)
-      : reference_(reference),
-        value_(std::move(value)),
-        normalized_root_(std::move(normalized_root)) {}
+      : data_(std::make_shared<const Data>(
+            reference, std::move(value), std::move(normalized_root))) {}
 
-  core::CapabilityDefinitionCatalogRecordRefDTO reference_;
-  core::CapabilityDefinitionDTO value_;
-  CanonicalValue normalized_root_;
+  std::shared_ptr<const Data> data_;
 
   friend QualifiedCapabilityDefinition
   resolve_and_qualify_capability_definition(

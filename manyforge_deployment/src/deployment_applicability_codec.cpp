@@ -912,7 +912,7 @@ decode_deployment_applicability_inputs_candidate(
 RevisionVerifiedDeploymentApplicabilityInputs
 compute_capability_provider_binding_revisions(
     const TypedDeploymentApplicabilityInputsCandidate& candidate) {
-  DeploymentApplicabilityInputsDTO value = candidate.value_;
+  DeploymentApplicabilityInputsDTO value = candidate.value();
   for (auto& binding : value.capability_provider_bindings) {
     const std::string revision = detail::compute_content_identity(
         encode_provider_binding(binding),
@@ -926,22 +926,24 @@ compute_capability_provider_binding_revisions(
       encode_provider_bindings(value.capability_provider_bindings);
 
   return RevisionVerifiedDeploymentApplicabilityInputs(
-      std::move(value),
-      candidate.normalized_desired_control_configurations_,
-      std::move(normalized_providers),
-      candidate.normalized_external_resources_,
-      candidate.site_overlay_ref_presence_,
-      candidate.normalized_site_overlay_ref_,
-      candidate.external_resources_was_present_);
+      TypedDeploymentApplicabilityInputsCandidate(
+          std::move(value),
+          candidate.normalized_desired_control_configurations(),
+          std::move(normalized_providers),
+          candidate.normalized_external_resources(),
+          candidate.site_overlay_ref_presence(),
+          candidate.normalized_site_overlay_ref(),
+          candidate.external_resources_was_present()));
 }
 
 RevisionVerifiedDeploymentApplicabilityInputs
 verify_capability_provider_binding_revisions(
     const TypedDeploymentApplicabilityInputsCandidate& candidate) {
   for (std::size_t index = 0;
-       index < candidate.value_.capability_provider_bindings.size(); ++index) {
+       index < candidate.value().capability_provider_bindings.size();
+       ++index) {
     const auto& binding =
-        candidate.value_.capability_provider_bindings[index];
+        candidate.value().capability_provider_bindings[index];
     if (!detail::verify_content_identity(
             encode_provider_binding(binding),
             kCapabilityProviderBindingIdentitySpec)) {
@@ -951,14 +953,7 @@ verify_capability_provider_binding_revisions(
     }
   }
 
-  return RevisionVerifiedDeploymentApplicabilityInputs(
-      candidate.value_,
-      candidate.normalized_desired_control_configurations_,
-      candidate.normalized_capability_provider_bindings_,
-      candidate.normalized_external_resources_,
-      candidate.site_overlay_ref_presence_,
-      candidate.normalized_site_overlay_ref_,
-      candidate.external_resources_was_present_);
+  return RevisionVerifiedDeploymentApplicabilityInputs(candidate);
 }
 
 }  // namespace manyforge::deployment

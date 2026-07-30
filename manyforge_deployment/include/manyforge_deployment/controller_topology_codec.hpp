@@ -2,6 +2,7 @@
 
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/controller_topology.hpp>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -26,32 +27,43 @@ class ControllerTopologyCodecError : public std::invalid_argument {
 /// instance. Those are retained-product and runtime responsibilities.
 class QualifiedControllerTopology final {
  public:
-  QualifiedControllerTopology(const QualifiedControllerTopology&) = default;
+  QualifiedControllerTopology(const QualifiedControllerTopology&) noexcept =
+      default;
   QualifiedControllerTopology& operator=(
-      const QualifiedControllerTopology&) = default;
+      const QualifiedControllerTopology&) noexcept = default;
 
   [[nodiscard]] const core::ControllerTopologyCatalogRecordRefDTO& reference()
       const noexcept {
-    return reference_;
+    return data_->reference;
   }
   [[nodiscard]] const core::ControllerTopologyDTO& value() const noexcept {
-    return value_;
+    return data_->value;
   }
   [[nodiscard]] const CanonicalValue& normalized_root() const noexcept {
-    return normalized_root_;
+    return data_->normalized_root;
   }
 
  private:
+  struct Data final {
+    Data(const core::ControllerTopologyCatalogRecordRefDTO& reference_in,
+         core::ControllerTopologyDTO value_in,
+         CanonicalValue normalized_root_in)
+        : reference(reference_in),
+          value(std::move(value_in)),
+          normalized_root(std::move(normalized_root_in)) {}
+
+    core::ControllerTopologyCatalogRecordRefDTO reference;
+    core::ControllerTopologyDTO value;
+    CanonicalValue normalized_root;
+  };
+
   QualifiedControllerTopology(
       const core::ControllerTopologyCatalogRecordRefDTO& reference,
       core::ControllerTopologyDTO value, CanonicalValue normalized_root)
-      : reference_(reference),
-        value_(std::move(value)),
-        normalized_root_(std::move(normalized_root)) {}
+      : data_(std::make_shared<const Data>(
+            reference, std::move(value), std::move(normalized_root))) {}
 
-  core::ControllerTopologyCatalogRecordRefDTO reference_;
-  core::ControllerTopologyDTO value_;
-  CanonicalValue normalized_root_;
+  std::shared_ptr<const Data> data_;
 
   friend QualifiedControllerTopology resolve_and_qualify_controller_topology(
       const core::ControllerTopologyCatalogRecordRefDTO&,

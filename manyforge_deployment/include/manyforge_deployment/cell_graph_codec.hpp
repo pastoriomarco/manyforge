@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/types/cell_graph.hpp>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -26,21 +27,34 @@ class CellGraphCodecError : public std::invalid_argument {
 /// qualification of catalog-constrained nested values.
 class TypedCellGraphCandidate final {
  public:
-  TypedCellGraphCandidate(const TypedCellGraphCandidate&) = default;
-  TypedCellGraphCandidate& operator=(const TypedCellGraphCandidate&) = default;
+  TypedCellGraphCandidate(const TypedCellGraphCandidate&) noexcept = default;
+  TypedCellGraphCandidate& operator=(
+      const TypedCellGraphCandidate&) noexcept = default;
 
-  [[nodiscard]] const core::CellGraphDTO& graph() const noexcept { return graph_; }
+  [[nodiscard]] const core::CellGraphDTO& graph() const noexcept {
+    return data_->graph;
+  }
   [[nodiscard]] const CanonicalValue& structurally_normalized_root() const noexcept {
-    return structurally_normalized_root_;
+    return data_->structurally_normalized_root;
   }
 
  private:
-  TypedCellGraphCandidate(core::CellGraphDTO graph, CanonicalValue structurally_normalized_root)
-      : graph_(std::move(graph)),
-        structurally_normalized_root_(std::move(structurally_normalized_root)) {}
+  struct Data final {
+    Data(core::CellGraphDTO graph_in,
+         CanonicalValue structurally_normalized_root_in)
+        : graph(std::move(graph_in)),
+          structurally_normalized_root(
+              std::move(structurally_normalized_root_in)) {}
 
-  core::CellGraphDTO graph_;
-  CanonicalValue structurally_normalized_root_;
+    core::CellGraphDTO graph;
+    CanonicalValue structurally_normalized_root;
+  };
+
+  TypedCellGraphCandidate(core::CellGraphDTO graph, CanonicalValue structurally_normalized_root)
+      : data_(std::make_shared<const Data>(
+            std::move(graph), std::move(structurally_normalized_root))) {}
+
+  std::shared_ptr<const Data> data_;
 
   friend TypedCellGraphCandidate decode_cell_graph_candidate(const ParsedArtifactCandidate&);
 };
@@ -55,23 +69,30 @@ class TypedCellGraphCandidate final {
 class IntrinsicallyValidatedCellGraphCandidate final {
  public:
   IntrinsicallyValidatedCellGraphCandidate(
-      const IntrinsicallyValidatedCellGraphCandidate&) = default;
+      const IntrinsicallyValidatedCellGraphCandidate&) noexcept = default;
   IntrinsicallyValidatedCellGraphCandidate& operator=(
-      const IntrinsicallyValidatedCellGraphCandidate&) = default;
+      const IntrinsicallyValidatedCellGraphCandidate&) noexcept = default;
 
-  [[nodiscard]] const core::CellGraphDTO& graph() const noexcept { return graph_; }
+  [[nodiscard]] const core::CellGraphDTO& graph() const noexcept {
+    return data_->candidate.graph();
+  }
   [[nodiscard]] const CanonicalValue& structurally_normalized_root() const noexcept {
-    return structurally_normalized_root_;
+    return data_->candidate.structurally_normalized_root();
   }
 
  private:
-  IntrinsicallyValidatedCellGraphCandidate(core::CellGraphDTO graph,
-                                           CanonicalValue structurally_normalized_root)
-      : graph_(std::move(graph)),
-        structurally_normalized_root_(std::move(structurally_normalized_root)) {}
+  struct Data final {
+    explicit Data(const TypedCellGraphCandidate& candidate_in)
+        : candidate(candidate_in) {}
 
-  core::CellGraphDTO graph_;
-  CanonicalValue structurally_normalized_root_;
+    TypedCellGraphCandidate candidate;
+  };
+
+  explicit IntrinsicallyValidatedCellGraphCandidate(
+      const TypedCellGraphCandidate& candidate)
+      : data_(std::make_shared<const Data>(candidate)) {}
+
+  std::shared_ptr<const Data> data_;
 
   friend IntrinsicallyValidatedCellGraphCandidate validate_intrinsic_cell_graph_candidate(
       const TypedCellGraphCandidate&);
@@ -90,25 +111,33 @@ class GraphRevisionVerifiedCellGraph;
 class GraphIdentityReadyCellGraphCandidate final {
  public:
   GraphIdentityReadyCellGraphCandidate(
-      const GraphIdentityReadyCellGraphCandidate&) = default;
+      const GraphIdentityReadyCellGraphCandidate&) noexcept = default;
   GraphIdentityReadyCellGraphCandidate& operator=(
-      const GraphIdentityReadyCellGraphCandidate&) = default;
+      const GraphIdentityReadyCellGraphCandidate&) noexcept = default;
 
   [[nodiscard]] const core::CellGraphDTO& graph() const noexcept {
-    return graph_;
+    return data_->graph;
   }
   [[nodiscard]] const CanonicalValue& normalized_root() const noexcept {
-    return normalized_root_;
+    return data_->normalized_root;
   }
 
  private:
+  struct Data final {
+    Data(core::CellGraphDTO graph_in, CanonicalValue normalized_root_in)
+        : graph(std::move(graph_in)),
+          normalized_root(std::move(normalized_root_in)) {}
+
+    core::CellGraphDTO graph;
+    CanonicalValue normalized_root;
+  };
+
   GraphIdentityReadyCellGraphCandidate(core::CellGraphDTO graph,
                                        CanonicalValue normalized_root)
-      : graph_(std::move(graph)),
-        normalized_root_(std::move(normalized_root)) {}
+      : data_(std::make_shared<const Data>(
+            std::move(graph), std::move(normalized_root))) {}
 
-  core::CellGraphDTO graph_;
-  CanonicalValue normalized_root_;
+  std::shared_ptr<const Data> data_;
 
   friend GraphIdentityReadyCellGraphCandidate prepare_cell_graph_identity(
       const IntrinsicallyValidatedCellGraphCandidate&,
@@ -127,26 +156,31 @@ class GraphIdentityReadyCellGraphCandidate final {
 /// retained-bundle completeness, runtime readiness, admission, or any lane.
 class GraphRevisionVerifiedCellGraph final {
  public:
-  GraphRevisionVerifiedCellGraph(const GraphRevisionVerifiedCellGraph&) =
-      default;
+  GraphRevisionVerifiedCellGraph(
+      const GraphRevisionVerifiedCellGraph&) noexcept = default;
   GraphRevisionVerifiedCellGraph& operator=(
-      const GraphRevisionVerifiedCellGraph&) = default;
+      const GraphRevisionVerifiedCellGraph&) noexcept = default;
 
   [[nodiscard]] const core::CellGraphDTO& graph() const noexcept {
-    return graph_;
+    return data_->candidate.graph();
   }
   [[nodiscard]] const CanonicalValue& normalized_root() const noexcept {
-    return normalized_root_;
+    return data_->candidate.normalized_root();
   }
 
  private:
-  GraphRevisionVerifiedCellGraph(core::CellGraphDTO graph,
-                                 CanonicalValue normalized_root)
-      : graph_(std::move(graph)),
-        normalized_root_(std::move(normalized_root)) {}
+  struct Data final {
+    explicit Data(const GraphIdentityReadyCellGraphCandidate& candidate_in)
+        : candidate(candidate_in) {}
 
-  core::CellGraphDTO graph_;
-  CanonicalValue normalized_root_;
+    GraphIdentityReadyCellGraphCandidate candidate;
+  };
+
+  explicit GraphRevisionVerifiedCellGraph(
+      const GraphIdentityReadyCellGraphCandidate& candidate)
+      : data_(std::make_shared<const Data>(candidate)) {}
+
+  std::shared_ptr<const Data> data_;
 
   friend GraphRevisionVerifiedCellGraph compute_graph_revision(
       const GraphIdentityReadyCellGraphCandidate&);

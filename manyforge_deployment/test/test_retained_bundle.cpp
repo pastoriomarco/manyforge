@@ -42,6 +42,9 @@ static_assert(!std::is_aggregate_v<RetainedBundle>);
 static_assert(!std::is_default_constructible_v<RetainedBundle>);
 static_assert(!std::is_constructible_v<RetainedBundle, core::RetainedBundleId,
                                        CanonicalValue, std::string>);
+static_assert(!std::is_constructible_v<
+              RetainedBundle, core::RetainedBundleId,
+              core::RetainedBundleDTO, CanonicalValue, std::string>);
 static_assert(!std::is_copy_constructible_v<InMemoryRawArtifactStore>);
 static_assert(!std::is_copy_assignable_v<InMemoryRawArtifactStore>);
 static_assert(!std::is_move_constructible_v<InMemoryRawArtifactStore>);
@@ -607,7 +610,7 @@ TEST(RetainedProductTest,
 }
 
 TEST(RetainedBundleRepositoryTest,
-     RemainsEmptyAndHasNoActiveAliasBeforeQualifiedI2ProducerExists) {
+     StartsEmptyAndExposesNoActiveAliasOrNullInsertionPath) {
   InMemoryRetainedBundleRepository repository;
   EXPECT_EQ(repository.size(), 0U);
   EXPECT_EQ(repository.retained_bytes(), 0U);

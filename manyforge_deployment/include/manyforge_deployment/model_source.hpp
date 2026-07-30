@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <manyforge_core/types/model_asset.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -77,33 +78,44 @@ struct ModelSourceRetrievalPlanRow final {
 /// policy independently.
 class ModelSourceRetrievalPlan final {
  public:
-  ModelSourceRetrievalPlan(const ModelSourceRetrievalPlan&) = default;
-  ModelSourceRetrievalPlan& operator=(const ModelSourceRetrievalPlan&) =
+  ModelSourceRetrievalPlan(const ModelSourceRetrievalPlan&) noexcept =
       default;
+  ModelSourceRetrievalPlan& operator=(
+      const ModelSourceRetrievalPlan&) noexcept = default;
 
   [[nodiscard]] const QualifiedModelAsset& qualified_asset() const noexcept {
-    return qualified_asset_;
+    return data_->qualified_asset;
   }
   [[nodiscard]] const std::vector<ModelSourceRetrievalPlanRow>& artifacts()
       const noexcept {
-    return artifacts_;
+    return data_->artifacts;
   }
   [[nodiscard]] std::uint64_t total_bytes() const noexcept {
-    return total_bytes_;
+    return data_->total_bytes;
   }
 
  private:
+  struct Data final {
+    Data(const QualifiedModelAsset& qualified_asset_in,
+         std::vector<ModelSourceRetrievalPlanRow> artifacts_in,
+         std::uint64_t total_bytes_in)
+        : qualified_asset(qualified_asset_in),
+          artifacts(std::move(artifacts_in)),
+          total_bytes(total_bytes_in) {}
+
+    QualifiedModelAsset qualified_asset;
+    std::vector<ModelSourceRetrievalPlanRow> artifacts;
+    std::uint64_t total_bytes;
+  };
+
   ModelSourceRetrievalPlan(
       const QualifiedModelAsset& qualified_asset,
       std::vector<ModelSourceRetrievalPlanRow> artifacts,
       std::uint64_t total_bytes)
-      : qualified_asset_(qualified_asset),
-        artifacts_(std::move(artifacts)),
-        total_bytes_(total_bytes) {}
+      : data_(std::make_shared<const Data>(
+            qualified_asset, std::move(artifacts), total_bytes)) {}
 
-  QualifiedModelAsset qualified_asset_;
-  std::vector<ModelSourceRetrievalPlanRow> artifacts_;
-  std::uint64_t total_bytes_;
+  std::shared_ptr<const Data> data_;
 
   friend ModelSourceRetrievalPlan preflight_model_source_declaration(
       const QualifiedModelAsset&);
@@ -577,36 +589,54 @@ class SourceVerifiedModelAsset;
 /// occurrence target-resource order.
 class ModelSourceIr final {
  public:
-  [[nodiscard]] const UrdfDocumentIr& urdf() const noexcept { return urdf_; }
+  ModelSourceIr(const ModelSourceIr&) noexcept = default;
+  ModelSourceIr& operator=(const ModelSourceIr&) noexcept = default;
+
+  [[nodiscard]] const UrdfDocumentIr& urdf() const noexcept {
+    return data_->urdf;
+  }
   [[nodiscard]] const std::optional<SrdfDocumentIr>& srdf() const noexcept {
-    return srdf_;
+    return data_->srdf;
   }
   [[nodiscard]] const ModelSourceSemanticIndex& semantic_index()
       const noexcept {
-    return semantic_index_;
+    return data_->semantic_index;
   }
   [[nodiscard]] const std::vector<SourceArtifactReferenceIr>&
   artifact_references() const noexcept {
-    return artifact_references_;
+    return data_->artifact_references;
   }
 
   /// Semantic equality deliberately excludes authored-default provenance.
   friend bool operator==(const ModelSourceIr&, const ModelSourceIr&);
 
  private:
+  struct Data final {
+    Data(
+        UrdfDocumentIr urdf_in, std::optional<SrdfDocumentIr> srdf_in,
+        ModelSourceSemanticIndex semantic_index_in,
+        std::vector<SourceArtifactReferenceIr> artifact_references_in)
+        : urdf(std::move(urdf_in)),
+          srdf(std::move(srdf_in)),
+          semantic_index(std::move(semantic_index_in)),
+          artifact_references(std::move(artifact_references_in)) {}
+
+    UrdfDocumentIr urdf;
+    std::optional<SrdfDocumentIr> srdf;
+    ModelSourceSemanticIndex semantic_index;
+    std::vector<SourceArtifactReferenceIr> artifact_references;
+  };
+
   ModelSourceIr(
       UrdfDocumentIr urdf, std::optional<SrdfDocumentIr> srdf,
       ModelSourceSemanticIndex semantic_index,
       std::vector<SourceArtifactReferenceIr> artifact_references)
-      : urdf_(std::move(urdf)),
-        srdf_(std::move(srdf)),
-        semantic_index_(std::move(semantic_index)),
-        artifact_references_(std::move(artifact_references)) {}
+      : data_(std::make_shared<const Data>(
+            std::move(urdf), std::move(srdf),
+            std::move(semantic_index),
+            std::move(artifact_references))) {}
 
-  UrdfDocumentIr urdf_;
-  std::optional<SrdfDocumentIr> srdf_;
-  ModelSourceSemanticIndex semantic_index_;
-  std::vector<SourceArtifactReferenceIr> artifact_references_;
+  std::shared_ptr<const Data> data_;
 
   friend class SourceVerifiedModelAsset;
   friend SourceVerifiedModelAsset verify_model_source_closure(
@@ -627,40 +657,52 @@ class ModelSourceIr final {
 /// This product proves neither graph placement nor lane/runtime compatibility.
 class SourceVerifiedModelAsset final {
  public:
-  SourceVerifiedModelAsset(const SourceVerifiedModelAsset&) = default;
-  SourceVerifiedModelAsset& operator=(const SourceVerifiedModelAsset&) =
+  SourceVerifiedModelAsset(const SourceVerifiedModelAsset&) noexcept =
       default;
+  SourceVerifiedModelAsset& operator=(
+      const SourceVerifiedModelAsset&) noexcept = default;
 
   [[nodiscard]] const core::ModelAssetDTO& value() const noexcept {
-    return retrieval_plan_.qualified_asset().value();
+    return data_->retrieval_plan.qualified_asset().value();
   }
   [[nodiscard]] const QualifiedModelAsset& qualified_asset() const noexcept {
-    return retrieval_plan_.qualified_asset();
+    return data_->retrieval_plan.qualified_asset();
   }
   [[nodiscard]] const ModelSourceRetrievalPlan& retrieval_plan()
       const noexcept {
-    return retrieval_plan_;
+    return data_->retrieval_plan;
   }
   [[nodiscard]] const std::vector<VerifiedModelSourceArtifact>&
   verified_artifacts() const noexcept {
-    return verified_artifacts_;
+    return data_->verified_artifacts;
   }
   [[nodiscard]] const ModelSourceIr& source_ir() const noexcept {
-    return source_ir_;
+    return data_->source_ir;
   }
 
  private:
+  struct Data final {
+    Data(const ModelSourceRetrievalPlan& retrieval_plan_in,
+         std::vector<VerifiedModelSourceArtifact> verified_artifacts_in,
+         ModelSourceIr source_ir_in)
+        : retrieval_plan(retrieval_plan_in),
+          verified_artifacts(std::move(verified_artifacts_in)),
+          source_ir(std::move(source_ir_in)) {}
+
+    ModelSourceRetrievalPlan retrieval_plan;
+    std::vector<VerifiedModelSourceArtifact> verified_artifacts;
+    ModelSourceIr source_ir;
+  };
+
   SourceVerifiedModelAsset(
       const ModelSourceRetrievalPlan& retrieval_plan,
       std::vector<VerifiedModelSourceArtifact> verified_artifacts,
       ModelSourceIr source_ir)
-      : retrieval_plan_(retrieval_plan),
-        verified_artifacts_(std::move(verified_artifacts)),
-        source_ir_(std::move(source_ir)) {}
+      : data_(std::make_shared<const Data>(
+            retrieval_plan, std::move(verified_artifacts),
+            std::move(source_ir))) {}
 
-  ModelSourceRetrievalPlan retrieval_plan_;
-  std::vector<VerifiedModelSourceArtifact> verified_artifacts_;
-  ModelSourceIr source_ir_;
+  std::shared_ptr<const Data> data_;
 
   friend SourceVerifiedModelAsset verify_model_source_closure(
       const QualifiedModelAsset&,

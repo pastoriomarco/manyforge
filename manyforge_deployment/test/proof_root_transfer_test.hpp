@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <memory>
+#include <type_traits>
 #include <utility>
 
 namespace manyforge::deployment::test {
@@ -33,6 +35,34 @@ void expect_source_preserving_rvalue_transfers(
   EXPECT_EQ(projection(reused_source), expected);
   EXPECT_EQ(projection(constructed), expected);
   EXPECT_EQ(projection(reused_destination), expected);
+}
+
+template <typename Root, typename SharedProjection>
+void expect_immutable_shared_copy_storage(
+    const Root& seed, SharedProjection shared_projection) {
+  static_assert(std::is_nothrow_copy_constructible_v<Root>);
+  static_assert(std::is_nothrow_copy_assignable_v<Root>);
+  static_assert(sizeof(Root) == sizeof(std::shared_ptr<const void>));
+  static_assert(std::is_lvalue_reference_v<
+                decltype(shared_projection(seed))>);
+
+  const auto* const expected =
+      std::addressof(shared_projection(seed));
+
+  Root copied(seed);
+  EXPECT_EQ(std::addressof(shared_projection(copied)), expected);
+
+  Root construction_source(seed);
+  Root constructed(std::move(construction_source));
+  EXPECT_EQ(std::addressof(shared_projection(construction_source)),
+            expected);
+  EXPECT_EQ(std::addressof(shared_projection(constructed)), expected);
+
+  Root assignment_source(seed);
+  Root assigned(seed);
+  assigned = std::move(assignment_source);
+  EXPECT_EQ(std::addressof(shared_projection(assignment_source)), expected);
+  EXPECT_EQ(std::addressof(shared_projection(assigned)), expected);
 }
 
 }  // namespace manyforge::deployment::test
