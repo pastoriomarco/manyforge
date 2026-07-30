@@ -488,7 +488,8 @@ StructurallyQualifiedCellGraph qualify_cell_structure(
     if (owner == model_owners.end()) {
       model_instances.push_back(
           {instance.model_instance_id, instance.model_asset_id,
-           instance.model_revision, asset->parsed_ir().root_link_name,
+           instance.model_revision,
+           asset->source_ir().semantic_index().root_link_name,
            std::nullopt, std::nullopt,
            StructuralPlacementSource::kDirectModelPoseInCell});
       continue;
@@ -509,7 +510,8 @@ StructurallyQualifiedCellGraph qualify_cell_structure(
                    : StructuralPlacementSource::kDirectComponentPoseInCell);
     model_instances.push_back(
         {instance.model_instance_id, instance.model_asset_id,
-         instance.model_revision, asset->parsed_ir().root_link_name,
+         instance.model_revision,
+         asset->source_ir().semantic_index().root_link_name,
          component->controllable_component_id,
          owner->second.role->model_role_id, placement_source});
   }

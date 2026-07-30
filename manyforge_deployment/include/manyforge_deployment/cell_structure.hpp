@@ -40,7 +40,7 @@ struct StructuralModelInstanceResolution final {
   core::ModelInstanceId model_instance_id;
   core::ModelAssetId model_asset_id;
   core::ModelRevision model_revision;
-  std::string parsed_root_link_name;
+  std::string source_root_link_name;
   std::optional<core::ControllableComponentId> owner_component_id;
   std::optional<core::ModelRoleId> owner_model_role_id;
   StructuralPlacementSource placement_source;

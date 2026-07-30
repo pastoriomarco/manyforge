@@ -20,6 +20,10 @@ ZERO_DIGEST = "sha256:" + ("0" * 64)
 assert core.MAX_MODEL_SOURCE_XML_DEPTH == 128
 assert core.MAX_MODEL_SOURCE_XML_ELEMENT_COUNT == 250_000
 assert core.MAX_MODEL_SOURCE_XML_ATTRIBUTE_COUNT == 1_000_000
+assert core.MAX_MODEL_SOURCE_COLLADA_XML_DEPTH == 128
+assert core.MAX_MODEL_SOURCE_COLLADA_XML_ELEMENT_COUNT == 250_000
+assert core.MAX_MODEL_SOURCE_COLLADA_XML_ATTRIBUTE_COUNT == 1_000_000
+assert core.MAX_MODEL_SOURCE_EXPANDED_SRDF_SEMANTIC_ROWS == 250_000
 
 
 def _sha256(value: bytes) -> str:
@@ -55,35 +59,112 @@ def _revisioned_document(
     return _canonical(root)
 
 
-def _source_fixture(*, urdf_declared_size: int | None = None):
+def _source_fixture(
+    *, urdf_declared_size: int | None = None, rich: bool = False
+):
     urdf_uri = "asset://python_arm/urdf/model.urdf"
     srdf_uri = "asset://python_arm/srdf/model.srdf"
     mesh_uri = "asset://python_arm/meshes/base.stl"
-    urdf = (
-        '<robot name="python_arm">'
-        '<link name="base_link"><visual><geometry>'
-        f'<mesh filename="{mesh_uri}"/>'
-        "</geometry></visual></link>"
-        '<link name="tool0"/>'
-        '<joint name="joint1" type="revolute">'
-        '<parent link="base_link"/><child link="tool0"/>'
-        '<axis xyz="0 0 1"/>'
-        '<limit lower="-3" upper="3" effort="1" velocity="1"/>'
-        "</joint></robot>"
-    ).encode()
-    srdf = (
-        '<robot name="python_arm">'
-        '<group name="manipulator">'
-        '<chain base_link="base_link" tip_link="tool0"/>'
-        '<joint name="joint1"/>'
-        "</group>"
-        '<group_state name="home" group="manipulator">'
-        '<joint name="joint1" value="0"/>'
-        "</group_state>"
-        '<disable_collisions link1="base_link" link2="tool0" '
-        'reason="Adjacent"/>'
-        "</robot>"
-    ).encode()
+    texture_uri = "asset://python_arm/textures/steel.png"
+    if rich:
+        urdf = (
+            '<robot name="python_arm">'
+            '<material name="Steel"><color rgba="0.1 0.2 0.3 1"/>'
+            f'<texture filename="{texture_uri}"/></material>'
+            '<link name="base_link"><inertial>'
+            '<origin xyz="0.1 0.2 0.3" rpy="0.4 0.5 0.6"/>'
+            '<mass value="2.5"/><inertia ixx="1" ixy="0.1" ixz="0.2" '
+            'iyy="2" iyz="0.3" izz="3"/></inertial>'
+            '<visual name="mesh_visual">'
+            '<origin xyz="1 2 3" rpy="0.1 0.2 0.3"/><geometry>'
+            f'<mesh filename="{mesh_uri}" scale="2 3 4"/>'
+            '</geometry><material name="Steel"/></visual>'
+            '<collision name="box_collision"><geometry>'
+            '<box size="1 2 3"/></geometry></collision></link>'
+            '<link name="tool0"><visual name="box_visual"><geometry>'
+            '<box size="4 5 6"/></geometry>'
+            '<material name="Inline"><color rgba="1 0 0 0.5"/>'
+            '</material></visual></link>'
+            '<link name="aux1"><collision><origin xyz="0 0 1"/>'
+            '<geometry><cylinder radius="0.5" length="2"/></geometry>'
+            '</collision></link>'
+            '<link name="aux2"><visual><geometry>'
+            '<sphere radius="0.75"/></geometry></visual></link>'
+            '<link name="aux3"/><link name="aux4"/><link name="aux5"/>'
+            '<joint name="joint1" type="revolute">'
+            '<origin xyz="0.1 0.2 0.3" rpy="0.4 0.5 0.6"/>'
+            '<parent link="base_link"/><child link="tool0"/>'
+            '<axis xyz="0 0 1"/>'
+            '<calibration rising="1.1" falling="1.2" '
+            'reference_position="1.3"/>'
+            '<dynamics damping="0.2" friction="0.3"/>'
+            '<limit lower="-3" upper="3" effort="4" velocity="5"/>'
+            '<safety_controller soft_lower_limit="-2" '
+            'soft_upper_limit="2" k_position="6" k_velocity="7"/>'
+            '</joint>'
+            '<joint name="joint2" type="continuous">'
+            '<parent link="tool0"/><child link="aux1"/>'
+            '<dynamics damping="0.4"/>'
+            '<limit effort="8" velocity="9"/>'
+            '<mimic joint="joint1" multiplier="-2" offset="0.5"/>'
+            '</joint>'
+            '<joint name="joint3" type="prismatic">'
+            '<parent link="aux1"/><child link="aux2"/>'
+            '<axis xyz="1 0 0"/>'
+            '<limit lower="0" upper="1" effort="10" velocity="11"/>'
+            '</joint>'
+            '<joint name="joint4" type="fixed">'
+            '<parent link="aux2"/><child link="aux3"/></joint>'
+            '<joint name="joint5" type="planar">'
+            '<parent link="aux3"/><child link="aux4"/>'
+            '<axis xyz="0 0 1"/></joint>'
+            '<joint name="joint6" type="floating">'
+            '<parent link="aux4"/><child link="aux5"/></joint>'
+            '</robot>'
+        ).encode()
+        srdf = (
+            '<robot name="python_arm">'
+            '<group name="manipulator">'
+            '<link name="aux2"/><joint name="joint3"/>'
+            '<chain base_link="base_link" tip_link="aux1"/>'
+            '<group name="tooling"/></group>'
+            '<group name="tooling"><link name="aux2"/></group>'
+            '<group_state name="home" group="manipulator">'
+            '<joint name="joint1" value="0.25"/>'
+            '<joint name="joint3" value="0.5"/></group_state>'
+            '<end_effector name="tool" parent_link="aux2" '
+            'group="tooling" parent_group="manipulator"/>'
+            '<passive_joint name="joint2"/>'
+            '<disable_collisions link1="base_link" link2="tool0" '
+            'reason="Adjacent"/>'
+            '</robot>'
+        ).encode()
+    else:
+        urdf = (
+            '<robot name="python_arm">'
+            '<link name="base_link"><visual><geometry>'
+            f'<mesh filename="{mesh_uri}"/>'
+            "</geometry></visual></link>"
+            '<link name="tool0"/>'
+            '<joint name="joint1" type="revolute">'
+            '<parent link="base_link"/><child link="tool0"/>'
+            '<axis xyz="0 0 1"/>'
+            '<limit lower="-3" upper="3" effort="1" velocity="1"/>'
+            "</joint></robot>"
+        ).encode()
+        srdf = (
+            '<robot name="python_arm">'
+            '<group name="manipulator">'
+            '<chain base_link="base_link" tip_link="tool0"/>'
+            '<joint name="joint1"/>'
+            "</group>"
+            '<group_state name="home" group="manipulator">'
+            '<joint name="joint1" value="0"/>'
+            "</group_state>"
+            '<disable_collisions link1="base_link" link2="tool0" '
+            'reason="Adjacent"/>'
+            "</robot>"
+        ).encode()
     # Deliberately not UTF-8: opaque source artifacts must remain exact bytes.
     mesh = b"\x00\xffbinary-stl\x00payload\x80"
     blobs = {
@@ -91,6 +172,8 @@ def _source_fixture(*, urdf_declared_size: int | None = None):
         srdf_uri: ("application/xml", srdf),
         mesh_uri: ("model/stl", mesh),
     }
+    if rich:
+        blobs[texture_uri] = ("image/png", b"\x89PNG\r\n\x1a\nfixture")
     artifacts = [
         {
             "logical_uri": uri,
@@ -305,6 +388,10 @@ def test_source_verification_is_typed_nonconstructible_and_immutable():
         == core.ModelSourceArtifactKind.kStlMesh
     )
     assert (
+        core.ModelSourceArtifactKind.kColladaMesh
+        != core.ModelSourceArtifactKind.kStlMesh
+    )
+    assert (
         retrieval_plan.artifacts[-1].artifact_kind
         == core.ModelSourceArtifactKind.kUrdfXmlEntrypoint
     )
@@ -317,29 +404,108 @@ def test_source_verification_is_typed_nonconstructible_and_immutable():
     assert [item.logical_uri for item in verified.verified_artifacts] == sorted(
         blobs
     )
-    assert verified.parsed_ir.robot_name == "python_arm"
-    assert verified.parsed_ir.root_link_name == "base_link"
-    assert verified.parsed_ir.link_names == ("base_link", "tool0")
-    assert verified.parsed_ir.material_names == ()
-    assert len(verified.parsed_ir.joints) == 1
-    assert (
-        verified.parsed_ir.joints[0].type
-        == core.ParsedUrdfJointType.kRevolute
+    assert verified.source_ir.urdf.robot_name == "python_arm"
+    assert verified.source_ir.semantic_index.root_link_name == "base_link"
+    assert tuple(link.name for link in verified.source_ir.urdf.links) == (
+        "base_link",
+        "tool0",
     )
-    assert verified.parsed_ir.groups[0].name == "manipulator"
-    assert verified.parsed_ir.groups[0].chains[0].tip_link_name == "tool0"
-    assert verified.parsed_ir.group_states[0].name == "home"
-    assert verified.parsed_ir.disabled_collisions[0].reason == "Adjacent"
-    assert verified.parsed_ir.referenced_artifact_logical_uris == (
+    assert verified.source_ir.urdf.materials == ()
+    assert len(verified.source_ir.urdf.joints) == 1
+    assert (
+        verified.source_ir.urdf.joints[0].type
+        == core.UrdfJointType.kRevolute
+    )
+    assert set(core.UrdfGeometryIr.__args__) == {
+        core.UrdfBoxGeometryIr,
+        core.UrdfCylinderGeometryIr,
+        core.UrdfSphereGeometryIr,
+        core.UrdfMeshGeometryIr,
+    }
+    assert set(core.SrdfGroupMemberIr.__args__) == {
+        core.SrdfLinkGroupMemberIr,
+        core.SrdfJointGroupMemberIr,
+        core.SrdfChainGroupMemberIr,
+        core.SrdfSubgroupMemberIr,
+    }
+    assert verified.source_ir.srdf.groups[0].name == "manipulator"
+    assert (
+        verified.source_ir.srdf.groups[0].members[0].tip_link_name
+        == "tool0"
+    )
+    assert verified.source_ir.srdf.group_states[0].name == "home"
+    assert (
+        verified.source_ir.srdf.disabled_collisions[0].reason == "Adjacent"
+    )
+    assert tuple(
+        item.logical_uri for item in verified.source_ir.artifact_references
+    ) == (
         "asset://python_arm/meshes/base.stl",
     )
+    assert isinstance(
+        verified.source_ir.semantic_index.group_expansion_postorder, tuple
+    )
+    assert isinstance(
+        verified.source_ir.semantic_index.group_expansion_provenance, tuple
+    )
+    assert isinstance(
+        verified.source_ir.semantic_index.expanded_groups, tuple
+    )
+    expanded = verified.source_ir.semantic_index.expanded_groups[0]
+    assert isinstance(expanded.links, tuple)
+    assert isinstance(expanded.joints, tuple)
+    assert isinstance(expanded.joints[0].provenance_indices, tuple)
+    assert len(expanded.joints[0].provenance_indices) == 2
+
+    canonical_urdf = core.emit_canonical_urdf(verified.source_ir)
+    canonical_srdf = core.emit_canonical_srdf(verified.source_ir)
+    assert isinstance(canonical_urdf, str)
+    assert canonical_urdf.startswith('<robot name="python_arm">')
+    assert isinstance(canonical_srdf, str)
+    assert canonical_srdf.startswith('<robot name="python_arm">')
 
     for type_name in (
         "VerifiedModelSourceArtifact",
-        "ParsedUrdfJoint",
-        "ParsedSrdfChain",
-        "ParsedSrdfGroup",
-        "ParsedModelSourceIr",
+        "UrdfOriginIr",
+        "UrdfBoxGeometryIr",
+        "UrdfCylinderGeometryIr",
+        "UrdfSphereGeometryIr",
+        "UrdfMeshGeometryIr",
+        "UrdfMaterialColorIr",
+        "UrdfMaterialTextureIr",
+        "UrdfResolvedMaterialReferenceIr",
+        "UrdfMaterialIr",
+        "UrdfVisualIr",
+        "UrdfCollisionIr",
+        "UrdfInertiaIr",
+        "UrdfInertialIr",
+        "UrdfLinkIr",
+        "UrdfAxisIr",
+        "UrdfCalibrationIr",
+        "UrdfDynamicsIr",
+        "UrdfLimitIr",
+        "UrdfMimicIr",
+        "UrdfSafetyControllerIr",
+        "UrdfJointIr",
+        "UrdfDocumentIr",
+        "SrdfLinkGroupMemberIr",
+        "SrdfJointGroupMemberIr",
+        "SrdfChainGroupMemberIr",
+        "SrdfSubgroupMemberIr",
+        "SrdfGroupIr",
+        "SrdfGroupStateJointIr",
+        "SrdfGroupStateIr",
+        "SrdfEndEffectorIr",
+        "SrdfDisabledCollisionIr",
+        "SrdfDocumentIr",
+        "SourceArtifactReferenceIr",
+        "ModelSourceNameIndexEntryIr",
+        "ModelSourceGroupStateIndexEntryIr",
+        "SrdfExpansionProvenanceNodeIr",
+        "SrdfExpandedMemberIr",
+        "ExpandedSrdfGroupIr",
+        "ModelSourceSemanticIndex",
+        "ModelSourceIr",
         "ModelSourceRetrievalPlanRow",
         "ModelSourceRetrievalPlan",
         "SourceVerifiedModelAsset",
@@ -347,11 +513,244 @@ def test_source_verification_is_typed_nonconstructible_and_immutable():
         with pytest.raises(TypeError):
             getattr(core, type_name)()
     with pytest.raises(AttributeError):
-        verified.parsed_ir.robot_name = "mutated"
+        verified.source_ir.urdf.robot_name = "mutated"
     with pytest.raises(AttributeError):
-        verified.parsed_ir.link_names = ()
+        verified.source_ir.urdf.links = ()
+    with pytest.raises(AttributeError):
+        expanded.group_name = "mutated"
+    with pytest.raises(TypeError):
+        expanded.joints[0].provenance_indices[0] = 42
     with pytest.raises(AttributeError):
         retrieval_plan.total_bytes = 0
+
+    for removed_name in (
+        "ParsedModelSourceIr",
+        "ParsedUrdfJoint",
+        "ParsedUrdfJointType",
+        "ParsedSrdfChain",
+        "ParsedSrdfDisabledCollision",
+        "ParsedSrdfEndEffector",
+        "ParsedSrdfGroup",
+        "ParsedSrdfGroupState",
+        "ParsedSrdfGroupStateJoint",
+    ):
+        assert not hasattr(core, removed_name)
+
+
+def test_complete_model_source_values_have_python_semantic_parity():
+    qualified, candidates, _ = _source_fixture(rich=True)
+    source = core.verify_model_source_closure(
+        qualified, candidates
+    ).source_ir
+
+    material = source.urdf.materials[0]
+    assert material.name == "Steel"
+    assert material.color.rgba == pytest.approx((0.1, 0.2, 0.3, 1.0))
+    assert (
+        material.texture.logical_uri
+        == "asset://python_arm/textures/steel.png"
+    )
+
+    links = {link.name: link for link in source.urdf.links}
+    inertial = links["base_link"].inertial
+    assert inertial.origin.element_authored
+    assert inertial.origin.authored_xyz_m == pytest.approx((0.1, 0.2, 0.3))
+    assert inertial.origin.authored_rpy_rad == pytest.approx((0.4, 0.5, 0.6))
+    assert inertial.origin.xyz_m == pytest.approx((0.1, 0.2, 0.3))
+    assert inertial.mass_kg == pytest.approx(2.5)
+    assert (
+        inertial.inertia.ixx,
+        inertial.inertia.ixy,
+        inertial.inertia.ixz,
+        inertial.inertia.iyy,
+        inertial.inertia.iyz,
+        inertial.inertia.izz,
+    ) == pytest.approx((1.0, 0.1, 0.2, 2.0, 0.3, 3.0))
+
+    mesh_visual = links["base_link"].visuals[0]
+    assert mesh_visual.name == "mesh_visual"
+    assert isinstance(mesh_visual.geometry, core.UrdfMeshGeometryIr)
+    assert mesh_visual.geometry.authored_scale == pytest.approx((2, 3, 4))
+    assert mesh_visual.geometry.scale == pytest.approx((2, 3, 4))
+    assert mesh_visual.material.resolved_reference.definition_name == "Steel"
+    assert mesh_visual.material.resolved_reference.color.rgba == pytest.approx(
+        (0.1, 0.2, 0.3, 1.0)
+    )
+    assert (
+        mesh_visual.material.resolved_reference.texture.logical_uri
+        == "asset://python_arm/textures/steel.png"
+    )
+    assert isinstance(
+        links["base_link"].collisions[0].geometry,
+        core.UrdfBoxGeometryIr,
+    )
+    assert links["base_link"].collisions[0].geometry.size_m == pytest.approx(
+        (1, 2, 3)
+    )
+    inline = links["tool0"].visuals[0]
+    assert isinstance(inline.geometry, core.UrdfBoxGeometryIr)
+    assert inline.material.name == "Inline"
+    assert inline.material.color.rgba == pytest.approx((1, 0, 0, 0.5))
+    cylinder = links["aux1"].collisions[0]
+    assert cylinder.origin.element_authored
+    assert isinstance(cylinder.geometry, core.UrdfCylinderGeometryIr)
+    assert cylinder.geometry.radius_m == pytest.approx(0.5)
+    assert cylinder.geometry.length_m == pytest.approx(2)
+    sphere = links["aux2"].visuals[0].geometry
+    assert isinstance(sphere, core.UrdfSphereGeometryIr)
+    assert sphere.radius_m == pytest.approx(0.75)
+
+    joints = {joint.name: joint for joint in source.urdf.joints}
+    assert {
+        name: (joint.type, joint.coordinate_kind)
+        for name, joint in joints.items()
+    } == {
+        "joint1": (core.UrdfJointType.kRevolute, core.UrdfCoordinateKind.kAngular),
+        "joint2": (
+            core.UrdfJointType.kContinuous,
+            core.UrdfCoordinateKind.kAngular,
+        ),
+        "joint3": (core.UrdfJointType.kPrismatic, core.UrdfCoordinateKind.kLinear),
+        "joint4": (core.UrdfJointType.kFixed, core.UrdfCoordinateKind.kNone),
+        "joint5": (core.UrdfJointType.kPlanar, core.UrdfCoordinateKind.kPlanar),
+        "joint6": (
+            core.UrdfJointType.kFloating,
+            core.UrdfCoordinateKind.kFloating,
+        ),
+    }
+
+    joint1 = joints["joint1"]
+    assert joint1.parent_link_name == "base_link"
+    assert joint1.child_link_name == "tool0"
+    assert joint1.origin.element_authored
+    assert joint1.axis.element_authored
+    assert joint1.axis.authored_xyz == pytest.approx((0, 0, 1))
+    assert joint1.axis.xyz == pytest.approx((0, 0, 1))
+    assert (
+        joint1.calibration.rising,
+        joint1.calibration.falling,
+        joint1.calibration.authored_reference_position,
+        joint1.calibration.reference_position,
+    ) == pytest.approx((1.1, 1.2, 1.3, 1.3))
+    assert (
+        joint1.dynamics.authored_damping,
+        joint1.dynamics.authored_friction,
+        joint1.dynamics.damping,
+        joint1.dynamics.friction,
+    ) == pytest.approx((0.2, 0.3, 0.2, 0.3))
+    assert (
+        joint1.limit.authored_lower,
+        joint1.limit.authored_upper,
+        joint1.limit.lower,
+        joint1.limit.upper,
+        joint1.limit.effort,
+        joint1.limit.velocity,
+    ) == pytest.approx((-3, 3, -3, 3, 4, 5))
+    assert (
+        joint1.safety_controller.authored_soft_lower_limit,
+        joint1.safety_controller.authored_soft_upper_limit,
+        joint1.safety_controller.authored_k_position,
+        joint1.safety_controller.soft_lower_limit,
+        joint1.safety_controller.soft_upper_limit,
+        joint1.safety_controller.k_position,
+        joint1.safety_controller.k_velocity,
+    ) == pytest.approx((-2, 2, 6, -2, 2, 6, 7))
+
+    joint2 = joints["joint2"]
+    assert not joint2.axis.element_authored
+    assert joint2.axis.authored_xyz is None
+    assert joint2.axis.xyz == pytest.approx((1, 0, 0))
+    assert joint2.dynamics.authored_friction is None
+    assert joint2.dynamics.friction == 0
+    assert joint2.limit.authored_lower is None
+    assert joint2.limit.authored_upper is None
+    assert joint2.limit.lower == 0
+    assert joint2.limit.upper == 0
+    assert joint2.mimic.joint_name == "joint1"
+    assert (
+        joint2.mimic.authored_multiplier,
+        joint2.mimic.authored_offset,
+        joint2.mimic.multiplier,
+        joint2.mimic.offset,
+    ) == pytest.approx((-2, 0.5, -2, 0.5))
+    assert joints["joint4"].axis is None
+    assert joints["joint5"].axis.xyz == pytest.approx((0, 0, 1))
+    assert joints["joint6"].axis is None
+
+    groups = {group.name: group for group in source.srdf.groups}
+    members = groups["manipulator"].members
+    assert isinstance(members[0], core.SrdfLinkGroupMemberIr)
+    assert members[0].link_name == "aux2"
+    assert isinstance(members[1], core.SrdfJointGroupMemberIr)
+    assert members[1].joint_name == "joint3"
+    assert isinstance(members[2], core.SrdfChainGroupMemberIr)
+    assert members[2].base_link_name == "base_link"
+    assert members[2].tip_link_name == "aux1"
+    assert isinstance(members[3], core.SrdfSubgroupMemberIr)
+    assert members[3].group_name == "tooling"
+    state = source.srdf.group_states[0]
+    assert (state.group_name, state.name) == ("manipulator", "home")
+    assert tuple((joint.joint_name, joint.value) for joint in state.joints) == (
+        ("joint1", 0.25),
+        ("joint3", 0.5),
+    )
+    end_effector = source.srdf.end_effectors[0]
+    assert (
+        end_effector.name,
+        end_effector.parent_link_name,
+        end_effector.group_name,
+        end_effector.parent_group_name,
+    ) == ("tool", "aux2", "tooling", "manipulator")
+    assert source.srdf.passive_joint_names == ("joint2",)
+    assert (
+        source.srdf.disabled_collisions[0].first_link_name,
+        source.srdf.disabled_collisions[0].second_link_name,
+        source.srdf.disabled_collisions[0].reason,
+    ) == ("base_link", "tool0", "Adjacent")
+
+    assert tuple(
+        (reference.logical_uri, reference.kind)
+        for reference in source.artifact_references
+    ) == (
+        (
+            "asset://python_arm/meshes/base.stl",
+            core.SourceArtifactReferenceKind.kMesh,
+        ),
+        (
+            "asset://python_arm/textures/steel.png",
+            core.SourceArtifactReferenceKind.kTexture,
+        ),
+    )
+    provenance = source.semantic_index.group_expansion_provenance
+    assert {
+        node.kind for node in provenance
+    } >= {
+        core.SrdfExpansionProvenanceKind.kDirectLink,
+        core.SrdfExpansionProvenanceKind.kDirectJoint,
+        core.SrdfExpansionProvenanceKind.kChainLink,
+        core.SrdfExpansionProvenanceKind.kChainJoint,
+        core.SrdfExpansionProvenanceKind.kSubgroup,
+    }
+    subgroup_nodes = [
+        node
+        for node in provenance
+        if node.kind == core.SrdfExpansionProvenanceKind.kSubgroup
+    ]
+    assert subgroup_nodes
+    assert all(node.source_symbol_name == "tooling" for node in subgroup_nodes)
+    assert all(node.nested_provenance_index is not None for node in subgroup_nodes)
+    chain_nodes = [
+        node
+        for node in provenance
+        if node.kind
+        in {
+            core.SrdfExpansionProvenanceKind.kChainLink,
+            core.SrdfExpansionProvenanceKind.kChainJoint,
+        }
+    ]
+    assert chain_nodes
+    assert all(node.chain_base_link_name == "base_link" for node in chain_nodes)
+    assert all(node.chain_tip_link_name == "aux1" for node in chain_nodes)
 
 
 def test_source_iterable_rejects_wrong_and_extra_items_at_exact_bound():

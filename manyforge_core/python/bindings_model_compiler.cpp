@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -34,6 +35,15 @@ template <typename Values>
     snapshot[index] = py::cast(values[index]);
   }
   return snapshot;
+}
+
+template <typename Values>
+[[nodiscard]] py::object optional_immutable_snapshot(
+    const std::optional<Values>& values) {
+  if (!values.has_value()) {
+    return py::none();
+  }
+  return immutable_snapshot(*values);
 }
 
 [[nodiscard]] std::vector<
@@ -157,18 +167,28 @@ template <typename Qualified, typename KeyFunction>
 }  // namespace
 
 void register_model_compiler_bindings(py::module_& module) {
-  using deployment::ParsedModelSourceIr;
-  using deployment::ParsedSrdfChain;
-  using deployment::ParsedSrdfDisabledCollision;
-  using deployment::ParsedSrdfEndEffector;
-  using deployment::ParsedSrdfGroup;
-  using deployment::ParsedSrdfGroupState;
-  using deployment::ParsedSrdfGroupStateJoint;
-  using deployment::ParsedUrdfJoint;
+  using deployment::ExpandedSrdfGroupIr;
+  using deployment::ModelSourceGroupStateIndexEntryIr;
+  using deployment::ModelSourceIr;
+  using deployment::ModelSourceNameIndexEntryIr;
   using deployment::ModelSourceRetrievalPlan;
   using deployment::ModelSourceRetrievalPlanRow;
+  using deployment::ModelSourceSemanticIndex;
   using deployment::ResolvedModelSourceArtifactCandidate;
+  using deployment::SourceArtifactReferenceIr;
   using deployment::SourceVerifiedModelAsset;
+  using deployment::SrdfChainGroupMemberIr;
+  using deployment::SrdfDisabledCollisionIr;
+  using deployment::SrdfDocumentIr;
+  using deployment::SrdfEndEffectorIr;
+  using deployment::SrdfExpandedMemberIr;
+  using deployment::SrdfExpansionProvenanceNodeIr;
+  using deployment::SrdfGroupIr;
+  using deployment::SrdfGroupStateIr;
+  using deployment::SrdfGroupStateJointIr;
+  using deployment::SrdfJointGroupMemberIr;
+  using deployment::SrdfLinkGroupMemberIr;
+  using deployment::SrdfSubgroupMemberIr;
   using deployment::StructurallyQualifiedCellGraph;
   using deployment::StructuralAttachmentEndpointResolution;
   using deployment::StructuralAttachmentInterfaceResolution;
@@ -184,6 +204,28 @@ void register_model_compiler_bindings(py::module_& module) {
   using deployment::StructuralModelOccurrence;
   using deployment::StructuralModelResourceResolution;
   using deployment::StructuralTargetFrameResolution;
+  using deployment::UrdfAxisIr;
+  using deployment::UrdfBoxGeometryIr;
+  using deployment::UrdfCalibrationIr;
+  using deployment::UrdfCollisionIr;
+  using deployment::UrdfCylinderGeometryIr;
+  using deployment::UrdfDocumentIr;
+  using deployment::UrdfDynamicsIr;
+  using deployment::UrdfInertiaIr;
+  using deployment::UrdfInertialIr;
+  using deployment::UrdfJointIr;
+  using deployment::UrdfLimitIr;
+  using deployment::UrdfLinkIr;
+  using deployment::UrdfMaterialColorIr;
+  using deployment::UrdfMaterialIr;
+  using deployment::UrdfMaterialTextureIr;
+  using deployment::UrdfResolvedMaterialReferenceIr;
+  using deployment::UrdfMeshGeometryIr;
+  using deployment::UrdfMimicIr;
+  using deployment::UrdfOriginIr;
+  using deployment::UrdfSafetyControllerIr;
+  using deployment::UrdfSphereGeometryIr;
+  using deployment::UrdfVisualIr;
   using deployment::VerifiedModelSourceArtifact;
 
   py::register_exception<deployment::ModelSourceError>(
@@ -199,20 +241,48 @@ void register_model_compiler_bindings(py::module_& module) {
              deployment::ModelSourceArtifactKind::kSrdfXmlEntrypoint)
       .value("kStlMesh",
              deployment::ModelSourceArtifactKind::kStlMesh)
+      .value("kColladaMesh",
+             deployment::ModelSourceArtifactKind::kColladaMesh)
       .value("kPngTexture",
              deployment::ModelSourceArtifactKind::kPngTexture)
       .value("kJpegTexture",
              deployment::ModelSourceArtifactKind::kJpegTexture);
 
-  py::enum_<deployment::ParsedUrdfJointType>(
-      module, "ParsedUrdfJointType")
-      .value("kRevolute", deployment::ParsedUrdfJointType::kRevolute)
-      .value("kContinuous",
-             deployment::ParsedUrdfJointType::kContinuous)
-      .value("kPrismatic", deployment::ParsedUrdfJointType::kPrismatic)
-      .value("kFixed", deployment::ParsedUrdfJointType::kFixed)
-      .value("kFloating", deployment::ParsedUrdfJointType::kFloating)
-      .value("kPlanar", deployment::ParsedUrdfJointType::kPlanar);
+  py::enum_<deployment::UrdfJointType>(module, "UrdfJointType")
+      .value("kRevolute", deployment::UrdfJointType::kRevolute)
+      .value("kContinuous", deployment::UrdfJointType::kContinuous)
+      .value("kPrismatic", deployment::UrdfJointType::kPrismatic)
+      .value("kFixed", deployment::UrdfJointType::kFixed)
+      .value("kFloating", deployment::UrdfJointType::kFloating)
+      .value("kPlanar", deployment::UrdfJointType::kPlanar);
+
+  py::enum_<deployment::UrdfCoordinateKind>(
+      module, "UrdfCoordinateKind")
+      .value("kNone", deployment::UrdfCoordinateKind::kNone)
+      .value("kAngular", deployment::UrdfCoordinateKind::kAngular)
+      .value("kLinear", deployment::UrdfCoordinateKind::kLinear)
+      .value("kPlanar", deployment::UrdfCoordinateKind::kPlanar)
+      .value("kFloating", deployment::UrdfCoordinateKind::kFloating);
+
+  py::enum_<deployment::SourceArtifactReferenceKind>(
+      module, "SourceArtifactReferenceKind")
+      .value("kMesh",
+             deployment::SourceArtifactReferenceKind::kMesh)
+      .value("kTexture",
+             deployment::SourceArtifactReferenceKind::kTexture);
+
+  py::enum_<deployment::SrdfExpansionProvenanceKind>(
+      module, "SrdfExpansionProvenanceKind")
+      .value("kDirectLink",
+             deployment::SrdfExpansionProvenanceKind::kDirectLink)
+      .value("kDirectJoint",
+             deployment::SrdfExpansionProvenanceKind::kDirectJoint)
+      .value("kChainLink",
+             deployment::SrdfExpansionProvenanceKind::kChainLink)
+      .value("kChainJoint",
+             deployment::SrdfExpansionProvenanceKind::kChainJoint)
+      .value("kSubgroup",
+             deployment::SrdfExpansionProvenanceKind::kSubgroup);
 
   py::enum_<deployment::StructuralPlacementSource>(
       module, "StructuralPlacementSource")
@@ -297,145 +367,493 @@ void register_model_compiler_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
-  py::class_<ParsedUrdfJoint>(module, "ParsedUrdfJoint",
-                              py::is_final())
-      .def_readonly("name", &ParsedUrdfJoint::name)
-      .def_readonly("type", &ParsedUrdfJoint::type)
-      .def_readonly("parent_link_name",
-                    &ParsedUrdfJoint::parent_link_name)
-      .def_readonly("child_link_name",
-                    &ParsedUrdfJoint::child_link_name)
-      .def_readonly("mimic_joint_name",
-                    &ParsedUrdfJoint::mimic_joint_name)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<ParsedSrdfChain>(module, "ParsedSrdfChain",
-                              py::is_final())
-      .def_readonly("base_link_name", &ParsedSrdfChain::base_link_name)
-      .def_readonly("tip_link_name", &ParsedSrdfChain::tip_link_name)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<ParsedSrdfGroup>(module, "ParsedSrdfGroup",
-                              py::is_final())
-      .def_readonly("name", &ParsedSrdfGroup::name)
+  py::class_<UrdfOriginIr>(module, "UrdfOriginIr", py::is_final())
+      .def_readonly("element_authored", &UrdfOriginIr::element_authored)
       .def_property_readonly(
-          "link_names",
-          [](const ParsedSrdfGroup& group) {
-            return immutable_snapshot(group.link_names);
+          "authored_xyz_m",
+          [](const UrdfOriginIr& value) {
+            return optional_immutable_snapshot(value.authored_xyz_m);
           })
       .def_property_readonly(
-          "joint_names",
-          [](const ParsedSrdfGroup& group) {
-            return immutable_snapshot(group.joint_names);
+          "authored_rpy_rad",
+          [](const UrdfOriginIr& value) {
+            return optional_immutable_snapshot(value.authored_rpy_rad);
           })
       .def_property_readonly(
-          "chains",
-          [](const ParsedSrdfGroup& group) {
-            return immutable_snapshot(group.chains);
+          "xyz_m",
+          [](const UrdfOriginIr& value) {
+            return immutable_snapshot(value.xyz_m);
           })
       .def_property_readonly(
-          "subgroup_names",
-          [](const ParsedSrdfGroup& group) {
-            return immutable_snapshot(group.subgroup_names);
+          "rpy_rad",
+          [](const UrdfOriginIr& value) {
+            return immutable_snapshot(value.rpy_rad);
           })
       .def(py::self == py::self)
       .def(py::self != py::self);
 
-  py::class_<ParsedSrdfGroupStateJoint>(
-      module, "ParsedSrdfGroupStateJoint", py::is_final())
-      .def_readonly("joint_name",
-                    &ParsedSrdfGroupStateJoint::joint_name)
-      .def_readonly("value", &ParsedSrdfGroupStateJoint::value)
+  py::class_<UrdfBoxGeometryIr>(
+      module, "UrdfBoxGeometryIr", py::is_final())
+      .def_property_readonly(
+          "size_m",
+          [](const UrdfBoxGeometryIr& value) {
+            return immutable_snapshot(value.size_m);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfCylinderGeometryIr>(
+      module, "UrdfCylinderGeometryIr", py::is_final())
+      .def_readonly("radius_m", &UrdfCylinderGeometryIr::radius_m)
+      .def_readonly("length_m", &UrdfCylinderGeometryIr::length_m)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfSphereGeometryIr>(
+      module, "UrdfSphereGeometryIr", py::is_final())
+      .def_readonly("radius_m", &UrdfSphereGeometryIr::radius_m)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfMeshGeometryIr>(
+      module, "UrdfMeshGeometryIr", py::is_final())
+      .def_readonly("logical_uri", &UrdfMeshGeometryIr::logical_uri)
+      .def_property_readonly(
+          "authored_scale",
+          [](const UrdfMeshGeometryIr& value) {
+            return optional_immutable_snapshot(value.authored_scale);
+          })
+      .def_property_readonly(
+          "scale",
+          [](const UrdfMeshGeometryIr& value) {
+            return immutable_snapshot(value.scale);
+          })
       .def(py::self == py::self)
       .def(py::self != py::self);
 
-  py::class_<ParsedSrdfGroupState>(
-      module, "ParsedSrdfGroupState", py::is_final())
-      .def_readonly("name", &ParsedSrdfGroupState::name)
-      .def_readonly("group_name", &ParsedSrdfGroupState::group_name)
+  py::tuple urdf_geometry_types{4U};
+  urdf_geometry_types[0] = module.attr("UrdfBoxGeometryIr");
+  urdf_geometry_types[1] = module.attr("UrdfCylinderGeometryIr");
+  urdf_geometry_types[2] = module.attr("UrdfSphereGeometryIr");
+  urdf_geometry_types[3] = module.attr("UrdfMeshGeometryIr");
+  module.attr("UrdfGeometryIr") =
+      py::module_::import("typing")
+          .attr("Union")
+          .attr("__getitem__")(urdf_geometry_types);
+
+  py::class_<UrdfMaterialColorIr>(
+      module, "UrdfMaterialColorIr", py::is_final())
+      .def_property_readonly(
+          "rgba",
+          [](const UrdfMaterialColorIr& value) {
+            return immutable_snapshot(value.rgba);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfMaterialTextureIr>(
+      module, "UrdfMaterialTextureIr", py::is_final())
+      .def_readonly("logical_uri",
+                    &UrdfMaterialTextureIr::logical_uri)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfResolvedMaterialReferenceIr>(
+      module, "UrdfResolvedMaterialReferenceIr", py::is_final())
+      .def_readonly("definition_name",
+                    &UrdfResolvedMaterialReferenceIr::definition_name)
+      .def_readonly("color",
+                    &UrdfResolvedMaterialReferenceIr::color)
+      .def_readonly("texture",
+                    &UrdfResolvedMaterialReferenceIr::texture)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfMaterialIr>(module, "UrdfMaterialIr", py::is_final())
+      .def_readonly("name", &UrdfMaterialIr::name)
+      .def_readonly("color", &UrdfMaterialIr::color)
+      .def_readonly("texture", &UrdfMaterialIr::texture)
+      .def_readonly("resolved_reference",
+                    &UrdfMaterialIr::resolved_reference)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<UrdfVisualIr>(module, "UrdfVisualIr", py::is_final())
+      .def_readonly("name", &UrdfVisualIr::name)
+      .def_readonly("origin", &UrdfVisualIr::origin)
+      .def_readonly("geometry", &UrdfVisualIr::geometry)
+      .def_readonly("material", &UrdfVisualIr::material)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfCollisionIr>(
+      module, "UrdfCollisionIr", py::is_final())
+      .def_readonly("name", &UrdfCollisionIr::name)
+      .def_readonly("origin", &UrdfCollisionIr::origin)
+      .def_readonly("geometry", &UrdfCollisionIr::geometry)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfInertiaIr>(module, "UrdfInertiaIr", py::is_final())
+      .def_readonly("ixx", &UrdfInertiaIr::ixx)
+      .def_readonly("ixy", &UrdfInertiaIr::ixy)
+      .def_readonly("ixz", &UrdfInertiaIr::ixz)
+      .def_readonly("iyy", &UrdfInertiaIr::iyy)
+      .def_readonly("iyz", &UrdfInertiaIr::iyz)
+      .def_readonly("izz", &UrdfInertiaIr::izz)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfInertialIr>(module, "UrdfInertialIr", py::is_final())
+      .def_readonly("origin", &UrdfInertialIr::origin)
+      .def_readonly("mass_kg", &UrdfInertialIr::mass_kg)
+      .def_readonly("inertia", &UrdfInertialIr::inertia)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfLinkIr>(module, "UrdfLinkIr", py::is_final())
+      .def_readonly("name", &UrdfLinkIr::name)
+      .def_readonly("inertial", &UrdfLinkIr::inertial)
+      .def_property_readonly(
+          "visuals",
+          [](const UrdfLinkIr& value) {
+            return immutable_snapshot(value.visuals);
+          })
+      .def_property_readonly(
+          "collisions",
+          [](const UrdfLinkIr& value) {
+            return immutable_snapshot(value.collisions);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<UrdfAxisIr>(module, "UrdfAxisIr", py::is_final())
+      .def_readonly("element_authored", &UrdfAxisIr::element_authored)
+      .def_property_readonly(
+          "authored_xyz",
+          [](const UrdfAxisIr& value) {
+            return optional_immutable_snapshot(value.authored_xyz);
+          })
+      .def_property_readonly(
+          "xyz",
+          [](const UrdfAxisIr& value) {
+            return immutable_snapshot(value.xyz);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfCalibrationIr>(
+      module, "UrdfCalibrationIr", py::is_final())
+      .def_readonly("rising", &UrdfCalibrationIr::rising)
+      .def_readonly("falling", &UrdfCalibrationIr::falling)
+      .def_readonly("authored_reference_position",
+                    &UrdfCalibrationIr::authored_reference_position)
+      .def_readonly("reference_position",
+                    &UrdfCalibrationIr::reference_position)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfDynamicsIr>(module, "UrdfDynamicsIr", py::is_final())
+      .def_readonly("authored_damping",
+                    &UrdfDynamicsIr::authored_damping)
+      .def_readonly("authored_friction",
+                    &UrdfDynamicsIr::authored_friction)
+      .def_readonly("damping", &UrdfDynamicsIr::damping)
+      .def_readonly("friction", &UrdfDynamicsIr::friction)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfLimitIr>(module, "UrdfLimitIr", py::is_final())
+      .def_readonly("authored_lower", &UrdfLimitIr::authored_lower)
+      .def_readonly("authored_upper", &UrdfLimitIr::authored_upper)
+      .def_readonly("lower", &UrdfLimitIr::lower)
+      .def_readonly("upper", &UrdfLimitIr::upper)
+      .def_readonly("effort", &UrdfLimitIr::effort)
+      .def_readonly("velocity", &UrdfLimitIr::velocity)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfMimicIr>(module, "UrdfMimicIr", py::is_final())
+      .def_readonly("joint_name", &UrdfMimicIr::joint_name)
+      .def_readonly("authored_multiplier",
+                    &UrdfMimicIr::authored_multiplier)
+      .def_readonly("authored_offset", &UrdfMimicIr::authored_offset)
+      .def_readonly("multiplier", &UrdfMimicIr::multiplier)
+      .def_readonly("offset", &UrdfMimicIr::offset)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfSafetyControllerIr>(
+      module, "UrdfSafetyControllerIr", py::is_final())
+      .def_readonly("authored_soft_lower_limit",
+                    &UrdfSafetyControllerIr::authored_soft_lower_limit)
+      .def_readonly("authored_soft_upper_limit",
+                    &UrdfSafetyControllerIr::authored_soft_upper_limit)
+      .def_readonly("authored_k_position",
+                    &UrdfSafetyControllerIr::authored_k_position)
+      .def_readonly("soft_lower_limit",
+                    &UrdfSafetyControllerIr::soft_lower_limit)
+      .def_readonly("soft_upper_limit",
+                    &UrdfSafetyControllerIr::soft_upper_limit)
+      .def_readonly("k_position", &UrdfSafetyControllerIr::k_position)
+      .def_readonly("k_velocity", &UrdfSafetyControllerIr::k_velocity)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfJointIr>(module, "UrdfJointIr", py::is_final())
+      .def_readonly("name", &UrdfJointIr::name)
+      .def_readonly("type", &UrdfJointIr::type)
+      .def_readonly("coordinate_kind", &UrdfJointIr::coordinate_kind)
+      .def_readonly("parent_link_name", &UrdfJointIr::parent_link_name)
+      .def_readonly("child_link_name", &UrdfJointIr::child_link_name)
+      .def_readonly("origin", &UrdfJointIr::origin)
+      .def_readonly("axis", &UrdfJointIr::axis)
+      .def_readonly("calibration", &UrdfJointIr::calibration)
+      .def_readonly("dynamics", &UrdfJointIr::dynamics)
+      .def_readonly("limit", &UrdfJointIr::limit)
+      .def_readonly("mimic", &UrdfJointIr::mimic)
+      .def_readonly("safety_controller",
+                    &UrdfJointIr::safety_controller)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<UrdfDocumentIr>(module, "UrdfDocumentIr", py::is_final())
+      .def_readonly("robot_name", &UrdfDocumentIr::robot_name)
+      .def_property_readonly(
+          "materials",
+          [](const UrdfDocumentIr& value) {
+            return immutable_snapshot(value.materials);
+          })
+      .def_property_readonly(
+          "links",
+          [](const UrdfDocumentIr& value) {
+            return immutable_snapshot(value.links);
+          })
       .def_property_readonly(
           "joints",
-          [](const ParsedSrdfGroupState& state) {
-            return immutable_snapshot(state.joints);
+          [](const UrdfDocumentIr& value) {
+            return immutable_snapshot(value.joints);
           })
       .def(py::self == py::self)
       .def(py::self != py::self);
 
-  py::class_<ParsedSrdfEndEffector>(
-      module, "ParsedSrdfEndEffector", py::is_final())
-      .def_readonly("name", &ParsedSrdfEndEffector::name)
+  py::class_<SrdfLinkGroupMemberIr>(
+      module, "SrdfLinkGroupMemberIr", py::is_final())
+      .def_readonly("link_name", &SrdfLinkGroupMemberIr::link_name)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<SrdfJointGroupMemberIr>(
+      module, "SrdfJointGroupMemberIr", py::is_final())
+      .def_readonly("joint_name", &SrdfJointGroupMemberIr::joint_name)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<SrdfChainGroupMemberIr>(
+      module, "SrdfChainGroupMemberIr", py::is_final())
+      .def_readonly("base_link_name",
+                    &SrdfChainGroupMemberIr::base_link_name)
+      .def_readonly("tip_link_name",
+                    &SrdfChainGroupMemberIr::tip_link_name)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<SrdfSubgroupMemberIr>(
+      module, "SrdfSubgroupMemberIr", py::is_final())
+      .def_readonly("group_name", &SrdfSubgroupMemberIr::group_name)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::tuple srdf_group_member_types{4U};
+  srdf_group_member_types[0] = module.attr("SrdfLinkGroupMemberIr");
+  srdf_group_member_types[1] = module.attr("SrdfJointGroupMemberIr");
+  srdf_group_member_types[2] = module.attr("SrdfChainGroupMemberIr");
+  srdf_group_member_types[3] = module.attr("SrdfSubgroupMemberIr");
+  module.attr("SrdfGroupMemberIr") =
+      py::module_::import("typing")
+          .attr("Union")
+          .attr("__getitem__")(srdf_group_member_types);
+  py::class_<SrdfGroupIr>(module, "SrdfGroupIr", py::is_final())
+      .def_readonly("name", &SrdfGroupIr::name)
+      .def_property_readonly(
+          "members",
+          [](const SrdfGroupIr& value) {
+            return immutable_snapshot(value.members);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<SrdfGroupStateJointIr>(
+      module, "SrdfGroupStateJointIr", py::is_final())
+      .def_readonly("joint_name", &SrdfGroupStateJointIr::joint_name)
+      .def_readonly("value", &SrdfGroupStateJointIr::value)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<SrdfGroupStateIr>(
+      module, "SrdfGroupStateIr", py::is_final())
+      .def_readonly("name", &SrdfGroupStateIr::name)
+      .def_readonly("group_name", &SrdfGroupStateIr::group_name)
+      .def_property_readonly(
+          "joints",
+          [](const SrdfGroupStateIr& value) {
+            return immutable_snapshot(value.joints);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<SrdfEndEffectorIr>(
+      module, "SrdfEndEffectorIr", py::is_final())
+      .def_readonly("name", &SrdfEndEffectorIr::name)
       .def_readonly("parent_link_name",
-                    &ParsedSrdfEndEffector::parent_link_name)
-      .def_readonly("group_name",
-                    &ParsedSrdfEndEffector::group_name)
+                    &SrdfEndEffectorIr::parent_link_name)
+      .def_readonly("group_name", &SrdfEndEffectorIr::group_name)
       .def_readonly("parent_group_name",
-                    &ParsedSrdfEndEffector::parent_group_name)
+                    &SrdfEndEffectorIr::parent_group_name)
       .def(py::self == py::self)
       .def(py::self != py::self);
-
-  py::class_<ParsedSrdfDisabledCollision>(
-      module, "ParsedSrdfDisabledCollision", py::is_final())
+  py::class_<SrdfDisabledCollisionIr>(
+      module, "SrdfDisabledCollisionIr", py::is_final())
       .def_readonly("first_link_name",
-                    &ParsedSrdfDisabledCollision::first_link_name)
+                    &SrdfDisabledCollisionIr::first_link_name)
       .def_readonly("second_link_name",
-                    &ParsedSrdfDisabledCollision::second_link_name)
-      .def_readonly("reason",
-                    &ParsedSrdfDisabledCollision::reason)
+                    &SrdfDisabledCollisionIr::second_link_name)
+      .def_readonly("reason", &SrdfDisabledCollisionIr::reason)
       .def(py::self == py::self)
       .def(py::self != py::self);
-
-  py::class_<ParsedModelSourceIr>(
-      module, "ParsedModelSourceIr", py::is_final())
-      .def_readonly("robot_name", &ParsedModelSourceIr::robot_name)
-      .def_readonly("root_link_name",
-                    &ParsedModelSourceIr::root_link_name)
-      .def_property_readonly(
-          "link_names",
-          [](const ParsedModelSourceIr& source) {
-            return immutable_snapshot(source.link_names);
-          })
-      .def_property_readonly(
-          "material_names",
-          [](const ParsedModelSourceIr& source) {
-            return immutable_snapshot(source.material_names);
-          })
-      .def_property_readonly(
-          "joints",
-          [](const ParsedModelSourceIr& source) {
-            return immutable_snapshot(source.joints);
-          })
+  py::class_<SrdfDocumentIr>(module, "SrdfDocumentIr", py::is_final())
+      .def_readonly("robot_name", &SrdfDocumentIr::robot_name)
       .def_property_readonly(
           "groups",
-          [](const ParsedModelSourceIr& source) {
-            return immutable_snapshot(source.groups);
+          [](const SrdfDocumentIr& value) {
+            return immutable_snapshot(value.groups);
           })
       .def_property_readonly(
           "group_states",
-          [](const ParsedModelSourceIr& source) {
-            return immutable_snapshot(source.group_states);
+          [](const SrdfDocumentIr& value) {
+            return immutable_snapshot(value.group_states);
           })
       .def_property_readonly(
           "end_effectors",
-          [](const ParsedModelSourceIr& source) {
-            return immutable_snapshot(source.end_effectors);
+          [](const SrdfDocumentIr& value) {
+            return immutable_snapshot(value.end_effectors);
           })
       .def_property_readonly(
           "passive_joint_names",
-          [](const ParsedModelSourceIr& source) {
-            return immutable_snapshot(source.passive_joint_names);
+          [](const SrdfDocumentIr& value) {
+            return immutable_snapshot(value.passive_joint_names);
           })
       .def_property_readonly(
           "disabled_collisions",
-          [](const ParsedModelSourceIr& source) {
-            return immutable_snapshot(source.disabled_collisions);
+          [](const SrdfDocumentIr& value) {
+            return immutable_snapshot(value.disabled_collisions);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::class_<SourceArtifactReferenceIr>(
+      module, "SourceArtifactReferenceIr", py::is_final())
+      .def_readonly("logical_uri",
+                    &SourceArtifactReferenceIr::logical_uri)
+      .def_readonly("kind", &SourceArtifactReferenceIr::kind)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<ModelSourceNameIndexEntryIr>(
+      module, "ModelSourceNameIndexEntryIr", py::is_final())
+      .def_readonly("name", &ModelSourceNameIndexEntryIr::name)
+      .def_readonly("source_index",
+                    &ModelSourceNameIndexEntryIr::source_index)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<ModelSourceGroupStateIndexEntryIr>(
+      module, "ModelSourceGroupStateIndexEntryIr", py::is_final())
+      .def_readonly("group_name",
+                    &ModelSourceGroupStateIndexEntryIr::group_name)
+      .def_readonly("state_name",
+                    &ModelSourceGroupStateIndexEntryIr::state_name)
+      .def_readonly("source_index",
+                    &ModelSourceGroupStateIndexEntryIr::source_index)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<SrdfExpansionProvenanceNodeIr>(
+      module, "SrdfExpansionProvenanceNodeIr", py::is_final())
+      .def_readonly("expansion_group_name",
+                    &SrdfExpansionProvenanceNodeIr::expansion_group_name)
+      .def_readonly("source_member_index",
+                    &SrdfExpansionProvenanceNodeIr::source_member_index)
+      .def_readonly("kind", &SrdfExpansionProvenanceNodeIr::kind)
+      .def_readonly("source_symbol_name",
+                    &SrdfExpansionProvenanceNodeIr::source_symbol_name)
+      .def_readonly("chain_base_link_name",
+                    &SrdfExpansionProvenanceNodeIr::chain_base_link_name)
+      .def_readonly("chain_tip_link_name",
+                    &SrdfExpansionProvenanceNodeIr::chain_tip_link_name)
+      .def_readonly("nested_provenance_index",
+                    &SrdfExpansionProvenanceNodeIr::
+                        nested_provenance_index)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<SrdfExpandedMemberIr>(
+      module, "SrdfExpandedMemberIr", py::is_final())
+      .def_readonly("name", &SrdfExpandedMemberIr::name)
+      .def_property_readonly(
+          "provenance_indices",
+          [](const SrdfExpandedMemberIr& value) {
+            return immutable_snapshot(value.provenance_indices);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<ExpandedSrdfGroupIr>(
+      module, "ExpandedSrdfGroupIr", py::is_final())
+      .def_readonly("group_name", &ExpandedSrdfGroupIr::group_name)
+      .def_property_readonly(
+          "links",
+          [](const ExpandedSrdfGroupIr& value) {
+            return immutable_snapshot(value.links);
           })
       .def_property_readonly(
-          "referenced_artifact_logical_uris",
-          [](const ParsedModelSourceIr& source) {
-            return immutable_snapshot(
-                source.referenced_artifact_logical_uris);
+          "joints",
+          [](const ExpandedSrdfGroupIr& value) {
+            return immutable_snapshot(value.joints);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<ModelSourceSemanticIndex>(
+      module, "ModelSourceSemanticIndex", py::is_final())
+      .def_readonly("root_link_name",
+                    &ModelSourceSemanticIndex::root_link_name)
+      .def_property_readonly(
+          "material_names",
+          [](const ModelSourceSemanticIndex& value) {
+            return immutable_snapshot(value.material_names);
+          })
+      .def_property_readonly(
+          "link_names",
+          [](const ModelSourceSemanticIndex& value) {
+            return immutable_snapshot(value.link_names);
+          })
+      .def_property_readonly(
+          "joint_names",
+          [](const ModelSourceSemanticIndex& value) {
+            return immutable_snapshot(value.joint_names);
+          })
+      .def_property_readonly(
+          "group_names",
+          [](const ModelSourceSemanticIndex& value) {
+            return immutable_snapshot(value.group_names);
+          })
+      .def_property_readonly(
+          "group_state_names",
+          [](const ModelSourceSemanticIndex& value) {
+            return immutable_snapshot(value.group_state_names);
+          })
+      .def_property_readonly(
+          "end_effector_names",
+          [](const ModelSourceSemanticIndex& value) {
+            return immutable_snapshot(value.end_effector_names);
+          })
+      .def_property_readonly(
+          "group_expansion_postorder",
+          [](const ModelSourceSemanticIndex& value) {
+            return immutable_snapshot(value.group_expansion_postorder);
+          })
+      .def_property_readonly(
+          "group_expansion_provenance",
+          [](const ModelSourceSemanticIndex& value) {
+            return immutable_snapshot(value.group_expansion_provenance);
+          })
+      .def_property_readonly(
+          "expanded_groups",
+          [](const ModelSourceSemanticIndex& value) {
+            return immutable_snapshot(value.expanded_groups);
+          })
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+  py::class_<ModelSourceIr>(module, "ModelSourceIr", py::is_final())
+      .def_property_readonly("urdf", &ModelSourceIr::urdf)
+      .def_property_readonly("srdf", &ModelSourceIr::srdf)
+      .def_property_readonly("semantic_index",
+                             &ModelSourceIr::semantic_index)
+      .def_property_readonly(
+          "artifact_references",
+          [](const ModelSourceIr& value) {
+            return immutable_snapshot(value.artifact_references());
           })
       .def(py::self == py::self)
       .def(py::self != py::self);
@@ -452,8 +870,8 @@ void register_model_compiler_bindings(py::module_& module) {
           [](const SourceVerifiedModelAsset& asset) {
             return immutable_snapshot(asset.verified_artifacts());
           })
-      .def_property_readonly("parsed_ir",
-                             &SourceVerifiedModelAsset::parsed_ir);
+      .def_property_readonly("source_ir",
+                             &SourceVerifiedModelAsset::source_ir);
 
   py::class_<StructuralModelInstanceResolution>(
       module, "StructuralModelInstanceResolution", py::is_final())
@@ -465,8 +883,8 @@ void register_model_compiler_bindings(py::module_& module) {
       .def_readonly("model_revision",
                     &StructuralModelInstanceResolution::model_revision)
       .def_readonly(
-          "parsed_root_link_name",
-          &StructuralModelInstanceResolution::parsed_root_link_name)
+          "source_root_link_name",
+          &StructuralModelInstanceResolution::source_root_link_name)
       .def_readonly(
           "owner_component_id",
           &StructuralModelInstanceResolution::owner_component_id)
@@ -778,6 +1196,15 @@ void register_model_compiler_bindings(py::module_& module) {
       },
       py::arg("qualified_asset"), py::arg("resolved_artifacts"));
 
+  module.def("emit_canonical_urdf",
+             &deployment::emit_canonical_urdf,
+             py::arg("source_ir"),
+             py::call_guard<py::gil_scoped_release>());
+  module.def("emit_canonical_srdf",
+             &deployment::emit_canonical_srdf,
+             py::arg("source_ir"),
+             py::call_guard<py::gil_scoped_release>());
+
   module.def(
       "qualify_cell_structure",
       [](const deployment::GraphRevisionVerifiedCellGraph& graph,
@@ -833,6 +1260,15 @@ void register_model_compiler_bindings(py::module_& module) {
       py::int_(deployment::kMaxModelSourceXmlElementCount);
   module.attr("MAX_MODEL_SOURCE_XML_ATTRIBUTE_COUNT") =
       py::int_(deployment::kMaxModelSourceXmlAttributeCount);
+  module.attr("MAX_MODEL_SOURCE_COLLADA_XML_DEPTH") =
+      py::int_(deployment::kMaxModelSourceColladaXmlDepth);
+  module.attr("MAX_MODEL_SOURCE_COLLADA_XML_ELEMENT_COUNT") =
+      py::int_(deployment::kMaxModelSourceColladaXmlElementCount);
+  module.attr("MAX_MODEL_SOURCE_COLLADA_XML_ATTRIBUTE_COUNT") =
+      py::int_(deployment::kMaxModelSourceColladaXmlAttributeCount);
+  module.attr("MAX_MODEL_SOURCE_EXPANDED_SRDF_SEMANTIC_ROWS") =
+      py::int_(
+          deployment::kMaxModelSourceExpandedSrdfSemanticRows);
 }
 
 }  // namespace manyforge::core::python
