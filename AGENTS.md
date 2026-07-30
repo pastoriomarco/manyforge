@@ -254,6 +254,7 @@ What lives where in this repo, and what it's for:
 | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
 | [`manyforge_core/`](manyforge_core/)                                     | C++20 core: planning DTOs, kernel state machine, ports                                                                      |
 | [`manyforge_deployment/`](manyforge_deployment/)                         | ROS-free composable-cell artifact decoding, identity, validation, and compiler substrate                                    |
+| [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ Component Manager runtime-observation and durable-persistence foundation                                       |
 | [`manyforge_behavior/`](manyforge_behavior/)                             | Behavior-tree runtime (py_trees), node catalog, tests                                                                       |
 | [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine                                        |
 | [`manyforge_roboplan/`](manyforge_roboplan/)                             | Native motion-planner backend bindings (RRT + TOPPRA)                                                                       |

@@ -26,6 +26,10 @@ machine-readable companion to this doc.
 ## Repository structure (for orientation)
 
 - `manyforge_core/` — C++ kernel, state machine, ports.
+- `manyforge_deployment/` — ROS-free composable-cell decoding, qualification,
+  and compiler substrate.
+- `manyforge_component_manager/` — ROS-free C++ runtime-observation and
+  durable-persistence foundation for the Component Manager.
 - `manyforge_roboplan/` — C++ planner / context / execution backends
   (native + ros2_control).
 - `manyforge_behavior/` — Python py_trees behavior-tree runner.

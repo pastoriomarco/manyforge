@@ -44,7 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libboost-python-dev libboost-chrono-dev libboost-thread-dev libboost-date-time-dev \
         libeigen3-dev libyaml-cpp-dev libyaml-dev liburdfdom-dev \
         libdouble-conversion-dev libexpat1-dev libssl-dev libutf8proc-dev \
-        liboctomap-dev \
+        liboctomap-dev libsqlite3-dev \
         git curl ca-certificates \
     && cd /usr/src/googletest && cmake . && make \
     && cp lib/*.a /usr/lib/ \

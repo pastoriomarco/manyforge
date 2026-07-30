@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace manyforge::component_manager::detail {
+
+inline constexpr std::string_view kEmbeddedPersistenceSchema =
+    R"mf_manager_sql(@MANYFORGE_MANAGER_PERSISTENCE_SCHEMA_SQL@)mf_manager_sql";
+
+}  // namespace manyforge::component_manager::detail

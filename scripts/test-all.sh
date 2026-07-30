@@ -93,6 +93,17 @@ build_manyforge_deployment() {
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
 }
 
+build_manyforge_component_manager() {
+    local build="$1"
+    local build_testing="$2"
+    mkdir -p "$build"
+    cd "$build"
+    cmake "$WORKSPACE/manyforge_component_manager" -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING="$build_testing" \
+        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
+    cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
+}
+
 run_cpp_tests() {
     section "C++ manyforge_core tests"
     local core_build="$BUILD_DIR/core"
@@ -116,6 +127,18 @@ run_cpp_tests() {
     build_manyforge_deployment "$deployment_build" ON
     cd "$deployment_build"
     if ! require_ctest_tests "manyforge_deployment"; then
+        FAIL=$((FAIL + 1))
+    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+
+    section "C++ manyforge_component_manager tests"
+    local manager_build="$BUILD_DIR/component-manager"
+    build_manyforge_component_manager "$manager_build" ON
+    cd "$manager_build"
+    if ! require_ctest_tests "manyforge_component_manager"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
@@ -196,11 +219,13 @@ run_pybind_tests() {
     section "pybind11 bindings tests"
     local core_build="$BUILD_DIR/core"
     local deployment_build="$BUILD_DIR/deployment"
+    local manager_build="$BUILD_DIR/component-manager-production"
     local pybind_build="$BUILD_DIR/pybind"
     # Always run both incremental ROS-free library builds. Merely finding an
     # archive does not prove it was built from the current source tree.
     build_manyforge_core "$core_build" OFF
     build_manyforge_deployment "$deployment_build" OFF
+    build_manyforge_component_manager "$manager_build" OFF
 
     local pybind11_dir
     pybind11_dir=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())" 2>/dev/null || echo "")
