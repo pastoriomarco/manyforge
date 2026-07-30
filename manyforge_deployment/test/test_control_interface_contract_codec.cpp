@@ -129,6 +129,7 @@ TEST(ControlInterfaceContractCodec, QualifiesArbitraryAuthoredContractAndPreserv
 
   const auto qualified =
       resolve_and_qualify_control_interface_contract(reference, store_key, document);
+  EXPECT_EQ(qualified.reference(), reference);
   EXPECT_EQ(qualified.value().control_interface_contract_id,
             core::ControlInterfaceContractId("application_specific_arm_and_tool"));
   EXPECT_EQ(qualified.value().control_interface_revision, reference.record_revision);

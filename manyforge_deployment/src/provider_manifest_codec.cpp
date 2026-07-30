@@ -321,7 +321,7 @@ QualifiedProviderManifest resolve_and_qualify_provider_manifest(
     fail("provider-manifest typed ID/revision selector does not match its "
          "referent");
   }
-  return QualifiedProviderManifest(std::move(decoded),
+  return QualifiedProviderManifest(reference, std::move(decoded),
                                    normalized.normalized_root());
 }
 

@@ -169,7 +169,7 @@ QualifiedRuntimeProfile resolve_and_qualify_runtime_profile(
     fail("runtime-profile typed ID/revision selector does not match its "
          "referent");
   }
-  return QualifiedRuntimeProfile(std::move(decoded),
+  return QualifiedRuntimeProfile(reference, std::move(decoded),
                                  normalized.normalized_root());
 }
 

@@ -191,8 +191,8 @@ QualifiedCapabilityDefinition resolve_and_qualify_capability_definition(
     fail("capability-definition typed ID/revision selector does not match its "
          "referent");
   }
-  return QualifiedCapabilityDefinition(std::move(decoded.value),
+  return QualifiedCapabilityDefinition(reference, std::move(decoded.value),
                                        std::move(decoded.normalized_root));
 }
 
-} // namespace manyforge::deployment
+}  // namespace manyforge::deployment

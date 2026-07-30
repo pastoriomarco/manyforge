@@ -689,7 +689,7 @@ QualifiedComponentType resolve_and_qualify_component_type(
     fail("component-type typed ID/revision selector does not match its "
          "referent");
   }
-  return QualifiedComponentType(std::move(decoded),
+  return QualifiedComponentType(reference, std::move(decoded),
                                 normalized.normalized_root());
 }
 

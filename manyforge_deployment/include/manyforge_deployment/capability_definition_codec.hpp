@@ -20,27 +20,39 @@ public:
 /// A capability definition whose descriptor, semantic identity, and complete
 /// built-in-registry row have all been verified by this build.
 class QualifiedCapabilityDefinition final {
-public:
-  [[nodiscard]] const core::CapabilityDefinitionDTO &value() const noexcept {
+ public:
+  QualifiedCapabilityDefinition(const QualifiedCapabilityDefinition&) =
+      default;
+  QualifiedCapabilityDefinition& operator=(
+      const QualifiedCapabilityDefinition&) = default;
+
+  [[nodiscard]] const core::CapabilityDefinitionCatalogRecordRefDTO&
+  reference() const noexcept {
+    return reference_;
+  }
+  [[nodiscard]] const core::CapabilityDefinitionDTO& value() const noexcept {
     return value_;
   }
-  [[nodiscard]] const CanonicalValue &normalized_root() const noexcept {
+  [[nodiscard]] const CanonicalValue& normalized_root() const noexcept {
     return normalized_root_;
   }
 
-private:
-  QualifiedCapabilityDefinition(core::CapabilityDefinitionDTO value,
-                                CanonicalValue normalized_root)
-      : value_(std::move(value)), normalized_root_(std::move(normalized_root)) {
-  }
+ private:
+  QualifiedCapabilityDefinition(
+      const core::CapabilityDefinitionCatalogRecordRefDTO& reference,
+      core::CapabilityDefinitionDTO value, CanonicalValue normalized_root)
+      : reference_(reference),
+        value_(std::move(value)),
+        normalized_root_(std::move(normalized_root)) {}
 
+  core::CapabilityDefinitionCatalogRecordRefDTO reference_;
   core::CapabilityDefinitionDTO value_;
   CanonicalValue normalized_root_;
 
   friend QualifiedCapabilityDefinition
   resolve_and_qualify_capability_definition(
-      const core::CapabilityDefinitionCatalogRecordRefDTO &,
-      const core::ContentAddressedStoreKey &, std::string_view);
+      const core::CapabilityDefinitionCatalogRecordRefDTO&,
+      const core::ContentAddressedStoreKey&, std::string_view);
 };
 
 /// Resolves the complete typed catalog-reference boundary for one exact byte
@@ -53,8 +65,8 @@ private:
 /// before returning a qualified value.
 [[nodiscard]] QualifiedCapabilityDefinition
 resolve_and_qualify_capability_definition(
-    const core::CapabilityDefinitionCatalogRecordRefDTO &reference,
-    const core::ContentAddressedStoreKey &resolved_store_key,
+    const core::CapabilityDefinitionCatalogRecordRefDTO& reference,
+    const core::ContentAddressedStoreKey& resolved_store_key,
     std::string_view stored_bytes);
 
-} // namespace manyforge::deployment
+}  // namespace manyforge::deployment

@@ -431,7 +431,7 @@ QualifiedModelAsset resolve_and_qualify_model_asset(
       decoded.model_revision != reference.record_revision) {
     fail("model-asset typed ID/revision selector does not match its referent");
   }
-  return QualifiedModelAsset(std::move(decoded),
+  return QualifiedModelAsset(reference, std::move(decoded),
                              normalized.normalized_root());
 }
 

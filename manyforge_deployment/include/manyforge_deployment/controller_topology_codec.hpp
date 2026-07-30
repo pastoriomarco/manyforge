@@ -26,6 +26,14 @@ class ControllerTopologyCodecError : public std::invalid_argument {
 /// instance. Those are retained-product and runtime responsibilities.
 class QualifiedControllerTopology final {
  public:
+  QualifiedControllerTopology(const QualifiedControllerTopology&) = default;
+  QualifiedControllerTopology& operator=(
+      const QualifiedControllerTopology&) = default;
+
+  [[nodiscard]] const core::ControllerTopologyCatalogRecordRefDTO& reference()
+      const noexcept {
+    return reference_;
+  }
   [[nodiscard]] const core::ControllerTopologyDTO& value() const noexcept {
     return value_;
   }
@@ -34,11 +42,14 @@ class QualifiedControllerTopology final {
   }
 
  private:
-  QualifiedControllerTopology(core::ControllerTopologyDTO value,
-                              CanonicalValue normalized_root)
-      : value_(std::move(value)),
+  QualifiedControllerTopology(
+      const core::ControllerTopologyCatalogRecordRefDTO& reference,
+      core::ControllerTopologyDTO value, CanonicalValue normalized_root)
+      : reference_(reference),
+        value_(std::move(value)),
         normalized_root_(std::move(normalized_root)) {}
 
+  core::ControllerTopologyCatalogRecordRefDTO reference_;
   core::ControllerTopologyDTO value_;
   CanonicalValue normalized_root_;
 

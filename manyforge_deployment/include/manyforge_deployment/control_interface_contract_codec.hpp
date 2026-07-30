@@ -20,18 +20,37 @@ class ControlInterfaceContractCodecError : public std::invalid_argument {
 /// verified by this build.
 class QualifiedControlInterfaceContract final {
  public:
-  [[nodiscard]] const core::ControlInterfaceContractDTO& value() const noexcept { return value_; }
-  [[nodiscard]] const CanonicalValue& normalized_root() const noexcept { return normalized_root_; }
+  QualifiedControlInterfaceContract(
+      const QualifiedControlInterfaceContract&) = default;
+  QualifiedControlInterfaceContract& operator=(
+      const QualifiedControlInterfaceContract&) = default;
+
+  [[nodiscard]] const core::ControlInterfaceContractCatalogRecordRefDTO&
+  reference() const noexcept {
+    return reference_;
+  }
+  [[nodiscard]] const core::ControlInterfaceContractDTO& value()
+      const noexcept {
+    return value_;
+  }
+  [[nodiscard]] const CanonicalValue& normalized_root() const noexcept {
+    return normalized_root_;
+  }
 
  private:
-  QualifiedControlInterfaceContract(core::ControlInterfaceContractDTO value,
-                                    CanonicalValue normalized_root)
-      : value_(std::move(value)), normalized_root_(std::move(normalized_root)) {}
+  QualifiedControlInterfaceContract(
+      const core::ControlInterfaceContractCatalogRecordRefDTO& reference,
+      core::ControlInterfaceContractDTO value, CanonicalValue normalized_root)
+      : reference_(reference),
+        value_(std::move(value)),
+        normalized_root_(std::move(normalized_root)) {}
 
+  core::ControlInterfaceContractCatalogRecordRefDTO reference_;
   core::ControlInterfaceContractDTO value_;
   CanonicalValue normalized_root_;
 
-  friend QualifiedControlInterfaceContract resolve_and_qualify_control_interface_contract(
+  friend QualifiedControlInterfaceContract
+  resolve_and_qualify_control_interface_contract(
       const core::ControlInterfaceContractCatalogRecordRefDTO&,
       const core::ContentAddressedStoreKey&, std::string_view);
 };
@@ -44,8 +63,10 @@ class QualifiedControlInterfaceContract final {
 /// the exact schema selector, byte digest, retrieval key, semantic identity,
 /// typed ID/revision, and all cross-field role/order invariants. It does not
 /// impose a build-owned whitelist of contract contents.
-[[nodiscard]] QualifiedControlInterfaceContract resolve_and_qualify_control_interface_contract(
+[[nodiscard]] QualifiedControlInterfaceContract
+resolve_and_qualify_control_interface_contract(
     const core::ControlInterfaceContractCatalogRecordRefDTO& reference,
-    const core::ContentAddressedStoreKey& resolved_store_key, std::string_view stored_bytes);
+    const core::ContentAddressedStoreKey& resolved_store_key,
+    std::string_view stored_bytes);
 
 }  // namespace manyforge::deployment

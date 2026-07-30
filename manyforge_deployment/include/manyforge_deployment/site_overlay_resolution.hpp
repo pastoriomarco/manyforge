@@ -25,6 +25,11 @@ class SiteOverlayResolutionError : public std::invalid_argument {
 /// and then projects only external-resource reference/kind keys.
 class VerifiedSiteOverlayArtifactProjection final {
  public:
+  VerifiedSiteOverlayArtifactProjection(
+      const VerifiedSiteOverlayArtifactProjection&) = default;
+  VerifiedSiteOverlayArtifactProjection& operator=(
+      const VerifiedSiteOverlayArtifactProjection&) = default;
+
   [[nodiscard]] const core::SiteOverlayRefDTO& reference() const noexcept {
     return reference_;
   }
@@ -59,6 +64,10 @@ class VerifiedSiteOverlayArtifactProjection final {
 /// readiness.
 class QualifiedSelectedSiteOverlay final {
  public:
+  QualifiedSelectedSiteOverlay(const QualifiedSelectedSiteOverlay&) = default;
+  QualifiedSelectedSiteOverlay& operator=(const QualifiedSelectedSiteOverlay&) =
+      default;
+
   [[nodiscard]] bool has_selection() const noexcept {
     return selection_.has_value();
   }

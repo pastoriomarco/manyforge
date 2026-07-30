@@ -24,6 +24,14 @@ class RuntimeProfileCodecError : public std::invalid_argument {
 /// live health/readiness.
 class QualifiedRuntimeProfile final {
  public:
+  QualifiedRuntimeProfile(const QualifiedRuntimeProfile&) = default;
+  QualifiedRuntimeProfile& operator=(const QualifiedRuntimeProfile&) =
+      default;
+
+  [[nodiscard]] const core::RuntimeProfileCatalogRecordRefDTO& reference()
+      const noexcept {
+    return reference_;
+  }
   [[nodiscard]] const core::RuntimeProfileDTO& value() const noexcept {
     return value_;
   }
@@ -32,11 +40,14 @@ class QualifiedRuntimeProfile final {
   }
 
  private:
-  QualifiedRuntimeProfile(core::RuntimeProfileDTO value,
-                          CanonicalValue normalized_root)
-      : value_(std::move(value)),
+  QualifiedRuntimeProfile(
+      const core::RuntimeProfileCatalogRecordRefDTO& reference,
+      core::RuntimeProfileDTO value, CanonicalValue normalized_root)
+      : reference_(reference),
+        value_(std::move(value)),
         normalized_root_(std::move(normalized_root)) {}
 
+  core::RuntimeProfileCatalogRecordRefDTO reference_;
   core::RuntimeProfileDTO value_;
   CanonicalValue normalized_root_;
 

@@ -12,10 +12,13 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "proof_root_transfer_test.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -275,6 +278,10 @@ TEST(ModelAssetCodec,
      QualifiesExpandedAggregateAndPreservesOnlySemanticOrdering) {
   const auto qualified = qualify(AssetSpec{});
   const auto& asset = qualified.value();
+  EXPECT_EQ(
+      qualified.reference(),
+      reference_for(AssetSpec{}.asset_id, model_asset_document(AssetSpec{}),
+                    core::ContentAddressedStoreKey("sha256/model-asset")));
 
   EXPECT_EQ(asset.model_asset_id, core::ModelAssetId("lite6_aggregate"));
   EXPECT_EQ(asset.instance_cardinality,
@@ -293,6 +300,15 @@ TEST(ModelAssetCodec,
             (std::vector<std::string>{"base_link", "tool0"}));
   EXPECT_EQ(canonical_json(qualified.normalized_root()),
             model_asset_document(AssetSpec{}));
+}
+
+TEST(ModelAssetCodec, RvalueTransfersPreserveQualifiedAssetSourceAndResult) {
+  const auto qualified = qualify(AssetSpec{});
+  test::expect_source_preserving_rvalue_transfers(
+      qualified, [](const QualifiedModelAsset& value) {
+        return std::tuple{value.reference(), value.value(),
+                          value.normalized_root()};
+      });
 }
 
 TEST(ModelAssetCodec, QualifiesFixedPneumaticAndPassiveUrdfOnlyAssets) {
@@ -541,8 +557,9 @@ TEST(ModelAssetCodec, EnforcesTheCompleteTypedReferentBoundary) {
   const core::ContentAddressedStoreKey store_key{"sha256/model-referent"};
   const auto reference = reference_for(spec.asset_id, document, store_key);
 
-  EXPECT_NO_THROW(
-      resolve_and_qualify_model_asset(reference, store_key, document));
+  const auto qualified =
+      resolve_and_qualify_model_asset(reference, store_key, document);
+  EXPECT_EQ(qualified.reference(), reference);
 
   auto wrong_digest = reference;
   wrong_digest.content_digest = core::ContentDigest(std::string(kZeroDigest));

@@ -11,10 +11,13 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "proof_root_transfer_test.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -24,10 +27,22 @@ constexpr std::string_view kModelAssetSchemaRevision =
 
 static_assert(!std::is_aggregate_v<SourceVerifiedModelAsset>);
 static_assert(!std::is_default_constructible_v<SourceVerifiedModelAsset>);
+static_assert(std::is_copy_constructible_v<SourceVerifiedModelAsset>);
+static_assert(std::is_move_constructible_v<SourceVerifiedModelAsset>);
 static_assert(!std::is_aggregate_v<ModelSourceRetrievalPlan>);
 static_assert(!std::is_default_constructible_v<ModelSourceRetrievalPlan>);
+static_assert(std::is_copy_constructible_v<ModelSourceRetrievalPlan>);
+static_assert(std::is_move_constructible_v<ModelSourceRetrievalPlan>);
 static_assert(!std::is_aggregate_v<ModelSourceIr>);
 static_assert(!std::is_default_constructible_v<ModelSourceIr>);
+static_assert(
+    !std::is_constructible_v<
+        ModelSourceRetrievalPlan, QualifiedModelAsset,
+        std::vector<ModelSourceRetrievalPlanRow>, std::uint64_t>);
+static_assert(
+    !std::is_constructible_v<
+        SourceVerifiedModelAsset, ModelSourceRetrievalPlan,
+        std::vector<VerifiedModelSourceArtifact>, ModelSourceIr>);
 static_assert(std::is_aggregate_v<UrdfDocumentIr>);
 static_assert(std::is_copy_constructible_v<UrdfDocumentIr>);
 static_assert(std::is_aggregate_v<SrdfDocumentIr>);
@@ -429,6 +444,80 @@ TEST(ModelSource, PreflightsOneCanonicalExactRetrievalPlan) {
   const auto verified =
       verify_model_source_closure(plan, candidates(fixture));
   EXPECT_EQ(verified.value(), qualified.value());
+}
+
+TEST(ModelSource,
+     RetainsExactRetrievalProvenanceThroughBothVerificationEntrypoints) {
+  const Fixture fixture;
+  const auto qualified = qualify(fixture);
+  const auto expected_plan =
+      preflight_model_source_declaration(qualified);
+
+  const auto assert_exact_plan =
+      [&expected_plan](const SourceVerifiedModelAsset& verified) {
+        EXPECT_EQ(verified.retrieval_plan().qualified_asset().value(),
+                  expected_plan.qualified_asset().value());
+        EXPECT_EQ(
+            verified.retrieval_plan().qualified_asset().normalized_root(),
+            expected_plan.qualified_asset().normalized_root());
+        EXPECT_EQ(verified.retrieval_plan().artifacts(),
+                  expected_plan.artifacts());
+        EXPECT_EQ(verified.retrieval_plan().total_bytes(),
+                  expected_plan.total_bytes());
+        EXPECT_EQ(&verified.qualified_asset(),
+                  &verified.retrieval_plan().qualified_asset());
+        EXPECT_EQ(&verified.value(),
+                  &verified.retrieval_plan().qualified_asset().value());
+        EXPECT_EQ(verified.value(),
+                  verified.retrieval_plan().qualified_asset().value());
+      };
+
+  const auto consumer_verified =
+      verify_model_source_closure(expected_plan, candidates(fixture));
+  EXPECT_NE(&consumer_verified.retrieval_plan(), &expected_plan);
+  assert_exact_plan(consumer_verified);
+
+  const auto producer_verified =
+      verify_model_source_closure(qualified, candidates(fixture));
+  assert_exact_plan(producer_verified);
+
+  const auto copied = consumer_verified;
+  EXPECT_NE(&copied.retrieval_plan(),
+            &consumer_verified.retrieval_plan());
+  assert_exact_plan(copied);
+
+  const auto plan_projection = [](const ModelSourceRetrievalPlan& plan) {
+    return std::tuple{plan.qualified_asset().reference(),
+                      plan.qualified_asset().normalized_root(),
+                      plan.artifacts(), plan.total_bytes()};
+  };
+  test::expect_source_preserving_rvalue_transfers(expected_plan,
+                                                   plan_projection);
+
+  auto rvalue_plan = expected_plan;
+  const auto rvalue_verified = verify_model_source_closure(
+      std::move(rvalue_plan), candidates(fixture));
+  EXPECT_EQ(plan_projection(rvalue_plan), plan_projection(expected_plan));
+  assert_exact_plan(rvalue_verified);
+
+  const auto verified_projection =
+      [](const SourceVerifiedModelAsset& verified) {
+        return std::tuple{
+            verified.qualified_asset().reference(),
+            verified.retrieval_plan().qualified_asset().normalized_root(),
+            verified.retrieval_plan().artifacts(),
+            verified.retrieval_plan().total_bytes(),
+            verified.verified_artifacts(),
+            emit_canonical_urdf(verified.source_ir()),
+            emit_canonical_srdf(verified.source_ir())};
+      };
+  test::expect_source_preserving_rvalue_transfers(producer_verified,
+                                                   verified_projection);
+
+  auto move_source = producer_verified;
+  const auto moved = std::move(move_source);
+  assert_exact_plan(move_source);
+  assert_exact_plan(moved);
 }
 
 TEST(ModelSource, PreflightEnforcesExactPerBlobAndClosureByteBounds) {

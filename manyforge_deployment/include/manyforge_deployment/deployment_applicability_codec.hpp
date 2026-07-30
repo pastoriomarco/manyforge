@@ -38,6 +38,11 @@ class RevisionVerifiedDeploymentApplicabilityInputs;
 /// compiler owns that envelope. Every nested record handled here is closed.
 class TypedDeploymentApplicabilityInputsCandidate final {
  public:
+  TypedDeploymentApplicabilityInputsCandidate(
+      const TypedDeploymentApplicabilityInputsCandidate&) = default;
+  TypedDeploymentApplicabilityInputsCandidate& operator=(
+      const TypedDeploymentApplicabilityInputsCandidate&) = default;
+
   [[nodiscard]] const core::DeploymentApplicabilityInputsDTO& value()
       const noexcept {
     return value_;
@@ -119,6 +124,11 @@ class TypedDeploymentApplicabilityInputsCandidate final {
 /// applicability remain the later C0.2n qualifier's responsibility.
 class RevisionVerifiedDeploymentApplicabilityInputs final {
  public:
+  RevisionVerifiedDeploymentApplicabilityInputs(
+      const RevisionVerifiedDeploymentApplicabilityInputs&) = default;
+  RevisionVerifiedDeploymentApplicabilityInputs& operator=(
+      const RevisionVerifiedDeploymentApplicabilityInputs&) = default;
+
   [[nodiscard]] const core::DeploymentApplicabilityInputsDTO& value()
       const noexcept {
     return value_;

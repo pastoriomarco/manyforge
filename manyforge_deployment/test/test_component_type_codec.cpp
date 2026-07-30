@@ -419,6 +419,12 @@ TEST(ComponentTypeCodecTest,
   spec.omit_max_attachments = true;
   const auto qualified = qualify(spec, rich_dependencies());
   const auto& type = qualified.value();
+  EXPECT_EQ(
+      qualified.reference(),
+      component_reference(
+          spec.type_id, component_document(spec),
+          core::ContentAddressedStoreKey("sha256/component-type/" +
+                                         spec.type_id)));
 
   EXPECT_EQ(type.component_type_id.value(), "composite_arm");
   ASSERT_TRUE(type.component_root.has_value());

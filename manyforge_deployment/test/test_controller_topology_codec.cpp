@@ -374,9 +374,11 @@ TEST(ControllerTopologyCodec,
   const auto shuffled =
       canonical_json(CanonicalValue(std::move(shuffled_root)));
   const core::ContentAddressedStoreKey key{"sha256/topology-shuffled"};
+  const auto reference =
+      topology_reference("test_topology", shuffled, key);
   const auto qualified = resolve_and_qualify_controller_topology(
-      topology_reference("test_topology", shuffled, key), key, shuffled,
-      contracts);
+      reference, key, shuffled, contracts);
+  EXPECT_EQ(qualified.reference(), reference);
   ASSERT_EQ(qualified.value().controllers.size(), 2U);
   EXPECT_EQ(qualified.value().controllers.front().controller_role_id,
             core::ControllerRoleId("downstream"));

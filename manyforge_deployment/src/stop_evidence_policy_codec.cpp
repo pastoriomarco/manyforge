@@ -657,7 +657,7 @@ QualifiedStopEvidencePolicy resolve_and_qualify_stop_evidence_policy(
     fail("stop-evidence policy typed ID/revision selector does not match its "
          "referent");
   }
-  return QualifiedStopEvidencePolicy(std::move(decoded),
+  return QualifiedStopEvidencePolicy(reference, std::move(decoded),
                                      normalized.normalized_root());
 }
 

@@ -12,9 +12,12 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include "proof_root_transfer_test.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -201,6 +204,48 @@ void expect_resolution_error_containing(
               std::string_view::npos)
         << error.what();
   }
+}
+
+TEST(SiteOverlayResolution,
+     RvalueTransfersPreserveVerifiedProjectionAndQualifiedSelection) {
+  const auto authored =
+      author_overlay(external_row("resources.robot.endpoint"));
+  auto verified = resolve_and_verify_site_overlay_artifact_projection(
+      authored.reference, authored.stored_bytes);
+  const auto verified_projection =
+      [](const VerifiedSiteOverlayArtifactProjection& value) {
+        return std::tuple{
+            value.reference(),
+            std::vector<core::SiteOverlayExternalResourceKeyDTO>(
+                value.external_resource_keys().begin(),
+                value.external_resource_keys().end())};
+      };
+  test::expect_source_preserving_rvalue_transfers(verified,
+                                                   verified_projection);
+
+  const auto verified_destination = std::move(verified);
+  const std::vector<core::ExternalResourceDTO> resources{
+      external_resource("robot_endpoint", "resources.robot.endpoint")};
+  const auto source_selection = select_site_overlay_for_deployment(
+      authored.reference, resources, &verified);
+  const auto destination_selection = select_site_overlay_for_deployment(
+      authored.reference, resources, &verified_destination);
+  ASSERT_TRUE(source_selection.has_selection());
+  ASSERT_TRUE(destination_selection.has_selection());
+  EXPECT_EQ(source_selection.reference()->site_overlay_revision,
+            destination_selection.reference()->site_overlay_revision);
+
+  test::expect_source_preserving_rvalue_transfers(
+      source_selection, [](const QualifiedSelectedSiteOverlay& value) {
+        const auto* reference = value.reference();
+        return std::tuple{
+            value.has_selection(),
+            reference == nullptr ? std::string{}
+                                 : reference->site_overlay_revision.value(),
+            std::vector<core::SiteOverlayExternalResourceKeyDTO>(
+                value.external_resource_keys().begin(),
+                value.external_resource_keys().end())};
+      });
 }
 
 TEST(SiteOverlayResolution,

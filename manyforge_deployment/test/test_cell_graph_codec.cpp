@@ -6,6 +6,7 @@
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -13,6 +14,7 @@
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/canonical_value.hpp"
 #include "manyforge_deployment/cell_graph_codec.hpp"
+#include "proof_root_transfer_test.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -1033,6 +1035,40 @@ TEST(CellGraphCodec,
   const auto verified = verify_graph_revision(verification_ready);
   EXPECT_EQ(verified.graph(), computed.graph());
   EXPECT_EQ(verified.normalized_root(), computed.normalized_root());
+}
+
+TEST(CellGraphCodec,
+     RvalueTransfersPreserveEveryGraphTrustStageAndBothRemainReusable) {
+  const auto typed = decode(empty_graph());
+  test::expect_source_preserving_rvalue_transfers(
+      typed, [](const TypedCellGraphCandidate& value) {
+        return std::tuple{value.graph(),
+                          value.structurally_normalized_root()};
+      });
+
+  const auto intrinsic = validate_intrinsic_cell_graph_candidate(typed);
+  test::expect_source_preserving_rvalue_transfers(
+      intrinsic, [](const IntrinsicallyValidatedCellGraphCandidate& value) {
+        return std::tuple{value.graph(),
+                          value.structurally_normalized_root()};
+      });
+
+  auto identity_source = prepare_cell_graph_identity(intrinsic, {});
+  test::expect_source_preserving_rvalue_transfers(
+      identity_source, [](const GraphIdentityReadyCellGraphCandidate& value) {
+        return std::tuple{value.graph(), value.normalized_root()};
+      });
+  const auto identity_destination = std::move(identity_source);
+  const auto first_verified = compute_graph_revision(identity_source);
+  const auto second_verified = compute_graph_revision(identity_destination);
+  EXPECT_EQ(first_verified.graph(), second_verified.graph());
+  EXPECT_EQ(first_verified.normalized_root(),
+            second_verified.normalized_root());
+
+  test::expect_source_preserving_rvalue_transfers(
+      first_verified, [](const GraphRevisionVerifiedCellGraph& value) {
+        return std::tuple{value.graph(), value.normalized_root()};
+      });
 }
 
 TEST(CellGraphCodec,

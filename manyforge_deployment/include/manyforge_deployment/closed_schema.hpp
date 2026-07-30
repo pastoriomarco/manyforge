@@ -194,6 +194,11 @@ class BuildCatalogSchemaEntry final {
 
 class BuildQualifiedValueSchemaEntry final {
  public:
+  BuildQualifiedValueSchemaEntry(const BuildQualifiedValueSchemaEntry&) =
+      default;
+  BuildQualifiedValueSchemaEntry& operator=(
+      const BuildQualifiedValueSchemaEntry&) = default;
+
   [[nodiscard]] const core::SchemaId& schema_id() const noexcept { return schema_id_; }
   [[nodiscard]] const core::SchemaRevision& schema_revision() const noexcept {
     return schema_revision_;
@@ -240,6 +245,11 @@ class BuildQualifiedValueSchemaEntry final {
 /// output budget, and verify or mint GraphRevision.
 class NonGraphQualifiedSchemaNormalizedValue final {
  public:
+  NonGraphQualifiedSchemaNormalizedValue(
+      const NonGraphQualifiedSchemaNormalizedValue&) = default;
+  NonGraphQualifiedSchemaNormalizedValue& operator=(
+      const NonGraphQualifiedSchemaNormalizedValue&) = default;
+
   [[nodiscard]] const core::SchemaId& schema_id() const noexcept {
     return schema_id_;
   }

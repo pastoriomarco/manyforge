@@ -3062,7 +3062,8 @@ SourceVerifiedModelAsset verify_model_source_closure(
   }
 
   return SourceVerifiedModelAsset(
-      qualified_asset, std::move(verified), std::move(source_ir));
+      retrieval_plan, std::move(verified),
+      std::move(source_ir));
 }
 
 SourceVerifiedModelAsset verify_model_source_closure(

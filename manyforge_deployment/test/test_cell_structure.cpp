@@ -10,7 +10,6 @@
 #include <manyforge_deployment/capability_definition_codec.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/cell_composition.hpp>
-#include <manyforge_deployment/cell_structure.hpp>
 #include <manyforge_deployment/component_type_codec.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
@@ -20,9 +19,12 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include "proof_root_transfer_test.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -36,9 +38,6 @@ constexpr std::string_view kComponentTypeSchemaRevision =
 constexpr std::string_view kModelAssetSchemaRevision =
     "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c";
 
-static_assert(!std::is_aggregate_v<StructurallyQualifiedCellGraph>);
-static_assert(
-    !std::is_default_constructible_v<StructurallyQualifiedCellGraph>);
 static_assert(!std::is_aggregate_v<CompositionQualifiedCellIr>);
 static_assert(!std::is_default_constructible_v<CompositionQualifiedCellIr>);
 
@@ -759,16 +758,16 @@ struct BindingSpec final {
 
 TEST(CellStructure, QualifiesTheEmptyGraphWithExactEmptyClosures) {
   const auto graph = graph_for({}, {});
-  const auto qualified = qualify_cell_structure(
+  const auto qualified = compose_cell_occurrences(
       graph, std::span<const SourceVerifiedModelAsset>{},
       std::span<const QualifiedComponentType>{});
 
   EXPECT_EQ(qualified.graph(), graph.graph());
   EXPECT_TRUE(qualified.model_assets().empty());
   EXPECT_TRUE(qualified.component_types().empty());
-  EXPECT_TRUE(qualified.model_instances().empty());
-  EXPECT_TRUE(qualified.components().empty());
-  EXPECT_TRUE(qualified.attachments().empty());
+  EXPECT_TRUE(qualified.model_occurrences().empty());
+  EXPECT_TRUE(qualified.targets().empty());
+  EXPECT_TRUE(qualified.fixed_connections().empty());
 }
 
 TEST(CellStructure,
@@ -813,40 +812,105 @@ TEST(CellStructure,
       source_values({&tool_source, &fixture_source, &arm_source});
   const auto types = type_values({&tool_type, &arm_type});
 
-  const auto qualified = qualify_cell_structure(graph, sources, types);
+  const auto qualified = compose_cell_occurrences(graph, sources, types);
 
   EXPECT_EQ(qualified.graph(), graph_before);
   EXPECT_EQ(qualified.verified_graph().normalized_root(), root_before);
   ASSERT_EQ(qualified.model_assets().size(), 3U);
-  EXPECT_EQ(qualified.model_assets().front().value().model_asset_id.value(),
+  EXPECT_EQ(qualified.model_assets()[0].value().model_asset_id.value(),
             "arm_asset");
-  ASSERT_EQ(qualified.model_instances().size(), 3U);
-  EXPECT_EQ(qualified.model_instances()[0].placement_source,
-            StructuralPlacementSource::kDirectComponentPoseInCell);
-  EXPECT_EQ(qualified.model_instances()[1].placement_source,
-            StructuralPlacementSource::kDirectModelPoseInCell);
+  EXPECT_EQ(qualified.model_assets()[0].value().model_revision,
+            arm_source.value.value().model_revision);
+  EXPECT_EQ(qualified.model_assets()[0].retrieval_plan().artifacts(),
+            arm_source.value.retrieval_plan().artifacts());
+  EXPECT_EQ(qualified.model_assets()[0].retrieval_plan().total_bytes(),
+            arm_source.value.retrieval_plan().total_bytes());
+  EXPECT_EQ(qualified.model_assets()[1].value().model_asset_id.value(),
+            "fixture_asset");
+  EXPECT_EQ(qualified.model_assets()[1].value().model_revision,
+            fixture_source.value.value().model_revision);
+  EXPECT_EQ(qualified.model_assets()[1].retrieval_plan().artifacts(),
+            fixture_source.value.retrieval_plan().artifacts());
+  EXPECT_EQ(qualified.model_assets()[1].retrieval_plan().total_bytes(),
+            fixture_source.value.retrieval_plan().total_bytes());
+  EXPECT_EQ(qualified.model_assets()[2].value().model_asset_id.value(),
+            "tool_asset");
+  EXPECT_EQ(qualified.model_assets()[2].value().model_revision,
+            tool_source.value.value().model_revision);
+  EXPECT_EQ(qualified.model_assets()[2].retrieval_plan().artifacts(),
+            tool_source.value.retrieval_plan().artifacts());
+  EXPECT_EQ(qualified.model_assets()[2].retrieval_plan().total_bytes(),
+            tool_source.value.retrieval_plan().total_bytes());
+
+  ASSERT_EQ(qualified.component_types().size(), 2U);
+  EXPECT_EQ(
+      qualified.component_types()[0].value().component_type_id.value(),
+      "arm_type");
+  EXPECT_EQ(qualified.component_types()[0].value().component_type_revision,
+            arm_type.value.value().component_type_revision);
+  EXPECT_EQ(
+      qualified.component_types()[1].value().component_type_id.value(),
+      "tool_type");
+  EXPECT_EQ(qualified.component_types()[1].value().component_type_revision,
+            tool_type.value.value().component_type_revision);
+
+  test::expect_source_preserving_rvalue_transfers(
+      arm_type.value, [](const QualifiedComponentType& value) {
+        return std::tuple{value.reference(), value.value(),
+                          value.normalized_root()};
+      });
+  test::expect_source_preserving_rvalue_transfers(
+      qualified, [](const CompositionQualifiedCellIr& value) {
+        return std::tuple{
+            value.verified_graph().normalized_root(),
+            emit_canonical_urdf_document(value.flattened_urdf()),
+            emit_canonical_srdf_document(value.flattened_srdf()),
+            value.model_occurrences(), value.fixed_connections(),
+            value.targets()};
+      });
+
+  auto graph_source = graph;
+  const auto graph_destination = std::move(graph_source);
+  const auto source_composition =
+      compose_cell_occurrences(graph_source, sources, types);
+  const auto destination_composition =
+      compose_cell_occurrences(graph_destination, sources, types);
+  EXPECT_EQ(source_composition.verified_graph().normalized_root(),
+            destination_composition.verified_graph().normalized_root());
+  EXPECT_EQ(source_composition.model_assets().size(),
+            destination_composition.model_assets().size());
+  EXPECT_EQ(source_composition.component_types().size(),
+            destination_composition.component_types().size());
+  EXPECT_EQ(source_composition.model_occurrences(),
+            destination_composition.model_occurrences());
+
+  ASSERT_EQ(qualified.model_occurrences().size(), 3U);
+  EXPECT_EQ(qualified.model_occurrences()[0].owner_component_id,
+            std::optional<core::ControllableComponentId>(
+                core::ControllableComponentId("arm")));
   EXPECT_FALSE(
-      qualified.model_instances()[1].owner_component_id.has_value());
-  EXPECT_EQ(qualified.model_instances()[2].placement_source,
-            StructuralPlacementSource::kDerivedFromComponentAttachment);
-  ASSERT_EQ(qualified.components().size(), 2U);
-  ASSERT_EQ(qualified.components()[0].command_targets.size(), 1U);
-  EXPECT_EQ(qualified.components()[0]
-                .command_targets[0]
-                .model_groups[0]
-                .source_group_name,
-            "arm_group");
-  EXPECT_EQ(std::get<StructuralModelResourceResolution>(
-                qualified.components()[0]
-                    .command_targets[0]
-                    .resources[0])
-                .source_joint_names,
-            (std::vector<std::string>{"joint1"}));
-  ASSERT_EQ(qualified.attachments().size(), 1U);
-  EXPECT_EQ(qualified.attachments()[0].parent.frame.source_link_name,
-            "tip_link");
-  EXPECT_EQ(qualified.attachments()[0].child.frame.source_link_name,
-            "base_link");
+      qualified.model_occurrences()[1].owner_component_id.has_value());
+  EXPECT_EQ(qualified.model_occurrences()[2].owner_component_id,
+            std::optional<core::ControllableComponentId>(
+                core::ControllableComponentId("tool")));
+  ASSERT_EQ(qualified.targets().size(), 1U);
+  ASSERT_EQ(qualified.targets()[0].model_groups.size(), 1U);
+  EXPECT_EQ(qualified.targets()[0].model_groups[0].model_instance_id.value(),
+            "arm_model");
+  EXPECT_FALSE(
+      qualified.targets()[0].model_groups[0].compiled_group_name.empty());
+  ASSERT_EQ(qualified.fixed_connections().size(), 3U);
+  EXPECT_TRUE(std::holds_alternative<CompositionDirectComponentAnchor>(
+      qualified.fixed_connections()[0].source));
+  EXPECT_TRUE(std::holds_alternative<CompositionDirectModelAnchor>(
+      qualified.fixed_connections()[1].source));
+  const auto* attachment =
+      std::get_if<CompositionComponentAttachment>(
+          &qualified.fixed_connections()[2].source);
+  ASSERT_NE(attachment, nullptr);
+  EXPECT_EQ(attachment->component_attachment_id.value(), "tool_on_arm");
+  EXPECT_EQ(attachment->parent_component_id.value(), "arm");
+  EXPECT_EQ(attachment->child_component_id.value(), "tool");
 }
 
 TEST(CellStructure, RequiresExactModelAndComponentTypeDependencyClosures) {
@@ -861,50 +925,50 @@ TEST(CellStructure, RequiresExactModelAndComponentTypeDependencyClosures) {
   const auto types = type_values({&type});
 
   EXPECT_THROW(
-      (void)qualify_cell_structure(
+      (void)compose_cell_occurrences(
           graph, std::span<const SourceVerifiedModelAsset>{}, types),
-      CellStructureError);
+      CellCompositionError);
   const std::vector<SourceVerifiedModelAsset> duplicate_sources{
       source.value, source.value};
   EXPECT_THROW(
-      (void)qualify_cell_structure(graph, duplicate_sources, types),
-      CellStructureError);
+      (void)compose_cell_occurrences(graph, duplicate_sources, types),
+      CellCompositionError);
   auto stale_source = qualify_source(
       AssetSpec{.id = "asset",
                 .cardinality = "one_per_cell",
                 .with_srdf = true});
   const auto stale_sources = source_values({&stale_source});
   EXPECT_THROW(
-      (void)qualify_cell_structure(graph, stale_sources, types),
-      CellStructureError);
+      (void)compose_cell_occurrences(graph, stale_sources, types),
+      CellCompositionError);
   auto extra_source =
       qualify_source(AssetSpec{.id = "extra", .with_srdf = true});
   const auto extra_sources = source_values({&source, &extra_source});
   EXPECT_THROW(
-      (void)qualify_cell_structure(graph, extra_sources, types),
-      CellStructureError);
+      (void)compose_cell_occurrences(graph, extra_sources, types),
+      CellCompositionError);
 
   EXPECT_THROW(
-      (void)qualify_cell_structure(
+      (void)compose_cell_occurrences(
           graph, sources, std::span<const QualifiedComponentType>{}),
-      CellStructureError);
+      CellCompositionError);
   const std::vector<QualifiedComponentType> duplicate_types{
       type.value, type.value};
   EXPECT_THROW(
-      (void)qualify_cell_structure(graph, sources, duplicate_types),
-      CellStructureError);
+      (void)compose_cell_occurrences(graph, sources, duplicate_types),
+      CellCompositionError);
   auto stale_type = qualify_type(
       TypeSpec{.id = "type", .tags = {"changed"}, .with_target = true});
   const auto stale_types = type_values({&stale_type});
   EXPECT_THROW(
-      (void)qualify_cell_structure(graph, sources, stale_types),
-      CellStructureError);
+      (void)compose_cell_occurrences(graph, sources, stale_types),
+      CellCompositionError);
   auto extra_type =
       qualify_type(TypeSpec{.id = "extra_type", .tags = {}});
   const auto extra_types = type_values({&type, &extra_type});
   EXPECT_THROW(
-      (void)qualify_cell_structure(graph, sources, extra_types),
-      CellStructureError);
+      (void)compose_cell_occurrences(graph, sources, extra_types),
+      CellCompositionError);
 }
 
 TEST(CellStructure, EnforcesAssetInstanceCardinalityAndRoleBijection) {
@@ -917,10 +981,10 @@ TEST(CellStructure, EnforcesAssetInstanceCardinalityAndRoleBijection) {
       {{"model_a", &singleton, true}, {"model_b", &singleton, true}}, {});
   const auto singleton_sources = source_values({&singleton});
   EXPECT_THROW(
-      (void)qualify_cell_structure(
+      (void)compose_cell_occurrences(
           two_passive, singleton_sources,
           std::span<const QualifiedComponentType>{}),
-      CellStructureError);
+      CellCompositionError);
 
   auto source = qualify_source(AssetSpec{.id = "asset"});
   auto type = qualify_type(TypeSpec{.id = "type", .tags = {}});
@@ -930,8 +994,8 @@ TEST(CellStructure, EnforcesAssetInstanceCardinalityAndRoleBijection) {
   const auto sources = source_values({&source});
   const auto types = type_values({&type});
   EXPECT_THROW(
-      (void)qualify_cell_structure(wrong_role, sources, types),
-      CellStructureError);
+      (void)compose_cell_occurrences(wrong_role, sources, types),
+      CellCompositionError);
 }
 
 TEST(CellStructure, ProvesRootMountAndCommandTargetSourceRoles) {
@@ -946,9 +1010,9 @@ TEST(CellStructure, ProvesRootMountAndCommandTargetSourceRoles) {
   const auto sources = source_values({&source});
   auto wrong_root_types = type_values({&wrong_root_type});
   EXPECT_THROW(
-      (void)qualify_cell_structure(
+      (void)compose_cell_occurrences(
           wrong_root_graph, sources, wrong_root_types),
-      CellStructureError);
+      CellCompositionError);
 
   auto missing_target_type = qualify_type(
       TypeSpec{.id = "missing_target",
@@ -960,9 +1024,9 @@ TEST(CellStructure, ProvesRootMountAndCommandTargetSourceRoles) {
       {{"component", &missing_target_type, {{"body", "model"}}, true}});
   auto missing_target_types = type_values({&missing_target_type});
   EXPECT_THROW(
-      (void)qualify_cell_structure(
+      (void)compose_cell_occurrences(
           missing_target_graph, sources, missing_target_types),
-      CellStructureError);
+      CellCompositionError);
 
   auto child_source = qualify_source(AssetSpec{.id = "child_asset"});
   const core::PlacementPoseDTO identity_pose_dto{
@@ -987,15 +1051,16 @@ TEST(CellStructure, ProvesRootMountAndCommandTargetSourceRoles) {
         true}});
   const auto mount_sources = source_values({&source, &child_source});
   const auto good_mount_types = type_values({&good_mount_type});
-  const auto mounted = qualify_cell_structure(
+  const auto mounted = compose_cell_occurrences(
       good_mount_graph, mount_sources, good_mount_types);
-  ASSERT_EQ(mounted.components()[0].model_mounts.size(), 1U);
-  EXPECT_EQ(mounted.components()[0].model_mounts[0].parent.source_link_name,
-            "tip_link");
-  EXPECT_EQ(mounted.components()[0].model_mounts[0].child.source_link_name,
-            "base_link");
-  EXPECT_EQ(mounted.model_instances()[1].placement_source,
-            StructuralPlacementSource::kDerivedFromComponentModelMount);
+  ASSERT_EQ(mounted.fixed_connections().size(), 2U);
+  EXPECT_TRUE(std::holds_alternative<CompositionDirectComponentAnchor>(
+      mounted.fixed_connections()[0].source));
+  const auto* mount = std::get_if<CompositionModelMount>(
+      &mounted.fixed_connections()[1].source);
+  ASSERT_NE(mount, nullptr);
+  EXPECT_EQ(mount->parent_model_instance_id.value(), "base_model");
+  EXPECT_EQ(mount->child_model_instance_id.value(), "tool_model");
 
   TypeSpec bad_mount{
       .id = "bad_mount",
@@ -1017,9 +1082,9 @@ TEST(CellStructure, ProvesRootMountAndCommandTargetSourceRoles) {
         true}});
   const auto mount_types = type_values({&bad_mount_type});
   EXPECT_THROW(
-      (void)qualify_cell_structure(
+      (void)compose_cell_occurrences(
           bad_mount_graph, mount_sources, mount_types),
-      CellStructureError);
+      CellCompositionError);
 }
 
 TEST(CellStructure,
@@ -1048,8 +1113,8 @@ TEST(CellStructure,
        {"tool", &tool_type, {{"body", "tool_model"}}, false}},
       {{"edge", "arm", "missing", "tool", "mount"}});
   EXPECT_THROW(
-      (void)qualify_cell_structure(missing, sources, types),
-      CellStructureError);
+      (void)compose_cell_occurrences(missing, sources, types),
+      CellCompositionError);
 
   auto incompatible_tool_type = qualify_type(
       TypeSpec{.id = "incompatible_tool",
@@ -1070,9 +1135,9 @@ TEST(CellStructure,
   const auto incompatible_types =
       type_values({&arm_type, &incompatible_tool_type});
   EXPECT_THROW(
-      (void)qualify_cell_structure(
+      (void)compose_cell_occurrences(
           incompatible, sources, incompatible_types),
-      CellStructureError);
+      CellCompositionError);
 
   auto nonroot_tool_type = qualify_type(
       TypeSpec{.id = "nonroot_tool",
@@ -1090,9 +1155,9 @@ TEST(CellStructure,
   const auto nonroot_types =
       type_values({&arm_type, &nonroot_tool_type});
   EXPECT_THROW(
-      (void)qualify_cell_structure(
+      (void)compose_cell_occurrences(
           nonroot_child, sources, nonroot_types),
-      CellStructureError);
+      CellCompositionError);
 
   const auto capacity = graph_for(
       {{"arm_model", &arm_source, false},
@@ -1104,8 +1169,8 @@ TEST(CellStructure,
       {{"edge_a", "arm", "flange", "tool_a", "mount"},
        {"edge_b", "arm", "flange", "tool_b", "mount"}});
   EXPECT_THROW(
-      (void)qualify_cell_structure(capacity, sources, types),
-      CellStructureError);
+      (void)compose_cell_occurrences(capacity, sources, types),
+      CellCompositionError);
 }
 
 [[nodiscard]] bool is_mf1_name(std::string_view value) {
@@ -1238,13 +1303,11 @@ void expect_pose_near(const core::PlacementPoseDTO& actual,
 TEST(CellComposition,
      EmptyCellContainsOnlyItsSemanticFrameAndUsesTheOrdinaryPath) {
   const auto graph = graph_for({}, {});
-  const auto structure = qualify_cell_structure(
+  const auto composed = compose_cell_occurrences(
       graph, std::span<const SourceVerifiedModelAsset>{},
       std::span<const QualifiedComponentType>{});
 
-  const auto composed = compose_cell_occurrences(structure);
-
-  EXPECT_EQ(composed.structure().graph(), graph.graph());
+  EXPECT_EQ(composed.graph(), graph.graph());
   EXPECT_TRUE(is_mf1_name(composed.cell_frame().compiled_frame_name));
   ASSERT_EQ(composed.flattened_urdf().links.size(), 1U);
   EXPECT_EQ(composed.flattened_urdf().links[0].name,
@@ -1285,8 +1348,8 @@ TEST(CellComposition,
   const auto graph = graph_for(
       {{"fixture", &passive_source, true}}, {});
   const auto composed = compose_cell_occurrences(
-      qualify_cell_structure(graph, source_values({&passive_source}),
-                             std::span<const QualifiedComponentType>{}));
+      graph, source_values({&passive_source}),
+      std::span<const QualifiedComponentType>{});
 
   ASSERT_EQ(composed.model_occurrences().size(), 1U);
   EXPECT_FALSE(
@@ -1341,13 +1404,11 @@ TEST(CellComposition,
   const auto sources =
       source_values({&tool_source, &fixture_source, &arm_source});
   const auto types = type_values({&tool_type, &arm_type});
-  const auto structure = qualify_cell_structure(graph, sources, types);
-
-  const auto composed = compose_cell_occurrences(structure);
+  const auto composed = compose_cell_occurrences(graph, sources, types);
   const auto composed_again =
-      compose_cell_occurrences(qualify_cell_structure(
+      compose_cell_occurrences(
           graph, source_values({&arm_source, &tool_source, &fixture_source}),
-          type_values({&arm_type, &tool_type})));
+          type_values({&arm_type, &tool_type}));
 
   EXPECT_EQ(emit_canonical_urdf_document(composed.flattened_urdf()),
             emit_canonical_urdf_document(composed_again.flattened_urdf()));
@@ -1450,10 +1511,9 @@ TEST(CellComposition,
                 .bodies = {{"body", {"base_link"}}}},
       urdf);
   const auto composed = compose_cell_occurrences(
-      qualify_cell_structure(
-          graph_for({{"material_model", &source, true}}, {}),
-          source_values({&source}),
-          std::span<const QualifiedComponentType>{}));
+      graph_for({{"material_model", &source, true}}, {}),
+      source_values({&source}),
+      std::span<const QualifiedComponentType>{});
 
   std::map<std::pair<std::string, std::string>, std::string>
       material_rewrites;
@@ -1596,10 +1656,8 @@ TEST(CellComposition,
         {{"drive", "drive_resource"},
          {"linear", "rail_resource"},
          {"linear", "gantry_resource"}}}});
-  const auto structure = qualify_cell_structure(
+  const auto composed = compose_cell_occurrences(
       graph, source_values({&source}), type_values({&type}));
-
-  const auto composed = compose_cell_occurrences(structure);
 
   ASSERT_EQ(composed.coordinates().size(), 8U);
   std::map<std::string, CompositionCoordinateUnit, std::less<>> units;
@@ -1764,10 +1822,10 @@ TEST(CellComposition,
         "command",
         {{"joints", "tool_resource_b"},
          {"vacuum", "vacuum_resource_b"}}}});
-  const auto composed = compose_cell_occurrences(qualify_cell_structure(
+  const auto composed = compose_cell_occurrences(
       graph,
       source_values({&tool_source, &passive_source, &robot_source}),
-      type_values({&tool_type, &robot_type})));
+      type_values({&tool_type, &robot_type}));
 
   const std::map<std::string, std::string, std::less<>>
       expected_model_by_component{
@@ -1861,8 +1919,7 @@ TEST(CellComposition,
         {{"model", &source, false}},
         {{"component", &type, {{"body", "model"}}, true}}, {},
         {{"binding", "component", "command", std::move(resources)}});
-    return compose_cell_occurrences(
-        qualify_cell_structure(graph, sources, types));
+    return compose_cell_occurrences(graph, sources, types);
   };
 
   EXPECT_THROW((void)compose_binding({{"first", "a"}}),
@@ -1904,9 +1961,9 @@ TEST(CellComposition,
         "command",
         {{"first", "a"}, {"second", "b"}}}});
   EXPECT_THROW(
-      (void)compose_cell_occurrences(qualify_cell_structure(
+      (void)compose_cell_occurrences(
           duplicate_graph, source_values({&duplicate_source}),
-          type_values({&duplicate_type}))),
+          type_values({&duplicate_type})),
       CellCompositionError);
 
   const std::string mimic_urdf =
@@ -1940,9 +1997,9 @@ TEST(CellComposition,
         "command",
         {{"first", "a"}, {"second", "b"}}}});
   EXPECT_THROW(
-      (void)compose_cell_occurrences(qualify_cell_structure(
+      (void)compose_cell_occurrences(
           mimic_graph, source_values({&mimic_source}),
-          type_values({&mimic_type}))),
+          type_values({&mimic_type})),
       CellCompositionError);
 }
 
@@ -1967,8 +2024,8 @@ TEST(CellComposition, ResourceIdReuseRequiresOneGlobalCoordinateIdentity) {
         "command",
         {{"joints", "shared_resource"}}}});
   EXPECT_NO_THROW(
-      (void)compose_cell_occurrences(qualify_cell_structure(
-          consistent, source_values({&source}), type_values({&type}))));
+      (void)compose_cell_occurrences(
+          consistent, source_values({&source}), type_values({&type})));
 
   const auto conflicting = graph_for(
       {{"model_a", &source, false}, {"model_b", &source, false}},
@@ -1984,8 +2041,8 @@ TEST(CellComposition, ResourceIdReuseRequiresOneGlobalCoordinateIdentity) {
         "command",
         {{"joints", "shared_resource"}}}});
   EXPECT_THROW(
-      (void)compose_cell_occurrences(qualify_cell_structure(
-          conflicting, source_values({&source}), type_values({&type}))),
+      (void)compose_cell_occurrences(
+          conflicting, source_values({&source}), type_values({&type})),
       CellCompositionError);
 
   auto mixed_type = qualify_type_with_component_local_resources(
@@ -2006,9 +2063,9 @@ TEST(CellComposition, ResourceIdReuseRequiresOneGlobalCoordinateIdentity) {
         "command",
         {{"joints", "joints_b"}, {"vacuum", "shared_resource"}}}});
   EXPECT_THROW(
-      (void)compose_cell_occurrences(qualify_cell_structure(
+      (void)compose_cell_occurrences(
           model_backed_vs_component_local, source_values({&source}),
-          type_values({&mixed_type}))),
+          type_values({&mixed_type})),
       CellCompositionError);
 }
 
@@ -2077,9 +2134,9 @@ TEST(CellComposition,
       {{"tool_attachment", "parent", "flange", "tool", "mount"}},
       {}, {}, {{"parent", anchor_pose}},
       {{"tool_attachment", attachment_pose}});
-  const auto composed = compose_cell_occurrences(qualify_cell_structure(
+  const auto composed = compose_cell_occurrences(
       graph, source_values({&tool_source, &segment_source}),
-      type_values({&tool_type, &aggregate_type})));
+      type_values({&tool_type, &aggregate_type}));
 
   const auto path = std::find_if(
       composed.frame_paths().begin(), composed.frame_paths().end(),
@@ -2179,8 +2236,8 @@ TEST(CellComposition,
         &type,
         {{"first", "tool_a"}, {"second", "tool_b"}},
         true}});
-  const auto composed = compose_cell_occurrences(qualify_cell_structure(
-      graph, source_values({&source}), type_values({&type})));
+  const auto composed = compose_cell_occurrences(
+      graph, source_values({&source}), type_values({&type}));
 
   ASSERT_EQ(composed.model_occurrences().size(), 2U);
   EXPECT_NE(composed.model_occurrences()[0].compiled_root_link_name,
@@ -2219,10 +2276,9 @@ TEST(CellComposition, PinsMf1DomainFieldEncodingAndBoundaryVectors) {
                             {"base:link=1", "base:link=11"}}}},
       urdf);
   const auto composed = compose_cell_occurrences(
-      qualify_cell_structure(
-          graph_for({{"golden_model", &source, true}}, {}),
-          source_values({&source}),
-          std::span<const QualifiedComponentType>{}));
+      graph_for({{"golden_model", &source, true}}, {}),
+      source_values({&source}),
+      std::span<const QualifiedComponentType>{});
 
   EXPECT_EQ(
       composed.cell_frame().compiled_frame_name,
@@ -2290,9 +2346,8 @@ TEST(CellComposition,
   }
   const auto exact_graph = graph_for(exact_models, {});
   const auto exact = compose_cell_occurrences(
-      qualify_cell_structure(
-          exact_graph, source_values({&source}),
-          std::span<const QualifiedComponentType>{}));
+      exact_graph, source_values({&source}),
+      std::span<const QualifiedComponentType>{});
   EXPECT_EQ(
       exact.frames().size(),
       kMaxCompositionFrameResolutions);
@@ -2301,10 +2356,9 @@ TEST(CellComposition,
       {"frame_budget_first_over", &extra_source, true});
   const auto first_over_graph = graph_for(exact_models, {});
   EXPECT_THROW(
-      (void)compose_cell_occurrences(qualify_cell_structure(
-          first_over_graph,
-          source_values({&source, &extra_source}),
-          std::span<const QualifiedComponentType>{})),
+      (void)compose_cell_occurrences(
+          first_over_graph, source_values({&source, &extra_source}),
+          std::span<const QualifiedComponentType>{}),
       CellCompositionError);
 }
 

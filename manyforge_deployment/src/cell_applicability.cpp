@@ -307,7 +307,7 @@ struct QualifiedIndexes final {
       {},
   };
 
-  const auto& graph = composition.structure().graph();
+  const auto& graph = composition.graph();
   for (const auto& runtime : graph.runtime_units) {
     result.required_runtime_profiles.insert(
         pair_key(runtime.runtime_profile_id,
@@ -333,8 +333,7 @@ struct QualifiedIndexes final {
         pair_key(binding.stop_evidence_policy_id,
                  binding.stop_evidence_policy_revision));
   }
-  for (const auto& component_type :
-       composition.structure().component_types()) {
+  for (const auto& component_type : composition.component_types()) {
     for (const auto& target : component_type.value().command_targets) {
       for (const auto& capability : target.capabilities) {
         result.required_capability_definitions.insert(
@@ -437,11 +436,11 @@ struct QualifiedIndexes final {
   return *result;
 }
 
-[[nodiscard]] const StructuralComponentResolution& require_component(
-    const StructurallyQualifiedCellGraph& structure,
+[[nodiscard]] const core::ControllableComponentDTO& require_component(
+    const core::CellGraphDTO& graph,
     const core::ControllableComponentId& id) {
   const auto* result = find_one(
-      structure.components(), [&id](const auto& value) {
+      graph.controllable_components, [&id](const auto& value) {
         return value.controllable_component_id == id;
       });
   if (result == nullptr) {
@@ -450,25 +449,13 @@ struct QualifiedIndexes final {
   return *result;
 }
 
-[[nodiscard]] const StructuralCommandTargetResolution& require_target(
-    const StructuralComponentResolution& component,
-    const core::CommandTargetId& id) {
-  const auto* result = find_one(
-      component.command_targets,
-      [&id](const auto& value) { return value.command_target_id == id; });
-  if (result == nullptr) {
-    fail("control applicability references an unknown command target");
-  }
-  return *result;
-}
-
 [[nodiscard]] const core::ComponentTypeCommandTargetDTO&
 require_type_target(
-    const StructurallyQualifiedCellGraph& structure,
-    const StructuralComponentResolution& component,
+    const CompositionQualifiedCellIr& composition,
+    const core::ControllableComponentDTO& component,
     const core::CommandTargetId& id) {
   const auto* type = find_one(
-      structure.component_types(), [&component](const auto& value) {
+      composition.component_types(), [&component](const auto& value) {
         return value.value().component_type_id == component.component_type_id &&
                value.value().component_type_revision ==
                    component.component_type_revision;
@@ -607,10 +594,10 @@ require_route_projection(const core::ControlBindingDTO& binding,
 
 [[nodiscard]] std::vector<core::ResourceRoleId>
 target_resource_role_order(
-    const StructuralCommandTargetResolution& target) {
+    const core::ComponentTypeCommandTargetDTO& target) {
   std::vector<core::ResourceRoleId> result;
-  result.reserve(target.resources.size());
-  for (const auto& resource : target.resources) {
+  result.reserve(target.resource_roles.size());
+  for (const auto& resource : target.resource_roles) {
     result.push_back(std::visit(
         [](const auto& value) { return value.resource_role_id; }, resource));
   }
@@ -622,7 +609,7 @@ using BoundResourceMap =
 
 [[nodiscard]] BoundResourceMap validate_and_index_bound_resources(
     const core::ControlBindingDTO& binding,
-    const StructuralCommandTargetResolution& target,
+    const core::ComponentTypeCommandTargetDTO& target,
     const CompositionControlBindingCoordinateMap& coordinate_map,
     const core::ControlInterfaceContractDTO& contract) {
   const auto target_roles = target_resource_role_order(target);
@@ -902,9 +889,6 @@ qualify_selected_overlay(
 struct BindingContext final {
   const core::ControlBindingDTO* binding;
   const core::ControlDomainDTO* domain;
-  const StructuralComponentResolution* component;
-  const StructuralCommandTargetResolution* target;
-  const core::ComponentTypeCommandTargetDTO* type_target;
   const CompositionControlBindingCoordinateMap* coordinate_map;
   const QualifiedCapabilityDefinition* capability;
   const QualifiedControlInterfaceContract* contract;
@@ -933,8 +917,7 @@ void require_target_capability(
 [[nodiscard]] std::vector<BindingContext> qualify_binding_contexts(
     const CompositionQualifiedCellIr& composition,
     const QualifiedIndexes& indexes) {
-  const auto& structure = composition.structure();
-  const auto& graph = structure.graph();
+  const auto& graph = composition.graph();
   std::vector<BindingContext> result;
   result.reserve(graph.control_bindings.size());
 
@@ -947,11 +930,9 @@ void require_target_capability(
     }
 
     const auto& component =
-        require_component(structure, binding.controllable_component_id);
-    const auto& target =
-        require_target(component, binding.command_target_id);
+        require_component(graph, binding.controllable_component_id);
     const auto& type_target =
-        require_type_target(structure, component,
+        require_type_target(composition, component,
                             binding.command_target_id);
     require_target_capability(type_target, binding.capability_id,
                               binding.capability_definition_revision);
@@ -1006,13 +987,10 @@ void require_target_capability(
     }
 
     BoundResourceMap resources = validate_and_index_bound_resources(
-        binding, target, coordinate_map, contract.value());
+        binding, type_target, coordinate_map, contract.value());
     result.push_back(
         {&binding,
          &domain,
-         &component,
-         &target,
-         &type_target,
          &coordinate_map,
          &capability,
          &contract,
@@ -1636,10 +1614,10 @@ struct CapabilityAndEndpointResult final {
 }
 
 void qualify_capability_provider_target(
-    const core::CellGraphDTO& graph,
-    const StructurallyQualifiedCellGraph& structure,
+    const CompositionQualifiedCellIr& composition,
     const core::CapabilityProviderBindingDTO& binding,
     const core::CapabilityDefinitionDTO& capability) {
+  const auto& graph = composition.graph();
   if (binding.scope != capability.scope ||
       capability.provider_binding_kind !=
           core::CapabilityProviderBindingKind::
@@ -1686,17 +1664,14 @@ void qualify_capability_provider_target(
         fail("target-binding capability has the wrong target alternative");
       }
       const auto& component =
-          require_component(structure, target->controllable_component_id);
+          require_component(graph, target->controllable_component_id);
       if (component.component_type_revision !=
           target->component_type_revision) {
         fail("target-binding capability-provider target selects a stale "
              "component-type revision");
       }
-      const auto& structural_target =
-          require_target(component, target->command_target_id);
-      (void)structural_target;
       const auto& type_target =
-          require_type_target(structure, component,
+          require_type_target(composition, component,
                               target->command_target_id);
       require_target_capability(
           type_target, binding.capability_id,
@@ -1759,8 +1734,7 @@ void qualify_complete_capability_coverage(
     const CompositionQualifiedCellIr& composition,
     const core::DeploymentApplicabilityInputsDTO& inputs,
     const QualifiedIndexes& indexes) {
-  const auto& structure = composition.structure();
-  const auto& graph = structure.graph();
+  const auto& graph = composition.graph();
 
   std::set<SemanticCapabilityCoverageKey> semantic_coverage;
   for (const auto& binding : inputs.capability_provider_bindings) {
@@ -1770,10 +1744,18 @@ void qualify_complete_capability_coverage(
     }
   }
 
-  for (const auto& component : structure.components()) {
-    for (const auto& structural_target : component.command_targets) {
-      const auto& target = require_type_target(
-          structure, component, structural_target.command_target_id);
+  for (const auto& component : graph.controllable_components) {
+    const auto* type = find_one(
+        composition.component_types(), [&component](const auto& value) {
+          return value.value().component_type_id ==
+                     component.component_type_id &&
+                 value.value().component_type_revision ==
+                     component.component_type_revision;
+        });
+    if (type == nullptr) {
+      fail("composed component lost its exact component-type referent");
+    }
+    for (const auto& target : type->value().command_targets) {
       for (const auto& declared : target.capabilities) {
         const auto& definition =
             indexes.capability_definitions
@@ -1790,8 +1772,7 @@ void qualify_complete_capability_coverage(
         for (const auto& binding : graph.control_bindings) {
           if (binding.controllable_component_id ==
                   component.controllable_component_id &&
-              binding.command_target_id ==
-                  structural_target.command_target_id) {
+              binding.command_target_id == target.command_target_id) {
             target_bindings.push_back(&binding);
           }
         }
@@ -1837,7 +1818,7 @@ void qualify_complete_capability_coverage(
                        target_binding->component_type_revision ==
                            component.component_type_revision &&
                        target_binding->command_target_id ==
-                           structural_target.command_target_id &&
+                           target.command_target_id &&
                        target_binding->control_binding_id ==
                            anchor->control_binding_id &&
                        target_binding->control_binding_revision ==
@@ -1860,8 +1841,7 @@ qualify_capabilities_and_endpoints(
     const QualifiedIndexes& indexes,
     const std::optional<core::SiteOverlayRefDTO>& selected_overlay,
     LogicalNameRegistry& names, std::size_t& logical_rows) {
-  const auto& structure = composition.structure();
-  const auto& graph = structure.graph();
+  const auto& graph = composition.graph();
   const auto& inputs = deployment_inputs.value();
   CapabilityAndEndpointResult result;
   result.capabilities.reserve(graph.control_bindings.size() +
@@ -1963,7 +1943,7 @@ qualify_capabilities_and_endpoints(
             pair_key(binding.capability_id,
                      binding.capability_definition_revision));
     qualify_capability_provider_target(
-        graph, structure, binding, capability.value());
+        composition, binding, capability.value());
     const auto& manifest =
         *indexes.manifests.at(
             pair_key(binding.provider_manifest_id,
@@ -2545,10 +2525,10 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
   const auto selected_overlay = qualify_selected_overlay(
       deployment_inputs.value(), selected_site_overlay);
   qualify_provider_instances(
-      composition.structure().graph(), deployment_inputs.value());
+      composition.graph(), deployment_inputs.value());
 
   auto bindings = qualify_binding_contexts(composition, indexes);
-  qualify_desired_configurations(composition.structure().graph(),
+  qualify_desired_configurations(composition.graph(),
                                  deployment_inputs.value(), indexes);
   qualify_complete_capability_coverage(
       composition, deployment_inputs.value(), indexes);
@@ -2558,17 +2538,17 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
   LogicalNameRegistry names(composition);
   std::size_t logical_rows = 0U;
   materialize_binding_interfaces(
-      composition.structure().graph().cell_id, bindings, names,
+      composition.graph().cell_id, bindings, names,
       logical_rows);
   auto controllers_and_routes = qualify_controllers_and_routes(
-      composition.structure().graph().cell_id, bindings, names,
+      composition.graph().cell_id, bindings, names,
       logical_rows);
   auto capabilities_and_endpoints =
       qualify_capabilities_and_endpoints(
           composition, deployment_inputs, indexes, selected_overlay,
           names, logical_rows);
   auto stop_applicability = qualify_stop_applicability(
-      composition.structure().graph().cell_id, bindings,
+      composition.graph().cell_id, bindings,
       controllers_and_routes.routes, controllers_and_routes.controllers,
       names, logical_rows);
 

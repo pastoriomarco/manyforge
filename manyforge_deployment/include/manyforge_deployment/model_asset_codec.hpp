@@ -24,6 +24,13 @@ class ModelAssetCodecError : public std::invalid_argument {
 /// claim compatibility with a runtime lane.
 class QualifiedModelAsset final {
  public:
+  QualifiedModelAsset(const QualifiedModelAsset&) = default;
+  QualifiedModelAsset& operator=(const QualifiedModelAsset&) = default;
+
+  [[nodiscard]] const core::ModelAssetCatalogRecordRefDTO& reference()
+      const noexcept {
+    return reference_;
+  }
   [[nodiscard]] const core::ModelAssetDTO& value() const noexcept {
     return value_;
   }
@@ -32,11 +39,14 @@ class QualifiedModelAsset final {
   }
 
  private:
-  QualifiedModelAsset(core::ModelAssetDTO value,
+  QualifiedModelAsset(const core::ModelAssetCatalogRecordRefDTO& reference,
+                      core::ModelAssetDTO value,
                       CanonicalValue normalized_root)
-      : value_(std::move(value)),
+      : reference_(reference),
+        value_(std::move(value)),
         normalized_root_(std::move(normalized_root)) {}
 
+  core::ModelAssetCatalogRecordRefDTO reference_;
   core::ModelAssetDTO value_;
   CanonicalValue normalized_root_;
 

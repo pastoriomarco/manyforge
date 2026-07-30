@@ -27,6 +27,13 @@ class ComponentTypeCodecError : public std::invalid_argument {
 /// to the later graph compiler and retained deployment product.
 class QualifiedComponentType final {
  public:
+  QualifiedComponentType(const QualifiedComponentType&) = default;
+  QualifiedComponentType& operator=(const QualifiedComponentType&) = default;
+
+  [[nodiscard]] const core::ComponentTypeCatalogRecordRefDTO& reference()
+      const noexcept {
+    return reference_;
+  }
   [[nodiscard]] const core::ComponentTypeDTO& value() const noexcept {
     return value_;
   }
@@ -35,11 +42,14 @@ class QualifiedComponentType final {
   }
 
  private:
-  QualifiedComponentType(core::ComponentTypeDTO value,
-                         CanonicalValue normalized_root)
-      : value_(std::move(value)),
+  QualifiedComponentType(
+      const core::ComponentTypeCatalogRecordRefDTO& reference,
+      core::ComponentTypeDTO value, CanonicalValue normalized_root)
+      : reference_(reference),
+        value_(std::move(value)),
         normalized_root_(std::move(normalized_root)) {}
 
+  core::ComponentTypeCatalogRecordRefDTO reference_;
   core::ComponentTypeDTO value_;
   CanonicalValue normalized_root_;
 

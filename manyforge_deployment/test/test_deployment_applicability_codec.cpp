@@ -9,8 +9,11 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <variant>
+
+#include "proof_root_transfer_test.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -307,6 +310,36 @@ TEST(DeploymentApplicabilityCodec,
       canonical_json(candidate.normalized_capability_provider_bindings());
   EXPECT_LT(canonical_providers.find("\"a_provider_binding\""),
             canonical_providers.find("\"z_provider_binding\""));
+}
+
+TEST(DeploymentApplicabilityCodec,
+     RvalueTransfersPreserveTypedAndRevisionVerifiedInputsForReuse) {
+  const auto typed = decode(minimal_document(
+      "[" + desired_configuration() + "]",
+      "[" + provider_binding() + "]",
+      "[" + external_resource() + "]", true, site_overlay_ref()));
+  const auto projection = [](const auto& value) {
+    return std::tuple{
+        value.value(),
+        value.normalized_desired_control_configurations(),
+        value.normalized_capability_provider_bindings(),
+        value.normalized_external_resources(),
+        value.site_overlay_ref_presence(),
+        value.normalized_site_overlay_ref(),
+        value.external_resources_was_present()};
+  };
+  test::expect_source_preserving_rvalue_transfers(typed, projection);
+
+  const auto typed_destination = std::move(typed);
+  const auto first_verified =
+      compute_capability_provider_binding_revisions(typed);
+  const auto second_verified =
+      compute_capability_provider_binding_revisions(typed_destination);
+  EXPECT_EQ(first_verified.value(), second_verified.value());
+  EXPECT_EQ(projection(first_verified), projection(second_verified));
+
+  test::expect_source_preserving_rvalue_transfers(first_verified,
+                                                   projection);
 }
 
 TEST(DeploymentApplicabilityCodec,

@@ -150,6 +150,10 @@ TEST(RuntimeProfileCodec,
   const auto document = profile_document(spec);
   const auto qualified = qualify(spec);
   const auto& profile = qualified.value();
+  EXPECT_EQ(
+      qualified.reference(),
+      reference_for(spec.profile_id, document,
+                    core::ContentAddressedStoreKey("sha256/runtime-profile")));
 
   EXPECT_EQ(profile.runtime_profile_id,
             core::RuntimeProfileId("ros2_control_xarm"));

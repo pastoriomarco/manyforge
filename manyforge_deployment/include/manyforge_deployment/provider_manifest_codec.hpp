@@ -25,6 +25,14 @@ class ProviderManifestCodecError : public std::invalid_argument {
 /// live readiness. Those are binding/compiler/runtime responsibilities.
 class QualifiedProviderManifest final {
  public:
+  QualifiedProviderManifest(const QualifiedProviderManifest&) = default;
+  QualifiedProviderManifest& operator=(const QualifiedProviderManifest&) =
+      default;
+
+  [[nodiscard]] const core::ProviderManifestCatalogRecordRefDTO& reference()
+      const noexcept {
+    return reference_;
+  }
   [[nodiscard]] const core::ProviderManifestDTO& value() const noexcept {
     return value_;
   }
@@ -33,11 +41,14 @@ class QualifiedProviderManifest final {
   }
 
  private:
-  QualifiedProviderManifest(core::ProviderManifestDTO value,
-                            CanonicalValue normalized_root)
-      : value_(std::move(value)),
+  QualifiedProviderManifest(
+      const core::ProviderManifestCatalogRecordRefDTO& reference,
+      core::ProviderManifestDTO value, CanonicalValue normalized_root)
+      : reference_(reference),
+        value_(std::move(value)),
         normalized_root_(std::move(normalized_root)) {}
 
+  core::ProviderManifestCatalogRecordRefDTO reference_;
   core::ProviderManifestDTO value_;
   CanonicalValue normalized_root_;
 

@@ -9,9 +9,9 @@
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/capability_definition_codec.hpp>
 #include <manyforge_deployment/cell_applicability.hpp>
+#include <manyforge_deployment/cell_compiler.hpp>
 #include <manyforge_deployment/cell_composition.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
-#include <manyforge_deployment/cell_structure.hpp>
 #include <manyforge_deployment/component_type_codec.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/control_interface_contract_codec.hpp>
@@ -25,10 +25,13 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "proof_root_transfer_test.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -1407,9 +1410,9 @@ struct GraphOptions final {
 [[nodiscard]] CompositionQualifiedCellIr compose_graph(
     const GraphRevisionVerifiedCellGraph& graph,
     const QualifiedComponentType& type) {
-  return compose_cell_occurrences(qualify_cell_structure(
+  return compose_cell_occurrences(
       graph, std::span<const SourceVerifiedModelAsset>{},
-      std::span<const QualifiedComponentType>(&type, 1U)));
+      std::span<const QualifiedComponentType>(&type, 1U));
 }
 
 struct AuthoredOverlay final {
@@ -1609,7 +1612,7 @@ struct InputOptions final {
     const QualifiedProviderManifest* conflicting_manifest,
     const InputOptions& options,
     const std::optional<core::SiteOverlayRefDTO>& overlay_reference) {
-  const auto& graph = composition.structure().graph();
+  const auto& graph = composition.graph();
   CanonicalValue::Array desired;
   if (!options.omit_desired) {
     CanonicalValue::Array binding_routes;
@@ -2271,6 +2274,29 @@ struct ApplicabilityFixture final {
       fixture.selected_overlay);
 }
 
+void expect_exact_catalog_reference(
+    const core::CatalogRecordRefDTO& actual,
+    const core::CatalogRecordRefDTO& expected) {
+  ASSERT_EQ(actual.index(), expected.index());
+  std::visit(
+      [&expected](const auto& actual_typed) {
+        using Typed = std::decay_t<decltype(actual_typed)>;
+        const auto* expected_typed = std::get_if<Typed>(&expected);
+        ASSERT_NE(expected_typed, nullptr);
+        EXPECT_EQ(actual_typed.record_id, expected_typed->record_id);
+        EXPECT_EQ(actual_typed.record_revision,
+                  expected_typed->record_revision);
+        EXPECT_EQ(actual_typed.schema_id, expected_typed->schema_id);
+        EXPECT_EQ(actual_typed.schema_revision,
+                  expected_typed->schema_revision);
+        EXPECT_EQ(actual_typed.content_digest,
+                  expected_typed->content_digest);
+        EXPECT_EQ(actual_typed.content_addressed_store_key,
+                  expected_typed->content_addressed_store_key);
+      },
+      actual);
+}
+
 TEST(CellApplicability,
      CanonicalEmptyPassesThroughRealGraphDeploymentAndOverlaySelectors) {
   const auto graph = compute_graph_revision(prepare_cell_graph_identity(
@@ -2284,9 +2310,9 @@ TEST(CellApplicability,
               "\"control_domains\":[],\"control_bindings\":[],"
               "\"component_attachments\":[]}"))),
       {}));
-  const auto composition = compose_cell_occurrences(qualify_cell_structure(
+  const auto composition = compose_cell_occurrences(
       graph, std::span<const SourceVerifiedModelAsset>{},
-      std::span<const QualifiedComponentType>{}));
+      std::span<const QualifiedComponentType>{});
   const auto inputs = compute_capability_provider_binding_revisions(
       decode_deployment_applicability_inputs_candidate(
           parse_strict_json_model_yaml(
@@ -2300,7 +2326,7 @@ TEST(CellApplicability,
   const auto result = qualify_cell_applicability(
       composition, inputs, {}, {}, {}, {}, {}, {}, overlay);
 
-  EXPECT_EQ(result.composition().structure().graph().cell_id,
+  EXPECT_EQ(result.composition().graph().cell_id,
             core::CellId("empty_cell"));
   EXPECT_FALSE(result.selected_site_overlay_ref().has_value());
   EXPECT_TRUE(result.binding_interfaces().empty());
@@ -2308,6 +2334,224 @@ TEST(CellApplicability,
   EXPECT_TRUE(result.routes().empty());
   EXPECT_TRUE(result.capabilities().empty());
   EXPECT_TRUE(result.stop_applicability().empty());
+}
+
+TEST(CellApplicability,
+     RvalueTransfersPreserveAllQualifiedApplicabilityRootsAndReuse) {
+  const auto fixture = make_fixture({.include_provider_binding = true});
+
+  test::expect_source_preserving_rvalue_transfers(
+      fixture.composition, [](const CompositionQualifiedCellIr& value) {
+        return std::tuple{
+            value.verified_graph().normalized_root(),
+            emit_canonical_urdf_document(value.flattened_urdf()),
+            emit_canonical_srdf_document(value.flattened_srdf()),
+            value.model_occurrences().size(), value.targets().size()};
+      });
+  test::expect_source_preserving_rvalue_transfers(
+      fixture.inputs,
+      [](const RevisionVerifiedDeploymentApplicabilityInputs& value) {
+        return std::tuple{
+            value.value(),
+            value.normalized_desired_control_configurations(),
+            value.normalized_capability_provider_bindings(),
+            value.normalized_external_resources(),
+            value.normalized_site_overlay_ref(),
+            value.external_resources_was_present()};
+      });
+
+  ASSERT_FALSE(fixture.runtime_profiles.empty());
+  test::expect_source_preserving_rvalue_transfers(
+      fixture.runtime_profiles.front(),
+      [](const QualifiedRuntimeProfile& value) {
+        return std::tuple{value.reference(), value.value(),
+                          value.normalized_root()};
+      });
+  ASSERT_FALSE(fixture.capabilities.empty());
+  test::expect_source_preserving_rvalue_transfers(
+      fixture.capabilities.front(),
+      [](const QualifiedCapabilityDefinition& value) {
+        return std::tuple{value.reference(), value.value(),
+                          value.normalized_root()};
+      });
+  ASSERT_FALSE(fixture.contracts.empty());
+  test::expect_source_preserving_rvalue_transfers(
+      fixture.contracts.front(),
+      [](const QualifiedControlInterfaceContract& value) {
+        return std::tuple{value.reference(), value.value(),
+                          value.normalized_root()};
+      });
+  ASSERT_FALSE(fixture.topologies.empty());
+  test::expect_source_preserving_rvalue_transfers(
+      fixture.topologies.front(),
+      [](const QualifiedControllerTopology& value) {
+        return std::tuple{value.reference(), value.value(),
+                          value.normalized_root()};
+      });
+  ASSERT_FALSE(fixture.manifests.empty());
+  test::expect_source_preserving_rvalue_transfers(
+      fixture.manifests.front(),
+      [](const QualifiedProviderManifest& value) {
+        return std::tuple{value.reference(), value.value(),
+                          value.normalized_root()};
+      });
+  ASSERT_FALSE(fixture.stop_policies.empty());
+  test::expect_source_preserving_rvalue_transfers(
+      fixture.stop_policies.front(),
+      [](const QualifiedStopEvidencePolicy& value) {
+        return std::tuple{value.reference(), value.value(),
+                          value.normalized_root()};
+      });
+
+  ASSERT_TRUE(fixture.selected_overlay.has_selection());
+  const auto overlay_projection =
+      [](const QualifiedSelectedSiteOverlay& value) {
+        const auto* reference = value.reference();
+        return std::tuple{
+            value.has_selection(),
+            reference == nullptr
+                ? std::string{}
+                : reference->site_overlay_id.value(),
+            std::vector<core::SiteOverlayExternalResourceKeyDTO>(
+                value.external_resource_keys().begin(),
+                value.external_resource_keys().end())};
+      };
+  test::expect_source_preserving_rvalue_transfers(
+      fixture.selected_overlay, overlay_projection);
+
+  auto applicability_source = qualify(fixture);
+  test::expect_source_preserving_rvalue_transfers(
+      applicability_source, [](const ApplicabilityQualifiedCellIr& value) {
+        return std::tuple{
+            value.composition().verified_graph().normalized_root(),
+            value.binding_interfaces().size(), value.controllers().size(),
+            value.routes().size(), value.capabilities().size(),
+            value.provider_endpoints().size(),
+            value.external_resources().size(),
+            value.stop_applicability().size()};
+      });
+
+  const auto applicability_destination = std::move(applicability_source);
+  EXPECT_EQ(applicability_source.composition().graph(),
+            applicability_destination.composition().graph());
+  EXPECT_EQ(applicability_source.binding_interfaces().size(),
+            applicability_destination.binding_interfaces().size());
+
+  // The same non-empty exact predecessors remain valid after rvalue syntax.
+  const auto first_requalified = qualify(fixture);
+  const auto second_requalified = qualify(fixture);
+  EXPECT_EQ(first_requalified.composition().graph(),
+            second_requalified.composition().graph());
+  EXPECT_EQ(first_requalified.binding_interfaces().size(),
+            second_requalified.binding_interfaces().size());
+
+  auto compiler_input = qualify(fixture);
+  const auto first_compiled = compile_cell_ir(std::move(compiler_input));
+  const auto second_compiled = compile_cell_ir(std::move(compiler_input));
+  EXPECT_EQ(compiler_input.composition().graph(),
+            first_compiled.applicability().composition().graph());
+  EXPECT_EQ(first_compiled.applicability().composition().graph(),
+            second_compiled.applicability().composition().graph());
+  EXPECT_EQ(first_compiled.applicability().deployment_inputs().value(),
+            second_compiled.applicability().deployment_inputs().value());
+  EXPECT_EQ(first_compiled.applicability().runtime_profiles().size(),
+            second_compiled.applicability().runtime_profiles().size());
+  EXPECT_EQ(first_compiled.applicability().binding_interfaces().size(),
+            second_compiled.applicability().binding_interfaces().size());
+  EXPECT_EQ(first_compiled.applicability().controllers().size(),
+            second_compiled.applicability().controllers().size());
+  EXPECT_EQ(first_compiled.applicability().routes().size(),
+            second_compiled.applicability().routes().size());
+  EXPECT_EQ(first_compiled.applicability().capabilities().size(),
+            second_compiled.applicability().capabilities().size());
+  EXPECT_EQ(first_compiled.applicability().provider_endpoints().size(),
+            second_compiled.applicability().provider_endpoints().size());
+  EXPECT_EQ(first_compiled.applicability().stop_applicability().size(),
+            second_compiled.applicability().stop_applicability().size());
+
+  const auto& retained = first_compiled.applicability();
+  std::vector<core::CatalogRecordRefDTO> expected_references;
+  for (const auto& asset : retained.composition().model_assets()) {
+    expected_references.emplace_back(asset.qualified_asset().reference());
+  }
+  const auto append_references =
+      [&expected_references](const auto& qualified_values) {
+        for (const auto& value : qualified_values) {
+          expected_references.emplace_back(value.reference());
+        }
+      };
+  append_references(retained.composition().component_types());
+  append_references(retained.runtime_profiles());
+  append_references(retained.capability_definitions());
+  append_references(retained.control_interface_contracts());
+  append_references(retained.controller_topologies());
+  append_references(retained.provider_manifests());
+  append_references(retained.stop_evidence_policies());
+  std::sort(expected_references.begin(), expected_references.end(),
+            core::CanonicalCatalogRecordRefLess{});
+
+  ASSERT_EQ(first_compiled.catalog_record_refs().size(),
+            expected_references.size());
+  EXPECT_TRUE(std::is_sorted(first_compiled.catalog_record_refs().begin(),
+                             first_compiled.catalog_record_refs().end(),
+                             core::CanonicalCatalogRecordRefLess{}));
+  for (std::size_t index = 0U; index < expected_references.size();
+       ++index) {
+    expect_exact_catalog_reference(first_compiled.catalog_record_refs()[index],
+                                   expected_references[index]);
+  }
+
+  for (const auto& asset : retained.composition().model_assets()) {
+    EXPECT_EQ(asset.qualified_asset().reference(),
+              asset.retrieval_plan().qualified_asset().reference());
+    const core::CatalogRecordRefDTO source_reference =
+        asset.retrieval_plan().qualified_asset().reference();
+    EXPECT_NE(std::find(first_compiled.catalog_record_refs().begin(),
+                        first_compiled.catalog_record_refs().end(),
+                        source_reference),
+              first_compiled.catalog_record_refs().end());
+  }
+
+  const auto shuffled_fixture = make_fixture(
+      {.include_provider_binding = true, .reverse_source_order = true});
+  const auto shuffled_applicability = qualify(shuffled_fixture);
+  const auto shuffled_compiled = compile_cell_ir(shuffled_applicability);
+  EXPECT_EQ(shuffled_compiled.catalog_record_refs(),
+            first_compiled.catalog_record_refs());
+
+  const auto detached_compiled = [] {
+    const auto local_fixture =
+        make_fixture({.include_provider_binding = true});
+    const auto local_applicability = qualify(local_fixture);
+    return compile_cell_ir(local_applicability);
+  }();
+  EXPECT_EQ(detached_compiled.catalog_record_refs(),
+            first_compiled.catalog_record_refs());
+  EXPECT_EQ(detached_compiled.applicability().composition().graph(),
+            first_compiled.applicability().composition().graph());
+
+  test::expect_source_preserving_rvalue_transfers(
+      first_compiled, [](const CompilerQualifiedCellIr& value) {
+        const auto& applicability = value.applicability();
+        return std::tuple{
+            applicability.composition().verified_graph().normalized_root(),
+            applicability.deployment_inputs()
+                .normalized_capability_provider_bindings(),
+            applicability.runtime_profiles().size(),
+            applicability.capability_definitions().size(),
+            applicability.control_interface_contracts().size(),
+            applicability.controller_topologies().size(),
+            applicability.provider_manifests().size(),
+            applicability.stop_evidence_policies().size(),
+            applicability.binding_interfaces().size(),
+            applicability.controllers().size(),
+            applicability.routes().size(),
+            applicability.capabilities().size(),
+            applicability.provider_endpoints().size(),
+            applicability.external_resources().size(),
+            applicability.stop_applicability().size(),
+            value.catalog_record_refs()};
+      });
 }
 
 TEST(CellApplicability,

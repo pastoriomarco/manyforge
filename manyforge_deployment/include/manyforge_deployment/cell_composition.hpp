@@ -4,9 +4,11 @@
 #include <cstdint>
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/placement_pose.hpp>
-#include <manyforge_deployment/cell_structure.hpp>
+#include <manyforge_deployment/cell_graph_codec.hpp>
+#include <manyforge_deployment/component_type_codec.hpp>
 #include <manyforge_deployment/model_source.hpp>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -363,9 +365,24 @@ struct CompositionFramePath final {
 /// runtime readiness, or any execution lane.
 class CompositionQualifiedCellIr final {
  public:
-  [[nodiscard]] const StructurallyQualifiedCellGraph& structure()
+  CompositionQualifiedCellIr(const CompositionQualifiedCellIr&) = default;
+  CompositionQualifiedCellIr& operator=(const CompositionQualifiedCellIr&) =
+      default;
+
+  [[nodiscard]] const GraphRevisionVerifiedCellGraph& verified_graph()
       const noexcept {
-    return structure_;
+    return verified_graph_;
+  }
+  [[nodiscard]] const core::CellGraphDTO& graph() const noexcept {
+    return verified_graph_.graph();
+  }
+  [[nodiscard]] const std::vector<SourceVerifiedModelAsset>& model_assets()
+      const noexcept {
+    return model_assets_;
+  }
+  [[nodiscard]] const std::vector<QualifiedComponentType>& component_types()
+      const noexcept {
+    return component_types_;
   }
   [[nodiscard]] const CompositionCellFrame& cell_frame() const noexcept {
     return cell_frame_;
@@ -419,7 +436,9 @@ class CompositionQualifiedCellIr final {
 
  private:
   CompositionQualifiedCellIr(
-      StructurallyQualifiedCellGraph structure,
+      const GraphRevisionVerifiedCellGraph& verified_graph,
+      std::vector<SourceVerifiedModelAsset> model_assets,
+      std::vector<QualifiedComponentType> component_types,
       CompositionCellFrame cell_frame, UrdfDocumentIr flattened_urdf,
       SrdfDocumentIr flattened_srdf,
       std::vector<CompositionModelOccurrence> model_occurrences,
@@ -433,7 +452,9 @@ class CompositionQualifiedCellIr final {
       std::vector<CompositionControlBindingCoordinateMap>
           control_binding_coordinate_maps,
       std::vector<CompositionTargetResolution> targets)
-      : structure_(std::move(structure)),
+      : verified_graph_(verified_graph),
+        model_assets_(std::move(model_assets)),
+        component_types_(std::move(component_types)),
         cell_frame_(std::move(cell_frame)),
         flattened_urdf_(std::move(flattened_urdf)),
         flattened_srdf_(std::move(flattened_srdf)),
@@ -449,7 +470,9 @@ class CompositionQualifiedCellIr final {
             std::move(control_binding_coordinate_maps)),
         targets_(std::move(targets)) {}
 
-  StructurallyQualifiedCellGraph structure_;
+  GraphRevisionVerifiedCellGraph verified_graph_;
+  std::vector<SourceVerifiedModelAsset> model_assets_;
+  std::vector<QualifiedComponentType> component_types_;
   CompositionCellFrame cell_frame_;
   UrdfDocumentIr flattened_urdf_;
   SrdfDocumentIr flattened_srdf_;
@@ -466,10 +489,19 @@ class CompositionQualifiedCellIr final {
   std::vector<CompositionTargetResolution> targets_;
 
   friend CompositionQualifiedCellIr compose_cell_occurrences(
-      const StructurallyQualifiedCellGraph&);
+      const GraphRevisionVerifiedCellGraph&,
+      std::span<const SourceVerifiedModelAsset>,
+      std::span<const QualifiedComponentType>);
 };
 
+/// Runs the private structural stage and deterministic occurrence composition
+/// for one exact identity-verified graph and its exact qualified closures.
+///
+/// Duplicate, missing, stale, or unused source/type closure entries reject.
+/// No structurally qualified intermediate is exposed to callers.
 [[nodiscard]] CompositionQualifiedCellIr compose_cell_occurrences(
-    const StructurallyQualifiedCellGraph& structure);
+    const GraphRevisionVerifiedCellGraph& graph,
+    std::span<const SourceVerifiedModelAsset> model_assets,
+    std::span<const QualifiedComponentType> component_types);
 
 }  // namespace manyforge::deployment

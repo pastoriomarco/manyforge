@@ -25,6 +25,14 @@ class StopEvidencePolicyCodecError : public std::invalid_argument {
 /// the selected command/provider, or authorize/execute Stop.
 class QualifiedStopEvidencePolicy final {
  public:
+  QualifiedStopEvidencePolicy(const QualifiedStopEvidencePolicy&) = default;
+  QualifiedStopEvidencePolicy& operator=(
+      const QualifiedStopEvidencePolicy&) = default;
+
+  [[nodiscard]] const core::StopEvidencePolicyCatalogRecordRefDTO& reference()
+      const noexcept {
+    return reference_;
+  }
   [[nodiscard]] const core::StopEvidencePolicyDTO& value() const noexcept {
     return value_;
   }
@@ -33,11 +41,14 @@ class QualifiedStopEvidencePolicy final {
   }
 
  private:
-  QualifiedStopEvidencePolicy(core::StopEvidencePolicyDTO value,
-                              CanonicalValue normalized_root)
-      : value_(std::move(value)),
+  QualifiedStopEvidencePolicy(
+      const core::StopEvidencePolicyCatalogRecordRefDTO& reference,
+      core::StopEvidencePolicyDTO value, CanonicalValue normalized_root)
+      : reference_(reference),
+        value_(std::move(value)),
         normalized_root_(std::move(normalized_root)) {}
 
+  core::StopEvidencePolicyCatalogRecordRefDTO reference_;
   core::StopEvidencePolicyDTO value_;
   CanonicalValue normalized_root_;
 

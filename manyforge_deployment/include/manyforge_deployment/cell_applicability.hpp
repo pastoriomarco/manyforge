@@ -341,12 +341,8 @@ using LogicalStopApplicabilityTemplate =
 class ApplicabilityQualifiedCellIr final {
  public:
   ApplicabilityQualifiedCellIr(const ApplicabilityQualifiedCellIr&) = default;
-  ApplicabilityQualifiedCellIr(ApplicabilityQualifiedCellIr&&) noexcept =
-      default;
   ApplicabilityQualifiedCellIr& operator=(
       const ApplicabilityQualifiedCellIr&) = default;
-  ApplicabilityQualifiedCellIr& operator=(
-      ApplicabilityQualifiedCellIr&&) noexcept = default;
 
   [[nodiscard]] const CompositionQualifiedCellIr& composition()
       const noexcept {
@@ -416,8 +412,8 @@ class ApplicabilityQualifiedCellIr final {
 
  private:
   ApplicabilityQualifiedCellIr(
-      CompositionQualifiedCellIr composition,
-      RevisionVerifiedDeploymentApplicabilityInputs deployment_inputs,
+      const CompositionQualifiedCellIr& composition,
+      const RevisionVerifiedDeploymentApplicabilityInputs& deployment_inputs,
       std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref,
       std::vector<QualifiedRuntimeProfile> runtime_profiles,
       std::vector<QualifiedCapabilityDefinition> capability_definitions,
@@ -433,8 +429,8 @@ class ApplicabilityQualifiedCellIr final {
       std::vector<LogicalProviderEndpointTemplate> provider_endpoints,
       std::vector<LogicalExternalResourceTemplate> external_resources,
       std::vector<LogicalStopApplicabilityTemplate> stop_applicability)
-      : composition_(std::move(composition)),
-        deployment_inputs_(std::move(deployment_inputs)),
+      : composition_(composition),
+        deployment_inputs_(deployment_inputs),
         selected_site_overlay_ref_(std::move(selected_site_overlay_ref)),
         runtime_profiles_(std::move(runtime_profiles)),
         capability_definitions_(std::move(capability_definitions)),

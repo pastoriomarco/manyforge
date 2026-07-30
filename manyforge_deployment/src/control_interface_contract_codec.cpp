@@ -190,7 +190,8 @@ QualifiedControlInterfaceContract resolve_and_qualify_control_interface_contract
         "control-interface contract typed ID/revision selector does not "
         "match its referent");
   }
-  return QualifiedControlInterfaceContract(std::move(decoded), normalized.normalized_root());
+  return QualifiedControlInterfaceContract(
+      reference, std::move(decoded), normalized.normalized_root());
 }
 
 }  // namespace manyforge::deployment

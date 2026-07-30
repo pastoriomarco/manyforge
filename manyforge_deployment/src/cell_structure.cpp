@@ -1,4 +1,6 @@
-#include "manyforge_deployment/cell_structure.hpp"
+#include "cell_structure_internal.hpp"
+
+#include "manyforge_deployment/cell_composition.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -11,14 +13,14 @@
 #include <variant>
 #include <vector>
 
-namespace manyforge::deployment {
+namespace manyforge::deployment::detail {
 namespace {
 
 using AssetKey = std::pair<std::string, std::string>;
 using ComponentTypeKey = std::pair<std::string, std::string>;
 
 [[noreturn]] void fail(std::string message) {
-  throw CellStructureError(std::move(message));
+  throw CellCompositionError(std::move(message));
 }
 
 [[nodiscard]] AssetKey asset_key(const core::ModelAssetId& id,
@@ -604,4 +606,4 @@ StructurallyQualifiedCellGraph qualify_cell_structure(
       std::move(attachments));
 }
 
-}  // namespace manyforge::deployment
+}  // namespace manyforge::deployment::detail

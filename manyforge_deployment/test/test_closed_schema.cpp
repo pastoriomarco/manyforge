@@ -8,6 +8,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -17,6 +18,7 @@
 #include "manyforge_deployment/canonical_value.hpp"
 #include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "proof_root_transfer_test.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -646,6 +648,34 @@ TEST(ClosedSchema,
   EXPECT_EQ(normalized.schema_revision(), schema->schema_revision());
   EXPECT_EQ(canonical_json(normalized.normalized_value()), "{}");
 
+  test::expect_source_preserving_rvalue_transfers(
+      *schema, [](const BuildQualifiedValueSchemaEntry& value) {
+        return std::tuple{value.schema_id(), value.schema_revision(),
+                          std::string(value.relative_path())};
+      });
+
+  auto schema_source = *schema;
+  const auto schema_destination = std::move(schema_source);
+  EXPECT_EQ(schema_source.schema_id(), schema->schema_id());
+  EXPECT_EQ(schema_source.schema_revision(), schema->schema_revision());
+  EXPECT_EQ(schema_source.relative_path(), schema->relative_path());
+  EXPECT_EQ(schema_destination.schema_id(), schema->schema_id());
+  EXPECT_EQ(schema_destination.schema_revision(), schema->schema_revision());
+  EXPECT_EQ(schema_destination.relative_path(), schema->relative_path());
+  EXPECT_EQ(
+      validate_and_normalize_build_qualified_value(
+          schema_source, CanonicalValue(CanonicalValue::Object{}))
+          .normalized_value(),
+      validate_and_normalize_build_qualified_value(
+          schema_destination, CanonicalValue(CanonicalValue::Object{}))
+          .normalized_value());
+
+  test::expect_source_preserving_rvalue_transfers(
+      normalized, [](const NonGraphQualifiedSchemaNormalizedValue& value) {
+        return std::tuple{value.schema_id(), value.schema_revision(),
+                          value.normalized_value()};
+      });
+
   EXPECT_THROW(
       validate_and_normalize_build_qualified_value(
           *schema,
@@ -679,6 +709,7 @@ TEST(ClosedSchema,
         document, store_key);
     const auto qualified = resolve_and_qualify_capability_definition(
         reference, store_key, document);
+    EXPECT_EQ(qualified.reference(), reference);
     EXPECT_EQ(qualified.value(),
               core::materialize_capability_definition(expected));
     EXPECT_EQ(qualified.normalized_root(), parsed.root());

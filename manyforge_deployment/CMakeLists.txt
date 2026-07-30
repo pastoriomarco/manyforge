@@ -91,6 +91,7 @@ add_library(manyforge_deployment
   src/capability_definition_codec.cpp
   src/canonical_value.cpp
   src/cell_applicability.cpp
+  src/cell_compiler.cpp
   src/cell_composition.cpp
   src/cell_graph_codec.cpp
   src/cell_structure.cpp
@@ -134,6 +135,65 @@ if(BUILD_TESTING)
   include(GoogleTest)
   set(MANYFORGE_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
       "Per-test timeout for manyforge_deployment gtest cases")
+
+  function(manyforge_try_public_header result_variable source_file)
+    unset(${result_variable} CACHE)
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+    try_compile(
+      ${result_variable}
+      "${CMAKE_CURRENT_BINARY_DIR}/compile_surface/${result_variable}"
+      SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test/compile_surface/${source_file}"
+      COMPILE_DEFINITIONS
+        "-I${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "-I${MANYFORGE_CORE_INCLUDE_DIR}"
+      CXX_STANDARD 20
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF
+      OUTPUT_VARIABLE compile_output)
+    set(${result_variable} "${${result_variable}}" PARENT_SCOPE)
+    set(${result_variable}_OUTPUT "${compile_output}" PARENT_SCOPE)
+  endfunction()
+
+  manyforge_try_public_header(
+    MANYFORGE_RETAINED_BUNDLE_PUBLIC_HEADER_COMPILES
+    retained_bundle_public_header_compiles.cpp)
+  if(NOT MANYFORGE_RETAINED_BUNDLE_PUBLIC_HEADER_COMPILES)
+    message(FATAL_ERROR
+      "The retained-bundle public-header compile control failed:\n"
+      "${MANYFORGE_RETAINED_BUNDLE_PUBLIC_HEADER_COMPILES_OUTPUT}")
+  endif()
+
+  manyforge_try_public_header(
+    MANYFORGE_RETAINED_ARTIFACT_INPUT_IS_PUBLIC
+    retained_artifact_input_is_private.cpp)
+  if(MANYFORGE_RETAINED_ARTIFACT_INPUT_IS_PUBLIC)
+    message(FATAL_ERROR
+      "RetainedArtifactInput remains nameable from the public header")
+  endif()
+
+  manyforge_try_public_header(
+    MANYFORGE_BUILD_AND_RETAIN_PRODUCT_IS_PUBLIC
+    build_and_retain_product_is_private.cpp)
+  if(MANYFORGE_BUILD_AND_RETAIN_PRODUCT_IS_PUBLIC)
+    message(FATAL_ERROR
+      "build_and_retain_product remains callable from the public header")
+  endif()
+
+  manyforge_try_public_header(
+    MANYFORGE_RETAINED_PRODUCT_PROJECTION_IS_PUBLIC
+    retained_product_projection_is_private.cpp)
+  if(MANYFORGE_RETAINED_PRODUCT_PROJECTION_IS_PUBLIC)
+    message(FATAL_ERROR
+      "retained_product_projection remains callable from the public header")
+  endif()
+
+  manyforge_try_public_header(
+    MANYFORGE_RETAINED_PRODUCT_OUTPUT_DIGEST_IS_PUBLIC
+    retained_product_output_digest_is_private.cpp)
+  if(MANYFORGE_RETAINED_PRODUCT_OUTPUT_DIGEST_IS_PUBLIC)
+    message(FATAL_ERROR
+      "retained_product_output_digest remains callable from the public header")
+  endif()
 
   add_executable(test_artifact_codec test/test_artifact_codec.cpp)
   target_link_libraries(test_artifact_codec PRIVATE
@@ -182,6 +242,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_cell_applicability_budget PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_cell_applicability_budget
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_cell_compiler
+    test/test_cell_compiler.cpp)
+  target_include_directories(test_cell_compiler PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_cell_compiler PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_cell_compiler
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_closed_schema test/test_closed_schema.cpp)
@@ -252,6 +321,10 @@ if(BUILD_TESTING)
 
   add_executable(test_retained_bundle
     test/test_retained_bundle.cpp)
+  target_compile_definitions(test_retained_bundle PRIVATE
+    MANYFORGE_RETAINED_BUNDLE_PUBLIC_HEADER="${CMAKE_CURRENT_SOURCE_DIR}/include/manyforge_deployment/retained_bundle.hpp")
+  target_include_directories(test_retained_bundle PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(test_retained_bundle PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_retained_bundle

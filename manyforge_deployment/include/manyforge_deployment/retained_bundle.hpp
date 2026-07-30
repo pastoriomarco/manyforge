@@ -200,30 +200,6 @@ private:
   std::unique_ptr<Storage> storage_;
 };
 
-struct RetainedArtifactInput final {
-  core::ArtifactRoleId artifact_role_id;
-  std::string media_type;
-  std::string bytes;
-};
-
-/// Validates an exact code-owned contract and retains its raw artifacts.
-///
-/// Contract shape is checked completely before the first store effect.
-[[nodiscard]] core::RetainedProductDTO build_and_retain_product(
-    const core::ProductId &product_id, core::RetainedProductKind product_kind,
-    ProductPlacement placement,
-    const core::ProductContractId &product_contract_id,
-    const core::ProductContractRevision &product_contract_revision,
-    std::span<const RetainedArtifactInput> artifacts,
-    IRawArtifactStore &artifact_store);
-
-[[nodiscard]] CanonicalValue
-retained_product_projection(const core::RetainedProductDTO &product);
-
-/// Domain-separated digest used by the product's sole provenance output row.
-[[nodiscard]] core::ContentDigest
-retained_product_output_digest(const core::RetainedProductDTO &product);
-
 /// Reserved immutable repository value for a future fully qualified bundle.
 ///
 /// Construction is deliberately sealed in this foundation. Completed I2 must

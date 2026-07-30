@@ -26,6 +26,9 @@ class CellGraphCodecError : public std::invalid_argument {
 /// qualification of catalog-constrained nested values.
 class TypedCellGraphCandidate final {
  public:
+  TypedCellGraphCandidate(const TypedCellGraphCandidate&) = default;
+  TypedCellGraphCandidate& operator=(const TypedCellGraphCandidate&) = default;
+
   [[nodiscard]] const core::CellGraphDTO& graph() const noexcept { return graph_; }
   [[nodiscard]] const CanonicalValue& structurally_normalized_root() const noexcept {
     return structurally_normalized_root_;
@@ -51,6 +54,11 @@ class TypedCellGraphCandidate final {
 /// admission.
 class IntrinsicallyValidatedCellGraphCandidate final {
  public:
+  IntrinsicallyValidatedCellGraphCandidate(
+      const IntrinsicallyValidatedCellGraphCandidate&) = default;
+  IntrinsicallyValidatedCellGraphCandidate& operator=(
+      const IntrinsicallyValidatedCellGraphCandidate&) = default;
+
   [[nodiscard]] const core::CellGraphDTO& graph() const noexcept { return graph_; }
   [[nodiscard]] const CanonicalValue& structurally_normalized_root() const noexcept {
     return structurally_normalized_root_;
@@ -81,6 +89,11 @@ class GraphRevisionVerifiedCellGraph;
 /// stage. This is not a compiler-qualified graph.
 class GraphIdentityReadyCellGraphCandidate final {
  public:
+  GraphIdentityReadyCellGraphCandidate(
+      const GraphIdentityReadyCellGraphCandidate&) = default;
+  GraphIdentityReadyCellGraphCandidate& operator=(
+      const GraphIdentityReadyCellGraphCandidate&) = default;
+
   [[nodiscard]] const core::CellGraphDTO& graph() const noexcept {
     return graph_;
   }
@@ -114,6 +127,11 @@ class GraphIdentityReadyCellGraphCandidate final {
 /// retained-bundle completeness, runtime readiness, admission, or any lane.
 class GraphRevisionVerifiedCellGraph final {
  public:
+  GraphRevisionVerifiedCellGraph(const GraphRevisionVerifiedCellGraph&) =
+      default;
+  GraphRevisionVerifiedCellGraph& operator=(
+      const GraphRevisionVerifiedCellGraph&) = default;
+
   [[nodiscard]] const core::CellGraphDTO& graph() const noexcept {
     return graph_;
   }

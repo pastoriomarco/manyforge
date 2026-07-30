@@ -6,20 +6,15 @@
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/component_type_codec.hpp>
 #include <manyforge_deployment/model_source.hpp>
+#include <cstdint>
 #include <optional>
 #include <span>
-#include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
 
-namespace manyforge::deployment {
-
-class CellStructureError : public std::invalid_argument {
- public:
-  using std::invalid_argument::invalid_argument;
-};
+namespace manyforge::deployment::detail {
 
 enum class StructuralPlacementSource : std::uint8_t {
   /// A passive/unowned model uses ModelInstanceDTO::root_pose_in_cell.
@@ -194,20 +189,14 @@ struct StructuralAttachmentResolution final {
                          const StructuralAttachmentResolution&) = default;
 };
 
-/// A graph whose exact component-type/model-source closures and structural
-/// composition have been proven.
+/// Private, invariant-owning structural compiler stage.
 ///
-/// This immutable trust stage owns the unchanged revision-verified graph,
-/// source metadata/parsed IR (never raw source bytes), type metadata, and all
-/// occurrence/source-role/attachment resolutions. It makes no claim about
-/// SRDF group expansion, generated names, scene-frame naming, control
-/// compatibility, retained products, runtime readiness, or any lane.
+/// This type is deliberately absent from the installed/public headers. The
+/// sole public composition operation creates it internally, consumes all of
+/// its structural resolutions, and transfers only the exact verified inputs
+/// and composed IR into CompositionQualifiedCellIr.
 class StructurallyQualifiedCellGraph final {
  public:
-  [[nodiscard]] const GraphRevisionVerifiedCellGraph& verified_graph()
-      const noexcept {
-    return verified_graph_;
-  }
   [[nodiscard]] const core::CellGraphDTO& graph() const noexcept {
     return verified_graph_.graph();
   }
@@ -230,6 +219,15 @@ class StructurallyQualifiedCellGraph final {
   [[nodiscard]] const std::vector<StructuralAttachmentResolution>&
   attachments() const noexcept {
     return attachments_;
+  }
+  [[nodiscard]] GraphRevisionVerifiedCellGraph take_verified_graph() && {
+    return std::move(verified_graph_);
+  }
+  [[nodiscard]] std::vector<SourceVerifiedModelAsset> take_model_assets() && {
+    return std::move(model_assets_);
+  }
+  [[nodiscard]] std::vector<QualifiedComponentType> take_component_types() && {
+    return std::move(component_types_);
   }
 
  private:
@@ -260,16 +258,9 @@ class StructurallyQualifiedCellGraph final {
       std::span<const QualifiedComponentType>);
 };
 
-/// Resolves and proves the pure structural boundary for one exact graph.
-///
-/// Both dependency spans are exact caller-prefiltered closures. Duplicate
-/// exact entries, missing/stale selections, and unused extras reject. The
-/// compiler proves model cardinality, component model-role bijection, root,
-/// mount, command-target and attachment-interface source roles, plus
-/// attachment endpoint compatibility and capacity.
 [[nodiscard]] StructurallyQualifiedCellGraph qualify_cell_structure(
     const GraphRevisionVerifiedCellGraph& graph,
     std::span<const SourceVerifiedModelAsset> model_assets,
     std::span<const QualifiedComponentType> component_types);
 
-}  // namespace manyforge::deployment
+}  // namespace manyforge::deployment::detail

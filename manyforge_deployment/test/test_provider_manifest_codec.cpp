@@ -185,6 +185,11 @@ TEST(ProviderManifestCodec,
   const auto document = document_from_identity(identity);
   const auto qualified = qualify(std::move(identity));
   const auto& manifest = qualified.value();
+  EXPECT_EQ(
+      qualified.reference(),
+      reference_for(
+          "xarm_trajectory_provider", document,
+          core::ContentAddressedStoreKey("sha256/provider-manifest")));
 
   EXPECT_EQ(manifest.provider_manifest_id,
             core::ProviderManifestId("xarm_trajectory_provider"));

@@ -743,7 +743,7 @@ QualifiedControllerTopology resolve_and_qualify_controller_topology(
     fail("controller-topology typed ID/revision selector does not match its "
          "referent");
   }
-  return QualifiedControllerTopology(std::move(decoded),
+  return QualifiedControllerTopology(reference, std::move(decoded),
                                      normalized.normalized_root());
 }
 

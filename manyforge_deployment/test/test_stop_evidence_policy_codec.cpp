@@ -298,9 +298,12 @@ TEST(StopEvidencePolicyCodec,
 
   const auto document = policy_document(spec);
   const core::ContentAddressedStoreKey store_key{"sha256/authored-stop"};
+  const auto reference =
+      reference_for(spec.policy_id, document, store_key);
   const auto qualified = resolve_and_qualify_stop_evidence_policy(
-      reference_for(spec.policy_id, document, store_key), store_key, document);
+      reference, store_key, document);
 
+  EXPECT_EQ(qualified.reference(), reference);
   EXPECT_EQ(qualified.value().stop_evidence_policy_id,
             core::StopEvidencePolicyId(spec.policy_id));
   EXPECT_EQ(qualified.value().disposition,

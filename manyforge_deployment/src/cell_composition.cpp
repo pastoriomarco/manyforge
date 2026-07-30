@@ -1,5 +1,7 @@
 #include "manyforge_deployment/cell_composition.hpp"
 
+#include "cell_structure_internal.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -24,6 +26,16 @@ namespace {
 using AssetKey = std::pair<std::string, std::string>;
 using SymbolTuple =
     std::tuple<std::string, std::uint8_t, std::string, std::string>;
+using detail::StructuralAttachmentResolution;
+using detail::StructuralCommandTargetResolution;
+using detail::StructuralComponentResolution;
+using detail::StructuralFrameResolution;
+using detail::StructuralModelInstanceResolution;
+using detail::StructuralModelMountResolution;
+using detail::StructuralModelResourceResolution;
+using detail::StructuralPlacementSource;
+using detail::StructuralResourceResolution;
+using detail::StructurallyQualifiedCellGraph;
 
 [[noreturn]] void fail(std::string message) {
   throw CellCompositionError(std::move(message));
@@ -1491,7 +1503,11 @@ build_control_binding_maps(
 }  // namespace
 
 CompositionQualifiedCellIr compose_cell_occurrences(
-    const StructurallyQualifiedCellGraph& structure) {
+    const GraphRevisionVerifiedCellGraph& verified_graph,
+    std::span<const SourceVerifiedModelAsset> model_assets,
+    std::span<const QualifiedComponentType> component_types) {
+  auto structure = detail::qualify_cell_structure(
+      verified_graph, model_assets, component_types);
   const auto& graph = structure.graph();
   std::set<std::string> all_compiled_names;
   const auto cell_link_name = detail::make_mf1_generated_name(
@@ -1911,9 +1927,13 @@ CompositionQualifiedCellIr compose_cell_occurrences(
       cell_frame, flattened_urdf, frames, connections, coordinates);
   auto reverse_rewrites = symbols.reverse();
   auto forward_rewrites = symbols.take_forward();
+  auto owned_graph = std::move(structure).take_verified_graph();
+  auto owned_assets = std::move(structure).take_model_assets();
+  auto owned_types = std::move(structure).take_component_types();
 
   return CompositionQualifiedCellIr(
-      structure, cell_frame, std::move(flattened_urdf),
+      std::move(owned_graph), std::move(owned_assets),
+      std::move(owned_types), cell_frame, std::move(flattened_urdf),
       std::move(flattened_srdf), std::move(occurrences),
       std::move(forward_rewrites), std::move(reverse_rewrites),
       std::move(references), std::move(frames), std::move(connections),

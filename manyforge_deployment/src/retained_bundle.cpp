@@ -10,6 +10,7 @@
 
 #include "content_identity_internal.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "retained_bundle_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -371,6 +372,8 @@ std::uint64_t InMemoryRawArtifactStore::retained_bytes() const noexcept {
   return storage_->retained_bytes;
 }
 
+namespace detail {
+
 core::RetainedProductDTO build_and_retain_product(
     const core::ProductId &product_id, core::RetainedProductKind product_kind,
     ProductPlacement placement,
@@ -500,6 +503,8 @@ retained_product_output_digest(const core::RetainedProductDTO &product) {
       kRetainedProductOutputDomain, kRetainedProductSchemaTag,
       retained_product_projection(product)));
 }
+
+}  // namespace detail
 
 bool verify_retained_bundle_identity(const RetainedBundle &bundle) {
   try {

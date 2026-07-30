@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <concepts>
 #include <exception>
+#include <fstream>
+#include <iterator>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
@@ -16,6 +18,8 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include "retained_bundle_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -49,6 +53,21 @@ static_assert(
     !std::is_move_constructible_v<InMemoryRetainedBundleRepository>);
 static_assert(!std::is_move_assignable_v<InMemoryRetainedBundleRepository>);
 
+TEST(RetainedBundlePublicSurfaceTest,
+     DoesNotExposeArbitrarySemanticProductRetention) {
+  std::ifstream header(MANYFORGE_RETAINED_BUNDLE_PUBLIC_HEADER);
+  ASSERT_TRUE(header.is_open());
+  const std::string source((std::istreambuf_iterator<char>(header)),
+                           std::istreambuf_iterator<char>());
+
+  for (const std::string_view removed_name :
+       {"RetainedArtifactInput"sv, "build_and_retain_product"sv,
+        "retained_product_projection"sv,
+        "retained_product_output_digest"sv}) {
+    EXPECT_EQ(source.find(removed_name), std::string::npos) << removed_name;
+  }
+}
+
 [[nodiscard]] const BuildQualifiedProductContract &flattened_contract() {
   const auto contracts =
       build_qualified_product_contract_registry().contracts();
@@ -59,7 +78,7 @@ static_assert(!std::is_move_assignable_v<InMemoryRetainedBundleRepository>);
   return contracts.front();
 }
 
-[[nodiscard]] std::vector<RetainedArtifactInput>
+[[nodiscard]] std::vector<detail::RetainedArtifactInput>
 product_contract_fixture_artifacts() {
   return {
       {core::ArtifactRoleId("urdf"), "application/xml",
@@ -72,10 +91,10 @@ product_contract_fixture_artifacts() {
 
 [[nodiscard]] core::RetainedProductDTO
 retain_fixture_product(IRawArtifactStore &store,
-                       std::vector<RetainedArtifactInput> artifacts =
+                       std::vector<detail::RetainedArtifactInput> artifacts =
                            product_contract_fixture_artifacts()) {
   const auto &contract = flattened_contract();
-  return build_and_retain_product(
+  return detail::build_and_retain_product(
       core::ProductId("cell_planning_collision_model"),
       core::RetainedProductKind::kPlanningCollisionModel,
       ProductPlacement::kCellPlanningCollisionModel,
@@ -359,13 +378,13 @@ TEST(RetainedProductTest, UsesContractBeforeRetainingCanonicalArtifacts) {
   EXPECT_EQ(product.artifact_refs[0].artifact_role_id.value(), "srdf");
   EXPECT_EQ(product.artifact_refs[1].artifact_role_id.value(), "urdf");
   EXPECT_EQ(store.size(), 2U);
-  EXPECT_EQ(std::get<std::string>(retained_product_projection(product)
+  EXPECT_EQ(std::get<std::string>(detail::retained_product_projection(product)
                                       .find_object_member("product_contract_id")
                                       ->storage()),
             "manyforge.flattened_model");
 
   const core::ContentDigest output_digest =
-      retained_product_output_digest(product);
+      detail::retained_product_output_digest(product);
   EXPECT_EQ(output_digest.value(),
             "sha256:"
             "a87a55c23c21484f64d996a56fe8ff8f0c132aa49b8b1511fc107d871a2419e9");
@@ -375,7 +394,7 @@ TEST(RetainedProductTest, UsesContractBeforeRetainingCanonicalArtifacts) {
   InMemoryRawArtifactStore second_store;
   const core::RetainedProductDTO same = retain_fixture_product(second_store);
   EXPECT_EQ(product, same);
-  EXPECT_EQ(output_digest, retained_product_output_digest(same));
+  EXPECT_EQ(output_digest, detail::retained_product_output_digest(same));
 }
 
 TEST(RetainedProductTest,
@@ -383,15 +402,15 @@ TEST(RetainedProductTest,
   InMemoryRawArtifactStore store;
   const core::RetainedProductDTO original = retain_fixture_product(store);
   const core::ContentDigest original_digest =
-      retained_product_output_digest(original);
+      detail::retained_product_output_digest(original);
 
   core::RetainedProductDTO changed = original;
   changed.product_id = core::ProductId("another_planning_collision_model");
-  EXPECT_NE(retained_product_output_digest(changed), original_digest);
+  EXPECT_NE(detail::retained_product_output_digest(changed), original_digest);
 
   changed = original;
   ++changed.artifact_refs.front().byte_size;
-  EXPECT_NE(retained_product_output_digest(changed), original_digest);
+  EXPECT_NE(detail::retained_product_output_digest(changed), original_digest);
 
   // A content digest and its digest-derived key form one indivisible valid
   // semantic change. Changing either alone is rejected below.
@@ -403,7 +422,7 @@ TEST(RetainedProductTest,
   changed.artifact_refs.front().content_addressed_store_key =
       core::ContentAddressedStoreKey("sha256/" +
                                      replacement_digest.substr(7U));
-  EXPECT_NE(retained_product_output_digest(changed), original_digest);
+  EXPECT_NE(detail::retained_product_output_digest(changed), original_digest);
 }
 
 TEST(RetainedProductTest,
@@ -413,43 +432,50 @@ TEST(RetainedProductTest,
 
   core::RetainedProductDTO changed = original;
   changed.product_kind = core::RetainedProductKind::kViewerModel;
-  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::retained_product_output_digest(changed)),
+      RetainedBundleError);
 
   changed = original;
   changed.product_contract_id =
       core::ProductContractId("manyforge.unqualified");
-  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::retained_product_output_digest(changed)),
+      RetainedBundleError);
 
   changed = original;
   changed.product_contract_revision =
       core::ProductContractRevision(std::string(kZeroDigest));
-  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::retained_product_output_digest(changed)),
+      RetainedBundleError);
 
   changed = original;
   changed.artifact_refs.front().artifact_role_id =
       core::ArtifactRoleId("unqualified_role");
-  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::retained_product_output_digest(changed)),
+      RetainedBundleError);
 
   changed = original;
   changed.artifact_refs.front().media_type = "text/xml";
-  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::retained_product_output_digest(changed)),
+      RetainedBundleError);
 
   changed = original;
   changed.artifact_refs.front().content_digest =
       core::ContentDigest(std::string(kZeroDigest));
-  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::retained_product_output_digest(changed)),
+      RetainedBundleError);
 
   changed = original;
   changed.artifact_refs.front().content_addressed_store_key =
       core::ContentAddressedStoreKey("sha256/" + std::string(64U, '0'));
-  EXPECT_THROW(static_cast<void>(retained_product_output_digest(changed)),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::retained_product_output_digest(changed)),
+      RetainedBundleError);
 }
 
 TEST(RetainedProductTest, RejectsContractDefectsBeforeStoreEffects) {
@@ -458,7 +484,7 @@ TEST(RetainedProductTest, RejectsContractDefectsBeforeStoreEffects) {
 
   auto missing = product_contract_fixture_artifacts();
   missing.pop_back();
-  EXPECT_THROW(static_cast<void>(build_and_retain_product(
+  EXPECT_THROW(static_cast<void>(detail::build_and_retain_product(
                    core::ProductId("cell_planning_collision_model"),
                    core::RetainedProductKind::kPlanningCollisionModel,
                    ProductPlacement::kCellPlanningCollisionModel,
@@ -469,7 +495,7 @@ TEST(RetainedProductTest, RejectsContractDefectsBeforeStoreEffects) {
 
   auto duplicate = product_contract_fixture_artifacts();
   duplicate.push_back(duplicate.front());
-  EXPECT_THROW(static_cast<void>(build_and_retain_product(
+  EXPECT_THROW(static_cast<void>(detail::build_and_retain_product(
                    core::ProductId("cell_planning_collision_model"),
                    core::RetainedProductKind::kPlanningCollisionModel,
                    ProductPlacement::kCellPlanningCollisionModel,
@@ -480,7 +506,7 @@ TEST(RetainedProductTest, RejectsContractDefectsBeforeStoreEffects) {
 
   auto wrong_media = product_contract_fixture_artifacts();
   wrong_media.front().media_type = "text/xml";
-  EXPECT_THROW(static_cast<void>(build_and_retain_product(
+  EXPECT_THROW(static_cast<void>(detail::build_and_retain_product(
                    core::ProductId("cell_planning_collision_model"),
                    core::RetainedProductKind::kPlanningCollisionModel,
                    ProductPlacement::kCellPlanningCollisionModel,
@@ -491,7 +517,7 @@ TEST(RetainedProductTest, RejectsContractDefectsBeforeStoreEffects) {
 
   auto extra = product_contract_fixture_artifacts();
   extra.push_back({core::ArtifactRoleId("mesh"), "model/stl", "solid fixture"});
-  EXPECT_THROW(static_cast<void>(build_and_retain_product(
+  EXPECT_THROW(static_cast<void>(detail::build_and_retain_product(
                    core::ProductId("cell_planning_collision_model"),
                    core::RetainedProductKind::kPlanningCollisionModel,
                    ProductPlacement::kCellPlanningCollisionModel,
@@ -501,7 +527,7 @@ TEST(RetainedProductTest, RejectsContractDefectsBeforeStoreEffects) {
   EXPECT_EQ(store.size(), 0U);
 
   EXPECT_THROW(
-      static_cast<void>(build_and_retain_product(
+      static_cast<void>(detail::build_and_retain_product(
           core::ProductId("cell_planning_collision_model"),
           core::RetainedProductKind::kViewerModel,
           ProductPlacement::kCellPlanningCollisionModel,
@@ -517,7 +543,7 @@ TEST(RetainedProductTest, RejectsArtifactCountBeforeCallingStore) {
   extra.push_back({core::ArtifactRoleId("mesh"), "model/stl", "solid fixture"});
   AdversarialRawArtifactStore store(StoreFault::kForgedDigest);
 
-  EXPECT_THROW(static_cast<void>(build_and_retain_product(
+  EXPECT_THROW(static_cast<void>(detail::build_and_retain_product(
                    core::ProductId("cell_planning_collision_model"),
                    core::RetainedProductKind::kPlanningCollisionModel,
                    ProductPlacement::kCellPlanningCollisionModel,
@@ -557,23 +583,27 @@ TEST(RetainedProductTest,
   core::RetainedProductDTO product = retain_fixture_product(store);
 
   product.product_kind = core::RetainedProductKind::kViewerModel;
-  EXPECT_THROW(static_cast<void>(retained_product_projection(product)),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::retained_product_projection(product)),
+      RetainedBundleError);
 
   product = retain_fixture_product(store);
   product.artifact_refs.pop_back();
-  EXPECT_THROW(static_cast<void>(retained_product_output_digest(product)),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::retained_product_output_digest(product)),
+      RetainedBundleError);
 
   product = retain_fixture_product(store);
   product.artifact_refs.front().media_type = "text/xml";
-  EXPECT_THROW(static_cast<void>(retained_product_projection(product)),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::retained_product_projection(product)),
+      RetainedBundleError);
 
   product = retain_fixture_product(store);
   std::swap(product.artifact_refs[0], product.artifact_refs[1]);
-  EXPECT_THROW(static_cast<void>(retained_product_projection(product)),
-               RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::retained_product_projection(product)),
+      RetainedBundleError);
 }
 
 TEST(RetainedBundleRepositoryTest,

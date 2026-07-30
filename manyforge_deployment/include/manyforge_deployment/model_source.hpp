@@ -77,6 +77,10 @@ struct ModelSourceRetrievalPlanRow final {
 /// policy independently.
 class ModelSourceRetrievalPlan final {
  public:
+  ModelSourceRetrievalPlan(const ModelSourceRetrievalPlan&) = default;
+  ModelSourceRetrievalPlan& operator=(const ModelSourceRetrievalPlan&) =
+      default;
+
   [[nodiscard]] const QualifiedModelAsset& qualified_asset() const noexcept {
     return qualified_asset_;
   }
@@ -90,10 +94,10 @@ class ModelSourceRetrievalPlan final {
 
  private:
   ModelSourceRetrievalPlan(
-      QualifiedModelAsset qualified_asset,
+      const QualifiedModelAsset& qualified_asset,
       std::vector<ModelSourceRetrievalPlanRow> artifacts,
       std::uint64_t total_bytes)
-      : qualified_asset_(std::move(qualified_asset)),
+      : qualified_asset_(qualified_asset),
         artifacts_(std::move(artifacts)),
         total_bytes_(total_bytes) {}
 
@@ -617,14 +621,25 @@ class ModelSourceIr final {
 /// immutable artifact identities, bounded XML syntax, and retained URDF/SRDF
 /// structural references have been verified.
 ///
+/// The exact I2 retrieval plan is retained transitively as source provenance;
+/// the model-asset views below derive from that sole owned plan.
+///
 /// This product proves neither graph placement nor lane/runtime compatibility.
 class SourceVerifiedModelAsset final {
  public:
+  SourceVerifiedModelAsset(const SourceVerifiedModelAsset&) = default;
+  SourceVerifiedModelAsset& operator=(const SourceVerifiedModelAsset&) =
+      default;
+
   [[nodiscard]] const core::ModelAssetDTO& value() const noexcept {
-    return qualified_asset_.value();
+    return retrieval_plan_.qualified_asset().value();
   }
   [[nodiscard]] const QualifiedModelAsset& qualified_asset() const noexcept {
-    return qualified_asset_;
+    return retrieval_plan_.qualified_asset();
+  }
+  [[nodiscard]] const ModelSourceRetrievalPlan& retrieval_plan()
+      const noexcept {
+    return retrieval_plan_;
   }
   [[nodiscard]] const std::vector<VerifiedModelSourceArtifact>&
   verified_artifacts() const noexcept {
@@ -636,14 +651,14 @@ class SourceVerifiedModelAsset final {
 
  private:
   SourceVerifiedModelAsset(
-      QualifiedModelAsset qualified_asset,
+      const ModelSourceRetrievalPlan& retrieval_plan,
       std::vector<VerifiedModelSourceArtifact> verified_artifacts,
       ModelSourceIr source_ir)
-      : qualified_asset_(std::move(qualified_asset)),
+      : retrieval_plan_(retrieval_plan),
         verified_artifacts_(std::move(verified_artifacts)),
         source_ir_(std::move(source_ir)) {}
 
-  QualifiedModelAsset qualified_asset_;
+  ModelSourceRetrievalPlan retrieval_plan_;
   std::vector<VerifiedModelSourceArtifact> verified_artifacts_;
   ModelSourceIr source_ir_;
 
