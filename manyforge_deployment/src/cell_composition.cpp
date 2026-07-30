@@ -16,7 +16,7 @@
 #include <variant>
 #include <vector>
 
-#include "manyforge_deployment/content_identity.hpp"
+#include "mf1_name_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -73,25 +73,6 @@ void require_room(std::size_t current, std::size_t added,
   fail("cell composition encountered an unknown source symbol kind");
 }
 
-[[nodiscard]] std::string make_generated_name(
-    std::string_view tag,
-    const std::vector<std::pair<std::string_view, std::string_view>>& fields) {
-  std::string preimage{"manyforge.occurrence-name.mf1"};
-  for (const auto& [field, value] : fields) {
-    preimage.push_back('\0');
-    preimage.append(field);
-    preimage.push_back('=');
-    preimage.append(std::to_string(value.size()));
-    preimage.push_back(':');
-    preimage.append(value);
-  }
-  const auto digest = sha256_digest(preimage);
-  if (!digest.starts_with("sha256:") || digest.size() != 71U) {
-    fail("internal occurrence-name digest is malformed");
-  }
-  return "mf1_" + std::string(tag) + "_" + digest.substr(7U);
-}
-
 [[nodiscard]] SymbolTuple symbol_tuple(const OccurrenceSymbolKey& key) {
   return {key.model_instance_id.value(),
           static_cast<std::uint8_t>(key.kind), key.scope_name,
@@ -121,7 +102,7 @@ class SymbolRegistry final {
     }
     require_room(forward_.size(), 1U, kMaxCompositionSymbols, "symbol table");
     const auto tag = symbol_tag(kind);
-    const auto compiled = make_generated_name(
+    const auto compiled = detail::make_mf1_generated_name(
         tag,
         {{"cell_id", cell_id_.value()},
          {"model_instance_id", model.model_instance_id.value()},
@@ -1513,13 +1494,13 @@ CompositionQualifiedCellIr compose_cell_occurrences(
     const StructurallyQualifiedCellGraph& structure) {
   const auto& graph = structure.graph();
   std::set<std::string> all_compiled_names;
-  const auto cell_link_name = make_generated_name(
+  const auto cell_link_name = detail::make_mf1_generated_name(
       "cell", {{"cell_id", graph.cell_id.value()}, {"kind", "cell_frame"}});
   if (!all_compiled_names.insert(cell_link_name).second) {
     fail("generated semantic cell-frame name collided");
   }
   const CompositionCellFrame cell_frame{graph.cell_id, cell_link_name};
-  const auto flattened_robot_name = make_generated_name(
+  const auto flattened_robot_name = detail::make_mf1_generated_name(
       "robot", {{"cell_id", graph.cell_id.value()}, {"kind", "cell_robot"}});
   if (!all_compiled_names.insert(flattened_robot_name).second) {
     fail("generated flattened robot name collided");
@@ -1828,7 +1809,7 @@ CompositionQualifiedCellIr compose_cell_occurrences(
         break;
       }
     }
-    const auto joint_name = make_generated_name(
+    const auto joint_name = detail::make_mf1_generated_name(
         tag,
         {{"cell_id", graph.cell_id.value()},
          {"model_instance_id", model->model_instance_id.value()},

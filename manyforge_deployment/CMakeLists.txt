@@ -90,6 +90,7 @@ add_library(manyforge_deployment
   src/artifact_codec.cpp
   src/capability_definition_codec.cpp
   src/canonical_value.cpp
+  src/cell_applicability.cpp
   src/cell_composition.cpp
   src/cell_graph_codec.cpp
   src/cell_structure.cpp
@@ -98,11 +99,13 @@ add_library(manyforge_deployment
   src/control_interface_contract_codec.cpp
   src/controller_topology_codec.cpp
   src/content_identity.cpp
+  src/deployment_applicability_codec.cpp
   src/model_asset_codec.cpp
   src/model_source.cpp
   src/provider_manifest_codec.cpp
   src/retained_bundle.cpp
   src/runtime_profile_codec.cpp
+  src/site_overlay_resolution.cpp
   src/stop_evidence_policy_codec.cpp
 )
 add_library(manyforge::deployment ALIAS manyforge_deployment)
@@ -165,6 +168,22 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_cell_structure
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_cell_applicability
+    test/test_cell_applicability.cpp)
+  target_link_libraries(test_cell_applicability PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_cell_applicability
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_cell_applicability_budget
+    test/test_cell_applicability_budget.cpp)
+  target_include_directories(test_cell_applicability_budget PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_cell_applicability_budget PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_cell_applicability_budget
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_closed_schema test/test_closed_schema.cpp)
   target_compile_definitions(test_closed_schema PRIVATE
     MANYFORGE_CLOSED_SCHEMA_RESOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/resources/closed_schema")
@@ -187,6 +206,20 @@ if(BUILD_TESTING)
   target_link_libraries(test_controller_topology_codec PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_controller_topology_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_deployment_applicability_codec
+    test/test_deployment_applicability_codec.cpp)
+  target_link_libraries(test_deployment_applicability_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_deployment_applicability_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_site_overlay_resolution
+    test/test_site_overlay_resolution.cpp)
+  target_link_libraries(test_site_overlay_resolution PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_site_overlay_resolution
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_model_asset_codec

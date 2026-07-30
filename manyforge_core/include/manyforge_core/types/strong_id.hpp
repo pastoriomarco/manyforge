@@ -94,6 +94,16 @@ MANYFORGE_DECLARE_STRONG_STRING(ContactPolicyRevision);
 MANYFORGE_DECLARE_STRONG_STRING(ProviderInstanceId);
 MANYFORGE_DECLARE_STRONG_STRING(ProviderManifestId);
 MANYFORGE_DECLARE_STRONG_STRING(ProviderManifestRevision);
+MANYFORGE_DECLARE_STRONG_STRING(CapabilityProviderBindingId);
+MANYFORGE_DECLARE_STRONG_STRING(CapabilityProviderBindingRevision);
+MANYFORGE_DECLARE_STRONG_STRING(SiteOverlayId);
+MANYFORGE_DECLARE_STRONG_STRING(SiteOverlayRevision);
+// Deployment-local aliases and overlay references are distinct typed values.
+// Their exact applicability and overlay-schema resolution remain compiler
+// policy; compile-time separation prevents a runtime-unit ID or arbitrary
+// identity domain from substituting for either field.
+MANYFORGE_DECLARE_STRONG_STRING(ExternalResourceAlias);
+MANYFORGE_DECLARE_STRONG_STRING(SiteOverlayValueRef);
 
 MANYFORGE_DECLARE_STRONG_STRING(ComponentAttachmentId);
 MANYFORGE_DECLARE_STRONG_STRING(ComponentAttachmentRevision);
