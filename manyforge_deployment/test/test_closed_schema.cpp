@@ -470,6 +470,19 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
                 &entry);
+    } else if (entry.record_kind() ==
+               core::CatalogRecordKind::kModelAsset) {
+      ++qualified_count;
+      EXPECT_EQ(entry.qualification(),
+                CatalogSchemaQualification::kQualified);
+      ASSERT_NE(entry.compiled_schema(), nullptr);
+      EXPECT_EQ(
+          entry.compiled_schema()->schema_revision().value(),
+          "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c");
+      EXPECT_EQ(registry.find_qualified_catalog_schema(
+                    entry.record_kind(), entry.schema_id(),
+                    entry.compiled_schema()->schema_revision()),
+                &entry);
     } else {
       EXPECT_EQ(entry.qualification(), CatalogSchemaQualification::kUnqualified);
       EXPECT_EQ(entry.compiled_schema(), nullptr);
@@ -480,9 +493,9 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                       "sha256:0000000000000000000000000000000000000000000000000000000000000000")),
               nullptr);
   }
-  EXPECT_EQ(qualified_count, 3U);
+  EXPECT_EQ(qualified_count, 4U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
-            "sha256:00877672c566fc361199ebc1e0f56717d9fb04a5d02f6f8d386c8c5b0c84bce7");
+            "sha256:f1e038cc6895c8939e946dcab4d9923a9487957e421a60f6af632d6f5c4b71d7");
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),
                 core::SchemaRevision(
@@ -699,7 +712,7 @@ TEST(ClosedSchema, EveryPackagedYamlResourcePassesStrictUniqueKeyIngress) {
         << relative_path;
     ++parsed_count;
   }
-  EXPECT_EQ(parsed_count, 7U);
+  EXPECT_EQ(parsed_count, 8U);
 }
 
 TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjections) {
@@ -835,6 +848,7 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
     if (built.record_kind() == core::CatalogRecordKind::kCapabilityDefinition ||
         built.record_kind() ==
             core::CatalogRecordKind::kControlInterfaceContract ||
+        built.record_kind() == core::CatalogRecordKind::kModelAsset ||
         built.record_kind() ==
             core::CatalogRecordKind::kStopEvidencePolicy) {
       EXPECT_EQ(projected.as_object().size(), 5U);
@@ -855,6 +869,11 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
             "sha256:4abdf2c402d8e6e818bc26df59ce1c9cdc911d1e807144bdf525d2f69d0a449d";
         expected_path =
             "catalog/manyforge.control_interface_contract.v1.yaml";
+      } else if (built.record_kind() ==
+                 core::CatalogRecordKind::kModelAsset) {
+        expected_revision =
+            "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c";
+        expected_path = "catalog/manyforge.model_asset.v1.yaml";
       } else {
         expected_revision =
             "sha256:e516114453cac5912b204bf17267b66f08a2afa47a72a8dd0c0f0f6b808478f2";
@@ -893,6 +912,7 @@ TEST(ClosedSchema, PackagedBootstrapAndRegistryAreExactNonAuthoritativeProjectio
       "registry.v1.yaml",
       "catalog/manyforge.capability_definition.v1.yaml",
       "catalog/manyforge.control_interface_contract.v1.yaml",
+      "catalog/manyforge.model_asset.v1.yaml",
       "catalog/manyforge.stop_evidence_policy.v1.yaml",
       "examples/manyforge.closed_schema.example_command.v1.yaml",
       "examples/manyforge.closed_schema.example_inventory.v1.yaml",

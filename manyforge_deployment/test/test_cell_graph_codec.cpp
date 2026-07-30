@@ -42,14 +42,9 @@ constexpr std::string_view kZeroDigest =
   const std::string first_model = R"YAML(
   - model_instance_id: robot_1_model
     model_asset_id: lite6_model
-    model_revision: )YAML" + std::string(kZeroDigest) +
-                                  R"YAML(
-    instance_parameters: {symbol_prefix: robot_1_}
-)YAML";
+    model_revision: )YAML" + std::string(kZeroDigest) + "\n";
   const std::string second_model = R"YAML(
-  - instance_parameters:
-      symbol_prefix: robot_2_
-    model_revision: )YAML" + std::string(kZeroDigest) +
+  - model_revision: )YAML" + std::string(kZeroDigest) +
                                    R"YAML(
     model_asset_id: lite6_model
     model_instance_id: robot_2_model
@@ -118,12 +113,10 @@ model_instances:
     model_asset_id: arm_asset
     model_revision: )YAML" +
          std::string(kZeroDigest) + R"YAML(
-    instance_parameters: {}
   - model_instance_id: tool_model
     model_asset_id: tool_asset
     model_revision: )YAML" +
          std::string(kZeroDigest) + R"YAML(
-    instance_parameters: {}
 controllable_components:
   - controllable_component_id: arm
     component_type_id: arm_type
@@ -263,10 +256,10 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
     "el_instance_id\":\"tool_model\",\"model_role_id\":\"body\"}],\"runtime_unit_ids\":[]}],"
     "\"graph_rev"
     "ision\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"model_"
-    "instances\":[{\"instance_parameters\":{},\"model_asset_id\":\"arm_asset\",\"model_instance_"
+    "instances\":[{\"model_asset_id\":\"arm_asset\",\"model_instance_"
     "id\":\""
     "arm_model\",\"model_revision\":\"sha256:0000000000000000000000000000000000000000000000000000"
-    "000000000000\"},{\"instance_parameters\":{},\"model_asset_id\":\"tool_"
+    "000000000000\"},{\"model_asset_id\":\"tool_"
     "asset\",\""
     "model_instance_id\":\"tool_model\",\"model_revision\":\"sha256:0000000000000000000000000000000"
     "000000000000000000000000000000000\"}],\"runtime_units\":[{"
@@ -416,13 +409,10 @@ TEST(CellGraphCodec, AllowsInjectiveMultiModelBindingPendingCatalogBijection) {
       "    model_revision: " +
           std::string(kZeroDigest) +
           "\n"
-          "    instance_parameters: {}\n"
           "  - model_instance_id: tool_model\n"
           "    model_asset_id: tool_asset\n"
           "    model_revision: " +
-          std::string(kZeroDigest) +
-          "\n"
-          "    instance_parameters: {}");
+          std::string(kZeroDigest));
   graph = replace_once(
       std::move(graph), "controllable_components: []",
       "controllable_components:\n"
@@ -487,6 +477,21 @@ TEST(CellGraphCodec, RejectsUnknownAndDuplicateFields) {
       CellGraphCodecError);
 }
 
+TEST(CellGraphCodec, RejectsRemovedInstanceParametersAsUnknownField) {
+  const std::string legacy_graph =
+      replace_once(full_graph(), "    model_asset_id: arm_asset\n",
+                   "    model_asset_id: arm_asset\n"
+                   "    instance_parameters: {}\n");
+
+  try {
+    (void)decode(legacy_graph);
+    FAIL() << "legacy instance_parameters must not be accepted or ignored";
+  } catch (const CellGraphCodecError& error) {
+    EXPECT_NE(std::string(error.what()).find("unknown field 'instance_parameters'"),
+              std::string::npos);
+  }
+}
+
 TEST(CellGraphCodec, OptionalPlacementUsesAbsenceAndRejectsNullOrLegacyFields) {
   EXPECT_NO_THROW({ (void)decode(two_instance_graph(false)); });
 
@@ -502,16 +507,16 @@ TEST(CellGraphCodec, OptionalPlacementUsesAbsenceAndRejectsNullOrLegacyFields) {
       CellGraphCodecError);
   EXPECT_THROW(
       {
-        (void)decode(replace_once(full_graph(), "    instance_parameters: {}",
-                                  "    instance_parameters: {}\n"
-                                  "    root_pose_in_cell: null"));
+        (void)decode(replace_once(full_graph(), "    model_asset_id: arm_asset\n",
+                                  "    model_asset_id: arm_asset\n"
+                                  "    root_pose_in_cell: null\n"));
       },
       CellGraphCodecError);
   EXPECT_THROW(
       {
-        (void)decode(replace_once(full_graph(), "    instance_parameters: {}",
-                                  "    mount_parent_frame_role: cell_world\n"
-                                  "    instance_parameters: {}"));
+        (void)decode(replace_once(full_graph(), "    model_asset_id: arm_asset\n",
+                                  "    model_asset_id: arm_asset\n"
+                                  "    mount_parent_frame_role: cell_world\n"));
       },
       CellGraphCodecError);
   EXPECT_THROW(
@@ -637,11 +642,11 @@ TEST(CellGraphCodec, RejectsMultipleModelOwnersAndTopologyMismatch) {
 TEST(CellGraphCodec, EnforcesOwnedPassiveAndComponentRootPlacement) {
   std::string owned_model_with_root = full_graph();
   owned_model_with_root =
-      replace_once(std::move(owned_model_with_root), "    instance_parameters: {}",
-                   "    instance_parameters: {}\n"
+      replace_once(std::move(owned_model_with_root), "    model_asset_id: arm_asset\n",
+                   "    model_asset_id: arm_asset\n"
                    "    root_pose_in_cell:\n"
                    "      position_m: [0.0, 0.0, 0.0]\n"
-                   "      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]");
+                   "      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]\n");
   EXPECT_THROW({ (void)validate(std::move(owned_model_with_root)); }, CellGraphCodecError);
 
   std::string passive_missing = empty_graph();
@@ -651,17 +656,15 @@ TEST(CellGraphCodec, EnforcesOwnedPassiveAndComponentRootPlacement) {
       "  - model_instance_id: passive_model\n"
       "    model_asset_id: fixture_asset\n"
       "    model_revision: " +
-          std::string(kZeroDigest) +
-          "\n"
-          "    instance_parameters: {}");
+          std::string(kZeroDigest));
   EXPECT_THROW({ (void)validate(passive_missing); }, CellGraphCodecError);
 
   std::string passive_placed =
-      replace_once(std::move(passive_missing), "    instance_parameters: {}",
-                   "    instance_parameters: {}\n"
+      replace_once(std::move(passive_missing), "    model_asset_id: fixture_asset\n",
+                   "    model_asset_id: fixture_asset\n"
                    "    root_pose_in_cell:\n"
                    "      position_m: [0.0, 0.0, 0.0]\n"
-                   "      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]");
+                   "      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]\n");
   EXPECT_NO_THROW({ (void)validate(std::move(passive_placed)); });
 
   const std::string component_root =

@@ -337,9 +337,8 @@ template <typename StrongType>
 [[nodiscard]] ModelInstanceDTO parse_model_instance(const CanonicalValue& value,
                                                     std::string_view path) {
   const auto& object = require_object(value, path);
-  require_fields(
-      object, {"model_instance_id", "model_asset_id", "model_revision", "instance_parameters"},
-      {"root_pose_in_cell"}, path);
+  require_fields(object, {"model_instance_id", "model_asset_id", "model_revision"},
+                 {"root_pose_in_cell"}, path);
   const CanonicalValue* root_pose = find_member(object, "root_pose_in_cell");
   return ModelInstanceDTO{
       parse_identity<ModelInstanceId>(require_member(object, "model_instance_id", path),
@@ -348,8 +347,6 @@ template <typename StrongType>
                                    child_path(path, "model_asset_id")),
       parse_digest<ModelRevision>(require_member(object, "model_revision", path),
                                   child_path(path, "model_revision")),
-      to_json_object(require_member(object, "instance_parameters", path),
-                     child_path(path, "instance_parameters")),
       root_pose == nullptr
           ? std::nullopt
           : std::optional<PlacementPoseDTO>{
@@ -724,8 +721,7 @@ template <typename StrongType>
   CanonicalValue::Object object{
       {"model_instance_id", identity_value(record.model_instance_id)},
       {"model_asset_id", identity_value(record.model_asset_id)},
-      {"model_revision", identity_value(record.model_revision)},
-      {"instance_parameters", json_object_to_canonical(record.instance_parameters)}};
+      {"model_revision", identity_value(record.model_revision)}};
   if (record.root_pose_in_cell.has_value()) {
     object.emplace_back("root_pose_in_cell",
                         placement_pose_value(*record.root_pose_in_cell));

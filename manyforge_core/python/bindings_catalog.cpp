@@ -6,6 +6,7 @@
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/control_interface_contract.hpp>
+#include <manyforge_core/types/model_asset.hpp>
 #include <manyforge_core/types/stop_evidence_policy.hpp>
 #include <optional>
 #include <string>
@@ -85,6 +86,243 @@ void bind_catalog_record_ref_helpers(py::module_& module) {
 }  // namespace
 
 void register_catalog_record_bindings(py::module_& module) {
+  py::enum_<ModelAssetInstanceCardinality>(
+      module, "ModelAssetInstanceCardinality")
+      .value("kOnePerCell", ModelAssetInstanceCardinality::kOnePerCell)
+      .value("kMultiplePerCell",
+             ModelAssetInstanceCardinality::kMultiplePerCell);
+
+  py::class_<ModelSourceArtifactDTO>(module, "ModelSourceArtifactDTO",
+                                     py::is_final())
+      .def(py::init([](std::string logical_uri, std::string media_type,
+                       std::uint64_t byte_size,
+                       ContentDigest content_digest) {
+             return ModelSourceArtifactDTO{
+                 std::move(logical_uri), std::move(media_type), byte_size,
+                 std::move(content_digest)};
+           }),
+           py::arg("logical_uri"), py::arg("media_type"),
+           py::arg("byte_size"), py::arg("content_digest"))
+      .def_readonly("logical_uri", &ModelSourceArtifactDTO::logical_uri)
+      .def_readonly("media_type", &ModelSourceArtifactDTO::media_type)
+      .def_readonly("byte_size", &ModelSourceArtifactDTO::byte_size)
+      .def_readonly("content_digest",
+                    &ModelSourceArtifactDTO::content_digest)
+      .def(
+          "__eq__",
+          [](const ModelSourceArtifactDTO& lhs,
+             const ModelSourceArtifactDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ModelSourceArtifactDTO& lhs,
+             const ModelSourceArtifactDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  py::class_<ExpandedModelSourceDTO>(module, "ExpandedModelSourceDTO",
+                                     py::is_final())
+      .def(py::init([](std::string urdf_logical_uri,
+                       std::vector<ModelSourceArtifactDTO> artifacts,
+                       std::optional<std::string> srdf_logical_uri) {
+             return ExpandedModelSourceDTO{
+                 std::move(urdf_logical_uri),
+                 std::move(srdf_logical_uri), std::move(artifacts)};
+           }),
+           py::arg("urdf_logical_uri"),
+           py::arg("artifacts"),
+           py::arg("srdf_logical_uri") = std::nullopt)
+      .def_readonly("urdf_logical_uri",
+                    &ExpandedModelSourceDTO::urdf_logical_uri)
+      .def_readonly("srdf_logical_uri",
+                    &ExpandedModelSourceDTO::srdf_logical_uri)
+      .def_readonly("artifacts", &ExpandedModelSourceDTO::artifacts)
+      .def(
+          "__eq__",
+          [](const ExpandedModelSourceDTO& lhs,
+             const ExpandedModelSourceDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ExpandedModelSourceDTO& lhs,
+             const ExpandedModelSourceDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  py::class_<ModelFrameRoleBindingDTO>(module,
+                                       "ModelFrameRoleBindingDTO",
+                                       py::is_final())
+      .def(py::init([](FrameRoleId frame_role_id,
+                       std::string source_link_name) {
+             return ModelFrameRoleBindingDTO{
+                 std::move(frame_role_id), std::move(source_link_name)};
+           }),
+           py::arg("frame_role_id"), py::arg("source_link_name"))
+      .def_readonly("frame_role_id",
+                    &ModelFrameRoleBindingDTO::frame_role_id)
+      .def_readonly("source_link_name",
+                    &ModelFrameRoleBindingDTO::source_link_name)
+      .def(
+          "__eq__",
+          [](const ModelFrameRoleBindingDTO& lhs,
+             const ModelFrameRoleBindingDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ModelFrameRoleBindingDTO& lhs,
+             const ModelFrameRoleBindingDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  py::class_<ModelGroupRoleBindingDTO>(module,
+                                       "ModelGroupRoleBindingDTO",
+                                       py::is_final())
+      .def(py::init([](ModelGroupRoleId model_group_role_id,
+                       std::string source_group_name) {
+             return ModelGroupRoleBindingDTO{
+                 std::move(model_group_role_id),
+                 std::move(source_group_name)};
+           }),
+           py::arg("model_group_role_id"), py::arg("source_group_name"))
+      .def_readonly("model_group_role_id",
+                    &ModelGroupRoleBindingDTO::model_group_role_id)
+      .def_readonly("source_group_name",
+                    &ModelGroupRoleBindingDTO::source_group_name)
+      .def(
+          "__eq__",
+          [](const ModelGroupRoleBindingDTO& lhs,
+             const ModelGroupRoleBindingDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ModelGroupRoleBindingDTO& lhs,
+             const ModelGroupRoleBindingDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  py::class_<ModelResourceRoleBindingDTO>(
+      module, "ModelResourceRoleBindingDTO", py::is_final())
+      .def(py::init([](ResourceRoleId resource_role_id,
+                       std::vector<std::string> source_joint_names) {
+             return ModelResourceRoleBindingDTO{
+                 std::move(resource_role_id),
+                 std::move(source_joint_names)};
+           }),
+           py::arg("resource_role_id"), py::arg("source_joint_names"))
+      .def_readonly("resource_role_id",
+                    &ModelResourceRoleBindingDTO::resource_role_id)
+      .def_readonly("source_joint_names",
+                    &ModelResourceRoleBindingDTO::source_joint_names)
+      .def(
+          "__eq__",
+          [](const ModelResourceRoleBindingDTO& lhs,
+             const ModelResourceRoleBindingDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ModelResourceRoleBindingDTO& lhs,
+             const ModelResourceRoleBindingDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<ModelCollisionBodyRoleBindingDTO>(
+      module, "ModelCollisionBodyRoleBindingDTO", py::is_final())
+      .def(py::init([](CollisionBodyRoleId collision_body_role_id,
+                       std::vector<std::string> source_link_names) {
+             return ModelCollisionBodyRoleBindingDTO{
+                 std::move(collision_body_role_id),
+                 std::move(source_link_names)};
+           }),
+           py::arg("collision_body_role_id"), py::arg("source_link_names"))
+      .def_readonly(
+          "collision_body_role_id",
+          &ModelCollisionBodyRoleBindingDTO::collision_body_role_id)
+      .def_readonly("source_link_names",
+                    &ModelCollisionBodyRoleBindingDTO::source_link_names)
+      .def(
+          "__eq__",
+          [](const ModelCollisionBodyRoleBindingDTO& lhs,
+             const ModelCollisionBodyRoleBindingDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ModelCollisionBodyRoleBindingDTO& lhs,
+             const ModelCollisionBodyRoleBindingDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<ModelAssetDTO>(module, "ModelAssetDTO", py::is_final())
+      .def(py::init([](
+               ModelAssetId model_asset_id, ModelRevision model_revision,
+               ModelAssetInstanceCardinality instance_cardinality,
+               ExpandedModelSourceDTO expanded_source,
+               FrameRoleId root_frame_role_id,
+               std::vector<ModelFrameRoleBindingDTO> frame_role_bindings,
+               std::vector<ModelGroupRoleBindingDTO>
+                   model_group_role_bindings,
+               std::vector<ModelResourceRoleBindingDTO>
+                   resource_role_bindings,
+               std::vector<ModelCollisionBodyRoleBindingDTO>
+                   collision_body_role_bindings) {
+             return ModelAssetDTO{
+                 std::move(model_asset_id),
+                 std::move(model_revision),
+                 instance_cardinality,
+                 std::move(expanded_source),
+                 std::move(root_frame_role_id),
+                 std::move(frame_role_bindings),
+                 std::move(model_group_role_bindings),
+                 std::move(resource_role_bindings),
+                 std::move(collision_body_role_bindings)};
+           }),
+           py::arg("model_asset_id"), py::arg("model_revision"),
+           py::arg("instance_cardinality"), py::arg("expanded_source"),
+           py::arg("root_frame_role_id"), py::arg("frame_role_bindings"),
+           py::arg("model_group_role_bindings"),
+           py::arg("resource_role_bindings"),
+           py::arg("collision_body_role_bindings"))
+      .def_readonly("model_asset_id", &ModelAssetDTO::model_asset_id)
+      .def_readonly("model_revision", &ModelAssetDTO::model_revision)
+      .def_readonly("instance_cardinality",
+                    &ModelAssetDTO::instance_cardinality)
+      .def_readonly("expanded_source", &ModelAssetDTO::expanded_source)
+      .def_readonly("root_frame_role_id",
+                    &ModelAssetDTO::root_frame_role_id)
+      .def_readonly("frame_role_bindings",
+                    &ModelAssetDTO::frame_role_bindings)
+      .def_readonly("model_group_role_bindings",
+                    &ModelAssetDTO::model_group_role_bindings)
+      .def_readonly("resource_role_bindings",
+                    &ModelAssetDTO::resource_role_bindings)
+      .def_readonly("collision_body_role_bindings",
+                    &ModelAssetDTO::collision_body_role_bindings)
+      .def(
+          "__eq__",
+          [](const ModelAssetDTO& lhs, const ModelAssetDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ModelAssetDTO& lhs, const ModelAssetDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  module.attr("MODEL_ASSET_API_VERSION") =
+      std::string(kModelAssetApiVersion);
+  module.attr("MAX_MODEL_ASSET_COLLECTION_ITEMS") =
+      kMaxModelAssetCollectionItems;
+  module.attr("MAX_MODEL_ASSET_LOGICAL_URI_BYTES") =
+      kMaxModelAssetLogicalUriBytes;
+  module.attr("MAX_MODEL_ASSET_MEDIA_TYPE_BYTES") =
+      kMaxModelAssetMediaTypeBytes;
+  module.attr("MAX_MODEL_ASSET_SOURCE_SYMBOL_CODE_POINTS") =
+      kMaxModelAssetSourceSymbolCodePoints;
+  module.attr("MAX_MODEL_ASSET_BYTE_SIZE") = kMaxModelAssetByteSize;
+
   py::enum_<CapabilityScope>(module, "CapabilityScope")
       .value("kCellGlobal", CapabilityScope::kCellGlobal)
       .value("kControlDomain", CapabilityScope::kControlDomain)

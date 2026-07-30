@@ -305,20 +305,18 @@ void register_cell_graph_bindings(py::module_& module) {
 
   py::class_<ModelInstanceDTO>(module, "ModelInstanceDTO", py::is_final())
       .def(py::init([](ModelInstanceId model_instance_id, ModelAssetId model_asset_id,
-                       ModelRevision model_revision, JsonObjectDTO instance_parameters,
+                       ModelRevision model_revision,
                        std::optional<PlacementPoseDTO> root_pose_in_cell) {
              return ModelInstanceDTO{
                  std::move(model_instance_id), std::move(model_asset_id),
-                 std::move(model_revision), std::move(instance_parameters),
-                 std::move(root_pose_in_cell),
+                 std::move(model_revision), std::move(root_pose_in_cell),
              };
            }),
            py::arg("model_instance_id"), py::arg("model_asset_id"), py::arg("model_revision"),
-           py::arg("instance_parameters"), py::arg("root_pose_in_cell") = std::nullopt)
+           py::arg("root_pose_in_cell") = std::nullopt)
       .def_readonly("model_instance_id", &ModelInstanceDTO::model_instance_id)
       .def_readonly("model_asset_id", &ModelInstanceDTO::model_asset_id)
       .def_readonly("model_revision", &ModelInstanceDTO::model_revision)
-      .def_readonly("instance_parameters", &ModelInstanceDTO::instance_parameters)
       .def_readonly("root_pose_in_cell", &ModelInstanceDTO::root_pose_in_cell)
       .def(
           "__eq__",

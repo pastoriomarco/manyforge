@@ -106,7 +106,6 @@ struct ModelInstanceDTO {
   ModelInstanceId model_instance_id;
   ModelAssetId model_asset_id;
   ModelRevision model_revision;
-  JsonObjectDTO instance_parameters;
   std::optional<PlacementPoseDTO> root_pose_in_cell;
 
   friend bool operator==(const ModelInstanceDTO&, const ModelInstanceDTO&) = default;

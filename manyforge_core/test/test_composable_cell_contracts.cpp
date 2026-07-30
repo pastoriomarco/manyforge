@@ -127,7 +127,6 @@ TEST(ComposableCellContracts, SixGraphRecordShapesComposeOneClosedEnvelope) {
       ModelInstanceId{"model.lite6.a"},
       ModelAssetId{"asset.lite6"},
       ModelRevision{kDigest},
-      {},
       std::nullopt,
   };
   const ControllableComponentDTO component{

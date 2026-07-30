@@ -364,7 +364,6 @@ def _cell_graph():
         model_instance_id=core.ModelInstanceId("model/arm"),
         model_asset_id=core.ModelAssetId("asset/lite6"),
         model_revision=core.ModelRevision("sha256:model"),
-        instance_parameters={"prefix": core.JsonValueDTO("arm_")},
     )
     component = core.ControllableComponentDTO(
         controllable_component_id=core.ControllableComponentId("component/arm"),
@@ -1069,6 +1068,7 @@ def test_all_six_graph_records_and_envelope_round_trip_read_only():
     )
     for value, removed_field in (
         (values["runtime_unit"], "runtime_profile_digest"),
+        (values["model_instance"], "instance_parameters"),
         (values["model_instance"], "mount_parent_frame_role"),
         (values["model_instance"], "mount_pose"),
         (values["component"], "component_type_digest"),
@@ -1120,6 +1120,16 @@ def test_all_six_graph_records_and_envelope_round_trip_read_only():
     projected_units = graph.runtime_units
     projected_units.clear()
     assert graph.runtime_units == [values["runtime_unit"]]
+
+
+def test_removed_model_instance_parameters_keyword_is_rejected():
+    with pytest.raises(TypeError):
+        core.ModelInstanceDTO(
+            model_instance_id=core.ModelInstanceId("model/legacy"),
+            model_asset_id=core.ModelAssetId("asset/legacy"),
+            model_revision=core.ModelRevision("sha256:legacy"),
+            instance_parameters={},
+        )
 
 
 def test_graph_dto_constructors_do_not_coerce_raw_strings_to_strong_ids():
@@ -1276,16 +1286,18 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kQualified
     ]
-    assert len(qualified_entries) == 3
+    assert len(qualified_entries) == 4
     assert {entry.record_kind for entry in qualified_entries} == {
         core.CatalogRecordKind.kCapabilityDefinition,
         core.CatalogRecordKind.kControlInterfaceContract,
+        core.CatalogRecordKind.kModelAsset,
         core.CatalogRecordKind.kStopEvidencePolicy,
     }
     assert all(entry.compiled_schema is not None for entry in qualified_entries)
     assert {entry.relative_path for entry in qualified_entries} == {
         "catalog/manyforge.capability_definition.v1.yaml",
         "catalog/manyforge.control_interface_contract.v1.yaml",
+        "catalog/manyforge.model_asset.v1.yaml",
         "catalog/manyforge.stop_evidence_policy.v1.yaml",
     }
     assert all(
@@ -1295,7 +1307,7 @@ target: 0.5
     )
     assert registry.value_schemas == ()
     assert registry.qualification_registry_digest.value == (
-        "sha256:00877672c566fc361199ebc1e0f56717d9fb04a5d02f6f8d386c8c5b0c84bce7"
+        "sha256:f1e038cc6895c8939e946dcab4d9923a9487957e421a60f6af632d6f5c4b71d7"
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][
