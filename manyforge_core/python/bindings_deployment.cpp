@@ -1,4 +1,5 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/capability_definition_codec.hpp>
@@ -6,12 +7,15 @@
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/closed_schema.hpp>
 #include <manyforge_deployment/control_interface_contract_codec.hpp>
+#include <manyforge_deployment/controller_topology_codec.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
 #include <manyforge_deployment/provider_manifest_codec.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "binding_registrations.hpp"
 
@@ -35,6 +39,8 @@ void register_deployment_candidate_bindings(py::module_& module) {
       module, "CapabilityDefinitionCodecError", PyExc_ValueError);
   py::register_exception<deployment::ControlInterfaceContractCodecError>(
       module, "ControlInterfaceContractCodecError", PyExc_ValueError);
+  py::register_exception<deployment::ControllerTopologyCodecError>(
+      module, "ControllerTopologyCodecError", PyExc_ValueError);
   py::register_exception<deployment::ModelAssetCodecError>(
       module, "ModelAssetCodecError", PyExc_ValueError);
   py::register_exception<deployment::ProviderManifestCodecError>(
@@ -218,6 +224,17 @@ void register_deployment_candidate_bindings(py::module_& module) {
             return deployment::canonical_json(contract.normalized_root());
           });
 
+  py::class_<deployment::QualifiedControllerTopology>(
+      module, "QualifiedControllerTopology", py::is_final())
+      .def_property_readonly(
+          "value", &deployment::QualifiedControllerTopology::value)
+      .def_property_readonly(
+          "normalized_canonical_json",
+          [](const deployment::QualifiedControllerTopology& topology) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(topology.normalized_root());
+          });
+
   py::class_<deployment::QualifiedModelAsset>(
       module, "QualifiedModelAsset", py::is_final())
       .def_property_readonly("value",
@@ -290,6 +307,21 @@ void register_deployment_candidate_bindings(py::module_& module) {
              py::arg("reference"), py::arg("resolved_store_key"),
              py::arg("stored_bytes"),
              py::call_guard<py::gil_scoped_release>());
+  module.def(
+      "resolve_and_qualify_controller_topology",
+      [](const core::ControllerTopologyCatalogRecordRefDTO& reference,
+         const core::ContentAddressedStoreKey& resolved_store_key,
+         const std::string& stored_bytes,
+         const std::vector<deployment::QualifiedControlInterfaceContract>&
+             qualified_contracts) {
+        return deployment::resolve_and_qualify_controller_topology(
+            reference, resolved_store_key, stored_bytes,
+            std::span<const deployment::QualifiedControlInterfaceContract>{
+                qualified_contracts});
+      },
+      py::arg("reference"), py::arg("resolved_store_key"),
+      py::arg("stored_bytes"), py::arg("qualified_contracts"),
+      py::call_guard<py::gil_scoped_release>());
   module.def("resolve_and_qualify_model_asset",
              &deployment::resolve_and_qualify_model_asset,
              py::arg("reference"), py::arg("resolved_store_key"),

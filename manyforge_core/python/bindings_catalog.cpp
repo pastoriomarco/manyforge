@@ -6,6 +6,7 @@
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/control_interface_contract.hpp>
+#include <manyforge_core/types/controller_topology.hpp>
 #include <manyforge_core/types/model_asset.hpp>
 #include <manyforge_core/types/provider_manifest.hpp>
 #include <manyforge_core/types/runtime_profile.hpp>
@@ -567,6 +568,319 @@ void register_catalog_record_bindings(py::module_& module) {
       std::string(kControlInterfaceContractApiVersion);
   module.attr("MAX_CONTROL_INTERFACE_CONTRACT_ITEMS") =
       kMaxControlInterfaceContractItems;
+
+  py::enum_<ControllerClaimDirection>(module, "ControllerClaimDirection")
+      .value("kCommand", ControllerClaimDirection::kCommand)
+      .value("kState", ControllerClaimDirection::kState);
+
+  py::class_<ControllerControlInterfaceClaimDTO>(
+      module, "ControllerControlInterfaceClaimDTO", py::is_final())
+      .def(py::init([](
+               ControlInterfaceContractId control_interface_contract_id,
+               ControlInterfaceRevision control_interface_revision,
+               std::vector<ControllerClaimDirection> claimed_directions) {
+             return ControllerControlInterfaceClaimDTO{
+                 std::move(control_interface_contract_id),
+                 std::move(control_interface_revision),
+                 std::move(claimed_directions)};
+           }),
+           py::arg("control_interface_contract_id"),
+           py::arg("control_interface_revision"),
+           py::arg("claimed_directions"))
+      .def_readonly(
+          "control_interface_contract_id",
+          &ControllerControlInterfaceClaimDTO::control_interface_contract_id)
+      .def_readonly(
+          "control_interface_revision",
+          &ControllerControlInterfaceClaimDTO::control_interface_revision)
+      .def_readonly("claimed_directions",
+                    &ControllerControlInterfaceClaimDTO::claimed_directions)
+      .def(
+          "__eq__",
+          [](const ControllerControlInterfaceClaimDTO& lhs,
+             const ControllerControlInterfaceClaimDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ControllerControlInterfaceClaimDTO& lhs,
+             const ControllerControlInterfaceClaimDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<ControllerTopologyControllerDTO>(
+      module, "ControllerTopologyControllerDTO", py::is_final())
+      .def(py::init([](
+               ControllerRoleId controller_role_id,
+               std::vector<ControllerControlInterfaceClaimDTO>
+                   control_interface_claims,
+               std::vector<ResourceInterfaceClaimDTO>
+                   exported_reference_interfaces,
+               std::vector<ResourceInterfaceClaimDTO>
+                   exported_state_interfaces) {
+             return ControllerTopologyControllerDTO{
+                 std::move(controller_role_id),
+                 std::move(control_interface_claims),
+                 std::move(exported_reference_interfaces),
+                 std::move(exported_state_interfaces)};
+           }),
+           py::arg("controller_role_id"),
+           py::arg("control_interface_claims"),
+           py::arg("exported_reference_interfaces"),
+           py::arg("exported_state_interfaces"))
+      .def_readonly("controller_role_id",
+                    &ControllerTopologyControllerDTO::controller_role_id)
+      .def_readonly(
+          "control_interface_claims",
+          &ControllerTopologyControllerDTO::control_interface_claims)
+      .def_readonly(
+          "exported_reference_interfaces",
+          &ControllerTopologyControllerDTO::exported_reference_interfaces)
+      .def_readonly(
+          "exported_state_interfaces",
+          &ControllerTopologyControllerDTO::exported_state_interfaces)
+      .def(
+          "__eq__",
+          [](const ControllerTopologyControllerDTO& lhs,
+             const ControllerTopologyControllerDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ControllerTopologyControllerDTO& lhs,
+             const ControllerTopologyControllerDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<ControllerChainEdgeDTO>(module, "ControllerChainEdgeDTO",
+                                     py::is_final())
+      .def(py::init([](
+               ControllerRoleId upstream_controller_role_id,
+               ControllerRoleId downstream_controller_role_id,
+               std::vector<ResourceInterfaceClaimDTO> reference_interfaces,
+               std::vector<ResourceInterfaceClaimDTO> state_interfaces) {
+             return ControllerChainEdgeDTO{
+                 std::move(upstream_controller_role_id),
+                 std::move(downstream_controller_role_id),
+                 std::move(reference_interfaces),
+                 std::move(state_interfaces)};
+           }),
+           py::arg("upstream_controller_role_id"),
+           py::arg("downstream_controller_role_id"),
+           py::arg("reference_interfaces"),
+           py::arg("state_interfaces"))
+      .def_readonly(
+          "upstream_controller_role_id",
+          &ControllerChainEdgeDTO::upstream_controller_role_id)
+      .def_readonly(
+          "downstream_controller_role_id",
+          &ControllerChainEdgeDTO::downstream_controller_role_id)
+      .def_readonly("reference_interfaces",
+                    &ControllerChainEdgeDTO::reference_interfaces)
+      .def_readonly("state_interfaces",
+                    &ControllerChainEdgeDTO::state_interfaces)
+      .def(
+          "__eq__",
+          [](const ControllerChainEdgeDTO& lhs,
+             const ControllerChainEdgeDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ControllerChainEdgeDTO& lhs,
+             const ControllerChainEdgeDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  py::class_<ControllerChainEdgeRefDTO>(
+      module, "ControllerChainEdgeRefDTO", py::is_final())
+      .def(py::init([](ControllerRoleId upstream_controller_role_id,
+                       ControllerRoleId downstream_controller_role_id) {
+             return ControllerChainEdgeRefDTO{
+                 std::move(upstream_controller_role_id),
+                 std::move(downstream_controller_role_id)};
+           }),
+           py::arg("upstream_controller_role_id"),
+           py::arg("downstream_controller_role_id"))
+      .def_readonly(
+          "upstream_controller_role_id",
+          &ControllerChainEdgeRefDTO::upstream_controller_role_id)
+      .def_readonly(
+          "downstream_controller_role_id",
+          &ControllerChainEdgeRefDTO::downstream_controller_role_id)
+      .def(
+          "__eq__",
+          [](const ControllerChainEdgeRefDTO& lhs,
+             const ControllerChainEdgeRefDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ControllerChainEdgeRefDTO& lhs,
+             const ControllerChainEdgeRefDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  py::class_<ControllerActivationSetDTO>(
+      module, "ControllerActivationSetDTO", py::is_final())
+      .def(py::init([](
+               ActivationSetId activation_set_id,
+               std::vector<ControllerRoleId> active_controller_role_ids,
+               std::vector<ControllerChainEdgeRefDTO> active_chain_edges) {
+             return ControllerActivationSetDTO{
+                 std::move(activation_set_id),
+                 std::move(active_controller_role_ids),
+                 std::move(active_chain_edges)};
+           }),
+           py::arg("activation_set_id"),
+           py::arg("active_controller_role_ids"),
+           py::arg("active_chain_edges"))
+      .def_readonly("activation_set_id",
+                    &ControllerActivationSetDTO::activation_set_id)
+      .def_readonly(
+          "active_controller_role_ids",
+          &ControllerActivationSetDTO::active_controller_role_ids)
+      .def_readonly("active_chain_edges",
+                    &ControllerActivationSetDTO::active_chain_edges)
+      .def(
+          "__eq__",
+          [](const ControllerActivationSetDTO& lhs,
+             const ControllerActivationSetDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ControllerActivationSetDTO& lhs,
+             const ControllerActivationSetDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<ControlRouteDTO>(module, "ControlRouteDTO", py::is_final())
+      .def(py::init([](
+               ControlRouteId control_route_id,
+               ControlInterfaceContractId control_interface_contract_id,
+               ControlInterfaceRevision control_interface_revision,
+               std::vector<ControllerRoleId> ordered_controller_role_ids,
+               std::vector<ActivationSetId> compatible_activation_set_ids) {
+             return ControlRouteDTO{
+                 std::move(control_route_id),
+                 std::move(control_interface_contract_id),
+                 std::move(control_interface_revision),
+                 std::move(ordered_controller_role_ids),
+                 std::move(compatible_activation_set_ids)};
+           }),
+           py::arg("control_route_id"),
+           py::arg("control_interface_contract_id"),
+           py::arg("control_interface_revision"),
+           py::arg("ordered_controller_role_ids"),
+           py::arg("compatible_activation_set_ids"))
+      .def_readonly("control_route_id", &ControlRouteDTO::control_route_id)
+      .def_readonly("control_interface_contract_id",
+                    &ControlRouteDTO::control_interface_contract_id)
+      .def_readonly("control_interface_revision",
+                    &ControlRouteDTO::control_interface_revision)
+      .def_readonly("ordered_controller_role_ids",
+                    &ControlRouteDTO::ordered_controller_role_ids)
+      .def_readonly("compatible_activation_set_ids",
+                    &ControlRouteDTO::compatible_activation_set_ids)
+      .def(
+          "__eq__",
+          [](const ControlRouteDTO& lhs, const ControlRouteDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ControlRouteDTO& lhs, const ControlRouteDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<ControllerTopologyDTO>(module, "ControllerTopologyDTO",
+                                    py::is_final())
+      .def(py::init([](
+               ControllerTopologyId controller_topology_id,
+               TopologyRevision topology_revision,
+               std::vector<ControllerTopologyControllerDTO> controllers,
+               std::vector<ControllerChainEdgeDTO> chain_edges,
+               std::vector<ControllerActivationSetDTO> activation_sets,
+               std::vector<ControlRouteDTO> legal_routes) {
+             return ControllerTopologyDTO{
+                 std::move(controller_topology_id),
+                 std::move(topology_revision),
+                 std::move(controllers),
+                 std::move(chain_edges),
+                 std::move(activation_sets),
+                 std::move(legal_routes)};
+           }),
+           py::arg("controller_topology_id"),
+           py::arg("topology_revision"), py::arg("controllers"),
+           py::arg("chain_edges"), py::arg("activation_sets"),
+           py::arg("legal_routes"))
+      .def_readonly("controller_topology_id",
+                    &ControllerTopologyDTO::controller_topology_id)
+      .def_readonly("topology_revision",
+                    &ControllerTopologyDTO::topology_revision)
+      .def_readonly("controllers", &ControllerTopologyDTO::controllers)
+      .def_readonly("chain_edges", &ControllerTopologyDTO::chain_edges)
+      .def_readonly("activation_sets",
+                    &ControllerTopologyDTO::activation_sets)
+      .def_readonly("legal_routes", &ControllerTopologyDTO::legal_routes)
+      .def(
+          "__eq__",
+          [](const ControllerTopologyDTO& lhs,
+             const ControllerTopologyDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ControllerTopologyDTO& lhs,
+             const ControllerTopologyDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  module.attr("CONTROLLER_TOPOLOGY_API_VERSION") =
+      std::string(kControllerTopologyApiVersion);
+  module.attr("MAX_CONTROLLER_TOPOLOGY_CONTROLLERS") =
+      kMaxControllerTopologyControllers;
+  module.attr(
+      "MAX_CONTROLLER_TOPOLOGY_CONTROL_INTERFACE_CLAIMS_PER_CONTROLLER") =
+      kMaxControllerTopologyControlInterfaceClaimsPerController;
+  module.attr(
+      "MAX_CONTROLLER_TOPOLOGY_CLAIMED_DIRECTIONS_PER_CLAIM") =
+      kMaxControllerTopologyClaimedDirectionsPerClaim;
+  module.attr(
+      "MAX_CONTROLLER_TOPOLOGY_EXPORTED_REFERENCE_INTERFACES_PER_CONTROLLER") =
+      kMaxControllerTopologyExportedReferenceInterfacesPerController;
+  module.attr(
+      "MAX_CONTROLLER_TOPOLOGY_EXPORTED_STATE_INTERFACES_PER_CONTROLLER") =
+      kMaxControllerTopologyExportedStateInterfacesPerController;
+  module.attr("MAX_CONTROLLER_TOPOLOGY_CHAIN_EDGES") =
+      kMaxControllerTopologyChainEdges;
+  module.attr(
+      "MAX_CONTROLLER_TOPOLOGY_REFERENCE_INTERFACES_PER_CHAIN_EDGE") =
+      kMaxControllerTopologyReferenceInterfacesPerChainEdge;
+  module.attr("MAX_CONTROLLER_TOPOLOGY_STATE_INTERFACES_PER_CHAIN_EDGE") =
+      kMaxControllerTopologyStateInterfacesPerChainEdge;
+  module.attr("MAX_CONTROLLER_TOPOLOGY_ACTIVATION_SETS") =
+      kMaxControllerTopologyActivationSets;
+  module.attr(
+      "MAX_CONTROLLER_TOPOLOGY_ACTIVE_CONTROLLER_ROLES_PER_ACTIVATION_SET") =
+      kMaxControllerTopologyActiveControllerRolesPerActivationSet;
+  module.attr(
+      "MAX_CONTROLLER_TOPOLOGY_ACTIVE_CHAIN_EDGES_PER_ACTIVATION_SET") =
+      kMaxControllerTopologyActiveChainEdgesPerActivationSet;
+  module.attr("MAX_CONTROLLER_TOPOLOGY_CONTROL_ROUTES") =
+      kMaxControllerTopologyControlRoutes;
+  module.attr(
+      "MAX_CONTROLLER_TOPOLOGY_ORDERED_CONTROLLER_ROLES_PER_ROUTE") =
+      kMaxControllerTopologyOrderedControllerRolesPerRoute;
+  module.attr(
+      "MAX_CONTROLLER_TOPOLOGY_COMPATIBLE_ACTIVATION_SETS_PER_ROUTE") =
+      kMaxControllerTopologyCompatibleActivationSetsPerRoute;
+  module.attr(
+      "MAX_CONTROLLER_TOPOLOGY_DISTINCT_CONTROL_INTERFACE_CONTRACTS") =
+      kMaxControllerTopologyDistinctControlInterfaceContracts;
 
   py::enum_<StopEvidenceDisposition>(module, "StopEvidenceDisposition")
       .value("kStoppable", StopEvidenceDisposition::kStoppable)

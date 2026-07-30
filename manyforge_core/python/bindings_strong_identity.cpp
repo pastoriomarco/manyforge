@@ -73,6 +73,8 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(ControlInterfaceRevision);
   MANYFORGE_BIND_STRONG_STRING(ControllerTopologyId);
   MANYFORGE_BIND_STRONG_STRING(TopologyRevision);
+  MANYFORGE_BIND_STRONG_STRING(ControllerRoleId);
+  MANYFORGE_BIND_STRONG_STRING(ActivationSetId);
   MANYFORGE_BIND_STRONG_STRING(ControlRouteId);
   MANYFORGE_BIND_STRONG_STRING(ControlDomainId);
   MANYFORGE_BIND_STRONG_STRING(ControlDomainRevision);

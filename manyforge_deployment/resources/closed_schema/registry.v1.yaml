@@ -32,7 +32,9 @@ catalog_schemas:
     qualification: qualified
   - record_kind: controller_topology
     schema_id: manyforge.controller_topology.v1
-    qualification: unqualified
+    schema_revision: sha256:7415c5e2df17491366755b401337e3ad96dd96703357b20c9e0d08bf3f46a9f6
+    relative_path: catalog/manyforge.controller_topology.v1.yaml
+    qualification: qualified
   - record_kind: model_asset
     schema_id: manyforge.model_asset.v1
     schema_revision: sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c

@@ -39,6 +39,11 @@ manyforge_embed_closed_schema(
   resources/closed_schema/catalog/manyforge.control_interface_contract.v1.yaml
   mf_ctrl_schema)
 manyforge_embed_closed_schema(
+  kEmbeddedControllerTopologySchema
+  controller_topology
+  resources/closed_schema/catalog/manyforge.controller_topology.v1.yaml
+  mf_topology)
+manyforge_embed_closed_schema(
   kEmbeddedModelAssetSchema
   model_asset
   resources/closed_schema/catalog/manyforge.model_asset.v1.yaml
@@ -82,6 +87,7 @@ add_library(manyforge_deployment
   src/cell_graph_codec.cpp
   src/closed_schema.cpp
   src/control_interface_contract_codec.cpp
+  src/controller_topology_codec.cpp
   src/content_identity.cpp
   src/model_asset_codec.cpp
   src/provider_manifest_codec.cpp
@@ -147,6 +153,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_control_interface_contract_codec PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_control_interface_contract_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_controller_topology_codec
+    test/test_controller_topology_codec.cpp)
+  target_link_libraries(test_controller_topology_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_controller_topology_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_model_asset_codec
