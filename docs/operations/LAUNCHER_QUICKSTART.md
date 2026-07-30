@@ -1,5 +1,11 @@
 # Launcher quick start
 
+> **Temporarily unavailable on `dev`:** the composable-cell destructive
+> migration has removed the legacy behavior-node factory/runtime path before
+> its replacement. This launcher guide records the last qualified baseline;
+> it must not be used to claim a working product lane until H0/N and the
+> lane-specific I/R restoration gates pass.
+
 This is the operator's recipe for bringing up the ManyForge stack with
 the unified launcher (`scripts/launch.sh`). Two flows are covered:
 

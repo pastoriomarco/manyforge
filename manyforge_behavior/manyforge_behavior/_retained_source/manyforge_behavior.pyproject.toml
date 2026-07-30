@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "manyforge_behavior"
+version = "0.1.0"
+description = "ManyForge orchestration runner (py_trees-based)"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Marco Pastorio" }]
+requires-python = ">=3.11"
+dependencies = [
+    "py_trees==2.4.0",
+    "pyyaml>=6.0",
+    "rfc8785==0.1.4",
+]
+
+[project.scripts]
+manyforge = "manyforge_behavior.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+manyforge_behavior = [
+    "../resources/*.yaml",
+    "_retained_source/manyforge_behavior.pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -86,6 +86,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
         py_trees==2.4.0 \
         pybind11==3.0.3 \
         pyyaml==6.0.3 \
+        rfc8785==0.1.4 \
         pillow==10.2.0 \
         trimesh==4.11.5 \
         yourdfpy==0.0.60 \

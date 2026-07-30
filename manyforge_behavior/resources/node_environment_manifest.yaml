@@ -1,0 +1,546 @@
+{
+  "api_version": "manyforge.node_environment_manifest.v1",
+  "catalog": {
+    "api_version": "manyforge.node_catalog.v2",
+    "catalog_digest": "sha256:94b9654bcf11b071b27ce959642c17b83ed63af2965d89a6fa0069895c85ca60",
+    "catalog_id": "manyforge_builtin",
+    "content_version": "1.0.0"
+  },
+  "environment_digest": "sha256:ad3e1dbcb9f15fdb55599da846a8da9bf4c80a0cdf784786363c484008c5375b",
+  "executable_packages": [
+    {
+      "content_digest": "sha256:ce797a672e40141bec65b3f325fa1d084bfa64c21b301bf7955a23880d4f8216",
+      "executable_package_id": "manyforge_behavior",
+      "package_format": "manyforge.python-source-package.v1",
+      "package_version": "0.1.0"
+    }
+  ],
+  "executable_registry": [
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "assistant_build_scene_selection_v1",
+      "node_id": "assistant.build_scene_selection"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "assistant_query_model_v1",
+      "node_id": "assistant.query_model"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "assistant_validate_scene_selection_v1",
+      "node_id": "assistant.validate_scene_selection"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "controller_select_route_v1",
+      "node_id": "controller.select_route"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "fallback_v1",
+      "node_id": "fallback"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "geometry_check_pose_distance_v1",
+      "node_id": "geometry.check_pose_distance"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "gripper_check_status_v1",
+      "node_id": "gripper.check_status"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "gripper_command_position_v1",
+      "node_id": "gripper.command_position"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "inverter_v1",
+      "node_id": "inverter"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "io_get_input_v1",
+      "node_id": "io.get_input"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "io_set_output_v1",
+      "node_id": "io.set_output"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "io_wait_for_input_v1",
+      "node_id": "io.wait_for_input"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "kernel_full_stop_v1",
+      "node_id": "kernel.full_stop"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "kernel_pause_operation_v1",
+      "node_id": "kernel.pause_operation"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "kernel_reset_operation_v1",
+      "node_id": "kernel.reset_operation"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "kernel_resume_operation_v1",
+      "node_id": "kernel.resume_operation"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "kernel_set_runtime_scale_v1",
+      "node_id": "kernel.set_runtime_scale"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "kernel_stop_operation_v1",
+      "node_id": "kernel.stop_operation"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "lifecycle_disable_component_v1",
+      "node_id": "lifecycle.disable_component"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "lifecycle_enable_component_v1",
+      "node_id": "lifecycle.enable_component"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "lifecycle_prepare_component_v1",
+      "node_id": "lifecycle.prepare_component"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "lifecycle_recover_component_v1",
+      "node_id": "lifecycle.recover_component"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "logic_check_bool_v1",
+      "node_id": "logic.check_bool"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "logic_set_bool_v1",
+      "node_id": "logic.set_bool"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "logic_wait_for_bool_v1",
+      "node_id": "logic.wait_for_bool"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "model_get_frame_pose_v1",
+      "node_id": "model.get_frame_pose"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "motion_follow_cartesian_path_v1",
+      "node_id": "motion.follow_cartesian_path"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "motion_invalidate_cached_plans_v1",
+      "node_id": "motion.invalidate_cached_plans"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "motion_move_to_joint_target_v1",
+      "node_id": "motion.move_to_joint_target"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "motion_move_to_pose_v1",
+      "node_id": "motion.move_to_pose"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "motion_move_until_signal_v1",
+      "node_id": "motion.move_until_signal"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "motion_probe_search_v1",
+      "node_id": "motion.probe_search"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "parallel_v1",
+      "node_id": "parallel"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "planning_plan_pick_sequence_v1",
+      "node_id": "planning.plan_pick_sequence"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "recovery_apply_offered_action_v1",
+      "node_id": "recovery.apply_offered_action"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "repeat_v1",
+      "node_id": "repeat"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "retry_v1",
+      "node_id": "retry"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "scene_add_object_v1",
+      "node_id": "scene.add_object"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "scene_attach_carried_object_v1",
+      "node_id": "scene.attach_carried_object"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "scene_detach_carried_object_v1",
+      "node_id": "scene.detach_carried_object"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "scene_remove_object_v1",
+      "node_id": "scene.remove_object"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "scene_update_object_pose_v1",
+      "node_id": "scene.update_object_pose"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "scene_upsert_object_v1",
+      "node_id": "scene.upsert_object"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "sequence_v1",
+      "node_id": "sequence"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "simulation_reset_v1",
+      "node_id": "simulation.reset"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "simulation_set_entity_pose_v1",
+      "node_id": "simulation.set_entity_pose"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "simulation_set_state_v1",
+      "node_id": "simulation.set_state"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "simulation_step_v1",
+      "node_id": "simulation.step"
+    },
+    {
+      "engine_id": "py_trees",
+      "executable_package_id": "manyforge_behavior",
+      "implementation_id": "timer_v1",
+      "node_id": "timer"
+    }
+  ],
+  "source_coverage": [
+    {
+      "content_digest": "sha256:77aa320ed1cf31562c6550131a7598d16277e8ef5636341d5dd968b6bb333563",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior"
+    },
+    {
+      "content_digest": "sha256:880745dcbe12aeefee51238178d4d4bcac159ae2b9d24fd327ee1ad93b763f51",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.action_span"
+    },
+    {
+      "content_digest": "sha256:f74b92be963e7a60e9b0755151812bd4e31b3a0a92e5abdc71a4b911c51ffbb5",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.blackboard_bindings"
+    },
+    {
+      "content_digest": "sha256:7aa5633169b18dee3a22251707ee7e2717f4afa0d7624e78988e5d64e6737d92",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.blackboard_namespace"
+    },
+    {
+      "content_digest": "sha256:3f2f5189d6daeaf178097e398d269fa95e30d46f39a5c6c8fdecdb86b2fa3175",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.canonical_artifact"
+    },
+    {
+      "content_digest": "sha256:1c4975c7b7cf1995bd48003afa468da4d08f77ecd231a7257439ee050824ff67",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.capabilities"
+    },
+    {
+      "content_digest": "sha256:c63385ee1c2edc3585e5b05fca830e2e2a918409723e58f0ec8defdf0a26bcc2",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.catalog"
+    },
+    {
+      "content_digest": "sha256:330a8d3e0a984c967405caa0cf96fb7f475f3c707154d4d777267a494a755bf0",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.catalog_schema"
+    },
+    {
+      "content_digest": "sha256:04af0a51d62fd77083d427df15dd7db188cf80143b0df690ff3a342cfe30add0",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.cli"
+    },
+    {
+      "content_digest": "sha256:2ede785c2e4840ec2d4a69c33b79e40f7567d51a5b7570279082970d31288e0f",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.cycle_manager"
+    },
+    {
+      "content_digest": "sha256:2045b103ada9a20cd392b80511c8ec428804b96b7495eda0d099ea794bd4be8c",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.cycle_recovery"
+    },
+    {
+      "content_digest": "sha256:57408ff461e0edfe52939c68b0e80d3ffa2eeef6c3df3ccb19c35328fe507f57",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.deployment"
+    },
+    {
+      "content_digest": "sha256:a8e266053647a3cc0421f298ba584353dd0a58f099498f9e4413cb7a34459d27",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.fault_taxonomy"
+    },
+    {
+      "content_digest": "sha256:3335974ce3327d4a74da4256eb40a125d9ec465d9637cc3889f0051520db522b",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.geometry"
+    },
+    {
+      "content_digest": "sha256:839c1253484b807469a71d06e30ae20c0a9f519afd73d5f8cfd84d2db3645f98",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.kernel_client"
+    },
+    {
+      "content_digest": "sha256:4b88adb2a48ead81562fa38311de7b5bd4ee8d2b76ea7ebdd830727beb3921a5",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.model_paths"
+    },
+    {
+      "content_digest": "sha256:0d4bc0270b31ae8f5db00ce8ed855cb078a37b2560def0b8936052dab3311471",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.motion_runtime"
+    },
+    {
+      "content_digest": "sha256:e5e8959ecc220c0c7e3b34c7de3f7d191623ed741b8bdaa4d5badea6467855d8",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.node_environment"
+    },
+    {
+      "content_digest": "sha256:5b3195e97f5da25914bc4c20448e601ad4af503c482e080d0789bda39764f2a8",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.node_registry"
+    },
+    {
+      "content_digest": "sha256:6f3ec7c8b755b83007b3a4a3262fa84547261659b990a60b590a20b487bde3bf",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes"
+    },
+    {
+      "content_digest": "sha256:ede14915c775fb1f528ad4077118e0b3332702de3462a3a69a5fea43b640d153",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.blackboard_output"
+    },
+    {
+      "content_digest": "sha256:622c003ad3c513550f39ed85eb6398ab493712f9e96c532f74bd922984294aa1",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.control_flow"
+    },
+    {
+      "content_digest": "sha256:7bd29a2ca8b91233791afb65e9829fbc194744aec97cd8fba02b3aaae2886ddf",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.geometry"
+    },
+    {
+      "content_digest": "sha256:7b290cf078e9e3cd9e22508f7b89a2d8600e35e4094a5a1d5c8e1946bec23793",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.logic"
+    },
+    {
+      "content_digest": "sha256:aede60775b05904b1f5ddf856ef810530f6481a0d101dca66598407fc15aa73b",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.model"
+    },
+    {
+      "content_digest": "sha256:7ebc17c426834c41244b211c12b91bd480d15268660998ad41ba3f039137e667",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.motion"
+    },
+    {
+      "content_digest": "sha256:52da8e0258b8ebe6d4dce11b5dc055cd1b94ee3c1c937b82169f2db5a7e89258",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.motion_scoped"
+    },
+    {
+      "content_digest": "sha256:0532ab472b58a9cb4c3044cf1275ba377c90b31260c0682a7d31cb17bdb60d55",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.pick_planning"
+    },
+    {
+      "content_digest": "sha256:5736f166a29fa3886f4ea60a04ba34799ba8772461f1f4538793d1faa90022ea",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.recovery"
+    },
+    {
+      "content_digest": "sha256:1988bb8437f9233dec08873057c9d4e7ed31095dd5095d508ef0de9ee5025395",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.scene"
+    },
+    {
+      "content_digest": "sha256:0fb3e27db46ff8af373794e5b4835a123d3d22ca08adf07d4b11a2c7689dd6ac",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.selection"
+    },
+    {
+      "content_digest": "sha256:c9a5536ced74afa31d7665e59e1d1cb645a894f7acd55e1315f250c80ec915e0",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.simulation"
+    },
+    {
+      "content_digest": "sha256:601da334f015155db4db6d05a6712b4f149d0e27747c32cfb3be800b9df0dc90",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.nodes.stop_policy"
+    },
+    {
+      "content_digest": "sha256:fb1b407777582c76692d086f3a2037d40942da7e1f4e93858cc2f1afdd939443",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.parameters"
+    },
+    {
+      "content_digest": "sha256:0ef6b32553193cfab5025c03628d1e2d99919710cf3330f93d1d94dd538b6b65",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.pick_stage_causes"
+    },
+    {
+      "content_digest": "sha256:c0a46e2d2552ab75181000355f1f8f0e0642abc3fa0f5096bc945e38e7a5e4b5",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.program"
+    },
+    {
+      "content_digest": "sha256:8ae4fc59a97aceb4bc811b1dbd67b441deeb724124a9e9e8fcafc3785df3fd28",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.reason_codes"
+    },
+    {
+      "content_digest": "sha256:7d234372cdbd637a52f0a11173b1662fe8b965898da78fd160ecff4a8359e0b0",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.robot_model_authority"
+    },
+    {
+      "content_digest": "sha256:bfbd1c589158a55448bfde5c82c0b7e07d41cc796540ba2b2d9bdaf6b60db15d",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.robot_model_runtime"
+    },
+    {
+      "content_digest": "sha256:45d2c1a4bfd26af303b280540bdb5f5210d7ffe2ae5e156f722240eb2c1349ac",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.runner"
+    },
+    {
+      "content_digest": "sha256:170ead9f9653b512ae5ad5bd61d68d4264be60c6e305040d564ec04eb950305d",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.runtime_pause"
+    },
+    {
+      "content_digest": "sha256:c04fa6de06c7269d366fcb2e7dce14060708d577d994b9abe4acd8429a2bb410",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.runtime_resources"
+    },
+    {
+      "content_digest": "sha256:64f04f016eab21ff15ab2ad660acdf7dd724078b13f32b80bb42bac72b6db5d1",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.scenarios"
+    },
+    {
+      "content_digest": "sha256:79adaaffaedec5b8aea8f7d37db1dc4885128b76bb635c4f2326175a8042bb39",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.signals"
+    },
+    {
+      "content_digest": "sha256:8d4801c5c2291157f0cefdb510f932b673d7c565e8a54013337bb5f7a5450b35",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-module:manyforge_behavior.skill_loader"
+    },
+    {
+      "content_digest": "sha256:92534e9a2ab7d38146b7745f2184506b2420ff8655cfb84a07d2c98f0a7da072",
+      "executable_package_id": "manyforge_behavior",
+      "source_id": "python-project:manyforge_behavior"
+    }
+  ]
+}

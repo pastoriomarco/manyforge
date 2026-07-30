@@ -2,6 +2,11 @@
 
 # ManyForge Stack Setup
 
+> **Temporarily unavailable on `dev`:** the composable-cell destructive
+> migration has intentionally taken product-lane startup offline. This runbook
+> records the last qualified baseline until H0/N and the lane-specific I/R
+> restoration gates pass.
+
 Operational runbook for bringing up ManyForge locally, with or without an
 assistant provider. This file intentionally stays compact. It points to scripts
 and live configuration sources instead of embedding their contents.

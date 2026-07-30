@@ -1,5 +1,10 @@
 # Lite6 Live Qualification
 
+> **Do not run this procedure from the current `dev` branch.** The
+> composable-cell destructive migration has intentionally taken the real-robot
+> product lane offline until the I10/R restoration gate. This document records
+> the last qualified baseline only.
+
 This runbook qualifies one physical Lite6 for the experimental ManyForge
 real-robot lane. It separates safe observation, supervised lifecycle
 qualification, and physical motion. Passing an earlier stage never authorizes a

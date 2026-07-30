@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Mapping
 
 
@@ -35,12 +36,22 @@ _ALLOWED_INLINE_SCHEMA_KEYS = {
     "allowed_when",
     "resolves_to",
     "requires_current_value",
+    "semantic_type",
 }
 _NUMERIC_CONSTRAINT_KEYS = {
     "min_inclusive",
     "max_inclusive",
     "min_exclusive",
     "max_exclusive",
+}
+_SEMANTIC_TYPES = {
+    "blackboard_key",
+    "collision_body_role",
+    "component_role",
+    "frame_role",
+    "parameter_ref",
+    "resource_role",
+    "target_role",
 }
 
 
@@ -74,6 +85,19 @@ def _strip_schema_descriptions(value: Any, *, in_properties_map: bool = False) -
 
 class CatalogSchemaError(Exception):
     """Raised when a catalog schema declaration is invalid."""
+
+
+def _freeze_json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                key: _freeze_json_value(nested)
+                for key, nested in value.items()
+            }
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_json_value(nested) for nested in value)
+    return value
 
 
 @dataclass(frozen=True)
@@ -113,6 +137,7 @@ class CatalogSchema:
     allowed_when: Mapping[str, Any] = field(default_factory=dict)
     resolves_to: str | None = None
     requires_current_value: bool = False
+    semantic_type: str | None = None
 
     def is_ref(self) -> bool:
         return self.ref is not None
@@ -153,7 +178,7 @@ class CatalogSchemaRegistry:
 
 def parse_schema_registry(raw_types: Any) -> CatalogSchemaRegistry:
     if raw_types in (None, {}):
-        return CatalogSchemaRegistry()
+        return CatalogSchemaRegistry(types=MappingProxyType({}))
     if not isinstance(raw_types, Mapping):
         raise CatalogSchemaError("schema_types must be a mapping")
     parsed: dict[str, CatalogSchema] = {}
@@ -163,7 +188,7 @@ def parse_schema_registry(raw_types: Any) -> CatalogSchemaRegistry:
         if name in parsed:
             raise CatalogSchemaError(f"Duplicate schema type '{name}'")
         parsed[name] = parse_schema(raw_schema, path=f"schema_types.{name}")
-    registry = CatalogSchemaRegistry(parsed)
+    registry = CatalogSchemaRegistry(types=MappingProxyType(parsed))
     for name, schema in parsed.items():
         _validate_schema(schema, registry, path=f"schema_types.{name}", stack=(name,))
     return registry
@@ -173,10 +198,14 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
     if not isinstance(raw_schema, Mapping):
         raise CatalogSchemaError(f"{path} must be a mapping")
 
-    ref = raw_schema.get("$ref") or raw_schema.get("schema_ref")
+    if "$ref" in raw_schema:
+        raise CatalogSchemaError(f"{path}: $ref is forbidden; use schema_ref")
+    ref = raw_schema.get("schema_ref")
     if ref is not None:
-        if set(raw_schema.keys()) - {"$ref", "schema_ref", "description"}:
-            raise CatalogSchemaError(f"{path}: references may only declare description")
+        if set(raw_schema.keys()) - {"schema_ref"}:
+            raise CatalogSchemaError(
+                f"{path}: schema_ref form cannot declare other fields"
+            )
         if not isinstance(ref, str) or not ref.strip():
             raise CatalogSchemaError(f"{path}: schema reference must be a non-empty string")
         return CatalogSchema(ref=ref, description=_optional_string(raw_schema, "description", path))
@@ -240,7 +269,9 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
 
     enum_values = ()
     if schema_type == "enum":
-        values = raw_schema.get("values", raw_schema.get("enum_values"))
+        if "enum_values" in raw_schema:
+            raise CatalogSchemaError(f"{path}: enum_values is forbidden; use values")
+        values = raw_schema.get("values")
         enum_values = _string_tuple(values, path=f"{path}.values")
         if not enum_values:
             raise CatalogSchemaError(f"{path}: enum requires non-empty values")
@@ -269,18 +300,11 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
 
     raw_additional_properties = raw_schema.get("additional_properties", False)
     additional_property_schema = None
-    if isinstance(raw_additional_properties, bool):
-        additional_properties = raw_additional_properties
-    elif isinstance(raw_additional_properties, Mapping):
-        additional_properties = True
-        additional_property_schema = parse_schema(
-            raw_additional_properties,
-            path=f"{path}.additional_properties",
-        )
-    else:
+    if not isinstance(raw_additional_properties, bool):
         raise CatalogSchemaError(
-            f"{path}.additional_properties must be a boolean or schema"
+            f"{path}.additional_properties must be a boolean"
         )
+    additional_properties = raw_additional_properties
 
     resolves_to = raw_schema.get("resolves_to")
     if resolves_to is not None and (not isinstance(resolves_to, str) or not resolves_to.strip()):
@@ -290,10 +314,21 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
     if not isinstance(requires_current_value, bool):
         raise CatalogSchemaError(f"{path}.requires_current_value must be a boolean")
 
+    semantic_type = raw_schema.get("semantic_type")
+    if semantic_type is not None:
+        if semantic_type not in _SEMANTIC_TYPES:
+            raise CatalogSchemaError(
+                f"{path}.semantic_type has unsupported value {semantic_type!r}"
+            )
+        if schema_type != "string":
+            raise CatalogSchemaError(
+                f"{path}.semantic_type requires type=string"
+            )
+
     return CatalogSchema(
         schema_type=str(schema_type),
         description=_optional_string(raw_schema, "description", path),
-        properties=properties,
+        properties=MappingProxyType(properties),
         required=required,
         additional_properties=additional_properties,
         additional_property_schema=additional_property_schema,
@@ -302,13 +337,14 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
         min_items=min_items,
         max_items=max_items,
         enum_values=enum_values,
-        constraints=dict(constraints),
+        constraints=_freeze_json_value(constraints),
         exactly_one=exactly_one,
         mutually_exclusive=mutually_exclusive,
-        required_when=dict(required_when),
-        allowed_when=dict(allowed_when),
+        required_when=_freeze_json_value(required_when),
+        allowed_when=_freeze_json_value(allowed_when),
         resolves_to=resolves_to,
         requires_current_value=requires_current_value,
+        semantic_type=semantic_type,
     )
 
 
@@ -630,6 +666,8 @@ def _to_json_schema(schema: CatalogSchema, registry: CatalogSchemaRegistry) -> d
     else:
         result["type"] = "string"
     _apply_numeric_json_constraints(result, schema)
+    if schema.semantic_type is not None:
+        result["x-manyforge-semantic-type"] = schema.semantic_type
     return result
 
 

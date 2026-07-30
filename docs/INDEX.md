@@ -10,6 +10,13 @@ other repo for runtime tasks.** Maintainers can also follow the
 robot-execution and assistant-provider lane selection, boundary rules, and the
 branch/commit workflow).
 
+> **Current `dev` outage:** the composable-cell destructive migration has
+> removed the legacy node factory and runtime resolver. Catalog inspection is
+> available; Composer program execution and the native, Isaac, and real-robot
+> product lanes are not. H0 restores headless resolution, N restores native
+> execution, and I/R restore Isaac/real operation. Operator runbooks below
+> remain baseline/reference material until their owning restoration gate.
+
 ## Choose A Path
 
 | Task                                        | Start here                                                                                                                          |
@@ -18,7 +25,7 @@ branch/commit workflow).
 | Choose a bundled program/deployment         | [`operations/EXAMPLES_CATALOG.md`](operations/EXAMPLES_CATALOG.md)                                                                  |
 | Diagnose a runtime symptom                  | [`operations/TROUBLESHOOTING.md`](operations/TROUBLESHOOTING.md), then [`operations/OBSERVABILITY.md`](operations/OBSERVABILITY.md) |
 | Operate stop/recovery controls              | [`operations/STOP_PROFILES.md`](operations/STOP_PROFILES.md)                                                                        |
-| Add a robot or trusted external node        | [`operations/ADDING_A_ROBOT.md`](operations/ADDING_A_ROBOT.md), [`operations/EXTERNAL_NODES.md`](operations/EXTERNAL_NODES.md)      |
+| Add a robot                                 | [`operations/ADDING_A_ROBOT.md`](operations/ADDING_A_ROBOT.md)                                                                    |
 | Qualify an experimental physical Lite6      | [`operations/LITE6_LIVE_QUALIFICATION.md`](operations/LITE6_LIVE_QUALIFICATION.md)                                                  |
 | Understand ownership and data flow          | [`reference/ARCHITECTURE.md`](reference/ARCHITECTURE.md)                                                                            |
 | Integrate an API/client                     | Generated REST/MCP/viewer contracts under [`reference/`](reference/)                                                                |
@@ -119,12 +126,6 @@ branch/commit workflow).
   - Log file locations, observability REST endpoints (health, kernel
     events/metrics/snapshot, execution history, debug export, scene
     diagnostics), diagnostic scripts, env vars, and container names.
-
-- [`operations/EXTERNAL_NODES.md`](operations/EXTERNAL_NODES.md)
-
-  - Trusted external behavior-node installation, container-root configuration,
-    validation CLI, deployment enablement and resource aliases, idle-only
-    Composer reload, diagnostics, and supplier delivery checklist.
 
 - [`operations/TROUBLESHOOTING.md`](operations/TROUBLESHOOTING.md)
 

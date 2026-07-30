@@ -564,11 +564,10 @@ ______________________________________________________________________
   [`ROBOPLAN_ADAPTER_NOTES.md`](ROBOPLAN_ADAPTER_NOTES.md).
 - **Scene / collision authority** — see
   [`SCENE_AUTHORITY.md`](SCENE_AUTHORITY.md).
-- **Trusted external behavior node** — install a reviewed descriptor/runtime
-  package under an approved external-node root. Discovery validates schema,
-  provenance, resources, and deployment capability/profile before an idle-only
-  atomic catalog swap; Composer cannot load arbitrary user or assistant code.
-  See [`../operations/EXTERNAL_NODES.md`](../operations/EXTERNAL_NODES.md).
+- **Trusted external behavior node** — filesystem-root discovery has been
+  removed. A future extension must enter through the same typed,
+  content-addressed package/compiler boundary as built-in nodes; no runtime
+  path loader or arbitrary Composer/assistant import is supported.
 
 ______________________________________________________________________
 

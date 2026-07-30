@@ -7,6 +7,15 @@ and an experimental supervised `real-robot` lane whose first qualified target
 is Lite6. Physical support remains robot- and cell-specific: the common
 controller/lifecycle contracts do not replace hardware qualification.
 
+> **`dev` migration status:** the composable-cell destructive implementation
+> window is active. The v2 node catalog and retained node-environment identity
+> are inspectable, but Composer program execution and all three product lanes
+> are intentionally unavailable while the old factory/runtime owner is
+> removed. Headless resolution returns at I5/H0, native execution at I6/N,
+> and Isaac/real operation at I9/I10. The launch recipes below describe the
+> last qualified baseline; they are not valid bring-up instructions for the
+> current `dev` branch.
+
 > **For LLMs** (Claude, ChatGPT, agentic IDEs): read
 > [`AGENTS.md`](AGENTS.md) before making any change. It tells you what
 > this repo is, how to operate it at runtime, and the branch + commit
@@ -21,7 +30,7 @@ controller/lifecycle contracts do not replace hardware qualification.
 | Operate, diagnose, or recover a running stack       | [`docs/INDEX.md`](docs/INDEX.md) → operator runbooks                                                                                               |
 | Understand architecture and authority boundaries    | [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md)                                                                                 |
 | Integrate through REST, MCP, or the viewer protocol | [`docs/INDEX.md`](docs/INDEX.md) → generated contracts                                                                                             |
-| Add a robot or trusted external node                | [`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md), [`docs/operations/EXTERNAL_NODES.md`](docs/operations/EXTERNAL_NODES.md) |
+| Add a robot                                         | [`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md)                                                                           |
 | Contribute code or documentation                    | [`CONTRIBUTING.md`](CONTRIBUTING.md); LLM agents also read [`AGENTS.md`](AGENTS.md)                                                                |
 
 The runtime documentation is self-contained in this repository. Private

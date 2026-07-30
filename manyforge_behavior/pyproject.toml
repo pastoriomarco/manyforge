@@ -12,6 +12,7 @@ requires-python = ">=3.11"
 dependencies = [
     "py_trees==2.4.0",
     "pyyaml>=6.0",
+    "rfc8785==0.1.4",
 ]
 
 [project.scripts]
@@ -21,7 +22,10 @@ manyforge = "manyforge_behavior.cli:main"
 where = ["."]
 
 [tool.setuptools.package-data]
-manyforge_behavior = ["../resources/*.yaml"]
+manyforge_behavior = [
+    "../resources/*.yaml",
+    "_retained_source/manyforge_behavior.pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

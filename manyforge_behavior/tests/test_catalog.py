@@ -1,978 +1,369 @@
-"""Tests for the node catalog loader and validator."""
+"""Contract tests for the sole v2 node-catalog runtime input."""
 
-import os
-import re
-import tempfile
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
-import yaml
+import rfc8785
 
+import manyforge_behavior.catalog as catalog_module
 from manyforge_behavior.catalog import (
+    EXPECTED_API_VERSION,
+    EXPECTED_CONTENT_VERSION,
     CatalogValidationError,
     NodeCatalog,
+    profile_satisfied,
 )
 from manyforge_behavior.catalog_schema import validate_value
-from manyforge_behavior.catalog_schema import CatalogSchemaRegistry, parse_schema
+from manyforge_behavior.node_registry import build_node_registry
+
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
+EXPECTED_CATALOG_DIGEST = (
+    "sha256:94b9654bcf11b071b27ce959642c17b83ed63af2965d89a6fa0069895c85ca60"
+)
 
 
-class TestCatalogLoading:
-    def test_loads_shipped_catalog(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        assert len(catalog.entries) > 0
-        assert catalog.version == "0.5.0"
-        assert catalog.api_version == "manyforge.node_catalog.v1"
-        assert all(
-            param.schema is not None
+def _catalog_data() -> dict[str, object]:
+    return NodeCatalog(CATALOG_PATH).raw_data
+
+
+def _write_recomputed(tmp_path: Path, mutation) -> Path:
+    data = copy.deepcopy(_catalog_data())
+    mutation(data)
+    payload = dict(data)
+    payload.pop("catalog_digest", None)
+    data["catalog_digest"] = (
+        "sha256:" + hashlib.sha256(rfc8785.dumps(payload)).hexdigest()
+    )
+    path = tmp_path / "catalog.yaml"
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, allow_nan=False),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+
+    assert catalog.api_version == EXPECTED_API_VERSION
+    assert catalog.content_version == EXPECTED_CONTENT_VERSION
+    assert catalog.catalog_id == "manyforge_builtin"
+    assert catalog.catalog_digest == EXPECTED_CATALOG_DIGEST
+    assert len(catalog.entries) == 49
+    assert len(
+        {
+            (entry.id, engine_id, implementation_id)
             for entry in catalog.entries
-            for param in entry.parameters
-        )
-
-    def test_adding_robot_recipe_tracks_shipped_catalog_version(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        recipe = (
-            CATALOG_PATH.parents[2] / "docs" / "operations" / "ADDING_A_ROBOT.md"
-        ).read_text(encoding="utf-8")
-        match = re.search(
-            r"catalog_version:\s*([0-9]+\.[0-9]+\.[0-9]+)"
-            r"\s+# exact value from manyforge_behavior/resources/node_catalog\.yaml",
-            recipe,
-        )
-        assert match is not None
-        assert match.group(1) == catalog.version
-
-    def test_all_entries_have_ids(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        for entry in catalog.entries:
-            assert entry.id
-            assert entry.name
-
-    def test_get_sequence(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        seq = catalog.get("sequence")
-        assert seq.name == "Sequence"
-        assert seq.kind == "composite"
-        assert seq.children_min == 1
-        assert seq.children_max == -1  # unbounded
-        assert "py_trees" in seq.runners
-
-    def test_parallel_exposes_success_policy_without_failure_thresholds(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        parallel = catalog.get("parallel")
-        success_policy = next(
-            param for param in parallel.parameters if param.name == "success_policy"
-        )
-
-        assert success_policy.default == "success_on_all"
-        assert success_policy.profiles_min == "v0.1"
-        assert success_policy.enum_values == ["success_on_all", "success_on_one"]
-        assert "fail-on-any-child-failure" in success_policy.description
-
-    def test_get_move_manipulator(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        move = catalog.get("move_manipulator_action")
-        assert move.kind == "leaf"
-        assert move.children_max == 0
-        assert move.stability == "stable"
-        assert len(move.parameters) > 0
-        move_id_param = next(p for p in move.parameters if p.name == "move_id")
-        assert move_id_param.required is True
-        target_mode_param = next(p for p in move.parameters if p.name == "target_mode")
-        relative_option = next(
-            option
-            for option in target_mode_param.enum_options
-            if option.value == "relative"
-        )
-        assert relative_option.profiles_min == "v0.1"
-        assert relative_option.required_capabilities == []
-        planning_profile_param = next(
-            p for p in move.parameters if p.name == "planning_profile"
-        )
-        assert {
-            option.value: option.required_capabilities
-            for option in planning_profile_param.enum_options
-        } == {
-            "first_feasible": ["planning.profile.first_feasible"],
-            "balanced": ["planning.profile.balanced"],
-            "quality_bounded": ["planning.profile.quality_bounded"],
+            for engine_id, implementation_id in entry.runner_implementation_ids.items()
         }
-        target_reference = next(
-            p for p in move.parameters if p.name == "target_reference"
-        )
-        assert target_reference.profiles_min == "v0.1"
-        assert target_reference.visible_when is not None
-        assert target_reference.visible_when.param == "target_mode"
-        assert target_reference.visible_when.equals == "relative"
+    ) == 49
 
-    def test_move_manipulator_per_joint_dynamics_schema_is_strict(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        move = catalog.get("move_manipulator_action")
-        parameter = next(
-            p for p in move.parameters if p.name == "per_joint_dynamics_limits"
-        )
-        assert parameter.schema is not None
 
-        valid = validate_value(
-            parameter.schema,
-            {
-                "joint_1": {
-                    "max_velocity_rad_s": 0.4,
-                    "max_acceleration_rad_s2": 1.5,
-                }
-            },
+def test_catalog_exposes_structured_v2_semantics() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    move = catalog.get("motion.move_to_pose")
+
+    assert move.kind == "leaf"
+    assert move.category == "motion"
+    assert move.min_program_profile == "composable-cell-v1"
+    assert move.execution.owner_api == "kernel.operation"
+    assert move.runner_implementation_ids == {
+        "py_trees": "motion_move_to_pose_v1"
+    }
+    assert {parameter.id for parameter in move.parameters} == {
+        "target_role",
+        "goal",
+        "planning_profile",
+        "target_mode",
+        "contact_policy_id",
+    }
+    assert {
+        (requirement.capability_id, requirement.scope)
+        for requirement in move.required_capabilities
+    } >= {
+        ("planning.motion.pose_goal", "target_binding"),
+        ("execution.trajectory.execute", "target_binding"),
+    }
+
+
+def test_profile_comparison_has_no_legacy_profile_family() -> None:
+    assert profile_satisfied("composable-cell-v1", "composable-cell-v2")
+    assert not profile_satisfied("composable-cell-v2", "composable-cell-v1")
+    assert not profile_satisfied("v0.1", "v0.2")
+
+
+def test_catalog_schema_retains_semantic_role_and_validates_defaults() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    move = catalog.get("motion.move_to_pose")
+    target_role = next(
+        parameter for parameter in move.parameters if parameter.id == "target_role"
+    )
+    planning_profile = next(
+        parameter
+        for parameter in move.parameters
+        if parameter.id == "planning_profile"
+    )
+
+    assert (
+        catalog.schema_registry.resolve(target_role.schema).semantic_type
+        == "target_role"
+    )
+    assert planning_profile.has_default is True
+    assert planning_profile.default == "balanced"
+    assert (
+        validate_value(
+            planning_profile.schema,
+            "balanced",
             registry=catalog.schema_registry,
-            path="params.per_joint_dynamics_limits",
         )
-        assert valid == []
+        == []
+    )
 
-        invalid = validate_value(
-            parameter.schema,
-            {
-                "joint_1": {
-                    "max_velocity_rad_s": 0.0,
-                    "unknown_cap": 1.0,
-                }
-            },
-            registry=catalog.schema_registry,
-            path="params.per_joint_dynamics_limits",
+
+@pytest.mark.parametrize(
+    "api_version",
+    ["manyforge.node_catalog.v0", "manyforge.node_catalog.v1"],
+)
+def test_old_catalog_apis_are_not_runtime_inputs(
+    tmp_path: Path,
+    api_version: str,
+) -> None:
+    path = _write_recomputed(
+        tmp_path,
+        lambda data: data.__setitem__("api_version", api_version),
+    )
+
+    with pytest.raises(
+        CatalogValidationError,
+        match="api_version must be 'manyforge.node_catalog.v2'",
+    ):
+        NodeCatalog(path)
+
+
+def test_catalog_digest_is_verified_over_rfc8785_content(tmp_path: Path) -> None:
+    data = _catalog_data()
+    data["entries"][0]["name"] = "Changed without digest"
+    path = tmp_path / "catalog.yaml"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(CatalogValidationError, match="digest mismatch"):
+        NodeCatalog(path)
+
+
+def test_recomputed_packet_change_cannot_reuse_frozen_content_version(
+    tmp_path: Path,
+) -> None:
+    path = _write_recomputed(
+        tmp_path,
+        lambda data: data["entries"][0].__setitem__(
+            "name",
+            "Semantically valid but not the frozen packet",
+        ),
+    )
+
+    with pytest.raises(
+        CatalogValidationError,
+        match="does not match the frozen built-in",
+    ):
+        NodeCatalog(path)
+
+
+def test_strict_loader_rejects_duplicate_keys(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate.yaml"
+    path.write_text(
+        "api_version: manyforge.node_catalog.v2\n"
+        "api_version: manyforge.node_catalog.v2\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CatalogValidationError, match="duplicate mapping key"):
+        NodeCatalog(path)
+
+
+def test_strict_loader_rejects_excessive_nesting(tmp_path: Path) -> None:
+    path = tmp_path / "deep.yaml"
+    path.write_text(("[" * 140) + "null" + ("]" * 140), encoding="utf-8")
+
+    with pytest.raises(CatalogValidationError, match="nesting exceeds"):
+        NodeCatalog(path)
+
+
+def test_recomputed_catalog_cannot_add_runner_import_metadata(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        data["entries"][0]["runners"]["py_trees"]["module"] = "unsafe.module"
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(CatalogValidationError, match="unknown fields.*module"):
+        NodeCatalog(path)
+
+
+def test_distinct_nodes_may_share_one_registered_implementation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        data["entries"][1]["runners"]["py_trees"]["implementation_id"] = (
+            data["entries"][0]["runners"]["py_trees"]["implementation_id"]
         )
-        assert any(
-            issue.path.endswith(".max_velocity_rad_s")
-            and "must be > 0.0" in issue.message
-            for issue in invalid
+
+    path = _write_recomputed(tmp_path, mutate)
+    digest = json.loads(path.read_text(encoding="utf-8"))["catalog_digest"]
+    monkeypatch.setattr(
+        catalog_module,
+        "EXPECTED_BUILTIN_CATALOG_DIGEST",
+        digest,
+    )
+    catalog = NodeCatalog(path)
+    registry = build_node_registry(catalog)
+    node_ids = [
+        entry["id"]
+        for entry in json.loads(path.read_text(encoding="utf-8"))["entries"][:2]
+    ]
+
+    assert (
+        registry.record(node_ids[0]).implementation_id
+        == registry.record(node_ids[1]).implementation_id
+    )
+
+
+def test_recomputed_catalog_rejects_wrong_capability_scope(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        move = next(
+            entry
+            for entry in data["entries"]
+            if entry["id"] == "motion.move_to_pose"
         )
-        assert any("must not contain unknown fields" in issue.message for issue in invalid)
+        move["required_capabilities"][0]["scope"] = "cell_global"
+        move["required_capabilities"][0].pop("target_parameter")
 
-    def test_blackboard_metadata_loaded_for_shipped_entries(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        set_key = catalog.get("set_key_bool_value")
-        check_pose = catalog.get("check_pose_distance")
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(CatalogValidationError, match="scope must be 'target_binding'"):
+        NodeCatalog(path)
 
-        assert set_key.bb_writer_params == ["key"]
-        assert set_key.bb_reader_params == []
-        assert check_pose.bb_reader_params == ["pose_key_a", "pose_key_b"]
-        assert check_pose.bb_writer_params == []
 
-    def test_shipped_catalog_open_object_params_are_intentional(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        open_params = []
-        for entry in catalog.entries:
-            for param in entry.parameters:
-                if param.schema is None:
-                    continue
-                resolved = catalog.schema_registry.resolve(param.schema)
-                if (
-                    resolved.schema_type == "object"
-                    and resolved.additional_properties is True
-                    and resolved.additional_property_schema is None
-                ):
-                    open_params.append(f"{entry.id}.{param.name}")
+def test_recomputed_catalog_rejects_runtime_identity_parameter(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        timer = next(entry for entry in data["entries"] if entry["id"] == "timer")
+        timer["parameters"][0]["id"] = "controller_name"
 
-        assert open_params == [
-            "fallback_override_node.fallback_params",
-            "recovery_skill_node.recovery_params",
-        ]
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(
+        CatalogValidationError,
+        match="forbidden runtime identity",
+    ):
+        NodeCatalog(path)
 
-    def test_interrupt_metadata_loaded_for_shipped_entries(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        move = catalog.get("move_manipulator_action")
-        wait_signal = catalog.get("wait_for_signal_edge")
 
-        assert move.interruptible is True
-        assert move.default_interrupt_scope == "kernel_motion"
-        assert wait_signal.interruptible is True
-        assert wait_signal.default_interrupt_scope == "active_node"
+def test_recomputed_catalog_rejects_authoring_schema_as_persisted_parameter(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        timer = next(entry for entry in data["entries"] if entry["id"] == "timer")
+        timer["parameters"][0].pop("schema")
+        timer["parameters"][0]["schema_ref"] = (
+            "#/schema_types/pose_authoring_input"
+        )
 
-    def test_get_nonexistent_raises(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        with pytest.raises(KeyError):
-            catalog.get("nonexistent_node_xyz")
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(CatalogValidationError, match="authoring-only schema"):
+        NodeCatalog(path)
 
-    def test_filter_by_profile_v0(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        v0_entries = catalog.filter_by_profile("v0.0")
-        assert all(entry.profiles_min == "v0.0" for entry in v0_entries)
-        v0_ids = {entry.id for entry in v0_entries}
-        # v0.1 entries (post-v0.0)
-        assert "command_gripper" not in v0_ids
-        assert "upsert_collision_object" not in v0_ids
-        assert "attach_object_to_link" not in v0_ids
-        assert "detach_object_from_link" not in v0_ids
-        assert "reset_simulation" not in v0_ids
-        assert "set_simulation_state" not in v0_ids
-        assert "step_simulation" not in v0_ids
-        assert "set_entity_state" not in v0_ids
-        # v0.2 entries: motion-scoped trip nodes
-        assert "move_until_signal" not in v0_ids
-        assert "probe_search_move" not in v0_ids
-        assert "confirm_gripper_grasp" not in v0_ids
-        assert "pick_plan_subtree" not in v0_ids
-        assert len(v0_entries) == len(catalog.entries) - 12
 
-    def test_command_gripper_is_marked_experimental(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        command_gripper = catalog.get("command_gripper")
-        assert command_gripper.stability == "experimental"
+def test_recomputed_catalog_rejects_blackboard_control_protocol(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        check = next(
+            entry for entry in data["entries"] if entry["id"] == "logic.check_bool"
+        )
+        check["parameters"][0]["id"] = "stop_requested"
+        check["blackboard"]["reads"][0]["key_parameter"] = "stop_requested"
 
-    def test_all_entries_have_py_trees_runner(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        for entry in catalog.entries:
-            if entry.kind == "authoring_macro":
-                assert entry.runners == {}
-                continue
-            assert "py_trees" in entry.runners, (
-                f"Entry '{entry.id}' missing py_trees runner"
-            )
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(
+        CatalogValidationError,
+        match="forbidden execution-control blackboard protocol",
+    ):
+        NodeCatalog(path)
 
-    def test_runtime_pause_service_injection_matches_builtin_contract(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        injected = {
-            entry.id
-            for entry in catalog.entries
-            if "runtime_pause_registry" in entry.runtime_injections
+
+def test_legacy_catalog_model_fields_are_removed() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    parameter = catalog.get("timer").parameters[0]
+
+    assert not hasattr(catalog, "version")
+    assert not hasattr(parameter, "name")
+    assert not hasattr(parameter, "type")
+    assert not hasattr(parameter, "enum_values")
+    assert not hasattr(catalog.get("timer"), "runtime_injections")
+
+
+def test_parsed_schema_maps_are_deeply_read_only() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    stored_pose = catalog.schema_registry.types["stored_pose"]
+
+    with pytest.raises(TypeError):
+        catalog.schema_registry.types["forged"] = stored_pose  # type: ignore[index]
+    with pytest.raises(TypeError):
+        stored_pose.properties["forged"] = stored_pose  # type: ignore[index]
+
+    shape = catalog.schema_registry.types["shape"]
+    box_dimensions = shape.properties["box_dimensions_m"]
+    with pytest.raises(TypeError):
+        box_dimensions.required_when["type"] = "mesh"  # type: ignore[index]
+
+    timer = catalog.get("timer")
+    with pytest.raises(TypeError):
+        timer.outcomes["success"] = "forged"  # type: ignore[index]
+
+
+def test_nested_parameter_defaults_are_transitively_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        add = next(
+            entry
+            for entry in data["entries"]
+            if entry["id"] == "scene.add_object"
+        )
+        shape = next(
+            parameter
+            for parameter in add["parameters"]
+            if parameter["id"] == "shape"
+        )
+        shape["default"] = {
+            "type": "box",
+            "box_dimensions_m": [1.0, 2.0, 3.0],
         }
 
-        # Runtime services are catalog-owned metadata after the registry cutover.
-        # Pin the complete migrated set so a permissive **kwargs constructor cannot
-        # silently hide a missing pause/fault channel again.
-        assert injected == {
-            "add_collision_object",
-            "attach_object_to_link",
-            "build_scene_selection_context",
-            "command_gripper",
-            "confirm_gripper_grasp",
-            "detach_object_from_link",
-            "move_manipulator_action",
-            "move_until_signal",
-            "plan_pick_sequence",
-            "probe_search_move",
-            "query_model",
-            "remove_collision_object",
-            "reset_simulation",
-            "set_entity_state",
-            "set_simulation_state",
-            "step_simulation",
-            "update_collision_object_pose",
-            "upsert_collision_object",
-        }
+    path = _write_recomputed(tmp_path, mutate)
+    digest = json.loads(path.read_text(encoding="utf-8"))["catalog_digest"]
+    monkeypatch.setattr(
+        catalog_module,
+        "EXPECTED_BUILTIN_CATALOG_DIGEST",
+        digest,
+    )
+    catalog = NodeCatalog(path)
+    default = next(
+        parameter.default
+        for parameter in catalog.get("scene.add_object").parameters
+        if parameter.id == "shape"
+    )
 
-    def test_pick_plan_subtree_is_authoring_only(self):
-        catalog = NodeCatalog(CATALOG_PATH)
-        macro = catalog.get("pick_plan_subtree")
-        assert macro.kind == "authoring_macro"
-        assert macro.children_min == 0
-        assert macro.children_max == 0
-        assert macro.runners == {}
-
-
-class TestCatalogValidation:
-    def _write_catalog(self, data: dict) -> str:
-        f = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        )
-        yaml.dump(data, f)
-        f.close()
-        return f.name
-
-    def _minimal_v1_catalog(self) -> dict:
-        return {
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "schema_types": {
-                "stored_pose": {
-                    "type": "object",
-                    "additional_properties": False,
-                    "required": ["frame_id", "position_m"],
-                    "properties": {
-                        "frame_id": {"type": "string"},
-                        "position_m": {"type": "array", "items": "float", "length": 3},
-                        "orientation_xyzw": {"type": "array", "items": "float", "length": 4},
-                        "orientation_rpy_deg": {"type": "array", "items": "float", "length": 3},
-                    },
-                    "exactly_one": [["orientation_xyzw", "orientation_rpy_deg"]],
-                },
-                "shape": {
-                    "type": "object",
-                    "additional_properties": False,
-                    "required": ["type"],
-                    "properties": {
-                        "type": {"type": "enum", "values": ["box", "sphere"]},
-                        "box_dimensions_m": {
-                            "type": "array",
-                            "items": "float",
-                            "length": 3,
-                            "required_when": {"type": "box"},
-                            "allowed_when": {"type": "box"},
-                        },
-                        "sphere_radius_m": {
-                            "type": "float",
-                            "constraints": {"min_exclusive": 0.0},
-                            "required_when": {"type": "sphere"},
-                            "allowed_when": {"type": "sphere"},
-                        },
-                    },
-                },
-            },
-            "entries": [
-                {
-                    "id": "upsert_collision_object",
-                    "name": "UpsertCollisionObject",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {
-                            "name": "object_id",
-                            "required": True,
-                            "schema": {"type": "string"},
-                        },
-                        {
-                            "name": "pose",
-                            "required": True,
-                            "schema_ref": "#/schema_types/stored_pose",
-                            "ui_editor": "pose",
-                        },
-                        {
-                            "name": "shape",
-                            "required": True,
-                            "schema_ref": "#/schema_types/shape",
-                            "ui_editor": "shape",
-                        },
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        }
-
-    def test_loads_v1_schema_catalog_and_derives_legacy_labels(self):
-        path = self._write_catalog(self._minimal_v1_catalog())
-        try:
-            catalog = NodeCatalog(path)
-            assert catalog.api_version == "manyforge.node_catalog.v1"
-            assert catalog.version == "0.2.0"
-            entry = catalog.get("upsert_collision_object")
-            pose_param = next(param for param in entry.parameters if param.name == "pose")
-            shape_param = next(param for param in entry.parameters if param.name == "shape")
-            assert pose_param.schema is not None
-            assert pose_param.type == "dict"
-            assert shape_param.type == "dict"
-            projected = catalog.schema_registry.to_json_schema(shape_param.schema)
-            assert projected["type"] == "object"
-            assert projected["additionalProperties"] is False
-            assert "allOf" in projected
-        finally:
-            os.unlink(path)
-
-    def test_v1_rejects_legacy_parameter_keys(self):
-        data = self._minimal_v1_catalog()
-        data["entries"][0]["parameters"][0]["type"] = "string"
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="remove legacy keys"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
-
-    def test_rejects_non_boolean_required_flag(self):
-        data = self._minimal_v1_catalog()
-        data["entries"][0]["parameters"][0]["required"] = "false - stray"
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="required must be a boolean"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
-
-    def test_schema_hash_preserves_description_property_name(self):
-        registry = CatalogSchemaRegistry()
-        empty_schema = parse_schema(
-            {
-                "type": "object",
-                "additional_properties": False,
-                "properties": {},
-            },
-            path="empty",
-        )
-        description_string_schema = parse_schema(
-            {
-                "type": "object",
-                "additional_properties": False,
-                "properties": {
-                    "description": {"type": "string", "description": "prose"},
-                },
-            },
-            path="with_description",
-        )
-        description_int_schema = parse_schema(
-            {
-                "type": "object",
-                "additional_properties": False,
-                "properties": {
-                    "description": {"type": "int", "description": "prose"},
-                },
-            },
-            path="with_description",
-        )
-
-        assert registry.schema_hash(empty_schema) != registry.schema_hash(
-            description_string_schema
-        )
-        assert registry.schema_hash(description_string_schema) != registry.schema_hash(
-            description_int_schema
-        )
-
-    def test_v1_schema_validator_rejects_unknown_and_missing_pose_fields(self):
-        path = self._write_catalog(self._minimal_v1_catalog())
-        try:
-            catalog = NodeCatalog(path)
-            pose_schema = catalog.get("upsert_collision_object").parameters[1].schema
-            assert pose_schema is not None
-            issues = validate_value(
-                pose_schema,
-                {
-                    "frame_id": "base_link",
-                    "position_m": [0.0, 0.0, 0.0],
-                    "unexpected": True,
-                },
-                registry=catalog.schema_registry,
-                path="params.pose",
-            )
-            messages = [issue.message for issue in issues]
-            assert any("unknown fields" in message for message in messages)
-            assert any("exactly one" in message for message in messages)
-        finally:
-            os.unlink(path)
-
-    def test_v1_requires_parameter_schema(self):
-        data = self._minimal_v1_catalog()
-        del data["entries"][0]["parameters"][0]["schema"]
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="v1 parameters require schema"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
-
-    def test_v1_rejects_invalid_schema_ref(self):
-        data = self._minimal_v1_catalog()
-        data["entries"][0]["parameters"][1]["schema_ref"] = "#/schema_types/missing"
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="Unknown schema reference"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
-
-    def test_v1_rejects_invalid_schema_default(self):
-        data = self._minimal_v1_catalog()
-        data["entries"][0]["parameters"][0]["default"] = 123
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="default.*must be a string"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
-
-    def test_v1_rejects_unknown_schema_keys(self):
-        data = self._minimal_v1_catalog()
-        data["schema_types"]["stored_pose"]["additionalProperties"] = False
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="unsupported schema keys"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
-
-    def test_v1_rejects_invalid_allowed_when_ref(self):
-        data = self._minimal_v1_catalog()
-        data["schema_types"]["shape"]["properties"]["sphere_radius_m"]["allowed_when"] = {
-            "missing": "sphere",
-        }
-        path = self._write_catalog(data)
-        try:
-            with pytest.raises(CatalogValidationError, match="allowed_when references unknown field"):
-                NodeCatalog(path)
-        finally:
-            os.unlink(path)
-
-    def test_v1_schema_validator_rejects_disallowed_conditional_fields(self):
-        path = self._write_catalog(self._minimal_v1_catalog())
-        try:
-            catalog = NodeCatalog(path)
-            shape_schema = catalog.get("upsert_collision_object").parameters[2].schema
-            assert shape_schema is not None
-            issues = validate_value(
-                shape_schema,
-                {
-                    "type": "box",
-                    "box_dimensions_m": [0.1, 0.2, 0.3],
-                    "sphere_radius_m": 0.05,
-                },
-                registry=catalog.schema_registry,
-                path="params.shape",
-            )
-            assert any(
-                issue.path == "params.shape.sphere_radius_m"
-                and "only allowed when type=sphere" in issue.message
-                for issue in issues
-            )
-            projected = catalog.schema_registry.to_json_schema(shape_schema)
-            assert any(
-                branch.get("then") == {"not": {"required": ["sphere_radius_m"]}}
-                for branch in projected.get("allOf", [])
-            )
-        finally:
-            os.unlink(path)
-
-    def test_v1_schema_validator_checks_additional_property_schema(self):
-        data = self._minimal_v1_catalog()
-        data["entries"][0]["parameters"].append(
-            {
-                "name": "per_joint_limits",
-                "required": False,
-                "schema": {
-                    "type": "object",
-                    "additional_properties": {
-                        "type": "float",
-                        "constraints": {"min_exclusive": 0.0},
-                    },
-                },
-            }
-        )
-        path = self._write_catalog(data)
-        try:
-            catalog = NodeCatalog(path)
-            schema = catalog.get("upsert_collision_object").parameters[3].schema
-            assert schema is not None
-            issues = validate_value(
-                schema,
-                {"joint_1": 1.0, "joint_2": -0.1},
-                registry=catalog.schema_registry,
-                path="params.per_joint_limits",
-            )
-            assert any(
-                issue.path == "params.per_joint_limits.joint_2"
-                and "must be > 0.0" in issue.message
-                for issue in issues
-            )
-            projected = catalog.schema_registry.to_json_schema(schema)
-            assert projected["additionalProperties"] == {
-                "type": "number",
-                "exclusiveMinimum": 0.0,
-            }
-        finally:
-            os.unlink(path)
-
-    def test_rejects_bad_api_version(self):
-        path = self._write_catalog({
-            "api_version": "wrong.version",
-            "catalog_version": "0.2.0",
-            "entries": [],
-        })
-        with pytest.raises(CatalogValidationError, match="api_version"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_v0_runtime_catalog(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
-            "entries": [],
-        })
-        with pytest.raises(CatalogValidationError, match="api_version"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_bad_catalog_version(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "not-semver",
-            "entries": [],
-        })
-        with pytest.raises(CatalogValidationError, match="catalog_version"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_duplicate_ids(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "dup",
-                    "name": "Dup1",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-                {
-                    "id": "dup",
-                    "name": "Dup2",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="Duplicate"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_leaf_with_children(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_leaf",
-                    "name": "BadLeaf",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 5},
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="leaf"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_decorator_wrong_children(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_dec",
-                    "name": "BadDec",
-                    "kind": "decorator",
-                    "children": {"min": 0, "max": 3},
-                    "runners": {"py_trees": {"implementation_kind": "native"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="decorator"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_enum_without_values(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_enum",
-                    "name": "BadEnum",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {"name": "mode", "schema": {"type": "enum"}, "required": True},
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="enum"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_derives_enum_values_from_enum_options(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "enum_options_node",
-                    "name": "EnumOptionsNode",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {
-                            "name": "mode",
-                            "schema": {"type": "enum", "values": ["a", "b"]},
-                            "required": True,
-                            "enum_options": [
-                                {"value": "a"},
-                                {"value": "b", "profiles": {"min_profile": "v0.1"}},
-                            ],
-                        },
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        try:
-            param = NodeCatalog(path).get("enum_options_node").parameters[0]
-            assert param.enum_values == ["a", "b"]
-            assert [option.value for option in param.enum_options] == ["a", "b"]
-            assert param.enum_options[1].profiles_min == "v0.1"
-        finally:
-            os.unlink(path)
-
-    def test_rejects_enum_values_that_do_not_match_enum_options(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_enum_options",
-                    "name": "BadEnumOptions",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {
-                            "name": "mode",
-                            "schema": {"type": "enum", "values": ["a", "b"]},
-                            "required": True,
-                            "enum_options": [{"value": "a"}, {"value": "c"}],
-                        },
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="enum_options values must match"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_duplicate_enum_options(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_duplicate_enum_options",
-                    "name": "BadDuplicateEnumOptions",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {
-                            "name": "mode",
-                            "schema": {"type": "enum", "values": ["a", "b"]},
-                            "required": True,
-                            "enum_options": [{"value": "a"}, {"value": "a"}],
-                        },
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="enum_options values must match"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_unknown_enum_option_required_capability(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_enum_option_capability",
-                    "name": "BadEnumOptionCapability",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {
-                            "name": "mode",
-                            "schema": {"type": "enum", "values": ["a"]},
-                            "required": True,
-                            "enum_options": [
-                                {
-                                    "value": "a",
-                                    "required_capabilities": ["unknown.capability.key"],
-                                },
-                            ],
-                        },
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="unknown required_capabilities"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_visible_when_unknown_parameter(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_visible_when",
-                    "name": "BadVisibleWhen",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {
-                            "name": "value",
-                            "schema": {"type": "string"},
-                            "required": False,
-                            "visible_when": {"param": "missing", "equals": "x"},
-                        },
-                    ],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="visible_when.param"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_missing_py_trees_runner(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "no_runner",
-                    "name": "NoRunner",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "runners": {"btcpp": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="py_trees"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_authoring_macro_requires_no_runtime_runner(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "authoring_template",
-                    "name": "AuthoringTemplate",
-                    "kind": "authoring_macro",
-                    "children": {"min": 0, "max": 0},
-                    "runners": {},
-                },
-            ],
-        })
-        try:
-            catalog = NodeCatalog(path)
-            assert catalog.get("authoring_template").runners == {}
-        finally:
-            os.unlink(path)
-
-    def test_rejects_runtime_runner_on_authoring_macro(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_authoring_template",
-                    "name": "BadAuthoringTemplate",
-                    "kind": "authoring_macro",
-                    "children": {"min": 0, "max": 0},
-                    "runners": {
-                        "py_trees": {"implementation_kind": "plugin"},
-                    },
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="must not declare runtime runners"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_unknown_required_capability(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_capability",
-                    "name": "BadCapability",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "required_capabilities": ["unknown.capability.key"],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="unknown required_capabilities"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_unknown_stability(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bad_stability",
-                    "name": "BadStability",
-                    "stability": "preview",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="stability"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_blackboard_metadata_for_unknown_parameter(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bb_bad",
-                    "name": "BadBlackboardNode",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {"name": "known", "schema": {"type": "string"}, "required": True},
-                    ],
-                    "bb_reader_params": ["missing"],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="unknown parameter 'missing'"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_duplicate_blackboard_metadata_names(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "bb_dup",
-                    "name": "DuplicateBlackboardNode",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "parameters": [
-                        {"name": "key", "schema": {"type": "string"}, "required": True},
-                    ],
-                    "bb_writer_params": ["key", "key"],
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="duplicate parameter names"):
-            NodeCatalog(path)
-        os.unlink(path)
-
-    def test_rejects_default_interrupt_scope_without_interruptible(self):
-        path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v1",
-            "catalog_version": "0.2.0",
-            "entries": [
-                {
-                    "id": "interrupt_bad",
-                    "name": "InterruptBad",
-                    "kind": "leaf",
-                    "children": {"min": 0, "max": 0},
-                    "default_interrupt_scope": "active_node",
-                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
-                },
-            ],
-        })
-        with pytest.raises(CatalogValidationError, match="requires interruptible=true"):
-            NodeCatalog(path)
-        os.unlink(path)
+    with pytest.raises(TypeError):
+        default["type"] = "sphere"
+    with pytest.raises(TypeError):
+        default["box_dimensions_m"][0] = 99.0
