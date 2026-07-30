@@ -66,6 +66,7 @@ STRONG_STRING_TYPES = (
     "ContactPolicyId",
     "ContactPolicyRevision",
     "ProviderInstanceId",
+    "ProviderManifestId",
     "ProviderManifestRevision",
     "ComponentAttachmentId",
     "ComponentAttachmentRevision",
@@ -112,7 +113,7 @@ CATALOG_REF_CASES = (
     ),
     (
         "ProviderManifestCatalogRecordRefDTO",
-        "ProviderInstanceId",
+        "ProviderManifestId",
         "ProviderManifestRevision",
         "kProviderManifest",
         "manyforge.provider_manifest.v1",
@@ -420,6 +421,7 @@ def _cell_graph():
         legal_control_route_ids=[route_projection.control_route_id],
         route_endpoint_projections=[route_projection],
         provider_instance_id=core.ProviderInstanceId("provider/fake"),
+        provider_manifest_id=core.ProviderManifestId("provider/xarm"),
         provider_manifest_revision=core.ProviderManifestRevision(
             "sha256:provider-manifest"
         ),
@@ -542,6 +544,16 @@ def test_catalog_record_ref_runtime_union_and_registry_are_closed():
             record_id=core.RuntimeProfileId("record"),
             record_revision=core.ModelRevision("revision"),
             schema_id=core.SchemaId("manyforge.model_asset.v1"),
+            schema_revision=core.SchemaRevision("schema-revision"),
+            content_digest=core.ContentDigest("sha256:content"),
+            content_addressed_store_key=core.ContentAddressedStoreKey("cas:key"),
+        )
+
+    with pytest.raises(TypeError):
+        core.ProviderManifestCatalogRecordRefDTO(
+            record_id=core.ProviderInstanceId("legacy-instance-key"),
+            record_revision=core.ProviderManifestRevision("revision"),
+            schema_id=core.SchemaId("manyforge.provider_manifest.v1"),
             schema_revision=core.SchemaRevision("schema-revision"),
             content_digest=core.ContentDigest("sha256:content"),
             content_addressed_store_key=core.ContentAddressedStoreKey("cas:key"),
@@ -1057,6 +1069,12 @@ def test_all_six_graph_records_and_envelope_round_trip_read_only():
     assert graph.controllable_components == [values["component"]]
     assert graph.control_domains == [values["domain"]]
     assert graph.control_bindings == [values["binding"]]
+    assert values["binding"].provider_instance_id == core.ProviderInstanceId(
+        "provider/fake"
+    )
+    assert values["binding"].provider_manifest_id == core.ProviderManifestId(
+        "provider/xarm"
+    )
     assert graph.component_attachments == [values["attachment"]]
     assert values["model_instance"].root_pose_in_cell is None
     assert values["component"].root_pose_in_cell == core.PlacementPoseDTO(
@@ -1131,6 +1149,47 @@ def test_removed_model_instance_parameters_keyword_is_rejected():
             model_revision=core.ModelRevision("sha256:legacy"),
             instance_parameters={},
         )
+
+
+def test_control_binding_requires_distinct_manifest_identity():
+    binding = _cell_graph()["binding"]
+    constructor_fields = (
+        "control_binding_id",
+        "control_binding_revision",
+        "controllable_component_id",
+        "command_target_id",
+        "capability_id",
+        "capability_definition_revision",
+        "control_domain_id",
+        "resource_bindings",
+        "control_interface_contract_id",
+        "control_interface_revision",
+        "controller_topology_id",
+        "topology_revision",
+        "legal_control_route_ids",
+        "route_endpoint_projections",
+        "provider_instance_id",
+        "provider_manifest_id",
+        "provider_manifest_revision",
+        "state_authority_id",
+        "state_authority_class",
+        "stop_evidence_policy_id",
+        "stop_evidence_policy_revision",
+        "containment_granularity",
+    )
+    arguments = {
+        field: getattr(binding, field) for field in constructor_fields
+    }
+
+    legacy_arguments = dict(arguments)
+    legacy_arguments.pop("provider_manifest_id")
+    with pytest.raises(TypeError):
+        core.ControlBindingDTO(**legacy_arguments)
+
+    wrong_type_arguments = dict(arguments)
+    wrong_type_arguments["provider_manifest_id"] = binding.provider_instance_id
+    with pytest.raises(TypeError):
+        core.ControlBindingDTO(**wrong_type_arguments)
 
 
 def test_graph_dto_constructors_do_not_coerce_raw_strings_to_strong_ids():
@@ -1287,11 +1346,12 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kQualified
     ]
-    assert len(qualified_entries) == 5
+    assert len(qualified_entries) == 6
     assert {entry.record_kind for entry in qualified_entries} == {
         core.CatalogRecordKind.kCapabilityDefinition,
         core.CatalogRecordKind.kControlInterfaceContract,
         core.CatalogRecordKind.kModelAsset,
+        core.CatalogRecordKind.kProviderManifest,
         core.CatalogRecordKind.kRuntimeProfile,
         core.CatalogRecordKind.kStopEvidencePolicy,
     }
@@ -1300,6 +1360,7 @@ target: 0.5
         "catalog/manyforge.capability_definition.v1.yaml",
         "catalog/manyforge.control_interface_contract.v1.yaml",
         "catalog/manyforge.model_asset.v1.yaml",
+        "catalog/manyforge.provider_manifest.v1.yaml",
         "catalog/manyforge.runtime_profile.v1.yaml",
         "catalog/manyforge.stop_evidence_policy.v1.yaml",
     }
@@ -1308,15 +1369,22 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kUnqualified
     )
-    assert len(registry.value_schemas) == 1
-    assert registry.value_schemas[0].schema_id == core.SchemaId(
-        "manyforge.value_schema.runtime.empty.v1"
-    )
-    assert registry.value_schemas[0].schema_revision == core.SchemaRevision(
-        "sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785"
-    )
+    assert len(registry.value_schemas) == 2
+    assert {
+        (entry.schema_id.value, entry.schema_revision.value)
+        for entry in registry.value_schemas
+    } == {
+        (
+            "manyforge.value_schema.provider_contract.empty.v1",
+            "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+        ),
+        (
+            "manyforge.value_schema.runtime.empty.v1",
+            "sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785",
+        ),
+    }
     assert registry.qualification_registry_digest.value == (
-        "sha256:178e82147dea213e70f686690238a61b6f7b87885108933cc135d3a0bd4a9027"
+        "sha256:02a38ecf6de2af242a935eee9e5ae82dae71b09e1f946abe4cbad7bb42c205f1"
     )
     assert (
         json.loads(registry.normalized_projection_canonical_json)["catalog_schemas"][0][

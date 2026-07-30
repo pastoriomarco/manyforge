@@ -1,0 +1,251 @@
+api_version: manyforge.closed_schema.v1
+schema_id: manyforge.provider_manifest.v1
+schema_revision: sha256:700b1978d531041e68d0dfb922f77352353daf0c473ffb13be8f1b791962eab3
+schema_purpose: artifact_document
+root_definition_id: provider_manifest
+definitions:
+  - definition_id: provider_manifest
+    value_schema:
+      kind: object
+      fields:
+        - field_id: api_version
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - manyforge.provider_manifest.v1
+              - kind: string_format
+                value: api_version
+        - field_id: provider_manifest_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: provider_manifest_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+        - field_id: offered_capabilities
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 1
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - capability_id
+            item_schema:
+              kind: local_ref
+              definition_id: capability_offer
+        - field_id: provider_contracts
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 256
+            collection:
+              kind: keyed_record_set
+              key_paths:
+                - - provider_contract_ref
+                  - provider_contract_role_id
+            item_schema:
+              kind: local_ref
+              definition_id: provider_contract_declaration
+  - definition_id: capability_offer
+    value_schema:
+      kind: object
+      fields:
+        - field_id: capability_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: capability_definition_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+        - field_id: required_endpoint_role_ids
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: endpoint_role_set
+  - definition_id: provider_contract_declaration
+    value_schema:
+      kind: object
+      fields:
+        - field_id: provider_contract_ref
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: provider_contract_ref
+        - field_id: stop_command_support
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: stop_command_support
+        - field_id: stop_evidence_support
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: stop_evidence_support
+  - definition_id: provider_contract_ref
+    value_schema:
+      kind: object
+      fields:
+        - field_id: provider_contract_role_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: contract_schema_id
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: api_version
+        - field_id: contract_schema_revision
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: sha256_digest
+  - definition_id: stop_command_support
+    value_schema:
+      kind: object
+      fields:
+        - field_id: command_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - motion_controlled_stop
+                  - safe_output_command
+                  - logical_cancel
+                  - registered
+              - kind: string_format
+                value: portable_id
+        - field_id: registered_command_kind_id
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: command_endpoint_role_ids
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: endpoint_role_set
+  - definition_id: stop_evidence_support
+    value_schema:
+      kind: object
+      fields:
+        - field_id: evidence_kind
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - motion_rest
+                  - io_safe_output
+                  - logical_cancellation_no_continuing_effect
+                  - registered
+              - kind: string_format
+                value: portable_id
+        - field_id: registered_evidence_kind_id
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
+        - field_id: evidence_endpoint_role_ids
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: endpoint_role_set
+  - definition_id: endpoint_role_set
+    value_schema:
+      kind: array
+      min_items: 0
+      max_items: 256
+      collection:
+        kind: scalar_set
+      item_schema:
+        kind: scalar
+        scalar_type: string
+        constraints:
+          - kind: string_format
+            value: portable_id

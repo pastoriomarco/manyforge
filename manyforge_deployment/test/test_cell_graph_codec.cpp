@@ -13,6 +13,8 @@ namespace {
 
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+constexpr std::string_view kOneDigest =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000001";
 
 [[nodiscard]] std::string empty_graph(std::string_view cell_id = "cell_a") {
   return "api_version: manyforge.cell_graph.v1\n"
@@ -173,6 +175,7 @@ control_bindings:
         command_endpoint_role_ids: [command_a]
         state_endpoint_role_ids: [state_a]
     provider_instance_id: hardware
+    provider_manifest_id: xarm_hardware
     provider_manifest_revision: )YAML" +
          std::string(kZeroDigest) + R"YAML(
     state_authority_id: measured_joint_state
@@ -220,7 +223,8 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
     "0000000000000000000000000000000000000000000000000000000000000000\",\"controllable_componen"
     "t_id\":\"arm\",\"controller_topology_id\":\"standard\",\"legal_control_route_ids\":[\"route_"
     "a\",\"ro"
-    "ute_b\"],\"provider_instance_id\":\"hardware\",\"provider_manifest_revision\":\"sha256:"
+    "ute_b\"],\"provider_instance_id\":\"hardware\",\"provider_manifest_id\":\"xarm_hardware\","
+    "\"provider_manifest_revision\":\"sha256:"
     "00000"
     "00000000000000000000000000000000000000000000000000000000000\",\"resource_bindings\":[{\"reso"
     "urce_id\":\"joint_2\",\"resource_role_id\":\"arm_joints\"},{\"resource_id\":\"joint_1\","
@@ -281,6 +285,38 @@ constexpr std::string_view kFullGraphNormalizedJsonGolden =
   }
   text.replace(position, from.size(), to);
   return text;
+}
+
+[[nodiscard]] std::string two_control_binding_graph(
+    std::string_view second_provider_instance_id,
+    std::string_view second_provider_manifest_id,
+    std::string_view second_provider_manifest_revision) {
+  std::string graph = full_graph();
+  const std::size_t binding_start =
+      graph.find("  - control_binding_id: arm_trajectory\n");
+  const std::size_t attachments = graph.find("component_attachments:\n");
+  if (binding_start == std::string::npos || attachments == std::string::npos ||
+      binding_start >= attachments) {
+    throw std::logic_error("control-binding fixture boundary was not found");
+  }
+  std::string second_binding =
+      graph.substr(binding_start, attachments - binding_start);
+  second_binding =
+      replace_once(std::move(second_binding), "arm_trajectory",
+                   "arm_trajectory_aux");
+  second_binding = replace_once(
+      std::move(second_binding), "provider_instance_id: hardware",
+      "provider_instance_id: " + std::string(second_provider_instance_id));
+  second_binding = replace_once(
+      std::move(second_binding), "provider_manifest_id: xarm_hardware",
+      "provider_manifest_id: " + std::string(second_provider_manifest_id));
+  second_binding = replace_once(
+      std::move(second_binding),
+      "provider_manifest_revision: " + std::string(kZeroDigest),
+      "provider_manifest_revision: " +
+          std::string(second_provider_manifest_revision));
+  graph.insert(attachments, second_binding);
+  return graph;
 }
 
 TEST(CellGraphCodec, EmptyGraphRetainsTypedDeclaredRevisionAsCandidate) {
@@ -477,6 +513,22 @@ TEST(CellGraphCodec, RejectsUnknownAndDuplicateFields) {
       CellGraphCodecError);
 }
 
+TEST(CellGraphCodec, RejectsLegacyTwoFieldProviderSelector) {
+  const std::string legacy_graph =
+      replace_once(full_graph(),
+                   "    provider_manifest_id: xarm_hardware\n", "");
+
+  try {
+    (void)decode(legacy_graph);
+    FAIL() << "legacy instance/revision provider selector must not be accepted";
+  } catch (const CellGraphCodecError& error) {
+    EXPECT_NE(
+        std::string(error.what())
+            .find("missing required field 'provider_manifest_id'"),
+        std::string::npos);
+  }
+}
+
 TEST(CellGraphCodec, RejectsRemovedInstanceParametersAsUnknownField) {
   const std::string legacy_graph =
       replace_once(full_graph(), "    model_asset_id: arm_asset\n",
@@ -637,6 +689,30 @@ TEST(CellGraphCodec, RejectsMultipleModelOwnersAndTopologyMismatch) {
   mismatch.replace(topology, std::string("controller_topology_id: standard").size(),
                    "controller_topology_id: different");
   EXPECT_THROW({ (void)validate(std::move(mismatch)); }, CellGraphCodecError);
+}
+
+TEST(CellGraphCodec,
+     OneProviderInstanceSelectsOneManifestIdentityAcrossControlBindings) {
+  EXPECT_NO_THROW({
+    (void)validate(two_control_binding_graph(
+        "hardware", "xarm_hardware", kZeroDigest));
+  });
+  EXPECT_THROW(
+      {
+        (void)validate(two_control_binding_graph(
+            "hardware", "other_hardware", kZeroDigest));
+      },
+      CellGraphCodecError);
+  EXPECT_THROW(
+      {
+        (void)validate(two_control_binding_graph(
+            "hardware", "xarm_hardware", kOneDigest));
+      },
+      CellGraphCodecError);
+  EXPECT_NO_THROW({
+    (void)validate(two_control_binding_graph(
+        "hardware_aux", "other_hardware", kOneDigest));
+  });
 }
 
 TEST(CellGraphCodec, EnforcesOwnedPassiveAndComponentRootPlacement) {

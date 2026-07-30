@@ -7,6 +7,7 @@
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/control_interface_contract.hpp>
 #include <manyforge_core/types/model_asset.hpp>
+#include <manyforge_core/types/provider_manifest.hpp>
 #include <manyforge_core/types/runtime_profile.hpp>
 #include <manyforge_core/types/stop_evidence_policy.hpp>
 #include <optional>
@@ -632,6 +633,204 @@ void register_catalog_record_bindings(py::module_& module) {
           [](const ProviderContractRefDTO& lhs,
              const ProviderContractRefDTO& rhs) { return lhs == rhs; },
           py::is_operator());
+
+  py::class_<ProviderCapabilityOfferDTO>(
+      module, "ProviderCapabilityOfferDTO", py::is_final())
+      .def(py::init([](
+               CapabilityId capability_id,
+               CapabilityDefinitionRevision capability_definition_revision,
+               std::vector<EndpointRoleId> required_endpoint_role_ids) {
+             return ProviderCapabilityOfferDTO{
+                 std::move(capability_id),
+                 std::move(capability_definition_revision),
+                 std::move(required_endpoint_role_ids)};
+           }),
+           py::arg("capability_id"),
+           py::arg("capability_definition_revision"),
+           py::arg("required_endpoint_role_ids"))
+      .def_readonly("capability_id",
+                    &ProviderCapabilityOfferDTO::capability_id)
+      .def_readonly(
+          "capability_definition_revision",
+          &ProviderCapabilityOfferDTO::capability_definition_revision)
+      .def_readonly(
+          "required_endpoint_role_ids",
+          &ProviderCapabilityOfferDTO::required_endpoint_role_ids)
+      .def(
+          "__eq__",
+          [](const ProviderCapabilityOfferDTO& lhs,
+             const ProviderCapabilityOfferDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ProviderCapabilityOfferDTO& lhs,
+             const ProviderCapabilityOfferDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<ProviderStopCommandSupportDTO>(
+      module, "ProviderStopCommandSupportDTO", py::is_final())
+      .def(py::init([](
+               StopContainmentCommandKind command_kind,
+               std::vector<EndpointRoleId> command_endpoint_role_ids,
+               std::optional<RegisteredStopCommandKindId>
+                   registered_command_kind_id) {
+             return ProviderStopCommandSupportDTO{
+                 command_kind, std::move(registered_command_kind_id),
+                 std::move(command_endpoint_role_ids)};
+           }),
+           py::arg("command_kind"),
+           py::arg("command_endpoint_role_ids"),
+           py::arg("registered_command_kind_id") = std::nullopt)
+      .def_readonly("command_kind",
+                    &ProviderStopCommandSupportDTO::command_kind)
+      .def_readonly(
+          "registered_command_kind_id",
+          &ProviderStopCommandSupportDTO::registered_command_kind_id)
+      .def_readonly(
+          "command_endpoint_role_ids",
+          &ProviderStopCommandSupportDTO::command_endpoint_role_ids)
+      .def(
+          "__eq__",
+          [](const ProviderStopCommandSupportDTO& lhs,
+             const ProviderStopCommandSupportDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ProviderStopCommandSupportDTO& lhs,
+             const ProviderStopCommandSupportDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<ProviderStopEvidenceSupportDTO>(
+      module, "ProviderStopEvidenceSupportDTO", py::is_final())
+      .def(py::init([](
+               StopEvidenceRequirementKind evidence_kind,
+               std::vector<EndpointRoleId> evidence_endpoint_role_ids,
+               std::optional<RegisteredStopEvidenceKindId>
+                   registered_evidence_kind_id) {
+             return ProviderStopEvidenceSupportDTO{
+                 evidence_kind, std::move(registered_evidence_kind_id),
+                 std::move(evidence_endpoint_role_ids)};
+           }),
+           py::arg("evidence_kind"),
+           py::arg("evidence_endpoint_role_ids"),
+           py::arg("registered_evidence_kind_id") = std::nullopt)
+      .def_readonly("evidence_kind",
+                    &ProviderStopEvidenceSupportDTO::evidence_kind)
+      .def_readonly(
+          "registered_evidence_kind_id",
+          &ProviderStopEvidenceSupportDTO::registered_evidence_kind_id)
+      .def_readonly(
+          "evidence_endpoint_role_ids",
+          &ProviderStopEvidenceSupportDTO::evidence_endpoint_role_ids)
+      .def(
+          "__eq__",
+          [](const ProviderStopEvidenceSupportDTO& lhs,
+             const ProviderStopEvidenceSupportDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ProviderStopEvidenceSupportDTO& lhs,
+             const ProviderStopEvidenceSupportDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<ProviderContractDeclarationDTO>(
+      module, "ProviderContractDeclarationDTO", py::is_final())
+      .def(py::init([](
+               ProviderContractRefDTO provider_contract_ref,
+               std::optional<ProviderStopCommandSupportDTO>
+                   stop_command_support,
+               std::optional<ProviderStopEvidenceSupportDTO>
+                   stop_evidence_support) {
+             return ProviderContractDeclarationDTO{
+                 std::move(provider_contract_ref),
+                 std::move(stop_command_support),
+                 std::move(stop_evidence_support)};
+           }),
+           py::arg("provider_contract_ref"),
+           py::arg("stop_command_support") = std::nullopt,
+           py::arg("stop_evidence_support") = std::nullopt)
+      .def_readonly(
+          "provider_contract_ref",
+          &ProviderContractDeclarationDTO::provider_contract_ref)
+      .def_readonly(
+          "stop_command_support",
+          &ProviderContractDeclarationDTO::stop_command_support)
+      .def_readonly(
+          "stop_evidence_support",
+          &ProviderContractDeclarationDTO::stop_evidence_support)
+      .def(
+          "__eq__",
+          [](const ProviderContractDeclarationDTO& lhs,
+             const ProviderContractDeclarationDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ProviderContractDeclarationDTO& lhs,
+             const ProviderContractDeclarationDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
+  py::class_<ProviderManifestDTO>(module, "ProviderManifestDTO",
+                                   py::is_final())
+      .def(py::init([](
+               ProviderManifestId provider_manifest_id,
+               ProviderManifestRevision provider_manifest_revision,
+               std::vector<ProviderCapabilityOfferDTO>
+                   offered_capabilities,
+               std::vector<ProviderContractDeclarationDTO>
+                   provider_contracts) {
+             return ProviderManifestDTO{
+                 std::move(provider_manifest_id),
+                 std::move(provider_manifest_revision),
+                 std::move(offered_capabilities),
+                 std::move(provider_contracts)};
+           }),
+           py::arg("provider_manifest_id"),
+           py::arg("provider_manifest_revision"),
+           py::arg("offered_capabilities"),
+           py::arg("provider_contracts"))
+      .def_readonly("provider_manifest_id",
+                    &ProviderManifestDTO::provider_manifest_id)
+      .def_readonly("provider_manifest_revision",
+                    &ProviderManifestDTO::provider_manifest_revision)
+      .def_readonly("offered_capabilities",
+                    &ProviderManifestDTO::offered_capabilities)
+      .def_readonly("provider_contracts",
+                    &ProviderManifestDTO::provider_contracts)
+      .def(
+          "__eq__",
+          [](const ProviderManifestDTO& lhs,
+             const ProviderManifestDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ProviderManifestDTO& lhs,
+             const ProviderManifestDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
+  module.attr("PROVIDER_MANIFEST_API_VERSION") =
+      std::string(kProviderManifestApiVersion);
+  module.attr("MAX_PROVIDER_MANIFEST_CAPABILITIES") =
+      kMaxProviderManifestCapabilities;
+  module.attr("MAX_PROVIDER_MANIFEST_CONTRACTS") =
+      kMaxProviderManifestContracts;
+  module.attr("MAX_PROVIDER_MANIFEST_ENDPOINT_ROLES") =
+      kMaxProviderManifestEndpointRoles;
 
   py::class_<StopContainmentCommandDTO>(
       module, "StopContainmentCommandDTO", py::is_final())

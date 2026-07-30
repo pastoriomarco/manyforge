@@ -154,6 +154,7 @@ struct ControlBindingDTO {
   std::vector<ControlRouteId> legal_control_route_ids;
   std::vector<RouteEndpointProjectionDTO> route_endpoint_projections;
   ProviderInstanceId provider_instance_id;
+  ProviderManifestId provider_manifest_id;
   ProviderManifestRevision provider_manifest_revision;
   StateAuthorityId state_authority_id;
   StateAuthorityClass state_authority_class;

@@ -57,6 +57,7 @@ using core::ModelRoleBindingDTO;
 using core::ModelRoleId;
 using core::PlacementPoseDTO;
 using core::ProviderInstanceId;
+using core::ProviderManifestId;
 using core::ProviderManifestRevision;
 using core::ResourceBindingDTO;
 using core::ResourceId;
@@ -511,6 +512,7 @@ template <typename StrongType>
                         "legal_control_route_ids",
                         "route_endpoint_projections",
                         "provider_instance_id",
+                        "provider_manifest_id",
                         "provider_manifest_revision",
                         "state_authority_id",
                         "state_authority_class",
@@ -572,6 +574,8 @@ template <typename StrongType>
       std::move(projections),
       parse_identity<ProviderInstanceId>(require_member(object, "provider_instance_id", path),
                                          child_path(path, "provider_instance_id")),
+      parse_identity<ProviderManifestId>(require_member(object, "provider_manifest_id", path),
+                                        child_path(path, "provider_manifest_id")),
       parse_digest<ProviderManifestRevision>(
           require_member(object, "provider_manifest_revision", path),
           child_path(path, "provider_manifest_revision")),
@@ -796,6 +800,7 @@ template <typename StrongType>
       {"legal_control_route_ids", identity_array(record.legal_control_route_ids)},
       {"route_endpoint_projections", CanonicalValue(std::move(projections))},
       {"provider_instance_id", identity_value(record.provider_instance_id)},
+      {"provider_manifest_id", identity_value(record.provider_manifest_id)},
       {"provider_manifest_revision", identity_value(record.provider_manifest_revision)},
       {"state_authority_id", identity_value(record.state_authority_id)},
       {"state_authority_class",
@@ -971,6 +976,8 @@ void validate_intrinsic(const CellGraphDTO& graph) {
     }
   }
 
+  std::map<std::string, std::pair<std::string, std::string>, std::less<>>
+      provider_manifest_by_instance;
   for (const auto& binding : graph.control_bindings) {
     require_reference(component_ids, binding.controllable_component_id.value(),
                       "control_bindings.controllable_component_id");
@@ -980,6 +987,19 @@ void validate_intrinsic(const CellGraphDTO& graph) {
     if (binding.controller_topology_id != domain.controller_topology_id ||
         binding.topology_revision != domain.topology_revision) {
       fail("control_bindings", "binding topology identity does not match its control domain");
+    }
+    const auto [selected_manifest, inserted] =
+        provider_manifest_by_instance.emplace(
+            binding.provider_instance_id.value(),
+            std::pair{binding.provider_manifest_id.value(),
+                      binding.provider_manifest_revision.value()});
+    if (!inserted &&
+        selected_manifest->second !=
+            std::pair{binding.provider_manifest_id.value(),
+                      binding.provider_manifest_revision.value()}) {
+      fail("control_bindings",
+           "provider instance '" + binding.provider_instance_id.value() +
+               "' selects more than one provider manifest ID/revision");
     }
   }
 

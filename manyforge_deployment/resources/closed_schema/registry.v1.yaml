@@ -40,7 +40,9 @@ catalog_schemas:
     qualification: qualified
   - record_kind: provider_manifest
     schema_id: manyforge.provider_manifest.v1
-    qualification: unqualified
+    schema_revision: sha256:700b1978d531041e68d0dfb922f77352353daf0c473ffb13be8f1b791962eab3
+    relative_path: catalog/manyforge.provider_manifest.v1.yaml
+    qualification: qualified
   - record_kind: runtime_policy
     schema_id: manyforge.runtime_policy.v1
     qualification: unqualified
@@ -55,6 +57,10 @@ catalog_schemas:
     relative_path: catalog/manyforge.stop_evidence_policy.v1.yaml
     qualification: qualified
 value_schemas:
+  - schema_id: manyforge.value_schema.provider_contract.empty.v1
+    schema_revision: sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270
+    relative_path: value/manyforge.value_schema.provider_contract.empty.v1.yaml
+    qualification: qualified
   - schema_id: manyforge.value_schema.runtime.empty.v1
     schema_revision: sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785
     relative_path: value/manyforge.value_schema.runtime.empty.v1.yaml

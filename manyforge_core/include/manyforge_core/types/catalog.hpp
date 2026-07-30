@@ -59,7 +59,7 @@ using ControllerTopologyCatalogRecordRefDTO =
     TypedCatalogRecordRefDTO<CatalogRecordKind::kControllerTopology, ControllerTopologyId,
                              TopologyRevision>;
 using ProviderManifestCatalogRecordRefDTO =
-    TypedCatalogRecordRefDTO<CatalogRecordKind::kProviderManifest, ProviderInstanceId,
+    TypedCatalogRecordRefDTO<CatalogRecordKind::kProviderManifest, ProviderManifestId,
                              ProviderManifestRevision>;
 using CommandSchemaCatalogRecordRefDTO =
     TypedCatalogRecordRefDTO<CatalogRecordKind::kCommandSchema, CommandSchemaId,
@@ -111,7 +111,7 @@ inline constexpr std::array<CatalogRecordTypeDescriptor, 11> kCatalogRecordTypeR
      "manyforge.control_interface_contract.v1"},
     {CatalogRecordKind::kControllerTopology, "controller_topology", "controller_topology_id",
      "topology_revision", "manyforge.controller_topology.v1"},
-    {CatalogRecordKind::kProviderManifest, "provider_manifest", "provider_instance_id",
+    {CatalogRecordKind::kProviderManifest, "provider_manifest", "provider_manifest_id",
      "provider_manifest_revision", "manyforge.provider_manifest.v1"},
     {CatalogRecordKind::kCommandSchema, "command_schema", "command_schema_id",
      "command_schema_revision", "manyforge.command_schema.v1"},

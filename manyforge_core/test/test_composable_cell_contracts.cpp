@@ -56,6 +56,7 @@ static_assert(!std::is_same_v<ModelRoleId, ModelGroupRoleId>);
 static_assert(!std::is_same_v<EndpointRoleId, StateAuthorityId>);
 static_assert(!std::is_same_v<ControlDomainId, ControlBindingId>);
 static_assert(!std::is_same_v<ComponentAttachmentId, ComponentAttachmentRevision>);
+static_assert(!std::is_same_v<ProviderInstanceId, ProviderManifestId>);
 static_assert(!std::is_constructible_v<CellId, ModelAssetId>);
 static_assert(!std::is_constructible_v<ModelAssetId, CellId>);
 static_assert(!std::is_convertible_v<std::string, CellId>);
@@ -78,6 +79,12 @@ static_assert(
 static_assert(std::is_same_v<decltype(ControlBindingDTO::state_authority_id), StateAuthorityId>);
 static_assert(std::is_same_v<decltype(ControlBindingDTO::capability_definition_revision),
                              CapabilityDefinitionRevision>);
+static_assert(
+    std::is_same_v<decltype(ControlBindingDTO::provider_instance_id), ProviderInstanceId>);
+static_assert(
+    std::is_same_v<decltype(ControlBindingDTO::provider_manifest_id), ProviderManifestId>);
+static_assert(std::is_same_v<decltype(ControlBindingDTO::provider_manifest_revision),
+                             ProviderManifestRevision>);
 static_assert(
     std::is_same_v<decltype(ComponentAttachmentEdgeDTO::parent), ComponentAttachmentEndpointDTO>);
 static_assert(std::is_same_v<
@@ -188,6 +195,7 @@ TEST(ComposableCellContracts, SixGraphRecordShapesComposeOneClosedEnvelope) {
         {EndpointRoleId{"trajectory_command"}},
         {EndpointRoleId{"joint_state"}}}},
       ProviderInstanceId{"xarm_hardware.a"},
+      ProviderManifestId{"xarm_hardware"},
       ProviderManifestRevision{kDigest},
       StateAuthorityId{"xarm_measured_state"},
       StateAuthorityClass::kMeasured,
@@ -231,6 +239,10 @@ TEST(ComposableCellContracts, SixGraphRecordShapesComposeOneClosedEnvelope) {
 static_assert(std::variant_size_v<CatalogRecordRefDTO> == kCatalogRecordTypeRegistry.size());
 static_assert(std::is_same_v<ModelAssetCatalogRecordRefDTO::IdType, ModelAssetId>);
 static_assert(std::is_same_v<ModelAssetCatalogRecordRefDTO::RevisionType, ModelRevision>);
+static_assert(
+    std::is_same_v<ProviderManifestCatalogRecordRefDTO::IdType, ProviderManifestId>);
+static_assert(std::is_same_v<ProviderManifestCatalogRecordRefDTO::RevisionType,
+                             ProviderManifestRevision>);
 static_assert(std::is_same_v<ContactPolicyCatalogRecordRefDTO::IdType, ContactPolicyId>);
 static_assert(
     std::is_same_v<ContactPolicyCatalogRecordRefDTO::RevisionType, ContactPolicyRevision>);
@@ -331,6 +343,23 @@ TEST(ComposableCellContracts, ContactPolicyRegistryUsesReferentOwnFieldNames) {
   const auto& descriptor = catalog_record_type_descriptor(record);
   EXPECT_EQ(descriptor.own_id_field, "policy_id");
   EXPECT_EQ(descriptor.own_revision_field, "version");
+  EXPECT_TRUE(catalog_record_ref_matches_registry_family(record));
+}
+
+TEST(ComposableCellContracts,
+     ProviderManifestRegistryUsesReusableManifestIdentity) {
+  const CatalogRecordRefDTO record = ProviderManifestCatalogRecordRefDTO{
+      ProviderManifestId{"xarm_hardware"},
+      ProviderManifestRevision{kDigest},
+      SchemaId{"manyforge.provider_manifest.v1"},
+      SchemaRevision{kDigest},
+      ContentDigest{kDigest},
+      ContentAddressedStoreKey{"sha256/provider-manifest"},
+  };
+
+  const auto& descriptor = catalog_record_type_descriptor(record);
+  EXPECT_EQ(descriptor.own_id_field, "provider_manifest_id");
+  EXPECT_EQ(catalog_record_id_value(record), "xarm_hardware");
   EXPECT_TRUE(catalog_record_ref_matches_registry_family(record));
 }
 

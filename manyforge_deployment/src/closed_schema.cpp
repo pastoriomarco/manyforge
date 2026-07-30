@@ -23,7 +23,9 @@
 #include "embedded_capability_definition_schema.hpp"
 #include "embedded_control_interface_contract_schema.hpp"
 #include "embedded_empty_runtime_configuration_schema.hpp"
+#include "embedded_empty_provider_contract_schema.hpp"
 #include "embedded_model_asset_schema.hpp"
+#include "embedded_provider_manifest_schema.hpp"
 #include "embedded_runtime_profile_schema.hpp"
 #include "embedded_stop_evidence_policy_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
@@ -1701,7 +1703,7 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
     std::string_view relative_path;
     std::string_view descriptor_yaml;
   };
-  const std::array<QualifiedCatalogSchemaSource, 5U> qualified_sources{{
+  const std::array<QualifiedCatalogSchemaSource, 6U> qualified_sources{{
       {core::CatalogRecordKind::kCapabilityDefinition,
        "catalog/manyforge.capability_definition.v1.yaml",
        detail::kEmbeddedCapabilityDefinitionSchema},
@@ -1711,6 +1713,9 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
       {core::CatalogRecordKind::kModelAsset,
        "catalog/manyforge.model_asset.v1.yaml",
        detail::kEmbeddedModelAssetSchema},
+      {core::CatalogRecordKind::kProviderManifest,
+       "catalog/manyforge.provider_manifest.v1.yaml",
+       detail::kEmbeddedProviderManifestSchema},
       {core::CatalogRecordKind::kRuntimeProfile,
        "catalog/manyforge.runtime_profile.v1.yaml",
        detail::kEmbeddedRuntimeProfileSchema},
@@ -1718,7 +1723,9 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
        "catalog/manyforge.stop_evidence_policy.v1.yaml",
        detail::kEmbeddedStopEvidencePolicySchema},
   }};
-  const std::array<QualifiedValueSchemaSource, 1U> qualified_value_sources{{
+  const std::array<QualifiedValueSchemaSource, 2U> qualified_value_sources{{
+      {"value/manyforge.value_schema.provider_contract.empty.v1.yaml",
+       detail::kEmbeddedEmptyProviderContractSchema},
       {"value/manyforge.value_schema.runtime.empty.v1.yaml",
        detail::kEmbeddedEmptyRuntimeConfigurationSchema},
   }};

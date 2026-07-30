@@ -13,25 +13,29 @@ The implemented foundation owns:
 - immutable `manyforge.closed_schema.v1` descriptor compilation, declared
   `SchemaRevision` verification, bounded default materialization, and
   schema-directed instance normalization;
-- one code-owned build registry whose catalog families are explicitly
-  unqualified and whose separately qualified value-schema table is empty at
-  this checkpoint; and
+- one code-owned build registry with six exact qualified catalog families
+  (`capability_definition`, `control_interface_contract`, `model_asset`,
+  `provider_manifest`, `runtime_profile`, and `stop_evidence_policy`), two
+  exact qualified value schemas, and explicit rejection of every remaining
+  unqualified family; and
 - intrinsic `CellGraphDTO` decoding, normalization, and validation.
 
 The bootstrap, registry, and dialect examples under `resources/` are hermetic
 source-tree projections and cross-language test goldens. They are not installed
 or loaded as runtime policy, never override the code-owned grammar, and never
-qualify runtime input. Catalog schema qualification, catalog-referent
-resolution, source/model composition, generated products, Apply, process
-ownership, and runtime/lane behavior are later checkpoints. A successfully
-parsed artifact is therefore only a candidate. Arbitrary revision-verified
-descriptors can only produce explicitly unqualified normalized candidates.
-Production interpretation must first select an exact schema ID, revision, and
-purpose from the immutable build-qualified registry, then validate and
-normalize through that pinned descriptor before later intrinsic, catalog, and
-compiler validation. No catalog family or value schema is production-qualified
-at this checkpoint, and no trusted `GraphRevision` compute/verify operation is
-exposed yet.
+qualify runtime input. The admitted catalog resolvers enforce exact typed
+reference, retrieval key, stored-byte digest, schema, semantic identity, and
+referent boundaries. Source/model composition, complete compiler products,
+Apply, process ownership, and runtime/lane behavior remain later checkpoints.
+A successfully parsed artifact is therefore only a candidate. Arbitrary
+revision-verified descriptors can only produce explicitly unqualified
+normalized candidates. Production interpretation must select an exact schema
+ID, revision, and purpose from the immutable build-qualified registry, then
+validate and normalize through that pinned descriptor before later intrinsic,
+catalog, and compiler validation. The six catalog families and two value
+schemas above are the only production-qualified schema families at this
+checkpoint; no trusted `GraphRevision` compute/verify operation is exposed
+yet.
 
 Build and run the focused tests through the repository container:
 

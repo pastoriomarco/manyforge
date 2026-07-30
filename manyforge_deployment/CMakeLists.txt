@@ -44,6 +44,11 @@ manyforge_embed_closed_schema(
   resources/closed_schema/catalog/manyforge.model_asset.v1.yaml
   mf_model_schema)
 manyforge_embed_closed_schema(
+  kEmbeddedProviderManifestSchema
+  provider_manifest
+  resources/closed_schema/catalog/manyforge.provider_manifest.v1.yaml
+  mf_pmanifest)
+manyforge_embed_closed_schema(
   kEmbeddedRuntimeProfileSchema
   runtime_profile
   resources/closed_schema/catalog/manyforge.runtime_profile.v1.yaml
@@ -58,6 +63,11 @@ manyforge_embed_closed_schema(
   empty_runtime_configuration
   resources/closed_schema/value/manyforge.value_schema.runtime.empty.v1.yaml
   mf_empty_cfg)
+manyforge_embed_closed_schema(
+  kEmbeddedEmptyProviderContractSchema
+  empty_provider_contract
+  resources/closed_schema/value/manyforge.value_schema.provider_contract.empty.v1.yaml
+  mf_pempty)
 
 set(
   MANYFORGE_CORE_INCLUDE_DIR
@@ -74,6 +84,7 @@ add_library(manyforge_deployment
   src/control_interface_contract_codec.cpp
   src/content_identity.cpp
   src/model_asset_codec.cpp
+  src/provider_manifest_codec.cpp
   src/runtime_profile_codec.cpp
   src/stop_evidence_policy_codec.cpp
 )
@@ -150,6 +161,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_runtime_profile_codec PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_runtime_profile_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_provider_manifest_codec
+    test/test_provider_manifest_codec.cpp)
+  target_link_libraries(test_provider_manifest_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_provider_manifest_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_stop_evidence_policy_codec

@@ -91,6 +91,7 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(ContactPolicyRevision);
 
   MANYFORGE_BIND_STRONG_STRING(ProviderInstanceId);
+  MANYFORGE_BIND_STRONG_STRING(ProviderManifestId);
   MANYFORGE_BIND_STRONG_STRING(ProviderManifestRevision);
 
   MANYFORGE_BIND_STRONG_STRING(ComponentAttachmentId);

@@ -1,0 +1,10 @@
+api_version: manyforge.closed_schema.v1
+schema_id: manyforge.value_schema.provider_contract.empty.v1
+schema_revision: sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270
+schema_purpose: value
+root_definition_id: empty_provider_contract
+definitions:
+  - definition_id: empty_provider_contract
+    value_schema:
+      kind: object
+      fields: []
