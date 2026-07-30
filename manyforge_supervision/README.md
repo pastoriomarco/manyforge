@@ -1,5 +1,15 @@
 # ManyForge Supervision
 
+`manyforge_supervision.runtime_observation` is a bounded ROS-free reducer
+foundation for composable runtime-unit observation. It keeps process
+presence/incarnation, source-attested health/progress, and Manager-derived
+freshness/dependency state separate. It operates on caller-supplied,
+already-qualified internal evidence; it does not yet qualify adapter/product
+identities, prove retained-bundle membership or staged readiness, or implement
+final I4 Manager convergence. The reducer performs no process effect, Apply,
+active-pointer mutation, or robot-readiness inference. Its immutable values
+remain an internal model until I3/I4 freeze the public progress wire contract.
+
 `manyforge_supervision.component_health` and
 `manyforge_supervision.manifest` form the ROS-free, vendor-neutral domain
 layer for component heartbeats, dependency-health reduction, strict manifest
