@@ -90,6 +90,7 @@ add_library(manyforge_deployment
   src/artifact_codec.cpp
   src/capability_definition_codec.cpp
   src/canonical_value.cpp
+  src/cell_composition.cpp
   src/cell_graph_codec.cpp
   src/cell_structure.cpp
   src/closed_schema.cpp

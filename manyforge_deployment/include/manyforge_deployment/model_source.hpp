@@ -686,4 +686,11 @@ class SourceVerifiedModelAsset final {
 [[nodiscard]] std::optional<std::string> emit_canonical_srdf(
     const ModelSourceIr& source_ir);
 
+/// Emits a transformed compiler document without claiming source
+/// qualification for that transformable leaf aggregate.
+[[nodiscard]] std::string emit_canonical_urdf_document(
+    const UrdfDocumentIr& document);
+[[nodiscard]] std::string emit_canonical_srdf_document(
+    const SrdfDocumentIr& document);
+
 }  // namespace manyforge::deployment

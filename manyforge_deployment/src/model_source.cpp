@@ -3096,4 +3096,14 @@ std::optional<std::string> emit_canonical_srdf(
   return emit_srdf_document(*source_ir.srdf());
 }
 
+std::string emit_canonical_urdf_document(
+    const UrdfDocumentIr& document) {
+  return emit_urdf_document(document);
+}
+
+std::string emit_canonical_srdf_document(
+    const SrdfDocumentIr& document) {
+  return emit_srdf_document(document);
+}
+
 }  // namespace manyforge::deployment
