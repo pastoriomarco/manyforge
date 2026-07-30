@@ -100,6 +100,7 @@ add_library(manyforge_deployment
   src/model_asset_codec.cpp
   src/model_source.cpp
   src/provider_manifest_codec.cpp
+  src/retained_bundle.cpp
   src/runtime_profile_codec.cpp
   src/stop_evidence_policy_codec.cpp
 )
@@ -213,6 +214,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_provider_manifest_codec PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_provider_manifest_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_retained_bundle
+    test/test_retained_bundle.cpp)
+  target_link_libraries(test_retained_bundle PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_retained_bundle
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_stop_evidence_policy_codec
