@@ -156,6 +156,8 @@ if(BUILD_TESTING)
   add_executable(test_closed_schema test/test_closed_schema.cpp)
   target_compile_definitions(test_closed_schema PRIVATE
     MANYFORGE_CLOSED_SCHEMA_RESOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/resources/closed_schema")
+  target_include_directories(test_closed_schema PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(test_closed_schema PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_closed_schema

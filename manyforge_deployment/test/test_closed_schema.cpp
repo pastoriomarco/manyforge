@@ -9,7 +9,9 @@
 #include <sstream>
 #include <string>
 #include <type_traits>
+#include <vector>
 
+#include "closed_schema_internal.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/capability_definition_codec.hpp"
 #include "manyforge_deployment/canonical_value.hpp"
@@ -24,6 +26,9 @@ static_assert(!std::is_default_constructible_v<CompiledClosedSchema>);
 static_assert(!std::is_aggregate_v<UnqualifiedSchemaNormalizedArtifactCandidate>);
 static_assert(
     !std::is_default_constructible_v<UnqualifiedSchemaNormalizedArtifactCandidate>);
+static_assert(!std::is_aggregate_v<NonGraphQualifiedSchemaNormalizedValue>);
+static_assert(
+    !std::is_default_constructible_v<NonGraphQualifiedSchemaNormalizedValue>);
 static_assert(!std::is_aggregate_v<BuildCatalogSchemaEntry>);
 static_assert(!std::is_aggregate_v<BuildQualifiedValueSchemaEntry>);
 static_assert(!std::is_aggregate_v<QualifiedCapabilityDefinition>);
@@ -340,6 +345,40 @@ steps:
       R"({"api_version":"manyforge.closed_schema.example_inventory.v1","enabled":true,"inventory_id":"cell_inventory","labels":["alpha","zeta"],"resources":[{"resource_id":"robot_a","revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"resource_id":"robot_b","revision":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],"retries":3,"steps":[{"name":"second"},{"name":"first"}]})");
 }
 
+TEST(ClosedSchema,
+     SharedNormalizerMaterializesDefaultsSortsSetsAndPreservesOrder) {
+  const auto schema =
+      compile_resource("examples/manyforge.closed_schema.example_inventory.v1.yaml");
+  const auto normalized =
+      validate_and_normalize_unqualified_artifact_candidate(
+          schema, parse_strict_json_model_yaml(R"(
+api_version: manyforge.closed_schema.example_inventory.v1
+inventory_id: cell_inventory
+labels: [zeta, alpha]
+resources:
+  - resource_id: robot_b
+    revision: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  - resource_id: robot_a
+    revision: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+steps:
+  - name: second
+  - name: first
+)"));
+
+  EXPECT_EQ(std::get<bool>(member(normalized.normalized_root(), "enabled").storage()),
+            true);
+  EXPECT_EQ(std::get<double>(member(normalized.normalized_root(), "retries").storage()),
+            3.0);
+  EXPECT_EQ(
+      canonical_json(member(normalized.normalized_root(), "labels")),
+      R"(["alpha","zeta"])");
+  EXPECT_EQ(
+      canonical_json(member(normalized.normalized_root(), "resources")),
+      R"([{"resource_id":"robot_a","revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"resource_id":"robot_b","revision":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}])");
+  EXPECT_EQ(canonical_json(member(normalized.normalized_root(), "steps")),
+            R"([{"name":"second"},{"name":"first"}])");
+}
+
 TEST(ClosedSchema, PythonOracleTaggedUnionGoldenSelectsOneClosedBranch) {
   const auto command =
       compile_resource("examples/manyforge.closed_schema.example_command.v1.yaml");
@@ -590,6 +629,28 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                 core::SchemaRevision(
                     "sha256:0000000000000000000000000000000000000000000000000000000000000000")),
             nullptr);
+}
+
+TEST(ClosedSchema,
+     DirectCanonicalValueNormalizationRequiresABuildQualifiedValueSchema) {
+  const auto& registry = build_qualified_closed_schema_registry();
+  const auto* schema = registry.find_qualified_value_schema(
+      core::SchemaId("manyforge.value_schema.runtime.empty.v1"),
+      core::SchemaRevision(
+          "sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785"));
+  ASSERT_NE(schema, nullptr);
+
+  const auto normalized = validate_and_normalize_build_qualified_value(
+      *schema, CanonicalValue(CanonicalValue::Object{}));
+  EXPECT_EQ(normalized.schema_id(), schema->schema_id());
+  EXPECT_EQ(normalized.schema_revision(), schema->schema_revision());
+  EXPECT_EQ(canonical_json(normalized.normalized_value()), "{}");
+
+  EXPECT_THROW(
+      validate_and_normalize_build_qualified_value(
+          *schema,
+          value_object({{"unexpected", CanonicalValue(true)}})),
+      ClosedSchemaError);
 }
 
 TEST(ClosedSchema,
@@ -1171,6 +1232,119 @@ definitions:
   EXPECT_THROW(validate_and_normalize_unqualified_artifact_candidate(
                    schema, parse_strict_json_model_yaml(repeated_empty_objects(83334U))),
                ClosedSchemaError);
+}
+
+TEST(ClosedSchema, CompleteCanonicalValueOutputBudgetEnforcesEveryV1Limit) {
+  auto nested_value = [](std::size_t depth) {
+    CanonicalValue value(nullptr);
+    for (std::size_t index = 0U; index < depth; ++index) {
+      CanonicalValue::Array wrapper;
+      wrapper.push_back(std::move(value));
+      value = CanonicalValue(std::move(wrapper));
+    }
+    return value;
+  };
+  EXPECT_NO_THROW(detail::validate_canonical_value_output_budget(
+      nested_value(kMaxArtifactNestingDepth)));
+  EXPECT_THROW(
+      detail::validate_canonical_value_output_budget(
+          nested_value(kMaxArtifactNestingDepth + 1U)),
+      ClosedSchemaError);
+
+  EXPECT_NO_THROW(detail::validate_canonical_value_output_budget(
+      CanonicalValue(std::string(kMaxArtifactScalarBytes, 'x'))));
+  EXPECT_THROW(detail::validate_canonical_value_output_budget(
+                   CanonicalValue(
+                       std::string(kMaxArtifactScalarBytes + 1U, 'x'))),
+               ClosedSchemaError);
+
+  auto keyed_node_aggregate = [](std::size_t item_count) {
+    CanonicalValue::Array items(item_count, CanonicalValue(nullptr));
+    return value_object(
+        {{"items", CanonicalValue(std::move(items))}});
+  };
+  EXPECT_NO_THROW(detail::validate_canonical_value_output_budget(
+      keyed_node_aggregate(kMaxArtifactNodeCount - 3U)));
+  EXPECT_THROW(
+      detail::validate_canonical_value_output_budget(
+          keyed_node_aggregate(kMaxArtifactNodeCount - 2U)),
+      ClosedSchemaError);
+
+  const auto scalar_size =
+      kMaxNormalizedAggregateScalarBytes / 16U - 2U;
+  auto scalar_aggregate = [scalar_size](bool append_overflow) {
+    CanonicalValue::Array values;
+    values.reserve(17U);
+    for (std::size_t index = 0U; index < 16U; ++index) {
+      values.emplace_back(std::string(scalar_size, 'x'));
+    }
+    if (append_overflow) {
+      values.emplace_back(nullptr);
+    }
+    return CanonicalValue(std::move(values));
+  };
+  EXPECT_NO_THROW(detail::validate_canonical_value_output_budget(
+      scalar_aggregate(false)));
+  EXPECT_THROW(detail::validate_canonical_value_output_budget(
+                   scalar_aggregate(true)),
+               ClosedSchemaError);
+}
+
+TEST(ClosedSchema,
+     CumulativeConstructionBudgetRejectsBeforeRetainingAnotherConfiguration) {
+  detail::CumulativeNormalizedValueBudget budget;
+  const CanonicalValue one_mebibyte_scalar(
+      std::string(kMaxArtifactScalarBytes - 2U, 'x'));
+  const CanonicalValue large_configuration =
+      value_object({{"payload", one_mebibyte_scalar}});
+
+  // Every object-root configuration is individually within all ceilings.
+  EXPECT_NO_THROW(detail::validate_canonical_value_output_budget(
+      large_configuration));
+
+  // Fifteen such configurations fit the shared construction budget. The
+  // sixteenth is rejected before the graph can retain it.
+  for (std::size_t index = 0U; index < 15U; ++index) {
+    EXPECT_NO_THROW(
+        detail::validate_canonical_value_output_budget_cumulatively(
+            large_configuration, budget));
+  }
+  EXPECT_THROW(
+      detail::validate_canonical_value_output_budget_cumulatively(
+          large_configuration, budget),
+      ClosedSchemaError);
+
+  detail::CumulativeNormalizedValueBudget node_budget;
+  const CanonicalValue half_node_budget(CanonicalValue::Array(
+      (kMaxArtifactNodeCount / 2U) - 1U, CanonicalValue(nullptr)));
+  EXPECT_NO_THROW(
+      detail::validate_canonical_value_output_budget_cumulatively(
+          half_node_budget, node_budget));
+  EXPECT_NO_THROW(
+      detail::validate_canonical_value_output_budget_cumulatively(
+          half_node_budget, node_budget));
+  EXPECT_EQ(node_budget.nodes, kMaxArtifactNodeCount);
+  EXPECT_THROW(
+      detail::validate_canonical_value_output_budget_cumulatively(
+          CanonicalValue(nullptr), node_budget),
+      ClosedSchemaError);
+
+  // The final one-shot graph budget counts graph-owned content and all
+  // configurations together rather than resetting at field boundaries.
+  CanonicalValue::Array configurations;
+  configurations.reserve(15U);
+  for (std::size_t index = 0U; index < 15U; ++index) {
+    configurations.push_back(large_configuration);
+  }
+  EXPECT_THROW(
+      detail::validate_canonical_value_output_budget(
+          value_object({
+              {"cell_id", CanonicalValue("cell_a")},
+              {"graph_owned_payload", one_mebibyte_scalar},
+              {"configurations",
+               CanonicalValue(std::move(configurations))},
+          })),
+      ClosedSchemaError);
 }
 
 }  // namespace

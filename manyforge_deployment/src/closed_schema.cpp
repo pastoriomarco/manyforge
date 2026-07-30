@@ -19,6 +19,7 @@
 #include <variant>
 #include <vector>
 
+#include "closed_schema_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "embedded_capability_definition_schema.hpp"
 #include "embedded_component_type_schema.hpp"
@@ -1178,15 +1179,18 @@ void validate_collection_shapes(const ConstDefinitionMap& definitions) {
 }
 
 struct ValueBudget final {
-  std::size_t nodes = 0U;
-  std::size_t scalar_bytes = 0U;
+  explicit ValueBudget(
+      detail::CumulativeNormalizedValueBudget& cumulative_budget)
+      : cumulative_budget(cumulative_budget) {}
+
+  detail::CumulativeNormalizedValueBudget& cumulative_budget;
 
   void consume_node(std::string_view label) {
-    if (nodes == kMaxArtifactNodeCount) {
+    if (cumulative_budget.nodes == kMaxArtifactNodeCount) {
       fail(label, "normalized value exceeds " + std::to_string(kMaxArtifactNodeCount) +
                       " total nodes");
     }
-    ++nodes;
+    ++cumulative_budget.nodes;
   }
 
   void consume_scalar(const CanonicalValue& value, std::string_view label) {
@@ -1196,11 +1200,13 @@ struct ValueBudget final {
       fail(label, "UTF-8 scalar exceeds " + std::to_string(kMaxArtifactScalarBytes) + " bytes");
     }
     const auto encoded_size = canonical_json(value).size();
-    if (encoded_size > kMaxNormalizedAggregateScalarBytes - scalar_bytes) {
+    if (encoded_size >
+        kMaxNormalizedAggregateScalarBytes -
+            cumulative_budget.scalar_bytes) {
       fail(label, "normalized scalar bytes exceed " +
                       std::to_string(kMaxNormalizedAggregateScalarBytes));
     }
-    scalar_bytes += encoded_size;
+    cumulative_budget.scalar_bytes += encoded_size;
   }
 };
 
@@ -1365,9 +1371,64 @@ struct ValueBudget final {
   throw ClosedSchemaError("unresolved local_ref reached instance normalization");
 }
 
+[[nodiscard]] CanonicalValue normalize_value(
+    const detail::CompiledClosedSchemaData& schema,
+    const CanonicalValue& candidate) {
+  detail::CumulativeNormalizedValueBudget cumulative_budget;
+  ValueBudget budget(cumulative_budget);
+  return normalize_instance(
+      *schema.definitions_by_id.at(schema.root_definition_id), candidate,
+      schema.definitions_by_id, schema.schema_id.value(), 0U, budget);
+}
+
+void validate_value_output_budget(const CanonicalValue& value,
+                                  std::string label, std::size_t depth,
+                                  ValueBudget& budget) {
+  if (const auto* object_value =
+          std::get_if<CanonicalValue::Object>(&value.storage());
+      object_value != nullptr) {
+    const auto collection_depth = depth + 1U;
+    if (collection_depth > kMaxArtifactNestingDepth) {
+      fail(label, "value collection nesting exceeds " +
+                      std::to_string(kMaxArtifactNestingDepth));
+    }
+    budget.consume_node(label);
+    for (std::size_t index = 0U; index < object_value->size(); ++index) {
+      const auto member_label =
+          label + ".members[" + std::to_string(index) + "]";
+      budget.consume_scalar(
+          CanonicalValue((*object_value)[index].first),
+          member_label + ".key");
+      validate_value_output_budget((*object_value)[index].second,
+                                   member_label + ".value",
+                                   collection_depth, budget);
+    }
+    return;
+  }
+  if (const auto* array_value =
+          std::get_if<CanonicalValue::Array>(&value.storage());
+      array_value != nullptr) {
+    const auto collection_depth = depth + 1U;
+    if (collection_depth > kMaxArtifactNestingDepth) {
+      fail(label, "value collection nesting exceeds " +
+                      std::to_string(kMaxArtifactNestingDepth));
+    }
+    budget.consume_node(label);
+    for (std::size_t index = 0U; index < array_value->size(); ++index) {
+      validate_value_output_budget(
+          (*array_value)[index],
+          label + "[" + std::to_string(index) + "]", collection_depth,
+          budget);
+    }
+    return;
+  }
+  budget.consume_scalar(value, label);
+}
+
 void normalize_defaults(std::vector<Definition>& definitions,
                         const ConstDefinitionMap& definitions_by_id) {
-  ValueBudget budget;
+  detail::CumulativeNormalizedValueBudget cumulative_budget;
+  ValueBudget budget(cumulative_budget);
   for (auto& definition : definitions) {
     std::vector<SchemaNode*> pending{definition.value_schema.get()};
     while (!pending.empty()) {
@@ -1530,6 +1591,23 @@ void validate_root_api_version(const SchemaNode& authored, const ConstDefinition
 
 }  // namespace
 
+namespace detail {
+
+void validate_canonical_value_output_budget(const CanonicalValue& value) {
+  CumulativeNormalizedValueBudget cumulative_budget;
+  validate_canonical_value_output_budget_cumulatively(
+      value, cumulative_budget);
+}
+
+void validate_canonical_value_output_budget_cumulatively(
+    const CanonicalValue& value,
+    CumulativeNormalizedValueBudget& cumulative_budget) {
+  ValueBudget budget(cumulative_budget);
+  validate_value_output_budget(value, "canonical_value", 0U, budget);
+}
+
+}  // namespace detail
+
 CompiledClosedSchema::CompiledClosedSchema(
     std::shared_ptr<const detail::CompiledClosedSchemaData> data)
     : data_(std::move(data)) {}
@@ -1677,14 +1755,20 @@ CompiledClosedSchema compile_closed_schema_descriptor(
 UnqualifiedSchemaNormalizedArtifactCandidate
 validate_and_normalize_unqualified_artifact_candidate(
     const CompiledClosedSchema& schema, const ParsedArtifactCandidate& candidate) {
-  ValueBudget budget;
-  auto normalized =
-      normalize_instance(*schema.data_->definitions_by_id.at(schema.data_->root_definition_id),
-                         candidate.root(), schema.data_->definitions_by_id,
-                         schema.data_->schema_id.value(), 0U, budget);
+  auto normalized = normalize_value(*schema.data_, candidate.root());
   return UnqualifiedSchemaNormalizedArtifactCandidate(
       schema.data_->schema_id, schema.data_->schema_revision,
       schema.data_->schema_purpose, std::move(normalized));
+}
+
+NonGraphQualifiedSchemaNormalizedValue
+validate_and_normalize_build_qualified_value(
+    const BuildQualifiedValueSchemaEntry& schema,
+    const CanonicalValue& candidate) {
+  const auto& compiled_schema = schema.compiled_schema();
+  return NonGraphQualifiedSchemaNormalizedValue(
+      schema.schema_id(), schema.schema_revision(),
+      normalize_value(*compiled_schema.data_, candidate));
 }
 
 struct BuildQualifiedClosedSchemaRegistry::Storage final {

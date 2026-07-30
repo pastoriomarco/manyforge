@@ -42,6 +42,13 @@ struct CompiledClosedSchemaData;
 }
 
 class UnqualifiedSchemaNormalizedArtifactCandidate;
+class BuildQualifiedValueSchemaEntry;
+class NonGraphQualifiedSchemaNormalizedValue;
+
+[[nodiscard]] NonGraphQualifiedSchemaNormalizedValue
+validate_and_normalize_build_qualified_value(
+    const BuildQualifiedValueSchemaEntry& schema,
+    const CanonicalValue& candidate);
 
 /// A descriptor whose closed shape, local-reference graph, defaults, and
 /// declared SchemaRevision have all been verified against the immutable v1
@@ -72,6 +79,10 @@ class CompiledClosedSchema final {
   friend UnqualifiedSchemaNormalizedArtifactCandidate
   validate_and_normalize_unqualified_artifact_candidate(
       const CompiledClosedSchema& schema, const ParsedArtifactCandidate& candidate);
+  friend NonGraphQualifiedSchemaNormalizedValue
+  validate_and_normalize_build_qualified_value(
+      const BuildQualifiedValueSchemaEntry& schema,
+      const CanonicalValue& candidate);
 };
 
 /// Unqualified artifact candidate normalized by one exact compiled descriptor.
@@ -220,6 +231,52 @@ class BuildQualifiedValueSchemaEntry final {
 
   friend class BuildQualifiedClosedSchemaRegistry;
 };
+
+/// A value normalized through one schema qualified into this build.
+///
+/// The wrapper records the exact schema selector but deliberately carries no
+/// graph identity or qualification. A caller must still place the value in its
+/// owning graph field, validate the complete graph, enforce the aggregate
+/// output budget, and verify or mint GraphRevision.
+class NonGraphQualifiedSchemaNormalizedValue final {
+ public:
+  [[nodiscard]] const core::SchemaId& schema_id() const noexcept {
+    return schema_id_;
+  }
+  [[nodiscard]] const core::SchemaRevision& schema_revision() const noexcept {
+    return schema_revision_;
+  }
+  [[nodiscard]] const CanonicalValue& normalized_value() const noexcept {
+    return normalized_value_;
+  }
+
+ private:
+  NonGraphQualifiedSchemaNormalizedValue(
+      core::SchemaId schema_id, core::SchemaRevision schema_revision,
+      CanonicalValue normalized_value)
+      : schema_id_(std::move(schema_id)),
+        schema_revision_(std::move(schema_revision)),
+        normalized_value_(std::move(normalized_value)) {}
+
+  core::SchemaId schema_id_;
+  core::SchemaRevision schema_revision_;
+  CanonicalValue normalized_value_;
+
+  friend NonGraphQualifiedSchemaNormalizedValue
+  validate_and_normalize_build_qualified_value(
+      const BuildQualifiedValueSchemaEntry& schema,
+      const CanonicalValue& candidate);
+};
+
+/// Validates and normalizes an in-memory value through an exact value schema
+/// qualified into this build, without serializing or parsing the candidate.
+///
+/// Per-value output budgets include materialized defaults. The result remains
+/// explicitly non-graph-qualified.
+[[nodiscard]] NonGraphQualifiedSchemaNormalizedValue
+validate_and_normalize_build_qualified_value(
+    const BuildQualifiedValueSchemaEntry& schema,
+    const CanonicalValue& candidate);
 
 /// Immutable schema registry compiled into this build.
 ///

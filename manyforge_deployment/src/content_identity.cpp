@@ -61,16 +61,35 @@ void require_ascii_token(std::string_view value, std::string_view name) {
   return CanonicalValue(std::move(payload));
 }
 
+void validate_root_shape(const CanonicalValue& normalized_root,
+                         const detail::ContentIdentitySpec& spec) {
+  switch (spec.root_shape) {
+    case detail::ContentIdentityRootShape::kDocument: {
+      const std::string& declared_api_version =
+          require_string_member(normalized_root, "api_version");
+      if (declared_api_version != spec.api_version) {
+        throw CanonicalValueError(
+            "root api_version does not match content-identity schema tag");
+      }
+      return;
+    }
+    case detail::ContentIdentityRootShape::kNestedRecord:
+      if (normalized_root.find_object_member("api_version") != nullptr) {
+        throw CanonicalValueError(
+            "nested content-identity root must not contain api_version");
+      }
+      return;
+  }
+  throw CanonicalValueError("unsupported content-identity root shape");
+}
+
 [[nodiscard]] std::string content_identity_preimage(const CanonicalValue& normalized_root,
                                                     const detail::ContentIdentitySpec& spec) {
   require_ascii_token(spec.identity_domain, "identity domain");
   require_ascii_token(spec.api_version, "api_version");
   require_ascii_token(spec.own_field, "own field");
 
-  const std::string& declared_api_version = require_string_member(normalized_root, "api_version");
-  if (declared_api_version != spec.api_version) {
-    throw CanonicalValueError("root api_version does not match content-identity schema tag");
-  }
+  validate_root_shape(normalized_root, spec);
   const std::string& declared_identity = require_string_member(normalized_root, spec.own_field);
   if (!is_sha256_digest(declared_identity)) {
     throw CanonicalValueError("content-identity own field must be an exact lowercase SHA-256");
@@ -140,9 +159,6 @@ std::string compute_content_identity(const CanonicalValue& normalized_root,
 bool verify_content_identity(const CanonicalValue& normalized_root,
                              const ContentIdentitySpec& spec) {
   const std::string& declared = require_string_member(normalized_root, spec.own_field);
-  if (!is_sha256_digest(declared)) {
-    return false;
-  }
   const std::string computed = compute_content_identity(normalized_root, spec);
   return declared.size() == computed.size() &&
          CRYPTO_memcmp(declared.data(), computed.data(), declared.size()) == 0;

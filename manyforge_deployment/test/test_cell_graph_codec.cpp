@@ -1,8 +1,14 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <manyforge_core/types/runtime_profile.hpp>
+#include <manyforge_deployment/content_identity.hpp>
+#include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/canonical_value.hpp"
@@ -15,6 +21,168 @@ constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 constexpr std::string_view kOneDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+constexpr std::string_view kRuntimeProfileSchemaRevision =
+    "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7";
+constexpr std::string_view kEmptyRuntimeConfigurationSchemaRevision =
+    "sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785";
+constexpr std::string_view kEmptyGraphRevisionGolden =
+    "sha256:443285fa98d7408c9249b581a8802f498bbe1501486bd579cc674be7a6b2cb34";
+
+static_assert(!std::is_aggregate_v<GraphIdentityReadyCellGraphCandidate>);
+static_assert(
+    !std::is_default_constructible_v<GraphIdentityReadyCellGraphCandidate>);
+static_assert(!std::is_aggregate_v<GraphRevisionVerifiedCellGraph>);
+static_assert(!std::is_default_constructible_v<GraphRevisionVerifiedCellGraph>);
+
+[[nodiscard]] std::string independent_identity(
+    const CanonicalValue& normalized_root, std::string_view identity_domain,
+    std::string_view api_version, std::string_view own_field) {
+  CanonicalValue::Object payload;
+  bool found = false;
+  for (const auto& [name, value] : normalized_root.as_object()) {
+    if (name == own_field) {
+      found = true;
+      continue;
+    }
+    payload.emplace_back(name, value);
+  }
+  EXPECT_TRUE(found);
+  std::string preimage{"manyforge.content-identity.v1"};
+  preimage.push_back('\0');
+  preimage.append(identity_domain);
+  preimage.push_back('\0');
+  preimage.append(api_version);
+  preimage.push_back('\0');
+  preimage.append(canonical_json(CanonicalValue(std::move(payload))));
+  return sha256_digest(preimage);
+}
+
+[[nodiscard]] CanonicalValue::Object replace_member(
+    const CanonicalValue& object_value, std::string_view field,
+    CanonicalValue replacement) {
+  CanonicalValue::Object object = object_value.as_object();
+  const auto found =
+      std::find_if(object.begin(), object.end(), [field](const auto& member) {
+        return member.first == field;
+      });
+  EXPECT_NE(found, object.end());
+  if (found != object.end()) {
+    found->second = std::move(replacement);
+  }
+  return object;
+}
+
+[[nodiscard]] CanonicalValue::Array replace_array_item_member(
+    const CanonicalValue& array_value, std::size_t index,
+    std::string_view field, CanonicalValue replacement) {
+  CanonicalValue::Array array =
+      std::get<CanonicalValue::Array>(array_value.storage());
+  EXPECT_LT(index, array.size());
+  if (index < array.size()) {
+    array[index] = CanonicalValue(
+        replace_member(array[index], field, std::move(replacement)));
+  }
+  return array;
+}
+
+[[nodiscard]] QualifiedRuntimeProfile qualify_runtime_profile(
+    std::string profile_id,
+    std::string lifecycle_control = "manager_managed") {
+  CanonicalValue identity(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(core::kRuntimeProfileApiVersion))},
+      {"runtime_profile_id", CanonicalValue(profile_id)},
+      {"runtime_profile_revision",
+       CanonicalValue(std::string(kZeroDigest))},
+      {"configuration_schema_ref",
+       CanonicalValue(CanonicalValue::Object{
+           {"schema_id",
+            CanonicalValue(
+                "manyforge.value_schema.runtime.empty.v1")},
+           {"schema_revision",
+            CanonicalValue(
+                std::string(kEmptyRuntimeConfigurationSchemaRevision))},
+       })},
+      {"process_contract",
+       CanonicalValue(CanonicalValue::Object{
+           {"lifecycle_control",
+            CanonicalValue(std::move(lifecycle_control))},
+       })},
+      {"supervision_contract",
+       CanonicalValue(CanonicalValue::Object{
+           {"status_endpoint_role_id",
+            CanonicalValue("runtime_status")},
+       })},
+      {"offered_runtime_role_ids",
+       CanonicalValue(
+           CanonicalValue::Array{CanonicalValue("runtime")})},
+      {"source_endpoint_role_ids",
+       CanonicalValue(
+           CanonicalValue::Array{CanonicalValue("runtime_status")})},
+  });
+  const std::string revision = independent_identity(
+      identity, "catalog-record-revision/runtime_profile",
+      core::kRuntimeProfileApiVersion, "runtime_profile_revision");
+  auto document_root =
+      replace_member(identity, "runtime_profile_revision",
+                     CanonicalValue(revision));
+  const std::string document =
+      canonical_json(CanonicalValue(std::move(document_root)));
+  const core::ContentAddressedStoreKey store_key(
+      "sha256/runtime-profile-cell-graph-" + profile_id + "-" +
+      revision.substr(revision.size() - 8U));
+  const core::RuntimeProfileCatalogRecordRefDTO reference{
+      core::RuntimeProfileId(std::move(profile_id)),
+      core::RuntimeProfileRevision(revision),
+      core::SchemaId(std::string(core::kRuntimeProfileApiVersion)),
+      core::SchemaRevision(std::string(kRuntimeProfileSchemaRevision)),
+      core::ContentDigest(sha256_digest(document)),
+      store_key,
+  };
+  return resolve_and_qualify_runtime_profile(reference, store_key, document);
+}
+
+struct RuntimeUnitSpec final {
+  std::string runtime_unit_id;
+  const QualifiedRuntimeProfile* profile;
+  std::string configuration{"{}"};
+};
+
+[[nodiscard]] std::string runtime_only_graph(
+    const std::vector<RuntimeUnitSpec>& units) {
+  std::string result =
+      "api_version: manyforge.cell_graph.v1\n"
+      "graph_revision: " +
+      std::string(kZeroDigest) +
+      "\n"
+      "cell_id: runtime_only\n"
+      "runtime_units:\n";
+  if (units.empty()) {
+    result.append("  []\n");
+  } else {
+    for (const auto& unit : units) {
+      result.append("  - runtime_unit_id: ");
+      result.append(unit.runtime_unit_id);
+      result.append("\n    runtime_profile_id: ");
+      result.append(unit.profile->value().runtime_profile_id.value());
+      result.append("\n    runtime_profile_revision: ");
+      result.append(
+          unit.profile->value().runtime_profile_revision.value());
+      result.append(
+          "\n    dependency_runtime_unit_ids: []\n"
+          "    configuration: ");
+      result.append(unit.configuration);
+      result.push_back('\n');
+    }
+  }
+  result.append(
+      "model_instances: []\n"
+      "controllable_components: []\n"
+      "control_domains: []\n"
+      "control_bindings: []\n"
+      "component_attachments: []\n");
+  return result;
+}
 
 [[nodiscard]] std::string empty_graph(std::string_view cell_id = "cell_a") {
   return "api_version: manyforge.cell_graph.v1\n"
@@ -842,6 +1010,275 @@ TEST(CellGraphCodec, RejectsAttachmentCyclesAndMultipleParents) {
                              "attachment_interface_id: mount_2");
   multiple_parent.append(second_edge);
   EXPECT_THROW({ (void)validate(std::move(multiple_parent)); }, CellGraphCodecError);
+}
+
+TEST(CellGraphCodec,
+     ComputesAndVerifiesTheIndependentEmptyGraphRevisionGolden) {
+  const auto ready = prepare_cell_graph_identity(validate(empty_graph()), {});
+  EXPECT_THROW({ (void)verify_graph_revision(ready); },
+               CellGraphCodecError);
+
+  const auto computed = compute_graph_revision(ready);
+  EXPECT_EQ(computed.graph().graph_revision.value(),
+            kEmptyGraphRevisionGolden);
+  EXPECT_EQ(
+      independent_identity(computed.normalized_root(), "graph-revision",
+                           core::kCellGraphApiVersion, "graph_revision"),
+      kEmptyGraphRevisionGolden);
+
+  const auto reparsed =
+      validate(canonical_json(computed.normalized_root()));
+  const auto verification_ready =
+      prepare_cell_graph_identity(reparsed, {});
+  const auto verified = verify_graph_revision(verification_ready);
+  EXPECT_EQ(verified.graph(), computed.graph());
+  EXPECT_EQ(verified.normalized_root(), computed.normalized_root());
+}
+
+TEST(CellGraphCodec,
+     RequiresTheExactRuntimeProfileClosureAndNormalizesConfiguration) {
+  const auto profile = qualify_runtime_profile("driver_profile");
+  const auto stale_profile =
+      qualify_runtime_profile("driver_profile", "externally_managed");
+  const auto unused_profile = qualify_runtime_profile("unused_profile");
+  const std::string graph =
+      runtime_only_graph({{"driver", &profile, "{}"}});
+  const auto intrinsic = validate(graph);
+
+  const std::vector<QualifiedRuntimeProfile> exact{profile};
+  const auto ready = prepare_cell_graph_identity(intrinsic, exact);
+  ASSERT_EQ(ready.graph().runtime_units.size(), 1U);
+  EXPECT_TRUE(ready.graph().runtime_units.front().configuration.empty());
+
+  EXPECT_THROW(
+      {
+        (void)prepare_cell_graph_identity(
+            intrinsic, std::span<const QualifiedRuntimeProfile>{});
+      },
+      CellGraphCodecError);
+
+  const std::vector<QualifiedRuntimeProfile> stale{stale_profile};
+  EXPECT_THROW(
+      { (void)prepare_cell_graph_identity(intrinsic, stale); },
+      CellGraphCodecError);
+
+  const std::vector<QualifiedRuntimeProfile> extra{profile, unused_profile};
+  EXPECT_THROW(
+      { (void)prepare_cell_graph_identity(intrinsic, extra); },
+      CellGraphCodecError);
+
+  const auto open_configuration = validate(
+      runtime_only_graph({{"driver", &profile, "{unexpected: true}"}}));
+  EXPECT_THROW(
+      { (void)prepare_cell_graph_identity(open_configuration, exact); },
+      CellGraphCodecError);
+}
+
+TEST(CellGraphCodec,
+     AllowsExactProfileReuseAndSeveralSelectedRevisionsOfOneProfileId) {
+  const auto managed = qualify_runtime_profile("shared_profile");
+  const auto external =
+      qualify_runtime_profile("shared_profile", "externally_managed");
+
+  const auto reused = validate(runtime_only_graph(
+      {{"driver_a", &managed, "{}"}, {"driver_b", &managed, "{}"}}));
+  const std::vector<QualifiedRuntimeProfile> one_profile{managed};
+  EXPECT_NO_THROW(
+      { (void)prepare_cell_graph_identity(reused, one_profile); });
+  const std::vector<QualifiedRuntimeProfile> duplicate{managed, managed};
+  EXPECT_THROW(
+      { (void)prepare_cell_graph_identity(reused, duplicate); },
+      CellGraphCodecError);
+
+  const auto unused = qualify_runtime_profile("unused_profile");
+  const std::vector<QualifiedRuntimeProfile> unused_extra{managed, unused};
+  EXPECT_THROW(
+      { (void)prepare_cell_graph_identity(reused, unused_extra); },
+      CellGraphCodecError);
+
+  const auto two_revisions = validate(runtime_only_graph(
+      {{"driver_a", &managed, "{}"}, {"driver_b", &external, "{}"}}));
+  const std::vector<QualifiedRuntimeProfile> both{managed, external};
+  EXPECT_NO_THROW(
+      { (void)prepare_cell_graph_identity(two_revisions, both); });
+}
+
+TEST(CellGraphCodec,
+     ComputesNestedIdentitiesBeforeGraphRevisionAndNeverRepairsOnVerify) {
+  const auto observer = qualify_runtime_profile("observer_profile");
+  const auto driver = qualify_runtime_profile("driver_profile");
+  std::string graph = full_graph();
+  graph = replace_once(
+      std::move(graph),
+      "runtime_profile_id: observer_profile\n"
+      "    runtime_profile_revision: " +
+          std::string(kZeroDigest),
+      "runtime_profile_id: observer_profile\n"
+      "    runtime_profile_revision: " +
+          observer.value().runtime_profile_revision.value());
+  graph = replace_once(
+      std::move(graph),
+      "runtime_profile_id: driver_profile\n"
+      "    runtime_profile_revision: " +
+          std::string(kZeroDigest),
+      "runtime_profile_id: driver_profile\n"
+      "    runtime_profile_revision: " +
+          driver.value().runtime_profile_revision.value());
+  graph = replace_once(
+      std::move(graph),
+      "configuration: {robot_ip_ref: site.robot.ip}",
+      "configuration: {}");
+
+  const std::vector<QualifiedRuntimeProfile> profiles{observer, driver};
+  const auto ready =
+      prepare_cell_graph_identity(validate(graph), profiles);
+  const auto computed = compute_graph_revision(ready);
+  const auto parsed =
+      parse_strict_json_model_yaml(canonical_json(computed.normalized_root()));
+
+  const auto* domains =
+      parsed.root().find_object_member("control_domains");
+  const auto* bindings =
+      parsed.root().find_object_member("control_bindings");
+  const auto* attachments =
+      parsed.root().find_object_member("component_attachments");
+  ASSERT_NE(domains, nullptr);
+  ASSERT_NE(bindings, nullptr);
+  ASSERT_NE(attachments, nullptr);
+  const auto& domain_array =
+      std::get<CanonicalValue::Array>(domains->storage());
+  const auto& binding_array =
+      std::get<CanonicalValue::Array>(bindings->storage());
+  const auto& attachment_array =
+      std::get<CanonicalValue::Array>(attachments->storage());
+  ASSERT_EQ(domain_array.size(), 1U);
+  ASSERT_EQ(binding_array.size(), 1U);
+  ASSERT_EQ(attachment_array.size(), 1U);
+
+  const auto* declared_domain =
+      domain_array.front().find_object_member("control_domain_revision");
+  const auto* declared_binding =
+      binding_array.front().find_object_member("control_binding_revision");
+  const auto* declared_attachment = attachment_array.front().find_object_member(
+      "component_attachment_revision");
+  ASSERT_NE(declared_domain, nullptr);
+  ASSERT_NE(declared_binding, nullptr);
+  ASSERT_NE(declared_attachment, nullptr);
+  EXPECT_EQ(
+      std::get<std::string>(declared_domain->storage()),
+      independent_identity(domain_array.front(),
+                           "control-domain-revision",
+                           core::kCellGraphApiVersion,
+                           "control_domain_revision"));
+  EXPECT_EQ(
+      std::get<std::string>(declared_binding->storage()),
+      independent_identity(binding_array.front(),
+                           "control-binding-revision",
+                           core::kCellGraphApiVersion,
+                           "control_binding_revision"));
+  EXPECT_EQ(
+      std::get<std::string>(declared_attachment->storage()),
+      independent_identity(attachment_array.front(),
+                           "component-attachment-revision",
+                           core::kCellGraphApiVersion,
+                           "component_attachment_revision"));
+  EXPECT_EQ(
+      computed.graph().graph_revision.value(),
+      independent_identity(parsed.root(), "graph-revision",
+                           core::kCellGraphApiVersion, "graph_revision"));
+
+  const auto computed_input =
+      prepare_cell_graph_identity(validate(canonical_json(parsed.root())),
+                                  profiles);
+  EXPECT_NO_THROW({ (void)verify_graph_revision(computed_input); });
+
+  auto expect_nested_rejection_without_repair =
+      [&](std::string_view collection_field,
+          const CanonicalValue& collection,
+          std::string_view revision_field) {
+        CanonicalValue stale_nested_root(replace_member(
+            parsed.root(), collection_field,
+            CanonicalValue(replace_array_item_member(
+                collection, 0U, revision_field,
+                CanonicalValue(std::string(kZeroDigest))))));
+        const std::string consistent_outer = independent_identity(
+            stale_nested_root, "graph-revision",
+            core::kCellGraphApiVersion, "graph_revision");
+        CanonicalValue stale_but_outer_consistent(replace_member(
+            stale_nested_root, "graph_revision",
+            CanonicalValue(consistent_outer)));
+        const auto stale_ready = prepare_cell_graph_identity(
+            validate(canonical_json(stale_but_outer_consistent)), profiles);
+        const auto graph_before = stale_ready.graph();
+        const auto root_before = stale_ready.normalized_root();
+        EXPECT_THROW({ (void)verify_graph_revision(stale_ready); },
+                     CellGraphCodecError);
+        EXPECT_EQ(stale_ready.graph(), graph_before);
+        EXPECT_EQ(stale_ready.normalized_root(), root_before);
+      };
+  expect_nested_rejection_without_repair(
+      "control_domains", *domains, "control_domain_revision");
+  expect_nested_rejection_without_repair(
+      "control_bindings", *bindings, "control_binding_revision");
+  expect_nested_rejection_without_repair(
+      "component_attachments", *attachments,
+      "component_attachment_revision");
+
+  const auto stale_outer_ready = prepare_cell_graph_identity(
+      validate(canonical_json(CanonicalValue(replace_member(
+          parsed.root(), "graph_revision",
+          CanonicalValue(std::string(kZeroDigest)))))), profiles);
+  const auto stale_outer_graph_before = stale_outer_ready.graph();
+  const auto stale_outer_root_before = stale_outer_ready.normalized_root();
+  EXPECT_THROW({ (void)verify_graph_revision(stale_outer_ready); },
+               CellGraphCodecError);
+  EXPECT_EQ(stale_outer_ready.graph(), stale_outer_graph_before);
+  EXPECT_EQ(stale_outer_ready.normalized_root(), stale_outer_root_before);
+
+  CanonicalValue stale_producer_root = parsed.root();
+  stale_producer_root = CanonicalValue(replace_member(
+      stale_producer_root, "control_domains",
+      CanonicalValue(replace_array_item_member(
+          *domains, 0U, "control_domain_revision",
+          CanonicalValue(std::string(kOneDigest))))));
+  stale_producer_root = CanonicalValue(replace_member(
+      stale_producer_root, "control_bindings",
+      CanonicalValue(replace_array_item_member(
+          *bindings, 0U, "control_binding_revision",
+          CanonicalValue(std::string(kOneDigest))))));
+  stale_producer_root = CanonicalValue(replace_member(
+      stale_producer_root, "component_attachments",
+      CanonicalValue(replace_array_item_member(
+          *attachments, 0U, "component_attachment_revision",
+          CanonicalValue(std::string(kOneDigest))))));
+  stale_producer_root = CanonicalValue(replace_member(
+      stale_producer_root, "graph_revision",
+      CanonicalValue(std::string(kOneDigest))));
+  const auto recomputed_from_stale = compute_graph_revision(
+      prepare_cell_graph_identity(
+          validate(canonical_json(stale_producer_root)), profiles));
+  EXPECT_EQ(recomputed_from_stale.graph(), computed.graph());
+  EXPECT_EQ(recomputed_from_stale.normalized_root(),
+            computed.normalized_root());
+
+  // The current production runtime schema is intentionally exact-empty.
+  // Exercise outer-only sensitivity with another valid non-nested graph field;
+  // the first owned non-empty runtime schema will add the equivalent
+  // configuration-change fixture.
+  const auto alternate_cell = compute_graph_revision(
+      prepare_cell_graph_identity(
+          validate(canonical_json(CanonicalValue(replace_member(
+              parsed.root(), "cell_id",
+              CanonicalValue("runtime_only_alternate"))))),
+          profiles));
+  EXPECT_NE(alternate_cell.graph().graph_revision,
+            computed.graph().graph_revision);
+  EXPECT_EQ(alternate_cell.graph().control_domains,
+            computed.graph().control_domains);
+  EXPECT_EQ(alternate_cell.graph().control_bindings,
+            computed.graph().control_bindings);
+  EXPECT_EQ(alternate_cell.graph().component_attachments,
+            computed.graph().component_attachments);
 }
 
 }  // namespace

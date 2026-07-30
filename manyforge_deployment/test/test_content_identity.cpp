@@ -18,6 +18,7 @@ namespace {
 
 using detail::catalog_record_identity_domain;
 using detail::compute_content_identity;
+using detail::ContentIdentityRootShape;
 using detail::ContentIdentitySpec;
 using detail::verify_content_identity;
 
@@ -164,6 +165,91 @@ TEST(ContentIdentityTest, ComputesAndVerifiesDomainSeparatedIdentity) {
       .own_field = spec.own_field,
   };
   EXPECT_NE(compute_content_identity(value, spec), compute_content_identity(value, other_domain));
+}
+
+TEST(ContentIdentityTest, ComputesNestedRecordIdentityFromExternalDocumentSchemaTag) {
+  const ContentIdentitySpec spec{
+      .identity_domain = "control-domain-revision",
+      .api_version = "manyforge.cell_graph.v1",
+      .own_field = "control_domain_revision",
+      .root_shape = ContentIdentityRootShape::kNestedRecord,
+  };
+  CanonicalValue value(CanonicalValue::Object{
+      {"control_domain_id", CanonicalValue("domain_a")},
+      {"control_domain_revision",
+       CanonicalValue("sha256:0000000000000000000000000000000000000000000000000000000000000000")},
+      {"runtime_unit_ids",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue("runtime_a")})},
+      {"control_coordinator_endpoint_role", CanonicalValue("control_coordinator")},
+      {"controller_topology_id", CanonicalValue("topology_a")},
+      {"topology_revision",
+       CanonicalValue("sha256:1111111111111111111111111111111111111111111111111111111111111111")},
+      {"containment_granularity", CanonicalValue("control_domain")},
+  });
+
+  const std::string identity = compute_content_identity(value, spec);
+  EXPECT_EQ(identity, "sha256:9b611e3795858764a013af3690a674875b796f0f4ee882cbb3f6abc5a7aa5eeb");
+  EXPECT_FALSE(verify_content_identity(value, spec));
+
+  CanonicalValue::Object matching_members = value.as_object();
+  for (auto& [name, member] : matching_members) {
+    if (name == "control_domain_revision") {
+      member = CanonicalValue(identity);
+    }
+  }
+  EXPECT_TRUE(verify_content_identity(CanonicalValue(std::move(matching_members)), spec));
+
+  const ContentIdentitySpec nested_schema_fragment{
+      .identity_domain = spec.identity_domain,
+      .api_version = "manyforge.cell_graph.v1#control_domain",
+      .own_field = spec.own_field,
+      .root_shape = ContentIdentityRootShape::kNestedRecord,
+  };
+  EXPECT_NE(compute_content_identity(value, spec),
+            compute_content_identity(value, nested_schema_fragment));
+}
+
+TEST(ContentIdentityTest, EnforcesDocumentAndNestedRecordRootShapes) {
+  const ContentIdentitySpec document_spec{
+      .identity_domain = "graph-revision",
+      .api_version = "manyforge.cell_graph.v1",
+      .own_field = "graph_revision",
+  };
+  const ContentIdentitySpec nested_spec{
+      .identity_domain = "control-domain-revision",
+      .api_version = "manyforge.cell_graph.v1",
+      .own_field = "control_domain_revision",
+      .root_shape = ContentIdentityRootShape::kNestedRecord,
+  };
+  const std::string zero_digest =
+      "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+  EXPECT_THROW(
+      compute_content_identity(
+          CanonicalValue(CanonicalValue::Object{
+              {"graph_revision", CanonicalValue(zero_digest)},
+          }),
+          document_spec),
+      CanonicalValueError);
+  EXPECT_THROW(
+      compute_content_identity(
+          CanonicalValue(CanonicalValue::Object{
+              {"api_version", CanonicalValue("manyforge.cell_graph.v1")},
+              {"control_domain_revision", CanonicalValue(zero_digest)},
+          }),
+          nested_spec),
+      CanonicalValueError);
+  EXPECT_THROW(
+      {
+        (void)verify_content_identity(
+            CanonicalValue(CanonicalValue::Object{
+                {"api_version",
+                 CanonicalValue("manyforge.cell_graph.v1")},
+                {"graph_revision", CanonicalValue("not-a-digest")},
+            }),
+            document_spec);
+      },
+      CanonicalValueError);
 }
 
 TEST(ContentIdentityTest, HashesExactBytesAndValidatesInputs) {

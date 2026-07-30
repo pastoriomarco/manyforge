@@ -13,9 +13,12 @@
 #include <manyforge_deployment/provider_manifest_codec.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
+#include <algorithm>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "binding_registrations.hpp"
@@ -26,6 +29,8 @@ namespace manyforge::core::python {
 
 void register_deployment_candidate_bindings(py::module_& module) {
   using deployment::IntrinsicallyValidatedCellGraphCandidate;
+  using deployment::GraphIdentityReadyCellGraphCandidate;
+  using deployment::GraphRevisionVerifiedCellGraph;
   using deployment::ParsedArtifactCandidate;
   using deployment::TypedCellGraphCandidate;
   using deployment::UnqualifiedSchemaNormalizedArtifactCandidate;
@@ -83,6 +88,36 @@ void register_deployment_candidate_bindings(py::module_& module) {
           [](const IntrinsicallyValidatedCellGraphCandidate& candidate) {
             py::gil_scoped_release release;
             return deployment::canonical_json(candidate.structurally_normalized_root());
+          });
+
+  py::class_<GraphIdentityReadyCellGraphCandidate>(
+      module, "GraphIdentityReadyCellGraphCandidate", py::is_final())
+      .def_property_readonly(
+          "graph",
+          [](const GraphIdentityReadyCellGraphCandidate& candidate) {
+            py::gil_scoped_release release;
+            return candidate.graph();
+          })
+      .def_property_readonly(
+          "normalized_canonical_json",
+          [](const GraphIdentityReadyCellGraphCandidate& candidate) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(candidate.normalized_root());
+          });
+
+  py::class_<GraphRevisionVerifiedCellGraph>(
+      module, "GraphRevisionVerifiedCellGraph", py::is_final())
+      .def_property_readonly(
+          "graph",
+          [](const GraphRevisionVerifiedCellGraph& graph) {
+            py::gil_scoped_release release;
+            return graph.graph();
+          })
+      .def_property_readonly(
+          "normalized_canonical_json",
+          [](const GraphRevisionVerifiedCellGraph& graph) {
+            py::gil_scoped_release release;
+            return deployment::canonical_json(graph.normalized_root());
           });
 
   py::enum_<deployment::ClosedSchemaPurpose>(module, "ClosedSchemaPurpose")
@@ -303,6 +338,69 @@ void register_deployment_candidate_bindings(py::module_& module) {
              py::arg("parsed"), py::call_guard<py::gil_scoped_release>());
   module.def("validate_intrinsic_cell_graph_candidate",
              &deployment::validate_intrinsic_cell_graph_candidate, py::arg("candidate"),
+             py::call_guard<py::gil_scoped_release>());
+  module.def(
+      "prepare_cell_graph_identity",
+      [](const IntrinsicallyValidatedCellGraphCandidate& candidate,
+         const py::iterable& qualified_runtime_profiles) {
+        std::set<std::pair<std::string, std::string>>
+            selected_runtime_profiles;
+        {
+          py::gil_scoped_release release;
+          for (const auto& unit : candidate.graph().runtime_units) {
+            selected_runtime_profiles.emplace(
+                unit.runtime_profile_id.value(),
+                unit.runtime_profile_revision.value());
+          }
+        }
+        const std::size_t maximum_closure_size =
+            selected_runtime_profiles.size();
+        std::set<std::pair<std::string, std::string>> seen_runtime_profiles;
+        std::vector<deployment::QualifiedRuntimeProfile> bounded_profiles;
+        bounded_profiles.reserve(maximum_closure_size);
+        for (const auto& profile : qualified_runtime_profiles) {
+          if (!py::isinstance<deployment::QualifiedRuntimeProfile>(profile)) {
+            throw py::type_error(
+                "qualified_runtime_profiles must contain only "
+                "QualifiedRuntimeProfile values");
+          }
+          const auto& qualified_profile =
+              profile.cast<const deployment::QualifiedRuntimeProfile&>();
+          const auto key = std::pair{
+              qualified_profile.value().runtime_profile_id.value(),
+              qualified_profile.value().runtime_profile_revision.value()};
+          if (!selected_runtime_profiles.contains(key)) {
+            const bool selected_id = std::any_of(
+                selected_runtime_profiles.begin(),
+                selected_runtime_profiles.end(),
+                [&key](const auto& selected) {
+                  return selected.first == key.first;
+                });
+            throw deployment::CellGraphCodecError(
+                std::string(selected_id
+                                ? "stale runtime-profile revision "
+                                : "unused extra runtime profile ") +
+                "'" + key.first + "' at revision '" + key.second + "'");
+          }
+          if (!seen_runtime_profiles.insert(key).second) {
+            throw deployment::CellGraphCodecError(
+                "duplicate exact runtime profile '" + key.first +
+                "' at revision '" + key.second + "'");
+          }
+          bounded_profiles.push_back(qualified_profile);
+        }
+        py::gil_scoped_release release;
+        return deployment::prepare_cell_graph_identity(
+            candidate,
+            std::span<const deployment::QualifiedRuntimeProfile>{
+                bounded_profiles});
+      },
+      py::arg("candidate"), py::arg("qualified_runtime_profiles"));
+  module.def("compute_graph_revision", &deployment::compute_graph_revision,
+             py::arg("candidate"),
+             py::call_guard<py::gil_scoped_release>());
+  module.def("verify_graph_revision", &deployment::verify_graph_revision,
+             py::arg("candidate"),
              py::call_guard<py::gil_scoped_release>());
   module.def("compile_closed_schema_descriptor",
              &deployment::compile_closed_schema_descriptor, py::arg("candidate"),

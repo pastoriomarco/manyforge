@@ -15,6 +15,9 @@
 #include <variant>
 #include <vector>
 
+#include "closed_schema_internal.hpp"
+#include "content_identity_internal.hpp"
+#include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 
 namespace manyforge::deployment {
@@ -72,6 +75,8 @@ using core::StateAuthorityId;
 using core::StopEvidencePolicyId;
 using core::StopEvidencePolicyRevision;
 using core::TopologyRevision;
+
+using RuntimeProfileKey = std::pair<std::string, std::string>;
 
 // Accept ordinary decimal serialization error while still rejecting poses
 // that require semantic renormalization. The codec never changes the value.
@@ -853,6 +858,108 @@ template <typename Record, typename Converter>
        record_array(graph.component_attachments, component_attachment_value)}});
 }
 
+[[nodiscard]] detail::ContentIdentitySpec nested_identity_spec(
+    std::string identity_domain, std::string own_field) {
+  return detail::ContentIdentitySpec{
+      .identity_domain = std::move(identity_domain),
+      .api_version = std::string(core::kCellGraphApiVersion),
+      .own_field = std::move(own_field),
+      .root_shape = detail::ContentIdentityRootShape::kNestedRecord,
+  };
+}
+
+[[nodiscard]] detail::ContentIdentitySpec graph_identity_spec() {
+  return detail::ContentIdentitySpec{
+      .identity_domain = "graph-revision",
+      .api_version = std::string(core::kCellGraphApiVersion),
+      .own_field = "graph_revision",
+  };
+}
+
+[[nodiscard]] RuntimeProfileKey runtime_profile_key(
+    const core::RuntimeProfileDTO& profile) {
+  return {profile.runtime_profile_id.value(),
+          profile.runtime_profile_revision.value()};
+}
+
+[[nodiscard]] RuntimeProfileKey runtime_profile_key(
+    const RuntimeUnitDTO& unit) {
+  return {unit.runtime_profile_id.value(),
+          unit.runtime_profile_revision.value()};
+}
+
+[[nodiscard]] std::string profile_key_label(
+    const RuntimeProfileKey& key) {
+  return "'" + key.first + "' at revision '" + key.second + "'";
+}
+
+void compute_nested_graph_revisions(CellGraphDTO& graph) {
+  const auto domain_spec =
+      nested_identity_spec("control-domain-revision",
+                           "control_domain_revision");
+  for (auto& domain : graph.control_domains) {
+    domain.control_domain_revision = ControlDomainRevision(
+        detail::compute_content_identity(control_domain_value(domain),
+                                         domain_spec));
+  }
+
+  const auto binding_spec =
+      nested_identity_spec("control-binding-revision",
+                           "control_binding_revision");
+  for (auto& binding : graph.control_bindings) {
+    binding.control_binding_revision = ControlBindingRevision(
+        detail::compute_content_identity(control_binding_value(binding),
+                                         binding_spec));
+  }
+
+  const auto attachment_spec =
+      nested_identity_spec("component-attachment-revision",
+                           "component_attachment_revision");
+  for (auto& attachment : graph.component_attachments) {
+    attachment.component_attachment_revision = ComponentAttachmentRevision(
+        detail::compute_content_identity(
+            component_attachment_value(attachment), attachment_spec));
+  }
+}
+
+void verify_nested_graph_revisions(const CellGraphDTO& graph) {
+  const auto domain_spec =
+      nested_identity_spec("control-domain-revision",
+                           "control_domain_revision");
+  for (const auto& domain : graph.control_domains) {
+    if (!detail::verify_content_identity(control_domain_value(domain),
+                                         domain_spec)) {
+      fail("$.control_domains",
+           "control_domain_revision mismatch for '" +
+               domain.control_domain_id.value() + "'");
+    }
+  }
+
+  const auto binding_spec =
+      nested_identity_spec("control-binding-revision",
+                           "control_binding_revision");
+  for (const auto& binding : graph.control_bindings) {
+    if (!detail::verify_content_identity(control_binding_value(binding),
+                                         binding_spec)) {
+      fail("$.control_bindings",
+           "control_binding_revision mismatch for '" +
+               binding.control_binding_id.value() + "'");
+    }
+  }
+
+  const auto attachment_spec =
+      nested_identity_spec("component-attachment-revision",
+                           "component_attachment_revision");
+  for (const auto& attachment : graph.component_attachments) {
+    if (!detail::verify_content_identity(
+            component_attachment_value(attachment), attachment_spec)) {
+      fail("$.component_attachments",
+           "component_attachment_revision mismatch for '" +
+               attachment.component_attachment_id.value() + "'");
+    }
+  }
+}
+
 template <typename Record, typename Getter>
 [[nodiscard]] std::set<std::string, std::less<>> collect_ids(const std::vector<Record>& records,
                                                              Getter getter) {
@@ -1116,6 +1223,112 @@ IntrinsicallyValidatedCellGraphCandidate validate_intrinsic_cell_graph_candidate
   validate_intrinsic(candidate.graph());
   return IntrinsicallyValidatedCellGraphCandidate(candidate.graph(),
                                                   candidate.structurally_normalized_root());
+}
+
+GraphIdentityReadyCellGraphCandidate prepare_cell_graph_identity(
+    const IntrinsicallyValidatedCellGraphCandidate& candidate,
+    std::span<const QualifiedRuntimeProfile> qualified_runtime_profiles) {
+  const auto& source_graph = candidate.graph();
+  std::set<RuntimeProfileKey> selected_profiles;
+  for (const auto& unit : source_graph.runtime_units) {
+    selected_profiles.insert(runtime_profile_key(unit));
+  }
+
+  std::map<RuntimeProfileKey, const QualifiedRuntimeProfile*> profile_index;
+  for (const auto& profile : qualified_runtime_profiles) {
+    const RuntimeProfileKey key = runtime_profile_key(profile.value());
+    if (!selected_profiles.contains(key)) {
+      const bool selected_id = std::any_of(
+          selected_profiles.begin(), selected_profiles.end(),
+          [&key](const RuntimeProfileKey& selected) {
+            return selected.first == key.first;
+          });
+      fail("qualified_runtime_profiles",
+           (selected_id ? "stale runtime-profile revision "
+                        : "unused extra runtime profile ") +
+               profile_key_label(key));
+    }
+    if (!profile_index.emplace(key, &profile).second) {
+      fail("qualified_runtime_profiles",
+           "duplicate exact runtime profile " + profile_key_label(key));
+    }
+  }
+
+  CellGraphDTO graph = source_graph;
+  const auto& schema_registry = build_qualified_closed_schema_registry();
+  detail::CumulativeNormalizedValueBudget normalized_configuration_budget;
+  for (std::size_t index = 0U; index < graph.runtime_units.size(); ++index) {
+    auto& unit = graph.runtime_units[index];
+    const RuntimeProfileKey key = runtime_profile_key(unit);
+    const auto found = profile_index.find(key);
+    if (found == profile_index.end()) {
+      fail("qualified_runtime_profiles",
+           "missing runtime profile " + profile_key_label(key) +
+               " for runtime unit '" + unit.runtime_unit_id.value() + "'");
+    }
+    const auto& schema_ref =
+        found->second->value().configuration_schema_ref;
+    const auto* schema_entry =
+        schema_registry.find_qualified_value_schema(
+            schema_ref.schema_id, schema_ref.schema_revision);
+    if (schema_entry == nullptr) {
+      fail("qualified_runtime_profiles",
+           "runtime profile " + profile_key_label(key) +
+               " selects a value schema not qualified by this build");
+    }
+
+    const std::string configuration_path =
+        "$.runtime_units[" + std::to_string(index) + "].configuration";
+    try {
+      const auto normalized =
+          validate_and_normalize_build_qualified_value(
+              *schema_entry,
+              json_object_to_canonical(unit.configuration));
+      detail::validate_canonical_value_output_budget_cumulatively(
+          normalized.normalized_value(), normalized_configuration_budget);
+      unit.configuration =
+          to_json_object(normalized.normalized_value(), configuration_path);
+    } catch (const ClosedSchemaError& error) {
+      fail(configuration_path, error.what());
+    } catch (const CanonicalValueError& error) {
+      fail(configuration_path, error.what());
+    }
+  }
+
+  CanonicalValue normalized_root = graph_value(graph);
+  try {
+    detail::validate_canonical_value_output_budget(normalized_root);
+  } catch (const ClosedSchemaError& error) {
+    fail("$", error.what());
+  }
+  return GraphIdentityReadyCellGraphCandidate(
+      std::move(graph), std::move(normalized_root));
+}
+
+GraphRevisionVerifiedCellGraph compute_graph_revision(
+    const GraphIdentityReadyCellGraphCandidate& candidate) {
+  CellGraphDTO graph = candidate.graph();
+  compute_nested_graph_revisions(graph);
+
+  CanonicalValue normalized_root = graph_value(graph);
+  graph.graph_revision = GraphRevision(
+      detail::compute_content_identity(normalized_root,
+                                       graph_identity_spec()));
+  normalized_root = graph_value(graph);
+  return GraphRevisionVerifiedCellGraph(std::move(graph),
+                                        std::move(normalized_root));
+}
+
+GraphRevisionVerifiedCellGraph verify_graph_revision(
+    const GraphIdentityReadyCellGraphCandidate& candidate) {
+  verify_nested_graph_revisions(candidate.graph());
+  if (!detail::verify_content_identity(candidate.normalized_root(),
+                                       graph_identity_spec())) {
+    fail("$.graph_revision",
+         "graph_revision does not match normalized graph content");
+  }
+  return GraphRevisionVerifiedCellGraph(candidate.graph(),
+                                        candidate.normalized_root());
 }
 
 }  // namespace manyforge::deployment

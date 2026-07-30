@@ -18,7 +18,9 @@ The implemented foundation owns:
   `controller_topology`, `model_asset`, `provider_manifest`,
   `runtime_profile`, and `stop_evidence_policy`), two exact qualified value
   schemas, and explicit rejection of every remaining unqualified family; and
-- intrinsic `CellGraphDTO` decoding, normalization, and validation.
+- intrinsic `CellGraphDTO` decoding and validation, exact runtime-profile
+  closure, schema-normalized runtime configuration, whole-graph output
+  budgets, and staged nested/outer graph content identity.
 
 The bootstrap, registry, and dialect examples under `resources/` are hermetic
 source-tree projections and cross-language test goldens. They are not installed
@@ -34,8 +36,14 @@ ID, revision, and purpose from the immutable build-qualified registry, then
 validate and normalize through that pinned descriptor before later intrinsic,
 catalog, and compiler validation. The eight catalog families and two value
 schemas above are the only production-qualified schema families at this
-checkpoint; no trusted `GraphRevision` compute/verify operation is exposed
-yet. Topology qualification proves only its immutable logical controller,
+checkpoint. `GraphRevision` compute/verify accepts only an intrinsically
+validated graph whose runtime configuration has been normalized through the
+exact qualified runtime-profile closure. It computes or verifies
+control-domain, control-binding, and component-attachment revisions before the
+outer graph revision; verification never repairs stale input. The resulting
+wrapper proves normalized graph content identity, not model/source/control
+compatibility, compiler products, runtime readiness, admission, or a lane.
+Topology qualification proves only its immutable logical controller,
 contract, chain, activation-set, and route declaration. It does not select
 plugins or configuration, generate names or endpoints, observe controller
 state, switch a route, or qualify a runtime lane.
