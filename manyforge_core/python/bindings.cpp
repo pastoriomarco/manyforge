@@ -37,6 +37,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
     manyforge::core::python::register_cell_graph_bindings(m);
     manyforge::core::python::register_component_type_bindings(m);
     manyforge::core::python::register_deployment_candidate_bindings(m);
+    manyforge::core::python::register_model_compiler_bindings(m);
 
     // ========================================================================
     // Enums

@@ -10,6 +10,7 @@ add_compile_options(-Wall -Wextra -Werror -pedantic)
 # Find pybind11
 find_package(pybind11 CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(EXPAT REQUIRED)
 find_package(double-conversion CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(UTF8PROC REQUIRED IMPORTED_TARGET libutf8proc)
@@ -45,6 +46,7 @@ set_target_properties(manyforge_deployment_archive PROPERTIES
 )
 target_link_libraries(manyforge_deployment_archive INTERFACE
   OpenSSL::Crypto
+  EXPAT::EXPAT
   PkgConfig::LIBYAML
   PkgConfig::UTF8PROC
   double-conversion::double-conversion
@@ -57,6 +59,7 @@ pybind11_add_module(manyforge_core_py
   bindings_cell_graph.cpp
   bindings_component_type.cpp
   bindings_deployment.cpp
+  bindings_model_compiler.cpp
   bindings_strong_identity.cpp
 )
 

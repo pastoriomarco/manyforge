@@ -9,5 +9,6 @@ void register_catalog_record_bindings(pybind11::module_& module);
 void register_cell_graph_bindings(pybind11::module_& module);
 void register_component_type_bindings(pybind11::module_& module);
 void register_deployment_candidate_bindings(pybind11::module_& module);
+void register_model_compiler_bindings(pybind11::module_& module);
 
 }  // namespace manyforge::core::python

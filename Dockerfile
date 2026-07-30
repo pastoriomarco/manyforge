@@ -43,7 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libboost-filesystem-dev libboost-serialization-dev libboost-system-dev \
         libboost-python-dev libboost-chrono-dev libboost-thread-dev libboost-date-time-dev \
         libeigen3-dev libyaml-cpp-dev libyaml-dev liburdfdom-dev \
-        libdouble-conversion-dev libssl-dev libutf8proc-dev \
+        libdouble-conversion-dev libexpat1-dev libssl-dev libutf8proc-dev \
         liboctomap-dev \
         git curl ca-certificates \
     && cd /usr/src/googletest && cmake . && make \

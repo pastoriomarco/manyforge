@@ -53,6 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libboost-thread-dev \
         libboost-date-time-dev \
         libeigen3-dev \
+        libexpat1-dev \
         libyaml-cpp-dev \
         liburdfdom-dev \
         liboctomap-dev \

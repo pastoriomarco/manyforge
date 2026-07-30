@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_compile_options(-Wall -Wextra -Werror -pedantic)
 
 find_package(OpenSSL REQUIRED)
+find_package(EXPAT REQUIRED)
 find_package(double-conversion CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(UTF8PROC REQUIRED IMPORTED_TARGET libutf8proc)
@@ -90,12 +91,14 @@ add_library(manyforge_deployment
   src/capability_definition_codec.cpp
   src/canonical_value.cpp
   src/cell_graph_codec.cpp
+  src/cell_structure.cpp
   src/closed_schema.cpp
   src/component_type_codec.cpp
   src/control_interface_contract_codec.cpp
   src/controller_topology_codec.cpp
   src/content_identity.cpp
   src/model_asset_codec.cpp
+  src/model_source.cpp
   src/provider_manifest_codec.cpp
   src/runtime_profile_codec.cpp
   src/stop_evidence_policy_codec.cpp
@@ -111,6 +114,7 @@ target_include_directories(manyforge_deployment PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(manyforge_deployment PUBLIC
   OpenSSL::Crypto
+  EXPAT::EXPAT
   PkgConfig::LIBYAML
   PkgConfig::UTF8PROC
   double-conversion::double-conversion
@@ -153,6 +157,12 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_cell_graph_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_cell_structure test/test_cell_structure.cpp)
+  target_link_libraries(test_cell_structure PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_cell_structure
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_closed_schema test/test_closed_schema.cpp)
   target_compile_definitions(test_closed_schema PRIVATE
     MANYFORGE_CLOSED_SCHEMA_RESOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/resources/closed_schema")
@@ -182,6 +192,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_model_asset_codec PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_model_asset_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_model_source
+    test/test_model_source.cpp)
+  target_link_libraries(test_model_source PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_model_source
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_runtime_profile_codec
