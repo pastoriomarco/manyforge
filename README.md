@@ -147,8 +147,8 @@ ctest --output-on-failure
 ```
 manyforge_core/          C++ library: execution kernel, state machine, DTOs, ports
   python/                pybind11 bindings exposing the kernel to Python
-manyforge_deployment/    ROS-free composable-cell artifact codec, identity, and compiler substrate
-manyforge_component_manager/  ROS-free C++ runtime-observation and durable-persistence foundation
+manyforge_deployment/    ROS-free composable-cell codec, qualification, final C++ trust boundary, and retention substrate
+manyforge_component_manager/  ROS-free Manager observation/persistence, owner ports, and active-publication store
 manyforge_collision/     C++ planner-neutral collision query implementation
 manyforge_roboplan/      C++ RoboPlan adapters: planner/projection, focused ports, native execution
   python/                pybind11 bindings + NativeKernelClient wrapper

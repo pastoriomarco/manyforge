@@ -11,6 +11,18 @@ find_package(OpenSSL REQUIRED)
 find_package(SQLite3 3.37 REQUIRED)
 
 set(
+  MANYFORGE_CORE_INCLUDE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_core/include"
+  CACHE PATH
+  "Path to the manyforge_core public headers")
+if(NOT EXISTS
+   "${MANYFORGE_CORE_INCLUDE_DIR}/manyforge_core/ports/iactive_bundle_publication_store.hpp")
+  message(FATAL_ERROR
+    "manyforge_component_manager requires the manyforge_core publication "
+    "port headers")
+endif()
+
+set(
   MANYFORGE_MANAGER_PERSISTENCE_SCHEMA
   "${CMAKE_CURRENT_SOURCE_DIR}/resources/001_component_manager_foundation.sql")
 set_property(
@@ -24,7 +36,33 @@ configure_file(
   "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_persistence_schema.hpp"
   @ONLY)
 
+set(
+  MANYFORGE_ACTIVE_BUNDLE_PUBLICATION_SCHEMA
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/002_active_bundle_publication_store.sql")
+set_property(
+  DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${MANYFORGE_ACTIVE_BUNDLE_PUBLICATION_SCHEMA}")
+file(READ
+  "${MANYFORGE_ACTIVE_BUNDLE_PUBLICATION_SCHEMA}"
+  MANYFORGE_ACTIVE_BUNDLE_PUBLICATION_SCHEMA_SQL)
+string(
+  FIND
+  "${MANYFORGE_ACTIVE_BUNDLE_PUBLICATION_SCHEMA_SQL}"
+  ")mf_abps\""
+  MANYFORGE_ACTIVE_BUNDLE_PUBLICATION_SCHEMA_DELIMITER_COLLISION)
+if(NOT MANYFORGE_ACTIVE_BUNDLE_PUBLICATION_SCHEMA_DELIMITER_COLLISION
+   EQUAL -1)
+  message(FATAL_ERROR
+    "active-bundle publication schema collides with its generated-header "
+    "raw-string delimiter")
+endif()
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_active_bundle_publication_schema.hpp.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_active_bundle_publication_schema.hpp"
+  @ONLY)
+
 add_library(manyforge_component_manager
+  src/active_bundle_publication_store.cpp
   src/persistence.cpp
   src/runtime_observation.cpp
 )
@@ -32,6 +70,7 @@ add_library(
   manyforge::component_manager ALIAS manyforge_component_manager)
 target_include_directories(manyforge_component_manager PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${MANYFORGE_CORE_INCLUDE_DIR}>
   $<INSTALL_INTERFACE:include>
 )
 target_include_directories(manyforge_component_manager PRIVATE
@@ -67,5 +106,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_persistence PRIVATE
     manyforge_component_manager GTest::gtest_main)
   gtest_discover_tests(test_persistence
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_active_bundle_publication_store
+    test/test_active_bundle_publication_store.cpp)
+  target_link_libraries(test_active_bundle_publication_store PRIVATE
+    manyforge_component_manager GTest::gtest_main)
+  gtest_discover_tests(test_active_bundle_publication_store
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 endif()

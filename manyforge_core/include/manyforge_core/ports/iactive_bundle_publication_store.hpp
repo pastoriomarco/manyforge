@@ -5,9 +5,12 @@
 
 namespace manyforge::core {
 
-/// Scene-owner capability for independent durable publication verification.
+/// Scene-owner capability for independent durable active-pointer verification.
 ///
-/// This capability intentionally cannot publish.
+/// A read succeeds only while the requested generation is the store's current
+/// public-pointer head. Immutable historical receipts may support internal
+/// publisher replay/integrity, but they are not active-pointer evidence and
+/// this capability intentionally cannot publish.
 class IActiveBundlePublicationReader {
  public:
   virtual ~IActiveBundlePublicationReader() = default;
