@@ -23,17 +23,28 @@ if(NOT EXISTS
 endif()
 
 set(
-  MANYFORGE_MANAGER_PERSISTENCE_SCHEMA
-  "${CMAKE_CURRENT_SOURCE_DIR}/resources/001_component_manager_foundation.sql")
+  MANYFORGE_MANAGER_BOOTSTRAP_JOURNAL_SCHEMA
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/001_manager_bootstrap_journal.sql")
 set_property(
   DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-  "${MANYFORGE_MANAGER_PERSISTENCE_SCHEMA}")
+  "${MANYFORGE_MANAGER_BOOTSTRAP_JOURNAL_SCHEMA}")
 file(READ
-  "${MANYFORGE_MANAGER_PERSISTENCE_SCHEMA}"
-  MANYFORGE_MANAGER_PERSISTENCE_SCHEMA_SQL)
+  "${MANYFORGE_MANAGER_BOOTSTRAP_JOURNAL_SCHEMA}"
+  MANYFORGE_MANAGER_BOOTSTRAP_JOURNAL_SCHEMA_SQL)
+string(
+  FIND
+  "${MANYFORGE_MANAGER_BOOTSTRAP_JOURNAL_SCHEMA_SQL}"
+  ")mf_mbjs\""
+  MANYFORGE_MANAGER_BOOTSTRAP_JOURNAL_SCHEMA_DELIMITER_COLLISION)
+if(NOT MANYFORGE_MANAGER_BOOTSTRAP_JOURNAL_SCHEMA_DELIMITER_COLLISION
+   EQUAL -1)
+  message(FATAL_ERROR
+    "manager bootstrap-journal schema collides with its generated-header "
+    "raw-string delimiter")
+endif()
 configure_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_persistence_schema.hpp.in"
-  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_persistence_schema.hpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_manager_bootstrap_journal_schema.hpp.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_manager_bootstrap_journal_schema.hpp"
   @ONLY)
 
 set(
@@ -63,7 +74,8 @@ configure_file(
 
 add_library(manyforge_component_manager
   src/active_bundle_publication_store.cpp
-  src/persistence.cpp
+  src/durable_store_set.cpp
+  src/manager_bootstrap_journal.cpp
   src/runtime_observation.cpp
 )
 add_library(
@@ -99,13 +111,11 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_runtime_observation
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
-  add_executable(test_persistence
-    test/test_persistence.cpp)
-  target_compile_definitions(test_persistence PRIVATE
-    MANYFORGE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/..")
-  target_link_libraries(test_persistence PRIVATE
-    manyforge_component_manager GTest::gtest_main)
-  gtest_discover_tests(test_persistence
+  add_executable(test_manager_bootstrap_journal
+    test/test_manager_bootstrap_journal.cpp)
+  target_link_libraries(test_manager_bootstrap_journal PRIVATE
+    manyforge_component_manager GTest::gtest_main SQLite::SQLite3)
+  gtest_discover_tests(test_manager_bootstrap_journal
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_active_bundle_publication_store
