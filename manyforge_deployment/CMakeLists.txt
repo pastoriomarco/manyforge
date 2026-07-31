@@ -92,11 +92,13 @@ file(
   "${CMAKE_CURRENT_SOURCE_DIR}/resources/*"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/*.cpp"
   "${MANYFORGE_CORE_INCLUDE_DIR}/*")
 list(
   REMOVE_ITEM
   MANYFORGE_COMPILER_SOURCE_INPUTS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_build_evidence.hpp.in"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_canonical_empty_deployment.hpp.in"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_closed_schema.hpp.in")
 list(SORT MANYFORGE_COMPILER_SOURCE_INPUTS)
 
@@ -105,6 +107,7 @@ set(
   "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
   "${MANYFORGE_NODE_ENVIRONMENT_CHECK}"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_build_evidence.hpp.in"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_canonical_empty_deployment.hpp.in"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_closed_schema.hpp.in")
 list(SORT MANYFORGE_COMPILER_RECIPE_INPUTS)
 
@@ -126,6 +129,9 @@ function(
     elseif(relative_path MATCHES
            "^manyforge_deployment/src/(.+)\\.(h|hpp)$")
       set(logical_id "cpp-internal-header:${CMAKE_MATCH_1}")
+    elseif(relative_path MATCHES
+           "^manyforge_deployment/tools/(.+)\\.cpp$")
+      set(logical_id "compiler-tool:${CMAKE_MATCH_1}")
     elseif(relative_path MATCHES
            "^manyforge_deployment/resources/(.+)$")
       set(logical_id "compiler-resource:${CMAKE_MATCH_1}")
@@ -310,6 +316,30 @@ configure_file(
   "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_build_evidence.hpp"
   @ONLY)
 
+set(
+  MANYFORGE_CANONICAL_EMPTY_DEPLOYMENT
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/canonical_empty/c1_build_authority.deployment.json")
+file(READ
+  "${MANYFORGE_CANONICAL_EMPTY_DEPLOYMENT}"
+  MANYFORGE_EMBEDDED_CANONICAL_EMPTY_DEPLOYMENT)
+string(
+  FIND
+  "${MANYFORGE_EMBEDDED_CANONICAL_EMPTY_DEPLOYMENT}"
+  ")mf_canon\""
+  MANYFORGE_CANONICAL_EMPTY_DELIMITER_COLLISION)
+if(NOT MANYFORGE_CANONICAL_EMPTY_DELIMITER_COLLISION EQUAL -1)
+  message(FATAL_ERROR
+    "canonical-empty deployment collides with the fixed generated-header "
+    "raw-string delimiter")
+endif()
+set_property(
+  DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${MANYFORGE_CANONICAL_EMPTY_DEPLOYMENT}")
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_canonical_empty_deployment.hpp.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_canonical_empty_deployment.hpp"
+  @ONLY)
+
 function(manyforge_embed_closed_schema symbol stem relative_path delimiter)
   set(schema_path "${CMAKE_CURRENT_SOURCE_DIR}/${relative_path}")
   set_property(
@@ -380,6 +410,7 @@ add_library(manyforge_deployment
   src/artifact_codec.cpp
   src/build_manifest.cpp
   src/build_manifest_repository.cpp
+  src/canonical_empty_admission.cpp
   src/capability_definition_codec.cpp
   src/canonical_value.cpp
   src/cell_applicability.cpp
@@ -425,7 +456,27 @@ target_link_libraries(manyforge_deployment PUBLIC
 set_target_properties(
   manyforge_deployment PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_executable(
+  manyforge_generate_canonical_empty_package
+  tools/generate_canonical_empty_package.cpp)
+target_include_directories(
+  manyforge_generate_canonical_empty_package PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(
+  manyforge_generate_canonical_empty_package PRIVATE
+  manyforge_deployment)
+
 option(BUILD_TESTING "Build unit tests" ON)
+option(
+  MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN
+  "Verify the repository-qualified canonical-empty Release package golden"
+  OFF)
+if(MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN AND
+   NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+  message(FATAL_ERROR
+    "MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN requires the "
+    "single-configuration Release qualification profile")
+endif()
 if(BUILD_TESTING)
   enable_testing()
   find_package(GTest REQUIRED)
@@ -466,6 +517,24 @@ if(BUILD_TESTING)
     message(FATAL_ERROR
       "The retained-bundle public-header compile control failed:\n"
       "${MANYFORGE_RETAINED_BUNDLE_PUBLIC_HEADER_COMPILES_OUTPUT}")
+  endif()
+
+  manyforge_try_public_header(
+    MANYFORGE_CANONICAL_EMPTY_ADMISSION_PUBLIC_HEADER_COMPILES
+    canonical_empty_admission_public_header_compiles.cpp)
+  if(NOT MANYFORGE_CANONICAL_EMPTY_ADMISSION_PUBLIC_HEADER_COMPILES)
+    message(FATAL_ERROR
+      "The canonical-empty admission public-header compile control failed:\n"
+      "${MANYFORGE_CANONICAL_EMPTY_ADMISSION_PUBLIC_HEADER_COMPILES_OUTPUT}")
+  endif()
+
+  manyforge_try_public_header(
+    MANYFORGE_CANONICAL_EMPTY_ADMISSION_PRODUCER_IS_PUBLIC
+    canonical_empty_admission_producer_is_private.cpp)
+  if(MANYFORGE_CANONICAL_EMPTY_ADMISSION_PRODUCER_IS_PUBLIC)
+    message(FATAL_ERROR
+      "canonical-empty admission producer remains callable from the public "
+      "header")
   endif()
 
   manyforge_try_public_header(
@@ -707,6 +776,33 @@ if(BUILD_TESTING)
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_retention_qualified_deployment
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(
+    test_canonical_empty_admission
+    test/test_canonical_empty_admission.cpp)
+  if(MANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN)
+    target_compile_definitions(
+      test_canonical_empty_admission PRIVATE
+      MANYFORGE_CANONICAL_EMPTY_RELEASE_GOLDEN_FILE="${CMAKE_CURRENT_SOURCE_DIR}/test/golden/canonical_empty_admission.release.json")
+  endif()
+  target_include_directories(
+    test_canonical_empty_admission PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(
+    test_canonical_empty_admission PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(
+    test_canonical_empty_admission
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_test(
+    NAME CanonicalEmptyGeneratorCli
+    COMMAND
+      "${CMAKE_COMMAND}"
+      "-DMANYFORGE_GENERATOR=$<TARGET_FILE:manyforge_generate_canonical_empty_package>"
+      "-DMANYFORGE_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/canonical_empty_cli_package"
+      -P
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/canonical_empty_generator_cli.cmake")
 
   add_executable(test_stop_evidence_policy_codec
     test/test_stop_evidence_policy_codec.cpp)

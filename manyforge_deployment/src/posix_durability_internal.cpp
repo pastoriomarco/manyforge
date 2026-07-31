@@ -132,6 +132,21 @@ void ensure_owned_plain_directory(
   sync_directory(directory.parent_path(), parent_sync_messages);
 }
 
+void require_existing_plain_directory(
+    const std::filesystem::path& directory, const ErrorPolicy& errors,
+    const ExistingDirectoryMessages& messages) {
+  std::error_code error;
+  const auto status = std::filesystem::symlink_status(directory, error);
+  if (error && error != std::errc::no_such_file_or_directory) {
+    throw std::filesystem::filesystem_error(
+        std::string(messages.inspect), directory, error);
+  }
+  if (error || !std::filesystem::is_directory(status) ||
+      std::filesystem::is_symlink(status)) {
+    fail_semantic(errors, messages.not_existing_plain_directory);
+  }
+}
+
 ScopedAdvisoryLock::ScopedAdvisoryLock(
     int descriptor, int operation, std::string_view failure_message)
     : descriptor_(descriptor) {
@@ -198,7 +213,8 @@ std::optional<std::string> read_exact_regular_file(
     bool missing_is_empty, const ErrorPolicy& errors,
     const ReadMessages& messages) {
   const int descriptor =
-      ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+      ::open(path.c_str(),
+             O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (descriptor < 0) {
     if (missing_is_empty && errno == ENOENT) {
       return std::nullopt;

@@ -33,7 +33,13 @@ The implemented offline boundary owns:
   deployment-envelope producer/verifier, and exact envelope/IR retention proof;
   and
 - code-owned product-contract/raw-CAS foundations plus closed retained-bundle
-  projection/verifier and bounded semantic repository mechanics.
+  projection/verifier and bounded semantic repository mechanics;
+- immutable filesystem repositories for build manifests, raw artifacts, and
+  semantic retained bundles beneath one trusted package root; and
+- one build-owned canonical-empty package generator plus a sealed, zero-input
+  Manager-facing admission proof that independently verifies the marker,
+  current build authority, semantic bundle, and complete raw-artifact closure
+  without repairing or enumerating the package.
 
 The bootstrap, registry, and dialect examples under `resources/` are hermetic
 source-tree projections and cross-language test goldens. They are not installed
@@ -67,15 +73,20 @@ Current limits are explicit:
   retained-bundle repository beneath one existing trusted package root; each
   process opens its own bounded, crash-adopting immutable repository instance,
   while production materialization independently reloads the semantic envelope
-  and directly rechecks its raw-artifact closure; separately, the sealed
-  filesystem verified-bundle source binds concrete raw and semantic stores to
-  that root and re-verifies every referenced retained artifact before returning
-  a caller-ID-selected bundle; this lookup is only a lower-level dependency of
-  later Manager canonical-empty admission;
+  and directly rechecks its raw-artifact closure;
+- the canonical-empty generator accepts only `--output-root`, traverses the
+  ordinary I2/I3 compiler and retention path, and publishes its admission marker
+  last with immutable no-replace semantics; the public filesystem source takes
+  only the trusted root and returns a sealed value containing the exact fixed
+  `CellId`, deployment/graph/bundle identities, build-authority digests, and
+  privately owned verified bundle;
+- all canonical-empty reads are fixed-name, bounded, read-only point lookups.
+  A visible invalid marker is never repaired, unrelated repository entries are
+  ignored, and missing, substituted, malformed, stale, or identity-incoherent
+  owned entries fail closed;
 - this does not complete I3 or the complete C1 exit: no build-owned public
-  canonical-empty selector/`CellId` golden is frozen here, and remaining
-  products, consumer equivalence, and runtime-shadow behavior remain later I3
-  work; and
+  runtime selection or active alias exists, and remaining products, consumer
+  equivalence, and runtime-shadow behavior remain later I3 work; and
 - Apply, active publication, process ownership, runtime convergence,
   simulation, controllers, execution, and lane restoration belong to later
   packages and plan checkpoints.
@@ -85,6 +96,13 @@ Build and run the focused tests through the repository container:
 ```bash
 docker compose run --rm dev ./scripts/test-all.sh cpp
 ```
+
+The repository qualification command enables the exact checked canonical-empty
+Release golden. Ad-hoc builds leave that golden gate disabled because a
+different compiler, toolchain, or flag set legitimately produces a different
+build-qualified identity; deterministic and closure verification still run.
+Maintainers reproducing the repository golden directly must configure Release
+with `-DMANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN=ON`.
 
 The implementation intentionally uses dedicated, qualified libraries for
 strict YAML events, Unicode NFC, ECMAScript-compatible binary64 formatting,

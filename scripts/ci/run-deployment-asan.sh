@@ -34,7 +34,7 @@ cmake \
 
 cmake --build "${BUILD_DIR}" --parallel "${PARALLEL}"
 
-non_gtest_regex="^BuildManifestAuthorityRejectsMultiConfigGenerator$"
+non_gtest_regex="^(BuildManifestAuthorityRejectsMultiConfigGenerator|CanonicalEmptyGeneratorCli)$"
 ctest \
   --test-dir "${BUILD_DIR}" \
   --output-on-failure \

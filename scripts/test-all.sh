@@ -89,6 +89,7 @@ build_manyforge_deployment() {
     cmake "$WORKSPACE/manyforge_deployment" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING="$build_testing" \
         -DMANYFORGE_CORE_INCLUDE_DIR="$WORKSPACE/manyforge_core/include" \
+        -DMANYFORGE_VERIFY_CANONICAL_EMPTY_RELEASE_GOLDEN=ON \
         -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
 }

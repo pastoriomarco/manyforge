@@ -82,6 +82,12 @@ constexpr posix::DirectoryMessages kDirectoryMessages{
     "concurrently created durable retention path is unsafe",
     "created durable retention directory is unsafe",
 };
+constexpr posix::ExistingDirectoryMessages
+    kReadOnlyDirectoryMessages{
+        "cannot inspect read-only durable retention directory",
+        "read-only durable retention path must be an existing plain "
+        "directory",
+    };
 constexpr posix::DirectorySyncMessages kDirectorySyncMessages{
     "cannot open durable retention directory for fsync",
     "cannot fsync durable retention directory",
@@ -451,8 +457,53 @@ class DurableFileCollection final {
   return hex;
 }
 
+struct ReadOnlyRetentionPaths final {
+  std::filesystem::path bundle_data;
+  std::filesystem::path raw_data;
+};
+
+[[nodiscard]] ReadOnlyRetentionPaths require_read_only_retention_paths(
+    const std::filesystem::path& trusted_root) {
+  const std::filesystem::path bundle_namespace =
+      trusted_root / "retained-bundles";
+  const std::filesystem::path bundle_data =
+      bundle_namespace / "sha256";
+  const std::filesystem::path raw_namespace =
+      trusted_root / "raw-artifacts";
+  const std::filesystem::path raw_data = raw_namespace / "sha256";
+  for (const auto& directory :
+       {bundle_namespace, bundle_data, raw_namespace, raw_data}) {
+    posix::require_existing_plain_directory(
+        directory, kPosixErrors, kReadOnlyDirectoryMessages);
+  }
+  return {bundle_data, raw_data};
+}
+
+[[nodiscard]] std::shared_ptr<const RetainedBundle>
+read_verified_bundle_entry(
+    const std::filesystem::path& bundle_data,
+    const core::RetainedBundleId& retained_bundle_id) {
+  const auto hex = digest_hex(retained_bundle_id.value());
+  if (!hex.has_value()) {
+    return nullptr;
+  }
+  const auto bytes = posix::read_exact_regular_file(
+      bundle_data / (std::string(*hex) + ".json"),
+      kMaxDurableRetainedBundleBytes, true, kPosixErrors,
+      kReadMessages);
+  if (!bytes.has_value()) {
+    return nullptr;
+  }
+  const auto bundle =
+      detail::RetainedBundleReloadAuthority::reload(*bytes);
+  if (bundle->retained_bundle_id() != retained_bundle_id) {
+    fail("read-only retained-bundle key/content mismatch");
+  }
+  return bundle;
+}
+
 void require_verified_raw_reference(
-    DurableFileCollection& files,
+    const std::filesystem::path& raw_data,
     const core::ContentAddressedStoreKey& key,
     const core::ContentDigest& digest,
     std::optional<std::uint64_t> expected_size,
@@ -462,7 +513,10 @@ void require_verified_raw_reference(
     fail(std::string(reference_label) +
          " has an inconsistent digest-derived raw-CAS key");
   }
-  const auto bytes = files.get_verified(*hex);
+  const auto bytes = posix::read_exact_regular_file(
+      raw_data / (std::string(*hex) + ".blob"),
+      kMaxDurableRetainedBlobBytes, true, kPosixErrors,
+      kReadMessages);
   if (!bytes.has_value()) {
     fail(std::string(reference_label) +
          " is absent from the durable raw-artifact CAS");
@@ -476,24 +530,24 @@ void require_verified_raw_reference(
 }
 
 void require_verified_product_artifacts(
-    DurableFileCollection& files,
+    const std::filesystem::path& raw_data,
     const core::RetainedProductDTO& product) {
   for (const auto& artifact : product.artifact_refs) {
     require_verified_raw_reference(
-        files, artifact.content_addressed_store_key,
+        raw_data, artifact.content_addressed_store_key,
         artifact.content_digest, artifact.byte_size,
         "retained product artifact reference");
   }
 }
 
 void require_verified_bundle_references(
-    DurableFileCollection& files, const RetainedBundle& bundle) {
+    const std::filesystem::path& raw_data, const RetainedBundle& bundle) {
   const auto& value = bundle.value();
   for (const auto& record : value.catalogs.records) {
     std::visit(
-        [&files](const auto& typed_record) {
+        [&raw_data](const auto& typed_record) {
           require_verified_raw_reference(
-              files, typed_record.content_addressed_store_key,
+              raw_data, typed_record.content_addressed_store_key,
               typed_record.content_digest, std::nullopt,
               "retained catalog-record reference");
         },
@@ -501,28 +555,29 @@ void require_verified_bundle_references(
   }
   for (const auto& schema : value.catalogs.schema_artifacts) {
     require_verified_raw_reference(
-        files, schema.content_addressed_store_key,
+        raw_data, schema.content_addressed_store_key,
         schema.content_digest, std::nullopt,
         "retained schema-artifact reference");
   }
 
   const auto& products = value.compiled_products;
   require_verified_product_artifacts(
-      files, products.planning_collision_model);
+      raw_data, products.planning_collision_model);
   if (products.viewer_model.has_value()) {
-    require_verified_product_artifacts(files, *products.viewer_model);
+    require_verified_product_artifacts(
+        raw_data, *products.viewer_model);
   }
   for (const auto& group : products.control_domain_products) {
     for (const auto& product : group.products) {
-      require_verified_product_artifacts(files, product);
+      require_verified_product_artifacts(raw_data, product);
     }
   }
   for (const auto& product : products.symbol_role_maps) {
-    require_verified_product_artifacts(files, product);
+    require_verified_product_artifacts(raw_data, product);
   }
   for (const auto& group : products.runtime_unit_products) {
     for (const auto& product : group.products) {
-      require_verified_product_artifacts(files, product);
+      require_verified_product_artifacts(raw_data, product);
     }
   }
 }
@@ -675,29 +730,30 @@ FilesystemRetainedBundleRepository::retained_bytes() const {
 
 FilesystemVerifiedRetainedBundleSource::
     FilesystemVerifiedRetainedBundleSource(
-        const FilesystemRetainedBundleRepository& bundle_repository,
-        const FilesystemRawArtifactStore& artifact_store)
-    : bundle_repository_(bundle_repository),
-      artifact_store_(artifact_store) {
-  if (bundle_repository_.storage_->files.trusted_root() !=
-      artifact_store_.storage_->files.trusted_root()) {
-    fail("verified retained-bundle source rejects repository/raw-CAS "
-         "trusted-root splicing");
-  }
+        std::filesystem::path trusted_package_root)
+    : trusted_package_root_(posix::normalize_existing_plain_root(
+          trusted_package_root, kPosixErrors, kTrustedRootMessages)) {
+  (void)require_read_only_retention_paths(trusted_package_root_);
 }
 
 std::shared_ptr<const RetainedBundle>
 FilesystemVerifiedRetainedBundleSource::get_verified(
     const core::RetainedBundleId& retained_bundle_id) const {
-  bundle_repository_.storage_->files.require_owner_process();
-  artifact_store_.storage_->files.require_owner_process();
+  const std::filesystem::path current_root =
+      posix::normalize_existing_plain_root(
+          trusted_package_root_, kPosixErrors, kTrustedRootMessages);
+  if (current_root != trusted_package_root_) {
+    fail("read-only retained-bundle trusted root changed after "
+         "construction");
+  }
+  const ReadOnlyRetentionPaths paths =
+      require_read_only_retention_paths(current_root);
   const auto bundle =
-      bundle_repository_.get_verified_envelope(retained_bundle_id);
+      read_verified_bundle_entry(paths.bundle_data, retained_bundle_id);
   if (bundle == nullptr) {
     return nullptr;
   }
-  require_verified_bundle_references(
-      artifact_store_.storage_->files, *bundle);
+  require_verified_bundle_references(paths.raw_data, *bundle);
   return bundle;
 }
 

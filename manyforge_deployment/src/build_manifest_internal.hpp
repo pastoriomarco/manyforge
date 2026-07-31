@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <filesystem>
 #include <memory>
 #include <string_view>
 
@@ -33,6 +34,8 @@ class BuildQualifiedRetentionAuthority final {
   [[nodiscard]] static BuildQualifiedRetentionContext qualify();
   [[nodiscard]] static BuildQualifiedRetentionContext qualify_persisted(
       IBuildManifestRepository& repository);
+  [[nodiscard]] static BuildQualifiedRetentionContext qualify_existing(
+      const std::filesystem::path& trusted_package_root);
 
  private:
   [[nodiscard]] static std::shared_ptr<const BuildQualifiedManifest>

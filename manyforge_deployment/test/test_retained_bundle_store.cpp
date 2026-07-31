@@ -136,6 +136,13 @@ static_assert(std::is_base_of_v<
 static_assert(!std::is_base_of_v<
               IVerifiedRetainedBundleSource,
               FilesystemRetainedBundleRepository>);
+static_assert(std::is_constructible_v<
+              FilesystemVerifiedRetainedBundleSource,
+              std::filesystem::path>);
+static_assert(!std::is_constructible_v<
+              FilesystemVerifiedRetainedBundleSource,
+              const FilesystemRetainedBundleRepository&,
+              const FilesystemRawArtifactStore&>);
 
 class ScopedTrustedRoot final {
  public:
@@ -546,8 +553,6 @@ TEST(FilesystemRawArtifactStoreTest,
   ScopedTrustedRoot root;
   FilesystemRawArtifactStore inherited(root.path(), 2U, 1024U, 1024U);
   FilesystemRetainedBundleRepository inherited_repository(root.path());
-  FilesystemVerifiedRetainedBundleSource inherited_source(
-      inherited_repository, inherited);
   const StoredRawArtifact parent_artifact =
       inherited.put_if_absent("parent artifact");
   const pid_t child = ::fork();
@@ -598,23 +603,13 @@ TEST(FilesystemRawArtifactStoreTest,
         }) ||
         !rejects_inherited_use([&] {
           static_cast<void>(inherited_repository.retained_bytes());
-        }) ||
-        !rejects_inherited_use([&] {
-          static_cast<void>(inherited_source.get_verified(
-              core::RetainedBundleId("not-a-digest")));
-        }) ||
-        !rejects_inherited_use([&] {
-          static_cast<void>(FilesystemVerifiedRetainedBundleSource(
-              inherited_repository, inherited));
         })) {
       ::_exit(22);
     }
     try {
       FilesystemRawArtifactStore fresh(
           root.path(), 2U, 1024U, 1024U);
-      FilesystemRetainedBundleRepository fresh_repository(root.path());
-      FilesystemVerifiedRetainedBundleSource fresh_source(
-          fresh_repository, fresh);
+      FilesystemVerifiedRetainedBundleSource fresh_source(root.path());
       if (fresh_source.get_verified(
               core::RetainedBundleId("not-a-digest")) != nullptr) {
         ::_exit(22);
@@ -850,10 +845,7 @@ TEST(FilesystemRetainedBundleRepositoryTest,
         nullptr);
   }
   {
-    FilesystemRawArtifactStore raw_store(root.path());
-    FilesystemRetainedBundleRepository reopened(root.path());
-    FilesystemVerifiedRetainedBundleSource verified_source(
-        reopened, raw_store);
+    FilesystemVerifiedRetainedBundleSource verified_source(root.path());
     const IVerifiedRetainedBundleSource& source = verified_source;
     const auto loaded =
         source.get_verified(bundle->retained_bundle_id());
@@ -880,10 +872,7 @@ TEST(FilesystemVerifiedRetainedBundleSourceTest,
         bundle->value()
             .compiled_products.planning_collision_model.artifact_refs;
     ASSERT_EQ(artifacts.size(), 2U);
-    FilesystemRawArtifactStore raw_store(root.path());
-    FilesystemRetainedBundleRepository repository(root.path());
-    FilesystemVerifiedRetainedBundleSource source(
-        repository, raw_store);
+    FilesystemVerifiedRetainedBundleSource source(root.path());
     ASSERT_TRUE(std::filesystem::remove(
         raw_path(root.path(), artifacts.front())));
     EXPECT_THROW(
@@ -900,10 +889,7 @@ TEST(FilesystemVerifiedRetainedBundleSourceTest,
         bundle->value()
             .compiled_products.planning_collision_model.artifact_refs;
     ASSERT_EQ(artifacts.size(), 2U);
-    FilesystemRawArtifactStore raw_store(root.path());
-    FilesystemRetainedBundleRepository repository(root.path());
-    FilesystemVerifiedRetainedBundleSource source(
-        repository, raw_store);
+    FilesystemVerifiedRetainedBundleSource source(root.path());
     write_file(raw_path(root.path(), artifacts.back()),
                "corrupt retained artifact");
     EXPECT_THROW(
@@ -911,23 +897,6 @@ TEST(FilesystemVerifiedRetainedBundleSourceTest,
             source.get_verified(bundle->retained_bundle_id())),
         RetainedBundleError);
   }
-}
-
-TEST(FilesystemVerifiedRetainedBundleSourceTest,
-     RejectsSemanticRepositoryAndRawCasTrustedRootSplicing) {
-  ScopedTrustedRoot artifact_root;
-  const auto bundle = materialize_durable_bundle(
-      artifact_root.path(), "durable_bundle_root_splice");
-  ScopedTrustedRoot semantic_root;
-  FilesystemRetainedBundleRepository semantic_repository(
-      semantic_root.path());
-  ASSERT_TRUE(semantic_repository.put_if_absent(bundle));
-  FilesystemRawArtifactStore artifact_store(artifact_root.path());
-
-  EXPECT_THROW(
-      static_cast<void>(FilesystemVerifiedRetainedBundleSource(
-          semantic_repository, artifact_store)),
-      RetainedBundleError);
 }
 
 TEST(FilesystemRetainedBundleRepositoryTest,

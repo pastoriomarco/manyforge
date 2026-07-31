@@ -36,6 +36,11 @@ struct DirectoryMessages final {
   std::string_view created_not_plain;
 };
 
+struct ExistingDirectoryMessages final {
+  std::string_view inspect;
+  std::string_view not_existing_plain_directory;
+};
+
 struct DirectorySyncMessages final {
   std::string_view open;
   std::string_view sync;
@@ -81,6 +86,12 @@ void ensure_owned_plain_directory(
     const std::filesystem::path& directory, const ErrorPolicy& errors,
     const DirectoryMessages& messages,
     const DirectorySyncMessages& parent_sync_messages);
+
+// Read-only counterpart to ensure_owned_plain_directory. It never creates or
+// syncs the path and rejects a symlink at the fixed component being checked.
+void require_existing_plain_directory(
+    const std::filesystem::path& directory, const ErrorPolicy& errors,
+    const ExistingDirectoryMessages& messages);
 
 class ScopedAdvisoryLock final {
  public:

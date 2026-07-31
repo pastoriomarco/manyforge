@@ -225,8 +225,6 @@ public:
 private:
   struct Storage;
   std::unique_ptr<Storage> storage_;
-
-  friend class FilesystemVerifiedRetainedBundleSource;
 };
 
 /// Immutable semantic retained-bundle value.
@@ -355,18 +353,15 @@ public:
 private:
   struct Storage;
   std::unique_ptr<Storage> storage_;
-
-  friend class FilesystemVerifiedRetainedBundleSource;
 };
 
 /// Filesystem-backed lower-level verified retained-bundle lookup.
 ///
-/// This narrow capability first reconstructs the complete semantic envelope,
+/// This narrow capability point-reads the selected complete semantic envelope,
 /// then resolves and independently verifies every retained catalog, schema,
-/// and product-artifact reference against the durable raw CAS. The repository
-/// and CAS must have the exact same normalized trusted root; construction
-/// rejects cross-root splicing. The referenced repository and CAS must outlive
-/// this source.
+/// and product-artifact reference against the same trusted package root.
+/// Construction validates the fixed package directories without creating,
+/// locking, syncing, cleaning, or enumerating them.
 ///
 /// This lookup performs no canonical-empty admission or selection and exposes
 /// no candidate, active, stage, Apply, bootstrap, scene, process, or runtime
@@ -374,9 +369,8 @@ private:
 class FilesystemVerifiedRetainedBundleSource final
     : public IVerifiedRetainedBundleSource {
 public:
-  FilesystemVerifiedRetainedBundleSource(
-      const FilesystemRetainedBundleRepository &bundle_repository,
-      const FilesystemRawArtifactStore &artifact_store);
+  explicit FilesystemVerifiedRetainedBundleSource(
+      std::filesystem::path trusted_package_root);
   ~FilesystemVerifiedRetainedBundleSource() override = default;
 
   FilesystemVerifiedRetainedBundleSource(
@@ -393,8 +387,7 @@ public:
       const core::RetainedBundleId &retained_bundle_id) const override;
 
 private:
-  const FilesystemRetainedBundleRepository &bundle_repository_;
-  const FilesystemRawArtifactStore &artifact_store_;
+  std::filesystem::path trusted_package_root_;
 };
 
 } // namespace manyforge::deployment

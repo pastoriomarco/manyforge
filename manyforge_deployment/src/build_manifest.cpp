@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <set>
@@ -40,6 +41,7 @@
 #include "content_identity_internal.hpp"
 #include "embedded_build_evidence.hpp"
 #include "model_source_contract_internal.hpp"
+#include "posix_durability_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -64,6 +66,52 @@ constexpr std::string_view kPythonSourcePackageFormat =
     "manyforge.python-source-package.v1";
 [[noreturn]] void fail(std::string_view message) {
   throw BuildManifestError(std::string(message));
+}
+
+[[nodiscard]] std::exception_ptr make_manifest_error(
+    std::string_view message) {
+  return std::make_exception_ptr(BuildManifestError(std::string(message)));
+}
+
+namespace posix = detail::posix_durability;
+
+const posix::ErrorPolicy kReadOnlyManifestPosixErrors{
+    make_manifest_error};
+constexpr posix::TrustedRootMessages kReadOnlyManifestRootMessages{
+    "canonical package root must not be empty",
+    "cannot resolve canonical package root",
+    "canonical package root must be an existing plain directory",
+};
+constexpr posix::ExistingDirectoryMessages
+    kReadOnlyManifestDirectoryMessages{
+        "cannot inspect canonical package manifest directory",
+        "canonical package manifest directory must be an existing plain "
+        "directory",
+    };
+constexpr posix::ReadMessages kReadOnlyManifestReadMessages{
+    "cannot open canonical package build manifest",
+    "cannot stat canonical package build manifest",
+    "canonical package build manifest violates its immutable byte bound",
+    "canonical package build manifest changed during exact read",
+    "canonical package build manifest grew during exact read",
+};
+
+[[nodiscard]] std::filesystem::path existing_manifest_path(
+    const std::filesystem::path& manifest_root,
+    const BuildManifestKey& key) {
+  const std::string_view kind = to_string(key.manifest_kind);
+  if (kind.empty() || !is_sha256_digest(key.content_digest.value())) {
+    fail("current build produced an invalid build-manifest key");
+  }
+  const std::filesystem::path kind_root =
+      manifest_root / std::string(kind);
+  posix::require_existing_plain_directory(
+      kind_root, kReadOnlyManifestPosixErrors,
+      kReadOnlyManifestDirectoryMessages);
+  return kind_root /
+         (key.content_digest.value().substr(
+              std::string_view("sha256:").size()) +
+          ".json");
 }
 
 [[nodiscard]] const CanonicalValue::Object& require_object(
@@ -1587,6 +1635,7 @@ void require_compiler_build_shape(const CanonicalValue& candidate) {
               ? (input_id.starts_with("cpp-public-header:") ||
                  input_id.starts_with("cpp-internal-header:") ||
                  input_id.starts_with("cpp-translation-unit:") ||
+                 input_id.starts_with("compiler-tool:") ||
                  input_id.starts_with("compiler-resource:"))
               : (input_id.starts_with("build-recipe:") ||
                  input_id.starts_with("build-template:"));
@@ -1755,6 +1804,53 @@ BuildQualifiedRetentionAuthority::qualify_persisted(
   return BuildQualifiedRetentionContext(
       retained_node_environment_from_manifest(
           *reloaded_manifests[0]),
+      reloaded_manifests[1]->key().content_digest,
+      reloaded_manifests[2]->key().content_digest,
+      std::move(reloaded_manifests));
+}
+
+BuildQualifiedRetentionContext
+BuildQualifiedRetentionAuthority::qualify_existing(
+    const std::filesystem::path& trusted_package_root) {
+  const BuildQualifiedRetentionContext current = qualify();
+  if (current.manifests().size() != 3U) {
+    throw std::logic_error(
+        "build authority omitted a required current manifest");
+  }
+
+  const std::filesystem::path root =
+      posix::normalize_existing_plain_root(
+          trusted_package_root, kReadOnlyManifestPosixErrors,
+          kReadOnlyManifestRootMessages);
+  const std::filesystem::path manifest_root = root / "build-manifests";
+  posix::require_existing_plain_directory(
+      manifest_root, kReadOnlyManifestPosixErrors,
+      kReadOnlyManifestDirectoryMessages);
+
+  std::vector<std::shared_ptr<const BuildQualifiedManifest>>
+      reloaded_manifests;
+  reloaded_manifests.reserve(current.manifests().size());
+  for (const auto& expected : current.manifests()) {
+    const auto bytes = posix::read_exact_regular_file(
+        existing_manifest_path(manifest_root, expected->key()),
+        kMaxQualifiedManifestBytes, false,
+        kReadOnlyManifestPosixErrors, kReadOnlyManifestReadMessages);
+    if (!bytes.has_value()) {
+      throw std::logic_error(
+          "required canonical package build manifest disappeared");
+    }
+    const auto reloaded = reload_self_verified_build_manifest(
+        expected->key().manifest_kind, *bytes);
+    if (reloaded->key() != expected->key() ||
+        reloaded->canonical_bytes() != expected->canonical_bytes()) {
+      fail("canonical package build manifest is stale or differs from this "
+           "exact build");
+    }
+    reloaded_manifests.push_back(reloaded);
+  }
+
+  return BuildQualifiedRetentionContext(
+      retained_node_environment_from_manifest(*reloaded_manifests[0]),
       reloaded_manifests[1]->key().content_digest,
       reloaded_manifests[2]->key().content_digest,
       std::move(reloaded_manifests));
