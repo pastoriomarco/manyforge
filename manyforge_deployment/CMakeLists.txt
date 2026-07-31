@@ -397,6 +397,7 @@ add_library(manyforge_deployment
   src/deployment_catalog_codec.cpp
   src/model_asset_codec.cpp
   src/model_source.cpp
+  src/posix_durability_internal.cpp
   src/provider_manifest_codec.cpp
   src/retained_bundle.cpp
   src/retained_bundle_store.cpp

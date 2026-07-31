@@ -1,22 +1,17 @@
 #include "manyforge_deployment/build_manifest.hpp"
 
-#include <fcntl.h>
 #include <sys/file.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
-#include <array>
 #include <algorithm>
-#include <atomic>
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <limits>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -26,9 +21,12 @@
 
 #include "build_manifest_internal.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "posix_durability_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
+
+namespace posix = detail::posix_durability;
 
 constexpr std::array kManifestKinds{
     BuildManifestKind::kNodeEnvironment,
@@ -45,6 +43,55 @@ constexpr std::size_t kMaximumStaleTemporaryManifestCount = 256U;
   throw std::runtime_error(
       std::string(operation) + ": " + std::strerror(errno));
 }
+
+[[nodiscard]] std::exception_ptr make_manifest_error(
+    std::string_view message) {
+  return std::make_exception_ptr(BuildManifestError(std::string(message)));
+}
+
+const posix::ErrorPolicy kPosixErrors{make_manifest_error};
+constexpr posix::TrustedRootMessages kTrustedRootMessages{
+    "semantic-manifest trusted root must not be empty",
+    "cannot resolve semantic-manifest trusted root",
+    "semantic-manifest trusted root must be an existing plain directory",
+};
+constexpr posix::DirectoryMessages kDirectoryMessages{
+    "cannot inspect semantic-manifest repository directory",
+    "semantic-manifest repository path is not a plain directory",
+    "cannot create semantic-manifest repository directory",
+    "concurrently created semantic-manifest repository path is not a plain "
+    "directory",
+    "created semantic-manifest repository directory is unsafe",
+};
+constexpr posix::DirectorySyncMessages kDirectorySyncMessages{
+    "cannot open semantic-manifest directory for fsync",
+    "cannot fsync semantic-manifest directory",
+};
+constexpr posix::LockFileMessages kLockFileMessages{
+    "cannot open semantic-manifest repository lock",
+    "cannot stat semantic-manifest repository lock",
+    "semantic-manifest repository lock is not a plain file",
+    "cannot lock semantic-manifest repository",
+    "filesystem semantic-manifest repository instances must be reopened "
+    "after fork",
+};
+constexpr posix::ReadMessages kReadMessages{
+    "cannot open semantic manifest",
+    "cannot stat semantic manifest",
+    "semantic manifest file violates its immutable byte bound",
+    "semantic manifest file changed during exact read",
+    "semantic manifest file grew during exact read",
+};
+constexpr posix::PublicationMessages kPublicationMessages{
+    "cannot create semantic-manifest temporary file",
+    "cannot allocate a unique semantic-manifest temporary file",
+    "cannot write semantic-manifest temporary file",
+    "cannot fsync semantic-manifest temporary file",
+    "cannot close semantic-manifest temporary file",
+    "cannot publish semantic manifest atomically",
+    "cannot remove idempotent semantic-manifest temporary file",
+    "cannot remove semantic-manifest temporary link",
+};
 
 [[nodiscard]] std::filesystem::path kind_directory(
     const std::filesystem::path& root, BuildManifestKind kind) {
@@ -102,179 +149,6 @@ constexpr std::size_t kMaximumStaleTemporaryManifestCount = 256U;
              .starts_with(kMiddle);
 }
 
-[[nodiscard]] std::filesystem::path absolute_trusted_root(
-    const std::filesystem::path& root) {
-  if (root.empty()) {
-    fail("semantic-manifest trusted root must not be empty");
-  }
-  std::error_code error;
-  std::filesystem::path absolute =
-      std::filesystem::absolute(root, error);
-  if (error) {
-    throw std::filesystem::filesystem_error(
-        "cannot resolve semantic-manifest trusted root", root, error);
-  }
-  absolute = absolute.lexically_normal();
-  while (absolute != absolute.root_path() &&
-         absolute.filename().empty()) {
-    absolute = absolute.parent_path();
-  }
-  const auto status =
-      std::filesystem::symlink_status(absolute, error);
-  if (error || !std::filesystem::is_directory(status) ||
-      std::filesystem::is_symlink(status)) {
-    fail("semantic-manifest trusted root must be an existing plain "
-         "directory");
-  }
-  return absolute;
-}
-
-[[nodiscard]] bool ensure_plain_directory(
-    const std::filesystem::path& path) {
-  std::error_code error;
-  const auto status = std::filesystem::symlink_status(path, error);
-  if (error &&
-      error != std::errc::no_such_file_or_directory) {
-    throw std::filesystem::filesystem_error(
-        "cannot inspect semantic-manifest repository directory", path,
-        error);
-  }
-  if (std::filesystem::exists(status)) {
-    if (!std::filesystem::is_directory(status) ||
-        std::filesystem::is_symlink(status)) {
-      fail("semantic-manifest repository path is not a plain directory");
-    }
-    return false;
-  }
-  const bool created = std::filesystem::create_directory(path, error);
-  if (error) {
-    throw std::filesystem::filesystem_error(
-        "cannot create semantic-manifest repository directory", path,
-        error);
-  }
-  if (!created) {
-    const auto raced_status =
-        std::filesystem::symlink_status(path, error);
-    if (error || !std::filesystem::is_directory(raced_status) ||
-        std::filesystem::is_symlink(raced_status)) {
-      fail("concurrently created semantic-manifest repository path is "
-           "not a plain directory");
-    }
-    return false;
-  }
-  const auto created_status = std::filesystem::symlink_status(path, error);
-  if (error || !std::filesystem::is_directory(created_status) ||
-      std::filesystem::is_symlink(created_status)) {
-    fail("created semantic-manifest repository directory is unsafe");
-  }
-  return true;
-}
-
-class AdvisoryFileLock final {
- public:
-  AdvisoryFileLock(int fd, int operation) : fd_(fd) {
-    if (::flock(fd_, operation) != 0) {
-      fail_errno("cannot lock semantic-manifest repository");
-    }
-  }
-  ~AdvisoryFileLock() { (void)::flock(fd_, LOCK_UN); }
-
-  AdvisoryFileLock(const AdvisoryFileLock&) = delete;
-  AdvisoryFileLock& operator=(const AdvisoryFileLock&) = delete;
-
- private:
-  int fd_;
-};
-
-[[nodiscard]] std::optional<std::string> read_plain_file(
-    const std::filesystem::path& path, std::uint64_t maximum_bytes,
-    bool missing_is_empty) {
-  const int fd =
-      ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  if (fd < 0) {
-    if (missing_is_empty && errno == ENOENT) {
-      return std::nullopt;
-    }
-    fail_errno("cannot open semantic manifest");
-  }
-  struct Close final {
-    int fd;
-    ~Close() {
-      if (fd >= 0) {
-        (void)::close(fd);
-      }
-    }
-  } close{fd};
-
-  struct stat status {};
-  if (::fstat(fd, &status) != 0) {
-    fail_errno("cannot stat semantic manifest");
-  }
-  if (!S_ISREG(status.st_mode) || status.st_size < 0 ||
-      static_cast<std::uint64_t>(status.st_size) > maximum_bytes ||
-      static_cast<std::uint64_t>(status.st_size) >
-          static_cast<std::uint64_t>(
-              std::numeric_limits<std::size_t>::max())) {
-    fail("semantic manifest file violates its immutable byte bound");
-  }
-  std::string bytes(static_cast<std::size_t>(status.st_size), '\0');
-  std::size_t offset = 0U;
-  while (offset < bytes.size()) {
-    const ssize_t read_count =
-        ::read(fd, bytes.data() + offset, bytes.size() - offset);
-    if (read_count < 0 && errno == EINTR) {
-      continue;
-    }
-    if (read_count <= 0) {
-      fail("semantic manifest file changed during exact read");
-    }
-    offset += static_cast<std::size_t>(read_count);
-  }
-  char extra = '\0';
-  ssize_t extra_count;
-  do {
-    extra_count = ::read(fd, &extra, 1U);
-  } while (extra_count < 0 && errno == EINTR);
-  if (extra_count != 0) {
-    fail("semantic manifest file grew during exact read");
-  }
-  return bytes;
-}
-
-void fsync_directory(const std::filesystem::path& directory) {
-  const int fd =
-      ::open(directory.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY |
-                                      O_NOFOLLOW);
-  if (fd < 0) {
-    fail_errno("cannot open semantic-manifest directory for fsync");
-  }
-  const int result = ::fsync(fd);
-  const int saved_errno = errno;
-  (void)::close(fd);
-  if (result != 0) {
-    errno = saved_errno;
-    fail_errno("cannot fsync semantic-manifest directory");
-  }
-}
-
-void write_all_and_fsync(int fd, std::string_view bytes) {
-  std::size_t offset = 0U;
-  while (offset < bytes.size()) {
-    const ssize_t written =
-        ::write(fd, bytes.data() + offset, bytes.size() - offset);
-    if (written < 0 && errno == EINTR) {
-      continue;
-    }
-    if (written <= 0) {
-      fail_errno("cannot write semantic-manifest temporary file");
-    }
-    offset += static_cast<std::size_t>(written);
-  }
-  if (::fsync(fd) != 0) {
-    fail_errno("cannot fsync semantic-manifest temporary file");
-  }
-}
-
 }  // namespace
 
 struct FilesystemBuildManifestRepository::Storage final {
@@ -283,14 +157,7 @@ struct FilesystemBuildManifestRepository::Storage final {
           std::uint64_t max_total_bytes_in)
       : root(std::move(root_in)),
         max_manifest_count(max_manifest_count_in),
-        max_total_bytes(max_total_bytes_in),
-        owner_pid(::getpid()) {}
-
-  ~Storage() {
-    if (lock_fd >= 0) {
-      (void)::close(lock_fd);
-    }
-  }
+        max_total_bytes(max_total_bytes_in) {}
 
   void refresh_index_locked(bool remove_stale_temporaries) {
     std::size_t refreshed_count = 0U;
@@ -362,8 +229,9 @@ struct FilesystemBuildManifestRepository::Storage final {
                     max_total_bytes - refreshed_bytes)) {
           fail("persistent semantic-manifest repository exceeds bounds");
         }
-        const auto bytes =
-            read_plain_file(iterator->path(), max_total_bytes, false);
+        const auto bytes = posix::read_exact_regular_file(
+            iterator->path(), max_total_bytes, false, kPosixErrors,
+            kReadMessages);
         if (!bytes.has_value()) {
           throw std::logic_error(
               "enumerated semantic manifest disappeared");
@@ -401,24 +269,21 @@ struct FilesystemBuildManifestRepository::Storage final {
     // prior writer linked and unlinked its temporary name but died before
     // fsyncing the kind directory.
     for (const BuildManifestKind kind : kManifestKinds) {
-      fsync_directory(kind_directory(root, kind));
+      posix::sync_directory(
+          kind_directory(root, kind), kDirectorySyncMessages);
     }
     manifest_count = refreshed_count;
     retained_bytes = refreshed_bytes;
   }
 
   void require_owner_process() const {
-    if (::getpid() != owner_pid) {
-      fail("filesystem semantic-manifest repository instances must be "
-           "reopened after fork");
-    }
+    lock->require_owner_process();
   }
 
   std::filesystem::path root;
   std::size_t max_manifest_count;
   std::uint64_t max_total_bytes;
-  pid_t owner_pid;
-  int lock_fd{-1};
+  std::unique_ptr<posix::ProcessAffineLockFile> lock;
   std::size_t manifest_count{0U};
   std::uint64_t retained_bytes{0U};
   mutable std::mutex mutex;
@@ -432,46 +297,27 @@ FilesystemBuildManifestRepository::FilesystemBuildManifestRepository(
     fail("filesystem semantic-manifest repository configuration is invalid");
   }
   const std::filesystem::path absolute_root =
-      absolute_trusted_root(trusted_root);
+      posix::normalize_existing_plain_root(
+          trusted_root, kPosixErrors, kTrustedRootMessages);
   const std::filesystem::path repository_root =
       absolute_root / "build-manifests";
-  (void)ensure_plain_directory(repository_root);
-  fsync_directory(absolute_root);
+  posix::ensure_owned_plain_directory(
+      repository_root, kPosixErrors, kDirectoryMessages,
+      kDirectorySyncMessages);
   for (const BuildManifestKind kind : kManifestKinds) {
-    (void)ensure_plain_directory(
-        kind_directory(repository_root, kind));
-    fsync_directory(repository_root);
+    posix::ensure_owned_plain_directory(
+        kind_directory(repository_root, kind), kPosixErrors,
+        kDirectoryMessages, kDirectorySyncMessages);
   }
   storage_ = std::make_unique<Storage>(
       repository_root, max_manifest_count, max_total_bytes);
   const std::filesystem::path lock_path =
       storage_->root / ".repository.lock";
-  storage_->lock_fd = ::open(
-      lock_path.c_str(),
-      O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-  if (storage_->lock_fd < 0) {
-    fail_errno("cannot open semantic-manifest repository lock");
-  }
-  try {
-    struct stat lock_status {};
-    if (::fstat(storage_->lock_fd, &lock_status) != 0) {
-      fail_errno("cannot stat semantic-manifest repository lock");
-    }
-    if (!S_ISREG(lock_status.st_mode)) {
-      fail("semantic-manifest repository lock is not a plain file");
-    }
-    fsync_directory(storage_->root);
-
-    std::lock_guard process_lock(storage_->mutex);
-    const AdvisoryFileLock file_lock(storage_->lock_fd, LOCK_EX);
-    storage_->refresh_index_locked(true);
-  } catch (...) {
-    const int saved_errno = errno;
-    (void)::close(storage_->lock_fd);
-    storage_->lock_fd = -1;
-    errno = saved_errno;
-    throw;
-  }
+  storage_->lock = std::make_unique<posix::ProcessAffineLockFile>(
+      lock_path, kPosixErrors, kLockFileMessages, kDirectorySyncMessages);
+  std::lock_guard process_lock(storage_->mutex);
+  const auto file_lock = storage_->lock->acquire(LOCK_EX);
+  storage_->refresh_index_locked(true);
 }
 
 FilesystemBuildManifestRepository::~FilesystemBuildManifestRepository() =
@@ -498,14 +344,16 @@ bool FilesystemBuildManifestRepository::put_if_absent(
   }
 
   std::lock_guard process_lock(storage_->mutex);
-  const AdvisoryFileLock file_lock(storage_->lock_fd, LOCK_EX);
+  const auto file_lock = storage_->lock->acquire(LOCK_EX);
   storage_->refresh_index_locked(true);
   const std::filesystem::path directory =
       kind_directory(storage_->root, manifest->key().manifest_kind);
   const std::filesystem::path final_path =
       directory / manifest_filename(manifest->key());
   if (const auto existing =
-          read_plain_file(final_path, storage_->max_total_bytes, true);
+          posix::read_exact_regular_file(
+              final_path, storage_->max_total_bytes, true, kPosixErrors,
+              kReadMessages);
       existing.has_value()) {
     const auto existing_manifest =
         detail::reload_self_verified_build_manifest(
@@ -524,70 +372,18 @@ bool FilesystemBuildManifestRepository::put_if_absent(
     fail("filesystem semantic-manifest repository bound is exhausted");
   }
 
-  static std::atomic<std::uint64_t> sequence{0U};
-  std::filesystem::path temporary_path;
-  int temporary_fd = -1;
-  for (std::size_t attempt = 0U; attempt < 64U; ++attempt) {
-    std::string temporary_name{"."};
-    temporary_name.append(manifest_filename(manifest->key()));
-    temporary_name.append(".tmp.");
-    temporary_name.append(
-        std::to_string(static_cast<long long>(::getpid())));
-    temporary_name.push_back('.');
-    temporary_name.append(
-        std::to_string(sequence.fetch_add(1U)));
-    temporary_path = directory / temporary_name;
-    temporary_fd = ::open(
-        temporary_path.c_str(),
-        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (temporary_fd >= 0) {
-      break;
-    }
-    if (errno != EEXIST) {
-      fail_errno("cannot create semantic-manifest temporary file");
-    }
-  }
-  if (temporary_fd < 0) {
-    fail("cannot allocate a unique semantic-manifest temporary file");
-  }
-
-  try {
-    write_all_and_fsync(temporary_fd, manifest->canonical_bytes());
-    if (::close(temporary_fd) != 0) {
-      temporary_fd = -1;
-      fail_errno("cannot close semantic-manifest temporary file");
-    }
-    temporary_fd = -1;
-    if (::link(temporary_path.c_str(), final_path.c_str()) != 0) {
-      if (errno != EEXIST) {
-        fail_errno("cannot publish semantic manifest atomically");
-      }
-      const auto existing = read_plain_file(
-          final_path, storage_->max_total_bytes, false);
-      if (!existing.has_value() ||
-          *existing != manifest->canonical_bytes()) {
-        throw std::runtime_error(
-            "filesystem semantic-manifest identity collision");
-      }
-      if (::unlink(temporary_path.c_str()) != 0) {
-        fail_errno(
-            "cannot remove idempotent semantic-manifest temporary file");
-      }
-      fsync_directory(directory);
-      return false;
-    }
-    if (::unlink(temporary_path.c_str()) != 0) {
-      fail_errno("cannot remove semantic-manifest temporary link");
-    }
-    fsync_directory(directory);
-  } catch (...) {
-    const int saved_errno = errno;
-    if (temporary_fd >= 0) {
-      (void)::close(temporary_fd);
-    }
-    (void)::unlink(temporary_path.c_str());
-    errno = saved_errno;
-    throw;
+  const bool inserted = posix::publish_immutable_file_no_replace(
+      final_path, manifest->canonical_bytes(), storage_->max_total_bytes,
+      kPosixErrors, kReadMessages, kDirectorySyncMessages,
+      kPublicationMessages,
+      [&manifest](std::string_view existing) {
+        if (existing != manifest->canonical_bytes()) {
+          throw std::runtime_error(
+              "filesystem semantic-manifest identity collision");
+        }
+      });
+  if (!inserted) {
+    return false;
   }
   ++storage_->manifest_count;
   storage_->retained_bytes += byte_size;
@@ -602,10 +398,12 @@ FilesystemBuildManifestRepository::get_verified(
       kind_directory(storage_->root, key.manifest_kind) /
       manifest_filename(key);
   std::lock_guard process_lock(storage_->mutex);
-  const AdvisoryFileLock file_lock(storage_->lock_fd, LOCK_SH);
+  const auto file_lock = storage_->lock->acquire(LOCK_SH);
   storage_->refresh_index_locked(false);
   const auto bytes =
-      read_plain_file(path, storage_->max_total_bytes, true);
+      posix::read_exact_regular_file(
+          path, storage_->max_total_bytes, true, kPosixErrors,
+          kReadMessages);
   if (!bytes.has_value()) {
     return nullptr;
   }
@@ -622,7 +420,7 @@ FilesystemBuildManifestRepository::get_verified(
 std::size_t FilesystemBuildManifestRepository::size() const {
   storage_->require_owner_process();
   std::lock_guard process_lock(storage_->mutex);
-  const AdvisoryFileLock file_lock(storage_->lock_fd, LOCK_SH);
+  const auto file_lock = storage_->lock->acquire(LOCK_SH);
   storage_->refresh_index_locked(false);
   return storage_->manifest_count;
 }
@@ -631,7 +429,7 @@ std::uint64_t
 FilesystemBuildManifestRepository::retained_bytes() const {
   storage_->require_owner_process();
   std::lock_guard process_lock(storage_->mutex);
-  const AdvisoryFileLock file_lock(storage_->lock_fd, LOCK_SH);
+  const auto file_lock = storage_->lock->acquire(LOCK_SH);
   storage_->refresh_index_locked(false);
   return storage_->retained_bytes;
 }

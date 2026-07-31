@@ -1,18 +1,14 @@
 #include "manyforge_deployment/retained_bundle.hpp"
 
-#include <fcntl.h>
 #include <sys/file.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,10 +21,13 @@
 #include <vector>
 
 #include "manyforge_deployment/content_identity.hpp"
+#include "posix_durability_internal.hpp"
 #include "retained_bundle_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
+
+namespace posix = detail::posix_durability;
 
 enum class DurableValueKind {
   kRawArtifact,
@@ -65,6 +64,53 @@ constexpr std::string_view kStoreKeyPrefix = "sha256/";
                            std::strerror(errno));
 }
 
+[[nodiscard]] std::exception_ptr make_retention_error(
+    std::string_view message) {
+  return std::make_exception_ptr(RetainedBundleError(std::string(message)));
+}
+
+const posix::ErrorPolicy kPosixErrors{make_retention_error};
+constexpr posix::TrustedRootMessages kTrustedRootMessages{
+    "durable retention trusted root must not be empty",
+    "cannot resolve durable retention trusted root",
+    "durable retention trusted root must be an existing plain directory",
+};
+constexpr posix::DirectoryMessages kDirectoryMessages{
+    "cannot inspect durable retention directory",
+    "durable retention path is not a plain directory",
+    "cannot create durable retention directory",
+    "concurrently created durable retention path is unsafe",
+    "created durable retention directory is unsafe",
+};
+constexpr posix::DirectorySyncMessages kDirectorySyncMessages{
+    "cannot open durable retention directory for fsync",
+    "cannot fsync durable retention directory",
+};
+constexpr posix::LockFileMessages kLockFileMessages{
+    "cannot open durable retention repository lock",
+    "cannot stat durable retention repository lock",
+    "durable retention repository lock is not a plain file",
+    "cannot lock durable retention store",
+    "durable retention store instances must be reopened after fork",
+};
+constexpr posix::ReadMessages kReadMessages{
+    "cannot open durable retention entry",
+    "cannot stat durable retention entry",
+    "durable retention entry violates its immutable byte bound",
+    "durable retention entry changed during exact read",
+    "durable retention entry grew during exact read",
+};
+constexpr posix::PublicationMessages kPublicationMessages{
+    "cannot create durable retention temporary file",
+    "cannot allocate a unique durable retention temporary file",
+    "cannot write durable retention temporary file",
+    "cannot fsync durable retention temporary file",
+    "cannot close durable retention temporary file",
+    "cannot publish durable retention value atomically",
+    "cannot remove idempotent durable retention temporary file",
+    "cannot remove durable retention temporary link",
+};
+
 [[nodiscard]] bool is_lower_hex(std::string_view value) noexcept {
   return !value.empty() &&
          std::all_of(value.begin(), value.end(), [](unsigned char byte) {
@@ -86,173 +132,6 @@ constexpr std::string_view kStoreKeyPrefix = "sha256/";
     fail("durable retention entry has an invalid digest filename");
   }
   return std::string(kDigestPrefix) + std::string(hex);
-}
-
-[[nodiscard]] std::filesystem::path absolute_trusted_root(
-    const std::filesystem::path& root) {
-  if (root.empty()) {
-    fail("durable retention trusted root must not be empty");
-  }
-  std::error_code error;
-  std::filesystem::path absolute = std::filesystem::absolute(root, error);
-  if (error) {
-    throw std::filesystem::filesystem_error(
-        "cannot resolve durable retention trusted root", root, error);
-  }
-  absolute = absolute.lexically_normal();
-  while (absolute != absolute.root_path() &&
-         absolute.filename().empty()) {
-    absolute = absolute.parent_path();
-  }
-  const auto status = std::filesystem::symlink_status(absolute, error);
-  if (error || !std::filesystem::is_directory(status) ||
-      std::filesystem::is_symlink(status)) {
-    fail("durable retention trusted root must be an existing plain "
-         "directory");
-  }
-  return absolute;
-}
-
-[[nodiscard]] bool ensure_plain_directory(
-    const std::filesystem::path& path) {
-  std::error_code error;
-  const auto status = std::filesystem::symlink_status(path, error);
-  if (error && error != std::errc::no_such_file_or_directory) {
-    throw std::filesystem::filesystem_error(
-        "cannot inspect durable retention directory", path, error);
-  }
-  if (std::filesystem::exists(status)) {
-    if (!std::filesystem::is_directory(status) ||
-        std::filesystem::is_symlink(status)) {
-      fail("durable retention path is not a plain directory");
-    }
-    return false;
-  }
-  const bool created = std::filesystem::create_directory(path, error);
-  if (error) {
-    throw std::filesystem::filesystem_error(
-        "cannot create durable retention directory", path, error);
-  }
-  if (!created) {
-    const auto raced_status = std::filesystem::symlink_status(path, error);
-    if (error || !std::filesystem::is_directory(raced_status) ||
-        std::filesystem::is_symlink(raced_status)) {
-      fail("concurrently created durable retention path is unsafe");
-    }
-    return false;
-  }
-  const auto created_status = std::filesystem::symlink_status(path, error);
-  if (error || !std::filesystem::is_directory(created_status) ||
-      std::filesystem::is_symlink(created_status)) {
-    fail("created durable retention directory is unsafe");
-  }
-  return true;
-}
-
-void fsync_directory(const std::filesystem::path& directory) {
-  const int fd =
-      ::open(directory.c_str(),
-             O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-  if (fd < 0) {
-    fail_errno("cannot open durable retention directory for fsync");
-  }
-  const int result = ::fsync(fd);
-  const int saved_errno = errno;
-  (void)::close(fd);
-  if (result != 0) {
-    errno = saved_errno;
-    fail_errno("cannot fsync durable retention directory");
-  }
-}
-
-class AdvisoryFileLock final {
- public:
-  AdvisoryFileLock(int fd, int operation) : fd_(fd) {
-    if (::flock(fd_, operation) != 0) {
-      fail_errno("cannot lock durable retention store");
-    }
-  }
-
-  ~AdvisoryFileLock() { (void)::flock(fd_, LOCK_UN); }
-
-  AdvisoryFileLock(const AdvisoryFileLock&) = delete;
-  AdvisoryFileLock& operator=(const AdvisoryFileLock&) = delete;
-
- private:
-  int fd_;
-};
-
-[[nodiscard]] std::optional<std::string> read_plain_file(
-    const std::filesystem::path& path, std::uint64_t maximum_bytes,
-    bool missing_is_empty) {
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  if (fd < 0) {
-    if (missing_is_empty && errno == ENOENT) {
-      return std::nullopt;
-    }
-    fail_errno("cannot open durable retention entry");
-  }
-  struct Close final {
-    int fd;
-    ~Close() {
-      if (fd >= 0) {
-        (void)::close(fd);
-      }
-    }
-  } close{fd};
-
-  struct stat status {};
-  if (::fstat(fd, &status) != 0) {
-    fail_errno("cannot stat durable retention entry");
-  }
-  if (!S_ISREG(status.st_mode) || status.st_size < 0 ||
-      static_cast<std::uint64_t>(status.st_size) > maximum_bytes ||
-      static_cast<std::uint64_t>(status.st_size) >
-          static_cast<std::uint64_t>(
-              std::numeric_limits<std::size_t>::max())) {
-    fail("durable retention entry violates its immutable byte bound");
-  }
-
-  std::string bytes(static_cast<std::size_t>(status.st_size), '\0');
-  std::size_t offset = 0U;
-  while (offset < bytes.size()) {
-    const ssize_t read_count =
-        ::read(fd, bytes.data() + offset, bytes.size() - offset);
-    if (read_count < 0 && errno == EINTR) {
-      continue;
-    }
-    if (read_count <= 0) {
-      fail("durable retention entry changed during exact read");
-    }
-    offset += static_cast<std::size_t>(read_count);
-  }
-  char extra = '\0';
-  ssize_t extra_count = 0;
-  do {
-    extra_count = ::read(fd, &extra, 1U);
-  } while (extra_count < 0 && errno == EINTR);
-  if (extra_count != 0) {
-    fail("durable retention entry grew during exact read");
-  }
-  return bytes;
-}
-
-void write_all_and_fsync(int fd, std::string_view bytes) {
-  std::size_t offset = 0U;
-  while (offset < bytes.size()) {
-    const ssize_t written =
-        ::write(fd, bytes.data() + offset, bytes.size() - offset);
-    if (written < 0 && errno == EINTR) {
-      continue;
-    }
-    if (written <= 0) {
-      fail_errno("cannot write durable retention temporary file");
-    }
-    offset += static_cast<std::size_t>(written);
-  }
-  if (::fsync(fd) != 0) {
-    fail_errno("cannot fsync durable retention temporary file");
-  }
 }
 
 [[nodiscard]] bool is_stale_temporary_filename(
@@ -312,14 +191,14 @@ class DurableFileCollection final {
                         std::uint64_t max_single_entry_bytes)
       : kind_(kind),
         layout_(layout_for(kind)),
-        root_(absolute_trusted_root(trusted_root)),
+        root_(posix::normalize_existing_plain_root(
+            trusted_root, kPosixErrors, kTrustedRootMessages)),
         namespace_directory_(
             root_ / std::string(layout_.directory_name)),
         data_directory_(namespace_directory_ / "sha256"),
         max_entry_count_(max_entry_count),
         max_total_bytes_(max_total_bytes),
-        max_single_entry_bytes_(max_single_entry_bytes),
-        owner_pid_(::getpid()) {
+        max_single_entry_bytes_(max_single_entry_bytes) {
     if (max_entry_count_ == 0U || max_total_bytes_ == 0U ||
         max_single_entry_bytes_ == 0U ||
         max_single_entry_bytes_ > max_total_bytes_) {
@@ -327,52 +206,28 @@ class DurableFileCollection final {
            "consistent");
     }
 
-    (void)ensure_plain_directory(namespace_directory_);
-    fsync_directory(root_);
-    (void)ensure_plain_directory(data_directory_);
-    fsync_directory(namespace_directory_);
+    posix::ensure_owned_plain_directory(
+        namespace_directory_, kPosixErrors, kDirectoryMessages,
+        kDirectorySyncMessages);
+    posix::ensure_owned_plain_directory(
+        data_directory_, kPosixErrors, kDirectoryMessages,
+        kDirectorySyncMessages);
     const std::filesystem::path lock_path =
         namespace_directory_ / ".repository.lock";
-    lock_fd_ = ::open(lock_path.c_str(),
-                      O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (lock_fd_ < 0) {
-      fail_errno("cannot open durable retention repository lock");
-    }
-    try {
-      struct stat lock_status {};
-      if (::fstat(lock_fd_, &lock_status) != 0) {
-        fail_errno("cannot stat durable retention repository lock");
-      }
-      if (!S_ISREG(lock_status.st_mode)) {
-        fail("durable retention repository lock is not a plain file");
-      }
-      fsync_directory(namespace_directory_);
+    lock_ = std::make_unique<posix::ProcessAffineLockFile>(
+        lock_path, kPosixErrors, kLockFileMessages,
+        kDirectorySyncMessages);
 
-      std::lock_guard process_lock(mutex_);
-      const AdvisoryFileLock file_lock(lock_fd_, LOCK_EX);
-      refresh_index_locked(true);
-    } catch (...) {
-      const int saved_errno = errno;
-      (void)::close(lock_fd_);
-      lock_fd_ = -1;
-      errno = saved_errno;
-      throw;
-    }
-  }
-
-  ~DurableFileCollection() {
-    if (lock_fd_ >= 0) {
-      (void)::close(lock_fd_);
-    }
+    std::lock_guard process_lock(mutex_);
+    const auto file_lock = lock_->acquire(LOCK_EX);
+    refresh_index_locked(true);
   }
 
   DurableFileCollection(const DurableFileCollection&) = delete;
   DurableFileCollection& operator=(const DurableFileCollection&) = delete;
 
   void require_owner_process() const {
-    if (::getpid() != owner_pid_) {
-      fail("durable retention store instances must be reopened after fork");
-    }
+    lock_->require_owner_process();
   }
 
   void require_insert_size(std::size_t byte_size) const {
@@ -389,12 +244,14 @@ class DurableFileCollection final {
     verify_entry_bytes(kind_, hex, bytes);
 
     std::lock_guard process_lock(mutex_);
-    const AdvisoryFileLock file_lock(lock_fd_, LOCK_EX);
+    const auto file_lock = lock_->acquire(LOCK_EX);
     refresh_index_locked(true);
     const std::filesystem::path final_path =
         data_directory_ / committed_filename(hex);
     if (const auto existing =
-            read_plain_file(final_path, max_single_entry_bytes_, true);
+            posix::read_exact_regular_file(
+                final_path, max_single_entry_bytes_, true, kPosixErrors,
+                kReadMessages);
         existing.has_value()) {
       verify_entry_bytes(kind_, hex, *existing);
       if (*existing != bytes) {
@@ -411,69 +268,18 @@ class DurableFileCollection final {
       fail("durable retention repository bound is exhausted");
     }
 
-    static std::atomic<std::uint64_t> sequence{0U};
-    std::filesystem::path temporary_path;
-    int temporary_fd = -1;
-    for (std::size_t attempt = 0U; attempt < 64U; ++attempt) {
-      std::string temporary_name{"."};
-      temporary_name.append(committed_filename(hex));
-      temporary_name.append(".tmp.");
-      temporary_name.append(
-          std::to_string(static_cast<long long>(::getpid())));
-      temporary_name.push_back('.');
-      temporary_name.append(std::to_string(sequence.fetch_add(1U)));
-      temporary_path = data_directory_ / temporary_name;
-      temporary_fd = ::open(
-          temporary_path.c_str(),
-          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-      if (temporary_fd >= 0) {
-        break;
-      }
-      if (errno != EEXIST) {
-        fail_errno("cannot create durable retention temporary file");
-      }
-    }
-    if (temporary_fd < 0) {
-      fail("cannot allocate a unique durable retention temporary file");
-    }
-
-    try {
-      write_all_and_fsync(temporary_fd, bytes);
-      if (::close(temporary_fd) != 0) {
-        temporary_fd = -1;
-        fail_errno("cannot close durable retention temporary file");
-      }
-      temporary_fd = -1;
-      if (::link(temporary_path.c_str(), final_path.c_str()) != 0) {
-        if (errno != EEXIST) {
-          fail_errno("cannot publish durable retention value atomically");
-        }
-        const auto existing =
-            read_plain_file(final_path, max_single_entry_bytes_, false);
-        if (!existing.has_value() || *existing != bytes) {
-          throw std::runtime_error(
-              "durable retention identity collision");
-        }
-        verify_entry_bytes(kind_, hex, *existing);
-        if (::unlink(temporary_path.c_str()) != 0) {
-          fail_errno(
-              "cannot remove idempotent durable retention temporary file");
-        }
-        fsync_directory(data_directory_);
-        return false;
-      }
-      if (::unlink(temporary_path.c_str()) != 0) {
-        fail_errno("cannot remove durable retention temporary link");
-      }
-      fsync_directory(data_directory_);
-    } catch (...) {
-      const int saved_errno = errno;
-      if (temporary_fd >= 0) {
-        (void)::close(temporary_fd);
-      }
-      (void)::unlink(temporary_path.c_str());
-      errno = saved_errno;
-      throw;
+    const bool inserted = posix::publish_immutable_file_no_replace(
+        final_path, bytes, max_single_entry_bytes_, kPosixErrors,
+        kReadMessages, kDirectorySyncMessages, kPublicationMessages,
+        [this, hex, bytes](std::string_view existing) {
+          if (existing != bytes) {
+            throw std::runtime_error(
+                "durable retention identity collision");
+          }
+          verify_entry_bytes(kind_, hex, existing);
+        });
+    if (!inserted) {
+      return false;
     }
     ++entry_count_;
     retained_bytes_ += byte_size;
@@ -485,10 +291,10 @@ class DurableFileCollection final {
     require_owner_process();
     (void)digest_from_hex(hex);
     std::lock_guard process_lock(mutex_);
-    const AdvisoryFileLock file_lock(lock_fd_, LOCK_SH);
-    const auto bytes = read_plain_file(
+    const auto file_lock = lock_->acquire(LOCK_SH);
+    const auto bytes = posix::read_exact_regular_file(
         data_directory_ / committed_filename(hex),
-        max_single_entry_bytes_, true);
+        max_single_entry_bytes_, true, kPosixErrors, kReadMessages);
     if (!bytes.has_value()) {
       return std::nullopt;
     }
@@ -496,14 +302,14 @@ class DurableFileCollection final {
     // A successful point read adopts a visible immutable final left by a
     // writer that may have died after link + temporary unlink but before its
     // directory fsync.
-    fsync_directory(data_directory_);
+    posix::sync_directory(data_directory_, kDirectorySyncMessages);
     return bytes;
   }
 
   [[nodiscard]] std::size_t size() {
     require_owner_process();
     std::lock_guard process_lock(mutex_);
-    const AdvisoryFileLock file_lock(lock_fd_, LOCK_SH);
+    const auto file_lock = lock_->acquire(LOCK_SH);
     refresh_index_locked(false);
     return entry_count_;
   }
@@ -511,7 +317,7 @@ class DurableFileCollection final {
   [[nodiscard]] std::uint64_t retained_bytes() {
     require_owner_process();
     std::lock_guard process_lock(mutex_);
-    const AdvisoryFileLock file_lock(lock_fd_, LOCK_SH);
+    const auto file_lock = lock_->acquire(LOCK_SH);
     refresh_index_locked(false);
     return retained_bytes_;
   }
@@ -583,8 +389,9 @@ class DurableFileCollection final {
                   max_total_bytes_ - refreshed_bytes)) {
         fail("persistent durable retention repository exceeds bounds");
       }
-      const auto bytes =
-          read_plain_file(iterator->path(), max_single_entry_bytes_, false);
+      const auto bytes = posix::read_exact_regular_file(
+          iterator->path(), max_single_entry_bytes_, false, kPosixErrors,
+          kReadMessages);
       if (!bytes.has_value()) {
         throw std::logic_error(
             "enumerated durable retention entry disappeared");
@@ -614,7 +421,7 @@ class DurableFileCollection final {
     // Successful enumeration adopts every visible immutable final. The
     // unconditional barrier also closes the final-only crash residue window
     // when there is no stale temporary name left to clean.
-    fsync_directory(data_directory_);
+    posix::sync_directory(data_directory_, kDirectorySyncMessages);
     entry_count_ = refreshed_count;
     retained_bytes_ = refreshed_bytes;
   }
@@ -627,8 +434,7 @@ class DurableFileCollection final {
   std::size_t max_entry_count_;
   std::uint64_t max_total_bytes_;
   std::uint64_t max_single_entry_bytes_;
-  pid_t owner_pid_;
-  int lock_fd_{-1};
+  std::unique_ptr<posix::ProcessAffineLockFile> lock_;
   std::size_t entry_count_{0U};
   std::uint64_t retained_bytes_{0U};
   std::mutex mutex_;
