@@ -9,26 +9,17 @@
 #include <vector>
 
 #include <manyforge_core/types/active_bundle_publication.hpp>
+#include <manyforge_core/types/logical_scene_snapshot.hpp>
 #include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 
 namespace manyforge::core {
 
-// The complete logical-scene value is owned by the scene-contract cutover.
-// Bootstrap carries it as an immutable root so this Manager-facing substrate
-// does not reuse the incompatible legacy LogicalSceneSnapshot shape.
-struct LogicalSceneSnapshotDTO;
-
-/// Non-null immutable ownership root for the future frozen logical-scene DTO.
+/// Non-null immutable ownership root for the frozen logical-scene DTO.
 ///
 /// Spec 220 permits shared immutable logical snapshots. Wrapping the shared
 /// pointer prevents a required snapshot field from acquiring a second
-/// "present-but-null" state while the scene DTO's implementation lands.
-///
-/// This bounded substrate cannot inspect the incomplete scene value and does
-/// not prove its cell, revision, or content identity. Operational I4 bootstrap
-/// remains unavailable until the scene-contract cutover supplies that
-/// validation at the owning boundary.
+/// "present-but-null" state.
 class LogicalSceneSnapshotRoot final {
  public:
   explicit LogicalSceneSnapshotRoot(
@@ -37,6 +28,10 @@ class LogicalSceneSnapshotRoot final {
     if (!snapshot_) {
       throw std::invalid_argument(
           "logical scene snapshot root must be non-null");
+    }
+    if (!snapshot_->locally_valid()) {
+      throw std::invalid_argument(
+          "logical scene snapshot root must be locally valid");
     }
   }
 
@@ -56,6 +51,16 @@ class LogicalSceneSnapshotRoot final {
   [[nodiscard]] const std::shared_ptr<const LogicalSceneSnapshotDTO>& shared()
       const noexcept {
     return snapshot_;
+  }
+
+  [[nodiscard]] bool has_exact_identity(
+      const LogicalSceneSnapshotIdentityDTO& expected) const noexcept {
+    return snapshot_->has_exact_identity(expected);
+  }
+
+  [[nodiscard]] bool canonical_empty_for(
+      const LogicalSceneSnapshotIdentityDTO& expected) const noexcept {
+    return snapshot_->canonical_empty_for(expected);
   }
 
  private:
@@ -161,11 +166,8 @@ struct ProjectionBootstrapIntentDTO final {
   }
 };
 
-/// Locally well-formed bootstrap acceptance.
-///
-/// `valid()` cannot inspect the incomplete logical-scene value. The scene
-/// owner must validate its exact cell/revision/content relationship before
-/// operational I4 may accept this record.
+/// Locally well-formed bootstrap acceptance with an exact initialized empty
+/// scene. Scene-content digest derivation remains the scene owner's authority.
 struct ProjectionBootstrapAcceptedDTO final {
   BootstrapId bootstrap_id;
   BootstrapGeneration bootstrap_generation;
@@ -175,7 +177,9 @@ struct ProjectionBootstrapAcceptedDTO final {
 
   [[nodiscard]] bool valid() const noexcept {
     return !bootstrap_id.empty() && bootstrap_generation.nonzero() &&
-           !cell_id.empty() && canonical_empty_target.valid();
+           !cell_id.empty() && canonical_empty_target.valid() &&
+           initialized_logical_scene.canonical_empty_for(
+               {canonical_empty_target.scene_revision, cell_id});
   }
 };
 
@@ -218,6 +222,9 @@ struct NativeProjectionBootstrapRebuildResultDTO final {
             RetainedProductKind::kPlanningCollisionModel ||
         planning_collision_model.product_contract_id.empty() ||
         planning_collision_model.product_contract_revision.empty() ||
+        !initialized_logical_scene.has_exact_identity(
+            {canonical_empty_target.scene_revision,
+             initialized_logical_scene.shared()->cell_id}) ||
         !resulting_health.valid() ||
         resulting_health.native_runtime_binding != native_runtime_binding ||
         (native_projection_generation.has_value() &&

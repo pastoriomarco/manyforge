@@ -102,13 +102,20 @@ All commands run inside the container (`docker compose run --rm dev bash`).
 ./scripts/test-all.sh all
 
 # Individual suites
-./scripts/test-all.sh cpp          # manyforge_core C++ tests
-./scripts/test-all.sh roboplan     # manyforge_roboplan C++ tests
-./scripts/test-all.sh bindings     # pybind11 bindings
+./scripts/test-all.sh cpp          # all C++ package tests
+./scripts/test-all.sh roboplan     # retained-model RoboPlan qualification only
+./scripts/test-all.sh bindings     # explicitly unavailable during I2 cutover
 ./scripts/test-all.sh python       # manyforge_behavior
-./scripts/test-all.sh integration  # end-to-end integration
+./scripts/test-all.sh integration  # unavailable until native restoration
 ./scripts/test-all.sh composer     # Composer backend tests + frontend build
 ```
+
+The current destructive `dev` checkpoint is not a full-suite qualification:
+the aggregate deployment registry intentionally retains stale identity/golden
+assertions until the I2/I3 surface freezes, and runtime-dependent Python,
+Composer, ROS, and lane suites remain unavailable. Use the focused package
+commands recorded by the active plan rather than interpreting an unavailable
+suite as a product regression.
 
 ROS adapter tests use the separate ROS Jazzy image:
 
@@ -147,11 +154,13 @@ ctest --output-on-failure
 ```
 manyforge_core/          C++ library: execution kernel, state machine, DTOs, ports
   python/                pybind11 bindings exposing the kernel to Python
+manyforge_content_identity/  Shared ROS-free canonical JSON and content-digest primitives
+manyforge_persistence/   Shared ROS-free mechanical durable-storage safety primitives
+manyforge_scene/         ROS-free logical-scene semantic owner and durable state
 manyforge_deployment/    ROS-free composable-cell codec, qualification, final C++ trust boundary, and retention substrate
 manyforge_component_manager/  ROS-free Manager observation, typed bootstrap journal, owner ports, and active-publication store
 manyforge_collision/     C++ planner-neutral collision query implementation
-manyforge_roboplan/      C++ RoboPlan adapters: planner/projection, focused ports, native execution
-  python/                pybind11 bindings + NativeKernelClient wrapper
+manyforge_roboplan/      Retained planning-model staging and offline RoboPlan import qualification
 manyforge_ros2_control_execution/  C++ ROS controller execution and exact-admission adapter
 manyforge_robot_lifecycle/  ROS-independent real-robot lifecycle supervisor
 manyforge_robot_lifecycle_msgs/  ROS IDL for same-host lifecycle admission transport
@@ -190,7 +199,9 @@ initialization, recovery, and observability model, see
 [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md).
 
 - **manyforge_core** is ROS-free, pure C++20. All robot-framework-specific code lives in adapter packages.
-- **manyforge_roboplan** provides motion planning via RoboPlan (RRT + TOPPRA + IK).
+- **manyforge_roboplan** currently provides retained planning-model staging
+  and offline RoboPlan import qualification. Runtime planning/execution is
+  intentionally unavailable until the target adapter is restored.
 - Python code calls C++ through pybind11 bindings -- no duplicate state machines.
 - The Docker container includes all dependencies (Pinocchio, RoboPlan, pybind11).
 

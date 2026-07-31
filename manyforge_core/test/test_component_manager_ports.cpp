@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -21,6 +22,8 @@ constexpr const char* kDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 constexpr const char* kOtherDigest =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+constexpr const char* kSceneIdDigest =
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
 static_assert(!std::is_same_v<ApplyId, BootstrapId>);
 static_assert(!std::is_same_v<ApplyGeneration, BootstrapGeneration>);
@@ -154,6 +157,10 @@ static_assert(std::is_same_v<
 using AcquireFenceSignature = ConfigurationFenceAcceptedDTO (
     IManagerKernelApplyFenceAcquireRehydratePort::*)(
         const ApplyConfigurationFenceIntentDTO&);
+using ReconcileFenceAttemptSignature =
+    ApplyFenceAcquireAttemptReconcileResultDTO (
+        IManagerKernelApplyFenceAcquireRehydratePort::*)(
+            const ApplyFenceAcquireAttemptQueryDTO&) const;
 using RehydrateFenceSignature = ApplyFenceReconcileResultDTO (
     IManagerKernelApplyFenceAcquireRehydratePort::*)(
         const ApplyFenceRehydrateDTO&);
@@ -161,6 +168,10 @@ static_assert(std::is_same_v<
               decltype(
                   &IManagerKernelApplyFenceAcquireRehydratePort::Acquire),
               AcquireFenceSignature>);
+static_assert(std::is_same_v<
+              decltype(&IManagerKernelApplyFenceAcquireRehydratePort::
+                           ReconcileAcquireAttempt),
+              ReconcileFenceAttemptSignature>);
 static_assert(
     std::is_same_v<
                    decltype(
@@ -193,7 +204,7 @@ static_assert(
   return ProjectionRevisionDTO{
       RetainedBundleId{bundle_digest},
       GraphRevision{graph_digest},
-      SceneRevision{SceneId{"scene.cell-a"}, scene_revision,
+      SceneRevision{SceneId{kSceneIdDigest}, scene_revision,
                     ContentDigest{kDigest}},
   };
 }
@@ -537,6 +548,14 @@ FinalizedTransitionEvidence() {
   };
 }
 
+[[nodiscard]] ApplyFenceAcquireAttemptQueryDTO FenceAttemptQuery() {
+  return ApplyFenceAcquireAttemptQueryDTO{
+      FenceIntent(),
+      ContentDigest{kDigest},
+      RuntimeEpoch{"manager-epoch-2"},
+  };
+}
+
 [[nodiscard]] ExecutionHostEpochDTO ExecutionHostEpoch() {
   return ExecutionHostEpochDTO{
       RuntimeUnitId{"runtime.kernel"},
@@ -608,7 +627,7 @@ TEST(ComponentManagerPortContracts,
   const ProjectionRevisionDTO invalid{
       valid.retained_bundle_id,
       valid.graph_revision,
-      SceneRevision{SceneId{"scene.cell-a"}, 0U, ContentDigest{kDigest}},
+      SceneRevision{SceneId{kSceneIdDigest}, 0U, ContentDigest{kDigest}},
   };
   EXPECT_FALSE(invalid.valid());
 }
@@ -1234,10 +1253,7 @@ TEST(ComponentManagerPortContracts,
 }
 
 TEST(ComponentManagerPortContracts,
-     LogicalSceneRootRejectsNullWithoutClaimingSceneValidation) {
-  // The concrete scene DTO is intentionally incomplete in this slice. This
-  // test proves only that required transport cannot be null; it does not
-  // manufacture a scene object or claim cell/revision/content validation.
+     LogicalSceneRootRejectsNull) {
   EXPECT_THROW(
       LogicalSceneSnapshotRoot{
           std::shared_ptr<const LogicalSceneSnapshotDTO>{}},
@@ -1600,6 +1616,78 @@ TEST(ComponentManagerPortContracts,
   EXPECT_FALSE(accepted.valid());
   accepted.replay_status = static_cast<RequestReplayStatusDTO>(999);
   EXPECT_FALSE(accepted.valid());
+}
+
+TEST(ComponentManagerPortContracts,
+     FenceAcceptanceMatchesExactScopeAndSuccessorGeneration) {
+  auto intent = FenceIntent();
+  ConfigurationFenceAcceptedDTO accepted{
+      ConfigurationFenceId{"fence-1"},
+      ConfigurationFenceGeneration{1U},
+      FenceScope(),
+      1,
+      RequestReplayStatusDTO::kAcceptedNew,
+  };
+  EXPECT_TRUE(accepted.matches(intent));
+
+  accepted.configuration_fence_generation =
+      ConfigurationFenceGeneration{2U};
+  EXPECT_FALSE(accepted.matches(intent));
+  accepted.configuration_fence_generation =
+      ConfigurationFenceGeneration{1U};
+  accepted.captured_scope.resources = {ResourceId{"different-resource"}};
+  EXPECT_FALSE(accepted.matches(intent));
+
+  intent.expected_fence_generation = ConfigurationFenceGeneration{
+      std::numeric_limits<std::uint64_t>::max()};
+  accepted.configuration_fence_generation = ConfigurationFenceGeneration{0U};
+  EXPECT_FALSE(accepted.matches(intent));
+}
+
+TEST(ComponentManagerPortContracts,
+     FenceAttemptReconciliationHasOneRetryableNoResultState) {
+  const auto query = FenceAttemptQuery();
+  ApplyFenceAcquireAttemptReconcileResultDTO result{
+      ExecutionHostEpoch(),
+      query,
+      ApplyFenceAcquireAttemptReconcileState::kNotSeen,
+      std::nullopt,
+      false,
+      "",
+      ContentDigest{kDigest},
+      std::nullopt,
+  };
+  EXPECT_TRUE(result.presence_valid());
+  EXPECT_TRUE(result.matches(query));
+
+  result.state = ApplyFenceAcquireAttemptReconcileState::kAcceptedExact;
+  EXPECT_FALSE(result.presence_valid());
+  result.accepted_fence = ConfigurationFenceAcceptedDTO{
+      ConfigurationFenceId{"fence-1"},
+      ConfigurationFenceGeneration{1U},
+      FenceScope(),
+      1,
+      RequestReplayStatusDTO::kAcceptedNew,
+  };
+  result.admission_fenced = true;
+  EXPECT_TRUE(result.presence_valid());
+
+  result.state = ApplyFenceAcquireAttemptReconcileState::kConflicting;
+  result.accepted_fence.reset();
+  EXPECT_FALSE(result.presence_valid());
+  result.error = ErrorDTO{"fence_attempt_conflict", "conflict", {}};
+  result.required_compensation_or_operator_direction =
+      "inspect the conflicting Kernel request ledger entry";
+  EXPECT_TRUE(result.presence_valid());
+
+  result.state = ApplyFenceAcquireAttemptReconcileState::kUncertain;
+  EXPECT_TRUE(result.presence_valid());
+  result.admission_fenced = false;
+  EXPECT_FALSE(result.presence_valid());
+
+  result.state = static_cast<ApplyFenceAcquireAttemptReconcileState>(999);
+  result.admission_fenced = true;
+  EXPECT_FALSE(result.presence_valid());
 }
 
 TEST(ComponentManagerPortContracts,

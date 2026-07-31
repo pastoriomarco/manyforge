@@ -26,12 +26,19 @@ machine-readable companion to this doc.
 ## Repository structure (for orientation)
 
 - `manyforge_core/` — C++ kernel, state machine, ports.
+- `manyforge_content_identity/` — shared ROS-free canonical JSON and
+  domain-separated content-digest primitives.
+- `manyforge_persistence/` — shared ROS-free mechanical durable-storage
+  safety primitives; semantic owners retain their own schemas and state.
+- `manyforge_scene/` — ROS-free logical-scene semantic owner and persistence.
 - `manyforge_deployment/` — ROS-free composable-cell decoding, qualification,
   and compiler substrate.
 - `manyforge_component_manager/` — ROS-free C++ runtime-observation and
   durable-persistence foundation for the Component Manager.
-- `manyforge_roboplan/` — C++ planner / context / execution backends
-  (native + ros2_control).
+- `manyforge_roboplan/` — retained planning-model staging and offline
+  RoboPlan import qualification during the destructive cutover; native and
+  ros2_control runtime adapters are intentionally unavailable until their
+  plan restoration gates.
 - `manyforge_behavior/` — Python py_trees behavior-tree runner.
 - `manyforge_composer/` — FastAPI backend + React frontend for the
   authoring UI and native 3D viewer.
@@ -115,9 +122,17 @@ During this plan only:
 
 Container-based checks, branch and authorization rules, normative ADR/spec
 approval, safety boundaries, focused tests for changed foundational layers,
-truthful documentation, and adversarial review remain mandatory. Full
-applicable CI and the named product-restoration gates must pass before the
-affected work is pushed or claimed restored.
+truthful documentation, and adversarial review remain mandatory. For this
+plan, run one full independent adversarial review against the cumulative diff
+of each qualification checkpoint: a named plan acceptance criterion, a new or
+changed public/persisted/safety/ownership boundary, or a restored or newly
+testable end-to-end capability. Multiple semantically related commits may
+belong to one checkpoint. Incomplete internal slices, mechanical migrations,
+fixtures, and evidence corrections need focused tests and normal review but
+do not independently trigger another full review unless they materially
+change architecture or safety semantics. Full applicable CI and the named
+product-restoration gates must pass before the affected work is pushed or
+claimed restored.
 
 The I12/M-final plan-closing change must remove this entire section and the
 matching temporary section in `AGENTS.md`. The plan cannot be marked complete

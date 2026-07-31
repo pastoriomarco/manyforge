@@ -1,5 +1,7 @@
 #include "manyforge_component_manager/durable_store_set.hpp"
 
+#include <manyforge_persistence/sqlite_read_only_preflight.hpp>
+
 #include <fcntl.h>
 #include <sqlite3.h>
 #include <sys/file.h>
@@ -158,58 +160,25 @@ std::int64_t ReadSqliteScalar(
 
 bool RequiresValidationBeforeInitialization(
     const std::filesystem::path& path) {
-  std::error_code error;
-  const auto status = std::filesystem::symlink_status(path, error);
-  if (error == std::make_error_code(std::errc::no_such_file_or_directory)) {
-    return false;
-  }
-  if (error) {
-    throw std::invalid_argument(
-        "cannot inspect manager durable-store path");
-  }
-  if (status.type() == std::filesystem::file_type::not_found) {
-    return false;
-  }
-  if (std::filesystem::is_symlink(status) ||
-      !std::filesystem::is_regular_file(status)) {
-    return true;
-  }
-  const auto size = std::filesystem::file_size(path, error);
-  if (error) {
-    return true;
-  }
-  if (size == 0U) {
-    return false;
-  }
-
-  sqlite3* database = nullptr;
-  const auto open_result = sqlite3_open_v2(
-      path.string().c_str(),
-      &database,
-      SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
-          SQLITE_OPEN_NOFOLLOW,
-      nullptr);
-  if (open_result != SQLITE_OK) {
-    if (database != nullptr) {
-      sqlite3_close(database);
-    }
-    return true;
-  }
   try {
-    const bool initialized =
-        ReadSqliteScalar(
-            database,
-            "SELECT COUNT(*) FROM sqlite_master "
-            "WHERE name NOT LIKE 'sqlite_%'") != 0 ||
-        ReadSqliteScalar(database, "PRAGMA application_id") != 0 ||
-        ReadSqliteScalar(database, "PRAGMA user_version") != 0;
-    if (sqlite3_close(database) != SQLITE_OK) {
-      throw std::runtime_error(
-          "cannot close SQLite store preflight");
-    }
-    return initialized;
+    bool initialized = false;
+    const bool exists = persistence::PreflightExistingSqliteReadOnly(
+        path,
+        {
+            64U * 1024U * 1024U,
+            64U * 1024U * 1024U,
+        },
+        [&initialized](sqlite3* database) {
+          initialized =
+              ReadSqliteScalar(
+                  database,
+                  "SELECT COUNT(*) FROM sqlite_master "
+                  "WHERE name NOT LIKE 'sqlite_%'") != 0 ||
+              ReadSqliteScalar(database, "PRAGMA application_id") != 0 ||
+              ReadSqliteScalar(database, "PRAGMA user_version") != 0;
+        });
+    return exists && initialized;
   } catch (...) {
-    sqlite3_close(database);
     return true;
   }
 }
@@ -258,10 +227,15 @@ class ExternallyProvisionedManagerStores::Impl final {
     const auto publication_path =
         stable_state_directory_ /
         std::string(kActiveBundlePublicationStoreFilename);
+    const auto apply_path =
+        stable_state_directory_ /
+        std::string(kManagerApplyJournalFilename);
     const bool journal_requires_validation =
         RequiresValidationBeforeInitialization(journal_path);
     const bool publication_requires_validation =
         RequiresValidationBeforeInitialization(publication_path);
+    const bool apply_requires_validation =
+        RequiresValidationBeforeInitialization(apply_path);
 
     const auto open_journal = [&] {
       bootstrap_journal_ =
@@ -273,25 +247,40 @@ class ExternallyProvisionedManagerStores::Impl final {
           std::make_unique<SqliteActiveBundlePublicationStore>(
               publication_path, cell_id_);
     };
+    const auto open_apply = [&] {
+      apply_journal_ = std::make_unique<SqliteManagerApplyJournal>(
+          apply_path, cell_id_);
+    };
 
-    // Validate the only initialized peer first. A missing or schema-empty
-    // path has no CellId yet; a foreign-cell initialized store must not cause
-    // this failed startup to initialize that peer with the requested (wrong)
-    // cell.
-    if (publication_requires_validation &&
-        !journal_requires_validation) {
-      open_publication();
+    // Validate every initialized peer before initializing any missing or
+    // schema-empty path. A foreign-cell initialized store must not make this
+    // failed startup create another store under the requested (wrong) cell.
+    if (journal_requires_validation) {
       open_journal();
-    } else {
-      open_journal();
+    }
+    if (publication_requires_validation) {
       open_publication();
+    }
+    if (apply_requires_validation) {
+      open_apply();
+    }
+    if (!journal_requires_validation) {
+      open_journal();
+    }
+    if (!publication_requires_validation) {
+      open_publication();
+    }
+    if (!apply_requires_validation) {
+      open_apply();
     }
 
     const auto journal_report = bootstrap_journal_->VerifyIntegrity();
     const auto publication_report =
         active_bundle_publication_store_->VerifyIntegrity();
+    const auto apply_report = apply_journal_->VerifyIntegrity();
     if (journal_report.cell_id != cell_id_ ||
-        publication_report.cell_id != cell_id_) {
+        publication_report.cell_id != cell_id_ ||
+        apply_report.cell_id != cell_id_) {
       throw ManagerBootstrapJournalIntegrityError(
           "manager durable stores do not share the configured cell identity");
     }
@@ -311,6 +300,7 @@ class ExternallyProvisionedManagerStores::Impl final {
   std::unique_ptr<SqliteManagerBootstrapJournal> bootstrap_journal_;
   std::unique_ptr<SqliteActiveBundlePublicationStore>
       active_bundle_publication_store_;
+  std::unique_ptr<SqliteManagerApplyJournal> apply_journal_;
 };
 
 ExternallyProvisionedManagerStores::ExternallyProvisionedManagerStores(
@@ -360,17 +350,24 @@ ExternallyProvisionedManagerStores::
   return *impl_->active_bundle_publication_store_;
 }
 
+SqliteManagerApplyJournal&
+ExternallyProvisionedManagerStores::apply_journal() noexcept {
+  return *impl_->apply_journal_;
+}
+
 ManagerDurableStoreStartupInventory
 ExternallyProvisionedManagerStores::StartupInventory() const {
   const auto bootstrap = impl_->bootstrap_journal_->VerifyIntegrity();
   const auto publication =
       impl_->active_bundle_publication_store_->VerifyIntegrity();
+  const auto apply = impl_->apply_journal_->VerifyIntegrity();
   if (bootstrap.cell_id != impl_->cell_id_ ||
-      publication.cell_id != impl_->cell_id_) {
+      publication.cell_id != impl_->cell_id_ ||
+      apply.cell_id != impl_->cell_id_) {
     throw ManagerBootstrapJournalIntegrityError(
         "manager durable-store inventory cell identity changed");
   }
-  return {bootstrap, publication};
+  return {bootstrap, publication, apply};
 }
 
 }  // namespace manyforge::component_manager

@@ -7,8 +7,6 @@
 
 namespace manyforge::deployment::detail {
 
-inline constexpr std::string_view kContentIdentityPrefix = "manyforge.content-identity.v1";
-
 /// How the schema version participating in an identity is represented.
 ///
 /// Standalone documents carry their schema tag in an `api_version` member.

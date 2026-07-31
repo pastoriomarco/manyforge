@@ -1832,17 +1832,20 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
                      });
     std::shared_ptr<const CompiledClosedSchema> compiled_schema;
     std::string relative_path;
+    std::string descriptor_bytes;
     if (source != qualified_sources.end()) {
       compiled_schema = std::make_shared<const CompiledClosedSchema>(
           compile_closed_schema_descriptor(
               parse_strict_json_model_yaml(source->descriptor_yaml)));
       relative_path = source->relative_path;
+      descriptor_bytes = source->descriptor_yaml;
     }
     storage->catalog_schemas.push_back(BuildCatalogSchemaEntry(
         descriptor.record_kind, core::SchemaId(std::string(descriptor.schema_family)),
         compiled_schema == nullptr ? CatalogSchemaQualification::kUnqualified
                                    : CatalogSchemaQualification::kQualified,
-        std::move(compiled_schema), std::move(relative_path)));
+        std::move(compiled_schema), std::move(relative_path),
+        std::move(descriptor_bytes)));
   }
   std::sort(storage->catalog_schemas.begin(), storage->catalog_schemas.end(),
             [](const BuildCatalogSchemaEntry& left, const BuildCatalogSchemaEntry& right) {
@@ -1857,7 +1860,8 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
             parse_strict_json_model_yaml(source.descriptor_yaml)));
     storage->value_schemas.push_back(BuildQualifiedValueSchemaEntry(
         compiled_schema->schema_id(), compiled_schema->schema_revision(),
-        std::move(compiled_schema), std::string(source.relative_path)));
+        std::move(compiled_schema), std::string(source.relative_path),
+        std::string(source.descriptor_yaml)));
   }
   std::sort(
       storage->value_schemas.begin(), storage->value_schemas.end(),

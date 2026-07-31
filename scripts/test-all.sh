@@ -10,6 +10,9 @@
 
 set -euo pipefail
 
+# shellcheck source=lib/composable-cell-runtime-availability.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/composable-cell-runtime-availability.sh"
+
 WORKSPACE="${WORKSPACE:-/workspace}"
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/manyforge-pycache}"
 # The canonical `docker compose run --rm dev ...` lane does not mount a
@@ -81,6 +84,39 @@ build_manyforge_core() {
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
 }
 
+build_manyforge_content_identity() {
+    local build="$1"
+    local build_testing="$2"
+    mkdir -p "$build"
+    cd "$build"
+    cmake "$WORKSPACE/manyforge_content_identity" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DMANYFORGE_CONTENT_IDENTITY_BUILD_TESTING="$build_testing" 2>&1 | tail -3
+    cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
+}
+
+build_manyforge_persistence() {
+    local build="$1"
+    local build_testing="$2"
+    mkdir -p "$build"
+    cd "$build"
+    cmake "$WORKSPACE/manyforge_persistence" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DMANYFORGE_PERSISTENCE_BUILD_TESTING="$build_testing" 2>&1 | tail -3
+    cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
+}
+
+build_manyforge_scene() {
+    local build="$1"
+    local build_testing="$2"
+    mkdir -p "$build"
+    cd "$build"
+    cmake "$WORKSPACE/manyforge_scene" -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING="$build_testing" \
+        -DMANYFORGE_SCENE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
+    cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
+}
+
 build_manyforge_deployment() {
     local build="$1"
     local build_testing="$2"
@@ -106,6 +142,30 @@ build_manyforge_component_manager() {
 }
 
 run_cpp_tests() {
+    section "C++ manyforge_content_identity tests"
+    local identity_build="$BUILD_DIR/content-identity"
+    build_manyforge_content_identity "$identity_build" ON
+    cd "$identity_build"
+    if ! require_ctest_tests "manyforge_content_identity"; then
+        FAIL=$((FAIL + 1))
+    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+
+    section "C++ manyforge_persistence tests"
+    local persistence_build="$BUILD_DIR/persistence"
+    build_manyforge_persistence "$persistence_build" ON
+    cd "$persistence_build"
+    if ! require_ctest_tests "manyforge_persistence"; then
+        FAIL=$((FAIL + 1))
+    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+
     section "C++ manyforge_core tests"
     local core_build="$BUILD_DIR/core"
     build_manyforge_core "$core_build" ON
@@ -116,6 +176,18 @@ run_cpp_tests() {
     # CLI flag as a safety net for any ad-hoc `ctest` invocation that
     # bypasses test-all.sh. ctest takes the min of the two.
     if ! require_ctest_tests "manyforge_core"; then
+        FAIL=$((FAIL + 1))
+    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+
+    section "C++ manyforge_scene tests"
+    local scene_build="$BUILD_DIR/scene"
+    build_manyforge_scene "$scene_build" ON
+    cd "$scene_build"
+    if ! require_ctest_tests "manyforge_scene"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
@@ -149,16 +221,7 @@ run_cpp_tests() {
 }
 
 run_roboplan_tests() {
-    section "C++ manyforge_roboplan tests"
-    if [ -f /opt/ros/jazzy/setup.bash ]; then
-        # RoboPlan's ROS-enabled targets may pull in ament_cmake. Source the
-        # ROS environment so ament's Python helpers are importable during CMake
-        # configure; this keeps the standard suite aligned with launch.sh.
-        # shellcheck disable=SC1091
-        set +u
-        source /opt/ros/jazzy/setup.bash
-        set -u
-    fi
+    section "C++ retained RoboPlan product-consumer tests"
     local build="$BUILD_DIR/roboplan"
     mkdir -p "$build"
     cd "$build"
@@ -190,17 +253,13 @@ PY
     if [ -f "${PINOCCHIO_PREFIX}/include/boost/version.hpp" ]; then
         boost_root="${PINOCCHIO_PREFIX}"
     fi
-    local pybind11_dir
-    pybind11_dir=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())" 2>/dev/null || echo "")
     CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}" \
         BOOST_ROOT="${boost_root}" \
         BOOST_INCLUDEDIR="${boost_root:+${boost_root}/include}" \
         BOOST_LIBRARYDIR="${boost_root:+${boost_root}/lib}" \
         cmake "$WORKSPACE/manyforge_roboplan" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=ON \
-        -DMANYFORGE_ENABLE_ROS2_CONTROL=OFF \
-        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" \
-        ${pybind11_dir:+-Dpybind11_DIR="$pybind11_dir"} 2>&1 | tail -3
+        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
     make -j"$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
     if ! require_ctest_tests "manyforge_roboplan"; then
         FAIL=$((FAIL + 1))
@@ -210,44 +269,11 @@ PY
         FAIL=$((FAIL + 1))
     fi
 
-    # Export roboplan build dir + Python wrappers so integration tests can import
-    if ls "$build"/manyforge_roboplan_py*.so 1>/dev/null 2>&1; then
-        export PYTHONPATH="$build:$WORKSPACE/manyforge_roboplan/python:${PYTHONPATH:-}"
-    fi
 }
 
 run_pybind_tests() {
     section "pybind11 bindings tests"
-    local core_build="$BUILD_DIR/core"
-    local deployment_build="$BUILD_DIR/deployment"
-    local manager_build="$BUILD_DIR/component-manager-production"
-    local pybind_build="$BUILD_DIR/pybind"
-    # Always run both incremental ROS-free library builds. Merely finding an
-    # archive does not prove it was built from the current source tree.
-    build_manyforge_core "$core_build" OFF
-    build_manyforge_deployment "$deployment_build" OFF
-    build_manyforge_component_manager "$manager_build" OFF
-
-    local pybind11_dir
-    pybind11_dir=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())" 2>/dev/null || echo "")
-
-    mkdir -p "$pybind_build"
-    cd "$pybind_build"
-    cmake "$WORKSPACE/manyforge_core/python" \
-        -DMANYFORGE_CORE_DIR="$core_build" \
-        -DMANYFORGE_CORE_INCLUDE_DIR="$WORKSPACE/manyforge_core/include" \
-        -DMANYFORGE_DEPLOYMENT_DIR="$deployment_build" \
-        -DMANYFORGE_DEPLOYMENT_INCLUDE_DIR="$WORKSPACE/manyforge_deployment/include" \
-        ${pybind11_dir:+-Dpybind11_DIR="$pybind11_dir"} \
-        2>&1 | tail -3
-    make -j"$BUILD_PARALLEL_LEVEL" 2>&1 | tail -3
-    export PYTHONPATH="$pybind_build:${PYTHONPATH:-}"
-    cd "$WORKSPACE"
-    if pytest manyforge_core/python/tests/ -v; then
-        PASS=$((PASS + 1))
-    else
-        FAIL=$((FAIL + 1))
-    fi
+    manyforge_fail_composable_cell_runtime_unavailable
 }
 
 run_python_tests() {
@@ -263,13 +289,7 @@ run_python_tests() {
 
 run_integration_tests() {
     section "Integration tests"
-    cd "$WORKSPACE"
-    setup_pythonpath
-    if pytest tests/ -v; then
-        PASS=$((PASS + 1))
-    else
-        FAIL=$((FAIL + 1))
-    fi
+    manyforge_fail_composable_cell_runtime_unavailable
 }
 
 run_bridge_tests() {
@@ -382,24 +402,7 @@ run_qualification_tests() {
 
 run_qualification_native_tests() {
     section "Native live-evaluation qualification matrix"
-    cd "$WORKSPACE"
-    setup_pythonpath
-    export PYTHONPATH="$WORKSPACE/manyforge_roboplan/python:${PYTHONPATH:-}"
-    local roboplan_build="$BUILD_DIR/roboplan"
-    if ls "$roboplan_build"/manyforge_roboplan_py*.so 1>/dev/null 2>&1; then
-        export PYTHONPATH="$roboplan_build:${PYTHONPATH:-}"
-    fi
-    if ! python_has_modules fastapi py_trees httpx uvicorn yaml manyforge_roboplan_py native_kernel_client; then
-        echo -e "${RED}  FAIL: missing Python deps for native qualification runner (need manyforge_roboplan_py, native_kernel_client)${NC}"
-        FAIL=$((FAIL + 1))
-        return
-    fi
-    chmod +x ./scripts/qualify-native-scenarios.sh ./scripts/run-scenarios.py
-    if ./scripts/qualify-native-scenarios.sh; then
-        PASS=$((PASS + 1))
-    else
-        FAIL=$((FAIL + 1))
-    fi
+    manyforge_fail_composable_cell_runtime_unavailable
 }
 
 run_qualification_soak_tests() {
@@ -436,10 +439,6 @@ run_ros_tests() {
     # standard simulation_interfaces service names nondeterministically.
     export ROS_DOMAIN_ID="${MANYFORGE_TEST_ROS_DOMAIN_ID:-119}"
     export PYTHONPATH="$WORKSPACE/manyforge_ros:${PYTHONPATH:-}"
-    local roboplan_build="$BUILD_DIR/roboplan"
-    if ls "$roboplan_build"/manyforge_roboplan_py*.so 1>/dev/null 2>&1; then
-        export PYTHONPATH="$roboplan_build:$WORKSPACE/manyforge_roboplan/python:${PYTHONPATH:-}"
-    fi
     if ! python_has_modules rclpy control_msgs trajectory_msgs action_msgs; then
         skip "Missing ROS 2 Python deps; run in the ros-jazzy image"
         return

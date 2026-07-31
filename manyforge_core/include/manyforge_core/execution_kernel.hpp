@@ -483,11 +483,11 @@ class ExecutionKernel {
  private:
   Result<TrajectoryDTO> plan_trajectory(
       const ExecuteRequestDTO& request,
-      const SceneRevisionBindingDTO& scene_binding,
+      const ProjectionLeaseBindingDTO& projection_binding,
       std::uint32_t planning_attempt_index = 0);
   Result<TrajectoryDTO> plan_resume_trajectory(
       const ExecuteRequestDTO& request,
-      const SceneRevisionBindingDTO& scene_binding);
+      const ProjectionLeaseBindingDTO& projection_binding);
 
   /// Move-only ownership of one retained scene/projection revision. Destruction
   /// releases the publisher lookup entry on every success, rejection,
@@ -510,7 +510,7 @@ class ExecutionKernel {
     [[nodiscard]] const CollisionWorldLeaseInventory& inventory() const {
       return inventory_;
     }
-    [[nodiscard]] SceneRevisionBindingDTO binding() const;
+    [[nodiscard]] ProjectionLeaseBindingDTO binding() const;
 
    private:
     void release() noexcept;
@@ -806,7 +806,7 @@ class ExecutionKernel {
   ExecuteWorkerPlanPhaseResult execute_worker_plan_phase(
       std::stop_token st,
       const ExecuteRequestDTO& request,
-      const SceneRevisionBindingDTO& scene_binding,
+      const ProjectionLeaseBindingDTO& projection_binding,
       std::uint64_t exec_id,
       std::optional<TrajectoryDTO> cached_trajectory,
       bool cache_revalidation_candidate,
@@ -821,7 +821,7 @@ class ExecutionKernel {
       bool& active_trajectory_from_cache,
       bool& cache_revalidation_candidate,
       const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
-      const SceneRevisionBindingDTO& scene_binding,
+      const ProjectionLeaseBindingDTO& projection_binding,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
       ActiveMotionExecution& motion_state);
 

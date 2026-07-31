@@ -27,6 +27,22 @@
 namespace manyforge::core {
 namespace {
 
+constexpr auto kTestDigestA =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+constexpr auto kTestDigestB =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+constexpr auto kTestDigestC =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+constexpr auto kTestDigestD =
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+ProjectionRevisionDTO test_projection_revision() {
+  return ProjectionRevisionDTO{
+      RetainedBundleId{kTestDigestA}, GraphRevision{kTestDigestB},
+      SceneRevision{SceneId{kTestDigestC}, 1U,
+                    ContentDigest{kTestDigestD}}};
+}
+
 // --- Mock backends ---
 
 class MockPlanner : public IPlannerBackend {
@@ -50,15 +66,17 @@ class MockPlanner : public IPlannerBackend {
       auto result = result_sequence.front();
       result_sequence.erase(result_sequence.begin());
       if (result.trajectory.has_value() &&
-          result.scene_revision.revision_id == 0) {
-        result.scene_revision = request.scene_binding.revision;
+          !result.projection_revision.valid()) {
+        result.projection_revision =
+            request.projection_binding.projection_revision;
       }
       return result;
     }
     auto result = next_result;
     if (result.trajectory.has_value() &&
-        result.scene_revision.revision_id == 0) {
-      result.scene_revision = request.scene_binding.revision;
+        !result.projection_revision.valid()) {
+      result.projection_revision =
+          request.projection_binding.projection_revision;
     }
     return result;
   }
@@ -115,8 +133,9 @@ class SlowMockPlanner : public IPlannerBackend {
 
     auto result = next_result;
     if (result.trajectory.has_value() &&
-        result.scene_revision.revision_id == 0) {
-      result.scene_revision = request.scene_binding.revision;
+        !result.projection_revision.valid()) {
+      result.projection_revision =
+          request.projection_binding.projection_revision;
     }
     return result;
   }
@@ -183,7 +202,6 @@ class MockFocusedPorts final : public IObservedRobotStateProvider,
     reference_pose_sequence = other.reference_pose_sequence;
     fk_sequence = other.fk_sequence;
     next_limits = other.next_limits;
-    next_scene_edit = other.next_scene_edit;
     current_revision = other.current_revision;
     get_state_count = other.get_state_count;
     validate_count = other.validate_count;
@@ -209,7 +227,6 @@ class MockFocusedPorts final : public IObservedRobotStateProvider,
   mutable std::vector<Result<Pose3DTO>> reference_pose_sequence;
   mutable std::vector<Pose3DTO> fk_sequence;
   JointLimitsDTO next_limits;
-  SceneEditResultDTO next_scene_edit;
   CollisionWorldRevision current_revision{1, "mock-collision-world"};
 
   mutable int get_state_count = 0;
@@ -318,7 +335,7 @@ class MockFocusedPorts final : public IObservedRobotStateProvider,
 
   Result<Pose3DTO> resolve_reference_pose(const ReferenceDTO& /*reference*/,
                                           const std::string& /*base_frame*/,
-                                          const SceneRevisionBindingDTO&) const override {
+                                          const ProjectionLeaseBindingDTO&) const override {
     if (!reference_pose_sequence.empty()) {
       auto result = reference_pose_sequence.front();
       reference_pose_sequence.erase(reference_pose_sequence.begin());
@@ -337,29 +354,6 @@ class MockFocusedPorts final : public IObservedRobotStateProvider,
       const std::string&) const override {
     return Result<std::vector<std::string>>::Ok(
         current_state_value.joint_names);
-  }
-
-  SceneEditResultDTO add_object(const AddObjectRequestDTO& /*request*/) {
-    return next_scene_edit;
-  }
-
-  SceneEditResultDTO remove_object(const RemoveObjectRequestDTO& /*request*/) {
-    return next_scene_edit;
-  }
-
-  SceneEditResultDTO update_object_pose(
-      const UpdateObjectPoseRequestDTO& /*request*/) {
-    return next_scene_edit;
-  }
-
-  SceneEditResultDTO attach_object(
-      const AttachObjectRequestDTO& /*request*/) {
-    return next_scene_edit;
-  }
-
-  SceneEditResultDTO detach_object(
-      const DetachObjectRequestDTO& /*request*/) {
-    return next_scene_edit;
   }
 
   CollisionWorldRevision current_collision_world_revision() {
@@ -518,24 +512,26 @@ class MockCollisionWorldPublisher final : public ICollisionWorldSnapshotPublishe
     if (!lease_inventory_enabled) {
       return std::nullopt;
     }
-    return make_lease_inventory({});
+    return make_lease_inventory(ProjectionLeaseId{"mock_current_lease"});
   }
 
   std::optional<CollisionWorldLeaseInventory>
-  retain_scene_snapshot_lease_inventory(std::string retention_id = {}) override {
+  retain_scene_snapshot_lease_inventory(
+      ProjectionLeaseId projection_lease_id =
+          ProjectionLeaseId{std::string{}}) override {
     lease_retain_call_count.fetch_add(1);
     if (!lease_inventory_enabled) {
       return std::nullopt;
     }
-    if (retention_id.empty()) {
-      retention_id =
-          "mock_lease_" + std::to_string(lease_retain_call_count.load());
+    if (projection_lease_id.empty()) {
+      projection_lease_id = ProjectionLeaseId{
+          "mock_lease_" + std::to_string(lease_retain_call_count.load())};
     }
-    return make_lease_inventory(std::move(retention_id));
+    return make_lease_inventory(std::move(projection_lease_id));
   }
 
   void release_scene_snapshot_lease_inventory(
-      const std::string& /*retention_id*/) override {
+      const ProjectionLeaseId& /*projection_lease_id*/) override {
     lease_release_call_count.fetch_add(1);
   }
 
@@ -557,9 +553,10 @@ class MockCollisionWorldPublisher final : public ICollisionWorldSnapshotPublishe
 
  private:
   CollisionWorldLeaseInventory make_lease_inventory(
-      std::string retention_id) const {
+      ProjectionLeaseId projection_lease_id) const {
     CollisionWorldLeaseInventory inventory;
-    inventory.retention_id = std::move(retention_id);
+    inventory.projection_binding = ProjectionLeaseBindingDTO{
+        test_projection_revision(), std::move(projection_lease_id)};
     inventory.captured_at_ns = lease_inventory_captured_at_ns;
     inventory.bundle = {snapshot(), current_policy};
     inventory.topology_epoch = lease_topology_epoch;

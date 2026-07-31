@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "retained_bundle_internal.hpp"
+#include "planning_resource_map_internal.hpp"
 #include "retention_store_fixtures.hpp"
 
 namespace manyforge::deployment {
@@ -81,11 +82,15 @@ TEST(RetainedBundlePublicSurfaceTest,
 [[nodiscard]] const BuildQualifiedProductContract &flattened_contract() {
   const auto contracts =
       build_qualified_product_contract_registry().contracts();
-  if (contracts.size() != 1U) {
-    throw std::logic_error(
-        "test requires exactly one qualified product contract");
+  const auto match = std::find_if(
+      contracts.begin(), contracts.end(), [](const auto &contract) {
+        return contract.product_contract_id().value() ==
+               "manyforge.flattened_model";
+      });
+  if (match == contracts.end()) {
+    throw std::logic_error("flattened-model contract is absent");
   }
-  return contracts.front();
+  return *match;
 }
 
 [[nodiscard]] std::vector<detail::RetainedArtifactInput>
@@ -96,6 +101,10 @@ product_contract_fixture_artifacts() {
       {core::ArtifactRoleId("srdf"), "application/xml",
        "<robot name=\"fixture\"><group name=\"fixture_group\"><link "
        "name=\"fixture_link\"/></group></robot>"},
+      {core::ArtifactRoleId(
+           std::string(detail::kPlanningResourceMapArtifactRole)),
+       std::string(detail::kPlanningResourceMapMediaType),
+       detail::emit_planning_resource_map({})},
   };
 }
 
@@ -184,11 +193,12 @@ void expect_no_thread_failures(
 
 } // namespace
 
-TEST(ProductContractRegistryTest, QualifiesOnlyExactFlattenedModelContract) {
+TEST(ProductContractRegistryTest,
+     QualifiesExactFlattenedModelAndComposedSymbolMapContracts) {
   const auto &registry = build_qualified_product_contract_registry();
   const auto contracts = registry.contracts();
-  ASSERT_EQ(contracts.size(), 1U);
-  const auto &contract = contracts.front();
+  ASSERT_EQ(contracts.size(), 2U);
+  const auto &contract = flattened_contract();
 
   EXPECT_EQ(contract.product_contract_id().value(),
             "manyforge.flattened_model");
@@ -199,11 +209,18 @@ TEST(ProductContractRegistryTest, QualifiesOnlyExactFlattenedModelContract) {
             core::RetainedProductKind::kPlanningCollisionModel);
   EXPECT_EQ(contract.placement(),
             ProductPlacement::kCellPlanningCollisionModel);
-  ASSERT_EQ(contract.artifact_roles().size(), 2U);
-  EXPECT_EQ(contract.artifact_roles()[0].artifact_role_id.value(), "srdf");
-  EXPECT_EQ(contract.artifact_roles()[1].artifact_role_id.value(), "urdf");
+  ASSERT_EQ(contract.artifact_roles().size(), 3U);
+  EXPECT_EQ(contract.artifact_roles()[0].artifact_role_id.value(),
+            detail::kPlanningResourceMapArtifactRole);
+  EXPECT_EQ(contract.artifact_roles()[0].media_type,
+            detail::kPlanningResourceMapMediaType);
+  EXPECT_EQ(contract.artifact_roles()[1].artifact_role_id.value(), "srdf");
+  EXPECT_EQ(contract.artifact_roles()[2].artifact_role_id.value(), "urdf");
   for (const auto &role : contract.artifact_roles()) {
-    EXPECT_EQ(role.media_type, "application/xml");
+    if (role.artifact_role_id.value() !=
+        detail::kPlanningResourceMapArtifactRole) {
+      EXPECT_EQ(role.media_type, "application/xml");
+    }
     EXPECT_EQ(role.cardinality,
               ProductArtifactCardinality::kRequiredExactlyOne);
   }
@@ -225,6 +242,32 @@ TEST(ProductContractRegistryTest, QualifiesOnlyExactFlattenedModelContract) {
   EXPECT_EQ(registry.find(core::ProductContractId("manyforge.unqualified"),
                           contract.product_contract_revision()),
             nullptr);
+
+  const auto symbol_map = std::find_if(
+      contracts.begin(), contracts.end(), [](const auto &candidate) {
+        return candidate.product_contract_id().value() ==
+               "manyforge.composed_model_symbol_role_map";
+      });
+  ASSERT_NE(symbol_map, contracts.end());
+  EXPECT_EQ(symbol_map->product_kind(),
+            core::RetainedProductKind::kSymbolRoleMap);
+  EXPECT_EQ(symbol_map->placement(), ProductPlacement::kSymbolRoleMap);
+  ASSERT_EQ(symbol_map->artifact_roles().size(), 1U);
+  EXPECT_EQ(symbol_map->artifact_roles().front().artifact_role_id.value(),
+            "composed_model_symbol_role_map");
+  EXPECT_EQ(symbol_map->artifact_roles().front().media_type,
+            "application/vnd.manyforge.composed-model-symbol-role-map+json");
+  EXPECT_EQ(symbol_map->artifact_roles().front().cardinality,
+            ProductArtifactCardinality::kRequiredExactlyOne);
+  const auto *symbol_declared_revision =
+      symbol_map->normalized_descriptor().find_object_member(
+          "product_contract_revision");
+  ASSERT_NE(symbol_declared_revision, nullptr);
+  EXPECT_EQ(std::get<std::string>(symbol_declared_revision->storage()),
+            symbol_map->product_contract_revision().value());
+  EXPECT_EQ(registry.find(symbol_map->product_contract_id(),
+                          symbol_map->product_contract_revision()),
+            &*symbol_map);
 }
 
 TEST(RawArtifactStoreTest, UsesImmutableDigestKeysAndReverifiesReads) {
@@ -388,10 +431,12 @@ TEST(RetainedProductTest, UsesContractBeforeRetainingCanonicalArtifacts) {
   const core::RetainedProductDTO product =
       retain_fixture_product(store, reversed);
 
-  ASSERT_EQ(product.artifact_refs.size(), 2U);
-  EXPECT_EQ(product.artifact_refs[0].artifact_role_id.value(), "srdf");
-  EXPECT_EQ(product.artifact_refs[1].artifact_role_id.value(), "urdf");
-  EXPECT_EQ(store.size(), 2U);
+  ASSERT_EQ(product.artifact_refs.size(), 3U);
+  EXPECT_EQ(product.artifact_refs[0].artifact_role_id.value(),
+            detail::kPlanningResourceMapArtifactRole);
+  EXPECT_EQ(product.artifact_refs[1].artifact_role_id.value(), "srdf");
+  EXPECT_EQ(product.artifact_refs[2].artifact_role_id.value(), "urdf");
+  EXPECT_EQ(store.size(), 3U);
   EXPECT_EQ(std::get<std::string>(detail::retained_product_projection(product)
                                       .find_object_member("product_contract_id")
                                       ->storage()),
@@ -404,6 +449,7 @@ TEST(RetainedProductTest, UsesContractBeforeRetainingCanonicalArtifacts) {
             "a87a55c23c21484f64d996a56fe8ff8f0c132aa49b8b1511fc107d871a2419e9");
   EXPECT_NE(output_digest, product.artifact_refs[0].content_digest);
   EXPECT_NE(output_digest, product.artifact_refs[1].content_digest);
+  EXPECT_NE(output_digest, product.artifact_refs[2].content_digest);
 
   test::InMemoryRawArtifactStoreFixture second_store;
   const core::RetainedProductDTO same = retain_fixture_product(second_store);

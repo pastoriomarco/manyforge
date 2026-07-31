@@ -99,6 +99,10 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(ComponentAttachmentId);
   MANYFORGE_BIND_STRONG_STRING(ComponentAttachmentRevision);
 
+  MANYFORGE_BIND_STRONG_STRING(RetainedBundleId);
+  MANYFORGE_BIND_STRONG_STRING(SceneId);
+  MANYFORGE_BIND_STRONG_STRING(ProjectionLeaseId);
+
   MANYFORGE_BIND_STRONG_STRING(CommandSchemaId);
   MANYFORGE_BIND_STRONG_STRING(CommandSchemaRevision);
 

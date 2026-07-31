@@ -42,16 +42,10 @@ if [ -n "${PINOCCHIO_CMAKE_DIR:-}" ]; then
 fi
 
 PYBIND_BUILD="$MANYFORGE_BUILD_DIR/pybind"
-ROBOPLAN_BUILD="$MANYFORGE_BUILD_DIR/roboplan"
 
 # Add pybind11 module to Python path
 if [ -d "$PYBIND_BUILD" ]; then
     export PYTHONPATH="$PYBIND_BUILD:${PYTHONPATH}"
-fi
-
-# Add roboplan pybind11 module + Python wrappers to Python path
-if [ -d "$ROBOPLAN_BUILD" ]; then
-    export PYTHONPATH="$ROBOPLAN_BUILD:/workspace/manyforge_roboplan/python:${PYTHONPATH}"
 fi
 
 exec "$@"

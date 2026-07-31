@@ -4,20 +4,26 @@
 #include <filesystem>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
+#include <manyforge_deployment/cell_composition.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace manyforge::deployment {
 
 namespace detail {
 class RetainedBundleConstructionAuthority;
+class VerifiedRetainedPlanningConstructionAuthority;
 }
 
 class FilesystemVerifiedRetainedProductArtifactSource;
+class FilesystemVerifiedRetainedModelMapSource;
+class FilesystemVerifiedRetainedPlanningModelSource;
+class VerifiedRetainedPlanningModel;
 
 inline constexpr std::uint64_t kMaxDurableRetainedBlobBytes =
     512ULL * 1024ULL * 1024ULL;
@@ -159,6 +165,274 @@ class IVerifiedRetainedProductArtifactSource {
   get_verified(const RetainedProductArtifactQuery& query) const = 0;
 };
 
+/// Exact coordinates for the generic composed-model map retained beside one
+/// planning model. Product kind and artifact role are fixed by this typed
+/// capability rather than supplied by a runtime consumer.
+struct RetainedModelMapQuery final {
+  core::RetainedBundleId retained_bundle_id;
+  core::ProductId product_id;
+
+  friend bool operator==(const RetainedModelMapQuery&,
+                         const RetainedModelMapQuery&) = default;
+};
+
+/// Sealed typed model/control namespace reconstructed from one exact retained
+/// symbol/role-map product.
+///
+/// This is the public runtime boundary. It exposes compiler-owned identities
+/// and role resolutions without exposing CanonicalValue, artifact bytes, or a
+/// CompilerQualifiedCellIr side channel. Every row was independently parsed,
+/// checked against the retained graph, and bound to the queried bundle.
+class VerifiedRetainedModelMap final {
+ public:
+  VerifiedRetainedModelMap(const VerifiedRetainedModelMap&) = default;
+  VerifiedRetainedModelMap& operator=(
+      const VerifiedRetainedModelMap&) = default;
+  VerifiedRetainedModelMap(VerifiedRetainedModelMap&&) noexcept = default;
+  VerifiedRetainedModelMap& operator=(
+      VerifiedRetainedModelMap&&) noexcept = default;
+  ~VerifiedRetainedModelMap() = default;
+
+  [[nodiscard]] const RetainedModelMapQuery& query() const noexcept {
+    return query_;
+  }
+  [[nodiscard]] const core::ProductContractId&
+  product_contract_id() const noexcept {
+    return product_contract_id_;
+  }
+  [[nodiscard]] const core::ProductContractRevision&
+  product_contract_revision() const noexcept {
+    return product_contract_revision_;
+  }
+  [[nodiscard]] const CompositionCellFrame& cell_frame() const noexcept {
+    return cell_frame_;
+  }
+  [[nodiscard]] const std::vector<CompositionModelOccurrence>&
+  model_occurrences() const noexcept {
+    return model_occurrences_;
+  }
+  [[nodiscard]] const std::vector<OccurrenceSymbolRewrite>& symbols()
+      const noexcept {
+    return symbols_;
+  }
+  [[nodiscard]] const std::vector<OccurrenceReferenceRewrite>& references()
+      const noexcept {
+    return references_;
+  }
+  [[nodiscard]] const std::vector<CompositionModelCoordinate>& coordinates()
+      const noexcept {
+    return coordinates_;
+  }
+  [[nodiscard]] const std::vector<CompositionControlBindingCoordinateMap>&
+  control_bindings() const noexcept {
+    return control_bindings_;
+  }
+  [[nodiscard]] const std::vector<CompositionTargetResolution>& targets()
+      const noexcept {
+    return targets_;
+  }
+
+  [[nodiscard]] const CompositionTargetResolution* find_target(
+      const core::ControllableComponentId& component_id,
+      const core::CommandTargetId& command_target_id) const noexcept;
+
+  /// Returns the sole binding for a logical component/target pair. Missing
+  /// and ambiguous pairs both return null; a future multi-route consumer must
+  /// select by an additional retained binding/capability coordinate instead
+  /// of relying on artifact order.
+  [[nodiscard]] const CompositionControlBindingCoordinateMap* find_binding(
+      const core::ControllableComponentId& component_id,
+      const core::CommandTargetId& command_target_id) const noexcept;
+
+  /// Fails closed if a consumer attempts to combine this namespace with a
+  /// planning product selected from another immutable bundle.
+  void require_same_bundle_as(
+      const VerifiedRetainedPlanningModel& planning_model) const;
+
+ private:
+  VerifiedRetainedModelMap(
+      RetainedModelMapQuery query,
+      core::ProductContractId product_contract_id,
+      core::ProductContractRevision product_contract_revision,
+      CompositionCellFrame cell_frame,
+      std::vector<CompositionModelOccurrence> model_occurrences,
+      std::vector<OccurrenceSymbolRewrite> symbols,
+      std::vector<OccurrenceReferenceRewrite> references,
+      std::vector<CompositionModelCoordinate> coordinates,
+      std::vector<CompositionControlBindingCoordinateMap> control_bindings,
+      std::vector<CompositionTargetResolution> targets)
+      : query_(std::move(query)),
+        product_contract_id_(std::move(product_contract_id)),
+        product_contract_revision_(std::move(product_contract_revision)),
+        cell_frame_(std::move(cell_frame)),
+        model_occurrences_(std::move(model_occurrences)),
+        symbols_(std::move(symbols)),
+        references_(std::move(references)),
+        coordinates_(std::move(coordinates)),
+        control_bindings_(std::move(control_bindings)),
+        targets_(std::move(targets)) {}
+
+  RetainedModelMapQuery query_;
+  core::ProductContractId product_contract_id_;
+  core::ProductContractRevision product_contract_revision_;
+  CompositionCellFrame cell_frame_;
+  std::vector<CompositionModelOccurrence> model_occurrences_;
+  std::vector<OccurrenceSymbolRewrite> symbols_;
+  std::vector<OccurrenceReferenceRewrite> references_;
+  std::vector<CompositionModelCoordinate> coordinates_;
+  std::vector<CompositionControlBindingCoordinateMap> control_bindings_;
+  std::vector<CompositionTargetResolution> targets_;
+
+  friend class FilesystemVerifiedRetainedModelMapSource;
+};
+
+class IVerifiedRetainedModelMapSource {
+ public:
+  virtual ~IVerifiedRetainedModelMapSource() = default;
+
+  [[nodiscard]] virtual std::optional<VerifiedRetainedModelMap>
+  get_verified(const RetainedModelMapQuery& query) const = 0;
+};
+
+/// Exact immutable coordinates for one retained planning model.
+///
+/// Product kind and placement are deliberately not caller-selectable: this
+/// capability resolves only the cell-wide planning/collision product.
+struct RetainedPlanningModelQuery final {
+  core::RetainedBundleId retained_bundle_id;
+  core::ProductId product_id;
+
+  friend bool operator==(const RetainedPlanningModelQuery&,
+                         const RetainedPlanningModelQuery&) = default;
+};
+
+/// One owned, independently reverified non-XML resource from a graph-selected
+/// model asset. `logical_uri()` is the compiler-owned revision-scoped URI
+/// retained by the planning product, not the source ModelAsset URI.
+///
+/// Construction is sealed behind the deployment reader. Copy and move are
+/// safe because every view below refers to storage owned by this value.
+class VerifiedRetainedPlanningResource final {
+ public:
+  VerifiedRetainedPlanningResource(
+      const VerifiedRetainedPlanningResource&) = default;
+  VerifiedRetainedPlanningResource& operator=(
+      const VerifiedRetainedPlanningResource&) = default;
+  VerifiedRetainedPlanningResource(
+      VerifiedRetainedPlanningResource&&) noexcept = default;
+  VerifiedRetainedPlanningResource& operator=(
+      VerifiedRetainedPlanningResource&&) noexcept = default;
+  ~VerifiedRetainedPlanningResource() = default;
+
+  [[nodiscard]] std::string_view logical_uri() const noexcept {
+    return logical_uri_;
+  }
+  [[nodiscard]] std::string_view media_type() const noexcept {
+    return media_type_;
+  }
+  [[nodiscard]] std::uint64_t byte_size() const noexcept {
+    return byte_size_;
+  }
+  [[nodiscard]] const core::ContentDigest&
+  content_digest() const noexcept {
+    return content_digest_;
+  }
+  [[nodiscard]] const core::ContentAddressedStoreKey&
+  content_addressed_store_key() const noexcept {
+    return content_addressed_store_key_;
+  }
+  [[nodiscard]] std::string_view bytes() const noexcept {
+    return bytes_;
+  }
+
+ private:
+  VerifiedRetainedPlanningResource(
+      std::string logical_uri, std::string media_type,
+      std::uint64_t byte_size, core::ContentDigest content_digest,
+      core::ContentAddressedStoreKey content_addressed_store_key,
+      std::string bytes)
+      : logical_uri_(std::move(logical_uri)),
+        media_type_(std::move(media_type)),
+        byte_size_(byte_size),
+        content_digest_(std::move(content_digest)),
+        content_addressed_store_key_(
+            std::move(content_addressed_store_key)),
+        bytes_(std::move(bytes)) {}
+
+  std::string logical_uri_;
+  std::string media_type_;
+  std::uint64_t byte_size_;
+  core::ContentDigest content_digest_;
+  core::ContentAddressedStoreKey content_addressed_store_key_;
+  std::string bytes_;
+
+  friend class detail::VerifiedRetainedPlanningConstructionAuthority;
+};
+
+/// Sealed, owned planning input reconstructed from one exact retained bundle.
+///
+/// The URDF/SRDF bytes are the exact compiled planning-product artifacts.
+/// Resources are the canonical-sorted non-XML portion of the complete
+/// graph-selected ModelAsset source closure projected through the retained
+/// compiler-owned resource map. The reader verifies the source XML as well,
+/// but does not duplicate those entrypoints in `resources()`.
+class VerifiedRetainedPlanningModel final {
+ public:
+  VerifiedRetainedPlanningModel(
+      const VerifiedRetainedPlanningModel&) = default;
+  VerifiedRetainedPlanningModel& operator=(
+      const VerifiedRetainedPlanningModel&) = default;
+  VerifiedRetainedPlanningModel(
+      VerifiedRetainedPlanningModel&&) noexcept = default;
+  VerifiedRetainedPlanningModel& operator=(
+      VerifiedRetainedPlanningModel&&) noexcept = default;
+  ~VerifiedRetainedPlanningModel() = default;
+
+  [[nodiscard]] const RetainedPlanningModelQuery&
+  query() const noexcept {
+    return query_;
+  }
+  [[nodiscard]] std::string_view urdf_bytes() const noexcept {
+    return urdf_bytes_;
+  }
+  [[nodiscard]] std::string_view srdf_bytes() const noexcept {
+    return srdf_bytes_;
+  }
+  [[nodiscard]] const std::vector<VerifiedRetainedPlanningResource>&
+  resources() const noexcept {
+    return resources_;
+  }
+
+ private:
+  VerifiedRetainedPlanningModel(
+      RetainedPlanningModelQuery query, std::string urdf_bytes,
+      std::string srdf_bytes,
+      std::vector<VerifiedRetainedPlanningResource> resources)
+      : query_(std::move(query)),
+        urdf_bytes_(std::move(urdf_bytes)),
+        srdf_bytes_(std::move(srdf_bytes)),
+        resources_(std::move(resources)) {}
+
+  RetainedPlanningModelQuery query_;
+  std::string urdf_bytes_;
+  std::string srdf_bytes_;
+  std::vector<VerifiedRetainedPlanningResource> resources_;
+
+  friend class FilesystemVerifiedRetainedPlanningModelSource;
+};
+
+/// Exact retained planning-model point-read capability.
+///
+/// Unknown bundle/product coordinates return no value. Present semantic or
+/// raw content that cannot be independently verified fails closed.
+class IVerifiedRetainedPlanningModelSource {
+ public:
+  virtual ~IVerifiedRetainedPlanningModelSource() = default;
+
+  [[nodiscard]] virtual std::optional<VerifiedRetainedPlanningModel>
+  get_verified(const RetainedPlanningModelQuery& query) const = 0;
+};
+
 /// Narrow lower-level verified-bundle lookup capability.
 ///
 /// The returned value is sealed and was independently reconstructed from the
@@ -236,6 +510,65 @@ class FilesystemVerifiedRetainedProductArtifactSource final
 
   [[nodiscard]] std::optional<VerifiedRetainedProductArtifact>
   get_verified(const RetainedProductArtifactQuery& query) const override;
+
+ private:
+  std::filesystem::path trusted_package_root_;
+};
+
+/// Filesystem-backed exact typed composed-model map reader.
+///
+/// The source reloads one exact bundle, fixes product kind and artifact role,
+/// verifies the raw map, binds it to the retained graph, and returns only the
+/// sealed typed namespace. It has no raw-map, listing, alias, or mutation
+/// surface.
+class FilesystemVerifiedRetainedModelMapSource final
+    : public IVerifiedRetainedModelMapSource {
+ public:
+  explicit FilesystemVerifiedRetainedModelMapSource(
+      std::filesystem::path trusted_package_root);
+  ~FilesystemVerifiedRetainedModelMapSource() override = default;
+
+  FilesystemVerifiedRetainedModelMapSource(
+      const FilesystemVerifiedRetainedModelMapSource&) = delete;
+  FilesystemVerifiedRetainedModelMapSource& operator=(
+      const FilesystemVerifiedRetainedModelMapSource&) = delete;
+  FilesystemVerifiedRetainedModelMapSource(
+      FilesystemVerifiedRetainedModelMapSource&&) = delete;
+  FilesystemVerifiedRetainedModelMapSource& operator=(
+      FilesystemVerifiedRetainedModelMapSource&&) = delete;
+
+  [[nodiscard]] std::optional<VerifiedRetainedModelMap>
+  get_verified(const RetainedModelMapQuery& query) const override;
+
+ private:
+  std::filesystem::path trusted_package_root_;
+};
+
+/// Filesystem-backed exact retained planning-model point reader.
+///
+/// This capability independently reloads one exact semantic bundle, selects
+/// only its cell planning/collision product, resolves exactly the
+/// graph-selected ModelAsset catalog/source closure, re-runs catalog and
+/// source qualification, and returns owned values. It has no path, listing,
+/// alias, candidate, Apply, ambient-package, or mutation surface.
+class FilesystemVerifiedRetainedPlanningModelSource final
+    : public IVerifiedRetainedPlanningModelSource {
+ public:
+  explicit FilesystemVerifiedRetainedPlanningModelSource(
+      std::filesystem::path trusted_package_root);
+  ~FilesystemVerifiedRetainedPlanningModelSource() override = default;
+
+  FilesystemVerifiedRetainedPlanningModelSource(
+      const FilesystemVerifiedRetainedPlanningModelSource&) = delete;
+  FilesystemVerifiedRetainedPlanningModelSource& operator=(
+      const FilesystemVerifiedRetainedPlanningModelSource&) = delete;
+  FilesystemVerifiedRetainedPlanningModelSource(
+      FilesystemVerifiedRetainedPlanningModelSource&&) = delete;
+  FilesystemVerifiedRetainedPlanningModelSource& operator=(
+      FilesystemVerifiedRetainedPlanningModelSource&&) = delete;
+
+  [[nodiscard]] std::optional<VerifiedRetainedPlanningModel>
+  get_verified(const RetainedPlanningModelQuery& query) const override;
 
  private:
   std::filesystem::path trusted_package_root_;

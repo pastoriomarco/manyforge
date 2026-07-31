@@ -108,6 +108,8 @@ def test_native_adapter_fails_closed_when_runtime_factory_missing(monkeypatch):
     detail = exc_info.value.to_detail()
     assert detail["reason_code"] == "native_factory_runtime_failed"
     assert detail["missing"] == ["native_roboplan_runtime"]
+    assert detail["suggested_command"] is None
+    assert "intentionally unavailable" in detail["message"]
     assert "MockKernelClient" not in str(exc_info.value)
 
 

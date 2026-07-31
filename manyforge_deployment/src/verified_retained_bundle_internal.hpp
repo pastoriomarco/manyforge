@@ -29,6 +29,15 @@ flattened_model_product_artifact_roles() noexcept;
 [[nodiscard]] const CanonicalValue&
 flattened_model_product_contract_descriptor();
 
+[[nodiscard]] std::string_view
+composed_model_symbol_role_map_product_contract_id() noexcept;
+[[nodiscard]] const core::ProductContractRevision&
+composed_model_symbol_role_map_product_contract_revision();
+[[nodiscard]] std::span<const QualifiedRetainedProductArtifactRole>
+composed_model_symbol_role_map_product_artifact_roles() noexcept;
+[[nodiscard]] const CanonicalValue&
+composed_model_symbol_role_map_product_contract_descriptor();
+
 [[noreturn]] void fail_retained_bundle(std::string_view message);
 void require_retained_portable_identity(std::string_view value,
                                         std::string_view field);

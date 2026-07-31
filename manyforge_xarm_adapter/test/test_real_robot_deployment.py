@@ -290,7 +290,8 @@ def test_product_launcher_separates_control_owner_from_composer() -> None:
     assert 'controller_manager ros2_control_node' in owner
     assert 'manyforge-xarm-run-execution-admission-provider' in owner
     assert 'manyforge_composer' not in owner
-    assert 'python -m manyforge_composer' in composer
+    assert 'manyforge_fail_composable_cell_runtime_unavailable' in composer
+    assert 'python -m manyforge_composer' not in composer
     assert 'controller_manager ros2_control_node' not in composer
     assert 'manyforge-xarm-run-execution-admission-provider' not in composer
     assert 'manyforge-real-robot-owner' in launcher

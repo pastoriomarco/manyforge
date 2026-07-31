@@ -11,6 +11,22 @@
 namespace manyforge::core {
 namespace {
 
+constexpr auto kDigestA =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+constexpr auto kDigestB =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+constexpr auto kDigestC =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+constexpr auto kDigestD =
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+ProjectionRevisionDTO make_projection_revision(std::uint64_t scene_revision = 7) {
+  return ProjectionRevisionDTO{
+      RetainedBundleId{kDigestA}, GraphRevision{kDigestB},
+      SceneRevision{SceneId{kDigestC}, scene_revision,
+                    ContentDigest{kDigestD}}};
+}
+
 Pose3DTO pose_at(double x_m, double yaw_hint = 0.0) {
   Pose3DTO pose;
   pose.position_m = Vector3DTO{x_m, 0.0, 0.0};
@@ -59,6 +75,7 @@ SceneSnapshotLease make_lease(
   lease.validation_epoch = 42;
   lease.captured_at_ns = 1'000;
   lease.lease_max_age_ns = 10'000;
+  lease.projection_revision = make_projection_revision();
   lease.world_revision = CollisionWorldRevision{7, "world-hash-v1"};
   lease.policy_revision = CollisionPolicyRevision{3, "policy-hash-v1"};
   lease.topology_epoch = 11;
@@ -71,6 +88,7 @@ SceneSnapshotLeaseValidationContext make_context(
     const SceneSnapshotLease& lease) {
   SceneSnapshotLeaseValidationContext context;
   context.now_ns = 1'200;
+  context.live_projection_revision = lease.projection_revision;
   context.live_world_revision = lease.world_revision;
   context.live_policy_revision = lease.policy_revision;
   context.topology_epoch = lease.topology_epoch;
@@ -112,6 +130,20 @@ TEST(SceneSnapshotLeaseValidator,
   EXPECT_EQ(result.live_world_revision.revision_id, 8u);
   EXPECT_EQ(result.details.at("accepted_live_world_revision_divergence"),
             "true");
+}
+
+TEST(SceneSnapshotLeaseValidator, StructuralProjectionChangeRejects) {
+  const auto lease = make_lease();
+  auto context = make_context(lease);
+  context.live_projection_revision->graph_revision = GraphRevision{kDigestC};
+
+  const auto result = validate_scene_snapshot_lease(lease, context);
+
+  expect_rejected(
+      result,
+      SceneSnapshotLeaseRejection::
+          kProjectionStructureChangedAfterValidation,
+      reason_codes::kProjectionStructureChangedAfterValidation);
 }
 
 TEST(SceneSnapshotLeaseValidator, MissingLeaseRejectsWithStableReason) {

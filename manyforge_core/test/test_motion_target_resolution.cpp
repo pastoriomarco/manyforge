@@ -23,7 +23,7 @@ class ReferenceResolver final : public IReferencePoseResolver {
   Result<Pose3DTO> resolve_reference_pose(
       const ReferenceDTO& reference,
       const std::string&,
-      const SceneRevisionBindingDTO&) const override {
+      const ProjectionLeaseBindingDTO&) const override {
     ++call_count;
     const auto found = poses.find(reference.id);
     if (found == poses.end()) {
@@ -63,7 +63,7 @@ TEST(MotionTargetResolution, RelativeJointDeltasResolveByJointName) {
   ReferenceResolver resolver;
 
   auto result = resolve_motion_target(
-      request, SceneRevisionBindingDTO{}, &start, resolver);
+      request, ProjectionLeaseBindingDTO{}, &start, resolver);
 
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(std::holds_alternative<JointGoalDTO>(result.value()));
@@ -81,7 +81,7 @@ TEST(MotionTargetResolution, RelativeJointRejectsMissingObservedStart) {
   ReferenceResolver resolver;
 
   auto result = resolve_motion_target(
-      request, SceneRevisionBindingDTO{}, nullptr, resolver);
+      request, ProjectionLeaseBindingDTO{}, nullptr, resolver);
 
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().code, kErrorStartStateMismatch);
@@ -101,7 +101,7 @@ TEST(MotionTargetResolution, JointTargetsRejectDuplicateNamesInEveryMode) {
     start.positions_rad = {1.0};
 
     auto result = resolve_motion_target(
-        request, SceneRevisionBindingDTO{}, &start, resolver);
+        request, ProjectionLeaseBindingDTO{}, &start, resolver);
 
     ASSERT_FALSE(result.ok());
     EXPECT_EQ(result.error().details.at("reason"),
@@ -118,7 +118,7 @@ TEST(MotionTargetResolution, RelativePoseResolvesReferenceOnce) {
   resolver.poses.emplace("fixture", pose_at(1.0, 2.0, 3.0));
 
   auto result = resolve_motion_target(
-      request, SceneRevisionBindingDTO{}, nullptr, resolver);
+      request, ProjectionLeaseBindingDTO{}, nullptr, resolver);
 
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(std::holds_alternative<PoseGoalDTO>(result.value()));
@@ -142,7 +142,7 @@ TEST(MotionTargetResolution,
   resolver.poses.emplace("fixture", pose_at(1.0, 2.0, 3.0));
 
   auto result = resolve_motion_target(
-      request, SceneRevisionBindingDTO{}, nullptr, resolver);
+      request, ProjectionLeaseBindingDTO{}, nullptr, resolver);
 
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(std::holds_alternative<CartesianPathDTO>(result.value()));
@@ -161,7 +161,7 @@ TEST(MotionTargetResolution, AbsoluteMotionRejectsSpatialReferences) {
   ReferenceResolver resolver;
 
   auto result = resolve_motion_target(
-      request, SceneRevisionBindingDTO{}, nullptr, resolver);
+      request, ProjectionLeaseBindingDTO{}, nullptr, resolver);
 
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().code, kErrorInvalidRequest);
@@ -176,7 +176,7 @@ TEST(MotionTargetResolution, NamedTargetsAreAbsoluteOnly) {
   ReferenceResolver resolver;
 
   auto result = resolve_motion_target(
-      request, SceneRevisionBindingDTO{}, nullptr, resolver);
+      request, ProjectionLeaseBindingDTO{}, nullptr, resolver);
 
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().details.at("reason"),

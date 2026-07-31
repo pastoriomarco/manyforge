@@ -7,6 +7,32 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_compile_options(-Wall -Wextra -Werror -pedantic)
 
+set(
+  MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_content_identity"
+  CACHE PATH
+  "Path to the shared ManyForge RFC 8785/content-identity library")
+get_filename_component(
+  MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR
+  "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}"
+  ABSOLUTE)
+if(NOT EXISTS
+   "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/include/manyforge_content_identity/content_identity.hpp")
+  message(FATAL_ERROR
+    "manyforge_core requires the shared content-identity source tree: "
+    "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}")
+endif()
+if(NOT TARGET manyforge_content_identity)
+  add_subdirectory(
+    "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_content_identity"
+    EXCLUDE_FROM_ALL)
+endif()
+if(NOT TARGET manyforge::content_identity)
+  message(FATAL_ERROR
+    "manyforge_core could not resolve the shared content-identity target")
+endif()
+
 # Core library
 add_library(manyforge_core
   src/state_machine.cpp
@@ -35,7 +61,6 @@ add_library(manyforge_core
   src/runtime_collision_monitor.cpp
   src/runtime_collision_query_session.cpp
   src/runtime_collision_lookahead_session.cpp
-  src/scene_authority.cpp
   src/scene_snapshot_lease.cpp
   src/stop_policy.cpp
   src/trajectory_cache.cpp
@@ -47,6 +72,7 @@ add_library(manyforge_core
   src/ordered_contact_validation.cpp
   src/parallel_collision_validation_worker_pool.cpp
   src/collision_world_snapshot_builder.cpp
+  src/logical_scene_identity_internal.cpp
   src/interrupt_manager.cpp
   src/soft_on_path_stop_planner.cpp
   src/execution_kernel.cpp
@@ -55,6 +81,7 @@ target_include_directories(manyforge_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
+target_link_libraries(manyforge_core PRIVATE manyforge::content_identity)
 
 # The static library is linked into both standalone test executables AND
 # the pybind11 shared module (manyforge_core_py). Shared modules require
@@ -112,6 +139,20 @@ if(BUILD_TESTING)
   target_link_libraries(test_component_manager_ports PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_component_manager_ports
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_logical_scene_snapshot
+    test/test_logical_scene_snapshot.cpp)
+  target_link_libraries(test_logical_scene_snapshot PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_logical_scene_snapshot
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_logical_scene_identity
+    test/test_logical_scene_identity.cpp)
+  target_link_libraries(test_logical_scene_identity PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_logical_scene_identity
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_execution_state_sink test/test_execution_state_sink.cpp)
@@ -356,13 +397,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_scene_snapshot_lease PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_scene_snapshot_lease
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_scene_authority
-    test/test_scene_authority.cpp)
-  target_link_libraries(test_scene_authority PRIVATE
-    manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_scene_authority
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_interrupt_manager

@@ -1,14 +1,12 @@
 #pragma once
 
-#include <string>
-#include <string_view>
+#include <manyforge_content_identity/content_identity.hpp>
 
 namespace manyforge::deployment {
 
-/// Returns `sha256:` followed by the lowercase SHA-256 of the exact bytes.
-[[nodiscard]] std::string sha256_digest(std::string_view bytes);
-
-/// Checks the exact lowercase `sha256:<64 hex>` wire spelling.
-[[nodiscard]] bool is_sha256_digest(std::string_view value) noexcept;
+// Existing deployment callers share the exact lower implementation while the
+// schema-owned compute/verify operations remain private to deployment.
+using content_identity::is_sha256_digest;
+using content_identity::sha256_digest;
 
 }  // namespace manyforge::deployment

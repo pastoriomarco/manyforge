@@ -150,8 +150,10 @@ def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, A
 def create_kernel(deployment: Deployment) -> KernelClient:
     """Create a kernel based on deployment adapter configuration.
 
-    Tries to import the native kernel (manyforge_roboplan) first.
-    Falls back to MockKernelClient for testing.
+    The explicit test adapter remains mock-backed. Production RoboPlan
+    construction is intentionally unavailable during the composable-cell
+    destructive cutover and must fail closed when its removed module is not
+    present.
     """
     execution_adapter = deployment.adapters.get("execution")
     if (
@@ -221,8 +223,13 @@ def create_kernel(deployment: Deployment) -> KernelClient:
                 attach_robot_model_metadata(kernel, runtime_model)
                 attach_robot_model_metadata(bundle, runtime_model)
             return kernel
-        except ImportError:
-            print("WARNING: manyforge_roboplan_py not available, using MockKernelClient")
+        except ImportError as error:
+            raise RuntimeError(
+                "Native RoboPlan execution is intentionally unavailable during "
+                "the composable-cell runtime cutover; the deleted "
+                "manyforge_roboplan_py/native client must not fall back to a "
+                "mock runtime"
+            ) from error
 
     # Fallback
     return MockKernelClient()

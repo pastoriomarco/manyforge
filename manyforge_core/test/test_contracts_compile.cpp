@@ -15,6 +15,8 @@
 #include <manyforge_core/types/execute_request.hpp>
 #include <manyforge_core/types/validation.hpp>
 #include <manyforge_core/types/scene_edit.hpp>
+#include <manyforge_core/types/logical_scene_snapshot.hpp>
+#include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/execution_result.hpp>
 
@@ -24,10 +26,8 @@
 
 // Port headers
 #include <manyforge_core/ports/iplanner_backend.hpp>
-#include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
 #include <manyforge_core/ports/irobot_kinematics.hpp>
-#include <manyforge_core/ports/iscene_authority.hpp>
 #include <manyforge_core/ports/itrajectory_validator.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
@@ -97,6 +97,7 @@ TEST(ContractsCompile, DefaultDTOs) {
   // Plan request DTO
   manyforge::core::PlanRequestDTO plan_request;
   EXPECT_TRUE(plan_request.robot_id.empty());
+  EXPECT_FALSE(plan_request.projection_binding.valid());
 
   // Plan result DTO
   manyforge::core::PlanResultDTO plan_result;
@@ -131,29 +132,14 @@ TEST(ContractsCompile, DefaultDTOs) {
   manyforge::core::JointLimitsDTO joint_limits;
   EXPECT_TRUE(joint_limits.joint_names.empty());
 
-  // Scene edit DTOs
-  manyforge::core::AddObjectRequestDTO add_object_request;
-  EXPECT_TRUE(add_object_request.object_id.empty());
-
-  manyforge::core::RemoveObjectRequestDTO remove_object_request;
-  EXPECT_TRUE(remove_object_request.object_id.empty());
-
-  manyforge::core::UpdateObjectPoseRequestDTO update_object_pose_request;
-  EXPECT_TRUE(update_object_pose_request.object_id.empty());
-
-  manyforge::core::AttachObjectRequestDTO attach_object_request;
-  EXPECT_TRUE(attach_object_request.object_id.empty());
-
-  manyforge::core::DetachObjectRequestDTO detach_object_request;
-  EXPECT_TRUE(detach_object_request.object_id.empty());
-
-  manyforge::core::ObjectStateDTO object_state;
-  EXPECT_FALSE(object_state.exists);
-  EXPECT_FALSE(object_state.attached);
-
-  manyforge::core::SceneEditResultDTO scene_edit_result;
-  EXPECT_FALSE(scene_edit_result.success);
-  EXPECT_FALSE(scene_edit_result.error.has_value());
+  // Composite scene/projection identity DTOs remain explicitly invalid until
+  // an owner supplies their complete strong identities.
+  manyforge::core::SceneRevision scene_revision;
+  EXPECT_FALSE(scene_revision.valid());
+  manyforge::core::ProjectionRevisionDTO projection_revision;
+  EXPECT_FALSE(projection_revision.valid());
+  manyforge::core::ProjectionLeaseBindingDTO projection_binding;
+  EXPECT_FALSE(projection_binding.valid());
 
   // Execution result DTOs
   manyforge::core::StopResultDTO stop_result;
@@ -378,29 +364,23 @@ TEST(ContractsCompile, ExecuteRequestComposition) {
 TEST(ContractsCompile, PortInterfaces) {
   // Just verify the types exist and are accessible
   using PlannerBackendType = manyforge::core::IPlannerBackend;
-  using PlannerSceneProjectionType = manyforge::core::IPlannerSceneProjection;
   using ReferenceResolverType = manyforge::core::IReferencePoseResolver;
   using RobotKinematicsType = manyforge::core::IRobotKinematics;
-  using SceneAuthorityType = manyforge::core::ISceneAuthority;
   using TrajectoryValidatorType = manyforge::core::ITrajectoryValidator;
   using ExecutionBackendType = manyforge::core::IExecutionBackend;
   using ExecutionStateSinkType = manyforge::core::IExecutionStateSink;
   
   // Verify they're pointers (abstract classes)
   PlannerBackendType* planner = nullptr;
-  PlannerSceneProjectionType* projection = nullptr;
   ReferenceResolverType* reference_resolver = nullptr;
   RobotKinematicsType* kinematics = nullptr;
-  SceneAuthorityType* scene_authority = nullptr;
   TrajectoryValidatorType* trajectory_validator = nullptr;
   ExecutionBackendType* execution = nullptr;
   ExecutionStateSinkType* execution_state_sink = nullptr;
   
   EXPECT_EQ(planner, nullptr);
-  EXPECT_EQ(projection, nullptr);
   EXPECT_EQ(reference_resolver, nullptr);
   EXPECT_EQ(kinematics, nullptr);
-  EXPECT_EQ(scene_authority, nullptr);
   EXPECT_EQ(trajectory_validator, nullptr);
   EXPECT_EQ(execution, nullptr);
   EXPECT_EQ(execution_state_sink, nullptr);

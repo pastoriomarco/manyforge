@@ -475,12 +475,11 @@ void validate_plan_case(const PlannerConformanceCase& test_case,
     }
     return;
   }
-  if (result.scene_revision.revision_id !=
-          test_case.request.scene_binding.revision.revision_id ||
-      result.scene_revision.content_hash !=
-          test_case.request.scene_binding.revision.content_hash) {
-    add_violation(report, test_case.id, "scene.exact_revision_acknowledgement",
-                  "planner result did not acknowledge the retained revision");
+  if (result.projection_revision !=
+      test_case.request.projection_binding.projection_revision) {
+    add_violation(
+        report, test_case.id, "projection.exact_revision_acknowledgement",
+        "planner result did not acknowledge the retained composite revision");
   }
   validate_trajectory(test_case, *result.trajectory, input, report);
 }

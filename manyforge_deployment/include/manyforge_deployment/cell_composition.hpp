@@ -114,6 +114,26 @@ struct OccurrenceReferenceRewrite final {
                          const OccurrenceReferenceRewrite&) = default;
 };
 
+/// One compiler-owned projection from an immutable source resource into the
+/// revision-scoped namespace used by the flattened planning model.
+///
+/// Rows are unique per exact ModelAsset identity and source URI, not per model
+/// occurrence. Reusing one exact asset therefore reuses the same immutable
+/// planning resource while two revisions of one stable asset ID cannot alias.
+struct CompositionPlanningResourceRewrite final {
+  core::ModelAssetId model_asset_id;
+  core::ModelRevision model_revision;
+  std::string source_logical_uri;
+  std::string compiled_logical_uri;
+  std::string media_type;
+  std::uint64_t byte_size;
+  core::ContentDigest content_digest;
+  core::ContentAddressedStoreKey content_addressed_store_key;
+
+  friend bool operator==(const CompositionPlanningResourceRewrite&,
+                         const CompositionPlanningResourceRewrite&) = default;
+};
+
 struct CompositionModelOccurrence final {
   core::ModelInstanceId model_instance_id;
   core::ModelAssetId model_asset_id;
@@ -411,6 +431,10 @@ class CompositionQualifiedCellIr final {
   reference_rewrites() const noexcept {
     return data_->reference_rewrites;
   }
+  [[nodiscard]] const std::vector<CompositionPlanningResourceRewrite>&
+  planning_resource_rewrites() const noexcept {
+    return data_->planning_resource_rewrites;
+  }
   [[nodiscard]] const std::vector<CompositionFrameResolution>& frames()
       const noexcept {
     return data_->frames;
@@ -450,6 +474,8 @@ class CompositionQualifiedCellIr final {
         std::vector<OccurrenceReverseSymbolRewrite>
             reverse_symbol_rewrites_in,
         std::vector<OccurrenceReferenceRewrite> reference_rewrites_in,
+        std::vector<CompositionPlanningResourceRewrite>
+            planning_resource_rewrites_in,
         std::vector<CompositionFrameResolution> frames_in,
         std::vector<CompositionFixedConnection> fixed_connections_in,
         std::vector<CompositionFramePath> frame_paths_in,
@@ -467,6 +493,8 @@ class CompositionQualifiedCellIr final {
           symbol_rewrites(std::move(symbol_rewrites_in)),
           reverse_symbol_rewrites(std::move(reverse_symbol_rewrites_in)),
           reference_rewrites(std::move(reference_rewrites_in)),
+          planning_resource_rewrites(
+              std::move(planning_resource_rewrites_in)),
           frames(std::move(frames_in)),
           fixed_connections(std::move(fixed_connections_in)),
           frame_paths(std::move(frame_paths_in)),
@@ -485,6 +513,8 @@ class CompositionQualifiedCellIr final {
     std::vector<OccurrenceSymbolRewrite> symbol_rewrites;
     std::vector<OccurrenceReverseSymbolRewrite> reverse_symbol_rewrites;
     std::vector<OccurrenceReferenceRewrite> reference_rewrites;
+    std::vector<CompositionPlanningResourceRewrite>
+        planning_resource_rewrites;
     std::vector<CompositionFrameResolution> frames;
     std::vector<CompositionFixedConnection> fixed_connections;
     std::vector<CompositionFramePath> frame_paths;
@@ -504,6 +534,8 @@ class CompositionQualifiedCellIr final {
       std::vector<OccurrenceSymbolRewrite> symbol_rewrites,
       std::vector<OccurrenceReverseSymbolRewrite> reverse_symbol_rewrites,
       std::vector<OccurrenceReferenceRewrite> reference_rewrites,
+      std::vector<CompositionPlanningResourceRewrite>
+          planning_resource_rewrites,
       std::vector<CompositionFrameResolution> frames,
       std::vector<CompositionFixedConnection> fixed_connections,
       std::vector<CompositionFramePath> frame_paths,
@@ -517,7 +549,8 @@ class CompositionQualifiedCellIr final {
             std::move(flattened_urdf), std::move(flattened_srdf),
             std::move(model_occurrences), std::move(symbol_rewrites),
             std::move(reverse_symbol_rewrites),
-            std::move(reference_rewrites), std::move(frames),
+            std::move(reference_rewrites),
+            std::move(planning_resource_rewrites), std::move(frames),
             std::move(fixed_connections), std::move(frame_paths),
             std::move(coordinates),
             std::move(control_binding_coordinate_maps),

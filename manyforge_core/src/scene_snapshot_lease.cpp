@@ -120,6 +120,8 @@ SceneSnapshotLeaseValidationResult base_result(
     const SceneSnapshotLeaseValidationContext& context) {
   SceneSnapshotLeaseValidationResult result;
   result.lease_id = lease.lease_id;
+  result.validated_projection_revision = lease.projection_revision;
+  result.live_projection_revision = context.live_projection_revision;
   result.validated_world_revision = lease.world_revision;
   result.validated_policy_revision = lease.policy_revision;
   if (context.live_world_revision.has_value()) {
@@ -135,6 +137,28 @@ SceneSnapshotLeaseValidationResult base_result(
 void add_revision_details(SceneSnapshotLeaseValidationResult& result,
                           const SceneSnapshotLease& lease,
                           const SceneSnapshotLeaseValidationContext& context) {
+  result.details["validated_retained_bundle_id"] =
+      lease.projection_revision.retained_bundle_id.value();
+  result.details["validated_graph_revision"] =
+      lease.projection_revision.graph_revision.value();
+  result.details["validated_scene_id"] =
+      lease.projection_revision.scene_revision.scene_id.value();
+  result.details["validated_scene_revision_id"] =
+      to_string(lease.projection_revision.scene_revision.revision_id);
+  result.details["validated_scene_content_hash"] =
+      lease.projection_revision.scene_revision.content_hash.value();
+  if (context.live_projection_revision.has_value()) {
+    result.details["live_retained_bundle_id"] =
+        context.live_projection_revision->retained_bundle_id.value();
+    result.details["live_graph_revision"] =
+        context.live_projection_revision->graph_revision.value();
+    result.details["live_scene_id"] =
+        context.live_projection_revision->scene_revision.scene_id.value();
+    result.details["live_scene_revision_id"] = to_string(
+        context.live_projection_revision->scene_revision.revision_id);
+    result.details["live_scene_content_hash"] =
+        context.live_projection_revision->scene_revision.content_hash.value();
+  }
   result.details["validated_world_revision_id"] =
       to_string(lease.world_revision.revision_id);
   result.details["validated_world_content_hash"] =
@@ -305,6 +329,9 @@ const char* to_reason_code(SceneSnapshotLeaseRejection rejection) {
       return reason_codes::kSceneSnapshotLeaseExpired;
     case SceneSnapshotLeaseRejection::kObservedSceneSourceStale:
       return reason_codes::kObservedSceneSourceStale;
+    case SceneSnapshotLeaseRejection::
+        kProjectionStructureChangedAfterValidation:
+      return reason_codes::kProjectionStructureChangedAfterValidation;
     case SceneSnapshotLeaseRejection::kSceneTopologyChangedAfterValidation:
       return reason_codes::kSceneTopologyChangedAfterValidation;
     case SceneSnapshotLeaseRejection::kCollisionPolicyChangedAfterValidation:
@@ -327,12 +354,6 @@ SceneSnapshotLeaseValidationResult validate_scene_snapshot_lease(
     result.rejection =
         SceneSnapshotLeaseRejection::kSceneSnapshotLeaseMissing;
     result.reason_code = to_reason_code(result.rejection);
-    if (context.live_world_revision.has_value()) {
-      result.live_world_revision = *context.live_world_revision;
-    }
-    if (context.live_policy_revision.has_value()) {
-      result.live_policy_revision = *context.live_policy_revision;
-    }
     return result;
   }
   return validate_scene_snapshot_lease(*lease, context);
@@ -344,11 +365,30 @@ SceneSnapshotLeaseValidationResult validate_scene_snapshot_lease(
   auto result = base_result(lease, context);
   add_revision_details(result, lease, context);
 
-  if (!context.live_world_revision.has_value() ||
+  if (!context.live_projection_revision.has_value() ||
+      !context.live_projection_revision->valid() ||
+      !context.live_world_revision.has_value() ||
       !context.live_policy_revision.has_value()) {
     return reject(std::move(result),
                   SceneSnapshotLeaseRejection::
                       kLiveSceneSnapshotUnavailable);
+  }
+
+  if (!lease.projection_revision.valid() ||
+      lease.projection_revision.retained_bundle_id !=
+          context.live_projection_revision->retained_bundle_id ||
+      lease.projection_revision.graph_revision !=
+          context.live_projection_revision->graph_revision ||
+      lease.projection_revision.scene_revision.scene_id !=
+          context.live_projection_revision->scene_revision.scene_id) {
+    return reject(
+        std::move(result),
+        SceneSnapshotLeaseRejection::
+            kProjectionStructureChangedAfterValidation);
+  }
+  if (lease.projection_revision.scene_revision !=
+      context.live_projection_revision->scene_revision) {
+    result.details["accepted_live_scene_revision_divergence"] = "true";
   }
 
   const std::int64_t lease_age =

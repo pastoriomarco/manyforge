@@ -22,16 +22,6 @@
 
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 
-namespace manyforge::core {
-// The operational scene value remains owned by the future scene-owner
-// implementation. This test-only definition lets the instrumented owner prove
-// that Begin returned a non-null immutable root without inventing production
-// scene semantics in Manager.
-struct LogicalSceneSnapshotDTO final {
-  std::uint64_t marker;
-};
-}  // namespace manyforge::core
-
 namespace manyforge::component_manager {
 namespace {
 
@@ -57,6 +47,8 @@ using core::SceneRevision;
 
 constexpr std::string_view kSceneDigest =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+constexpr std::string_view kSceneIdDigest =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 constexpr std::string_view kMaterializationDigest =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 constexpr std::string_view kRetirementDigest =
@@ -132,11 +124,33 @@ ProjectionRevisionDTO Target(
       query.canonical_empty_retained_bundle_id,
       query.canonical_empty_graph_revision,
       SceneRevision{
-          SceneId("canonical-empty.scene"),
+          SceneId(std::string(kSceneIdDigest)),
           1U,
           ContentDigest(std::string(kSceneDigest)),
       },
   };
+}
+
+core::LogicalSceneSnapshotRoot CanonicalEmptyScene(
+    const core::CellId& cell_id,
+    const ProjectionRevisionDTO& target) {
+  core::CollisionPolicySnapshot policy;
+  policy.policy_id = "free_space";
+  policy.revision = {
+      1U,
+      std::string(core::kCanonicalEmptyCollisionPolicyDigest),
+  };
+  return core::LogicalSceneSnapshotRoot(
+      std::make_shared<const core::LogicalSceneSnapshotDTO>(
+          core::LogicalSceneSnapshotDTO{
+              target.scene_revision,
+              cell_id,
+              0U,
+              0U,
+              0U,
+              std::move(policy),
+              {},
+              {}}));
 }
 
 ManagerBootstrapIntentDTO DurableIntent(
@@ -346,9 +360,7 @@ class InstrumentedSceneOwner final
         intent.bootstrap_generation,
         intent.cell_id,
         target_,
-        core::LogicalSceneSnapshotRoot(
-            std::make_shared<const core::LogicalSceneSnapshotDTO>(
-                core::LogicalSceneSnapshotDTO{1U})),
+        CanonicalEmptyScene(intent.cell_id, target_),
     };
     if (lose_next_accepted_response_) {
       lose_next_accepted_response_ = false;

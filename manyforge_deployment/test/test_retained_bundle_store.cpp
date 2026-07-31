@@ -38,6 +38,11 @@
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 
+#include "catalog_artifact_store_internal.hpp"
+#include "composed_model_symbol_role_map_internal.hpp"
+#include "lite6_controllable_retention_fixture.hpp"
+#include "lite6_structural_retention_fixture.hpp"
+#include "planning_resource_map_internal.hpp"
 #include "retained_bundle_internal.hpp"
 #include "runtime_only_retention_fixture.hpp"
 
@@ -136,18 +141,51 @@ static_assert(std::is_base_of_v<
 static_assert(std::is_base_of_v<
               IVerifiedRetainedProductArtifactSource,
               FilesystemVerifiedRetainedProductArtifactSource>);
+static_assert(std::is_base_of_v<
+              IVerifiedRetainedModelMapSource,
+              FilesystemVerifiedRetainedModelMapSource>);
+static_assert(std::is_base_of_v<
+              IVerifiedRetainedPlanningModelSource,
+              FilesystemVerifiedRetainedPlanningModelSource>);
 static_assert(!std::is_base_of_v<
               IVerifiedRetainedBundleSource,
               FilesystemRetainedBundleRepository>);
 static_assert(!std::is_default_constructible_v<
               VerifiedRetainedProductArtifact>);
+static_assert(!std::is_default_constructible_v<
+              VerifiedRetainedModelMap>);
+static_assert(!std::is_default_constructible_v<
+              VerifiedRetainedPlanningResource>);
+static_assert(!std::is_default_constructible_v<
+              VerifiedRetainedPlanningModel>);
+static_assert(!std::is_aggregate_v<
+              VerifiedRetainedPlanningResource>);
+static_assert(!std::is_aggregate_v<
+              VerifiedRetainedPlanningModel>);
+static_assert(std::is_copy_constructible_v<
+              VerifiedRetainedPlanningResource>);
+static_assert(std::is_move_constructible_v<
+              VerifiedRetainedPlanningResource>);
+static_assert(std::is_copy_constructible_v<
+              VerifiedRetainedPlanningModel>);
+static_assert(std::is_move_constructible_v<
+              VerifiedRetainedPlanningModel>);
 static_assert(!std::is_aggregate_v<
               VerifiedRetainedProductArtifact>);
+static_assert(!std::is_aggregate_v<VerifiedRetainedModelMap>);
+static_assert(std::is_copy_constructible_v<VerifiedRetainedModelMap>);
+static_assert(std::is_move_constructible_v<VerifiedRetainedModelMap>);
 static_assert(std::is_constructible_v<
               FilesystemVerifiedRetainedBundleSource,
               std::filesystem::path>);
 static_assert(std::is_constructible_v<
               FilesystemVerifiedRetainedProductArtifactSource,
+              std::filesystem::path>);
+static_assert(std::is_constructible_v<
+              FilesystemVerifiedRetainedModelMapSource,
+              std::filesystem::path>);
+static_assert(std::is_constructible_v<
+              FilesystemVerifiedRetainedPlanningModelSource,
               std::filesystem::path>);
 static_assert(!std::is_constructible_v<
               FilesystemVerifiedRetainedBundleSource,
@@ -223,12 +261,97 @@ materialize_durable_bundle(
     const std::filesystem::path& root, std::string_view cell_id) {
   FilesystemBuildManifestRepository manifest_repository(
       root);
+  detail::RejectingCatalogArtifactStore catalog_store;
   FilesystemRawArtifactStore raw_store(root);
   FilesystemRetainedBundleRepository bundle_repository(root);
+  const detail::RejectingCompilerInputArtifactSource input_source;
   return detail::RetainedBundleMaterializer::
       materialize_store_and_reload_production(
-          qualify_empty(cell_id), manifest_repository, raw_store,
+          qualify_empty(cell_id), manifest_repository, input_source,
+          {}, catalog_store, raw_store, bundle_repository);
+}
+
+struct DurableLite6PlanningFixture final {
+  test::Lite6StructuralRetentionFixture input;
+  std::shared_ptr<const RetainedBundle> bundle;
+};
+
+struct DurableControllableLite6Fixture final {
+  test::Lite6ControllableRetentionFixture input;
+  std::shared_ptr<const RetainedBundle> bundle;
+};
+
+[[nodiscard]] DurableControllableLite6Fixture
+materialize_durable_controllable_lite6_bundle(
+    const std::filesystem::path& root) {
+  auto input = test::make_lite6_controllable_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      input);
+  FilesystemBuildManifestRepository manifest_repository(root);
+  FilesystemCatalogArtifactStore catalog_store(root);
+  FilesystemRawArtifactStore raw_store(root);
+  FilesystemRetainedBundleRepository bundle_repository(root);
+  auto bundle = detail::RetainedBundleMaterializer::
+      materialize_store_and_reload_production(
+          input.qualified, manifest_repository, input_source,
+          input.structural_preparations(), catalog_store, raw_store,
           bundle_repository);
+  if (bundle == nullptr) {
+    throw std::logic_error(
+        "controllable Lite6 fixture materialization returned no bundle");
+  }
+  return {std::move(input), std::move(bundle)};
+}
+
+[[nodiscard]] DurableLite6PlanningFixture
+materialize_durable_lite6_bundle(
+    const std::filesystem::path& root) {
+  auto input = test::make_lite6_structural_retention_fixture();
+  if (input.verified_asset.verified_artifacts().size() !=
+      input.source_artifacts.size()) {
+    throw std::logic_error(
+        "Lite6 fixture source declaration/proof count mismatch");
+  }
+  for (const auto& artifact : input.source_artifacts) {
+    if (std::none_of(
+            input.verified_asset.verified_artifacts().begin(),
+            input.verified_asset.verified_artifacts().end(),
+            [&artifact](const VerifiedModelSourceArtifact& proof) {
+              return proof.logical_uri == artifact.logical_uri &&
+                     proof.resolved_store_key ==
+                         artifact.store_key &&
+                     proof.content_digest ==
+                         artifact.content_digest &&
+                     proof.byte_size == artifact.bytes.size();
+            })) {
+      throw std::logic_error(
+          "Lite6 fixture source artifact has no exact verified proof " +
+          artifact.logical_uri);
+    }
+  }
+  const test::Lite6CompilerInputArtifactSource input_source(input);
+  FilesystemBuildManifestRepository manifest_repository(root);
+  FilesystemCatalogArtifactStore catalog_store(root);
+  FilesystemRawArtifactStore raw_store(root);
+  FilesystemRetainedBundleRepository bundle_repository(root);
+  auto bundle =
+      detail::RetainedBundleMaterializer::
+          materialize_store_and_reload_production(
+              test::qualify_lite6_passive_deployment(input),
+              manifest_repository, input_source,
+              input.structural_preparations(), catalog_store, raw_store,
+              bundle_repository);
+  for (const auto& artifact : input.source_artifacts) {
+    const auto retained = raw_store.get_verified(
+        artifact.store_key, artifact.content_digest,
+        static_cast<std::uint64_t>(artifact.bytes.size()));
+    if (!retained.has_value() || *retained != artifact.bytes) {
+      throw std::logic_error(
+          "Lite6 fixture materialization omitted source artifact " +
+          artifact.logical_uri);
+    }
+  }
+  return {std::move(input), std::move(bundle)};
 }
 
 [[nodiscard]] std::shared_ptr<const RetainedBundle> make_sealed_bundle(
@@ -249,6 +372,28 @@ materialize_durable_bundle(
     const core::RetainedArtifactRefDTO& artifact) {
   return root / "raw-artifacts" / "sha256" /
          (artifact.content_digest.value().substr(7U) + ".blob");
+}
+
+[[nodiscard]] std::filesystem::path raw_path(
+    const std::filesystem::path& root,
+    const test::Lite6InputArtifact& artifact) {
+  return root / "raw-artifacts" / "sha256" /
+         (artifact.content_digest.value().substr(7U) + ".blob");
+}
+
+[[nodiscard]] std::filesystem::path catalog_path(
+    const std::filesystem::path& root,
+    const core::ContentAddressedStoreKey& key) {
+  const auto storage_hex =
+      detail::catalog_artifact_storage_hex(key.value());
+  if (!storage_hex.has_value()) {
+    throw std::logic_error(
+        "test catalog key violates the bounded store contract");
+  }
+  return root / detail::kCatalogArtifactNamespaceDirectory /
+         detail::kCatalogArtifactDataDirectory /
+         (*storage_hex +
+          std::string(detail::kCatalogArtifactFileSuffix));
 }
 
 [[nodiscard]] std::filesystem::path bundle_path(
@@ -881,7 +1026,7 @@ TEST(FilesystemVerifiedRetainedBundleSourceTest,
     const auto& artifacts =
         bundle->value()
             .compiled_products.planning_collision_model.artifact_refs;
-    ASSERT_EQ(artifacts.size(), 2U);
+    ASSERT_EQ(artifacts.size(), 3U);
     FilesystemVerifiedRetainedBundleSource source(root.path());
     ASSERT_TRUE(std::filesystem::remove(
         raw_path(root.path(), artifacts.front())));
@@ -898,7 +1043,7 @@ TEST(FilesystemVerifiedRetainedBundleSourceTest,
     const auto& artifacts =
         bundle->value()
             .compiled_products.planning_collision_model.artifact_refs;
-    ASSERT_EQ(artifacts.size(), 2U);
+    ASSERT_EQ(artifacts.size(), 3U);
     FilesystemVerifiedRetainedBundleSource source(root.path());
     write_file(raw_path(root.path(), artifacts.back()),
                "corrupt retained artifact");
@@ -916,7 +1061,7 @@ TEST(FilesystemVerifiedRetainedProductArtifactSourceTest,
       root.path(), "durable_product_point_read");
   const auto& product =
       bundle->value().compiled_products.planning_collision_model;
-  ASSERT_EQ(product.artifact_refs.size(), 2U);
+  ASSERT_EQ(product.artifact_refs.size(), 3U);
 
   const RetainedProductArtifactQuery urdf_query{
       bundle->retained_bundle_id(), product.product_id,
@@ -953,6 +1098,140 @@ TEST(FilesystemVerifiedRetainedProductArtifactSourceTest,
             first->product_contract_revision());
   EXPECT_EQ(second->artifact_ref(), first->artifact_ref());
   EXPECT_EQ(second->bytes(), first->bytes());
+}
+
+TEST(FilesystemVerifiedRetainedProductArtifactSourceTest,
+     ComposedSymbolMapPointReadReverifiesExactArtifactAndCorruption) {
+  ScopedTrustedRoot root;
+  const auto materialized =
+      materialize_durable_lite6_bundle(root.path());
+  ASSERT_EQ(materialized.bundle->value()
+                .compiled_products.symbol_role_maps.size(),
+            1U);
+  const auto& product = materialized.bundle->value()
+                            .compiled_products.symbol_role_maps.front();
+  ASSERT_EQ(product.product_kind,
+            core::RetainedProductKind::kSymbolRoleMap);
+  ASSERT_EQ(product.artifact_refs.size(), 1U);
+  EXPECT_EQ(product.artifact_refs.front().artifact_role_id.value(),
+            detail::kComposedModelSymbolRoleMapArtifactRole);
+
+  const RetainedProductArtifactQuery query{
+      materialized.bundle->retained_bundle_id(), product.product_id,
+      product.product_kind, product.artifact_refs.front().artifact_role_id};
+  const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
+  const auto loaded = source.get_verified(query);
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(loaded->query(), query);
+  EXPECT_EQ(loaded->product_contract_id(), product.product_contract_id);
+  EXPECT_EQ(loaded->product_contract_revision(),
+            product.product_contract_revision);
+  EXPECT_EQ(loaded->artifact_ref(), product.artifact_refs.front());
+  EXPECT_EQ(sha256_digest(loaded->bytes()),
+            product.artifact_refs.front().content_digest.value());
+  EXPECT_NO_THROW(
+      static_cast<void>(detail::parse_and_verify_composed_model_symbol_role_map(
+          loaded->bytes())));
+
+  write_file(raw_path(root.path(), product.artifact_refs.front()),
+             "corrupt composed symbol map");
+  const FilesystemVerifiedRetainedProductArtifactSource reopened(root.path());
+  EXPECT_THROW(static_cast<void>(reopened.get_verified(query)),
+               RetainedBundleError);
+}
+
+TEST(FilesystemVerifiedRetainedModelMapSourceTest,
+     ControllableLite6SurvivesDurablePlanningAndTypedModelMapPointReads) {
+  ScopedTrustedRoot root;
+  const auto materialized =
+      materialize_durable_controllable_lite6_bundle(root.path());
+
+  const FilesystemVerifiedRetainedBundleSource bundle_source(root.path());
+  const auto reloaded = bundle_source.get_verified(
+      materialized.bundle->retained_bundle_id());
+  ASSERT_NE(reloaded, nullptr);
+  EXPECT_EQ(reloaded->value(), materialized.bundle->value());
+  ASSERT_EQ(reloaded->value().desired_control_configurations.size(), 1U);
+  EXPECT_EQ(reloaded->value().catalogs.records.size(), 7U);
+  EXPECT_EQ(reloaded->value().provenance.source_records.size(), 7U);
+  EXPECT_TRUE(
+      reloaded->value().compiled_products.control_domain_products.empty());
+  EXPECT_TRUE(
+      reloaded->value().compiled_products.runtime_unit_products.empty());
+
+  const auto& planning =
+      reloaded->value().compiled_products.planning_collision_model;
+  const FilesystemVerifiedRetainedPlanningModelSource planning_source(
+      root.path());
+  const auto planning_model = planning_source.get_verified(
+      {reloaded->retained_bundle_id(), planning.product_id});
+  ASSERT_TRUE(planning_model.has_value());
+  EXPECT_FALSE(planning_model->resources().empty());
+
+  ASSERT_EQ(reloaded->value().compiled_products.symbol_role_maps.size(), 1U);
+  const auto& symbol =
+      reloaded->value().compiled_products.symbol_role_maps.front();
+  ASSERT_EQ(symbol.artifact_refs.size(), 1U);
+  const RetainedModelMapQuery query{
+      reloaded->retained_bundle_id(), symbol.product_id};
+  const FilesystemVerifiedRetainedModelMapSource symbol_source(
+      root.path());
+  const auto model_map = symbol_source.get_verified(query);
+  ASSERT_TRUE(model_map.has_value());
+  RetainedModelMapQuery unknown_query = query;
+  unknown_query.retained_bundle_id =
+      core::RetainedBundleId(std::string(kZeroDigest));
+  EXPECT_FALSE(symbol_source.get_verified(unknown_query).has_value());
+  unknown_query = query;
+  unknown_query.product_id = core::ProductId("unknown_symbol_map");
+  EXPECT_FALSE(symbol_source.get_verified(unknown_query).has_value());
+  EXPECT_EQ(model_map->query(), query);
+  EXPECT_NO_THROW(model_map->require_same_bundle_as(*planning_model));
+  EXPECT_EQ(model_map->query().retained_bundle_id,
+            planning_model->query().retained_bundle_id);
+  EXPECT_EQ(model_map->cell_frame().cell_id,
+            reloaded->value().cell_graph.cell_id);
+  EXPECT_EQ(model_map->model_occurrences().size(), 1U);
+  EXPECT_FALSE(model_map->symbols().empty());
+  EXPECT_FALSE(model_map->references().empty());
+  EXPECT_FALSE(model_map->coordinates().empty());
+
+  const core::ControllableComponentId component_id(
+      std::string(test::kLite6ControllableComponentId));
+  const core::CommandTargetId command_target_id(
+      std::string(test::kLite6ArmTargetId));
+  const auto* binding =
+      model_map->find_binding(component_id, command_target_id);
+  const auto* target =
+      model_map->find_target(component_id, command_target_id);
+  ASSERT_NE(binding, nullptr);
+  ASSERT_NE(target, nullptr);
+  EXPECT_EQ(binding->control_binding_id.value(),
+            test::kLite6ArmBindingId);
+  ASSERT_EQ(binding->resources.size(), 6U);
+  for (std::size_t index = 0U; index < binding->resources.size(); ++index) {
+    EXPECT_EQ(binding->resources[index].resource_id.value(),
+              "lite6_joint_" + std::to_string(index + 1U));
+  }
+  EXPECT_FALSE(target->model_groups.empty());
+  EXPECT_FALSE(target->frames.empty());
+  EXPECT_FALSE(target->collision_bodies.empty());
+  EXPECT_EQ(model_map->find_binding(
+                core::ControllableComponentId("other"), command_target_id),
+            nullptr);
+  EXPECT_EQ(model_map->find_target(
+                component_id, core::CommandTargetId("other")),
+            nullptr);
+
+  const auto other_bundle = materialize_durable_bundle(
+      root.path(), "typed_model_map_other_bundle");
+  const auto& other_product =
+      other_bundle->value().compiled_products.planning_collision_model;
+  const auto other_planning_model = planning_source.get_verified(
+      {other_bundle->retained_bundle_id(), other_product.product_id});
+  ASSERT_TRUE(other_planning_model.has_value());
+  EXPECT_THROW(model_map->require_same_bundle_as(*other_planning_model),
+               RetainedBundleError);
 }
 
 TEST(FilesystemVerifiedRetainedProductArtifactSourceTest,
@@ -1072,6 +1351,420 @@ TEST(FilesystemVerifiedRetainedProductArtifactSourceTest,
         static_cast<void>(source.get_verified(query)),
         RetainedBundleError);
   }
+}
+
+TEST(FilesystemVerifiedRetainedPlanningModelSourceTest,
+     CanonicalEmptyModelIsExactOwnedAndCopyMoveSafe) {
+  ScopedTrustedRoot root;
+  const auto bundle = materialize_durable_bundle(
+      root.path(), "durable_empty_planning_model");
+  const auto& product =
+      bundle->value().compiled_products.planning_collision_model;
+  const RetainedPlanningModelQuery query{
+      bundle->retained_bundle_id(), product.product_id};
+  const FilesystemVerifiedRetainedPlanningModelSource source(
+      root.path());
+
+  auto loaded = source.get_verified(query);
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(loaded->query(), query);
+  EXPECT_TRUE(loaded->resources().empty());
+  EXPECT_NE(loaded->urdf_bytes().find("<robot"),
+            std::string_view::npos);
+  EXPECT_NE(loaded->srdf_bytes().find("<robot"),
+            std::string_view::npos);
+
+  const auto urdf = std::find_if(
+      product.artifact_refs.begin(), product.artifact_refs.end(),
+      [](const core::RetainedArtifactRefDTO& artifact) {
+        return artifact.artifact_role_id.value() == "urdf";
+      });
+  const auto srdf = std::find_if(
+      product.artifact_refs.begin(), product.artifact_refs.end(),
+      [](const core::RetainedArtifactRefDTO& artifact) {
+        return artifact.artifact_role_id.value() == "srdf";
+      });
+  ASSERT_NE(urdf, product.artifact_refs.end());
+  ASSERT_NE(srdf, product.artifact_refs.end());
+  EXPECT_EQ(loaded->urdf_bytes().size(), urdf->byte_size);
+  EXPECT_EQ(loaded->srdf_bytes().size(), srdf->byte_size);
+  EXPECT_EQ(sha256_digest(loaded->urdf_bytes()),
+            urdf->content_digest.value());
+  EXPECT_EQ(sha256_digest(loaded->srdf_bytes()),
+            srdf->content_digest.value());
+
+  VerifiedRetainedPlanningModel copied = *loaded;
+  VerifiedRetainedPlanningModel moved = std::move(copied);
+  EXPECT_EQ(moved.query(), query);
+  EXPECT_EQ(moved.urdf_bytes(), loaded->urdf_bytes());
+  EXPECT_EQ(moved.srdf_bytes(), loaded->srdf_bytes());
+  EXPECT_TRUE(moved.resources().empty());
+}
+
+TEST(FilesystemVerifiedRetainedPlanningModelSourceTest,
+     UnknownBundleOrPlanningProductIsAbsent) {
+  ScopedTrustedRoot root;
+  const auto bundle = materialize_durable_bundle(
+      root.path(), "durable_unknown_planning_model");
+  const auto& product =
+      bundle->value().compiled_products.planning_collision_model;
+  const FilesystemVerifiedRetainedPlanningModelSource source(
+      root.path());
+
+  RetainedPlanningModelQuery query{
+      core::RetainedBundleId(std::string(kZeroDigest)),
+      product.product_id};
+  EXPECT_FALSE(source.get_verified(query).has_value());
+  query.retained_bundle_id = bundle->retained_bundle_id();
+  query.product_id = core::ProductId("unknown_planning_product");
+  EXPECT_FALSE(source.get_verified(query).has_value());
+}
+
+TEST(FilesystemVerifiedRetainedPlanningModelSourceTest,
+     MissingOrCorruptCompiledPlanningBytesFailClosed) {
+  {
+    ScopedTrustedRoot root;
+    const auto bundle = materialize_durable_bundle(
+        root.path(), "durable_planning_model_missing_product");
+    const auto& product =
+        bundle->value().compiled_products.planning_collision_model;
+    const RetainedPlanningModelQuery query{
+        bundle->retained_bundle_id(), product.product_id};
+    const FilesystemVerifiedRetainedPlanningModelSource source(
+        root.path());
+    ASSERT_TRUE(std::filesystem::remove(
+        raw_path(root.path(), product.artifact_refs.front())));
+    EXPECT_THROW(
+        static_cast<void>(source.get_verified(query)),
+        RetainedBundleError);
+  }
+
+  {
+    ScopedTrustedRoot root;
+    const auto bundle = materialize_durable_bundle(
+        root.path(), "durable_planning_model_corrupt_product");
+    const auto& product =
+        bundle->value().compiled_products.planning_collision_model;
+    const RetainedPlanningModelQuery query{
+        bundle->retained_bundle_id(), product.product_id};
+    const FilesystemVerifiedRetainedPlanningModelSource source(
+        root.path());
+    write_file(raw_path(root.path(), product.artifact_refs.back()),
+               "corrupt planning XML");
+    EXPECT_THROW(
+        static_cast<void>(source.get_verified(query)),
+        RetainedBundleError);
+  }
+}
+
+TEST(FilesystemVerifiedRetainedPlanningModelSourceTest,
+     NonEmptyModelReturnsOnlyItsExactCanonicalOwnedResourceClosure) {
+  ScopedTrustedRoot root;
+  const auto materialized =
+      materialize_durable_lite6_bundle(root.path());
+  const auto& product =
+      materialized.bundle->value()
+          .compiled_products.planning_collision_model;
+  const RetainedPlanningModelQuery query{
+      materialized.bundle->retained_bundle_id(),
+      product.product_id};
+
+  std::map<std::string, const test::Lite6InputArtifact*,
+           std::less<>>
+      expected_resources;
+  for (const auto& artifact :
+       materialized.input.source_artifacts) {
+    if (artifact.logical_uri == test::kLite6UrdfLogicalUri ||
+        artifact.logical_uri == test::kLite6SrdfLogicalUri) {
+      continue;
+    }
+    const std::string compiled_uri =
+        manyforge::deployment::detail::compiled_planning_resource_uri(
+            materialized.input.catalog_reference.record_id,
+            materialized.input.catalog_reference.record_revision,
+            artifact.logical_uri);
+    ASSERT_TRUE(
+        expected_resources.emplace(compiled_uri, &artifact).second);
+  }
+  ASSERT_FALSE(expected_resources.empty());
+
+  const StoredRawArtifact ambient = [&]() {
+    FilesystemRawArtifactStore raw_store(root.path());
+    return raw_store.put_if_absent(
+        "ambient bytes outside the selected model closure");
+  }();
+
+  const FilesystemVerifiedRetainedPlanningModelSource source(
+      root.path());
+  auto loaded = source.get_verified(query);
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(loaded->query(), query);
+  EXPECT_EQ(loaded->resources().size(),
+            expected_resources.size());
+  EXPECT_NE(loaded->urdf_bytes().find("<robot"),
+            std::string_view::npos);
+  EXPECT_NE(loaded->srdf_bytes().find("<robot"),
+            std::string_view::npos);
+
+  std::string previous_uri;
+  for (const auto& resource : loaded->resources()) {
+    EXPECT_LT(previous_uri, resource.logical_uri());
+    previous_uri = resource.logical_uri();
+    const auto found =
+        expected_resources.find(resource.logical_uri());
+    ASSERT_NE(found, expected_resources.end());
+    const auto& expected = *found->second;
+    EXPECT_EQ(resource.media_type(), expected.media_type);
+    EXPECT_EQ(resource.byte_size(), expected.bytes.size());
+    EXPECT_EQ(resource.content_digest(),
+              expected.content_digest);
+    EXPECT_EQ(resource.content_addressed_store_key(),
+              expected.store_key);
+    EXPECT_EQ(resource.bytes(), expected.bytes);
+    EXPECT_NE(resource.content_digest(), ambient.content_digest);
+    EXPECT_NE(resource.bytes(),
+              "ambient bytes outside the selected model closure");
+  }
+
+  const auto urdf = std::find_if(
+      product.artifact_refs.begin(), product.artifact_refs.end(),
+      [](const core::RetainedArtifactRefDTO& artifact) {
+        return artifact.artifact_role_id.value() == "urdf";
+      });
+  const auto srdf = std::find_if(
+      product.artifact_refs.begin(), product.artifact_refs.end(),
+      [](const core::RetainedArtifactRefDTO& artifact) {
+        return artifact.artifact_role_id.value() == "srdf";
+      });
+  ASSERT_NE(urdf, product.artifact_refs.end());
+  ASSERT_NE(srdf, product.artifact_refs.end());
+  EXPECT_EQ(sha256_digest(loaded->urdf_bytes()),
+            urdf->content_digest.value());
+  EXPECT_EQ(sha256_digest(loaded->srdf_bytes()),
+            srdf->content_digest.value());
+
+  VerifiedRetainedPlanningResource copied =
+      loaded->resources().front();
+  const std::string copied_uri(copied.logical_uri());
+  const std::string copied_bytes(copied.bytes());
+  VerifiedRetainedPlanningModel copied_model = *loaded;
+  loaded.reset();
+  VerifiedRetainedPlanningResource moved =
+      std::move(copied);
+  EXPECT_EQ(moved.logical_uri(), copied_uri);
+  EXPECT_EQ(moved.bytes(), copied_bytes);
+  VerifiedRetainedPlanningModel moved_model =
+      std::move(copied_model);
+  EXPECT_EQ(moved_model.query(), query);
+  EXPECT_EQ(moved_model.resources().size(),
+            expected_resources.size());
+}
+
+TEST(FilesystemVerifiedRetainedPlanningModelSourceTest,
+     MetadataOnlyAssetRevisionsReturnDistinctCompiledResourceUris) {
+  ScopedTrustedRoot root;
+  const auto revision_a =
+      test::make_lite6_structural_retention_fixture();
+  const auto revision_b =
+      test::make_lite6_structural_retention_fixture(
+          "arm_collision_revision_b");
+  const std::array<test::Lite6PassiveModelSelection, 2U> selections{{
+      {"lite6_a", &revision_a},
+      {"lite6_b", &revision_b},
+  }};
+  const std::array<BuildQualifiedStructuralModelPreparation, 2U>
+      preparations{revision_a.preparation, revision_b.preparation};
+  const test::Lite6CompilerInputArtifactSource input_source(
+      {&revision_a, &revision_b});
+  FilesystemBuildManifestRepository manifest_repository(root.path());
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  FilesystemRawArtifactStore raw_store(root.path());
+  FilesystemRetainedBundleRepository bundle_repository(root.path());
+  const auto bundle =
+      detail::RetainedBundleMaterializer::
+          materialize_store_and_reload_production(
+              test::qualify_lite6_passive_deployment(selections),
+              manifest_repository, input_source, preparations,
+              catalog_store, raw_store, bundle_repository);
+  ASSERT_NE(bundle, nullptr);
+
+  const auto& product =
+      bundle->value().compiled_products.planning_collision_model;
+  const FilesystemVerifiedRetainedPlanningModelSource source(root.path());
+  const auto loaded = source.get_verified(
+      {bundle->retained_bundle_id(), product.product_id});
+  ASSERT_TRUE(loaded.has_value());
+
+  const std::size_t expected_per_revision =
+      revision_a.source_artifacts.size() - 2U;
+  ASSERT_EQ(loaded->resources().size(),
+            expected_per_revision * 2U);
+  std::map<std::string, const VerifiedRetainedPlanningResource*,
+           std::less<>>
+      by_uri;
+  for (const auto& resource : loaded->resources()) {
+    ASSERT_TRUE(
+        by_uri.emplace(resource.logical_uri(), &resource).second);
+    EXPECT_NE(
+        loaded->urdf_bytes().find(resource.logical_uri()),
+        std::string_view::npos);
+  }
+  for (const auto& artifact : revision_a.source_artifacts) {
+    if (artifact.logical_uri == test::kLite6UrdfLogicalUri ||
+        artifact.logical_uri == test::kLite6SrdfLogicalUri) {
+      continue;
+    }
+    const std::string uri_a =
+        detail::compiled_planning_resource_uri(
+            revision_a.catalog_reference.record_id,
+            revision_a.catalog_reference.record_revision,
+            artifact.logical_uri);
+    const std::string uri_b =
+        detail::compiled_planning_resource_uri(
+            revision_b.catalog_reference.record_id,
+            revision_b.catalog_reference.record_revision,
+            artifact.logical_uri);
+    ASSERT_NE(uri_a, uri_b);
+    const auto found_a = by_uri.find(uri_a);
+    const auto found_b = by_uri.find(uri_b);
+    ASSERT_NE(found_a, by_uri.end());
+    ASSERT_NE(found_b, by_uri.end());
+    EXPECT_EQ(found_a->second->content_digest(),
+              found_b->second->content_digest());
+    EXPECT_EQ(found_a->second->bytes(),
+              found_b->second->bytes());
+  }
+}
+
+TEST(FilesystemVerifiedRetainedPlanningModelSourceTest,
+     MissingOrCorruptSelectedModelResourceFailsClosed) {
+  {
+    ScopedTrustedRoot root;
+    const auto materialized =
+        materialize_durable_lite6_bundle(root.path());
+    const auto& product =
+        materialized.bundle->value()
+            .compiled_products.planning_collision_model;
+    const RetainedPlanningModelQuery query{
+        materialized.bundle->retained_bundle_id(),
+        product.product_id};
+    const auto selected = std::find_if(
+        materialized.input.source_artifacts.begin(),
+        materialized.input.source_artifacts.end(),
+        [](const test::Lite6InputArtifact& artifact) {
+          return artifact.logical_uri !=
+                     test::kLite6UrdfLogicalUri &&
+                 artifact.logical_uri !=
+                     test::kLite6SrdfLogicalUri;
+        });
+    ASSERT_NE(selected,
+              materialized.input.source_artifacts.end());
+    ASSERT_TRUE(
+        std::filesystem::remove(raw_path(root.path(), *selected)));
+    const FilesystemVerifiedRetainedPlanningModelSource source(
+        root.path());
+    EXPECT_THROW(
+        static_cast<void>(source.get_verified(query)),
+        RetainedBundleError);
+  }
+
+  {
+    ScopedTrustedRoot root;
+    const auto materialized =
+        materialize_durable_lite6_bundle(root.path());
+    const auto& product =
+        materialized.bundle->value()
+            .compiled_products.planning_collision_model;
+    const RetainedPlanningModelQuery query{
+        materialized.bundle->retained_bundle_id(),
+        product.product_id};
+    const auto selected = std::find_if(
+        materialized.input.source_artifacts.begin(),
+        materialized.input.source_artifacts.end(),
+        [](const test::Lite6InputArtifact& artifact) {
+          return artifact.logical_uri !=
+                     test::kLite6UrdfLogicalUri &&
+                 artifact.logical_uri !=
+                     test::kLite6SrdfLogicalUri;
+        });
+    ASSERT_NE(selected,
+              materialized.input.source_artifacts.end());
+    write_file(raw_path(root.path(), *selected),
+               "corrupt selected model resource");
+    const FilesystemVerifiedRetainedPlanningModelSource source(
+        root.path());
+    EXPECT_THROW(
+        static_cast<void>(source.get_verified(query)),
+        RetainedBundleError);
+  }
+}
+
+TEST(FilesystemVerifiedRetainedPlanningModelSourceTest,
+     MissingFilteredSourceXmlEntrypointFailsClosed) {
+  ScopedTrustedRoot root;
+  const auto materialized =
+      materialize_durable_lite6_bundle(root.path());
+  const auto& product =
+      materialized.bundle->value()
+          .compiled_products.planning_collision_model;
+  const RetainedPlanningModelQuery query{
+      materialized.bundle->retained_bundle_id(),
+      product.product_id};
+  const auto selected = std::find_if(
+      materialized.input.source_artifacts.begin(),
+      materialized.input.source_artifacts.end(),
+      [](const test::Lite6InputArtifact& artifact) {
+        return artifact.logical_uri ==
+               test::kLite6UrdfLogicalUri;
+      });
+  ASSERT_NE(selected,
+            materialized.input.source_artifacts.end());
+  ASSERT_TRUE(
+      std::filesystem::remove(raw_path(root.path(), *selected)));
+
+  const FilesystemVerifiedRetainedPlanningModelSource source(
+      root.path());
+  EXPECT_THROW(
+      static_cast<void>(source.get_verified(query)),
+      RetainedBundleError);
+}
+
+TEST(FilesystemVerifiedRetainedPlanningModelSourceTest,
+     CatalogEnvelopeSplicedAcrossOpaqueKeysFailsClosed) {
+  ScopedTrustedRoot root;
+  const auto materialized =
+      materialize_durable_lite6_bundle(root.path());
+  const auto& product =
+      materialized.bundle->value()
+          .compiled_products.planning_collision_model;
+  const RetainedPlanningModelQuery query{
+      materialized.bundle->retained_bundle_id(),
+      product.product_id};
+  const core::ContentAddressedStoreKey alternate_key(
+      "opaque:test-only-cross-key-splice");
+  {
+    FilesystemCatalogArtifactStore catalog_store(root.path());
+    const auto stored = catalog_store.put_if_absent(
+        alternate_key,
+        materialized.input.catalog_reference.content_digest,
+        materialized.input.catalog_bytes);
+    EXPECT_TRUE(stored.inserted);
+  }
+  const std::string alternate_envelope =
+      test::read_lite6_fixture_file(
+          catalog_path(root.path(), alternate_key));
+  write_file(
+      catalog_path(
+          root.path(),
+          materialized.input.catalog_reference
+              .content_addressed_store_key),
+      alternate_envelope);
+
+  const FilesystemVerifiedRetainedPlanningModelSource source(
+      root.path());
+  EXPECT_THROW(
+      static_cast<void>(source.get_verified(query)),
+      RetainedBundleError);
 }
 
 TEST(FilesystemRetainedBundleRepositoryTest,
@@ -1436,13 +2129,15 @@ TEST(FilesystemRetentionStoreTest,
       root.path());
   FilesystemRawArtifactStore raw_store(root.path());
   FilesystemRetainedBundleRepository bundle_repository(root.path());
+  const detail::RejectingCompilerInputArtifactSource input_source;
+  detail::RejectingCatalogArtifactStore catalog_store;
 
   EXPECT_THROW(
       static_cast<void>(
           detail::RetainedBundleMaterializer::
               materialize_store_and_reload_production(
-                  fixture.qualified, manifest_repository, raw_store,
-                  bundle_repository)),
+                  fixture.qualified, manifest_repository, input_source,
+                  {}, catalog_store, raw_store, bundle_repository)),
       RetainedBundleError);
   EXPECT_EQ(manifest_repository.size(), 0U);
   EXPECT_EQ(raw_store.size(), 0U);

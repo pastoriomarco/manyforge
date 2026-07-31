@@ -41,6 +41,7 @@
 #include "content_identity_internal.hpp"
 #include "embedded_build_evidence.hpp"
 #include "model_source_contract_internal.hpp"
+#include "mf2_joint_name_internal.hpp"
 #include "posix_durability_internal.hpp"
 
 namespace manyforge::deployment {
@@ -64,6 +65,37 @@ constexpr std::string_view kBuiltinCatalogId = "manyforge_builtin";
 constexpr std::string_view kBuiltinCatalogContentVersion = "1.0.0";
 constexpr std::string_view kPythonSourcePackageFormat =
     "manyforge.python-source-package.v1";
+constexpr std::string_view kCompositionNamingScheme =
+    "mf1-non-joint+mf2-dependency-ordered-joint";
+constexpr std::string_view kCompositionNamePreimagePrefixes =
+    "non-joint=manyforge.occurrence-name.mf1;"
+    "joint=manyforge.occurrence-joint-name.mf2";
+constexpr std::string_view kCompositionGeneratedNamePrefixes =
+    "non-joint=mf1_;joint=mf2_joint_";
+constexpr std::string_view kMf2JointNameTokenFormat =
+    "mf2_joint_<parent-local-rank:zero-padded-decimal-6>_"
+    "<semantic-identity-sha256:lowerhex-64>";
+constexpr std::string_view kMf2JointSourceTieBreak =
+    "utf8-bytewise-source-joint-name";
+constexpr std::string_view kMf2JointMimicProjectionPolicy =
+    "master-before-follower-at-first-divergent-siblings-under-"
+    "lowest-common-ancestor;ancestor-master=already-safe;"
+    "descendant-master=reject";
+constexpr std::string_view kMf2JointSiblingOrderingPolicy =
+    "deterministic-kahn-topological-sort;"
+    "ready-tie-break=utf8-bytewise-source-joint-name;"
+    "projected-cycle=reject";
+constexpr std::string_view kMf2FixedConnectionOrderingPolicy =
+    "after-all-source-children;"
+    "then=utf8-bytewise-model-instance-id";
+constexpr std::string_view kMf2JointHashFieldEncoding =
+    "domain-utf8;then-each-field=NUL+label+'='+"
+    "decimal-utf8-byte-length+':'+raw-utf8-value";
+constexpr std::string_view kMf2SourceJointHashFields =
+    "cell_id,model_instance_id,model_asset_id,model_revision,"
+    "kind,scope,source";
+constexpr std::string_view kMf2FixedConnectionHashFields =
+    "cell_id,model_instance_id,kind,parent_link,child_link";
 [[noreturn]] void fail(std::string_view message) {
   throw BuildManifestError(std::string(message));
 }
@@ -726,10 +758,40 @@ struct IdentityContractRow final {
       {"resource_limits", resource_limits()},
       {"composition_contract",
        CanonicalValue(CanonicalValue::Object{
-           {"naming_scheme", CanonicalValue("mf1")},
+           {"naming_scheme",
+            CanonicalValue(std::string(kCompositionNamingScheme))},
            {"name_preimage_prefix",
-            CanonicalValue("manyforge.occurrence-name.mf1")},
-           {"generated_name_prefix", CanonicalValue("mf1_")},
+            CanonicalValue(std::string(kCompositionNamePreimagePrefixes))},
+           {"generated_name_prefix",
+            CanonicalValue(std::string(kCompositionGeneratedNamePrefixes))},
+           {"joint_name_token_format",
+            CanonicalValue(std::string(kMf2JointNameTokenFormat))},
+           {"joint_parent_local_rank_decimal_width",
+            CanonicalValue(
+                static_cast<double>(detail::kMf2JointLocalRankWidth))},
+           {"joint_parent_local_rank_capacity",
+            CanonicalValue(static_cast<double>(
+                detail::kMf2JointMaximumLocalRank + 1U))},
+           {"joint_source_tie_break",
+            CanonicalValue(std::string(kMf2JointSourceTieBreak))},
+           {"joint_mimic_projection_policy",
+            CanonicalValue(
+                std::string(kMf2JointMimicProjectionPolicy))},
+           {"joint_sibling_ordering_policy",
+            CanonicalValue(
+                std::string(kMf2JointSiblingOrderingPolicy))},
+           {"fixed_connection_ordering_policy",
+            CanonicalValue(
+                std::string(kMf2FixedConnectionOrderingPolicy))},
+           {"joint_hash_preimage_domain",
+            CanonicalValue(
+                std::string(detail::kMf2JointHashPreimageDomain))},
+           {"joint_hash_field_encoding",
+            CanonicalValue(std::string(kMf2JointHashFieldEncoding))},
+           {"source_joint_hash_fields",
+            CanonicalValue(std::string(kMf2SourceJointHashFields))},
+           {"fixed_connection_hash_fields",
+            CanonicalValue(std::string(kMf2FixedConnectionHashFields))},
            {"cell_frame_policy",
             CanonicalValue("one-compiler-owned-cell-frame")},
            {"rewrite_policy",
@@ -762,7 +824,8 @@ struct IdentityContractRow final {
            {"policies", CanonicalValue("reject-if-present")},
            {"compatibility", CanonicalValue("reject-if-present")},
            {"i3_retention_subset",
-            CanonicalValue("canonical-empty-only")},
+            CanonicalValue(
+                "passive-model-only-with-composed-symbol-role-map")},
        })},
       {"retained_projection_contract",
        CanonicalValue(CanonicalValue::Object{
@@ -779,13 +842,16 @@ struct IdentityContractRow final {
            {"qualified_product_contract_ids",
             CanonicalValue(sorted_text_values({
                 "manyforge.flattened_model",
+                "manyforge.composed_model_symbol_role_map",
             }))},
            {"qualified_product_placements",
             CanonicalValue(sorted_text_values({
                 "cell_planning_collision_model",
+                "symbol_role_map",
             }))},
            {"canonical_empty_artifact_roles",
-            CanonicalValue(sorted_text_values({"srdf", "urdf"}))},
+            CanonicalValue(sorted_text_values(
+                {"planning_resource_map", "srdf", "urdf"}))},
            {"active_alias_owner", CanonicalValue("none")},
        })},
   });
@@ -1410,23 +1476,85 @@ void require_compiler_contract_nested_shapes(
     previous_limit = id;
   }
 
-  const auto require_closed_text_object =
-      [](const CanonicalValue& value, std::string_view field,
-         std::initializer_list<std::string_view> fields) {
-        const auto& object = require_object(value, field);
-        require_exact_fields(object, fields, field);
-        for (const std::string_view name : fields) {
-          (void)require_text(require_member(object, name, field),
-                             std::string(field) + "." +
-                                 std::string(name));
-        }
-      };
-  require_closed_text_object(
+  const std::string composition_field =
+      "compiler_contract_manifest.composition_contract";
+  const auto& composition = require_object(
       require_member(root, "composition_contract",
                      "compiler_contract_manifest"),
-      "compiler_contract_manifest.composition_contract",
+      composition_field);
+  require_exact_fields(
+      composition,
       {"naming_scheme", "name_preimage_prefix", "generated_name_prefix",
-       "cell_frame_policy", "rewrite_policy", "frame_path_policy"});
+       "joint_name_token_format",
+       "joint_parent_local_rank_decimal_width",
+       "joint_parent_local_rank_capacity", "joint_source_tie_break",
+       "joint_mimic_projection_policy",
+       "joint_sibling_ordering_policy",
+       "fixed_connection_ordering_policy",
+       "joint_hash_preimage_domain", "joint_hash_field_encoding",
+       "source_joint_hash_fields", "fixed_connection_hash_fields",
+       "cell_frame_policy",
+       "rewrite_policy", "frame_path_policy"},
+      composition_field);
+  const auto require_exact_composition_text =
+      [&](std::string_view name, std::string_view expected) {
+        const auto& actual = require_text(
+            require_member(composition, name, composition_field),
+            composition_field + "." + std::string(name));
+        if (actual != expected) {
+          fail(composition_field + "." + std::string(name) +
+               " does not match the compiler-owned naming contract");
+        }
+      };
+  require_exact_composition_text("naming_scheme",
+                                 kCompositionNamingScheme);
+  require_exact_composition_text("name_preimage_prefix",
+                                 kCompositionNamePreimagePrefixes);
+  require_exact_composition_text("generated_name_prefix",
+                                 kCompositionGeneratedNamePrefixes);
+  require_exact_composition_text("joint_name_token_format",
+                                 kMf2JointNameTokenFormat);
+  require_exact_composition_text("joint_source_tie_break",
+                                 kMf2JointSourceTieBreak);
+  require_exact_composition_text("joint_mimic_projection_policy",
+                                 kMf2JointMimicProjectionPolicy);
+  require_exact_composition_text("joint_sibling_ordering_policy",
+                                 kMf2JointSiblingOrderingPolicy);
+  require_exact_composition_text("fixed_connection_ordering_policy",
+                                 kMf2FixedConnectionOrderingPolicy);
+  require_exact_composition_text("joint_hash_preimage_domain",
+                                 detail::kMf2JointHashPreimageDomain);
+  require_exact_composition_text("joint_hash_field_encoding",
+                                 kMf2JointHashFieldEncoding);
+  require_exact_composition_text("source_joint_hash_fields",
+                                 kMf2SourceJointHashFields);
+  require_exact_composition_text("fixed_connection_hash_fields",
+                                 kMf2FixedConnectionHashFields);
+  if (require_safe_integer(
+          require_member(composition,
+                         "joint_parent_local_rank_decimal_width",
+                         composition_field),
+          composition_field +
+              ".joint_parent_local_rank_decimal_width") !=
+      detail::kMf2JointLocalRankWidth) {
+    fail(composition_field +
+         ".joint_parent_local_rank_decimal_width is not the mf2 width");
+  }
+  if (require_safe_integer(
+          require_member(composition,
+                         "joint_parent_local_rank_capacity",
+                         composition_field),
+          composition_field + ".joint_parent_local_rank_capacity") !=
+      detail::kMf2JointMaximumLocalRank + 1U) {
+    fail(composition_field +
+         ".joint_parent_local_rank_capacity is not the mf2 capacity");
+  }
+  for (const std::string_view name :
+       {"cell_frame_policy", "rewrite_policy", "frame_path_policy"}) {
+    (void)require_text(
+        require_member(composition, name, composition_field),
+        composition_field + "." + std::string(name));
+  }
 
   const auto& accepted = require_object(
       require_member(root, "accepted_deployment_subset",
@@ -1636,6 +1764,7 @@ void require_compiler_build_shape(const CanonicalValue& candidate) {
                  input_id.starts_with("cpp-internal-header:") ||
                  input_id.starts_with("cpp-translation-unit:") ||
                  input_id.starts_with("compiler-tool:") ||
+                 input_id.starts_with("compiler-python-tool:") ||
                  input_id.starts_with("compiler-resource:"))
               : (input_id.starts_with("build-recipe:") ||
                  input_id.starts_with("build-template:"));
@@ -1901,8 +2030,11 @@ BuildManifestTestAccess::materialize_with_candidates(
   for (const auto& manifest : context.manifests()) {
     (void)manifest_repository.put_if_absent(manifest);
   }
+  const RejectingCompilerInputArtifactSource input_source;
+  RejectingCatalogArtifactStore catalog_store;
   return RetainedBundleMaterializer::materialize(
-      qualified, context, artifact_store);
+      qualified, context, input_source, {}, catalog_store,
+      artifact_store);
 }
 
 std::shared_ptr<const BuildQualifiedManifest>

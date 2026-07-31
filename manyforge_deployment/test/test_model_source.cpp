@@ -2,12 +2,16 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <manyforge_core/types/model_asset.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
 #include <manyforge_deployment/model_source.hpp>
+#include <manyforge_deployment/structural_model_preparation.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -111,7 +115,8 @@ struct Fixture final {
   return *found;
 }
 
-[[nodiscard]] CanonicalValue asset_identity_value(const Fixture& fixture) {
+[[nodiscard]] CanonicalValue expanded_source_value(
+    const Fixture& fixture) {
   auto blobs = fixture.blobs;
   std::sort(blobs.begin(), blobs.end(),
             [](const SourceBlob& left, const SourceBlob& right) {
@@ -136,6 +141,10 @@ struct Fixture final {
     expanded.emplace_back("srdf_logical_uri",
                           CanonicalValue(*fixture.srdf_uri));
   }
+  return CanonicalValue(std::move(expanded));
+}
+
+[[nodiscard]] CanonicalValue asset_identity_value(const Fixture& fixture) {
   CanonicalValue::Array groups;
   if (fixture.srdf_uri.has_value()) {
     groups.emplace_back(CanonicalValue::Object{
@@ -148,7 +157,7 @@ struct Fixture final {
        CanonicalValue(std::string(core::kModelAssetApiVersion))},
       {"model_asset_id", CanonicalValue(fixture.asset_id)},
       {"instance_cardinality", CanonicalValue("multiple_per_cell")},
-      {"expanded_source", CanonicalValue(std::move(expanded))},
+      {"expanded_source", expanded_source_value(fixture)},
       {"root_frame_role_id", CanonicalValue("base")},
       {"frame_role_bindings",
        CanonicalValue(CanonicalValue::Array{
@@ -185,8 +194,8 @@ struct Fixture final {
   });
 }
 
-[[nodiscard]] std::string model_asset_document(const Fixture& fixture) {
-  const auto identity = asset_identity_value(fixture);
+[[nodiscard]] std::string model_asset_document_from_identity(
+    const CanonicalValue& identity) {
   std::string preimage{"manyforge.content-identity.v1"};
   preimage.push_back('\0');
   preimage.append("catalog-record-revision/model_asset");
@@ -198,6 +207,11 @@ struct Fixture final {
   root.emplace_back("model_revision",
                     CanonicalValue(sha256_digest(preimage)));
   return canonical_json(CanonicalValue(std::move(root)));
+}
+
+[[nodiscard]] std::string model_asset_document(const Fixture& fixture) {
+  return model_asset_document_from_identity(
+      asset_identity_value(fixture));
 }
 
 [[nodiscard]] std::string revision_from_document(
@@ -223,6 +237,134 @@ struct Fixture final {
       core::SchemaRevision(std::string(kModelAssetSchemaRevision)),
       core::ContentDigest(sha256_digest(document)), key};
   return resolve_and_qualify_model_asset(reference, key, document);
+}
+
+[[nodiscard]] std::string read_binary_file(
+    const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    ADD_FAILURE() << "unable to read fixture file " << path;
+    return {};
+  }
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+}
+
+[[nodiscard]] Fixture lite6_fixture() {
+  Fixture fixture;
+  fixture.asset_id = "lite6_lite_gripper";
+  fixture.urdf_uri = "asset://lite6_lite_gripper/model.urdf";
+  fixture.srdf_uri = "asset://lite6_lite_gripper/model.srdf";
+  fixture.blobs.clear();
+
+  const std::filesystem::path prepared_root{
+      MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT};
+  const std::filesystem::path source_root{
+      MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT};
+  fixture.blobs.emplace_back(
+      fixture.urdf_uri, "application/xml",
+      read_binary_file(prepared_root / "model.urdf"));
+  fixture.blobs.emplace_back(
+      *fixture.srdf_uri, "application/xml",
+      read_binary_file(prepared_root / "model.srdf"));
+
+  std::vector<std::filesystem::path> mesh_paths;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(
+           source_root / "meshes")) {
+    if (entry.is_regular_file() && entry.path().extension() == ".stl") {
+      mesh_paths.push_back(entry.path());
+    }
+  }
+  std::sort(mesh_paths.begin(), mesh_paths.end());
+  for (const auto& mesh_path : mesh_paths) {
+    const auto relative =
+        std::filesystem::relative(mesh_path, source_root).generic_string();
+    fixture.blobs.emplace_back(
+        "asset://lite6_lite_gripper/" + relative, "model/stl",
+        read_binary_file(mesh_path));
+  }
+  return fixture;
+}
+
+[[nodiscard]] CanonicalValue lite6_asset_identity_value(
+    const Fixture& fixture) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(core::kModelAssetApiVersion))},
+      {"model_asset_id", CanonicalValue(fixture.asset_id)},
+      {"instance_cardinality", CanonicalValue("multiple_per_cell")},
+      {"expanded_source", expanded_source_value(fixture)},
+      {"root_frame_role_id", CanonicalValue("root")},
+      {"frame_role_bindings",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(CanonicalValue::Object{
+               {"frame_role_id", CanonicalValue("base")},
+               {"source_link_name", CanonicalValue("link_base")},
+           }),
+           CanonicalValue(CanonicalValue::Object{
+               {"frame_role_id", CanonicalValue("flange")},
+               {"source_link_name", CanonicalValue("link_eef")},
+           }),
+           CanonicalValue(CanonicalValue::Object{
+               {"frame_role_id", CanonicalValue("root")},
+               {"source_link_name", CanonicalValue("world")},
+           }),
+           CanonicalValue(CanonicalValue::Object{
+               {"frame_role_id", CanonicalValue("tcp")},
+               {"source_link_name", CanonicalValue("link_tcp")},
+           }),
+       })},
+      {"model_group_role_bindings",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(CanonicalValue::Object{
+               {"model_group_role_id", CanonicalValue("arm")},
+               {"source_group_name", CanonicalValue("lite6")},
+           }),
+           CanonicalValue(CanonicalValue::Object{
+               {"model_group_role_id", CanonicalValue("gripper")},
+               {"source_group_name", CanonicalValue("lite_gripper")},
+           }),
+       })},
+      {"resource_role_bindings",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(CanonicalValue::Object{
+               {"resource_role_id", CanonicalValue("arm_joints")},
+               {"source_joint_names",
+                CanonicalValue(CanonicalValue::Array{
+                    CanonicalValue("joint1"), CanonicalValue("joint2"),
+                    CanonicalValue("joint3"), CanonicalValue("joint4"),
+                    CanonicalValue("joint5"), CanonicalValue("joint6")})},
+           }),
+           CanonicalValue(CanonicalValue::Object{
+               {"resource_role_id", CanonicalValue("gripper_joint")},
+               {"source_joint_names",
+                CanonicalValue(CanonicalValue::Array{
+                    CanonicalValue("right_finger_joint")})},
+           }),
+       })},
+      {"collision_body_role_bindings",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(CanonicalValue::Object{
+               {"collision_body_role_id",
+                CanonicalValue("arm_collision")},
+               {"source_link_names",
+                CanonicalValue(CanonicalValue::Array{
+                    CanonicalValue("link1"), CanonicalValue("link2"),
+                    CanonicalValue("link3"), CanonicalValue("link4"),
+                    CanonicalValue("link5"), CanonicalValue("link6"),
+                    CanonicalValue("link_base")})},
+           }),
+           CanonicalValue(CanonicalValue::Object{
+               {"collision_body_role_id",
+                CanonicalValue("gripper_collision")},
+               {"source_link_names",
+                CanonicalValue(CanonicalValue::Array{
+                    CanonicalValue("lite_gripper_base_link"),
+                    CanonicalValue("lite_gripper_left_finger"),
+                    CanonicalValue("lite_gripper_right_finger")})},
+           }),
+       })},
+  });
 }
 
 [[nodiscard]] std::vector<ResolvedModelSourceArtifactCandidate> candidates(
@@ -621,6 +763,84 @@ TEST(ModelSource, VerifiesExactClosureAndRetainsCompleteTypedSourceIr) {
       (std::vector<SourceArtifactReferenceIr>{
           {"asset://test_robot/meshes/base.stl",
            SourceArtifactReferenceKind::kMesh}}));
+}
+
+TEST(ModelSource,
+     PreparedLite6ArticulatedGripperPassesExactSourceVerification) {
+  const auto fixture = lite6_fixture();
+  const auto document = model_asset_document_from_identity(
+      lite6_asset_identity_value(fixture));
+  const auto document_digest = sha256_digest(document);
+  const core::ContentAddressedStoreKey key(
+      "sha256/" + document_digest.substr(7U));
+  const core::ModelAssetCatalogRecordRefDTO reference{
+      core::ModelAssetId(fixture.asset_id),
+      core::ModelRevision(revision_from_document(document)),
+      core::SchemaId(std::string(core::kModelAssetApiVersion)),
+      core::SchemaRevision(std::string(kModelAssetSchemaRevision)),
+      core::ContentDigest(document_digest), key};
+
+  const auto qualified =
+      resolve_and_qualify_model_asset(reference, key, document);
+  const auto verified =
+      verify_model_source_closure(qualified, candidates(fixture));
+  const auto& source = verified.source_ir();
+
+  ASSERT_EQ(verified.verified_artifacts().size(), 20U);
+  EXPECT_EQ(source.urdf().robot_name, "lite6_lite_gripper");
+  EXPECT_EQ(source.semantic_index().root_link_name, "world");
+  ASSERT_EQ(source.urdf().links.size(), 13U);
+  ASSERT_EQ(source.urdf().joints.size(), 12U);
+  ASSERT_EQ(source.artifact_references().size(), 18U);
+  EXPECT_TRUE(std::all_of(
+      source.artifact_references().begin(),
+      source.artifact_references().end(),
+      [](const SourceArtifactReferenceIr& reference) {
+        return reference.kind == SourceArtifactReferenceKind::kMesh &&
+               reference.logical_uri.starts_with(
+                   "asset://lite6_lite_gripper/meshes/");
+      }));
+
+  const auto& left_finger =
+      named(source.urdf().joints, "left_finger_joint");
+  ASSERT_TRUE(left_finger.mimic.has_value());
+  EXPECT_EQ(left_finger.mimic->joint_name, "right_finger_joint");
+  EXPECT_DOUBLE_EQ(left_finger.mimic->multiplier, 1.0);
+  EXPECT_DOUBLE_EQ(left_finger.mimic->offset, 0.0);
+
+  ASSERT_TRUE(source.srdf().has_value());
+  const auto& srdf = *source.srdf();
+  EXPECT_EQ(named(srdf.groups, "lite6").name, "lite6");
+  EXPECT_EQ(named(srdf.groups, "lite_gripper").name, "lite_gripper");
+  EXPECT_EQ(srdf.disabled_collisions.size(), 29U);
+
+  const auto independent_coordinates = std::count_if(
+      source.urdf().joints.begin(), source.urdf().joints.end(),
+      [](const UrdfJointIr& joint) {
+        return joint.coordinate_kind != UrdfCoordinateKind::kNone &&
+               !joint.mimic.has_value();
+      });
+  EXPECT_EQ(independent_coordinates, 7);
+
+  const auto preparation =
+      verify_build_qualified_structural_model_preparation(
+          read_binary_file(
+              std::filesystem::path{
+                  MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT} /
+              "preparation-manifest.json"),
+          read_binary_file(
+              std::filesystem::path{
+                  MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT} /
+              "lite6_lite_gripper.urdf"),
+          read_binary_file(
+              std::filesystem::path{
+                  MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT} /
+              "lite6_lite_gripper.srdf"),
+          verified);
+  EXPECT_EQ(preparation.generator_record().generator_id.value(),
+            kStructuralModelPreparationGeneratorId);
+  EXPECT_EQ(preparation.generator_record().generator_version.value(),
+            kStructuralModelPreparationGeneratorVersion);
 }
 
 TEST(ModelSource, RetainsEverySupportedRecordAndCanonicalRoundTrips) {

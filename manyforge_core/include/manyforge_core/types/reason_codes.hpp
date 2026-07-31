@@ -25,6 +25,8 @@ inline constexpr char kSceneSnapshotLeaseExpired[] =
     "scene_snapshot_lease_expired";
 inline constexpr char kObservedSceneSourceStale[] =
     "observed_scene_source_stale";
+inline constexpr char kProjectionStructureChangedAfterValidation[] =
+    "projection_structure_changed_after_validation";
 inline constexpr char kSceneTopologyChangedAfterValidation[] =
     "scene_topology_changed_after_validation";
 inline constexpr char kCollisionPolicyChangedAfterValidation[] =

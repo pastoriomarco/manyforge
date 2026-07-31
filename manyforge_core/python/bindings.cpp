@@ -477,6 +477,50 @@ PYBIND11_MODULE(manyforge_core_py, m) {
     // Planning DTOs
     // ========================================================================
 
+    py::class_<manyforge::core::SceneRevision>(m, "SceneRevision")
+        .def(py::init<>())
+        .def(py::init<manyforge::core::SceneId, std::uint64_t,
+                      manyforge::core::ContentDigest>(),
+             py::arg("scene_id"), py::arg("revision_id"),
+             py::arg("content_hash"))
+        .def_readwrite("scene_id", &manyforge::core::SceneRevision::scene_id)
+        .def_readwrite("revision_id",
+                       &manyforge::core::SceneRevision::revision_id)
+        .def_readwrite("content_hash",
+                       &manyforge::core::SceneRevision::content_hash)
+        .def("valid", &manyforge::core::SceneRevision::valid);
+
+    py::class_<manyforge::core::ProjectionRevisionDTO>(
+        m, "ProjectionRevisionDTO")
+        .def(py::init<>())
+        .def(py::init<manyforge::core::RetainedBundleId,
+                      manyforge::core::GraphRevision,
+                      manyforge::core::SceneRevision>(),
+             py::arg("retained_bundle_id"), py::arg("graph_revision"),
+             py::arg("scene_revision"))
+        .def_readwrite(
+            "retained_bundle_id",
+            &manyforge::core::ProjectionRevisionDTO::retained_bundle_id)
+        .def_readwrite("graph_revision",
+                       &manyforge::core::ProjectionRevisionDTO::graph_revision)
+        .def_readwrite("scene_revision",
+                       &manyforge::core::ProjectionRevisionDTO::scene_revision)
+        .def("valid", &manyforge::core::ProjectionRevisionDTO::valid);
+
+    py::class_<manyforge::core::ProjectionLeaseBindingDTO>(
+        m, "ProjectionLeaseBindingDTO")
+        .def(py::init<>())
+        .def(py::init<manyforge::core::ProjectionRevisionDTO,
+                      manyforge::core::ProjectionLeaseId>(),
+             py::arg("projection_revision"), py::arg("projection_lease_id"))
+        .def_readwrite(
+            "projection_revision",
+            &manyforge::core::ProjectionLeaseBindingDTO::projection_revision)
+        .def_readwrite(
+            "projection_lease_id",
+            &manyforge::core::ProjectionLeaseBindingDTO::projection_lease_id)
+        .def("valid", &manyforge::core::ProjectionLeaseBindingDTO::valid);
+
     py::class_<manyforge::core::PlanRequestDTO>(m, "PlanRequestDTO")
         .def(py::init<>())
         .def(py::init<const std::string&, const std::string&, const std::string&,
@@ -502,7 +546,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("planning_profile",
                        &manyforge::core::PlanRequestDTO::planning_profile)
         .def_readwrite("per_joint_dynamics_limits", &manyforge::core::PlanRequestDTO::per_joint_dynamics_limits)
-        .def_readwrite("scene_binding", &manyforge::core::PlanRequestDTO::scene_binding)
+        .def_readwrite("projection_binding",
+                       &manyforge::core::PlanRequestDTO::projection_binding)
         .def("__repr__", [](const manyforge::core::PlanRequestDTO& p) {
             return py::str("PlanRequestDTO(robot_id='{}', group_id='{}')")
                 .format(p.robot_id, p.group_id);
@@ -512,7 +557,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def(py::init<>())
         .def_readwrite("trajectory", &manyforge::core::PlanResultDTO::trajectory)
         .def_readwrite("error", &manyforge::core::PlanResultDTO::error)
-        .def_readwrite("scene_revision", &manyforge::core::PlanResultDTO::scene_revision)
+        .def_readwrite("projection_revision",
+                       &manyforge::core::PlanResultDTO::projection_revision)
         .def("__repr__", [](const manyforge::core::PlanResultDTO& p) {
             return py::str("PlanResultDTO(trajectory={})")
                 .format(p.trajectory.has_value() ? "present" : "absent");
@@ -634,100 +680,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             return py::str("MeshShapeDTO(resource_uri='{}')").format(m.resource_uri);
         });
 
-    py::class_<manyforge::core::AddObjectRequestDTO>(m, "AddObjectRequestDTO")
-        .def(py::init<>())
-        .def(py::init<const std::string&, manyforge::core::CollisionShapeDTO,
-                      manyforge::core::Pose3DTO, const std::string&>(),
-             py::arg("object_id"), py::arg("shape"), py::arg("pose"), py::arg("frame_id"))
-        .def_readwrite("object_id", &manyforge::core::AddObjectRequestDTO::object_id)
-        .def_readwrite("shape", &manyforge::core::AddObjectRequestDTO::shape)
-        .def_readwrite("pose", &manyforge::core::AddObjectRequestDTO::pose)
-        .def_readwrite("frame_id", &manyforge::core::AddObjectRequestDTO::frame_id)
-        .def("__repr__", [](const manyforge::core::AddObjectRequestDTO& a) {
-            return py::str("AddObjectRequestDTO(object_id='{}')").format(a.object_id);
-        });
-
-    py::class_<manyforge::core::RemoveObjectRequestDTO>(m, "RemoveObjectRequestDTO")
-        .def(py::init<>())
-        .def(py::init<const std::string&>(), py::arg("object_id"))
-        .def_readwrite("object_id", &manyforge::core::RemoveObjectRequestDTO::object_id)
-        .def("__repr__", [](const manyforge::core::RemoveObjectRequestDTO& r) {
-            return py::str("RemoveObjectRequestDTO(object_id='{}')").format(r.object_id);
-        });
-
-    py::class_<manyforge::core::UpdateObjectPoseRequestDTO>(m, "UpdateObjectPoseRequestDTO")
-        .def(py::init<>())
-        .def(py::init<const std::string&, manyforge::core::Pose3DTO, const std::string&>(),
-             py::arg("object_id"), py::arg("pose"), py::arg("frame_id"))
-        .def_readwrite("object_id", &manyforge::core::UpdateObjectPoseRequestDTO::object_id)
-        .def_readwrite("pose", &manyforge::core::UpdateObjectPoseRequestDTO::pose)
-        .def_readwrite("frame_id", &manyforge::core::UpdateObjectPoseRequestDTO::frame_id)
-        .def_readwrite("source_id", &manyforge::core::UpdateObjectPoseRequestDTO::source_id)
-        .def_readwrite("source_timestamp_ns",
-                       &manyforge::core::UpdateObjectPoseRequestDTO::source_timestamp_ns)
-        .def_readwrite(
-            "source_freshness_budget_ns",
-            &manyforge::core::UpdateObjectPoseRequestDTO::source_freshness_budget_ns)
-        .def_readwrite("scene_admission_role",
-                       &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_role)
-        .def_readwrite("scene_admission_lease_max_age_ns",
-                       &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_lease_max_age_ns)
-        .def_readwrite(
-            "scene_admission_target_drift_tolerance_m",
-            &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_target_drift_tolerance_m)
-        .def_readwrite(
-            "scene_admission_target_angular_tolerance_rad",
-            &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_target_angular_tolerance_rad)
-        .def_readwrite(
-            "scene_admission_obstacle_drift_tolerance_m",
-            &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_obstacle_drift_tolerance_m)
-        .def_readwrite(
-            "scene_admission_obstacle_angular_tolerance_rad",
-            &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_obstacle_angular_tolerance_rad)
-        .def_readwrite(
-            "scene_admission_allow_runtime_dynamic_obstacle",
-            &manyforge::core::UpdateObjectPoseRequestDTO::scene_admission_allow_runtime_dynamic_obstacle)
-        .def_readwrite("expected_attached",
-                       &manyforge::core::UpdateObjectPoseRequestDTO::expected_attached)
-        .def("__repr__", [](const manyforge::core::UpdateObjectPoseRequestDTO& u) {
-            return py::str("UpdateObjectPoseRequestDTO(object_id='{}')").format(u.object_id);
-        });
-
-    py::class_<manyforge::core::ObjectStateDTO>(m, "ObjectStateDTO")
-        .def(py::init<>())
-        .def(py::init<const std::string&, bool, bool, std::optional<std::string>>(),
-             py::arg("object_id"),
-             py::arg("exists"),
-             py::arg("attached"),
-             py::arg("frame_id") = std::nullopt)
-        .def_readwrite("object_id", &manyforge::core::ObjectStateDTO::object_id)
-        .def_readwrite("exists", &manyforge::core::ObjectStateDTO::exists)
-        .def_readwrite("attached", &manyforge::core::ObjectStateDTO::attached)
-        .def_readwrite("frame_id", &manyforge::core::ObjectStateDTO::frame_id)
-        .def("__repr__", [](const manyforge::core::ObjectStateDTO& o) {
-            return py::str("ObjectStateDTO(object_id='{}', exists={}, attached={}, frame_id={})")
-                .format(o.object_id, o.exists, o.attached,
-                        o.frame_id.has_value() ? py::cast(*o.frame_id) : py::none());
-        });
-
-    py::class_<manyforge::core::SceneEditResultDTO>(m, "SceneEditResultDTO")
-        .def(py::init<>())
-        .def_readwrite("success", &manyforge::core::SceneEditResultDTO::success)
-        .def_readwrite("error", &manyforge::core::SceneEditResultDTO::error)
-        .def_readwrite("update_status",
-                       &manyforge::core::SceneEditResultDTO::update_status)
-        .def_readwrite(
-            "collision_world_revision_changed",
-            &manyforge::core::SceneEditResultDTO::collision_world_revision_changed)
-        .def_readwrite(
-            "collision_world_freshness_changed",
-            &manyforge::core::SceneEditResultDTO::collision_world_freshness_changed)
-        .def_readwrite("rollback_proven",
-                       &manyforge::core::SceneEditResultDTO::rollback_proven)
-        .def("__repr__", [](const manyforge::core::SceneEditResultDTO& s) {
-            return py::str("SceneEditResultDTO(success={})").format(s.success);
-        });
-
     // ========================================================================
     // Normalized Collision DTOs (spec §3.8.1)
     //
@@ -828,17 +780,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             return py::str("CollisionWorldRevision(revision_id={}, content_hash='{}')")
                 .format(r.revision_id, r.content_hash);
         });
-
-    py::class_<manyforge::core::SceneRevisionBindingDTO>(m, "SceneRevisionBindingDTO")
-        .def(py::init<>())
-        .def(py::init<manyforge::core::SceneRevisionDTO, const std::string&>(),
-             py::arg("revision"), py::arg("projection_lease_id"))
-        .def_readwrite("revision",
-                       &manyforge::core::SceneRevisionBindingDTO::revision)
-        .def_readwrite(
-            "projection_lease_id",
-            &manyforge::core::SceneRevisionBindingDTO::projection_lease_id)
-        .def("valid", &manyforge::core::SceneRevisionBindingDTO::valid);
 
     py::enum_<manyforge::core::CollisionWorldMutationSource>(m, "CollisionWorldMutationSource")
         .value("kProgramLoad",

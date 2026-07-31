@@ -422,8 +422,8 @@ class TestLauncherKernelCreation:
         finally:
             os.unlink(path)
 
-    def test_create_kernel_returns_mock_when_roboplan_not_available(self):
-        """When roboplan adapter but module not available, return MockKernelClient."""
+    def test_create_kernel_fails_closed_when_roboplan_not_available(self):
+        """A production adapter cannot masquerade as a mock during cutover."""
         data = _minimal_deployment()
         data["adapters"]["planning"]["adapter_id"] = "planning.roboplan"
         data["adapters"]["planning"]["capability_keys"] = [
@@ -439,12 +439,13 @@ class TestLauncherKernelCreation:
 
         try:
             deployment = Deployment(deploy_path)
-            # Force ImportError for manyforge_roboplan_py to test fallback path
+            # Force ImportError for the deliberately removed runtime module.
             with patch.dict(sys.modules, {"manyforge_roboplan_py": None}):
-                kernel = create_kernel(deployment)
-
-            # Should fall back to MockKernelClient since manyforge_roboplan_py is not available
-            assert isinstance(kernel, MockKernelClient)
+                with pytest.raises(
+                    RuntimeError,
+                    match="intentionally unavailable during the composable-cell",
+                ):
+                    create_kernel(deployment)
         finally:
             os.unlink(deploy_path)
 

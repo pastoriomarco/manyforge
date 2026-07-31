@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -264,6 +265,9 @@ struct ApplyConfigurationFenceIntentDTO final {
     }
     return true;
   }
+
+  friend bool operator==(const ApplyConfigurationFenceIntentDTO&,
+                         const ApplyConfigurationFenceIntentDTO&) = default;
 };
 
 struct ConfigurationFenceAcceptedDTO final {
@@ -279,6 +283,22 @@ struct ConfigurationFenceAcceptedDTO final {
            captured_scope.valid() && accepted_at_ns >= 0 &&
            IsAcceptedRequestReplayStatus(replay_status);
   }
+
+  /// Exact successful Acquire relation.
+  ///
+  /// `expected_fence_generation` is a compare-and-swap predecessor. A new
+  /// acceptance is its immediate successor; exact request replay returns that
+  /// same accepted identity and therefore satisfies the same relation.
+  [[nodiscard]] bool matches(
+      const ApplyConfigurationFenceIntentDTO& intent) const noexcept {
+    const auto predecessor = intent.expected_fence_generation.value();
+    return valid() && intent.valid() && captured_scope == intent.scope &&
+           predecessor < std::numeric_limits<std::uint64_t>::max() &&
+           configuration_fence_generation.value() == predecessor + 1U;
+  }
+
+  friend bool operator==(const ConfigurationFenceAcceptedDTO&,
+                         const ConfigurationFenceAcceptedDTO&) = default;
 };
 
 enum class ConfigurationFenceState {
@@ -317,6 +337,97 @@ struct ExecutionHostEpochDTO final {
 
   friend bool operator==(const ExecutionHostEpochDTO&,
                          const ExecutionHostEpochDTO&) = default;
+};
+
+/// Exact durable Manager attempt used only to reconcile a lost Acquire
+/// response before any later Apply effect is allowed.
+///
+/// The complete immutable intent is included deliberately: request identity
+/// alone cannot distinguish an exact result from an ID conflict. The attempt
+/// digest binds this value to the Manager's append-only journal record.
+struct ApplyFenceAcquireAttemptQueryDTO final {
+  ApplyConfigurationFenceIntentDTO persisted_intent;
+  ContentDigest persisted_attempt_digest;
+  RuntimeEpoch manager_runtime_epoch;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return persisted_intent.valid() && !persisted_attempt_digest.empty() &&
+           !manager_runtime_epoch.empty();
+  }
+
+  friend bool operator==(const ApplyFenceAcquireAttemptQueryDTO&,
+                         const ApplyFenceAcquireAttemptQueryDTO&) = default;
+};
+
+enum class ApplyFenceAcquireAttemptReconcileState {
+  kAcceptedExact,
+  kNotSeen,
+  kConflicting,
+  kUncertain,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(
+    ApplyFenceAcquireAttemptReconcileState state) noexcept {
+  switch (state) {
+    case ApplyFenceAcquireAttemptReconcileState::kAcceptedExact:
+      return "accepted_exact";
+    case ApplyFenceAcquireAttemptReconcileState::kNotSeen:
+      return "not_seen";
+    case ApplyFenceAcquireAttemptReconcileState::kConflicting:
+      return "conflicting";
+    case ApplyFenceAcquireAttemptReconcileState::kUncertain:
+      return "uncertain";
+  }
+  return {};
+}
+
+/// Closed read-only result for an attempt-only Manager journal record.
+///
+/// `kNotSeen` is the sole state that permits retrying the exact persisted
+/// Acquire request. `kAcceptedExact` supplies the result that Manager must
+/// append before normal fence rehydration. Conflict or uncertainty always
+/// leaves admission fenced and requires explicit recovery direction.
+struct ApplyFenceAcquireAttemptReconcileResultDTO final {
+  ExecutionHostEpochDTO execution_host_epoch;
+  ApplyFenceAcquireAttemptQueryDTO echoed_query;
+  ApplyFenceAcquireAttemptReconcileState state;
+  std::optional<ConfigurationFenceAcceptedDTO> accepted_fence;
+  bool admission_fenced;
+  std::string required_compensation_or_operator_direction;
+  ContentDigest result_digest;
+  std::optional<ErrorDTO> error;
+
+  [[nodiscard]] bool presence_valid() const noexcept {
+    if (!execution_host_epoch.valid() || !echoed_query.valid() ||
+        result_digest.empty()) {
+      return false;
+    }
+    const bool has_error = error.has_value();
+    if (has_error && error->code.empty()) {
+      return false;
+    }
+
+    switch (state) {
+      case ApplyFenceAcquireAttemptReconcileState::kAcceptedExact:
+        return accepted_fence.has_value() &&
+               accepted_fence->matches(echoed_query.persisted_intent) &&
+               admission_fenced && !has_error &&
+               required_compensation_or_operator_direction.empty();
+      case ApplyFenceAcquireAttemptReconcileState::kNotSeen:
+        return !accepted_fence.has_value() && !has_error &&
+               required_compensation_or_operator_direction.empty();
+      case ApplyFenceAcquireAttemptReconcileState::kConflicting:
+      case ApplyFenceAcquireAttemptReconcileState::kUncertain:
+        return !accepted_fence.has_value() && admission_fenced && has_error &&
+               !required_compensation_or_operator_direction.empty();
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool matches(
+      const ApplyFenceAcquireAttemptQueryDTO& query) const noexcept {
+    return presence_valid() && query.valid() && echoed_query == query;
+  }
 };
 
 struct ApplyFenceRehydrateDTO final {

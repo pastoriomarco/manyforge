@@ -1,5 +1,10 @@
 # Controlled Stop — Internals Reference
 
+> **Current `dev` status:** the runtime adapters described here are
+> intentionally unavailable during the composable-cell destructive cutover.
+> This remains the last qualified baseline and must not be read as evidence
+> that native, Isaac, or real-robot Stop paths are currently runnable.
+
 Reference companion to [`operations/STOP_PROFILES.md`](../operations/STOP_PROFILES.md).
 This document describes the implemented stop architecture and the current
 qualification surface. It is intentionally code-facing: future maintainers should

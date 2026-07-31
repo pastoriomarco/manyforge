@@ -29,6 +29,23 @@ flattened_model_artifact_roles() {
   return roles;
 }
 
+[[nodiscard]] std::vector<ProductContractArtifactRole>
+composed_model_symbol_role_map_artifact_roles() {
+  std::vector<ProductContractArtifactRole> roles;
+  const auto qualified =
+      detail::composed_model_symbol_role_map_product_artifact_roles();
+  roles.reserve(qualified.size());
+  for (const auto& role : qualified) {
+    roles.push_back(ProductContractArtifactRole{
+        core::ArtifactRoleId(std::string(role.artifact_role_id)),
+        std::string(role.media_type),
+        role.required ? ProductArtifactCardinality::kRequiredExactlyOne
+                      : ProductArtifactCardinality::kOptionalAtMostOne,
+    });
+  }
+  return roles;
+}
+
 }  // namespace
 
 BuildQualifiedProductContract::BuildQualifiedProductContract(
@@ -54,6 +71,14 @@ BuildQualifiedProductContractRegistry::
       ProductPlacement::kCellPlanningCollisionModel,
       flattened_model_artifact_roles(),
       detail::flattened_model_product_contract_descriptor()));
+  contracts_.push_back(BuildQualifiedProductContract(
+      core::ProductContractId(std::string(
+          detail::composed_model_symbol_role_map_product_contract_id())),
+      detail::composed_model_symbol_role_map_product_contract_revision(),
+      core::RetainedProductKind::kSymbolRoleMap,
+      ProductPlacement::kSymbolRoleMap,
+      composed_model_symbol_role_map_artifact_roles(),
+      detail::composed_model_symbol_role_map_product_contract_descriptor()));
 }
 
 const BuildQualifiedProductContract*
@@ -77,13 +102,12 @@ build_qualified_product_contract_registry() {
 
 namespace detail {
 
-core::RetainedProductDTO build_and_retain_product(
+void preflight_retained_product(
     const core::ProductId& product_id,
     core::RetainedProductKind product_kind, ProductPlacement placement,
     const core::ProductContractId& product_contract_id,
     const core::ProductContractRevision& product_contract_revision,
-    std::span<const RetainedArtifactInput> artifacts,
-    IRawArtifactStore& artifact_store) {
+    std::span<const RetainedArtifactInput> artifacts) {
   require_retained_portable_identity(product_id.value(), "product_id");
   const auto* contract = build_qualified_product_contract_registry().find(
       product_contract_id, product_contract_revision);
@@ -141,7 +165,28 @@ core::RetainedProductDTO build_and_retain_product(
           "product artifact byte size exceeds the I-JSON safe integer");
     }
   }
+}
 
+core::RetainedProductDTO build_and_retain_product(
+    const core::ProductId& product_id,
+    core::RetainedProductKind product_kind, ProductPlacement placement,
+    const core::ProductContractId& product_contract_id,
+    const core::ProductContractRevision& product_contract_revision,
+    std::span<const RetainedArtifactInput> artifacts,
+    IRawArtifactStore& artifact_store) {
+  preflight_retained_product(
+      product_id, product_kind, placement, product_contract_id,
+      product_contract_revision, artifacts);
+  const auto* contract = build_qualified_product_contract_registry().find(
+      product_contract_id, product_contract_revision);
+  if (contract == nullptr) {
+    throw std::logic_error(
+        "retained product contract disappeared after pure preflight");
+  }
+  std::map<std::string, const RetainedArtifactInput*> supplied;
+  for (const auto& artifact : artifacts) {
+    supplied.emplace(artifact.artifact_role_id.value(), &artifact);
+  }
   std::vector<core::RetainedArtifactRefDTO> retained;
   retained.reserve(supplied.size());
   for (const auto& expected : contract->artifact_roles()) {

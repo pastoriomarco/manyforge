@@ -209,6 +209,27 @@ TEST(ContentIdentityTest, ComputesNestedRecordIdentityFromExternalDocumentSchema
             compute_content_identity(value, nested_schema_fragment));
 }
 
+TEST(ContentIdentityTest, ComputesLogicalSceneLineageGoldenThroughQualifiedPrimitive) {
+  const ContentIdentitySpec spec{
+      .identity_domain = "scene-id",
+      .api_version = "manyforge.logical_scene.v1",
+      .own_field = "scene_id",
+      .root_shape = ContentIdentityRootShape::kNestedRecord,
+  };
+  const CanonicalValue root(CanonicalValue::Object{
+      {"scene_id",
+       CanonicalValue(
+           "sha256:0000000000000000000000000000000000000000000000000000000000000000")},
+      {"cell_id", CanonicalValue("cell-alpha")},
+      {"bootstrap_id", CanonicalValue("bootstrap-alpha")},
+      {"bootstrap_generation", CanonicalValue(1.0)},
+  });
+
+  EXPECT_EQ(
+      compute_content_identity(root, spec),
+      "sha256:1702618655fff8c8b8f86181440bc94fb28d0a7853113bb5d162ebbe1d71be17");
+}
+
 TEST(ContentIdentityTest, EnforcesDocumentAndNestedRecordRootShapes) {
   const ContentIdentitySpec document_spec{
       .identity_domain = "graph-revision",

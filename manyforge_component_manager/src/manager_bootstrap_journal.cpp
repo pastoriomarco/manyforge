@@ -1,6 +1,7 @@
 #include "manyforge_component_manager/manager_bootstrap_journal.hpp"
 
 #include "embedded_manager_bootstrap_journal_schema.hpp"
+#include <manyforge_persistence/sqlite_read_only_preflight.hpp>
 
 #include <openssl/evp.h>
 #include <sqlite3.h>
@@ -635,6 +636,96 @@ std::filesystem::path ValidateDatabasePath(std::filesystem::path path) {
   return path;
 }
 
+void ValidateBootstrapJournalMetadata(
+    sqlite3* database,
+    const CellId& cell_id) {
+  Statement row(database, "SELECT * FROM bootstrap_journal_metadata");
+  if (!row.Step()) {
+    throw ManagerBootstrapJournalIntegrityError(
+        "bootstrap-journal metadata singleton is missing");
+  }
+  if (row.Integer(0) != 1 ||
+      row.Text(1) != kManagerBootstrapJournalSchemaId ||
+      row.Integer(2) != kManagerBootstrapJournalSchemaVersion ||
+      row.Text(3) !=
+          RawDigest(detail::kEmbeddedManagerBootstrapJournalSchema)) {
+    throw ManagerBootstrapJournalIntegrityError(
+        "bootstrap-journal metadata mismatch");
+  }
+  if (row.Text(4) != cell_id.value()) {
+    throw ManagerBootstrapJournalConflictError(
+        "bootstrap journal belongs to a different cell");
+  }
+  if (row.Integer(5) !=
+          static_cast<std::int64_t>(kMaximumBootstrapAttempts) ||
+      row.Integer(6) !=
+          static_cast<std::int64_t>(
+              kMaximumBootstrapNativeRuntimeBindings) ||
+      row.Integer(7) !=
+          kMaximumBootstrapJournalDatabasePageImageBytes) {
+    throw ManagerBootstrapJournalIntegrityError(
+        "bootstrap-journal resource-limit metadata mismatch");
+  }
+  if (row.Step()) {
+    throw ManagerBootstrapJournalIntegrityError(
+        "bootstrap-journal metadata singleton is invalid");
+  }
+}
+
+void ValidateBootstrapJournalBeforeConfiguration(
+    sqlite3* database,
+    const CellId& cell_id) {
+  const auto existing = ReadSchemaObjects(database);
+  const auto application_id =
+      ScalarInteger(database, "PRAGMA application_id");
+  const auto user_version =
+      ScalarInteger(database, "PRAGMA user_version");
+  if (existing.empty()) {
+    if (application_id != 0 || user_version != 0) {
+      throw ManagerBootstrapJournalIntegrityError(
+          "schema-empty bootstrap-journal database has foreign SQLite "
+          "identity");
+    }
+    return;
+  }
+  if (application_id != kManagerBootstrapJournalSqliteApplicationId) {
+    throw ManagerBootstrapJournalIntegrityError(
+        "bootstrap-journal SQLite application ID mismatch");
+  }
+  if (user_version != kManagerBootstrapJournalSchemaVersion) {
+    throw ManagerBootstrapJournalIntegrityError(
+        "bootstrap-journal SQLite user version mismatch");
+  }
+  if (existing != ExpectedSchemaObjects()) {
+    throw ManagerBootstrapJournalIntegrityError(
+        "SQLite schema objects differ from the versioned bootstrap "
+        "artifact");
+  }
+  ValidateBootstrapJournalMetadata(database, cell_id);
+}
+
+void PreflightBootstrapJournal(
+    const std::filesystem::path& database_path,
+    const CellId& cell_id) {
+  try {
+    static_cast<void>(persistence::PreflightExistingSqliteReadOnly(
+        database_path,
+        {
+            static_cast<std::uintmax_t>(
+                kMaximumBootstrapJournalDatabasePageImageBytes),
+            static_cast<std::uintmax_t>(
+                kMaximumBootstrapJournalDatabasePageImageBytes),
+        },
+        [&cell_id](sqlite3* database) {
+          ValidateBootstrapJournalBeforeConfiguration(database, cell_id);
+        }));
+  } catch (const persistence::SqliteReadOnlyPreflightError& error) {
+    throw ManagerBootstrapJournalIntegrityError(
+        "bootstrap-journal read-only preflight failed: " +
+        std::string(error.what()));
+  }
+}
+
 }  // namespace
 
 bool ManagerBootstrapIntentDTO::valid() const noexcept {
@@ -719,6 +810,7 @@ class SqliteManagerBootstrapJournal::Impl final {
       throw ManagerBootstrapJournalError(
           "manyforge_component_manager requires SQLite 3.37.0 or newer");
     }
+    PreflightBootstrapJournal(database_path_, cell_id_);
     const int flags =
         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX |
         SQLITE_OPEN_NOFOLLOW;
@@ -736,6 +828,11 @@ class SqliteManagerBootstrapJournal::Impl final {
           "cannot open bootstrap-journal database: " + error);
     }
     try {
+      Check(
+          database_,
+          sqlite3_busy_timeout(database_, kBusyTimeoutMilliseconds),
+          "configure SQLite busy timeout");
+      ValidateBootstrapJournalBeforeConfiguration(database_, cell_id_);
       Configure();
       InitializeOrValidateSchema();
       Transaction transaction(database_, "BEGIN");
@@ -865,6 +962,12 @@ class SqliteManagerBootstrapJournal::Impl final {
     Transaction transaction(database_, "BEGIN EXCLUSIVE");
     const auto existing = ReadSchemaObjects(database_);
     if (existing.empty()) {
+      if (ScalarInteger(database_, "PRAGMA application_id") != 0 ||
+          ScalarInteger(database_, "PRAGMA user_version") != 0) {
+        throw ManagerBootstrapJournalIntegrityError(
+            "schema-empty bootstrap-journal database has foreign SQLite "
+            "identity");
+      }
       Exec(database_, detail::kEmbeddedManagerBootstrapJournalSchema);
       Statement metadata(
           database_,
@@ -913,37 +1016,7 @@ class SqliteManagerBootstrapJournal::Impl final {
       throw ManagerBootstrapJournalIntegrityError(
           "bootstrap-journal SQLite user version mismatch");
     }
-    Statement row(database_, "SELECT * FROM bootstrap_journal_metadata");
-    if (!row.Step()) {
-      throw ManagerBootstrapJournalIntegrityError(
-          "bootstrap-journal metadata singleton is missing");
-    }
-    if (row.Integer(0) != 1 ||
-        row.Text(1) != kManagerBootstrapJournalSchemaId ||
-        row.Integer(2) != kManagerBootstrapJournalSchemaVersion ||
-        row.Text(3) !=
-            RawDigest(detail::kEmbeddedManagerBootstrapJournalSchema)) {
-      throw ManagerBootstrapJournalIntegrityError(
-          "bootstrap-journal metadata mismatch");
-    }
-    if (row.Text(4) != cell_id_.value()) {
-      throw ManagerBootstrapJournalConflictError(
-          "bootstrap journal belongs to a different cell");
-    }
-    if (row.Integer(5) !=
-            static_cast<std::int64_t>(kMaximumBootstrapAttempts) ||
-        row.Integer(6) !=
-            static_cast<std::int64_t>(
-                kMaximumBootstrapNativeRuntimeBindings) ||
-        row.Integer(7) !=
-            kMaximumBootstrapJournalDatabasePageImageBytes) {
-      throw ManagerBootstrapJournalIntegrityError(
-          "bootstrap-journal resource-limit metadata mismatch");
-    }
-    if (row.Step()) {
-      throw ManagerBootstrapJournalIntegrityError(
-          "bootstrap-journal metadata singleton is invalid");
-    }
+    ValidateBootstrapJournalMetadata(database_, cell_id_);
   }
 
   std::optional<BootstrapId> StoredBootstrapIdLocked() const {

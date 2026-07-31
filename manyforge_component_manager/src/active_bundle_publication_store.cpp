@@ -1,6 +1,7 @@
 #include "manyforge_component_manager/active_bundle_publication_store.hpp"
 
 #include "embedded_active_bundle_publication_schema.hpp"
+#include <manyforge_persistence/sqlite_read_only_preflight.hpp>
 
 #include <openssl/evp.h>
 #include <sqlite3.h>
@@ -646,6 +647,88 @@ std::filesystem::path ValidateDatabasePath(std::filesystem::path path) {
   return path;
 }
 
+void ValidatePublicationStoreMetadata(
+    sqlite3* database,
+    const core::CellId& cell_id) {
+  Statement row(database, "SELECT * FROM publication_store_metadata");
+  if (!row.Step() || row.Integer(0) != 1 ||
+      row.Text(1) != kActiveBundlePublicationStoreSchemaId ||
+      row.Integer(2) != kActiveBundlePublicationStoreSchemaVersion ||
+      row.Text(3) !=
+          RawDigest(detail::kEmbeddedActiveBundlePublicationSchema)) {
+    throw ActiveBundlePublicationIntegrityError(
+        "publication-store metadata mismatch");
+  }
+  if (row.Text(4) != cell_id.value()) {
+    throw ActiveBundlePublicationConflictError(
+        "active-bundle publication store belongs to a different cell");
+  }
+  if (row.Integer(5) != kMaximumActiveBundlePublicationReceipts ||
+      row.Integer(6) !=
+          kMaximumActiveBundlePublicationDatabasePageImageBytes) {
+    throw ActiveBundlePublicationIntegrityError(
+        "publication-store resource-limit metadata mismatch");
+  }
+  if (row.Step()) {
+    throw ActiveBundlePublicationIntegrityError(
+        "publication-store metadata singleton is invalid");
+  }
+}
+
+void ValidatePublicationStoreBeforeConfiguration(
+    sqlite3* database,
+    const core::CellId& cell_id) {
+  const auto existing = ReadSchemaObjects(database);
+  const auto application_id =
+      ScalarInteger(database, "PRAGMA application_id");
+  const auto user_version =
+      ScalarInteger(database, "PRAGMA user_version");
+  if (existing.empty()) {
+    if (application_id != 0 || user_version != 0) {
+      throw ActiveBundlePublicationIntegrityError(
+          "schema-empty publication-store database has foreign SQLite "
+          "identity");
+    }
+    return;
+  }
+  if (application_id != kActiveBundlePublicationStoreSqliteApplicationId) {
+    throw ActiveBundlePublicationIntegrityError(
+        "publication-store SQLite application ID mismatch");
+  }
+  if (user_version != kActiveBundlePublicationStoreSchemaVersion) {
+    throw ActiveBundlePublicationIntegrityError(
+        "publication-store SQLite user version mismatch");
+  }
+  if (existing != ExpectedSchemaObjects()) {
+    throw ActiveBundlePublicationIntegrityError(
+        "publication-store schema objects differ from the versioned "
+        "artifact");
+  }
+  ValidatePublicationStoreMetadata(database, cell_id);
+}
+
+void PreflightPublicationStore(
+    const std::filesystem::path& database_path,
+    const core::CellId& cell_id) {
+  try {
+    static_cast<void>(persistence::PreflightExistingSqliteReadOnly(
+        database_path,
+        {
+            static_cast<std::uintmax_t>(
+                kMaximumActiveBundlePublicationDatabasePageImageBytes),
+            static_cast<std::uintmax_t>(
+                kMaximumActiveBundlePublicationDatabasePageImageBytes),
+        },
+        [&cell_id](sqlite3* database) {
+          ValidatePublicationStoreBeforeConfiguration(database, cell_id);
+        }));
+  } catch (const persistence::SqliteReadOnlyPreflightError& error) {
+    throw ActiveBundlePublicationIntegrityError(
+        "publication-store read-only preflight failed: " +
+        std::string(error.what()));
+  }
+}
+
 struct StoredReceipt final {
   ActiveBundlePublicationReceiptDTO receipt;
   std::string request_digest;
@@ -664,6 +747,7 @@ class SqliteActiveBundlePublicationStore::Impl final {
           "active-bundle publication storage requires SQLite 3.37.0 or "
           "newer");
     }
+    PreflightPublicationStore(database_path_, cell_id_);
     const int flags =
         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX |
         SQLITE_OPEN_NOFOLLOW;
@@ -681,6 +765,11 @@ class SqliteActiveBundlePublicationStore::Impl final {
           "cannot open active-bundle publication store: " + detail);
     }
     try {
+      Check(
+          database_,
+          sqlite3_busy_timeout(database_, kBusyTimeoutMilliseconds),
+          "configure SQLite busy timeout");
+      ValidatePublicationStoreBeforeConfiguration(database_, cell_id_);
       Configure();
       InitializeOrValidateSchema();
       Transaction transaction(database_, "BEGIN");
@@ -816,6 +905,12 @@ class SqliteActiveBundlePublicationStore::Impl final {
     Transaction transaction(database_, "BEGIN EXCLUSIVE");
     const auto existing = ReadSchemaObjects(database_);
     if (existing.empty()) {
+      if (ScalarInteger(database_, "PRAGMA application_id") != 0 ||
+          ScalarInteger(database_, "PRAGMA user_version") != 0) {
+        throw ActiveBundlePublicationIntegrityError(
+            "schema-empty publication-store database has foreign SQLite "
+            "identity");
+      }
       Exec(database_, detail::kEmbeddedActiveBundlePublicationSchema);
       Statement metadata(
           database_,
@@ -863,29 +958,7 @@ class SqliteActiveBundlePublicationStore::Impl final {
       throw ActiveBundlePublicationIntegrityError(
           "publication-store SQLite user version mismatch");
     }
-    Statement row(database_, "SELECT * FROM publication_store_metadata");
-    if (!row.Step() || row.Integer(0) != 1 ||
-        row.Text(1) != kActiveBundlePublicationStoreSchemaId ||
-        row.Integer(2) != kActiveBundlePublicationStoreSchemaVersion ||
-        row.Text(3) !=
-            RawDigest(detail::kEmbeddedActiveBundlePublicationSchema)) {
-      throw ActiveBundlePublicationIntegrityError(
-          "publication-store metadata mismatch");
-    }
-    if (row.Text(4) != cell_id_.value()) {
-      throw ActiveBundlePublicationConflictError(
-          "active-bundle publication store belongs to a different cell");
-    }
-    if (row.Integer(5) != kMaximumActiveBundlePublicationReceipts ||
-        row.Integer(6) !=
-            kMaximumActiveBundlePublicationDatabasePageImageBytes) {
-      throw ActiveBundlePublicationIntegrityError(
-          "publication-store resource-limit metadata mismatch");
-    }
-    if (row.Step()) {
-      throw ActiveBundlePublicationIntegrityError(
-          "publication-store metadata singleton is invalid");
-    }
+    ValidatePublicationStoreMetadata(database_, cell_id_);
   }
 
   [[nodiscard]] StoredReceipt ReceiptFromRow(Statement& row) const {

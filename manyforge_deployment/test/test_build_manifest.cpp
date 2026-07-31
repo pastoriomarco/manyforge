@@ -149,6 +149,11 @@ static_assert(!std::is_default_constructible_v<
   return std::get<CanonicalValue::Array>(member(value, name).storage());
 }
 
+[[nodiscard]] double number_member(
+    const CanonicalValue& value, std::string_view name) {
+  return std::get<double>(member(value, name).storage());
+}
+
 [[nodiscard]] CanonicalValue replace_member(
     const CanonicalValue& value, std::string_view name,
     CanonicalValue replacement) {
@@ -253,6 +258,18 @@ static_assert(!std::is_default_constructible_v<
       {}, selected_overlay);
   return qualify_deployment_for_retention(
       deployment, compile_cell_ir(applicability));
+}
+
+[[nodiscard]] const detail::ICompilerInputArtifactSource&
+rejecting_input_source() {
+  static const detail::RejectingCompilerInputArtifactSource source;
+  return source;
+}
+
+[[nodiscard]] detail::RejectingCatalogArtifactStore&
+rejecting_catalog_store() {
+  static detail::RejectingCatalogArtifactStore store;
+  return store;
 }
 
 class CountingRawArtifactStore final : public IRawArtifactStore {
@@ -550,6 +567,112 @@ TEST(BuildManifestAuthority,
       detail::find_model_source_dependency_media_contract(
           "application/octet-stream"),
       nullptr);
+}
+
+TEST(BuildManifestAuthority,
+     CompilerContractPinsTheCompleteMf2JointNamingRule) {
+  const auto contract =
+      detail::BuildManifestTestAccess::current_candidate(
+          BuildManifestKind::kCompilerContract);
+  const auto& composition = member(contract, "composition_contract");
+  EXPECT_EQ(text_member(composition, "naming_scheme"),
+            "mf1-non-joint+mf2-dependency-ordered-joint");
+  EXPECT_EQ(
+      text_member(composition, "name_preimage_prefix"),
+      "non-joint=manyforge.occurrence-name.mf1;"
+      "joint=manyforge.occurrence-joint-name.mf2");
+  EXPECT_EQ(text_member(composition, "generated_name_prefix"),
+            "non-joint=mf1_;joint=mf2_joint_");
+  EXPECT_EQ(
+      text_member(composition, "joint_name_token_format"),
+      "mf2_joint_<parent-local-rank:zero-padded-decimal-6>_"
+      "<semantic-identity-sha256:lowerhex-64>");
+  EXPECT_EQ(number_member(
+                composition,
+                "joint_parent_local_rank_decimal_width"),
+            6.0);
+  EXPECT_EQ(number_member(
+                composition,
+                "joint_parent_local_rank_capacity"),
+            1000000.0);
+  EXPECT_EQ(text_member(composition, "joint_source_tie_break"),
+            "utf8-bytewise-source-joint-name");
+  EXPECT_EQ(
+      text_member(composition, "joint_mimic_projection_policy"),
+      "master-before-follower-at-first-divergent-siblings-under-"
+      "lowest-common-ancestor;ancestor-master=already-safe;"
+      "descendant-master=reject");
+  EXPECT_EQ(
+      text_member(composition, "joint_sibling_ordering_policy"),
+      "deterministic-kahn-topological-sort;"
+      "ready-tie-break=utf8-bytewise-source-joint-name;"
+      "projected-cycle=reject");
+  EXPECT_EQ(
+      text_member(composition, "fixed_connection_ordering_policy"),
+      "after-all-source-children;"
+      "then=utf8-bytewise-model-instance-id");
+  EXPECT_EQ(text_member(composition, "joint_hash_preimage_domain"),
+            "manyforge.occurrence-joint-name.mf2");
+  EXPECT_EQ(
+      text_member(composition, "joint_hash_field_encoding"),
+      "domain-utf8;then-each-field=NUL+label+'='+"
+      "decimal-utf8-byte-length+':'+raw-utf8-value");
+  EXPECT_EQ(
+      text_member(composition, "source_joint_hash_fields"),
+      "cell_id,model_instance_id,model_asset_id,model_revision,"
+      "kind,scope,source");
+  EXPECT_EQ(
+      text_member(composition, "fixed_connection_hash_fields"),
+      "cell_id,model_instance_id,kind,parent_link,child_link");
+
+  for (const std::string_view field : {
+           "naming_scheme",
+           "name_preimage_prefix",
+           "generated_name_prefix",
+           "joint_name_token_format",
+           "joint_source_tie_break",
+           "joint_mimic_projection_policy",
+           "joint_sibling_ordering_policy",
+           "fixed_connection_ordering_policy",
+           "joint_hash_preimage_domain",
+           "joint_hash_field_encoding",
+           "source_joint_hash_fields",
+           "fixed_connection_hash_fields",
+       }) {
+    const auto changed_composition =
+        replace_member(composition, field,
+                       CanonicalValue(std::string("invalid")));
+    const auto changed_contract = reidentify(
+        replace_member(contract, "composition_contract",
+                       changed_composition),
+        BuildManifestKind::kCompilerContract);
+    EXPECT_THROW(
+        static_cast<void>(
+            detail::BuildManifestTestAccess::qualify_candidate(
+                BuildManifestKind::kCompilerContract,
+                changed_contract)),
+        BuildManifestError)
+        << field;
+  }
+  for (const auto& [field, invalid] :
+       std::vector<std::pair<std::string_view, double>>{
+           {"joint_parent_local_rank_decimal_width", 5.0},
+           {"joint_parent_local_rank_capacity", 999999.0},
+       }) {
+    const auto changed_composition =
+        replace_member(composition, field, CanonicalValue(invalid));
+    const auto changed_contract = reidentify(
+        replace_member(contract, "composition_contract",
+                       changed_composition),
+        BuildManifestKind::kCompilerContract);
+    EXPECT_THROW(
+        static_cast<void>(
+            detail::BuildManifestTestAccess::qualify_candidate(
+                BuildManifestKind::kCompilerContract,
+                changed_contract)),
+        BuildManifestError)
+        << field;
+  }
 }
 
 TEST(BuildManifestAuthority,
@@ -1167,7 +1290,9 @@ TEST(BuildManifestAuthority,
   const auto bundle =
       detail::RetainedBundleMaterializer::
           materialize_store_and_reload_production(
-              qualify_empty(), reopened, raw_store, bundle_repository);
+              qualify_empty(), reopened, rejecting_input_source(),
+              {}, rejecting_catalog_store(), raw_store,
+              bundle_repository);
   ASSERT_NE(bundle, nullptr);
   EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
   EXPECT_EQ(reopened.size(), 4U);
@@ -1307,7 +1432,8 @@ TEST(BuildManifestAuthority,
     const auto first =
         detail::RetainedBundleMaterializer::
             materialize_store_and_reload_production(
-                qualify_empty(), repository, raw_store,
+                qualify_empty(), repository, rejecting_input_source(),
+                {}, rejecting_catalog_store(), raw_store,
                 bundle_repository);
     ASSERT_NE(first, nullptr);
     first_id = first->retained_bundle_id();
@@ -1320,7 +1446,8 @@ TEST(BuildManifestAuthority,
     const auto second =
         detail::RetainedBundleMaterializer::
             materialize_store_and_reload_production(
-                qualify_empty(), reopened, raw_store,
+                qualify_empty(), reopened, rejecting_input_source(),
+                {}, rejecting_catalog_store(), raw_store,
                 bundle_repository);
     ASSERT_NE(second, nullptr);
     ASSERT_TRUE(first_id.has_value());
@@ -1391,6 +1518,7 @@ TEST(BuildManifestAuthority,
         << forbidden;
   }
   bool covers_node_environment_freshness_check = false;
+  bool covers_structural_preparation_tool = false;
   for (const std::string_view table_name :
        {"source_inputs", "recipe_inputs"}) {
     std::string previous;
@@ -1399,6 +1527,10 @@ TEST(BuildManifestAuthority,
       if (input_id ==
           "build-recipe:node-environment-manifest-freshness-check") {
         covers_node_environment_freshness_check = true;
+      }
+      if (input_id ==
+          "compiler-python-tool:prepare_structural_model") {
+        covers_structural_preparation_tool = true;
       }
       EXPECT_FALSE(input_id.empty());
       EXPECT_EQ(input_id.find('/'), std::string::npos);
@@ -1410,6 +1542,7 @@ TEST(BuildManifestAuthority,
     }
   }
   EXPECT_TRUE(covers_node_environment_freshness_check);
+  EXPECT_TRUE(covers_structural_preparation_tool);
   EXPECT_TRUE(is_sha256_digest(
       text_member(build, "build_configuration_digest")));
   const CanonicalValue changed_configuration = reidentify(
@@ -1505,7 +1638,9 @@ TEST(BuildManifestAuthority,
       static_cast<void>(
           detail::RetainedBundleMaterializer::
               materialize_store_and_reload_production(
-                  fixture.qualified, manifest_repository, raw_store,
+                  fixture.qualified, manifest_repository,
+                  rejecting_input_source(), {},
+                  rejecting_catalog_store(), raw_store,
                   bundle_repository)),
       RetainedBundleError);
   EXPECT_EQ(manifest_repository.put_calls(), 0U);
@@ -1525,7 +1660,9 @@ TEST(BuildManifestAuthority,
         static_cast<void>(
             detail::RetainedBundleMaterializer::
                 materialize_store_and_reload_production(
-                    qualify_empty(), manifest_repository, raw_store,
+                    qualify_empty(), manifest_repository,
+                    rejecting_input_source(), {},
+                    rejecting_catalog_store(), raw_store,
                     bundle_repository)),
         BuildManifestError);
     EXPECT_EQ(raw_store.put_calls(), 0U);
@@ -1539,7 +1676,9 @@ TEST(BuildManifestAuthority,
       static_cast<void>(
           detail::RetainedBundleMaterializer::
               materialize_store_and_reload_production(
-                  qualify_empty(), partial_repository, raw_store,
+                  qualify_empty(), partial_repository,
+                  rejecting_input_source(), {},
+                  rejecting_catalog_store(), raw_store,
                   bundle_repository)),
       BuildManifestError);
   // One immutable manifest may have been retained, but it grants no
@@ -1557,7 +1696,9 @@ TEST(BuildManifestAuthority,
   const auto bundle =
       detail::RetainedBundleMaterializer::
           materialize_store_and_reload_production(
-              qualify_empty(), manifest_repository, raw_store,
+              qualify_empty(), manifest_repository,
+              rejecting_input_source(), {},
+              rejecting_catalog_store(), raw_store,
               bundle_repository);
   ASSERT_NE(bundle, nullptr);
   EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
@@ -1567,8 +1708,8 @@ TEST(BuildManifestAuthority,
   EXPECT_EQ(manifest_repository.put_calls(), 3U);
   EXPECT_EQ(manifest_repository.get_calls(), 3U);
   EXPECT_EQ(manifest_repository.size(), 3U);
-  EXPECT_EQ(raw_store.put_calls(), 2U);
-  EXPECT_EQ(raw_store.get_calls(), 4U);
+  EXPECT_EQ(raw_store.put_calls(), 3U);
+  EXPECT_EQ(raw_store.get_calls(), 6U);
 
   EXPECT_EQ(bundle_repository.size(), 1U);
   const auto reloaded =

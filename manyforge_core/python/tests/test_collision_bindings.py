@@ -742,18 +742,6 @@ def test_collision_world_body_round_trip():
     assert len(b.geometries) == 1
 
 
-def test_update_object_pose_request_source_freshness_round_trip():
-    req = manyforge_core_py.UpdateObjectPoseRequestDTO()
-    req.object_id = "box"
-    req.frame_id = "universe"
-    req.pose = _identity_pose()
-    req.source_timestamp_ns = 123
-    req.source_freshness_budget_ns = 50_000_000
-
-    assert req.source_timestamp_ns == 123
-    assert req.source_freshness_budget_ns == 50_000_000
-
-
 def test_collision_robot_model_frame_round_trip():
     frame = manyforge_core_py.CollisionRobotModelFrame()
     frame.robot_id = "robot0"

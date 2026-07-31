@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <vector>
@@ -27,6 +28,8 @@ constexpr std::string_view kSceneDigest =
     "sha256:3333333333333333333333333333333333333333333333333333333333333333";
 constexpr std::string_view kOtherSceneDigest =
     "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+constexpr std::string_view kSceneIdDigest =
+    "sha256:abababababababababababababababababababababababababababababababab";
 
 deployment::CanonicalEmptyRetainedBundleAdmission
 LoadCanonicalEmptyAdmission() {
@@ -97,7 +100,7 @@ ManagerBootstrapAcceptedTargetDTO AcceptedTarget(
           core::RetainedBundleId(std::string(kBundleDigest)),
           core::GraphRevision(std::string(kGraphDigest)),
           core::SceneRevision{
-              core::SceneId("scene-a"),
+              core::SceneId(std::string(kSceneIdDigest)),
               1U,
               core::ContentDigest(std::string(scene_digest)),
           },
@@ -123,6 +126,113 @@ void RawExec(
     FAIL() << detail;
   }
   ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+}
+
+std::string ReadFileBytes(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot open test file");
+  }
+  return {
+      std::istreambuf_iterator<char>(input),
+      std::istreambuf_iterator<char>(),
+  };
+}
+
+void ExpectNoSqliteSidecars(const std::filesystem::path& path) {
+  EXPECT_FALSE(std::filesystem::exists(path.string() + "-wal"));
+  EXPECT_FALSE(std::filesystem::exists(path.string() + "-shm"));
+  EXPECT_FALSE(std::filesystem::exists(path.string() + "-journal"));
+}
+
+TEST(ManagerBootstrapJournalIntegrity,
+     RejectsSchemaEmptyDatabaseWithForeignSqliteIdentity) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "bootstrap.sqlite3";
+  RawExec(
+      path,
+      "PRAGMA application_id=424242;"
+      "PRAGMA user_version=77;");
+  const auto before = ReadFileBytes(path);
+  ExpectNoSqliteSidecars(path);
+
+  EXPECT_THROW(
+      SqliteManagerBootstrapJournal(path, core::CellId("cell-a")),
+      ManagerBootstrapJournalIntegrityError);
+  EXPECT_EQ(ReadFileBytes(path), before);
+  ExpectNoSqliteSidecars(path);
+}
+
+TEST(
+    ManagerBootstrapJournalIntegrity,
+    RejectsForeignSchemaAndCellWithoutChangingAtRestSource) {
+  TemporaryDirectory directory;
+  const auto schema_path = directory.path() / "foreign-schema.sqlite3";
+  RawExec(schema_path, "CREATE TABLE foreign_table(value TEXT);");
+  const auto schema_before = ReadFileBytes(schema_path);
+  EXPECT_THROW(
+      SqliteManagerBootstrapJournal(
+          schema_path, core::CellId("cell-a")),
+      ManagerBootstrapJournalIntegrityError);
+  EXPECT_EQ(ReadFileBytes(schema_path), schema_before);
+  ExpectNoSqliteSidecars(schema_path);
+
+  const auto cell_path = directory.path() / "foreign-cell.sqlite3";
+  {
+    SqliteManagerBootstrapJournal owner(
+        cell_path, core::CellId("foreign-cell"));
+  }
+  ExpectNoSqliteSidecars(cell_path);
+  const auto cell_before = ReadFileBytes(cell_path);
+  EXPECT_THROW(
+      SqliteManagerBootstrapJournal(cell_path, core::CellId("cell-a")),
+      ManagerBootstrapJournalConflictError);
+  EXPECT_EQ(ReadFileBytes(cell_path), cell_before);
+  ExpectNoSqliteSidecars(cell_path);
+}
+
+TEST(
+    ManagerBootstrapJournalIntegrity,
+    RejectsForeignCellFromWalCrashResidueWithoutChangingSource) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "wal-residue.sqlite3";
+  const auto child = fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    try {
+      auto* owner = new SqliteManagerBootstrapJournal(
+          path, core::CellId("foreign-cell"));
+      static_cast<void>(owner);
+      _exit(0);
+    } catch (...) {
+      _exit(1);
+    }
+  }
+  int status = 0;
+  ASSERT_EQ(waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), 0);
+  const auto wal_path =
+      std::filesystem::path(path.string() + "-wal");
+  const auto shm_path =
+      std::filesystem::path(path.string() + "-shm");
+  ASSERT_TRUE(std::filesystem::exists(wal_path));
+  std::filesystem::remove(shm_path);
+  const auto database_before = ReadFileBytes(path);
+  const auto wal_before = ReadFileBytes(wal_path);
+
+  EXPECT_THROW(
+      SqliteManagerBootstrapJournal(path, core::CellId("cell-a")),
+      ManagerBootstrapJournalConflictError);
+  EXPECT_EQ(ReadFileBytes(path), database_before);
+  EXPECT_EQ(ReadFileBytes(wal_path), wal_before);
+  EXPECT_FALSE(std::filesystem::exists(shm_path));
+
+  EXPECT_NO_THROW({
+    SqliteManagerBootstrapJournal recovered(
+        path, core::CellId("foreign-cell"));
+    EXPECT_EQ(recovered.cell_id(), core::CellId("foreign-cell"));
+  });
 }
 
 TEST(ManagerBootstrapJournalValues, EnforcesClosedTypedShape) {
@@ -518,7 +628,7 @@ TEST(ManagerBootstrapJournalCrash, UncommittedAcceptedTargetDisappears) {
         ") VALUES ('bootstrap-1',1,'"
         "sha256:1111111111111111111111111111111111111111111111111111111111111111',"
         "'sha256:2222222222222222222222222222222222222222222222222222222222222222',"
-        "'scene-a',1,'"
+        "'sha256:abababababababababababababababababababababababababababababababab',1,'"
         "sha256:3333333333333333333333333333333333333333333333333333333333333333',"
         "'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');",
         nullptr,
@@ -694,6 +804,10 @@ TEST(
         stores.active_bundle_publication_store()
             .database_path().filename(),
         kActiveBundlePublicationStoreFilename);
+    EXPECT_EQ(
+        stores.apply_journal().database_path().filename(),
+        kManagerApplyJournalFilename);
+    EXPECT_EQ(inventory.apply_journal.apply_intent_count, 0);
     EXPECT_EQ(stores.cell_id(), admission.cell_id());
   }
 
@@ -704,6 +818,87 @@ TEST(
       inventory.bootstrap_journal.bootstrap_attempt_count,
       0);
   EXPECT_EQ(inventory.active_bundle_publication.receipt_count, 0);
+  EXPECT_EQ(inventory.apply_journal.apply_intent_count, 0);
+}
+
+TEST(
+    ExternallyProvisionedManagerStores,
+    RejectsEveryHeaderInitializedForeignPeerBeforeCreatingMissingStores) {
+  TemporaryDirectory directory;
+  const auto admission = LoadCanonicalEmptyAdmission();
+  const std::vector<std::string_view> filenames{
+      kManagerBootstrapJournalFilename,
+      kActiveBundlePublicationStoreFilename,
+      kManagerApplyJournalFilename,
+  };
+
+  for (std::size_t index = 0U; index < filenames.size(); ++index) {
+    SCOPED_TRACE(filenames[index]);
+    const auto stable =
+        directory.path() / ("header-foreign-" + std::to_string(index));
+    std::filesystem::create_directory(stable);
+    RawExec(
+        stable / std::string(filenames[index]),
+        "PRAGMA application_id=424242;"
+        "PRAGMA user_version=77;");
+    const auto foreign_path = stable / std::string(filenames[index]);
+    const auto foreign_before = ReadFileBytes(foreign_path);
+    ExpectNoSqliteSidecars(foreign_path);
+
+    EXPECT_ANY_THROW(
+        ExternallyProvisionedManagerStores(stable, admission));
+    EXPECT_EQ(ReadFileBytes(foreign_path), foreign_before);
+    ExpectNoSqliteSidecars(foreign_path);
+    for (std::size_t peer = 0U; peer < filenames.size(); ++peer) {
+      if (peer != index) {
+        EXPECT_FALSE(std::filesystem::exists(
+            stable / std::string(filenames[peer])));
+      }
+    }
+  }
+}
+
+TEST(
+    ExternallyProvisionedManagerStores,
+    RejectsEveryOrphanSidecarBeforeCreatingAnyDatabasePeer) {
+  TemporaryDirectory directory;
+  const auto admission = LoadCanonicalEmptyAdmission();
+  const std::vector<std::string_view> filenames{
+      kManagerBootstrapJournalFilename,
+      kActiveBundlePublicationStoreFilename,
+      kManagerApplyJournalFilename,
+  };
+  const std::vector<std::string_view> suffixes{
+      "-wal",
+      "-shm",
+      "-journal",
+  };
+
+  std::size_t case_index = 0U;
+  for (const auto filename : filenames) {
+    for (const auto suffix : suffixes) {
+      SCOPED_TRACE(std::string(filename) + std::string(suffix));
+      const auto stable =
+          directory.path() / ("orphan-" + std::to_string(case_index++));
+      std::filesystem::create_directory(stable);
+      const auto main_path = stable / std::string(filename);
+      const auto orphan_path =
+          std::filesystem::path(main_path.string() + std::string(suffix));
+      {
+        std::ofstream orphan(orphan_path, std::ios::binary);
+        ASSERT_TRUE(orphan);
+        orphan << "orphan-sidecar";
+      }
+      const auto orphan_before = ReadFileBytes(orphan_path);
+
+      EXPECT_ANY_THROW(
+          ExternallyProvisionedManagerStores(stable, admission));
+      EXPECT_EQ(ReadFileBytes(orphan_path), orphan_before);
+      for (const auto peer : filenames) {
+        EXPECT_FALSE(std::filesystem::exists(stable / std::string(peer)));
+      }
+    }
+  }
 }
 
 TEST(
@@ -754,6 +949,9 @@ TEST(
   EXPECT_FALSE(std::filesystem::exists(
       publication_only /
       std::string(kManagerBootstrapJournalFilename)));
+  EXPECT_FALSE(std::filesystem::exists(
+      publication_only /
+      std::string(kManagerApplyJournalFilename)));
 
   const auto journal_only = directory.path() / "journal-only";
   std::filesystem::create_directory(journal_only);
@@ -768,6 +966,26 @@ TEST(
       ManagerBootstrapJournalConflictError);
   EXPECT_FALSE(std::filesystem::exists(
       journal_only /
+      std::string(kActiveBundlePublicationStoreFilename)));
+  EXPECT_FALSE(std::filesystem::exists(
+      journal_only /
+      std::string(kManagerApplyJournalFilename)));
+
+  const auto apply_only = directory.path() / "apply-only";
+  std::filesystem::create_directory(apply_only);
+  {
+    SqliteManagerApplyJournal apply(
+        apply_only / std::string(kManagerApplyJournalFilename),
+        foreign_cell);
+  }
+  EXPECT_THROW(
+      ExternallyProvisionedManagerStores(apply_only, admission),
+      ManagerApplyJournalConflictError);
+  EXPECT_FALSE(std::filesystem::exists(
+      apply_only /
+      std::string(kManagerBootstrapJournalFilename)));
+  EXPECT_FALSE(std::filesystem::exists(
+      apply_only /
       std::string(kActiveBundlePublicationStoreFilename)));
 
   const auto foreign_empty_journal_peer =
@@ -794,6 +1012,9 @@ TEST(
           foreign_empty_journal_peer /
           std::string(kManagerBootstrapJournalFilename)),
       0U);
+  EXPECT_FALSE(std::filesystem::exists(
+      foreign_empty_journal_peer /
+      std::string(kManagerApplyJournalFilename)));
 
   const auto foreign_empty_publication_peer =
       directory.path() / "foreign-empty-publication-peer";
@@ -819,6 +1040,37 @@ TEST(
           foreign_empty_publication_peer /
           std::string(kActiveBundlePublicationStoreFilename)),
       0U);
+  EXPECT_FALSE(std::filesystem::exists(
+      foreign_empty_publication_peer /
+      std::string(kManagerApplyJournalFilename)));
+
+  const auto foreign_empty_apply_peer =
+      directory.path() / "foreign-empty-apply-peer";
+  std::filesystem::create_directory(foreign_empty_apply_peer);
+  {
+    SqliteManagerBootstrapJournal journal(
+        foreign_empty_apply_peer /
+            std::string(kManagerBootstrapJournalFilename),
+        foreign_cell);
+  }
+  {
+    std::ofstream empty(
+        foreign_empty_apply_peer /
+        std::string(kManagerApplyJournalFilename));
+    ASSERT_TRUE(empty);
+  }
+  EXPECT_THROW(
+      ExternallyProvisionedManagerStores(
+          foreign_empty_apply_peer, admission),
+      ManagerBootstrapJournalConflictError);
+  EXPECT_EQ(
+      std::filesystem::file_size(
+          foreign_empty_apply_peer /
+          std::string(kManagerApplyJournalFilename)),
+      0U);
+  EXPECT_FALSE(std::filesystem::exists(
+      foreign_empty_apply_peer /
+      std::string(kActiveBundlePublicationStoreFilename)));
 
   const auto empty_journal_peer =
       directory.path() / "empty-journal-peer";
@@ -857,6 +1109,31 @@ TEST(
   EXPECT_NO_THROW(
       ExternallyProvisionedManagerStores(
           empty_publication_peer, admission));
+
+  const auto empty_apply_peer =
+      directory.path() / "empty-apply-peer";
+  std::filesystem::create_directory(empty_apply_peer);
+  {
+    SqliteManagerBootstrapJournal journal(
+        empty_apply_peer /
+            std::string(kManagerBootstrapJournalFilename),
+        admission.cell_id());
+  }
+  {
+    SqliteActiveBundlePublicationStore publication(
+        empty_apply_peer /
+            std::string(kActiveBundlePublicationStoreFilename),
+        admission.cell_id());
+  }
+  {
+    std::ofstream empty(
+        empty_apply_peer /
+        std::string(kManagerApplyJournalFilename));
+    ASSERT_TRUE(empty);
+  }
+  EXPECT_NO_THROW(
+      ExternallyProvisionedManagerStores(
+          empty_apply_peer, admission));
 }
 
 }  // namespace

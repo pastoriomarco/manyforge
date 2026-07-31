@@ -2,11 +2,14 @@
 
 #include <gtest/gtest.h>
 #include <sqlite3.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -23,6 +26,8 @@ constexpr std::string_view kGraphDigest =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 constexpr std::string_view kSceneDigest =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+constexpr std::string_view kSceneIdDigest =
+    "sha256:abababababababababababababababababababababababababababababababab";
 constexpr std::string_view kMaterializationDigest =
     "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 constexpr std::string_view kRetirementDigest =
@@ -30,7 +35,7 @@ constexpr std::string_view kRetirementDigest =
 constexpr std::string_view kOtherDigest =
     "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 constexpr std::string_view kBootstrapPointerGolden =
-    "sha256:cad877e6824efccaa0af76b251faa1a0bd976fb36059c99583345255e31e8973";
+    "sha256:0915805d1a1f92c31cc8281518b5c4732b174d2490c555b37d5342648250a00f";
 
 class TemporaryDirectory final {
  public:
@@ -70,7 +75,7 @@ ProjectionRevisionDTO Projection(
       RetainedBundleId{std::string(bundle)},
       GraphRevision{std::string(graph)},
       SceneRevision{
-          SceneId{"scene.cell-a"},
+          SceneId{std::string(kSceneIdDigest)},
           scene_revision,
           ContentDigest{std::string(kSceneDigest)}},
   };
@@ -117,6 +122,139 @@ void SqliteExec(sqlite3* database, const std::string& sql) {
       error == nullptr ? sqlite3_errmsg(database) : error;
   sqlite3_free(error);
   ASSERT_EQ(result, SQLITE_OK) << detail;
+}
+
+void SqliteExecPath(
+    const std::filesystem::path& path,
+    const std::string& sql) {
+  sqlite3* database = nullptr;
+  ASSERT_EQ(
+      sqlite3_open_v2(
+          path.string().c_str(),
+          &database,
+          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+              SQLITE_OPEN_FULLMUTEX,
+          nullptr),
+      SQLITE_OK);
+  SqliteExec(database, sql);
+  ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+}
+
+std::string ReadFileBytes(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot open test file");
+  }
+  return {
+      std::istreambuf_iterator<char>(input),
+      std::istreambuf_iterator<char>(),
+  };
+}
+
+void ExpectNoSqliteSidecars(const std::filesystem::path& path) {
+  EXPECT_FALSE(std::filesystem::exists(path.string() + "-wal"));
+  EXPECT_FALSE(std::filesystem::exists(path.string() + "-shm"));
+  EXPECT_FALSE(std::filesystem::exists(path.string() + "-journal"));
+}
+
+TEST(ActiveBundlePublicationStoreIntegrity,
+     RejectsSchemaEmptyDatabaseWithForeignSqliteIdentity) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "publication.sqlite3";
+  sqlite3* database = nullptr;
+  ASSERT_EQ(
+      sqlite3_open_v2(
+          path.string().c_str(),
+          &database,
+          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+              SQLITE_OPEN_FULLMUTEX,
+          nullptr),
+      SQLITE_OK);
+  SqliteExec(
+      database,
+      "PRAGMA application_id=424242;"
+      "PRAGMA user_version=77;");
+  ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+  const auto before = ReadFileBytes(path);
+  ExpectNoSqliteSidecars(path);
+
+  EXPECT_THROW(
+      SqliteActiveBundlePublicationStore(path, CellId{"cell-a"}),
+      ActiveBundlePublicationIntegrityError);
+  EXPECT_EQ(ReadFileBytes(path), before);
+  ExpectNoSqliteSidecars(path);
+}
+
+TEST(
+    ActiveBundlePublicationStoreIntegrity,
+    RejectsForeignSchemaAndCellWithoutChangingAtRestSource) {
+  TemporaryDirectory directory;
+  const auto schema_path = directory.path() / "foreign-schema.sqlite3";
+  SqliteExecPath(schema_path, "CREATE TABLE foreign_table(value TEXT);");
+  const auto schema_before = ReadFileBytes(schema_path);
+  EXPECT_THROW(
+      SqliteActiveBundlePublicationStore(
+          schema_path, CellId{"cell-a"}),
+      ActiveBundlePublicationIntegrityError);
+  EXPECT_EQ(ReadFileBytes(schema_path), schema_before);
+  ExpectNoSqliteSidecars(schema_path);
+
+  const auto cell_path = directory.path() / "foreign-cell.sqlite3";
+  {
+    SqliteActiveBundlePublicationStore owner(
+        cell_path, CellId{"foreign-cell"});
+  }
+  ExpectNoSqliteSidecars(cell_path);
+  const auto cell_before = ReadFileBytes(cell_path);
+  EXPECT_THROW(
+      SqliteActiveBundlePublicationStore(cell_path, CellId{"cell-a"}),
+      ActiveBundlePublicationConflictError);
+  EXPECT_EQ(ReadFileBytes(cell_path), cell_before);
+  ExpectNoSqliteSidecars(cell_path);
+}
+
+TEST(
+    ActiveBundlePublicationStoreIntegrity,
+    RejectsForeignCellFromWalCrashResidueWithoutChangingSource) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "wal-residue.sqlite3";
+  const auto child = fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    try {
+      auto* owner = new SqliteActiveBundlePublicationStore(
+          path, CellId{"foreign-cell"});
+      static_cast<void>(owner);
+      _exit(0);
+    } catch (...) {
+      _exit(1);
+    }
+  }
+  int status = 0;
+  ASSERT_EQ(waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), 0);
+  const auto wal_path =
+      std::filesystem::path(path.string() + "-wal");
+  const auto shm_path =
+      std::filesystem::path(path.string() + "-shm");
+  ASSERT_TRUE(std::filesystem::exists(wal_path));
+  std::filesystem::remove(shm_path);
+  const auto database_before = ReadFileBytes(path);
+  const auto wal_before = ReadFileBytes(wal_path);
+
+  EXPECT_THROW(
+      SqliteActiveBundlePublicationStore(path, CellId{"cell-a"}),
+      ActiveBundlePublicationConflictError);
+  EXPECT_EQ(ReadFileBytes(path), database_before);
+  EXPECT_EQ(ReadFileBytes(wal_path), wal_before);
+  EXPECT_FALSE(std::filesystem::exists(shm_path));
+
+  EXPECT_NO_THROW({
+    SqliteActiveBundlePublicationStore recovered(
+        path, CellId{"foreign-cell"});
+    EXPECT_EQ(recovered.cell_id(), CellId{"foreign-cell"});
+  });
 }
 
 TEST(ActiveBundlePublicationStoreValues, RejectsInvalidDurableInputs) {
@@ -392,7 +530,8 @@ TEST(
           "obsolete_managed_command_surfaces_retired_evidence_digest,"
           "request_digest,durable_public_pointer_content_digest"
           ") VALUES (1,'bootstrap','bootstrap-uncommitted',1,0,0,'") +
-          digest + "','" + digest + "','scene.cell-a',1,'" + digest + "','" +
+          digest + "','" + digest + "','" + std::string(kSceneIdDigest) +
+          "',1,'" + digest + "','" +
           digest + "','" + digest +
           "','sha256:"
           "1111111111111111111111111111111111111111111111111111111111111111',"
@@ -514,7 +653,8 @@ TEST(
           "obsolete_managed_command_surfaces_retired_evidence_digest,"
           "request_digest,durable_public_pointer_content_digest"
           ") VALUES (1,'bootstrap','bootstrap-raw',1,0,0,'") +
-      digest + "','" + digest + "','scene.cell-a',1,'" + digest + "','" +
+      digest + "','" + digest + "','" + std::string(kSceneIdDigest) +
+      "',1,'" + digest + "','" +
       digest + "','" + digest + "','" + digest + "','" + digest + "');"
       "WITH RECURSIVE generation(value) AS ("
       "VALUES(2) UNION ALL SELECT value+1 FROM generation WHERE value<4097"
@@ -528,7 +668,8 @@ TEST(
       "obsolete_managed_command_surfaces_retired_evidence_digest,"
       "request_digest,durable_public_pointer_content_digest"
       ") SELECT value,'named_apply',printf('apply-%d',value),1,1,value-1,'" +
-      digest + "','" + digest + "','scene.cell-a',value,'" + digest + "','" +
+      digest + "','" + digest + "','" + std::string(kSceneIdDigest) +
+      "',value,'" + digest + "','" +
       digest + "','" + digest +
       "','sha256:'||printf('%064x',value),"
       "'sha256:'||printf('%064x',value+5000) FROM generation;"

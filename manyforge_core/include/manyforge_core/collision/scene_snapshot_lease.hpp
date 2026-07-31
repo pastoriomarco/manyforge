@@ -8,6 +8,7 @@
 
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/geometry.hpp>
+#include <manyforge_core/types/projection_common.hpp>
 
 namespace manyforge::core {
 
@@ -28,6 +29,7 @@ enum class SceneSnapshotLeaseRejection {
   kLiveSceneSnapshotUnavailable,
   kSceneSnapshotLeaseExpired,
   kObservedSceneSourceStale,
+  kProjectionStructureChangedAfterValidation,
   kSceneTopologyChangedAfterValidation,
   kCollisionPolicyChangedAfterValidation,
   kTargetMovedAfterValidation,
@@ -67,6 +69,7 @@ struct SceneSnapshotLease {
   std::uint64_t validation_epoch = 0;
   std::int64_t captured_at_ns = 0;
   std::optional<std::int64_t> lease_max_age_ns;
+  ProjectionRevisionDTO projection_revision;
   CollisionWorldRevision world_revision;
   CollisionPolicyRevision policy_revision;
   std::uint64_t topology_epoch = 0;
@@ -103,6 +106,7 @@ struct RuntimeDynamicSceneCoverage {
 struct SceneSnapshotLeaseValidationContext {
   std::int64_t now_ns = 0;
   std::optional<std::int64_t> default_lease_max_age_ns;
+  std::optional<ProjectionRevisionDTO> live_projection_revision;
   std::optional<CollisionWorldRevision> live_world_revision;
   std::optional<CollisionPolicyRevision> live_policy_revision;
   std::uint64_t topology_epoch = 0;
@@ -116,6 +120,8 @@ struct SceneSnapshotLeaseValidationResult {
   SceneSnapshotLeaseRejection rejection = SceneSnapshotLeaseRejection::kNone;
   std::string reason_code;
   std::string lease_id;
+  std::optional<ProjectionRevisionDTO> validated_projection_revision;
+  std::optional<ProjectionRevisionDTO> live_projection_revision;
   CollisionWorldRevision validated_world_revision;
   CollisionWorldRevision live_world_revision;
   CollisionPolicyRevision validated_policy_revision;

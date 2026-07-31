@@ -11,7 +11,7 @@ namespace manyforge::core {
 
 Result<MotionSpecDTO> resolve_motion_target(
     const ExecuteRequestDTO& request,
-    const SceneRevisionBindingDTO& scene_binding,
+    const ProjectionLeaseBindingDTO& projection_binding,
     const RobotStateDTO* observed_start_state,
     const IReferencePoseResolver& reference_resolver) {
   const auto invalid_target_shape = [](std::string message,
@@ -132,14 +132,14 @@ Result<MotionSpecDTO> resolve_motion_target(
   }
 
   auto target_pose = reference_resolver.resolve_reference_pose(
-      *request.target_reference, request.base_frame, scene_binding);
+      *request.target_reference, request.base_frame, projection_binding);
   if (!target_pose.ok()) {
     return Result<MotionSpecDTO>::Err(target_pose.error());
   }
   Pose3DTO offset_basis_pose = target_pose.value();
   if (request.offset_reference.has_value()) {
     auto offset_reference_pose = reference_resolver.resolve_reference_pose(
-        *request.offset_reference, request.base_frame, scene_binding);
+        *request.offset_reference, request.base_frame, projection_binding);
     if (!offset_reference_pose.ok()) {
       return Result<MotionSpecDTO>::Err(offset_reference_pose.error());
     }

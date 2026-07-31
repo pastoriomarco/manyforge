@@ -22,12 +22,6 @@
 
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 
-namespace manyforge::core {
-struct LogicalSceneSnapshotDTO final {
-  std::uint64_t marker;
-};
-}  // namespace manyforge::core
-
 namespace manyforge::component_manager {
 namespace {
 
@@ -57,6 +51,9 @@ using core::ProjectionHealthState;
 using core::ProjectionRevisionDTO;
 using core::SceneId;
 using core::SceneRevision;
+
+constexpr std::string_view kSceneIdDigest =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 template <typename T>
 concept HasPublicAdmissionMatcher = requires(
@@ -110,7 +107,7 @@ ProjectionRevisionDTO Target(
       admission.retained_bundle_id(),
       admission.graph_revision(),
       SceneRevision{
-          SceneId("canonical-empty.scene"),
+          SceneId(std::string(kSceneIdDigest)),
           1U,
           ContentDigest(
               "sha256:"

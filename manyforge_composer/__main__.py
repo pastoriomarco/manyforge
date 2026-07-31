@@ -910,14 +910,15 @@ def _make_kernel(
         raise RuntimeFactoryRequirementsError(
             reason_code="native_factory_runtime_failed",
             message=(
-                "Native RoboPlan execution runtime factory failed while building "
-                "the Composer kernel. Check the native RoboPlan build, robot "
-                "model paths, and deployment configuration."
+                "Native RoboPlan execution is intentionally unavailable during "
+                "the composable-cell runtime cutover; the deleted factory must "
+                "be restored through the target retained-product adapter before "
+                "this deployment can run."
             ),
             missing=("native_roboplan_runtime",),
             expected_lane="manyforge-only",
             current_lane=detect_current_lane(),
-            suggested_command="scripts/launch.sh --lane manyforge-only restart",
+            suggested_command=None,
             original_error=str(e),
         ) from e
 

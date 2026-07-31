@@ -5,6 +5,7 @@ if [[ -n "${_MANYFORGE_LIB_REAL_ROBOT:-}" ]]; then return 0; fi
 _MANYFORGE_LIB_REAL_ROBOT=1
 
 source "$(dirname "${BASH_SOURCE[0]}")/runner.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/composable-cell-runtime-availability.sh"
 
 REAL_ROBOT_OWNER_CONTAINER="${MANYFORGE_REAL_ROBOT_OWNER_CONTAINER:-manyforge-real-robot-owner}"
 REAL_ROBOT_COMPOSER_CONTAINER="${MANYFORGE_REAL_ROBOT_CONTAINER:-manyforge-real-robot-composer}"
@@ -41,6 +42,9 @@ real_robot_supervisor_pid_matches() {
 }
 
 real_robot_preflight() {
+    manyforge_fail_composable_cell_runtime_unavailable
+    return $?
+
     if [[ "${REAL_ROBOT_RESOLVER:-}" != "xarm.lite6_supervised.v1" ]]; then
         fail "Unsupported real-robot resolver: ${REAL_ROBOT_RESOLVER:-unset}"
         return 1
@@ -110,6 +114,9 @@ real_robot_preflight() {
 }
 
 start_real_robot_lane() {
+    manyforge_fail_composable_cell_runtime_unavailable
+    return $?
+
     local provider_uuid session_id container_runtime_root owner_timeout_s
     local supervisor_epoch heartbeat_path supervisor_deadline
     if [[ -z "${REAL_ROBOT_BUILD_CACHE_VOLUME}" ]]; then

@@ -17,6 +17,7 @@ namespace manyforge::deployment {
 
 inline constexpr std::size_t kMaxDurableRetainedBlobCount = 4096U;
 inline constexpr std::size_t kMaxDurableRetainedBundleCount = 1024U;
+inline constexpr std::size_t kMaxDurableCatalogArtifactCount = 4096U;
 
 enum class ProductPlacement : std::uint8_t {
   kCellPlanningCollisionModel = 0,
@@ -206,6 +207,87 @@ public:
   [[nodiscard]] std::uint64_t retained_bytes() const;
 
 private:
+  struct Storage;
+  std::unique_ptr<Storage> storage_;
+};
+
+struct StoredCatalogArtifact final {
+  core::ContentAddressedStoreKey content_addressed_store_key;
+  core::ContentDigest content_digest;
+  std::uint64_t byte_size;
+  bool inserted;
+
+  friend bool operator==(const StoredCatalogArtifact&,
+                         const StoredCatalogArtifact&) = default;
+};
+
+/// Exact-key immutable catalog-artifact port.
+///
+/// Unlike IRawArtifactStore, the supplied content-store key is an opaque
+/// catalog identity and is not required to be digest-derived. Implementations
+/// must never interpret it as a path. The expected digest still binds the
+/// exact payload bytes independently.
+class ICatalogArtifactStore {
+ public:
+  virtual ~ICatalogArtifactStore() = default;
+
+  [[nodiscard]] virtual StoredCatalogArtifact put_if_absent(
+      const core::ContentAddressedStoreKey& exact_key,
+      const core::ContentDigest& expected_digest,
+      std::string_view bytes) = 0;
+  [[nodiscard]] virtual std::optional<std::string> get_verified(
+      const core::ContentAddressedStoreKey& exact_key,
+      const core::ContentDigest& expected_digest,
+      std::optional<std::uint64_t> expected_size = std::nullopt) const = 0;
+};
+
+/// Durable exact-key catalog-artifact store.
+///
+/// Opaque keys are mapped to domain-separated SHA-256 filenames under a
+/// private namespace. Each immutable stored envelope retains the original
+/// key, expected payload digest, exact payload size, and byte-exact payload.
+/// Reopen and point reads reverify that complete relationship, including the
+/// filename mapping, so filesystem-path text in a key is inert and a
+/// filename-hash collision or substituted envelope fails closed.
+///
+/// Count and byte limits apply to payloads. Envelope metadata has a separate
+/// fixed upper bound derived from the existing bounded catalog-key contract.
+/// Publication, locking, fork handling, and trusted-root assumptions are the
+/// same as FilesystemRawArtifactStore.
+class FilesystemCatalogArtifactStore final : public ICatalogArtifactStore {
+ public:
+  explicit FilesystemCatalogArtifactStore(
+      std::filesystem::path trusted_root,
+      std::size_t max_artifact_count = kMaxDurableCatalogArtifactCount,
+      std::uint64_t max_total_payload_bytes =
+          kMaxDurableRetainedBlobBytes,
+      std::uint64_t max_single_payload_bytes =
+          kMaxDurableRetainedBlobBytes);
+  ~FilesystemCatalogArtifactStore() override;
+
+  FilesystemCatalogArtifactStore(
+      const FilesystemCatalogArtifactStore&) = delete;
+  FilesystemCatalogArtifactStore& operator=(
+      const FilesystemCatalogArtifactStore&) = delete;
+  FilesystemCatalogArtifactStore(
+      FilesystemCatalogArtifactStore&&) = delete;
+  FilesystemCatalogArtifactStore& operator=(
+      FilesystemCatalogArtifactStore&&) = delete;
+
+  [[nodiscard]] StoredCatalogArtifact put_if_absent(
+      const core::ContentAddressedStoreKey& exact_key,
+      const core::ContentDigest& expected_digest,
+      std::string_view bytes) override;
+  [[nodiscard]] std::optional<std::string> get_verified(
+      const core::ContentAddressedStoreKey& exact_key,
+      const core::ContentDigest& expected_digest,
+      std::optional<std::uint64_t> expected_size =
+          std::nullopt) const override;
+
+  [[nodiscard]] std::size_t size() const;
+  [[nodiscard]] std::uint64_t retained_bytes() const;
+
+ private:
   struct Storage;
   std::unique_ptr<Storage> storage_;
 };

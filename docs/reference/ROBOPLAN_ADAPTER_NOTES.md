@@ -1,5 +1,11 @@
 # RoboPlan Adapter Runtime Notes
 
+> **Current `dev` status:** this is historical baseline behavior until native
+> restoration. `manyforge_roboplan` currently contains only retained-model
+> staging and offline import qualification; its former runtime planner,
+> projection, execution, gripper, Python, and dynamic-collision adapters have
+> been destructively removed.
+
 This document records backend-specific behavior in the ManyForge RoboPlan
 adapter that affects runtime semantics. It is deployment-facing documentation,
 not a development plan.

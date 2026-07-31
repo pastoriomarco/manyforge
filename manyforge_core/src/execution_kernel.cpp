@@ -1599,13 +1599,14 @@ ExecutionKernel::RetainedSceneSnapshotLease::operator=(
 }
 
 void ExecutionKernel::RetainedSceneSnapshotLease::release() noexcept {
-  if (publisher_ == nullptr || inventory_.retention_id.empty()) {
+  if (publisher_ == nullptr ||
+      inventory_.projection_binding.projection_lease_id.empty()) {
     publisher_ = nullptr;
     return;
   }
   try {
     publisher_->release_scene_snapshot_lease_inventory(
-        inventory_.retention_id);
+        inventory_.projection_binding.projection_lease_id);
   } catch (...) {
     // Cleanup is idempotent and must not mask the motion outcome. Publishers
     // expose release as a no-fail operation; a violating implementation is
@@ -1614,14 +1615,9 @@ void ExecutionKernel::RetainedSceneSnapshotLease::release() noexcept {
   publisher_ = nullptr;
 }
 
-SceneRevisionBindingDTO
+ProjectionLeaseBindingDTO
 ExecutionKernel::RetainedSceneSnapshotLease::binding() const {
-  SceneRevisionBindingDTO binding;
-  if (inventory_.bundle.world) {
-    binding.revision = inventory_.bundle.world->revision;
-  }
-  binding.projection_lease_id = inventory_.retention_id;
-  return binding;
+  return inventory_.projection_binding;
 }
 
 Result<ExecutionKernel::RetainedSceneSnapshotLease>
@@ -1636,21 +1632,25 @@ ExecutionKernel::retain_current_scene_snapshot_lease_inventory(
         "Scene authority is unavailable for planning",
         {{"reason", "scene_projection_authority_unavailable"}}});
   }
-  std::string retention_id =
+  std::string projection_lease_id =
       "execution_" + std::to_string(exec_id);
   if (!move_id.empty()) {
-    retention_id += "_" + move_id;
+    projection_lease_id += "_" + move_id;
   }
+  const ProjectionLeaseId requested_lease_id{projection_lease_id};
   try {
     auto inventory =
-        publisher->retain_scene_snapshot_lease_inventory(retention_id);
-    if (!inventory.has_value() || inventory->retention_id.empty() ||
+        publisher->retain_scene_snapshot_lease_inventory(requested_lease_id);
+    if (!inventory.has_value() || !inventory->projection_binding.valid() ||
+        inventory->projection_binding.projection_lease_id !=
+            requested_lease_id ||
         !inventory->bundle.world ||
         inventory->bundle.world->revision.revision_id == 0 ||
         inventory->bundle.world->revision.content_hash.empty()) {
-      if (inventory.has_value() && !inventory->retention_id.empty()) {
+      if (inventory.has_value() &&
+          !inventory->projection_binding.projection_lease_id.empty()) {
         publisher->release_scene_snapshot_lease_inventory(
-            inventory->retention_id);
+            inventory->projection_binding.projection_lease_id);
       }
       return Result<RetainedSceneSnapshotLease>::Err(ErrorDTO{
           kErrorExecutionRejected,
@@ -1683,13 +1683,15 @@ std::optional<SceneSnapshotLease> ExecutionKernel::build_scene_snapshot_lease(
   }
 
   SceneSnapshotLease lease;
-  lease.lease_id = inventory.retention_id.empty()
+  lease.lease_id = inventory.projection_binding.projection_lease_id.empty()
                        ? "execution_" + std::to_string(exec_id)
-                       : inventory.retention_id;
+                       : inventory.projection_binding.projection_lease_id.value();
   lease.validation_epoch = exec_id;
   lease.captured_at_ns =
       inventory.captured_at_ns > 0 ? inventory.captured_at_ns : clock_.now();
   lease.lease_max_age_ns = config_.scene_snapshot_lease_max_age_ns;
+  lease.projection_revision =
+      inventory.projection_binding.projection_revision;
   lease.world_revision = inventory.bundle.world->revision;
   lease.policy_revision = inventory.bundle.policy->revision;
   lease.topology_epoch = inventory.topology_epoch;
@@ -1803,6 +1805,8 @@ ExecutionKernel::current_scene_snapshot_lease_validation_context() const {
     context.now_ns = clock_.now();
     context.default_lease_max_age_ns =
         config_.scene_snapshot_lease_max_age_ns;
+    context.live_projection_revision =
+        inventory->projection_binding.projection_revision;
     context.live_world_revision = inventory->bundle.world->revision;
     context.live_policy_revision = inventory->bundle.policy->revision;
     context.topology_epoch = inventory->topology_epoch;
@@ -4519,7 +4523,7 @@ ExecutionKernel::ExecuteWorkerPlanPhaseResult
 ExecutionKernel::execute_worker_plan_phase(
     std::stop_token st,
     const ExecuteRequestDTO& request,
-    const SceneRevisionBindingDTO& scene_binding,
+    const ProjectionLeaseBindingDTO& projection_binding,
     std::uint64_t exec_id,
     std::optional<TrajectoryDTO> cached_trajectory,
     bool cache_revalidation_candidate,
@@ -4561,7 +4565,7 @@ ExecutionKernel::execute_worker_plan_phase(
         SchedulerPriority::Monitoring);
   }
 
-  auto plan_result = plan_trajectory(request, scene_binding);
+  auto plan_result = plan_trajectory(request, projection_binding);
   const bool planning_timed_out =
       planning_timeout_ns > 0 &&
       (clock_.now() - planning_start_ns) >= planning_timeout_ns;
@@ -4791,7 +4795,7 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     bool& active_trajectory_from_cache,
     bool& cache_revalidation_candidate,
     const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
-    const SceneRevisionBindingDTO& scene_binding,
+    const ProjectionLeaseBindingDTO& projection_binding,
     const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
     ActiveMotionExecution& motion_state) {
   ExecuteWorkerValidationPhaseResult phase_result;
@@ -4925,7 +4929,7 @@ ExecutionKernel::execute_worker_validate_replan_phase(
           SchedulerPriority::Monitoring);
     }
     auto replan_result = plan_trajectory(
-        request, scene_binding,
+        request, projection_binding,
         static_cast<std::uint32_t>(authoritative_validation_attempt));
     const bool replan_timed_out =
         replan_timeout_ns > 0 &&
@@ -6061,16 +6065,16 @@ void ExecutionKernel::async_execute_worker(
   };
 
   try {
-    const auto scene_binding = retained_scene.binding();
-    if (!scene_binding.valid()) {
+    const auto projection_binding = retained_scene.binding();
+    if (!projection_binding.valid()) {
       throw std::runtime_error(
-          "execute worker received an invalid retained scene binding");
+          "execute worker received an invalid retained projection binding");
     }
     // Capture initial state for correct prev_state in events (B-2)
     const auto worker_entry_state = sm_.status().state;
 
     auto plan_phase = execute_worker_plan_phase(
-        st, request, scene_binding, exec_id, std::move(cached_trajectory),
+        st, request, projection_binding, exec_id, std::move(cached_trajectory),
         cache_revalidation_candidate,
         worker_entry_state, motion_state);
     if (plan_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
@@ -6084,7 +6088,7 @@ void ExecutionKernel::async_execute_worker(
     auto validation_phase = execute_worker_validate_replan_phase(
         st, request, exec_id, trajectory, active_trajectory_from_cache,
         cache_revalidation_candidate,
-        retained_scene.inventory(), scene_binding, scene_snapshot_lease,
+        retained_scene.inventory(), projection_binding, scene_snapshot_lease,
         motion_state);
     if (validation_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
       return;
@@ -6676,11 +6680,11 @@ void ExecutionKernel::async_execute_worker(
             return;
           }
           auto resume_scene = std::move(resume_scene_result.value());
-          const auto resume_scene_binding = resume_scene.binding();
+          const auto resume_projection_binding = resume_scene.binding();
           auto resume_scene_snapshot_lease = build_scene_snapshot_lease(
               resume_scene.inventory(), request, exec_id);
           auto resume_plan =
-              plan_resume_trajectory(request, resume_scene_binding);
+              plan_resume_trajectory(request, resume_projection_binding);
           if (!resume_plan.ok()) {
             fail_resume_closed(resume_plan.error(),
                                "resume planning failed",
@@ -7180,12 +7184,12 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     return reject_admission(std::move(retained_scene_result.error()));
   }
   auto retained_scene = std::move(retained_scene_result.value());
-  const auto scene_binding = retained_scene.binding();
-  if (!scene_binding.valid()) {
+  const auto projection_binding = retained_scene.binding();
+  if (!projection_binding.valid()) {
     return reject_admission(ErrorDTO{
         kErrorExecutionRejected,
         "Retained planner projection binding is invalid",
-        {{"reason", "planner_scene_binding_invalid"}}});
+        {{"reason", "planner_projection_binding_invalid"}}});
   }
   std::optional<SceneSnapshotLease> scene_snapshot_lease;
   scene_snapshot_lease = build_scene_snapshot_lease(
@@ -7199,7 +7203,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
 
   ExecuteRequestDTO resolved_request(request);
   auto resolved_motion = resolve_motion_target(
-      request, scene_binding,
+      request, projection_binding,
       synced_state.has_value() ? &*synced_state : nullptr,
       reference_resolver_);
   if (!resolved_motion.ok()) {
@@ -7222,15 +7226,16 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   resolved_request.motion = std::move(resolved_motion.value());
 
   PreparedExecutionStart prepared;
+  const auto active_collision_world_revision =
+      retained_scene.inventory().bundle.world->revision;
   if (request.cache_mode != CacheMode::kDisable) {
     // Exact-revision entries are cache hits. A same-intent older-revision entry
     // is only a current-snapshot revalidation candidate; it carries no stale
     // proof and cannot dispatch until the ordinary validation gate restamps it.
-    const auto active_revision = scene_binding.revision;
     const auto intent_identity =
         trajectory_cache_intent_identity(resolved_request);
     auto cache_lookup = cache_.lookup_with_revision(
-        request.move_id, active_revision, intent_identity);
+        request.move_id, active_collision_world_revision, intent_identity);
     const bool exact_cache_hit =
         cache_lookup.disposition == TrajectoryCacheLookupDisposition::kHit;
     const bool revalidation_candidate =
@@ -7398,7 +7403,8 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
                 std::nullopt,
                 {{"move_id", request.move_id},
                  {"current_revision_id",
-                  std::to_string(scene_binding.revision.revision_id)}}});
+                  std::to_string(
+                      active_collision_world_revision.revision_id)}}});
     std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
     metrics_.cache_revalidation_candidates++;
   } else {
@@ -9954,13 +9960,13 @@ Result<void> ExecutionKernel::collision_check_tick() {
 
 Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
     const ExecuteRequestDTO& request,
-    const SceneRevisionBindingDTO& scene_binding,
+    const ProjectionLeaseBindingDTO& projection_binding,
     std::uint32_t planning_attempt_index) {
-  if (!scene_binding.valid()) {
+  if (!projection_binding.valid()) {
     return Result<TrajectoryDTO>::Err(ErrorDTO{
         kErrorInvalidRequest,
         "Planning requires a valid retained scene projection binding",
-        {{"reason", "planner_scene_binding_invalid"}}});
+        {{"reason", "planner_projection_binding_invalid"}}});
   }
   auto current_state_result = observed_state_.current_state(clock_.now());
   if (!current_state_result.ok()) {
@@ -9986,22 +9992,23 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
   plan_req.contact_policy_id = request.contact_policy_id;
   plan_req.planning_timeout_s = request.timeouts.planning_timeout_s;
   plan_req.planning_attempt_index = planning_attempt_index;
-  plan_req.scene_binding = scene_binding;
+  plan_req.projection_binding = projection_binding;
 
   auto result = planner_.plan(plan_req);
 
   if (result.trajectory.has_value()) {
-    if (result.scene_revision.revision_id != scene_binding.revision.revision_id ||
-        result.scene_revision.content_hash !=
-            scene_binding.revision.content_hash) {
+    if (result.projection_revision !=
+        projection_binding.projection_revision) {
       return Result<TrajectoryDTO>::Err(ErrorDTO{
           kErrorInvariantViolation,
-          "Planner result did not acknowledge the retained scene revision",
-          {{"reason", "planner_result_scene_revision_mismatch"},
+          "Planner result did not acknowledge the retained projection revision",
+          {{"reason", "planner_result_projection_revision_mismatch"},
            {"requested_revision_id",
-            std::to_string(scene_binding.revision.revision_id)},
+            std::to_string(projection_binding.projection_revision
+                               .scene_revision.revision_id)},
            {"returned_revision_id",
-            std::to_string(result.scene_revision.revision_id)}}});
+            std::to_string(result.projection_revision.scene_revision
+                               .revision_id)}}});
     }
     return Result<TrajectoryDTO>::Ok(std::move(*result.trajectory));
   }
@@ -10015,7 +10022,7 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
 
 Result<TrajectoryDTO> ExecutionKernel::plan_resume_trajectory(
     const ExecuteRequestDTO& request,
-    const SceneRevisionBindingDTO& scene_binding) {
+    const ProjectionLeaseBindingDTO& projection_binding) {
   auto sync_result = execution_backend_.sync_observed_state_before_planning();
   if (!sync_result.ok()) {
     auto error = sync_result.error();
@@ -10024,7 +10031,7 @@ Result<TrajectoryDTO> ExecutionKernel::plan_resume_trajectory(
   }
 
   try {
-    auto planned = plan_trajectory(request, scene_binding);
+    auto planned = plan_trajectory(request, projection_binding);
     if (!planned.ok()) {
       auto error = planned.error();
       error.details["resume_phase"] = "planning";

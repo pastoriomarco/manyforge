@@ -12,15 +12,38 @@
 
 namespace manyforge::core {
 
+inline constexpr std::string_view kSha256DigestPrefix = "sha256:";
+
+/// Exact portable digest spelling used by scene and projection identities.
+///
+/// This predicate deliberately validates representation only. It neither
+/// computes nor vouches for the digest's semantic preimage.
+[[nodiscard]] constexpr bool IsExactLowercaseSha256Digest(
+    const std::string_view value) noexcept {
+  if (value.size() != kSha256DigestPrefix.size() + 64U ||
+      value.substr(0U, kSha256DigestPrefix.size()) != kSha256DigestPrefix) {
+    return false;
+  }
+  for (const char digit : value.substr(kSha256DigestPrefix.size())) {
+    if (!((digit >= '0' && digit <= '9') ||
+          (digit >= 'a' && digit <= 'f'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /// Exact logical-scene identity. The scene owner alone mints monotonically
 /// increasing revision IDs and the deterministic logical-content hash.
 struct SceneRevision final {
-  SceneId scene_id;
-  std::uint64_t revision_id;
-  ContentDigest content_hash;
+  SceneId scene_id{std::string{}};
+  std::uint64_t revision_id = 0U;
+  ContentDigest content_hash{std::string{}};
 
   [[nodiscard]] bool valid() const noexcept {
-    return !scene_id.empty() && revision_id != 0U && !content_hash.empty();
+    return revision_id != 0U &&
+           IsExactLowercaseSha256Digest(scene_id.value()) &&
+           IsExactLowercaseSha256Digest(content_hash.value());
   }
 
   friend bool operator==(const SceneRevision&, const SceneRevision&) = default;
@@ -28,8 +51,8 @@ struct SceneRevision final {
 
 /// Indivisible retained-bundle, graph, and logical-scene projection identity.
 struct ProjectionRevisionDTO final {
-  RetainedBundleId retained_bundle_id;
-  GraphRevision graph_revision;
+  RetainedBundleId retained_bundle_id{std::string{}};
+  GraphRevision graph_revision{std::string{}};
   SceneRevision scene_revision;
 
   [[nodiscard]] bool valid() const noexcept {
@@ -43,7 +66,7 @@ struct ProjectionRevisionDTO final {
 
 struct ProjectionLeaseBindingDTO final {
   ProjectionRevisionDTO projection_revision;
-  ProjectionLeaseId projection_lease_id;
+  ProjectionLeaseId projection_lease_id{std::string{}};
 
   [[nodiscard]] bool valid() const noexcept {
     return projection_revision.valid() && !projection_lease_id.empty();

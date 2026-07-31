@@ -107,11 +107,13 @@ CanonicalEmptyRetainedBundleAdmission generate_canonical_empty_package(
     FilesystemBuildManifestRepository manifest_repository(root);
     FilesystemRawArtifactStore artifact_store(root);
     FilesystemRetainedBundleRepository bundle_repository(root);
+    const detail::RejectingCompilerInputArtifactSource input_source;
+    detail::RejectingCatalogArtifactStore catalog_store;
     const auto produced =
         RetainedBundleMaterializer::
             materialize_store_and_reload_production(
-                qualified, manifest_repository, artifact_store,
-                bundle_repository);
+                qualified, manifest_repository, input_source, {},
+                catalog_store, artifact_store, bundle_repository);
     if (produced == nullptr) {
       throw std::logic_error(
           "canonical-empty materializer returned null");

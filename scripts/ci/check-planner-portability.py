@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the RP5-6 planner-neutral conformance and mapping proof."""
+"""Validate planner-neutral contracts and truthful adapter availability."""
 
 from __future__ import annotations
 
@@ -37,11 +37,6 @@ REQUIRED_EVIDENCE = {
     "neutral_harness_detects_private_ik_names",
     "neutral_harness_contains_noncooperative_cancel",
     "explicit_optional_capability_rejection",
-    "roboplan_real_adapter_matrix",
-    "roboplan_profile_policy_mapping",
-    "roboplan_cartesian_output_contract",
-    "roboplan_cartesian_continuous_certificate",
-    "roboplan_unavailable_projection_fails_closed",
     "relative_resolution_precedes_planner",
     "relative_execution_reaches_planner_as_resolved_pose",
     "exact_revision_cache_hit_revalidates",
@@ -113,9 +108,18 @@ def main() -> int:
     if set(document.get("portable_profiles", [])) != REQUIRED_PROFILES:
         fail(failures, "portable_profiles does not match the required contract")
 
+    availability = document.get("runtime_availability", {})
+    if availability.get("status") != "temporarily_unavailable_composable_cell_rebuild":
+        fail(failures, "planner runtime availability must record the composable-cell outage")
+    if (
+        availability.get("available_surface")
+        != "retained_planning_product_consumer_qualification_only"
+    ):
+        fail(failures, "runtime availability overclaims the retained-consumer-only surface")
+
     authority = document.get("authority", {})
     expected_authority = {
-        "logical_scene": "manyforge_core.ISceneAuthority",
+        "logical_scene": "manyforge_scene",
         "non_collision_validation": "manyforge_core.ITrajectoryValidator",
         "collision_validation": "manyforge_core.ICollisionQueryEngine",
         "dispatch": "manyforge_core.ExecutionKernel",
@@ -137,12 +141,21 @@ def main() -> int:
     if fake.get("status") != "test_only_implemented":
         fail(failures, "deterministic_fake is not marked test_only_implemented")
     roboplan = adapters.get("roboplan_0_5_1", {})
-    if roboplan.get("status") != "implemented_and_conformant":
-        fail(failures, "RoboPlan 0.5.1 is not marked implemented_and_conformant")
+    if roboplan.get("status") != "temporarily_unavailable_composable_cell_rebuild":
+        fail(failures, "RoboPlan runtime is not explicitly marked unavailable")
+    if (
+        roboplan.get("available_surface")
+        != "retained_planning_product_consumer_qualification_only"
+    ):
+        fail(failures, "RoboPlan overclaims more than retained-product consumer qualification")
     if set(roboplan.get("capability_disposition", {})) != REQUIRED_CAPABILITIES:
         fail(failures, "RoboPlan mapping does not cover every portable capability")
+    elif set(roboplan["capability_disposition"].values()) != {"temporarily_unavailable"}:
+        fail(failures, "RoboPlan capability mapping contains a runtime support claim")
     if set(roboplan.get("profile_disposition", {})) != REQUIRED_PROFILES:
         fail(failures, "RoboPlan mapping does not cover every portable profile")
+    elif set(roboplan["profile_disposition"].values()) != {"temporarily_unavailable"}:
+        fail(failures, "RoboPlan profile mapping contains a runtime support claim")
 
     moveit = adapters.get("moveit2", {})
     require_mapping_fields(
@@ -153,6 +166,7 @@ def main() -> int:
             "proposed_package",
             "dependency_boundary",
             "composition",
+            "retained_product_input",
             "ports",
             "capability_disposition",
             "profile_disposition",
@@ -168,7 +182,6 @@ def main() -> int:
     if set(moveit.get("profile_disposition", {})) != REQUIRED_PROFILES:
         fail(failures, "MoveIt2 mapping does not cover every portable profile")
     required_ports = {
-        "IPlannerSceneProjection",
         "IPlannerBackend",
         "IRobotKinematics",
         "IReferencePoseResolver",
@@ -183,6 +196,11 @@ def main() -> int:
     for backend_option in FORBIDDEN_BACKEND_OPTION_KEYS:
         if backend_option in serialized_moveit:
             fail(failures, f"MoveIt2 mapping leaks backend option {backend_option}")
+
+    serialized_document = json.dumps(document)
+    for deleted_surface in ("IPlannerSceneProjection", "ISceneAuthority"):
+        if deleted_surface in serialized_document:
+            fail(failures, f"mapping references deleted surface {deleted_surface}")
 
     curobo = adapters.get("curobo", {})
     if curobo.get("status") != "explicitly_unsupported_deferred":
@@ -315,7 +333,7 @@ def main() -> int:
 
     print(
         "Planner portability check passed "
-        f"({len(evidence)} evidence rows, fake/RoboPlan/MoveIt2/cuRobo mapped)."
+        f"({len(evidence)} evidence rows; RoboPlan runtime explicitly unavailable)."
     )
     return 0
 

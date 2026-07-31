@@ -1,0 +1,11 @@
+#pragma once
+
+#include <string_view>
+
+namespace manyforge::deployment::detail {
+
+inline constexpr std::string_view
+    kStructuralModelPreparationGeneratorBuildDigest =
+        "@MANYFORGE_STRUCTURAL_PREPARATION_BUILD_DIGEST@";
+
+}  // namespace manyforge::deployment::detail

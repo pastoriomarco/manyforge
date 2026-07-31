@@ -7,6 +7,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -151,24 +152,30 @@ class BuildCatalogSchemaEntry final {
   [[nodiscard]] std::string_view relative_path() const noexcept {
     return relative_path_;
   }
+  [[nodiscard]] std::string_view descriptor_bytes() const noexcept {
+    return descriptor_bytes_;
+  }
 
  private:
   BuildCatalogSchemaEntry(core::CatalogRecordKind record_kind, core::SchemaId schema_id,
                           CatalogSchemaQualification qualification,
                           std::shared_ptr<const CompiledClosedSchema> compiled_schema,
-                          std::string relative_path)
+                          std::string relative_path,
+                          std::string descriptor_bytes)
       : record_kind_(record_kind),
         schema_id_(std::move(schema_id)),
         qualification_(qualification),
         compiled_schema_(std::move(compiled_schema)),
-        relative_path_(std::move(relative_path)) {
+        relative_path_(std::move(relative_path)),
+        descriptor_bytes_(std::move(descriptor_bytes)) {
     const auto* family = core::catalog_record_type_descriptor(record_kind_);
     if (family == nullptr || family->schema_family != schema_id_.value()) {
       throw std::logic_error(
           "catalog schema entry does not match the closed record-kind family");
     }
     if (qualification_ == CatalogSchemaQualification::kUnqualified) {
-      if (compiled_schema_ != nullptr || !relative_path_.empty()) {
+      if (compiled_schema_ != nullptr || !relative_path_.empty() ||
+          !descriptor_bytes_.empty()) {
         throw std::logic_error(
             "unqualified catalog schema entry cannot own a compiled schema or path");
       }
@@ -177,7 +184,8 @@ class BuildCatalogSchemaEntry final {
     if (compiled_schema_ == nullptr || relative_path_.empty() ||
         compiled_schema_->schema_purpose() !=
             ClosedSchemaPurpose::kArtifactDocument ||
-        compiled_schema_->schema_id() != schema_id_) {
+        compiled_schema_->schema_id() != schema_id_ ||
+        descriptor_bytes_.empty()) {
       throw std::logic_error(
           "qualified catalog schema entry requires an exact artifact-document schema");
     }
@@ -188,6 +196,7 @@ class BuildCatalogSchemaEntry final {
   CatalogSchemaQualification qualification_;
   std::shared_ptr<const CompiledClosedSchema> compiled_schema_;
   std::string relative_path_;
+  std::string descriptor_bytes_;
 
   friend class BuildQualifiedClosedSchemaRegistry;
 };
@@ -209,21 +218,26 @@ class BuildQualifiedValueSchemaEntry final {
   [[nodiscard]] std::string_view relative_path() const noexcept {
     return relative_path_;
   }
+  [[nodiscard]] std::string_view descriptor_bytes() const noexcept {
+    return descriptor_bytes_;
+  }
 
  private:
   BuildQualifiedValueSchemaEntry(core::SchemaId schema_id,
                                  core::SchemaRevision schema_revision,
                                  std::shared_ptr<const CompiledClosedSchema> compiled_schema,
-                                 std::string relative_path)
+                                 std::string relative_path,
+                                 std::string descriptor_bytes)
       : schema_id_(std::move(schema_id)),
         schema_revision_(std::move(schema_revision)),
         compiled_schema_(std::move(compiled_schema)),
-        relative_path_(std::move(relative_path)) {
+        relative_path_(std::move(relative_path)),
+        descriptor_bytes_(std::move(descriptor_bytes)) {
     if (compiled_schema_ == nullptr ||
         compiled_schema_->schema_purpose() != ClosedSchemaPurpose::kValue ||
         compiled_schema_->schema_id() != schema_id_ ||
         compiled_schema_->schema_revision() != schema_revision_ ||
-        relative_path_.empty()) {
+        relative_path_.empty() || descriptor_bytes_.empty()) {
       throw std::logic_error(
           "qualified value-schema entry requires an exact value descriptor and path");
     }
@@ -233,6 +247,7 @@ class BuildQualifiedValueSchemaEntry final {
   core::SchemaRevision schema_revision_;
   std::shared_ptr<const CompiledClosedSchema> compiled_schema_;
   std::string relative_path_;
+  std::string descriptor_bytes_;
 
   friend class BuildQualifiedClosedSchemaRegistry;
 };

@@ -253,11 +253,14 @@ What lives where in this repo, and what it's for:
 | Path                                                                     | What                                                                                                                        |
 | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
 | [`manyforge_core/`](manyforge_core/)                                     | C++20 core: planning DTOs, kernel state machine, ports                                                                      |
+| [`manyforge_content_identity/`](manyforge_content_identity/)             | Shared ROS-free RFC 8785 serialization and domain-separated content-digest primitives                                      |
+| [`manyforge_persistence/`](manyforge_persistence/)                       | Shared ROS-free mechanical durable-storage safety primitives; no semantic state ownership                                  |
+| [`manyforge_scene/`](manyforge_scene/)                                   | ROS-free logical-scene semantic owner and durable state                                                                     |
 | [`manyforge_deployment/`](manyforge_deployment/)                         | ROS-free composable-cell artifact decoding, identity, validation, and compiler substrate                                    |
 | [`manyforge_component_manager/`](manyforge_component_manager/)           | ROS-free C++ Component Manager runtime-observation and durable-persistence foundation                                       |
 | [`manyforge_behavior/`](manyforge_behavior/)                             | Behavior-tree runtime (py_trees), node catalog, tests                                                                       |
 | [`manyforge_collision/`](manyforge_collision/)                           | Planner-neutral immutable collision-world publication and authoritative query engine                                        |
-| [`manyforge_roboplan/`](manyforge_roboplan/)                             | Native motion-planner backend bindings (RRT + TOPPRA)                                                                       |
+| [`manyforge_roboplan/`](manyforge_roboplan/)                             | Retained planning-model staging and offline RoboPlan import qualification; runtime adapters are intentionally unavailable   |
 | [`manyforge_ros2_control_execution/`](manyforge_ros2_control_execution/) | C++ ROS controller execution, exact binding/admission, feedback/progress, bounded stop/reset, and isolated scene projection |
 | [`manyforge_robot_lifecycle/`](manyforge_robot_lifecycle/)               | ROS-independent lifecycle supervision, authority sessions, and admission projection                                         |
 | [`manyforge_robot_lifecycle_msgs/`](manyforge_robot_lifecycle_msgs/)     | Robot-neutral ROS IDL for same-host lifecycle admission transport                                                           |
@@ -350,9 +353,16 @@ For those plan slices only:
 This exception does **not** relax container-based validation, branch rules,
 commit or push authorization, normative ADR/spec approval, private-spec
 boundaries, robot/safety constraints, focused tests for changed foundational
-layers, or adversarial review of substantial chunks. Full applicable CI and
-the named product gates must pass before the affected work is pushed or
-claimed restored.
+layers, or adversarial review. For this plan, one full independent adversarial
+review covers the cumulative diff of a qualification checkpoint: a named plan
+acceptance criterion, a new or changed public/persisted/safety/ownership
+boundary, or a restored or newly testable end-to-end capability. Multiple
+semantically related commits may belong to that checkpoint. Incomplete
+internal slices, mechanical migrations, fixtures, and evidence corrections
+need focused tests and normal review but do not trigger a separate full review
+unless they materially change architecture or safety semantics. Full
+applicable CI and the named product gates must pass before the affected work
+is pushed or claimed restored.
 
 The I12/M-final plan-closing change must delete this entire section and the
 matching section in `CONTRIBUTING.md`. The plan cannot be marked complete while

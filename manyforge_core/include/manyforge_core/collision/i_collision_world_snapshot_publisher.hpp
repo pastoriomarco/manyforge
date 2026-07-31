@@ -12,6 +12,7 @@
 #include <manyforge_core/collision/scene_snapshot_lease.hpp>
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
+#include <manyforge_core/types/projection_common.hpp>
 
 namespace manyforge::core {
 
@@ -77,7 +78,7 @@ using RuntimeCollisionQueryBundlePtr =
     std::shared_ptr<const RuntimeCollisionQueryBundle>;
 
 struct CollisionWorldLeaseInventory {
-  std::string retention_id;
+  ProjectionLeaseBindingDTO projection_binding;
   std::int64_t captured_at_ns = 0;
   CollisionWorldPolicySnapshotBundle bundle;
   std::uint64_t topology_epoch = 0;
@@ -89,7 +90,7 @@ struct CollisionWorldLeaseRetentionStats {
   std::size_t retained_count = 0;
   std::size_t retained_capacity = 0;
   std::int64_t retained_max_age_ns = 0;
-  std::vector<std::string> retained_ids_oldest_first;
+  std::vector<ProjectionLeaseId> retained_ids_oldest_first;
 };
 
 /// Backend-agnostic publisher of `CollisionWorldSnapshot` (spec §3.8.1,
@@ -201,8 +202,10 @@ class ICollisionWorldSnapshotPublisher {
   /// returned shared pointers remain valid even after release; release only
   /// removes this publisher's lookup/retention entry.
   [[nodiscard]] virtual std::optional<CollisionWorldLeaseInventory>
-  retain_scene_snapshot_lease_inventory(std::string retention_id = {}) {
-    (void)retention_id;
+  retain_scene_snapshot_lease_inventory(
+      ProjectionLeaseId projection_lease_id =
+          ProjectionLeaseId{std::string{}}) {
+    (void)projection_lease_id;
     return std::nullopt;
   }
 
@@ -210,8 +213,8 @@ class ICollisionWorldSnapshotPublisher {
   /// callers may race cancellation/timeout cleanup without turning cleanup into
   /// a new failure source.
   virtual void release_scene_snapshot_lease_inventory(
-      const std::string& retention_id) {
-    (void)retention_id;
+      const ProjectionLeaseId& projection_lease_id) {
+    (void)projection_lease_id;
   }
 
   [[nodiscard]] virtual CollisionWorldLeaseRetentionStats

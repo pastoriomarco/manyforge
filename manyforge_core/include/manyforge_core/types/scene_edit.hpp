@@ -1,15 +1,10 @@
 #pragma once
 
-#include <cstdint>
-#include <optional>
 #include <string>
-#include <utility>
 #include <variant>
-#include <vector>
 
-#include <manyforge_core/types/error_code.hpp>
-#include <manyforge_core/types/geometry.hpp>
 #include <manyforge_core/types/collision.hpp>
+#include <manyforge_core/types/geometry.hpp>
 
 namespace manyforge::core {
 
@@ -58,114 +53,6 @@ struct SupportContactDTO {
   bool require_separation_by_end = true;
   bool require_strictly_decreasing_penetration = true;
   bool allow_recontact = false;
-};
-
-/// Add object request (spec §3.9)
-struct AddObjectRequestDTO {
-  std::string object_id;  // unique within the backend-owned scene
-  CollisionShapeDTO shape;
-  Pose3DTO pose;          // expressed in frame_id
-  std::string frame_id;   // reference frame for the object pose
-  std::vector<SupportContactDTO> support_contacts;
-};
-
-/// Remove object request (spec §3.9)
-struct RemoveObjectRequestDTO {
-  std::string object_id;
-};
-
-/// Update object pose request (spec §3.9)
-struct UpdateObjectPoseRequestDTO {
-  std::string object_id;
-  Pose3DTO pose;          // expressed in frame_id
-  std::string frame_id;
-  /// Optional observation timestamp in the kernel steady-clock domain.
-  ///
-  /// Pose-source updates set this together with `source_freshness_budget_ns` so
-  /// runtime collision monitoring can fail closed when dynamic object poses go
-  /// stale. Authored/manual scene edits leave both fields unset, which clears
-  /// any previous source authority for the object.
-  std::optional<std::string> source_id;
-  std::optional<std::int64_t> source_timestamp_ns;
-  std::optional<std::int64_t> source_freshness_budget_ns;
-
-  /// Optional deployment-authored observed-scene admission policy. These fields
-  /// are evidence/configuration carried with a normal revision-visible scene
-  /// mutation; the kernel still owns lease validation and dispatch admission.
-  std::optional<std::string> scene_admission_role;
-  std::optional<std::int64_t> scene_admission_lease_max_age_ns;
-  std::optional<double> scene_admission_target_drift_tolerance_m;
-  std::optional<double> scene_admission_target_angular_tolerance_rad;
-  std::optional<double> scene_admission_obstacle_drift_tolerance_m;
-  std::optional<double> scene_admission_obstacle_angular_tolerance_rad;
-  bool scene_admission_allow_runtime_dynamic_obstacle = false;
-
-  /// Optional compare-and-commit precondition on the object's attachment state.
-  /// SceneAuthority evaluates it while holding the scene writer lock, before the
-  /// planner projection is called. Pose sources use `false` when their policy
-  /// permits updates only while an object is detached.
-  std::optional<bool> expected_attached;
-};
-
-/// Attach an existing object to a frame while preserving its current world pose.
-struct AttachObjectRequestDTO {
-  std::string object_id;
-  std::string frame_id;
-  std::vector<std::string> touch_links;
-};
-
-/// Detach/reparent an existing object into a target frame while preserving world pose.
-struct DetachObjectRequestDTO {
-  std::string object_id;
-  std::string frame_id;
-};
-
-/// Set one robot model's world placement in the logical scene.
-///
-/// Robot placement is scene geometry, not observed joint state. It therefore
-/// advances the logical scene revision and every native/collision projection
-/// through the same transaction protocol as object geometry.
-struct SetRobotBasePoseRequestDTO {
-  std::string robot_id;
-  Pose3DTO pose_in_world;
-};
-
-/// Replace the collision policy owned by the logical scene authority.
-///
-/// Policy changes use the same compare-and-commit protocol as geometry so a
-/// projection rebuild can restore geometry and policy from one immutable
-/// committed snapshot.
-struct SetCollisionPolicyRequestDTO {
-  CollisionPolicySnapshot policy;
-};
-
-/// Object state query result (spec §3.9)
-struct ObjectStateDTO {
-  std::string object_id;
-  bool exists = false;
-  bool attached = false;
-  std::optional<std::string> frame_id;
-};
-
-/// Scene edit result (spec §3.9)
-struct SceneEditResultDTO {
-  SceneEditResultDTO() = default;
-  SceneEditResultDTO(bool ok, std::optional<ErrorDTO> maybe_error = std::nullopt)
-      : success(ok), error(std::move(maybe_error)) {}
-
-  bool success = false;
-  std::optional<ErrorDTO> error;  // present when success is false
-  /// Additive status for successful scene edits. Existing callers should keep
-  /// using `success`; high-rate observed-source paths use this to distinguish
-  /// real geometry writes from freshness-only/no-op updates.
-  std::optional<std::string> update_status;
-  bool collision_world_revision_changed = false;
-  bool collision_world_freshness_changed = false;
-  /// True only when the projection can prove a failed edit did not mutate any
-  /// native scene, policy, or publication state. SceneAuthority consumes this
-  /// evidence to distinguish an ordinary rejected request from a projection
-  /// that must be rebuilt before further use.
-  bool rollback_proven = false;
 };
 
 }  // namespace manyforge::core

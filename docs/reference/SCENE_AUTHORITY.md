@@ -1,5 +1,12 @@
 # Live Scene Authority Contract
 
+> **Current `dev` status:** this reference describes the last qualified
+> baseline. The legacy Core scene owner and its outward clients have been
+> destructively removed. Only the sealed canonical-empty bootstrap path in
+> `manyforge_scene` is currently implemented; live scene edits, queries,
+> projection leases, and scene-backed execution remain unavailable until their
+> composable-cell restoration gates.
+
 The live planning scene is execution state. It must not be reconciled from the
 authored program draft by background UI effects or other undeclared writers.
 

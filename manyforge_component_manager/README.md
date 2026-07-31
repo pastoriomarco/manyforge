@@ -1,13 +1,13 @@
 # ManyForge Component Manager C++ foundation
 
 This ROS-free C++ package is the selected semantic-owner foundation for the
-Composable Cell Component Manager. It currently owns four bounded mechanisms:
+Composable Cell Component Manager. It currently owns five bounded mechanisms:
 
 - receiver-local runtime-unit observation and convergence reduction;
 - a typed durable journal for one canonical-empty bootstrap intent and its
   scene-owner-accepted target;
 - the separate durable `IActiveBundlePublicationStore` public-pointer owner;
-  and
+- a typed durable journal for immutable initial named-Apply intent; and
 - the canonical-empty prerequisite/Begin coordinator that consumes the sealed
   I3 admission, durably records the scene-owner-accepted target, and advances
   that exact zero-native target through Rebuild, publication, and Finalize.
@@ -38,32 +38,51 @@ must serialize every call into one reducer instance. The reducer intentionally
 contains no mutex: mutation has one owner, and readers receive immutable
 snapshots instead of sharing mutable reducer state.
 
-Both SQLite owners are internally synchronized because several NRT clients or
-replacement processes may race on one store. Each owns a distinct embedded
-schema artifact, uses WAL with `synchronous=FULL`, and enforces fixed
-cardinality and database page-image ceilings. The bootstrap journal validates
-its exact schema, immutable rows, typed identities, canonical binding order,
-and semantic digests on every reopen. The publication store separately
-validates generation continuity, each receipt digest, and the singleton head.
-Database files are opened without following a final-path symlink; SQLite 3.37
-or newer and `SQLITE_OPEN_NOFOLLOW` are mandatory.
+All three SQLite owners are internally synchronized because several NRT
+clients or replacement processes may race on one store. Each owns a distinct
+embedded schema artifact, uses WAL with `synchronous=FULL`, and enforces fixed
+cardinality and database page-image ceilings. Before any read-write open or
+persistent PRAGMA, each owner performs an exact read-only identity, schema,
+metadata, resource-limit, and cell preflight. Clean at-rest WAL databases use
+an immutable connection so inspection cannot create sidecars. A WAL crash
+residue without SHM is validated through a bounded private copy; source
+database and WAL bytes remain untouched. A live database whose WAL and SHM
+already exist is read coherently in place; SQLite may update transient
+coordination bytes in that existing SHM, but the preflight does not create a
+sidecar or change database/WAL/header content. Schema-empty files are adoptable
+only when both SQLite identity headers remain zero. Orphan WAL/SHM/journal
+files, SHM without WAL, rollback-journal residue, and over-ceiling main/WAL
+images fail closed before a missing peer can be created.
+The mechanical filesystem/WAL inspection is supplied by the adjacent
+`manyforge_persistence` library so other semantic owners can reuse the same
+qualified startup primitive. Manager still owns all three schemas, records,
+limits, and recovery decisions; the shared library interprets none of them.
+
+The bootstrap journal validates its exact schema, immutable rows, typed
+identities, canonical binding order, and semantic digests on every reopen. The
+Apply journal validates immutable public-request/Apply identity, contiguous
+per-Apply generations, exact predecessor projection, and candidate retained
+identity. The publication store separately validates generation continuity,
+each receipt digest, and the singleton head. Database files are opened without
+following a final-path symlink; SQLite 3.37 or newer and
+`SQLITE_OPEN_NOFOLLOW` are mandatory.
 
 `ExternallyProvisionedManagerStores` is the composition-root startup helper.
 It requires a trusted, existing, non-symlink stable-state directory; opens the
-bootstrap journal and publication store at fixed filenames with the exact
-`CellId` derived from a sealed
-`CanonicalEmptyRetainedBundleAdmission`; verifies both stores; and `fsync`s
+bootstrap journal, Apply journal, and publication store at fixed filenames
+with the exact `CellId` derived from a sealed
+`CanonicalEmptyRetainedBundleAdmission`; verifies all three stores; and `fsync`s
 the directory before exposing them. There is no caller-supplied parallel cell
 identity. The running store set also retains the sealed admission digest,
 bundle ID, and graph revision, so another otherwise-valid package for the same
-cell cannot be substituted through the coordinator. It neither makes the two
+cell cannot be substituted through the coordinator. It neither makes the three
 databases one transaction nor infers cross-store recovery. Deployment
 bootstrap remains responsible for loading the admission first and for
-directory ownership and permissions. When exactly one store already exists,
-startup uses a cell-neutral directory lock and read-only SQLite classification
-to validate an initialized peer before creating or initializing the missing or
-schema-empty store. A foreign-cell startup attempt therefore cannot poison the
-directory with a mismatched database.
+directory ownership and permissions. When any subset of stores already
+exists, startup uses a cell-neutral directory lock and read-only SQLite
+classification to validate every initialized peer before creating or
+initializing any missing or schema-empty store. A foreign-cell startup attempt
+therefore cannot poison the directory with a mismatched database.
 
 The bootstrap journal retains one bounded append-only generation sequence
 under the first durable `BootstrapId`. Its latest attempt has exactly three
@@ -76,6 +95,28 @@ It stores no arbitrary event bytes, mutable generic phase, Apply transaction,
 active alias, or effect command. Its initial resource envelope is at most 64
 attempts, 64 canonical native-runtime bindings per attempt, 256
 printable-ASCII bytes per identity, and a 64 MiB main database page image.
+
+The Apply journal stores the exact immutable named transaction and predecessor
+projection, the complete exact Kernel-fence attempt, and the complete accepted
+fence bound to that attempt. The focused `ManagerApplyFenceCoordinator`
+commits the intent and attempt before each Acquire it invokes and never returns
+the fence until the acceptance is durable. A durable acceptance replays without
+another Kernel call. An attempt-only restart first uses the read-only Kernel
+reconciliation query: `accepted_exact` is appended, only authoritative
+`not_seen` permits an exact persisted-request retry, and conflicting,
+uncertain, malformed, or mismatched evidence fails closed. Acquire uncertainty
+is a distinct typed error retaining the exact recovery query and every observed
+Kernel result. This ordering applies only to Acquire calls made through this
+coordinator; it does not claim global first-effect ownership. One
+`(request_owner_epoch, request_id)` maps to exactly one intent; an exact
+duplicate replays the original digest, and another payload fails without
+another journal write. Reusing one `ApplyId` requires its next contiguous
+generation. The journal intentionally stops after fence acceptance and before
+busy-policy ownership, process convergence, stage rows, activation selection,
+publication, release, or terminal phase: those are later generation-bound I4
+records. Its resource envelope is at most 256 intents/fence attempts, 64
+domains, 256 bindings, and 1,024 resources per attempt, bounded text fields,
+and a 64 MiB main database page image.
 
 The active-bundle publication owner is deliberately separate from the
 bootstrap journal. It stores one immutable, generation-contiguous receipt
@@ -105,8 +146,9 @@ replay-consistency checks, not tamper evidence against a writer that can
 rewrite the databases and recompute them.
 
 `CanonicalEmptyBootstrapCoordinator::BeginOrRecover` is a bounded Manager-side
-I4 ordering proof. It verifies that the sealed admission, both durable stores,
-and publication head identify the same cell; observes the scene owner’s exact
+I4 ordering proof. It verifies that the sealed admission, its bootstrap
+journal and publication store, and the publication head identify the same
+cell; observes the scene owner’s exact
 command-fenced prerequisites; mints at least 128 bits of random bootstrap
 identity; and persists the exact empty-binding intent before any effectful
 external call or Begin. It then reconciles scene-owner status, repeats the
@@ -148,11 +190,14 @@ logical-scene value, implement native projection adapters, or directly open
 scene writes and leases. Those openings remain the scene owner's responsibility
 inside a successful Finalize after its independent receipt and health checks.
 
-The focused publication store implements only publication persistence and
-current-head reread. It does not implement a scene owner, Apply coordinator,
-private materialization, obsolete-command-surface retirement, fence release,
-process convergence, bootstrap coordinator, or M0 behavior. Opening the
-external store set creates no bootstrap intent and publishes nothing.
+The focused Apply journal itself has no effect surface. Its pre-effect fence
+coordinator acquires or recovers only the first configuration fence; it does
+not make an Apply operational. The focused publication store implements only
+publication persistence and current-head reread. These slices do not implement
+a production scene owner, complete Apply coordinator, private materialization,
+obsolete-command-surface retirement, fence release, process convergence, or M0
+behavior. Opening the external store set creates no bootstrap intent and
+publishes nothing.
 
 The old generic raw persistence fixture and its `FoundationHead` compare-and-
 swap surface have been removed rather than retained as compatibility

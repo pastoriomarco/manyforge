@@ -13,6 +13,7 @@ _MANYFORGE_LIB_ISAAC=1
 source "$(dirname "${BASH_SOURCE[0]}")/runner.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/compose.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/wait.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/composable-cell-runtime-availability.sh"
 
 ROS_DISCOVERY_TIMEOUT_S="${ROS_DISCOVERY_TIMEOUT_S:-45}"
 ARM_ACTION="${ARM_ACTION:-/isaac_arm_controller/follow_joint_trajectory}"
@@ -59,8 +60,7 @@ ros_shell() {
 }
 
 build_ros2_control_runtime() {
-    step "Building ROS-enabled ManyForge native runtime (one-time per image)"
-    ros_shell "./scripts/ros/build-ros2-control-runtime.sh"
+    manyforge_fail_composable_cell_runtime_unavailable
 }
 
 # Shared log tail for all isaac smoke probes — isaac-topic-control is the
@@ -150,6 +150,9 @@ isaac_image_runtime_ready() {
 }
 
 maybe_build_isaac_image() {
+    manyforge_fail_composable_cell_runtime_unavailable
+    return $?
+
     local rebuild="${REBUILD:-auto}"
     case "${rebuild}" in
         true)
@@ -196,6 +199,9 @@ maybe_build_isaac_image() {
 }
 
 start_isaac_services() {
+    manyforge_fail_composable_cell_runtime_unavailable
+    return $?
+
     step "Starting Isaac ros2_control bridge and ROS-capable Composer"
     # SUPERVISOR_AUTO_LOAD lets the isaac_demo_supervisor inside the
     # isaac-topic-control container POST /api/program/load itself once

@@ -29,6 +29,21 @@ set(
   "${MANYFORGE_DEPLOYMENT_INCLUDE_DIR}"
   CACHE PATH
   "Path to manyforge_deployment headers")
+set(
+  MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../manyforge_content_identity"
+  CACHE PATH
+  "Path to the shared ManyForge content-identity source tree")
+get_filename_component(
+  MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR
+  "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}"
+  ABSOLUTE)
+if(NOT EXISTS
+   "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/include/manyforge_content_identity/content_identity.hpp")
+  message(FATAL_ERROR
+    "manyforge_core_py requires the shared content-identity source tree: "
+    "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}")
+endif()
 
 # Add manyforge_core headers (try explicit include dir, then fall back to build-dir/../include)
 if(MANYFORGE_CORE_INCLUDE_DIR)
@@ -43,6 +58,14 @@ set_target_properties(manyforge_deployment_archive PROPERTIES
     "${MANYFORGE_DEPLOYMENT_DIR}/libmanyforge_deployment.a"
   INTERFACE_INCLUDE_DIRECTORIES
     "${MANYFORGE_DEPLOYMENT_INCLUDE_DIR}"
+)
+
+add_library(manyforge_content_identity_archive STATIC IMPORTED)
+set_target_properties(manyforge_content_identity_archive PROPERTIES
+  IMPORTED_LOCATION
+    "${MANYFORGE_CORE_DIR}/manyforge_content_identity/libmanyforge_content_identity.a"
+  INTERFACE_INCLUDE_DIRECTORIES
+    "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/include"
 )
 
 add_library(manyforge_deployment_verification_core_archive STATIC IMPORTED)
@@ -76,6 +99,7 @@ pybind11_add_module(manyforge_core_py
 # Link against the manyforge_core library
 target_link_libraries(manyforge_core_py PRIVATE
   ${MANYFORGE_CORE_DIR}/libmanyforge_core.a
+  manyforge_content_identity_archive
   manyforge_deployment_archive
   pybind11::module
   pybind11::headers

@@ -11,7 +11,7 @@ namespace manyforge::core {
 /// non-dispatching preview/plan surfaces.
 Result<MotionSpecDTO> resolve_motion_target(
     const ExecuteRequestDTO& request,
-    const SceneRevisionBindingDTO& scene_binding,
+    const ProjectionLeaseBindingDTO& projection_binding,
     const RobotStateDTO* observed_start_state,
     const IReferencePoseResolver& reference_resolver);
 

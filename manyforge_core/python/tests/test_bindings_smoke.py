@@ -325,22 +325,6 @@ def test_collision_check_result_dto():
     assert r.estimated_force_n == 3.5
 
 
-def test_scene_edit_result_dto():
-    """Test SceneEditResultDTO creation and attributes."""
-    import manyforge_core_py
-    
-    r = manyforge_core_py.SceneEditResultDTO()
-    assert r.success is False
-    assert r.update_status is None
-    assert r.collision_world_revision_changed is False
-    assert r.collision_world_freshness_changed is False
-    assert r.rollback_proven is False
-    r.update_status = "freshness_only"
-    r.collision_world_freshness_changed = True
-    assert r.update_status == "freshness_only"
-    assert r.collision_world_freshness_changed is True
-
-
 def test_box_shape_dto():
     """Test BoxShapeDTO creation and attributes."""
     import manyforge_core_py
@@ -365,52 +349,6 @@ def test_cylinder_shape_dto():
     c = manyforge_core_py.CylinderShapeDTO(0.1, 0.5)
     assert c.radius_m == 0.1
     assert c.height_m == 0.5
-
-
-def test_add_object_request_dto():
-    """Test AddObjectRequestDTO creation and attributes."""
-    import manyforge_core_py
-    
-    shape = manyforge_core_py.BoxShapeDTO(manyforge_core_py.Vector3DTO(0.1, 0.1, 0.1))
-    pose = manyforge_core_py.Pose3DTO(
-        manyforge_core_py.Vector3DTO(1.0, 0.0, 0.5),
-        manyforge_core_py.QuaternionDTO(0.0, 0.0, 0.0, 1.0)
-    )
-    
-    req = manyforge_core_py.AddObjectRequestDTO("obj1", shape, pose, "base_link")
-    assert req.object_id == "obj1"
-
-
-def test_remove_object_request_dto():
-    """Test RemoveObjectRequestDTO creation and attributes."""
-    import manyforge_core_py
-    
-    req = manyforge_core_py.RemoveObjectRequestDTO("obj1")
-    assert req.object_id == "obj1"
-
-
-def test_update_object_pose_request_dto():
-    """Test UpdateObjectPoseRequestDTO creation and attributes."""
-    import manyforge_core_py
-    
-    pose = manyforge_core_py.Pose3DTO(
-        manyforge_core_py.Vector3DTO(1.0, 0.0, 0.5),
-        manyforge_core_py.QuaternionDTO(0.0, 0.0, 0.0, 1.0)
-    )
-    
-    req = manyforge_core_py.UpdateObjectPoseRequestDTO("obj1", pose, "base_link")
-    assert req.object_id == "obj1"
-
-
-def test_object_state_dto():
-    """Test ObjectStateDTO creation and attributes."""
-    import manyforge_core_py
-
-    state = manyforge_core_py.ObjectStateDTO("obj1", True, False, "universe")
-    assert state.object_id == "obj1"
-    assert state.exists is True
-    assert state.attached is False
-    assert state.frame_id == "universe"
 
 
 def test_reference_dto():

@@ -221,6 +221,111 @@ class InMemoryRawArtifactStoreFixture final : public IRawArtifactStore {
   mutable std::mutex mutex_;
 };
 
+class InMemoryCatalogArtifactStoreFixture final
+    : public ICatalogArtifactStore {
+ public:
+  explicit InMemoryCatalogArtifactStoreFixture(
+      std::size_t max_artifact_count =
+          kMaxDurableCatalogArtifactCount,
+      std::uint64_t max_total_payload_bytes =
+          kMaxDurableRetainedBlobBytes,
+      std::uint64_t max_single_payload_bytes =
+          kMaxDurableRetainedBlobBytes)
+      : max_artifact_count_(max_artifact_count),
+        max_total_payload_bytes_(max_total_payload_bytes),
+        max_single_payload_bytes_(max_single_payload_bytes) {
+    if (max_artifact_count_ == 0U ||
+        max_total_payload_bytes_ == 0U ||
+        max_single_payload_bytes_ == 0U ||
+        max_single_payload_bytes_ > max_total_payload_bytes_) {
+      throw RetainedBundleError(
+          "test catalog-artifact fixture limits are invalid");
+    }
+  }
+
+  [[nodiscard]] StoredCatalogArtifact put_if_absent(
+      const core::ContentAddressedStoreKey& exact_key,
+      const core::ContentDigest& expected_digest,
+      std::string_view bytes) override {
+    if (!is_sha256_digest(expected_digest.value()) ||
+        sha256_digest(bytes) != expected_digest.value()) {
+      throw RetainedBundleError(
+          "test catalog-artifact fixture rejects an invalid digest");
+    }
+    const std::uint64_t byte_size =
+        static_cast<std::uint64_t>(bytes.size());
+    if (byte_size > max_single_payload_bytes_) {
+      throw RetainedBundleError(
+          "test catalog-artifact fixture single-artifact bound is "
+          "exhausted");
+    }
+    std::lock_guard lock(mutex_);
+    const auto existing = artifacts_.find(exact_key.value());
+    if (existing != artifacts_.end()) {
+      if (existing->second.digest != expected_digest ||
+          existing->second.bytes != bytes) {
+        throw std::runtime_error(
+            "test catalog-artifact fixture detected an exact-key "
+            "collision");
+      }
+      return {
+          exact_key, expected_digest, byte_size, false};
+    }
+    if (artifacts_.size() >= max_artifact_count_ ||
+        byte_size >
+            max_total_payload_bytes_ - retained_payload_bytes_) {
+      throw RetainedBundleError(
+          "test catalog-artifact fixture bound is exhausted");
+    }
+    artifacts_.emplace(
+        exact_key.value(),
+        Artifact{expected_digest, std::string(bytes)});
+    retained_payload_bytes_ += byte_size;
+    return {exact_key, expected_digest, byte_size, true};
+  }
+
+  [[nodiscard]] std::optional<std::string> get_verified(
+      const core::ContentAddressedStoreKey& exact_key,
+      const core::ContentDigest& expected_digest,
+      std::optional<std::uint64_t> expected_size =
+          std::nullopt) const override {
+    std::lock_guard lock(mutex_);
+    const auto found = artifacts_.find(exact_key.value());
+    if (found == artifacts_.end() ||
+        found->second.digest != expected_digest ||
+        sha256_digest(found->second.bytes) !=
+            expected_digest.value() ||
+        (expected_size.has_value() &&
+         found->second.bytes.size() != *expected_size)) {
+      return std::nullopt;
+    }
+    return found->second.bytes;
+  }
+
+  [[nodiscard]] std::size_t size() const noexcept {
+    std::lock_guard lock(mutex_);
+    return artifacts_.size();
+  }
+
+  [[nodiscard]] std::uint64_t retained_payload_bytes() const noexcept {
+    std::lock_guard lock(mutex_);
+    return retained_payload_bytes_;
+  }
+
+ private:
+  struct Artifact final {
+    core::ContentDigest digest;
+    std::string bytes;
+  };
+
+  std::size_t max_artifact_count_;
+  std::uint64_t max_total_payload_bytes_;
+  std::uint64_t max_single_payload_bytes_;
+  std::map<std::string, Artifact> artifacts_;
+  std::uint64_t retained_payload_bytes_{0U};
+  mutable std::mutex mutex_;
+};
+
 class InMemoryRetainedBundleRepositoryFixture final
     : public IRetainedBundleRepository {
  public:

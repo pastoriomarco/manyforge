@@ -1,5 +1,12 @@
 # ManyForge Architecture
 
+> **Current `dev` status:** this document still describes the last complete
+> three-lane runtime baseline. The composable-cell destructive cutover has
+> removed the legacy scene owner and RoboPlan native/ROS factories; program
+> execution and all three lanes are intentionally unavailable. The new Core,
+> retained-product, canonical-empty scene-owner, and Manager foundations are
+> not yet a restored end-to-end runtime.
+
 A coherent, mid-depth map of how ManyForge is put together: the components, how
 a program flows through them, and — most importantly — which layer owns which
 decision. For install and operation see

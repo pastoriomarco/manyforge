@@ -28,11 +28,15 @@ set(
 set(
   MANYFORGE_NODE_ENVIRONMENT_CHECK
   "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/scripts/generate_node_environment_manifest.py")
+set(
+  MANYFORGE_STRUCTURAL_PREPARATION_TOOL
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_structural_model.py")
 if(NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}" OR
-   NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_CHECK}")
+   NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_CHECK}" OR
+   NOT EXISTS "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}")
   message(FATAL_ERROR
-    "manyforge_deployment production retention requires the sole "
-    "manyforge_behavior node-environment manifest and its freshness checker")
+    "manyforge_deployment production retention requires the node-environment "
+    "closure and the structural-model preparation tool")
 endif()
 execute_process(
   COMMAND
@@ -83,6 +87,32 @@ if(NOT IS_DIRECTORY "${MANYFORGE_CORE_INCLUDE_DIR}")
     "${MANYFORGE_CORE_INCLUDE_DIR}")
 endif()
 
+set(
+  MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_content_identity"
+  CACHE PATH
+  "Path to the shared ManyForge RFC 8785/content-identity library")
+get_filename_component(
+  MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR
+  "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}"
+  ABSOLUTE)
+if(NOT EXISTS
+   "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/include/manyforge_content_identity/content_identity.hpp")
+  message(FATAL_ERROR
+    "manyforge_deployment requires the shared content-identity source tree: "
+    "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}")
+endif()
+if(NOT TARGET manyforge_content_identity)
+  add_subdirectory(
+    "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_content_identity"
+    EXCLUDE_FROM_ALL)
+endif()
+if(NOT TARGET manyforge::content_identity)
+  message(FATAL_ERROR
+    "manyforge_deployment could not resolve the shared content-identity target")
+endif()
+
 file(
   GLOB_RECURSE
   MANYFORGE_COMPILER_SOURCE_INPUTS
@@ -93,18 +123,23 @@ file(
   "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/tools/*.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/*.py"
+  "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/include/*"
+  "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/src/*.cpp"
   "${MANYFORGE_CORE_INCLUDE_DIR}/*")
 list(
   REMOVE_ITEM
   MANYFORGE_COMPILER_SOURCE_INPUTS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_build_evidence.hpp.in"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_canonical_empty_deployment.hpp.in"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_closed_schema.hpp.in")
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_closed_schema.hpp.in"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_structural_model_preparation.hpp.in")
 list(SORT MANYFORGE_COMPILER_SOURCE_INPUTS)
 
 set(
   MANYFORGE_COMPILER_RECIPE_INPUTS
   "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
+  "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/CMakeLists.txt"
   "${MANYFORGE_NODE_ENVIRONMENT_CHECK}"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_build_evidence.hpp.in"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_canonical_empty_deployment.hpp.in"
@@ -124,6 +159,16 @@ function(
            "^manyforge_core/include/(.+)\\.(h|hpp)$")
       set(logical_id "cpp-public-header:${CMAKE_MATCH_1}")
     elseif(relative_path MATCHES
+           "^manyforge_content_identity/include/(.+)\\.(h|hpp)$")
+      set(
+        logical_id
+        "cpp-public-header:manyforge_content_identity/${CMAKE_MATCH_1}")
+    elseif(relative_path MATCHES
+           "^manyforge_content_identity/src/(.+)\\.cpp$")
+      set(
+        logical_id
+        "cpp-translation-unit:manyforge_content_identity/${CMAKE_MATCH_1}")
+    elseif(relative_path MATCHES
            "^manyforge_deployment/src/(.+)\\.cpp$")
       set(logical_id "cpp-translation-unit:${CMAKE_MATCH_1}")
     elseif(relative_path MATCHES
@@ -132,6 +177,9 @@ function(
     elseif(relative_path MATCHES
            "^manyforge_deployment/tools/(.+)\\.cpp$")
       set(logical_id "compiler-tool:${CMAKE_MATCH_1}")
+    elseif(relative_path MATCHES
+           "^manyforge_deployment/tools/(.+)\\.py$")
+      set(logical_id "compiler-python-tool:${CMAKE_MATCH_1}")
     elseif(relative_path MATCHES
            "^manyforge_deployment/resources/(.+)$")
       set(logical_id "compiler-resource:${CMAKE_MATCH_1}")
@@ -144,6 +192,9 @@ function(
     if(relative_path STREQUAL
        "manyforge_deployment/CMakeLists.txt")
       set(logical_id "build-recipe:manyforge_deployment")
+    elseif(relative_path STREQUAL
+           "manyforge_content_identity/CMakeLists.txt")
+      set(logical_id "build-recipe:manyforge_content_identity")
     elseif(relative_path STREQUAL
            "manyforge_behavior/scripts/generate_node_environment_manifest.py")
       set(
@@ -316,6 +367,18 @@ configure_file(
   "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_build_evidence.hpp"
   @ONLY)
 
+file(
+  SHA256
+  "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
+  MANYFORGE_STRUCTURAL_PREPARATION_BUILD_SHA256)
+set(
+  MANYFORGE_STRUCTURAL_PREPARATION_BUILD_DIGEST
+  "sha256:${MANYFORGE_STRUCTURAL_PREPARATION_BUILD_SHA256}")
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_structural_model_preparation.hpp.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_structural_model_preparation.hpp"
+  @ONLY)
+
 set(
   MANYFORGE_CANONICAL_EMPTY_DEPLOYMENT
   "${CMAKE_CURRENT_SOURCE_DIR}/resources/canonical_empty/c1_build_authority.deployment.json")
@@ -409,14 +472,12 @@ manyforge_embed_closed_schema(
 set(MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<BUILD_INTERFACE:${MANYFORGE_CORE_INCLUDE_DIR}>
+  $<BUILD_INTERFACE:${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
 set(MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES
-  OpenSSL::Crypto
   EXPAT::EXPAT
   PkgConfig::LIBYAML
-  PkgConfig::UTF8PROC
-  double-conversion::double-conversion
 )
 
 # Read-neutral parsing, identity, and exact retained-bundle verification.
@@ -424,13 +485,16 @@ set(MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES
 # repository-writer, package-generator, and admission-selection effects.
 add_library(manyforge_deployment_verification_core
   src/artifact_codec.cpp
-  src/canonical_value.cpp
+  src/composed_model_symbol_role_map_verifier.cpp
   src/cell_graph_codec.cpp
   src/closed_schema.cpp
   src/content_identity.cpp
   src/deployment_applicability_codec.cpp
   src/deployment_artifact_codec.cpp
   src/deployment_catalog_codec.cpp
+  src/model_asset_codec.cpp
+  src/model_source.cpp
+  src/planning_resource_map_internal.cpp
   src/posix_read_only_internal.cpp
   src/verified_retained_bundle.cpp
   src/verified_retained_bundle_store.cpp
@@ -441,6 +505,7 @@ target_include_directories(manyforge_deployment_verification_core PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(manyforge_deployment_verification_core PUBLIC
+  manyforge::content_identity
   ${MANYFORGE_DEPLOYMENT_EXTERNAL_LIBRARIES})
 set_target_properties(
   manyforge_deployment_verification_core
@@ -458,10 +523,10 @@ add_library(manyforge_deployment
   src/cell_composition.cpp
   src/cell_structure.cpp
   src/component_type_codec.cpp
+  src/composed_model_symbol_role_map_internal.cpp
   src/control_interface_contract_codec.cpp
   src/controller_topology_codec.cpp
-  src/model_asset_codec.cpp
-  src/model_source.cpp
+  src/mf2_joint_name_internal.cpp
   src/posix_durability_internal.cpp
   src/provider_manifest_codec.cpp
   src/retained_bundle.cpp
@@ -471,6 +536,7 @@ add_library(manyforge_deployment
   src/runtime_profile_codec.cpp
   src/site_overlay_resolution.cpp
   src/stop_evidence_policy_codec.cpp
+  src/structural_model_preparation.cpp
 )
 add_library(manyforge::deployment ALIAS manyforge_deployment)
 
@@ -559,7 +625,8 @@ target_include_directories(
   "${MANYFORGE_CORE_INCLUDE_DIR}")
 target_link_libraries(
   manyforge_generate_canonical_empty_package PRIVATE
-  manyforge_deployment_canonical_package_generator)
+  manyforge_deployment_canonical_package_generator
+  manyforge::deployment_admission)
 
 option(BUILD_TESTING "Build unit tests" ON)
 option(
@@ -597,6 +664,7 @@ if(BUILD_TESTING)
       COMPILE_DEFINITIONS
         "-I${CMAKE_CURRENT_SOURCE_DIR}/include"
         "-I${MANYFORGE_CORE_INCLUDE_DIR}"
+        "-I${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/include"
       CXX_STANDARD 20
       CXX_STANDARD_REQUIRED ON
       CXX_EXTENSIONS OFF
@@ -621,6 +689,16 @@ if(BUILD_TESTING)
     message(FATAL_ERROR
       "The verified retained-bundle public-header compile control failed:\n"
       "${MANYFORGE_VERIFIED_RETAINED_BUNDLE_PUBLIC_HEADER_COMPILES_OUTPUT}")
+  endif()
+
+  manyforge_try_public_header(
+    MANYFORGE_STRUCTURAL_MODEL_PREPARATION_PUBLIC_HEADER_COMPILES
+    structural_model_preparation_public_header_compiles.cpp)
+  if(NOT MANYFORGE_STRUCTURAL_MODEL_PREPARATION_PUBLIC_HEADER_COMPILES)
+    message(FATAL_ERROR
+      "The structural-model preparation public-header compile control "
+      "failed:\n"
+      "${MANYFORGE_STRUCTURAL_MODEL_PREPARATION_PUBLIC_HEADER_COMPILES_OUTPUT}")
   endif()
 
   manyforge_try_public_header(
@@ -730,6 +808,14 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_cell_structure
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_mf2_joint_name test/test_mf2_joint_name.cpp)
+  target_include_directories(test_mf2_joint_name PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_mf2_joint_name PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_mf2_joint_name
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_cell_applicability
     test/test_cell_applicability.cpp)
   target_link_libraries(test_cell_applicability PRIVATE
@@ -818,11 +904,108 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_model_asset_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  set(
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+  set(
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural")
+  file(
+    GLOB_RECURSE
+    MANYFORGE_LITE6_STRUCTURAL_RESOURCE_INPUTS
+    CONFIGURE_DEPENDS
+    LIST_DIRECTORIES false
+    "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/meshes/*")
+  file(MAKE_DIRECTORY "${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}")
+  execute_process(
+    COMMAND
+      "${Python3_EXECUTABLE}"
+      "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
+      --urdf
+      "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/lite6_lite_gripper.urdf"
+      --srdf
+      "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/lite6_lite_gripper.srdf"
+      --model-asset-id
+      lite6_lite_gripper
+      --accepted-package-uri-prefix
+      "package://manyforge_example_models/models/lite6_lite_gripper/"
+      --resource-root
+      "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}"
+      --output-directory
+      "${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+    RESULT_VARIABLE MANYFORGE_LITE6_STRUCTURAL_PREPARATION_RESULT
+    OUTPUT_VARIABLE MANYFORGE_LITE6_STRUCTURAL_PREPARATION_OUTPUT
+    ERROR_VARIABLE MANYFORGE_LITE6_STRUCTURAL_PREPARATION_ERROR)
+  if(NOT MANYFORGE_LITE6_STRUCTURAL_PREPARATION_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "Lite6 structural-model qualification preparation failed:\n"
+      "${MANYFORGE_LITE6_STRUCTURAL_PREPARATION_OUTPUT}"
+      "${MANYFORGE_LITE6_STRUCTURAL_PREPARATION_ERROR}")
+  endif()
+  set_property(
+    DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
+    "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/lite6_lite_gripper.urdf"
+    "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/lite6_lite_gripper.srdf"
+    ${MANYFORGE_LITE6_STRUCTURAL_RESOURCE_INPUTS})
+
   add_executable(test_model_source
     test/test_model_source.cpp)
+  target_compile_definitions(test_model_source PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
   target_link_libraries(test_model_source PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_model_source
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  set(
+    MANYFORGE_STRUCTURAL_PREPARATION_TEST_SOURCE_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/structural_model_preparation")
+  set(
+    MANYFORGE_STRUCTURAL_PREPARATION_TEST_OUTPUT_ROOT
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/structural_model_preparation_test")
+  file(MAKE_DIRECTORY
+    "${MANYFORGE_STRUCTURAL_PREPARATION_TEST_OUTPUT_ROOT}")
+  execute_process(
+    COMMAND
+      "${Python3_EXECUTABLE}"
+      "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
+      --urdf
+      "${MANYFORGE_STRUCTURAL_PREPARATION_TEST_SOURCE_ROOT}/source.urdf"
+      --srdf
+      "${MANYFORGE_STRUCTURAL_PREPARATION_TEST_SOURCE_ROOT}/source.srdf"
+      --model-asset-id
+      qualified_model
+      --accepted-package-uri-prefix
+      "package://qualified_models/example/"
+      --resource-root
+      "${MANYFORGE_STRUCTURAL_PREPARATION_TEST_SOURCE_ROOT}"
+      --output-directory
+      "${MANYFORGE_STRUCTURAL_PREPARATION_TEST_OUTPUT_ROOT}"
+    RESULT_VARIABLE MANYFORGE_STRUCTURAL_PREPARATION_TEST_RESULT
+    OUTPUT_VARIABLE MANYFORGE_STRUCTURAL_PREPARATION_TEST_OUTPUT
+    ERROR_VARIABLE MANYFORGE_STRUCTURAL_PREPARATION_TEST_ERROR)
+  if(NOT MANYFORGE_STRUCTURAL_PREPARATION_TEST_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "structural-model provenance fixture generation failed:\n"
+      "${MANYFORGE_STRUCTURAL_PREPARATION_TEST_OUTPUT}"
+      "${MANYFORGE_STRUCTURAL_PREPARATION_TEST_ERROR}")
+  endif()
+  set_property(
+    DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${MANYFORGE_STRUCTURAL_PREPARATION_TEST_SOURCE_ROOT}/source.urdf"
+    "${MANYFORGE_STRUCTURAL_PREPARATION_TEST_SOURCE_ROOT}/source.srdf"
+    "${MANYFORGE_STRUCTURAL_PREPARATION_TEST_SOURCE_ROOT}/meshes/tool.stl")
+
+  add_executable(test_structural_model_preparation
+    test/test_structural_model_preparation.cpp)
+  target_compile_definitions(test_structural_model_preparation PRIVATE
+    MANYFORGE_STRUCTURAL_PREPARATION_TEST_OUTPUT_ROOT="${MANYFORGE_STRUCTURAL_PREPARATION_TEST_OUTPUT_ROOT}"
+    MANYFORGE_STRUCTURAL_PREPARATION_TEST_SOURCE_ROOT="${MANYFORGE_STRUCTURAL_PREPARATION_TEST_SOURCE_ROOT}")
+  target_link_libraries(test_structural_model_preparation PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_structural_model_preparation
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_runtime_profile_codec
@@ -852,6 +1035,9 @@ if(BUILD_TESTING)
 
   add_executable(test_retained_bundle_store
     test/test_retained_bundle_store.cpp)
+  target_compile_definitions(test_retained_bundle_store PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
   target_include_directories(test_retained_bundle_store PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(test_retained_bundle_store PRIVATE
@@ -861,8 +1047,20 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_retained_bundle_store
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_catalog_artifact_store
+    test/test_catalog_artifact_store.cpp)
+  target_include_directories(test_catalog_artifact_store PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_catalog_artifact_store PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_catalog_artifact_store
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_retained_bundle_materializer
     test/test_retained_bundle_materializer.cpp)
+  target_compile_definitions(test_retained_bundle_materializer PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
   target_include_directories(test_retained_bundle_materializer PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(test_retained_bundle_materializer PRIVATE

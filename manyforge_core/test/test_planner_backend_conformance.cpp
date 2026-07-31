@@ -12,6 +12,24 @@
 namespace manyforge::core::testing {
 namespace {
 
+constexpr auto kDigestA =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+constexpr auto kDigestB =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+constexpr auto kDigestC =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+constexpr auto kDigestD =
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+ProjectionLeaseBindingDTO projection_binding() {
+  return ProjectionLeaseBindingDTO{
+      ProjectionRevisionDTO{
+          RetainedBundleId{kDigestA}, GraphRevision{kDigestB},
+          SceneRevision{SceneId{kDigestC}, 7U,
+                        ContentDigest{kDigestD}}},
+      ProjectionLeaseId{"lease-seven"}};
+}
+
 Pose3DTO pose_at(double x, double y) {
   Pose3DTO pose;
   pose.position_m = {x, y, 0.0};
@@ -40,12 +58,12 @@ class DeterministicPlanner final : public IPlannerBackend {
       std::lock_guard<std::mutex> lock(mutex_);
       cancel_requested_ = false;
     }
-    if (!request.scene_binding.valid()) {
+    if (!request.projection_binding.valid()) {
       return PlanResultDTO{
           std::nullopt,
           ErrorDTO{kErrorInvalidRequest,
                    "deterministic planner requires a retained scene binding",
-                   {{"reason", "planner_scene_binding_invalid"}}},
+                   {{"reason", "planner_projection_binding_invalid"}}},
           {}};
     }
     const auto capability = [&]() -> std::pair<bool, std::string> {
@@ -133,7 +151,7 @@ class DeterministicPlanner final : public IPlannerBackend {
       trajectory.waypoints.back().time_from_start_s = 0.0;
     }
     return PlanResultDTO{std::move(trajectory), std::nullopt,
-                         request.scene_binding.revision};
+                         request.projection_binding.projection_revision};
   }
 
   void request_cancel() override {
@@ -190,8 +208,7 @@ PlanRequestDTO base_request(std::string move_id) {
   request.tolerances = {1e-6, 1e-6, 1e-6};
   request.speed_profile = {0.5, 0.5, std::nullopt};
   request.planning_timeout_s = 1.0;
-  request.scene_binding.revision = {7, "scene-seven"};
-  request.scene_binding.projection_lease_id = "lease-seven";
+  request.projection_binding = projection_binding();
   return request;
 }
 
@@ -226,10 +243,10 @@ PlannerBackendConformanceInput make_input(DeterministicPlanner& planner) {
   };
   auto invalid = joint;
   invalid.move_id = "invalid_binding";
-  invalid.scene_binding = {};
+  invalid.projection_binding = {};
   input.expected_failures.push_back(PlannerExpectedFailureCase{
-      "invalid_scene_binding", invalid, kErrorInvalidRequest,
-      "planner_scene_binding_invalid"});
+      "invalid_projection_binding", invalid, kErrorInvalidRequest,
+      "planner_projection_binding_invalid"});
   input.ik_case = PlannerIkConformanceCase{
       "single_shot_ik",
       IkRequestDTO{pose_at(0.15, -0.05), "base", "tcp",

@@ -1,13 +1,17 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "manyforge_deployment/build_manifest.hpp"
 #include "manyforge_deployment/retention_qualified_deployment.hpp"
 #include "manyforge_deployment/retained_bundle.hpp"
+#include "manyforge_deployment/structural_model_preparation.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment::detail {
@@ -15,6 +19,61 @@ namespace manyforge::deployment::detail {
 class RetentionMaterializerTestAccess;
 class BuildQualifiedRetentionAuthority;
 class BuildManifestTestAccess;
+
+/// Exact read-only input-artifact source used before I3 creates any retained
+/// output.
+///
+/// This is deliberately distinct from IRawArtifactStore: source/catalog bytes
+/// may live in an independently qualified importer store, and the materializer
+/// must not assume that its output CAS is also the source of compiler inputs.
+/// A null expected size means "bounded by the implementation's fixed input
+/// limit"; digest and key verification remain mandatory.
+class ICompilerInputArtifactSource {
+ public:
+  virtual ~ICompilerInputArtifactSource() = default;
+
+  [[nodiscard]] virtual std::optional<std::string> get_verified(
+      const core::ContentAddressedStoreKey& key,
+      const core::ContentDigest& expected_digest,
+      std::optional<std::uint64_t> expected_size) const = 0;
+};
+
+/// Explicit no-input source for the ordinary canonical-empty path.
+///
+/// It is not a fallback: any deployment that requires a catalog or model
+/// source artifact fails immediately when this source is selected.
+class RejectingCompilerInputArtifactSource final
+    : public ICompilerInputArtifactSource {
+ public:
+  [[nodiscard]] std::optional<std::string> get_verified(
+      const core::ContentAddressedStoreKey&,
+      const core::ContentDigest&,
+      std::optional<std::uint64_t>) const override {
+    return std::nullopt;
+  }
+};
+
+/// Explicit no-catalog-output store for the canonical-empty path.
+///
+/// It creates no unused durable namespace. Any attempt to retain a catalog
+/// referent through this path is a logic error rather than a fallback to the
+/// digest-derived raw CAS.
+class RejectingCatalogArtifactStore final : public ICatalogArtifactStore {
+ public:
+  [[nodiscard]] StoredCatalogArtifact put_if_absent(
+      const core::ContentAddressedStoreKey&,
+      const core::ContentDigest&, std::string_view) override {
+    throw std::logic_error(
+        "canonical-empty retention cannot publish a catalog artifact");
+  }
+
+  [[nodiscard]] std::optional<std::string> get_verified(
+      const core::ContentAddressedStoreKey&,
+      const core::ContentDigest&,
+      std::optional<std::uint64_t>) const override {
+    return std::nullopt;
+  }
+};
 
 /// Exact offline build/environment evidence accepted by the current I3
 /// retained-bundle materializer.
@@ -90,6 +149,10 @@ class RetainedBundleMaterializer final {
   materialize_store_and_reload_production(
       const RetentionQualifiedDeployment& qualified,
       IBuildManifestRepository& manifest_repository,
+      const ICompilerInputArtifactSource& input_artifact_source,
+      std::span<const BuildQualifiedStructuralModelPreparation>
+          structural_model_preparations,
+      ICatalogArtifactStore& catalog_artifact_store,
       IRawArtifactStore& artifact_store,
       IRetainedBundleRepository& bundle_repository);
 
@@ -98,6 +161,10 @@ class RetainedBundleMaterializer final {
   [[nodiscard]] static std::shared_ptr<const RetainedBundle> materialize(
       const RetentionQualifiedDeployment& qualified,
       const BuildQualifiedRetentionContext& context,
+      const ICompilerInputArtifactSource& input_artifact_source,
+      std::span<const BuildQualifiedStructuralModelPreparation>
+          structural_model_preparations,
+      ICatalogArtifactStore& catalog_artifact_store,
       IRawArtifactStore& artifact_store);
 
  private:
@@ -106,7 +173,13 @@ class RetainedBundleMaterializer final {
       const RetentionQualifiedDeployment& qualified,
       const BuildQualifiedRetentionContext& context,
       std::string_view urdf, std::string_view srdf,
+      std::string_view planning_resource_map,
       const BuildQualifiedProductContract& contract,
+      std::optional<std::string_view> symbol_role_map,
+      const BuildQualifiedProductContract* symbol_role_map_contract,
+      std::span<const core::RetainedSchemaArtifactRefDTO> schema_artifacts,
+      std::span<const core::RetainedSourceRecordDTO> source_records,
+      std::span<const core::RetainedGeneratorRecordDTO> generator_records,
       IRawArtifactStore& artifact_store);
 };
 
@@ -120,6 +193,30 @@ struct RetainedArtifactInput final {
   std::string media_type;
   std::string bytes;
 };
+
+/// Current I3 planning/collision import profile.
+///
+/// Generic I2 source/composition accepts and preserves valid transitive mimic
+/// chains. The current retained planning/collision product is consumed by the
+/// Pinocchio family, whose mimic import is qualified only for one-level
+/// master/follower relations. This prepublication guard rejects a
+/// mimic-of-mimic without rewriting it or creating a second naming universe.
+/// It is internal because it is a product-profile constraint, not a generic
+/// model-source rule.
+void require_pinocchio_family_mimic_profile(
+    const UrdfDocumentIr& urdf);
+
+/// Pure complete product-contract and byte-bound preflight.
+///
+/// This performs no store access. Producers that retain other transitive
+/// inputs before the product itself must call it first so an invalid product
+/// cannot leave durable side effects.
+void preflight_retained_product(
+    const core::ProductId& product_id,
+    core::RetainedProductKind product_kind, ProductPlacement placement,
+    const core::ProductContractId& product_contract_id,
+    const core::ProductContractRevision& product_contract_revision,
+    std::span<const RetainedArtifactInput> artifacts);
 
 /// Validates an exact code-owned contract and retains its raw artifacts.
 ///

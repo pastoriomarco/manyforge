@@ -10,13 +10,20 @@
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 
+#include <algorithm>
+#include <array>
 #include <memory>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
 
 #include "retained_bundle_internal.hpp"
+#include "composed_model_symbol_role_map_internal.hpp"
+#include "lite6_controllable_retention_fixture.hpp"
+#include "lite6_structural_retention_fixture.hpp"
+#include "planning_resource_map_internal.hpp"
 #include "retention_store_fixtures.hpp"
 #include "runtime_only_retention_fixture.hpp"
 
@@ -123,9 +130,88 @@ static_assert(!std::is_constructible_v<
 [[nodiscard]] std::shared_ptr<const RetainedBundle> materialize_empty(
     std::string_view cell_id, IRawArtifactStore& store) {
   const auto qualified = qualify_empty(cell_id);
+  const detail::RejectingCompilerInputArtifactSource input_source;
+  detail::RejectingCatalogArtifactStore catalog_store;
   return detail::RetainedBundleMaterializer::materialize(
       qualified, detail::RetentionMaterializerTestAccess::make_context(),
-      store);
+      input_source, {}, catalog_store, store);
+}
+
+[[nodiscard]] std::string require_product_artifact_bytes(
+    const core::RetainedProductDTO& product, std::string_view role,
+    const IRawArtifactStore& store) {
+  const auto& artifacts = product.artifact_refs;
+  const auto found = std::find_if(
+      artifacts.begin(), artifacts.end(),
+      [role](const core::RetainedArtifactRefDTO& artifact) {
+        return artifact.artifact_role_id.value() == role;
+      });
+  if (found == artifacts.end()) {
+    throw std::logic_error(
+        "test bundle is missing retained product artifact");
+  }
+  const auto bytes = store.get_verified(
+      found->content_addressed_store_key, found->content_digest,
+      found->byte_size);
+  if (!bytes.has_value()) {
+    throw std::logic_error(
+        "test bundle artifact did not verify in the raw store");
+  }
+  return *bytes;
+}
+
+[[nodiscard]] std::string require_product_artifact_bytes(
+    const RetainedBundle& bundle, std::string_view role,
+    const IRawArtifactStore& store) {
+  return require_product_artifact_bytes(
+      bundle.value().compiled_products.planning_collision_model,
+      role, store);
+}
+
+[[nodiscard]] CanonicalValue replace_root_member(
+    const CanonicalValue& root, std::string_view member_name,
+    CanonicalValue replacement) {
+  CanonicalValue::Object object = root.as_object();
+  const auto found = std::find_if(
+      object.begin(), object.end(), [member_name](const auto& member) {
+        return member.first == member_name;
+      });
+  if (found == object.end()) {
+    throw std::logic_error("test fixture is missing root member " +
+                           std::string(member_name));
+  }
+  found->second = std::move(replacement);
+  return CanonicalValue(std::move(object));
+}
+
+[[nodiscard]] CanonicalValue replace_object_member(
+    const CanonicalValue& value, std::string_view member_name,
+    CanonicalValue replacement) {
+  CanonicalValue::Object object = value.as_object();
+  const auto found = std::find_if(
+      object.begin(), object.end(), [member_name](const auto& member) {
+        return member.first == member_name;
+      });
+  if (found == object.end()) {
+    throw std::logic_error("test fixture is missing object member " +
+                           std::string(member_name));
+  }
+  found->second = std::move(replacement);
+  return CanonicalValue(std::move(object));
+}
+
+[[nodiscard]] CanonicalValue replace_first_array_object_member(
+    const CanonicalValue& root, std::string_view array_name,
+    std::string_view member_name, CanonicalValue replacement) {
+  CanonicalValue::Array rows = array_member(root, array_name);
+  if (rows.empty()) {
+    throw std::logic_error("test fixture array is empty: " +
+                           std::string(array_name));
+  }
+  rows.front() = replace_object_member(
+      rows.front(), member_name, std::move(replacement));
+  return replace_root_member(
+      root, array_name, CanonicalValue(std::move(rows)));
 }
 
 class CountingRawArtifactStore final : public IRawArtifactStore {
@@ -173,14 +259,16 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(expected_srdf.find("<group"), std::string::npos);
 
   test::InMemoryRawArtifactStoreFixture store;
+  const detail::RejectingCompilerInputArtifactSource input_source;
+  detail::RejectingCatalogArtifactStore catalog_store;
   const auto bundle = detail::RetainedBundleMaterializer::materialize(
       qualified, detail::RetentionMaterializerTestAccess::make_context(),
-      store);
+      input_source, {}, catalog_store, store);
 
   ASSERT_NE(bundle, nullptr);
   EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
   EXPECT_EQ(bundle->canonical_bytes(), canonical_json(bundle->normalized_root()));
-  EXPECT_EQ(store.size(), 2U);
+  EXPECT_EQ(store.size(), 3U);
 
   const CanonicalValue& root = bundle->normalized_root();
   EXPECT_EQ(root.as_object().size(), 10U);
@@ -198,6 +286,7 @@ TEST(RetainedBundleMaterializer,
   EXPECT_TRUE(bundle->value().catalogs.records.empty());
   EXPECT_TRUE(bundle->value().catalogs.schema_artifacts.empty());
   EXPECT_FALSE(bundle->value().compiled_products.viewer_model.has_value());
+  EXPECT_TRUE(bundle->value().compiled_products.symbol_role_maps.empty());
   EXPECT_EQ(bundle->value().provenance.output_records.size(), 1U);
 
   const CanonicalValue& catalogs = member(root, "catalogs");
@@ -211,12 +300,25 @@ TEST(RetainedBundleMaterializer,
   const CanonicalValue& planning =
       member(products, "planning_collision_model");
   const auto& artifacts = array_member(planning, "artifact_refs");
-  ASSERT_EQ(artifacts.size(), 2U);
-  EXPECT_EQ(string_member(artifacts[0], "artifact_role_id"), "srdf");
-  EXPECT_EQ(string_member(artifacts[1], "artifact_role_id"), "urdf");
+  ASSERT_EQ(artifacts.size(), 3U);
+  EXPECT_EQ(string_member(artifacts[0], "artifact_role_id"),
+            detail::kPlanningResourceMapArtifactRole);
+  EXPECT_EQ(string_member(artifacts[1], "artifact_role_id"), "srdf");
+  EXPECT_EQ(string_member(artifacts[2], "artifact_role_id"), "urdf");
 
+  const std::string expected_resource_map =
+      detail::emit_planning_resource_map({});
+  const std::string resource_map_digest =
+      sha256_digest(expected_resource_map);
   const std::string srdf_digest = sha256_digest(expected_srdf);
   const std::string urdf_digest = sha256_digest(expected_urdf);
+  EXPECT_EQ(
+      store.get_verified(
+          core::ContentAddressedStoreKey(
+              "sha256/" + resource_map_digest.substr(7U)),
+          core::ContentDigest(resource_map_digest),
+          expected_resource_map.size()),
+      expected_resource_map);
   EXPECT_EQ(
       store.get_verified(
           core::ContentAddressedStoreKey("sha256/" + srdf_digest.substr(7U)),
@@ -242,13 +344,593 @@ TEST(RetainedBundleMaterializer,
   ASSERT_EQ(fixture.qualified.compiler_ir().catalog_record_refs().size(), 1U);
 
   CountingRawArtifactStore store;
+  const detail::RejectingCompilerInputArtifactSource input_source;
+  detail::RejectingCatalogArtifactStore catalog_store;
   EXPECT_THROW(
       static_cast<void>(detail::RetainedBundleMaterializer::materialize(
           fixture.qualified,
-          detail::RetentionMaterializerTestAccess::make_context(), store)),
+          detail::RetentionMaterializerTestAccess::make_context(),
+          input_source, {}, catalog_store, store)),
       RetainedBundleError);
   EXPECT_EQ(store.put_calls(), 0U);
   EXPECT_EQ(store.get_calls(), 0U);
+}
+
+TEST(RetainedBundleMaterializer,
+     PassiveLite6RetainsOpaqueCatalogAndExactStructuralClosure) {
+  const auto fixture =
+      test::make_lite6_structural_retention_fixture();
+  const auto qualified =
+      test::qualify_lite6_passive_deployment(fixture);
+  const test::Lite6CompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+
+  const auto bundle =
+      detail::RetainedBundleMaterializer::materialize(
+          qualified,
+          detail::RetentionMaterializerTestAccess::make_context(),
+          input_source, fixture.structural_preparations(),
+          catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
+  ASSERT_EQ(bundle->value().catalogs.records.size(), 1U);
+  EXPECT_EQ(bundle->value().catalogs.records.front(),
+            core::CatalogRecordRefDTO(fixture.catalog_reference));
+  ASSERT_EQ(bundle->value().provenance.source_records.size(), 1U);
+  ASSERT_EQ(bundle->value().provenance.generator_records.size(), 1U);
+  EXPECT_EQ(
+      std::get<core::RetainedModelAssetSourceRecordDTO>(
+          bundle->value().provenance.source_records.front())
+          .record_id,
+      fixture.catalog_reference.record_id);
+  EXPECT_EQ(
+      bundle->value().provenance.generator_records.front(),
+      fixture.preparation.generator_record());
+  EXPECT_EQ(catalog_store.size(), 1U);
+  EXPECT_EQ(
+      catalog_store.get_verified(
+          fixture.catalog_reference.content_addressed_store_key,
+          fixture.catalog_reference.content_digest,
+          fixture.catalog_bytes.size()),
+      fixture.catalog_bytes);
+  EXPECT_NE(
+      fixture.catalog_reference.content_addressed_store_key.value(),
+      detail::retained_store_key_for_digest(
+          fixture.catalog_reference.content_digest.value()));
+
+  for (const auto& artifact : fixture.source_artifacts) {
+    EXPECT_EQ(
+        raw_store.get_verified(
+            artifact.store_key, artifact.content_digest,
+            static_cast<std::uint64_t>(artifact.bytes.size())),
+        artifact.bytes)
+        << artifact.logical_uri;
+  }
+  ASSERT_EQ(
+      bundle->value().compiled_products.planning_collision_model
+          .artifact_refs.size(),
+      3U);
+  for (const auto& artifact :
+       bundle->value().compiled_products.planning_collision_model
+           .artifact_refs) {
+    EXPECT_TRUE(
+        raw_store
+            .get_verified(
+                artifact.content_addressed_store_key,
+                artifact.content_digest, artifact.byte_size)
+            .has_value());
+  }
+
+  ASSERT_EQ(bundle->value().compiled_products.symbol_role_maps.size(), 1U);
+  const auto& symbol_product =
+      bundle->value().compiled_products.symbol_role_maps.front();
+  EXPECT_EQ(symbol_product.product_id.value(),
+            "cell_composed_model_symbol_role_map");
+  EXPECT_EQ(symbol_product.product_kind,
+            core::RetainedProductKind::kSymbolRoleMap);
+  EXPECT_EQ(symbol_product.product_contract_id.value(),
+            detail::kComposedModelSymbolRoleMapContractId);
+  ASSERT_EQ(symbol_product.artifact_refs.size(), 1U);
+  EXPECT_EQ(symbol_product.artifact_refs.front().artifact_role_id.value(),
+            detail::kComposedModelSymbolRoleMapArtifactRole);
+  EXPECT_EQ(symbol_product.artifact_refs.front().media_type,
+            detail::kComposedModelSymbolRoleMapMediaType);
+
+  const std::string symbol_map = require_product_artifact_bytes(
+      symbol_product, detail::kComposedModelSymbolRoleMapArtifactRole,
+      raw_store);
+  const CanonicalValue parsed_symbol_map =
+      detail::parse_and_verify_composed_model_symbol_role_map(symbol_map);
+  EXPECT_EQ(canonical_json(parsed_symbol_map), symbol_map);
+  EXPECT_NO_THROW(detail::require_composed_model_symbol_role_map_matches(
+      symbol_map, qualified.compiler_ir()));
+  const auto& composition =
+      qualified.compiler_ir().applicability().composition();
+  EXPECT_EQ(array_member(parsed_symbol_map, "model_occurrences").size(),
+            composition.model_occurrences().size());
+  EXPECT_EQ(array_member(parsed_symbol_map, "symbol_rows").size(),
+            composition.symbol_rewrites().size());
+  EXPECT_EQ(array_member(parsed_symbol_map, "reference_rows").size(),
+            composition.reference_rewrites().size());
+  EXPECT_EQ(array_member(parsed_symbol_map, "coordinate_rows").size(),
+            composition.coordinates().size());
+  EXPECT_EQ(
+      array_member(parsed_symbol_map, "control_binding_coordinate_maps")
+          .size(),
+      composition.control_binding_coordinate_maps().size());
+  EXPECT_EQ(array_member(parsed_symbol_map, "target_role_maps").size(),
+            composition.targets().size());
+
+  std::set<std::string> source_symbols;
+  std::set<std::string> compiled_symbols;
+  for (const auto& row : array_member(parsed_symbol_map, "symbol_rows")) {
+    const std::string source_key =
+        string_member(row, "model_instance_id") + "\x1f" +
+        string_member(row, "kind") + "\x1f" +
+        string_member(row, "scope_name") + "\x1f" +
+        string_member(row, "source_name");
+    EXPECT_TRUE(source_symbols.insert(source_key).second);
+    EXPECT_TRUE(compiled_symbols
+                    .insert(string_member(row, "compiled_name"))
+                    .second);
+  }
+  EXPECT_EQ(source_symbols.size(), compiled_symbols.size());
+}
+
+TEST(RetainedBundleMaterializer,
+     ControllableLite6RetainsExactTargetBindingAndCatalogClosure) {
+  const auto fixture =
+      test::make_lite6_controllable_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(),
+      input_source, fixture.structural_preparations(), catalog_store,
+      raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
+  EXPECT_EQ(bundle->value().catalogs.records.size(), 7U);
+  EXPECT_EQ(bundle->value().catalogs.schema_artifacts.size(), 7U);
+  EXPECT_EQ(bundle->value().provenance.source_records.size(), 7U);
+  EXPECT_EQ(bundle->value().provenance.generator_records.size(), 1U);
+  EXPECT_EQ(catalog_store.size(), 7U);
+  ASSERT_EQ(bundle->value().desired_control_configurations.size(), 1U);
+  EXPECT_TRUE(bundle->value().capability_provider_bindings.empty());
+  EXPECT_TRUE(
+      bundle->value().compiled_products.control_domain_products.empty());
+  EXPECT_TRUE(
+      bundle->value().compiled_products.runtime_unit_products.empty());
+
+  ASSERT_EQ(bundle->value().compiled_products.symbol_role_maps.size(), 1U);
+  const std::string symbol_map = require_product_artifact_bytes(
+      bundle->value().compiled_products.symbol_role_maps.front(),
+      detail::kComposedModelSymbolRoleMapArtifactRole, raw_store);
+  const CanonicalValue parsed =
+      detail::parse_and_verify_composed_model_symbol_role_map(symbol_map);
+  EXPECT_NO_THROW(detail::require_composed_model_symbol_role_map_matches(
+      symbol_map, fixture.qualified.compiler_ir()));
+
+  const auto& binding_maps =
+      array_member(parsed, "control_binding_coordinate_maps");
+  ASSERT_EQ(binding_maps.size(), 1U);
+  EXPECT_EQ(string_member(binding_maps.front(), "control_binding_id"),
+            test::kLite6ArmBindingId);
+  EXPECT_EQ(
+      string_member(binding_maps.front(), "controllable_component_id"),
+      test::kLite6ControllableComponentId);
+  EXPECT_EQ(string_member(binding_maps.front(), "command_target_id"),
+            test::kLite6ArmTargetId);
+  const auto& resources = array_member(binding_maps.front(), "resources");
+  ASSERT_EQ(resources.size(), 6U);
+  for (std::size_t index = 0U; index < resources.size(); ++index) {
+    EXPECT_EQ(string_member(resources[index], "resource_role_id"),
+              "joints");
+    EXPECT_EQ(string_member(resources[index], "resource_id"),
+              "lite6_joint_" + std::to_string(index + 1U));
+    ASSERT_EQ(array_member(resources[index], "coordinates").size(), 1U);
+  }
+
+  const auto& targets = array_member(parsed, "target_role_maps");
+  ASSERT_EQ(targets.size(), 1U);
+  EXPECT_EQ(string_member(targets.front(), "controllable_component_id"),
+            test::kLite6ControllableComponentId);
+  EXPECT_EQ(string_member(targets.front(), "command_target_id"),
+            test::kLite6ArmTargetId);
+  EXPECT_EQ(array_member(targets.front(), "model_groups").size(), 1U);
+  EXPECT_EQ(array_member(targets.front(), "frames").size(), 1U);
+  EXPECT_EQ(array_member(targets.front(), "collision_bodies").size(), 1U);
+}
+
+TEST(RetainedBundleMaterializer,
+     ControllableLite6SymbolMapRejectsOwnerTargetResourceAndMapSplice) {
+  const auto fixture =
+      test::make_lite6_controllable_retention_fixture();
+  const std::string bytes = detail::emit_composed_model_symbol_role_map(
+      fixture.qualified.compiler_ir());
+  const CanonicalValue parsed =
+      detail::parse_and_verify_composed_model_symbol_role_map(bytes);
+
+  const CanonicalValue wrong_owner = replace_first_array_object_member(
+      parsed, "model_occurrences", "owner_component_id",
+      CanonicalValue("foreign_component"));
+  EXPECT_THROW(
+      static_cast<void>(
+          detail::parse_and_verify_composed_model_symbol_role_map(
+              canonical_json(wrong_owner))),
+      RetainedBundleError);
+
+  const CanonicalValue wrong_target = replace_first_array_object_member(
+      parsed, "control_binding_coordinate_maps", "command_target_id",
+      CanonicalValue("foreign_target"));
+  EXPECT_THROW(
+      static_cast<void>(
+          detail::parse_and_verify_composed_model_symbol_role_map(
+              canonical_json(wrong_target))),
+      RetainedBundleError);
+
+  CanonicalValue::Array binding_maps =
+      array_member(parsed, "control_binding_coordinate_maps");
+  CanonicalValue::Array resources =
+      array_member(binding_maps.front(), "resources");
+  ASSERT_EQ(resources.size(), 6U);
+  resources.front() = replace_object_member(
+      resources.front(), "resource_id", CanonicalValue("lite6_joint_0"));
+  binding_maps.front() = replace_object_member(
+      binding_maps.front(), "resources", CanonicalValue(std::move(resources)));
+  const CanonicalValue wrong_resource = replace_root_member(
+      parsed, "control_binding_coordinate_maps",
+      CanonicalValue(std::move(binding_maps)));
+  const std::string wrong_resource_bytes = canonical_json(wrong_resource);
+  EXPECT_NO_THROW(
+      static_cast<void>(
+          detail::parse_and_verify_composed_model_symbol_role_map(
+              wrong_resource_bytes)));
+  EXPECT_THROW(
+      detail::require_composed_model_symbol_role_map_matches(
+          wrong_resource_bytes, fixture.qualified.compiler_ir()),
+      RetainedBundleError);
+
+  const auto passive_input =
+      test::make_lite6_structural_retention_fixture();
+  const auto passive =
+      test::qualify_lite6_passive_deployment(passive_input);
+  const std::string spliced =
+      detail::emit_composed_model_symbol_role_map(passive.compiler_ir());
+  EXPECT_NO_THROW(
+      static_cast<void>(
+          detail::parse_and_verify_composed_model_symbol_role_map(spliced)));
+  EXPECT_THROW(
+      detail::require_composed_model_symbol_role_map_matches(
+          spliced, fixture.qualified.compiler_ir()),
+      RetainedBundleError);
+}
+
+TEST(RetainedBundleMaterializer,
+     ComposedSymbolRoleMapCodecIsCanonicalClosedAndBijective) {
+  const auto fixture = test::make_lite6_structural_retention_fixture();
+  const auto qualified =
+      test::qualify_lite6_passive_deployment(fixture);
+  const std::string bytes =
+      detail::emit_composed_model_symbol_role_map(qualified.compiler_ir());
+  const CanonicalValue parsed =
+      detail::parse_and_verify_composed_model_symbol_role_map(bytes);
+  EXPECT_EQ(canonical_json(parsed), bytes);
+  EXPECT_NO_THROW(detail::require_composed_model_symbol_role_map_matches(
+      bytes, qualified.compiler_ir()));
+
+  EXPECT_THROW(
+      static_cast<void>(
+          detail::parse_and_verify_composed_model_symbol_role_map(" " +
+                                                                  bytes)),
+      RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(detail::parse_and_verify_composed_model_symbol_role_map(
+          std::string(detail::kMaxComposedModelSymbolRoleMapBytes + 1U,
+                      'x'))),
+      RetainedBundleError);
+
+  CanonicalValue::Object extra_fields = parsed.as_object();
+  extra_fields.emplace_back("consumer_hint", CanonicalValue("roboplan"));
+  EXPECT_THROW(
+      static_cast<void>(detail::parse_and_verify_composed_model_symbol_role_map(
+          canonical_json(CanonicalValue(std::move(extra_fields))))),
+      RetainedBundleError);
+
+  CanonicalValue::Array symbols = array_member(parsed, "symbol_rows");
+  ASSERT_GT(symbols.size(), 1U);
+  CanonicalValue::Object first = symbols[0].as_object();
+  const auto compiled = std::find_if(
+      first.begin(), first.end(), [](const auto& member) {
+        return member.first == "compiled_name";
+      });
+  ASSERT_NE(compiled, first.end());
+  compiled->second = CanonicalValue(string_member(symbols[1],
+                                                   "compiled_name"));
+  symbols[0] = CanonicalValue(std::move(first));
+  const CanonicalValue duplicate_reverse = replace_root_member(
+      parsed, "symbol_rows", CanonicalValue(std::move(symbols)));
+  EXPECT_THROW(
+      static_cast<void>(detail::parse_and_verify_composed_model_symbol_role_map(
+          canonical_json(duplicate_reverse))),
+      RetainedBundleError);
+}
+
+TEST(RetainedBundleMaterializer,
+     PassiveLite6RequiresExactPreparationBijectionBeforeStoreEffects) {
+  const auto fixture =
+      test::make_lite6_structural_retention_fixture();
+  const auto qualified =
+      test::qualify_lite6_passive_deployment(fixture);
+  const test::Lite6CompilerInputArtifactSource input_source(
+      fixture);
+
+  {
+    test::InMemoryCatalogArtifactStoreFixture catalog_store;
+    CountingRawArtifactStore raw_store;
+    EXPECT_THROW(
+        static_cast<void>(
+            detail::RetainedBundleMaterializer::materialize(
+                qualified,
+                detail::RetentionMaterializerTestAccess::make_context(),
+                input_source, {}, catalog_store, raw_store)),
+        RetainedBundleError);
+    EXPECT_EQ(catalog_store.size(), 0U);
+    EXPECT_EQ(raw_store.put_calls(), 0U);
+    EXPECT_EQ(raw_store.get_calls(), 0U);
+  }
+
+  {
+    const std::array<BuildQualifiedStructuralModelPreparation, 2U>
+        duplicate_preparations{
+            fixture.preparation, fixture.preparation};
+    test::InMemoryCatalogArtifactStoreFixture catalog_store;
+    CountingRawArtifactStore raw_store;
+    EXPECT_THROW(
+        static_cast<void>(
+            detail::RetainedBundleMaterializer::materialize(
+                qualified,
+                detail::RetentionMaterializerTestAccess::make_context(),
+                input_source, duplicate_preparations, catalog_store,
+                raw_store)),
+        RetainedBundleError);
+    EXPECT_EQ(catalog_store.size(), 0U);
+    EXPECT_EQ(raw_store.put_calls(), 0U);
+    EXPECT_EQ(raw_store.get_calls(), 0U);
+  }
+}
+
+TEST(RetainedBundleMaterializer,
+     PlanningResourceMapDeduplicatesOneExactAssetAcrossOccurrences) {
+  const auto fixture =
+      test::make_lite6_structural_retention_fixture();
+  const std::array<test::Lite6PassiveModelSelection, 2U> selections{{
+      {"lite6_a", &fixture},
+      {"lite6_b", &fixture},
+  }};
+  const auto qualified =
+      test::qualify_lite6_passive_deployment(selections);
+  const test::Lite6CompilerInputArtifactSource input_source(fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+
+  const auto bundle =
+      detail::RetainedBundleMaterializer::materialize(
+          qualified,
+          detail::RetentionMaterializerTestAccess::make_context(),
+          input_source, fixture.structural_preparations(),
+          catalog_store, raw_store);
+
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_EQ(bundle->value().catalogs.records.size(), 1U);
+  EXPECT_EQ(bundle->value().provenance.source_records.size(), 1U);
+  EXPECT_EQ(bundle->value().provenance.generator_records.size(), 1U);
+  const auto rows = detail::parse_and_verify_planning_resource_map(
+      require_product_artifact_bytes(
+          *bundle, detail::kPlanningResourceMapArtifactRole,
+          raw_store));
+  const std::size_t expected_resources =
+      fixture.source_artifacts.size() - 2U;
+  ASSERT_EQ(rows.size(), expected_resources);
+  const std::string urdf = require_product_artifact_bytes(
+      *bundle, "urdf", raw_store);
+  for (const auto& row : rows) {
+    EXPECT_EQ(
+        urdf.find(row.source_logical_uri), std::string::npos);
+    const auto first = urdf.find(row.compiled_logical_uri);
+    ASSERT_NE(first, std::string::npos);
+    EXPECT_NE(
+        urdf.find(row.compiled_logical_uri,
+                  first + row.compiled_logical_uri.size()),
+        std::string::npos);
+  }
+}
+
+TEST(RetainedBundleMaterializer,
+     PlanningResourceMapSeparatesMetadataOnlyRevisionsDeterministically) {
+  const auto revision_a =
+      test::make_lite6_structural_retention_fixture();
+  const auto revision_b =
+      test::make_lite6_structural_retention_fixture(
+          "arm_collision_revision_b");
+  ASSERT_EQ(revision_a.catalog_reference.record_id,
+            revision_b.catalog_reference.record_id);
+  ASSERT_NE(revision_a.catalog_reference.record_revision,
+            revision_b.catalog_reference.record_revision);
+  ASSERT_EQ(revision_a.source_artifacts,
+            revision_b.source_artifacts);
+  ASSERT_EQ(revision_a.preparation.generator_record(),
+            revision_b.preparation.generator_record());
+
+  const std::array<test::Lite6PassiveModelSelection, 2U> selections_a{{
+      {"lite6_a", &revision_a},
+      {"lite6_b", &revision_b},
+  }};
+  const std::array<test::Lite6PassiveModelSelection, 2U> selections_b{{
+      {"lite6_b", &revision_b},
+      {"lite6_a", &revision_a},
+  }};
+  const auto qualified_a =
+      test::qualify_lite6_passive_deployment(selections_a);
+  const auto qualified_b =
+      test::qualify_lite6_passive_deployment(selections_b);
+  const test::Lite6CompilerInputArtifactSource input_a(
+      {&revision_a, &revision_b});
+  const test::Lite6CompilerInputArtifactSource input_b(
+      {&revision_b, &revision_a});
+  const std::array<BuildQualifiedStructuralModelPreparation, 2U>
+      preparations_a{revision_a.preparation, revision_b.preparation};
+  const std::array<BuildQualifiedStructuralModelPreparation, 2U>
+      preparations_b{revision_b.preparation, revision_a.preparation};
+  test::InMemoryCatalogArtifactStoreFixture catalogs_a;
+  test::InMemoryCatalogArtifactStoreFixture catalogs_b;
+  test::InMemoryRawArtifactStoreFixture raw_a;
+  test::InMemoryRawArtifactStoreFixture raw_b;
+
+  const auto bundle_a =
+      detail::RetainedBundleMaterializer::materialize(
+          qualified_a,
+          detail::RetentionMaterializerTestAccess::make_context(),
+          input_a, preparations_a, catalogs_a, raw_a);
+  const auto bundle_b =
+      detail::RetainedBundleMaterializer::materialize(
+          qualified_b,
+          detail::RetentionMaterializerTestAccess::make_context(),
+          input_b, preparations_b, catalogs_b, raw_b);
+
+  ASSERT_NE(bundle_a, nullptr);
+  ASSERT_NE(bundle_b, nullptr);
+  EXPECT_EQ(bundle_a->retained_bundle_id(),
+            bundle_b->retained_bundle_id());
+  EXPECT_EQ(bundle_a->canonical_bytes(), bundle_b->canonical_bytes());
+  EXPECT_EQ(bundle_a->value().catalogs.records.size(), 2U);
+  EXPECT_EQ(bundle_a->value().provenance.source_records.size(), 2U);
+  EXPECT_EQ(bundle_a->value().provenance.generator_records.size(), 1U);
+
+  const auto rows = detail::parse_and_verify_planning_resource_map(
+      require_product_artifact_bytes(
+          *bundle_a, detail::kPlanningResourceMapArtifactRole, raw_a));
+  const std::size_t expected_per_revision =
+      revision_a.source_artifacts.size() - 2U;
+  ASSERT_EQ(rows.size(), expected_per_revision * 2U);
+  for (std::size_t index = 0U; index < expected_per_revision; ++index) {
+    const auto& first = rows[index];
+    const auto& second = rows[index + expected_per_revision];
+    EXPECT_EQ(first.source_logical_uri, second.source_logical_uri);
+    EXPECT_EQ(first.content_digest, second.content_digest);
+    EXPECT_EQ(first.content_addressed_store_key,
+              second.content_addressed_store_key);
+    EXPECT_NE(first.model_revision, second.model_revision);
+    EXPECT_NE(first.compiled_logical_uri,
+              second.compiled_logical_uri);
+  }
+}
+
+TEST(RetainedBundleMaterializer,
+     PlanningResourceMapCodecIsCanonicalClosedAndFailClosed) {
+  const core::ModelAssetId asset_id("resource_fixture");
+  const core::ModelRevision revision(
+      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  const std::string source_uri =
+      "asset://resource_fixture/meshes/base.stl";
+  const std::string digest =
+      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const detail::PlanningResourceMapRow row{
+      asset_id,
+      revision,
+      source_uri,
+      detail::compiled_planning_resource_uri(
+          asset_id, revision, source_uri),
+      "model/stl",
+      12U,
+      core::ContentDigest(digest),
+      core::ContentAddressedStoreKey(
+          "sha256/" + digest.substr(7U)),
+  };
+  const std::string canonical =
+      detail::emit_planning_resource_map({row});
+  EXPECT_EQ(
+      detail::parse_and_verify_planning_resource_map(canonical),
+      std::vector<detail::PlanningResourceMapRow>{row});
+
+  auto duplicate = std::vector<detail::PlanningResourceMapRow>{
+      row, row};
+  EXPECT_THROW(
+      static_cast<void>(
+          detail::emit_planning_resource_map(std::move(duplicate))),
+      RetainedBundleError);
+
+  auto wrong_store = row;
+  wrong_store.content_addressed_store_key =
+      core::ContentAddressedStoreKey(
+          "sha256/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+  EXPECT_THROW(
+      static_cast<void>(
+          detail::emit_planning_resource_map({wrong_store})),
+      RetainedBundleError);
+
+  std::string tampered = canonical;
+  const auto compiled_offset =
+      tampered.find(row.compiled_logical_uri);
+  ASSERT_NE(compiled_offset, std::string::npos);
+  tampered.insert(
+      compiled_offset + row.compiled_logical_uri.size(), "x");
+  EXPECT_THROW(
+      static_cast<void>(
+          detail::parse_and_verify_planning_resource_map(tampered)),
+      RetainedBundleError);
+  EXPECT_THROW(
+      static_cast<void>(
+          detail::parse_and_verify_planning_resource_map(
+              canonical + "\n")),
+      RetainedBundleError);
+}
+
+TEST(RetainedBundleMaterializer,
+     PinocchioFamilyProfileAcceptsOneLevelMimicAndRejectsChain) {
+  UrdfDocumentIr one_level;
+  one_level.robot_name = "one_level";
+  UrdfJointIr master{};
+  master.name = "master";
+  UrdfJointIr follower{};
+  follower.name = "follower";
+  follower.mimic = UrdfMimicIr{
+      .joint_name = "master",
+      .authored_multiplier = 1.0,
+      .authored_offset = 0.0,
+      .multiplier = 1.0,
+      .offset = 0.0,
+  };
+  one_level.joints = {master, follower};
+  EXPECT_NO_THROW(
+      detail::require_pinocchio_family_mimic_profile(one_level));
+
+  UrdfDocumentIr chain = one_level;
+  UrdfJointIr second_follower{};
+  second_follower.name = "second_follower";
+  second_follower.mimic = UrdfMimicIr{
+      .joint_name = "follower",
+      .authored_multiplier = 2.0,
+      .authored_offset = 0.5,
+      .multiplier = 2.0,
+      .offset = 0.5,
+  };
+  chain.joints.push_back(second_follower);
+  EXPECT_THROW(
+      detail::require_pinocchio_family_mimic_profile(chain),
+      RetainedBundleError);
+
+  std::reverse(chain.joints.begin(), chain.joints.end());
+  EXPECT_THROW(
+      detail::require_pinocchio_family_mimic_profile(chain),
+      RetainedBundleError);
 }
 
 TEST(RetainedBundleMaterializer,
@@ -324,13 +1006,19 @@ TEST(RetainedBundleMaterializer,
   const auto& second_artifacts =
       second->value()
           .compiled_products.planning_collision_model.artifact_refs;
-  ASSERT_EQ(first_artifacts.size(), 2U);
+  ASSERT_EQ(first_artifacts.size(), 3U);
   ASSERT_EQ(second_artifacts.size(), first_artifacts.size());
   for (std::size_t index = 0U; index < first_artifacts.size(); ++index) {
     EXPECT_EQ(first_artifacts[index].artifact_role_id,
               second_artifacts[index].artifact_role_id);
-    EXPECT_NE(first_artifacts[index].content_digest,
-              second_artifacts[index].content_digest);
+    if (first_artifacts[index].artifact_role_id.value() ==
+        detail::kPlanningResourceMapArtifactRole) {
+      EXPECT_EQ(first_artifacts[index].content_digest,
+                second_artifacts[index].content_digest);
+    } else {
+      EXPECT_NE(first_artifacts[index].content_digest,
+                second_artifacts[index].content_digest);
+    }
   }
 }
 

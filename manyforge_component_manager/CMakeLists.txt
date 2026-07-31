@@ -13,6 +13,28 @@ find_package(OpenSSL REQUIRED)
 find_package(SQLite3 3.37 REQUIRED)
 
 set(
+  MANYFORGE_PERSISTENCE_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_persistence"
+  CACHE PATH
+  "Path to the manyforge_persistence source tree")
+if(NOT TARGET manyforge::persistence)
+  if(NOT EXISTS
+     "${MANYFORGE_PERSISTENCE_SOURCE_DIR}/include/manyforge_persistence/sqlite_read_only_preflight.hpp")
+    message(FATAL_ERROR
+      "manyforge_component_manager requires the manyforge_persistence "
+      "mechanical storage-primitives target")
+  endif()
+  add_subdirectory(
+    "${MANYFORGE_PERSISTENCE_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_persistence"
+    EXCLUDE_FROM_ALL)
+endif()
+if(NOT TARGET manyforge::persistence)
+  message(FATAL_ERROR
+    "manyforge_component_manager could not resolve manyforge_persistence")
+endif()
+
+set(
   MANYFORGE_CORE_INCLUDE_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_core/include"
   CACHE PATH
@@ -116,10 +138,37 @@ configure_file(
   "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_active_bundle_publication_schema.hpp"
   @ONLY)
 
+set(
+  MANYFORGE_MANAGER_APPLY_JOURNAL_SCHEMA
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/003_manager_apply_journal.sql")
+set_property(
+  DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${MANYFORGE_MANAGER_APPLY_JOURNAL_SCHEMA}")
+file(READ
+  "${MANYFORGE_MANAGER_APPLY_JOURNAL_SCHEMA}"
+  MANYFORGE_MANAGER_APPLY_JOURNAL_SCHEMA_SQL)
+string(
+  FIND
+  "${MANYFORGE_MANAGER_APPLY_JOURNAL_SCHEMA_SQL}"
+  ")mf_majs\""
+  MANYFORGE_MANAGER_APPLY_JOURNAL_SCHEMA_DELIMITER_COLLISION)
+if(NOT MANYFORGE_MANAGER_APPLY_JOURNAL_SCHEMA_DELIMITER_COLLISION
+   EQUAL -1)
+  message(FATAL_ERROR
+    "manager Apply-journal schema collides with its generated-header "
+    "raw-string delimiter")
+endif()
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_manager_apply_journal_schema.hpp.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_manager_apply_journal_schema.hpp"
+  @ONLY)
+
 add_library(manyforge_component_manager
   src/active_bundle_publication_store.cpp
   src/canonical_empty_bootstrap_coordinator.cpp
   src/durable_store_set.cpp
+  src/manager_apply_fence_coordinator.cpp
+  src/manager_apply_journal.cpp
   src/manager_bootstrap_journal.cpp
   src/runtime_observation.cpp
 )
@@ -136,6 +185,7 @@ target_link_libraries(manyforge_component_manager PRIVATE
   OpenSSL::Crypto
   SQLite::SQLite3
   manyforge::deployment_admission
+  manyforge::persistence
 )
 get_target_property(
   MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS
@@ -145,6 +195,11 @@ if(NOT "manyforge::deployment_admission" IN_LIST
        MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS)
   message(FATAL_ERROR
     "manyforge_component_manager lost its focused admission dependency")
+endif()
+if(NOT "manyforge::persistence" IN_LIST
+       MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS)
+  message(FATAL_ERROR
+    "manyforge_component_manager lost its mechanical persistence dependency")
 endif()
 if("manyforge::deployment" IN_LIST MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS OR
    "manyforge_deployment" IN_LIST MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS)
@@ -230,6 +285,23 @@ if(BUILD_TESTING)
   target_link_libraries(test_active_bundle_publication_store PRIVATE
     manyforge_component_manager GTest::gtest_main)
   gtest_discover_tests(test_active_bundle_publication_store
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_manager_apply_journal
+    test/test_manager_apply_journal.cpp)
+  target_link_libraries(test_manager_apply_journal PRIVATE
+    manyforge_component_manager
+    GTest::gtest_main
+    SQLite::SQLite3)
+  gtest_discover_tests(test_manager_apply_journal
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_manager_apply_fence_coordinator
+    test/test_manager_apply_fence_coordinator.cpp)
+  target_link_libraries(test_manager_apply_fence_coordinator PRIVATE
+    manyforge_component_manager
+    GTest::gtest_main)
+  gtest_discover_tests(test_manager_apply_fence_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_canonical_empty_bootstrap_coordinator

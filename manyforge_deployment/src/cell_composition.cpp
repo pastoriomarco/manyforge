@@ -19,11 +19,15 @@
 #include <vector>
 
 #include "mf1_name_internal.hpp"
+#include "mf2_joint_name_internal.hpp"
+#include "planning_resource_map_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
 
 using AssetKey = std::pair<std::string, std::string>;
+using ResourceUriMap =
+    std::map<std::string, std::string, std::less<>>;
 using SymbolTuple =
     std::tuple<std::string, std::uint8_t, std::string, std::string>;
 using detail::StructuralAttachmentResolution;
@@ -57,6 +61,77 @@ void require_room(std::size_t current, std::size_t added,
 [[nodiscard]] AssetKey asset_key(
     const StructuralModelInstanceResolution& model) {
   return asset_key(model.model_asset_id, model.model_revision);
+}
+
+struct PlanningResourceRegistry final {
+  std::map<AssetKey, ResourceUriMap> by_asset;
+  std::vector<CompositionPlanningResourceRewrite> rewrites;
+};
+
+[[nodiscard]] PlanningResourceRegistry build_planning_resource_registry(
+    const std::map<AssetKey, const SourceVerifiedModelAsset*>& assets) {
+  PlanningResourceRegistry result;
+  std::set<std::string, std::less<>> compiled_uris;
+  for (const auto& [identity, asset] : assets) {
+    const auto& value = asset->value();
+    const auto& source = value.expanded_source;
+    ResourceUriMap resource_uris;
+    for (const auto& artifact : asset->verified_artifacts()) {
+      if (artifact.logical_uri == source.urdf_logical_uri ||
+          (source.srdf_logical_uri.has_value() &&
+           artifact.logical_uri == *source.srdf_logical_uri)) {
+        continue;
+      }
+      require_room(result.rewrites.size(), 1U,
+                   core::kMaxModelAssetCollectionItems,
+                   "planning resource rewrite table");
+      const std::string compiled =
+          detail::compiled_planning_resource_uri(
+              value.model_asset_id, value.model_revision,
+              artifact.logical_uri);
+      if (!resource_uris.emplace(artifact.logical_uri, compiled).second ||
+          !compiled_uris.insert(compiled).second) {
+        fail("compiled planning resource URI collision");
+      }
+      result.rewrites.push_back(
+          {value.model_asset_id,
+           value.model_revision,
+           artifact.logical_uri,
+           compiled,
+           artifact.media_type,
+           artifact.byte_size,
+           artifact.content_digest,
+           artifact.resolved_store_key});
+    }
+    result.by_asset.emplace(identity, std::move(resource_uris));
+  }
+  std::sort(
+      result.rewrites.begin(), result.rewrites.end(),
+      [](const auto& left, const auto& right) {
+        return std::tie(left.model_asset_id, left.model_revision,
+                        left.source_logical_uri) <
+               std::tie(right.model_asset_id, right.model_revision,
+                        right.source_logical_uri);
+      });
+  return result;
+}
+
+void rewrite_resource_uri(std::string& logical_uri,
+                          const ResourceUriMap& resource_uris) {
+  const auto found = resource_uris.find(logical_uri);
+  if (found == resource_uris.end()) {
+    fail("flattened URDF references a resource outside the exact "
+         "compiler-owned planning map");
+  }
+  logical_uri = found->second;
+}
+
+void rewrite_geometry_resources(UrdfGeometryIr& geometry,
+                                const ResourceUriMap& resource_uris) {
+  if (auto* mesh = std::get_if<UrdfMeshGeometryIr>(&geometry);
+      mesh != nullptr) {
+    rewrite_resource_uri(mesh->logical_uri, resource_uris);
+  }
 }
 
 [[nodiscard]] std::string_view symbol_tag(OccurrenceSymbolKind kind) {
@@ -104,7 +179,8 @@ class SymbolRegistry final {
   [[nodiscard]] std::string add(
       const StructuralModelInstanceResolution& model,
       OccurrenceSymbolKind kind, std::string scope_name,
-      std::string source_name) {
+      std::string source_name,
+      std::optional<std::size_t> joint_parent_local_rank = std::nullopt) {
     OccurrenceSymbolKey key{model.model_instance_id, kind,
                             std::move(scope_name), std::move(source_name)};
     const auto tuple = symbol_tuple(key);
@@ -114,15 +190,24 @@ class SymbolRegistry final {
     }
     require_room(forward_.size(), 1U, kMaxCompositionSymbols, "symbol table");
     const auto tag = symbol_tag(kind);
-    const auto compiled = detail::make_mf1_generated_name(
-        tag,
-        {{"cell_id", cell_id_.value()},
-         {"model_instance_id", model.model_instance_id.value()},
-         {"model_asset_id", model.model_asset_id.value()},
-         {"model_revision", model.model_revision.value()},
-         {"kind", tag},
-         {"scope", key.scope_name},
-         {"source", key.source_name}});
+    if ((kind == OccurrenceSymbolKind::kJoint) !=
+        joint_parent_local_rank.has_value()) {
+      fail("internal occurrence joint rank does not match its symbol kind");
+    }
+    const auto fields =
+        std::vector<std::pair<std::string_view, std::string_view>>{
+            {"cell_id", cell_id_.value()},
+            {"model_instance_id", model.model_instance_id.value()},
+            {"model_asset_id", model.model_asset_id.value()},
+            {"model_revision", model.model_revision.value()},
+            {"kind", tag},
+            {"scope", key.scope_name},
+            {"source", key.source_name}};
+    const auto compiled =
+        joint_parent_local_rank.has_value()
+            ? detail::make_mf2_generated_joint_name(
+                  *joint_parent_local_rank, fields)
+            : detail::make_mf1_generated_name(tag, fields);
     if (!all_names_.insert(compiled).second ||
         !reverse_.emplace(compiled, key).second) {
       fail("generated occurrence-name collision for '" + compiled + "'");
@@ -301,7 +386,7 @@ struct CompositionPreflight final {
       checked_add(result.estimated_flattened_bytes, srdf_bytes->size(),
                   "flattened-byte preflight");
     }
-    // A compiled name is at most 78 bytes today. Ninety-six is a deliberate
+    // An mf2 joint name is at most 81 bytes today. Ninety-six is a deliberate
     // version-local conservative allowance for XML quoting and separators.
     checked_add_scaled(result.estimated_flattened_bytes, symbols, 96U,
                        "flattened-byte preflight");
@@ -375,8 +460,23 @@ void register_source_symbols(const StructuralModelInstanceResolution& model,
       }
     }
   }
+  std::map<std::string, std::size_t, std::less<>> joint_ranks;
+  try {
+    for (auto&& [name, rank] :
+         detail::dependency_ordered_joint_local_ranks(source.urdf())) {
+      joint_ranks.emplace(std::move(name), rank);
+    }
+  } catch (const detail::Mf2JointOrderingError& error) {
+    fail("cell composition cannot generate dependency-ordered joint names: " +
+         std::string(error.what()));
+  }
   for (const auto& joint : source.urdf().joints) {
-    (void)symbols.add(model, OccurrenceSymbolKind::kJoint, {}, joint.name);
+    const auto rank = joint_ranks.find(joint.name);
+    if (rank == joint_ranks.end()) {
+      fail("internal mf2 joint ordering omitted a source joint");
+    }
+    (void)symbols.add(model, OccurrenceSymbolKind::kJoint, {}, joint.name,
+                      rank->second);
   }
   if (!source.srdf().has_value()) {
     return;
@@ -413,6 +513,7 @@ void add_reference(
     const StructuralModelInstanceResolution& model,
     const UrdfMaterialIr& source, SymbolRegistry& symbols,
     std::vector<OccurrenceReferenceRewrite>& references,
+    const ResourceUriMap& resource_uris,
     std::string_view definition_scope,
     std::string_view owner_scope, std::string_view owner_name,
     std::size_t ordinal) {
@@ -440,13 +541,22 @@ void add_reference(
         compiled);
     result.resolved_reference->definition_name = compiled;
   }
+  if (result.texture.has_value()) {
+    rewrite_resource_uri(result.texture->logical_uri, resource_uris);
+  }
+  if (result.resolved_reference.has_value() &&
+      result.resolved_reference->texture.has_value()) {
+    rewrite_resource_uri(
+        result.resolved_reference->texture->logical_uri, resource_uris);
+  }
   return result;
 }
 
 [[nodiscard]] UrdfDocumentIr rewrite_urdf_occurrence(
     const StructuralModelInstanceResolution& model,
     const UrdfDocumentIr& source, SymbolRegistry& symbols,
-    std::vector<OccurrenceReferenceRewrite>& references) {
+    std::vector<OccurrenceReferenceRewrite>& references,
+    const ResourceUriMap& resource_uris) {
   UrdfDocumentIr result;
   result.robot_name = symbols.require(
       model.model_instance_id, OccurrenceSymbolKind::kRobot, {},
@@ -454,8 +564,8 @@ void add_reference(
   result.materials.reserve(source.materials.size());
   for (std::size_t index = 0; index < source.materials.size(); ++index) {
     result.materials.push_back(rewrite_material(
-        model, source.materials[index], symbols, references, {}, "robot",
-        source.robot_name, index));
+        model, source.materials[index], symbols, references, resource_uris,
+        {}, "robot", source.robot_name, index));
   }
 
   result.links.reserve(source.links.size());
@@ -477,10 +587,11 @@ void add_reference(
             visual_scope,
             *visual.name);
       }
+      rewrite_geometry_resources(visual.geometry, resource_uris);
       if (visual.material.has_value()) {
         visual.material = rewrite_material(
-            model, *visual.material, symbols, references, visual_scope,
-            visual_scope, original_visual_name, index);
+            model, *visual.material, symbols, references, resource_uris,
+            visual_scope, visual_scope, original_visual_name, index);
       }
     }
     for (std::size_t index = 0; index < link.collisions.size(); ++index) {
@@ -491,6 +602,7 @@ void add_reference(
             indexed_scope(original_link_name, "collision", index),
             *collision.name);
       }
+      rewrite_geometry_resources(collision.geometry, resource_uris);
     }
     result.links.push_back(std::move(link));
   }
@@ -1528,6 +1640,8 @@ CompositionQualifiedCellIr compose_cell_occurrences(
                              asset.value().model_revision),
                    &asset);
   }
+  auto planning_resources =
+      build_planning_resource_registry(assets);
   std::vector<const StructuralModelInstanceResolution*> ordered_models;
   ordered_models.reserve(structure.model_instances().size());
   std::map<std::string,
@@ -1569,8 +1683,14 @@ CompositionQualifiedCellIr compose_cell_occurrences(
   for (const auto* model : ordered_models) {
     const auto& asset = require_asset(assets, *model);
     const auto& source = asset.source_ir();
-    auto rewritten =
-        rewrite_urdf_occurrence(*model, source.urdf(), symbols, references);
+    const auto resource_uris =
+        planning_resources.by_asset.find(asset_key(*model));
+    if (resource_uris == planning_resources.by_asset.end()) {
+      fail("planning resource registry is missing one exact ModelAsset");
+    }
+    auto rewritten = rewrite_urdf_occurrence(
+        *model, source.urdf(), symbols, references,
+        resource_uris->second);
     require_room(flattened_urdf.materials.size(), rewritten.materials.size(),
                  kMaxCompositionSymbols, "flattened material");
     flattened_urdf.materials.insert(
@@ -1735,8 +1855,16 @@ CompositionQualifiedCellIr compose_cell_occurrences(
     }
   }
 
-  std::vector<CompositionFixedConnection> connections;
-  connections.reserve(structure.model_instances().size());
+  struct PendingFixedConnection final {
+    CompositionConnectionSource source;
+    std::string kind;
+    core::ModelInstanceId model_instance_id;
+    std::string compiled_parent_link_name;
+    std::string compiled_child_link_name;
+    core::PlacementPoseDTO child_pose_in_parent;
+  };
+  std::vector<PendingFixedConnection> pending_connections;
+  pending_connections.reserve(structure.model_instances().size());
   for (const auto* model : ordered_models) {
     CompositionConnectionSource source =
         CompositionDirectModelAnchor{
@@ -1825,18 +1953,40 @@ CompositionQualifiedCellIr compose_cell_occurrences(
         break;
       }
     }
-    const auto joint_name = detail::make_mf1_generated_name(
-        tag,
+    pending_connections.push_back(
+        {std::move(source), std::move(tag), model->model_instance_id,
+         std::move(parent_link), std::move(child_link), pose});
+  }
+
+  // Source joints already occupy [0, N) under each compiled parent link.
+  // Connections have no cross-occurrence mimic edges, so placing the stable
+  // model-identity order after those source children preserves every
+  // dependency ordering without renaming the reusable source occurrence.
+  std::map<std::string, std::size_t, std::less<>>
+      next_connection_rank_by_parent;
+  for (const auto& joint : flattened_urdf.joints) {
+    ++next_connection_rank_by_parent[joint.parent_link_name];
+  }
+  std::vector<CompositionFixedConnection> connections;
+  connections.reserve(pending_connections.size());
+  for (auto& pending : pending_connections) {
+    auto& rank =
+        next_connection_rank_by_parent[pending.compiled_parent_link_name];
+    const auto joint_name = detail::make_mf2_generated_joint_name(
+        rank++,
         {{"cell_id", graph.cell_id.value()},
-         {"model_instance_id", model->model_instance_id.value()},
-         {"parent_link", parent_link},
-         {"child_link", child_link}});
+         {"model_instance_id", pending.model_instance_id.value()},
+         {"kind", pending.kind},
+         {"parent_link", pending.compiled_parent_link_name},
+         {"child_link", pending.compiled_child_link_name}});
     if (!all_compiled_names.insert(joint_name).second) {
       fail("generated fixed-connection name collided");
     }
     connections.push_back(
-        {std::move(source), joint_name, std::move(parent_link),
-         std::move(child_link), pose});
+        {std::move(pending.source), joint_name,
+         std::move(pending.compiled_parent_link_name),
+         std::move(pending.compiled_child_link_name),
+         pending.child_pose_in_parent});
   }
   for (const auto& connection : connections) {
     require_room(flattened_urdf.joints.size(), 1U,
@@ -1936,7 +2086,8 @@ CompositionQualifiedCellIr compose_cell_occurrences(
       std::move(owned_types), cell_frame, std::move(flattened_urdf),
       std::move(flattened_srdf), std::move(occurrences),
       std::move(forward_rewrites), std::move(reverse_rewrites),
-      std::move(references), std::move(frames), std::move(connections),
+      std::move(references), std::move(planning_resources.rewrites),
+      std::move(frames), std::move(connections),
       std::move(frame_paths), std::move(coordinates),
       std::move(coordinate_maps), std::move(targets));
 }

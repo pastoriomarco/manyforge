@@ -24,9 +24,9 @@ The implemented offline boundary owns:
 - exact caller-resolved source closure, complete typed/re-emittable URDF/SRDF
   IR, bounded self-contained COLLADA support, structural/source-role proof,
   and immutable source qualification;
-- deterministic `mf1` occurrence composition, flattened URDF/SRDF, complete
-  rewrite proof, portable frame/path projection, resource-coordinate maps,
-  target projections, and checked cell-wide bounds;
+- deterministic mixed `mf1`/dependency-ordered `mf2` occurrence composition,
+  flattened URDF/SRDF, complete rewrite proof, portable frame/path projection,
+  resource-coordinate maps, target projections, and checked cell-wide bounds;
 - exact occurrence-specific control/provider/capability/route/Stop
   applicability and deterministic logical templates;
 - a private-constructor `CompilerQualifiedCellIr`, complete current-subset

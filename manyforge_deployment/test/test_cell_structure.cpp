@@ -116,6 +116,12 @@ static_assert(!std::is_default_constructible_v<CompositionQualifiedCellIr>);
       store_key, document);
 }
 
+struct SourceArtifactSpec final {
+  std::string relative_path;
+  std::string media_type;
+  std::string bytes;
+};
+
 struct AssetSpec final {
   std::string id;
   std::string cardinality{"multiple_per_cell"};
@@ -128,11 +134,39 @@ struct AssetSpec final {
       {"arm_joints", {"joint1"}}};
   std::vector<std::pair<std::string, std::vector<std::string>>> bodies{
       {"arm_collision", {"base_link", "tip_link"}}};
+  std::vector<SourceArtifactSpec> source_artifacts{};
 };
 
 [[nodiscard]] std::string urdf_for(std::string_view id) {
   return "<robot name=\"" + std::string(id) +
          "\"><link name=\"base_link\"/><link name=\"tip_link\"/>"
+         "<joint name=\"joint1\" type=\"revolute\">"
+         "<parent link=\"base_link\"/><child link=\"tip_link\"/>"
+         "<axis xyz=\"0 0 1\"/><limit lower=\"-3\" upper=\"3\" "
+         "effort=\"1\" velocity=\"1\"/></joint></robot>";
+}
+
+[[nodiscard]] std::string mesh_urdf_for(std::string_view id) {
+  return "<robot name=\"" + std::string(id) +
+         "\"><link name=\"base_link\"><visual><geometry><mesh filename=\""
+         "asset://" + std::string(id) +
+         "/meshes/base.stl\"/></geometry></visual></link>"
+         "<link name=\"tip_link\"/><joint name=\"joint1\" type=\"revolute\">"
+         "<parent link=\"base_link\"/><child link=\"tip_link\"/>"
+         "<axis xyz=\"0 0 1\"/><limit lower=\"-3\" upper=\"3\" "
+         "effort=\"1\" velocity=\"1\"/></joint></robot>";
+}
+
+[[nodiscard]] std::string mesh_and_texture_urdf_for(
+    std::string_view id) {
+  return "<robot name=\"" + std::string(id) +
+         "\"><material name=\"paint\"><texture filename=\"asset://" +
+         std::string(id) +
+         "/textures/steel.png\"/></material>"
+         "<link name=\"base_link\"><visual><geometry><mesh filename=\""
+         "asset://" + std::string(id) +
+         "/meshes/base.stl\"/></geometry><material name=\"paint\"/>"
+         "</visual></link><link name=\"tip_link\"/>"
          "<joint name=\"joint1\" type=\"revolute\">"
          "<parent link=\"base_link\"/><child link=\"tip_link\"/>"
          "<axis xyz=\"0 0 1\"/><limit lower=\"-3\" upper=\"3\" "
@@ -169,19 +203,36 @@ struct QualifiedSource final {
   const std::string urdf_uri = "asset://" + spec.id + "/a.urdf";
   const std::string srdf_uri = "asset://" + spec.id + "/b.srdf";
 
-  CanonicalValue::Array artifacts{
-      CanonicalValue(CanonicalValue::Object{
-          {"logical_uri", CanonicalValue(urdf_uri)},
-          {"media_type", CanonicalValue("application/xml")},
-          {"byte_size", CanonicalValue(static_cast<double>(urdf.size()))},
-          {"content_digest", CanonicalValue(sha256_digest(urdf))},
-      })};
+  struct SourceBlob final {
+    std::string logical_uri;
+    std::string media_type;
+    std::string bytes;
+  };
+  std::vector<SourceBlob> source_blobs{
+      {urdf_uri, "application/xml", urdf}};
   if (srdf.has_value()) {
+    source_blobs.push_back(
+        {srdf_uri, "application/xml", *srdf});
+  }
+  for (const auto& artifact : spec.source_artifacts) {
+    source_blobs.push_back(
+        {"asset://" + spec.id + "/" + artifact.relative_path,
+         artifact.media_type, artifact.bytes});
+  }
+  std::sort(
+      source_blobs.begin(), source_blobs.end(),
+      [](const SourceBlob& left, const SourceBlob& right) {
+        return left.logical_uri < right.logical_uri;
+      });
+  CanonicalValue::Array artifacts;
+  artifacts.reserve(source_blobs.size());
+  for (const auto& artifact : source_blobs) {
     artifacts.emplace_back(CanonicalValue::Object{
-        {"logical_uri", CanonicalValue(srdf_uri)},
-        {"media_type", CanonicalValue("application/xml")},
-        {"byte_size", CanonicalValue(static_cast<double>(srdf->size()))},
-        {"content_digest", CanonicalValue(sha256_digest(*srdf))},
+        {"logical_uri", CanonicalValue(artifact.logical_uri)},
+        {"media_type", CanonicalValue(artifact.media_type)},
+        {"byte_size",
+         CanonicalValue(static_cast<double>(artifact.bytes.size()))},
+        {"content_digest", CanonicalValue(sha256_digest(artifact.bytes))},
     });
   }
   CanonicalValue::Object expanded{
@@ -254,17 +305,14 @@ struct QualifiedSource final {
        core::ContentDigest(sha256_digest(document)), catalog_key},
       catalog_key, document);
 
-  std::vector<ResolvedModelSourceArtifactCandidate> closure{
-      {urdf_uri,
-       core::ContentAddressedStoreKey(
-           store_key_for(sha256_digest(urdf))),
-       urdf}};
-  if (srdf.has_value()) {
+  std::vector<ResolvedModelSourceArtifactCandidate> closure;
+  closure.reserve(source_blobs.size());
+  for (const auto& artifact : source_blobs) {
     closure.push_back(
-        {srdf_uri,
+        {artifact.logical_uri,
          core::ContentAddressedStoreKey(
-             store_key_for(sha256_digest(*srdf))),
-         *srdf});
+             store_key_for(sha256_digest(artifact.bytes))),
+         artifact.bytes});
   }
   return {verify_model_source_closure(qualified, std::move(closure)),
           document};
@@ -1198,6 +1246,26 @@ TEST(CellStructure,
       });
 }
 
+[[nodiscard]] bool is_mf2_joint_name(std::string_view value) {
+  constexpr std::string_view kPrefix = "mf2_joint_";
+  if (!value.starts_with(kPrefix) ||
+      value.size() != kPrefix.size() + 6U + 1U + 64U) {
+    return false;
+  }
+  const auto rank = value.substr(kPrefix.size(), 6U);
+  if (!std::all_of(rank.begin(), rank.end(), [](char character) {
+        return character >= '0' && character <= '9';
+      }) ||
+      value[kPrefix.size() + 6U] != '_') {
+    return false;
+  }
+  return std::all_of(
+      value.end() - 64, value.end(), [](char character) {
+        return (character >= '0' && character <= '9') ||
+               (character >= 'a' && character <= 'f');
+      });
+}
+
 [[nodiscard]] std::array<double, 4> multiply_quaternion(
     const std::array<double, 4>& left,
     const std::array<double, 4>& right) {
@@ -1453,15 +1521,25 @@ TEST(CellComposition,
   ASSERT_EQ(composed.symbol_rewrites().size(),
             composed.reverse_symbol_rewrites().size());
   std::map<std::string, OccurrenceSymbolKey, std::less<>> reverse;
+  std::set<std::string, std::less<>> represented_joints;
   for (const auto& row : composed.reverse_symbol_rewrites()) {
-    EXPECT_TRUE(is_mf1_name(row.compiled_name));
+    EXPECT_TRUE(
+        row.source.kind == OccurrenceSymbolKind::kJoint
+            ? is_mf2_joint_name(row.compiled_name)
+            : is_mf1_name(row.compiled_name));
     EXPECT_TRUE(reverse.emplace(row.compiled_name, row.source).second);
   }
   for (const auto& row : composed.symbol_rewrites()) {
-    EXPECT_TRUE(is_mf1_name(row.compiled_name));
+    EXPECT_TRUE(
+        row.source.kind == OccurrenceSymbolKind::kJoint
+            ? is_mf2_joint_name(row.compiled_name)
+            : is_mf1_name(row.compiled_name));
     const auto found = reverse.find(row.compiled_name);
     ASSERT_NE(found, reverse.end());
     EXPECT_EQ(found->second, row.source);
+    if (row.source.kind == OccurrenceSymbolKind::kJoint) {
+      EXPECT_TRUE(represented_joints.insert(row.compiled_name).second);
+    }
   }
   for (const auto& reference : composed.reference_rewrites()) {
     const auto found = reverse.find(reference.compiled_target_name);
@@ -1470,6 +1548,9 @@ TEST(CellComposition,
   }
 
   for (const auto& connection : composed.fixed_connections()) {
+    EXPECT_TRUE(is_mf2_joint_name(connection.compiled_joint_name));
+    EXPECT_TRUE(
+        represented_joints.insert(connection.compiled_joint_name).second);
     EXPECT_EQ(connection.child_pose_in_parent,
               std::visit(
                   [](const auto& source)
@@ -1492,6 +1573,11 @@ TEST(CellComposition,
                     }
                   },
                   connection.source));
+  }
+  ASSERT_EQ(represented_joints.size(),
+            composed.flattened_urdf().joints.size());
+  for (const auto& joint : composed.flattened_urdf().joints) {
+    EXPECT_TRUE(represented_joints.contains(joint.name));
   }
 }
 
@@ -2214,8 +2300,13 @@ TEST(CellComposition,
      ReusesOneAssetWithoutNameInjectionAndRetainsInternalMountPaths) {
   const std::string hostile_urdf =
       "<robot name=\"mf1_robot_injected\"><link name=\"mf1_link_injected\"/>"
-      "<link name=\"tip\"/><joint name=\"mf1_joint_injected\" "
+      "<link name=\"middle\"/><link name=\"tip\"/>"
+      "<joint name=\"mf1_joint_injected\" "
       "type=\"fixed\"><parent link=\"mf1_link_injected\"/>"
+      "<child link=\"middle\"/></joint>"
+      "<joint name=\"mf2_joint_000000_"
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" "
+      "type=\"fixed\"><parent link=\"middle\"/>"
       "<child link=\"tip\"/></joint></robot>";
   auto source = qualify_source_with_documents(
       AssetSpec{.id = "same_tool",
@@ -2223,7 +2314,8 @@ TEST(CellComposition,
                            {"tcp", "tip"}},
                 .groups = {},
                 .resources = {},
-                .bodies = {{"body", {"mf1_link_injected", "tip"}}}},
+                .bodies = {
+                    {"body", {"mf1_link_injected", "middle", "tip"}}}},
       hostile_urdf);
   const core::PlacementPoseDTO identity{
       {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
@@ -2256,7 +2348,10 @@ TEST(CellComposition,
   EXPECT_TRUE(std::holds_alternative<CompositionModelMount>(
       composed.fixed_connections()[1].source));
   for (const auto& rewrite : composed.symbol_rewrites()) {
-    EXPECT_TRUE(is_mf1_name(rewrite.compiled_name));
+    EXPECT_TRUE(
+        rewrite.source.kind == OccurrenceSymbolKind::kJoint
+            ? is_mf2_joint_name(rewrite.compiled_name)
+            : is_mf1_name(rewrite.compiled_name));
     EXPECT_NE(rewrite.compiled_name, rewrite.source.source_name);
   }
   for (const auto& path : composed.frame_paths()) {
@@ -2267,7 +2362,226 @@ TEST(CellComposition,
   }
 }
 
-TEST(CellComposition, PinsMf1DomainFieldEncodingAndBoundaryVectors) {
+TEST(CellComposition,
+     OrdersSourceMimicsBeforeDeterministicConnectionSiblingsAndIgnoresInputShuffle) {
+  const std::string parent_urdf =
+      "<robot name=\"parent\">"
+      "<link name=\"base_link\"/><link name=\"master_link\"/>"
+      "<link name=\"follower_link\"/>"
+      "<joint name=\"a_follower\" type=\"revolute\">"
+      "<parent link=\"base_link\"/><child link=\"follower_link\"/>"
+      "<limit lower=\"-1\" upper=\"1\" effort=\"1\" velocity=\"1\"/>"
+      "<mimic joint=\"z_master\"/></joint>"
+      "<joint name=\"z_master\" type=\"revolute\">"
+      "<parent link=\"base_link\"/><child link=\"master_link\"/>"
+      "<limit lower=\"-1\" upper=\"1\" effort=\"1\" velocity=\"1\"/>"
+      "</joint></robot>";
+  auto parent_source = qualify_source_with_documents(
+      AssetSpec{.id = "connection_parent_asset",
+                .frames = {{"base", "base_link"},
+                           {"tcp", "master_link"}},
+                .groups = {},
+                .resources = {},
+                .bodies = {{"body",
+                            {"base_link", "master_link",
+                             "follower_link"}}}},
+      parent_urdf);
+  auto child_source =
+      qualify_source(AssetSpec{.id = "connection_child_asset"});
+  auto parent_type = qualify_type(
+      TypeSpec{.id = "connection_parent_type",
+               .tags = {"parent"},
+               .with_interface = true,
+               .interface_id = "port",
+               .interface_frame = "base",
+               .accepts_tags = {"child"},
+               .max_attachments = 2U});
+  auto child_type = qualify_type(
+      TypeSpec{.id = "connection_child_type",
+               .tags = {"child"},
+               .with_interface = true,
+               .interface_id = "mount",
+               .interface_frame = "base",
+               .accepts_tags = {"parent"}});
+
+  const auto first_graph = graph_for(
+      {{"parent_model", &parent_source, false},
+       {"child_b_model", &child_source, false},
+       {"child_a_model", &child_source, false}},
+      {{"child_b", &child_type, {{"body", "child_b_model"}}, false},
+       {"parent", &parent_type, {{"body", "parent_model"}}, true},
+       {"child_a", &child_type, {{"body", "child_a_model"}}, false}},
+      {{"attach_b", "parent", "port", "child_b", "mount"},
+       {"attach_a", "parent", "port", "child_a", "mount"}});
+  const auto shuffled_graph = graph_for(
+      {{"child_a_model", &child_source, false},
+       {"parent_model", &parent_source, false},
+       {"child_b_model", &child_source, false}},
+      {{"parent", &parent_type, {{"body", "parent_model"}}, true},
+       {"child_a", &child_type, {{"body", "child_a_model"}}, false},
+       {"child_b", &child_type, {{"body", "child_b_model"}}, false}},
+      {{"attach_a", "parent", "port", "child_a", "mount"},
+       {"attach_b", "parent", "port", "child_b", "mount"}});
+  const auto first = compose_cell_occurrences(
+      first_graph, source_values({&parent_source, &child_source}),
+      type_values({&parent_type, &child_type}));
+  const auto shuffled = compose_cell_occurrences(
+      shuffled_graph, source_values({&child_source, &parent_source}),
+      type_values({&child_type, &parent_type}));
+
+  EXPECT_EQ(emit_canonical_urdf_document(first.flattened_urdf()),
+            emit_canonical_urdf_document(shuffled.flattened_urdf()));
+  EXPECT_EQ(first.symbol_rewrites(), shuffled.symbol_rewrites());
+  EXPECT_EQ(first.reference_rewrites(), shuffled.reference_rewrites());
+  EXPECT_EQ(first.fixed_connections(), shuffled.fixed_connections());
+
+  auto compiled_source_joint =
+      [&](std::string_view source_name) -> std::string {
+    const auto found = std::find_if(
+        first.symbol_rewrites().begin(), first.symbol_rewrites().end(),
+        [&](const OccurrenceSymbolRewrite& row) {
+          return row.source.model_instance_id.value() == "parent_model" &&
+                 row.source.kind == OccurrenceSymbolKind::kJoint &&
+                 row.source.source_name == source_name;
+        });
+    if (found == first.symbol_rewrites().end()) {
+      throw std::runtime_error("source joint rewrite is absent");
+    }
+    return found->compiled_name;
+  };
+  EXPECT_TRUE(compiled_source_joint("z_master").starts_with(
+      "mf2_joint_000000_"));
+  EXPECT_TRUE(compiled_source_joint("a_follower").starts_with(
+      "mf2_joint_000001_"));
+
+  std::vector<std::string> attachment_joint_names;
+  std::optional<std::string> attachment_parent;
+  for (const auto& connection : first.fixed_connections()) {
+    if (!std::holds_alternative<CompositionComponentAttachment>(
+            connection.source)) {
+      continue;
+    }
+    if (!attachment_parent.has_value()) {
+      attachment_parent = connection.compiled_parent_link_name;
+    }
+    EXPECT_EQ(connection.compiled_parent_link_name, *attachment_parent);
+    attachment_joint_names.push_back(connection.compiled_joint_name);
+  }
+  ASSERT_EQ(attachment_joint_names.size(), 2U);
+  EXPECT_TRUE(attachment_joint_names[0].starts_with(
+      "mf2_joint_000002_"));
+  EXPECT_TRUE(attachment_joint_names[1].starts_with(
+      "mf2_joint_000003_"));
+}
+
+TEST(CellComposition,
+     PlanningResourcesAreExactAssetRevisionScopedAndOrderIndependent) {
+  constexpr std::string_view kMeshBytes =
+      "solid resource\nendsolid resource\n";
+  const SourceArtifactSpec mesh{
+      "meshes/base.stl", "model/stl", std::string(kMeshBytes)};
+  const SourceArtifactSpec texture{
+      "textures/steel.png", "image/png", "png"};
+
+  AssetSpec shared_spec{.id = "shared_resource_asset"};
+  shared_spec.source_artifacts = {mesh, texture};
+  auto shared = qualify_source_with_documents(
+      shared_spec, mesh_and_texture_urdf_for(shared_spec.id));
+  const auto shared_graph = graph_for(
+      {{"shared_a", &shared, true}, {"shared_b", &shared, true}}, {});
+  const auto shared_composed = compose_cell_occurrences(
+      shared_graph, source_values({&shared}), {});
+  ASSERT_EQ(shared_composed.planning_resource_rewrites().size(), 2U);
+  const std::string shared_urdf =
+      emit_canonical_urdf_document(shared_composed.flattened_urdf());
+  for (const auto& shared_row :
+       shared_composed.planning_resource_rewrites()) {
+    EXPECT_NE(shared_row.compiled_logical_uri,
+              shared_row.source_logical_uri);
+    const auto first_shared_reference =
+        shared_urdf.find(shared_row.compiled_logical_uri);
+    ASSERT_NE(first_shared_reference, std::string::npos);
+    EXPECT_EQ(shared_urdf.find(shared_row.source_logical_uri),
+              std::string::npos);
+    EXPECT_NE(
+        shared_urdf.find(
+            shared_row.compiled_logical_uri,
+            first_shared_reference +
+                shared_row.compiled_logical_uri.size()),
+        std::string::npos);
+  }
+
+  AssetSpec first_spec{.id = "resource_asset_a"};
+  first_spec.source_artifacts = {mesh};
+  AssetSpec second_spec{.id = "resource_asset_b"};
+  second_spec.source_artifacts = {mesh};
+  auto first = qualify_source_with_documents(
+      first_spec, mesh_urdf_for(first_spec.id));
+  auto second = qualify_source_with_documents(
+      second_spec, mesh_urdf_for(second_spec.id));
+  const auto distinct_graph = graph_for(
+      {{"asset_a", &first, true}, {"asset_b", &second, true}}, {});
+  const auto distinct = compose_cell_occurrences(
+      distinct_graph, source_values({&first, &second}), {});
+  const auto distinct_reordered = compose_cell_occurrences(
+      distinct_graph, source_values({&second, &first}), {});
+  ASSERT_EQ(distinct.planning_resource_rewrites().size(), 2U);
+  EXPECT_NE(distinct.planning_resource_rewrites()[0].compiled_logical_uri,
+            distinct.planning_resource_rewrites()[1].compiled_logical_uri);
+  EXPECT_EQ(distinct.planning_resource_rewrites(),
+            distinct_reordered.planning_resource_rewrites());
+  EXPECT_EQ(
+      emit_canonical_urdf_document(distinct.flattened_urdf()),
+      emit_canonical_urdf_document(distinct_reordered.flattened_urdf()));
+
+  AssetSpec revision_a_spec{.id = "revisioned_resource_asset"};
+  revision_a_spec.source_artifacts = {mesh};
+  AssetSpec revision_b_spec = revision_a_spec;
+  revision_b_spec.bodies = {
+      {"alternate_collision", {"base_link", "tip_link"}}};
+  auto revision_a = qualify_source_with_documents(
+      revision_a_spec, mesh_urdf_for(revision_a_spec.id));
+  auto revision_b = qualify_source_with_documents(
+      revision_b_spec, mesh_urdf_for(revision_b_spec.id));
+  ASSERT_NE(revision_a.value.value().model_revision,
+            revision_b.value.value().model_revision);
+  const auto same_bytes_graph = graph_for(
+      {{"revision_a", &revision_a, true},
+       {"revision_b", &revision_b, true}},
+      {});
+  const auto same_bytes = compose_cell_occurrences(
+      same_bytes_graph, source_values({&revision_b, &revision_a}), {});
+  ASSERT_EQ(same_bytes.planning_resource_rewrites().size(), 2U);
+  EXPECT_NE(same_bytes.planning_resource_rewrites()[0].compiled_logical_uri,
+            same_bytes.planning_resource_rewrites()[1].compiled_logical_uri);
+  EXPECT_EQ(same_bytes.planning_resource_rewrites()[0].source_logical_uri,
+            same_bytes.planning_resource_rewrites()[1].source_logical_uri);
+  EXPECT_EQ(same_bytes.planning_resource_rewrites()[0].content_digest,
+            same_bytes.planning_resource_rewrites()[1].content_digest);
+
+  AssetSpec revision_c_spec = revision_a_spec;
+  revision_c_spec.bodies = {
+      {"third_collision", {"base_link", "tip_link"}}};
+  revision_c_spec.source_artifacts = {
+      {"meshes/base.stl", "model/stl",
+       "solid changed\nendsolid changed\n"}};
+  auto revision_c = qualify_source_with_documents(
+      revision_c_spec, mesh_urdf_for(revision_c_spec.id));
+  const auto changed_bytes_graph = graph_for(
+      {{"revision_a", &revision_a, true},
+       {"revision_c", &revision_c, true}},
+      {});
+  const auto changed_bytes = compose_cell_occurrences(
+      changed_bytes_graph, source_values({&revision_a, &revision_c}), {});
+  ASSERT_EQ(changed_bytes.planning_resource_rewrites().size(), 2U);
+  EXPECT_NE(
+      changed_bytes.planning_resource_rewrites()[0].compiled_logical_uri,
+      changed_bytes.planning_resource_rewrites()[1].compiled_logical_uri);
+  EXPECT_NE(changed_bytes.planning_resource_rewrites()[0].content_digest,
+            changed_bytes.planning_resource_rewrites()[1].content_digest);
+}
+
+TEST(CellComposition, PinsMixedMf1Mf2DomainFieldEncodingAndBoundaryVectors) {
   const std::string urdf =
       "<robot name=\"golden:robot=1\">"
       "<link name=\"base:link=1\"/><link name=\"base:link=11\"/>"
@@ -2318,7 +2632,12 @@ TEST(CellComposition, PinsMf1DomainFieldEncodingAndBoundaryVectors) {
   ASSERT_EQ(composed.fixed_connections().size(), 1U);
   EXPECT_EQ(
       composed.fixed_connections()[0].compiled_joint_name,
-      "mf1_anchor_32a472f805dd1e3eb2b7a9baeeda8d61df7aed146e730b165d50214c5ddd642d");
+      "mf2_joint_000000_"
+      "da38214c7b450c16ba1270cb7126cc6a436853852c7520a067210746bbe7d92c");
+  EXPECT_EQ(
+      compiled_symbol(OccurrenceSymbolKind::kJoint, "joint=1:two"),
+      "mf2_joint_000000_"
+      "e12e1daaec8e24d2a5f32b029f60b479c6fae5038b19e106646b6ab21600f18e");
 }
 
 TEST(CellComposition,

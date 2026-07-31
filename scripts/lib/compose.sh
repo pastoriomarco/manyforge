@@ -17,6 +17,7 @@ _MANYFORGE_LIB_COMPOSE=1
 source "$(dirname "${BASH_SOURCE[0]}")/runner.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/preflight.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/realtime-resources.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/composable-cell-runtime-availability.sh"
 
 # launch.sh exports MANYFORGE_ROOT; fall back to deriving it from this file's
 # location so compose targeting works even if this lib is sourced standalone.
@@ -190,6 +191,9 @@ stop_vllm_status_watcher() {
 # Optional env (forwarded to Composer): assistant settings plus
 # MANYFORGE_NODE_ROOTS, MANYFORGE_NODE_STRICT, and MANYFORGE_SCENARIO_ROOTS.
 start_composer_dev_container() {
+    manyforge_fail_composable_cell_runtime_unavailable
+    return $?
+
     local container_name="${COMPOSER_CONTAINER:-manyforge-e2e-composer}"
     local composer_port="${COMPOSER_PORT:-9000}"
     if ! prepare_native_composer_rt_docker_args; then
@@ -264,8 +268,6 @@ start_composer_dev_container() {
             # everything until each invocation exited.
             echo "Building C++ backends..."
             ./scripts/test-all.sh cpp 2>&1
-            echo "Building roboplan..."
-            ./scripts/test-all.sh roboplan 2>&1
             source /workspace/scripts/lib/frontend.sh
             manyforge_build_frontend_dist /workspace/manyforge_composer/frontend /tmp/manyforge-build
         '; then
@@ -290,7 +292,6 @@ start_composer_dev_container() {
         "${NATIVE_COMPOSER_IMAGE_ID}" \
         bash -lc '
             set -euo pipefail
-            export PYTHONPATH="/tmp/manyforge-build/roboplan:/workspace/manyforge_roboplan/python:${PYTHONPATH:-}"
             source /workspace/scripts/lib/realtime-resources.sh
             manyforge_exec_with_nrt_affinity python -m manyforge_composer \
                 --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \

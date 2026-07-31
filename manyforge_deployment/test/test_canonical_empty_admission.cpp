@@ -536,10 +536,10 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
   const auto all_files = paths_with_suffix(base_path(), "");
 
   ASSERT_EQ(manifest_files.size(), 3U);
-  ASSERT_EQ(raw_files.size(), 2U);
+  ASSERT_EQ(raw_files.size(), 3U);
   ASSERT_EQ(bundle_files.size(), 1U);
   ASSERT_EQ(lock_files.size(), 3U);
-  ASSERT_EQ(all_files.size(), 10U);
+  ASSERT_EQ(all_files.size(), 11U);
   ASSERT_TRUE(std::filesystem::is_regular_file(
       admission_path(base_path())));
   std::size_t directory_count = 0U;
@@ -584,9 +584,11 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
   EXPECT_EQ(
       planning.product_kind,
       core::RetainedProductKind::kPlanningCollisionModel);
-  ASSERT_EQ(planning.artifact_refs.size(), 2U);
-  EXPECT_EQ(planning.artifact_refs[0].artifact_role_id.value(), "srdf");
-  EXPECT_EQ(planning.artifact_refs[1].artifact_role_id.value(), "urdf");
+  ASSERT_EQ(planning.artifact_refs.size(), 3U);
+  EXPECT_EQ(planning.artifact_refs[0].artifact_role_id.value(),
+            "planning_resource_map");
+  EXPECT_EQ(planning.artifact_refs[1].artifact_role_id.value(), "srdf");
+  EXPECT_EQ(planning.artifact_refs[2].artifact_role_id.value(), "urdf");
 }
 
 TEST_F(CanonicalEmptyAdmissionPackageTest,
@@ -768,7 +770,7 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
       base_path(), text_member(record, "retained_bundle_id")));
   const auto raw_targets =
       paths_with_suffix(base_path() / "raw-artifacts", ".blob");
-  ASSERT_EQ(raw_targets.size(), 2U);
+  ASSERT_EQ(raw_targets.size(), 3U);
   selected_targets.insert(
       selected_targets.end(), raw_targets.begin(), raw_targets.end());
 
@@ -890,7 +892,7 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
   };
   const auto raw_targets =
       paths_with_suffix(base_path() / "raw-artifacts", ".blob");
-  ASSERT_EQ(raw_targets.size(), 2U);
+  ASSERT_EQ(raw_targets.size(), 3U);
   selected.push_back(raw_targets.front());
 
   enum class Mutation : std::uint8_t {
