@@ -98,36 +98,6 @@ class IBuildManifestRepository {
   get_verified(const BuildManifestKey& key) const = 0;
 };
 
-class InMemoryBuildManifestRepository final
-    : public IBuildManifestRepository {
- public:
-  explicit InMemoryBuildManifestRepository(
-      std::size_t max_manifest_count = kMaxQualifiedManifestCount,
-      std::uint64_t max_total_bytes = kMaxQualifiedManifestBytes);
-  ~InMemoryBuildManifestRepository() override;
-
-  InMemoryBuildManifestRepository(
-      const InMemoryBuildManifestRepository&) = delete;
-  InMemoryBuildManifestRepository& operator=(
-      const InMemoryBuildManifestRepository&) = delete;
-  InMemoryBuildManifestRepository(
-      InMemoryBuildManifestRepository&&) = delete;
-  InMemoryBuildManifestRepository& operator=(
-      InMemoryBuildManifestRepository&&) = delete;
-
-  [[nodiscard]] bool put_if_absent(
-      std::shared_ptr<const BuildQualifiedManifest> manifest) override;
-  [[nodiscard]] std::shared_ptr<const BuildQualifiedManifest>
-  get_verified(const BuildManifestKey& key) const override;
-
-  [[nodiscard]] std::size_t size() const noexcept;
-  [[nodiscard]] std::uint64_t retained_bytes() const noexcept;
-
- private:
-  struct Storage;
-  std::unique_ptr<Storage> storage_;
-};
-
 /// Durable immutable semantic-manifest repository.
 ///
 /// Each qualified manifest is stored under its strong kind/digest key using a
@@ -135,15 +105,22 @@ class InMemoryBuildManifestRepository final
 /// process independently reparses and requalifies bytes before returning
 /// them. There is no mutable current/active alias.
 ///
-/// The configured root and its ancestors are trusted deployment-owned
-/// storage: they must not be renamed or replaced concurrently by an
-/// untrusted actor. Within that stable root, entries are required to be plain
-/// files/directories and publication is immutable and process-serialized.
+/// `trusted_root` is one existing plain deployment-owned package directory.
+/// The repository durably owns `build-manifests/` beneath it; first creation
+/// and durability of the trusted root itself are bootstrap responsibilities.
+/// The root and its ancestors must not be renamed or replaced concurrently by
+/// an untrusted actor. Within that stable root, entries are required to be
+/// plain files/directories and publication is immutable and
+/// process-serialized.
+///
+/// Instances are process-affine. A child created by `fork()` must construct a
+/// fresh repository before use so it owns an independently opened advisory
+/// lock description.
 class FilesystemBuildManifestRepository final
     : public IBuildManifestRepository {
  public:
   explicit FilesystemBuildManifestRepository(
-      std::filesystem::path root,
+      std::filesystem::path trusted_root,
       std::size_t max_manifest_count = kMaxQualifiedManifestCount,
       std::uint64_t max_total_bytes = kMaxQualifiedManifestBytes);
   ~FilesystemBuildManifestRepository() override;

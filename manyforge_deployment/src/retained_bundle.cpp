@@ -3,9 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
-#include <limits>
 #include <map>
-#include <mutex>
 #include <set>
 #include <string>
 #include <utility>
@@ -465,113 +463,6 @@ const BuildQualifiedProductContractRegistry &
 build_qualified_product_contract_registry() {
   static const BuildQualifiedProductContractRegistry registry;
   return registry;
-}
-
-struct InMemoryRawArtifactStore::Storage final {
-  Storage(std::size_t max_blob_count_in, std::uint64_t max_total_bytes_in,
-          std::uint64_t max_single_blob_bytes_in)
-      : max_blob_count(max_blob_count_in), max_total_bytes(max_total_bytes_in),
-        max_single_blob_bytes(max_single_blob_bytes_in) {}
-
-  std::size_t max_blob_count;
-  std::uint64_t max_total_bytes;
-  std::uint64_t max_single_blob_bytes;
-  std::map<std::string, std::string> blobs;
-  std::uint64_t retained_bytes{0U};
-  mutable std::mutex mutex;
-};
-
-InMemoryRawArtifactStore::InMemoryRawArtifactStore(
-    std::size_t max_blob_count, std::uint64_t max_total_bytes,
-    std::uint64_t max_single_blob_bytes) {
-  if (max_blob_count == 0U || max_total_bytes == 0U ||
-      max_single_blob_bytes == 0U || max_single_blob_bytes > max_total_bytes) {
-    fail("raw artifact store limits must be positive and internally "
-         "consistent");
-  }
-  storage_ = std::make_unique<Storage>(max_blob_count, max_total_bytes,
-                                       max_single_blob_bytes);
-}
-
-InMemoryRawArtifactStore::~InMemoryRawArtifactStore() = default;
-
-StoredRawArtifact
-InMemoryRawArtifactStore::put_if_absent(std::string_view bytes) {
-  if (bytes.size() > static_cast<std::size_t>(std::min<std::uint64_t>(
-                         storage_->max_single_blob_bytes,
-                         static_cast<std::uint64_t>(
-                             std::numeric_limits<std::size_t>::max())))) {
-    fail("raw artifact exceeds the configured single-blob bound");
-  }
-  const std::uint64_t byte_size = static_cast<std::uint64_t>(bytes.size());
-  const std::string digest = sha256_digest(bytes);
-  const std::string key = store_key_for_digest(digest);
-
-  std::lock_guard lock(storage_->mutex);
-  const auto existing = storage_->blobs.find(key);
-  if (existing != storage_->blobs.end()) {
-    if (existing->second.size() != bytes.size() ||
-        !std::equal(existing->second.begin(), existing->second.end(),
-                    bytes.begin(), bytes.end())) {
-      throw std::runtime_error(
-          "immutable raw artifact store detected a digest-key collision");
-    }
-    return {
-        core::ContentDigest(digest),
-        core::ContentAddressedStoreKey(key),
-        byte_size,
-        false,
-    };
-  }
-
-  if (storage_->blobs.size() >= storage_->max_blob_count) {
-    fail("raw artifact store entry bound is exhausted");
-  }
-  if (byte_size > storage_->max_total_bytes - storage_->retained_bytes) {
-    fail("raw artifact store byte bound is exhausted");
-  }
-  storage_->blobs.emplace(key, std::string(bytes));
-  storage_->retained_bytes += byte_size;
-  return {
-      core::ContentDigest(digest),
-      core::ContentAddressedStoreKey(key),
-      byte_size,
-      true,
-  };
-}
-
-std::optional<std::string> InMemoryRawArtifactStore::get_verified(
-    const core::ContentAddressedStoreKey &key,
-    const core::ContentDigest &expected_digest,
-    std::uint64_t expected_size) const {
-  if (!is_sha256_digest(expected_digest.value()) ||
-      key.value() != store_key_for_digest(expected_digest.value())) {
-    return std::nullopt;
-  }
-  std::string bytes;
-  {
-    std::lock_guard lock(storage_->mutex);
-    const auto found = storage_->blobs.find(key.value());
-    if (found == storage_->blobs.end()) {
-      return std::nullopt;
-    }
-    bytes = found->second;
-  }
-  if (bytes.size() != expected_size ||
-      sha256_digest(bytes) != expected_digest.value()) {
-    return std::nullopt;
-  }
-  return bytes;
-}
-
-std::size_t InMemoryRawArtifactStore::size() const noexcept {
-  std::lock_guard lock(storage_->mutex);
-  return storage_->blobs.size();
-}
-
-std::uint64_t InMemoryRawArtifactStore::retained_bytes() const noexcept {
-  std::lock_guard lock(storage_->mutex);
-  return storage_->retained_bytes;
 }
 
 namespace detail {
@@ -1253,6 +1144,57 @@ verify_current_retained_bundle_projection(const CanonicalValue& root) {
   };
 }
 
+void require_verified_product_artifact_readback(
+    const core::RetainedProductDTO& product,
+    IRawArtifactStore& artifact_store) {
+  for (const auto& artifact : product.artifact_refs) {
+    const auto bytes = artifact_store.get_verified(
+        artifact.content_addressed_store_key, artifact.content_digest,
+        artifact.byte_size);
+    if (!bytes.has_value() ||
+        static_cast<std::uint64_t>(bytes->size()) != artifact.byte_size ||
+        sha256_digest(*bytes) != artifact.content_digest.value() ||
+        artifact.content_addressed_store_key.value() !=
+            store_key_for_digest(artifact.content_digest.value())) {
+      throw std::runtime_error(
+          "production retention could not re-verify a referenced raw "
+          "artifact");
+    }
+  }
+}
+
+void require_verified_current_bundle_artifacts(
+    const RetainedBundle& bundle, IRawArtifactStore& artifact_store) {
+  const auto& value = bundle.value();
+  if (!value.catalogs.records.empty() ||
+      !value.catalogs.schema_artifacts.empty()) {
+    throw std::logic_error(
+        "current production retention cannot verify non-empty catalog "
+        "content through the bounded raw-artifact port");
+  }
+
+  const auto& products = value.compiled_products;
+  require_verified_product_artifact_readback(
+      products.planning_collision_model, artifact_store);
+  if (products.viewer_model.has_value()) {
+    require_verified_product_artifact_readback(
+        *products.viewer_model, artifact_store);
+  }
+  for (const auto& group : products.control_domain_products) {
+    for (const auto& product : group.products) {
+      require_verified_product_artifact_readback(product, artifact_store);
+    }
+  }
+  for (const auto& product : products.symbol_role_maps) {
+    require_verified_product_artifact_readback(product, artifact_store);
+  }
+  for (const auto& group : products.runtime_unit_products) {
+    for (const auto& product : group.products) {
+      require_verified_product_artifact_readback(product, artifact_store);
+    }
+  }
+}
+
 }  // namespace
 
 detail::BuildQualifiedRetentionContext::BuildQualifiedRetentionContext(
@@ -1348,10 +1290,11 @@ detail::RetainedBundleMaterializer::materialize_prepared(
 }
 
 std::shared_ptr<const RetainedBundle>
-detail::RetainedBundleMaterializer::materialize_production(
+detail::RetainedBundleMaterializer::materialize_store_and_reload_production(
     const RetentionQualifiedDeployment& qualified,
     IBuildManifestRepository& manifest_repository,
-    IRawArtifactStore& artifact_store) {
+    IRawArtifactStore& artifact_store,
+    IRetainedBundleRepository& bundle_repository) {
   // Complete semantic/subset preparation and build-authority qualification
   // precede the first repository or CAS effect.
   const PreparedCanonicalEmptyProduct prepared =
@@ -1359,9 +1302,23 @@ detail::RetainedBundleMaterializer::materialize_production(
   const BuildQualifiedRetentionContext context =
       BuildQualifiedRetentionAuthority::qualify_persisted(
           manifest_repository);
-  return materialize_prepared(
+  const auto bundle = materialize_prepared(
       qualified, context, prepared.urdf, prepared.srdf,
       *prepared.contract, artifact_store);
+  (void)bundle_repository.put_if_absent(bundle);
+  const auto reloaded =
+      bundle_repository.get_verified_envelope(
+          bundle->retained_bundle_id());
+  if (reloaded == nullptr ||
+      reloaded->retained_bundle_id() != bundle->retained_bundle_id() ||
+      reloaded->canonical_bytes() != bundle->canonical_bytes() ||
+      !verify_retained_bundle_identity(*reloaded)) {
+    throw std::runtime_error(
+        "production retention did not independently reload the exact "
+        "semantic bundle");
+  }
+  require_verified_current_bundle_artifacts(*reloaded, artifact_store);
+  return reloaded;
 }
 
 std::shared_ptr<const RetainedBundle>
@@ -1406,97 +1363,38 @@ bool verify_retained_bundle_identity(const RetainedBundle &bundle) {
   }
 }
 
-struct InMemoryRetainedBundleRepository::Storage final {
-  struct Entry final {
-    std::shared_ptr<const RetainedBundle> bundle;
-    std::string exact_bytes;
-  };
-
-  Storage(std::size_t max_bundle_count_in, std::uint64_t max_total_bytes_in)
-      : max_bundle_count(max_bundle_count_in),
-        max_total_bytes(max_total_bytes_in) {}
-
-  std::size_t max_bundle_count;
-  std::uint64_t max_total_bytes;
-  std::map<std::string, Entry> bundles;
-  std::uint64_t retained_bytes{0U};
-  mutable std::mutex mutex;
-};
-
-InMemoryRetainedBundleRepository::InMemoryRetainedBundleRepository(
-    std::size_t max_bundle_count, std::uint64_t max_total_bytes) {
-  if (max_bundle_count == 0U || max_total_bytes == 0U) {
-    fail("retained bundle repository limits must be positive");
-  }
-  storage_ = std::make_unique<Storage>(max_bundle_count, max_total_bytes);
-}
-
-InMemoryRetainedBundleRepository::~InMemoryRetainedBundleRepository() = default;
-
-bool InMemoryRetainedBundleRepository::put_if_absent(
-    std::shared_ptr<const RetainedBundle> bundle) {
-  if (bundle == nullptr) {
-    fail("retained bundle repository rejects a null bundle");
-  }
-  if (!verify_retained_bundle_identity(*bundle)) {
-    fail("retained bundle repository rejects an invalid semantic identity");
-  }
-  const std::uint64_t byte_size =
-      static_cast<std::uint64_t>(bundle->canonical_bytes().size());
-  std::lock_guard lock(storage_->mutex);
-  const auto existing =
-      storage_->bundles.find(bundle->retained_bundle_id().value());
-  if (existing != storage_->bundles.end()) {
-    if (existing->second.exact_bytes != bundle->canonical_bytes()) {
-      throw std::runtime_error(
-          "retained bundle repository detected an identity collision");
-    }
-    return false;
-  }
-  if (storage_->bundles.size() >= storage_->max_bundle_count) {
-    fail("retained bundle repository entry bound is exhausted");
-  }
-  if (byte_size > storage_->max_total_bytes - storage_->retained_bytes) {
-    fail("retained bundle repository byte bound is exhausted");
-  }
-  storage_->bundles.emplace(
-      bundle->retained_bundle_id().value(),
-      Storage::Entry{bundle, std::string(bundle->canonical_bytes())});
-  storage_->retained_bytes += byte_size;
-  return true;
-}
-
 std::shared_ptr<const RetainedBundle>
-InMemoryRetainedBundleRepository::get_verified(
-    const core::RetainedBundleId &retained_bundle_id) const {
-  std::shared_ptr<const RetainedBundle> bundle;
-  std::string exact_bytes;
-  {
-    std::lock_guard lock(storage_->mutex);
-    const auto found = storage_->bundles.find(retained_bundle_id.value());
-    if (found == storage_->bundles.end()) {
-      return nullptr;
+detail::RetainedBundleReloadAuthority::reload(
+    std::string_view canonical_bytes) {
+  try {
+    const ParsedArtifactCandidate parsed =
+        parse_strict_json_model_yaml(canonical_bytes);
+    CanonicalValue root = parsed.root();
+    if (canonical_json(root) != canonical_bytes) {
+      fail("retained-bundle repository bytes are not RFC 8785 canonical");
     }
-    bundle = found->second.bundle;
-    exact_bytes = found->second.exact_bytes;
+    core::RetainedBundleDTO value =
+        verify_current_retained_bundle_projection(root);
+    const core::RetainedBundleId retained_bundle_id =
+        value.retained_bundle_id;
+    auto bundle = std::shared_ptr<const RetainedBundle>(
+        new RetainedBundle(retained_bundle_id, std::move(value),
+                           std::move(root), std::string(canonical_bytes)));
+    if (!verify_retained_bundle_identity(*bundle)) {
+      fail("retained-bundle repository bytes have an invalid semantic "
+           "identity");
+    }
+    return bundle;
+  } catch (const CanonicalValueError& error) {
+    fail(std::string("retained-bundle repository bytes are invalid: ") +
+         error.what());
+  } catch (const ArtifactCodecError& error) {
+    fail(std::string("retained-bundle repository bytes are invalid: ") +
+         error.what());
+  } catch (const CellGraphCodecError& error) {
+    fail(std::string("retained-bundle repository bytes are invalid: ") +
+         error.what());
   }
-  if (bundle == nullptr || bundle->canonical_bytes() != exact_bytes ||
-      !verify_retained_bundle_identity(*bundle)) {
-    throw std::runtime_error(
-        "retained bundle repository re-verification failed");
-  }
-  return bundle;
-}
-
-std::size_t InMemoryRetainedBundleRepository::size() const noexcept {
-  std::lock_guard lock(storage_->mutex);
-  return storage_->bundles.size();
-}
-
-std::uint64_t
-InMemoryRetainedBundleRepository::retained_bytes() const noexcept {
-  std::lock_guard lock(storage_->mutex);
-  return storage_->retained_bytes;
 }
 
 } // namespace manyforge::deployment

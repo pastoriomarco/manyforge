@@ -102,7 +102,35 @@ constexpr std::size_t kMaximumStaleTemporaryManifestCount = 256U;
              .starts_with(kMiddle);
 }
 
-void ensure_plain_directory(const std::filesystem::path& path) {
+[[nodiscard]] std::filesystem::path absolute_trusted_root(
+    const std::filesystem::path& root) {
+  if (root.empty()) {
+    fail("semantic-manifest trusted root must not be empty");
+  }
+  std::error_code error;
+  std::filesystem::path absolute =
+      std::filesystem::absolute(root, error);
+  if (error) {
+    throw std::filesystem::filesystem_error(
+        "cannot resolve semantic-manifest trusted root", root, error);
+  }
+  absolute = absolute.lexically_normal();
+  while (absolute != absolute.root_path() &&
+         absolute.filename().empty()) {
+    absolute = absolute.parent_path();
+  }
+  const auto status =
+      std::filesystem::symlink_status(absolute, error);
+  if (error || !std::filesystem::is_directory(status) ||
+      std::filesystem::is_symlink(status)) {
+    fail("semantic-manifest trusted root must be an existing plain "
+         "directory");
+  }
+  return absolute;
+}
+
+[[nodiscard]] bool ensure_plain_directory(
+    const std::filesystem::path& path) {
   std::error_code error;
   const auto status = std::filesystem::symlink_status(path, error);
   if (error &&
@@ -116,9 +144,9 @@ void ensure_plain_directory(const std::filesystem::path& path) {
         std::filesystem::is_symlink(status)) {
       fail("semantic-manifest repository path is not a plain directory");
     }
-    return;
+    return false;
   }
-  const bool created = std::filesystem::create_directories(path, error);
+  const bool created = std::filesystem::create_directory(path, error);
   if (error) {
     throw std::filesystem::filesystem_error(
         "cannot create semantic-manifest repository directory", path,
@@ -132,13 +160,14 @@ void ensure_plain_directory(const std::filesystem::path& path) {
       fail("concurrently created semantic-manifest repository path is "
            "not a plain directory");
     }
-    return;
+    return false;
   }
   const auto created_status = std::filesystem::symlink_status(path, error);
   if (error || !std::filesystem::is_directory(created_status) ||
       std::filesystem::is_symlink(created_status)) {
     fail("created semantic-manifest repository directory is unsafe");
   }
+  return true;
 }
 
 class AdvisoryFileLock final {
@@ -254,7 +283,8 @@ struct FilesystemBuildManifestRepository::Storage final {
           std::uint64_t max_total_bytes_in)
       : root(std::move(root_in)),
         max_manifest_count(max_manifest_count_in),
-        max_total_bytes(max_total_bytes_in) {}
+        max_total_bytes(max_total_bytes_in),
+        owner_pid(::getpid()) {}
 
   ~Storage() {
     if (lock_fd >= 0) {
@@ -323,22 +353,32 @@ struct FilesystemBuildManifestRepository::Storage final {
         }
         const BuildManifestKey key =
             key_from_filename(kind, filename);
+        const std::uintmax_t byte_size =
+            iterator->file_size(iteration_error);
+        if (iteration_error ||
+            refreshed_count >= max_manifest_count ||
+            byte_size >
+                static_cast<std::uintmax_t>(
+                    max_total_bytes - refreshed_bytes)) {
+          fail("persistent semantic-manifest repository exceeds bounds");
+        }
         const auto bytes =
             read_plain_file(iterator->path(), max_total_bytes, false);
         if (!bytes.has_value()) {
           throw std::logic_error(
               "enumerated semantic manifest disappeared");
         }
+        if (refreshed_count >= max_manifest_count ||
+            static_cast<std::uint64_t>(bytes->size()) >
+                max_total_bytes - refreshed_bytes) {
+          fail("persistent semantic-manifest repository exceeds bounds");
+        }
         const auto reloaded =
             detail::reload_self_verified_build_manifest(kind, *bytes);
         if (reloaded->key() != key) {
           fail("semantic-manifest filename does not match its content");
         }
-        if (++refreshed_count > max_manifest_count ||
-            static_cast<std::uint64_t>(bytes->size()) >
-                max_total_bytes - refreshed_bytes) {
-          fail("persistent semantic-manifest repository exceeds bounds");
-        }
+        ++refreshed_count;
         refreshed_bytes +=
             static_cast<std::uint64_t>(bytes->size());
       }
@@ -349,30 +389,35 @@ struct FilesystemBuildManifestRepository::Storage final {
       }
     }
     if (remove_stale_temporaries) {
-      std::vector<std::filesystem::path> changed_directories;
       for (const auto& temporary : stale_temporaries) {
         if (::unlink(temporary.c_str()) != 0) {
           fail_errno(
               "cannot remove stale semantic-manifest temporary file");
         }
-        const auto directory = temporary.parent_path();
-        if (std::find(changed_directories.begin(),
-                      changed_directories.end(),
-                      directory) == changed_directories.end()) {
-          changed_directories.push_back(directory);
-        }
       }
-      for (const auto& directory : changed_directories) {
-        fsync_directory(directory);
-      }
+    }
+    // A successful scan adopts every visible immutable final entry. This is
+    // deliberately unconditional: it closes the crash window in which a
+    // prior writer linked and unlinked its temporary name but died before
+    // fsyncing the kind directory.
+    for (const BuildManifestKind kind : kManifestKinds) {
+      fsync_directory(kind_directory(root, kind));
     }
     manifest_count = refreshed_count;
     retained_bytes = refreshed_bytes;
   }
 
+  void require_owner_process() const {
+    if (::getpid() != owner_pid) {
+      fail("filesystem semantic-manifest repository instances must be "
+           "reopened after fork");
+    }
+  }
+
   std::filesystem::path root;
   std::size_t max_manifest_count;
   std::uint64_t max_total_bytes;
+  pid_t owner_pid;
   int lock_fd{-1};
   std::size_t manifest_count{0U};
   std::uint64_t retained_bytes{0U};
@@ -380,18 +425,25 @@ struct FilesystemBuildManifestRepository::Storage final {
 };
 
 FilesystemBuildManifestRepository::FilesystemBuildManifestRepository(
-    std::filesystem::path root, std::size_t max_manifest_count,
+    std::filesystem::path trusted_root, std::size_t max_manifest_count,
     std::uint64_t max_total_bytes) {
-  if (root.empty() || max_manifest_count == 0U ||
+  if (trusted_root.empty() || max_manifest_count == 0U ||
       max_total_bytes == 0U) {
     fail("filesystem semantic-manifest repository configuration is invalid");
   }
-  ensure_plain_directory(root);
+  const std::filesystem::path absolute_root =
+      absolute_trusted_root(trusted_root);
+  const std::filesystem::path repository_root =
+      absolute_root / "build-manifests";
+  (void)ensure_plain_directory(repository_root);
+  fsync_directory(absolute_root);
   for (const BuildManifestKind kind : kManifestKinds) {
-    ensure_plain_directory(kind_directory(root, kind));
+    (void)ensure_plain_directory(
+        kind_directory(repository_root, kind));
+    fsync_directory(repository_root);
   }
   storage_ = std::make_unique<Storage>(
-      std::move(root), max_manifest_count, max_total_bytes);
+      repository_root, max_manifest_count, max_total_bytes);
   const std::filesystem::path lock_path =
       storage_->root / ".repository.lock";
   storage_->lock_fd = ::open(
@@ -400,9 +452,26 @@ FilesystemBuildManifestRepository::FilesystemBuildManifestRepository(
   if (storage_->lock_fd < 0) {
     fail_errno("cannot open semantic-manifest repository lock");
   }
-  std::lock_guard process_lock(storage_->mutex);
-  const AdvisoryFileLock file_lock(storage_->lock_fd, LOCK_EX);
-  storage_->refresh_index_locked(true);
+  try {
+    struct stat lock_status {};
+    if (::fstat(storage_->lock_fd, &lock_status) != 0) {
+      fail_errno("cannot stat semantic-manifest repository lock");
+    }
+    if (!S_ISREG(lock_status.st_mode)) {
+      fail("semantic-manifest repository lock is not a plain file");
+    }
+    fsync_directory(storage_->root);
+
+    std::lock_guard process_lock(storage_->mutex);
+    const AdvisoryFileLock file_lock(storage_->lock_fd, LOCK_EX);
+    storage_->refresh_index_locked(true);
+  } catch (...) {
+    const int saved_errno = errno;
+    (void)::close(storage_->lock_fd);
+    storage_->lock_fd = -1;
+    errno = saved_errno;
+    throw;
+  }
 }
 
 FilesystemBuildManifestRepository::~FilesystemBuildManifestRepository() =
@@ -410,8 +479,15 @@ FilesystemBuildManifestRepository::~FilesystemBuildManifestRepository() =
 
 bool FilesystemBuildManifestRepository::put_if_absent(
     std::shared_ptr<const BuildQualifiedManifest> manifest) {
+  storage_->require_owner_process();
   if (manifest == nullptr) {
     fail("filesystem semantic-manifest repository rejects null");
+  }
+  const std::uint64_t byte_size =
+      static_cast<std::uint64_t>(manifest->canonical_bytes().size());
+  if (byte_size > storage_->max_total_bytes) {
+    fail("filesystem semantic-manifest value exceeds its repository byte "
+         "bound");
   }
   const auto reloaded =
       detail::reload_self_verified_build_manifest(
@@ -443,8 +519,6 @@ bool FilesystemBuildManifestRepository::put_if_absent(
     return false;
   }
 
-  const std::uint64_t byte_size =
-      static_cast<std::uint64_t>(manifest->canonical_bytes().size());
   if (storage_->manifest_count >= storage_->max_manifest_count ||
       byte_size > storage_->max_total_bytes - storage_->retained_bytes) {
     fail("filesystem semantic-manifest repository bound is exhausted");
@@ -523,12 +597,13 @@ bool FilesystemBuildManifestRepository::put_if_absent(
 std::shared_ptr<const BuildQualifiedManifest>
 FilesystemBuildManifestRepository::get_verified(
     const BuildManifestKey& key) const {
-  std::lock_guard process_lock(storage_->mutex);
-  const AdvisoryFileLock file_lock(storage_->lock_fd, LOCK_SH);
-  storage_->refresh_index_locked(false);
+  storage_->require_owner_process();
   const std::filesystem::path path =
       kind_directory(storage_->root, key.manifest_kind) /
       manifest_filename(key);
+  std::lock_guard process_lock(storage_->mutex);
+  const AdvisoryFileLock file_lock(storage_->lock_fd, LOCK_SH);
+  storage_->refresh_index_locked(false);
   const auto bytes =
       read_plain_file(path, storage_->max_total_bytes, true);
   if (!bytes.has_value()) {
@@ -545,6 +620,7 @@ FilesystemBuildManifestRepository::get_verified(
 }
 
 std::size_t FilesystemBuildManifestRepository::size() const {
+  storage_->require_owner_process();
   std::lock_guard process_lock(storage_->mutex);
   const AdvisoryFileLock file_lock(storage_->lock_fd, LOCK_SH);
   storage_->refresh_index_locked(false);
@@ -553,6 +629,7 @@ std::size_t FilesystemBuildManifestRepository::size() const {
 
 std::uint64_t
 FilesystemBuildManifestRepository::retained_bytes() const {
+  storage_->require_owner_process();
   std::lock_guard process_lock(storage_->mutex);
   const AdvisoryFileLock file_lock(storage_->lock_fd, LOCK_SH);
   storage_->refresh_index_locked(false);

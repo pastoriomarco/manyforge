@@ -399,6 +399,7 @@ add_library(manyforge_deployment
   src/model_source.cpp
   src/provider_manifest_codec.cpp
   src/retained_bundle.cpp
+  src/retained_bundle_store.cpp
   src/retention_qualified_deployment.cpp
   src/runtime_profile_codec.cpp
   src/site_overlay_resolution.cpp
@@ -667,6 +668,17 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_retained_bundle
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_retained_bundle_store
+    test/test_retained_bundle_store.cpp)
+  target_include_directories(test_retained_bundle_store PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_retained_bundle_store PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  target_link_options(test_retained_bundle_store PRIVATE
+    "-Wl,--wrap=fsync")
+  gtest_discover_tests(test_retained_bundle_store
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_retained_bundle_materializer
     test/test_retained_bundle_materializer.cpp)
   target_include_directories(test_retained_bundle_materializer PRIVATE
@@ -683,6 +695,8 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
   target_link_libraries(test_build_manifest PRIVATE
     manyforge_deployment GTest::gtest_main)
+  target_link_options(test_build_manifest PRIVATE
+    "-Wl,--wrap=fsync")
   gtest_discover_tests(test_build_manifest
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 

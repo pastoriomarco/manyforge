@@ -27,7 +27,6 @@
 #include <cstdint>
 #include <limits>
 #include <map>
-#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -1861,98 +1860,5 @@ core::RetainedNodeEnvironmentDTO retained_node_environment_from_manifest(
 }
 
 }  // namespace detail
-
-struct InMemoryBuildManifestRepository::Storage final {
-  Storage(std::size_t max_manifest_count_in,
-          std::uint64_t max_total_bytes_in)
-      : max_manifest_count(max_manifest_count_in),
-        max_total_bytes(max_total_bytes_in) {}
-
-  std::size_t max_manifest_count;
-  std::uint64_t max_total_bytes;
-  std::map<BuildManifestKey, std::string> manifests;
-  std::uint64_t retained_bytes{0U};
-  mutable std::mutex mutex;
-};
-
-InMemoryBuildManifestRepository::InMemoryBuildManifestRepository(
-    std::size_t max_manifest_count, std::uint64_t max_total_bytes) {
-  if (max_manifest_count == 0U || max_total_bytes == 0U) {
-    fail("build-manifest repository limits must be positive");
-  }
-  storage_ =
-      std::make_unique<Storage>(max_manifest_count, max_total_bytes);
-}
-
-InMemoryBuildManifestRepository::~InMemoryBuildManifestRepository() =
-    default;
-
-bool InMemoryBuildManifestRepository::put_if_absent(
-    std::shared_ptr<const BuildQualifiedManifest> manifest) {
-  if (manifest == nullptr) {
-    fail("build-manifest repository rejects a null manifest");
-  }
-  const auto reloaded =
-      detail::reload_self_verified_build_manifest(
-          manifest->key().manifest_kind,
-          manifest->canonical_bytes());
-  if (reloaded->key() != manifest->key()) {
-    fail("build-manifest repository rejects a key/content mismatch");
-  }
-  const std::uint64_t byte_size =
-      static_cast<std::uint64_t>(manifest->canonical_bytes().size());
-  std::lock_guard lock(storage_->mutex);
-  const auto existing = storage_->manifests.find(manifest->key());
-  if (existing != storage_->manifests.end()) {
-    if (existing->second != manifest->canonical_bytes()) {
-      throw std::runtime_error(
-          "build-manifest repository detected an identity collision");
-    }
-    return false;
-  }
-  if (storage_->manifests.size() >= storage_->max_manifest_count) {
-    fail("build-manifest repository entry bound is exhausted");
-  }
-  if (byte_size > storage_->max_total_bytes - storage_->retained_bytes) {
-    fail("build-manifest repository byte bound is exhausted");
-  }
-  storage_->manifests.emplace(
-      manifest->key(), std::string(manifest->canonical_bytes()));
-  storage_->retained_bytes += byte_size;
-  return true;
-}
-
-std::shared_ptr<const BuildQualifiedManifest>
-InMemoryBuildManifestRepository::get_verified(
-    const BuildManifestKey& key) const {
-  std::string bytes;
-  {
-    std::lock_guard lock(storage_->mutex);
-    const auto found = storage_->manifests.find(key);
-    if (found == storage_->manifests.end()) {
-      return nullptr;
-    }
-    bytes = found->second;
-  }
-  const auto manifest =
-      detail::reload_self_verified_build_manifest(
-          key.manifest_kind, bytes);
-  if (manifest->key() != key) {
-    throw std::runtime_error(
-        "build-manifest repository reloaded a different semantic key");
-  }
-  return manifest;
-}
-
-std::size_t InMemoryBuildManifestRepository::size() const noexcept {
-  std::lock_guard lock(storage_->mutex);
-  return storage_->manifests.size();
-}
-
-std::uint64_t
-InMemoryBuildManifestRepository::retained_bytes() const noexcept {
-  std::lock_guard lock(storage_->mutex);
-  return storage_->retained_bytes;
-}
 
 }  // namespace manyforge::deployment

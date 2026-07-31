@@ -62,11 +62,20 @@ Current limits are explicit:
 - qualified compiler-build evidence currently requires a single-configuration
   CMake generator; multi-config generators reject at configure time rather
   than sharing one ambiguous manifest across several binary configurations;
-- manifest durability does not complete I3 storage: the raw CAS and semantic
-  retained-bundle repository are still in-memory, and production
-  materialization returns rather than durably stores/reloads the bundle;
-- remaining products, consumer equivalence, runtime-shadow behavior, and the
-  Manager-facing compile/store/verify port remain later I3 work; and
+- the bounded I3 durability checkpoint now provides an immutable filesystem
+  build-manifest repository, raw-artifact CAS, and distinct semantic
+  retained-bundle repository beneath one existing trusted package root; each
+  process opens its own bounded, crash-adopting immutable repository instance,
+  while production materialization independently reloads the semantic envelope
+  and directly rechecks its raw-artifact closure; separately, the sealed
+  filesystem verified-bundle source binds concrete raw and semantic stores to
+  that root and re-verifies every referenced retained artifact before returning
+  a caller-ID-selected bundle; this lookup is only a lower-level dependency of
+  later Manager canonical-empty admission;
+- this does not complete I3 or the complete C1 exit: no build-owned public
+  canonical-empty selector/`CellId` golden is frozen here, and remaining
+  products, consumer equivalence, and runtime-shadow behavior remain later I3
+  work; and
 - Apply, active publication, process ownership, runtime convergence,
   simulation, controllers, execution, and lane restoration belong to later
   packages and plan checkpoints.

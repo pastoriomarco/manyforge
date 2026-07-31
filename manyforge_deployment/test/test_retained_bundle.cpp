@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "retained_bundle_internal.hpp"
+#include "retention_store_fixtures.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -45,16 +46,20 @@ static_assert(!std::is_constructible_v<RetainedBundle, core::RetainedBundleId,
 static_assert(!std::is_constructible_v<
               RetainedBundle, core::RetainedBundleId,
               core::RetainedBundleDTO, CanonicalValue, std::string>);
-static_assert(!std::is_copy_constructible_v<InMemoryRawArtifactStore>);
-static_assert(!std::is_copy_assignable_v<InMemoryRawArtifactStore>);
-static_assert(!std::is_move_constructible_v<InMemoryRawArtifactStore>);
-static_assert(!std::is_move_assignable_v<InMemoryRawArtifactStore>);
 static_assert(
-    !std::is_copy_constructible_v<InMemoryRetainedBundleRepository>);
-static_assert(!std::is_copy_assignable_v<InMemoryRetainedBundleRepository>);
+    !std::is_copy_constructible_v<FilesystemRawArtifactStore>);
+static_assert(!std::is_copy_assignable_v<FilesystemRawArtifactStore>);
 static_assert(
-    !std::is_move_constructible_v<InMemoryRetainedBundleRepository>);
-static_assert(!std::is_move_assignable_v<InMemoryRetainedBundleRepository>);
+    !std::is_move_constructible_v<FilesystemRawArtifactStore>);
+static_assert(!std::is_move_assignable_v<FilesystemRawArtifactStore>);
+static_assert(
+    !std::is_copy_constructible_v<FilesystemRetainedBundleRepository>);
+static_assert(
+    !std::is_copy_assignable_v<FilesystemRetainedBundleRepository>);
+static_assert(
+    !std::is_move_constructible_v<FilesystemRetainedBundleRepository>);
+static_assert(
+    !std::is_move_assignable_v<FilesystemRetainedBundleRepository>);
 
 TEST(RetainedBundlePublicSurfaceTest,
      DoesNotExposeArbitrarySemanticProductRetention) {
@@ -66,7 +71,9 @@ TEST(RetainedBundlePublicSurfaceTest,
   for (const std::string_view removed_name :
        {"RetainedArtifactInput"sv, "build_and_retain_product"sv,
         "retained_product_projection"sv,
-        "retained_product_output_digest"sv}) {
+        "retained_product_output_digest"sv,
+        "InMemoryRawArtifactStore"sv,
+        "InMemoryRetainedBundleRepository"sv}) {
     EXPECT_EQ(source.find(removed_name), std::string::npos) << removed_name;
   }
 }
@@ -221,7 +228,7 @@ TEST(ProductContractRegistryTest, QualifiesOnlyExactFlattenedModelContract) {
 }
 
 TEST(RawArtifactStoreTest, UsesImmutableDigestKeysAndReverifiesReads) {
-  InMemoryRawArtifactStore store;
+  test::InMemoryRawArtifactStoreFixture store;
   const StoredRawArtifact first = store.put_if_absent("binary\0bytes"sv);
   EXPECT_TRUE(first.inserted);
   EXPECT_EQ(first.byte_size, 12U);
@@ -247,17 +254,20 @@ TEST(RawArtifactStoreTest, UsesImmutableDigestKeysAndReverifiesReads) {
 }
 
 TEST(RawArtifactStoreTest, AppliesEntryAndByteBoundsWithoutEviction) {
-  EXPECT_THROW(InMemoryRawArtifactStore(0U, 1U, 1U), RetainedBundleError);
-  EXPECT_THROW(InMemoryRawArtifactStore(1U, 0U, 1U), RetainedBundleError);
-  EXPECT_THROW(InMemoryRawArtifactStore(1U, 1U, 2U), RetainedBundleError);
+  EXPECT_THROW(test::InMemoryRawArtifactStoreFixture(0U, 1U, 1U),
+               RetainedBundleError);
+  EXPECT_THROW(test::InMemoryRawArtifactStoreFixture(1U, 0U, 1U),
+               RetainedBundleError);
+  EXPECT_THROW(test::InMemoryRawArtifactStoreFixture(1U, 1U, 2U),
+               RetainedBundleError);
 
-  InMemoryRawArtifactStore store(1U, 4U, 4U);
+  test::InMemoryRawArtifactStoreFixture store(1U, 4U, 4U);
   EXPECT_TRUE(store.put_if_absent("abcd").inserted);
   EXPECT_FALSE(store.put_if_absent("abcd").inserted);
   EXPECT_THROW(static_cast<void>(store.put_if_absent("x")),
                RetainedBundleError);
 
-  InMemoryRawArtifactStore single_bound(2U, 8U, 4U);
+  test::InMemoryRawArtifactStoreFixture single_bound(2U, 8U, 4U);
   EXPECT_THROW(static_cast<void>(single_bound.put_if_absent("abcde")),
                RetainedBundleError);
   EXPECT_EQ(single_bound.size(), 0U);
@@ -267,7 +277,8 @@ TEST(RawArtifactStoreTest,
      ConcurrentSameBytesAreIdempotentWithExactAccounting) {
   constexpr std::size_t kThreadCount = 16U;
   const std::string bytes = "one immutable concurrent artifact";
-  InMemoryRawArtifactStore store(1U, bytes.size(), bytes.size());
+  test::InMemoryRawArtifactStoreFixture store(1U, bytes.size(),
+                                               bytes.size());
   std::barrier<> start(static_cast<std::ptrdiff_t>(kThreadCount + 1U));
   std::vector<std::optional<StoredRawArtifact>> results(kThreadCount);
   std::vector<std::exception_ptr> failures(kThreadCount);
@@ -329,7 +340,7 @@ TEST(RawArtifactStoreTest,
         std::max(maximum_single_bytes, inputs.back().size());
   }
 
-  InMemoryRawArtifactStore store(
+  test::InMemoryRawArtifactStoreFixture store(
       kThreadCount, expected_total_bytes,
       static_cast<std::uint64_t>(maximum_single_bytes));
   std::barrier<> start(static_cast<std::ptrdiff_t>(kThreadCount + 1U));
@@ -371,7 +382,7 @@ TEST(RawArtifactStoreTest,
 }
 
 TEST(RetainedProductTest, UsesContractBeforeRetainingCanonicalArtifacts) {
-  InMemoryRawArtifactStore store;
+  test::InMemoryRawArtifactStoreFixture store;
   auto reversed = product_contract_fixture_artifacts();
   std::reverse(reversed.begin(), reversed.end());
   const core::RetainedProductDTO product =
@@ -394,7 +405,7 @@ TEST(RetainedProductTest, UsesContractBeforeRetainingCanonicalArtifacts) {
   EXPECT_NE(output_digest, product.artifact_refs[0].content_digest);
   EXPECT_NE(output_digest, product.artifact_refs[1].content_digest);
 
-  InMemoryRawArtifactStore second_store;
+  test::InMemoryRawArtifactStoreFixture second_store;
   const core::RetainedProductDTO same = retain_fixture_product(second_store);
   EXPECT_EQ(product, same);
   EXPECT_EQ(output_digest, detail::retained_product_output_digest(same));
@@ -402,7 +413,7 @@ TEST(RetainedProductTest, UsesContractBeforeRetainingCanonicalArtifacts) {
 
 TEST(RetainedProductTest,
      OutputDigestCoversEveryContractValidSemanticField) {
-  InMemoryRawArtifactStore store;
+  test::InMemoryRawArtifactStoreFixture store;
   const core::RetainedProductDTO original = retain_fixture_product(store);
   const core::ContentDigest original_digest =
       detail::retained_product_output_digest(original);
@@ -430,7 +441,7 @@ TEST(RetainedProductTest,
 
 TEST(RetainedProductTest,
      ContractOwnedOrIncoherentSemanticFieldMutationsFailClosed) {
-  InMemoryRawArtifactStore store;
+  test::InMemoryRawArtifactStoreFixture store;
   const core::RetainedProductDTO original = retain_fixture_product(store);
 
   core::RetainedProductDTO changed = original;
@@ -483,7 +494,7 @@ TEST(RetainedProductTest,
 
 TEST(RetainedProductTest, RejectsContractDefectsBeforeStoreEffects) {
   const auto &contract = flattened_contract();
-  InMemoryRawArtifactStore store;
+  test::InMemoryRawArtifactStoreFixture store;
 
   auto missing = product_contract_fixture_artifacts();
   missing.pop_back();
@@ -582,7 +593,7 @@ TEST(RetainedProductTest, RequiresVerifiedExactArtifactReadBack) {
 
 TEST(RetainedProductTest,
      ProjectionRejectsCallerConstructedContractInconsistency) {
-  InMemoryRawArtifactStore store;
+  test::InMemoryRawArtifactStoreFixture store;
   core::RetainedProductDTO product = retain_fixture_product(store);
 
   product.product_kind = core::RetainedProductKind::kViewerModel;
@@ -611,19 +622,22 @@ TEST(RetainedProductTest,
 
 TEST(RetainedBundleRepositoryTest,
      StartsEmptyAndExposesNoActiveAliasOrNullInsertionPath) {
-  InMemoryRetainedBundleRepository repository;
+  test::InMemoryRetainedBundleRepositoryFixture repository;
   EXPECT_EQ(repository.size(), 0U);
   EXPECT_EQ(repository.retained_bytes(), 0U);
   EXPECT_EQ(
-      repository.get_verified(core::RetainedBundleId(std::string(kZeroDigest))),
+      repository.get_verified_envelope(
+          core::RetainedBundleId(std::string(kZeroDigest))),
       nullptr);
   EXPECT_THROW(static_cast<void>(repository.put_if_absent(nullptr)),
                RetainedBundleError);
 }
 
 TEST(RetainedBundleRepositoryTest, AppliesRepositoryBounds) {
-  EXPECT_THROW(InMemoryRetainedBundleRepository(0U, 1U), RetainedBundleError);
-  EXPECT_THROW(InMemoryRetainedBundleRepository(1U, 0U), RetainedBundleError);
+  EXPECT_THROW(test::InMemoryRetainedBundleRepositoryFixture(0U, 1U),
+               RetainedBundleError);
+  EXPECT_THROW(test::InMemoryRetainedBundleRepositoryFixture(1U, 0U),
+               RetainedBundleError);
 }
 
 } // namespace manyforge::deployment

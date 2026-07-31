@@ -17,6 +17,7 @@
 #include <type_traits>
 
 #include "retained_bundle_internal.hpp"
+#include "retention_store_fixtures.hpp"
 #include "runtime_only_retention_fixture.hpp"
 
 namespace manyforge::deployment::detail {
@@ -171,7 +172,7 @@ TEST(RetainedBundleMaterializer,
   EXPECT_NE(expected_urdf.find("<link"), std::string::npos);
   EXPECT_EQ(expected_srdf.find("<group"), std::string::npos);
 
-  InMemoryRawArtifactStore store;
+  test::InMemoryRawArtifactStoreFixture store;
   const auto bundle = detail::RetainedBundleMaterializer::materialize(
       qualified, detail::RetentionMaterializerTestAccess::make_context(),
       store);
@@ -252,8 +253,8 @@ TEST(RetainedBundleMaterializer,
 
 TEST(RetainedBundleMaterializer,
      RegenerationIsByteExactAndRepositoryRoundTripReverifiesWholeEnvelope) {
-  InMemoryRawArtifactStore first_store;
-  InMemoryRawArtifactStore second_store;
+  test::InMemoryRawArtifactStoreFixture first_store;
+  test::InMemoryRawArtifactStoreFixture second_store;
   const auto first = materialize_empty("i3_empty_cell", first_store);
   const auto second = materialize_empty("i3_empty_cell", second_store);
 
@@ -261,14 +262,14 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(first->normalized_root(), second->normalized_root());
   EXPECT_EQ(first->canonical_bytes(), second->canonical_bytes());
 
-  InMemoryRetainedBundleRepository repository;
+  test::InMemoryRetainedBundleRepositoryFixture repository;
   EXPECT_TRUE(repository.put_if_absent(first));
   EXPECT_FALSE(repository.put_if_absent(second));
   EXPECT_EQ(repository.size(), 1U);
   EXPECT_EQ(repository.retained_bytes(), first->canonical_bytes().size());
 
   const auto loaded =
-      repository.get_verified(first->retained_bundle_id());
+      repository.get_verified_envelope(first->retained_bundle_id());
   ASSERT_NE(loaded, nullptr);
   EXPECT_TRUE(verify_retained_bundle_identity(*loaded));
   EXPECT_EQ(loaded->retained_bundle_id(), first->retained_bundle_id());
@@ -279,13 +280,13 @@ TEST(RetainedBundleMaterializer,
 
 TEST(RetainedBundleMaterializer,
      SealedRepositoryEnforcesActualBundleCountAndByteBounds) {
-  InMemoryRawArtifactStore first_store;
-  InMemoryRawArtifactStore second_store;
+  test::InMemoryRawArtifactStoreFixture first_store;
+  test::InMemoryRawArtifactStoreFixture second_store;
   const auto first = materialize_empty("i3_bound_cell_a", first_store);
   const auto second = materialize_empty("i3_bound_cell_b", second_store);
 
   ASSERT_GT(first->canonical_bytes().size(), 1U);
-  InMemoryRetainedBundleRepository byte_bounded(
+  test::InMemoryRetainedBundleRepositoryFixture byte_bounded(
       2U, first->canonical_bytes().size() - 1U);
   EXPECT_THROW(static_cast<void>(byte_bounded.put_if_absent(first)),
                RetainedBundleError);
@@ -295,7 +296,8 @@ TEST(RetainedBundleMaterializer,
   const std::uint64_t combined_bytes =
       static_cast<std::uint64_t>(first->canonical_bytes().size()) +
       static_cast<std::uint64_t>(second->canonical_bytes().size());
-  InMemoryRetainedBundleRepository count_bounded(1U, combined_bytes);
+  test::InMemoryRetainedBundleRepositoryFixture count_bounded(
+      1U, combined_bytes);
   EXPECT_TRUE(count_bounded.put_if_absent(first));
   EXPECT_THROW(static_cast<void>(count_bounded.put_if_absent(second)),
                RetainedBundleError);
@@ -305,8 +307,8 @@ TEST(RetainedBundleMaterializer,
 
 TEST(RetainedBundleMaterializer,
      ValidCellIdentityChangesRemainOrdinaryCellSpecificProducts) {
-  InMemoryRawArtifactStore first_store;
-  InMemoryRawArtifactStore second_store;
+  test::InMemoryRawArtifactStoreFixture first_store;
+  test::InMemoryRawArtifactStoreFixture second_store;
   const auto first = materialize_empty("i3_empty_cell_a", first_store);
   const auto second = materialize_empty("i3_empty_cell_b", second_store);
 

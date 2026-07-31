@@ -82,12 +82,15 @@ class RetainedBundleMaterializer final {
  public:
   /// Production path. Build/environment authority is regenerated before the
   /// first manifest-repository effect, then the exact persisted closure is
-  /// independently reloaded before the first raw-CAS effect.
+  /// independently reloaded before the first raw-CAS effect. The resulting
+  /// semantic bundle is durably inserted and independently reconstructed
+  /// before it is returned.
   [[nodiscard]] static std::shared_ptr<const RetainedBundle>
-  materialize_production(
+  materialize_store_and_reload_production(
       const RetentionQualifiedDeployment& qualified,
       IBuildManifestRepository& manifest_repository,
-      IRawArtifactStore& artifact_store);
+      IRawArtifactStore& artifact_store,
+      IRetainedBundleRepository& bundle_repository);
 
   /// Private, explicitly non-authoritative fixture path retained only for the
   /// bounded mechanical tests that preceded C1.0.
@@ -104,6 +107,17 @@ class RetainedBundleMaterializer final {
       std::string_view urdf, std::string_view srdf,
       const BuildQualifiedProductContract& contract,
       IRawArtifactStore& artifact_store);
+};
+
+/// Sole reconstruction authority for durable semantic repository bytes.
+///
+/// Reload reparses the exact canonical envelope, verifies the complete
+/// currently qualified retained-bundle projection and semantic identity, and
+/// only then reconstructs the sealed RetainedBundle value.
+class RetainedBundleReloadAuthority final {
+ public:
+  [[nodiscard]] static std::shared_ptr<const RetainedBundle> reload(
+      std::string_view canonical_bytes);
 };
 
 /// Compiler-internal input for one product-contract artifact role.

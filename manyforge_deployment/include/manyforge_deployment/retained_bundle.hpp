@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <memory>
@@ -17,13 +18,16 @@ namespace manyforge::deployment {
 
 namespace detail {
 class RetainedBundleMaterializer;
+class RetainedBundleReloadAuthority;
 }
 
-inline constexpr std::size_t kMaxInMemoryRetainedBlobCount = 4096U;
-inline constexpr std::uint64_t kMaxInMemoryRetainedBlobBytes =
+class FilesystemVerifiedRetainedBundleSource;
+
+inline constexpr std::size_t kMaxDurableRetainedBlobCount = 4096U;
+inline constexpr std::uint64_t kMaxDurableRetainedBlobBytes =
     512ULL * 1024ULL * 1024ULL;
-inline constexpr std::size_t kMaxInMemoryRetainedBundleCount = 1024U;
-inline constexpr std::uint64_t kMaxInMemoryRetainedBundleBytes =
+inline constexpr std::size_t kMaxDurableRetainedBundleCount = 1024U;
+inline constexpr std::uint64_t kMaxDurableRetainedBundleBytes =
     512ULL * 1024ULL * 1024ULL;
 
 class RetainedBundleError : public std::invalid_argument {
@@ -174,20 +178,38 @@ public:
                std::uint64_t expected_size) const = 0;
 };
 
-class InMemoryRawArtifactStore final : public IRawArtifactStore {
+/// Durable immutable raw-artifact CAS.
+///
+/// Blobs are published under their digest-derived key only after a
+/// same-directory write and file fsync. Publication uses a no-replace hard
+/// link followed by directory fsync; committed names are never opened for
+/// writing. Every reopen enumerates the complete bounded store and verifies
+/// each filename, size, and digest before use.
+///
+/// `trusted_root` must be an existing deployment-owned plain directory. The
+/// root and its ancestors must not be renamed, replaced, or modified by an
+/// untrusted actor while the store is open. The implementation rejects
+/// symlinks at every path it owns and serializes cooperating processes, but
+/// it does not defend against a privileged writer that can replace the
+/// trusted hierarchy or deliberately forge filesystem state. Store instances
+/// are process-affine: after `fork()`, the child must construct a fresh store
+/// before use so it owns a distinct advisory-lock file description.
+class FilesystemRawArtifactStore final : public IRawArtifactStore {
 public:
-  explicit InMemoryRawArtifactStore(
-      std::size_t max_blob_count = kMaxInMemoryRetainedBlobCount,
-      std::uint64_t max_total_bytes = kMaxInMemoryRetainedBlobBytes,
-      std::uint64_t max_single_blob_bytes = kMaxInMemoryRetainedBlobBytes);
-  ~InMemoryRawArtifactStore() override;
+  explicit FilesystemRawArtifactStore(
+      std::filesystem::path trusted_root,
+      std::size_t max_blob_count = kMaxDurableRetainedBlobCount,
+      std::uint64_t max_total_bytes = kMaxDurableRetainedBlobBytes,
+      std::uint64_t max_single_blob_bytes =
+          kMaxDurableRetainedBlobBytes);
+  ~FilesystemRawArtifactStore() override;
 
-  InMemoryRawArtifactStore(const InMemoryRawArtifactStore &) = delete;
-  InMemoryRawArtifactStore &
-  operator=(const InMemoryRawArtifactStore &) = delete;
-  InMemoryRawArtifactStore(InMemoryRawArtifactStore &&) = delete;
-  InMemoryRawArtifactStore &
-  operator=(InMemoryRawArtifactStore &&) = delete;
+  FilesystemRawArtifactStore(const FilesystemRawArtifactStore &) = delete;
+  FilesystemRawArtifactStore &
+  operator=(const FilesystemRawArtifactStore &) = delete;
+  FilesystemRawArtifactStore(FilesystemRawArtifactStore &&) = delete;
+  FilesystemRawArtifactStore &
+  operator=(FilesystemRawArtifactStore &&) = delete;
 
   [[nodiscard]] StoredRawArtifact
   put_if_absent(std::string_view bytes) override;
@@ -196,12 +218,15 @@ public:
                const core::ContentDigest &expected_digest,
                std::uint64_t expected_size) const override;
 
-  [[nodiscard]] std::size_t size() const noexcept;
-  [[nodiscard]] std::uint64_t retained_bytes() const noexcept;
+  /// Repository-wide snapshots refreshed under the cross-process lock.
+  [[nodiscard]] std::size_t size() const;
+  [[nodiscard]] std::uint64_t retained_bytes() const;
 
 private:
   struct Storage;
   std::unique_ptr<Storage> storage_;
+
+  friend class FilesystemVerifiedRetainedBundleSource;
 };
 
 /// Immutable semantic retained-bundle value.
@@ -247,10 +272,29 @@ private:
   std::string canonical_bytes_;
 
   friend class detail::RetainedBundleMaterializer;
+  friend class detail::RetainedBundleReloadAuthority;
 };
 
 [[nodiscard]] bool
 verify_retained_bundle_identity(const RetainedBundle &bundle);
+
+/// Narrow lower-level verified-bundle lookup capability.
+///
+/// The returned value is sealed and was independently reconstructed from the
+/// complete canonical envelope. Every raw content reference present in that
+/// envelope must also have been independently resolved and digest-verified
+/// before return. A missing bundle returns null; present but unverifiable
+/// content fails closed. Callers supply a strong bundle ID, so this capability
+/// is only a dependency of the later zero-input, build-owned canonical-empty
+/// admission source; it is not that Manager admission boundary. It exposes no
+/// candidate, active, stage, or Apply effect.
+class IVerifiedRetainedBundleSource {
+public:
+  virtual ~IVerifiedRetainedBundleSource() = default;
+
+  [[nodiscard]] virtual std::shared_ptr<const RetainedBundle>
+  get_verified(const core::RetainedBundleId &retained_bundle_id) const = 0;
+};
 
 /// Semantic retained-bundle repository port. It owns immutable envelopes and
 /// never owns an active/candidate alias or Apply selection.
@@ -261,37 +305,96 @@ public:
   [[nodiscard]] virtual bool
   put_if_absent(std::shared_ptr<const RetainedBundle> bundle) = 0;
   [[nodiscard]] virtual std::shared_ptr<const RetainedBundle>
-  get_verified(const core::RetainedBundleId &retained_bundle_id) const = 0;
+  get_verified_envelope(
+      const core::RetainedBundleId &retained_bundle_id) const = 0;
 };
 
-class InMemoryRetainedBundleRepository final
+/// Durable immutable semantic retained-bundle repository.
+///
+/// Each bundle is published by strong RetainedBundleId after its exact
+/// canonical envelope has been re-parsed and fully verified. Reopen performs
+/// the same verification for every bounded entry. The repository has no
+/// mutable current/active alias. A verified semantic envelope alone is not a
+/// fully verified bundle: referenced raw artifacts are checked separately by
+/// FilesystemVerifiedRetainedBundleSource.
+///
+/// `trusted_root` has the same deployment-owned, stable-hierarchy threat
+/// model as FilesystemRawArtifactStore. First creation and durability of that
+/// root are bootstrap responsibilities; the repository durably creates only
+/// its owned descendants and files.
+class FilesystemRetainedBundleRepository final
     : public IRetainedBundleRepository {
 public:
-  explicit InMemoryRetainedBundleRepository(
-      std::size_t max_bundle_count = kMaxInMemoryRetainedBundleCount,
-      std::uint64_t max_total_bytes = kMaxInMemoryRetainedBundleBytes);
-  ~InMemoryRetainedBundleRepository() override;
+  explicit FilesystemRetainedBundleRepository(
+      std::filesystem::path trusted_root,
+      std::size_t max_bundle_count = kMaxDurableRetainedBundleCount,
+      std::uint64_t max_total_bytes = kMaxDurableRetainedBundleBytes,
+      std::uint64_t max_single_bundle_bytes =
+          kMaxDurableRetainedBundleBytes);
+  ~FilesystemRetainedBundleRepository() override;
 
-  InMemoryRetainedBundleRepository(const InMemoryRetainedBundleRepository &) =
-      delete;
-  InMemoryRetainedBundleRepository &
-  operator=(const InMemoryRetainedBundleRepository &) = delete;
-  InMemoryRetainedBundleRepository(
-      InMemoryRetainedBundleRepository &&) = delete;
-  InMemoryRetainedBundleRepository &
-  operator=(InMemoryRetainedBundleRepository &&) = delete;
+  FilesystemRetainedBundleRepository(
+      const FilesystemRetainedBundleRepository &) = delete;
+  FilesystemRetainedBundleRepository &
+  operator=(const FilesystemRetainedBundleRepository &) = delete;
+  FilesystemRetainedBundleRepository(
+      FilesystemRetainedBundleRepository &&) = delete;
+  FilesystemRetainedBundleRepository &
+  operator=(FilesystemRetainedBundleRepository &&) = delete;
 
   [[nodiscard]] bool
   put_if_absent(std::shared_ptr<const RetainedBundle> bundle) override;
   [[nodiscard]] std::shared_ptr<const RetainedBundle>
-  get_verified(const core::RetainedBundleId &retained_bundle_id) const override;
+  get_verified_envelope(
+      const core::RetainedBundleId &retained_bundle_id) const override;
 
-  [[nodiscard]] std::size_t size() const noexcept;
-  [[nodiscard]] std::uint64_t retained_bytes() const noexcept;
+  /// Repository-wide snapshots refreshed under the cross-process lock.
+  [[nodiscard]] std::size_t size() const;
+  [[nodiscard]] std::uint64_t retained_bytes() const;
 
 private:
   struct Storage;
   std::unique_ptr<Storage> storage_;
+
+  friend class FilesystemVerifiedRetainedBundleSource;
+};
+
+/// Filesystem-backed lower-level verified retained-bundle lookup.
+///
+/// This narrow capability first reconstructs the complete semantic envelope,
+/// then resolves and independently verifies every retained catalog, schema,
+/// and product-artifact reference against the durable raw CAS. The repository
+/// and CAS must have the exact same normalized trusted root; construction
+/// rejects cross-root splicing. The referenced repository and CAS must outlive
+/// this source.
+///
+/// This lookup performs no canonical-empty admission or selection and exposes
+/// no candidate, active, stage, Apply, bootstrap, scene, process, or runtime
+/// effect.
+class FilesystemVerifiedRetainedBundleSource final
+    : public IVerifiedRetainedBundleSource {
+public:
+  FilesystemVerifiedRetainedBundleSource(
+      const FilesystemRetainedBundleRepository &bundle_repository,
+      const FilesystemRawArtifactStore &artifact_store);
+  ~FilesystemVerifiedRetainedBundleSource() override = default;
+
+  FilesystemVerifiedRetainedBundleSource(
+      const FilesystemVerifiedRetainedBundleSource &) = delete;
+  FilesystemVerifiedRetainedBundleSource &
+  operator=(const FilesystemVerifiedRetainedBundleSource &) = delete;
+  FilesystemVerifiedRetainedBundleSource(
+      FilesystemVerifiedRetainedBundleSource &&) = delete;
+  FilesystemVerifiedRetainedBundleSource &
+  operator=(FilesystemVerifiedRetainedBundleSource &&) = delete;
+
+  [[nodiscard]] std::shared_ptr<const RetainedBundle>
+  get_verified(
+      const core::RetainedBundleId &retained_bundle_id) const override;
+
+private:
+  const FilesystemRetainedBundleRepository &bundle_repository_;
+  const FilesystemRawArtifactStore &artifact_store_;
 };
 
 } // namespace manyforge::deployment

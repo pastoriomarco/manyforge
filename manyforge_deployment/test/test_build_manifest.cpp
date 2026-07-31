@@ -1,5 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/cell_applicability.hpp>
@@ -12,7 +17,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <barrier>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -29,13 +36,77 @@
 #include <utility>
 #include <vector>
 
-#include <unistd.h>
-
 #include "build_manifest_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "model_source_contract_internal.hpp"
 #include "retained_bundle_internal.hpp"
+#include "retention_store_fixtures.hpp"
 #include "runtime_only_retention_fixture.hpp"
+
+namespace {
+
+std::atomic<bool> g_fail_directory_fsync{false};
+std::atomic<std::uint64_t> g_fsync_device{0U};
+std::atomic<std::uint64_t> g_fsync_inode{0U};
+std::atomic<std::uint64_t> g_matching_fsync_count{0U};
+std::atomic<std::uint64_t> g_fail_on_matching_fsync{1U};
+
+class ScopedDirectoryFsyncFailure final {
+ public:
+  explicit ScopedDirectoryFsyncFailure(
+      const std::filesystem::path& directory,
+      std::uint64_t fail_on_matching_fsync = 1U) {
+    if (fail_on_matching_fsync == 0U) {
+      throw std::logic_error(
+          "test fsync fault occurrence must be positive");
+    }
+    struct stat status {};
+    if (::stat(directory.c_str(), &status) != 0 ||
+        !S_ISDIR(status.st_mode)) {
+      throw std::logic_error(
+          "test could not stat directory for fsync fault");
+    }
+    g_fsync_device.store(
+        static_cast<std::uint64_t>(status.st_dev));
+    g_fsync_inode.store(
+        static_cast<std::uint64_t>(status.st_ino));
+    g_matching_fsync_count.store(0U);
+    g_fail_on_matching_fsync.store(fail_on_matching_fsync);
+    g_fail_directory_fsync.store(true);
+  }
+
+  ~ScopedDirectoryFsyncFailure() {
+    g_fail_directory_fsync.store(false);
+  }
+
+  ScopedDirectoryFsyncFailure(
+      const ScopedDirectoryFsyncFailure&) = delete;
+  ScopedDirectoryFsyncFailure& operator=(
+      const ScopedDirectoryFsyncFailure&) = delete;
+};
+
+}  // namespace
+
+extern "C" int __real_fsync(int fd);
+
+extern "C" int __wrap_fsync(int fd) {
+  if (g_fail_directory_fsync.load()) {
+    struct stat status {};
+    if (::fstat(fd, &status) == 0 &&
+        static_cast<std::uint64_t>(status.st_dev) ==
+            g_fsync_device.load() &&
+        static_cast<std::uint64_t>(status.st_ino) ==
+            g_fsync_inode.load()) {
+      const std::uint64_t occurrence =
+          g_matching_fsync_count.fetch_add(1U) + 1U;
+      if (occurrence == g_fail_on_matching_fsync.load()) {
+        errno = EIO;
+        return -1;
+      }
+    }
+  }
+  return __real_fsync(fd);
+}
 
 namespace manyforge::deployment {
 namespace {
@@ -47,9 +118,9 @@ constexpr std::string_view kExpectedNodeEnvironmentDigest =
 constexpr std::string_view kExpectedCompilerContractDigest =
     "sha256:5af892e007d2f839aa9ce3f7a77a73feaf41e397c8f085f1f86afbed88e5e6d2";
 constexpr std::string_view kExpectedReleaseCompilerBuildDigest =
-    "sha256:db25065c1c0036509ffcb9bd2518022ff46a6e344354b3774500b4653ddee5ac";
+    "sha256:f9440c4c9a9678f4628e6c84a484b7c652d6da294b76eacecd2793af5355425a";
 constexpr std::string_view kExpectedReleaseCanonicalEmptyBundleId =
-    "sha256:ad9f9d13f940a94db1f84d7c692229c58fe0dfe6cd2d385f6ffdb501290a164d";
+    "sha256:391065e230584776a897bd7c08c69f4cdf9c67fce5b2aabab022f380ccd02f0c";
 
 static_assert(!std::is_default_constructible_v<BuildQualifiedManifest>);
 static_assert(!std::is_aggregate_v<BuildQualifiedManifest>);
@@ -208,7 +279,7 @@ class CountingRawArtifactStore final : public IRawArtifactStore {
   }
 
  private:
-  InMemoryRawArtifactStore store_;
+  test::InMemoryRawArtifactStoreFixture store_;
   std::size_t put_calls_{0U};
   mutable std::size_t get_calls_{0U};
 };
@@ -238,7 +309,7 @@ class CountingManifestRepository final : public IBuildManifestRepository {
   }
 
  private:
-  InMemoryBuildManifestRepository repository_;
+  test::InMemoryBuildManifestRepositoryFixture repository_;
   std::size_t put_calls_{0U};
   mutable std::size_t get_calls_{0U};
 };
@@ -274,7 +345,7 @@ class FaultingManifestRepository final : public IBuildManifestRepository {
 
  private:
   ManifestReloadFault fault_;
-  InMemoryBuildManifestRepository repository_;
+  test::InMemoryBuildManifestRepositoryFixture repository_;
   std::vector<std::shared_ptr<const BuildQualifiedManifest>> retained_;
 };
 
@@ -300,7 +371,7 @@ class SecondPutFailsManifestRepository final
   }
 
  private:
-  InMemoryBuildManifestRepository repository_;
+  test::InMemoryBuildManifestRepositoryFixture repository_;
   std::size_t put_calls_{0U};
 };
 
@@ -314,6 +385,10 @@ class ScopedRepositoryDirectory final {
              std::to_string(sequence_++))) {
     std::error_code error;
     (void)std::filesystem::remove_all(path_, error);
+    if (!std::filesystem::create_directory(path_, error) || error) {
+      throw std::logic_error(
+          "test could not create semantic-manifest trusted root");
+    }
   }
 
   ~ScopedRepositoryDirectory() {
@@ -330,11 +405,31 @@ class ScopedRepositoryDirectory final {
   std::filesystem::path path_;
 };
 
+class ScopedCurrentPathRestore final {
+ public:
+  ScopedCurrentPathRestore()
+      : original_(std::filesystem::current_path()) {}
+
+  ~ScopedCurrentPathRestore() {
+    std::error_code error;
+    std::filesystem::current_path(original_, error);
+  }
+
+  ScopedCurrentPathRestore(
+      const ScopedCurrentPathRestore&) = delete;
+  ScopedCurrentPathRestore& operator=(
+      const ScopedCurrentPathRestore&) = delete;
+
+ private:
+  std::filesystem::path original_;
+};
+
 [[nodiscard]] std::filesystem::path manifest_path(
     const std::filesystem::path& root,
     const BuildManifestKey& key) {
   constexpr std::string_view kDigestPrefix = "sha256:";
-  return root / std::string(to_string(key.manifest_kind)) /
+  return root / "build-manifests" /
+         std::string(to_string(key.manifest_kind)) /
          (key.content_digest.value().substr(kDigestPrefix.size()) +
           ".json");
 }
@@ -348,6 +443,23 @@ void write_file(const std::filesystem::path& path,
   stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   if (!stream.good()) {
     throw std::logic_error("test could not write manifest file");
+  }
+}
+
+void write_file_and_fsync(const std::filesystem::path& path,
+                          std::string_view bytes) {
+  write_file(path, bytes);
+  const int fd =
+      ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) {
+    throw std::logic_error(
+        "test could not reopen semantic-manifest residue");
+  }
+  const int sync_result = ::fsync(fd);
+  const int close_result = ::close(fd);
+  if (sync_result != 0 || close_result != 0) {
+    throw std::logic_error(
+        "test could not fsync semantic-manifest residue");
   }
 }
 
@@ -468,10 +580,11 @@ TEST(BuildManifestAuthority,
   const auto before =
       detail::BuildManifestTestAccess::current_candidate(
           BuildManifestKind::kCompilerContract);
-  InMemoryBuildManifestRepository manifest_repository(
+  test::InMemoryBuildManifestRepositoryFixture manifest_repository(
       1U, kMaxQualifiedManifestBytes / 2U);
-  InMemoryRawArtifactStore raw_store(1U, 1024U, 1024U);
-  InMemoryRetainedBundleRepository bundle_repository(1U, 1024U);
+  test::InMemoryRawArtifactStoreFixture raw_store(1U, 1024U, 1024U);
+  test::InMemoryRetainedBundleRepositoryFixture bundle_repository(
+      1U, 1024U);
   (void)manifest_repository;
   (void)raw_store;
   (void)bundle_repository;
@@ -484,7 +597,7 @@ TEST(BuildManifestAuthority,
 TEST(BuildManifestAuthority,
      SemanticRepositoryReloadsAndRequalifiesIndependentValues) {
   const auto context = detail::BuildQualifiedRetentionAuthority::qualify();
-  InMemoryBuildManifestRepository repository;
+  test::InMemoryBuildManifestRepositoryFixture repository;
   std::uint64_t expected_bytes = 0U;
   for (const auto& manifest : context.manifests()) {
     expected_bytes +=
@@ -544,6 +657,27 @@ TEST(BuildManifestAuthority,
 }
 
 TEST(BuildManifestAuthority,
+     PersistentRepositoryRejectsSingleValueExceedingRepositoryByteBound) {
+  const auto context =
+      detail::BuildQualifiedRetentionAuthority::qualify();
+  ASSERT_FALSE(context.manifests().empty());
+  ScopedRepositoryDirectory directory;
+  FilesystemBuildManifestRepository repository(
+      directory.path(), 1U, 1U);
+  try {
+    static_cast<void>(
+        repository.put_if_absent(context.manifests().front()));
+    FAIL() << "oversize semantic manifest was accepted";
+  } catch (const BuildManifestError& error) {
+    EXPECT_EQ(
+        std::string_view(error.what()),
+        "filesystem semantic-manifest value exceeds its repository byte "
+        "bound");
+  }
+  EXPECT_EQ(repository.size(), 0U);
+}
+
+TEST(BuildManifestAuthority,
      PersistentRepositoryRefreshesSnapshotsAfterExternalWriters) {
   const auto context = detail::BuildQualifiedRetentionAuthority::qualify();
   ASSERT_EQ(context.manifests().size(), 3U);
@@ -568,9 +702,200 @@ TEST(BuildManifestAuthority,
 }
 
 TEST(BuildManifestAuthority,
-     PersistentRepositoryAcceptsConcurrentFirstCreation) {
+     PersistentRepositoryRejectsInheritedUseAndFreshChildReopens) {
+  const auto context =
+      detail::BuildQualifiedRetentionAuthority::qualify();
+  ASSERT_EQ(context.manifests().size(), 3U);
   ScopedRepositoryDirectory directory;
-  const auto root = directory.path() / "nested" / "repository";
+  FilesystemBuildManifestRepository inherited(directory.path());
+  ASSERT_TRUE(inherited.put_if_absent(context.manifests()[0]));
+
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    const auto rejects_inherited_use = [](auto operation) {
+      try {
+        operation();
+      } catch (const BuildManifestError& error) {
+        return std::string_view(error.what()) ==
+               "filesystem semantic-manifest repository instances must "
+               "be reopened after fork";
+      } catch (...) {
+        return false;
+      }
+      return false;
+    };
+    const BuildManifestKey invalid_key{
+        static_cast<BuildManifestKind>(255U),
+        core::ContentDigest("not-a-digest")};
+    if (!rejects_inherited_use([&] {
+          static_cast<void>(inherited.put_if_absent(
+              std::shared_ptr<const BuildQualifiedManifest>{}));
+        }) ||
+        !rejects_inherited_use([&] {
+          static_cast<void>(
+              inherited.get_verified(invalid_key));
+        }) ||
+        !rejects_inherited_use([&] {
+          static_cast<void>(inherited.get_verified(
+              context.manifests()[0]->key()));
+        }) ||
+        !rejects_inherited_use(
+            [&] { static_cast<void>(inherited.size()); }) ||
+        !rejects_inherited_use([&] {
+          static_cast<void>(inherited.retained_bytes());
+        })) {
+      ::_exit(22);
+    }
+
+    try {
+      FilesystemBuildManifestRepository fresh(directory.path());
+      const auto first =
+          fresh.get_verified(context.manifests()[0]->key());
+      const bool inserted =
+          fresh.put_if_absent(context.manifests()[1]);
+      ::_exit(first != nullptr && inserted && fresh.size() == 2U
+                  ? 20
+                  : 22);
+    } catch (...) {
+      ::_exit(22);
+    }
+  }
+
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 20);
+  EXPECT_EQ(inherited.size(), 2U);
+  EXPECT_NE(inherited.get_verified(context.manifests()[1]->key()),
+            nullptr);
+}
+
+TEST(BuildManifestAuthority,
+     PersistentRepositorySerializesDistinctProcessCountBound) {
+  const auto context =
+      detail::BuildQualifiedRetentionAuthority::qualify();
+  ASSERT_GE(context.manifests().size(), 2U);
+  ScopedRepositoryDirectory directory;
+  {
+    FilesystemBuildManifestRepository initialize(
+        directory.path(), 1U, kMaxQualifiedManifestBytes);
+  }
+
+  int start_pipe[2]{-1, -1};
+  int ready_pipe[2]{-1, -1};
+  ASSERT_EQ(::pipe(start_pipe), 0);
+  ASSERT_EQ(::pipe(ready_pipe), 0);
+  std::array<pid_t, 2U> children{};
+  for (std::size_t index = 0U; index < children.size(); ++index) {
+    children[index] = ::fork();
+    ASSERT_GE(children[index], 0);
+    if (children[index] != 0) {
+      continue;
+    }
+    (void)::close(start_pipe[1]);
+    (void)::close(ready_pipe[0]);
+    try {
+      FilesystemBuildManifestRepository repository(
+          directory.path(), 1U, kMaxQualifiedManifestBytes);
+      const char ready = 'r';
+      if (::write(ready_pipe[1], &ready, 1U) != 1) {
+        ::_exit(22);
+      }
+      (void)::close(ready_pipe[1]);
+      char token = '\0';
+      ssize_t read_count = 0;
+      do {
+        read_count = ::read(start_pipe[0], &token, 1U);
+      } while (read_count < 0 && errno == EINTR);
+      (void)::close(start_pipe[0]);
+      if (read_count != 1) {
+        ::_exit(22);
+      }
+      ::_exit(repository.put_if_absent(context.manifests()[index])
+                  ? 20
+                  : 22);
+    } catch (const BuildManifestError& error) {
+      ::_exit(std::string_view(error.what()) ==
+                      "filesystem semantic-manifest repository bound is "
+                      "exhausted"
+                  ? 21
+                  : 22);
+    } catch (...) {
+      ::_exit(22);
+    }
+  }
+  (void)::close(start_pipe[0]);
+  (void)::close(ready_pipe[1]);
+  std::array<char, 2U> ready_tokens{};
+  std::size_t ready_offset = 0U;
+  while (ready_offset < ready_tokens.size()) {
+    const ssize_t count =
+        ::read(ready_pipe[0], ready_tokens.data() + ready_offset,
+               ready_tokens.size() - ready_offset);
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    ASSERT_GT(count, 0);
+    ready_offset += static_cast<std::size_t>(count);
+  }
+  (void)::close(ready_pipe[0]);
+  const std::array<char, 2U> tokens{'x', 'x'};
+  ASSERT_EQ(::write(start_pipe[1], tokens.data(), tokens.size()),
+            static_cast<ssize_t>(tokens.size()));
+  (void)::close(start_pipe[1]);
+
+  std::size_t inserted = 0U;
+  std::size_t bounded = 0U;
+  std::size_t failed = 0U;
+  for (const pid_t child : children) {
+    int status = 0;
+    if (::waitpid(child, &status, 0) != child ||
+        !WIFEXITED(status)) {
+      ++failed;
+    } else if (WEXITSTATUS(status) == 20) {
+      ++inserted;
+    } else if (WEXITSTATUS(status) == 21) {
+      ++bounded;
+    } else {
+      ++failed;
+    }
+  }
+  EXPECT_EQ(inserted, 1U);
+  EXPECT_EQ(bounded, 1U);
+  EXPECT_EQ(failed, 0U);
+
+  FilesystemBuildManifestRepository reopened(
+      directory.path(), 1U, kMaxQualifiedManifestBytes);
+  EXPECT_EQ(reopened.size(), 1U);
+  std::size_t present = 0U;
+  std::uint64_t expected_bytes = 0U;
+  for (std::size_t index = 0U; index < 2U; ++index) {
+    const auto reloaded =
+        reopened.get_verified(context.manifests()[index]->key());
+    if (reloaded == nullptr) {
+      continue;
+    }
+    ++present;
+    expected_bytes = static_cast<std::uint64_t>(
+        context.manifests()[index]->canonical_bytes().size());
+    EXPECT_EQ(reloaded->canonical_bytes(),
+              context.manifests()[index]->canonical_bytes());
+  }
+  EXPECT_EQ(present, 1U);
+  EXPECT_EQ(reopened.retained_bytes(), expected_bytes);
+}
+
+TEST(BuildManifestAuthority,
+     PersistentRepositoryRequiresExistingRootAndAcceptsConcurrentOwnedCreation) {
+  ScopedRepositoryDirectory directory;
+  const auto missing_root = directory.path() / "missing";
+  EXPECT_THROW(
+      static_cast<void>(
+          FilesystemBuildManifestRepository(missing_root)),
+      BuildManifestError);
+
+  const auto& root = directory.path();
   std::barrier<> start{3};
   std::array<std::exception_ptr, 2U> failures{};
   std::array<std::thread, 2U> workers;
@@ -599,6 +924,149 @@ TEST(BuildManifestAuthority,
   }
   FilesystemBuildManifestRepository repository(root);
   EXPECT_EQ(repository.size(), 0U);
+  EXPECT_TRUE(std::filesystem::is_directory(
+      root / "build-manifests" / "node_environment"));
+  EXPECT_TRUE(std::filesystem::is_directory(
+      root / "build-manifests" / "compiler_contract"));
+  EXPECT_TRUE(std::filesystem::is_directory(
+      root / "build-manifests" / "compiler_build"));
+}
+
+TEST(BuildManifestAuthority,
+     PersistentRepositoryRejectsSymlinkRootsAndNonPlainLock) {
+  ScopedRepositoryDirectory directory;
+  const auto target = directory.path() / "target";
+  const auto symlink = directory.path() / "root-symlink";
+  ASSERT_TRUE(std::filesystem::create_directory(target));
+  std::filesystem::create_directory_symlink(target, symlink);
+  EXPECT_THROW(
+      static_cast<void>(
+          FilesystemBuildManifestRepository(symlink)),
+      BuildManifestError);
+  EXPECT_THROW(
+      static_cast<void>(
+          FilesystemBuildManifestRepository(symlink / "")),
+      BuildManifestError);
+
+  {
+    FilesystemBuildManifestRepository initialize(directory.path());
+  }
+  const auto lock_path =
+      directory.path() / "build-manifests" / ".repository.lock";
+  ASSERT_TRUE(std::filesystem::remove(lock_path));
+  ASSERT_EQ(::mkfifo(lock_path.c_str(), 0600), 0);
+  EXPECT_THROW(
+      static_cast<void>(
+          FilesystemBuildManifestRepository(directory.path())),
+      BuildManifestError);
+}
+
+TEST(BuildManifestAuthority,
+     PersistentRepositoryPinsRelativeTrustedRootAcrossChdir) {
+  const auto context =
+      detail::BuildQualifiedRetentionAuthority::qualify();
+  ASSERT_FALSE(context.manifests().empty());
+  ScopedRepositoryDirectory trusted_root;
+  ScopedRepositoryDirectory later_working_directory;
+  ScopedCurrentPathRestore restore_current_path;
+
+  std::filesystem::current_path(trusted_root.path().parent_path());
+  const std::filesystem::path relative_root =
+      trusted_root.path().filename();
+  FilesystemBuildManifestRepository repository(relative_root);
+  std::filesystem::current_path(later_working_directory.path());
+
+  EXPECT_TRUE(repository.put_if_absent(context.manifests().front()));
+  EXPECT_EQ(repository.size(), 1U);
+  EXPECT_NE(
+      repository.get_verified(context.manifests().front()->key()),
+      nullptr);
+  EXPECT_FALSE(std::filesystem::exists(
+      later_working_directory.path() / relative_root));
+  EXPECT_TRUE(std::filesystem::exists(
+      trusted_root.path() / "build-manifests"));
+}
+
+TEST(BuildManifestAuthority,
+     PersistentRepositoryAdoptsSyntheticFinalOnlyCrashResidue) {
+  const auto context =
+      detail::BuildQualifiedRetentionAuthority::qualify();
+  ASSERT_FALSE(context.manifests().empty());
+  const auto& manifest = context.manifests().front();
+  ScopedRepositoryDirectory directory;
+  FilesystemBuildManifestRepository already_open(directory.path());
+
+  const auto final_path =
+      manifest_path(directory.path(), manifest->key());
+  const auto temporary_path =
+      final_path.parent_path() /
+      ("." + manifest->key().content_digest.value().substr(7U) +
+       ".json.tmp.synthetic-final-only");
+  write_file_and_fsync(temporary_path, manifest->canonical_bytes());
+  std::filesystem::create_hard_link(temporary_path, final_path);
+  ASSERT_TRUE(std::filesystem::remove(temporary_path));
+
+  // This is a deterministic residue simulation, not a real crash: it models
+  // the state after link + temporary unlink but before the kind-directory
+  // fsync. Fresh-open verification must adopt the visible final with its own
+  // durability barrier before acknowledging it.
+  {
+    ScopedDirectoryFsyncFailure fail_kind_fsync(
+        final_path.parent_path());
+    EXPECT_THROW(
+        static_cast<void>(
+            already_open.get_verified(manifest->key())),
+        std::runtime_error);
+  }
+  {
+    ScopedDirectoryFsyncFailure fail_kind_fsync(
+        final_path.parent_path());
+    EXPECT_THROW(
+        static_cast<void>(
+            already_open.put_if_absent(manifest)),
+        std::runtime_error);
+  }
+  {
+    ScopedDirectoryFsyncFailure fail_kind_fsync(
+        final_path.parent_path());
+    EXPECT_THROW(
+        static_cast<void>(
+            FilesystemBuildManifestRepository(directory.path())),
+        std::runtime_error);
+  }
+
+  FilesystemBuildManifestRepository reopened(directory.path());
+  EXPECT_EQ(reopened.size(), 1U);
+  const auto adopted = reopened.get_verified(manifest->key());
+  ASSERT_NE(adopted, nullptr);
+  EXPECT_EQ(adopted->canonical_bytes(), manifest->canonical_bytes());
+  EXPECT_FALSE(reopened.put_if_absent(manifest));
+}
+
+TEST(BuildManifestAuthority,
+     PersistentNewPutFailsWhenPostpublicationFsyncFailsAndReopenAdopts) {
+  const auto context =
+      detail::BuildQualifiedRetentionAuthority::qualify();
+  ASSERT_FALSE(context.manifests().empty());
+  const auto& manifest = context.manifests().front();
+  ScopedRepositoryDirectory directory;
+  {
+    FilesystemBuildManifestRepository repository(directory.path());
+    ScopedDirectoryFsyncFailure fail_postpublication_fsync(
+        manifest_path(directory.path(), manifest->key()).parent_path(),
+        2U);
+    EXPECT_THROW(
+        static_cast<void>(
+            repository.put_if_absent(manifest)),
+        std::runtime_error);
+  }
+
+  FilesystemBuildManifestRepository reopened(directory.path());
+  EXPECT_EQ(reopened.size(), 1U);
+  const auto adopted = reopened.get_verified(manifest->key());
+  ASSERT_NE(adopted, nullptr);
+  EXPECT_EQ(adopted->canonical_bytes(), manifest->canonical_bytes());
+  EXPECT_FALSE(reopened.put_if_absent(manifest));
 }
 
 TEST(BuildManifestAuthority,
@@ -608,7 +1076,7 @@ TEST(BuildManifestAuthority,
     FilesystemBuildManifestRepository repository(directory.path());
   }
   const auto kind_directory =
-      directory.path() / "node_environment";
+      directory.path() / "build-manifests" / "node_environment";
   const auto temporary =
       kind_directory /
       (".0000000000000000000000000000000000000000000000000000000000000000"
@@ -694,10 +1162,12 @@ TEST(BuildManifestAuthority,
               self_verified->canonical_bytes());
   }
 
-  InMemoryRawArtifactStore raw_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+  test::InMemoryRetainedBundleRepositoryFixture bundle_repository;
   const auto bundle =
-      detail::RetainedBundleMaterializer::materialize_production(
-          qualify_empty(), reopened, raw_store);
+      detail::RetainedBundleMaterializer::
+          materialize_store_and_reload_production(
+              qualify_empty(), reopened, raw_store, bundle_repository);
   ASSERT_NE(bundle, nullptr);
   EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
   EXPECT_EQ(reopened.size(), 4U);
@@ -737,25 +1207,121 @@ TEST(BuildManifestAuthority,
 }
 
 TEST(BuildManifestAuthority,
+     PersistentRepositoryValidatesLookupKeyBeforeRepositoryScan) {
+  const auto context =
+      detail::BuildQualifiedRetentionAuthority::qualify();
+  ASSERT_FALSE(context.manifests().empty());
+  ScopedRepositoryDirectory directory;
+  FilesystemBuildManifestRepository repository(directory.path());
+  ASSERT_TRUE(
+      repository.put_if_absent(context.manifests().front()));
+  write_file(
+      manifest_path(directory.path(),
+                    context.manifests().front()->key()),
+      "{corrupt");
+
+  try {
+    static_cast<void>(repository.get_verified(BuildManifestKey{
+        static_cast<BuildManifestKind>(255U),
+        context.manifests().front()->key().content_digest}));
+    FAIL() << "invalid manifest kind was accepted";
+  } catch (const BuildManifestError& error) {
+    EXPECT_EQ(std::string_view(error.what()),
+              "filesystem manifest key has an invalid kind");
+  }
+  try {
+    static_cast<void>(repository.get_verified(BuildManifestKey{
+        BuildManifestKind::kNodeEnvironment,
+        core::ContentDigest(std::string("not-a-digest"))}));
+    FAIL() << "invalid manifest digest was accepted";
+  } catch (const BuildManifestError& error) {
+    EXPECT_EQ(std::string_view(error.what()),
+              "filesystem manifest key has an invalid digest");
+  }
+  EXPECT_ANY_THROW(static_cast<void>(repository.size()));
+}
+
+TEST(BuildManifestAuthority,
+     PersistentRepositoryPreflightsBoundsBeforeParsingOutOfBudgetEntry) {
+  const auto context =
+      detail::BuildQualifiedRetentionAuthority::qualify();
+  ASSERT_GE(context.manifests().size(), 2U);
+  ASSERT_EQ(context.manifests()[0]->key().manifest_kind,
+            BuildManifestKind::kNodeEnvironment);
+  ASSERT_EQ(context.manifests()[1]->key().manifest_kind,
+            BuildManifestKind::kCompilerContract);
+  const std::uint64_t individually_sufficient_bytes =
+      static_cast<std::uint64_t>(std::max(
+          context.manifests()[0]->canonical_bytes().size(),
+          context.manifests()[1]->canonical_bytes().size()));
+
+  const auto expect_preflight_rejection =
+      [&](std::size_t max_count, std::uint64_t max_total_bytes) {
+        ScopedRepositoryDirectory directory;
+        {
+          FilesystemBuildManifestRepository repository(
+              directory.path());
+          EXPECT_TRUE(
+              repository.put_if_absent(context.manifests()[0]));
+          EXPECT_TRUE(
+              repository.put_if_absent(context.manifests()[1]));
+        }
+        std::string corrupted(
+            context.manifests()[1]->canonical_bytes());
+        ASSERT_FALSE(corrupted.empty());
+        corrupted.front() = '[';
+        write_file(
+            manifest_path(
+                directory.path(),
+                context.manifests()[1]->key()),
+            corrupted);
+
+        try {
+          FilesystemBuildManifestRepository reopened(
+              directory.path(), max_count, max_total_bytes);
+          static_cast<void>(reopened);
+          FAIL() << "out-of-budget manifest repository reopened";
+        } catch (const BuildManifestError& error) {
+          EXPECT_EQ(
+              std::string_view(error.what()),
+              "persistent semantic-manifest repository exceeds bounds");
+        } catch (const std::exception& error) {
+          FAIL() << "wrong rejection type: " << error.what();
+        }
+      };
+
+  expect_preflight_rejection(
+      1U, kMaxQualifiedManifestBytes);
+  expect_preflight_rejection(
+      2U, individually_sufficient_bytes);
+}
+
+TEST(BuildManifestAuthority,
      ProductionMaterializationReloadsFromFreshPersistentRepository) {
   ScopedRepositoryDirectory directory;
   std::optional<core::RetainedBundleId> first_id;
   {
     FilesystemBuildManifestRepository repository(directory.path());
-    InMemoryRawArtifactStore raw_store;
+    test::InMemoryRawArtifactStoreFixture raw_store;
+    test::InMemoryRetainedBundleRepositoryFixture bundle_repository;
     const auto first =
-        detail::RetainedBundleMaterializer::materialize_production(
-            qualify_empty(), repository, raw_store);
+        detail::RetainedBundleMaterializer::
+            materialize_store_and_reload_production(
+                qualify_empty(), repository, raw_store,
+                bundle_repository);
     ASSERT_NE(first, nullptr);
     first_id = first->retained_bundle_id();
     EXPECT_EQ(repository.size(), 3U);
   }
   {
     FilesystemBuildManifestRepository reopened(directory.path());
-    InMemoryRawArtifactStore raw_store;
+    test::InMemoryRawArtifactStoreFixture raw_store;
+    test::InMemoryRetainedBundleRepositoryFixture bundle_repository;
     const auto second =
-        detail::RetainedBundleMaterializer::materialize_production(
-            qualify_empty(), reopened, raw_store);
+        detail::RetainedBundleMaterializer::
+            materialize_store_and_reload_production(
+                qualify_empty(), reopened, raw_store,
+                bundle_repository);
     ASSERT_NE(second, nullptr);
     ASSERT_TRUE(first_id.has_value());
     EXPECT_EQ(second->retained_bundle_id(), *first_id);
@@ -934,10 +1500,13 @@ TEST(BuildManifestAuthority,
   const auto fixture = test::make_runtime_only_retention_fixture();
   CountingManifestRepository manifest_repository;
   CountingRawArtifactStore raw_store;
+  test::InMemoryRetainedBundleRepositoryFixture bundle_repository;
   EXPECT_THROW(
       static_cast<void>(
-          detail::RetainedBundleMaterializer::materialize_production(
-              fixture.qualified, manifest_repository, raw_store)),
+          detail::RetainedBundleMaterializer::
+              materialize_store_and_reload_production(
+                  fixture.qualified, manifest_repository, raw_store,
+                  bundle_repository)),
       RetainedBundleError);
   EXPECT_EQ(manifest_repository.put_calls(), 0U);
   EXPECT_EQ(manifest_repository.size(), 0U);
@@ -951,10 +1520,13 @@ TEST(BuildManifestAuthority,
         ManifestReloadFault::kWrongManifest}) {
     FaultingManifestRepository manifest_repository(fault);
     CountingRawArtifactStore raw_store;
+    test::InMemoryRetainedBundleRepositoryFixture bundle_repository;
     EXPECT_THROW(
         static_cast<void>(
-            detail::RetainedBundleMaterializer::materialize_production(
-                qualify_empty(), manifest_repository, raw_store)),
+            detail::RetainedBundleMaterializer::
+                materialize_store_and_reload_production(
+                    qualify_empty(), manifest_repository, raw_store,
+                    bundle_repository)),
         BuildManifestError);
     EXPECT_EQ(raw_store.put_calls(), 0U);
     EXPECT_EQ(raw_store.get_calls(), 0U);
@@ -962,10 +1534,13 @@ TEST(BuildManifestAuthority,
 
   SecondPutFailsManifestRepository partial_repository;
   CountingRawArtifactStore raw_store;
+  test::InMemoryRetainedBundleRepositoryFixture bundle_repository;
   EXPECT_THROW(
       static_cast<void>(
-          detail::RetainedBundleMaterializer::materialize_production(
-              qualify_empty(), partial_repository, raw_store)),
+          detail::RetainedBundleMaterializer::
+              materialize_store_and_reload_production(
+                  qualify_empty(), partial_repository, raw_store,
+                  bundle_repository)),
       BuildManifestError);
   // One immutable manifest may have been retained, but it grants no
   // production context and no semantic product/CAS effect occurred.
@@ -978,9 +1553,12 @@ TEST(BuildManifestAuthority,
      CanonicalEmptyProductionPathRetainsExactAuthorityBeforeProducts) {
   CountingManifestRepository manifest_repository;
   CountingRawArtifactStore raw_store;
+  test::InMemoryRetainedBundleRepositoryFixture bundle_repository;
   const auto bundle =
-      detail::RetainedBundleMaterializer::materialize_production(
-          qualify_empty(), manifest_repository, raw_store);
+      detail::RetainedBundleMaterializer::
+          materialize_store_and_reload_production(
+              qualify_empty(), manifest_repository, raw_store,
+              bundle_repository);
   ASSERT_NE(bundle, nullptr);
   EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
   RecordProperty(
@@ -990,12 +1568,12 @@ TEST(BuildManifestAuthority,
   EXPECT_EQ(manifest_repository.get_calls(), 3U);
   EXPECT_EQ(manifest_repository.size(), 3U);
   EXPECT_EQ(raw_store.put_calls(), 2U);
-  EXPECT_EQ(raw_store.get_calls(), 2U);
+  EXPECT_EQ(raw_store.get_calls(), 4U);
 
-  InMemoryRetainedBundleRepository bundle_repository;
-  EXPECT_TRUE(bundle_repository.put_if_absent(bundle));
+  EXPECT_EQ(bundle_repository.size(), 1U);
   const auto reloaded =
-      bundle_repository.get_verified(bundle->retained_bundle_id());
+      bundle_repository.get_verified_envelope(
+          bundle->retained_bundle_id());
   ASSERT_NE(reloaded, nullptr);
   EXPECT_EQ(reloaded->retained_bundle_id(), bundle->retained_bundle_id());
   EXPECT_EQ(reloaded->canonical_bytes(), bundle->canonical_bytes());
@@ -1021,14 +1599,14 @@ TEST(BuildManifestAuthority,
   const auto context = detail::BuildQualifiedRetentionAuthority::qualify();
   ASSERT_EQ(context.manifests().size(), 3U);
   const auto& first = context.manifests().front();
-  InMemoryBuildManifestRepository byte_bounded(
+  test::InMemoryBuildManifestRepositoryFixture byte_bounded(
       3U, static_cast<std::uint64_t>(first->canonical_bytes().size() - 1U));
   EXPECT_THROW(
       static_cast<void>(byte_bounded.put_if_absent(first)),
       BuildManifestError);
   EXPECT_EQ(byte_bounded.size(), 0U);
 
-  InMemoryBuildManifestRepository count_bounded(
+  test::InMemoryBuildManifestRepositoryFixture count_bounded(
       1U, kMaxQualifiedManifestBytes);
   EXPECT_TRUE(count_bounded.put_if_absent(first));
   EXPECT_THROW(
